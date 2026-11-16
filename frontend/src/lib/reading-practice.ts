@@ -252,8 +252,14 @@ export const REVIEW_ALERT_HEADING: Record<"unknown" | "refused" | "stale", strin
  * Classify the review route's answer. `status` null = no answer at all (offline, timeout, reload). 409 key_reused
  * means this card's key already stored a grade (an earlier try whose answer was lost, then a different grade):
  * the card is graded, so it advances, and the overview reload shows which grade it was.
+ *
+ * `retryOfUnconfirmed`: this request reused the key of an earlier try whose answer never came. A refusal of it
+ * (session, origin, size, rate limit: all answered before the receipt is looked up) proves nothing about that
+ * earlier try, which may have been stored, so the card stays "Save not confirmed" and keeps the key; only the
+ * receipt (a later Retry) settles it. A 409 / 404 stays definitive: the function looks the receipt up first, so it
+ * means no grade is stored under this key.
  */
-export function classifyReviewAnswer(status: number | null, body: unknown): ReviewOutcome {
+export function classifyReviewAnswer(status: number | null, body: unknown, retryOfUnconfirmed = false): ReviewOutcome {
   const b = (plainObject(body) ? body : {}) as Record<string, unknown>;
   if (status === null) return { kind: "unknown", message: "No answer from Onyx, so this grade may or may not be stored." };
   if (status >= 200 && status < 300 && b.success === true) {
@@ -265,7 +271,10 @@ export function classifyReviewAnswer(status: number | null, body: unknown): Revi
     return { kind: "stale", message: code === "archived" ? "This highlight was removed." : status === 404 ? "This highlight no longer exists." : "This highlight was graded on another screen." };
   }
   if (status === 503) return { kind: "unknown", message: "Reviews are unavailable right now." };
-  if (status >= 400 && status < 500) return { kind: "refused", message: "Onyx refused this grade." };
+  if (status >= 400 && status < 500) {
+    if (retryOfUnconfirmed) return { kind: "unknown", message: "Onyx refused this retry, so the earlier try is still unconfirmed." };
+    return { kind: "refused", message: "Onyx refused this grade." };
+  }
   return { kind: "unknown", message: "Onyx answered with an error before confirming the grade." };
 }
 

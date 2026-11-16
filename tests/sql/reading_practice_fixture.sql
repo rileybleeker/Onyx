@@ -8,7 +8,9 @@
 --   * a quiz result replays once; one with ungraded answers, a wrong score or another book's answers is refused;
 --   * a correction invalidates the old answers (kept) and marks the result that counted them;
 --   * an edit of a source's text alone makes a new version without invalidating anything, and a wording fix can
---     say so (invalidate = false); a grade replay still matches after retention cleared its feedback.
+--     say so (invalidate = false); a grade replay still matches after retention cleared its feedback;
+--   * invalidate = true needs no other change: after a wrong source text was fixed (and an answer already made the
+--     version for the fixed text), it voids the answers given against the old text and keeps the newer ones.
 --
 -- Run ONLY on a disposable copy of the database (a local restore or a throwaway branch) with both SQL files
 -- applied, never on production. It refuses to start without the session setting below, and the whole run is one
@@ -71,6 +73,13 @@ DECLARE
   qz3   UUID := gen_random_uuid();
   a4    UUID := gen_random_uuid();
   a5    UUID := gen_random_uuid();
+  v_h3  BIGINT;
+  qk4   UUID := gen_random_uuid();
+  qz4   UUID := gen_random_uuid();
+  a6    UUID := gen_random_uuid();
+  a7    UUID := gen_random_uuid();
+  kc4   UUID := gen_random_uuid();
+  kc5   UUID := gen_random_uuid();
   n2    INTEGER;
   r     JSONB;
   r2    JSONB;
@@ -290,6 +299,53 @@ BEGIN
     AND (r->>'affected_quizzes')::int = 1, 'a real correction: ' || r::text;
   SELECT invalidated_count INTO n FROM pds.reading_quizzes WHERE op_key = qz3;
   ASSERT n = 1, 'now the quiz is marked corrected';
+
+  -- The source text was wrong: the answers given against it must stop counting, even after the next answer made the
+  -- version for the fixed text by itself (same prompt, rubric and source, so the content no longer differs).
+  INSERT INTO pds.book_highlights (book_id, chapter, passage, comment)
+    VALUES (v_a, 3, 'Fixture passage about inventory.', 'Fixture comment that turns out to be wrong.')
+    RETURNING highlight_id INTO v_h3;
+  r := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'answer', 'op_key', a6, 'book_id', v_a, 'question_key', qk4, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'answer', 'Fixture answer.', 'quiz_key', qz4));
+  ASSERT (r->>'ok')::boolean AND (r->>'version')::int = 1, 'answer: ' || r::text;
+  PERFORM pds.reading_question_apply(jsonb_build_object('kind', 'grade', 'op_key', a6, 'correct', true, 'grader', 'self'));
+  r := pds.reading_record_quiz(jsonb_build_object('op_key', qz4, 'book_id', v_a, 'checkpoint', 'ch3', 'score', 1, 'total', 1, 'quiz_date', d0));
+  ASSERT (r->>'ok')::boolean, 'quiz verified against one answer: ' || r::text;
+  r := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'correct', 'op_key', kc4, 'question_key', qk4, 'expected_version', 1, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'reason', 'Fixture: nothing changed.'));
+  ASSERT r->>'code' = 'no_change', 'no change and no flag is still no correction: ' || r::text;
+  r := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'correct', 'op_key', kc4, 'question_key', qk4, 'expected_version', 1, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'reason', 'Fixture: nothing changed.', 'invalidate', true));
+  ASSERT r->>'code' = 'no_change', 'answers to the current content are not voided by the flag alone: ' || r::text;
+  UPDATE pds.book_highlights SET comment = 'Fixture comment, fixed.' WHERE highlight_id = v_h3;
+  r := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'answer', 'op_key', a7, 'book_id', v_a, 'question_key', qk4, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'answer', 'Fixture answer against the fixed text.'));
+  ASSERT (r->>'ok')::boolean AND (r->>'version')::int = 2 AND (r->>'source_revised')::boolean, 'auto version 2: ' || r::text;
+  PERFORM pds.reading_question_apply(jsonb_build_object('kind', 'grade', 'op_key', a7, 'correct', true, 'grader', 'self'));
+  r := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'correct', 'op_key', kc4, 'question_key', qk4, 'expected_version', 2, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'reason', 'Fixture: the source text was wrong.', 'invalidate', true));
+  ASSERT (r->>'ok')::boolean AND (r->>'version')::int = 3 AND (r->>'invalidated')::boolean
+    AND (r->>'invalidated_attempts')::int = 1 AND (r->>'affected_quizzes')::int = 1,
+    'an explicit invalidation with nothing else changed: ' || r::text;
+  r2 := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'correct', 'op_key', kc4, 'question_key', qk4, 'expected_version', 2, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'reason', 'Fixture: the source text was wrong.', 'invalidate', true));
+  ASSERT (r2->>'replayed')::boolean AND (r2->>'version')::int = 3, 'the same invalidation replays: ' || r2::text;
+  SELECT count(*) INTO n FROM pds.reading_question_attempts WHERE attempt_key = a6 AND grading_status = 'invalidated' AND correct;
+  ASSERT n = 1, 'the answer given against the wrong text is kept, as invalidated';
+  SELECT count(*) INTO n FROM pds.reading_question_attempts WHERE attempt_key = a7 AND grading_status = 'graded';
+  ASSERT n = 1, 'the answer given against the fixed text keeps counting';
+  SELECT invalidated_count INTO n FROM pds.reading_quizzes WHERE op_key = qz4;
+  ASSERT n = 1, 'the quiz that counted the old answer is marked corrected';
+  r := pds.reading_question_apply(jsonb_build_object(
+    'kind', 'correct', 'op_key', kc5, 'question_key', qk4, 'expected_version', 3, 'prompt', 'Fixture question four?',
+    'source_kind', 'highlight', 'source_ref', v_h3, 'reason', 'Fixture: again.', 'invalidate', true));
+  ASSERT r->>'code' = 'no_change', 'nothing left against another content: ' || r::text;
 
   -- Retention clears the feedback text; the same grade sent again still replays instead of conflicting.
   UPDATE pds.reading_question_attempts SET graded_at = NOW() - INTERVAL '40 days' WHERE attempt_key = a3;

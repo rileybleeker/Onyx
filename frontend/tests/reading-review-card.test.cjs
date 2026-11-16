@@ -149,6 +149,52 @@ for (const [mode, lose] of [
   });
 }
 
+// Codex R2 follow-up: the grade committed and its answer was lost; the Retry is then refused BEFORE it reaches the
+// receipt (session expired, cross-origin, rate limit). That refusal says nothing about the first try, so the card must
+// keep its key and stay "Save not confirmed"; the next Retry is answered from the stored receipt.
+for (const refusal of [401, 403, 429]) {
+  test(`committed, answer lost, then a Retry refused with ${refusal}: still "Save not confirmed", same key, one review`, async (t) => {
+    const receipts = new Map();
+    const stored = [];
+    const { h, sent, events, alerts, header } = mount(t, {
+      answer: (body, n) => {
+        if (n === 2) return response({ error: "bad_request" }, refusal); // refused before the function is called
+        const prior = receipts.get(body.op_key);
+        if (prior) return response({ ...prior, replayed: true });
+        const receipt = { success: true, xp_gained: 15, next_review: "2026-03-11", interval_days: 1, op_key: body.op_key };
+        receipts.set(body.op_key, receipt);
+        stored.push({ highlight_id: body.highlight_id, grade: body.grade });
+        throw new TypeError("connection reset"); // the first try commits, its answer never arrives
+      },
+    });
+    await h.flush();
+    h.click(REVEAL);
+    await h.flush();
+    h.click("Good, next review in 1 day");
+    await h.flush();
+    assert.equal(stored.length, 1, "the fixture committed the grade");
+    assert.match(alerts()[0], /^Save not confirmed: /);
+    h.click("Retry Good");
+    await h.flush();
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].op_key, sent[0].op_key, "the refused Retry carried the same key");
+    assert.equal(alerts().length, 1);
+    assert.match(alerts()[0], /^Save not confirmed: Onyx refused this retry, so the earlier try is still unconfirmed\./);
+    assert.doesNotMatch(alerts()[0], /Not saved|Nothing was saved|Pick a grade again/, "a refused Retry never claims the grade is absent");
+    assert.equal(h.buttons("Retry Good").length, 1, "Retry is still offered");
+    assert.equal(header(), "2 due");
+    assert.equal(events.graded.length, 0);
+    h.click("Retry Good");
+    await h.flush();
+    assert.equal(sent.length, 3);
+    assert.equal(sent[2].op_key, sent[0].op_key, "the key survived the refusal");
+    assert.equal(stored.length, 1, "one review stored");
+    assert.deepEqual(events.graded, [15], "advanced exactly once, with the receipt's original award");
+    assert.equal(header(), "1 due");
+    assert.equal(alerts().length, 0);
+  });
+}
+
 test("a pending grade blocks every grade button and says why; a second tap sends nothing", async (t) => {
   const gate = deferred();
   const { h, sent, events } = mount(t, { answer: () => gate.promise });
@@ -365,6 +411,12 @@ test("pure helpers: answer classification, key reuse, and a graded card never re
   assert.equal(P.classifyReviewAnswer(503, { error: "practice_unavailable" }).kind, "unknown");
   assert.deepEqual(P.REVIEW_ALERT_HEADING, { unknown: "Save not confirmed", refused: "Not saved", stale: "Card out of date" });
   assert.equal(P.classifyReviewAnswer(400, { error: "bad_grade" }).kind, "refused");
+  // A refused retry of an unconfirmed try stays unconfirmed; a 409 / 404 (after the receipt lookup) stays definitive.
+  assert.equal(P.classifyReviewAnswer(403, { error: "bad_request" }, true).kind, "unknown");
+  assert.equal(P.classifyReviewAnswer(403, { error: "bad_request" }, false).kind, "refused");
+  assert.equal(P.classifyReviewAnswer(409, { error: "changed" }, true).kind, "stale");
+  assert.equal(P.classifyReviewAnswer(404, { error: "not_found" }, true).kind, "stale");
+  assert.equal(P.classifyReviewAnswer(409, { error: "key_reused" }, true).kind, "saved");
   assert.equal(P.classifyReviewAnswer(404, { error: "not_found" }).kind, "stale");
   assert.equal(P.classifyReviewAnswer(409, { error: "archived" }).message, "This highlight was removed.");
   assert.deepEqual(P.classifyReviewAnswer(409, { error: "key_reused" }), { kind: "saved", xp: 0, replayed: true, earlier: true });

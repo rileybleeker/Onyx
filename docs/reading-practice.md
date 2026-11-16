@@ -68,6 +68,9 @@ Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 K
   graded. A reload loses the key, which stays safe: every grade carries the card's review count, and
   a grade on an older state of the row is `409 changed`, so a card is still graded once.
 - A refusal (4xx) wrote nothing: "Not saved", no Retry, any grade can be picked, the next try gets a new key.
+  A refusal of a RETRY (the request reused the key of a try whose answer never came; refused before the receipt is
+  looked up: session expired, cross-origin, size, rate limit) proves nothing about that earlier try, so the card
+  stays "Save not confirmed" and keeps the key; the next Retry is answered from the receipt.
   Graded on another screen, archived or gone (409 / 404): "Card out of date", grades are blocked and Refresh
   re-reads the overview. While it re-reads, a
   status line says "Refreshing" and the grades stay blocked; a re-read that leaves the same card on top unblocks
@@ -113,7 +116,12 @@ Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under t
   to an older version is marked `invalidated` (kept, with its grade and the reason), and a recorded result that
   counted one gets `invalidated_count` > 0: the checkpoint tile shows it as "corrected", and it earns no XP and no
   pass badge. `invalidate: true | false` overrides that default (true when the source text itself was wrong; false
-  for a wording fix that changes nothing for the answers given). Answering a question whose prompt, rubric or
+  for a wording fix that changes nothing for the answers given). `invalidate: true` needs no other change: with the
+  same prompt, rubric and source it still makes the next version and invalidates the answers to every version whose
+  content differs from the current one. That is how answers given against a wrong source text are voided after the
+  text was fixed, also when the next answer already made the version for the fixed text by itself (below). Answers
+  to the current content stay valid; with none to invalidate it is `400 no_change`, as is no change without the
+  flag. Answering a question whose prompt, rubric or
   source reference no longer matches the stored version is `409 question_changed`, never silently accepted.
 - **Source edits.** When only the source's text moved (a highlight comment edited on /reading, a Kindle note
   re-imported, a recall note edited on /log), the next answer makes the next version itself (superseded reason
@@ -159,7 +167,8 @@ The guards complement SQL review. The real functions are exercised by `tests/sql
 (replay after a lost answer, `key_reused`, `changed` / `raced`, a failing schedule write rolling the review back,
 quiz refusals for ungraded answers, a wrong score and another book's answers, a correction invalidating and
 keeping the old answer, a source edit making a new version while the old quiz stays verified, a wording fix with
-`invalidate = false`, and a grade replay after retention cleared its feedback), plus a two-session concurrency check
+`invalidate = false`, `invalidate = true` with nothing else changed voiding only the answers given against a fixed
+source text, and a grade replay after retention cleared its feedback), plus a two-session concurrency check
 in its last comment. It runs on a disposable copy of
 the database only (it refuses without `onyx.fixture_db = disposable` and ends in ROLLBACK), never on production, so
 it is a manual check after the SQL is reviewed, not a scheduled job.

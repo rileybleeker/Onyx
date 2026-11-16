@@ -26,10 +26,11 @@ import {
  * - A failure keeps the card. No answer / a server error: "Save not confirmed" (the grade may have been stored and
  *   only its answer lost, so never "Not saved") with Retry, which sends the SAME operation key
  *   (lib/reading-practice.ts attemptFor), so a grade that did land is answered from its receipt instead of being
- *   stored twice. A refusal: "Not saved", nothing was written, any grade can be picked again. Graded on another
- *   screen (409): "Card out of date" with Refresh, which keeps the grades blocked ("Refreshing") until the re-read
- *   lands; a re-read that fails keeps the card stale with its own message and Refresh. The message is a role=alert
- *   line with a word and an icon, not color alone.
+ *   stored twice. A refusal of a Retry says nothing about the earlier try, so it stays "Save not confirmed" with
+ *   the same key. A refusal of a first try: "Not saved", nothing was written, any grade can be picked again.
+ *   Graded on another screen (409): "Card out of date" with Refresh, which keeps the grades blocked ("Refreshing")
+ *   until the re-read lands; a re-read that fails keeps the card stale with its own message and Refresh. The message
+ *   is a role=alert line with a word and an icon, not color alone.
  * - Success advances exactly once (this card's graded ids are kept, so a reload that raced the grade cannot bring
  *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line.
  * - Retry and Refresh leave the screen while they work, so focus never drops to the page: both put it on the note
@@ -133,6 +134,8 @@ export default function ReviewCard({
   const grade = async (g: PracticeGrade, fromRetry = false) => {
     if (!cur || inFlight.current || status.kind === "stale" || status.kind === "refreshing") return;
     const attempt = attemptFor(pending, cur, g);
+    // This tap reuses the key of a try whose answer never came: a refusal of it settles nothing about that try.
+    const retryOfUnconfirmed = pending !== null && pending.op_key === attempt.op_key;
     // A Refresh that left this card on top must not move focus when a later answer changes it.
     focusNextCard.current = false;
     inFlight.current = true;
@@ -153,7 +156,7 @@ export default function ReviewCard({
     }
     inFlight.current = false;
     if (!alive.current) return;
-    const out = classifyReviewAnswer(httpStatus, body);
+    const out = classifyReviewAnswer(httpStatus, body, retryOfUnconfirmed);
     if (out.kind === "saved") {
       setPending(null);
       setStatus({ kind: "idle" });
@@ -163,7 +166,8 @@ export default function ReviewCard({
       onGraded(out.xp);
       return;
     }
-    // Refused or stale: nothing was written under this key, so it is not reused.
+    // Refused (a first try under this key) or stale (no receipt under it): nothing is stored under this key, so it is
+    // not reused. A refused Retry comes back as unknown and keeps the key until its receipt is read.
     if (out.kind !== "unknown") setPending(null);
     // The card left the top while the request was out (the overview was re-read): its message would sit on another card.
     if (curRef.current?.highlight_id !== attempt.highlight_id) {

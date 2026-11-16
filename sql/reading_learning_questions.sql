@@ -37,7 +37,10 @@
 -- and is stored against it: the earlier answers were graded against their own version, whose source hash is kept,
 -- so they stay counted. A correction invalidates the answers to older versions when the prompt, rubric or source
 -- reference changes; `invalidate` (true | false) overrides that default, e.g. true when the source text itself was
--- wrong, false for a wording fix that changes nothing for the answers already given.
+-- wrong, false for a wording fix that changes nothing for the answers already given. `invalidate: true` needs no
+-- other change: with the same prompt, rubric and source it invalidates the answers to the versions whose content
+-- differs from the current one (a wrong source text that was fixed, also after an answer already made the version
+-- for the fixed text); answers to the current content stay valid, and with none to invalidate it is no_change.
 -- A quiz result recorded under quiz key K (pds.reading_quizzes.op_key) links the attempts answered with
 -- quiz_key K: the trigger below refuses the quiz while any of them is ungraded (OXQ01), when its score / total
 -- differ from the graded answers (OXQ02) or when any of them is about another book (OXQ03), and stores
@@ -47,7 +50,7 @@
 -- the same, changed or removed now) and every attempt of the book. Retention: pds.reading_clear_question_answers
 -- (days) clears the raw answer and feedback text of attempts graded or invalidated more than `days` ago (at least
 -- 30), keeping the answer's hash, the grade and the timestamps. It is NOT scheduled by this file (docs/reading-
--- practice.md: proposed 180 days, a rollout decision).
+-- practice.md: 180 days, run daily by the READ-QUIZ-01 worker, decided 2026-11-16).
 --
 -- Additive only: two new tables, two nullable columns, indexes, functions and one trigger. Existing quizzes are not
 -- rewritten. Grants: tables and functions are service_role only (row level security on, no policies); the
@@ -181,6 +184,7 @@ DECLARE
   v_correct  BOOLEAN;
   v_inval    BOOLEAN;
   v_wrong    BOOLEAN;
+  v_same     BOOLEAN;
   v_revised  BOOLEAN := false;
   v_prompt   TEXT := btrim(COALESCE(p->>'prompt', ''));
   v_rubric   TEXT := NULLIF(btrim(COALESCE(p->>'rubric', '')), '');
@@ -349,7 +353,17 @@ BEGIN
     v_shash := pds.reading_sha256(v_src);
     v_chash := pds.reading_sha256(jsonb_build_object('prompt', v_prompt, 'rubric', v_rubric, 'source_kind', v_skind,
       'source_ref', v_sref, 'source_hash', v_shash)::text);
-    IF v_chash = v_q.content_hash THEN
+    -- Nothing about the question changed. Without `invalidate: true` that is no correction. With it, the answers given
+    -- to a version with OTHER content are invalidated: typically the source text was found wrong and fixed, and the
+    -- next answer already made the version for the fixed text by itself ("source text changed", which keeps earlier
+    -- answers counted), so the content no longer differs from what was answered wrongly. Answers to versions with the
+    -- current content stay valid: they were judged against the question as it stands, and voiding them takes a real
+    -- correction of the prompt, rubric or source. Nothing left to invalidate is still no_change.
+    v_same := v_chash = v_q.content_hash;
+    IF v_same AND (v_inval IS NOT TRUE OR NOT EXISTS (
+         SELECT 1 FROM pds.reading_question_attempts a
+           JOIN pds.reading_questions q ON q.question_id = a.question_id
+          WHERE q.question_key = v_qkey AND q.content_hash <> v_chash AND a.grading_status <> 'invalidated')) THEN
       RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'no_change');
     END IF;
     -- The question itself changed (prompt, rubric or source reference): the answers given to it were judged against
@@ -364,11 +378,13 @@ BEGIN
     RETURNING * INTO v_new;
 
     -- Invalidating: answers to every older version are marked (kept, with the reason); results that counted them
-    -- say so. Not invalidating: nothing is marked, every earlier answer keeps counting.
+    -- say so. Not invalidating: nothing is marked, every earlier answer keeps counting. An explicit invalidation that
+    -- changed nothing else marks only the answers to versions whose content differs from the current one (above).
     SELECT COALESCE(array_agg(a.attempt_key), '{}') INTO v_hit
       FROM pds.reading_question_attempts a
       JOIN pds.reading_questions q ON q.question_id = a.question_id
-     WHERE v_inval AND q.question_key = v_qkey AND q.question_id <> v_new.question_id AND a.grading_status <> 'invalidated';
+     WHERE v_inval AND q.question_key = v_qkey AND q.question_id <> v_new.question_id AND a.grading_status <> 'invalidated'
+       AND (NOT v_same OR q.content_hash <> v_chash);
     UPDATE pds.reading_question_attempts
        SET grading_status = 'invalidated', invalidated_at = NOW(),
            invalidated_reason = 'question corrected to version ' || v_new.version

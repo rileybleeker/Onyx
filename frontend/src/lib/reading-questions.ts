@@ -11,7 +11,9 @@
  *   key is 409 key_reused. Grading is a separate step (pending -> graded), so a stored answer whose grading never
  *   finished stays visible as pending.
  * - A correction makes a new version, supersedes the old one and, when the prompt, rubric or source reference
- *   changed (or `invalidate: true` says so), invalidates the answers given to older versions (kept, with the reason);
+ *   changed (or `invalidate: true` says so), invalidates the answers given to older versions (kept, with the reason).
+ *   `invalidate: true` with nothing else changed voids the answers given to versions with other content (a wrong
+ *   source text that was fixed, also after an answer already made the version for the fixed text);
  *   a quiz result that counted one of them is shown as corrected and not counted. An edit of the source's TEXT alone
  *   (a highlight comment, a recall note) makes the next version when the question is next answered and invalidates
  *   nothing: those answers were graded against their own version, whose source hash is kept.
@@ -66,7 +68,9 @@ export type QuestionOp =
       reason: string;
       /**
        * Whether the answers to older versions stop counting. null = the default: yes when the prompt, rubric or
-       * source reference changes, no when only the source's text moved.
+       * source reference changes, no when only the source's text moved. true needs no other change: with the same
+       * prompt, rubric and source it voids the answers to versions whose content differs from the current one (a wrong
+       * source text that was fixed); answers to the current content stay valid.
        */
       invalidate: boolean | null;
     };
@@ -99,7 +103,11 @@ function questionFields(raw: Record<string, unknown>) {
 
 /** POST /api/reading/questions body: one operation. Unknown fields are refused. */
 export function parseQuestionOp(raw: unknown): { ok: true; op: QuestionOp } | { ok: false; error: string } {
-  if (!plainObject(raw) || typeof raw.op !== "string" || !(raw.op in KEYS)) return { ok: false, error: "bad_request" };
+  // An own key only: `in` also accepts names inherited from Object.prototype ("toString", "constructor", ...),
+  // whose value has no .has(), so such a body would throw (a 500) instead of being refused.
+  if (!plainObject(raw) || typeof raw.op !== "string" || !Object.prototype.hasOwnProperty.call(KEYS, raw.op)) {
+    return { ok: false, error: "bad_request" };
+  }
   const kind = raw.op as QuestionOp["op"];
   for (const k of Object.keys(raw)) if (!KEYS[kind].has(k)) return { ok: false, error: "bad_request" };
 

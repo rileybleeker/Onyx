@@ -59,6 +59,19 @@ test("parsing: only highlight / session / chapter sources; unknown fields, bad k
   ]) assert.equal(Q.parseQuestionOp(bad).ok, false, JSON.stringify(bad)?.slice(0, 80));
 });
 
+test("parsing: an op named after an inherited property is a 400 refusal, never a thrown error (a 500)", () => {
+  for (const name of ["toString", "constructor", "hasOwnProperty", "valueOf", "__proto__", "isPrototypeOf"]) {
+    let out;
+    assert.doesNotThrow(() => { out = Q.parseQuestionOp({ op: name }); }, name);
+    assert.deepEqual(out, { ok: false, error: "bad_request" }, name);
+    assert.doesNotThrow(() => { out = Q.parseQuestionOp({ op: name, op_key: key(), question_key: key() }); }, name);
+    assert.equal(out.ok, false, name);
+  }
+  // A body parsed from JSON carries "__proto__" as an own key: refused as an unknown field, like any other.
+  assert.equal(Q.parseQuestionOp(JSON.parse(JSON.stringify(answerBody()).replace(/^\{/, '{"__proto__":{"x":1},'))).ok, false);
+  assert.equal(Q.parseQuestionOp(answerBody()).ok, true, "a real op still parses");
+});
+
 test("corrections: `invalidate` is optional (true / false / default), carried to the function, nothing else accepted", () => {
   const base = { op: "correct", op_key: key(), question_key: key(), expected_version: 2, prompt: "Synthetic prompt", source_kind: "highlight", source_ref: 41, reason: "Synthetic reason" };
   assert.equal(Q.parseQuestionOp(base).op.invalidate, null, "omitted = the database's default");
@@ -108,6 +121,28 @@ test("SQL: an edit of the source's text alone makes a new version and keeps earl
   assert.match(corr, /v_inval := COALESCE\(v_inval, v_wrong\);/);
   assert.match(corr, /WHERE v_inval AND q\.question_key = v_qkey/);
   assert.ok(corr.indexOf("v_rhash := pds.reading_sha256") < corr.indexOf("v_inval := COALESCE"), "the request hash holds the value as sent, so a replay matches");
+});
+
+test("SQL: an explicit invalidation needs no other change, and voids only answers to other content", () => {
+  const apply = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_question_apply"), sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts"));
+  const corr = apply.slice(apply.indexOf("ELSE -- correct"));
+  // After an answer made the version for an edited source by itself, a correction with the same prompt, rubric and
+  // source has the same content: `invalidate: true` must still apply (it used to be no_change).
+  const same = corr.indexOf("v_same := v_chash = v_q.content_hash;");
+  assert.ok(same > 0, "the unchanged case is named");
+  const noChange = corr.indexOf("'code', 'no_change'");
+  assert.ok(noChange > same);
+  const guard = corr.slice(same, noChange);
+  assert.match(guard, /IF v_same AND \(v_inval IS NOT TRUE OR NOT EXISTS \(/, "no_change only without the flag, or with nothing to void");
+  assert.match(guard, /q\.content_hash <> v_chash AND a\.grading_status <> 'invalidated'/);
+  assert.doesNotMatch(corr, /IF v_chash = v_q\.content_hash THEN\s+RETURN/, "unchanged content alone is no longer a refusal");
+  // Only answers to versions with other content are voided when nothing else changed; a real correction voids every older version.
+  assert.match(corr, /a\.grading_status <> 'invalidated'\s+AND \(NOT v_same OR q\.content_hash <> v_chash\);/);
+  assert.ok(corr.indexOf("v_inval := COALESCE") > noChange, "the flag as sent decides the unchanged case");
+  // The behaviour itself is pinned by the database fixture.
+  const fixture = fs.readFileSync(path.join(SRC, "..", "..", "tests", "sql", "reading_practice_fixture.sql"), "utf8");
+  assert.match(fixture, /'an explicit invalidation with nothing else changed: '/);
+  assert.match(fixture, /'the answer given against the fixed text keeps counting'/);
 });
 
 test("SQL: a grade replay still matches after retention cleared its feedback", () => {
