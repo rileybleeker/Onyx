@@ -608,7 +608,7 @@ GENERIC_WORDS = frozenset({
     "THE", "AND", "FOR", "FROM", "WWW", "COM", "NET", "ORG", "HTTP", "HTTPS", "USA", "PAYPAL", "SQ", "TST",
     # Two-letter words are merchant words since the short-name review ('ZQ' and 'XK' are two businesses), so the
     # two-letter fillers and payment-processor prefixes that say nothing join the list ('PURCHASE AUTHORIZED ON
-    # 11/14 ...', 'AMZN MKTP US', 'SP DEMO SHOP', 'IC* DEMO MARKET', 'DD *DEMO CAFE', 'PP*DEMO').
+    # 11/14 ...', 'DEMO MKTP US', 'SP DEMO SHOP', 'IC* DEMO MARKET', 'DD *DEMO CAFE', 'PP*DEMO').
     "ON", "OF", "TO", "US", "SP", "IC", "DD", "PP",
 })
 # US state and territory codes: where a purchase was made, never which merchant it was. Never a merchant word (they
