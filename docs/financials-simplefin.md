@@ -77,11 +77,18 @@ evidence is the account, the amount and the currency plus either:
   below).
 - **merchant**: dates within 3 days (either feed's original or posted date counts) and the same merchant: more than
   half of the shorter side's description and merchant name words in common, the distinctive words of one side (all
-  but kinds of business such as `COFFEE` or `DELI`) all present on the other, including the word that names the
-  business, and no payee names, store numbers or kinds of business that contradict each other. A shared city,
-  kind of business or first word is not enough (`DEMO COFFEE ATLANTA` and `OTHER COFFEE ATLANTA`, or `DEMO BOTTLE
-  COFFEE` and `DEMO DONKEY COFFEE`, are two merchants), while a bank text and its cleaned name agree (`DEMO CAFE
-  0042 ATLANTA GA` and `Demo Cafe`). A candidate pair counts only at the smallest date gap of both its rows, so
+  but kinds of business such as `COFFEE` or `DELI`) all present on the other, both rows leading with the same word
+  (the one that names the business), at least one shared word that is neither a city nor a kind of business, and
+  no payee names, store numbers or kinds of business that contradict each other. A shared city, kind of business
+  or first word is not enough (`DEMO COFFEE ATLANTA` and `OTHER COFFEE ATLANTA`, or `DEMO BOTTLE COFFEE` and `DEMO
+  DONKEY COFFEE`, are two merchants), while a bank text and its cleaned name agree (`DEMO CAFE 0042 ATLANTA GA` and
+  `Demo Cafe`). Two-letter names are merchant words (review of round 8): `ZQ ATLANTA GA` and `XK ATLANTA GA` are
+  two merchants, where dropping short words had left both as just `ATLANTA`. The city is read as the words before
+  a trailing state code (`ATLANTA` in `DEMO CAFE 0042 ATLANTA GA`; a multi-word city through a short list of
+  words such as `NEW`, `SAN`, `CITY` or `BEACH`), never the first word of the text; state codes, two-letter fillers
+  (`ON`, `OF`, `TO`, `US`) and processor prefixes (`SQ`, `TST`, `SP`, `IC`, `DD`, `PP`) are never merchant words.
+  A merchant named by digits only (`88 ATLANTA GA`) leads with its city and shares nothing else, so it is kept
+  for review; a city word the list does not know still leaves the two rows leading with different words. A candidate pair counts only at the smallest date gap of both its rows, so
   the same purchase on consecutive days pairs day by day. A day Rocket Money lacks is kept, since its neighbours
   are the nearer twins.
 

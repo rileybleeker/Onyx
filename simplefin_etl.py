@@ -20,8 +20,9 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence
      (PIPE-04; the two feeds share no transaction id): same account, amount and currency, and either the same date
      and description text (store numbers included) that names a merchant ('exact') or a date within OVERLAP_DAYS and
-     the same merchant name ('merchant': one side's distinctive words all on the other side, including the word that
-     names the business, at the smallest date gap of both rows); payee names whose distinctive words contradict,
+     the same merchant name ('merchant': one side's distinctive words all on the other side, both rows leading with
+     the word that names the business, a shared word that is neither a city nor a kind of business, two-letter names
+     counted, at the smallest date gap of both rows); payee names whose distinctive words contradict,
      store numbers that contradict ('DEMO DELI 0042' and 'DEMO DELI 0099') or two different kinds of business ('DEMO
      CAFE' and 'DEMO HOTEL') are never a match (a shared STORE or COFFEE is no evidence). A group of candidate pairs
      is a match only when it is one to one, or when it has as many SimpleFIN rows as Rocket Money rows and its rows
@@ -605,7 +606,28 @@ GENERIC_WORDS = frozenset({
     "POS", "PURCHASE", "DEBIT", "CREDIT", "CARD", "ONLINE", "PAYMENT", "PMT", "ACH", "WEB", "RECURRING", "CHECKCARD",
     "VISA", "MASTERCARD", "TRANSACTION", "WITHDRAWAL", "DEPOSIT", "AUTHORIZED", "PENDING", "INC", "LLC", "LTD", "CORP",
     "THE", "AND", "FOR", "FROM", "WWW", "COM", "NET", "ORG", "HTTP", "HTTPS", "USA", "PAYPAL", "SQ", "TST",
+    # Two-letter words are merchant words since the short-name review ('ZQ' and 'XK' are two businesses), so the
+    # two-letter fillers and payment-processor prefixes that say nothing join the list ('PURCHASE AUTHORIZED ON
+    # 11/14 ...', 'AMZN MKTP US', 'SP DEMO SHOP', 'IC* DEMO MARKET', 'DD *DEMO CAFE', 'PP*DEMO').
+    "ON", "OF", "TO", "US", "SP", "IC", "DD", "PP",
 })
+# US state and territory codes: where a purchase was made, never which merchant it was. Never a merchant word (they
+# were dropped before as two-letter words, and still are), and a trailing one marks the words before it as the city
+# (location_words).
+STATE_CODES = frozenset(
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR "
+    "PA RI SC SD TN TX UT VT VA WA WV WI WY DC PR GU VI AS MP".split())
+# Words that start a multi-word city ('NEW YORK NY', 'SAN JOSE CA', 'FORT WORTH TX') and words that end one ('KANSAS
+# CITY MO', 'PALM BEACH FL', 'ROCK SPRINGS WY'): location_words takes them with the word next to them.
+CITY_PREFIX_WORDS = frozenset({
+    "NEW", "SAN", "SANTA", "LOS", "LAS", "SAINT", "ST", "FORT", "FT", "EAST", "WEST", "NORTH", "SOUTH", "PORT",
+    "MOUNT", "MT", "PALM", "EL", "GRAND", "LAKE",
+})
+CITY_SUFFIX_WORDS = frozenset({
+    "CITY", "BEACH", "SPRINGS", "HEIGHTS", "FALLS", "HILLS", "PARK", "VILLAGE", "VALLEY", "CREEK", "MOUNTAIN",
+    "CORNERS", "JUNCTION",
+})
+CITY_MAX_WORDS = 3
 # Words that name a kind of business, not which one. They count toward the shared words, but never as the word that
 # identifies the merchant: "DEMOBREW COFFEE ATLANTA" and "OTHERBREW COFFEE ATLANTA" share two of three words and are
 # still two merchants. Two DIFFERENT kinds are evidence against a match (trades_conflict): "DEMO CAFE ATLANTA" and
@@ -645,7 +667,38 @@ def date_gap(a: dict, b: dict) -> int:
 
 
 def _merchant_words(text: Optional[str]) -> list[str]:
-    return [w for w in norm_text(text).split() if len(w) >= 3 and w not in GENERIC_WORDS]
+    """The words of a text that can name a merchant, in order: letters only (norm_text: digits and single letters
+    drop out), not a GENERIC_WORD, not a state code. Two-letter words count (review of round 8): with them dropped,
+    'ZQ ATLANTA GA' and 'XK ATLANTA GA' were both just 'ATLANTA', and an equal amount nearby was matched."""
+    return [w for w in norm_text(text).split() if w not in GENERIC_WORDS and w not in STATE_CODES]
+
+
+def location_words(row: dict) -> frozenset:
+    """The city words of a row: in its description and in its name, the words before a trailing state code ('DEMO
+    CAFE 0042 ATLANTA GA' -> ATLANTA, 'ZQ ATLANTA GA' -> ATLANTA, 'DEMO DELI NEW YORK NY' -> NEW, YORK), at most
+    CITY_MAX_WORDS of them: the word right before the state, then a word before that only while the city goes on
+    (the word after it ends a city, CITY_SUFFIX_WORDS, or it starts one, CITY_PREFIX_WORDS). Never the first merchant
+    word of the text, which is where the merchant is named ('ZQ GA' -> none), and never a kind of business. A text
+    without a trailing state code has none: 'DEMO DELI ATLANTA' is not read for a place. A city says where a purchase
+    was made, never which merchant: merchant_evidence needs a shared word that is neither a city nor a kind of
+    business, so two businesses in one city are never matched on the city."""
+    out = set()
+    for text in (row.get("description"), row.get("name")):
+        seq = [w for w in norm_text(text).split() if w not in GENERIC_WORDS]
+        if len(seq) < 2 or seq[-1] not in STATE_CODES:
+            continue
+        slot = next((i for i, w in enumerate(seq) if w not in STATE_CODES), len(seq))   # the first merchant word
+        i, taken = len(seq) - 2, 0
+        while i > slot and taken < CITY_MAX_WORDS:
+            w = seq[i]
+            if w in STATE_CODES or w in TRADE_WORDS:
+                break
+            if taken and not (seq[i + 1] in CITY_SUFFIX_WORDS or w in CITY_PREFIX_WORDS):
+                break
+            out.add(w)
+            taken += 1
+            i -= 1
+    return frozenset(out)
 
 
 def merchant_tokens(row: dict) -> frozenset:
@@ -665,7 +718,8 @@ def ident_text(s: Optional[str]) -> str:
 
 def merchant_leads(row: dict) -> frozenset:
     """The first merchant word of the description and of the name, where it names the business (not a TRADE_WORD).
-    Bank descriptions start with the merchant ('DEMO CAFE 0042 ATLANTA GA') and end with the place."""
+    Bank descriptions start with the merchant ('DEMO CAFE 0042 ATLANTA GA', 'ZQ 0042 ATLANTA GA') and end with the
+    place. merchant_evidence needs a lead both rows share: the business is named first on both."""
     out = set()
     for text in (row.get("description"), row.get("name")):
         words = _merchant_words(text)
@@ -739,11 +793,15 @@ def merchant_evidence(a: dict, b: dict) -> bool:
     are shared; the distinctive words of one side (its merchant words other than TRADE_WORDS) are ALL on the other
     side, so a bank text and its cleaned name agree ('DEMO CAFE 0042 ATLANTA GA' vs 'Demo Cafe') but two shops that
     share a first word, a city or a kind of business do not ('DEMO BOTTLE COFFEE' vs 'DEMO DONKEY COFFEE', 'DEMO
-    ATLANTA' vs 'SHOP ATLANTA', 'DEMOBREW COFFEE' vs 'OTHERBREW COFFEE'); the shared words include the word that
-    names the business on one side; and neither the payee names, the store numbers nor the kinds of business
-    contradict each other (identity_conflict: merchant_tokens drop the digits, so 'DEMO DELI 0042' and 'DEMO DELI
-    0099' share every word and are still two shops, and the distinctive words leave the TRADE_WORDS out, so 'DEMO
-    CAFE ATLANTA' and 'DEMO HOTEL ATLANTA' agree on them and are still two businesses)."""
+    ATLANTA' vs 'SHOP ATLANTA', 'DEMOBREW COFFEE' vs 'OTHERBREW COFFEE'); the shared words include one that is
+    neither a city of either row (location_words) nor a kind of business, so a place is never the evidence ('ZQ
+    ATLANTA GA' vs 'XK ATLANTA GA', or a merchant named by digits only, '88 ATLANTA GA' vs 'XK ATLANTA GA'); both
+    rows lead with the same word, the one that names the business (merchant_leads: 'XK DEMOTOWN MILLS GA' leads with
+    XK, '88 DEMOTOWN MILLS GA' with DEMOTOWN, a city word the lists do not know); and neither the payee names, the
+    store numbers nor the kinds of business contradict each other (identity_conflict: merchant_tokens drop the
+    digits, so 'DEMO DELI 0042' and 'DEMO DELI 0099' share every word and are still two shops, and the distinctive
+    words leave the TRADE_WORDS out, so 'DEMO CAFE ATLANTA' and 'DEMO HOTEL ATLANTA' agree on them and are still two
+    businesses). Short names are merchant words (_merchant_words), so 'ZQ' and 'XK' are two payees too."""
     ta, tb = merchant_tokens(a), merchant_tokens(b)
     shared = ta & tb
     if not shared or 2 * len(shared) <= min(len(ta), len(tb)):
@@ -751,7 +809,9 @@ def merchant_evidence(a: dict, b: dict) -> bool:
     da, db = ta - TRADE_WORDS, tb - TRADE_WORDS
     if not (da and db) or not (da <= db or db <= da):
         return False
-    if not (merchant_leads(a) & tb or merchant_leads(b) & ta):
+    if not shared - TRADE_WORDS - location_words(a) - location_words(b):
+        return False   # the place and the kind of business are all they share: no evidence of which merchant
+    if not merchant_leads(a) & merchant_leads(b):
         return False
     return not identity_conflict(a, b)
 

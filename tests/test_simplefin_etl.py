@@ -639,6 +639,45 @@ def test_cutover_different_kinds_of_business_are_not_identity():
     assert not sf.trades_conflict(cafe, hrow("h5", "2026-11-11", 1250, "DEMO CAFE BAKERY ATLANTA"))
 
 
+def test_cutover_short_names_and_places_are_not_identity():
+    """Review of round 8: a two-letter merchant name is a merchant word, and a place is never the evidence. With
+    short words dropped, 'ZQ ATLANTA GA' and 'XK ATLANTA GA' were both just 'ATLANTA': an equal amount nearby was
+    matched, a real purchase left out and the false match recorded. The row is now kept and listed for review. A
+    merchant named by digits only, or a city word the lists do not know, is no evidence either, while the same
+    short name still matches its twin."""
+    zq = row("a", "2026-11-11", 1800, desc="ZQ ATLANTA GA")
+    xk = hrow("h1", "2026-11-11", 1800, "XK ATLANTA GA", name="XK")
+    assert sf.merchant_tokens(zq) == {"ZQ", "ATLANTA"} and sf.location_words(zq) == {"ATLANTA"}
+    assert sf.merchant_leads(zq) == {"ZQ"} and sf.names_conflict(zq, xk)
+    assert not sf.merchant_evidence(zq, xk) and sf.same_purchase(zq, xk) is None
+    kept, dropped, decisions = sf.apply_cutover([zq], [xk], CUT, set())
+    assert kept == [zq] and not dropped and decided(decisions) == {"a": ("unconfirmed", None, ("h1",))}
+    assert sf.new_review_count(decisions, {}) == 1
+    # A merchant named by digits only: its first word is the city, and the place is all the rows share.
+    num = row("b", "2026-11-11", 1800, desc="88 ATLANTA GA")
+    assert sf.location_words(num) == frozenset() and sf.merchant_leads(num) == {"ATLANTA"}
+    assert not sf.merchant_evidence(num, xk) and sf.same_purchase(num, xk) is None
+    assert decided(sf.apply_cutover([num], [xk], CUT, set())[2]) == {"b": ("unconfirmed", None, ("h1",))}
+    # A city the lists do not know (only its last word is read as the city): the rows lead with different words.
+    far = row("c", "2026-11-11", 1800, desc="88 DEMOTOWN MILLS GA")
+    other = hrow("h2", "2026-11-11", 1800, "XK DEMOTOWN MILLS GA", name="XK")
+    assert sf.location_words(other) == {"MILLS"} and sf.merchant_leads(far) == {"DEMOTOWN"}
+    assert not sf.merchant_evidence(far, other) and sf.same_purchase(far, other) is None
+    # The same short name still agrees: a bank text and its cleaned name.
+    twin = hrow("h3", "2026-11-10", 1800, None, name="ZQ")
+    assert sf.merchant_evidence(zq, twin) and sf.same_purchase(zq, twin) == "merchant"
+    kept, dropped, decisions = sf.apply_cutover([zq], [xk, twin], CUT, set())
+    assert not kept and decided(decisions) == {"a": ("matched", "merchant", ("h3",))}
+    # Where the place is read: the words before a trailing state code, never the merchant's own word, and the
+    # fillers and processor prefixes are not merchant words.
+    assert sf.location_words(row("x", "2026-11-11", 1, desc="ZQ GA")) == frozenset()
+    assert sf.location_words(row("x", "2026-11-11", 1, desc="DEMO DELI NEW YORK NY")) == {"NEW", "YORK"}
+    assert sf.location_words(row("x", "2026-11-11", 1, desc="DEMO DELI ATLANTA")) == frozenset()
+    wf = row("x", "2026-11-11", 1, desc="PURCHASE AUTHORIZED ON 11/14 DEMO CAFE ATLANTA GA CARD 1234")
+    assert sf.merchant_leads(wf) == {"DEMO"} and sf.location_words(wf) == {"ATLANTA"}
+    assert sf.merchant_leads(row("x", "2026-11-11", 1, desc="DD *DEMO CAFE")) == {"DEMO"}
+
+
 def test_cutover_claim_whose_twin_is_not_in_the_history():
     """Codex review (round 7): a recorded claim is carried for its row whether or not the Rocket Money row it names is
     in this run's history. build_plan reads every named row by key, so one missing here is not in the ledger any
