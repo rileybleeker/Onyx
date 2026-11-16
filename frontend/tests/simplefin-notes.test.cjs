@@ -89,6 +89,20 @@ test("the card: free text in a failed heartbeat is never shown; an empty failed 
   assert.equal(coded.status, "partial");
   assert.equal(coded.errorMessage, S.formatSimplefinNotes({ sf_reauth: 1 }));
   assert.equal(S.simplefinLedgerCard(beat({ status: "failed" }), beat(), now).errorMessage, "The latest transactions import failed (no error text recorded).");
+  // Several codes at once (Codex review): the note passes 300 characters and its later codes are tokens only. The
+  // card shows it whole, so a trailing warning such as cutover_review is never cut off.
+  const counts = { sf_reauth: 1, sf_account_failed: 2, account_unmatched: 1, account_type_unset: 1, cutover_review: 3 };
+  const long = S.formatSimplefinNotes(counts);
+  assert.ok(long.length > S.SIMPLEFIN_NOTE_LIMIT && long.length > S.FINANCE_TEXT_LIMIT, long);
+  const shown = S.simplefinLedgerCard(beat({ status: "partial", error_message: long }), beat(), now).errorMessage;
+  assert.equal(shown, long);
+  assert.ok(shown.endsWith("[cutover_review x3]"), shown);
+  for (const c of Object.keys(counts)) assert.ok(shown.includes(`[${c}`), c);
+  const every = S.formatSimplefinNotes(Object.fromEntries(Object.keys(S.SIMPLEFIN_NOTES).map((c) => [c, 2])));
+  assert.equal(S.simplefinLedgerCard(beat({ status: "failed", error_message: every }), beat(), now).errorMessage, every);
+  // Free text from other finance heartbeats is still cut at FINANCE_TEXT_LIMIT.
+  const free = S.financeLedgerCard(beat({ status: "failed", error_message: "y".repeat(900) }), beat(), now).errorMessage;
+  assert.equal(free.length, S.FINANCE_TEXT_LIMIT);
   // SimpleFIN thresholds: 14 h degraded, 30 h red.
   const old = (h) => beat({ sync_start: new Date(now - h * 3_600_000).toISOString() });
   assert.equal(S.simplefinLedgerCard(old(13), old(13), now).status, "success");

@@ -16,26 +16,27 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
   2. Transactions (posted only; pending are not requested) -> rows with the ledger's sign (expense-positive).
      Investment accounts are balances-only, as they were under Rocket Money (trades and dividends are not spending).
   3. Cutover from the Rocket Money history, per account: a row transacted more than OVERLAP_DAYS before the last
-     Rocket Money row and posted by that date is dropped (that history already has it; a row posted after it may
-     not be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence
-     (PIPE-04; the two feeds share no transaction id): same account, amount and currency, and either the same date
-     and description text (store numbers included) that names a merchant ('exact') or a date within OVERLAP_DAYS
-     and the same merchant name ('merchant': one side's distinctive words all on the other side, including the
-     word that names the business, at the smallest date gap of both rows); payee names whose distinctive words
-     contradict are never a match (a shared STORE or COFFEE is no evidence). A group of candidate pairs is a match
-     only when it is one to one, or when its rows cannot be told apart on either side and every SimpleFIN row gets
-     a twin of its own; more SimpleFIN rows than twins is never guessed. Every SimpleFIN row of the response takes
-     part, so a Rocket Money row whose twin is before the window is taken by that twin, and a Rocket Money row an
-     earlier run matched stays taken (pds.finance_cutover_matches); the candidates of a row recorded as ambiguous
-     stay held while that row is missing from a later answer, and a recorded claim or hold the run no longer makes
-     is recorded again as 'unconfirmed' (kept for review), never left behind. An equal amount alone never drops a
-     row: a row with competing candidates ('ambiguous') or with a same-amount Rocket Money row nearby but no
-     merchant evidence ('unconfirmed') is KEPT and counted for review. Every match and every row kept for review is
-     recorded (also the decisions on rows dropped before the window, which hold or take a Rocket Money row) in
+     Rocket Money row and posted by that date is dropped (that history already has it; a row posted after it may not
+     be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence (PIPE-04;
+     the two feeds share no transaction id): same account, amount and currency, and either the same date and
+     description text (store numbers included) that names a merchant ('exact') or a date within OVERLAP_DAYS and the
+     same merchant name ('merchant': one side's distinctive words all on the other side, including the word that
+     names the business, at the smallest date gap of both rows); payee names whose distinctive words contradict, or
+     store numbers that contradict ('DEMO DELI 0042' and 'DEMO DELI 0099'), are never a match (a shared STORE or
+     COFFEE is no evidence). A group of candidate pairs is a match only when it is one to one, or when it has as many
+     SimpleFIN rows as Rocket Money rows and its rows cannot be told apart on either side; a group of unequal size is
+     never guessed (key order is not identity evidence). Every SimpleFIN row of the response takes part, so a Rocket
+     Money row whose twin is before the window is taken by that twin, and a Rocket Money row an earlier run matched
+     stays taken (pds.finance_cutover_matches); the candidates of a row recorded as ambiguous stay held while that
+     row is missing from a later answer, and a recorded claim or hold the run no longer makes is recorded again as
+     'unconfirmed' (kept for review), never left behind. An equal amount alone never drops a row: a row with
+     competing candidates ('ambiguous') or with a same-amount Rocket Money row nearby but no merchant evidence
+     ('unconfirmed') is KEPT and counted for review. Every match and every row kept for review is recorded (also the
+     decisions on rows dropped before the window, which hold or take a Rocket Money row) in
      pds.finance_cutover_matches (keys only) BEFORE the ledger is written: when that record cannot be read (other
      than not applied yet), cannot be written, or is missing while there are decisions to record, the run fails
-     before writing anything, so a row is never left out on a match that is not on record. Rows already stored by
-     an earlier SimpleFIN run are always rewritten in place.
+     before writing anything, so a row is never left out on a match that is not on record. Rows already stored by an
+     earlier SimpleFIN run are always rewritten in place.
   4. Category (SimpleFIN sends none; /financials needs one to keep card payments and transfers out of spending):
      a payment/transfer pair (same amount, opposite sign, two of Riley's accounts, within PAIR_DAYS, one side worded
      like a payment or transfer) -> "Credit Card Payment" or "Internal Transfers"; else the category Rocket Money
@@ -597,7 +598,11 @@ TRADE_WORDS = frozenset({
 })
 REVIEW_DECISIONS = ("stored_duplicate", "ambiguous", "unconfirmed")
 CLAIM_DECISIONS = ("matched", "stored_duplicate")   # a recorded decision that ties a Rocket Money row to one SimpleFIN row
-MAX_CANDIDATES = 10    # Rocket Money keys kept per decision record
+# A decision records EVERY Rocket Money key it names, never cut to a few: the candidates of an ambiguous row are what
+# step 0 of apply_cutover holds on later runs, so a key left out would be free for another purchase (Codex review).
+# They are few anyway: same account, amount and currency, within OVERLAP_DAYS.
+
+STORE_NUMBER_DIGITS = 3   # a run of this many digits or more is a store / location number ('0042'); '11/14' is not
 
 
 def _currency(row: dict) -> str:
@@ -659,6 +664,31 @@ def names_conflict(a: dict, b: dict) -> bool:
     return not (na <= _distinctive(merchant_tokens(b)) or nb <= _distinctive(merchant_tokens(a)))
 
 
+def store_numbers(row: dict) -> frozenset:
+    """The store / location numbers of a row: every run of STORE_NUMBER_DIGITS digits or more in its description and
+    name, leading zeros dropped ('DEMO DELI #0042' -> {'42'}). Shorter numbers ('11/14', '#7') say nothing."""
+    out = set()
+    for text in (row.get("description"), row.get("name")):
+        for tok in ident_text(text).split():
+            if tok.isdigit() and len(tok) >= STORE_NUMBER_DIGITS:
+                out.add(tok.lstrip("0") or "0")
+    return frozenset(out)
+
+
+def numbers_conflict(a: dict, b: dict) -> bool:
+    """Both rows carry store numbers and neither row's numbers are all on the other: two shops of one chain
+    ('DEMO DELI 0042' vs 'DEMO DELI 0099'; Codex review), even when their words agree. A number on one side only
+    (the other feed left it out: 'DEMO CAFE 0042 ATLANTA' vs 'Demo Cafe'), or one side's numbers all on the other
+    (an extra reference or date), is no conflict."""
+    na, nb = store_numbers(a), store_numbers(b)
+    return bool(na and nb) and not (na <= nb or nb <= na)
+
+
+def identity_conflict(a: dict, b: dict) -> bool:
+    """The rows name two different payees or two different store numbers: never the same purchase."""
+    return names_conflict(a, b) or numbers_conflict(a, b)
+
+
 def exact_key(row: dict) -> Optional[tuple]:
     """Same account (callers compare one account), date, amount, currency and description text, store numbers
     included (ident_text). Only a description that names a merchant counts ('POS PURCHASE', '#1234' or 'COFFEE
@@ -675,7 +705,9 @@ def merchant_evidence(a: dict, b: dict) -> bool:
     side, so a bank text and its cleaned name agree ('DEMO CAFE 0042 ATLANTA GA' vs 'Demo Cafe') but two shops that
     share a first word, a city or a kind of business do not ('DEMO BOTTLE COFFEE' vs 'DEMO DONKEY COFFEE', 'DEMO
     ATLANTA' vs 'SHOP ATLANTA', 'STARBUCKS COFFEE' vs 'CARIBOU COFFEE'); the shared words include the word that
-    names the business on one side; and the payee names do not contradict each other."""
+    names the business on one side; and neither the payee names nor the store numbers contradict each other
+    (identity_conflict: merchant_tokens drop the digits, so 'DEMO DELI 0042' and 'DEMO DELI 0099' share every word
+    and are still two shops)."""
     ta, tb = merchant_tokens(a), merchant_tokens(b)
     shared = ta & tb
     if not shared or 2 * len(shared) <= min(len(ta), len(tb)):
@@ -685,7 +717,7 @@ def merchant_evidence(a: dict, b: dict) -> bool:
         return False
     if not (merchant_leads(a) & tb or merchant_leads(b) & ta):
         return False
-    return not names_conflict(a, b)
+    return not identity_conflict(a, b)
 
 
 def same_purchase(a: dict, b: dict) -> Optional[str]:
@@ -693,7 +725,7 @@ def same_purchase(a: dict, b: dict) -> Optional[str]:
     if a["amount_cents"] != b["amount_cents"] or _currency(a) != _currency(b) or date_gap(a, b) > OVERLAP_DAYS:
         return None
     ka = exact_key(a)
-    if ka is not None and ka == exact_key(b) and not names_conflict(a, b):
+    if ka is not None and ka == exact_key(b) and not identity_conflict(a, b):
         return "exact"
     return "merchant" if merchant_evidence(a, b) else None
 
@@ -753,18 +785,21 @@ def _components(edges: Iterable[tuple[str, str]]) -> list[tuple[list, list]]:
 
 def _resolve(ss: list, hs: list, sf: dict, hist: dict) -> Optional[list]:
     """One connected group of candidate pairs (sorted SimpleFIN keys, sorted Rocket Money keys) -> its pairs, or None
-    when the group must not be guessed. A group is a match when it is one to one, or when the rows on each side
-    cannot be told apart (_signature) and every SimpleFIN row gets a twin of its own: then the choice of twin
-    changes nothing about what is kept or dropped, and the Rocket Money rows left over stay free. More SimpleFIN
-    rows than Rocket Money rows (two indistinguishable new rows competing for one twin), or rows that can be told
-    apart competing, is never guessed: key order is not identity evidence (Codex review)."""
-    if len(ss) == len(hs) == 1:
-        return [(ss[0], hs[0])]
-    if len(ss) > len(hs):
+    when the group must not be guessed. A group is a match when it is one to one, or when it has as many SimpleFIN
+    rows as Rocket Money rows and the rows on each side cannot be told apart (_signature): every row on both sides
+    is then paired, so the order of the pairs changes nothing about what is kept, dropped or taken. A group of
+    unequal size is never paired (Codex + Claude review): more SimpleFIN rows than twins (two identical new rows
+    for one Rocket Money row), and also fewer (one row for two identical Rocket Money rows: which one, or whether
+    either, is its twin is not known, and key order is not identity evidence). Rows that can be told apart
+    competing are never guessed either. The rows of such a group are kept as ambiguous and its Rocket Money rows
+    held (apply_cutover)."""
+    if len(ss) != len(hs):
         return None
+    if len(ss) == 1:
+        return [(ss[0], hs[0])]
     if len({_signature(sf[k]) for k in ss}) != 1 or len({_signature(hist[k]) for k in hs}) != 1:
         return None
-    return [(sk, hs[i]) for i, sk in enumerate(ss)]   # every SimpleFIN row is paired (len(ss) <= len(hs))
+    return list(zip(ss, hs))   # equal sizes: every row on both sides is paired
 
 
 @dataclass(frozen=True)
@@ -843,24 +878,24 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
         else:
             held.update(k for k in keys if k in hist and k not in used)
 
-    # 1. Exact: same date, amount, currency and description text, payees not contradicting. Each connected group of
-    #    such pairs is decided by _resolve: one to one, or indistinguishable rows with a twin for every SimpleFIN row,
-    #    is a match; anything else (two identical new rows and one twin, or a twin held by step 0) is ambiguous, and
-    #    the group's Rocket Money rows are held for it, so no other row can take them in step 2.
+    # 1. Exact: same date, amount, currency and description text, payees and store numbers not contradicting. Each
+    #    connected group of such pairs is decided by _resolve: one to one, or as many indistinguishable rows on each
+    #    side, is a match; anything else (a group of unequal size, rows that can be told apart, or a twin held by step
+    #    0) is ambiguous, and the group's Rocket Money rows are held for it, so no other row can take them in step 2.
     by_key: dict[tuple, list] = defaultdict(list)
     for h in pool:
         k = exact_key(h)
         if k and h["txn_key"] not in used:
             by_key[k].append(h)
     exact_edges = [(r["txn_key"], h["txn_key"]) for r in rows if r["txn_key"] not in found
-                   for h in by_key.get(exact_key(r), ()) if not names_conflict(r, h)]
+                   for h in by_key.get(exact_key(r), ()) if not identity_conflict(r, h)]
     for ss, hs in _components(exact_edges):
         pairs = None if held.intersection(hs) else _resolve(ss, hs, present, hist)
         if pairs is None:
             held.update(hs)
             for sk in ss:
                 cands = tuple(sorted(hk for s, hk in exact_edges if s == sk))
-                found[sk] = ("ambiguous", None, cands[:MAX_CANDIDATES])
+                found[sk] = ("ambiguous", None, cands)
             continue
         for sk, hk in pairs:
             used.add(hk)
@@ -870,8 +905,8 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
     #    candidate pair counts only at the smallest date gap of BOTH its rows, so a purchase repeated on the next
     #    days pairs day by day (the next day's row is the next day's twin). Each group of such pairs is decided by
     #    _resolve, like step 1. Rounds repeat on what is left until one matches nothing. A row still holding
-    #    candidates then is ambiguous (a tie, rows that can be told apart, more SimpleFIN rows than twins, or a twin
-    #    held by step 1) and is kept.
+    #    candidates then is ambiguous (a tie, rows that can be told apart, a group of unequal size, or a twin held by
+    #    step 1) and is kept. Every candidate is recorded, none cut: step 0 holds them all on later runs.
     rest = [r for r in rows if r["txn_key"] not in found]
     free = {h["txn_key"]: h for h in pool if h["txn_key"] not in used}   # held rows included: candidates only
     near = {r["txn_key"]: [h for h in free.values() if h["amount_cents"] == r["amount_cents"]
@@ -901,7 +936,7 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
         if r["txn_key"] not in found:
             cands = tuple(sorted(hk for (sk, hk) in edge_gap if sk == r["txn_key"] and hk not in used))
             if cands:
-                found[r["txn_key"]] = ("ambiguous", None, cands[:MAX_CANDIDATES])
+                found[r["txn_key"]] = ("ambiguous", None, cands)
 
     # 3. Unconfirmed: an unclaimed Rocket Money row with the same amount is near, but nothing says it is the same
     #    purchase (the case an amount-only rule used to drop). Kept.
@@ -910,7 +945,7 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
             continue
         cands = tuple(sorted(h["txn_key"] for h in near[r["txn_key"]] if h["txn_key"] not in used))
         if cands:
-            found[r["txn_key"]] = ("unconfirmed", None, cands[:MAX_CANDIDATES])
+            found[r["txn_key"]] = ("unconfirmed", None, cands)
 
     # 4. A row here whose recorded claim or ambiguity this run no longer makes, and that got no other decision:
     #    recorded as 'unconfirmed' with the keys its record named. That replaces the record before the ledger is
@@ -918,7 +953,7 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
     #    Money row is free for its real twin), while the row is still listed for review. 'unconfirmed' holds nothing.
     for sk, keys in carried.items():
         if sk not in found:
-            found[sk] = ("unconfirmed", None, tuple(sorted(keys))[:MAX_CANDIDATES])
+            found[sk] = ("unconfirmed", None, tuple(sorted(keys)))
 
     decisions: list[CutoverDecision] = []
     for r in rows:
@@ -1396,17 +1431,17 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     # without the claimant would then let another purchase take the same Rocket Money row. Recorded only by a run
     # that read the record (saved is None only while the table is missing), so it is never rewritten from
     # decisions made without it; the table missing is then a failed run too (cutover_provenance_unsaved). The
-    # workflow's concurrency group keeps two runs from deciding at once. A kept-for-review row is reported once, by
-    # the run that records it (also when that run then fails to write the ledger).
+    # workflow's concurrency group keeps two runs from deciding at once. A kept-for-review row is reported by the run
+    # that records it (also when that run then fails to write the ledger, or fails while saving the record itself).
     review = Counter()
     if plan.cutover:
         if plan.saved is None:
             return fail("cutover_provenance_unsaved", None)
+        n = new_review_count(plan.cutover, plan.saved)
         try:
             store.save_cutover_decisions(decision_rows(plan.cutover, now or datetime.now(timezone.utc)))
         except Exception as e:
-            return fail("db_write_failed", safe_type_name(e))
-        n = new_review_count(plan.cutover, plan.saved)
+            return fail("db_write_failed", safe_type_name(e), Counter(cutover_review=review_on_record(store, plan, n)))
         if n:
             review["cutover_review"] = n
 
@@ -1433,6 +1468,21 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     if note:
         out(f"  heartbeat codes: {note_codes_summary(plan.notes)}")
     return 0
+
+
+def review_on_record(store, plan: Plan, n: int) -> int:
+    """After a failed save of the cutover record: how many of the n rows newly kept for review are on record all the
+    same (Codex review: an earlier chunk was written, or the write went through and its answer was lost). Those are
+    reported on the failed heartbeat, because the retry reads them as recorded and does not report them again; the
+    rest are reported by the run that records them. When the record cannot be read back, all n are reported here:
+    some may then be reported a second time by the retry, but none is never reported."""
+    if not n:
+        return 0
+    try:
+        after = store.cutover_decisions()
+    except Exception:
+        return n
+    return n - new_review_count(plan.cutover, after)
 
 
 def safe_type_name(e: BaseException) -> str:

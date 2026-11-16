@@ -116,7 +116,11 @@ export interface FinanceCard {
 }
 
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-const text = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim().slice(0, 300) : null);
+/** How much of a heartbeat's own (free) text the card keeps by default (the retired harvester wrote free text). */
+export const FINANCE_TEXT_LIMIT = 300;
+/** A heartbeat's own text for the card, at most `limit` characters. */
+const text = (v: unknown, limit: number): string | null =>
+  typeof v === "string" && v.trim() ? v.trim().slice(0, limit) : null;
 const ageHours = (e: Entry, now: number): number => {
   const t = typeof e?.sync_start === "string" ? Date.parse(e.sync_start) : NaN;
   return Number.isFinite(t) ? (now - t) / 3_600_000 : Infinity;
@@ -140,9 +144,13 @@ export function financeLedgerCard(
   balances: Entry,
   now = Date.now(),
   keepalive: Entry = null,
-  thresholds: { warnHours: number; failHours: number } = { warnHours: FINANCE_WARN_HOURS, failHours: FINANCE_FAIL_HOURS },
+  // textLimit: how much of a heartbeat's own text the card keeps (FINANCE_TEXT_LIMIT unless given).
+  thresholds: { warnHours: number; failHours: number; textLimit?: number } = {
+    warnHours: FINANCE_WARN_HOURS,
+    failHours: FINANCE_FAIL_HOURS,
+  },
 ): FinanceCard {
-  const { warnHours, failHours } = thresholds;
+  const { warnHours, failHours, textLimit = FINANCE_TEXT_LIMIT } = thresholds;
   const parts = [
     { name: "transactions", entry: transactions ?? null },
     { name: "balances", entry: balances ?? null },
@@ -167,7 +175,7 @@ export function financeLedgerCard(
   let errorMessage: string | null = null;
   for (const wantStatus of ["failed", "partial"] as const) {
     for (const p of ranked) {
-      if (p.status === wantStatus && p.entry) errorMessage ??= text(p.entry.error_message);
+      if (p.status === wantStatus && p.entry) errorMessage ??= text(p.entry.error_message, textLimit);
     }
   }
   if (!errorMessage && status !== "success" && status !== "unknown") {
@@ -203,9 +211,13 @@ export function financeLedgerCard(
 
 /**
  * The SimpleFIN card (/status) and the /financials freshness line: financeLedgerCard with the SimpleFIN
- * thresholds, after each heartbeat's text is re-rendered from its allowlisted codes (safeSimplefinNote).
+ * thresholds, after each heartbeat's text is re-rendered from its allowlisted codes (safeSimplefinNote). That
+ * note is shown whole, never cut at FINANCE_TEXT_LIMIT (Codex review): past SIMPLEFIN_NOTE_LIMIT the later codes
+ * are kept as tokens ("...; also [cutover_review x2]"), and cutting them off would hide a warning such as
+ * cutover_review. Its length is bounded by the allowlist (formatSimplefinNotes), not by the stored text.
  */
 export function simplefinLedgerCard(transactions: Entry, balances: Entry, now = Date.now()): FinanceCard {
   const safe = (e: Entry): Entry => (e ? { ...e, error_message: safeSimplefinNote(e.error_message) } : e);
-  return financeLedgerCard(safe(transactions), safe(balances), now, null, SIMPLEFIN_THRESHOLDS);
+  const whole = { ...SIMPLEFIN_THRESHOLDS, textLimit: Number.POSITIVE_INFINITY };
+  return financeLedgerCard(safe(transactions), safe(balances), now, null, whole);
 }

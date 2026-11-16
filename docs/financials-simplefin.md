@@ -43,7 +43,7 @@ Every message ends with its code in brackets (`[sf_reauth]`, `[account_unmatched
 | Other `[sf_...]` codes (amber) | SimpleFIN reported a connection, account or general problem; check its site. Most clear on the next run. |
 | `an account was not imported [account_unmatched]` (amber) | A new or renamed account could not be matched; see step 4. |
 | `a new account is balances-only ... [account_type_unset]` | Set `finance_accounts.account_type` (Cash or Credit Card) if its transactions should count. |
-| `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. Reported by the run that records them: if that run's ledger write then fails, the count is on its red `db_write_failed` heartbeat, and the next run (which writes those rows) does not report them again. |
+| `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. Reported by the run that records them: if that run's ledger write then fails, the count is on its red `db_write_failed` heartbeat, and the next run (which writes those rows) does not report them again. If saving the record itself fails, the rows on record all the same (part of it was written, or the answer was lost) are counted on that red heartbeat and the others by the retry that records them; when the record cannot be read back, all of them are counted on the red heartbeat and the retry may count some again (never none). |
 | `the cutover match record table is missing ... [cutover_provenance_unsaved]` (red) | Apply `sql/finance_cutover_matches.sql`. Nothing was written that run: a run with cutover decisions to record stops before the ledger, so no row is left out on a match that is not on record. |
 | `the SimpleFIN ETL could not write to Supabase [db_write_failed]` (red) | The cutover record (written first) or the ledger could not be written; the next run retries (every write is an upsert). |
 | `the SimpleFIN ETL could not read its cutover record ... [db_read_failed]` (red) | Nothing was written that run; the next run retries. If it repeats, check that Supabase is up and the table is readable. |
@@ -75,24 +75,30 @@ evidence is the account, the amount and the currency plus either:
   DELI 0099` are two shops), where the description names a merchant (`POS PURCHASE` or `COFFEE SHOP` alone does
   not) and the payee names do not contradict each other.
 - **merchant**: dates within 3 days (either feed's original or posted date counts) and the same merchant: more than
-  half of the shorter side's description and merchant name words in common, the distinctive words of one side
-  (all but kinds of business such as `COFFEE` or `DELI`) all present on the other, including the word that names
-  the business, and payee names that do not contradict each other. A shared city, kind of business or first word
-  is not enough (`DEMO COFFEE ATLANTA` and `OTHER COFFEE ATLANTA`, or `DEMO BOTTLE COFFEE` and `DEMO DONKEY
-  COFFEE`, are two merchants), while a bank text and its cleaned name agree (`DEMO CAFE 0042 ATLANTA GA` and
-  `Demo Cafe`). A candidate pair counts only at the smallest date gap of both its rows, so the same purchase on
+  half of the shorter side's description and merchant name words in common, the distinctive words of one side (all
+  but kinds of business such as `COFFEE` or `DELI`) all present on the other, including the word that names the
+  business, and no payee names or store numbers that contradict each other. A shared city, kind of business or first
+  word is not enough (`DEMO COFFEE ATLANTA` and `OTHER COFFEE ATLANTA`, or `DEMO BOTTLE COFFEE` and `DEMO DONKEY
+  COFFEE`, are two merchants), while a bank text and its cleaned name agree (`DEMO CAFE 0042 ATLANTA GA` and `Demo
+  Cafe`). A candidate pair counts only at the smallest date gap of both its rows, so the same purchase on
   consecutive days pairs day by day. A day Rocket Money lacks is kept, since its neighbours are the nearer twins.
 
 Payee names contradict when both name a business and neither one's distinctive words (all but kinds of business
 and generic words such as `STORE`, `COFFEE` or `POS`) are all on the other row: `Demo Store` and `Other Store`
-share a word and are still two payees. A payee of generic words only says nothing either way.
+share a word and are still two payees. A payee of generic words only says nothing either way. Store numbers
+contradict when both rows carry one (a run of three digits or more, such as `0042` or `#042`, leading zeros
+ignored; dates such as `11/14` do not count) and neither row's numbers are all on the other: `DEMO DELI 0042` and
+`DEMO DELI 0099` share every word once the digits are dropped and are still two shops, so neither step matches
+them. A number on one side only (`DEMO CAFE 0042 ATLANTA GA` and `Demo Cafe`), or an extra number on one side,
+agrees.
 
-In both steps a group of candidate pairs is a match only when it is one to one, or when its rows cannot be told
-apart on either side (same dates and text) and every SimpleFIN row has a twin of its own: two identical coffees on
-both sides both match, and one coffee with two identical Rocket Money twins matches one of them (the only unequal
-group that is paired: whichever twin it takes, the same SimpleFIN row is dropped and the other twin stays free).
-More SimpleFIN rows than twins (two identical new rows and one Rocket Money row) is never guessed: all of them are
-kept as ambiguous, and that Rocket Money row is held, so no other row is matched to it.
+In both steps a group of candidate pairs is a match only when it is one to one, or when it has as many SimpleFIN
+rows as Rocket Money rows and its rows cannot be told apart on either side (same dates and text): two identical
+coffees on both sides both match. A group of unequal size is never guessed, in either direction (key order is not
+identity evidence): two identical new rows and one Rocket Money row, and also one coffee with two identical Rocket
+Money twins (which twin it is, or whether either is, is not known). All of its SimpleFIN rows are kept as
+ambiguous and recorded with every candidate (never cut to a few: those are the Rocket Money rows held on later
+runs), and its Rocket Money rows are held, so no other row is matched to them.
 
 Every SimpleFIN row of the response takes part, also the rows before the window, so a Rocket Money row whose twin is
 before the window is taken by that twin and a later purchase of the same amount is not matched to it. That match is
@@ -108,7 +114,7 @@ by **unconfirmed** with the Rocket Money keys the old record named: the row is k
 Rocket Money row is free again for its real twin, also when a later answer lacks the corrected row.
 
 An equal amount alone never drops a row. A row with competing candidates (**ambiguous**: a tie on dates, rows that
-can be told apart competing for one twin, or more SimpleFIN rows than twins) or with a same-amount Rocket Money row
+can be told apart competing for one twin, or a group of unequal size) or with a same-amount Rocket Money row
 nearby but no merchant evidence (**unconfirmed**) is kept, and so is a row an earlier run already stored that turns
 out to match (**stored_duplicate**). The SimpleFIN card turns amber once, with `[cutover_review xN]`, by the run that
 records such rows; they may be duplicates to fix by hand, so check them (for example in the weekly review) until
