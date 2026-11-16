@@ -341,7 +341,7 @@ test("planBankJobs: nothing while the book is off", () => {
 test("planBankJobs: the source map first (unknown mapping or a changed table of contents)", () => {
   for (const o of [{ mapping: "unknown" }, { toc_hash_stored: "b".repeat(64) }]) {
     const p = B.planBankJobs(planInput(o), V);
-    assert.deepEqual(p.jobs, [{ step: "map", chapter: 0, input_hash: sha(`${V}|${TOC}|${TITLE}|A. Writer|6`), prompt_version: V, priority: 10 }]);
+    assert.deepEqual(p.jobs, [{ step: "map", chapter: 0, input_hash: sha(`${V}|${TOC}|${TITLE}|A. Writer|6|0`), prompt_version: V, priority: 10 }]);
     assert.deepEqual(p.quizzable, [1, 2, 3]);
   }
 });
@@ -415,6 +415,79 @@ test("estimateRemainingCents counts the chapters without a current bank", () => 
   const built = { chapter: 1, status: "ready", chapter_hash: hashOf(1), rebuilds: 0, built_rebuilds: 0, built_at: null, quizzable_since: null };
   assert.equal(B.estimateRemainingCents(planInput({ bank: [built] })), 5 * 37);
   assert.equal(B.estimateRemainingCents(planInput({ mapping: "unknown" })), 20 + 6 * 37);
+});
+
+/* ---------------- review round 2 ---------------- */
+
+test("the end of the book while the chapter count is unknown is never reached (unsure and whole-book ideas)", () => {
+  const structure = { ideas: [idea({ placement: "unsure" }), idea({ title: "Second" })], highlight_links: [], rejected: 0 };
+  const r = B.applyVerify(structure, okVerify(structure), { chapter: 3, totalChapters: 0 });
+  assert.deepEqual(r.ideas.map((i) => i.unlock_chapter), [B.UNKNOWN_END_CHAPTER, 3]);
+  const whole = B.applyVerify(structure, okVerify(structure), { chapter: 0, totalChapters: 0 });
+  assert.ok(whole.ideas.every((i) => i.unlock_chapter === B.UNKNOWN_END_CHAPTER), "chapter 0 never unlocks at 0");
+  assert.equal(B.endChapter(3, 12), 12);
+  assert.equal(B.endChapter(14, 12), 14);
+  assert.equal(B.UNKNOWN_END_CHAPTER, 2147483647, "equals pds.reading_bank_end_chapter's value");
+});
+
+test("citedNotes: the copy guard drops a note (and an UNSURE note) that repeats 12 words of a snippet", () => {
+  const snippet = "the keeper wrote every ship into the ledger before dawn because the tide tables could not be trusted any longer";
+  const content = [
+    { type: "text", text: "Chapter three: the keeper wrote every ship into the ledger before dawn because the tide tables could not be trusted.", citations: [{ type: "web_search_result_location", url: "https://guides.example.org/ledger/ch3", title: "Guide", cited_text: snippet }] },
+    { type: "text", text: "The chapter turns on a count of ships.", citations: [{ type: "web_search_result_location", url: "https://guides.example.org/ledger/ch3", title: "Guide", cited_text: snippet }] },
+    { type: "text", text: "UNSURE: whether the keeper wrote every ship into the ledger before dawn because the tide tables failed.", citations: null },
+  ];
+  const r = B.citedNotes(content);
+  assert.deepEqual(r.notes.map((n) => n.text), ["The chapter turns on a count of ships."]);
+  assert.equal(r.unsure, "");
+  assert.equal(r.dropped, 2);
+  assert.equal(r.sources.length, 1, "the citation itself is still evidence");
+});
+
+test("mergeHighlightLinks folds valid links into support before verify; validateBuild never reads highlight_links", () => {
+  const structure = {
+    ideas: [idea({ support: ["E1"] }), idea({ title: "Other idea", support: ["E2"] })],
+    highlight_links: [{ highlight: "H5", idea_index: 0 }, { highlight: "H5", idea_index: 0 }, { highlight: "H99", idea_index: 1 }, { highlight: "H5", idea_index: 7 }, { highlight: "H5", idea_index: -1 }],
+    rejected: 0,
+  };
+  const merged = B.mergeHighlightLinks(structure, ["H5"]);
+  assert.deepEqual(merged.ideas.map((i) => i.support), [["E1", "H5"], ["E2"]]);
+  assert.deepEqual(merged.highlight_links, []);
+  assert.deepEqual(structure.ideas[0].support, ["E1"], "the input is not changed");
+  // Unmerged: the link verify never saw is not evidence.
+  const r = B.validateBuild({
+    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, promptVersion: V, rebuilds: 0, replace: true,
+    structure, verify: okVerify(structure), evidence: [E1, E2], highlights: [H5], existingTitles: [],
+  });
+  assert.deepEqual(r.payload.ideas.map((i) => i.evidence), [["E1"], ["E2"]]);
+  assert.ok(!r.payload.sources.some((s) => s.kind === "highlight"));
+});
+
+test("a build with nothing to cite needs no model call and stores no_sources", () => {
+  assert.equal(B.buildNeedsModel([], []), false);
+  assert.equal(B.buildNeedsModel([E1], []), true);
+  assert.equal(B.buildNeedsModel([], [H5]), true);
+  const r = B.validateBuild({
+    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, promptVersion: V, rebuilds: 0, replace: true,
+    structure: B.EMPTY_STRUCTURE, verify: null, evidence: [], highlights: [], existingTitles: [],
+  });
+  assert.deepEqual([r.status, r.kept, r.payload.status, r.payload.ideas.length], ["no_sources", 0, "no_sources", 0]);
+});
+
+test("planBankJobs: a failed map is planned again only after a book-level Rebuild (map_rebuilds in its hash)", () => {
+  const first = B.planBankJobs(planInput({ mapping: "unknown" }), V).jobs[0];
+  const failed = { job_id: 60, step: "map", chapter: 0, input_hash: first.input_hash, status: "failed", result: null };
+  const again = B.planBankJobs(planInput({ mapping: "unknown", jobs: [failed] }), V);
+  assert.deepEqual(again.jobs.map((j) => j.input_hash), [first.input_hash], "same hash: enqueue leaves the failed job (web_search_disabled aside)");
+  assert.deepEqual(again.skip_jobs, []);
+  const rebuilt = B.planBankJobs(planInput({ mapping: "unknown", jobs: [failed], map_rebuilds: 1 }), V).jobs[0];
+  assert.notEqual(rebuilt.input_hash, first.input_hash);
+  assert.equal(rebuilt.input_hash, sha(`${V}|${TOC}|${TITLE}|A. Writer|6|1`));
+  assert.equal(B.mapInputHash(V, { toc_hash: TOC, title: TITLE, author: "A. Writer", total_chapters: 6 }), first.input_hash, "no count = 0");
+});
+
+test("the codes a skipped or refused job may carry are known codes", () => {
+  for (const c of ["not_pending", "question_changed", "superseded", "cost_limit"]) assert.equal(B.bankCode(c), c);
 });
 
 /* ---------------- heartbeat ---------------- */

@@ -334,3 +334,11 @@ test("chapter recall is due the day after, then at day 7 and day 21", () => {
   assert.equal(R.chapterRecallDueOn("2026-03-01", 2), "2026-03-22");
   assert.equal(R.chapterRecallDueOn("2026-03-01", 3), null);
 });
+
+test("a chapter recall grade without a hit for an idea gives that idea the answer's own verdict (mirrors the SQL)", () => {
+  const hits = [{ id: R.recallPointId(11), hit: "yes" }, { id: R.recallPointId(12), hit: "no" }, { id: R.recallPointId(13), hit: "partial" }];
+  assert.deepEqual([11, 12, 13, 14].map((i) => R.recallEventVerdict("partial", hits, i)), ["correct", "incorrect", "partial", "partial"]);
+  assert.equal(R.recallEventVerdict("correct", null, 11), "correct", "a self grade with no hits is never a lapse for every idea");
+  assert.equal(R.recallEventVerdict("incorrect", [], 11), "incorrect");
+  assert.equal(R.recallEventVerdict("dont_know", hits, 11), "dont_know");
+});

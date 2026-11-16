@@ -213,20 +213,34 @@ test("T07's export is re-defined with T07's fields unchanged and the spoiler gat
   assert.deepEqual(objectsStartingWith(b, "attempt_key"), objectsStartingWith(a, "attempt_key"));
   assert.deepEqual(objectsStartingWith(b, "questions"), objectsStartingWith(a, "questions"));
   assert.match(b, /reading_bank_quiz_through\(p_book\)/);
-  const gates = b.match(/q\.format IS NULL OR q\.unlock_chapter <= \(SELECT through FROM t\)/g) ?? [];
+  const gates = b.match(/pds\.reading_bank_question_open\(q\.question_id, \(SELECT through FROM t\)\)/g) ?? [];
   assert.equal(gates.length, 2, "questions and the attempts on them");
+  // The gate: unlocked, current edition, the idea unlocked, and every idea an (older) recall rubric names unlocked.
+  const open = fn(fnsMain, "pds.reading_bank_question_open").body;
+  assert.match(open, /WHEN q\.format IS NULL THEN true/);
+  assert.match(open, /q\.unlock_chapter <= p_through/);
+  assert.match(open, /q\.chapter_hash IS NOT DISTINCT FROM pds\.reading_bank_chapter_hash\(q\.book_id, q\.bank_chapter\)/);
+  assert.match(open, /i\.idea_id = q\.idea_id AND i\.unlock_chapter > p_through/);
+  assert.match(open, /q\.format = 'chapter_recall' THEN q\.rubric::jsonb->'ideas'[\s\S]*i\.unlock_chapter > p_through/);
 });
 
 test("the chapter recall rubric lists only ideas that unlock with the chapter, and nothing locked is served or answered", () => {
-  const recall = fn(fnsMain, "pds.reading_bank_recall_refresh").body;
+  const recall = fn(fnsMain, "pds.reading_bank_recall_rubric").body;
   assert.match(recall, /i\.unlock_chapter = p_ch/, "an unsure / whole-book / moved idea (unlock at the end) is never listed");
   assert.match(recall, /i\.chapter_hash = v_hash/);
   assert.match(recall, /reading_bank_idea_supported\(i\.idea_id\)/);
+  assert.match(fn(fnsMain, "pds.reading_bank_recall_refresh").body, /v_rj := pds\.reading_bank_recall_rubric\(p_book, p_ch\)/);
   assert.doesNotMatch(fn(fnsMain, "pds.reading_bank_store").body, /'format', 'chapter_recall', 'ideas'/, "one rubric builder");
   const deck = fn(fnsMain, "pds.reading_bank_deck").body;
   assert.match(deck, /jsonb_array_elements\(q\.rubric::jsonb->'ideas'\)[\s\S]*i\.unlock_chapter > \(SELECT through FROM t\)/, "deck backstop");
+  assert.match(deck, /pds\.reading_bank_recall_valid\(q\.rubric, p_book, c\.chapter\)/, "deck: every listed idea still valid");
   const attempt = fn(fnsMain, "pds.reading_bank_attempt").body;
   assert.match(attempt, /i\.idea_id = ANY\(v_covers\)[\s\S]*i\.unlock_chapter > pds\.reading_bank_quiz_through/, "attempt backstop");
+  assert.match(attempt, /NOT pds\.reading_bank_recall_valid\(v_q\.rubric, v_q\.book_id, v_q\.bank_chapter\)[\s\S]{0,120}'question_changed'/, "attempt: never scores an idea without evidence");
+  const valid = fn(fnsMain, "pds.reading_bank_recall_valid").body;
+  for (const cond of ["i.status <> 'active'", "i.unlock_chapter <> p_ch", "i.chapter_hash <> pds.reading_bank_chapter_hash(p_book, p_ch)", "NOT pds.reading_bank_idea_supported(i.idea_id)"]) {
+    assert.ok(valid.includes(cond), cond);
+  }
   const flag = fn(fnsMain, "pds.reading_bank_flag").body;
   assert.ok((flag.match(/reading_bank_recall_refresh\(/g) ?? []).length >= 4, "wrong, not_in_chapter and their Restores re-version the recall");
 });
@@ -237,8 +251,11 @@ test("served ideas need valid evidence; flags move state_version; chapter recall
   }
   assert.match(fn(fnsMain, "pds.reading_bank_idea_supported").body, /pds\.reading_sha256\(h\.passage\) = src\.passage_sha/);
   const flag = fn(fnsMain, "pds.reading_bank_flag").body;
-  assert.doesNotMatch(flag, /SET dirty = true WHERE/, "every dirty mark also moves state_version");
-  assert.ok((flag.match(/SET dirty = true, state_version = state_version \+ 1/g) ?? []).length >= 2);
+  assert.doesNotMatch(flag, /SET dirty = true/, "dirty marks go through reading_bank_touch_states (which also moves state_version)");
+  assert.ok((flag.match(/pds\.reading_bank_touch_states\(v_ideas, true\)/g) ?? []).length >= 2);
+  const touch = fn(fnsMain, "pds.reading_bank_touch_states").body;
+  assert.match(touch, /INSERT INTO pds\.reading_idea_state[\s\S]*1, COALESCE\(p_dirty, false\)[\s\S]*ON CONFLICT \(idea_id\) DO UPDATE SET state_version = s\.state_version \+ 1/,
+    "an idea with no state row gets one at version 1, so a replay with basis 0 from before cannot pass");
   assert.match(fn(fnsMain, "pds.reading_bank_events").body, /f\.kind = 'wrong' AND f\.idea_id = c\.idea_id AND f\.created_at > a\.answered_at/);
   const grade = fn(fnsMain, "pds.reading_bank_grade").body;
   assert.match(grade, /v_a\.covers/, "a chapter recall grade carries every covered idea's state");
@@ -293,7 +310,73 @@ test("the last chapter unlocks from a session Riley logged himself, not a Kindle
   assert.match(last, /s\.source <> 'kindle'/);
 });
 
-test("schema_ok reports both checks and the idea branch (the worker's preflight)", () => {
+test("schema_ok reports both checks, the idea branch and the export gate (the worker's preflight)", () => {
   const body = fn(fnsMain, "pds.reading_bank_schema_ok").body;
-  for (const k of ["source_kind_idea", "grader_local", "idea_source_branch"]) assert.match(body, new RegExp(`'${k}'`));
+  for (const k of ["source_kind_idea", "grader_local", "idea_source_branch", "export_gate", "all_ok"]) assert.match(body, new RegExp(`'${k}'`));
+  // Every check on the value list must allow the bank's value (a narrower one left under another name still refuses).
+  assert.match(body, /NOT EXISTS \(SELECT 1 FROM c WHERE conrelid = 'pds\.reading_questions'::regclass AND def ~ '\\msource_kind = ANY'\s+AND def NOT LIKE '%''idea''%'\)/);
+  assert.match(body, /NOT EXISTS \(SELECT 1 FROM c WHERE conrelid = 'pds\.reading_question_attempts'::regclass AND def ~ '\\mgrader = ANY'\s+AND def NOT LIKE '%''local''%'\)/);
+  assert.match(body, /position\('reading_bank_question_open' IN pg_get_functiondef\('pds\.reading_questions_export\(bigint\)'::regprocedure\)\)/);
+});
+
+test("a chapter recall graded with no hit for an idea gives it the answer's verdict, never a blanket 'incorrect'", () => {
+  const ev = fn(fnsMain, "pds.reading_bank_events").body;
+  assert.match(ev, /WHEN h\.hit = 'no' THEN 'incorrect'\s+ELSE a\.verdict END/);
+  assert.doesNotMatch(ev, /WHEN h\.hit = 'partial' THEN 'partial' ELSE 'incorrect'/);
+});
+
+test("pending answers move the state_version of what they cover; grade jobs of answers no longer pending are never claimed", () => {
+  const attempt = fn(fnsMain, "pds.reading_bank_attempt").body;
+  assert.match(attempt, /ELSE\s+PERFORM pds\.reading_bank_touch_states\(v_need, false\);\s+INSERT INTO pds\.reading_bank_jobs/);
+  assert.match(attempt, /CASE WHEN v_inline THEN NOW\(\) \+ interval '10 minutes' ELSE NOW\(\) END/, "an inline (chat) grade's job is only a safety net");
+  const claim = fn(fnsMain, "pds.reading_bank_claim").body;
+  const skip = claim.indexOf("SET status = 'skipped'");
+  assert.ok(skip > 0 && skip < claim.indexOf("SELECT j.* INTO v_job"), "skipped before the pick");
+  assert.match(claim, /j\.step = 'grade' AND j\.status = 'queued'\s+AND NOT EXISTS \(SELECT 1 FROM pds\.reading_question_attempts a WHERE a\.attempt_key = j\.attempt_key AND a\.grading_status = 'pending'\)/);
+});
+
+test("reserve raises a running job's reservation only within both caps, under the claim lock", () => {
+  const r = fn(fnsMain, "pds.reading_bank_reserve").body;
+  const lock = r.indexOf("pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'))");
+  assert.ok(lock > 0 && lock < r.indexOf("UPDATE pds.reading_bank_jobs SET reserved_cents"));
+  assert.match(r, /v_job\.status <> 'running' OR v_job\.lease_until < NOW\(\)/);
+  assert.match(r, /IF v_att <> v_job\.attempts THEN[\s\S]{0,80}'lease_lost'/);
+  assert.match(r, /v_month \+ v_delta > v_capm[\s\S]{0,120}'monthly_cap'/);
+  assert.match(r, /v_used \+ v_delta > v_cap[\s\S]{0,260}'budget'/);
+  assert.match(r, /sum\(reserved_cents\) FILTER \(WHERE status = 'running' AND lease_until >= NOW\(\)\)/, "every other running job's reservation counts");
+});
+
+test("a failed job has a way back: web_search_disabled retried after 6 h, the map through the book-level Rebuild", () => {
+  const enq = fn(fnsMain, "pds.reading_bank_enqueue").body;
+  assert.match(enq, /WHERE jb\.status = 'skipped'\s+OR \(jb\.status = 'failed' AND jb\.error_code = 'web_search_disabled' AND jb\.finished_at < NOW\(\) - interval '6 hours'\)/);
+  assert.match(enq, /PERFORM pds\.reading_bank_recall_sync\(v_book\)/);
+  const rb = fn(fnsMain, "pds.reading_bank_rebuild").body;
+  assert.match(rb, /IF v_ch = 0 THEN[\s\S]*map_rebuilds = b\.map_rebuilds \+ 1/);
+  assert.match(fn(fnsMain, "pds.reading_bank_plan_input").body, /'map_rebuilds', COALESCE\(\(SELECT map_rebuilds FROM bb\), 0\)/);
+  assert.match(main, /map_rebuilds\s+INTEGER\s+NOT NULL DEFAULT 0/);
+});
+
+test("the recall rubric follows its ideas: every store refreshes it, the sync re-versions a stale one without voiding answers", () => {
+  const store = fn(fnsMain, "pds.reading_bank_store").body;
+  assert.match(store, /IF v_ch >= 1 AND NOT v_keep THEN\s+v_qs := v_qs \+ pds\.reading_bank_recall_refresh/);
+  assert.match(store, /CASE WHEN v_replace THEN NULL ELSE false END, v_replace\)/, "the highlights step keeps the answers already given");
+  const sync = fn(fnsMain, "pds.reading_bank_recall_sync").body;
+  assert.match(sync, /q\.rubric IS DISTINCT FROM pds\.reading_bank_recall_rubric\(p_book, q\.bank_chapter\)::text/);
+  assert.match(sync, /reading_bank_recall_refresh\(p_book, v_ch, NULL, NULL, 'chapter ideas changed', false, false\)/);
+});
+
+test("the end of the book is never 'now': the store and the flag unlock unsure, moved and whole-book ideas there", () => {
+  assert.match(fn(fnsMain, "pds.reading_bank_end_chapter").body, /ELSE 2147483647 END/);
+  const store = fn(fnsMain, "pds.reading_bank_store").body;
+  assert.match(store, /v_unlock := CASE WHEN v_ch = 0 OR v_unlock > v_ch THEN GREATEST\(v_ch, v_end\) ELSE v_ch END;/);
+  assert.match(store, /v_end := pds\.reading_bank_end_chapter\(v_book\)/);
+  assert.match(fn(fnsMain, "pds.reading_bank_flag").body, /v_total := pds\.reading_bank_end_chapter\(v_q\.book_id\)/);
+});
+
+test("a flag on an older question version acts on the current one; a chapter never gets two live recall questions back", () => {
+  const flag = fn(fnsMain, "pds.reading_bank_flag").body;
+  assert.match(flag, /IF v_q\.superseded_at IS NOT NULL THEN[\s\S]{0,200}question_key = v_q\.question_key AND superseded_at IS NULL[\s\S]{0,200}'question_changed'/);
+  assert.match(flag, /CASE WHEN question_id = v_q\.question_id THEN v_kind ELSE 'idea_retired' END/);
+  assert.match(flag, /VALUES \(v_key, v_q\.question_id, v_q\.idea_id/, "the flag row records the version acted on");
+  assert.match(flag, /o\.question_key <> v_q\.question_key AND o\.superseded_at IS NULL AND o\.retired_at IS NULL\) THEN\s+RETURN jsonb_build_object\('ok', false, 'http', 409, 'code', 'superseded'\)/);
 });

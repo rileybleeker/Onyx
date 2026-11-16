@@ -8,6 +8,8 @@
  * - Edition binding: chapterHash / tocHash (mirrors of the SQL; the planner uses the database's own values).
  * - Sources: BLOCKED_DOMAINS + isBlockedUrl (piracy and full-text hosts), citedNotes (API citations -> evidence;
  *   a sentence without a citation is thrown away), cutAtWord, registrableDomain.
+ * - Before verify: mergeHighlightLinks (the structure call's highlight links become support the verifier checks);
+ *   buildNeedsModel / EMPTY_STRUCTURE (a build with nothing to cite stores no_sources without a model call).
  * - After the build: applyVerify (the second model can only take things away) and validateBuild (the code gates:
  *   evidence exists, exact-fact gate, copy guard at 12 words, answer not in the prompt, choice / order / explain
  *   shapes, length limits, rubric size, title dedupe, chapter status) -> the payload of pds.reading_bank_store.
@@ -265,7 +267,17 @@ export function citedNotes(content: ContentBlockLike[]): CitedNotes {
     else if (/^unsure\s*:/i.test(text) || unsure) unsure = cutAtWord(`${unsure} ${text}`, 1000);
     else dropped++;
   }
-  return { notes, sources, unsure, dropped, tool_errors: toolErrors };
+  // The copy guard (D23) on the notes, which are stored text (reading_bank_jobs.output): a segment that shares
+  // COPY_RUN_WORDS consecutive words with any kept snippet is thrown away (counted in `dropped`), and so is an
+  // UNSURE: note that does. The prompt asks for the model's own words; this is the check in code.
+  const runs = wordRuns(sources.map((s) => s.cited_text));
+  const kept = notes.filter((n) => !sharesRun(n.text, runs));
+  dropped += notes.length - kept.length;
+  if (unsure && sharesRun(unsure, runs)) {
+    unsure = "";
+    dropped++;
+  }
+  return { notes: kept, sources, unsure, dropped, tool_errors: toolErrors };
 }
 
 /* ------------------------------------------------------------------ */
@@ -543,10 +555,22 @@ const bump = (r: Partial<Record<RejectReason, number>>, k: RejectReason, by = 1)
 };
 
 /**
+ * "The end of the book" while the chapter count is unknown: never reached, so an unsure or whole-book idea can never
+ * unlock early for want of a length (mirrors pds.reading_bank_end_chapter, which the store applies whatever is sent).
+ */
+export const UNKNOWN_END_CHAPTER = 2147483647;
+
+/** The unlock chapter of "the end of the book": the chapter count (at least the chapter), or UNKNOWN_END_CHAPTER. */
+export function endChapter(chapter: number, totalChapters: number): number {
+  const total = Math.trunc(Number(totalChapters)) || 0;
+  return total > 0 ? Math.max(Math.trunc(chapter) || 0, total) : UNKNOWN_END_CHAPTER;
+}
+
+/**
  * The verify pass's verdicts applied (it can only take things away): supported no / partly, later content or a
  * later placement -> the idea is not stored; earlier -> stored in this chapter; unsure (either pass) -> stored, but
- * unlocked only at the end of the book. A question verify did not mark ok is not stored; an idea left without a
- * question is not stored.
+ * unlocked only at the end of the book (endChapter: never, while the chapter count is unknown). A question verify
+ * did not mark ok is not stored; an idea left without a question is not stored.
  */
 export function applyVerify(
   structure: StructureOutput,
@@ -555,7 +579,7 @@ export function applyVerify(
 ): { ideas: VerifiedIdea[]; reasons: Partial<Record<RejectReason, number>> } {
   const reasons: Partial<Record<RejectReason, number>> = {};
   const out: VerifiedIdea[] = [];
-  const total = Math.max(opts.chapter, Math.trunc(opts.totalChapters) || 0);
+  const total = endChapter(opts.chapter, opts.totalChapters);
   (structure?.ideas ?? []).forEach((idea, index) => {
     const v = verify?.ideas?.find((x) => x.index === index);
     if (!v) return bump(reasons, "verify_missing");
@@ -577,6 +601,38 @@ export function applyVerify(
   return { ideas: out, reasons };
 }
 
+/**
+ * The structure call's `highlight_links` folded into the ideas' `support` lists (deduped, valid H<id> of this build
+ * and existing idea indexes only), with `highlight_links` emptied. A highlight counts as evidence only for an idea it
+ * states, and the verifier is what checks that: so the worker calls this on the structure output BEFORE the verify
+ * call, which then sees (and can reject) each linked highlight as support. validateBuild itself never reads
+ * highlight_links: a link verify did not see is never stored as evidence.
+ */
+export function mergeHighlightLinks(structure: StructureOutput, highlightIds: Iterable<string>): StructureOutput {
+  const valid = new Set([...highlightIds].map((h) => clean(h)));
+  const ideas = (structure?.ideas ?? []).map((idea) => ({ ...idea, support: [...(idea.support ?? [])] }));
+  for (const l of structure?.highlight_links ?? []) {
+    const ref = clean(l?.highlight);
+    const i = l?.idea_index;
+    if (!valid.has(ref) || !Number.isInteger(i) || i < 0 || i >= ideas.length) continue;
+    if (!ideas[i].support.map(clean).includes(ref)) ideas[i].support.push(ref);
+  }
+  return { ...structure, ideas, highlight_links: [] };
+}
+
+/** An empty structure answer: what a build with nothing to cite stores (no model call; see buildNeedsModel). */
+export const EMPTY_STRUCTURE: Readonly<StructureOutput> = Object.freeze({ ideas: [], highlight_links: [], rejected: 0 });
+
+/**
+ * Whether a build has anything to cite. With no web snippet and no highlight (an uncertain mapping on a chapter
+ * without highlights, a research job that found no sources) the worker makes NO model call: it stores
+ * validateBuild({...input, structure: EMPTY_STRUCTURE, verify: null}), i.e. status no_sources at no cost, so the
+ * chapter still gets a status and a later highlight there is offered to the highlights step.
+ */
+export function buildNeedsModel(evidence: readonly unknown[], highlights: readonly unknown[]): boolean {
+  return (evidence?.length ?? 0) > 0 || (highlights?.length ?? 0) > 0;
+}
+
 export interface BuildInput {
   bookId: number;
   chapter: number;
@@ -589,6 +645,7 @@ export interface BuildInput {
   rebuilds: number;
   /** true for a build / rebuild; false for the highlights step (adds ideas, keeps the chapter status). */
   replace: boolean;
+  /** The structure answer, with highlight_links already folded into support by mergeHighlightLinks before verify. */
   structure: StructureOutput;
   verify: VerifyOutput | null;
   evidence: BuildEvidence[];
@@ -696,7 +753,8 @@ export function chapterResult(kept: StoreIdea[], target: number): ChapterResult 
  * of this build); exact facts appear literally in a cited snippet or highlight of the idea (else the fact becomes
  * non-exact and questions answered by its value are left out); no field shares 12 words with any snippet or
  * highlight; length limits; dedupe against existing titles and this batch. Questions: the shapes of
- * questionRubric. Only evidence an idea that is stored cites goes into the payload.
+ * questionRubric. Only evidence an idea that is stored cites goes into the payload. `structure.highlight_links` is
+ * ignored here (see mergeHighlightLinks: links become support before verify, or not at all).
  */
 export function validateBuild(input: BuildInput): BuildResult {
   const { ideas: verified, reasons } = applyVerify(input.structure, input.verify, { chapter: input.chapter, totalChapters: input.totalChapters });
@@ -863,6 +921,8 @@ export interface PlanInput {
   mapping: "unknown" | "ok" | "uncertain";
   narrative: boolean | null;
   map_urls: unknown[];
+  /** Book-level Rebuild taps (pds.reading_bank_rebuild with chapter 0): part of the map job's hash. */
+  map_rebuilds?: number;
   toc_hash_stored: string | null;
   toc_hash: string;
   quiz_through: number;
@@ -888,8 +948,13 @@ export interface Plan {
 
 export const BUILT_STATUSES = new Set(["ready", "thin", "anchors_only", "no_sources"]);
 
-export const mapInputHash = (v: string, i: Pick<PlanInput, "toc_hash" | "title" | "author" | "total_chapters">) =>
-  sha256Hex(`${v}|${i.toc_hash}|${i.title}|${i.author ?? ""}|${i.total_chapters}`);
+/**
+ * The map job's hash carries the book-level rebuild count, so a source map that failed for good (refusal, bad
+ * output, an expired lease) is planned again after Riley's Rebuild instead of blocking the book. (A map that
+ * failed with web_search_disabled is also retried by pds.reading_bank_enqueue itself, 6 hours on.)
+ */
+export const mapInputHash = (v: string, i: Pick<PlanInput, "toc_hash" | "title" | "author" | "total_chapters" | "map_rebuilds">) =>
+  sha256Hex(`${v}|${i.toc_hash}|${i.title}|${i.author ?? ""}|${i.total_chapters}|${Math.max(0, Math.trunc(Number(i.map_rebuilds) || 0))}`);
 export const researchInputHash = (v: string, chapterHashHex: string, mapUrls: unknown[], rebuilds: number) =>
   sha256Hex(`${v}|${chapterHashHex}|${JSON.stringify(mapUrls ?? [])}|${rebuilds}`);
 /** researchJobId = the done research job the build reads, or "anchors" (uncertain mapping: highlights only) / "whole" (chapter 0). */
@@ -910,8 +975,11 @@ export function chapterBuilt(bank: PlanBank | undefined, chapterHashHex: string)
  * research then build (build waits for its research job, except with an uncertain mapping, where chapters are
  * built from Riley's highlights only); a highlights job for a built chapter with highlights whose content no job
  * has looked at (new or edited; the database lists only those); a whole-book chapter 0 once an uncertainly mapped
- * book is finished. Queued jobs that are no longer
- * planned are skipped (an obsolete input hash, a chapter that left the window).
+ * book is finished. Queued jobs that are no longer planned are skipped (an obsolete input hash, a chapter that left
+ * the window). A job that failed keeps its hash, so it is not planned again until Riley's Rebuild changes the hash
+ * (the chapter's rebuild count; for the map, the book-level count `map_rebuilds`), except a web_search_disabled
+ * failure, which pds.reading_bank_enqueue retries itself after 6 hours. A build with nothing to cite costs nothing
+ * (buildNeedsModel), so an uncertainly mapped chapter without highlights is planned and stored as no_sources free.
  */
 export function planBankJobs(input: PlanInput, promptVersion: string): Plan {
   const plan: Plan = { book_id: input.book_id, jobs: [], quizzable: [], skip_jobs: [] };
@@ -999,7 +1067,7 @@ export const BANK_CODES: ReadonlySet<string> = new Set([
   "auth", "bad_request", "web_search_disabled", "failed", "budget", "monthly_cap", "uncertain", "schema_checks",
   "schema_missing", "lease_expired", "lease_lost", "not_running", "raced", "thin", "no_sources", "anchors_only", "ready",
   "no_citations", "store_failed", "verify_failed", "no_research", "invalidated", "already_graded", "cost_limit",
-  "chapter_changed", "highlight_changed", "job_mismatch", "other",
+  "chapter_changed", "highlight_changed", "job_mismatch", "not_pending", "question_changed", "superseded", "other",
 ]);
 
 /** A safe error / outcome code from BANK_CODES ("other" for anything else), never message text. */

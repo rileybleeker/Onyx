@@ -176,3 +176,76 @@ test("defaultBankClient builds the SDK client with two retries", () => {
   assert.deepEqual(seen, { apiKey: "sk-synthetic", maxRetries: 2 });
   assert.equal(typeof c.beta.messages.stream, "function");
 });
+
+/* ---------------- review round 2 ---------------- */
+
+test("money is checked before the FIRST request too: a request whose bound passes maxCostCents is never sent", async () => {
+  const s = spec({ maxTokens: 32000, model: "claude-opus-5-5" });
+  const bound = M.requestBoundCents(s, [{ role: "user", content: s.user }]);
+  assert.ok(bound >= 32000 * 25 / 1_000_000 * 100, "its whole output at the dearest known price");
+  const { client, calls } = fakeClient([msg("end_turn")]);
+  const r = await M.bankModelCall(client, { ...s, maxCostCents: bound - 1 });
+  assert.deepEqual([r.ok, r.code, calls.length], [false, "cost_limit", 0]);
+  const ok = await M.bankModelCall(fakeClient([msg("end_turn")]).client, { ...s, maxCostCents: bound + 1 });
+  assert.equal(ok.ok, true);
+  const prior = await M.bankModelCall(fakeClient([msg("end_turn")]).client, { ...s, maxCostCents: bound + 1, priorCostCents: 5 });
+  assert.equal(prior.code, "cost_limit", "what the job spent on its earlier call counts");
+});
+
+test("the bound counts every allowed web search and fetch at full size", () => {
+  const base = spec();
+  const plain = M.requestBoundCents(base, []);
+  const tooled = M.requestBoundCents({ ...base, tools: [M.webSearchTool(2), M.webFetchTool(3)] }, []);
+  const extra = (2 * M.BOUND_SEARCH_TOKENS + 3 * 12000) * M.UNKNOWN_PRICE.input / 1_000_000 * 100 + 2 * M.WEB_SEARCH_CENTS;
+  assert.ok(tooled - plain >= extra - 1, "searches, their results and every fetch's content");
+});
+
+test("reserve: called before every request with the job's possible total; a refusal sends nothing", async () => {
+  const seen = [];
+  const paused = () => msg("pause_turn", [], { usage: usage({ input_tokens: 100_000 }) });
+  const { client, calls } = fakeClient([paused(), msg("end_turn")]);
+  const r = await M.bankModelCall(client, spec({ priorCostCents: 3, reserve: async (t) => (seen.push(t), true) }));
+  assert.equal(r.ok, true);
+  assert.equal(seen.length, 2);
+  assert.equal(calls.length, 2);
+  assert.ok(seen[0] >= 3 + M.requestBoundCents(spec(), [{ role: "user", content: "Synthetic user turn." }]) - 0.01);
+  assert.ok(seen[1] >= 3 + 20 + 20, "prior + the first turn's cost + at least that much again");
+  const refused = fakeClient([msg("end_turn")]);
+  const no = await M.bankModelCall(refused.client, spec({ reserve: async () => false }));
+  assert.deepEqual([no.ok, no.code, refused.calls.length], [false, "cost_limit", 0]);
+  const threw = fakeClient([msg("end_turn")]);
+  const t = await M.bankModelCall(threw.client, spec({ reserve: async () => { throw new Error("Synthetic"); } }));
+  assert.deepEqual([t.code, threw.calls.length], ["cost_limit", 0]);
+});
+
+test("deadlineAt: a step's two calls share one deadline; a passed deadline sends nothing", async () => {
+  const B = loadTs("lib/reading-bank.ts");
+  const now = 1_000_000;
+  assert.equal(M.callDeadlineMs({ step: "build", deadlineAt: now + 40_000 }, now), 40_000);
+  assert.equal(M.callDeadlineMs({ step: "build", deadlineAt: now + 900_000 }, now), B.STEP_MAX_SECONDS.build * 1000);
+  assert.equal(M.callDeadlineMs({ timeoutMs: 5000, deadlineAt: now - 1 }, now), 0);
+  assert.equal(M.stepDeadlineAt("build", now), now + B.STEP_MAX_SECONDS.build * 1000);
+  const { client, calls } = fakeClient([msg("end_turn")]);
+  const r = await M.bankModelCall(client, spec({ step: "build", deadlineAt: Date.now() + 1000 }));
+  assert.deepEqual([r.code, calls.length], ["timeout", 0], "less than MIN_TURN_MS left");
+  const { client: c2, calls: k2 } = fakeClient([msg("end_turn")]);
+  await M.bankModelCall(c2, spec({ step: "build", deadlineAt: Date.now() + 60_000 }));
+  assert.ok(k2[0].options.timeout <= 60_000 && k2[0].options.timeout > 50_000);
+});
+
+test("a turn a server-side fallback served is priced at the dearer model, over every attempt in usage.iterations", () => {
+  const iterations = [
+    { type: "message", input_tokens: 1_000_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    { type: "fallback_message", input_tokens: 1_000_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+  ];
+  const sticky = { model: "claude-sonnet-5-5", content: [{ type: "text", text: "x" }], usage: usage({ input_tokens: 1_000_000, iterations }) };
+  // The requested model's name, a fallback attempt: the serving model is unknown, so UNKNOWN_PRICE; both attempts.
+  assert.equal(M.turnCostCents("claude-sonnet-5-5", sticky), 2 * M.UNKNOWN_PRICE.input * 100);
+  const mid = { model: "claude-sonnet-5-5", content: [{ type: "text", text: "a" }, { type: "fallback", from: { model: "claude-sonnet-5-5" }, to: { model: "claude-opus-5-5" } }], usage: usage({ input_tokens: 1_000_000 }) };
+  assert.equal(M.servedModel("claude-sonnet-5-5", mid), "claude-opus-5-5", "the fallback block, not message_start's model");
+  assert.equal(M.turnCostCents("claude-sonnet-5-5", mid), 400);
+  const plain = { model: "claude-sonnet-5-5", content: [], usage: usage({ input_tokens: 1_000_000 }) };
+  assert.equal(M.fellBack("claude-sonnet-5-5", plain), false);
+  assert.equal(M.turnCostCents("claude-sonnet-5-5", plain), 200);
+  assert.deepEqual(M.billedTokens(usage({ input_tokens: 5, iterations })).input_tokens, 2_000_000);
+});

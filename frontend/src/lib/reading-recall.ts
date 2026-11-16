@@ -360,6 +360,18 @@ export function explainScore(points: ExplainPoint[], hits: PointHit[] | null | u
 /** The point id of a covered idea in a chapter recall grade. */
 export const recallPointId = (ideaId: number) => `i${ideaId}`;
 
+/**
+ * The verdict a graded chapter recall answer gives ONE covered idea (mirrors pds.reading_bank_events): "I don't
+ * know" for every idea; else the idea's own hit (yes correct, partial partial, no incorrect); else, when the grade
+ * carries no hit for it (a self grade after a failed model grade, the chat tool's single verdict), the answer's own
+ * verdict, so a "correct" self grade is never a lapse for every idea.
+ */
+export function recallEventVerdict(attemptVerdict: Verdict, hits: PointHit[] | null | undefined, ideaId: number): Verdict {
+  if (attemptVerdict === "dont_know") return "dont_know";
+  const h = hitMap(hits).get(recallPointId(ideaId));
+  return h === "yes" ? "correct" : h === "partial" ? "partial" : h === "no" ? "incorrect" : attemptVerdict;
+}
+
 /** Chapter recall: (2 x core hits + supporting hits) / (2 x core + supporting), partial = 0.5. */
 export function chapterRecallScore(ideas: ChapterRecallIdea[], hits: PointHit[] | null | undefined): number {
   const m = hitMap(hits);

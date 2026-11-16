@@ -26,7 +26,10 @@ the UI (S4), the chapter map / checkpoint / XP (S5) and the chat tools (S6) buil
 2. Read `pds.reading_bank_schema_ok()` after step 3, or check T07's two CHECK constraints before it: when
    `source_kind` does not allow `'idea'` or `grader` does not allow `'local'`, run
    `sql/reading_question_bank_checks.sql` in the Supabase dashboard SQL editor (it replaces two constraints, which
-   the MCP refuses). It only widens; every value T07 allows stays allowed.
+   the MCP refuses). It only widens; every value T07 allows stays allowed. `schema_ok` answers `source_kind_idea`
+   and `grader_local` (true only when every check on that column's value list allows the value, so a widened check
+   added beside a narrower original still reads false), `idea_source_branch` and `export_gate` (false after
+   `sql/reading_learning_questions.sql` was applied again: re-apply step 3), and `all_ok`.
 3. `sql/reading_question_bank.sql` (through the Supabase MCP or the dashboard). Re-apply it whenever
    `sql/reading_learning_questions.sql` is applied again: it re-defines two T07 functions,
    `pds.reading_source_text` (an added `idea` branch) and `pds.reading_questions_export` (bank rows above the
@@ -87,7 +90,14 @@ Every read (`reading_bank_deck` / `_round`, `_summary`, `_overview`, `_chapter`,
 flag functions apply it, together with the edition check (an idea's `chapter_hash` must equal the current sha256 of
 `chapter|N|<table of contents title>`, so a changed table of contents hides stale ideas at once). Locked rows never
 leave the server. An idea the verifier placed as unsure, an idea flagged "Not in this chapter" and whole-book ideas
-(chapter 0) unlock at the end of the book. Banks are built up to two chapters ahead and stay locked until then.
+(chapter 0) unlock at the end of the book (`pds.reading_bank_end_chapter`: the chapter count, or never while the
+count is unknown; the store and the flag apply it whatever number a caller sends). Banks are built up to two
+chapters ahead and stay locked until then.
+
+T07's export lists a bank question version, and the answers to it, only while `pds.reading_bank_question_open`
+holds: unlocked, of the current edition, its idea unlocked, and every idea a chapter recall rubric names unlocked.
+So an older recall version that still names an idea later moved to the end of the book, or a version from a
+replaced table of contents, stays on the server.
 
 A **chapter recall** rubric lists only the chapter's core and supporting ideas that unlock *with* the chapter
 (`unlock_chapter` = the chapter), of the current edition, with valid evidence (`pds.reading_bank_recall_refresh`, the
@@ -95,6 +105,14 @@ one place it is built). So an unsure, whole-book or moved idea never has its tit
 idea out (Not in this chapter) or retires it (Wrong), and the Restore of either, gives the question a new T07 version
 without (or again with) that idea; the answers already given keep counting for the other ideas. As a backstop, the
 deck never serves, and the attempt refuses (`locked`), a recall question whose rubric lists an idea above the gate.
+
+The rubric follows its ideas. Every store refreshes it: a build with T07's default invalidation (its ideas were all
+replaced), the highlights step with invalidation off (the recall answers already given keep counting for what they
+covered, and later recalls also assess the ideas it added). `pds.reading_bank_recall_sync`, run by every
+`pds.reading_bank_enqueue` (each kick and worker pass), re-versions any live rubric that differs from what
+`pds.reading_bank_recall_rubric` builds now, e.g. after an idea's only highlight was edited or archived. Until then
+`pds.reading_bank_recall_valid` keeps that recall out of the deck and the attempt refuses it (409
+`question_changed`): an idea without evidence is never scored through a recall answer.
 
 An idea is served only while it has **valid evidence** (`pds.reading_bank_idea_supported`): a web citation, or a live
 highlight whose passage still has the sha256 it had when the evidence was stored. An edited or archived highlight
@@ -105,7 +123,9 @@ highlights step links the new passage again or the idea has other evidence, and 
 ## Sources and evidence
 
 - Web evidence: only the citations the API returns on a research or map answer (`citedNotes`); a sentence without a
-  citation is thrown away; pages are never stored.
+  citation is thrown away; pages are never stored. The research notes themselves are stored text, so the copy
+  guard runs on them in code too: a note (or the `UNSURE:` line) that shares 12 consecutive words with a kept
+  snippet is thrown away.
 - Blocked: `BLOCKED_DOMAINS` (e-reader hosts and shadow-library / full-text-copy hosts, at most 64) on both web
   tools, and `isBlockedUrl()` after the call (book files off publisher hosts, "free download", "full text", "read
   online").
@@ -116,6 +136,11 @@ highlights step links the new passage again or the idea has other evidence, and 
 
 ## Build gates (`applyVerify` + `validateBuild`, pure)
 
+0. Before verify, the worker folds the structure call's `highlight_links` into the ideas' `support`
+   (`mergeHighlightLinks`), so the verifier checks each linked highlight as support. `validateBuild` never reads
+   `highlight_links`: a link the verifier did not see is never stored as evidence. A build with nothing to cite (no
+   snippet and no highlight) makes no model call (`buildNeedsModel`): it stores `no_sources` for free
+   (`EMPTY_STRUCTURE`), so the chapter still has a status.
 1. The verify pass (a second model, fresh context, same evidence) can only take things away: `supported` no or
    partly, later content or a later placement → not stored; earlier → stored in this chapter; unsure → stored,
    unlocked at the end of the book. A question it did not mark ok is not stored; an idea left without a question is
@@ -148,6 +173,11 @@ highlights step links the new passage again or the idea has other evidence, and 
   touches the row but not the content, costs nothing; its hash follows the highlight content); with an
   uncertain mapping, chapters are built from highlights only and a whole-book chapter 0 (90) once the book is
   finished. Queued jobs no longer planned are skipped (and queued again if planned again later).
+- A failed job keeps its input hash, so it is not planned again until Riley's **Rebuild** changes it: the
+  chapter's rebuild count, or for the source map the book-level count (`pds.reading_bank_rebuild` with chapter 0 or
+  none bumps `map_rebuilds`, part of the map hash, and chapter 0's own count). A job that failed with
+  `web_search_disabled` is queued again by the enqueue itself 6 hours later (that refusal is a 400 before any
+  token, so trying again costs nothing until Riley turns web search on in the Console).
 - Estimate: 20¢ + 37¢ per chapter (40 chapters ≈ $15). Riley's one tap per book approves the cap: estimate × 1.25,
   rounded up to whole dollars, at most $25. A monthly cap of $30 across generation and grading
   (`READING_BANK_MONTHLY_CAP_CENTS`). `pds.reading_bank_claim` reserves the step's estimate before a call and pauses
@@ -157,12 +187,29 @@ highlights step links the new passage again or the idea has other evidence, and 
   next claim **charges its reservation** (to the job, this month's spend and the book) before offering the job again
   or failing it after 3 attempts, so neither cap leaks; the late finish of that run is refused. The claim answers
   `headroom_cents`, the most the job may spend before a cap is reached.
+- Money is checked before **every** request, the first one included. `requestBoundCents` is a conservative bound
+  on one request: its whole `max_tokens` output and its prompt (about 2.5 characters a token, at the cache-write
+  rate), at the dearer of the model's and `UNKNOWN_PRICE`, plus every allowed web search (1 cent and 8,000 result
+  tokens) and fetch (its `max_content_tokens`). A request is sent only when the job's spend so far
+  (`priorCostCents`, the earlier call of a two-call step, plus this call) plus that bound fits `maxCostCents`, and,
+  with `reserve` (the worker passes `pds.reading_bank_reserve`), only after the database raised the job's
+  reservation to that total under the claim lock, counting every other running job, so two jobs at once cannot
+  spend the same headroom (a refusal: `budget` pauses the book as the claim does, or `monthly_cap`). Otherwise
+  `cost_limit` and nothing is sent. A continuation's bound is at least what the previous turn cost (it re-sends
+  everything). What the bound does not cover: the server tool loop re-reading earlier results within one request,
+  and a refusal mid-stream followed by a fallback answer; the real usage is charged at finish either way.
+- Pricing a turn a server-side fallback served (a `fallback` content block, a `fallback_message` attempt in
+  `usage.iterations`, or another model named): the dearer of the requested and the serving model's prices
+  (`UNKNOWN_PRICE` for a model the table lacks), over every attempt in `usage.iterations` (the declined one too).
+  SDK 0.80 reads the message's model from `message_start`, which names the requested model after a mid-stream
+  fallback; `servedModel` reads the `fallback` block instead.
 - `bankModelCall` (one helper for every call): streaming, the server-side refusal fallback, explicit effort, no
   `thinking` parameter, the system prompt as a cached prefix, stop reasons checked before content (`refusal`,
   `max_tokens`, `pause_turn` continued up to 3 times), cost from usage (Opus 5.5 $4 / $20 per million tokens,
   Sonnet 5.5 $2 / $10, web search $10 per 1,000), errors as codes only. One deadline for the whole call (every
   continuation and SDK retry, through an abort signal): `timeoutMs`, else the step's `STEP_MAX_SECONDS` (`step`),
-  never the SDK's 10 minutes. `maxCostCents` (the claim's `headroom_cents`) stops a continuation that could pass it
+  never the SDK's 10 minutes, and never past `deadlineAt`: a step that makes two calls (map, build, highlights)
+  passes both the same `stepDeadlineAt(step, start)`, so the pair stays within the step's budget. `maxCostCents` (the claim's `headroom_cents`) stops a continuation that could pass it
   (`cost_limit`). A timeout or dropped connection reports `maybeBilled`, and the worker then charges the job's
   reservation rather than 0. A re-claimed job whose `store_receipt` is set has stored already: the worker finishes
   it without a new model call.
@@ -194,13 +241,23 @@ highlights step links the new passage again or the idea has other evidence, and 
   the "Next: in 3 days" preview is the same replay: preview equals commit.
 - **Chapter recall**: one dictated answer per chapter, the day after it became quizzable, then day 7 and day 21. The
   model marks each covered idea; each gets that verdict as its event for the day, so a missed core idea is due
-  tomorrow. Its grade (and an "I don't know") must carry the replayed schedule of every active idea it covers
-  (`states_missing` otherwise).
+  tomorrow. A covered idea the grade has no mark for (a self grade after a failed model grade, the chat tool's
+  single verdict) takes the answer's own verdict (`recallEventVerdict` mirrors `pds.reading_bank_events`), never a
+  blanket "incorrect". Its grade (and an "I don't know") must carry the replayed schedule of every active idea it
+  covers (`states_missing` otherwise).
+- **Pending answers**: an answer code cannot grade is stored pending and moves the `state_version` of every idea it
+  covers (it holds its day's slot), so a replay computed before it cannot pass the compare-and-set. Its grade job is
+  queued at once, or 10 minutes later with `grade_inline` (the chat tool grades in the same request); a grade job
+  whose answer is no longer pending (graded inline, self graded, voided) is marked skipped by the claim and never
+  paid for.
 - **Flags**: Wrong retires the idea and its questions and voids their answers (kept, with the reason); the chapter
   recall answers that covered it stop counting for that idea only. Unclear retires one question. Not in this chapter
   moves the idea to the end of the book (answers stay valid). Not read yet sets a hold (the overview carries the
   hold's flag key, so it can be restored although the held chapter's sheet is locked). Every state a flag marks
-  dirty also moves `state_version`, so a replay computed before the flag cannot write back what it voided.
+  dirty also moves `state_version` (`pds.reading_bank_touch_states`, which creates the row of an idea that has
+  none), so a replay computed before the flag cannot write back what it voided. A flag sent for an older version of
+  a question acts on its current version; Restore of a chapter recall question is refused (`superseded`) once a
+  rebuild gave the chapter another one.
 
 ## Privacy and the public repo
 
