@@ -306,6 +306,17 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
     throw new Error("track_ids must be a non-empty array");
   }
 
+  const sb = supabaseAdmin();
+  // From chat (SEC-04): the audit row must be able to carry the operation id, or a retry could never find the playlist
+  // this call makes. Checked before Spotify is asked for anything, so a missing key column (sql/chat_operations.sql
+  // not applied, or rolled back) or a failed read means nothing was created ("Spotify playlist key unavailable", read
+  // by the chat route as "not created"). A playlist already logged under this key is never made a second time.
+  if (clientKey) {
+    const { data: logged, error: keyError } = await sb.from("spotify_playlists").select("playlist_id").eq("client_key", clientKey).limit(1);
+    if (keyError) throw new Error("Spotify playlist key unavailable");
+    if (Array.isArray(logged) && logged.length > 0) throw new Error("A Spotify playlist was already created for this request");
+  }
+
   // Nothing has been asked of Spotify's API yet: a failure here (a network error included) means nothing was created.
   // Callers read that from the "Spotify token refresh failed" prefix (the chat route's PLAYLIST_NOT_CREATED).
   let accessToken: string;
@@ -335,7 +346,6 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
 
-  const sb = supabaseAdmin();
   const audit = {
     playlist_id: playlistId,
     name,
@@ -356,9 +366,7 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   if (clientKey) {
     const { error } = await sb.from("spotify_playlists").insert({ ...audit, track_count: null, client_key: clientKey });
     earlyAudit = !error;
-    if (error && error.code !== "42703" && error.code !== "PGRST204") {
-      console.error("Failed to log playlist to pds.spotify_playlists:", { code: error.code });
-    }
+    if (error) console.error("Failed to log playlist to pds.spotify_playlists:", { code: error.code });
   }
 
   // 1a. Enforce visibility via three layered attempts.
@@ -445,11 +453,8 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   if (earlyAudit) {
     ({ error: insertErr } = await sb.from("spotify_playlists").update({ track_count: trackIds.length }).eq("playlist_id", playlistId));
   } else {
+    // From chat the row always carries its key (checked above); it is never written without it.
     ({ error: insertErr } = await sb.from("spotify_playlists").insert(clientKey ? { ...audit, client_key: clientKey } : audit));
-    // The client_key column comes with sql/chat_operations.sql; until it is applied the row is written without it.
-    if (insertErr && clientKey && (insertErr.code === "42703" || insertErr.code === "PGRST204")) {
-      ({ error: insertErr } = await sb.from("spotify_playlists").insert(audit));
-    }
   }
   if (insertErr) {
     console.error("Failed to log playlist to pds.spotify_playlists:", insertErr);

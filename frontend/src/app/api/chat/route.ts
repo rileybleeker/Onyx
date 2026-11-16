@@ -2,18 +2,18 @@ import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
-import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
+import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/supplement-stacks";
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
-import { behavioralToday, currentTimeZone, logSupplementIntake } from "@/lib/supplement-intake";
+import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
 import { BOOK_COLS, HIGHLIGHT_COLS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
-import { ambiguousDbError } from "@/lib/write-outcome";
+import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
 
 /**
  * Set explicitly: the replay ledger's one-try-at-a-time lease (REQUEST_LEASE_MS in lib/chat-operations.ts, 6 min)
@@ -513,7 +513,7 @@ async function describeStackIntakes(intakeIds: number[]): Promise<Record<string,
 
 /** createPlaylist errors raised before the create call reached Spotify, or a 4xx answer to it: nothing was created. */
 const PLAYLIST_NOT_CREATED =
-  /^(Playlist name is required|track_ids must be a non-empty array|Spotify is not configured|Spotify tokens not found|Spotify refresh token rejected|Spotify token refresh failed|Spotify playlist create failed \(4\d\d\))/;
+  /^(Playlist name is required|track_ids must be a non-empty array|Spotify playlist key unavailable|Spotify is not configured|Spotify tokens not found|Spotify refresh token rejected|Spotify token refresh failed|Spotify playlist create failed \(4\d\d\))/;
 const PLAYLIST_MAYBE_CREATED =
   "Spotify may have created the playlist before this failed, possibly without all its tracks. Do not create it again: tell the user to check Spotify first.";
 
@@ -537,12 +537,14 @@ interface OpContext {
   today: string;
   /** The book being read when the operation first ran (a reading call that names no book): re-runs keep it. */
   bookId?: number;
-  /** When the operation first ran (ISO): a highlight created since then was created by this operation. */
+  /** When the operation first ran (ISO): in check mode, a highlight changed since then may have been changed by it. */
   startedAt?: string;
   /**
-   * Check mode (CHECK_ON_RERUN in lib/chat-operations.ts): an earlier try of this call may have written, and Riley
-   * may have changed the row since. Confirm what is there when it is what the call asked for, complete only when
-   * nothing is there and nothing could have removed it, and otherwise write nothing and report it as unconfirmed.
+   * Check mode (lib/chat-operations.ts): an earlier try of this call may have written. Never write over what is there.
+   * A habit answer is only read (confirmed when the day holds exactly that answer, otherwise unconfirmed, also when
+   * the day holds none); a highlight is confirmed by its key, or written only when provably nothing the earlier try
+   * could have changed exists; a keyed intake, stack or session (RERUN_SAFE, when another call of the earlier try also
+   * wrote) only reads back what its key holds and is otherwise unconfirmed, never written now.
    */
   check?: boolean;
 }
@@ -557,6 +559,34 @@ const HIGHLIGHT_UNCONFIRMED =
 /** A keyed write whose key column cannot be read: it is refused, never written without its key. */
 const KEY_UNAVAILABLE =
   "Onyx could not set up safe logging for this action, so it was not done and nothing was written. Tell the user to try again in a moment.";
+
+/** A keyed re-run in check mode whose key holds nothing: not written now, reported as unconfirmed. */
+const keyedUnconfirmed = (tool: string): string => JSON.stringify({ error: uncertainText(tool), incomplete: true, uncertain: true });
+
+/** What an earlier try wrote under this operation id was removed since: settled, never written again. */
+const REMOVED_RESULT = JSON.stringify({ error: REMOVED_SINCE_ERROR, removed_since: true });
+
+/** SQLSTATE / PostgREST codes of a missing table or column (a schema file not applied yet, or rolled back). */
+const MISSING_SCHEMA = new Set(["42P01", "PGRST205", "42703", "PGRST204"]);
+
+/**
+ * Was the supplement intake / stack / reading session written under this operation id removed since (a tombstone,
+ * sql/chat_operations.sql)? "missing" (the tombstone table is not there) and "error" (the read failed) mean it cannot
+ * be told, so the keyed write is refused: written now, it could repeat one that Riley removed.
+ */
+async function removedSince(opId: string): Promise<"removed" | "none" | "missing" | "error"> {
+  const { data, error } = await supabase.from("chat_operation_tombstones").select("op_id").eq("op_id", opId).maybeSingle();
+  if (error) return MISSING_SCHEMA.has(error.code) ? "missing" : "error";
+  return data ? "removed" : "none";
+}
+
+/** The answer to a keyed write that must not run now (removed since, or its tombstone cannot be read); null = run it. */
+async function removedGate(opId: string | undefined): Promise<string | null> {
+  if (!opId) return null;
+  const removed = await removedSince(opId);
+  if (removed === "removed") return REMOVED_RESULT;
+  return removed === "none" ? null : JSON.stringify({ error: KEY_UNAVAILABLE });
+}
 
 /** The date to use when the model gave none: the operation's first day, when that is not today (a re-run). */
 const pinnedDate = (op?: OpContext): string | null => (op && op.day !== op.today ? op.day : null);
@@ -582,18 +612,12 @@ async function currentBookId(): Promise<number | undefined> {
 const SESSION_NOT_WRITTEN = /^(No active book found|chapter_through must be|chapter_through cannot exceed)/;
 const SESSION_MAYBE_WRITTEN =
   "The database did not confirm this reading session, and it may have been saved anyway. Do not log it again: tell the user to check /reading first.";
-const HIGHLIGHT_NOT_WRITTEN = /^(No active book found|passage is required)/;
+const HIGHLIGHT_NOT_WRITTEN = /^(No active book found|passage is required|client_key must be a UUID)/;
 const HIGHLIGHT_MAYBE_WRITTEN =
   "The database did not confirm this highlight, and it may have been saved anyway. Do not add it again: tell the user to check /reading first.";
 
-/** A highlight created no earlier than this before the operation began counts as created by it (clock skew). */
-const OWN_HIGHLIGHT_MARGIN_MS = 5_000;
-
-const createdSince = (createdAt: string | null | undefined, startedAt: string | undefined): boolean => {
-  const made = createdAt ? Date.parse(createdAt) : NaN;
-  const began = startedAt ? Date.parse(startedAt) : NaN;
-  return Number.isFinite(made) && Number.isFinite(began) && made >= began - OWN_HIGHLIGHT_MARGIN_MS;
-};
+/** Clock skew allowed between this server and the database when asking "changed since the operation began". */
+const CHANGED_SINCE_MARGIN_MS = 5_000;
 
 interface HighlightCall {
   book_id?: number;
@@ -606,9 +630,9 @@ interface HighlightCall {
 
 /**
  * Check mode: the highlight this call names as it stands now, read-only, on the same book addHighlight would use
- * (the pinned one, the named one, else the book being read). "none" = no highlight with that passage in that book.
+ * (the pinned one, the named one, else the book being read). highlight null = no highlight with that passage there.
  */
-async function highlightFor(call: HighlightCall): Promise<{ book: Book; highlight: Highlight } | "none" | "no_book" | "no_passage" | "error"> {
+async function highlightFor(call: HighlightCall): Promise<{ book: Book; highlight: Highlight | null } | "no_book" | "no_passage" | "error"> {
   let book: Book | null;
   try {
     book = call.book_id !== undefined
@@ -627,7 +651,64 @@ async function highlightFor(call: HighlightCall): Promise<{ book: Book; highligh
     .eq("passage", passage)
     .maybeSingle();
   if (error) return "error";
-  return data ? { book, highlight: data as Highlight } : "none";
+  return { book, highlight: (data as Highlight | null) ?? null };
+}
+
+/**
+ * The highlight this operation created (lib/reading.ts addHighlight stores the operation id as client_key on insert),
+ * with its book: "none" (no highlight carries the key, so this operation created none), "missing" (the key column is
+ * not there: the write is refused, never made without its key) or "error" (the read failed).
+ */
+async function highlightByKey(opId: string): Promise<{ book: Book; highlight: Highlight } | "none" | "missing" | "error"> {
+  const { data, error } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("client_key", opId).maybeSingle();
+  if (error) return MISSING_SCHEMA.has(error.code) ? "missing" : "error";
+  if (!data) return "none";
+  const highlight = data as Highlight;
+  const { data: book, error: bookError } = await supabase.from("books").select(BOOK_COLS).eq("book_id", highlight.book_id).maybeSingle();
+  if (bookError || !book) return "error";
+  return { book: book as Book, highlight };
+}
+
+/**
+ * Was any highlight of this book created or changed since the operation began (updated_at moves on every change,
+ * sql/reading_schema.sql)? null = cannot tell (no start time, or the read failed).
+ */
+async function highlightsChangedSince(bookId: number, startedAt: string | undefined): Promise<boolean | null> {
+  const began = startedAt ? Date.parse(startedAt) : NaN;
+  if (!Number.isFinite(began)) return null;
+  const { data, error } = await supabase
+    .from("book_highlights")
+    .select("highlight_id")
+    .eq("book_id", bookId)
+    .gte("updated_at", new Date(began - CHANGED_SINCE_MARGIN_MS).toISOString())
+    .limit(1);
+  if (error || !Array.isArray(data)) return null;
+  return data.length > 0;
+}
+
+/** The tool's answer for a highlight, after making its Notion entry when `mirrorNow` (none was made yet). */
+async function highlightReply(book: Book, highlight: Highlight, opts: { created: boolean; replayed: boolean; mirrorNow: boolean }): Promise<string> {
+  let mirrored = false;
+  if (opts.mirrorNow) {
+    const blockId = await mirrorHighlight(book, highlight);
+    if (blockId) {
+      await supabase.from("book_highlights").update({ notion_block_id: blockId }).eq("highlight_id", highlight.highlight_id);
+      mirrored = true;
+    }
+  }
+  return JSON.stringify({
+    success: true,
+    created: opts.created,
+    highlight_id: highlight.highlight_id,
+    book: book.title,
+    chapter: highlight.chapter,
+    passage_excerpt: highlight.passage.slice(0, 200),
+    has_comment: !!highlight.comment,
+    next_review: highlight.next_review,
+    notion_mirrored: mirrored,
+    // Nothing was written to the highlight now: it is what an earlier try (or Riley) left.
+    ...(opts.replayed ? { replayed: true } : {}),
+  });
 }
 
 /**
@@ -1140,6 +1221,9 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
   }
 
   if (name === "log_reading_session") {
+    // Written by an earlier try of this operation and removed since: never written again.
+    const gate = await removedGate(opId);
+    if (gate) return gate;
     // A re-run of an operation that already wrote its session: name that session's book, so logSession finds it by
     // its key even when the book is no longer the one being read (it resolves the book before it checks the key).
     // Otherwise the book pinned when the operation first ran, so a re-run never logs to a book started since.
@@ -1148,6 +1232,8 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     // session WITHOUT its key when the column is missing, which a retry could never find again (fail closed). A
     // refusal on a re-run is kept as "unconfirmed" by the ledger, never "not saved".
     if (prior === "missing" || prior === "error") return JSON.stringify({ error: KEY_UNAVAILABLE });
+    // Check mode: only what the key already holds is reported; a session the earlier try never wrote is not written now.
+    if (op?.check && prior === "none") return keyedUnconfirmed(name);
     const priorBook = typeof prior === "object" ? prior.book : null;
     const sessionInput = {
       ...(priorBook !== null ? { book_id: priorBook } : pinnedBook(op, input)),
@@ -1223,52 +1309,45 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       // A re-run on a later day schedules the first review from the day the highlight was first sent.
       ...(pinnedDate(op) ? { date: pinnedDate(op) } : {}),
     };
+    if (opId) {
+      // The highlight this operation created, found by its key: an earlier try made it and stopped before the ledger
+      // recorded it. It is that earlier write, whatever was edited since (its passage included), so nothing is written
+      // to it now; only its Notion entry is made when the earlier try stopped before it. Removed (archived) since:
+      // never written again. A key column that cannot be read: refused, never written without its key.
+      const own = await highlightByKey(opId);
+      if (own === "missing" || own === "error") return JSON.stringify({ error: KEY_UNAVAILABLE });
+      if (own !== "none") {
+        if (own.highlight.archived) return REMOVED_RESULT;
+        return highlightReply(own.book, own.highlight, { created: true, replayed: true, mirrorNow: !own.highlight.notion_block_id });
+      }
+    }
     let checked: { book: Book; highlight: Highlight } | null = null;
     if (op?.check) {
-      // An earlier try may have saved this highlight, and Riley may have edited or removed it since: addHighlight
-      // would write this call's comment / chapter / concept over that edit, so it runs only when there is nothing
-      // to overwrite. Highlights are never deleted (removing one archives it), so no row = the earlier try never
-      // wrote it, and writing it now is the first write.
+      // No highlight carries this operation's key, so the earlier try created none. It may still have changed one that
+      // already had this passage (addHighlight then updates it), and Riley may have edited that one since: addHighlight
+      // would write this call's comment / chapter / concept over the edit. So the highlight with this passage is only
+      // confirmed when it is what the call asked for, and a new one is written only when no highlight of the book
+      // changed since the operation began (nothing the earlier try could have changed exists, renamed or not).
       const found = await highlightFor(highlightInput);
       if (found === "no_book") return JSON.stringify({ error: "No active book found" });
       if (found === "no_passage") return JSON.stringify({ error: "passage is required" });
       if (found === "error") return JSON.stringify({ error: HIGHLIGHT_UNCONFIRMED, incomplete: true, uncertain: true });
-      if (found !== "none") {
+      if (found.highlight) {
         if (!highlightMatches(found.highlight, highlightInput)) return JSON.stringify({ error: HIGHLIGHT_UNCONFIRMED, incomplete: true, uncertain: true });
-        checked = found;
+        checked = { book: found.book, highlight: found.highlight };
+      } else if ((await highlightsChangedSince(found.book.book_id, op.startedAt)) !== false) {
+        return JSON.stringify({ error: HIGHLIGHT_UNCONFIRMED, incomplete: true, uncertain: true });
       }
     }
-    const result = checked ? { ok: true as const, ...checked, created: false } : await addHighlight(supabase, highlightInput);
+    if (checked) return highlightReply(checked.book, checked.highlight, { created: false, replayed: true, mirrorNow: false });
+    // The operation id goes on a highlight this call creates (lib/reading.ts addHighlight), so a retry finds it.
+    const result = await addHighlight(supabase, { ...highlightInput, ...(opId ? { client_key: opId } : {}) });
     if (!result.ok) {
       // A refusal wrote nothing; a failed write may have committed, so the model and the receipt must not read it as
-      // "not saved" (a retry then re-runs it in check mode, which never overwrites).
+      // "not saved" (a retry then finds it by its key, or re-runs it in check mode, which never overwrites).
       return JSON.stringify(HIGHLIGHT_NOT_WRITTEN.test(result.error) ? { error: result.error } : { error: HIGHLIGHT_MAYBE_WRITTEN, incomplete: true });
     }
-    // Already there, created since this operation began and never mirrored: an earlier try of this operation made it
-    // and stopped before the Notion entry. Mirror it now and report it as that earlier write.
-    const ownEarlier =
-      !result.created && !result.highlight.notion_block_id && createdSince(result.highlight.created_at, op?.startedAt);
-    let mirrored = false;
-    if (result.created || ownEarlier) {
-      const blockId = await mirrorHighlight(result.book, result.highlight);
-      if (blockId) {
-        await supabase.from("book_highlights").update({ notion_block_id: blockId }).eq("highlight_id", result.highlight.highlight_id);
-        mirrored = true;
-      }
-    }
-    return JSON.stringify({
-      success: true,
-      created: result.created || ownEarlier,
-      highlight_id: result.highlight.highlight_id,
-      book: result.book.title,
-      chapter: result.highlight.chapter,
-      passage_excerpt: result.highlight.passage.slice(0, 200),
-      has_comment: !!result.highlight.comment,
-      next_review: result.highlight.next_review,
-      notion_mirrored: mirrored,
-      // Nothing was written to the highlight now: it is what an earlier try (or Riley) left.
-      ...(ownEarlier || checked ? { replayed: true } : {}),
-    });
+    return highlightReply(result.book, result.highlight, { created: result.created, replayed: false, mirrorNow: result.created });
   }
 
   if (name === "record_reading_quiz") {
@@ -1290,6 +1369,14 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
   }
 
   if (name === "log_supplement_intake") {
+    // Written by an earlier try of this operation and removed since: never written again.
+    const gate = await removedGate(opId);
+    if (gate) return gate;
+    if (op?.check && opId) {
+      // Check mode: read back what the key holds; an intake the earlier try never wrote is not written now.
+      const prior = await intakeEventReplay(supabase, opId);
+      return prior ? JSON.stringify({ ...prior, ok: undefined, success: true }) : keyedUnconfirmed(name);
+    }
     const result = await logSupplementIntake(supabase, {
       product: String(input.product ?? ""),
       amount: input.amount != null ? Number(input.amount) : null,
@@ -1307,9 +1394,14 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     if (!wanted) return JSON.stringify({ error: "stack name is required" });
     const date = (input.date as string) || pinnedDate(op) || undefined;
 
+    // Logged by an earlier try of this operation and removed since (any of its rows): never logged again.
+    const gate = await removedGate(opId);
+    if (gate) return gate;
     // A re-run of an operation that already logged its stack: answer from those rows before resolving the name (the
     // stack may have been renamed or archived since, which would otherwise read as "not logged").
     let result: LogStackResult | null = opId ? await stackEventReplay(supabase, opId) : null;
+    // Check mode: only what the key already holds is reported; a stack the earlier try never logged is not logged now.
+    if (!result && op?.check) return keyedUnconfirmed(name);
     if (!result) {
       // Resolve the stack by case-insensitive name among active stacks.
       const { data: candidates, error: lookupErr } = await supabase
@@ -1337,7 +1429,9 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...event });
     }
     // incomplete = the insert may have committed before its answer was lost: "check first", never "not logged".
-    if (!result.ok) return JSON.stringify({ error: result.error, ...(result.incomplete ? { incomplete: true } : {}) });
+    if (!result.ok) {
+      return JSON.stringify({ error: result.error, ...(result.incomplete ? { incomplete: true } : {}), ...(result.removed_since ? { removed_since: true } : {}) });
+    }
     const written = await describeStackIntakes(result.intake_ids ?? []);
     return JSON.stringify({
       success: true,

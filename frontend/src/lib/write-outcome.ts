@@ -14,3 +14,13 @@ export function ambiguousDbError(error: { code?: unknown } | null | undefined): 
   const code = typeof error.code === "string" ? error.code.trim() : "";
   return !(/^[0-9A-Z]{5}$/.test(code) || /^PGRST\d+$/.test(code));
 }
+
+/**
+ * A chat write keyed by its operation id was removed by Riley after it was saved (sql/chat_operations.sql leaves a
+ * tombstone when such a supplement intake or reading session is deleted; a highlight is archived). A retry of the
+ * same chat message never writes it again: the database refuses an insert under a tombstoned key with this SQLSTATE,
+ * and the writers answer with REMOVED_SINCE_ERROR and `removed_since: true`.
+ */
+export const REMOVED_SINCE_CODE = "OXC01";
+export const REMOVED_SINCE_ERROR =
+  "An earlier try of this same message saved this, and some or all of it has been removed since, so nothing was written again. If it is still wanted, the user should send it as a new message.";

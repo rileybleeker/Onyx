@@ -34,12 +34,20 @@
 --                         is keyed by the operation id; a habit answer or a
 --                         highlight is re-run in check mode, which never
 --                         overwrites a change made since); a call that matches
---                         nothing is refused once an earlier try wrote, or may
---                         have written, anything. A Spotify playlist is never
+--                         nothing (or matches a call that was refused) is
+--                         refused once an earlier try wrote, or may have
+--                         written, anything. A Spotify playlist is never
 --                         re-run: it is looked up read-only in
 --                         pds.spotify_playlists by its client_key. A quiz
 --                         result is never re-run and has no lookup yet (no
 --                         operation key): it stays "check this".
+--   pds.chat_operation_tombstones
+--                         one row per operation whose keyed supplement intake
+--                         or reading session was removed after it was saved
+--                         (Undo on /log, a removal on /supplements or
+--                         /reading), written by a trigger. A retry of the
+--                         message then writes nothing again, and the database
+--                         refuses an insert under that key (SQLSTATE OXC01).
 --
 -- The operation id (op_id) is also passed into the write itself, so a write
 -- that happened before the ledger could record it is found again:
@@ -51,6 +59,10 @@
 --       repeated below so this file alone is enough; both are IF NOT EXISTS).
 --   pds.spotify_playlists.client_key: the audit row of a playlist created
 --       from chat (lib/spotify-server.ts createPlaylist).
+--   pds.book_highlights.client_key: a highlight created from chat
+--       (lib/reading.ts addHighlight, set on insert only), so a retry finds
+--       the highlight its earlier try made even after its passage or note
+--       was edited.
 --
 -- Access: service-role only (RLS on, no policy for anon / authenticated, no
 -- grants to them). Only the /api/chat route reads or writes these tables.
@@ -64,8 +76,9 @@
 --
 -- Additive and safe to re-run (IF NOT EXISTS everywhere). Fail closed: while
 -- it is not applied (or after a rollback) a request with a request_id runs no
--- write tool (questions are still answered), and a keyed intake or session is
--- refused rather than written without its key.
+-- write tool (questions are still answered), and a keyed intake, session,
+-- highlight or playlist is refused rather than written without its key (also
+-- while the tombstone table is missing).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS pds.chat_requests (
@@ -189,6 +202,119 @@ ALTER TABLE pds.spotify_playlists ADD COLUMN IF NOT EXISTS client_key UUID;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_spotify_playlists_client_key
   ON pds.spotify_playlists (client_key)
   WHERE client_key IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Highlights created from chat: the operation id as client_key, set on insert
+-- only (a call that updates an existing highlight leaves it alone). Rows from
+-- every other path keep it NULL. Highlights are never hard removed (removing
+-- one archives it), so they need no tombstone.
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.book_highlights ADD COLUMN IF NOT EXISTS client_key UUID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_book_highlights_client_key
+  ON pds.book_highlights (client_key)
+  WHERE client_key IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Removed since: tombstones for keyed chat writes Riley removed afterwards
+-- ---------------------------------------------------------------------------
+-- A chat write keyed by its operation id can be removed after it was saved.
+-- If the answer to that chat message was lost before the ledger recorded the
+-- write, a retry re-runs it under the same operation id, and with the row
+-- gone it would be written a second time. So removing such a row leaves a
+-- tombstone (the operation id and the table, nothing else): the chat route
+-- reads it before a keyed write and answers "removed since, not written
+-- again", and the insert guard below refuses an insert under that key
+-- (SQLSTATE OXC01), also when a removal and a retry cross. Only keys that are
+-- chat operation ids get one (the /log reading form's own client keys never
+-- do), so every other path is unchanged. A tombstone goes with its operation
+-- (ON DELETE CASCADE), so a future ledger retention window covers it too.
+CREATE TABLE IF NOT EXISTS pds.chat_operation_tombstones (
+    op_id       UUID        PRIMARY KEY
+                            REFERENCES pds.chat_operations (op_id) ON DELETE CASCADE,
+    target      TEXT        NOT NULL CHECK (target IN ('supplement_intake', 'reading_sessions')),
+    removed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE pds.chat_operation_tombstones IS
+  'Onyx Chat replay ledger: operations whose keyed supplement intake or reading session was removed after it was saved, so a retried chat message never writes it again. Written by trigger only. Service role only.';
+
+ALTER TABLE pds.chat_operation_tombstones ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'pds' AND tablename = 'chat_operation_tombstones' AND policyname = 'service_full_access'
+  ) THEN
+    CREATE POLICY service_full_access ON pds.chat_operation_tombstones
+      FOR ALL TO service_role USING (true) WITH CHECK (true);
+  END IF;
+END $$;
+
+REVOKE ALL ON pds.chat_operation_tombstones FROM anon, authenticated;
+GRANT ALL ON pds.chat_operation_tombstones TO service_role;
+
+-- TG_ARGV[0] = the key column of the table the trigger is on. SECURITY DEFINER
+-- so a removal by any role allowed to remove the row also records its
+-- tombstone (the ledger tables are service-role only).
+CREATE OR REPLACE FUNCTION pds.chat_operation_tombstone()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pds
+AS $$
+DECLARE
+  k UUID := (to_jsonb(OLD) ->> TG_ARGV[0])::uuid;
+BEGIN
+  IF k IS NOT NULL THEN
+    INSERT INTO pds.chat_operation_tombstones (op_id, target)
+    SELECT o.op_id, TG_TABLE_NAME FROM pds.chat_operations o WHERE o.op_id = k
+    ON CONFLICT (op_id) DO NOTHING;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pds.chat_operation_not_removed()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pds
+AS $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pds.chat_operation_tombstones t
+    WHERE t.op_id = (to_jsonb(NEW) ->> TG_ARGV[0])::uuid
+  ) THEN
+    RAISE EXCEPTION 'this chat write was removed after it was saved' USING ERRCODE = 'OXC01';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION pds.chat_operation_tombstone() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pds.chat_operation_not_removed() FROM PUBLIC;
+
+CREATE OR REPLACE TRIGGER supplement_intake_chat_tombstone
+  AFTER DELETE ON pds.supplement_intake
+  FOR EACH ROW WHEN (OLD.client_event_key IS NOT NULL)
+  EXECUTE FUNCTION pds.chat_operation_tombstone('client_event_key');
+
+CREATE OR REPLACE TRIGGER reading_sessions_chat_tombstone
+  AFTER DELETE ON pds.reading_sessions
+  FOR EACH ROW WHEN (OLD.client_key IS NOT NULL)
+  EXECUTE FUNCTION pds.chat_operation_tombstone('client_key');
+
+CREATE OR REPLACE TRIGGER supplement_intake_chat_not_removed
+  BEFORE INSERT ON pds.supplement_intake
+  FOR EACH ROW WHEN (NEW.client_event_key IS NOT NULL)
+  EXECUTE FUNCTION pds.chat_operation_not_removed('client_event_key');
+
+CREATE OR REPLACE TRIGGER reading_sessions_chat_not_removed
+  BEFORE INSERT ON pds.reading_sessions
+  FOR EACH ROW WHEN (NEW.client_key IS NOT NULL)
+  EXECUTE FUNCTION pds.chat_operation_not_removed('client_key');
 
 -- Make PostgREST pick up the new tables and columns without waiting for a restart.
 NOTIFY pgrst, 'reload schema';

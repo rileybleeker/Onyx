@@ -228,3 +228,23 @@ test("a stack event is found by its key alone, for the stack its rows belong to,
   assert.equal(again.stack_id, 7);
   assert.equal(d.rows("supplement_intake").length, 2);
 });
+
+test("an event removed since (its key tombstoned, SQLSTATE OXC01) is refused by the insert and says so", async () => {
+  // The database refuses an insert under a tombstoned key (sql/chat_operations.sql chat_operation_not_removed).
+  const removed = () => db({ fail: ({ table, op }) => (table === "supplement_intake" && op === "insert" ? { code: "OXC01", message: "synthetic" } : null) });
+  const d = removed();
+  const stack = await stacks.logStackIntake(d, 7, { event_key: KEY });
+  assert.equal(stack.ok, false);
+  assert.equal(stack.removed_since, true);
+  assert.equal(stack.incomplete, undefined, "a definite refusal: nothing written");
+  assert.equal(d.rows("supplement_intake").length, 0);
+  const d2 = removed();
+  const single = await intake.logSupplementIntake(d2, { product: "Synthetic Calm", event_key: KEY });
+  assert.equal(single.ok, false);
+  assert.equal(single.removed_since, true);
+  assert.equal(d2.rows("supplement_intake").length, 0);
+  // Without a key the code means nothing special (no chat path sets it): a plain refusal.
+  const d3 = removed();
+  const unkeyed = await stacks.logStackIntake(d3, 7, {});
+  assert.equal(unkeyed.removed_since, undefined);
+});

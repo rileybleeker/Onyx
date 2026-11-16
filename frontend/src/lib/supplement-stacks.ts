@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { ambiguousDbError } from "./write-outcome";
+import { REMOVED_SINCE_CODE, REMOVED_SINCE_ERROR, ambiguousDbError } from "./write-outcome";
 
 /**
  * Shared logic for recording a stack as consumed: writes one
@@ -38,6 +38,8 @@ export interface LogStackResult {
   replayed?: boolean;
   /** The insert failed in a way that does not prove nothing was written: the stack may be logged. */
   incomplete?: boolean;
+  /** An earlier call with this event_key logged it and some of its rows were deleted since: nothing written again. */
+  removed_since?: boolean;
 }
 
 export const STACK_MAYBE_LOGGED =
@@ -175,6 +177,8 @@ export async function logStackIntake(
     .insert(keyed)
     .select("intake_id");
   let unreadable = false;
+  // The event was logged once and deleted since (its key is tombstoned): the database refused it, nothing written.
+  if (insErr && key && insErr.code === REMOVED_SINCE_CODE) return { ok: false, error: REMOVED_SINCE_ERROR, removed_since: true };
   // Fail closed: the insert was rejected for the key columns, so nothing was written; it is not tried again unkeyed.
   if (insErr && key && missingColumn(insErr)) return { ok: false, error: STACK_KEY_UNAVAILABLE };
   if (insErr && key) {

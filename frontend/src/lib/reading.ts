@@ -1040,6 +1040,11 @@ export interface AddHighlightInput {
   page?: number | null;
   highlighted_at?: string | null;
   note_at?: string | null;
+  /**
+   * The Onyx Chat operation id (SEC-04, sql/chat_operations.sql): stored on a highlight this call CREATES (never on
+   * one it updates), so a retried chat message finds the highlight its earlier try made, even after an edit.
+   */
+  client_key?: string | null;
 }
 
 export async function addHighlight(
@@ -1097,7 +1102,10 @@ export async function addHighlight(
     return { ok: true, book, highlight: existing as Highlight, created: false };
   }
 
-  const { data, error } = await supabase.from("book_highlights").insert(row).select(HIGHLIGHT_COLS).single();
+  const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
+  // A key that was given but is not a UUID is refused, never dropped (the highlight would then be unkeyed).
+  if (!key && input.client_key != null && input.client_key !== "") return { ok: false, error: "client_key must be a UUID" };
+  const { data, error } = await supabase.from("book_highlights").insert(key ? { ...row, client_key: key } : row).select(HIGHLIGHT_COLS).single();
   if (error) return { ok: false, error: error.message };
   return { ok: true, book, highlight: data as Highlight, created: true };
 }

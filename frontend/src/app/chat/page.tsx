@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSends, rememberPendingSend, seenPendingSends, settledPendingSends, type ChatMessage, type PendingSend } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSends, rememberPendingSend, settledPendingSends, unresolvedPendingSend, type ChatMessage, type PendingSend } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
@@ -15,10 +15,17 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
  * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
  * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. A send whose
  * answer never arrived is also remembered on this device until it is resolved (hash + id only, PENDING_SEND_KEY, no
- * expiry), so the same conversation sent again after a reload or a closed tab, however much later, is still
- * recognised.
+ * expiry). When the same conversation is sent again after a reload or a closed tab, Riley chooses: retry that send
+ * (its id, so nothing is saved twice) or send it as a new message (a new id). A remembered send whose account Riley
+ * has already seen and dismissed is resolved and never matches again.
  */
 interface FailedSend { text: string; requestId: string; at: number }
+
+/** A new send that is the same conversation as a remembered send whose answer never arrived: Riley picks. */
+interface MatchedSend { text: string; requestId: string; at: number }
+
+/** How a send picks its request id: as usual, the remembered send's id (a retry of it), or a new one (a new message). */
+type SendChoice = { retryOf: string } | { fresh: true };
 
 function readPendingSends(): PendingSend[] {
   try {
@@ -71,6 +78,8 @@ export default function ChatPage() {
   const [replaySafe, setReplaySafe] = useState(false);
   // What the send that was pending at the last reload saved (null = nothing to show).
   const [recovery, setRecovery] = useState<Recovery | null>(null);
+  // A new send that matched a remembered send whose answer never arrived, waiting for Riley's choice.
+  const [matched, setMatched] = useState<MatchedSend | null>(null);
   const recoveryId = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -101,11 +110,12 @@ export default function ChatPage() {
   }
 
   function dismissRecovery() {
-    // The remembered send itself stays until it is resolved, so the same message sent again from a fresh chat is
-    // still recognised as that request. Once the server gave a definite account (settled / none) and Riley saw it, it
-    // is not shown again after the next reload; "running" or "could not check" is shown again.
+    // Once the server gave a definite account (settled / none) and Riley saw and dismissed it, the remembered send is
+    // resolved: it is forgotten, so the same message sent later is a new message, never a replay of this one. "Still
+    // running" or "could not check" is not an account: that send stays remembered (shown again after a reload, and
+    // a new send of the same conversation asks whether it is that send again).
     const id = recoveryId.current;
-    if (id && (recovery?.state === "settled" || recovery?.state === "none")) writePendingSends(seenPendingSends(readPendingSends(), id));
+    if (id && (recovery?.state === "settled" || recovery?.state === "none")) settlePendingSend(id);
     recoveryId.current = null;
     setRecovery(null);
   }
@@ -119,7 +129,7 @@ export default function ChatPage() {
     void checkPendingSend(pendingSend.id);
   }, []);
 
-  async function send(again?: string) {
+  async function send(again?: string, choice?: SendChoice) {
     const text = (again ?? input).trim();
     if (!text || sending.current) return;
     const updated: ShownMessage[] = [...messages, { role: "user", content: text }];
@@ -127,13 +137,28 @@ export default function ChatPage() {
       setError("This conversation is full. Start a new chat to continue.");
       return;
     }
+    sending.current = true;
     const previous = failedSend.current;
-    let requestId: string | null = previous && previous.text === text && previous.at === messages.length ? previous.requestId : null;
+    let requestId: string | null =
+      choice && "retryOf" in choice ? choice.retryOf
+        : !choice && previous && previous.text === text && previous.at === messages.length ? previous.requestId
+          : null;
+    // The same conversation as a send whose answer never arrived (before a reload or a closed tab): never reused
+    // silently, Riley chooses (retry that send, or send this as a new message). Seen and dismissed ones are gone.
+    const conv = await conversationKey(updated);
+    if (!requestId && !choice && conv) {
+      const stored = unresolvedPendingSend(readPendingSends(), conv);
+      if (stored) {
+        sending.current = false;
+        setMatched({ text, requestId: stored.id, at: messages.length });
+        return;
+      }
+    }
+    setMatched(null);
     failedSend.current = null;
     setResendText(null);
     recoveryId.current = null;
     setRecovery(null);
-    sending.current = true;
     setPending(text);
     setInput("");
     setError(null);
@@ -142,12 +167,6 @@ export default function ChatPage() {
     let safe = replaySafe;
     let staleId = false;
     try {
-      // The same conversation as a send whose answer never arrived (before a reload or a closed tab): the same request.
-      const conv = await conversationKey(updated);
-      if (!requestId && conv) {
-        const stored = readPendingSends().find((p) => p.conv === conv);
-        if (stored) requestId = stored.id;
-      }
       if (!requestId) requestId = newRequestId();
       if (conv) writePendingSends(rememberPendingSend(readPendingSends(), { conv, id: requestId, at: Date.now() }));
       const res = await fetch("/api/chat", {
@@ -195,6 +214,7 @@ export default function ChatPage() {
     if (sending.current) return;
     failedSend.current = null;
     setResendText(null);
+    setMatched(null);
     setMessages([]);
     setInput("");
     setError(null);
@@ -259,6 +279,20 @@ export default function ChatPage() {
             </button>
           )}
           <ChatReceipts receipts={errorReceipts} heading="Before it stopped, this request had already done the following" />
+        </div>
+      )}
+      {matched && input.trim() === matched.text && messages.length === matched.at && (
+        <div role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3">
+          <p>You sent this same message before and it did not finish, so it may already have saved something.</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button type="button" onClick={() => void send(matched.text, { retryOf: matched.requestId })} disabled={loading} className="text-sm text-accent border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
+              Retry that message
+            </button>
+            <button type="button" onClick={() => void send(matched.text, { fresh: true })} disabled={loading} className="text-sm text-text-secondary border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
+              Send as a new message
+            </button>
+          </div>
+          <p className="text-xs text-text-tertiary mt-2">Retry shows what it saved and saves nothing twice. A new message does it all again.</p>
         </div>
       )}
       {recovery && (

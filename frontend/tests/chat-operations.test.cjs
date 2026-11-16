@@ -633,3 +633,122 @@ test("a request read back by its id alone: none, running, then what it saved (re
   const missing = ops.supabaseLedgerStore(createFakePostgrest({ fail: () => ({ code: "PGRST205" }) }));
   assert.deepEqual(plain(await ops.requestOutcome(missing, OWNER, REQUEST, receipts.buildWriteReceipt)), { status: "unavailable", code: "PGRST205", receipts: [] });
 });
+
+// ---------------------------------------------------------------------------
+// Review round 5 (SEC-04): a refused call is a new write on a retry, a write removed since is never made again, and a
+// playlist checks its key before Spotify is asked for anything. Synthetic ids and names only.
+// ---------------------------------------------------------------------------
+
+test("a call the first try refused is not run on a retry once another earlier call wrote (stack refused, its products logged)", async () => {
+  const { db, open } = setup();
+  const write = keyedWrite();
+  const first = await open();
+  // The stack call is refused (e.g. a transient lookup error read as a clean refusal); the model then logs the stack's
+  // products one by one, which are written.
+  await first.run(STACK, input(), async () => ({ failed: false, result: JSON.stringify({ error: "synthetic lookup refused" }) }));
+  await first.run(INTAKE, { product: "synthetic x" }, write.execute("X"));
+  await first.run(INTAKE, { product: "synthetic y" }, write.execute("Y"));
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["refused", "done", "done"]);
+
+  // The retry asks for the stack again, which now would work: it would log X and Y a second time.
+  const retry = await open();
+  let ran = 0;
+  const stack = await retry.run(STACK, input(), async (opId) => { ran++; return write.execute()(opId); });
+  assert.equal(ran, 0, "the refused stack did not run: something earlier was written");
+  const forModel = JSON.parse(stack.result);
+  assert.equal(forModel.error, ops.FRESH_ERROR);
+  assert.equal(forModel.conflict, true);
+  assert.equal(forModel.earlier_tool, INTAKE);
+  assert.equal(stack.receipt.status, "not_saved");
+  // Asked again in the same try: refused again; the earlier products are still answered from the ledger.
+  assert.equal(JSON.parse((await retry.run(STACK, input(), write.execute())).result).error, ops.FRESH_ERROR);
+  assert.equal((await retry.run(INTAKE, { product: "synthetic x" }, write.execute("X"))).replayed, true);
+  assert.equal(write.effects.size, 2, "X and Y once each, no stack");
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["refused", "done", "done"], "the refused row was not taken back");
+});
+
+test("a write removed since is settled: never written again, and its replay does not say 'already saved'", async () => {
+  let failFinish = true;
+  const { db, open } = setup({
+    fail: ({ table, op, payload }) => (failFinish && table === "chat_operations" && op === "update" && payload && payload.status ? { code: "08006" } : null),
+  });
+  const write = keyedWrite();
+  await (await open()).run(INTAKE, { product: "synthetic a" }, write.execute("A"));
+  assert.equal(db.rows("chat_operations")[0].status, "pending", "written, but the ledger never recorded it");
+  failFinish = false;
+  // Riley removed the intake since: the keyed write finds its tombstone and writes nothing.
+  const removed = JSON.stringify({ error: "synthetic removed since", removed_since: true });
+  let ran = 0;
+  const again = await (await open()).run(INTAKE, { product: "synthetic a" }, async () => { ran++; return { failed: false, result: removed }; });
+  assert.equal(ran, 1, "re-run under the same key, which found the tombstone");
+  assert.equal(ops.classifyOutcome({ failed: false, result: removed }), "done");
+  assert.equal(again.receipt.status, "not_saved", "nothing is saved now");
+  assert.equal(db.rows("chat_operations")[0].status, "done", "settled: a later retry never re-runs it");
+  assert.equal(write.effects.size, 1);
+
+  const later = await open();
+  let ranLater = 0;
+  const replay = await later.run(INTAKE, { product: "synthetic a" }, async () => { ranLater++; return { failed: false, result: removed }; });
+  assert.equal(ranLater, 0, "answered from the ledger");
+  const forModel = JSON.parse(replay.result);
+  assert.equal(forModel.removed_since, true);
+  assert.equal("note" in forModel, false, "not told to say it was already saved");
+  // It still counts as an earlier write: a new call next to it is refused.
+  const fresh = await later.run(INTAKE, { product: "synthetic b" }, write.execute("B"));
+  assert.equal(JSON.parse(fresh.result).error, ops.FRESH_ERROR);
+  assert.equal(JSON.parse(fresh.result).earlier_outcome, "removed_since");
+  assert.equal(write.effects.size, 1);
+});
+
+test("a playlist from chat checks its key before Spotify is asked for anything", async () => {
+  const KEY = "66666666-6666-4666-8666-666666666666";
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => { calls.push(String(url)); throw new Error("synthetic: no network in tests"); };
+  try {
+    const load = (db) => loadTs("lib/spotify-server.ts", { "@supabase/supabase-js": { createClient: () => db } });
+    const args = { name: "Synthetic mix", trackIds: ["t1"], createdVia: "chat", clientKey: KEY };
+    // The key column is missing (sql/chat_operations.sql not applied): refused as "not created", nothing asked of Spotify.
+    const missing = createFakePostgrest({ fail: ({ table, op }) => (table === "spotify_playlists" && op === "select" ? { code: "42703" } : null) });
+    await assert.rejects(load(missing).createPlaylist(args), /^Error: Spotify playlist key unavailable/);
+    // A playlist is already logged under this key: never made a second time.
+    const logged = createFakePostgrest({ tables: { spotify_playlists: [{ playlist_id: "pl9", client_key: KEY }] } });
+    await assert.rejects(load(logged).createPlaylist(args), /already created for this request/);
+    assert.deepEqual(calls, [], "Spotify was never called");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a keyed call left unfinished is re-run read-back only when another earlier call wrote; alone it re-runs as before", async () => {
+  // A stack the first try could not confirm (it may or may not have written), then its products logged one by one.
+  const { db, open } = setup();
+  const write = keyedWrite();
+  const first = await open();
+  await first.run(STACK, input(), async () => ({ failed: false, result: JSON.stringify({ error: "The database did not confirm this.", incomplete: true }) }));
+  await first.run(INTAKE, { product: "synthetic x" }, write.execute("X"));
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["unknown", "done"]);
+  const checks = [];
+  const retry = await open();
+  const stack = await retry.run(STACK, input(), async (opId, _ctx, check) => {
+    checks.push(check);
+    // In check mode the keyed write only reads back; its key holds nothing here, so it is unconfirmed.
+    return check
+      ? { failed: false, result: JSON.stringify({ error: ops.uncertainText(STACK), incomplete: true, uncertain: true }) }
+      : write.execute()(opId);
+  });
+  assert.deepEqual(checks, [true], "read back only: X was written next to it");
+  assert.equal(stack.receipt.status, "unknown");
+  assert.equal(write.effects.size, 1, "the stack was not logged next to its products");
+
+  // Alone (no other earlier write), an unfinished keyed call re-runs as a write under its own key.
+  const solo = setup();
+  await solo.store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  await solo.store.claim({ owner_id: OWNER, request_id: REQUEST, tool: STACK, ordinal: 1 }, ops.intentSha(STACK, input()), input());
+  await expireLeases(solo.db);
+  const soloChecks = [];
+  const soloWrite = keyedWrite();
+  await (await solo.open()).run(STACK, input(), async (opId, _ctx, check) => { soloChecks.push(check); return soloWrite.execute()(opId); });
+  assert.deepEqual(soloChecks, [false]);
+  assert.equal(soloWrite.effects.size, 1);
+});

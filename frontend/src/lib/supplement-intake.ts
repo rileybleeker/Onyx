@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { ambiguousDbError } from "./write-outcome";
+import { REMOVED_SINCE_CODE, REMOVED_SINCE_ERROR, ambiguousDbError } from "./write-outcome";
 
 /**
  * Log one product from the /supplements list by NAME, with an optional
@@ -74,6 +74,8 @@ export interface LogIntakeResult {
   replayed?: boolean;
   /** The insert failed in a way that does not prove nothing was written (lib/write-outcome.ts): it may be logged. */
   incomplete?: boolean;
+  /** An earlier call with this event_key wrote it and it was deleted since: nothing was written again. */
+  removed_since?: boolean;
 }
 
 export const INTAKE_MAYBE_LOGGED =
@@ -314,6 +316,17 @@ async function replayIntake(supabase: Pds, rows: EventRow[]): Promise<LogIntakeR
   };
 }
 
+/**
+ * The stored result of an earlier single-product log with this event key, or null (no key, nothing written under it,
+ * or the rows cannot be read). Read-only: the chat route asks this when a re-run must only read back, never write.
+ */
+export async function intakeEventReplay(supabase: Pds, event_key: unknown): Promise<LogIntakeResult | null> {
+  const key = typeof event_key === "string" && EVENT_UUID.test(event_key) ? event_key.toLowerCase() : null;
+  if (!key) return null;
+  const prior = await rowsForEvent(supabase, key);
+  return prior.length > 0 ? replayIntake(supabase, prior) : null;
+}
+
 export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput): Promise<LogIntakeResult> {
   const key = typeof input.event_key === "string" && EVENT_UUID.test(input.event_key) ? input.event_key.toLowerCase() : null;
   // A key that was given but is not a UUID is refused, never dropped (the log would then be unkeyed).
@@ -409,6 +422,8 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       .insert(keyed)
       .select("intake_id,intake_time");
     let unreadable = false;
+    // The event was written once and deleted since (its key is tombstoned): the database refused it, nothing written.
+    if (insErr && key && insErr.code === REMOVED_SINCE_CODE) return { ok: false, error: REMOVED_SINCE_ERROR, removed_since: true };
     // Fail closed: the insert was rejected for the key columns, so nothing was written; it is not tried again unkeyed.
     if (insErr && key && missingColumn(insErr)) return { ok: false, error: INTAKE_KEY_UNAVAILABLE };
     if (insErr && key) {

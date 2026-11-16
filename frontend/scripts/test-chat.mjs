@@ -766,7 +766,7 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   // Stored before the request goes out, reused for the same conversation, settled on an answer or a 409.
   assert.match(page, /if \(conv\) writePendingSends\(rememberPendingSend\(readPendingSends\(\), \{ conv, id: requestId, at: Date\.now\(\) \}\)\)/);
-  assert.match(page, /readPendingSends\(\)\.find\(\(p\) => p\.conv === conv\)/);
+  assert.match(page, /unresolvedPendingSend\(readPendingSends\(\), conv\)/);
   assert.equal((page.match(/settlePendingSend\(requestId\)/g) ?? []).length, 2);
   assert.doesNotMatch(page, /PENDING_SEND_TTL_MS|Date\.now\(\) - |parsePendingSend\(/, "no expiry of an unresolved send");
   assert.match(contract.PENDING_SEND_KEY, /^onyx/, "an onyx key, so signing out wipes it");
@@ -800,6 +800,12 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   assert.equal(many.length, contract.PENDING_SEND_MAX);
   assert.equal(many.some((p) => p.id === idOf(13)), false);
   assert.equal(many[0].id, idOf(10), "the oldest unresolved one is kept");
+
+  // A resolved (seen) send never matches a later message; an unresolved one does.
+  const both = [{ conv: convOf(1), id: idOf(1), at: 1, seen: true }, { conv: convOf(2), id: idOf(2), at: 2 }];
+  assert.equal(contract.unresolvedPendingSend(both, convOf(1)), null);
+  assert.equal(contract.unresolvedPendingSend(both, convOf(2)).id, idOf(2));
+  assert.equal(contract.unresolvedPendingSend(both, convOf(3)), null);
 
   // The stored value never holds the text: only the hash of the conversation.
   const key = await contract.conversationKey([user("Log Synthetic Focus")]);
@@ -892,72 +898,193 @@ test("a replayed session never overrides an answer given since, and a lost answe
   assert.equal((await (await refused.post({ messages: [user("I read chapter 99")] })).json()).receipts[0].status, "not_saved");
 });
 
-test("a highlight re-run stays on the pinned book, checks before it writes and never overwrites an edit made since", async () => {
-  let failFinish = true;
-  const db = ledgerDb({
-    tables: { books: [{ book_id: 9, slug: "synthetic-nine", title: "Synthetic Nine" }, { book_id: 10, slug: "synthetic-ten", title: "Synthetic Ten" }] },
-    fail: ({ table, op, payload }) => (failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null),
-  });
-  let current = 9;
-  const seen = [];
-  let mirrors = 0;
-  const reading = {
-    getBook: async () => db.rows("books").find((b) => b.book_id === current) ?? null,
-    // Like lib/reading.ts addHighlight: one highlight per book + passage, a given comment is written over the stored one.
+/** Like lib/reading.ts addHighlight: one highlight per book + passage, a given comment is written over the stored one
+ * (which moves updated_at), and the client_key (the operation id) goes on a highlight it CREATES. */
+function highlightLibrary(db, { current = () => 9, seen = [] } = {}) {
+  return {
+    getBook: async () => db.rows("books").find((b) => b.book_id === current()) ?? null,
     addHighlight: async (_client, input) => {
       seen.push(input.book_id);
       const book = db.rows("books").find((b) => b.book_id === input.book_id);
       const passage = input.passage.trim();
       const existing = db.rows("book_highlights").find((h) => h.book_id === input.book_id && h.passage === passage);
       if (existing) {
-        if (input.comment && input.comment !== existing.comment) await db.from("book_highlights").update({ comment: input.comment }).eq("highlight_id", existing.highlight_id);
+        if (input.comment && input.comment !== existing.comment) {
+          await db.from("book_highlights").update({ comment: input.comment, updated_at: new Date().toISOString() }).eq("highlight_id", existing.highlight_id);
+        }
         return { ok: true, book, highlight: db.rows("book_highlights").find((h) => h.highlight_id === existing.highlight_id), created: false };
       }
-      const h = { highlight_id: db.rows("book_highlights").length + 1, book_id: input.book_id, passage, comment: input.comment ?? null, chapter: null, concept: null, archived: false, next_review: "2026-11-12", notion_block_id: null, created_at: new Date().toISOString() };
+      const now = new Date().toISOString();
+      const h = { highlight_id: db.rows("book_highlights").length + 1, book_id: input.book_id, passage, comment: input.comment ?? null, chapter: null, concept: null, archived: false, next_review: "2026-11-12", notion_block_id: null, client_key: input.client_key ?? null, created_at: now, updated_at: now };
       db.seed("book_highlights", [h]);
       return { ok: true, book, highlight: h, created: true };
     },
   };
+}
+const highlightBooks = () => [{ book_id: 9, slug: "synthetic-nine", title: "Synthetic Nine" }, { book_id: 10, slug: "synthetic-ten", title: "Synthetic Ten" }];
+const finishFails = (state) => ({ table, op, payload }) => (state.failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null);
+
+test("a highlight re-run finds the highlight its earlier try made by its key, on the pinned book, and writes nothing to it", async () => {
+  const state = { failFinish: true };
+  const db = ledgerDb({ tables: { books: highlightBooks() }, fail: finishFails(state) });
+  let current = 9;
+  const seen = [];
+  let mirrors = 0;
+  const reading = highlightLibrary(db, { current: () => current, seen });
   // The first try made the highlight and stopped before its Notion entry (the mirror failed) and before the ledger
   // recorded it.
   const readingNotion = { mirrorHighlight: async () => { mirrors++; return mirrors === 1 ? null : "synthetic-block"; } };
   const call = { passage: "A synthetic line.", comment: "First note." };
   const body = { request_id: RID, messages: [user("Save this synthetic line")] };
   await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body);
-  failFinish = false;
+  const op = db.rows("chat_operations")[0];
+  assert.equal(db.rows("book_highlights")[0].client_key, op.op_id, "the created highlight carries the operation id");
+  state.failFinish = false;
   current = 10; // a new book was started since
   const retryBody = await (await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body)).json();
-  assert.deepEqual(seen, [9], "the re-run only checked (on the pinned book): the highlight is what the call asked for");
+  assert.deepEqual(seen, [9], "addHighlight did not run on the retry");
   assert.equal(db.rows("book_highlights").length, 1);
   assert.equal(mirrors, 2, "mirrored again only because the first try's entry was never made");
   assert.equal(db.rows("book_highlights")[0].notion_block_id, "synthetic-block");
   assert.equal(retryBody.receipts[0].status, "unchanged");
   assert.equal(db.rows("chat_operations")[0].context.book_id, 9);
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+});
 
-  // Another message: saved, the answer lost, then Riley edits the note on /reading. The retry must not write the
-  // old note back over the edit.
-  failFinish = true;
-  const other = { request_id: "55555555-5555-4555-8555-555555555555", messages: [user("Save another synthetic line")] };
-  const call2 = { passage: "Another synthetic line.", comment: "Old note." };
+test("a highlight whose passage and note were edited after a lost answer is never made again (found by its key)", async () => {
+  const state = { failFinish: true };
+  const db = ledgerDb({ tables: { books: highlightBooks() }, fail: finishFails(state) });
+  const seen = [];
+  const reading = highlightLibrary(db, { seen });
+  const readingNotion = { mirrorHighlight: async () => "synthetic-block" };
+  const call = { passage: "Another synthetic line.", comment: "Old note." };
+  const body = { request_id: RID, messages: [user("Save another synthetic line")] };
+  await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body);
+  state.failFinish = false;
+  // Riley edits the passage and the note on /reading: no highlight has the call's passage any more.
+  await db.from("book_highlights").update({ passage: "Another synthetic line, edited.", comment: "Edited since.", updated_at: new Date().toISOString() }).eq("highlight_id", 1);
+  const retry = await (await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body)).json();
+  assert.equal(seen.length, 1, "addHighlight did not run on the retry");
+  assert.equal(db.rows("book_highlights").length, 1, "no second highlight with the old passage");
+  assert.equal(db.rows("book_highlights")[0].comment, "Edited since.", "the edit stands");
+  assert.equal(retry.receipts[0].status, "unchanged", "saved by the earlier try");
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+
+  // Removed (archived) since, in another message: never made again, and it says so.
+  state.failFinish = true;
+  const other = { request_id: "55555555-5555-4555-8555-555555555555", messages: [user("Save a removed synthetic line")] };
+  const call2 = { passage: "A removed synthetic line." };
   await route(afterTool("add_book_highlight", call2), { supabase: db, reading, readingNotion }).post(other);
-  failFinish = false;
-  await db.from("book_highlights").update({ comment: "Edited since." }).eq("passage", "Another synthetic line.");
-  const edited = await (await route(afterTool("add_book_highlight", call2), { supabase: db, reading, readingNotion }).post(other)).json();
+  state.failFinish = false;
+  await db.from("book_highlights").update({ archived: true }).eq("passage", "A removed synthetic line.");
+  const gone = await (await route(afterTool("add_book_highlight", call2), { supabase: db, reading, readingNotion }).post(other)).json();
   assert.equal(seen.length, 2, "addHighlight did not run on the retry");
-  assert.equal(db.rows("book_highlights").find((h) => h.passage === "Another synthetic line.").comment, "Edited since.");
-  assert.equal(edited.receipts[0].status, "unknown", "unconfirmed, not 'not saved' and not 'saved'");
-  assert.equal(db.rows("chat_operations").find((r) => r.request_id === other.request_id).status, "unknown");
+  assert.equal(db.rows("book_highlights").filter((h) => h.passage === "A removed synthetic line.").length, 1);
+  assert.equal(gone.receipts[0].status, "not_saved");
+  assert.match(gone.receipts[0].details.join(" "), /removed since/);
+  assert.equal(db.rows("chat_operations").find((r) => r.request_id === other.request_id).status, "done", "settled, never re-run");
+});
 
-  // A highlight the earlier try never wrote (no row, and highlights are never deleted) is written by the re-run.
-  failFinish = true;
+test("a highlight the earlier try may have changed is never written over an edit, renamed or not; one it never wrote is written once", async () => {
+  // An existing highlight (no key) gets this call's note: addHighlight updates it. The answer is lost.
+  const state = { failFinish: true };
+  const db = ledgerDb({
+    tables: {
+      books: highlightBooks(),
+      book_highlights: [{ highlight_id: 1, book_id: 9, passage: "An existing synthetic line.", comment: null, chapter: null, concept: null, archived: false, next_review: "2026-11-12", notion_block_id: "b", client_key: null, created_at: "2020-01-01T00:00:00.000Z", updated_at: "2020-01-01T00:00:00.000Z" }],
+    },
+    fail: finishFails(state),
+  });
+  const seen = [];
+  const reading = highlightLibrary(db, { seen });
+  const readingNotion = { mirrorHighlight: async () => "synthetic-block" };
+  const call = { passage: "An existing synthetic line.", comment: "A note from chat." };
+  const body = { request_id: RID, messages: [user("Note on the existing synthetic line")] };
+  await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body);
+  assert.equal(db.rows("book_highlights")[0].comment, "A note from chat.");
+  assert.equal(db.rows("book_highlights")[0].client_key, null, "an updated highlight gets no key");
+  state.failFinish = false;
+  // Riley then edits that highlight's passage: no highlight has the call's passage now.
+  await db.from("book_highlights").update({ passage: "An existing synthetic line, edited.", updated_at: new Date().toISOString() }).eq("highlight_id", 1);
+  const retry = await (await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body)).json();
+  assert.equal(seen.length, 1, "nothing written: a highlight of the book changed since the operation began");
+  assert.equal(db.rows("book_highlights").length, 1, "the old passage is not made again next to the edited one");
+  assert.equal(retry.receipts[0].status, "unknown");
+
+  // A highlight the earlier try never wrote (the write failed before reaching the database; no keyed row, nothing of
+  // the book changed since) is written by the re-run, once.
+  const fresh = ledgerDb({ tables: { books: highlightBooks() } });
+  const freshSeen = [];
+  const lostBeforeWrite = { ...highlightLibrary(fresh, { seen: freshSeen }), addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
   const third = { request_id: "77777777-7777-4777-8777-777777777777", messages: [user("Save a third synthetic line")] };
-  const lostBeforeWrite = { ...reading, addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
   const call3 = { passage: "A third synthetic line." };
-  const firstThird = await (await route(afterTool("add_book_highlight", call3), { supabase: db, reading: lostBeforeWrite, readingNotion }).post(third)).json();
+  const firstThird = await (await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: lostBeforeWrite, readingNotion }).post(third)).json();
   assert.equal(firstThird.receipts[0].status, "unknown");
-  failFinish = false;
-  await route(afterTool("add_book_highlight", call3), { supabase: db, reading, readingNotion }).post(third);
-  assert.equal(db.rows("book_highlights").filter((h) => h.passage === "A third synthetic line.").length, 1);
+  await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: highlightLibrary(fresh, { seen: freshSeen }), readingNotion }).post(third);
+  assert.equal(fresh.rows("book_highlights").filter((h) => h.passage === "A third synthetic line.").length, 1);
+  await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: highlightLibrary(fresh, { seen: freshSeen }), readingNotion }).post(third);
+  assert.equal(fresh.rows("book_highlights").length, 1, "the next retry replays it");
+});
+
+test("a highlight whose key column cannot be read is refused, never written without its key", async () => {
+  for (const code of ["42703", "08006"]) {
+    const db = ledgerDb({ tables: { books: highlightBooks() }, fail: ({ table, op }) => (table === "book_highlights" && op === "select" ? { code } : null) });
+    const seen = [];
+    const body = await (await route(afterTool("add_book_highlight", { passage: "A synthetic line." }), { supabase: db, reading: highlightLibrary(db, { seen }) }).post({ request_id: RID, messages: [user("Save this synthetic line")] })).json();
+    assert.deepEqual(seen, [], code);
+    assert.equal(body.receipts[0].status, "not_saved", code);
+  }
+});
+
+test("an intake or reading session written by a lost try and removed since is never written again", async () => {
+  // The tombstone a removal leaves (sql/chat_operations.sql trigger) is seeded here as the trigger would write it.
+  const state = { failFinish: true };
+  const db = ledgerDb({ fail: finishFails(state) });
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  const op = db.rows("chat_operations")[0];
+  assert.equal(op.status, "pending");
+  state.failFinish = false;
+  db.seed("chat_operation_tombstones", [{ op_id: op.op_id, target: "supplement_intake" }]);
+  const retry = route(logFocus, { supabase: db, intake: w.intake });
+  const retryBody = await (await retry.post(body)).json();
+  assert.equal(retry.writes(), 0, "the intake was not written again");
+  assert.equal(retryBody.receipts[0].status, "not_saved");
+  assert.match(retryBody.receipts[0].details.join(" "), /removed since/);
+  assert.equal(JSON.parse(retry.requests()[1].messages.at(-1).content[0].content).removed_since, true);
+  assert.equal(db.rows("chat_operations")[0].status, "done", "settled");
+  const later = route(logFocus, { supabase: db, intake: w.intake });
+  await later.post(body);
+  assert.equal(later.writes(), 0);
+
+  // A reading session the same way.
+  const rstate = { failFinish: true };
+  const rdb = ledgerDb({ fail: finishFails(rstate) });
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: null, total_chapters: 20, status: "reading" };
+  let sessions = 0;
+  const reading = {
+    logSession: async () => { sessions++; return { ok: true, book, session: { session_id: sessions, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, notion_block_id: "b" }, xpGained: 20, finished: false, habitMarked: false, habitCreated: false }; },
+    getOverview: async () => null,
+  };
+  const readingNotion = { mirrorSession: async () => "b", mirrorProgress: async () => {} };
+  const readingBody = { request_id: "33333333-3333-4333-8333-333333333333", messages: [user("I read chapters 1 and 2")] };
+  await route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody);
+  rstate.failFinish = false;
+  rdb.seed("chat_operation_tombstones", [{ op_id: rdb.rows("chat_operations")[0].op_id, target: "reading_sessions" }]);
+  const readingRetry = await (await route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody)).json();
+  assert.equal(sessions, 1, "the session was not written again");
+  assert.equal(readingRetry.receipts[0].status, "not_saved");
+
+  // The tombstone table cannot be read (missing, or the read failed): a keyed write is refused, never run blind.
+  for (const code of ["PGRST205", "08006"]) {
+    const broken = ledgerDb({ fail: ({ table }) => (table === "chat_operation_tombstones" ? { code } : null) });
+    const wb = keyedIntake();
+    const r = route(logFocus, { supabase: broken, intake: wb.intake });
+    const out = await (await r.post({ request_id: RID, messages: [user("Log Synthetic Focus")] })).json();
+    assert.equal(r.writes(), 0, code);
+    assert.equal(out.receipts[0].status, "not_saved", code);
+  }
 });
 
 test("an unconfirmed habit answer is checked on the retry: confirmed when the day holds it, never overwritten when it changed", async () => {
@@ -1045,4 +1172,44 @@ test("GET /api/chat/operations reads a request back by its id alone, for the sig
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   assert.match(page, /fetch\(`\/api\/chat\/operations\?request_id=\$\{encodeURIComponent\(id\)\}`/);
   assert.match(page, /input\.trim\(\) === resendText/, "the resend button only sends the message the composer still holds");
+});
+
+test("the chat page never reuses a remembered send silently: Riley picks retry or new, and a dismissed account is resolved", () => {
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  // A match stops the send and asks; only "Retry that message" reuses the id, "Send as a new message" makes a new one.
+  assert.match(page, /setMatched\(\{ text, requestId: stored\.id, at: messages\.length \}\);\s*return;/);
+  assert.match(page, /send\(matched\.text, \{ retryOf: matched\.requestId \}\)/);
+  assert.match(page, /send\(matched\.text, \{ fresh: true \}\)/);
+  assert.match(page, /Retry that message/);
+  assert.match(page, /Send as a new message/);
+  assert.match(page, /if \(!requestId && !choice && conv\)/, "a choice skips the question");
+  // Dismissing a definite account (what it saved, or that it never arrived) forgets the send.
+  assert.match(page, /recovery\?\.state === "settled" \|\| recovery\?\.state === "none"\)\) settlePendingSend\(id\)/);
+  assert.doesNotMatch(page, /seenPendingSends/);
+  // New chat clears the question.
+  assert.match(page, /function newChat\(\) \{[\s\S]*?setMatched\(null\);/);
+});
+
+test("a stack left unconfirmed next to products the first try logged is only read back on the retry, never logged", async () => {
+  const db = ledgerDb({ tables: { supplement_stack: [{ stack_id: 7, name: "Synthetic Morning", is_active: true }] } });
+  let stackLogs = 0;
+  const stacks = {
+    stackEventReplay: async () => null, // nothing was written under the stack's key
+    logStackIntake: async () => { stackLogs++; return stackLogs === 1 ? { ok: false, error: "The database did not confirm this stack log.", incomplete: true } : { ok: true, stack_id: 7, stack_name: "Synthetic Morning", intake_date: "2026-11-11", intake_ids: [], count: 2, total_doses: 3 }; },
+  };
+  const w = keyedIntake();
+  const firstTry = [
+    { stop_reason: "tool_use", content: [toolUse("log_supplement_stack", { stack: "synthetic morning" }, "s1")] },
+    { stop_reason: "tool_use", content: [toolUse("log_supplement_intake", { product: "Synthetic Focus" }, "i1")] },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
+  ];
+  const body = { request_id: RID, messages: [user("Log my synthetic morning stack")] };
+  await route(firstTry, { supabase: db, stacks, intake: w.intake }).post(body);
+  assert.deepEqual(db.rows("chat_operations").map((r) => [r.tool, r.status]), [["log_supplement_stack", "unknown"], ["log_supplement_intake", "done"]]);
+  // The retry asks for the stack again: its key holds nothing, and a product was logged next to it, so nothing is
+  // logged now (it would repeat that product).
+  const retry = await (await route(afterTool("log_supplement_stack", { stack: "synthetic morning" }), { supabase: db, stacks, intake: w.intake }).post(body)).json();
+  assert.equal(stackLogs, 1, "logStackIntake did not run on the retry");
+  assert.equal(retry.receipts.find((r) => r.tool === "log_supplement_stack").status, "unknown");
+  assert.equal(w.effects.size, 1);
 });
