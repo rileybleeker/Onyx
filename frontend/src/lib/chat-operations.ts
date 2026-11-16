@@ -7,19 +7,27 @@
  * write calls are matched to the stored rows BY CONTENT (same tool, same canonical input), in any order:
  *
  *   - a call that matches a stored row is answered from it: done = the stored result and receipt, nothing written;
- *     refused (nothing was written) = run again; pending / unknown (the try stopped mid-way) = run again only when
- *     the write itself is keyed by the operation id or naturally idempotent (RERUN_SAFE), otherwise looked up
- *     read-only (reconcilers) and never created again;
- *   - a call that matches nothing is refused while any write of an earlier try is still unmatched (it may be the
- *     same thing asked differently: a stack logged as single products, another wording); it is refused again if
- *     the model repeats it; an extra copy of a call already answered from a stored row is refused too;
- *   - only once every earlier write is matched does a new call run (the earlier try stopped before reaching it).
+ *     refused (nothing was written) = run again; pending / unknown (the try stopped mid-way) = run again under the
+ *     same operation id only when the write itself is keyed by that id (RERUN_SAFE); a habit answer or a highlight
+ *     is re-run in check mode (CHECK_ON_RERUN: it completes only when nothing is there yet and never overwrites what
+ *     is there now, which may be a change Riley made since); anything else is looked up read-only (reconcilers) and
+ *     never created again. A re-run whose answer is a refusal stays unknown: an earlier try may still have written;
+ *   - a call that matches nothing is refused whenever an earlier try wrote, or may have written, anything (any row
+ *     that is not refused). It may be the same thing asked differently (a stack logged as single products, another
+ *     wording, changed details), and no stored plan can prove otherwise, so a retry never starts a new write next to
+ *     an earlier one: a different intentional action is a new message. It is refused again if the model repeats it;
+ *     an extra copy of a call already answered from a stored row is refused too;
+ *   - only when nothing earlier was written (no rows, or every earlier call was refused) does a new call run, as it
+ *     would on a first try.
  *
  * The operation id is passed into the write (supplement event key, reading client_key, playlist audit key), so a
  * write that happened before the ledger could record it is found again rather than repeated. What the call depended
  * on when it first ran is stored with it (`context`: the behavioral day, the book being read) and a re-run uses that,
  * so a retry after midnight / 06:00 never moves an omitted "today" to the next day, and a highlight or session never
  * moves to a book started since.
+ *
+ * Fail closed (the route): a request that carries a request_id runs NO write tool unless its ledger is open, also
+ * when the ledger tables are missing; a keyed write whose key column is missing refuses rather than writing unkeyed.
  *
  * One try at a time: each try of a request holds a lease on its chat_requests row (REQUEST_LEASE_MS, longer than the
  * route's maxDuration, so no try outlives its lease) and a retry that arrives while another try still holds it is
@@ -32,8 +40,8 @@
  *
  * Known gaps (follow-ups): a playlist created on Spotify whose audit row could not be written stays "unknown" (no
  * read-only Spotify lookup yet); a Notion entry made by a try that died before it stored the block id is made again
- * by the re-run; a quiz result has no operation key and is matched by book, checkpoint, score and time; the ledger
- * keeps tool inputs and results with no retention window yet.
+ * by the re-run; a quiz result has no operation key yet (PR #362 adds one), so a quiz left pending is never
+ * confirmed and stays "check this"; the ledger keeps tool inputs and results with no retention window yet.
  *
  * Errors are reported by code only (never a message, which can echo user text). No personal data in this file.
  */
@@ -94,7 +102,10 @@ export interface LedgerStore {
   finish(row: OperationRow, status: OperationStatus, result: unknown, receipt: WriteReceipt | null): Promise<boolean>;
 }
 
-/** The ledger tables are not there yet (the SQL file is not applied): the route runs as before. */
+/**
+ * The ledger tables are not there (the SQL file is not applied, or was rolled back): the route answers questions but
+ * runs no write tool for the request, exactly as for any other ledger failure (never an unrecorded write).
+ */
 export class LedgerUnavailable extends Error {
   code: string;
   constructor(code: string) {
@@ -173,18 +184,24 @@ export const conversationSha = (messages: ReadonlyArray<{ role: string; content:
 /* ------------------------------------------------------------------ */
 
 /**
- * Write tools whose write cannot happen twice when re-run with the same operation id: a habit answer is an upsert on
- * (day, question), a highlight is unique on (book, passage), and a supplement intake, a stack log and a reading
- * session carry the operation id as their own key. Any other write tool (quiz result, Spotify playlist, and every
- * future write tool until it is added here) is never re-run by a retry.
+ * Write tools whose write carries the operation id as its own key (a supplement intake, a stack log, a reading
+ * session): re-run under the same id, the write finds what an earlier try wrote and never happens twice.
  */
 export const RERUN_SAFE: ReadonlySet<string> = new Set([
-  "mark_habit_complete",
   "log_supplement_intake",
   "log_supplement_stack",
   "log_reading_session",
-  "add_book_highlight",
 ]);
+
+/**
+ * Write tools with no key of their own whose target row can be edited by Riley between two tries (a habit answer, a
+ * highlight): an unconfirmed call is re-run in CHECK mode only. The tool then confirms what is there when it is
+ * exactly what the call asked for, completes the write only when nothing is there yet and nothing Riley does could
+ * have removed it, and otherwise writes nothing and reports the outcome as unconfirmed. Never an overwrite.
+ */
+export const CHECK_ON_RERUN: ReadonlySet<string> = new Set(["mark_habit_complete", "add_book_highlight"]);
+// Every other write tool (quiz result, Spotify playlist, and any future write tool until it is added above) is never
+// re-run by a retry: it is looked up read-only (reconcilers) or reported as unconfirmed.
 
 export const REPLAY_NOTE =
   "An earlier try of this same message already did this, so nothing was written again. Tell the user it was already saved, using this result.";
@@ -194,6 +211,8 @@ export const CONFLICT_ERROR =
   "An earlier try of this same message already did this with different details, so nothing new was written. To log something different, the user should send it as a new message.";
 export const REPEAT_ERROR =
   "An earlier try of this same message did this once and that was already reported in this answer, so nothing more was written. To do it again, the user should send it as a new message.";
+export const FRESH_ERROR =
+  "An earlier try of this same message already saved something, so this retry starts nothing new and nothing was written. If this is still wanted, the user should send it as a new message.";
 export const LEDGER_ERROR =
   "Onyx could not record this action safely, so it was not done and nothing was written. Tell the user to try again in a moment.";
 const UNCERTAIN: Record<string, string> = {
@@ -299,7 +318,11 @@ function errorCode(e: unknown): string {
   return typeof name === "string" ? name : typeof e;
 }
 
-export type Execute = (opId: string, context: OperationContext) => Promise<ToolOutcome>;
+/**
+ * Runs the tool. `check` = an unconfirmed earlier call of a CHECK_ON_RERUN tool is being re-run: the tool must not
+ * overwrite what is there (see CHECK_ON_RERUN).
+ */
+export type Execute = (opId: string, context: OperationContext, check: boolean) => Promise<ToolOutcome>;
 
 export class ChatLedger {
   readonly retry: boolean;
@@ -312,6 +335,11 @@ export class ChatLedger {
   private readonly conflicted = new Set<string>();
   /** Calls (by intent hash) of this try whose outcome is unknown: a repeat of one runs as the same operation. */
   private readonly unsettled = new Map<string, OperationRow>();
+  /**
+   * A retry: whether an earlier try wrote, or may have written, anything (a row that is not refused), as the rows
+   * stood when this try first read them (before it made any row itself). Then no new call runs. null = not read yet.
+   */
+  private earlierWritten: boolean | null = null;
 
   constructor(opts: LedgerOptions) {
     this.opts = opts;
@@ -358,7 +386,11 @@ export class ChatLedger {
     return this.claimAndRun(tool, input, sha, intent, ordinal, execute, context);
   }
 
-  /** A retry: match the call to a stored row by content; a call that matches nothing runs only past every earlier write. */
+  /**
+   * A retry: match the call to a stored row by content. A call that matches nothing runs only when no earlier try
+   * wrote, or may have written, anything; otherwise it is refused (it could repeat an earlier write in another form:
+   * a stack's products asked for one by one, changed details), and a new message is the way to ask for more.
+   */
   private async runRetry(
     tool: string, input: unknown, sha: string, intent: unknown, execute: Execute, context: OperationContext,
   ): Promise<LedgerOutcome> {
@@ -369,21 +401,27 @@ export class ChatLedger {
       this.report("list", e);
       return this.refuse(tool, input);
     }
+    // The first read happens before this try makes any row of its own (every row it makes comes after a read here),
+    // so every row seen now is an earlier try's.
+    if (this.earlierWritten === null) this.earlierWritten = rows.some((r) => r.status !== "refused");
     const same = rows
       .filter((r) => r.tool === tool && r.intent_sha === sha && !this.used.has(r.op_id))
       .sort((a, b) => a.ordinal - b.ordinal)[0];
     if (same) return this.resume(same, tool, input, execute);
     // One more copy of a call already answered from a stored row: the earlier try made it fewer times.
     if (rows.some((r) => r.tool === tool && r.intent_sha === sha)) return this.conflict(tool, input, null, REPEAT_ERROR);
-    // The model asks again for a change this retry already refused.
-    if (this.conflicted.has(sha)) return this.conflict(tool, input, null);
-    // An earlier write not matched yet may be this same thing asked differently: refuse rather than risk a second one.
-    const outstanding = rows.filter((r) => !this.used.has(r.op_id) && r.status !== "refused");
-    if (outstanding.length > 0) {
+    // The model asks again for a call this retry already refused.
+    if (this.conflicted.has(sha)) return this.conflict(tool, input, null, this.earlierWritten ? FRESH_ERROR : CONFLICT_ERROR);
+    if (this.earlierWritten) {
+      // Something was (or may have been) written by an earlier try: never a new write next to it. The earlier write
+      // named in the answer is one not matched yet, of this tool when there is one, else any earlier write.
       this.conflicted.add(sha);
-      return this.conflict(tool, input, outstanding.find((r) => r.tool === tool) ?? outstanding[0]);
+      const earlier = rows.filter((r) => r.status !== "refused");
+      const unmatched = earlier.filter((r) => !this.used.has(r.op_id));
+      const named = unmatched.find((r) => r.tool === tool) ?? unmatched[0] ?? earlier.find((r) => r.tool === tool) ?? earlier[0] ?? null;
+      return this.conflict(tool, input, named, unmatched.length > 0 ? CONFLICT_ERROR : FRESH_ERROR);
     }
-    // Every write the earlier tries made is accounted for: this call goes past where they stopped.
+    // Nothing earlier was written (no rows, or only refused ones): this call runs as on a first try.
     const ordinal = rows.filter((r) => r.tool === tool).reduce((n, r) => Math.max(n, r.ordinal), 0) + 1;
     return this.claimAndRun(tool, input, sha, intent, ordinal, execute, context);
   }
@@ -435,8 +473,10 @@ export class ChatLedger {
     const context = asObject(row.context) ?? {};
     if (row.status === "done") return this.replay(row, tool);
     if (row.status === "refused") return this.reclaimAndRun(row, tool, input, execute, context);
-    // pending (a try still running, or one that stopped mid-way) or unknown (one that failed part-way).
-    if (RERUN_SAFE.has(tool)) return this.execute(row, tool, input, execute, context);
+    // pending (a try still running, or one that stopped mid-way) or unknown (one that failed part-way): it may have
+    // written. Keyed writes re-run under the same id; habit answers and highlights re-run in check mode only.
+    if (RERUN_SAFE.has(tool)) return this.execute(row, tool, input, execute, context, { rerun: true, check: false });
+    if (CHECK_ON_RERUN.has(tool)) return this.execute(row, tool, input, execute, context, { rerun: true, check: true });
     return this.reconcile(row, tool, input);
   }
 
@@ -456,19 +496,35 @@ export class ChatLedger {
     return this.execute(fresh, tool, input, execute, context);
   }
 
+  /**
+   * `rerun` = the row was pending / unknown (an earlier try may have written): a refusal now does not prove nothing
+   * was written (the earlier write may exist and the lookup that would find it may have failed), so it is kept as
+   * unknown and reported as unconfirmed, never as "not saved". `check` is passed to the tool (CHECK_ON_RERUN).
+   */
   private async execute(
     row: OperationRow, tool: string, input: unknown, execute: Execute, context: OperationContext,
+    mode: { rerun: boolean; check: boolean } = { rerun: false, check: false },
   ): Promise<LedgerOutcome> {
     this.used.add(row.op_id);
     let outcome: ToolOutcome;
     try {
-      outcome = await execute(row.op_id, context);
+      outcome = await execute(row.op_id, context, mode.check);
     } catch (e) {
       this.report("execute", e);
       outcome = {
         failed: true,
         result: JSON.stringify({ error: "This tool failed unexpectedly and may have completed only part of its work. Do not retry it; tell the user to check the relevant page.", incomplete: true }),
       };
+    }
+    if (mode.rerun && classifyOutcome(outcome) === "refused") {
+      const unconfirmed = this.uncertain(row, tool, input);
+      try {
+        await this.opts.store.finish(row, "unknown", storedResult("unknown", parseResult(unconfirmed.result)), unconfirmed.receipt);
+      } catch (e) {
+        this.report("finish", e);
+      }
+      this.unsettled.set(row.intent_sha, { ...row, status: "unknown" });
+      return unconfirmed;
     }
     const parsed = parseResult(outcome.result);
     const status = classifyOutcome(outcome);
@@ -751,21 +807,13 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
 }
 
 /**
- * The quiz row gets its timestamp from the database clock after the operation row was inserted, so a small margin is
- * enough; it keeps an older row with the same details from being taken for this one.
- */
-const RECONCILE_MARGIN_MS = 5_000;
-
-/**
  * Read-only lookups for the write tools that are never re-run. Exactly one matching row counts; two is ambiguous.
- * A playlist is found by its audit key (pds.spotify_playlists.client_key = the operation id, set by createPlaylist);
- * a quiz result, which has no key, by its book, checkpoint, score and total, taken after the operation began.
+ * A playlist is found by its audit key (pds.spotify_playlists.client_key = the operation id, set by createPlaylist).
+ * A quiz result has no operation key yet, so there is deliberately no lookup for it: a match by book, checkpoint,
+ * score and time could take a later attempt for this one. A quiz left pending stays "check this" until the quiz write
+ * carries the operation id (PR #362's op_key) and is read back by it.
  */
 export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Reconciler>> {
-  const since = (row: OperationRow) => {
-    const t = Date.parse(row.created_at);
-    return new Date((Number.isFinite(t) ? t : Date.now()) - RECONCILE_MARGIN_MS).toISOString();
-  };
   return {
     create_spotify_playlist: async (row) => {
       const { data, error } = await supabase
@@ -786,38 +834,6 @@ export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Recon
         reconciled: true,
         ...(p.track_count == null ? { partly_confirmed: PLAYLIST_TRACKS_UNCONFIRMED } : {}),
       };
-    },
-
-    record_reading_quiz: async (row) => {
-      const intent = asObject(row.intent) ?? {};
-      const checkpoint = typeof intent.checkpoint === "string" ? intent.checkpoint.trim() : "";
-      const score = Math.round(Number(intent.score));
-      const total = Math.round(Number(intent.total));
-      if (!checkpoint || !Number.isFinite(score) || !Number.isFinite(total) || total <= 0) return null;
-      // The book the tool used: the named one, else the book being read when the operation first ran (its context),
-      // else the book being read now (lib/reading.ts getBook).
-      const slug = typeof intent.book === "string" && intent.book.trim() ? intent.book.trim() : null;
-      const pinned = asObject(row.context)?.book_id;
-      let bookId: unknown = !slug && typeof pinned === "number" ? pinned : undefined;
-      if (bookId === undefined) {
-        let books = supabase.from("books").select("book_id");
-        books = slug ? books.eq("slug", slug) : books.eq("status", "reading");
-        const { data: book, error: bookError } = await books.order("created_at", { ascending: false }).limit(1);
-        bookId = !bookError && Array.isArray(book) ? (book[0] as { book_id?: unknown } | undefined)?.book_id : undefined;
-      }
-      if (typeof bookId !== "number") return null;
-      const { data, error } = await supabase
-        .from("reading_quizzes")
-        .select("quiz_id,checkpoint,score,total,quiz_date")
-        .eq("book_id", bookId)
-        .eq("checkpoint", checkpoint)
-        .eq("score", score)
-        .eq("total", total)
-        .gte("taken_at", since(row))
-        .limit(2);
-      if (error || !Array.isArray(data) || data.length !== 1) return null;
-      const q = data[0] as { quiz_id: number; checkpoint: string; score: number; total: number; quiz_date: string };
-      return { success: true, passed: q.score / q.total >= 0.8, score: `${q.score}/${q.total}`, checkpoint: q.checkpoint, quiz_date: q.quiz_date, quiz_id: q.quiz_id, reconciled: true };
     },
   };
 }

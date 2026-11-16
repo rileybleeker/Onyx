@@ -330,34 +330,26 @@ test("a playlist left unconfirmed is looked up read-only and never created again
   assert.equal(creates, 1);
 });
 
-test("a quiz result left pending is confirmed from pds.reading_quizzes, never recorded twice", async () => {
+test("a quiz result left pending is never confirmed by a lookalike row and never recorded twice", async () => {
   const { db, store, open } = setup({
-    tables: {
-      books: [
-        { book_id: 3, slug: "synthetic-book", status: "reading", created_at: "2029-06-01T00:00:00.000Z" },
-        { book_id: 4, slug: "other-synthetic-book", status: "finished", created_at: "2029-01-01T00:00:00.000Z" },
-      ],
-    },
+    tables: { books: [{ book_id: 3, slug: "synthetic-book", status: "reading", created_at: "2029-06-01T00:00:00.000Z" }] },
   });
   const QUIZ = "record_reading_quiz";
   const call = { checkpoint: "ch12", score: 4, total: 5 };
   await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
-  const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call);
+  const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call, { book_id: 3 });
   await expireLeases(db);
   let records = 0;
   const record = async () => { records++; return { failed: false, result: JSON.stringify({ success: true }) }; };
   const reconcilers = ops.supabaseReconcilers(db);
-  const unsure = await (await open({ reconcilers })).run(QUIZ, call, record);
-  assert.equal(records, 0);
-  assert.equal(unsure.receipt.status, "unknown");
-  // The same checkpoint and score for another book is not this quiz.
-  db.seed("reading_quizzes", [{ quiz_id: 8, book_id: 4, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
-  assert.equal((await (await open({ reconcilers })).run(QUIZ, call, record)).receipt.status, "unknown");
+  assert.equal(reconcilers.record_reading_quiz, undefined, "no approximate quiz lookup until the quiz write carries the operation id");
+  // A row for the same book, checkpoint and score taken after the operation began may be a LATER attempt: not proof.
   db.seed("reading_quizzes", [{ quiz_id: 9, book_id: 3, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
-  const found = await (await open({ reconcilers })).run(QUIZ, call, record);
-  assert.equal(records, 0);
-  assert.equal(found.receipt.status, "unchanged");
-  assert.deepEqual(plain(found.receipt.details.slice(0, 2)), ["ch12: 4/5 (passed)", "Day: 2030-01-01"]);
+  const unsure = await (await open({ reconcilers })).run(QUIZ, call, record);
+  assert.equal(records, 0, "never recorded again");
+  assert.equal(unsure.receipt.status, "unknown");
+  assert.equal(JSON.parse(unsure.result).uncertain, true);
+  assert.equal(db.rows("chat_operations")[0].status, "pending", "still unconfirmed, never certified done");
 });
 
 test("a ledger that cannot record the call refuses the write instead of running it unrecorded", async () => {
@@ -379,22 +371,26 @@ test("missing ledger tables are reported as unavailable (the route then runs as 
   assert.deepEqual(plain(await ops.openLedger(broken, { ownerId: OWNER, requestId: REQUEST, conversationSha: CONVERSATION, buildReceipt: receipts.buildWriteReceipt })), { kind: "failed", code: "08006" });
 });
 
-test("only the keyed and naturally idempotent write tools are re-run; every other write tool is looked up", () => {
+test("only keyed write tools are re-run; habit and highlight re-run in check mode; every other write tool is looked up", () => {
   for (const tool of receipts.WRITE_TOOLS) {
-    const rerun = ops.RERUN_SAFE.has(tool);
-    assert.equal(rerun, !["record_reading_quiz", "create_spotify_playlist"].includes(tool), tool);
+    const keyed = ["log_supplement_intake", "log_supplement_stack", "log_reading_session"].includes(tool);
+    const checked = ["mark_habit_complete", "add_book_highlight"].includes(tool);
+    assert.equal(ops.RERUN_SAFE.has(tool), keyed, tool);
+    assert.equal(ops.CHECK_ON_RERUN.has(tool), checked, tool);
   }
   assert.equal(ops.RERUN_SAFE.has("a_future_write_tool"), false);
+  assert.equal(ops.CHECK_ON_RERUN.has("a_future_write_tool"), false);
 });
 
 test("uncertain-outcome texts fit the receipt without being cut", () => {
   for (const tool of receipts.WRITE_TOOLS) assert.ok(ops.uncertainText(tool).length <= 240, tool);
-  for (const text of [ops.CONFLICT_ERROR, ops.REPEAT_ERROR, ops.LEDGER_ERROR]) assert.ok(text.length <= 240);
+  for (const text of [ops.CONFLICT_ERROR, ops.REPEAT_ERROR, ops.FRESH_ERROR, ops.LEDGER_ERROR]) assert.ok(text.length <= 240);
 });
 
 // ---------------------------------------------------------------------------
-// Retries whose model makes the calls differently (review round 1). A retry never creates a new write while an
-// earlier write is still unmatched, so a reordered, reworded or repeated call cannot write a second time.
+// Retries whose model makes the calls differently (review rounds 1 and 4). A retry never creates a new write once an
+// earlier try wrote, or may have written, anything, so a reordered, reworded, split or repeated call cannot write a
+// second time.
 // ---------------------------------------------------------------------------
 const INTAKE = "log_supplement_intake";
 
@@ -442,7 +438,7 @@ test("a stack the first try logged, asked for as single products on the retry, i
   assert.equal((await retry.earlierReceipts()).length, 1, "the stack the first try saved is still shown");
 });
 
-test("one more copy of a call than the first try made is refused; a new call past every earlier write runs", async () => {
+test("one more copy of a call than the first try made is refused; so is a new call once anything earlier was written", async () => {
   const { db, open } = setup();
   const write = keyedWrite();
   await (await open()).run(INTAKE, { product: "synthetic a" }, write.execute("A"));
@@ -451,17 +447,70 @@ test("one more copy of a call than the first try made is refused; a new call pas
   const extra = await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"));
   assert.equal(JSON.parse(extra.result).error, ops.REPEAT_ERROR);
   assert.equal(write.effects.size, 1);
-  // The first try stopped before B; with A accounted for, B is the rest of the message and runs once.
+  // A matched, and the model now asks for B: no stored plan says B was part of the first try, so it is refused.
   const b = await retry.run(INTAKE, { product: "synthetic b" }, write.execute("B"));
-  assert.equal(JSON.parse(b.result).success, true);
-  assert.equal(b.replayed, false);
+  assert.equal(JSON.parse(b.result).error, ops.FRESH_ERROR);
+  assert.equal(JSON.parse(b.result).earlier_tool, INTAKE);
+  assert.equal(b.receipt.status, "not_saved");
+  // Asked again in the same try: refused again.
+  assert.equal(JSON.parse((await retry.run(INTAKE, { product: "synthetic b" }, write.execute("B"))).result).error, ops.FRESH_ERROR);
+  assert.equal(write.effects.size, 1);
+  assert.equal(db.rows("chat_operations").length, 1, "the refused calls made no row");
+  // B sent as a new message is a new request and writes.
+  await (await open({ request: "22222222-2222-4222-8222-222222222222" })).run(INTAKE, { product: "synthetic b" }, write.execute("B"));
   assert.equal(write.effects.size, 2);
-  assert.deepEqual(db.rows("chat_operations").map((r) => r.ordinal).sort(), [1, 2]);
-  // A later retry answers both from the ledger.
-  const later = await open();
-  assert.equal((await later.run(INTAKE, { product: "synthetic b" }, write.execute("B"))).replayed, true);
-  assert.equal((await later.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).replayed, true);
+});
+
+test("a stack replayed on a retry, followed by its products one by one, writes nothing more (SEC04-R1)", async () => {
+  const { db, open } = setup();
+  const write = keyedWrite();
+  await (await open()).run(STACK, input(), write.execute());
+  const retry = await open();
+  let ran = 0;
+  const count = (name) => async (opId) => { ran++; return write.execute(name)(opId); };
+  const stack = await retry.run(STACK, input(), count("Synthetic Morning"));
+  assert.equal(stack.replayed, true);
+  const x = await retry.run(INTAKE, { product: "synthetic x" }, count("X"));
+  const y = await retry.run(INTAKE, { product: "synthetic y" }, count("Y"));
+  assert.equal(ran, 0, "nothing ran: the stack came from the ledger and its products were refused");
+  for (const refused of [x, y]) {
+    const forModel = JSON.parse(refused.result);
+    assert.equal(forModel.error, ops.FRESH_ERROR);
+    assert.equal(forModel.earlier_tool, STACK);
+    assert.equal(forModel.earlier_result.stack, "Synthetic Morning");
+    assert.equal(refused.receipt.status, "not_saved");
+  }
+  assert.equal(write.effects.size, 1, "one stack log, no single intakes");
+  assert.equal(db.rows("chat_operations").length, 1);
+});
+
+test("a retry whose earlier try wrote nothing (no rows, or refused ones only) runs new calls as a first try would", async () => {
+  const { db, store, open } = setup();
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  await expireLeases(db);
+  const write = keyedWrite();
+  const retry = await open();
+  assert.equal(retry.retry, true);
+  assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).receipt.status, "saved");
+  assert.equal((await retry.run(INTAKE, { product: "synthetic b" }, write.execute("B"))).receipt.status, "saved", "a second new call of the same try runs too");
   assert.equal(write.effects.size, 2);
+});
+
+test("a re-run whose answer is a refusal stays unknown, so a later retry still starts nothing new", async () => {
+  const { db, store, open } = setup();
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  // The first try claimed the stack call and stopped: it may have written.
+  await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: STACK, ordinal: 1 }, ops.intentSha(STACK, input()), input());
+  await expireLeases(db);
+  const refuse = async () => ({ failed: false, result: JSON.stringify({ error: 'No stack named "synthetic morning".' }) });
+  const unsure = await (await open()).run(STACK, input(), refuse);
+  assert.equal(JSON.parse(unsure.result).uncertain, true, "not 'not saved': the earlier write may exist");
+  assert.equal(unsure.receipt.status, "unknown");
+  assert.equal(db.rows("chat_operations")[0].status, "unknown");
+  const write = keyedWrite();
+  const fresh = await (await open()).run(INTAKE, { product: "synthetic x" }, write.execute("X"));
+  assert.equal(JSON.parse(fresh.result).conflict, true);
+  assert.equal(write.effects.size, 0);
 });
 
 test("a re-run gets the context the operation first ran with (its behavioral day), not the retry's", async () => {
@@ -470,14 +519,17 @@ test("a re-run gets the context the operation first ran with (its behavioral day
     fail: ({ table, op, payload }) => (failFinish && table === "chat_operations" && op === "update" && payload && payload.status ? { code: "08006" } : null),
   });
   const seen = [];
-  const execute = async (opId, context) => {
+  const checks = [];
+  const execute = async (opId, context, check) => {
     seen.push(context.behavioral_today);
+    checks.push(check);
     return { failed: false, result: JSON.stringify({ success: true, entry: { question: "Synthetic habit", answer: "Yes", cycle_date: context.behavioral_today } }) };
   };
   await (await open()).run("mark_habit_complete", { habit: "Synthetic habit" }, execute, { behavioral_today: "2030-01-01" });
   failFinish = false;
   const again = await (await open()).run("mark_habit_complete", { habit: "Synthetic habit" }, execute, { behavioral_today: "2030-01-02" });
   assert.deepEqual(seen, ["2030-01-01", "2030-01-01"], "the re-run after the day rolled over keeps the first day");
+  assert.deepEqual(checks, [false, true], "the first run writes; the re-run of an unconfirmed habit answer only checks");
   assert.match(again.receipt.details.join(" "), /2030-01-01/);
 });
 
@@ -553,28 +605,6 @@ test("a playlist found with its tracks unconfirmed is never made again and its r
   assert.ok(found.receipt.details.includes(ops.PLAYLIST_TRACKS_UNCONFIRMED));
   assert.equal(found.receipt.link.href, "https://open.spotify.com/playlist/pl2");
   assert.equal(db.rows("chat_operations")[0].status, "done", "it exists: a later retry replays it and never creates");
-});
-
-test("a quiz is looked up under the book pinned when the operation began, not the one being read now", async () => {
-  const { db, store, open } = setup({
-    tables: {
-      books: [
-        { book_id: 3, slug: "synthetic-book", status: "finished", created_at: "2029-06-01T00:00:00.000Z" },
-        { book_id: 5, slug: "newer-synthetic-book", status: "reading", created_at: "2029-09-01T00:00:00.000Z" },
-      ],
-    },
-  });
-  const QUIZ = "record_reading_quiz";
-  const call = { checkpoint: "ch3", score: 5, total: 5 };
-  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
-  const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call, { book_id: 3 });
-  await expireLeases(db);
-  db.seed("reading_quizzes", [
-    { quiz_id: 21, book_id: 5, checkpoint: "ch3", score: 5, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at },
-    { quiz_id: 22, book_id: 3, checkpoint: "ch3", score: 5, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at },
-  ]);
-  const found = await (await open({ reconcilers: ops.supabaseReconcilers(db) })).run(QUIZ, call, async () => ({ failed: false, result: "{}" }));
-  assert.equal(JSON.parse(found.result).quiz_id, 22);
 });
 
 test("a request read back by its id alone: none, running, then what it saved (refused calls left out)", async () => {

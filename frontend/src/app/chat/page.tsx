@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSend, type ChatMessage, type PendingSend } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSends, rememberPendingSend, seenPendingSends, settledPendingSends, type ChatMessage, type PendingSend } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
@@ -14,34 +14,32 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
  * The send that failed: its text, its request id and where in the conversation it was sent. Sending the same text
  * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
  * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. A send whose
- * answer never arrived is also remembered on this device for a while (hash + id only, PENDING_SEND_KEY), so the same
- * conversation sent again after a reload or a closed tab is still recognised.
+ * answer never arrived is also remembered on this device until it is resolved (hash + id only, PENDING_SEND_KEY, no
+ * expiry), so the same conversation sent again after a reload or a closed tab, however much later, is still
+ * recognised.
  */
 interface FailedSend { text: string; requestId: string; at: number }
 
-function readPendingSend(): PendingSend | null {
+function readPendingSends(): PendingSend[] {
   try {
-    const raw = window.localStorage.getItem(PENDING_SEND_KEY);
-    const pending = parsePendingSend(raw, Date.now());
-    if (raw && !pending) window.localStorage.removeItem(PENDING_SEND_KEY);
-    return pending;
+    return parsePendingSends(window.localStorage.getItem(PENDING_SEND_KEY));
   } catch {
-    return null;
+    return [];
   }
 }
 
-function writePendingSend(pending: PendingSend | null) {
+function writePendingSends(list: PendingSend[]) {
   try {
-    if (pending) window.localStorage.setItem(PENDING_SEND_KEY, JSON.stringify(pending));
+    if (list.length > 0) window.localStorage.setItem(PENDING_SEND_KEY, JSON.stringify(list));
     else window.localStorage.removeItem(PENDING_SEND_KEY);
   } catch {
     /* storage full or blocked: the in-memory retry still works */
   }
 }
 
-/** An answer (or a definite refusal) arrived for this request: forget it, unless a newer send replaced it. */
+/** An answer (or a definite refusal) arrived for this request: it is resolved, forget it. */
 function settlePendingSend(requestId: string) {
-  if (readPendingSend()?.id === requestId) writePendingSend(null);
+  writePendingSends(settledPendingSends(readPendingSends(), requestId));
 }
 
 /**
@@ -103,15 +101,19 @@ export default function ChatPage() {
   }
 
   function dismissRecovery() {
-    // The remembered send itself stays (until it expires or a new send replaces it): the same message sent again
-    // from a fresh chat is still recognised as that request.
+    // The remembered send itself stays until it is resolved, so the same message sent again from a fresh chat is
+    // still recognised as that request. Once the server gave a definite account (settled / none) and Riley saw it, it
+    // is not shown again after the next reload; "running" or "could not check" is shown again.
+    const id = recoveryId.current;
+    if (id && (recovery?.state === "settled" || recovery?.state === "none")) writePendingSends(seenPendingSends(readPendingSends(), id));
     recoveryId.current = null;
     setRecovery(null);
   }
 
-  // A send was still waiting for its answer when this page was last left: show what it saved.
+  // A send was still waiting for its answer when this page was last left: show what the newest one not yet shown saved.
   useEffect(() => {
-    const pendingSend = readPendingSend();
+    const unseen = readPendingSends().filter((p) => !p.seen);
+    const pendingSend = unseen[unseen.length - 1];
     if (!pendingSend) return;
     recoveryId.current = pendingSend.id;
     void checkPendingSend(pendingSend.id);
@@ -143,11 +145,11 @@ export default function ChatPage() {
       // The same conversation as a send whose answer never arrived (before a reload or a closed tab): the same request.
       const conv = await conversationKey(updated);
       if (!requestId && conv) {
-        const stored = readPendingSend();
-        if (stored?.conv === conv) requestId = stored.id;
+        const stored = readPendingSends().find((p) => p.conv === conv);
+        if (stored) requestId = stored.id;
       }
       if (!requestId) requestId = newRequestId();
-      if (conv) writePendingSend({ conv, id: requestId, at: Date.now() });
+      if (conv) writePendingSends(rememberPendingSend(readPendingSends(), { conv, id: requestId, at: Date.now() }));
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

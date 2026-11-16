@@ -48,8 +48,14 @@ type Pds = SupabaseClient<any, any, any>;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** The key columns are new: until sql/chat_operations.sql is applied the key is ignored (codes only, never a 23505). */
+/**
+ * The key columns are missing (sql/chat_operations.sql not applied, or rolled back). Codes only, never a 23505. A
+ * keyed log is then REFUSED (nothing written), never written without its key: a retry could not find it again.
+ */
 const missingColumn = (error: { code?: string } | null | undefined) => !!error && (error.code === "42703" || error.code === "PGRST204");
+
+export const STACK_KEY_UNAVAILABLE =
+  "Onyx could not set up safe logging for this stack, so it was not logged and nothing was written. Try again in a moment.";
 
 export const eventKeyOf = (value: unknown): string | null =>
   typeof value === "string" && UUID_RE.test(value) ? value.toLowerCase() : null;
@@ -109,6 +115,8 @@ export async function logStackIntake(
   opts: { intake_date?: string | null; intake_time?: string | null; event_key?: string | null } = {},
 ): Promise<LogStackResult> {
   const key = eventKeyOf(opts.event_key);
+  // A key that was given but is not a UUID is refused, never dropped (the log would then be unkeyed).
+  if (!key && opts.event_key != null && opts.event_key !== "") return { ok: false, error: "event_key must be a UUID" };
   if (key) {
     const prior = await rowsForEvent(supabase, key);
     if (prior.length > 0) return replayStack(supabase, prior, stack_id);
@@ -162,14 +170,14 @@ export async function logStackIntake(
   }));
 
   const keyed = key ? rows.map((r, i) => ({ ...r, client_event_key: key, client_event_line: i })) : rows;
-  let { data: inserted, error: insErr } = await supabase
+  const { data: inserted, error: insErr } = await supabase
     .from("supplement_intake")
     .insert(keyed)
     .select("intake_id");
   let unreadable = false;
-  if (insErr && key && missingColumn(insErr)) {
-    ({ data: inserted, error: insErr } = await supabase.from("supplement_intake").insert(rows).select("intake_id"));
-  } else if (insErr && key) {
+  // Fail closed: the insert was rejected for the key columns, so nothing was written; it is not tried again unkeyed.
+  if (insErr && key && missingColumn(insErr)) return { ok: false, error: STACK_KEY_UNAVAILABLE };
+  if (insErr && key) {
     // The same event arrived twice at once (a 23505 on the key: the other call wrote the whole set), or the answer
     // was lost after the insert committed: read the rows back under the key.
     const prior = await rowsForEvent(supabase, key);

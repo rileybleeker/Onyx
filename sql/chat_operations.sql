@@ -31,13 +31,15 @@
 --                         retry's calls are matched to the stored rows by
 --                         content: a match gets the stored result back (or is
 --                         re-run when nothing was written, or when the write
---                         is keyed / idempotent); a call that matches nothing
---                         is refused while an earlier write is unmatched, and
---                         runs only past every earlier write. A Spotify
---                         playlist or quiz result is never re-run: it is
---                         looked up read-only (pds.spotify_playlists by its
---                         client_key, pds.reading_quizzes by book, checkpoint
---                         and score) and never created again by the retry.
+--                         is keyed by the operation id; a habit answer or a
+--                         highlight is re-run in check mode, which never
+--                         overwrites a change made since); a call that matches
+--                         nothing is refused once an earlier try wrote, or may
+--                         have written, anything. A Spotify playlist is never
+--                         re-run: it is looked up read-only in
+--                         pds.spotify_playlists by its client_key. A quiz
+--                         result is never re-run and has no lookup yet (no
+--                         operation key): it stays "check this".
 --
 -- The operation id (op_id) is also passed into the write itself, so a write
 -- that happened before the ledger could record it is found again:
@@ -60,9 +62,10 @@
 -- credential. There is no retention window yet (a scheduled clean-up needs
 -- Riley's approval; roadmap follow-up).
 --
--- Additive and safe to re-run (IF NOT EXISTS everywhere). Until it is applied
--- the route detects the missing table and runs as before (no ledger); the new
--- intake columns are ignored the same way.
+-- Additive and safe to re-run (IF NOT EXISTS everywhere). Fail closed: while
+-- it is not applied (or after a rollback) a request with a request_id runs no
+-- write tool (questions are still answered), and a keyed intake or session is
+-- refused rather than written without its key.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS pds.chat_requests (

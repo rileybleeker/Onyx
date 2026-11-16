@@ -77,23 +77,40 @@ test("another event key is another log, and no key keeps the old behaviour (a ne
   assert.ok(rows.filter((r) => r.client_event_key === null).every((r) => r.client_event_line === null));
 });
 
-test("a malformed key is ignored rather than stored", async () => {
+test("a malformed key is refused, never dropped (the log would be unkeyed)", async () => {
   const d = db();
-  await stacks.logStackIntake(d, 7, { event_key: "not-a-uuid" });
-  assert.ok(d.rows("supplement_intake").every((r) => r.client_event_key === null));
+  const out = await stacks.logStackIntake(d, 7, { event_key: "not-a-uuid" });
+  assert.equal(out.ok, false);
+  assert.equal(out.incomplete, undefined);
+  const single = await intake.logSupplementIntake(d, { product: "Synthetic Calm", event_key: "not-a-uuid" });
+  assert.equal(single.ok, false);
+  assert.equal(d.rows("supplement_intake").length, 0, "nothing written");
 });
 
-test("before the key columns exist, a keyed stack log falls back to a plain insert", async () => {
-  const d = db({
-    fail: ({ table, op, payload }) =>
-      table === "supplement_intake" && ((op === "insert" && Array.isArray(payload) && payload.some((r) => "client_event_key" in r)) || op === "select")
-        ? { code: "PGRST204" }
-        : null,
-  });
+test("when the key columns are missing, a keyed log is refused (fail closed), never written without its key", async () => {
+  const missing = () =>
+    db({
+      fail: ({ table, op, payload }) =>
+        table === "supplement_intake" && ((op === "insert" && Array.isArray(payload) && payload.some((r) => "client_event_key" in r)) || op === "select")
+          ? { code: "PGRST204" }
+          : null,
+    });
+  const d = missing();
   const out = await stacks.logStackIntake(d, 7, { event_key: KEY });
-  assert.equal(out.ok, true);
-  assert.equal(d.rows("supplement_intake").length, 2);
-  assert.ok(d.rows("supplement_intake").every((r) => r.client_event_key === null));
+  assert.equal(out.ok, false);
+  assert.equal(out.error, stacks.STACK_KEY_UNAVAILABLE);
+  assert.equal(out.incomplete, undefined, "the insert was rejected: nothing was written");
+  assert.equal(d.rows("supplement_intake").length, 0);
+  assert.equal(d.log.filter((c) => c.table === "supplement_intake" && c.op === "insert").length, 1, "no second, unkeyed insert");
+  const d2 = missing();
+  const single = await intake.logSupplementIntake(d2, { product: "Synthetic Calm", event_key: KEY });
+  assert.equal(single.ok, false);
+  assert.equal(single.error, intake.INTAKE_KEY_UNAVAILABLE);
+  assert.equal(d2.rows("supplement_intake").length, 0);
+  // Without a key (the /supplements and /log pages) nothing changes.
+  const d3 = missing();
+  assert.equal((await stacks.logStackIntake(d3, 7, {})).ok, true);
+  assert.equal(d3.rows("supplement_intake").length, 2);
 });
 
 test("a failed stack insert writes nothing and says so", async () => {

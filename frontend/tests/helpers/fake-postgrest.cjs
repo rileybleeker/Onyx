@@ -1,5 +1,5 @@
 // Test helper (not a test: CI only runs tests/*.test.cjs). A small in-memory stand-in for the supabase-js query
-// builder: insert / upsert / update / select with eq / neq / in / gte / lt / is / order / limit / single / maybeSingle,
+// builder: insert / upsert (also ignoreDuplicates) / update / select with eq / neq / in / gte / lt / is / order / limit / single / maybeSingle,
 // unique keys per table (all-or-nothing inserts, a 23505 on a clash, keys with a NULL column never clash, like a
 // partial unique index) and injectable failures: one that writes nothing (`fail`) and one that writes and then loses
 // the answer (`lose`, e.g. a network error after the commit). Enough to run code that writes through PostgREST
@@ -32,7 +32,7 @@ function createFakePostgrest(options = {}) {
   };
 
   function query(table) {
-    const q = { op: "select", filters: [], orders: [], max: null, mode: "many", returning: false, payload: null, conflict: null };
+    const q = { op: "select", filters: [], orders: [], max: null, mode: "many", returning: false, payload: null, conflict: null, ignoreDuplicates: false };
     const shape = (list) => {
       if (q.mode === "single") return list.length === 1 ? { data: clone(list[0]), error: null } : { data: null, error: { code: "PGRST116" } };
       if (q.mode === "maybe") return list.length <= 1 ? { data: clone(list[0] ?? null), error: null } : { data: null, error: { code: "PGRST116" } };
@@ -54,6 +54,8 @@ function createFakePostgrest(options = {}) {
         for (const row of Array.isArray(q.payload) ? q.payload : [q.payload]) {
           const hit = cols.length ? all.find((r) => cols.every((c) => r[c] === row[c])) : null;
           if (hit) {
+            // ignoreDuplicates = INSERT ... ON CONFLICT DO NOTHING: the stored row stays as it is and is not returned.
+            if (q.ignoreDuplicates) continue;
             Object.assign(hit, clone(row));
             out.push(hit);
           } else {
@@ -111,6 +113,7 @@ function createFakePostgrest(options = {}) {
         q.op = "upsert";
         q.payload = payload;
         q.conflict = opts.onConflict ?? null;
+        q.ignoreDuplicates = opts.ignoreDuplicates === true;
         return api;
       },
       eq(col, value) {
