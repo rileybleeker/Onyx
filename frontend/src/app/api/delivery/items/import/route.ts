@@ -22,7 +22,8 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
 });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-const MODEL = "claude-opus-5-5";
+// A per-dish calorie guess does not need Opus (model routing policy, 2026-11-16).
+const MODEL = "claude-sonnet-5-5";
 const BATCH = 25;
 
 interface Body {

@@ -234,6 +234,7 @@ export async function POST(req: NextRequest) {
           system: systemPrompt,
           tools,
           messages,
+          output_config: { effort: "low" },
         });
 
         let iter = 0;
@@ -313,6 +314,7 @@ export async function POST(req: NextRequest) {
             system: systemPrompt,
             tools,
             messages,
+            output_config: { effort: "low" },
           });
         }
 
