@@ -43,7 +43,7 @@ Every message ends with its code in brackets (`[sf_reauth]`, `[account_unmatched
 | Other `[sf_...]` codes (amber) | SimpleFIN reported a connection, account or general problem; check its site. Most clear on the next run. |
 | `an account was not imported [account_unmatched]` (amber) | A new or renamed account could not be matched; see step 4. |
 | `a new account is balances-only ... [account_type_unset]` | Set `finance_accounts.account_type` (Cash or Credit Card) if its transactions should count. |
-| `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. Reported by the run that records them: if that run's ledger write then fails, the count is on its red `db_write_failed` heartbeat, and the next run (which writes those rows) does not report them again. If saving the record itself fails, the rows on record all the same (part of it was written, or the answer was lost) are counted on that red heartbeat and the others by the retry that records them; when the record cannot be read back, all of them are counted on the red heartbeat and the retry may count some again (never none). |
+| `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. Reported by the run that records them: if that run's ledger write then fails, the count is on its red `db_write_failed` heartbeat, and the next run (which writes those rows) does not report them again. If saving the record itself fails, the rows on record all the same (the write went through and its answer was lost; the record is saved in one statement, so it is all of it or none) are counted on that red heartbeat and the others by the retry that records them; when the record cannot be read back, all of them are counted on the red heartbeat and the retry may count some again (never none). |
 | `the cutover match record table is missing ... [cutover_provenance_unsaved]` (red) | Apply `sql/finance_cutover_matches.sql`. Nothing was written that run: a run with cutover decisions to record stops before the ledger, so no row is left out on a match that is not on record. |
 | `the SimpleFIN ETL could not write to Supabase [db_write_failed]` (red) | The cutover record (written first) or the ledger could not be written; the next run retries (every write is an upsert). |
 | `the SimpleFIN ETL could not read its cutover record ... [db_read_failed]` (red) | Nothing was written that run; the next run retries. If it repeats, check that Supabase is up and the table is readable. |
@@ -98,7 +98,10 @@ coffees on both sides both match. A group of unequal size is never guessed, in e
 identity evidence): two identical new rows and one Rocket Money row, and also one coffee with two identical Rocket
 Money twins (which twin it is, or whether either is, is not known). All of its SimpleFIN rows are kept as
 ambiguous and recorded with every candidate (never cut to a few: those are the Rocket Money rows held on later
-runs), and its Rocket Money rows are held, so no other row is matched to them.
+runs), and its Rocket Money rows are held, so no other row is matched to them. The nearest date is judged over every
+contender, held rows and ambiguous rows included: a row whose nearest Rocket Money candidate is held, or a Rocket
+Money row whose nearest SimpleFIN row is ambiguous, is never paired with a farther row instead. That row is kept as
+ambiguous with all its candidates.
 
 Every SimpleFIN row of the response takes part, also the rows before the window, so a Rocket Money row whose twin is
 before the window is taken by that twin and a later purchase of the same amount is not matched to it. That match is
@@ -138,8 +141,9 @@ are in the ledger (counts only).
 
 The matches and the kept rows are recorded in `pds.finance_cutover_matches` (`sql/finance_cutover_matches.sql`,
 service-role only): the SimpleFIN row's key, the decision, its evidence and the Rocket Money key(s), no amounts or
-text. The record is written **before** the ledger, and a run that cannot write it writes nothing (`[db_write_failed]`,
-red; the next run retries): a row is left out of the ledger, and its Rocket Money twin taken, only by a match on
+text. The record is written **before** the ledger, as the run's whole set in one statement (all of it is on record,
+or none of it: never one of two competing rows without the other), and a run that cannot write it writes nothing
+(`[db_write_failed]`, red; the next run retries): a row is left out of the ledger, and its Rocket Money twin taken, only by a match on
 record. Otherwise a failed record followed by a SimpleFIN answer without that row could let another purchase take the
 same Rocket Money row. While the table does not exist, a run with decisions to record stops the same way
 (`[cutover_provenance_unsaved]`, red); `--dry-run` says so. Any other error reading the record fails the run

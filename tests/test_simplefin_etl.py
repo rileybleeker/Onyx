@@ -624,9 +624,57 @@ def test_cutover_every_candidate_is_recorded_and_held():
     new = row("n", "2026-11-12", 330, desc="DEMO DELI ATLANTA GA")
     kept, dropped, decisions = sf.apply_cutover([new], hist, CUT, {r["txn_key"] for r in twelve}, records=saved)
     assert kept == [new] and not dropped and decided(decisions) == {"n": ("ambiguous", None, every)}
-    # A record that named only the first ten would have freed the eleventh row for the new purchase.
+    # A record that named only the first ten would leave the eleventh row free. Here the ten held rows are as near
+    # to the new purchase as the eleventh, so they still block it (R4: a held contender counts for the nearest
+    # date); an eleventh row a day nearer would be matched, and only the full record holds it.
     cut = {k: dict(r, history_txn_keys=r["history_txn_keys"][:10]) for k, r in saved.items()}
-    assert sf.apply_cutover([new], hist, CUT, set(), records=cut)[0] == []
+    assert sf.apply_cutover([new], hist, CUT, set(), records=cut)[0] == [new]
+    nearer = hist[:10] + [dict(hist[10], txn_date="2026-11-12")]
+    assert sf.apply_cutover([new], nearer, CUT, set(), records=cut)[0] == []
+    assert decided(sf.apply_cutover([new], nearer, CUT, set(), records=saved)[2]) == {"n": ("ambiguous", None, every)}
+
+
+def test_cutover_nearest_held_candidate_is_never_skipped():
+    """Codex review (R4): the nearest date is judged over every contender, held rows included. A row whose nearest
+    Rocket Money candidate is held (by a recorded ambiguity, or by an ambiguous group of this run) is never paired
+    with a farther, otherwise eligible purchase instead: it is kept and recorded as ambiguous with both. The same
+    from the Rocket Money side: a row whose nearest SimpleFIN row is ambiguous is not given to a farther one."""
+    h1 = hrow("h1", "2026-11-09", 610, None, name="Demo Cafe")
+    h2 = hrow("h2", "2026-11-11", 610, None, name="Demo Cafe")
+    s = row("s", "2026-11-09", 610, desc="SQ *DEMO CAFE ATLANTA GA")
+    assert sf.merchant_evidence(s, h2) and sf.date_gap(s, h2) == 2
+    assert decided(sf.apply_cutover([s], [h2], CUT, set())[2]) == {"s": ("matched", "merchant", ("h2",))}, \
+        "alone, the farther purchase would be its twin"
+    assert decided(sf.apply_cutover([s], [h1, h2], CUT, set())[2]) == {"s": ("matched", "merchant", ("h1",))}
+    # h1 held by a row recorded as ambiguous and missing from this answer: s is kept, never matched to h2.
+    held = {"x1": {"decision": "ambiguous", "history_txn_keys": ["h1"]}}
+    kept, dropped, decisions = sf.apply_cutover([s], [h1, h2], CUT, set(), records=held)
+    assert kept == [s] and not dropped and decided(decisions) == {"s": ("ambiguous", None, ("h1", "h2"))}
+    assert sf.new_review_count(decisions, held) == 1
+    # Held by this run's exact step: two identical rows for one Rocket Money row (ambiguous), and a third row on the
+    # same day whose text differs. Its nearest candidate k1 is held, so it does not take k2 two days later. The two
+    # ambiguous rows record k2 too, so it stays held while they are missing from a later answer.
+    k1 = hrow("k1", "2026-11-09", 820, "DEMO DELI ATLANTA")
+    k2 = hrow("k2", "2026-11-11", 820, "DEMO DELI ATLANTA")
+    d = row("d", "2026-11-09", 820, desc="DEMO DELI ATLANTA")
+    e = row("e", "2026-11-09", 820, desc="DEMO DELI ATLANTA")
+    f = row("f", "2026-11-09", 820, desc="DEMO DELI ATLANTA GA")
+    assert sf.exact_key(f) != sf.exact_key(k1) and sf.merchant_evidence(f, k2)
+    kept, dropped, decisions = sf.apply_cutover([d, e, f], [k1, k2], CUT, set())
+    assert sorted(r["txn_key"] for r in kept) == ["d", "e", "f"] and not dropped
+    assert decided(decisions) == {k: ("ambiguous", None, ("k1", "k2")) for k in ("d", "e", "f")}
+    assert sf.apply_cutover([f, e, d], [k2, k1], CUT, set())[2] == decisions, "order-independent"
+    # Rocket Money side: a is the only SimpleFIN row for two identical Rocket Money rows m1 and m1b (ambiguous) and is
+    # a day from m2; b is two days from m2. m2's nearest SimpleFIN row is a, so b is not matched to it.
+    m1 = hrow("m1", "2026-11-09", 930, "DEMO DELI ATLANTA")
+    m1b = hrow("m1b", "2026-11-09", 930, "DEMO DELI ATLANTA")
+    m2 = hrow("m2", "2026-11-10", 930, "DEMO DELI ATLANTA")
+    a = row("a", "2026-11-09", 930, desc="DEMO DELI ATLANTA")
+    b = row("b", "2026-11-12", 930, desc="DEMO DELI ATLANTA GA")
+    assert decided(sf.apply_cutover([b], [m2], CUT, set())[2]) == {"b": ("matched", "merchant", ("m2",))}
+    kept, dropped, decisions = sf.apply_cutover([a, b], [m1, m1b, m2], CUT, set())
+    assert sorted(r["txn_key"] for r in kept) == ["a", "b"] and not dropped
+    assert decided(decisions) == {k: ("ambiguous", None, ("m1", "m1b", "m2")) for k in ("a", "b")}
 
 
 def test_cutover_recorded_matches_hold_across_runs():
@@ -1154,13 +1202,13 @@ def test_run_cutover_record_is_saved_before_the_ledger():
 
 
 def test_run_partly_saved_record_reports_review():
-    """Codex review: a failed save of the record may have written part or all of it all the same (an earlier chunk,
-    or the write went through and its answer was lost). The rows kept for review that are on record are reported on
-    that failed heartbeat, since the retry reads them as recorded; nothing is written to the ledger. When the record
-    cannot be read back, every such row is reported there (the retry may report it again, but it is never left
-    unreported)."""
+    """Codex review: a failed save of the record may have written it all the same (the write went through and its
+    answer was lost; the save is one statement, so it is all of the set or none of it: R5). The rows kept for review
+    that are on record are reported on that failed heartbeat, since the retry reads them as recorded; nothing is
+    written to the ledger. When the record cannot be read back, every such row is reported there (the retry may
+    report it again, but it is never left unreported)."""
     class PartSave(FakeStore):
-        mode = "review_only"      # what the failing save writes before it raises; "ok" = a normal save
+        mode = "all"              # what the failing save writes before it raises; "ok" = a normal save
         readback_fails = False
 
         def __init__(self, *a, **kw):
@@ -1176,31 +1224,28 @@ def test_run_partly_saved_record_reports_review():
         def save_cutover_decisions(self, rows):
             if self.mode == "ok":
                 return super().save_cutover_decisions(rows)
-            if self.mode == "review_only":     # the chunk holding the review row was written, a later one failed
-                super().save_cutover_decisions([r for r in rows if r["decision"] != "matched"])
-            elif self.mode == "all":           # written, but the answer was lost
+            if self.mode == "all":             # written, but the answer was lost
                 super().save_cutover_decisions(rows)
             raise FakeApiError("57014", pii_msg())
 
     w1, w2 = sf.txn_key("S-WF", "w1"), sf.txn_key("S-WF", "w2")
-    for mode in ("review_only", "all"):
-        store = cutover_store(PartSave)
-        store.mode = mode
-        lines = []
-        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1, mode
-        assert [b[:2] for b in store.beats] == [("transactions", "failed"), ("balances", "failed")]
-        note = sf.format_notes({"db_write_failed": 1, "cutover_review": 1})
-        assert store.beats[0][3] == store.beats[1][3] == note, mode
-        assert not (store.txns or store.balances or store.created or store.links), "nothing written to the ledger"
-        assert store.saved[w1]["decision"] == "unconfirmed"
-        assert_no_pii("\n".join(lines) + store.beats[0][3])
-        # The retry records the rest and writes the ledger; the review row is not reported a second time.
-        store.mode = "ok"
-        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
-        assert [(b[1], b[3]) for b in store.beats[2:]] == [("success", None), ("success", None)], mode
-        assert store.saved[w2]["decision"] == "matched"
-        written = {t["source_txn_id"] for t in store.txns}
-        assert "sf:S-WF:w1" in written and "sf:S-WF:w2" not in written
+    store = cutover_store(PartSave)
+    store.mode = "all"
+    lines = []
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+    assert [b[:2] for b in store.beats] == [("transactions", "failed"), ("balances", "failed")]
+    note = sf.format_notes({"db_write_failed": 1, "cutover_review": 1})
+    assert store.beats[0][3] == store.beats[1][3] == note
+    assert not (store.txns or store.balances or store.created or store.links), "nothing written to the ledger"
+    assert store.saved[w1]["decision"] == "unconfirmed"
+    assert_no_pii("\n".join(lines) + store.beats[0][3])
+    # The retry records the set again and writes the ledger; the review row is not reported a second time.
+    store.mode = "ok"
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert [(b[1], b[3]) for b in store.beats[2:]] == [("success", None), ("success", None)]
+    assert store.saved[w2]["decision"] == "matched"
+    written = {t["source_txn_id"] for t in store.txns}
+    assert "sf:S-WF:w1" in written and "sf:S-WF:w2" not in written
     # Nothing written and the record unreadable after the failure: reported on the failed heartbeat all the same,
     # and again by the retry that records it.
     store = cutover_store(PartSave)
@@ -1215,6 +1260,126 @@ def test_run_partly_saved_record_reports_review():
     store.mode = "none"
     assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 1
     assert store.beats[0][3] == sf.format_notes({"db_write_failed": 1})
+
+
+class OneStatementDb:
+    """A fake Supabase client for Store.save_cutover_decisions. Like PostgREST, each request is one statement in one
+    transaction: it lands whole or not at all. `fail` names the requests that fail, by number from 0."""
+
+    def __init__(self, fail=()):
+        self.fail, self.requests, self.rows = set(fail), [], {}
+
+    def schema(self, name):
+        assert name == "pds"
+        return self
+
+    def from_(self, table):
+        self._table = table
+        return self
+
+    def upsert(self, rows, on_conflict=None):
+        self._pending = (self._table, [dict(r) for r in rows], on_conflict)
+        return self
+
+    def execute(self):
+        table, rows, on_conflict = self._pending
+        n = len(self.requests)
+        self.requests.append((table, len(rows), on_conflict))
+        if n in self.fail:
+            raise FakeApiError("57014", pii_msg())   # rolled back: none of its rows land
+        assert len({r["sf_txn_key"] for r in rows}) == len(rows), "one statement cannot upsert a key twice"
+        self.rows.update({r["sf_txn_key"]: r for r in rows})
+
+
+def test_cutover_record_is_saved_in_one_statement():
+    """Codex review (R5): the run's whole decision set goes in ONE upsert request, so it is on record completely or
+    not at all. Saved in requests of CHUNK rows, a request after the first failing left part of the set on record."""
+    decisions = [sf.CutoverDecision(f"s{i:04d}", "wf1", "ambiguous", None, ("h1",), "2026-11-11")
+                 for i in range(2 * sf.CHUNK + 7)]
+    rows = sf.decision_rows(decisions, NOW)
+    db = OneStatementDb(fail=range(1, 10))   # a second request would fail, as a second chunk did
+    sf.Store(db).save_cutover_decisions(rows)
+    assert db.requests == [("finance_cutover_matches", len(rows), "sf_txn_key")] and len(db.rows) == len(rows)
+    db = OneStatementDb(fail={0})            # the one request fails: nothing is on record
+    try:
+        sf.Store(db).save_cutover_decisions(rows)
+    except FakeApiError:
+        pass
+    else:
+        raise AssertionError("a failed save must raise")
+    assert db.rows == {} and len(db.requests) == 1
+    db = OneStatementDb()
+    sf.Store(db).save_cutover_decisions([])
+    assert db.requests == [], "nothing to record: no request"
+    # A key twice (a run never decides one row twice, but one statement could not upsert it): one row, the last.
+    db = OneStatementDb()
+    sf.Store(db).save_cutover_decisions(rows[:2] + [dict(rows[0], decision="unconfirmed")])
+    assert db.requests[0][1] == 2 and db.rows[rows[0]["sf_txn_key"]]["decision"] == "unconfirmed"
+
+
+def test_run_failed_record_save_never_leaves_part_of_the_set():
+    """Codex review (R5), end to end with the real Store save: two identical purchases compete for one Rocket Money
+    row (ambiguous) among more than CHUNK other decisions, the case where saving in chunks could put one contender
+    on record and lose the other. On a database where every request after the first fails (as a second chunk did),
+    the whole set is on record, so a later answer without one contender keeps the other ambiguous and in the ledger.
+    When the one request fails, nothing is on record and nothing is written: the failed run leaves no trace, so the
+    next answer (one without a contender) is decided exactly as on a store that never saw that run. A record that
+    holds one contender and not the other can no longer exist."""
+    n = sf.CHUNK + 20
+    window = [hrow("rm-x", "2026-11-09", 820, "DEMO DELI ATLANTA")] + [
+        hrow(f"rm-f{i:04d}", "2026-11-01", 100 + i, f"DEMO SHOP {i:04d}") for i in range(n)]
+    fillers = [txn(f"f{i:04d}", "2026-11-01", f"-{(100 + i) / 100:.2f}", f"DEMO SHOP {i:04d}") for i in range(n)]
+
+    def answer(*contenders):
+        return wf_answer(*[txn(k, "2026-11-09", "-8.20", "DEMO DELI ATLANTA") for k in contenders], *fillers)
+
+    class RealSave(FakeStore):
+        def __init__(self, db):
+            super().__init__(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+            self.db = db
+
+        def cutover_decisions(self):
+            return {k: {"decision": r["decision"], "history_txn_keys": list(r["history_txn_keys"])}
+                    for k, r in self.db.rows.items()}
+
+        def save_cutover_decisions(self, rows):
+            sf.Store(self.db).save_cutover_decisions(rows)
+
+    quiet = lambda *_: None  # noqa: E731
+    x1, x2 = sf.txn_key("S-WF", "x1"), sf.txn_key("S-WF", "x2")
+    # Every request after the first fails: the set is one request, so it is all on record.
+    store = RealSave(OneStatementDb(fail=range(1, 10)))
+    assert sf.run(store, Http(get=Res(200, answer("x1", "x2"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert [r[1] for r in store.db.requests] == [n + 2]
+    rec = store.cutover_decisions()
+    assert rec[x1] == rec[x2] == {"decision": "ambiguous", "history_txn_keys": ["rm-x"]}
+    assert sum(1 for r in rec.values() if r["decision"] == "matched") == n
+    assert {sf.txn_key("S-WF", "x1"), sf.txn_key("S-WF", "x2")} <= {t["txn_key"] for t in store.txns}
+    # The next answer lacks x2: rm-x stays held, so x1 stays ambiguous (never matched to it) and in the ledger.
+    store.db.fail = set()
+    assert sf.run(store, Http(get=Res(200, answer("x1"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert store.cutover_decisions()[x1] == {"decision": "ambiguous", "history_txn_keys": ["rm-x"]}
+    # The one request fails: nothing on record, nothing written, the run fails.
+    store = RealSave(OneStatementDb(fail={0}))
+    assert sf.run(store, Http(get=Res(200, answer("x1", "x2"))), ACCESS, 60, False, now=NOW, out=quiet) == 1
+    assert store.db.rows == {} and not (store.txns or store.balances or store.created or store.links)
+    # Nothing is on record, so the review rows are reported by the run that records them, not here.
+    assert store.beats[0][1] == "failed" and store.beats[0][3] == sf.format_notes({"db_write_failed": 1})
+    # The answer after it lacks x2 and is decided exactly as on a store that never saw the failed run.
+    store.db.fail = set()
+    fresh = RealSave(OneStatementDb())
+    for s in (store, fresh):
+        assert sf.run(s, Http(get=Res(200, answer("x1"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert store.cutover_decisions() == fresh.cutover_decisions()
+    assert sorted(t["txn_key"] for t in store.txns) == sorted(t["txn_key"] for t in fresh.txns)
+    # With the full answer instead, the retry records both contenders in one statement, and they hold as above.
+    store = RealSave(OneStatementDb(fail={0}))
+    assert sf.run(store, Http(get=Res(200, answer("x1", "x2"))), ACCESS, 60, False, now=NOW, out=quiet) == 1
+    store.db.fail = set()
+    assert sf.run(store, Http(get=Res(200, answer("x1", "x2"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert sf.run(store, Http(get=Res(200, answer("x1"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert store.cutover_decisions()[x1]["decision"] == "ambiguous"
+    assert sf.txn_key("S-WF", "x1") in {t["txn_key"] for t in store.txns}
 
 
 def test_run_recorded_match_survives_a_response_without_its_row():

@@ -25,18 +25,20 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      store numbers that contradict ('DEMO DELI 0042' and 'DEMO DELI 0099'), are never a match (a shared STORE or
      COFFEE is no evidence). A group of candidate pairs is a match only when it is one to one, or when it has as many
      SimpleFIN rows as Rocket Money rows and its rows cannot be told apart on either side; a group of unequal size is
-     never guessed (key order is not identity evidence). Every SimpleFIN row of the response takes part, so a Rocket
-     Money row whose twin is before the window is taken by that twin, and a Rocket Money row an earlier run matched
-     stays taken (pds.finance_cutover_matches); the candidates of a row recorded as ambiguous stay held while that
-     row is missing from a later answer, and a recorded claim or hold the run no longer makes is recorded again as
-     'unconfirmed' (kept for review), never left behind. An equal amount alone never drops a row: a row with
-     competing candidates ('ambiguous') or with a same-amount Rocket Money row nearby but no merchant evidence
-     ('unconfirmed') is KEPT and counted for review. Every match and every row kept for review is recorded (also the
-     decisions on rows dropped before the window, which hold or take a Rocket Money row) in
-     pds.finance_cutover_matches (keys only) BEFORE the ledger is written: when that record cannot be read (other
-     than not applied yet), cannot be written, or is missing while there are decisions to record, the run fails
-     before writing anything, so a row is never left out on a match that is not on record. Rows already stored by an
-     earlier SimpleFIN run are always rewritten in place.
+     never guessed (key order is not identity evidence). The smallest date gap is found over every contender, held
+     and ambiguous rows included, so a row whose nearest candidate is held is never paired with a farther one. Every
+     SimpleFIN row of the response takes part, so a Rocket Money row whose twin is before the window is taken by that
+     twin, and a Rocket Money row an earlier run matched stays taken (pds.finance_cutover_matches); the candidates of
+     a row recorded as ambiguous stay held while that row is missing from a later answer, and a recorded claim or
+     hold the run no longer makes is recorded again as 'unconfirmed' (kept for review), never left behind. An equal
+     amount alone never drops a row: a row with competing candidates ('ambiguous') or with a same-amount Rocket Money
+     row nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review. Every match and every row
+     kept for review is recorded (also the decisions on rows dropped before the window, which hold or take a Rocket
+     Money row) in pds.finance_cutover_matches (keys only; the run's whole set in one statement, so it is never on
+     record in part) BEFORE the ledger is written: when that record cannot be read (other than not applied yet),
+     cannot be written, or is missing while there are decisions to record, the run fails before writing anything, so
+     a row is never left out on a match that is not on record. Rows already stored by an earlier SimpleFIN run are
+     always rewritten in place.
   4. Category (SimpleFIN sends none; /financials needs one to keep card payments and transfers out of spending):
      a payment/transfer pair (same amount, opposite sign, two of Riley's accounts, within PAIR_DAYS, one side worded
      like a payment or transfer) -> "Credit Card Payment" or "Internal Transfers"; else the category Rocket Money
@@ -869,7 +871,7 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
         elif claimants - present.keys():
             used.add(hk)
         elif evidenced:
-            held.add(hk)   # two present claimants still evidenced (a partly saved record): never guessed
+            held.add(hk)   # two present claimants still evidenced (a record this code never writes): never guessed
     #    Ambiguities: the candidates of a row recorded as ambiguous and missing from this response are held. A row
     #    recorded as ambiguous that is here competes again on its own.
     for sk, keys in recorded_holds(records).items():
@@ -907,14 +909,22 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
     #    _resolve, like step 1. Rounds repeat on what is left until one matches nothing. A row still holding
     #    candidates then is ambiguous (a tie, rows that can be told apart, a group of unequal size, or a twin held by
     #    step 1) and is kept. Every candidate is recorded, none cut: step 0 holds them all on later runs.
+    #    The smallest date gaps are taken over EVERY contender (Codex review R4): a held Rocket Money row (step 0 or
+    #    1) and a SimpleFIN row step 1 left ambiguous count too. Held and ambiguous rows are never matched here, but a
+    #    group they are nearest in is not matched either, so a row whose nearest candidate is held, or a Rocket Money
+    #    row whose nearest SimpleFIN row is ambiguous, is never paired with a farther row instead (that would guess
+    #    another purchase and drop a real one). A row step 1 left ambiguous also records its merchant candidates, so
+    #    they stay held while it is missing from a later answer.
     rest = [r for r in rows if r["txn_key"] not in found]
-    free = {h["txn_key"]: h for h in pool if h["txn_key"] not in used}   # held rows included: candidates only
+    contested = {sk for sk, (decision, _, _) in found.items() if decision == "ambiguous"}   # step 1: never matched
+    contenders = rest + [r for r in rows if r["txn_key"] in contested]
+    free = {h["txn_key"]: h for h in pool if h["txn_key"] not in used}   # held rows included: contenders only
     near = {r["txn_key"]: [h for h in free.values() if h["amount_cents"] == r["amount_cents"]
-                           and _currency(h) == _currency(r) and date_gap(r, h) <= OVERLAP_DAYS] for r in rest}
+                           and _currency(h) == _currency(r) and date_gap(r, h) <= OVERLAP_DAYS] for r in contenders}
     edge_gap = {(r["txn_key"], h["txn_key"]): date_gap(r, h)
-                for r in rest for h in near[r["txn_key"]] if merchant_evidence(r, h)}
+                for r in contenders for h in near[r["txn_key"]] if merchant_evidence(r, h)}
     while True:
-        live = {e: g for e, g in edge_gap.items() if e[0] not in found and e[1] not in used and e[1] not in held}
+        live = {e: g for e, g in edge_gap.items() if (e[0] not in found or e[0] in contested) and e[1] not in used}
         s_min: dict[str, int] = {}
         h_min: dict[str, int] = {}
         for (sk, hk), g in live.items():
@@ -923,6 +933,8 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
         nearest = sorted(e for e, g in live.items() if g == s_min[e[0]] == h_min[e[1]])
         matched = 0
         for ss, hs in _components(nearest):
+            if held.intersection(hs) or contested.intersection(ss):
+                continue   # a nearest contender is held or ambiguous: never matched, never moved to a farther row
             pairs = _resolve(ss, hs, present, free)
             if pairs is None:
                 continue   # never guessed; the rows stay candidates and end up ambiguous unless a later round frees them
@@ -932,11 +944,13 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
                 matched += 1
         if not matched:
             break
-    for r in rest:
-        if r["txn_key"] not in found:
-            cands = tuple(sorted(hk for (sk, hk) in edge_gap if sk == r["txn_key"] and hk not in used))
-            if cands:
-                found[r["txn_key"]] = ("ambiguous", None, cands)
+    for r in contenders:
+        sk = r["txn_key"]
+        cands = {hk for (s, hk) in edge_gap if s == sk and hk not in used}
+        if sk in contested:
+            found[sk] = ("ambiguous", None, tuple(sorted(cands.union(found[sk][2]))))
+        elif sk not in found and cands:
+            found[sk] = ("ambiguous", None, tuple(sorted(cands)))
 
     # 3. Unconfirmed: an unclaimed Rocket Money row with the same amount is near, but nothing says it is the same
     #    purchase (the case an amount-only rule used to drop). Kept.
@@ -1240,8 +1254,16 @@ class Store:
         return out
 
     def save_cutover_decisions(self, rows: list[dict]) -> None:
-        for i in range(0, len(rows), CHUNK):
-            _t(self.supa, "finance_cutover_matches").upsert(rows[i:i + CHUNK], on_conflict="sf_txn_key").execute()
+        """The run's whole decision set in ONE upsert request (Codex review R5). PostgREST runs a request as one
+        statement in one transaction, so the set is on record completely or not at all. Never chunked: with chunks,
+        a later chunk failing left part of the set on record, and a contender whose decision was in the lost chunk
+        could not hold its Rocket Money candidate on a later answer without it, letting the surviving contender be
+        matched to it. The set is one run's cutover decisions (keys only): at most one small row per transaction in
+        the response. A key appears once (rows are unique per account and keys name the account); deduplicated all
+        the same, because one statement cannot upsert the same key twice."""
+        unique = list({r["sf_txn_key"]: r for r in rows}.values())
+        if unique:
+            _t(self.supa, "finance_cutover_matches").upsert(unique, on_conflict="sf_txn_key").execute()
 
     def heartbeat(self, data_type: str, status: str, records: int, started: float, error: Optional[str],
                   start: Optional[date] = None, end: Optional[date] = None) -> None:
@@ -1428,7 +1450,9 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     # The cutover decisions are recorded BEFORE the ledger is written, and a run that cannot record them writes
     # nothing (PIPE-04, Codex review). A matched row is left out of the ledger and its Rocket Money twin is taken
     # only by a durable record: a best-effort record after the writes could fail, and a later SimpleFIN answer
-    # without the claimant would then let another purchase take the same Rocket Money row. Recorded only by a run
+    # without the claimant would then let another purchase take the same Rocket Money row. The whole set is saved in
+    # one statement (Store.save_cutover_decisions), so a failed save leaves the record as it was, never in part
+    # (Codex review R5): a contender left off the record could not hold its candidate. Recorded only by a run
     # that read the record (saved is None only while the table is missing), so it is never rewritten from
     # decisions made without it; the table missing is then a failed run too (cutover_provenance_unsaved). The
     # workflow's concurrency group keeps two runs from deciding at once. A kept-for-review row is reported by the run
@@ -1472,10 +1496,11 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
 
 def review_on_record(store, plan: Plan, n: int) -> int:
     """After a failed save of the cutover record: how many of the n rows newly kept for review are on record all the
-    same (Codex review: an earlier chunk was written, or the write went through and its answer was lost). Those are
-    reported on the failed heartbeat, because the retry reads them as recorded and does not report them again; the
-    rest are reported by the run that records them. When the record cannot be read back, all n are reported here:
-    some may then be reported a second time by the retry, but none is never reported."""
+    same (Codex review: the save is one statement, so that is all of them when the write went through and its answer
+    was lost, and none when it did not). Those are reported on the failed heartbeat, because the retry reads them as
+    recorded and does not report them again; the rest are reported by the run that records them. When the record
+    cannot be read back, all n are reported here: some may then be reported a second time by the retry, but none is
+    never reported."""
     if not n:
         return 0
     try:
