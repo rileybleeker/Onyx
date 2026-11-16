@@ -651,6 +651,19 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(its sync hasn't reported a run/).isVisible());
         assert.equal(await quietPanel.getByText(/Nothing needs you/).count(), 0, 'missing sync freshness is never a clear day');
         await close(page);
+        // Money answered with no alert, but the cash forecast's input check failed: not an all-clear either.
+        page = await setup('empty', 390, false, 'none');
+        quietPanel = quietOf(page);
+        await settled(page);
+        await page.evaluate(() => { window.moneyFixture = { status: 'ready', alerts: [], asOf: new Date().toISOString(), cash: { eligible: false, reasons: ['The balance for Synthetic Checking is older than 48 hours.'] } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor();
+        assert(await quietPanel.getByText('Nothing to show yet, but not every source could be checked, so this is not an all-clear.').isVisible());
+        assert(await quietPanel.getByText(/Money \(the cash forecast's inputs are incomplete, so an alert may be missing\)/).isVisible());
+        assert.equal(await quietPanel.getByText(/Nothing needs you/).count(), 0, 'an incomplete cash forecast is never a clear day');
+        await close(page);
         // A failed save stays on this device and says so; Retry (Riley's tap) sends it.
         page = await setup('empty', 390, false, 'none');
         quietPanel = quietOf(page);

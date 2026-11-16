@@ -21,6 +21,10 @@ import { classifyTxn, isNonSpendingCategory } from "./finance-ledger";
 import { addDays, addMonths, daysBetween, displayMerchant, merchantKey, rowLabel, stableId } from "./procurement-recurring";
 import { FORECAST } from "./cash-forecast-config";
 import { wordKey } from "./finance-categories";
+import { UNVERIFIED } from "./cash-forecast-eligibility";
+
+// The eligibility readers live in a small module so client views can use them without bundling the engine.
+export { eligibilityOf, safeToMoveOf } from "./cash-forecast-eligibility";
 
 // ─── Types ────────────────────────────────────────────────────────────────────────────────────
 
@@ -103,6 +107,12 @@ export interface ForecastSettings {
   cardMonths?: number;
   /** Backtests only: the pool's opening balance, instead of the latest snapshots. */
   openingOverride?: { cents: number; asOf: string };
+  /**
+   * Pool accounts Riley left out of the safe-to-move amount (driver "safe-to-move", e.g. an account the feed can no
+   * longer refresh): their balance is not counted in the amount and is not checked for freshness. The projection
+   * still includes them.
+   */
+  safeToMoveLeaveOut?: readonly string[];
 }
 export interface ForecastInput {
   today: string;
@@ -117,6 +127,100 @@ export interface ForecastInput {
   /** What-ifs: extra payments to a card on a date (lower its balance and interest in the net worth side). */
   extraCardPayments?: readonly { account_key: string; date: string; cents: number }[];
   settings?: ForecastSettings;
+  /** What the caller knows about its own reads (the engine cannot see them); feeds `eligibility`. */
+  quality?: InputQuality;
+}
+
+/** What the caller's reads could not deliver. Each one withholds the safe-to-move amount. */
+export interface InputQuality {
+  /** A paged read stopped at its page limit: part of the balances or the transaction history is missing. */
+  historyTruncated?: boolean;
+  /** The planned items or the plan drivers (settings, tax profile, move, stream changes) could not be read. */
+  planUnavailable?: boolean;
+  /**
+   * The planned items or plan drivers read stopped at its page limit: it answered, but not with every row, so some
+   * planned payments or settings may be missing (a row cap is a success with fewer rows, never an error).
+   */
+  planTruncated?: boolean;
+  /** A saved tax profile or move plan was read but no longer parses, so its tax payments or move costs are missing. */
+  planInvalid?: boolean;
+  /** Riley's category fixes could not be read, so transfers and card payments are classified from raw categories. */
+  categoriesUnavailable?: boolean;
+  /** The category-fix read stopped at its page limit, so some of Riley's fixes were not applied. */
+  categoriesTruncated?: boolean;
+  /**
+   * Balance rows the loader read but could not match to any account (no account key). Any pool account's newest
+   * balance could be among them, so they withhold the amount and leaving an account out cannot clear that.
+   */
+  balanceRowsUnmatched?: number;
+  /**
+   * Pool accounts whose balance read FAILED (not "no row": the read itself errored), so their balance is unknown and
+   * could be an overdraft. Each withholds the amount even when Riley left the account out: leaving an account out
+   * narrows what the amount counts, it does not make an unread balance known.
+   */
+  balanceUnreadable?: readonly string[];
+}
+/** Why the forecast's inputs do not support an actionable amount. */
+export type EligibilityCode =
+  | "no-pool"
+  | "no-balance"
+  | "missing-balance"
+  | "invalid-balance"
+  | "stale-balance"
+  | "balance-unreadable"
+  | "freshness-unknown"
+  | "short-history"
+  | "history-truncated"
+  | "plan-unavailable"
+  | "plan-invalid"
+  | "categories-unavailable"
+  | "invalid-input"
+  | "unverified";
+export interface EligibilityReason {
+  code: EligibilityCode;
+  /** One short sentence, shown next to the withheld amount and on Today. */
+  text: string;
+  /**
+   * The pool account a balance reason is about: Riley can leave it out of the amount to clear the reason. Absent on
+   * a reason leaving an account out cannot clear (an unreadable balance).
+   */
+  account?: string;
+}
+/**
+ * A pool account whose balance the safe-to-move amount does not count (its positive part is taken out). Only Riley's
+ * explicit choice (driver "safe-to-move") leaves an account out: a stale balance of any size withholds the amount.
+ */
+export interface LeftOutAccount {
+  account: string;
+  label: string;
+  /** Its newest balance time (ISO); null when it has none. */
+  asOf: string | null;
+  /** Riley left it out ("Leave it out"). The only value: nothing leaves an account out automatically. */
+  why: "chosen";
+}
+/**
+ * Whether the inputs were complete and fresh enough for the ACTIONABLE number (safe to move). When false the
+ * projection is still drawn as an estimate; only `headlines.safeToMoveCents` is withheld (null). The forecast page,
+ * the what-if comparison and Today all read this one result (eligibilityOf / safeToMoveOf).
+ */
+export interface ForecastEligibility {
+  eligible: boolean;
+  reasons: EligibilityReason[];
+  /**
+   * When the check stops holding (ISO): the first balance the amount counts turns FORECAST.staleBalanceHours old.
+   * A stored result read after it is not eligible (eligibilityOf with a clock). Absent when no balance was checked.
+   */
+  validUntil?: string;
+  /** Pool accounts the amount does not count (named next to it). Absent when none. */
+  leftOut?: LeftOutAccount[];
+  /**
+   * The positive balance of the `leftOut` accounts (cents, >= 0; present with `leftOut`). Every ACTIONABLE number
+   * takes it out of the projection the same way: the safe-to-move amount and Today's low-cash alert (lib/finance-alerts.ts),
+   * so an account Riley left out never props up either. The projection itself still counts it.
+   */
+  leftOutCents?: number;
+  /** The oldest balance the amount counts (ISO). Absent when none was checked. */
+  cashAsOf?: string;
 }
 
 export interface ForecastLine {
@@ -221,10 +325,13 @@ export interface ForecastResult {
   planned: PlannedStatus[];
   weeks: Rollup[];
   months: Rollup[];
+  /** Whether the inputs support the actionable amount; read it through eligibilityOf() (stored results may predate it). */
+  eligibility: ForecastEligibility;
   headlines: {
     lowest: { date: string; cents: number } | null;
     lowestLikely: { date: string; cents: number } | null;
-    safeToMoveCents: number;
+    /** null = withheld: the inputs were incomplete, stale or unreadable (see `eligibility`). Read it through safeToMoveOf(). */
+    safeToMoveCents: number | null;
     end13w: { likely: number; low: number; high: number } | null;
     end12m: { likely: number; low: number; high: number } | null;
     nextPromoEnd: PromoMilestone | null;
@@ -475,14 +582,59 @@ export function poolAccountKeys(accounts: readonly ForecastAccount[], settings?:
   return accounts.filter((a) => isCashType(a.account_type)).map((a) => a.account_key);
 }
 
+/**
+ * The newest USABLE US-dollar balance per account (a finite amount), the one the estimate starts from. Rows in another
+ * currency, or with no usable amount (a row the loader kept as rejected: amount NaN), are skipped here; the gate reads
+ * them through unvaluedDebt / supersededByOtherCurrency, so a newer unusable row still withholds the amount.
+ */
 function latestBalances(balances: readonly ForecastBalance[]): Map<string, ForecastBalance> {
   const out = new Map<string, ForecastBalance>();
   for (const b of balances) {
     if ((b.currency ?? "USD").toUpperCase() !== "USD") continue;
+    if (!Number.isFinite(b.balance_cents)) continue;
     const cur = out.get(b.account_key);
     if (!cur || b.captured_at > cur.captured_at) out.set(b.account_key, b);
   }
   return out;
+}
+/**
+ * Whether `account` has a snapshot in another currency that is not older than the US-dollar one taken at `atMs`
+ * (latestBalances skips those rows), or one whose date cannot be compared. Then the US-dollar balance is not known to
+ * be the account's current one, so the safe-to-move gate must not count it as fresh.
+ */
+function supersededByOtherCurrency(balances: readonly ForecastBalance[], account: string, atMs: number): boolean {
+  return balances.some((x) => x.account_key === account && (x.currency ?? "USD").toUpperCase() !== "USD" && !(Date.parse(x.captured_at) < atMs));
+}
+/** What a balance row says about debt: "debt" (overdrawn or owed), "unknown" (no usable amount: it could be), or null. */
+function debtKind(x: ForecastBalance): "debt" | "unknown" | null {
+  if (!Number.isFinite(x.balance_cents)) return "unknown";
+  return x.balance_cents < 0 || (x.kind === "liability" && x.balance_cents !== 0) ? "debt" : null;
+}
+/**
+ * Whether `account`'s newest snapshot that cannot be valued in US dollars (another currency, or no usable amount) is,
+ * or could be, a debt. Only rows not older than the US-dollar balance in use count (`usdAtMs`; null = there is none,
+ * so every such row counts); a row whose date cannot be compared counts too (it may be the current one). The amount
+ * cannot value that debt, so leaving the account out would count it as $0: it withholds the amount even then.
+ */
+function unvaluedDebt(balances: readonly ForecastBalance[], account: string, usdAtMs: number | null): "debt" | "unknown" | null {
+  let newest: ForecastBalance | null = null;
+  let newestMs = Number.NEGATIVE_INFINITY;
+  let undated: "debt" | "unknown" | null = null;
+  for (const x of balances) {
+    if (x.account_key !== account) continue;
+    if ((x.currency ?? "USD").toUpperCase() === "USD" && Number.isFinite(x.balance_cents)) continue;
+    const ms = Date.parse(x.captured_at);
+    if (!Number.isFinite(ms)) {
+      undated = undated ?? debtKind(x);
+      continue;
+    }
+    if (usdAtMs !== null && ms < usdAtMs) continue;
+    if (ms > newestMs) {
+      newest = x;
+      newestMs = ms;
+    }
+  }
+  return (newest ? debtKind(newest) : null) ?? undated;
 }
 /** Owed on a card (positive) from its balance row: liabilities are stored as their size, sometimes negative. */
 const owedFrom = (b: ForecastBalance | undefined): number => (b ? Math.abs(b.balance_cents) : 0);
@@ -870,7 +1022,7 @@ function expandPlanned(items: readonly PlannedItem[]): PlannedOcc[] {
 
 // ─── The forecast ─────────────────────────────────────────────────────────────────────────────
 
-const EMPTY_HEADLINES: ForecastResult["headlines"] = { lowest: null, lowestLikely: null, safeToMoveCents: 0, end13w: null, end12m: null, nextPromoEnd: null };
+const EMPTY_HEADLINES: ForecastResult["headlines"] = { lowest: null, lowestLikely: null, safeToMoveCents: null, end13w: null, end12m: null, nextPromoEnd: null };
 
 export function forecastCash(input: ForecastInput): ForecastResult {
   const { today } = input;
@@ -885,11 +1037,32 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   const pool = poolKeys.map((k) => ({ account_key: k, label: accountsByKey.get(k)?.label ?? k }));
   const latest = latestBalances(input.balances);
 
+  // Eligibility: every reason the inputs do not support an actionable amount. Any reason withholds safe to move.
+  const reasons: EligibilityReason[] = [];
+  const reason = (code: EligibilityCode, text: string, account?: string) => {
+    // One reason per sentence and account: two pool accounts with the same label each keep their own Leave it out.
+    if (!reasons.some((r) => r.text === text && r.account === account)) reasons.push(account ? { code, text, account } : { code, text });
+  };
+  const notEligible = (): ForecastEligibility => ({ eligible: false, reasons: [...reasons] });
+  const quality = input.quality ?? {};
+  if (quality.historyTruncated) {
+    warnings.push("Part of the history was not read (page limit), so the forecast may be off.");
+    reason("history-truncated", "Part of the balance or transaction history was not read.");
+  }
+  if (quality.planUnavailable) reason("plan-unavailable", "Planned items or plan settings could not be read, so planned payments and taxes may be missing.");
+  if (quality.planTruncated) reason("plan-unavailable", "Not all planned items or plan settings were read (page limit), so planned payments and taxes may be missing.");
+  if (quality.planInvalid) reason("plan-invalid", "Your saved tax profile or move plan could not be read, so planned taxes or move costs may be missing.");
+  if (quality.categoriesUnavailable) reason("categories-unavailable", "Your category fixes could not be read, so some transfers or card payments may be counted as spending.");
+  if (quality.categoriesTruncated) reason("categories-unavailable", "Not all of your category fixes were read (page limit), so some transfers or card payments may be counted as spending.");
+  // A balance row matched to no account could be any pool account's newest one: withheld, with no Leave it out.
+  if (typeof quality.balanceRowsUnmatched === "number" && quality.balanceRowsUnmatched !== 0) reason("invalid-balance", "A balance could not be matched to an account.");
+
   const base: ForecastResult = {
     state: "ok",
     today,
     pool,
     opening: { cents: 0, asOf: null, stale: false },
+    eligibility: UNVERIFIED,
     days: [],
     lines: [],
     streams: [],
@@ -904,30 +1077,118 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     notes,
     warnings,
   };
-  if (!poolKeys.length) return { ...base, state: "no-pool" };
+  if (!poolKeys.length) {
+    reason("no-pool", "No checking or savings account found.");
+    return { ...base, state: "no-pool", eligibility: notEligible() };
+  }
 
   // Opening balance.
   let opening = 0;
   let asOf: string | null = null;
   let stale = false;
+  // What the actionable amount does not count, and how long its check holds (eligibility below).
+  const staleMs = FORECAST.staleBalanceHours * 3_600_000;
+  const leaveOut = new Set(settings.safeToMoveLeaveOut ?? []);
+  const unreadable = new Set(quality.balanceUnreadable ?? []);
+  const leftOut: LeftOutAccount[] = [];
+  let leftOutCents = 0;
+  let cashAsOf: string | null = null;
+  let validUntilMs = Number.POSITIVE_INFINITY;
   if (settings.openingOverride) {
     opening = Math.round(settings.openingOverride.cents);
     asOf = settings.openingOverride.asOf;
   } else {
     let found = 0;
     for (const k of poolKeys) {
+      const label = accountsByKey.get(k)?.label ?? k;
+      const chosen = leaveOut.has(k);
       const b = latest.get(k);
-      if (!b) {
-        warnings.push(`No balance for ${accountsByKey.get(k)?.label ?? k}: counted as $0.`);
+      // A balance read that failed: the balance is unknown (it could be an overdraft), so the amount is withheld
+      // whether or not Riley left the account out, and the reason carries no account (leaving it out cannot clear it).
+      if (unreadable.has(k)) reason("balance-unreadable", `The balance for ${label} could not be read.`);
+      const usable = !!b && Number.isFinite(b.balance_cents);
+      const usdAt = b && usable ? Date.parse(b.captured_at) : Number.NaN;
+      // A debt the amount cannot value in US dollars (an overdraft or a card balance in another currency, or a row
+      // with no usable amount): withheld the same way, whether or not Riley left the account out (leaving it out
+      // would count the debt as $0), so the reason carries no account. It replaces the account's other balance reasons:
+      // Leave it out could clear those but not this one.
+      const debt = unvaluedDebt(input.balances, k, Number.isFinite(usdAt) ? usdAt : null);
+      if (debt === "debt") reason("invalid-balance", `The newest balance for ${label} is a debt in another currency, so it cannot be counted.`);
+      else if (debt === "unknown") reason("invalid-balance", `A balance record for ${label} could not be read (no usable amount or date), so it could be a debt.`);
+      if (!b || !usable) {
+        warnings.push(`No balance for ${label}: counted as $0.`);
+        if (chosen) leftOut.push({ account: k, label, asOf: null, why: "chosen" });
+        // An unreadable one is already named above: not "missing", the read did not answer. A debt is named above too.
+        else if (!unreadable.has(k) && !debt) {
+          // A row in another currency (or with no usable amount) is there but cannot be counted: invalid, not missing.
+          if (b || input.balances.some((x) => x.account_key === k)) reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`, k);
+          else reason("missing-balance", `No recent balance for ${label}.`, k);
+        }
         continue;
       }
       found++;
-      opening += b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
+      const signedCents = b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
+      opening += signedCents;
       if (!asOf || b.captured_at < asOf) asOf = b.captured_at;
-      // A small balance that rarely updates (Apple Cash) should not flag the whole forecast.
-      if (input.now && Math.abs(b.balance_cents) >= 10_000 && input.now.getTime() - Date.parse(b.captured_at) > FORECAST.staleBalanceHours * 3_600_000) stale = true;
+      const at = Date.parse(b.captured_at);
+      const age = input.now && Number.isFinite(at) ? input.now.getTime() - at : null;
+      const big = Math.abs(b.balance_cents) >= FORECAST.smallBalanceCents;
+      const tooOld = age !== null && age > staleMs;
+      // The projection's stale badge: a small balance that rarely updates (Apple Cash) does not flag the whole forecast.
+      if (tooOld && big) stale = true;
+      // Left out by Riley: not counted in the amount (only its positive part; an overdraft keeps lowering it) and not
+      // checked for freshness. The projection still counts it.
+      if (chosen) {
+        leftOut.push({ account: k, label, asOf: b.captured_at, why: "chosen" });
+        leftOutCents += Math.max(0, signedCents);
+        continue;
+      }
+      // A newer debt in another currency, or a newer row with no usable amount (named above), decides: this US-dollar
+      // balance is not the current one.
+      if (debt) {
+        warnings.push(
+          debt === "unknown"
+            ? `The newest balance for ${label} has no usable amount: the estimate uses its last usable balance.`
+            : `The newest balance for ${label} is not in US dollars: the estimate uses its last US-dollar balance.`,
+        );
+        continue;
+      }
+      if (!Number.isFinite(at)) {
+        reason("invalid-balance", `The balance for ${label} has no readable date.`, k);
+        continue;
+      }
+      // The account's NEWEST snapshot decides, in any currency: a newer row in another currency means this older
+      // US-dollar balance is not its current one, however fresh it looks. Withheld like any unusable balance (the
+      // estimate keeps the last US-dollar balance; Leave it out clears the reason).
+      if (supersededByOtherCurrency(input.balances, k, at)) {
+        warnings.push(`The newest balance for ${label} is not in US dollars: the estimate uses its last US-dollar balance.`);
+        reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`, k);
+        continue;
+      }
+      if (age === null) {
+        if (!cashAsOf || b.captured_at < cashAsOf) cashAsOf = b.captured_at;
+        continue;
+      }
+      if (age < -FORECAST.futureBalanceSkewMs) {
+        reason("invalid-balance", `The balance for ${label} is dated in the future.`, k);
+        continue;
+      }
+      // A balance too old to trust withholds the amount whatever its size: an old small or zero balance is no proof
+      // the account is not overdrawn now. Leaving the account out ("Leave it out", Riley's explicit choice) is the
+      // only way to stop it counting.
+      if (tooOld) {
+        reason("stale-balance", `The balance for ${label} is older than ${FORECAST.staleBalanceHours} hours.`, k);
+        continue;
+      }
+      // A fresh balance the amount counts: the check holds until it turns staleBalanceHours old.
+      validUntilMs = Math.min(validUntilMs, at + staleMs);
+      if (!cashAsOf || b.captured_at < cashAsOf) cashAsOf = b.captured_at;
     }
-    if (!found) return { ...base, state: "no-balance" };
+    if (!found) {
+      reason("no-balance", "No balance yet for your cash accounts.");
+      return { ...base, state: "no-balance", eligibility: notEligible() };
+    }
+    if (!input.now) reason("freshness-unknown", "The balance dates could not be checked.");
     if (stale) warnings.push(`A cash balance is older than ${FORECAST.staleBalanceHours} hours, so the starting point may be off.`);
   }
 
@@ -1024,7 +1285,10 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   }
   const baselineProjected = weeklySeries.length >= FORECAST.minBaselineWeeks;
   const weeklyMean = baselineProjected ? Math.round(mean(weeklySeries)) : 0;
-  if (!baselineProjected) warnings.push(`Fewer than ${FORECAST.minBaselineWeeks} weeks of history: everyday spending is not projected.`);
+  if (!baselineProjected) {
+    warnings.push(`Fewer than ${FORECAST.minBaselineWeeks} weeks of history: everyday spending is not projected.`);
+    reason("short-history", `Fewer than ${FORECAST.minBaselineWeeks} weeks of history, so everyday spending is not in the forecast.`);
+  }
 
   // Stream adjustments (stop / new amount from a date).
   const adjustments = input.adjustments ?? [];
@@ -1165,10 +1429,24 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   const lowestLikely = minBy((d) => d.likely);
   const buffer = Math.max(0, settings.bufferCents ?? 0);
   const at = (n: number) => (days[n - 1] ? { likely: days[n - 1].likely, low: days[n - 1].low, high: days[n - 1].high } : null);
+  if (!Number.isFinite(opening) || !Number.isFinite(buffer) || days.some((d) => !Number.isFinite(d.low) || !Number.isFinite(d.likely))) {
+    reason("invalid-input", "Some forecast inputs are not valid numbers.");
+  }
+  const eligibility: ForecastEligibility = {
+    eligible: reasons.length === 0,
+    reasons: [...reasons],
+    ...(Number.isFinite(validUntilMs) ? { validUntil: new Date(validUntilMs).toISOString() } : {}),
+    ...(leftOut.length ? { leftOut, leftOutCents } : {}),
+    ...(cashAsOf ? { cashAsOf } : {}),
+  };
   const headlines: ForecastResult["headlines"] = {
     lowest,
     lowestLikely,
-    safeToMoveCents: lowest ? Math.max(0, Math.min(opening, lowest.cents) - buffer) : 0,
+    // Withheld unless every input was read, complete and fresh: an amount Riley could act on must not rest on a
+    // stale balance or on planned obligations that could not be read.
+    // Accounts Riley left out take their positive balance out of both the opening and the lowest point: the same as
+    // starting the path without it (an overdraft on one keeps lowering the amount).
+    safeToMoveCents: eligibility.eligible && lowest ? Math.max(0, Math.min(opening, lowest.cents) - leftOutCents - buffer) : null,
     end13w: at(Math.min(91, H)),
     end12m: at(Math.min(365, H)),
     nextPromoEnd: null,
@@ -1211,6 +1489,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   return {
     ...base,
     opening: { cents: opening, asOf, stale },
+    eligibility,
     days,
     lines,
     baseline: { weeklyMeanCents: weeklyMean, weeksUsed: weeklySeries.length, projected: baselineProjected, oneOffs: oneOffs.length },

@@ -126,6 +126,11 @@ test("unknown: a source that is checking, failed, stale or partial never yields 
     assert.equal(sel.verdict, "unknown", `${JSON.stringify(probe)} is not a clear day`);
     assert.deepEqual(sel.unknown.map((u) => u.source), ["calendar"]);
   }
+  // A partial answer can say what is missing (Money: an incomplete cash forecast); it is still never a clear day.
+  const cash = A.sourceStatus("money", { load: "ready", partial: true, partialNote: "the cash forecast's inputs are incomplete, so an alert may be missing" }, NOW);
+  assert.deepEqual([cash.state, cash.note], ["partial", "the cash forecast's inputs are incomplete, so an alert may be missing"]);
+  assert.equal(quiet([], [A.sourceStatus("agents", ok, NOW), cash]).verdict, "unknown");
+  assert.equal(A.sourceStatus("money", { load: "ready", partial: true }, NOW).note, "part of it couldn't be read, so an item may be missing", "the generic note without one");
   // Not connected is a normal answer (nothing to confirm), reported apart.
   const off = A.sourceStatus("packages", { load: "ready", connected: false }, NOW);
   assert.equal(off.state, "not_connected");

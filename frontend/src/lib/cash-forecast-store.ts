@@ -98,7 +98,111 @@ export function itemRowToPlanned(r: ItemRow): PlannedItem {
   };
 }
 
-/** Body {key, value}: key 'settings' | 'card:<account_key>' | 'growth:<account_key>'; value null removes the driver. */
+/** The most pool accounts the "safe-to-move" driver can leave out of the amount. */
+export const MAX_LEAVE_OUT = 20;
+
+/**
+ * Body {key: 'safe-to-move', account, leaveOut}: leave ONE pool account out of the safe-to-move amount (leaveOut true)
+ * or count it again (false). The server applies it to the saved list with a compare-and-swap (applyLeaveOut), so a
+ * page whose drivers read failed, or a second open tab, never overwrites the other choices. This is the ONLY way to
+ * change that driver: a whole-list body ({key: 'safe-to-move', value}) is refused, because a plain write of the list
+ * would bypass the compare-and-swap. null = another driver's body (parseDriverBody reads it).
+ */
+export function parseLeaveOutChange(
+  body: unknown,
+  knownAccounts: ReadonlySet<string>,
+): { ok: true; account: string; leaveOut: boolean } | { ok: false; error: string } | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (b.key !== "safe-to-move") return null;
+  for (const k of Object.keys(b)) if (k !== "key" && k !== "account" && k !== "leaveOut") return { ok: false, error: `unknown field ${k}` };
+  if (typeof b.account !== "string" || !knownAccounts.has(b.account)) return { ok: false, error: "unknown account" };
+  if (typeof b.leaveOut !== "boolean") return { ok: false, error: "leaveOut must be true or false" };
+  return { ok: true, account: b.account, leaveOut: b.leaveOut };
+}
+
+/** The saved "safe-to-move" driver value with one account left out or counted again; null value = remove the driver. */
+export function mergeLeaveOut(current: unknown, account: string, leaveOut: boolean): { ok: true; value: Record<string, unknown> | null } | { ok: false; error: string } {
+  const raw = current && typeof current === "object" ? (current as { leaveOut?: unknown }).leaveOut : undefined;
+  const list = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === "string") : [];
+  const next = list.filter((a, i) => a !== account && list.indexOf(a) === i);
+  if (leaveOut) next.push(account);
+  if (next.length > MAX_LEAVE_OUT) return { ok: false, error: `at most ${MAX_LEAVE_OUT} accounts can be left out` };
+  return { ok: true, value: next.length ? { leaveOut: next } : null };
+}
+
+/** The saved "safe-to-move" row as the compare-and-swap sees it: its value and its version (updated_at, as read). */
+export interface LeaveOutRow {
+  value: unknown;
+  version: string;
+}
+/**
+ * The storage applyLeaveOut writes through (lib/cash-forecast-server.ts wires it to pds.finance_plan_drivers).
+ * "conflict" = the row changed (or appeared, or went away) since it was read; nothing was written.
+ */
+export interface LeaveOutStore {
+  read(): Promise<{ ok: true; row: LeaveOutRow | null } | { ok: false }>;
+  /** Insert the row; "conflict" when one exists already. */
+  insert(value: Record<string, unknown>): Promise<"ok" | "conflict" | "error">;
+  /** Replace the value only while the row still has `version`. */
+  update(version: string, value: Record<string, unknown>): Promise<"ok" | "conflict" | "error">;
+  /** Remove the row only while it still has `version`. */
+  remove(version: string): Promise<"ok" | "conflict" | "error">;
+}
+/** How many times a change is re-read and re-applied after a conflict before answering 409. */
+export const LEAVE_OUT_ATTEMPTS = 5;
+
+/**
+ * One account's Leave it out / Count it again, applied to the saved list with a compare-and-swap: read the row,
+ * merge this ONE change (mergeLeaveOut), then write only if the row is still the version read; on a conflict read
+ * again and re-apply, at most `attempts` times. So two tabs changing DIFFERENT accounts at the same moment both keep
+ * their change; two changes to the SAME account are applied one after the other, and the one that commits last
+ * decides (each is re-applied to the list as it stands, never to a stale copy). After the last attempt the answer is
+ * 409 and nothing of this change is saved.
+ */
+export async function applyLeaveOut(
+  store: LeaveOutStore,
+  account: string,
+  leaveOut: boolean,
+  attempts = LEAVE_OUT_ATTEMPTS,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  for (let i = 0; i < attempts; i++) {
+    const cur = await store.read();
+    if (!cur.ok) return { ok: false, status: 500, error: "could not save" };
+    const merged = mergeLeaveOut(cur.row?.value ?? null, account, leaveOut);
+    if (!merged.ok) return { ok: false, status: 400, error: merged.error };
+    let res: "ok" | "conflict" | "error";
+    if (!cur.row) {
+      // Nothing saved and nothing to save (counting again an account that was never left out).
+      if (merged.value === null) return { ok: true };
+      res = await store.insert(merged.value);
+    } else if (merged.value === null) {
+      res = await store.remove(cur.row.version);
+    } else if (JSON.stringify(merged.value) === JSON.stringify(cur.row.value)) {
+      // Already the saved list: nothing to write.
+      return { ok: true };
+    } else {
+      res = await store.update(cur.row.version, merged.value);
+    }
+    if (res === "ok") return { ok: true };
+    if (res === "error") return { ok: false, status: 500, error: "could not save" };
+  }
+  return { ok: false, status: 409, error: "the list was changed at the same time; try again" };
+}
+
+/**
+ * The version (updated_at) a compare-and-swap write stores: now, but always after `previous`, so a row written twice
+ * within one millisecond still gets a new version. `previous` is the stored text (it may carry microseconds).
+ */
+export function nextLeaveOutVersion(previous: string | null, nowMs: number): string {
+  const before = previous === null ? Number.NaN : Date.parse(previous);
+  return new Date(Number.isFinite(before) ? Math.max(nowMs, Math.floor(before) + 1) : nowMs).toISOString();
+}
+
+/**
+ * Body {key, value}: key 'settings' | 'card:<account_key>' | 'growth:<account_key>' | ...; value null removes the
+ * driver. Not 'safe-to-move': that driver changes one account at a time (parseLeaveOutChange, applyLeaveOut).
+ */
 export function parseDriverBody(
   body: unknown,
   knownAccounts: ReadonlySet<string>,
@@ -112,6 +216,9 @@ export function parseDriverBody(
     const profile = parseTaxProfile(b.value);
     return profile ? { ok: true, key, value: profile as unknown as Record<string, unknown> } : { ok: false, error: "tax profile needs salaryAnnualCents and employmentStart" };
   }
+  // Changed one account at a time (parseLeaveOutChange + applyLeaveOut): a whole-list write would bypass the
+  // compare-and-swap and could undo another tab's change.
+  if (key === "safe-to-move") return { ok: false, error: "change one account at a time: {key: 'safe-to-move', account, leaveOut}" };
   if (key === "move") {
     if (b.value === null) return { ok: true, key, value: null };
     const plan = parseMovePlan(b.value);
@@ -202,6 +309,9 @@ export function driversToInputs(rows: readonly DriverRow[]): { settings: Forecas
       if (cm && cm >= 1) settings.cardMonths = Math.round(cm);
       const lp = n(v.lowPercentile);
       if (lp && lp >= 5) settings.lowPercentile = lp / 100;
+    } else if (r.key === "safe-to-move") {
+      const list = Array.isArray(v.leaveOut) ? v.leaveOut.filter((a): a is string => typeof a === "string") : [];
+      if (list.length) settings.safeToMoveLeaveOut = list.slice(0, MAX_LEAVE_OUT);
     } else if (r.key.startsWith("card:")) {
       cardTerms.push({
         account_key: r.key.slice(5),

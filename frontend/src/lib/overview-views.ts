@@ -296,6 +296,8 @@ const money: View = ([alertsAnswer, renewalsAnswer]) => {
   const alerts = alertsAnswer === undefined ? null : rowsOf(alertsAnswer, "alerts");
   const r = renewalsAnswer as { status?: string; count?: number; withinDays?: number; soon?: Row[] } | undefined;
   const high = alerts ? alerts.filter((a) => a.severity === "high").length : 0;
+  // The cash forecast's input check (the gate behind safe to move): not eligible = "nothing to act on" is unverified.
+  const cashIncomplete = (alertsAnswer as { cash?: { eligible?: unknown } } | undefined)?.cash?.eligible === false;
   const renewals = r?.status === "ready" ? r.count ?? 0 : r?.status === "empty" ? 0 : null;
   const lines: Line[] = (alerts ?? []).slice(0, 2).map((a) => ({ text: str(a.title) ?? "Money alert", tone: a.severity === "high" ? "down" : undefined }));
   if (r?.status === "ready") for (const s of r.soon ?? []) if (lines.length < 2) lines.push({ text: `${str(s.merchant) ?? "A subscription"} ${str(s.label) ?? ""}`.trim() });
@@ -303,7 +305,7 @@ const money: View = ([alertsAnswer, renewalsAnswer]) => {
     metrics: [
       alerts === null
         ? { label: "Alerts", value: DASH, sub: "Couldn't check" }
-        : { label: "Alerts", value: String(alerts.length), sub: high ? `${high} need action now` : alerts.length ? "from forecast & budgets" : "nothing to act on", tone: high ? "down" : undefined },
+        : { label: "Alerts", value: String(alerts.length), sub: high ? `${high} need action now` : cashIncomplete ? "cash forecast incomplete" : alerts.length ? "from forecast & budgets" : "nothing to act on", tone: high ? "down" : cashIncomplete ? "mid" : undefined },
       { label: "Renewals", value: renewals === null ? DASH : String(renewals), sub: renewals === null ? "Couldn't check" : `in the next ${r?.status === "ready" ? r.withinDays ?? 3 : 3} days` },
     ],
     lines,

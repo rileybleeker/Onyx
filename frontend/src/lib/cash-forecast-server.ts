@@ -5,11 +5,12 @@ import { fetchPaged, loadCategoryFixes, serviceClient } from "@/lib/finance-ledg
 import { fixedCategory } from "@/lib/finance-categories";
 import { computeGoals, type GoalRow, type GoalView } from "@/lib/finance-goals";
 import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
-import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
-import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
+import { forecastCash, poolAccountKeys, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
+import { applyLeaveOut, driversToInputs, itemRowToPlanned, nextLeaveOutVersion, type DriverRow, type ItemInput, type ItemRow, type LeaveOutStore } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, taxYearsFor, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
 import { addDays } from "@/lib/procurement-recurring";
+import { FORECAST } from "@/lib/cash-forecast-config";
 
 /**
  * Server-side reads and writes for the cash forecast (/financials/forecast). SERVICE ROLE ONLY: the finance
@@ -18,10 +19,64 @@ import { addDays } from "@/lib/procurement-recurring";
  */
 
 const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
+const BAL_COLS = "account_key,captured_at,balance_cents,currency,kind";
 const HISTORY_DAYS = 450;
 /** The forecast runs two years ahead; the tax years are picked from the same window. */
 const HORIZON_DAYS = 730;
 const MAX_PAGES = 40;
+/** Accounts, planned items and plan drivers are a few dozen rows each; 10 pages (10k rows) is far beyond that, and a
+ * read that still stops there is reported (quality.historyTruncated / planTruncated), never treated as complete. */
+const SMALL_MAX_PAGES = 10;
+
+/**
+ * Balance rows as the forecast reads them. A row the ledger parser rejects (no usable amount, no date), or one whose
+ * date does not parse (it could be the newest), does not vanish: it is kept as an UNUSABLE balance of its account
+ * (amount NaN, its date if it has one), so the engine's gate sees it (unvaluedDebt: a newest row with no usable amount
+ * could be a debt, so the amount is withheld, also when the account is left out) instead of an older row looking
+ * current or the account looking merely missing (which Leave it out would clear, counting it as $0). A row with no
+ * account key cannot be matched to any account: it is counted in `unmatched` (quality.balanceRowsUnmatched withholds
+ * the amount). Rows parseBalance accepts with a readable date are returned as parsed.
+ */
+export function forecastBalanceRows(rows: readonly unknown[]): { usable: ForecastBalance[]; rejected: ForecastBalance[]; unmatched: number } {
+  const usable: ForecastBalance[] = [];
+  const rejected: ForecastBalance[] = [];
+  let unmatched = 0;
+  for (const raw of rows) {
+    const b = parseBalance(raw);
+    if (b && Number.isFinite(b.balance_cents) && Number.isFinite(Date.parse(b.captured_at))) {
+      usable.push(b);
+      continue;
+    }
+    const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    if (typeof r.account_key !== "string" || !r.account_key) {
+      unmatched++;
+      continue;
+    }
+    const currency = typeof r.currency === "string" && r.currency.trim() ? r.currency.trim().toUpperCase() : "USD";
+    const kind = typeof r.kind === "string" ? r.kind.trim().toLowerCase() : "";
+    rejected.push({
+      account_key: r.account_key,
+      captured_at: typeof r.captured_at === "string" ? r.captured_at : "",
+      balance_cents: Number.NaN,
+      currency,
+      kind: kind === "asset" || kind === "liability" ? kind : null,
+    });
+  }
+  return { usable, rejected, unmatched };
+}
+
+type PagedRows = { rows: unknown[]; truncated: boolean; failed: boolean };
+/** A paged read that never throws: a failed read is `failed` (its code logged, never a row), a capped one `truncated`. */
+async function pagedRows(what: string, build: Parameters<typeof fetchPaged>[0], maxPages: number): Promise<PagedRows> {
+  try {
+    const r = await fetchPaged(build, maxPages);
+    return { rows: r.rows, truncated: r.truncated, failed: false };
+  } catch (e) {
+    const code = e && typeof e === "object" && "code" in e ? (e as { code: unknown }).code : null;
+    console.error(`${what} read failed: ${typeof code === "string" ? code : "unknown"}`);
+    return { rows: [], truncated: false, failed: true };
+  }
+}
 
 export interface PlanItemView {
   account: string | null;
@@ -91,24 +146,78 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       return p;
     };
     const fixesRead = started(loadCategoryFixes(db));
+    // Planned items and plan drivers are read in pages (ordered by a unique key, so the pages join without gaps or
+    // repeats): a single select would silently stop at the server's row cap, and a read that still stops at the page
+    // limit is reported (quality.planTruncated), so the amount is never computed from part of the plan.
     const planRead = started(
       Promise.all([
-        db.from("finance_plan_items").select("id,label,item_date,amount_cents,certainty,repeat_unit,repeat_every,repeat_count,note,account_key").is("removed_at", null).order("item_date", { ascending: true }),
-        db.from("finance_plan_drivers").select("key,value"),
+        pagedRows(
+          "plan items",
+          (f, t, c) =>
+            db
+              .from("finance_plan_items")
+              .select("id,label,item_date,amount_cents,certainty,repeat_unit,repeat_every,repeat_count,note,account_key", c ? { count: "exact" } : undefined)
+              .is("removed_at", null)
+              .order("item_date", { ascending: true })
+              .order("id", { ascending: true })
+              .range(f, t),
+          SMALL_MAX_PAGES,
+        ),
+        pagedRows("plan drivers", (f, t, c) => db.from("finance_plan_drivers").select("key,value", c ? { count: "exact" } : undefined).order("key", { ascending: true }).range(f, t), SMALL_MAX_PAGES),
       ]),
     );
     const snapsRead = started(db.from("finance_forecast_snapshots").select("as_of,week_end,likely_cents,low_cents,high_cents").lt("week_end", today).order("week_end", { ascending: false }).limit(200));
     const goalsRead = started(db.from("finance_goals").select("id,name,target_cents,target_date,account_key").is("removed_at", null).order("target_date", { ascending: true }));
+    // Accounts are paged like the history (a capped single select could drop a cash account from the check entirely);
+    // a failed read is an error page, as before, and one cut off at its page limit withholds the amount.
     const [acc, bal, txn] = await Promise.all([
-      db.from("finance_accounts").select("account_key,institution,account_name,account_type,mask"),
-      fetchPaged((f, t, c) => db.from("finance_balance_snapshots").select("account_key,captured_at,balance_cents,currency,kind", c ? { count: "exact" } : undefined).gte("captured_at", balSince).order("captured_at", { ascending: true }).order("account_key", { ascending: true }).range(f, t), MAX_PAGES),
+      fetchPaged((f, t, c) => db.from("finance_accounts").select("account_key,institution,account_name,account_type,mask", c ? { count: "exact" } : undefined).order("account_key", { ascending: true }).range(f, t), SMALL_MAX_PAGES),
+      fetchPaged((f, t, c) => db.from("finance_balance_snapshots").select(BAL_COLS, c ? { count: "exact" } : undefined).gte("captured_at", balSince).order("captured_at", { ascending: true }).order("account_key", { ascending: true }).range(f, t), MAX_PAGES),
       fetchPaged((f, t, c) => db.from("finance_transactions").select(TXN_COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), MAX_PAGES),
     ]);
-    if (acc.error) return { kind: "error", code: acc.error.code ?? "accounts" };
-    const parsedAccounts = (acc.data ?? []).map(parseAccount).filter((a): a is NonNullable<typeof a> => !!a);
+    const parsedAccounts = acc.rows.map(parseAccount).filter((a): a is NonNullable<typeof a> => !!a);
     if (!parsedAccounts.length) return { kind: "empty" };
     const accounts: ForecastAccount[] = parsedAccounts.map((a) => ({ account_key: a.account_key, account_type: a.account_type, label: accountLabel(a) }));
-    const balances: ForecastBalance[] = bal.rows.map(parseBalance).filter((b): b is NonNullable<typeof b> => !!b);
+    // Rows parseBalance rejects are kept as unusable balances (forecastBalanceRows), so the gate sees them.
+    const read60 = forecastBalanceRows(bal.rows);
+    const balances: ForecastBalance[] = read60.usable;
+    const rejected: ForecastBalance[] = [...read60.rejected];
+    let unmatched = read60.unmatched;
+    // A cash account with no balance in the 60-day read (one the feed no longer refreshes, or a closed one): its
+    // newest snapshot is read on its own and kept when it is SMALL or NEGATIVE (an overdraft, any size). Either way it
+    // is too old to trust, so it withholds the amount (stale-balance) until Riley leaves the account out; a negative
+    // one keeps lowering the amount after he does, so a known debt is never dropped to $0. A larger positive one
+    // stays missing: the projection keeps counting it as $0 (as before) and the amount stays withheld until Riley
+    // leaves it out. One limit-1 read per such account, only when there is one. A read that FAILS is not "no balance":
+    // the account goes to quality.balanceUnreadable, which withholds the amount even when Riley left the account out
+    // (an unread balance could be an overdraft). Forecast only: goals keep the 60-day balances.
+    const seen = new Set(bal.rows.map((r) => (r as { account_key?: unknown }).account_key));
+    const unseen = poolAccountKeys(accounts).filter((k) => !seen.has(k));
+    const older: ForecastBalance[] = [];
+    const unreadable: string[] = [];
+    if (unseen.length) {
+      const reads = await Promise.all(
+        unseen.map((k) =>
+          Promise.resolve(db.from("finance_balance_snapshots").select(BAL_COLS).eq("account_key", k).order("captured_at", { ascending: false }).limit(1)).catch(() => null),
+        ),
+      );
+      reads.forEach((res, i) => {
+        if (!res || res.error) {
+          console.error(`older balance read failed: ${res?.error?.code ?? "unknown"}`);
+          unreadable.push(unseen[i]);
+          return;
+        }
+        // The newest snapshot decides: one parseBalance rejects is kept as unusable (the amount is withheld, also
+        // when the account is left out), never skipped so the account looks merely missing.
+        const got = forecastBalanceRows(res.data ?? []);
+        rejected.push(...got.rejected);
+        unmatched += got.unmatched;
+        for (const b of got.usable) {
+          const signed = b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
+          if (signed < 0 || Math.abs(b.balance_cents) < FORECAST.smallBalanceCents) older.push(b);
+        }
+      });
+    }
     const fixes = await fixesRead;
     const txns: ForecastTxn[] = [];
     for (const raw of txn.rows) {
@@ -127,18 +236,24 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       });
     }
 
-    // Plan inputs: a missing table (migration not applied) shows the forecast without them.
-    let setupPending = false;
+    // Plan inputs: a missing table (migration not applied) or a failed read shows the forecast without them, as an
+    // estimate: setupPending withholds the safe-to-move amount (quality.planUnavailable below).
     const [itemsRes, driversRes] = await planRead;
-    if (itemsRes.error || driversRes.error) setupPending = true;
-    const itemRows = ((itemsRes.data ?? []) as ItemRow[]).map((r) => ({ ...r, amount_cents: Number(r.amount_cents) }));
-    const drivers = ((driversRes.data ?? []) as DriverRow[]).filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
+    const setupPending = itemsRes.failed || driversRes.failed;
+    const planTruncated = itemsRes.truncated || driversRes.truncated;
+    const itemRows = (itemsRes.rows as ItemRow[]).map((r) => ({ ...r, amount_cents: Number(r.amount_cents) }));
+    const driverRows = driversRes.rows as DriverRow[];
+    const drivers = driverRows.filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
     const { settings, cardTerms, growth, adjustments: savedAdjust } = driversToInputs(drivers);
 
     // Tax plan; its payments, refunds and after-tax bonus become planned cash lines.
     // The move plan (driver "move") is the single source of the move date: it also sets the tax residency change.
     const move = parseMovePlan(drivers.find((d) => d.key === "move")?.value);
     const rawProfile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
+    // A saved tax profile or move plan that no longer parses (stored by older code, or a parser change) drops its
+    // tax payments or move costs from the forecast: that withholds the amount too (quality.planInvalid).
+    const hasDriver = (key: string) => driverRows.some((d) => d && d.key === key);
+    const planInvalid = (hasDriver("tax") && !rawProfile) || (hasDriver("move") && !move);
     const profile = rawProfile && move ? { ...rawProfile, moveDate: move.date } : rawProfile;
     const year = Number(today.slice(0, 4));
     // Tax years by cash date (taxYearsFor): every year with a line inside the forecast window, including LAST year
@@ -148,7 +263,21 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const taxFor = (p: TaxProfile | null) => (p ? taxYears.map((y) => computeTaxYear(p, y, today)) : []);
     const tax = taxFor(profile);
     const manual = itemRows.map(itemRowToPlanned);
-    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS } };
+    // What the reads could not deliver: each withholds the safe-to-move amount in the base plan AND the what-if,
+    // because both are computed from this one input (result.eligibility, lib/cash-forecast.ts).
+    const quality = {
+      historyTruncated: acc.truncated || bal.truncated || txn.truncated,
+      planUnavailable: setupPending,
+      planTruncated,
+      planInvalid,
+      categoriesUnavailable: fixes.failed === true,
+      categoriesTruncated: fixes.truncated === true,
+      ...(unreadable.length ? { balanceUnreadable: unreadable } : {}),
+      ...(unmatched ? { balanceRowsUnmatched: unmatched } : {}),
+    };
+    // The engine reads the rejected rows too (its gate); goals below keep the usable 60-day balances only.
+    const forecastBalances = [...balances, ...older, ...rejected];
+    const baseInput = { today, now, accounts, txns, balances: forecastBalances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS }, quality };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
     let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
     // Annual raise: the paycheck stream grows each January (net pay scaled with gross; a planning approximation).
@@ -233,7 +362,6 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const saved = drivers
       .filter((d) => d.key.startsWith("scenario:"))
       .map((d) => ({ slug: d.key.slice(9), name: String((d.value as { name?: unknown }).name ?? d.key.slice(9)), params: ((d.value as { params?: ScenarioParams }).params ?? {}) as ScenarioParams }));
-    if (bal.truncated || txn.truncated) result.warnings.push("Part of the history was not read (page limit), so the forecast may be off.");
     const accountLabelsByKey = new Map<string, string>([
       ...parsedAccounts.map((a) => [a.account_key, accountLabel(a)] as [string, string]),
       ...drivers.filter((d) => d.key.startsWith("growth:virtual-")).map((d) => [d.key.slice(7), String((d.value as { label?: unknown }).label ?? d.key.slice(7))] as [string, string]),
@@ -264,7 +392,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       move,
     };
   } catch (e) {
-    const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "unknown";
+    const code = e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code ?? "unknown") : "unknown";
     console.error(`cash forecast load failed: ${code}`);
     return { kind: "error", code };
   }
@@ -305,4 +433,62 @@ export async function saveDriver(key: string, value: Record<string, unknown> | n
     return { ok: false };
   }
   return { ok: true };
+}
+
+/**
+ * The "safe-to-move" driver row as a compare-and-swap store (lib/cash-forecast-store.ts applyLeaveOut): the version is
+ * the row's updated_at as read, and every write is conditional on it (an UPDATE / DELETE whose WHERE also names that
+ * updated_at, an INSERT that fails on the primary key), so a write that lost a race changes nothing and is retried.
+ * Invariant this relies on: only this store writes the "safe-to-move" row (saveDriver refuses that key through
+ * parseDriverBody) and pds.finance_plan_drivers has no trigger that rewrites updated_at, so updated_at changes exactly
+ * when this store writes (nextLeaveOutVersion keeps it moving forward). Logs a database code only.
+ */
+export function leaveOutStore(db: ReturnType<typeof serviceClient>): LeaveOutStore {
+  const KEY = "safe-to-move";
+  const table = () => db.from("finance_plan_drivers");
+  const failed = (what: string, code: unknown) => {
+    console.error(`plan driver ${what} failed: ${typeof code === "string" ? code : "unknown"}`);
+    return "error" as const;
+  };
+  return {
+    async read() {
+      const { data, error } = await table().select("value,updated_at").eq("key", KEY);
+      if (error) {
+        failed("read", error.code);
+        return { ok: false };
+      }
+      const row = (data ?? [])[0] as { value?: unknown; updated_at?: unknown } | undefined;
+      if (!row) return { ok: true, row: null };
+      if (typeof row.updated_at !== "string") {
+        failed("read", "no-version");
+        return { ok: false };
+      }
+      return { ok: true, row: { value: row.value ?? null, version: row.updated_at } };
+    },
+    async insert(value) {
+      const { error } = await table().insert({ key: KEY, value, updated_at: nextLeaveOutVersion(null, Date.now()) });
+      if (!error) return "ok";
+      return error.code === "23505" ? "conflict" : failed("insert", error.code);
+    },
+    async update(version, value) {
+      const { data, error } = await table().update({ value, updated_at: nextLeaveOutVersion(version, Date.now()) }).eq("key", KEY).eq("updated_at", version).select("key");
+      if (error) return failed("update", error.code);
+      return (data ?? []).length ? "ok" : "conflict";
+    },
+    async remove(version) {
+      const { data, error } = await table().delete().eq("key", KEY).eq("updated_at", version).select("key");
+      if (error) return failed("remove", error.code);
+      return (data ?? []).length ? "ok" : "conflict";
+    },
+  };
+}
+
+/**
+ * Leave one pool account out of the safe-to-move amount, or count it again: applied to the saved list with a
+ * compare-and-swap and a bounded retry (applyLeaveOut), so two tabs changing different accounts both keep their change
+ * and the page's possibly stale or empty copy of the drivers is never written back. A failed read saves nothing; a
+ * change still colliding after the last retry answers 409 and saves nothing.
+ */
+export async function changeLeaveOut(account: string, leaveOut: boolean): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  return applyLeaveOut(leaveOutStore(serviceClient()), account, leaveOut);
 }

@@ -18,7 +18,7 @@ import { type EmailClearMark, MAX_CLEAR_ITEMS, clearedLabel, hiddenEmailKey } fr
 import { CACHE_KEYS, clientCache, isGoneStatus } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 // Import-free too: how current the money alerts are (bundled by name in the same test).
-import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
+import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyIncomplete, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
 // Import-free too: the first load takes the reads the page's HTML already started (app/today/EarlyReads.tsx).
 import { earlyOr } from "@/lib/early-fetch";
 // One card per area of the app under Today's own panels (loaded as its own chunk; components/overview/).
@@ -567,6 +567,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // The experiment is a source only when it can matter: a trial is on, or the check has not answered (the scroll's
   // copy never asks, so there it counts only for an arm /today already read).
   const experimentSource = trial !== null || (!feed && (experiment.state !== "ready" || !!experiment.stale));
+  const moneyGap = money ? moneyIncomplete(money) : null;
   const attention = quiet.on ? todayAttention({
     now,
     requests: { probe: probe(inbox, "agents"), items: requests },
@@ -581,8 +582,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     experiment: experimentSource ? { probe: probe(experiment, "experiment"), trial } : undefined,
     calendar: { probe: probe(calendar, "calendar", { connected: !calendarOff, syncLate: !!agenda && calendarSync !== "ok", syncAt: agenda?.lastSync?.at ?? null, partial: !!agenda?.truncated }), events: agenda?.events ?? [] },
     money: {
+      // A part that could not be read, or a cash forecast whose input check failed (money.cash.eligible false), is
+      // partial: "no low-cash alert" is then not an all-clear (moneyIncomplete names what is missing).
       probe: money
-        ? { load: "ready", refreshFailed: money.refreshFailed, checking: (money.updating && !money.refreshFailed) || lifeChecks.money.state === "checking", partial: money.partial !== null, asOf: money.asOf ?? iso(lifeChecks.money.at) }
+        ? { load: "ready", refreshFailed: money.refreshFailed, checking: (money.updating && !money.refreshFailed) || lifeChecks.money.state === "checking", partial: moneyGap !== null, ...(moneyGap ? { partialNote: moneyGap } : {}), asOf: money.asOf ?? iso(lifeChecks.money.at) }
         : lifeProbe("money", false),
       alerts: money?.alerts ?? [],
       // Budgets are monthly (the Eastern month the server computes them for): a budget alert hidden this month comes
@@ -975,6 +978,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         </ul>}
         {moneyStatus && <p className={`mt-3 text-sm ${moneyStatus.tone === "warn" ? "text-mid" : "text-text-secondary"}`}>{moneyStatus.text}</p>}
         <p className="mt-2 text-xs text-text-secondary">From your forecast and budgets. Onyx never moves money.</p>
+        {/* The cash forecast's check failed: its reasons (and Leave it out) are on the forecast page. */}
+        {money.cash && !money.cash.eligible && <Link href="/financials/forecast" className={`${linkStyle} mt-4 mr-4 inline-block`}>Open cash forecast</Link>}
         <Link href="/financials/budgets" className={`${linkStyle} mt-4 inline-block`}>Open budgets</Link>
       </section>
       </Part>}

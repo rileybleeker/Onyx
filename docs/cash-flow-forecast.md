@@ -70,6 +70,61 @@ pool for a card, a brokerage or an outside account is an outflow, even though `/
 Opening balance = the latest `finance_balance_snapshots` row per pool account. A balance older than
 `STALE_BALANCE_HOURS` puts a stale badge on the whole forecast.
 
+**Safe-to-move gate (2026-11-16).** "Safe to move" is the one number Riley could act on, so it is shown only
+when every input it rests on was read, complete and fresh (`ForecastResult.eligibility`, decided in
+`lib/cash-forecast.ts`, read through `lib/cash-forecast-eligibility.ts`). Any of these withholds it
+(`headlines.safeToMoveCents` = null) while the projection is still drawn as an estimate:
+
+| Reason code | When |
+|---|---|
+| `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small or negative older one (counted as $0 in the estimate) |
+| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future. When that newest row is a DEBT (negative, or a card balance owed) in another currency, or has no usable amount (so it could be one), the reason offers no Leave it out and leaving the account out does not clear it: the amount cannot value that debt in US dollars, and leaving it out would count it as $0. A row the ledger parser rejects (no whole-cent amount, no date) is never dropped: the loader keeps it as an unusable balance of its account (`forecastBalanceRows`, in the 60-day read and the older-balance read alike), so a newest unusable row withholds the amount (an older row never looks current, and the account never looks merely missing), and the estimate starts from the newest usable balance. The reason then reads "A balance record for <account> could not be read (no usable amount or date), so it could be a debt"; it clears once a newer usable balance of that account lands (an unusable row older than the US-dollar balance in use is skipped). A row with no account key withholds the amount too (it could be any account's newest), for as long as it is inside the 60-day read: "A balance could not be matched to an account", with no Leave it out (there is no account to leave out) |
+| `stale-balance` | a pool balance of ANY size older than 48 h (`staleBalanceHours`; an old small or zero balance is no proof the account is not overdrawn now), or a stored result read after its `validUntil` |
+| `balance-unreadable` | the read of a pool account's older balance failed (not "no row": the read itself errored), so its balance is unknown. Leaving the account out does not clear it, and the reason offers no Leave it out |
+| `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
+| `history-truncated` | a paged read of the accounts, the balances or the history stopped at its page limit |
+| `plan-unavailable` | the planned items or the plan drivers could not be read (`setupPending`), or their read stopped at its page limit (`planTruncated`: both are read in pages ordered by a unique key, so a server row cap is paged through, never taken as the whole plan) |
+| `plan-invalid` | a saved tax profile or move plan was read but no longer parses, so its taxes or move costs are missing |
+| `categories-unavailable` | Riley's category fixes could not be read (a missing table is not a failure), or their paged read stopped at its page limit (`loadCategoryFixes` `truncated`), so transfers and card payments may be misclassified |
+| `short-history` | fewer than `minBaselineWeeks` of history, so everyday spending is not projected |
+| `invalid-input` | an input that is not a number reached the projection |
+| `unverified` | a stored result from before the gate (no `eligibility`), or a malformed one: never eligible |
+
+**Left out of the amount, named next to it** (`eligibility.leftOut`; the projection still counts them): only a pool
+account Riley leaves out with "Leave it out" beside a balance reason. Nothing is left out automatically: a stale
+balance withholds the amount whatever its size (2026-11-16, Codex review of PIPE-02: an old small balance does not
+show the account cannot be overdrawn now). For a cash account with no row in the 60-day read the loader reads its
+newest snapshot and keeps it when it is under $100 or negative, so the reason says "older than 48 hours" and a debt
+is never dropped to $0. The choice is the driver `safe-to-move` = `{leaveOut: [account keys]}`; "Count it again"
+removes it. Each tap sends one account, `{key: "safe-to-move", account, leaveOut}` (the only accepted body for that
+driver; a whole-list `value` is refused), and the server applies it with a compare-and-swap on the row's
+`updated_at` (`applyLeaveOut`: read, merge the one change, write only if the row is still the version read, else read
+again; at most 5 tries, then 409 and nothing saved). So two tabs changing different accounts at the same moment both
+keep their change, and two changes to the same account are applied in turn, the last one to commit deciding. A
+left-out account's positive balance is taken out of the opening and the lowest point, so the amount never rests on
+it; an overdraft keeps lowering the amount, also once it is older than the 60-day read. Leaving an account out never
+clears `balance-unreadable`, an `invalid-balance` debt in another currency, a balance record that could not be read, or a balance that could not be matched to an account. The low-cash alert (Today, the
+finance pages) uses the same cash: the left-out accounts' positive balance (`eligibility.leftOutCents`) is taken out
+of the cautious and likely paths before the alert is checked, so a left-out savings balance cannot keep a low-cash
+alert from firing on the accounts that are counted; the alert then says so ("not counting the accounts you left out").
+
+**When the check stops holding.** `eligibility.validUntil` = the first counted balance's time + 48 h. The stored
+results (`pds.finance_result_cache`) are served up to an hour fresh and longer while a refresh is pending or
+failed, so `cachedForecast` (`forecastLoadAt`) and the alerts answer (`cashCheckAt`) re-check it when they serve:
+past it, the amount is withheld in the base plan and the what-if, and Today's check is not eligible. A stored
+result whose check has expired counts as stale even inside its fresh hour: the page recomputes it (so the reason
+names the account and offers Leave it out), and Today gets it at once marked `updating` and asks again. The
+browser re-checks too: the forecast tile and the what-if row use the browser's clock once mounted, at the next
+`validUntil` and whenever the page comes back into view, so a page or scroll section left open never keeps an
+expired amount.
+
+The tile shows the first three reasons inside the same Personalize part as the amount (the rest folded below
+them), the accounts left out, and the time of the oldest cash balance the amount counts. The what-if comparison
+and Today read the same result: `/api/finance/alerts` answers `cash: {eligible, reasons}` and Today shows the
+Money panel with the reason and a link to the forecast instead of "No alerts to act on"; its quiet view counts Money
+as not confirmed ("the cash forecast's inputs are incomplete"), never "Nothing needs you right now". The amount itself is unchanged when the inputs are
+complete and nothing is left out.
+
 ### 4.2 Sign convention
 
 The ledger is expense-positive. Forecast lines use **balance-positive** amounts (money in is +, money out is −).
