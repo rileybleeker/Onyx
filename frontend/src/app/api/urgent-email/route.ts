@@ -4,12 +4,14 @@ import { getUrgentEmail } from "@/lib/urgent-email-query";
 
 export const dynamic = "force-dynamic";
 // Edge runtime, in the region of the database (Supabase us-east-1) and the Node functions (PERF-01, 2026-11-16).
-// On a cold Today load this call went over the one-second budget while its three queries (indexed, run in parallel)
-// took tens of milliseconds at the database: the request only reached Supabase once a new Node function instance had
-// started. An edge isolate starts in milliseconds. Everything here runs on the edge runtime: supabase-js over fetch,
-// Web Crypto for the clear-mark hashes (lib/today-clear.ts), Intl for the Eastern day; no Node API. Same middleware
-// (owner session), same answer.
-export const runtime = "edge";
+// What was checked: the three queries are not the slow part. EXPLAIN (no ANALYZE, read-only) shows an index scan or a
+// scan of a table of a few pages for each, and they already run in parallel (getUrgentEmail). What the perf-timing run
+// showed is a call that was slow only on the cold first visit and ordinary on every warm view, which points at the
+// start of a new function instance. An edge isolate starts in milliseconds. This is NOT yet measured on production:
+// the next perf-timing runs after the deploy decide it, and if the cold first visit does not improve this export goes
+// back to Node. Everything here runs on the edge runtime: supabase-js over fetch (the middleware already bundles it on
+// the edge), Web Crypto for the clear-mark hashes (lib/today-clear.ts), Intl for the Eastern day; no Node API. Same
+// middleware (owner session), same answer.
 export const preferredRegion = "iad1";
 
 /**

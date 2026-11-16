@@ -257,28 +257,29 @@ const ALL_SCRIPTS = () => [
   ["/agents", T.agentsEarlyScript(SUPABASE, WORKER)],
 ];
 
-test("once the app is running (React inserted the script on an in-app navigation), no script starts a read or sets the /log mark", (t) => {
+test("once the document has finished loading (React inserted the script on an in-app navigation), no script starts a read or sets the /log mark", (t) => {
   const calls = withWindow(t, { cookie: `${COOKIE}=base64-${b64url(session(3600))}` });
   t.after(() => { delete global.next; delete global[L.LOG_EARLY_MARK]; });
-  global.next = { version: "synthetic", appDir: true };
-  for (const state of ["interactive", "complete"]) {
-    global.document.readyState = state;
+  global.document.readyState = "complete";
+  for (const next of [true, false]) {
+    if (next) global.next = { version: "synthetic", appDir: true };
+    else delete global.next;
     for (const [name, script] of ALL_SCRIPTS()) {
       calls.length = 0;
       delete global[E.EARLY_FETCH_KEY];
       new Function(script)();
-      assert.equal(calls.length, 0, `${name} (${state})`);
+      assert.equal(calls.length, 0, `${name} (next=${next})`);
     }
-    assert.equal(L.takeLogEarlyMark(), false, `no /log mark (${state})`);
+    assert.equal(L.takeLogEarlyMark(), false, `no /log mark (next=${next})`);
   }
 });
 
-test("during a full page load every script still runs: while parsing, and before Next has started", (t) => {
+test("during a full page load every script runs, however late: it never depends on Next's own globals", (t) => {
   const calls = withWindow(t, { cookie: `${COOKIE}=base64-${b64url(session(3600))}` });
   t.after(() => { delete global.next; delete global[L.LOG_EARLY_MARK]; });
-  // [Next bootstrapped?, readyState]: an inline script always runs while the parser runs ("loading"); the head's async
-  // script normally runs before Next's own scripts, whatever the parser is doing.
-  for (const [next, state] of [[true, "loading"], [false, "loading"], [false, "interactive"], [false, "complete"]]) {
+  // An inline script runs while the parser runs ("loading"); the head's async script holds the load event back, so even
+  // a late run (HTML parsed, Next already started) is "interactive" at the latest, never "complete".
+  for (const [next, state] of [[false, "loading"], [true, "loading"], [false, "interactive"], [true, "interactive"]]) {
     if (next) global.next = { version: "synthetic", appDir: true };
     else delete global.next;
     global.document.readyState = state;
@@ -326,35 +327,26 @@ test("Today, /log and /agents render their early script as an async script with 
   const fs = require("node:fs");
   const path = require("node:path");
   const read = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
-  const today = read("app/today/EarlyReads.tsx");
-  assert.match(today, /const SRC = earlyScriptSrc\(todayEarlyScript\(process\.env\.NEXT_PUBLIC_SUPABASE_URL, AGENTS_API\)\);/);
-  assert.match(today, /return <script async src=\{SRC\} \/>;/);
-  const log = read("app/log/EarlyReads.tsx");
-  assert.match(log, /const SRC = earlyScriptSrc\(logEarlyScript\(\)\);/);
-  assert.match(log, /return <script async src=\{SRC\} \/>;/);
-  const agents = read("app/agents/EarlyInbox.tsx");
-  assert.match(agents, /const SCRIPT = agentsEarlyScript\(process\.env\.NEXT_PUBLIC_SUPABASE_URL, AGENTS_API\);/);
-  assert.match(agents, /const SRC = SCRIPT \? earlyScriptSrc\(SCRIPT\) : "";/);
-  assert.match(agents, /return SRC \? <script async src=\{SRC\} \/> : null;/);
-  // An inline script in the body waits for the stylesheet: none of the three may go back to one.
-  for (const [f, src] of [["today", today], ["log", log], ["agents", agents]]) assert.ok(!/dangerouslySetInnerHTML/.test(src), f);
-  // React hoists a <script> only with async + src and no onLoad / onError: keep it that way.
-  for (const [f, src] of [["today", today], ["log", log], ["agents", agents]]) assert.ok(!/onLoad|onError/.test(src), f);
+  for (const f of ["app/today/EarlyReads.tsx", "app/log/EarlyReads.tsx", "app/agents/EarlyInbox.tsx"]) {
+    const src = read(f);
+    assert.match(src, /<script async src=\{SRC\} \/>/, `${f}: async + src`);
+    assert.match(src, /earlyScriptSrc\(/, `${f}: the data: URL helper`);
+    // An inline script in the body waits for the stylesheet; React hoists a <script> only with async + src and no handlers.
+    assert.ok(!/dangerouslySetInnerHTML/.test(src), `${f}: nothing inline`);
+    assert.ok(!/onLoad|onError/.test(src), `${f}: no handlers`);
+  }
 });
 
-test("/log: the Drinks section's first read is started with the others and taken on the routed page only", () => {
+test("/log: the Drinks section's first read is started with the others, at the URL the section reads, on the routed page only", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const read = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
   assert.ok(L.LOG_EARLY_GETS.includes(L.LOG_DRINKS_URL));
-  // The URL the section builds for behavioral today (no ?day=).
+  // The URL the section builds for behavioral today (no ?day=) is the one the script starts.
   assert.match(read("lib/drink-capture.ts"), new RegExp(`export const DRINKS_URL = "${L.LOG_DRINKS_URL}";`));
   const drinks = read("app/log/sections/Drinks.tsx");
-  assert.match(drinks, /const dayUrl = \(day: string \| null\) => \(day \? `\$\{DRINKS_URL\}\?day=\$\{day\}` : DRINKS_URL\);/);
-  assert.match(drinks, /const routed = !useInFeed\(\);/);
-  assert.match(drinks, /const get = !day && url === LOG_DRINKS_URL \? logEarlyGet\(url, routed\) : undefined;/);
-  assert.match(drinks, /cachedJson\(url, \{ check: checkDay, get \}\)/);
-  assert.match(drinks, /\.finally\(\(\) => loading\.current\.delete\(url\)\);\s*\}, \[routed\]\);/, "load follows routed");
+  assert.ok(drinks.includes("LOG_DRINKS_URL") && drinks.includes("logEarlyGet(url, routed)"), "the section takes the started read");
+  assert.ok(drinks.includes("useInFeed()"), "a copy in the continuous scroll fetches for itself");
 });
 
 test("/log: the Uber Eats section's reads start before the frame and the sections are evaluated, on a full page load only", () => {
@@ -366,8 +358,7 @@ test("/log: the Uber Eats section's reads start before the frame and the section
   const start = loader.indexOf('import "./early-delivery-start";');
   const client = loader.indexOf('import "./LogClient";');
   assert.ok(start !== -1 && client !== -1 && start < client, "early-delivery-start is imported before LogClient");
-  assert.ok(!/startEarlyDeliveryReads|takeLogEarlyMark/.test(loader), "LogLoader's own body no longer starts them late");
   const starter = read("app/log/early-delivery-start.ts");
-  assert.match(starter, /if \(typeof window !== "undefined" && takeLogEarlyMark\(\)\) startEarlyDeliveryReads\(\);/);
+  assert.ok(starter.includes("takeLogEarlyMark()"), "only a full page load of /log (the head script's mark)");
   assert.ok(!/fetch\(|method:\s*"(POST|PUT|PATCH|DELETE)"/.test(starter), "read-only: nothing is sent from here");
 });

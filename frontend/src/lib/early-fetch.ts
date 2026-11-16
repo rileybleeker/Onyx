@@ -8,7 +8,7 @@
  * Used by /check-in and /status (an inline script, below) and by Today (`/` and `/today`, lib/today-early.ts), /log
  * (lib/log-early.ts) and /agents (head script, next paragraph). Only a full page load starts reads: React never runs
  * an inline script it inserts itself (an in-app navigation, the continuous scroll), and the head script below checks
- * for itself that the app is not yet running.
+ * for itself that the document is still loading.
  *
  * Today, /log and /agents load theirs from the HEAD instead (`earlyScriptSrc`, PERF-01, 2026-11-16): an inline
  * script in the body waits until every stylesheet before it has loaded (HTML spec: a parser-inserted classic script
@@ -16,8 +16,7 @@
  * a cold first visit those reads only left the browser once the CSS had arrived over the network.
  * `<script async src="data:...">` is hoisted into the head by React and an async script never waits for a
  * stylesheet, so they start as soon as the head is parsed. React does run an async script it inserts on an in-app
- * navigation, so every script built by `earlyFetchWrap` does nothing once the app is running and the document is
- * parsed.
+ * navigation, so every script built by `earlyFetchWrap` does nothing once the document has finished loading.
  *
  * Import-free on purpose: the script text is built here so the page and the client agree on the key and the URLs.
  */
@@ -56,14 +55,15 @@ export function earlyFetchPrelude(): string {
 }
 
 /**
- * Plain-ES5 condition (uses the prelude's `w`): true once the app is running, so the script was inserted by React on
+ * Plain-ES5 condition: true once the document has finished loading, which means the script was inserted by React on
  * an in-app navigation, where the page reads for itself and an early read would only be a second, unused request.
- * `window.next` is set by Next's client bootstrap (before hydration) and readyState leaves "loading" once the HTML is
- * parsed. During a full page load it is false: an inline script runs while the parser runs ("loading"), and the
- * head's async script runs long before the body is parsed. If it ever were true on a full load, the page simply reads
- * for itself, as without an early script.
+ * `readyState === "complete"` is never true while a full page load is still running a script of this kind: an inline
+ * script runs while the parser runs ("loading"), and an async script in the head delays the load event, so it runs
+ * before "complete" however late it is. It does not depend on Next's own globals, so a late run on a slow or busy
+ * load cannot be mistaken for an in-app navigation. A navigation made before the load event (state "interactive")
+ * starts the reads too; the page then takes them instead of fetching for itself, so nothing is wasted.
  */
-export const EARLY_APP_RUNNING = `w.next&&document.readyState!=="loading"`;
+export const EARLY_APP_RUNNING = `document.readyState==="complete"`;
 
 /** Wraps a script body (which may use `m` and `go`) so nothing it does can break the page. */
 export function earlyFetchWrap(body: string): string {
