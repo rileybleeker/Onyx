@@ -535,17 +535,25 @@ def test_method_review_covers_only_the_calibrated_designs():
         assert "block design" in (ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_blocks": None}) or "")
         assert "block design" in (ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_a": True}) or "")
         # Another block shape, or a block count outside the calibrated range.
-        assert "not this trial's 5 days with 2 on arm A" in (
+        assert "covers blocks of 4 days with 2 on arm A, not this trial's blocks of 5 days with 2 on arm A" in (
             ea.method_review_problem(0.05, 10000, **{**DESIGN, "block_len": 5}) or "")
-        assert "not this trial's 4 days with 1 on arm A" in (
+        assert "not this trial's blocks of 4 days with 1 on arm A" in (
             ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_a": 1}) or "")
         for n_blocks in (6, 59):
             assert f"covers 7 to 58 scheduled blocks, not this trial's {n_blocks}" in (
                 ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_blocks": n_blocks}) or ""), n_blocks
+        # Blocks the analysis keeps (method review, gpt-5.2): 58 scheduled but most excluded or after an early
+        # stop is outside the calibration too; None = all kept (registration); a malformed count fails closed.
+        assert ea.method_review_problem(0.05, 10000, **DESIGN, n_blocks_analysed=7) is None
+        assert ea.method_review_problem(0.05, 10000, **DESIGN, n_blocks_analysed=None) is None
+        assert "analyses 6 of its 58 scheduled blocks" in (
+            ea.method_review_problem(0.05, 10000, **DESIGN, n_blocks_analysed=6) or "")
+        for analysed in (-1, 59, 7.0, True):
+            assert "block design" in (ea.method_review_problem(0.05, 10000, **DESIGN, n_blocks_analysed=analysed) or ""), analysed
         # A record without designs, or with a malformed range, covers none.
         for changes in (dict(block_designs=()), dict(block_designs=((4,),)), dict(block_designs=(("4", "2"),))):
             ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)), **changes)
-            assert "covers no blocks" in (ea.method_review_problem(0.05, 10000, **DESIGN) or ""), changes
+            assert "covers no block design" in (ea.method_review_problem(0.05, 10000, **DESIGN) or ""), changes
         for changes in (dict(n_blocks=()), dict(n_blocks=(58, 7)), dict(n_blocks=(7,)), dict(n_blocks=("7", "58"))):
             ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)), **changes)
             assert "covers no scheduled blocks" in (ea.method_review_problem(0.05, 10000, **DESIGN) or ""), changes
@@ -558,6 +566,12 @@ def test_method_review_covers_only_the_calibrated_designs():
         assert report["decision_if_supported"] == "adopt_A"
         ea.METHOD_REVIEW.update(synthetic_method_review())
         assert ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))["decision_firm"] is True
+        # ... and the blocks it keeps: with 34 of its 40 blocks excluded it analyses 6, below the record's 7.
+        data.excluded_blocks = set(range(34))
+        few = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
+        assert few["decision_firm"] is False and few["excluded_blocks"] == list(range(34))
+        assert few["decision_withheld"] == ["the trial analyses 6 of its 40 scheduled blocks (the others excluded or after "
+                                            "an early stop), fewer than the 7 the calibration report covers"]
     finally:
         ea.METHOD_REVIEW.clear()
         ea.METHOD_REVIEW.update(saved)
@@ -706,10 +720,16 @@ def test_a_trial_without_a_declared_model_never_gets_a_firm_decision():
             outputs = ea.output_semantics(0.001, 0.05)
             ea.unsupported_outputs(outputs, judged)
             assert outputs["p_value_no_effect"]["supported"] is False, (missing, kind)
-        numpy_false = {"threat": np.False_, "fisher_p": 0.4}
-        for kind in (ed.KIND_AA, ed.KIND_TREATMENT):
-            judged = {c["id"]: c for c in ea.assumption_checks(bounded, numpy_false, replace(spec, kind=kind))}
-            assert judged["missing_not_caused_by_arm"]["status"] == "ok", ("a readable result passes", kind)
+        # A readable result is judged, numpy scalars included (method review: np.float32 and numpy ints are not
+        # Python floats / ints).
+        for readable in ({"threat": np.False_, "fisher_p": 0.4}, {"threat": False, "fisher_p": np.float32(0.4)},
+                         {"threat": False, "fisher_p": np.float64(0.4)}, {"threat": False, "fisher_p": np.int64(1)},
+                         {"threat": False, "fisher_p": 1}):
+            for kind in (ed.KIND_AA, ed.KIND_TREATMENT):
+                judged = {c["id"]: c for c in ea.assumption_checks(bounded, readable, replace(spec, kind=kind))}
+                assert judged["missing_not_caused_by_arm"]["status"] == "ok", ("a readable result passes", readable, kind)
+        tied32 = {c["id"]: c for c in ea.assumption_checks(bounded, {"threat": False, "fisher_p": np.float32(0.01)}, spec)}
+        assert tied32["missing_not_caused_by_arm"]["status"] == "failed"
         # Without a spec nothing is declared, so the protocol checks fail closed.
         closed = {c["id"]: c["status"] for c in ea.assumption_checks({"carryover_set_bounded": True}, {"threat": False})}
         assert closed["model_justified"] == "failed" and closed["registered_method"] == "failed"
@@ -855,7 +875,7 @@ def test_smoke_scenarios_meet_their_prespecified_tolerances():
     assert "direct_power" not in by_name["carryover_only"]["informational"]
     # What the report may back: its own configuration, and a subset run never passes.
     assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [SMOKE_REDRAWS], "alpha": [0.05],
-                                "block_designs": [[cal.BLOCK_LEN, cal.N_A]], "n_blocks": [58, 58],
+                                "block_designs": [[cal.BLOCK_LEN, cal.N_A]], "n_blocks": [52, 58],
                                 "inference_fingerprint": ef.inference_fingerprint()}
     assert report["harness_fingerprint"] == ef.harness_fingerprint() and report["revision"] is None
     assert report["all_supported_scenarios"] is False

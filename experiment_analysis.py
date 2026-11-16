@@ -139,23 +139,27 @@ METHOD_REVIEW: dict[str, Any] = {
     },
     "n_redraws": (),                       # re-draw counts the report calibrated
     "alpha": (),                           # alpha levels it calibrated
-    # The designs it calibrated (doc 8.2): (block length, arm-A days per block) pairs, and the inclusive
-    # range (fewest, most) of scheduled blocks across its supported scenarios. A trial outside them is
-    # not covered: the method is exact for any design under the assumptions, but the calibration is the
-    # check that the code delivers that, and it ran only on these designs.
+    # The designs it calibrated (doc 8.2): (block length, arm-A days per block) pairs, and n_blocks =
+    # (fewest blocks a supported scenario analysed, most blocks one scheduled). A trial is covered when its
+    # scheduled blocks lie in that range and it analyses at least the fewest. Outside them it is not: the
+    # method is exact for any design under the assumptions, but the calibration is the check that the code
+    # delivers that, and it ran only on these designs.
     "block_designs": (),
     "n_blocks": (),
 }
 
 
 def method_review_problem(alpha: float, n_redraws: int, *, block_len: int | None = None, n_a: int | None = None,
-                          n_blocks: int | None = None) -> str | None:
+                          n_blocks: int | None = None, n_blocks_analysed: int | None = None) -> str | None:
     """Why a trial with this alpha, re-draw count and block design (block length, arm-A days per
     block, scheduled blocks) has no recorded review of INFERENCE_METHOD that covers it, or None when
     it has one. Both halves of METHOD_REVIEW must be structured records whose inference fingerprint is
     the running code's (experiment_fingerprint), and the calibration must cover the trial's alpha,
     re-draw count and design; anything else, an unreadable source or a design not given included,
-    withholds the decision. Its helpers stay inside it, so they stay outside the fingerprint with it."""
+    withholds the decision. n_blocks_analysed is the number of scheduled blocks the analysis keeps
+    (excluded blocks and those after an early stop left out); None means all of them (registration,
+    before any is excluded), and fewer than the calibration's lowest block count withholds the
+    decision too. Its helpers stay inside it, so they stay outside the fingerprint with it."""
     from experiment_fingerprint import inference_fingerprint
 
     review = METHOD_REVIEW
@@ -230,17 +234,18 @@ def method_review_problem(alpha: float, n_redraws: int, *, block_len: int | None
     def whole(value: Any) -> bool:
         return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
 
-    if not all(whole(v) for v in (block_len, n_a, n_blocks)):
-        return ("the trial's block design (block length, arm-A days per block, scheduled blocks) is not given, so it "
-                "cannot be checked against the designs the calibration report covers")
+    analysed = n_blocks if n_blocks_analysed is None else n_blocks_analysed
+    if not (all(whole(v) for v in (block_len, n_a, n_blocks, analysed)) and 0 <= int(analysed) <= int(n_blocks)):
+        return ("the trial's block design (block length, arm-A days per block, scheduled and analysed blocks) is not "
+                "given, so it cannot be checked against the designs the calibration report covers")
     designs = []
     for pair in review.get("block_designs") or ():
         if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(whole(v) for v in pair):
             designs.append((int(pair[0]), int(pair[1])))
     designs = sorted(set(designs))
     if (int(block_len), int(n_a)) not in designs:
-        shown = ", ".join(f"{b} days with {a} on arm A" for b, a in designs) or "no"
-        return (f"the calibration report covers {shown} blocks, not this trial's {int(block_len)} days with "
+        shown = ", ".join(f"blocks of {b} days with {a} on arm A" for b, a in designs) or "no block design"
+        return (f"the calibration report covers {shown}, not this trial's blocks of {int(block_len)} days with "
                 f"{int(n_a)} on arm A")
     span = review.get("n_blocks") or ()
     bounded = (isinstance(span, (list, tuple)) and len(span) == 2 and all(whole(v) for v in span)
@@ -248,6 +253,9 @@ def method_review_problem(alpha: float, n_redraws: int, *, block_len: int | None
     if not (bounded and int(span[0]) <= int(n_blocks) <= int(span[1])):
         covered = f"{int(span[0])} to {int(span[1])}" if bounded else "no"
         return f"the calibration report covers {covered} scheduled blocks, not this trial's {int(n_blocks)}"
+    if int(analysed) < int(span[0]):
+        return (f"the trial analyses {int(analysed)} of its {int(n_blocks)} scheduled blocks (the others excluded or "
+                f"after an early stop), fewer than the {int(span[0])} the calibration report covers")
     return None
 
 
@@ -1148,20 +1156,24 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
 
 def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
                       spec: TrialSpec | None = None,
-                      secondary_missingness: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+                      secondary_missingness: dict[str, dict[str, Any]] | None = None,
+                      n_blocks_analysed: int | None = None) -> list[dict[str, Any]]:
     """What the data, the registered protocol and the method record can check. A failed or pending
     check with blocks_decision withholds the decision; `covers` names the assumptions a failed
     check leaves unsupported (the outputs that need them are marked unsupported in the report).
     Without a spec nothing is declared, so the protocol checks fail (closed). Each secondary
     outcome gets its own missingness check, which never withholds the decision (the rule does not
     read secondary outcomes) but marks that series' numbers unsupported when it fails.
+    n_blocks_analysed (analyze_trial passes it) is the number of scheduled blocks the analysis keeps,
+    for the method-review check; None = all of them.
 
     Missing nights: a treatment trial fails the check on the 10-point rule (fail closed; the arm can
     change behaviour). In an A/A check both arms are the same instruction, so only a pipeline fault
     can tie missing nights to the arm; it fails on Fisher's exact test of the arm x missing table at
     the trial's alpha instead, because on a 4-week check the 10-point rule fires on chance alone
     about half the time when a fifth of nights are missing (14 nights per arm), which would void
-    the check's own no-effect test."""
+    the check's own no-effect test. Either way a check without a readable result (no Fisher p, no
+    boolean 10-point flag) fails closed."""
     kind = spec.kind if spec is not None else design.KIND_TREATMENT
     alpha = spec.alpha if spec is not None else 0.05
 
@@ -1171,9 +1183,10 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
             return True
         if kind == design.KIND_AA:
             fisher_p = check.get("fisher_p")
-            if not isinstance(fisher_p, (int, float)) or isinstance(fisher_p, bool) or not math.isfinite(fisher_p):
+            if (not isinstance(fisher_p, (int, float, np.integer, np.floating))
+                    or isinstance(fisher_p, (bool, np.bool_)) or not math.isfinite(float(fisher_p))):
                 return True
-            return fisher_p < alpha
+            return float(fisher_p) < alpha
         threat = check.get("threat")
         return not isinstance(threat, (bool, np.bool_)) or bool(threat)
 
@@ -1198,8 +1211,8 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
     registered = spec.inference_method if spec is not None else None
     review = method_review_problem(
         alpha, spec.n_redraws if spec is not None else 10000,
-        **({"block_len": spec.block_len, "n_a": spec.n_a, "n_blocks": spec.n_days // spec.block_len}
-           if spec is not None else {}))
+        **({"block_len": spec.block_len, "n_a": spec.n_a, "n_blocks": spec.n_days // spec.block_len,
+            "n_blocks_analysed": n_blocks_analysed} if spec is not None else {}))
     return [
         {"id": "missing_not_caused_by_arm", "status": "failed" if missing_failed(missingness) else "ok",
          "blocks_decision": True, "covers": ["missing_not_caused_by_arm"],
@@ -1350,7 +1363,9 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
 
     missingness = missingness_check(t[in_scope], np.isnan(y[in_scope]))
     rule = decide(primary["estimate"], primary["ci_low"], primary["ci_high"], primary["p_value"], spec.mid_ms, spec.alpha)
-    checks = assumption_checks(primary, missingness, spec, secondary_missing)
+    n_blocks = n_sched // spec.block_len
+    n_blocks_analysed = n_blocks - len({b for b in excluded if 0 <= b < n_blocks})
+    checks = assumption_checks(primary, missingness, spec, secondary_missing, n_blocks_analysed=n_blocks_analysed)
     withheld = [c["reason"] for c in checks if c["blocks_decision"] and c["status"] != "ok"]
     outputs = output_semantics(primary["nuisance_beta"], spec.alpha, sensitivity=list(sensitivity),
                                secondary=list(secondary))

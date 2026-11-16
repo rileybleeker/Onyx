@@ -33,7 +33,8 @@ pseudo-randomness assumption of doc 8.1 (the Monte Carlo randomization p-value (
 and this report is the empirical evidence for it.
 
 The report records the configuration it calibrated (method, alpha, re-draw count, the block shape
-BLOCK_LEN / N_A and the range of scheduled blocks of its supported scenarios) and the code it ran:
+BLOCK_LEN / N_A, and the fewest blocks a supported scenario analysed and the most one scheduled) and
+the code it ran:
 the inference fingerprint (experiment_fingerprint) of the analysis it calibrated, the harness
 fingerprint of this file and the revision (--revision, else $GITHUB_SHA). A METHOD_REVIEW entry
 covers exactly that configuration and that inference code, and a trial's decision is firm only
@@ -365,14 +366,17 @@ def _assemble(config: dict[str, Any], scenarios: list[dict[str, Any]]) -> dict[s
     supported = [x for x in scenarios if x["supported"]]
     every_supported = {s.name for s in SCENARIOS if s.supported} <= {x["name"] for x in scenarios}
     passed = bool(supported) and every_supported and all(x["ok"] for x in supported)
-    blocks = {s.name: s.n_blocks for s in SCENARIOS}
-    spans = sorted({blocks[x["name"]] for x in supported})
+    by_name = {s.name: s for s in SCENARIOS}
+    ran = [by_name[x["name"]] for x in supported]
     return {
         **config,
         # What a METHOD_REVIEW entry may cover once this report passed with every supported scenario:
-        # its configuration, its block shape and the range of scheduled blocks its supported scenarios ran.
+        # its configuration, its block shape and n_blocks = (fewest blocks a supported scenario analysed,
+        # most blocks one scheduled); excluded blocks are not analysed.
         "covers": {"method": config["method"], "n_redraws": [config["n_redraws"]], "alpha": [config["alpha"]],
-                   "block_designs": [[BLOCK_LEN, N_A]], "n_blocks": [spans[0], spans[-1]] if spans else [],
+                   "block_designs": [[BLOCK_LEN, N_A]],
+                   "n_blocks": ([min(s.n_blocks - s.excluded_blocks for s in ran), max(s.n_blocks for s in ran)]
+                                if ran else []),
                    "inference_fingerprint": config.get("inference_fingerprint")},
         "all_supported_scenarios": every_supported,
         "scenarios": scenarios,
