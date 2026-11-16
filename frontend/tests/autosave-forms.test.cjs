@@ -47,7 +47,7 @@ const FORMS = [
 ];
 
 for (const [file, hooks, retired] of FORMS) {
-  test(`${file}: every saver shows its own status line with Retry, sends a typed field when it is left, and no Save button is left`, () => {
+  test(`${file}: every saver wires its own status line with Retry, sends a typed field when it is left, and no Save button is left`, () => {
     const sf = F.parseFile(file);
     assert.deepEqual(F.autosaveFormProblems(sf, { hooks, retired }), []);
     assert.deepEqual(F.blurFlushProblems(sf, { hooks }), []);
@@ -124,6 +124,11 @@ const NEW_STACK = { stack_id: null, name: "", description: null, remind_time: nu
 const SAVED_STACK = { stack_id: 7, name: "Synthetic stack", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] };
 const STACK_NAME = byPlaceholder("e.g. Morning stack");
 const STACK_DESCRIPTION = byPlaceholder("e.g. taken right after waking");
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// The stack the editor sends. A save may carry more (a version or save ids for the server's conflict check): those
+// belong to the stacks route's own tests, so they are left out of the comparison here instead of being pinned.
+const STACK_FIELDS = ["stack_id", "name", "description", "remind_time", "items"];
+const stackFields = (body) => Object.fromEntries(STACK_FIELDS.filter((k) => k in body).map((k) => [k, body[k]]));
 
 async function mountStack(t, { stack = NEW_STACK, answer } = {}) {
   const events = { closed: 0, saved: 0 };
@@ -152,15 +157,14 @@ test("stack editor: a new stack is created once it has a name and a product; lat
   await h.tick(400);
   const [create] = h.net.writes();
   assert.equal(create.method, "POST");
-  const { client_key, ...fields } = create.body;
-  assert.deepEqual(fields, { name: "Synthetic stack", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] });
-  assert.match(client_key, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, "the create carries a key for a retry");
+  assert.deepEqual(stackFields(create.body), { name: "Synthetic stack", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] }, "a create names no stack");
+  assert.match(create.body.client_key, UUID, "the create carries a key for a retry");
   assert.match(h.text(), /Stack created/);
   change(one(h, STACK_DESCRIPTION, "the description field"), "Synthetic description");
   await h.flush();
   await h.tick(1200);
   assert.deepEqual(methods(h), ["POST /api/supplements/stacks", "PATCH /api/supplements/stacks"], "edited in place, never a second create");
-  assert.deepEqual(h.net.writes()[1].body, { stack_id: 41, name: "Synthetic stack", description: "Synthetic description", remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] });
+  assert.deepEqual(stackFields(h.net.writes()[1].body), { stack_id: 41, name: "Synthetic stack", description: "Synthetic description", remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] });
 });
 
 test("stack editor: a create whose answer is lost is shown, retried with the same key, and then edited in place", async (t) => {
@@ -210,7 +214,7 @@ test("stack editor: leaving a field sends its change at once, and only once", as
   await h.flush();
   one(h, STACK_NAME, "the name field").props.onBlur();
   await h.flush();
-  assert.deepEqual(h.net.writes().map((c) => c.body), [{ stack_id: 7, name: "Synthetic stack, renamed", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] }]);
+  assert.deepEqual(h.net.writes().map((c) => [c.method, stackFields(c.body)]), [["PATCH", { stack_id: 7, name: "Synthetic stack, renamed", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] }]]);
   await h.tick(60_000);
   assert.equal(h.net.writes().length, 1, "the pause that followed sent nothing more");
 });
@@ -232,6 +236,52 @@ test("stack editor: Close with a change that could not be saved stays open; once
   await h.flush();
   assert.equal(h.net.writes().length, 2, "nothing is sent twice");
   assert.deepEqual(h.events, { closed: 0, saved: 1 });
+});
+
+test("stack editor: after a create, Close and another new stack make a second stack with its own key", async (t) => {
+  // Like the stacks route: a create repeated with a key answers the stack that key made, a new key makes a new one.
+  const made = new Map();
+  const answer = (call) => {
+    if (call.method !== "POST") return response({ stack_id: call.body.stack_id });
+    if (!made.has(call.body.client_key)) made.set(call.body.client_key, 41 + made.size);
+    return response({ stack_id: made.get(call.body.client_key), item_count: call.body.items.length });
+  };
+  let host = null;
+  // SupplementsClient keeps the editor mounted between opens (stack null = closed) and passes a fresh object for
+  // every "New stack", so the editor's refs (stack id, key) outlive one stack.
+  const probe = (load, hooks) => {
+    const StackEditorModal = load("components/StackEditorModal.tsx").default;
+    return function StackEditorHost() {
+      const [stack, setStack] = hooks.useState(() => ({ ...NEW_STACK }));
+      host = { open: (next) => setStack(next) };
+      return jsx(StackEditorModal, { open: stack !== null, stack, products: PRODUCTS, onClose: () => setStack(null), onSaved: () => setStack(null) });
+    };
+  };
+  const h = await mountForm(t, probe, { answer });
+  async function createAndClose(name, productId) {
+    change(one(h, STACK_NAME, "the name field"), name);
+    await h.flush();
+    change(one(h, (n) => n.type === "select", "the product picker"), productId);
+    await h.flush();
+    await h.tick(400);
+    assert.match(h.text(), /Stack created/);
+    h.click("Close");
+    await h.flush();
+    assert.equal(h.find(STACK_NAME).length, 0, "the editor closed");
+  }
+  await createAndClose("Synthetic stack A", "synthetic-product-1");
+  host.open({ ...NEW_STACK });
+  await h.flush();
+  assert.equal(one(h, STACK_NAME, "the name field").props.value, "", "the new stack starts empty");
+  await createAndClose("Synthetic stack B", "synthetic-product-2");
+  const writes = h.net.writes();
+  assert.deepEqual(writes.map((c) => c.method), ["POST", "POST"], "two creates; the first stack is never PATCHed from the second");
+  assert.match(writes[1].body.client_key, UUID);
+  assert.notEqual(writes[1].body.client_key, writes[0].body.client_key, "each new stack has its own key, so the first is not adopted and renamed");
+  assert.deepEqual(writes.map((c) => stackFields(c.body)), [
+    { name: "Synthetic stack A", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] },
+    { name: "Synthetic stack B", description: null, remind_time: null, items: [{ product_id: "synthetic-product-2", doses: 1 }] },
+  ], "the second create carries only the second stack");
 });
 
 // ─── supplement intake editor (mounted) ──────────────────────────────────────
@@ -370,7 +420,8 @@ test("care planner: a create whose answer was lost is shown with Retry, and the 
   assert.match(h.text(), /Not saved: Couldn.t save that to Onyx\./, "the failure is visible");
   assert.ok(h.button("Retry"), "with Retry");
   // Whether a lost answer is also retried on its own is not pinned here (AGENTS.md: only a refusal waits for
-  // Retry; this page treats every failure as one today). What must hold: one item, with the newest edits.
+  // Retry; this page treats every failure as one today: Onyx Roadmap row "Care planner (/health): retry an outage on
+  // its own", which pins it here once fixed). What must hold: one item, with the newest edits.
   change(one(h, CARE_TITLE, "the label field"), "Synthetic checkup, moved");
   await h.flush();
   await h.tick(60_000);
@@ -640,10 +691,9 @@ test("weight rules: what can be saved and how long to wait", () => {
 
 const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
 
-/** A supabase-js stand-in over in-memory tables. `onInsert` / `onSelect` may answer an error instead. */
-function fakeSupabase(tables = {}, { onInsert, onSelect } = {}) {
+/** A supabase-js stand-in over in-memory tables (the weight route's reads and writes). */
+function fakeSupabase(tables = {}) {
   const db = { tables, ops: [] };
-  let nextId = 100;
   db.from = (table) => {
     const q = { op: "select", filters: [], value: null };
     const rows = () => (db.tables[table] ??= []);
@@ -651,9 +701,7 @@ function fakeSupabase(tables = {}, { onInsert, onSelect } = {}) {
     const exec = (mode) => {
       db.ops.push({ table, op: q.op, filters: [...q.filters], value: q.value });
       if (q.op === "insert") {
-        const err = onInsert?.(table, q.value, db);
-        if (err) return { data: null, error: err };
-        const list = (Array.isArray(q.value) ? q.value : [q.value]).map((r) => ({ ...(table === "supplement_stack" ? { stack_id: nextId++ } : {}), ...r }));
+        const list = (Array.isArray(q.value) ? q.value : [q.value]).map((r) => ({ ...r }));
         rows().push(...list);
         return { data: mode === "many" ? list : list[0], error: null };
       }
@@ -667,8 +715,6 @@ function fakeSupabase(tables = {}, { onInsert, onSelect } = {}) {
         db.tables[table] = rows().filter((r) => !gone.has(r));
         return { data: null, error: null };
       }
-      const err = onSelect?.(table, q.filters, db);
-      if (err) return { data: null, error: err };
       const hit = matches();
       return { data: mode === "many" ? hit : hit[0] ?? null, error: null };
     };
@@ -702,102 +748,6 @@ function fakeSupabase(tables = {}, { onInsert, onSelect } = {}) {
 }
 const loadRoute = (rel, db) => loadTs(rel, { "@supabase/supabase-js": { createClient: () => db }, "next/server": nextServer });
 const jsonRequest = (body) => ({ json: async () => structuredClone(body) });
-
-const KEY = "0f0f0f0f-1111-4222-8333-444444444444";
-const stackBody = (over = {}) => ({ name: "Synthetic stack", description: "", remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }], client_key: KEY, ...over });
-const itemsOf = (db, id) => (db.tables.supplement_stack_item ?? []).filter((r) => r.stack_id === id);
-
-test("stacks route: a create retried with the same key answers the stack it made and brings it up to date", async () => {
-  const db = fakeSupabase();
-  const { POST } = loadRoute("app/api/supplements/stacks/route.ts", db);
-  const first = await POST(jsonRequest(stackBody()));
-  assert.equal(first.status, 200);
-  const again = await POST(jsonRequest(stackBody({ name: "Synthetic stack, renamed", items: [{ product_id: "synthetic-product-2", doses: 2 }] })));
-  assert.equal(again.status, 200);
-  assert.equal(again.body.existing, true);
-  assert.equal(again.body.stack_id, first.body.stack_id);
-  assert.equal(db.tables.supplement_stack.length, 1, "one stack, not two");
-  assert.equal(db.tables.supplement_stack[0].name, "Synthetic stack, renamed", "the retry's newer body is kept");
-  assert.deepEqual(itemsOf(db, first.body.stack_id).map((r) => [r.product_id, r.doses]), [["synthetic-product-2", 2]], "items replaced, not doubled");
-});
-
-test("stacks route: a concurrent create with the same key adopts the other request's stack", async () => {
-  let raced = false;
-  const db = fakeSupabase({}, {
-    onInsert: (table, row, d) => {
-      if (table !== "supplement_stack" || raced) return null;
-      raced = true;
-      d.tables.supplement_stack = [{ stack_id: 200, name: row.name, description: null, remind_time: null, client_key: row.client_key }];
-      return { code: "23505", message: "duplicate key value violates unique constraint" };
-    },
-  });
-  const { POST } = loadRoute("app/api/supplements/stacks/route.ts", db);
-  const res = await POST(jsonRequest(stackBody()));
-  assert.deepEqual([res.status, res.body.stack_id, res.body.existing], [200, 200, true]);
-  assert.equal(db.tables.supplement_stack.length, 1);
-});
-
-test("stacks route: works before the client_key column exists, and refuses a key that is not a UUID", async () => {
-  const missing = { code: "42703", message: "column supplement_stack.client_key does not exist" };
-  const db = fakeSupabase({}, {
-    onSelect: (table, filters) => (table === "supplement_stack" && filters.some(([c]) => c === "client_key") ? missing : null),
-    onInsert: (table, row) => (table === "supplement_stack" && "client_key" in row ? missing : null),
-  });
-  const { POST } = loadRoute("app/api/supplements/stacks/route.ts", db);
-  const res = await POST(jsonRequest(stackBody()));
-  assert.equal(res.status, 200);
-  assert.equal(db.tables.supplement_stack.length, 1);
-  assert.equal("client_key" in db.tables.supplement_stack[0], false, "created without the key, as before");
-
-  const db2 = fakeSupabase();
-  const bad = await loadRoute("app/api/supplements/stacks/route.ts", db2).POST(jsonRequest(stackBody({ client_key: "not-a-uuid" })));
-  assert.equal(bad.status, 400);
-  assert.deepEqual(db2.ops, [], "nothing read or written");
-});
-
-test("stack editor + stacks route: after a create, Close and another new stack make a second stack with its own key", async (t) => {
-  const db = fakeSupabase();
-  const route = loadRoute("app/api/supplements/stacks/route.ts", db);
-  const toRoute = async (call) => {
-    const res = await route[call.method](jsonRequest(call.body));
-    return response(res.body, res.status);
-  };
-  let host = null;
-  // SupplementsClient keeps the editor mounted between opens (stack null = closed) and passes a fresh object for
-  // every "New stack", so the editor's refs (stack id, key) outlive one stack.
-  const probe = (load, hooks) => {
-    const StackEditorModal = load("components/StackEditorModal.tsx").default;
-    return function StackEditorHost() {
-      const [stack, setStack] = hooks.useState(() => ({ ...NEW_STACK }));
-      host = { open: (next) => setStack(next) };
-      return jsx(StackEditorModal, { open: stack !== null, stack, products: PRODUCTS, onClose: () => setStack(null), onSaved: () => setStack(null) });
-    };
-  };
-  const h = await mountForm(t, probe, { answer: toRoute });
-  async function createAndClose(name, productId) {
-    change(one(h, STACK_NAME, "the name field"), name);
-    await h.flush();
-    change(one(h, (n) => n.type === "select", "the product picker"), productId);
-    await h.flush();
-    await h.tick(400);
-    assert.match(h.text(), /Stack created/);
-    h.click("Close");
-    await h.flush();
-    assert.equal(h.find(STACK_NAME).length, 0, "the editor closed");
-  }
-  await createAndClose("Synthetic stack A", "synthetic-product-1");
-  host.open({ ...NEW_STACK });
-  await h.flush();
-  assert.equal(one(h, STACK_NAME, "the name field").props.value, "", "the new stack starts empty");
-  await createAndClose("Synthetic stack B", "synthetic-product-2");
-  const writes = h.net.writes();
-  assert.deepEqual(writes.map((c) => c.method), ["POST", "POST"], "two creates; the first stack is never PATCHed from the second");
-  assert.notEqual(writes[1].body.client_key, writes[0].body.client_key, "each new stack has its own key");
-  assert.deepEqual(db.tables.supplement_stack.map((r) => r.name), ["Synthetic stack A", "Synthetic stack B"], "two stacks: the first was not adopted and renamed");
-  const [a, b] = db.tables.supplement_stack.map((r) => r.stack_id);
-  assert.deepEqual(itemsOf(db, a).map((r) => r.product_id), ["synthetic-product-1"]);
-  assert.deepEqual(itemsOf(db, b).map((r) => r.product_id), ["synthetic-product-2"]);
-});
 
 test("the stack key migration is additive (no DROP; the Supabase connector declines it)", () => {
   const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "supplement_stack_client_key.sql"), "utf8");

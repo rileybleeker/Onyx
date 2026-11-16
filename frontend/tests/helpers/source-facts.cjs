@@ -153,6 +153,9 @@ const hookBindings = (node, hooks) => saverBindings(node, hooks).map((b) => b.na
  * line for EVERY saver that shows that saver's own state, in the component holding the saver, and offers Retry (so
  * a failed save is never invisible), and no button still carrying a retired Save label. A status line in another
  * component of the file does not count, even when its saver has the same name. Answers the problems found; [] = fine.
+ * The limit of a structural check: it proves the status line and its Retry are wired, not that they are ever shown.
+ * A status line behind a condition that is never true, or an onRetry that does nothing, still passes; only a form
+ * mounted with tests/helpers/autosave-harness.cjs proves a failure reaches the screen.
  */
 function autosaveFormProblems(sf, { hooks, retired = [] }) {
   const problems = [];
