@@ -15,7 +15,9 @@ inside it that has no food any more (its last entry removed in Cronometer) is
 emptied in Onyx too, but only when the export passes the importer's
 completeness check and at most --max-empty-days stored days per run (a bigger
 change is refused with a partial heartbeat). A failed login or export never
-reaches the importer, so it changes nothing.
+reaches the importer, so it changes nothing. --no-empty-days (or the env var
+CRONOMETER_EMPTY_DAYS=off) turns this off: the run then imports exactly as a
+manual export does (date-set replace, nothing emptied, no completeness check).
 
 UNOFFICIAL — this replays the web app's own flow (the same one gocronometer /
 cronometer-mcp use):
@@ -288,8 +290,15 @@ def mint_token(client: httpx.Client, permutation: str, policy: str, user_id: int
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────
+def empty_days_enabled(flag_off: bool) -> bool:
+    """False when --no-empty-days was passed or CRONOMETER_EMPTY_DAYS is off/0/false/no."""
+    env = os.environ.get("CRONOMETER_EMPTY_DAYS", "").strip().lower()
+    return not flag_off and env not in ("off", "0", "false", "no")
+
+
 def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False,
-                     max_empty_days: int = DEFAULT_MAX_EMPTY_DAYS) -> tuple[int, int]:
+                     max_empty_days: int = DEFAULT_MAX_EMPTY_DAYS,
+                     empty_days: bool = True) -> tuple[int, int]:
     email = os.environ.get("CRONOMETER_EMAIL")
     password = os.environ.get("CRONOMETER_PASSWORD")
     if not email or not password:
@@ -323,8 +332,13 @@ def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False,
             f.write(servings_csv.lstrip("﻿"))
         with open(dpath, "w", encoding="utf-8-sig", newline="") as f:
             f.write(daily_csv.lstrip("﻿"))
-        # The window is what WE asked Cronometer for (both ends inclusive); it is
-        # what lets the importer treat a day missing from the export as empty.
+        # The window is what WE asked Cronometer for; it is what lets the importer
+        # treat a day missing from the export as empty (never the first or last
+        # day: nothing has checked that both ends are inclusive). Without it the
+        # import is the manual one, which never empties a day.
+        if not empty_days:
+            log.info("Emptying days with no food is off (--no-empty-days / CRONOMETER_EMPTY_DAYS)")
+            return run_import([spath, dpath], dry_run=dry_run)
         return run_import([spath, dpath], dry_run=dry_run, window=(start, end),
                           max_empty_days=max_empty_days)
 
@@ -341,6 +355,9 @@ def main() -> None:
                     help="most stored days one run may empty because Cronometer no longer has "
                          f"food on them (default {DEFAULT_MAX_EMPTY_DAYS}; 0 = empty none). More "
                          "than this and none are emptied (partial heartbeat)")
+    ap.add_argument("--no-empty-days", action="store_true",
+                    help="import like a manual export: never empty a day, no completeness check "
+                         "(same as CRONOMETER_EMPTY_DAYS=off)")
     args = ap.parse_args()
     if args.max_empty_days < 0:
         ap.error("--max-empty-days must be 0 or more")
@@ -353,7 +370,8 @@ def main() -> None:
     t0 = now_epoch()
     try:
         scount, dcount = fetch_and_import(args.days, dry_run=args.dry_run,
-                                          max_empty_days=args.max_empty_days)
+                                          max_empty_days=args.max_empty_days,
+                                          empty_days=empty_days_enabled(args.no_empty_days))
         log.info("Done — %d servings, %d daily rows.", scount, dcount)
     except BaseException as e:  # noqa: BLE001  (also catches SystemExit from the importer)
         # run_import emits per-data_type success heartbeats on the happy path;
