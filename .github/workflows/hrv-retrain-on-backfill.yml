@@ -86,12 +86,37 @@ jobs:
         if: steps.decide.outputs.retrain == 'true'
         run: python hrv_analysis.py
 
-      - name: Save refreshed model to cache
-        # Per-run key so this save never collides with an existing cache; the
-        # companion restore step in hrv-prediction.yml uses restore-keys to
-        # find the most recently saved pickle regardless of exact key.
+      - name: Read the trained model's cache key
+        # The artifact hrv_analysis.py wrote in THIS run, checked against its manifest (audit
+        # PIPE-08, hrv_model_artifact.py). Its cache key is its checksum, so it never collides.
+        id: trained
+        if: steps.decide.outputs.retrain == 'true'
+        run: python hrv_model_artifact.py key
+
+      - name: Save the trained model
         if: steps.decide.outputs.retrain == 'true'
         uses: actions/cache/save@v5
         with:
-          path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
+          path: |
+            analysis_output/xgboost_hrv_model.pkl
+            analysis_output/xgboost_hrv_model.manifest.json
+          key: ${{ steps.trained.outputs.key }}
+
+      - name: Confirm the saved model can be restored
+        id: saved
+        if: steps.decide.outputs.retrain == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            analysis_output/xgboost_hrv_model.pkl
+            analysis_output/xgboost_hrv_model.manifest.json
+          key: ${{ steps.trained.outputs.key }}
+          lookup-only: true
+
+      - name: Publish the trained model
+        # Adds the artifact to pds.hrv_model_artifacts, which the hourly forecast reads. Runs only
+        # after the whole analysis succeeded and the artifact restores from the cache; publishing
+        # the same artifact again changes nothing. A failure leaves the served model unchanged
+        # and turns the HRV Retrain card partial.
+        if: steps.decide.outputs.retrain == 'true'
+        run: python hrv_model_artifact.py publish --saved "${{ steps.saved.outputs.cache-hit }}"

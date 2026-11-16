@@ -74,33 +74,97 @@ jobs:
           pip install -r requirements-analysis.txt
           pip install supabase python-dotenv
 
-      - name: Download model artifact
-        # Try to restore the trained model from cache. Key is per-run so
-        # retrain workflows can save a new cache without "already exists"
-        # collisions; restore-keys matches the most recently saved model.
+      - name: Select the published model
+        # Read-only (audit PIPE-08, hrv_model_artifact.py): the newest successful training in
+        # pds.hrv_model_artifacts that this code and these packages can serve, ordered by its
+        # provenance. This job never saves or publishes a model it restored; only a training run
+        # (hrv-retrain-on-backfill.yml, or the missing-model step below) adds one.
+        id: select
+        run: python hrv_model_artifact.py select
+
+      - name: Restore the selected model
+        # Exact content key: the restored files are that artifact or nothing.
         id: model-cache
-        uses: actions/cache@v5
+        if: steps.select.outputs.found == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            analysis_output/xgboost_hrv_model.pkl
+            analysis_output/xgboost_hrv_model.manifest.json
+          key: ${{ steps.select.outputs.key }}
+
+      - name: Restore the newest cached training (registry unreadable)
+        # Degraded mode only (registry table missing, Supabase down): the most recently saved
+        # TRAINING artifact. hrv_predict.py checks it against its manifest and writes a partial
+        # hrv_predict|model_artifact heartbeat.
+        if: steps.select.outputs.registry == 'unavailable'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            analysis_output/xgboost_hrv_model.pkl
+            analysis_output/xgboost_hrv_model.manifest.json
+          key: hrv-model-${{ runner.os }}-v2-registry-unavailable
+          restore-keys: |
+            hrv-model-${{ runner.os }}-v2-
+
+      - name: Restore a pre-provenance model (registry unreadable, nothing newer)
+        if: steps.select.outputs.registry == 'unavailable' && hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
+        uses: actions/cache/restore@v5
         with:
           path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
+          key: hrv-model-${{ runner.os }}-v1-registry-unavailable
           restore-keys: |
             hrv-model-${{ runner.os }}-v1-
             hrv-model-${{ runner.os }}-
 
       - name: Train model if missing
-        # Self-heal: if cache was empty or the pickle is gone, retrain from scratch
-        # so hrv_predict.py always has a model to load.
+        # The one training path in this workflow: nothing servable was published, or the selected
+        # artifact is no longer in the cache. The model trained here is saved and published below
+        # exactly like the retrain workflow's.
+        id: self-train
         if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
         run: |
           echo "Model pickle missing - running hrv_analysis.py to retrain"
           python hrv_analysis.py --skip-analysis
 
-      - name: Backfill actuals & predict tomorrow
-        run: python hrv_predict.py --predict
+      - name: Read the new model's cache key
+        id: trained
+        if: steps.self-train.outcome == 'success'
+        run: python hrv_model_artifact.py key
 
-      - name: Upload model artifact
+      - name: Save the new model
+        if: steps.trained.outcome == 'success'
         uses: actions/cache/save@v5
-        if: always()
         with:
-          path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1-${{ github.run_id }}
+          path: |
+            analysis_output/xgboost_hrv_model.pkl
+            analysis_output/xgboost_hrv_model.manifest.json
+          key: ${{ steps.trained.outputs.key }}
+
+      - name: Confirm the new model can be restored
+        id: saved
+        if: steps.trained.outcome == 'success'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            analysis_output/xgboost_hrv_model.pkl
+            analysis_output/xgboost_hrv_model.manifest.json
+          key: ${{ steps.trained.outputs.key }}
+          lookup-only: true
+
+      - name: Publish the new model
+        # A failed publish leaves the registry unchanged and writes a partial HRV Retrain
+        # heartbeat; the forecast below still runs with the model trained here.
+        if: steps.trained.outcome == 'success'
+        continue-on-error: true
+        run: python hrv_model_artifact.py publish --saved "${{ steps.saved.outputs.cache-hit }}"
+
+      - name: Backfill actuals & predict tomorrow
+        # Never with a model from a training that failed; otherwise also after a failed key or
+        # publish step, so the artifact check below reports it.
+        if: ${{ !cancelled() && steps.self-train.outcome != 'failure' }}
+        env:
+          HRV_MODEL_REGISTRY: ${{ steps.select.outputs.registry }}
+          HRV_MODEL_SELECTED_SHA256: ${{ steps.select.outputs.sha }}
+          HRV_MODEL_RESTORED: ${{ steps.model-cache.outputs.cache-hit }}
+        run: python hrv_predict.py --predict

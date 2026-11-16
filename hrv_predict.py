@@ -20,7 +20,6 @@ import argparse
 import json
 import logging
 import os
-import pickle
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -31,6 +30,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
+import hrv_model_artifact as model_artifact
 from sync_log_helper import log_sync as _shared_log_sync
 
 load_dotenv()
@@ -94,12 +94,27 @@ ALIGNMENT_CUTOVER_AT = pd.Timestamp("2026-11-11T01:00:00", tz=ET_TZ)
 # one "success" row only when the newest row of this heartbeat is not already "success".
 PREPROCESSING_HEARTBEAT = ("hrv_predict", "preprocessing")
 PREPROCESSING_REPORT_EVERY_HOURS = 12
+# Heartbeat for the model artifact a forecast is made with (audit PIPE-08, hrv_model_artifact.py):
+# success = exactly the artifact the registry selected; partial = served without that check
+# (registry unreadable, a pre-PIPE-08 pickle, the selected one missing from the cache, or the
+# forecast stored without its artifact column); failed = refused before unpickling. Same
+# repeat rule as the preprocessing heartbeat.
+MODEL_ARTIFACT_HEARTBEAT = ("hrv_predict", "model_artifact")
 
 
 def report_preprocessing(status: str, message: str | None) -> bool:
     """Write the preprocessing heartbeat unless it would repeat (see above). Never raises.
     Returns True when a row was written."""
-    source, data_type = PREPROCESSING_HEARTBEAT
+    return _report_deduped(PREPROCESSING_HEARTBEAT, status, message)
+
+
+def report_model_artifact(status: str, message: str | None) -> bool:
+    """Write the model-artifact heartbeat unless it would repeat. Never raises."""
+    return _report_deduped(MODEL_ARTIFACT_HEARTBEAT, status, message)
+
+
+def _report_deduped(heartbeat: tuple[str, str], status: str, message: str | None) -> bool:
+    source, data_type = heartbeat
     last = None
     try:
         resp = (
@@ -110,7 +125,7 @@ def report_preprocessing(status: str, message: str | None) -> bool:
         )
         last = (resp.data or [None])[0]
     except Exception as e:  # noqa: BLE001 - the heartbeat must never stop a forecast
-        log.warning(f"  preprocessing heartbeat lookup failed ({type(e).__name__}); writing it anyway")
+        log.warning(f"  {data_type} heartbeat lookup failed ({type(e).__name__}); writing it anyway")
     if status == "success":
         if last is None or last.get("status") == "success":
             return False
@@ -125,7 +140,7 @@ def report_preprocessing(status: str, message: str | None) -> bool:
         _shared_log_sync(supa, source=source, data_type=data_type, status=status,
                          records=0, error=message)
     except Exception as e:  # noqa: BLE001
-        log.warning(f"  preprocessing heartbeat write failed ({type(e).__name__})")
+        log.warning(f"  {data_type} heartbeat write failed ({type(e).__name__})")
         return False
     return True
 
@@ -262,12 +277,40 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def load_model() -> dict | None:
-    if not MODEL_PATH.exists():
-        log.error(f"Model not found at {MODEL_PATH}. Run hrv_analysis.py first.")
-        return None
-    with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
+def load_model() -> tuple[dict | None, dict]:
+    """The model bundle to serve and the report for its artifact heartbeat (audit PIPE-08).
+
+    The workflow restores the artifact the registry selected and passes its checksum
+    (HRV_MODEL_SELECTED_SHA256, HRV_MODEL_RESTORED = exact-key hit): the file must be exactly that
+    artifact, and its manifest must match the pickle and this code, before anything is unpickled.
+    report = {"sha256", "status", "message"}; the bundle is None when it must not be served."""
+    from hrv_analysis import SPARSE_FILL_VERSIONS
+    import hrv_alignment as al
+
+    selected = os.environ.get("HRV_MODEL_SELECTED_SHA256", "")
+    restored = os.environ.get("HRV_MODEL_RESTORED", "") == "true"
+    try:
+        loaded = model_artifact.load_artifact(
+            MODEL_PATH, expected_sha=selected if (selected and restored) else None,
+            alignment_version=al.ALIGNMENT_VERSION, preprocessing_versions=SPARSE_FILL_VERSIONS,
+            runtime_deps=model_artifact.dependency_versions())
+    except model_artifact.ArtifactError as e:
+        log.error(str(e))
+        return None, {"sha256": None, "status": "failed", "message": str(e)}
+    status, message = model_artifact.serving_report(loaded)
+    trained = (loaded.manifest or {}).get("provenance", {})
+    log.info(f"Model artifact {loaded.sha256[:12]} (trained {trained.get('trained_at', 'unknown')}, "
+             f"data through {trained.get('data_cutoff', 'unknown')}): {status}")
+    return loaded.bundle, {"sha256": loaded.sha256, "status": status, "message": message}
+
+
+def _store_forecast(rows: list[dict]) -> None:
+    # Audit P1 (G1): on_conflict targets the 4-tuple so retrain versions accumulate as separate
+    # rows; same-day reruns with the same version upsert in place.
+    supa.schema("pds").from_("hrv_predictions").upsert(
+        _clean_for_json(rows),
+        on_conflict="prediction_date,model,horizon_days,model_version",
+    ).execute()
 
 
 def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
@@ -298,8 +341,9 @@ def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
         return None, None
 
 
-def predict_tomorrow(model_bundle: dict) -> dict | None:
-    """Predict tonight's sleep (wake-up tomorrow) using the loaded model."""
+def predict_tomorrow(model_bundle: dict, artifact_sha256: str | None = None) -> dict | None:
+    """Predict tonight's sleep (wake-up tomorrow) using the loaded model. `artifact_sha256` is the
+    checksum of the artifact the bundle came from; the forecast row records it."""
     from hrv_analysis import (FEATURE_LABELS, compute_input_data_hash, TARGET, serve_features,
                               model_preprocessing, SPARSE_FILL_VERSION, SPARSE_FILL_VERSIONS)
     import hrv_alignment as al
@@ -403,6 +447,8 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         "training_window_end": train_end,
         "today_hrv": today_hrv,
         "input_data_hash": input_data_hash,
+        # Which artifact produced this forecast (pds.hrv_model_artifacts, PIPE-08).
+        model_artifact.LINK_COLUMN: artifact_sha256,
     }
 
 
@@ -590,12 +636,13 @@ def main() -> None:
         log.exception(f"recompute_rolling_metrics failed: {e}")
 
     if args.predict:
+        artifact = None
         try:
-            model_bundle = load_model()
+            model_bundle, artifact = load_model()
             if model_bundle is None:
                 stage_errors.append("load_model")
             else:
-                prediction = predict_tomorrow(model_bundle)
+                prediction = predict_tomorrow(model_bundle, artifact_sha256=artifact["sha256"])
                 if prediction is None:
                     stage_errors.append("predict_tomorrow")
                     log.error("Failed to generate prediction.")
@@ -603,13 +650,9 @@ def main() -> None:
                     today_hrv = prediction.pop("today_hrv", None)
 
                     payload = [{k: v for k, v in prediction.items() if v is not None}]
-                    # Audit P1 (G1): on_conflict targets the 4-tuple so retrain
-                    # versions accumulate as separate rows; same-day reruns
-                    # with the same version upsert in place.
-                    supa.schema("pds").from_("hrv_predictions").upsert(
-                        _clean_for_json(payload),
-                        on_conflict="prediction_date,model,horizon_days,model_version",
-                    ).execute()
+                    if not model_artifact.upsert_with_artifact_link(_store_forecast, payload):
+                        artifact = model_artifact.with_unlinked_forecast(artifact)
+                        log.warning(artifact["message"])
 
                     log.info(
                         f"Tonight's sleep (night of {prediction['prediction_date']}): "
@@ -627,6 +670,8 @@ def main() -> None:
         except Exception as e:
             stage_errors.append("predict")
             log.exception(f"predict stage failed: {e}")
+        if artifact is not None:
+            report_model_artifact(artifact["status"], artifact["message"])
 
     if stage_errors:
         log.error(f"{len(stage_errors)} stage(s) failed: {', '.join(stage_errors)}")
