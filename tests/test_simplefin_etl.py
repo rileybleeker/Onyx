@@ -137,9 +137,91 @@ def test_normalize_transactions():
     assert by["sf:A1:t1"]["txn_key"] == sf.txn_key("A1", "t1") and all(r["source"] == "simplefin" for r in rows)
 
 
-def test_connection_errors_masked():
-    body = {"errlist": [{"code": "con.auth", "msg": "Reconnect Demo Bank account 12345678"}], "errors": ["Rate limit warning"]}
-    assert sf.connection_errors(body) == ["Reconnect Demo Bank account ####", "Rate limit warning"]
+# Provider text a heartbeat must never carry: an institution / person name, an email, URLs, long and short ids.
+PII = ["Demo Bank", "Jane Q Example", "jane@example.com", "https://bank.example.com/login?u=42",
+       "www.demo-bank.example", "12345678", "acct 42", "ACT-0042"]
+
+
+def pii_msg(i=0):
+    return f"Reconnect {PII[0]} for {PII[1]} <{PII[2]}> at {PII[3]} ({PII[4]}) account {PII[5]} / {PII[6]} / {PII[7]} #{i}"
+
+
+def assert_no_pii(text):
+    for s in PII + ["Reconnect", "for Jane"]:
+        assert s not in str(text), f"provider text leaked: {s!r} in {text!r}"
+
+
+def assert_only_allowlisted(note):
+    """A heartbeat note is exactly what format_notes builds from allowlisted codes: no other text at all."""
+    import re
+    tokens = re.findall(r"\[([a-z][a-z0-9_]*)(?: x(\d+))?\]", note)
+    assert tokens, note
+    counts = {}
+    for code, n in tokens:
+        assert code in sf.NOTE_CODES, code
+        counts[code] = counts.get(code, 0) + (int(n) if n else 1)
+    assert note == sf.format_notes(counts), f"note has text beyond the allowlist: {note!r}"
+
+
+def test_classify_error_codes():
+    assert sf.classify_error("con.auth") == "sf_reauth"
+    assert sf.classify_error("CON.AUTH ") == "sf_reauth"
+    assert sf.classify_error("con.") == "sf_connection_error"
+    assert sf.classify_error("con.something_new") == "sf_connection_error"   # unknown subcode = bare prefix
+    assert sf.classify_error("act.failed") == "sf_account_failed"
+    assert sf.classify_error("act.missingdata") == "sf_account_incomplete"
+    assert sf.classify_error("act.other") == "sf_account_error"
+    assert sf.classify_error("gen.auth") == "sf_server_auth"
+    assert sf.classify_error("gen.api") == "sf_api_error"
+    assert sf.classify_error("gen.") == "sf_general_error"
+    for bad in ("zzz.auth", "", None, 42, "con", "con.auth please reconnect jane@example.com", "Reconnect Demo Bank",
+                "https://bank.example.com", "x" * 200, {"code": "con.auth"}):
+        assert sf.classify_error(bad) == "sf_unclassified", bad
+
+
+def test_connection_errors_codes_only():
+    body = {
+        "errlist": [
+            {"code": "con.auth", "msg": pii_msg(1), "conn_id": "CON-1"},
+            {"code": "con.auth", "msg": pii_msg(2), "conn_id": "CON-1"},          # same issue twice: counted once
+            {"code": "act.missingdata", "msg": pii_msg(3), "account_id": "S-AMEX"},
+            {"code": "bogus.code", "msg": pii_msg(4)},
+            {"msg": pii_msg(5)},                                                   # no code at all
+            pii_msg(6),                                                            # malformed entry
+        ],
+        "errors": [pii_msg(7)],                                                    # v1 duplicate: ignored with an errlist
+    }
+    issues = sf.connection_errors(body)
+    assert [i.code for i in issues] == ["sf_reauth", "sf_account_incomplete", "sf_unclassified"]
+    assert issues[0].conn_id == "CON-1" and issues[1].account_id == "S-AMEX"
+    for i in issues:
+        assert_no_pii(i)
+    # Only the deprecated strings: each is unclassified (never echoed); a non-list errlist is a format change.
+    assert [i.code for i in sf.connection_errors({"errors": [pii_msg(8), pii_msg(9)]})] == ["sf_unclassified"]
+    assert [i.code for i in sf.connection_errors({"errlist": pii_msg(10)})] == ["sf_unclassified"]
+    assert sf.connection_errors({"errlist": [], "errors": []}) == []
+    assert sf.connection_errors({}) == []
+
+
+def test_format_notes():
+    assert sf.format_notes({}) is None and sf.format_notes({"not_a_code": 3}) is None
+    one = sf.format_notes({"sf_reauth": 1})
+    assert one == f"{sf.NOTE_CODES['sf_reauth']} [sf_reauth]"
+    two = sf.format_notes({"account_unmatched": 2, "sf_reauth": 1, "not_a_code": 5})
+    assert two == f"{sf.NOTE_CODES['sf_reauth']} [sf_reauth]; {sf.NOTE_CODES['account_unmatched']} [account_unmatched x2]"
+    assert "not_a_code" not in two
+    assert sf.format_notes({"sf_reauth": 10 ** 9}).endswith("[sf_reauth x9999]")
+    # Many codes: the later ones keep only their token, so no code is ever lost, and the length stays bounded.
+    every = sf.format_notes({c: 2 for c in sf.NOTE_CODES})
+    for c in sf.NOTE_CODES:
+        assert f"[{c} x2]" in every, c
+    assert "; also [" in every and len(every) < sf.NOTE_LIMIT + 30 * len(sf.NOTE_CODES)
+    assert_only_allowlisted(every)
+    # The wording never carries a bracket, a double quote or a backslash (the frontend parses tokens out of the
+    # note and reads this table from the source), and one code with the largest count always fits the limit.
+    for code, text in sf.NOTE_CODES.items():
+        assert "[" not in text and "]" not in text and '"' not in text and "\\" not in text, code
+        assert len(f"{text} [{code} x9999]") <= sf.NOTE_LIMIT, code
 
 
 # --- matching ---------------------------------------------------------------------------------------------------
@@ -337,14 +419,50 @@ def test_run_success_counts_only():
 
 def test_run_partial_and_dry_run():
     store = FakeStore(ledger_with_fidelity())
-    code = sf.run(store, Http(get=Res(200, body([{"code": "con.auth", "msg": "Reconnect Wells Fargo"}]))), ACCESS, 60, False, now=NOW, out=lambda *_: None)
-    assert code == 0 and store.beats[0][1] == "partial" and "Reconnect Wells Fargo" in store.beats[0][3]
+    code = sf.run(store, Http(get=Res(200, body([{"code": "con.auth", "msg": "Reconnect Wells Fargo", "conn_id": "c2"}]))),
+                  ACCESS, 60, False, now=NOW, out=lambda *_: None)
+    assert code == 0 and store.beats[0][1] == "partial"
+    assert store.beats[0][3] == sf.format_notes({"sf_reauth": 1}) == store.beats[1][3]
+    assert "Wells Fargo" not in store.beats[0][3], "the institution never reaches sync_log"
 
     dry = FakeStore(ledger_with_fidelity())
     lines = []
-    assert sf.run(dry, Http(get=Res(200, body())), ACCESS, 60, True, now=NOW, out=lines.append) == 0
+    errs = [{"code": "con.auth", "msg": pii_msg(), "conn_id": "c2"}]
+    assert sf.run(dry, Http(get=Res(200, body(errs))), ACCESS, 60, True, now=NOW, out=lines.append) == 0
     assert not (dry.txns or dry.balances or dry.created or dry.links or dry.beats)
     assert any("Platinum" in line for line in lines)   # the local dry run shows the matching
+    # ... flags the account whose connection SimpleFIN named, by our code; SimpleFIN's own text is never printed
+    assert any("Checking 7000" in line and "SimpleFIN issue: sf_reauth" in line for line in lines), lines
+    assert not any("SimpleFIN issue" in line for line in lines if "Platinum" in line)
+    assert_no_pii("\n".join(lines))
+
+
+def test_provider_text_never_reaches_heartbeats_or_output():
+    """SEC-07: provider errors full of names, emails, URLs and short / long ids -> approved codes only."""
+    errs = [{"code": c, "msg": pii_msg(i), "conn_id": f"c{i}", "account_id": PII[5]}
+            for i, c in enumerate(["con.auth", "con.weird", "act.failed", "act.missingdata", "gen.auth", "gen.api",
+                                   "gen.", "nope.x", "", None, pii_msg()])]
+    errs += [pii_msg(99), 12345678, None]
+    b = body(errs)
+    b["errors"] = [pii_msg(100)]
+    b["accounts"].append({"name": pii_msg(101), "conn_id": "c2"})               # account without an id
+    b["accounts"].append(acct("S-WFX", "Some Account", "c2", [txn("9", "2026-11-18", "-1.00", "X")]))  # unmatched
+    store = FakeStore(ledger_with_fidelity())
+    lines = []
+    assert sf.run(store, Http(get=Res(200, b)), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+    assert {beat[1] for beat in store.beats} == {"partial"}
+    for beat in store.beats:
+        assert_no_pii(beat[3])
+        assert_only_allowlisted(beat[3])
+        assert "Wells Fargo" not in beat[3] and "American Express" not in beat[3]
+    note = store.beats[0][3]
+    for code in ("sf_reauth", "sf_connection_error", "sf_account_failed", "sf_account_incomplete", "sf_server_auth",
+                 "sf_api_error", "sf_general_error", "sf_unclassified", "account_no_id", "account_unmatched"):
+        assert f"[{code}" in note, code
+    out = "\n".join(lines)
+    assert_no_pii(out)
+    assert_no_secret(out)
+    assert "heartbeat codes: sf_reauth x1" in out and "Wells Fargo" not in out
 
 
 def test_run_failure_writes_failed_heartbeats():
@@ -352,8 +470,69 @@ def test_run_failure_writes_failed_heartbeats():
     lines = []
     assert sf.run(store, Http(get=Res(403)), ACCESS, 60, False, now=NOW, out=lines.append) == 1
     assert [b[:2] for b in store.beats] == [("transactions", "failed"), ("balances", "failed")]
+    assert store.beats[0][3] == sf.format_notes({"sf_access_refused": 1}) == store.beats[1][3]
     assert_no_secret(store.beats[0][3])
     assert_no_secret("\n".join(lines))
+
+
+def test_failure_codes_and_recovery():
+    cases = [
+        (Res(402), "sf_payment_required", None),
+        (Res(503), "sf_http_error", "HTTP 503"),
+        (Res(200, None), "sf_bad_answer", None),
+        (Res(200, {"accounts": "nope"}), "sf_bad_answer", None),
+    ]
+    for res, code, detail in cases:
+        store, lines = FakeStore(LEDGER), []
+        assert sf.run(store, Http(get=res), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+        assert [b[3] for b in store.beats] == [sf.format_notes({code: 1})] * 2, code
+        assert (detail in lines[0]) if detail else "HTTP" not in lines[0]
+    # A network error and an unexpected crash carry no exception text: only our code (+ the type name in the log).
+    class Boom(Exception):
+        pass
+
+    class RaisingHttp(Http):
+        def __init__(self, exc):
+            super().__init__()
+            self.exc = exc
+
+        def get(self, url, **kw):
+            raise self.exc
+
+    store, lines = FakeStore(LEDGER), []
+    assert sf.run(store, RaisingHttp(Boom(pii_msg())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+    assert store.beats[0][3] == sf.format_notes({"sf_unreachable": 1})
+    assert_no_pii("\n".join(lines))
+
+    class CrashingStore(FakeStore):
+        def accounts(self):
+            raise KeyError(pii_msg())
+
+    crash, lines = CrashingStore(LEDGER), []
+    assert sf.run(crash, Http(get=Res(200, body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+    assert crash.beats[0][3] == sf.format_notes({"etl_error": 1}) and "(KeyError)" in lines[0]
+    assert_no_pii(crash.beats[0][3] + "\n".join(lines))
+
+    class WriteFails(FakeStore):
+        def upsert_transactions(self, rows):
+            raise RuntimeError(f"duplicate key value violates unique constraint; row: {pii_msg()}")
+
+    wf, lines = WriteFails(ledger_with_fidelity()), []
+    assert sf.run(wf, Http(get=Res(200, body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+    assert [b[1] for b in wf.beats] == ["failed", "failed"] and wf.beats[0][3] == sf.format_notes({"db_write_failed": 1})
+    assert_no_pii(wf.beats[0][3] + "\n".join(lines))
+    # Recovery: the next good run writes success with no note at all (nothing sticks from the failure).
+    good = FakeStore(ledger_with_fidelity())
+    assert sf.run(good, Http(get=Res(200, body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert [(b[1], b[3]) for b in good.beats] == [("success", None), ("success", None)]
+    # The not-connected path (main) and a malformed Access URL map to their own codes.
+    assert sf.failure_code(sf.SimpleFinError("sf_not_connected")) == ("sf_not_connected", None)
+    bad_url = expect_error(sf.split_access_url, "https://u:p@evil.example.com/x")
+    assert "evil.example.com" not in bad_url
+    store = FakeStore(LEDGER)
+    assert sf.run(store, Http(get=Res(200, body())), "https://u:p@evil.example.com/x", 60, False, now=NOW, out=lambda *_: None) == 1
+    assert store.beats[0][3] == sf.format_notes({"sf_access_url_invalid": 1})
+    assert sf.failure_code(sf.SimpleFinError("claim_failed", "x")) == ("etl_error", "SimpleFinError")
 
 
 def test_skipped_account_is_partial():
@@ -361,7 +540,8 @@ def test_skipped_account_is_partial():
     b["accounts"].append(acct("S-WFX", "Some Account", "c2", [txn("9", "2026-11-18", "-1.00", "X")]))
     store = FakeStore(ledger_with_fidelity())
     sf.run(store, Http(get=Res(200, b)), ACCESS, 60, False, now=NOW, out=lambda *_: None)
-    assert store.beats[0][1] == "partial" and "not imported" in store.beats[0][3]
+    assert store.beats[0][1] == "partial" and store.beats[0][3] == sf.format_notes({"account_unmatched": 1})
+    assert "Wells Fargo" not in store.beats[0][3] and "Some Account" not in store.beats[0][3]
     assert not any(t["source_txn_id"].startswith("sf:S-WFX") for t in store.txns)
 
 

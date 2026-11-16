@@ -32,18 +32,30 @@ Investment accounts (Fidelity, the Wells Fargo brokerage) are stored as balances
 
 ## When the card is not green
 
+Every message ends with its code in brackets (`[sf_reauth]`, `[account_unmatched x2]`). The full list is
+`NOTE_CODES` in `simplefin_etl.py`.
+
 | Card says | Do |
 |---|---|
-| `SimpleFIN refused the Access URL ...` | The Access URL was revoked or disabled. Make a new setup token on SimpleFIN's site, then step 3. |
-| `SimpleFIN says payment is required` | Renew the SimpleFIN Bridge subscription. |
-| `SimpleFIN: <a message about a bank>` (amber) | That bank needs reconnecting on SimpleFIN's site. |
-| `one ... account was not imported` (amber) | A new or renamed account could not be matched; see step 4. |
-| `one new ... account is balances-only until its account type is set` | Set `finance_accounts.account_type` (Cash or Credit Card) if its transactions should count. |
+| `SimpleFIN refused the Access URL ... [sf_access_refused]` | The Access URL was revoked or disabled. Make a new setup token on SimpleFIN's site, then step 3. |
+| `SimpleFIN says payment is required [sf_payment_required]` | Renew the SimpleFIN Bridge subscription. |
+| `SimpleFIN: a bank connection needs signing in again [sf_reauth]` (amber) | Reconnect that bank on SimpleFIN's site (it marks which one). `--dry-run` locally flags the account too. |
+| Other `[sf_...]` codes (amber) | SimpleFIN reported a connection, account or general problem; check its site. Most clear on the next run. |
+| `an account was not imported [account_unmatched]` (amber) | A new or renamed account could not be matched; see step 4. |
+| `a new account is balances-only ... [account_type_unset]` | Set `finance_accounts.account_type` (Cash or Credit Card) if its transactions should count. |
+| `SimpleFIN reported a problem; its details are not shown here` | An older heartbeat (or an unexpected one) without a code. Wait for the next run, or run `--dry-run` locally. |
 
 ## What is never stored or printed
 
 The Access URL is a credential: it is never printed, logged or written to `sync_log`. The Actions log is public,
 so a run prints counts only (no names, descriptions, amounts or ids). Pending transactions are not requested.
+
+Heartbeat text is an allowlist (2026-11-16): a code from `NOTE_CODES`, its fixed wording and a count. SimpleFIN's
+own error messages (which can name the bank, the person or an account number), institution and account names and
+ids never reach `sync_log` or the log; SimpleFIN's `errlist` codes (`con.auth`, `act.failed`, ...) are mapped to our
+codes and anything unknown is `sf_unclassified`. `/status` and `/financials` re-render SimpleFIN heartbeats from the
+codes alone (`lib/finance-status.ts`, `SIMPLEFIN_NOTES`, which must match `NOTE_CODES`: a test checks), so an older
+row or a rolled-back ETL still cannot show free text there.
 
 ## The cutover from Rocket Money
 

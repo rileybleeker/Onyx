@@ -26,7 +26,7 @@ import {
   type LedgerQuery,
   type LedgerTxn,
 } from "@/lib/finance-ledger";
-import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
+import { FINANCE_SOURCE, simplefinLedgerCard } from "@/lib/finance-status";
 import { NO_FIXES, applyFixes, fixedCategory, type CategoryFixes } from "@/lib/finance-categories";
 import { merchantKey } from "@/lib/procurement-recurring";
 
@@ -186,7 +186,7 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
       .map(parseAccount)
       .filter((a): a is LedgerAccount => a !== null);
     const freshness =
-      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime(), null, SIMPLEFIN_THRESHOLDS) : null;
+      txHeartbeat || balHeartbeat ? simplefinLedgerCard(txHeartbeat, balHeartbeat, now.getTime()) : null;
 
     if (accounts.length === 0 && maxDate === null) return { kind: "empty", freshness };
 

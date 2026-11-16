@@ -31,6 +31,12 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
 Output is COUNTS ONLY (the repo and its Actions logs are public): never names, descriptions, amounts or ids.
 --dry-run (local) prints a per-account table for checking the matching before the first real run.
 
+Heartbeat text is an ALLOWLIST (NOTE_CODES): a fixed code, fixed wording and a count, nothing else. SimpleFIN's own
+error messages, institution and account names and ids never reach sync_log or the log; its errlist codes (gen. /
+con. / act.) map to our codes, and anything unknown or malformed is sf_unclassified. /status re-renders these
+heartbeats from the codes alone (lib/finance-status.ts, SIMPLEFIN_NOTES), so an older row with free text shows a
+generic note.
+
 Secrets: the Access URL comes from SIMPLEFIN_ACCESS_URL or ~/.simplefin_access_url; it is never printed, and every
 error text is built from fixed wording. Supabase: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY, else
 ~/.onyx_supabase_secret (local).
@@ -93,8 +99,84 @@ CARD_WORDS = re.compile(r"\b(CARD|CREDIT|VISA|MASTERCARD|PLATINUM|GOLD|SAPPHIRE)
 CASH_WORDS = re.compile(r"\b(CHECKING|SAVINGS|WAY2SAVE|DEPOSIT|MONEY MARKET)\b", re.I)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Heartbeat notes: the only text a run writes to sync_log or prints about a problem
+# ---------------------------------------------------------------------------------------------------------------
+# sync_log is read by /status (a cacheable endpoint) and by the support agents, so a note carries only a code from
+# this list, its fixed wording and a count: never SimpleFIN's own message text, an institution or account name, an
+# id, an amount or the Access URL. SimpleFIN's own site marks the connection that needs attention, and --dry-run
+# (local) flags the account. lib/finance-status.ts (SIMPLEFIN_NOTES) lists the same codes with the same wording and
+# renders these heartbeats from the codes alone (a frontend test reads this block: one entry per line, in double
+# quotes, no escapes).
+NOTE_CODES: dict[str, str] = {
+    "sf_not_connected": "SimpleFIN is not connected: set the SIMPLEFIN_ACCESS_URL secret (simplefin_etl.py --claim --set-github-secret)",
+    "sf_access_url_invalid": "the SimpleFIN Access URL is not a valid SimpleFIN address: claim a new one (simplefin_etl.py --claim --set-github-secret)",
+    "sf_access_refused": "SimpleFIN refused the Access URL (revoked, disabled for too many requests, or wrong): create a new setup token at beta-bridge.simplefin.org and run simplefin_etl.py --claim --set-github-secret",
+    "sf_payment_required": "SimpleFIN says payment is required: renew the SimpleFIN Bridge subscription",
+    "sf_unreachable": "SimpleFIN could not be reached; the next run retries",
+    "sf_http_error": "SimpleFIN returned an unexpected HTTP status; the next run retries (the Actions log has the number)",
+    "sf_bad_answer": "SimpleFIN's answer was not the expected JSON (the format may have changed)",
+    "window_too_long": "the requested window is longer than SimpleFIN's 90-day limit",
+    "etl_error": "the SimpleFIN ETL failed unexpectedly (the Actions log names the error type)",
+    "db_write_failed": "the SimpleFIN ETL could not write to Supabase; the next run retries",
+    "sf_reauth": "SimpleFIN: a bank connection needs signing in again: reconnect it on SimpleFIN's site",
+    "sf_connection_error": "SimpleFIN: a bank connection reported an error: check it on SimpleFIN's site",
+    "sf_account_failed": "SimpleFIN could not read an account this run; it retries",
+    "sf_account_incomplete": "SimpleFIN says an account's transaction list is incomplete this run; it retries",
+    "sf_account_error": "SimpleFIN reported an account error: check the connections on SimpleFIN's site",
+    "sf_server_auth": "SimpleFIN reported an authentication problem with the Access URL: if it repeats, claim a new one",
+    "sf_api_error": "SimpleFIN says the request was malformed (a bug in simplefin_etl.py)",
+    "sf_general_error": "SimpleFIN reported a general problem: check SimpleFIN's site",
+    "sf_unclassified": "SimpleFIN reported a problem it did not classify: check the connections on SimpleFIN's site",
+    "account_no_id": "SimpleFIN sent an account without an id; it was skipped",
+    "account_unmatched": "an account was not imported: it could not be matched uniquely to a ledger account (run simplefin_etl.py --dry-run locally)",
+    "account_type_unset": "a new account is balances-only until its finance_accounts.account_type is set",
+}
+NOTE_LIMIT = 300      # past this the later codes keep only their token (format_notes); lib/finance-status.ts agrees
+NOTE_MAX_COUNT = 9999
+
+# SimpleFIN protocol v2 errlist codes ("prefix.subcode"; an unknown subcode is treated as the bare prefix).
+ERRLIST_CODES = {
+    ("con", "auth"): "sf_reauth",
+    ("con", ""): "sf_connection_error",
+    ("act", "failed"): "sf_account_failed",
+    ("act", "missingdata"): "sf_account_incomplete",
+    ("act", ""): "sf_account_error",
+    ("gen", "auth"): "sf_server_auth",
+    ("gen", "api"): "sf_api_error",
+    ("gen", ""): "sf_general_error",
+}
+
+
+def note_token(code: str, n: int) -> str:
+    return f"[{code} x{n}]" if n > 1 else f"[{code}]"
+
+
+def format_notes(counts) -> Optional[str]:
+    """{code: count} -> 'wording [code]; wording [code x2]' in NOTE_CODES order; codes not in NOTE_CODES are left
+    out. Once the wording passes NOTE_LIMIT the later codes keep only their token ('...; also [code x2] [code]'),
+    so no code is lost and the length is bounded by the allowlist. The first code always has its wording."""
+    items = [(c, min(int(counts.get(c) or 0), NOTE_MAX_COUNT)) for c in NOTE_CODES]
+    items = [(c, n) for c, n in items if n > 0]
+    if not items:
+        return None
+    out: list[str] = []
+    for i, (c, n) in enumerate(items):
+        seg = f"{NOTE_CODES[c]} {note_token(c, n)}"
+        if out and len("; ".join(out + [seg])) > NOTE_LIMIT:
+            return "; ".join(out) + "; also " + " ".join(note_token(rc, rn) for rc, rn in items[i:])
+        out.append(seg)
+    return "; ".join(out)
+
+
 class SimpleFinError(Exception):
-    """An error whose text is fixed wording, safe for logs and sync_log (never a URL, credential or row)."""
+    """An error whose text is fixed wording, safe for logs (never a URL, credential or row). `code` is what a
+    heartbeat gets (a NOTE_CODES key); `detail` is an HTTP status or an exception type name, for the log only."""
+
+    def __init__(self, code: str, message: Optional[str] = None, detail: Optional[str] = None):
+        self.code = code
+        self.detail = detail
+        super().__init__(message or NOTE_CODES.get(code) or "the SimpleFIN ETL failed")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -105,11 +187,11 @@ def split_access_url(access_url: str) -> tuple[str, tuple[str, str]]:
     try:
         parts = urlsplit((access_url or "").strip())
     except ValueError:
-        raise SimpleFinError("the SimpleFIN Access URL could not be read") from None
+        raise SimpleFinError("sf_access_url_invalid", "the SimpleFIN Access URL could not be read") from None
     if parts.scheme != "https" or (parts.hostname or "").lower() not in ALLOWED_HOSTS:
-        raise SimpleFinError("the SimpleFIN Access URL is not an https URL on SimpleFIN's host")
+        raise SimpleFinError("sf_access_url_invalid", "the SimpleFIN Access URL is not an https URL on SimpleFIN's host")
     if not parts.username or parts.password is None:
-        raise SimpleFinError("the SimpleFIN Access URL has no credentials in it")
+        raise SimpleFinError("sf_access_url_invalid", "the SimpleFIN Access URL has no credentials in it")
     host = parts.hostname + (f":{parts.port}" if parts.port else "")
     base = urlunsplit(("https", host, parts.path.rstrip("/"), "", ""))
     return base, (unquote(parts.username), unquote(parts.password))
@@ -119,14 +201,14 @@ def decode_setup_token(token: str) -> str:
     """Setup token (base64 of the claim URL) -> claim URL, checked to be https on SimpleFIN's host."""
     raw = re.sub(r"\s+", "", token or "")
     if not raw:
-        raise SimpleFinError("the setup token file is empty")
+        raise SimpleFinError("claim_failed", "the setup token file is empty")
     try:
         url = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=False).decode("utf-8").strip()
     except Exception:
-        raise SimpleFinError("the setup token is not base64") from None
+        raise SimpleFinError("claim_failed", "the setup token is not base64") from None
     parts = urlsplit(url)
     if parts.scheme != "https" or (parts.hostname or "").lower() not in ALLOWED_HOSTS:
-        raise SimpleFinError("the setup token does not point at SimpleFIN's claim URL")
+        raise SimpleFinError("claim_failed", "the setup token does not point at SimpleFIN's claim URL")
     return url
 
 
@@ -136,11 +218,11 @@ def claim_access_url(token: str, http) -> str:
     try:
         res = http.post(claim_url, headers={"Content-Length": "0"}, timeout=30)
     except Exception:
-        raise SimpleFinError("the claim request could not be sent") from None
+        raise SimpleFinError("claim_failed", "the claim request could not be sent") from None
     if res.status_code == 403:
-        raise SimpleFinError("SimpleFIN refused the setup token (already used or wrong); create a new one")
+        raise SimpleFinError("claim_failed", "SimpleFIN refused the setup token (already used or wrong); create a new one")
     if res.status_code != 200:
-        raise SimpleFinError(f"the claim request returned HTTP {res.status_code}")
+        raise SimpleFinError("claim_failed", f"the claim request returned HTTP {int(res.status_code)}")
     access_url = (res.text or "").strip()
     split_access_url(access_url)  # validates host + credentials
     return access_url
@@ -155,7 +237,7 @@ def load_access_url() -> str:
     except OSError:
         text = ""
     if not text:
-        raise SimpleFinError("no SimpleFIN Access URL: set SIMPLEFIN_ACCESS_URL (GitHub secret) or run --claim")
+        raise SimpleFinError("sf_not_connected", "no SimpleFIN Access URL: set SIMPLEFIN_ACCESS_URL (GitHub secret) or run --claim")
     return text
 
 
@@ -169,28 +251,25 @@ def epoch(d: date) -> int:
 def fetch_accounts(access_url: str, start: date, end_exclusive: date, http) -> dict:
     """GET /accounts?version=2 over [start, end_exclusive). Raises SimpleFinError with fixed wording."""
     if (end_exclusive - start).days > MAX_DAYS:
-        raise SimpleFinError(f"the window is longer than SimpleFIN's {MAX_DAYS}-day limit")
+        raise SimpleFinError("window_too_long")
     base, auth = split_access_url(access_url)
     params = {"version": "2", "start-date": str(epoch(start)), "end-date": str(epoch(end_exclusive))}
     try:
         res = http.get(f"{base}/accounts", params=params, auth=auth, timeout=90, follow_redirects=True)
     except Exception:
-        raise SimpleFinError("SimpleFIN could not be reached") from None
+        raise SimpleFinError("sf_unreachable") from None
     if res.status_code == 403:
-        raise SimpleFinError(
-            "SimpleFIN refused the Access URL (revoked, disabled for too many requests, or wrong): "
-            "create a new setup token at beta-bridge.simplefin.org and run simplefin_etl.py --claim --set-github-secret"
-        )
+        raise SimpleFinError("sf_access_refused")
     if res.status_code == 402:
-        raise SimpleFinError("SimpleFIN says payment is required: renew the SimpleFIN Bridge subscription")
+        raise SimpleFinError("sf_payment_required")
     if res.status_code != 200:
-        raise SimpleFinError(f"SimpleFIN returned HTTP {res.status_code}")
+        raise SimpleFinError("sf_http_error", detail=f"HTTP {res.status_code if isinstance(res.status_code, int) else 0}")
     try:
         body = res.json()
     except Exception:
-        raise SimpleFinError("SimpleFIN's answer was not JSON") from None
+        raise SimpleFinError("sf_bad_answer", "SimpleFIN's answer was not JSON") from None
     if not isinstance(body, dict) or not isinstance(body.get("accounts"), list):
-        raise SimpleFinError("SimpleFIN's answer had no accounts list (the format may have changed)")
+        raise SimpleFinError("sf_bad_answer", "SimpleFIN's answer had no accounts list (the format may have changed)")
     return body
 
 
@@ -291,19 +370,20 @@ class SfAccount:
     balance_cents: Optional[int]
     balance_at: Optional[datetime]
     transactions: list = field(default_factory=list)
+    conn_id: str = ""
 
 
-def parse_accounts(body: dict) -> tuple[list[SfAccount], list[str]]:
-    """The /accounts body -> accounts + counts-free problems (each a short fixed-shape note)."""
+def parse_accounts(body: dict) -> tuple[list[SfAccount], Counter]:
+    """The /accounts body -> accounts + problems as NOTE_CODES counts."""
     conns = {}
     for c in body.get("connections") or []:
         if isinstance(c, dict) and c.get("conn_id"):
             conns[str(c["conn_id"])] = c
     out: list[SfAccount] = []
-    problems: list[str] = []
+    problems: Counter = Counter()
     for a in body.get("accounts") or []:
         if not isinstance(a, dict) or not a.get("id"):
-            problems.append("an account without an id was skipped")
+            problems["account_no_id"] += 1
             continue
         conn = conns.get(str(a.get("conn_id") or ""), {})
         org = a.get("org") if isinstance(a.get("org"), dict) else {}
@@ -322,26 +402,55 @@ def parse_accounts(body: dict) -> tuple[list[SfAccount], list[str]]:
             balance_cents=to_cents(a.get("balance")),
             balance_at=bal_at,
             transactions=[t for t in (a.get("transactions") or []) if isinstance(t, dict)],
+            conn_id=str(a.get("conn_id") or ""),
         ))
     return out, problems
 
 
-def connection_errors(body: dict) -> list[str]:
-    """errlist (v2 objects) + errors (deprecated strings) -> short texts, digits runs masked."""
-    texts: list[str] = []
-    for e in body.get("errlist") or []:
-        if isinstance(e, dict):
-            texts.append(clean(e.get("msg")) or clean(e.get("code")) or "error")
-        elif isinstance(e, str):
-            texts.append(clean(e) or "error")
-    for e in body.get("errors") or []:
-        if isinstance(e, str) and clean(e):
-            texts.append(clean(e))
-    out = []
-    for t in texts:
-        t = re.sub(r"\d{4,}", "####", t)[:160]
-        if t not in out:
-            out.append(t)
+def classify_error(code: Any) -> str:
+    """A SimpleFIN errlist code -> one of our NOTE_CODES. An unknown subcode counts as the bare prefix (as the
+    protocol asks); an unknown prefix or anything malformed is sf_unclassified. The message text is never read."""
+    c = code.strip().lower() if isinstance(code, str) else ""
+    if not re.fullmatch(r"[a-z]{1,10}\.[a-z0-9_.]{0,40}", c):
+        return "sf_unclassified"
+    prefix, _, sub = c.partition(".")
+    return ERRLIST_CODES.get((prefix, sub.split(".")[0])) or ERRLIST_CODES.get((prefix, "")) or "sf_unclassified"
+
+
+@dataclass(frozen=True)
+class SfIssue:
+    code: str              # a NOTE_CODES key
+    conn_id: str = ""      # only to flag an account in the local --dry-run table; never written or logged
+    account_id: str = ""
+
+
+def _opaque_id(v: Any) -> str:
+    return str(v)[:200] if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v) else ""
+
+
+def connection_errors(body: dict) -> list[SfIssue]:
+    """errlist (v2) -> distinct issues: our code + the connection / account SimpleFIN named. The deprecated `errors`
+    strings are read only when there is no errlist (v2 servers send both), each as sf_unclassified."""
+    issues: list[SfIssue] = []
+    errlist = body.get("errlist")
+    if isinstance(errlist, list) and errlist:
+        for e in errlist:
+            if isinstance(e, dict):
+                issues.append(SfIssue(classify_error(e.get("code")), _opaque_id(e.get("conn_id")), _opaque_id(e.get("account_id"))))
+            else:
+                issues.append(SfIssue("sf_unclassified"))
+    elif errlist not in (None, [], ""):
+        issues.append(SfIssue("sf_unclassified"))  # an errlist that is not a list: the format changed
+    else:
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            issues.extend(SfIssue("sf_unclassified") for e in errors if e)
+        elif errors:
+            issues.append(SfIssue("sf_unclassified"))
+    out: list[SfIssue] = []
+    for i in issues:
+        if i not in out:
+            out.append(i)
     return out
 
 
@@ -621,7 +730,7 @@ def supabase_client():
         except OSError:
             key = ""
     if not key:
-        raise SimpleFinError("no Supabase service key (SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret)")
+        raise SimpleFinError("supabase_key_missing", "no Supabase service key (SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret)")
     return create_client(url, key)
 
 
@@ -703,7 +812,7 @@ class Plan:
     links: list
     transactions: list
     balances: list
-    notes: list
+    notes: Counter       # NOTE_CODES -> count; the only problem text a heartbeat or the log carries
     per_account: list
     categories: Counter
     dropped: Counter
@@ -718,7 +827,8 @@ def et_today(now: Optional[datetime] = None) -> date:
 
 def build_plan(body: dict, store, today: date, days: int) -> Plan:
     sf_accounts, notes = parse_accounts(body)
-    notes += [f"SimpleFIN: {e}" for e in connection_errors(body)]
+    issues = connection_errors(body)
+    notes.update(i.code for i in issues)
     ledger = store.accounts()
     matches = match_accounts(sf_accounts, ledger)
     by_key = {r["account_key"]: r for r in ledger}
@@ -738,9 +848,12 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     for a in sf_accounts:
         m = matches[a.id]
         line = {"institution": a.institution, "name": a.name, "mask": a.mask, "action": m.action, "reason": m.reason,
-                "kept": 0, "dropped": 0, "balances_only": False}
+                "kept": 0, "dropped": 0, "balances_only": False,
+                # local --dry-run only: which of our codes SimpleFIN raised for this account or its connection
+                "issues": sorted({i.code for i in issues
+                                  if (i.account_id and i.account_id == a.id) or (i.conn_id and i.conn_id == a.conn_id)})}
         if m.action == "skip":
-            notes.append(f"one {a.institution} account was not imported: {m.reason}")
+            notes["account_unmatched"] += 1
             per_account.append(line)
             continue
         if m.action == "new":
@@ -766,7 +879,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
         if is_balances_only(acct_type):
             line["balances_only"] = True
             if acct_type in (None, "", "Unknown"):
-                notes.append(f"one new {a.institution} account is balances-only until its account type is set")
+                notes["account_type_unset"] += 1
             per_account.append(line)
             continue
         rows, skip = normalize_transactions(a, key)
@@ -792,8 +905,9 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         body = fetch_accounts(access_url, start, today + timedelta(days=1), http)
         plan = build_plan(body, store, today, days)
     except Exception as e:
-        msg = str(e) if isinstance(e, SimpleFinError) else f"SimpleFIN ETL failed ({type(e).__name__})"
-        out(f"FAILED: {msg}")
+        code, detail = failure_code(e)
+        msg = format_notes({code: 1})
+        out(f"FAILED: {msg}" + (f" ({detail})" if detail else ""))
         if not dry_run:
             store.heartbeat("transactions", "failed", 0, started, msg)
             store.heartbeat("balances", "failed", 0, started, msg)
@@ -807,11 +921,12 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
                 what = "balances only"
             else:
                 what = f"keep {line['kept']}, drop {line['dropped']}, cutover {line.get('cutover')}"
-            out(f"  {line['institution']} | {line['name']} | last4 {line.get('mask') or '-'} | {line['action']}{why} | {what}")
+            flag = f" | SimpleFIN issue: {', '.join(line['issues'])}" if line.get("issues") else ""
+            out(f"  {line['institution']} | {line['name']} | last4 {line.get('mask') or '-'} | {line['action']}{why} | {what}{flag}")
         out(f"  transactions to write: {len(plan.transactions)}; balances: {len(plan.balances)}; new accounts: {len(plan.new_accounts)}")
         out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
-        for n in plan.notes:
-            out(f"  note: {n}")
+        if plan.notes:
+            out(f"  heartbeat note: {format_notes(plan.notes)}")
         return 0
 
     try:
@@ -822,22 +937,41 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         store.upsert_transactions(plan.transactions)
         store.upsert_balances(plan.balances)
     except Exception as e:
-        msg = f"SimpleFIN ETL could not write to Supabase ({type(e).__name__})"
-        out(f"FAILED: {msg}")
+        msg = format_notes({"db_write_failed": 1})
+        out(f"FAILED: {msg} ({safe_type_name(e)})")
         store.heartbeat("transactions", "failed", 0, started, msg)
         store.heartbeat("balances", "failed", 0, started, msg)
         return 1
 
-    note = "; ".join(plan.notes)[:300] or None
-    status = "partial" if plan.notes else "success"
+    note = format_notes(plan.notes)
+    status = "partial" if note else "success"
     store.heartbeat("transactions", status, len(plan.transactions), started, note, start, today)
     store.heartbeat("balances", status, len(plan.balances), started, note)
     out(f"{status}: {len(plan.accounts)} account(s), {len(plan.transactions)} transaction(s), "
         f"{len(plan.balances)} balance(s), {len(plan.new_accounts)} new account(s), {len(plan.links)} linked")
     out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
-    if plan.notes:
-        out(f"  {len(plan.notes)} note(s) written to the heartbeat")
+    if note:
+        out(f"  heartbeat codes: {note_codes_summary(plan.notes)}")
     return 0
+
+
+def safe_type_name(e: BaseException) -> str:
+    """An exception's class name for the log (a name from code, never its message); anything odd -> 'error'."""
+    name = type(e).__name__
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", name) else "error"
+
+
+def failure_code(e: BaseException) -> tuple[str, Optional[str]]:
+    """A failed run -> (NOTE_CODES key for the heartbeat, detail for the log only)."""
+    if isinstance(e, SimpleFinError) and e.code in NOTE_CODES:
+        detail = e.detail if isinstance(e.detail, str) and re.fullmatch(r"HTTP \d{1,3}", e.detail) else None
+        return e.code, detail
+    return "etl_error", safe_type_name(e)
+
+
+def note_codes_summary(counts) -> str:
+    """'sf_reauth x1, account_unmatched x2' (NOTE_CODES order): the codes only, for the log."""
+    return ", ".join(f"{c} x{min(int(counts[c]), NOTE_MAX_COUNT)}" for c in NOTE_CODES if counts.get(c))
 
 
 def claim_command(set_github_secret: bool, http) -> int:
@@ -893,8 +1027,9 @@ def main() -> int:
             if args.dry_run:
                 return 1
             started = time.time()
-            store.heartbeat("transactions", "failed", 0, started, str(e))
-            store.heartbeat("balances", "failed", 0, started, str(e))
+            msg = format_notes({failure_code(e)[0]: 1})
+            store.heartbeat("transactions", "failed", 0, started, msg)
+            store.heartbeat("balances", "failed", 0, started, msg)
             # Before Riley has connected SimpleFIN the scheduled run only reports it (red /status card),
             # without turning every Actions run red.
             if os.environ.get("GITHUB_ACTIONS") == "true":

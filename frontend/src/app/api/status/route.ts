@@ -4,7 +4,7 @@ import { getNycScoutFreshness } from "@/lib/nyc";
 import { staleCheckNote, swrCacheTimed } from "@/lib/swr-cache";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
-import { SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
+import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
 
@@ -1399,16 +1399,10 @@ export async function GET() {
       // (simplefin_etl.py; the Rocket Money harvester it replaced is retired). Each run writes a
       // simplefin|transactions and a simplefin|balances heartbeat. Status is the worse of the two
       // (>14h degraded, >30h or a failed row red; 'partial' = SimpleFIN reported a connection problem
-      // or an account could not be matched, with that text). Heartbeat-only by design: no amounts or
-      // row contents ever reach this cacheable endpoint.
+      // or an account could not be matched). Heartbeat-only by design: no amounts or row contents ever reach
+      // this cacheable endpoint, and the heartbeat text is re-rendered from its allowlisted codes (SEC-07).
       simplefin: (() => {
-        const card = financeLedgerCard(
-          latestBySrcType["simplefin|transactions"],
-          latestBySrcType["simplefin|balances"],
-          Date.now(),
-          null,
-          SIMPLEFIN_THRESHOLDS,
-        );
+        const card = simplefinLedgerCard(latestBySrcType["simplefin|transactions"], latestBySrcType["simplefin|balances"]);
         return {
           label: "SimpleFIN",
           lastSync: card.lastSync,
@@ -1480,7 +1474,8 @@ export async function GET() {
       },
     };
 
-    const recentHistory = (syncRows ?? []).slice(0, 20).map((r) => ({
+    // SimpleFIN rows' text is re-rendered from its allowlisted codes (withSafeSimplefinNote), like the card.
+    const recentHistory = (syncRows ?? []).slice(0, 20).map(withSafeSimplefinNote).map((r) => ({
       source: r.source,
       data_type: r.data_type,
       sync_start: r.sync_start,
