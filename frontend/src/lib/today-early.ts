@@ -20,6 +20,10 @@ export const TODAY_RENEWALS_URL = "/api/procurement/renewals/summary";
 export const TODAY_CALENDAR_PATH = "/api/calendar/events";
 /** The agents Worker's inbox (GET, read-only: lists open cards and unread messages). */
 export const AGENTS_INBOX_PATH = "/onyx/inbox";
+/** One conversation's messages (GET, read-only: marking read is the separate POST /onyx/read). */
+export const AGENTS_MESSAGES_PATH = "/onyx/messages";
+/** How many messages AgentsChat's first read asks for. */
+export const AGENTS_THREAD_FIRST_LIMIT = 60;
 
 /** Same-origin GETs, fetched exactly as TodayClient fetches them (`cache: "no-store"`). */
 export const TODAY_EARLY_GETS = [TODAY_READING_URL, TODAY_URGENT_URL, TODAY_ORDERS_URL, TODAY_RENEWALS_URL, MONEY_URL] as const;
@@ -53,13 +57,25 @@ export function todayEarlyScript(supabaseUrl: string | undefined, agentsApi: str
 }
 
 /**
- * Plain-ES5 inline script for /agents (app/agents/EarlyInbox.tsx): the Worker's inbox, as on Today, unless the URL
- * opens one conversation (`?t=<agent>`, which AgentsApp shows as AgentsChat and which never reads the inbox).
+ * Plain-ES5 inline script for /agents (app/agents/EarlyInbox.tsx): the Worker's inbox, as on Today, or, when the
+ * URL opens one conversation (`?t=<agent>`, which AgentsApp shows as AgentsChat and which never reads the inbox),
+ * that conversation's first read, the URL agentsThreadFirstUrl() names. A push deep link used to paint from the
+ * copy on the device; agents:* is memory-only since SEC-03 (2026-11-16), so its read starts here instead.
  */
 export function agentsEarlyScript(supabaseUrl: string | undefined, agentsApi: string): string {
-  const body = inboxEarlyBody(supabaseUrl, agentsApi);
-  if (!body) return "";
-  return earlyFetchWrap(`var t=new URLSearchParams(location.search).get("t");if(!(t&&/^[\\w][\\w.-]{0,39}$/.test(t))){${body}}`);
+  const inbox = inboxEarlyBody(supabaseUrl, agentsApi);
+  if (!inbox) return "";
+  const head = `${agentsApi}${AGENTS_MESSAGES_PATH}?thread=`;
+  const thread = workerEarlyBody(supabaseUrl, `${JSON.stringify(head)}+encodeURIComponent(t)+${JSON.stringify(`&limit=${AGENTS_THREAD_FIRST_LIMIT}`)}`);
+  return earlyFetchWrap(`var t=new URLSearchParams(location.search).get("t");if(t&&/^[\\w][\\w.-]{0,39}$/.test(t)){${thread}}else{${inbox}}`);
+}
+
+/**
+ * The first read AgentsChat makes for `thread` on a full load: what agentsApi.messages({ thread, limit: 60 })
+ * requests (URLSearchParams puts `thread` before `limit`; a thread name AgentsApp accepts needs no escaping).
+ */
+export function agentsThreadFirstUrl(agentsApi: string, thread: string): string {
+  return `${agentsApi}${AGENTS_MESSAGES_PATH}?thread=${encodeURIComponent(thread)}&limit=${AGENTS_THREAD_FIRST_LIMIT}`;
 }
 
 /**
@@ -67,6 +83,14 @@ export function agentsEarlyScript(supabaseUrl: string | undefined, agentsApi: st
  * access token read from the Supabase cookie; "" without a Supabase URL. Never throws.
  */
 export function inboxEarlyBody(supabaseUrl: string | undefined, agentsApi: string): string {
+  return workerEarlyBody(supabaseUrl, JSON.stringify(agentsApi + AGENTS_INBOX_PATH));
+}
+
+/**
+ * Script body that starts one agents Worker GET (`urlExpr`: a plain-ES5 expression for its full URL) with the
+ * session's access token read from the Supabase cookie; "" without a Supabase URL. Never throws.
+ */
+function workerEarlyBody(supabaseUrl: string | undefined, urlExpr: string): string {
   const cookie = supabaseUrl ? authCookieName(supabaseUrl) : null;
   return cookie
     ? `try{var K=${JSON.stringify(cookie)},c=document.cookie.split(";"),v=null,ch=[],i,j,k,x;` +
@@ -77,6 +101,6 @@ export function inboxEarlyBody(supabaseUrl: string | undefined, agentsApi: strin
       `if(v){if(v.indexOf("base64-")===0){var s=v.slice(7).replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";` +
       `var b=atob(s),a=new Uint8Array(b.length);for(i=0;i<b.length;i++)a[i]=b.charCodeAt(i);v=new TextDecoder().decode(a);}` +
       `var S=JSON.parse(v);if(S&&typeof S.access_token==="string"&&S.expires_at*1000-Date.now()>90000)` +
-      `go(${JSON.stringify(agentsApi + AGENTS_INBOX_PATH)},{cache:"no-store",headers:{Authorization:"Bearer "+S.access_token}});}}catch(e){}`
+      `go(${urlExpr},{cache:"no-store",headers:{Authorization:"Bearer "+S.access_token}});}}catch(e){}`
     : "";
 }

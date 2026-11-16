@@ -126,13 +126,15 @@ export function cachedVisibleCards(): string[] {
 
 /**
  * The overview's reads for the background warm-up (lib/warmup.ts DataWarmer shape), for the cards that are
- * shown, skipping keys Today loads itself and memory-only ones. Long freshness: the cards revalidate when they come into view.
+ * shown, skipping keys Today loads itself and sources marked `persist: false`. Keys the cache keeps in memory only
+ * by rule (lib/client-cache.ts isSensitiveKey: /api/status, the agents inbox, ...) may still be warmed: the cache
+ * never writes them to the device. Long freshness: the cards revalidate when they come into view.
  */
 export function overviewWarmers(): { key: string; fetch: () => Promise<unknown>; freshMs: number }[] {
   const out: { key: string; fetch: () => Promise<unknown>; freshMs: number }[] = [];
   for (const id of cachedVisibleCards()) {
     for (const s of cardSources(id)) {
-      // The warm-up stores with the default persistence, so memory-only sources are left to the card itself.
+      // The warm-up stores with the default persistence, so `persist: false` sources are left to the card itself.
       if (s.today || s.persist === false || out.some((w) => w.key === s.key)) continue;
       out.push({ key: s.key, fetch: checkedFetch(s), freshMs: Math.max(s.freshMs, 10 * MIN) });
     }

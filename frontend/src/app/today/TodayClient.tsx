@@ -278,7 +278,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     });
   }, [feed, markCheck]);
   // Reopening the app: fill empty panels from the copy kept on this device (IndexedDB) while the network
-  // answers. Finance, procurement and experiment answers are never on the device, so they wait for the network.
+  // answers. Finance, procurement and experiment answers, the agents inbox and urgent email are never on the device
+  // (memory-only keys, lib/client-cache.ts isSensitiveKey), so they wait for the network (most of those GETs start
+  // with the HTML, app/today/EarlyReads.tsx).
   useEffect(() => {
     let alive = true;
     function fill<T>(key: string, parse: (data: unknown) => T, apply: (value: T) => void) {
@@ -289,9 +291,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         apply(value);
       });
     }
-    fill(CACHE_KEYS.agentsInbox, parseInbox, (v) => setInbox(fromDevice(v)));
     fill(READING_URL, parseReading, (v) => setReading(fromDevice(v)));
-    fill(URGENT_URL, parseUrgent, (v) => setUrgent(fromDevice(v)));
     fill(calendarUrl(), readCalendarResponse, (v) => setCalendar(fromDevice(v)));
     fill(ORDERS_URL, parseOrders, (v) => setOrders((previous) => previous ?? v));
     return () => { alive = false; };

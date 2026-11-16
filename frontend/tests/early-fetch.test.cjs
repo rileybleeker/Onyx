@@ -165,23 +165,42 @@ test("Today's early URLs are the ones TodayClient reads (so each answer is taken
   assert.match(read("app/status/page.tsx"), /earlyFetchScript\(STATUS_URL/);
 });
 
-test("/agents: the inbox read starts on the inbox view only, never for a conversation (?t=<agent>)", (t) => {
+test("/agents: the inbox read starts on the inbox view; a conversation (?t=<agent>) starts its own first read instead", (t) => {
   const value = "base64-" + b64url(session(3600));
   const calls = withWindow(t, { cookie: `${COOKIE}=${value}` });
-  for (const [search, expected] of [["", true], ["?view=unread", true], ["?t=nyc-scout", false], ["?t=bad%20name", true]]) {
+  const INBOX = WORKER + T.AGENTS_INBOX_PATH;
+  for (const [search, expected] of [["", INBOX], ["?view=unread", INBOX], ["?t=nyc-scout", T.agentsThreadFirstUrl(WORKER, "nyc-scout")],
+    ["?t=a.b-c_1&reply=A12", T.agentsThreadFirstUrl(WORKER, "a.b-c_1")], ["?t=bad%20name", INBOX]]) {
     calls.length = 0;
     delete global[E.EARLY_FETCH_KEY];
     global.location = { search };
     new Function(T.agentsEarlyScript(SUPABASE, WORKER))();
-    assert.equal(calls.some((c) => c.url === WORKER + T.AGENTS_INBOX_PATH), expected, search || "(none)");
-    assert.ok(calls.every((c) => c.url === WORKER + T.AGENTS_INBOX_PATH), "nothing else");
+    assert.deepEqual(calls.map((c) => c.url), [expected], search || "(none)");
+    assert.equal(calls[0].init.headers.Authorization, "Bearer tok-synthetic");
+    assert.equal(calls[0].init.cache, "no-store");
+    assert.equal(calls[0].init.method, undefined, "GET only");
+    assert.equal(calls[0].init.credentials, undefined, "no cookies to the Worker");
   }
+  // The URL is exactly what agentsApi.messages({ thread, limit }) builds for AgentsChat's first read.
+  const q = new URLSearchParams();
+  q.set("thread", "nyc-scout");
+  q.set("limit", String(T.AGENTS_THREAD_FIRST_LIMIT));
+  assert.equal(T.agentsThreadFirstUrl(WORKER, "nyc-scout"), `${WORKER}${T.AGENTS_MESSAGES_PATH}?${q}`);
+  // A token about to expire starts nothing for a conversation either (the client refreshes and asks).
+  calls.length = 0;
+  delete global[E.EARLY_FETCH_KEY];
+  global.location = { search: "?t=nyc-scout" };
+  global.document.cookie = `${COOKIE}=base64-${b64url(session(30))}`;
+  new Function(T.agentsEarlyScript(SUPABASE, WORKER))();
+  assert.equal(calls.length, 0);
   assert.equal(T.agentsEarlyScript(undefined, WORKER), "", "no Supabase URL: no script");
   const fs = require("node:fs");
   const path = require("node:path");
   const src = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
   assert.match(src("app/agents/page.tsx"), /<EarlyInbox \/>/);
   assert.match(src("app/agents/AgentsInbox.tsx"), /agentsApi\.inbox\(\{ early \}\)/);
+  assert.match(src("app/agents/AgentsChat.tsx"), /limit: full \? AGENTS_THREAD_FIRST_LIMIT : 100 \},\s*\{ early \}/, "the conversation's first read takes it");
+  assert.match(src("lib/agents-api.ts"), /takeEarlyFetch\(`\$\{AGENTS_API\}\$\{path\}`\)/, "the conversation's early key");
   // The same rule AgentsApp uses to open a conversation instead of the inbox.
   assert.ok(src("app/agents/AgentsApp.tsx").includes(String.raw`/^[\w][\w.-]{0,39}$/.test(thread)`));
 });

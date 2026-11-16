@@ -7,8 +7,11 @@
  *
  * - Persisted copies live in IndexedDB, scoped to the signed-in Supabase user and to CACHE_SCHEMA_VERSION:
  *   another user or another schema deletes the whole store before anything is read (attach()).
- * - Sensitive data (finance, procurement, medical, screen time, experiments, tokens and auth routes) is kept
- *   in memory only, so it is gone when the tab or app closes (isSensitiveKey()).
+ * - Sensitive data (finance, procurement, medical, care, screen time, experiments, tokens and auth routes) is kept
+ *   in memory only, so it is gone when the tab or app closes (isSensitiveKey()). So are mixed payloads that carry
+ *   text copied from other sources (agent conversations and cards, /api/status, /api/urgent-email): they keep the
+ *   strictest class of anything they may carry. A key that becomes memory-only is deleted from the persisted store
+ *   at the next start (attach()), so a policy change needs no sign-out and no schema bump to take effect.
  * - Every entry carries a timestamp and a max age (7 days by default). Expired entries are deleted when read
  *   and by the sweep that runs at startup and once a day.
  * - The persisted store has a size cap (25 MB) with least-recently-used eviction; a quota error evicts and
@@ -19,7 +22,9 @@
  * plain node. The IndexedDB backend lives in client-cache-idb.ts.
  */
 
-export const CACHE_SCHEMA_VERSION = 1;
+// 2 (2026-11-16): agents, /api/status and /api/urgent-email became memory-only; a store written under 1 may hold
+// copies of them, so attach() deletes it whole (and purges memory-only keys from any store, see above).
+export const CACHE_SCHEMA_VERSION = 2;
 export const CACHE_DB_NAME = "onyx-client-cache";
 export const DEFAULT_MAX_AGE_MS = 7 * 24 * 3_600_000;
 export const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
@@ -34,9 +39,16 @@ export const APP_STORAGE_PREFIXES = ["onyx", "chartCard."];
 // Keys whose data never touches the disk. URL keys are the GET path + query; other keys are "<area>:<name>".
 const SENSITIVE: RegExp[] = [
   // journal: the personal journal's titles, moods and snippets (the /log Journal section's read).
-  /^\/api\/(finance|procurement|medical|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
+  // care: the /health care planner's items (every caller already passes persist: false; enforced here too).
+  /^\/api\/(finance|procurement|medical|care|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
   /^\/(financials|procurement|screen-time|health\/records)(\/|\?|$)/,
-  /^(finance|procurement|medical|screen-time|spotify|experiments):/,
+  /^(finance|procurement|medical|care|screen-time|spotify|experiments):/,
+  // Mixed payloads (SEC-03, 2026-11-16): the agents inbox and conversations (message bodies and cards can quote
+  // finance, medical or email content), the agents Worker's /onyx/* routes by path or full URL, /api/status
+  // (heartbeat error text such as bank or provider names) and /api/urgent-email (subjects and senders of any mail).
+  /^agents:/,
+  /^(https?:\/\/[^/]+)?\/onyx(\/|\?|$)/,
+  /^\/api\/(status|urgent-email)(\/|\?|$)/,
   /token|auth|secret|session|password|callback|exchange|credential|install/i,
 ];
 
@@ -50,6 +62,11 @@ export const CACHE_KEYS = {
 
 export function isSensitiveKey(key: string): boolean {
   return SENSITIVE.some((re) => re.test(key));
+}
+
+/** Keys of persisted rows that the current rules keep in memory only (purged by attach()). */
+export function sensitiveRowKeys(rows: { key: string }[]): string[] {
+  return rows.filter((r) => typeof r?.key === "string" && isSensitiveKey(r.key)).map((r) => r.key);
 }
 
 export function isAppStorageKey(key: string): boolean {
@@ -250,7 +267,10 @@ export class ClientCache {
 
   /**
    * Attach the persisted store for the signed-in user. A store written for another user or another schema
-   * version is deleted before anything is read from it. Then expired rows go and the size cap is applied.
+   * version is deleted before anything is read from it. Rows whose key is memory-only under the current rules
+   * (written by an older version of this file, or by a tab still running one) are deleted before the store is
+   * used; if they cannot be deleted one by one the whole store goes, and if that fails too this session stays
+   * memory only. Then expired rows go and the size cap is applied.
    */
   async attach(backend: CacheBackend, userId: string): Promise<void> {
     const gen = this.generation;
@@ -262,8 +282,22 @@ export class ClientCache {
         await backend.writeScope(scope);
       }
       if (gen !== this.generation) return;
-      const rows = await backend.listRows();
+      let rows = await backend.listRows();
       if (gen !== this.generation) return;
+      const purge = sensitiveRowKeys(rows);
+      if (purge.length) {
+        rows = rows.filter((r) => !isSensitiveKey(r.key));
+        try {
+          await backend.remove(purge);
+        } catch {
+          // Never keep them on disk: delete the whole store instead (a throw here leaves this session memory only).
+          await backend.destroy();
+          scope = { userId, schema: CACHE_SCHEMA_VERSION, lastSweep: 0 };
+          await backend.writeScope(scope);
+          rows = [];
+        }
+        if (gen !== this.generation) return;
+      }
       this.backend = backend;
       this.scope = scope;
       this.rows = new Map(rows.map((r) => [r.key, r]));
@@ -475,6 +509,7 @@ export class ClientCache {
     this.pending.clear();
     for (const [key, value] of batch) {
       if (gen !== this.generation || this.backend !== backend) return;
+      if (isSensitiveKey(key)) continue; // never reaches the disk, however it was queued
       const entry = this.mem.get(key);
       if (!entry || entry.value !== value) continue; // replaced or removed since it was queued
       const size = sizeOf(value);
