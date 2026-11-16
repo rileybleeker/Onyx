@@ -463,9 +463,9 @@ test("a goal change refuses an old tap, a kept tap is not offered under another 
 
 test("one unsaved tap at a time: the answer buttons wait; every mount, the day rollover and the Habits page follow", () => {
   const panel = read("components/sleep/WindDownPanel.tsx");
-  assert.match(panel, /const saving = s\.saver\.status === "saving" \|\| s\.saver\.status === "retrying" \|\| s\.saver\.status === "cancelling" \|\| !!s\.recovery;/);
+  assert.match(panel, /const saving = s\.saver\.status === "saving" \|\| s\.saver\.status === "retrying" \|\| s\.saver\.status === "cancelling" \|\| !!s\.recovery \|\| s\.recoveryChecking;/);
   const store = read("lib/use-winddown.ts");
-  assert.match(store, /if \(snap\.recovery \|\| !saver\.canAccept\(night\)\) return false;/);
+  assert.match(store, /if \(snap\.recovery \|\| snap\.recoveryChecking \|\| fencing !== null \|\| !saver\.canAccept\(night\)\) return false;/);
   assert.match(store, /if \(!saver\.unsaved\) overlay = null;/, "a tap still waiting keeps its optimistic answer");
   assert.match(store, /else if \(Date\.now\(\) - lastLoad > REMOUNT_RELOAD_MS && !saver\.unsaved\)/, "a later mount revalidates");
   assert.match(store, /msUntilRollover\(new Date\(\)\)/);
@@ -495,13 +495,196 @@ test("offline recovery: a kept tap is offered (never sent) only while it still a
   assert.equal(kept.night, TODAY);
   const tomorrow = payload({ today: day(1) });
   assert.deepEqual(W.pendingToOffer(kept, tomorrow, now), { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1, opId: kept.opId }, "resent for the same night with the new day, with its own tap id");
-  assert.equal(W.pendingToOffer(kept, payload({ today: day(1), answers: [yes(0)] }), now), null, "it landed: nothing to offer");
+  assert.equal(W.pendingToOffer(kept, payload({ today: day(1), answers: [yes(0)] }), now), null, "the day moved past it (its request is refused as stale) and the night shows its answer: nothing to offer");
   assert.equal(W.pendingToOffer(kept, payload({ today: day(3) }), now), null, "the night is outside the answer window");
   assert.equal(W.pendingToOffer(kept, tomorrow, now + W.PENDING_MAX_AGE_MS + 1), null, "too old");
   assert.equal(W.pendingToOffer(kept, payload({ status: "not_set_up", rules: [] }), now), null);
   assert.equal(W.parsePending("{bad json"), null);
   assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Maybe", expect: "none", today: TODAY, ruleId: 1, opId: newOp(), at: 1 })), null);
   assert.ok(W.WINDDOWN_PENDING_KEY.startsWith("onyx"), "wiped on sign-out with every onyx* key");
+});
+
+// A model of the server's tap protocol, rule for rule as pds.sleep_winddown_set_night / _cancel_op apply it (the SQL
+// contract tests pin the order in the SQL itself): the ledger first, then the day, then the goal version, then the
+// answer. One night, one goal; `other` is a write from the check-in, Habits or another device (no tap id).
+function fakeServer({ today = TODAY, ruleId = 1 } = {}) {
+  const ledger = new Map();
+  const srv = {
+    today, ruleId, answer: null, writes: 0,
+    setNight(i) {
+      const o = ledger.get(i.opId);
+      if (o) {
+        if (o.state === "cancelled") throw new W.WindDownRefused(W.WINDDOWN_DB_ERRORS.OXW17.error, "cancelled");
+        return { ...o.result, replayed: true, changed: false };
+      }
+      if (i.today !== srv.today) throw new W.WindDownRefused(W.WINDDOWN_STALE_MESSAGE, "stale");
+      if (i.ruleId !== srv.ruleId) throw new W.WindDownRefused(W.WINDDOWN_DB_ERRORS.OXW16.error, "goal_changed");
+      let changed = false;
+      if ((srv.answer ?? "none") !== (i.answer ?? "none")) {
+        if ((srv.answer ?? "none") !== i.expect) throw new W.WindDownRefused(W.WINDDOWN_DB_ERRORS.OXW15.error, "changed");
+        srv.answer = i.answer;
+        srv.writes++;
+        changed = true;
+      }
+      const result = { night: i.night, answer: i.answer, changed };
+      ledger.set(i.opId, { state: "applied", result });
+      return result;
+    },
+    cancelOp(i) {
+      const o = ledger.get(i.opId);
+      if (o) return o.state === "applied" ? { landed: true, night: i.night, answer: o.result.answer } : { landed: false, night: i.night };
+      ledger.set(i.opId, { state: "cancelled" });
+      return { landed: false, night: i.night };
+    },
+    other(answer) { srv.answer = answer; srv.writes++; },
+    payload() { return payload({ today: srv.today, answers: srv.answer ? [{ date: TODAY, question: HABIT, answer: srv.answer }] : [] }); },
+  };
+  return srv;
+}
+
+test("kept tap decision: forgotten only once its request can no longer land, never because the night shows its answer", () => {
+  const at = Date.parse("2031-03-20T22:00:00Z");
+  const now = at + 3600_000;
+  const kept = W.parsePending(W.pendingRecord(intent({ night: TODAY, answer: "Yes", expect: "none" }), at));
+  // Same day, same goal: the request may still be on its way. Offered even when the night already shows Yes, with
+  // that answer as `expect` (settling it changes nothing on the night, so there is nothing to undo).
+  const same = W.keptTapDecision(kept, payload({ answers: [yes(0)] }), now);
+  assert.equal(same.kind, "offer", "a matching answer proves nothing (SLEEP01-R2)");
+  assert.deepEqual(same.intent, { night: TODAY, answer: "Yes", expect: "Yes", today: TODAY, ruleId: 1, opId: kept.opId });
+  assert.equal(W.offerMatchesShown(same.intent), true);
+  const open = W.keptTapDecision(kept, payload(), now);
+  assert.equal(open.kind, "offer");
+  assert.equal(open.intent.expect, "none");
+  assert.equal(W.offerMatchesShown(open.intent), false);
+  // Even long after (or with the device clock moved back), the same day keeps it: only the server can settle it.
+  assert.equal(W.keptTapDecision(kept, payload({ answers: [yes(0)] }), at - 3600_000).kind, "offer");
+  // The server's day moved past the tap's: its request is refused as stale (OXW10) wherever it is, so it may go.
+  assert.equal(W.keptTapDecision(kept, payload({ today: day(1), answers: [yes(0)] }), now).kind, "drop");
+  // A newer goal version applies to the night: refused (OXW16), so it may go.
+  const newer = payload({ rules: [rule(), rule({ id: 2, effectiveFrom: TODAY, habitPageId: ID_B, habitName: HABIT_2 })], habitNames: { [ID_A]: HABIT, [ID_B]: HABIT_2 } });
+  assert.equal(W.keptTapDecision(kept, newer, now).kind, "drop");
+  // A payload from before the tap (a cached copy: an older day, or an older goal version) decides nothing.
+  const later = W.parsePending(W.pendingRecord(intent({ night: TODAY, today: TODAY, ruleId: 2 }), at));
+  assert.equal(W.keptTapDecision(later, payload(), now).kind, "hold", "the goal version shown is older than the tap's");
+  const tomorrowTap = W.parsePending(W.pendingRecord(intent({ night: day(1), today: day(1) }), at));
+  assert.equal(W.keptTapDecision(tomorrowTap, payload({ answers: [yes(1)] }), now).kind, "hold", "the day shown is older than the tap's");
+  assert.equal(W.keptTapDecision(kept, payload({ status: "not_set_up", rules: [] }), now).kind, "hold");
+  assert.equal(W.keptTapDecision(null, payload(), now).kind, "none");
+});
+
+test("other writer sets the same answer, reopen, Clear, then the delayed original arrives: it never lands (Discard)", async () => {
+  const srv = fakeServer();
+  const at = Date.parse("2031-03-20T22:00:00Z");
+  // 1. Tap A (Yes) is sent and its request is delayed somewhere on the way; the device kept it.
+  const a = intent({ night: TODAY, answer: "Yes", expect: "none" });
+  const kept = W.parsePending(W.pendingRecord(a, at));
+  // 2. Another writer (Habits, another device) sets the same Yes.
+  srv.other("Yes");
+  // 3. Reopen: the night shows Yes. The kept tap is NOT forgotten; it is offered, and every other tap waits for it.
+  const d = W.keptTapDecision(kept, srv.payload(), at + 60_000);
+  assert.equal(d.kind, "offer");
+  // 4. Discard asks the server to settle tap A by its id: it never landed, so it is cancelled for good.
+  assert.deepEqual(srv.cancelOp(d.intent), { landed: false, night: TODAY });
+  // 5. Riley clears the night (a new tap B, made on the Yes the screen shows) through the real saver.
+  const saved = [];
+  const saver = new W.WindDownSaver({ send: async (i) => srv.setNight(i), onSaved: (i, r) => saved.push([i.opId, r.answer]) });
+  const b = intent({ night: TODAY, answer: null, expect: "Yes" });
+  saver.submit(b);
+  await flush();
+  assert.deepEqual(saved, [[b.opId, null]]);
+  assert.equal(srv.answer, null);
+  // 6. The delayed original A finally arrives with its original expectation (none): refused, nothing written.
+  const writes = srv.writes;
+  assert.throws(() => srv.setNight(a), (e) => e instanceof W.WindDownRefused && e.code === "cancelled");
+  assert.equal(srv.answer, null, "the Clear stands");
+  assert.equal(srv.writes, writes);
+});
+
+test("other writer sets the same answer, reopen, Confirm it, Clear, then the delayed original arrives: a replay, no write", async () => {
+  const srv = fakeServer();
+  const at = Date.parse("2031-03-20T22:00:00Z");
+  const a = intent({ night: TODAY, answer: "Yes", expect: "none" });
+  const kept = W.parsePending(W.pendingRecord(a, at));
+  srv.other("Yes");
+  const d = W.keptTapDecision(kept, srv.payload(), at + 60_000);
+  assert.equal(d.kind, "offer");
+  const saved = [];
+  const saver = new W.WindDownSaver({ send: async (i) => srv.setNight(i), onSaved: (i, r) => saved.push([i.opId, r.answer, r.changed]) });
+  // Confirm it: the same tap id, sent with the answer the night shows as its expectation. Nothing changes on the
+  // night; the server records tap A as applied.
+  saver.submit(d.intent);
+  await flush();
+  assert.deepEqual(saved, [[a.opId, "Yes", false]]);
+  const b = intent({ night: TODAY, answer: null, expect: "Yes" });
+  saver.submit(b);
+  await flush();
+  assert.equal(srv.answer, null);
+  const writes = srv.writes;
+  const late = srv.setNight(a);
+  assert.equal(late.replayed, true, "the delayed original is answered from the ledger");
+  assert.equal(srv.answer, null, "the Clear stands");
+  assert.equal(srv.writes, writes);
+});
+
+test("the earlier behaviour this replaces: forgetting a kept tap because the answers matched lets it land after a Clear", () => {
+  // Kept here as the counterexample (SLEEP01-R2): with no settled ledger row for tap A, nothing fences it.
+  const srv = fakeServer();
+  const a = intent({ night: TODAY, answer: "Yes", expect: "none" });
+  srv.other("Yes");
+  srv.setNight(intent({ night: TODAY, answer: null, expect: "Yes" }));
+  srv.setNight(a);
+  assert.equal(srv.answer, "Yes", "the cleared night came back: this is why answer equality never settles a tap");
+});
+
+test("a refusal after an unanswered send is settled by the tap's id before its kept copy goes", async () => {
+  const { timers, queue } = manualTimers();
+  const refused = [];
+  let calls = 0;
+  const saver = new W.WindDownSaver({
+    timers,
+    send: async () => { calls++; if (calls === 1) throw new TypeError("offline"); throw new W.WindDownRefused(W.WINDDOWN_DB_ERRORS.OXW15.error, "changed"); },
+    onRefused: (_i, e, sentBefore) => refused.push([e.code, sentBefore]),
+  });
+  saver.submit(intent());
+  await flush();
+  saver.retryNow();
+  await flush();
+  assert.deepEqual(refused, [["changed", true]], "the refused send had an unanswered send before it");
+  assert.equal(queue.length, 0);
+  const first = [];
+  const once = new W.WindDownSaver({ send: async () => { throw new W.WindDownRefused("x", "changed"); }, onRefused: (_i, e, sentBefore) => first.push(sentBefore) });
+  once.submit(intent());
+  await flush();
+  assert.deepEqual(first, [false], "a refusal of the first send leaves nothing on its way");
+  // Refusals the server gives a request every time need no settling; "changed" depends on the night and does.
+  for (const code of ["stale", "goal_changed", "cancelled", "too_old", "future", "not_set_up", "400"]) assert.ok(W.WINDDOWN_FINAL_REFUSALS.has(code), code);
+  assert.equal(W.WINDDOWN_FINAL_REFUSALS.has("changed"), false);
+  // The interleaving the settling closes: A's first send delayed, the night moves (refusing A's retry), then is put
+  // back to what A expected; without settling, the delayed send would write.
+  const srv = fakeServer();
+  const a = intent({ night: TODAY, answer: "Yes", expect: "none" });
+  srv.other("No");
+  assert.throws(() => srv.setNight(a), (e) => e.code === "changed");
+  assert.deepEqual(srv.cancelOp(a), { landed: false, night: TODAY }, "settled by its id after the refusal");
+  srv.other(null);
+  assert.throws(() => srv.setNight(a), (e) => e.code === "cancelled", "the delayed first send is refused");
+  assert.equal(srv.answer, null);
+  // The store does that: the kept copy is forgotten only after the cancel answer, never on OK.
+  const store = read("lib/use-winddown.ts");
+  const fence = store.slice(store.indexOf("async function fenceRefused("), store.indexOf("function resetAfterSessionEnd("));
+  assert.ok(fence.indexOf("await send(WINDDOWN_CANCEL_URL") >= 0 && fence.indexOf("await send(WINDDOWN_CANCEL_URL") < fence.indexOf("keep(null)"), "forgotten only after the server answered");
+  assert.match(store, /earlierSend && !WINDDOWN_FINAL_REFUSALS\.has\(e\.code\)[^\n]*\) \{\s+void fenceRefused\(intent\);\s+return;/);
+  assert.match(store, /resentKept\.add\(r\.opId\);/, "a kept tap sent again had an unanswered send in an earlier visit");
+  // The store forgets a kept tap on a read only when the decision says its request can no longer land.
+  assert.match(store, /if \(kept\.kind === "drop" && !saver\.unsaved && fencing === null\) keep\(null\);/);
+  assert.ok(!/answerOn\(server/.test(store), "the store never compares answers to decide a kept tap");
+  const lib = read("lib/sleep-winddown.ts");
+  const decision = lib.slice(lib.indexOf("export function keptTapDecision("), lib.indexOf("export function pendingToOffer("));
+  assert.ok(decision.indexOf("if (shown === wanted) return { kind: \"drop\" }") > decision.indexOf("if (fenced)"), "equal answers drop a kept tap only once its request is fenced");
+  const panel = read("components/sleep/WindDownPanel.tsx");
+  assert.match(panel, /the tap may still be on its way/);
+  assert.match(panel, /matches \? "Confirm it" : "Save it"/);
+  assert.match(panel, /Checking a tap from earlier/);
 });
 
 test("client to handler: the tap's request body is what the night route reads (rule_id, no unknown field)", () => {
@@ -558,8 +741,9 @@ test("a tap that reaches the server after 06:00 is refused as stale and its kept
   const offer = W.pendingToOffer(kept, payload({ today: day(1) }), Date.parse("2031-03-21T11:00:00Z"));
   assert.deepEqual(offer, { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1, opId: kept.opId }, "the night Riley tapped, sent with the new day");
   const store = read("lib/use-winddown.ts");
-  assert.match(store, /if \(e\.code !== WINDDOWN_STALE_CODE\) keep\(null\);/, "only a stale refusal keeps the tap");
-  assert.match(store, /if \(!snap\.recovery && !stale\) keep\(null\);/, "OK on the message does not drop the offered tap");
+  assert.match(store, /if \(e\.code === WINDDOWN_STALE_CODE\) \{\s+\/\/ kept, offered again/, "a stale refusal keeps the tap");
+  const dismiss = store.slice(store.indexOf("export function dismissTap("), store.indexOf("export function resolveRecovery("));
+  assert.ok(!/keep\(null\)/.test(dismiss), "OK on the message never drops a kept tap");
 });
 
 test("the session ending empties the store: no data, no retry, no write to the device afterwards", async () => {

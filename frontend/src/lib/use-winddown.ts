@@ -18,6 +18,11 @@
  * - Every tap carries its own id (the same on every retry). A tap that was sent and not answered may have landed, so
  *   "Cancel" (and "Discard" on a kept tap) asks the server to settle it: it had landed (shown as saved, with Undo) or
  *   it had not and now never will (a late arrival is refused). When the server cannot be asked, nothing is dropped.
+ * - A kept tap is never forgotten because the night shows its answer (another writer may have set the same answer
+ *   while the tap is still on its way, SLEEP01-R2). It is forgotten only once its request can no longer land (the
+ *   server's day or the night's goal version moved past the tap's: keptTapDecision), or once the server settled
+ *   its id (saved, replayed, landed or cancelled). A refusal that depends on what the night holds (OXW15) of a tap
+ *   sent before without an answer is settled by its id too (fenceRefused) before the kept copy goes.
  * - A read that started before a confirmed write is never shown (it may predate the write): each read is tagged with
  *   the write count at its start, the re-read after a write is always a NEW request, and untagged copies wait for it.
  * - The session ending (sign-out, 401, redirect to sign-in) empties this store: the private data, any retry waiting
@@ -37,6 +42,7 @@ import {
   WINDDOWN_RULE_URL,
   WINDDOWN_SAVED_EVENT,
   WINDDOWN_SESSION_ENDED_CODE,
+  WINDDOWN_FINAL_REFUSALS,
   WINDDOWN_STALE_CODE,
   WINDDOWN_STALE_MESSAGE,
   WINDDOWN_URL,
@@ -45,12 +51,12 @@ import {
   answerOn,
   confirmNightReply,
   msUntilRollover,
+  keptTapDecision,
   newOpId,
   nightRequestBody,
   parsePending,
   parseWindDownPayload,
   pendingRecord,
-  pendingToOffer,
   readIsCurrent,
   ruleFor,
   withAnswer,
@@ -73,6 +79,11 @@ export interface WindDownSnapshot {
   saver: SaverState;
   /** A tap kept from an earlier visit that was never confirmed: offered, never sent on its own. */
   recovery: NightIntent | null;
+  /**
+   * A kept tap exists but the payload shown cannot judge it yet (a cached copy from before it), or it is being
+   * settled by its id after a refusal: nothing is offered and every answer button waits.
+   */
+  recoveryChecking: boolean;
   /** The last thing a tap did, for the screen reader and the undo line. */
   last: { night: string; answer: NightAnswer | null; previous: NightAnswer | null } | null;
   /** A goal / pause / hide action (or discarding a kept tap) in flight, and the message of the last one that failed. */
@@ -88,7 +99,7 @@ const REMOUNT_RELOAD_MS = 5_000;
 let server: WindDownPayload | null = null;
 let overlay: { night: string; answer: NightAnswer | null } | null = null;
 const INITIAL: WindDownSnapshot = {
-  load: "loading", payload: null, refreshFailed: false, at: null, fresh: false, saver: { status: "idle" }, recovery: null, last: null, busy: null, actionError: null, notice: null,
+  load: "loading", payload: null, refreshFailed: false, at: null, fresh: false, saver: { status: "idle" }, recovery: null, recoveryChecking: false, last: null, busy: null, actionError: null, notice: null,
 };
 let snap: WindDownSnapshot = INITIAL;
 const listeners = new Set<() => void>();
@@ -109,15 +120,23 @@ const born = new WeakMap<object, number>();
 let reading: { seq: number; epoch: number; p: Promise<boolean> } | null = null;
 /** The last payload object that was accepted (the cache notifies the same object again after our own put). */
 let lastRaw: unknown = null;
+/** The tap id being settled after a refusal (fenceRefused): its kept copy stays until the server answered. */
+let fencing: string | null = null;
 function afterWrite() { writeSeq++; settling = true; }
 const CANCELLED_NOTICE = "Stopped. That tap was not saved and will not be.";
 const DISCARDED_NOTICE = "Discarded. That tap was not saved and will not be.";
 const LANDED_NOTICE = "That tap had already been saved.";
+/**
+ * Tap ids sent again from a kept copy (Save it): their earlier sends, in an earlier visit, went unanswered, so a
+ * refusal of the resend does not prove the first request will never land (see onRefused).
+ */
+const resentKept = new Set<string>();
 
-function readKept(): NightIntent | null {
+/** What to do with the kept tap on the payload shown now (keptTapDecision; never decided by equal answers). */
+function readKept(): ReturnType<typeof keptTapDecision> {
   try {
-    return pendingToOffer(parsePending(window.localStorage.getItem(WINDDOWN_PENDING_KEY)), server, Date.now());
-  } catch { return null; }
+    return keptTapDecision(parsePending(window.localStorage.getItem(WINDDOWN_PENDING_KEY)), server, Date.now());
+  } catch { return { kind: "none" }; }
 }
 function keep(intent: NightIntent | null) {
   try {
@@ -143,10 +162,17 @@ function accept(raw: unknown, fresh = false): boolean {
   lastRaw = raw;
   if (tag !== undefined) settling = false;
   server = next;
-  // A kept tap that did land (the server now holds its answer) is dropped without asking.
-  const offer = readKept();
-  if (!offer && !saver.unsaved) keep(null);
-  emit({ load: "ready", refreshFailed: false, at: clientCache.fetchedAt(WINDDOWN_URL) ?? Date.now(), fresh: snap.fresh || fresh, recovery: saver.unsaved ? null : offer });
+  // A kept tap is forgotten here only when the server can no longer apply it (the day or the goal moved on past it).
+  // A night that already shows its answer proves nothing (another writer may have set it while the tap is still on
+  // its way), so that tap is offered to be settled by its id instead (SLEEP01-R2).
+  const kept = readKept();
+  if (kept.kind === "drop" && !saver.unsaved && fencing === null) keep(null);
+  const owned = saver.unsaved || fencing !== null;
+  emit({
+    load: "ready", refreshFailed: false, at: clientCache.fetchedAt(WINDDOWN_URL) ?? Date.now(), fresh: snap.fresh || fresh,
+    recovery: !owned && kept.kind === "offer" ? kept.intent : null,
+    recoveryChecking: fencing !== null || (!saver.unsaved && kept.kind === "hold"),
+  });
   return true;
 }
 
@@ -230,7 +256,9 @@ function settled(intent: NightIntent, answer: NightAnswer | null, replayed: bool
   // (A same-night tap still waiting behind this one keeps the overlay until it is saved too.)
   if (!saver.unsaved) overlay = null;
   afterWrite();
-  emit({ last: { night: intent.night, answer, previous: intent.expect === "none" ? null : intent.expect }, recovery: null, notice });
+  const previous = intent.expect === "none" ? null : intent.expect;
+  // A kept tap confirmed on a night that already showed its answer changed nothing: there is nothing to undo.
+  emit({ last: previous === answer ? null : { night: intent.night, answer, previous }, recovery: null, recoveryChecking: false, notice });
   try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ }
   void reloadWindDown();
 }
@@ -264,18 +292,57 @@ const saver = new WindDownSaver({
     void reloadWindDown();
   },
   onSaved: (intent, answer) => {
+    resentKept.delete(intent.opId);
     const a = answer as { answer?: NightAnswer | null; replayed?: boolean };
     settled(intent, a.answer ?? intent.answer, a.replayed === true, null);
   },
-  onRefused: (_intent, e) => {
-    // A stale refusal is the only one that keeps the tap: its night is still the one Riley tapped and may still be
-    // answerable on the new day, so the reload below offers it again (pendingToOffer). Every other refusal is final.
-    if (e.code !== WINDDOWN_STALE_CODE) keep(null);
+  onRefused: (intent, e, sentBefore) => {
+    // A stale refusal keeps the tap: its night is still the one Riley tapped and may still be answerable on the new
+    // day, so the reload below offers it again (keptTapDecision). A refusal the server gives this request every time
+    // ends it. Any other refusal of a tap that was sent before without an answer does not prove that earlier send
+    // will never land (the night can change back to what the tap expected), so it is settled by its id first.
+    const earlierSend = sentBefore || resentKept.has(intent.opId);
+    resentKept.delete(intent.opId);
     overlay = null;
+    if (e.code === WINDDOWN_STALE_CODE) {
+      // kept, offered again by the reload below
+    } else if (earlierSend && !WINDDOWN_FINAL_REFUSALS.has(e.code) && e.code !== WINDDOWN_SESSION_ENDED_CODE) {
+      void fenceRefused(intent);
+      return;
+    } else {
+      keep(null);
+    }
     emit({ recovery: null });
     void reloadWindDown();
   },
 });
+
+/**
+ * A refused tap whose earlier send went unanswered: ask the server to settle that tap id (pds.sleep_winddown_cancel_op)
+ * before its kept copy is forgotten. Landed (the earlier send had been applied after all): shown as saved. Not
+ * landed: it now never will. When the server cannot be asked the kept copy stays, and the next read offers it
+ * (Save it / Discard) or drops it once the day or the goal moved past it. Every answer button waits meanwhile.
+ */
+async function fenceRefused(intent: NightIntent) {
+  const mine = epoch;
+  fencing = intent.opId;
+  emit({ recovery: null, recoveryChecking: true });
+  let d: Record<string, unknown> | null = null;
+  try {
+    d = await send(WINDDOWN_CANCEL_URL, "POST", { op_id: intent.opId, night: intent.night }, confirmCancelReply(intent));
+  } catch { /* not settled: kept, offered by the read below */ }
+  if (mine !== epoch) return;
+  fencing = null;
+  if (d && d.landed === true) {
+    // Not a refusal after all: the earlier send had landed. The refusal message goes; the night shows as saved.
+    saver.dismiss();
+    settled(intent, d.answer === "Yes" || d.answer === "No" ? d.answer : intent.answer, true, LANDED_NOTICE);
+    return;
+  }
+  if (d) { keep(null); afterWrite(); }
+  emit({ recovery: null, recoveryChecking: false });
+  void reloadWindDown();
+}
 
 /** The session ended: this store holds private data and maybe a write waiting to retry. Drop all of it, silently. */
 function resetAfterSessionEnd() {
@@ -288,6 +355,8 @@ function resetAfterSessionEnd() {
   reading = null;
   lastRaw = null;
   settling = false;
+  fencing = null;
+  resentKept.clear();
   keep(null);
   unsavedWork.setDirty("sleep-winddown", false);
   snap = INITIAL;
@@ -368,7 +437,7 @@ export function useWindDown(): WindDownSnapshot {
 export function answerNight(night: string, answer: NightAnswer | null): boolean {
   const p = snap.payload;
   if (!p || p.status !== "ready") return false;
-  if (snap.recovery || !saver.canAccept(night)) return false;
+  if (snap.recovery || snap.recoveryChecking || fencing !== null || !saver.canAccept(night)) return false;
   const rule = ruleFor(p.rules, night);
   if (!rule) return false;
   const expect = answerOn(p, night);
@@ -393,11 +462,9 @@ export function dismissTap() {
   const st = saver.current;
   if (st.status === "retrying") { void saver.cancel(); return; }
   if (st.status === "cancelling") return;
-  const stale = st.status === "refused" && st.code === WINDDOWN_STALE_CODE;
   saver.dismiss();
-  // A tap that is being offered again (after a stale refusal) keeps its copy until Riley picks Save it or Discard;
-  // the next read drops it when that night can no longer be answered here.
-  if (!snap.recovery && !stale) keep(null);
+  // OK only clears the message. The kept copy was already decided when the refusal came (onRefused): forgotten when
+  // the server refuses that tap every time, kept while it is settled by its id or offered again.
   overlay = null;
   emit({ saver: saver.current });
 }
@@ -413,7 +480,8 @@ export function resolveRecovery(save: boolean) {
   emit({ recovery: null, notice: null });
   overlay = { night: r.night, answer: r.answer };
   emit({});
-  saver.submit(r);
+  resentKept.add(r.opId);
+  if (!saver.submit(r)) resentKept.delete(r.opId);
 }
 async function discardRecovery(r: NightIntent) {
   const mine = epoch;
@@ -423,7 +491,7 @@ async function discardRecovery(r: NightIntent) {
     if (mine !== epoch) return;
     keep(null);
     afterWrite();
-    emit({ busy: null, recovery: null, notice: d.landed === true ? LANDED_NOTICE : DISCARDED_NOTICE });
+    emit({ busy: null, recovery: null, recoveryChecking: false, notice: d.landed === true ? LANDED_NOTICE : DISCARDED_NOTICE });
     if (d.landed === true) { try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ } }
     void reloadWindDown();
   } catch {

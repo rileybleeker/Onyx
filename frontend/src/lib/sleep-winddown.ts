@@ -688,6 +688,15 @@ export const WINDDOWN_STALE_MESSAGE = "A new day started before this was saved. 
 export function coalesceIntents(older: NightIntent | null, newer: NightIntent): NightIntent {
   return older && older.night === newer.night ? { ...newer, expect: older.expect, ruleId: older.ruleId } : newer;
 }
+/**
+ * Refusals the server gives a tap EVERY time it arrives, so an earlier copy of that request still on its way can
+ * never land either: the day moved on (OXW10), the night has not started / is too old (OXW11, OXW12), no goal or a
+ * newer goal for the night (OXW13, OXW16; goal versions only move forward), the tap was cancelled (OXW17), or the
+ * body itself is invalid (400). Any other refusal (OXW15: the answer changed elsewhere) depends on what the night
+ * holds, which can change back, so a tap refused that way after an unanswered send is settled with
+ * pds.sleep_winddown_cancel_op before it is forgotten.
+ */
+export const WINDDOWN_FINAL_REFUSALS: ReadonlySet<string> = new Set(["stale", "future", "too_old", "not_set_up", "goal_changed", "cancelled", "400"]);
 /** The server refused the tap (4xx): shown with its code, never retried on its own. */
 export class WindDownRefused extends Error {
   constructor(message: string, readonly code: string) {
@@ -709,7 +718,8 @@ export interface SaverOptions {
   send: (intent: NightIntent) => Promise<unknown>;
   onState?: (s: SaverState) => void;
   onSaved?: (intent: NightIntent, answer: unknown) => void;
-  onRefused?: (intent: NightIntent, error: WindDownRefused) => void;
+  /** `sentBefore`: an earlier send of this tap went unanswered, so it may still land later (the store fences it). */
+  onRefused?: (intent: NightIntent, error: WindDownRefused, sentBefore: boolean) => void;
   /** Settles a tap whose outcome is unknown: landed (it was applied) or not (and now never will be). */
   cancel?: (intent: NightIntent) => Promise<{ landed: boolean; answer: NightAnswer | null }>;
   /** Cancel found that the tap HAD landed: the same as a save (Undo, reload). */
@@ -871,7 +881,7 @@ export class WindDownSaver {
       // Refused: the screen's picture of the night was wrong, so a tap made on top of it is not sent either.
       this.queued = null;
       this.set({ status: "refused", intent, error: e.message, code: e.code });
-      this.opts.onRefused?.(intent, e);
+      this.opts.onRefused?.(intent, e, attempt > 0);
     }
     const next = this.queued;
     this.queued = null;
@@ -898,19 +908,55 @@ export function parsePending(raw: string | null | undefined): PendingTap | null 
   return { night: r.night, answer: r.answer as NightAnswer | null, expect: r.expect, today: r.today, ruleId: r.ruleId, opId: r.opId, at: r.at };
 }
 /**
- * The kept tap worth offering again on this payload, or null: it must be under PENDING_MAX_AGE_MS old, for a night
- * still answerable here, and not already what the server holds (then it did land and the answer was lost). It is
- * OFFERED, never sent on its own: opening a page writes nothing. Sent with the payload's `today` (the night stays
- * the one tapped); a stored answer that moved meanwhile refuses it (OXW15) instead of overwriting it. A tap made
- * under a goal that has since changed is not offered at all (the server would refuse it, OXW16).
+ * What to do with a tap kept on this device (its answer never confirmed) when a payload arrives:
+ *
+ * - "drop": the server can provably never apply that tap's request any more, and nothing is worth offering. The
+ *   request carries the day the screen showed (`today`) and the goal version (`ruleId`); the server refuses it once
+ *   its behavioral day moved past that day (OXW10) or once a newer goal applies to that night (OXW16), and both only
+ *   move forward. Only then may a kept tap be forgotten without asking: equal answers prove nothing (another device
+ *   or the Habits page may have written the same answer while this tap is still on its way, SLEEP01-R2).
+ * - "offer": shown with Save it / Discard; every other tap waits until one of them settled it on the server (Save it
+ *   sends the same tap id: applied once, or the first result replayed; Discard asks pds.sleep_winddown_cancel_op).
+ *   When the night already shows the tap's answer, the offer's `expect` is that answer (nothing would change, so
+ *   nothing is offered to undo), and the screen says the tap may still be on its way.
+ * - "hold": this payload is not newer than the tap (a cached copy from before it, or a payload that is not ready), so
+ *   it decides nothing: the tap is kept, not offered, and taps wait for the server's own read.
  */
+export type KeptTapDecision =
+  | { kind: "none" }
+  | { kind: "drop" }
+  | { kind: "hold" }
+  | { kind: "offer"; intent: NightIntent };
+export function keptTapDecision(tap: PendingTap | null, p: WindDownPayload | null, nowMs: number): KeptTapDecision {
+  if (!tap) return { kind: "none" };
+  if (!p || p.status !== "ready") return { kind: "hold" };
+  const ruleNow = ruleFor(p.rules, tap.night)?.id ?? 0;
+  // A payload from before the tap (older day, or a goal version older than the tap's) cannot judge it.
+  if (p.today < tap.today || ruleNow < tap.ruleId) return { kind: "hold" };
+  const shown = answerOn(p, tap.night);
+  const wanted = tap.answer ?? "none";
+  const fenced = p.today > tap.today || ruleNow > tap.ruleId;
+  if (fenced) {
+    // The request as it was sent can no longer land. Offered again only while it would still mean something here
+    // (same goal, night still answerable, not too old, and not already what the night shows), with the new day.
+    if (ruleNow !== tap.ruleId) return { kind: "drop" };
+    if (nowMs - tap.at > PENDING_MAX_AGE_MS || nowMs < tap.at - 60_000) return { kind: "drop" };
+    if (tap.night > p.today || tap.night < addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)) return { kind: "drop" };
+    if (shown === wanted) return { kind: "drop" };
+    return { kind: "offer", intent: { night: tap.night, answer: tap.answer, expect: tap.expect, today: p.today, ruleId: tap.ruleId, opId: tap.opId } };
+  }
+  // Same day, same goal: the request may still be on its way, so it is never forgotten here, even when the night
+  // already shows its answer.
+  return { kind: "offer", intent: { night: tap.night, answer: tap.answer, expect: shown === wanted ? shown : tap.expect, today: p.today, ruleId: tap.ruleId, opId: tap.opId } };
+}
+/** The kept tap to offer on this payload, or null (keptTapDecision; null never means it may be forgotten). */
 export function pendingToOffer(tap: PendingTap | null, p: WindDownPayload | null, nowMs: number): NightIntent | null {
-  if (!tap || !p || p.status !== "ready") return null;
-  if (nowMs - tap.at > PENDING_MAX_AGE_MS || nowMs < tap.at - 60_000) return null;
-  if (tap.night > p.today || tap.night < addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)) return null;
-  if (ruleFor(p.rules, tap.night)?.id !== tap.ruleId) return null;
-  if (answerOn(p, tap.night) === (tap.answer ?? "none")) return null;
-  return { night: tap.night, answer: tap.answer, expect: tap.expect, today: p.today, ruleId: tap.ruleId, opId: tap.opId };
+  const d = keptTapDecision(tap, p, nowMs);
+  return d.kind === "offer" ? d.intent : null;
+}
+/** The offered tap's answer is already what the night shows: settling it changes nothing on the night. */
+export function offerMatchesShown(i: NightIntent): boolean {
+  return i.expect === (i.answer ?? "none");
 }
 
 /**

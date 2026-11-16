@@ -18,6 +18,7 @@ import {
   durationLabel,
   nightName,
   nightWeekday,
+  offerMatchesShown,
   shortDate,
   sleepFeedback,
   windDownAttention,
@@ -202,12 +203,21 @@ function SleepLine({ s, now }: { s: WindDownSnapshot; now: number }) {
 function Recovery({ s }: { s: WindDownSnapshot }) {
   const r = s.recovery;
   const p = s.payload;
+  if (!r && s.recoveryChecking) {
+    return <p role="status" className="mt-3 text-[13px] text-text-secondary">Checking a tap from earlier that wasn&apos;t confirmed…</p>;
+  }
   if (!r || !p) return null;
   const what = r.answer === "Yes" ? "wound down" : r.answer === "No" ? "not done" : "cleared";
+  // The night already shows this answer (set somewhere else, or this tap landed and its answer was lost): the tap may
+  // still be on its way, so it is settled by its id (Confirm it / Discard) before any other tap for the night.
+  const matches = offerMatchesShown(r);
   return (
     <div role="status" className="mt-3 flex flex-wrap items-center gap-2 rounded-control border border-border-subtle px-3 py-2 text-[13px] text-text-primary">
-      <span>A tap for {nightName(r.night, p.today).toLowerCase()} ({what}) wasn&apos;t confirmed as saved.</span>
-      <button type="button" onClick={() => resolveRecovery(true)} disabled={s.busy === "recovery"} className={textButton}>Save it</button>
+      <span>
+        A tap for {nightName(r.night, p.today).toLowerCase()} ({what}) wasn&apos;t confirmed as saved.
+        {matches ? " The night already shows that answer, but the tap may still be on its way." : ""}
+      </span>
+      <button type="button" onClick={() => resolveRecovery(true)} disabled={s.busy === "recovery"} className={textButton}>{matches ? "Confirm it" : "Save it"}</button>
       <button type="button" onClick={() => resolveRecovery(false)} disabled={s.busy === "recovery"} className={textButton}>{s.busy === "recovery" ? "Checking…" : "Discard"}</button>
       {s.actionError && <span role="alert" className="basis-full text-[12px] text-mid">{s.actionError}</span>}
     </div>
@@ -236,7 +246,7 @@ export default function WindDownPanel({ surface, className = "" }: { surface: "t
   const Heading = surface === "log" ? "h2" : "h3";
   // One unsaved tap at a time: while one is saving, waiting to retry, being checked or kept from an earlier visit, the
   // answer buttons wait (the line below them says why; Retry now / Cancel and check / Save it / Discard resolve it).
-  const saving = s.saver.status === "saving" || s.saver.status === "retrying" || s.saver.status === "cancelling" || !!s.recovery;
+  const saving = s.saver.status === "saving" || s.saver.status === "retrying" || s.saver.status === "cancelling" || !!s.recovery || s.recoveryChecking;
   const checked = ago(s.at, now);
   const stopped = p.streak.current === 0 && p.streak.stoppedAt
     ? `Streak ended ${shortDate(p.streak.stoppedAt.date)}: ${p.streak.stoppedAt.status === "missed" ? "not done" : "not answered"}.`

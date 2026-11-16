@@ -71,9 +71,25 @@ tool and not an experiment: it never claims that winding down improved sleep.
   unsaved and keeps retrying (a kept tap stays offered). The ledger is append-only (one small row per tap).
 - The tap is kept on the device until the server confirmed it; a tap from a closed tab is offered on the next visit
   (**Save it** / **Discard**), never sent on its own, and not offered at all when the goal changed since.
+- **A kept tap is settled by its id, never by matching answers** (`keptTapDecision`, Codex SLEEP01-R2). A night that
+  already shows the tap's answer proves nothing: another device or the Habits page may have written the same answer
+  while the tap is still on its way, and forgetting it then would let it land after a later Clear. On the same day and
+  goal it is therefore still offered ("The night already shows that answer, but the tap may still be on its way":
+  **Confirm it** sends the same id, recorded as applied with nothing changed, or **Discard** cancels it), and every
+  other tap waits. It is forgotten without asking only once its request can no longer land anywhere: the server's
+  behavioral day moved past the day it carries (409 stale) or a newer goal version applies to its night (409
+  goal_changed); both only move forward. A cached copy older than the tap decides nothing ("Checking a tap from
+  earlier", the buttons wait for the server's read).
 - A tap that reaches the server after the behavioral day turned over (offline across 06:00, or a screen left open)
   is refused as stale, and **its kept copy stays**: the screen reloads the new day and offers the tap again for the
-  night Riley tapped (Save it / Discard) while that night can still be answered here. Every other refusal drops it.
+  night Riley tapped (Save it / Discard) while that night can still be answered here. A refusal the server gives that
+  request every time (stale, goal changed, too old, cancelled, an invalid body) ends it. A refusal that depends on what
+  the night holds (409 changed) of a tap that was sent before without an answer is settled by its id first
+  (`pds.sleep_winddown_cancel_op`), because that earlier send could still land if the night changed back; when the
+  server cannot be asked, the kept copy stays and is offered.
+- Known limit: the session ending empties the device, the kept tap included, so a request still on its way at that
+  moment cannot be settled from this device afterwards. It is refused once the behavioral day moves on or the goal
+  changes, like every request.
 - **A read that started before a write is never shown.** Each read is tagged with the number of confirmed writes at the
   moment it started, a read tagged older is ignored, the re-read after a write is always a new request (never the
   cache's shared request, which can have been sent before the write), and untagged copies wait for that re-read.
