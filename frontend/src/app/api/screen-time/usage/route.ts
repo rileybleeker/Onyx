@@ -44,7 +44,12 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * missing chunk or an app stopped halfway leaves the hours unverified. A body
  * without `run` (older builds) is stored exactly as before and stays
  * unverified: completeness unknown, never complete. A malformed `run` is a
- * rejected upload (400), like a malformed segment.
+ * rejected upload (400), like a malformed segment. An hour an earlier run already
+ * verified is a snapshot: the database holds this route's write to it back
+ * (staged, never applied) until the later run's finalization comes back complete.
+ * The route writes last_run_id / last_run_item_count / last_export_at on every
+ * hour, run metadata or not, so sql/phone_usage_completeness.sql must be applied
+ * BEFORE this route is deployed.
  *
  * Auth: a browser session, or the `x-onyx-ci-token` header (middleware
  * carve-out — the app stores the token in the iPhone Keychain).

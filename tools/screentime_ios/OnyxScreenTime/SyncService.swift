@@ -190,7 +190,7 @@ enum SyncService {
         let hours = String(format: "%.1f", result.totalMinutes / 60)
         let head = sent.map { "Sent \($0) hours" } ?? "Read \(result.segments.count) hours"
         return "\(head) (\(from) → \(to)), \(hours) h of screen time"
-            + (result.streamEnded ? "" : " [stream stopped by watchdog]")
+            + (result.streamEnded ? "" : (result.streamFailed ? " [stream failed before it ended]" : " [stream stopped by watchdog]"))
             + completenessNote(completeness)
     }
 

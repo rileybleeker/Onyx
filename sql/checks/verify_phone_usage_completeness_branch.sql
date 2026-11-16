@@ -22,6 +22,18 @@
 --  10. an hour whose items do not all belong to the run is not verified; ordinary writes cannot set verified_*
 --  11. the window check: a pre-sleep window with an unverified hour is not complete
 --  12. anon and authenticated cannot call the functions or read the new tables
+--  13. a later COMPLETE export of an already verified hour is staged, and its finalization replaces the snapshot
+--      (corrected total, items it no longer lists are gone, the old run's copy is not mixed in)
+--  14. a later export that never completes (stream_ended false) leaves the verified snapshot as it was
+--  15. an export read before the snapshot's is not even staged
+--
+-- Not scriptable in one transaction (run by hand on the branch with two sessions after the cases above pass):
+--  A. session 1: BEGIN; the upsert of case 13 for an hour that run X owns and has not verified, but with run Y;
+--     do not commit. Session 2: finalize run X. It must wait on the hour (its lock statement), and after session 1
+--     commits it must NOT verify that hour for X (the hour now belongs to Y: hours_verified excludes it).
+--  B. session 2 first: finalize run X inside an open transaction (BEGIN; SELECT pds.finalize_phone_usage_run(...);),
+--     then session 1 upserts the same hour with run Y. The upsert must wait, and after session 2 commits it must be
+--     staged or ignored (the hour is verified), never applied.
 BEGIN;
 SET LOCAL statement_timeout = '60s';
 DO $check$
@@ -39,6 +51,10 @@ DECLARE
     r_old   constant uuid := '00000000-0000-4000-8000-0000000c0005';
     r_a     constant uuid := '00000000-0000-4000-8000-0000000c0006';
     r_b     constant uuid := '00000000-0000-4000-8000-0000000c0007';
+    r_c     constant uuid := '00000000-0000-4000-8000-0000000c0008';
+    r_d     constant uuid := '00000000-0000-4000-8000-0000000c0009';
+    r_e     constant uuid := '00000000-0000-4000-8000-0000000c000a';
+    wend2   constant timestamptz := '2001-02-05 15:30:00+00';   -- a later export, the next day
     ans   jsonb;
     n     int;
     v     numeric;
@@ -61,8 +77,13 @@ BEGIN
         RAISE EXCEPTION 'a browser role can read the run tables';
     END IF;
     IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'pds.phone_usage_sync_runs'::regclass)
-       OR NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'pds.phone_usage_sync_chunks'::regclass) THEN
-        RAISE EXCEPTION 'RLS is off on a run table';
+       OR NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'pds.phone_usage_sync_chunks'::regclass)
+       OR NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'pds.phone_usage_pending_hours'::regclass) THEN
+        RAISE EXCEPTION 'RLS is off on a run or staging table';
+    END IF;
+    IF has_table_privilege('anon', 'pds.phone_usage_pending_hours', 'SELECT')
+       OR has_table_privilege('authenticated', 'pds.phone_usage_pending_hours', 'SELECT') THEN
+        RAISE EXCEPTION 'a browser role can read the staging table';
     END IF;
 
     EXECUTE 'SET LOCAL ROLE service_role';
@@ -198,6 +219,65 @@ BEGIN
         RAISE EXCEPTION 'a window without a start reads complete';
     END IF;
 
+    -- 13. A later complete export corrects a verified hour. Hour d0 is verified by r_ok (600 s, one item at 420 s,
+    --     export read at wend). Run r_c, read a day later, uploads it with 700 s and the item at 690 s.
+    INSERT INTO pds.phone_usage_segments AS s (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, d0, d0 + INTERVAL '1 hour', 700, now(), r_c, 1, wend2)
+    ON CONFLICT (device, segment_start) DO UPDATE SET segment_end = EXCLUDED.segment_end, total_seconds = EXCLUDED.total_seconds,
+        synced_at = EXCLUDED.synced_at, last_run_id = EXCLUDED.last_run_id, last_run_item_count = EXCLUDED.last_run_item_count,
+        last_export_at = EXCLUDED.last_export_at;
+    INSERT INTO pds.phone_usage_items (device, segment_start, kind, identifier, seconds, last_run_id)
+    VALUES (dev, d0, 'app', 'com.example.kept', 690, r_c)
+    ON CONFLICT (device, segment_start, kind, identifier) DO UPDATE SET seconds = EXCLUDED.seconds, last_run_id = EXCLUDED.last_run_id;
+    SELECT total_seconds INTO v FROM pds.phone_usage_segments WHERE device = dev AND segment_start = d0;
+    IF v <> 600 OR (SELECT seconds FROM pds.phone_usage_items WHERE device = dev AND segment_start = d0 AND identifier = 'com.example.kept') <> 420 THEN
+        RAISE EXCEPTION 'a later run changed the verified snapshot before it completed (%)', v;
+    END IF;
+    IF (SELECT count(*) FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_c AND segment_start = d0) <> 1
+       OR (SELECT count(*) FROM pds.phone_usage_pending_hours h, jsonb_object_keys(h.items) WHERE h.device = dev AND h.run_id = r_c) <> 1 THEN
+        RAISE EXCEPTION 'the later run hour and item were not staged';
+    END IF;
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_c, 0, 1, wstart, wend2, true, 1, 1, d0, d0 + INTERVAL '1 hour');
+    ans := pds.finalize_phone_usage_run(dev, r_c);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_replaced')::int <> 1 OR (ans ->> 'hours_verified')::int <> 1 THEN
+        RAISE EXCEPTION 'correction: %', ans;
+    END IF;
+    SELECT total_seconds INTO v FROM pds.phone_usage_segments
+     WHERE device = dev AND segment_start = d0 AND verified_run_id = r_c AND verified_export_at = wend2 AND last_run_id = r_c;
+    IF v IS DISTINCT FROM 700 THEN RAISE EXCEPTION 'the verified hour was not replaced by the later complete export (%)', v; END IF;
+    IF (SELECT count(*) FROM pds.phone_usage_items WHERE device = dev AND segment_start = d0) <> 1
+       OR (SELECT seconds FROM pds.phone_usage_items WHERE device = dev AND segment_start = d0 AND last_run_id = r_c) IS DISTINCT FROM 690 THEN
+        RAISE EXCEPTION 'the replaced hour kept an item of the old snapshot';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_c) THEN
+        RAISE EXCEPTION 'a settled run left staged hours behind';
+    END IF;
+
+    -- 14. A later export that never completes (the watchdog stopped Apple's stream) leaves the snapshot as it is.
+    INSERT INTO pds.phone_usage_segments AS s (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, d0, d0 + INTERVAL '1 hour', 5, now(), r_d, 0, wend2 + INTERVAL '1 day')
+    ON CONFLICT (device, segment_start) DO UPDATE SET segment_end = EXCLUDED.segment_end, total_seconds = EXCLUDED.total_seconds,
+        synced_at = EXCLUDED.synced_at, last_run_id = EXCLUDED.last_run_id, last_run_item_count = EXCLUDED.last_run_item_count,
+        last_export_at = EXCLUDED.last_export_at;
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_d, 0, 1, wstart, wend2 + INTERVAL '1 day', false, 1, 1, d0, d0 + INTERVAL '1 hour');
+    ans := pds.finalize_phone_usage_run(dev, r_d);
+    IF ans ->> 'status' <> 'stream_open' OR (ans ->> 'hours_verified')::int <> 0 THEN RAISE EXCEPTION 'stopped later run: %', ans; END IF;
+    SELECT total_seconds INTO v FROM pds.phone_usage_segments WHERE device = dev AND segment_start = d0 AND verified_run_id = r_c;
+    IF v IS DISTINCT FROM 700 THEN RAISE EXCEPTION 'an incomplete later run replaced the snapshot (%)', v; END IF;
+
+    -- 15. An export read before the snapshot's is not staged.
+    INSERT INTO pds.phone_usage_segments AS s (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, d0, d0 + INTERVAL '1 hour', 1, now(), r_e, 0, wend - INTERVAL '1 day')
+    ON CONFLICT (device, segment_start) DO UPDATE SET total_seconds = EXCLUDED.total_seconds, last_run_id = EXCLUDED.last_run_id,
+        last_export_at = EXCLUDED.last_export_at;
+    IF EXISTS (SELECT 1 FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_e) THEN
+        RAISE EXCEPTION 'an older export was staged';
+    END IF;
+
     -- 12. Browser roles cannot call the functions.
     EXECUTE 'SET LOCAL ROLE authenticated';
     BEGIN
@@ -212,7 +292,9 @@ BEGIN
         'inconsistent_not_verified', true, 'complete_verifies_closed_hours', true, 'stale_items_removed', true,
         'in_progress_hour_unverified', true, 'repeat_idempotent', true, 'verified_snapshot_kept', true,
         'older_export_refused', true, 'foreign_run_item_refused', true, 'item_mismatch_not_verified', true,
-        'verified_columns_guarded', true, 'window_check', true, 'browser_roles_refused', true)::text, true);
+        'verified_columns_guarded', true, 'window_check', true, 'browser_roles_refused', true,
+        'later_complete_export_replaces_snapshot', true, 'later_incomplete_export_keeps_snapshot', true,
+        'older_export_not_staged', true)::text, true);
 END
 $check$;
 SELECT current_setting('onyx.phone_usage_completeness_verification')::jsonb AS verification;

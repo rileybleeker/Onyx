@@ -33,6 +33,9 @@ private actor SegmentStore {
     private(set) var deviceModel: String?
     private(set) var lastUpdate = Date()
     private(set) var finished = false
+    /// True only when Apple's stream ran to its natural end with no error. A stream that threw (after
+    /// any number of hours) is `finished` but never `endedCleanly`: its hours cannot be certified complete.
+    private(set) var endedCleanly = false
     private(set) var failure: Error?
 
     func put(_ segment: UsageSegment) {
@@ -48,6 +51,7 @@ private actor SegmentStore {
     func finish(_ error: Error?) {
         finished = true
         failure = error
+        endedCleanly = (error == nil)
     }
 
     var count: Int { byStart.count }
@@ -147,7 +151,10 @@ enum ScreenTimeExporter {
         }
         // Snapshot BEFORE cancelling: cancellation can end the stream, which
         // would flip `finished` and could still store a half-read hour.
-        let ended = await store.finished
+        // `ended` is read first and means "the stream ended by itself with no error": an error
+        // after some hours, a watchdog stop and a cancellation are all NOT an end (Onyx counts the
+        // run's hours as complete only when this is true).
+        let ended = await store.endedCleanly
         let segments = await store.segments
         let failure = await store.failure
         reader.cancel()
@@ -164,6 +171,7 @@ enum ScreenTimeExporter {
             deviceName: await store.deviceName,
             deviceModel: await store.deviceModel,
             streamEnded: ended,
+            streamFailed: failure != nil && !ended,
             windowStart: firstDay,
             windowEnd: now
         )

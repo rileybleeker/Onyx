@@ -109,13 +109,20 @@ Export completeness (from the build after 2026-11-16, PIPE-11): every chunk
 carries a `run` object (one id per sync, the requested window, whether Apple's
 stream ended on its own, the hour count and the chunk's index / count). Onyx
 counts the hours as verified only when every chunk of the run arrived and the
-stream ended; a sync the watchdog stopped ("[stream stopped by watchdog]" in the
-summary), a chunk that failed or an app stopped halfway leaves them unverified,
-and the summary ends with what Onyx made of the run ("verified complete" or
-"not verified: ..."). Uploads from older builds are still accepted but never
-verified, so Screen Time days read as unverified until this build syncs; a
-"Days back: 30" sync from the app re-sends (and can verify) the last 30 days.
-Needs `sql/phone_usage_completeness.sql` applied first.
+stream ended by itself with no error; a sync the watchdog stopped ("[stream
+stopped by watchdog]" in the summary), a stream that threw part-way ("[stream
+failed before it ended]"), a chunk that failed or an app stopped halfway leaves
+them unverified, and the summary ends with what Onyx made of the run ("verified
+complete" or "not verified: ..."). An hour Onyx already verified keeps that
+snapshot until a LATER run completes, which then replaces it (a later run that
+does not complete changes nothing). Uploads from older builds are still accepted
+but never verified, so Screen Time days read as unverified until this build
+syncs; a "Days back: 30" sync from the app re-sends (and can verify) the last 30
+days. Needs `sql/phone_usage_completeness.sql` applied first (before the site
+that receives these uploads is deployed). Open question for the first device
+check: if the live policy never ends its stream, every sync reads "stream stopped
+by watchdog" and nothing is ever verified (the safe outcome); switch the
+scheduled sync to the cached policy or change how the end is detected.
 
 If neither install link works, download the `.ipa` from `/install` on the PC and
 install over USB with `pymobiledevice3 apps install <file>` (it also prints the

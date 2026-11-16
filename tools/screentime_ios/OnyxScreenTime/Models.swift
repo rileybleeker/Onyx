@@ -64,7 +64,8 @@ struct ExportResult {
     let segments: [UsageSegment]
     let deviceName: String?
     let deviceModel: String?
-    let streamEnded: Bool       // false = stopped by the idle/timeout watchdog
+    let streamEnded: Bool       // true only when Apple's stream ended by itself with no error
+    let streamFailed: Bool      // the stream threw an error (so streamEnded is false and the hours are not certified)
     let windowStart: Date       // the requested window (the DeviceActivityFilter interval)
     let windowEnd: Date
 

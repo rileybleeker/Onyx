@@ -9,8 +9,11 @@ applied. This file keeps a later edit from quietly undoing the rules that check 
     nullable; CREATE TABLE IF NOT EXISTS),
   * the new tables are service-role only (RLS on, nothing granted to anon / authenticated),
   * the finalization refuses a watchdog stop, a missing chunk and disagreeing chunks before it
-    verifies anything, verifies only closed whole hours the run still owns, and removes only items
-    of an hour it verifies,
+    verifies anything, locks the hours it may change before it decides, verifies only closed whole
+    hours the run still owns, and removes only items of an hour it verifies or replaces and the
+    staged copies of settled or old runs,
+  * a verified hour is a snapshot an ordinary upload cannot change; a newer run's upload is staged and
+    replaces the snapshot only when that run finalizes complete,
   * the view keeps every existing column, in order, and appends the five completeness columns,
   * every reader asks the view for columns that exist.
 
@@ -77,18 +80,22 @@ def test_additive_and_sendable():
                 "verified_export_at"):
         assert re.search(rf"ADD COLUMN IF NOT EXISTS {col}\s+\w+[,;]\n", sql), col
     assert not re.search(r"ADD COLUMN[^\n]*NOT NULL", sql), "new columns on existing tables stay nullable"
-    for table in ("phone_usage_sync_chunks", "phone_usage_sync_runs"):
+    for table in ("phone_usage_sync_chunks", "phone_usage_sync_runs", "phone_usage_pending_hours"):
         assert f"CREATE TABLE IF NOT EXISTS pds.{table}" in sql, table
-    # The only removal is of items inside the finalization (and only of hours it verifies).
-    assert sql.count("DELETE FROM") == 1
+    # The only removals are inside the finalization: items of an hour it verifies or replaces, and staged copies.
+    deletes = re.findall(r"DELETE FROM (pds\.\w+)", sql)
+    assert set(deletes) == {"pds.phone_usage_items", "pds.phone_usage_pending_hours"}, deletes
+    finalize = _no_comments(_function(_sql(MIGRATION), "finalize_phone_usage_run"))
+    assert len(deletes) == len(re.findall(r"DELETE FROM", finalize)) == 4, "every removal is inside the finalization"
     assert "DELETE FROM pds.phone_usage_items i\n             USING owned o" in sql
 
 
 def test_new_tables_are_service_role_only():
     sql = _no_comments(_sql(MIGRATION))
-    for table in ("phone_usage_sync_chunks", "phone_usage_sync_runs"):
+    for table in ("phone_usage_sync_chunks", "phone_usage_sync_runs", "phone_usage_pending_hours"):
         assert f"ALTER TABLE pds.{table}" in sql and "ENABLE ROW LEVEL SECURITY" in sql
-    assert "REVOKE ALL ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs FROM PUBLIC, anon, authenticated;" in sql
+    assert ("REVOKE ALL ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs, pds.phone_usage_pending_hours "
+            "FROM PUBLIC, anon, authenticated;") in sql
     assert not re.search(r"GRANT[^;]*\bTO\s+(anon|authenticated|PUBLIC)\b", sql, re.I), "nothing is granted to a browser role"
     assert "TO authenticated USING" not in sql
     for fn in ("finalize_phone_usage_run(TEXT, UUID)", "phone_usage_window_complete(TIMESTAMPTZ, TIMESTAMPTZ)",
@@ -114,6 +121,17 @@ def test_finalization_refuses_unsupported_runs_before_verifying():
         assert rule in verify, rule
     assert verify.index("set_config('onyx.phone_usage_verified_write', 'on', true)") < verify.index("UPDATE pds.phone_usage_segments")
     assert "set_config('onyx.phone_usage_verified_write', 'off', true)" in verify
+    # Lock the hours first, decide second: no concurrent upload can slip between the check and the marking.
+    assert "ORDER BY s.segment_start\n           FOR UPDATE;" in verify
+    assert verify.index("FOR UPDATE") < verify.index("WITH owned AS")
+    assert "AND s.last_run_id = p_run_id AND s.verified_at IS NULL\n            RETURNING 1" in verify, "the marking rechecks ownership"
+    # A later complete export replaces the snapshot of an hour an earlier run verified, only from its own staged copy.
+    fix = verify[verify.index("SELECT COALESCE(array_agg"):verify.index("DELETE FROM pds.phone_usage_pending_hours h WHERE h.device")]
+    for rule in ("h.run_id = p_run_id", "s.verified_at IS NOT NULL", "s.verified_export_at < c.window_end",
+                 "(h.segment ->> 'segment_end')::timestamptz <= c.window_end", ">= INTERVAL '1 hour'",
+                 "(h.segment ->> 'last_run_item_count')::int = (SELECT count(*) FROM jsonb_object_keys(h.items))",
+                 "verified_run_id        = p_run_id"):
+        assert rule in fix, rule
     # Usage rows are touched only inside the complete branch.
     outside = fn.replace(verify, "")
     assert "UPDATE pds.phone_usage_segments" not in outside and "DELETE FROM" not in outside
@@ -124,12 +142,19 @@ def test_finalization_refuses_unsupported_runs_before_verifying():
 def test_guards_keep_the_snapshot_and_the_ownership():
     sql = _sql(MIGRATION)
     seg = _no_comments(_function(sql, "phone_usage_segments_guard"))
-    assert "IF OLD.verified_at IS NOT NULL THEN\n            RETURN NULL;" in seg
+    # A verified hour is never changed by an upload: a NEWER run's copy is staged, anything else ignored.
+    verified = seg[seg.index("IF OLD.verified_at IS NOT NULL THEN"):seg.index("IF OLD.last_export_at IS NOT NULL")]
+    assert "NEW.last_run_id IS NOT NULL" in verified and "NEW.last_export_at > OLD.verified_export_at" in verified
+    assert "INSERT INTO pds.phone_usage_pending_hours" in verified
+    assert "RETURN NULL;" in verified and "RETURN NEW" not in verified
     assert "NEW.last_export_at < OLD.last_export_at" in seg
     for col in ("verified_at", "verified_run_id", "verified_export_at"):
         assert f"NEW.{col}" in seg and ":= NULL" in seg, col
     items = _no_comments(_function(sql, "phone_usage_items_guard"))
-    assert "IF parent_verified IS NOT NULL THEN\n        RETURN NULL;" in items
+    verified_items = items[items.index("IF parent_verified IS NOT NULL THEN"):items.index("parent_run IS DISTINCT FROM NEW.last_run_id")]
+    assert "NEW.last_run_id IS DISTINCT FROM parent_verified_run" in verified_items
+    assert "UPDATE pds.phone_usage_pending_hours" in verified_items
+    assert "RETURN NULL;" in verified_items and "RETURN NEW" not in verified_items, "a verified hour's items never change directly"
     assert "NEW.last_run_id IS NOT NULL AND parent_run IS DISTINCT FROM NEW.last_run_id" in items
     assert "BEFORE INSERT OR UPDATE ON pds.phone_usage_segments" in sql
     assert "BEFORE INSERT OR UPDATE ON pds.phone_usage_items" in sql
@@ -200,7 +225,9 @@ def test_branch_check_is_rolled_back_and_refuses_real_data():
     assert "COMMIT" not in body.upper()
     assert "IF EXISTS (SELECT 1 FROM pds.phone_usage_segments) THEN\n        RAISE EXCEPTION 'refusing to run" in body
     for case in ("'stream_open'", "'receiving'", "'inconsistent'", "'complete'", "'unknown'", "'partial'",
-                 "items_removed", "'already'"):
+                 "items_removed", "'already'", "hours_replaced", "pds.phone_usage_pending_hours",
+                 "later_complete_export_replaces_snapshot", "later_incomplete_export_keeps_snapshot",
+                 "older_export_not_staged"):
         assert case in body, case
 
 

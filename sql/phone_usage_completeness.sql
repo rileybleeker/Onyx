@@ -20,19 +20,29 @@
 --     only then, the hours the run still owns that had ended at export time
 --     are marked verified, and items such an hour no longer lists are removed
 --     (a completed hour cannot keep stale usage).
---   * A verified hour is a snapshot: only a later finalization changes it
---     (guard triggers below). Uploads without `run` (every app build before
---     this change) write as before and are never verified.
+--   * A verified hour is a snapshot: an ordinary upload never changes it, and an
+--     upload that carries a newer run is STAGED in pds.phone_usage_pending_hours
+--     instead. Only the finalization of that later run, and only when it is
+--     complete, replaces the snapshot (hours and items), so a newer complete
+--     export corrects totals and removes items the old snapshot still listed,
+--     while a newer export that never completes (watchdog stop, failed chunk)
+--     leaves the last verified snapshot exactly as it was. Uploads without
+--     `run` (every app build before this change) write as before and are
+--     never verified.
 --   * pds.phone_usage_daily gains, at the end: hours_verified, export_complete,
 --     completeness ('complete' | 'partial' | 'unknown'), pre_sleep_complete,
 --     during_sleep_complete. Readers count a day or an estimate only when the
 --     flag is true: 'unknown' (an older build) is never complete.
 --
--- Additive only: nullable columns, two new tables, functions, triggers and
--- appended view columns. The route deployed before this change keeps working
--- after it (it sends none of the new fields, so its rows stay unverified).
--- Uploaded hours are never removed; the only rows a finalization removes are
--- items of an hour being verified that the verifying export no longer lists.
+-- Additive only: nullable columns, three new tables, functions, triggers and
+-- appended view columns. ORDER: apply this file BEFORE the route that writes
+-- the new columns is deployed (the route sends last_run_id, last_run_item_count
+-- and last_export_at on every hour, run metadata or not). After it, the route
+-- deployed before this change keeps working (it sends none of the new fields,
+-- so its rows stay unverified).
+-- Uploaded hours are never removed; the only usage rows a finalization removes
+-- are items of an hour it verifies or replaces that the verifying export no
+-- longer lists, and staged copies older than three days.
 --
 -- Rollback without data loss: the readers can go back to ignoring the new
 -- columns (the view's existing columns are unchanged). Replacing the two guard
@@ -67,7 +77,8 @@ CREATE INDEX IF NOT EXISTS phone_usage_segments_run_idx
 
 -- ----------------------------------------------------------------------------
 -- 2. One row per received chunk (written by the route after the chunk's hours),
---    and one row per run (written by pds.finalize_phone_usage_run).
+--    one row per run (written by pds.finalize_phone_usage_run) and the staging
+--    table for corrections of verified hours.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS pds.phone_usage_sync_chunks (
     device               TEXT NOT NULL,
@@ -113,26 +124,46 @@ CREATE TABLE IF NOT EXISTS pds.phone_usage_sync_runs (
 CREATE INDEX IF NOT EXISTS phone_usage_sync_runs_complete_idx
     ON pds.phone_usage_sync_runs (window_start, window_end) WHERE status = 'complete';
 
+-- Staged copy of an hour a NEWER run uploaded over an already verified hour (written only by the
+-- guard triggers below, one row per run and hour; `segment` is the uploaded hour row and `items` its
+-- items keyed kind|identifier, both as the table rows they would have been). The finalization of
+-- that run promotes them when the run is complete; otherwise they are never used and are removed
+-- after three days. The live hour and its items stay the last verified snapshot meanwhile.
+CREATE TABLE IF NOT EXISTS pds.phone_usage_pending_hours (
+    device         TEXT NOT NULL,
+    run_id         UUID NOT NULL,
+    segment_start  TIMESTAMPTZ NOT NULL,
+    segment        JSONB NOT NULL,
+    items          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    staged_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (device, run_id, segment_start)
+);
+
 -- SERVICE ROLE ONLY, like the usage tables they describe.
-ALTER TABLE pds.phone_usage_sync_chunks ENABLE ROW LEVEL SECURITY;
-ALTER TABLE pds.phone_usage_sync_runs   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.phone_usage_sync_chunks  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.phone_usage_sync_runs    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.phone_usage_pending_hours ENABLE ROW LEVEL SECURITY;
 DO $$
 DECLARE t text;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['phone_usage_sync_chunks', 'phone_usage_sync_runs'] LOOP
+    FOREACH t IN ARRAY ARRAY['phone_usage_sync_chunks', 'phone_usage_sync_runs', 'phone_usage_pending_hours'] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'pds' AND tablename = t AND policyname = 'service_full_access') THEN
             EXECUTE format('CREATE POLICY service_full_access ON pds.%I FOR ALL TO service_role USING (true) WITH CHECK (true)', t);
         END IF;
     END LOOP;
 END $$;
-REVOKE ALL ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs FROM PUBLIC, anon, authenticated;
-GRANT ALL  ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs TO service_role;
+REVOKE ALL ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs, pds.phone_usage_pending_hours FROM PUBLIC, anon, authenticated;
+GRANT ALL  ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs, pds.phone_usage_pending_hours TO service_role;
 
 -- ----------------------------------------------------------------------------
 -- 3. Guards. Only pds.finalize_phone_usage_run (which sets the transaction-local
 --    setting onyx.phone_usage_verified_write) may write a verified hour, its
 --    items, or the verified_* columns. An integrity rule, not an access rule:
 --    the service role is the only writer either way.
+--    An upload that carries a NEWER run for a verified hour is not lost: it is
+--    staged in pds.phone_usage_pending_hours (the hour row here, its items in the
+--    items guard) and the finalization of that run replaces the snapshot only
+--    when the run is complete.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.phone_usage_segments_guard()
 RETURNS TRIGGER
@@ -144,8 +175,16 @@ BEGIN
         RETURN NEW;
     END IF;
     IF TG_OP = 'UPDATE' THEN
-        -- The snapshot of a complete export: ordinary uploads leave it as it is.
+        -- The snapshot of a complete export: ordinary uploads leave it as it is. A newer run's copy
+        -- is staged (a repeat of the verifying run, or an older export, is simply ignored).
         IF OLD.verified_at IS NOT NULL THEN
+            IF NEW.last_run_id IS NOT NULL AND NEW.last_export_at IS NOT NULL
+               AND (OLD.verified_export_at IS NULL OR NEW.last_export_at > OLD.verified_export_at) THEN
+                INSERT INTO pds.phone_usage_pending_hours AS h (device, run_id, segment_start, segment)
+                VALUES (NEW.device, NEW.last_run_id, NEW.segment_start, to_jsonb(NEW))
+                ON CONFLICT (device, run_id, segment_start)
+                DO UPDATE SET segment = EXCLUDED.segment, items = '{}'::jsonb, staged_at = now();
+            END IF;
             RETURN NULL;
         END IF;
         -- An export read before the one that wrote this hour must not replace it.
@@ -172,20 +211,29 @@ LANGUAGE plpgsql
 SET search_path = pds, pg_temp
 AS $$
 DECLARE
-    parent_verified TIMESTAMPTZ;
-    parent_run      UUID;
+    parent_verified     TIMESTAMPTZ;
+    parent_run          UUID;
+    parent_verified_run UUID;
 BEGIN
     IF current_setting('onyx.phone_usage_verified_write', true) = 'on' THEN
         RETURN NEW;
     END IF;
-    SELECT s.verified_at, s.last_run_id INTO parent_verified, parent_run
+    SELECT s.verified_at, s.last_run_id, s.verified_run_id
+      INTO parent_verified, parent_run, parent_verified_run
       FROM pds.phone_usage_segments s
      WHERE s.device = NEW.device AND s.segment_start = NEW.segment_start;
     IF NOT FOUND THEN
         RETURN NEW;          -- the foreign key answers for a missing hour
     END IF;
     IF parent_verified IS NOT NULL THEN
-        RETURN NULL;         -- a verified hour's items are part of its snapshot
+        -- A verified hour's items are part of its snapshot. A newer run's item goes to that run's staged
+        -- copy of the hour (none staged = its hour was refused as older, so the item is ignored too).
+        IF NEW.last_run_id IS NOT NULL AND NEW.last_run_id IS DISTINCT FROM parent_verified_run THEN
+            UPDATE pds.phone_usage_pending_hours h
+               SET items = h.items || jsonb_build_object(NEW.kind || '|' || NEW.identifier, to_jsonb(NEW))
+             WHERE h.device = NEW.device AND h.run_id = NEW.last_run_id AND h.segment_start = NEW.segment_start;
+        END IF;
+        RETURN NULL;
     END IF;
     -- An item from a run applies only while that run owns the hour: when another upload's run
     -- took the hour over (or this run's hour write was refused), the item is not mixed in.
@@ -204,13 +252,23 @@ CREATE OR REPLACE TRIGGER phone_usage_items_guard
 -- 4. Finalization: called by the route after every chunk it recorded. Idempotent
 --    (a complete run answers 'complete' again and changes nothing), one call per
 --    run at a time (advisory lock), and a run that is not complete changes no
---    usage row. Answers {status, hours_verified, items_removed, chunks_received,
---    chunk_count, already}; status is one of 'unknown_run', 'inconsistent',
---    'stream_open', 'receiving', 'complete'.
+--    usage row. Answers {status, hours_verified, hours_replaced, items_removed,
+--    chunks_received, chunk_count, already}; status is one of 'unknown_run',
+--    'inconsistent', 'stream_open', 'receiving', 'complete'.
 --    An hour is verified when this run still owns it (last_run_id), it had ended
 --    at export time (segment_end <= window_end) and is a whole hour (an in-progress
 --    hour that Apple clips to the export time is shorter), and every item the run
 --    sent for it is still the run's (last_run_item_count).
+--    A complete run also REPLACES the snapshot of an hour an earlier run verified
+--    when it staged its own copy of that hour (same whole-hour and item-count
+--    rules, and its export must have been read later than the snapshot's): the
+--    hour row and all its items become the later export's, so totals are
+--    corrected and items the old snapshot listed but this export does not are
+--    gone. hours_verified counts both; hours_replaced only the second kind.
+--    Before it decides anything the finalization locks every hour it may change
+--    (in key order), so a concurrent upload cannot slip between the ownership
+--    check and the marking: it waits, then finds the hour verified and stages or
+--    ignores its copy.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.finalize_phone_usage_run(p_device TEXT, p_run_id UUID)
 RETURNS JSONB
@@ -224,6 +282,8 @@ DECLARE
     v_status   TEXT;
     v_verified INTEGER := 0;
     v_removed  INTEGER := 0;
+    v_fix      TIMESTAMPTZ[] := ARRAY[]::timestamptz[];
+    v_fixed    INTEGER := 0;
 BEGIN
     IF p_device IS NULL OR p_run_id IS NULL THEN
         RAISE EXCEPTION 'finalize_phone_usage_run: device and run id are required' USING ERRCODE = '22023';
@@ -232,9 +292,9 @@ BEGIN
 
     SELECT * INTO v_prior FROM pds.phone_usage_sync_runs r WHERE r.device = p_device AND r.run_id = p_run_id;
     IF FOUND AND v_prior.status = 'complete' THEN
-        RETURN jsonb_build_object('status', 'complete', 'hours_verified', v_prior.hours_verified, 'items_removed', 0,
-                                  'chunks_received', v_prior.chunks_received, 'chunk_count', v_prior.chunk_count,
-                                  'already', true);
+        RETURN jsonb_build_object('status', 'complete', 'hours_verified', v_prior.hours_verified, 'hours_replaced', 0,
+                                  'items_removed', 0, 'chunks_received', v_prior.chunks_received,
+                                  'chunk_count', v_prior.chunk_count, 'already', true);
     END IF;
 
     SELECT count(*)                       AS n,
@@ -257,7 +317,7 @@ BEGIN
      WHERE k.device = p_device AND k.run_id = p_run_id;
 
     IF c.n = 0 THEN
-        RETURN jsonb_build_object('status', 'unknown_run', 'hours_verified', 0, 'items_removed', 0,
+        RETURN jsonb_build_object('status', 'unknown_run', 'hours_verified', 0, 'hours_replaced', 0, 'items_removed', 0,
                                   'chunks_received', 0, 'chunk_count', NULL, 'already', false);
     END IF;
 
@@ -277,6 +337,18 @@ BEGIN
 
     IF v_status = 'complete' THEN
         PERFORM set_config('onyx.phone_usage_verified_write', 'on', true);
+        -- Lock first, decide second: from here until this transaction ends no other writer can change an
+        -- hour this run owns or has staged (a waiting upload then finds it verified). The ownership test
+        -- below runs in a later statement, so it sees whatever the writers we waited for committed.
+        PERFORM 1
+          FROM pds.phone_usage_segments s
+         WHERE s.device = p_device
+           AND ((s.last_run_id = p_run_id AND s.verified_at IS NULL)
+                OR s.segment_start IN (SELECT h.segment_start FROM pds.phone_usage_pending_hours h
+                                        WHERE h.device = p_device AND h.run_id = p_run_id))
+         ORDER BY s.segment_start
+           FOR UPDATE;
+
         WITH owned AS (
             SELECT s.device, s.segment_start
               FROM pds.phone_usage_segments s
@@ -301,9 +373,67 @@ BEGIN
                SET verified_at = now(), verified_run_id = p_run_id, verified_export_at = c.window_end
               FROM owned o
              WHERE s.device = o.device AND s.segment_start = o.segment_start
+               AND s.last_run_id = p_run_id AND s.verified_at IS NULL
             RETURNING 1
         )
         SELECT (SELECT count(*) FROM marked), (SELECT count(*) FROM removed) INTO v_verified, v_removed;
+
+        -- Hours an earlier run verified that this complete run uploaded again: its staged copy replaces the snapshot.
+        SELECT COALESCE(array_agg(x.segment_start ORDER BY x.segment_start), ARRAY[]::timestamptz[])
+          INTO v_fix
+          FROM (
+              SELECT h.segment_start
+                FROM pds.phone_usage_pending_hours h
+                JOIN pds.phone_usage_segments s ON s.device = h.device AND s.segment_start = h.segment_start
+               WHERE h.device = p_device AND h.run_id = p_run_id
+                 AND s.verified_at IS NOT NULL
+                 AND s.verified_export_at < c.window_end
+                 AND (h.segment ->> 'segment_end')::timestamptz <= c.window_end
+                 AND (h.segment ->> 'segment_end')::timestamptz - h.segment_start >= INTERVAL '1 hour'
+                 AND (h.segment ->> 'last_run_item_count')::int = (SELECT count(*) FROM jsonb_object_keys(h.items))
+          ) x;
+
+        IF COALESCE(array_length(v_fix, 1), 0) > 0 THEN
+            DELETE FROM pds.phone_usage_items i
+             WHERE i.device = p_device AND i.segment_start = ANY (v_fix);
+
+            UPDATE pds.phone_usage_segments s
+               SET segment_end            = (h.segment ->> 'segment_end')::timestamptz,
+                   total_seconds          = (h.segment ->> 'total_seconds')::numeric,
+                   first_pickup           = (h.segment ->> 'first_pickup')::timestamptz,
+                   pickups_without_app    = (h.segment ->> 'pickups_without_app')::int,
+                   longest_activity_start = (h.segment ->> 'longest_activity_start')::timestamptz,
+                   longest_activity_end   = (h.segment ->> 'longest_activity_end')::timestamptz,
+                   device_name            = h.segment ->> 'device_name',
+                   device_model           = h.segment ->> 'device_model',
+                   synced_at              = (h.segment ->> 'synced_at')::timestamptz,
+                   last_run_id            = p_run_id,
+                   last_run_item_count    = (h.segment ->> 'last_run_item_count')::int,
+                   last_export_at         = c.window_end,
+                   verified_at            = now(),
+                   verified_run_id        = p_run_id,
+                   verified_export_at     = c.window_end
+              FROM pds.phone_usage_pending_hours h
+             WHERE h.device = p_device AND h.run_id = p_run_id AND h.segment_start = ANY (v_fix)
+               AND s.device = h.device AND s.segment_start = h.segment_start;
+            GET DIAGNOSTICS v_fixed = ROW_COUNT;
+
+            INSERT INTO pds.phone_usage_items
+                   (device, segment_start, kind, identifier, name, category, seconds, pickups, notifications, last_run_id)
+            SELECT h.device, h.segment_start, e.value ->> 'kind', e.value ->> 'identifier', e.value ->> 'name',
+                   e.value ->> 'category', (e.value ->> 'seconds')::numeric, (e.value ->> 'pickups')::int,
+                   (e.value ->> 'notifications')::int, p_run_id
+              FROM pds.phone_usage_pending_hours h
+             CROSS JOIN LATERAL jsonb_each(h.items) e
+             WHERE h.device = p_device AND h.run_id = p_run_id AND h.segment_start = ANY (v_fix);
+
+            v_verified := v_verified + v_fixed;
+        END IF;
+
+        -- The run is settled: its staged copies have done their job (an hour it could not replace keeps the
+        -- snapshot), and copies of runs that never completed are removed after three days.
+        DELETE FROM pds.phone_usage_pending_hours h WHERE h.device = p_device AND h.run_id = p_run_id;
+        DELETE FROM pds.phone_usage_pending_hours h WHERE h.staged_at < now() - INTERVAL '3 days';
         PERFORM set_config('onyx.phone_usage_verified_write', 'off', true);
     END IF;
 
@@ -327,8 +457,9 @@ BEGIN
         checked_at        = EXCLUDED.checked_at,
         completed_at      = EXCLUDED.completed_at;
 
-    RETURN jsonb_build_object('status', v_status, 'hours_verified', v_verified, 'items_removed', v_removed,
-                              'chunks_received', c.chunks, 'chunk_count', c.chunk_count_max, 'already', false);
+    RETURN jsonb_build_object('status', v_status, 'hours_verified', v_verified, 'hours_replaced', v_fixed,
+                              'items_removed', v_removed, 'chunks_received', c.chunks,
+                              'chunk_count', c.chunk_count_max, 'already', false);
 END;
 $$;
 

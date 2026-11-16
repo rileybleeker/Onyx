@@ -263,3 +263,22 @@ test("the route is still the only CI-token Screen Time path and the app sends `r
     assert.match(models, new RegExp(`let ${key}:`), key);
   }
 });
+
+test("the app reports stream_ended only for a stream that ended by itself with no error", () => {
+  const exporter = fs.readFileSync(
+    path.join(SRC, "..", "..", "tools", "screentime_ios", "OnyxScreenTime", "ScreenTimeExporter.swift"),
+    "utf8",
+  );
+  // finish(error) marks the store finished even when Apple's stream threw after some hours arrived;
+  // that must never read as "ended" (the server would certify the hours it did get as complete).
+  assert.match(exporter, /endedCleanly = \(error == nil\)/);
+  assert.match(exporter, /let ended = await store\.endedCleanly/);
+  assert.doesNotMatch(exporter, /let ended = await store\.finished/);
+  assert.match(exporter, /streamEnded: ended,/);
+  // The summary tells a failed stream from a watchdog stop.
+  const sync = fs.readFileSync(
+    path.join(SRC, "..", "..", "tools", "screentime_ios", "OnyxScreenTime", "SyncService.swift"),
+    "utf8",
+  );
+  assert.match(sync, /result\.streamFailed/);
+});
