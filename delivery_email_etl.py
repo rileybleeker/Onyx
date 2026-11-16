@@ -36,7 +36,8 @@ Usage:
     python delivery_email_etl.py --days 1500    # history backfill
     python delivery_email_etl.py --reprocess    # re-parse emails already in delivery_email_log
     python delivery_email_etl.py --dry-run      # parse + print, no DB access at all
-    python delivery_email_etl.py --file x.html  # parse one saved email body (parser QA)
+    python delivery_email_etl.py --file x.html  # parse one saved email body (parser QA; prints
+                                                # found/missing flags and classifications only)
 
 Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and the IMAP_EMAIL* /
      IMAP_APP_PASSWORD* pairs shared with flights_email_etl.py.
@@ -58,6 +59,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Optional
 
+from email_log_safety import HeartbeatGate, bounded_days, log_failure, quiet_dependency_loggers
 # Shared IMAP / HTML plumbing — one implementation for both email ETLs.
 from flights_email_etl import (
     IMAP_HOST, _fetch_chunks, _imap_date, account_fingerprint, body_lines, decode_hdr,
@@ -65,6 +67,10 @@ from flights_email_etl import (
 )
 
 log = logging.getLogger("delivery_email_etl")
+# CI logs are public: counts and codes only (email_log_safety.py). No subject, merchant,
+# order key, total, address, account address or exception text is ever logged.
+quiet_dependency_loggers()
+HEARTBEAT = HeartbeatGate()   # opened by main() only for a write-mode run
 
 # Uber receipts go to this mailbox; if it isn't configured the heartbeat says so.
 REQUIRED_ACCOUNTS = ("rileybleeklm@gmail.com",)
@@ -413,8 +419,7 @@ class Store:
         if twin:
             if twin["time_source"] == "payment_estimate" or row["time_source"] == "date_only":
                 return "re-sent receipt for an order already stored"
-            # The stored copy has no usable time and this one does: keep this one only.
-            log.info(f"    removing duplicate of {row['order_key']!r}: {twin['order_key']!r}")
+            # The stored copy has no usable time and this one does: keep this one only (counted in twins_removed).
             if self.dry_run:
                 self._dry.pop(twin["order_key"], None)
             else:
@@ -457,27 +462,32 @@ def search_uids(imap: imaplib.IMAP4_SSL, since: date) -> tuple[list[bytes], str]
                                 f'"from:{SENDER_DOMAIN} subject:(order with Uber Eats) after:{since:%Y/%m/%d}"')
         if status == "OK":
             return (data[0].split() if data and data[0] else []), "X-GM-RAW"
-    except imaplib.IMAP4.error as e:
-        log.info(f"X-GM-RAW search unavailable ({e}); using IMAP FROM")
+    except imaplib.IMAP4.error:
+        log.info("search: X-GM-RAW unavailable; using IMAP FROM")
     status, data = imap.uid("SEARCH", None, f'(FROM "{SENDER_DOMAIN}" SUBJECT "Uber Eats" SINCE {_imap_date(since)})')
     return (data[0].split() if status == "OK" and data and data[0] else []), "FROM"
 
 
 def process_account(account: str, password: str, store: Store, since: date, reprocess: bool) -> dict:
-    stats = {"account": account, "candidates": 0, "receipts": 0, "written": 0, "unmatched": 0, "errors": 0,
-             "skipped_done": 0, "kinds": Counter(), "unmatched_subjects": []}
+    fp = account_fingerprint(account)
+    stats = {"fp": fp, "candidates": 0, "receipts": 0, "written": 0, "unmatched": 0, "errors": 0,
+             "skipped_done": 0, "kinds": Counter(), "unmatched_reasons": Counter()}
     imap = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
         imap.login(account, password)
         box = select_all_mail(imap)
+        window = "default"
         if not reprocess:
             oldest = store.oldest_error_day(account)
             if oldest and oldest - timedelta(days=1) < since:
                 since = oldest - timedelta(days=1)   # one day of slack: the search is date-granular
-                log.info(f"[{account_fingerprint(account)}] widening the search to {since} to retry an errored email")
+                window = "widened"
+                # The widened start comes from a private receipt's date: log the stage, never the date.
+                log.info(f"[fp={fp}] retry_window_widened")
         uids, how = search_uids(imap, since)
         stats["candidates"] = len(uids)
-        log.info(f"[{account}] fp={account_fingerprint(account)} {len(uids)} candidate email(s) since {since} in {box} via {how}")
+        mailbox = "inbox_fallback" if box == "INBOX" else "all_mail"
+        log.info(f"[fp={fp}] {len(uids)} candidate email(s) window={window} mailbox={mailbox} via {how}")
         if not uids:
             return stats
         done = set() if reprocess else store.processed_ids(account)
@@ -500,7 +510,7 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                 edate = datetime.now(timezone.utc)
             wanted.append((uid, {"message_id": mid, "subject": subject, "email_date": edate, "account": account}))
         wanted.sort(key=lambda w: w[1]["email_date"])  # chronological, so "latest email wins" is cheap
-        log.info(f"[{account}] {stats['receipts']} receipt(s), {stats['skipped_done']} already processed, {len(wanted)} to parse")
+        log.info(f"[fp={fp}] {stats['receipts']} receipt(s), {stats['skipped_done']} already processed, {len(wanted)} to parse")
         bodies: dict[bytes, bytes] = {}
         for uid, raw in _fetch_chunks(imap, [u for u, _ in wanted], "(BODY.PEEK[])", chunk=10):
             bodies[uid] = raw
@@ -516,12 +526,10 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                         else "tip_only" if parsed["tip_only"] else "receipt")
                 if not parsed["merchant"] or not parsed["order_date"]:
                     stats["unmatched"] += 1
-                    if len(stats["unmatched_subjects"]) < 8:
-                        stats["unmatched_subjects"].append(
-                            f"{meta['email_date']:%Y-%m-%d} {meta['subject'][:60]} :: {parsed['text_head']}")
-                    store.log_email(meta, kind, parsed["merchant"], "unmatched",
-                                    f"merchant={'ok' if parsed['merchant'] else 'missing'} "
-                                    f"order_date={'ok' if parsed['order_date'] else 'missing'}")
+                    reason = (f"merchant={'ok' if parsed['merchant'] else 'missing'} "
+                              f"order_date={'ok' if parsed['order_date'] else 'missing'}")
+                    stats["unmatched_reasons"][reason] += 1    # a reason code, never the subject or body text
+                    store.log_email(meta, kind, parsed["merchant"], "unmatched", reason)
                     continue
                 row = build_row(parsed, meta)
                 if not row["merchant_tz"] and row["ordered_local"]:
@@ -536,8 +544,11 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                 store.log_email(meta, kind, parsed["merchant"], "parsed", None if outcome == "written" else outcome)
             except Exception as e:  # one bad email must not sink the run
                 stats["errors"] += 1
-                log.exception(f"  parse failed for {meta['subject']!r}")
-                store.log_email(meta, "receipt", None, "error", repr(e))
+                code = log_failure(log, "message_failed", e, fp=fp)
+                try:
+                    store.log_email(meta, "receipt", None, "error", code)
+                except Exception as log_e:   # the error row itself failed: count it, keep going
+                    log_failure(log, "email_log_write_failed", log_e, fp=fp)
         return stats
     finally:
         try:
@@ -546,34 +557,52 @@ def process_account(account: str, password: str, store: Store, since: date, repr
             pass
 
 
+FILE_FIELDS = ("merchant", "order_date", "ordered_local", "delivered_local", "pickup_local", "charge_local",
+               "merchant_address", "total", "currency", "fulfillment")
+
+
+def file_summary(parsed: dict) -> dict:
+    """What the parser found, as present/missing flags and classifications only.
+
+    No merchant, total, time, address or body text: a saved receipt is someone's real order.
+    """
+    out = {f: ("found" if parsed.get(f) is not None else "missing") for f in FILE_FIELDS}
+    out.update({"canceled": bool(parsed.get("canceled")), "tip_only": bool(parsed.get("tip_only")),
+                "refund": bool(parsed.get("refund")),
+                "fulfillment_kind": parsed.get("fulfillment") if parsed.get("fulfillment") in ("delivery", "pickup") else None,
+                "merchant_tz": "resolved" if merchant_tz(parsed.get("merchant_address")) else "unresolved"})
+    if parsed.get("merchant") and parsed.get("order_date"):
+        row = build_row(parsed, {"message_id": "<file>", "email_date": datetime.now(timezone.utc), "account": "file",
+                                 "subject": ""})
+        out.update({"row": "buildable", "status": row["status"], "time_source": row["time_source"]})
+    else:
+        out["row"] = "unmatched"
+    return out
+
+
 def run_file(path: str) -> None:
+    """Parser dev aid: parse one saved body and print what was found (flags and classifications only)."""
     text = open(path, encoding="utf-8", errors="replace").read()
     lines = html_to_lines(text) if "<" in text[:2000] else plain_to_lines(text)
-    parsed = parse_receipt(lines)
-    print(json.dumps(parsed, indent=2, default=str))
-    if parsed["merchant"] and parsed["order_date"]:
-        meta = {"message_id": "<file>", "email_date": datetime.now(timezone.utc), "account": "file",
-                "subject": os.path.basename(path)}
-        print(json.dumps(build_row(parsed, meta), indent=2, default=str))
+    print(json.dumps(file_summary(parse_receipt(lines)), indent=2))
+
+
+def dry_summary(store: Store) -> dict:
+    """Dry-run totals by status and time source. No merchant, kind-by-year, time or total."""
+    c: Counter = Counter()
+    for r in store._dry.values():
+        c[f"status:{r['status']}"] += 1
+        c[f"time:{r['time_source']}"] += 1
+    return dict(sorted(c.items()))
 
 
 def print_dry_summary(store: Store) -> None:
-    rows = sorted(store._dry.values(), key=lambda r: (r["order_date_local"], r["ordered_local"] or r["delivered_local"] or ""))
-    by_year: dict[str, Counter] = {}
-    for r in rows:
-        c = by_year.setdefault(r["order_date_local"][:4], Counter())
-        c[f"{r['status']}/{r['merchant_kind']}"] += 1
-        c[f"time:{r['time_source']}"] += 1
-    for y in sorted(by_year):
-        log.info(f"  {y}: {dict(sorted(by_year[y].items()))}")
-    for r in rows[-12:]:
-        log.info(f"    {r['status']:9} {r['merchant_kind']:10} {r['time_source']:16} {r['order_date_local']} "
-                 f"ordered={r['ordered_local']} delivered={r['delivered_local']} {r['currency'] or ''} {r['total']}  {r['merchant_name']}")
+    log.info(f"  dry run: {len(store._dry)} order(s) {dry_summary(store)}, {store.twins_removed} duplicate(s) folded")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"look-back window (default {DEFAULT_DAYS})")
+    ap.add_argument("--days", type=bounded_days, default=DEFAULT_DAYS, help=f"look-back window (default {DEFAULT_DAYS})")
     ap.add_argument("--reprocess", action="store_true", help="re-parse emails already in delivery_email_log")
     ap.add_argument("--dry-run", action="store_true", help="parse and print; touches no database")
     ap.add_argument("--file", help="parse one saved email body and exit")
@@ -585,6 +614,7 @@ def main() -> int:
 
     supa = None
     if not args.dry_run:
+        HEARTBEAT.open()          # write mode, arguments valid: a crash from here on writes a heartbeat
         from supabase import create_client
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
     store = Store(supa, dry_run=args.dry_run)
@@ -594,22 +624,24 @@ def main() -> int:
     per_account: list[dict] = []
     failures: list[str] = []
     for acct, pw in accounts:
+        fp = account_fingerprint(acct)
         try:
             per_account.append(process_account(acct, pw, store, since, args.reprocess))
         except Exception as e:
-            log.exception(f"[{acct}] account failed")
-            failures.append(f"{account_fingerprint(acct)}: {e!r}"[:200])
+            code = log_failure(log, "account_failed", e, fp=fp, level=logging.ERROR)
+            failures.append(f"account {fp}: {code}")
 
     written = sum(s["written"] for s in per_account)
     errors = sum(s["errors"] for s in per_account)
     unmatched = sum(s["unmatched"] for s in per_account)
     kinds: Counter = Counter()
+    reasons: Counter = Counter()
     for s in per_account:
         kinds.update(s["kinds"])
-        for subj in s["unmatched_subjects"]:
-            log.info(f"  unmatched: {subj}")
+        reasons.update(s["unmatched_reasons"])
     log.info(f"Done: {len(per_account)}/{len(accounts)} account(s) ok, {written} order write(s) "
-             f"{dict(sorted(kinds.items()))}, {unmatched} unmatched, {errors} parse error(s)")
+             f"{dict(sorted(kinds.items()))}, {unmatched} unmatched {dict(sorted(reasons.items()))}, "
+             f"{errors} parse error(s)")
 
     if args.dry_run:
         print_dry_summary(store)
@@ -628,7 +660,7 @@ def main() -> int:
         missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
         if missing:
             status = "partial"
-            notes.append(f"Gmail account not configured: {', '.join(missing)}")
+            notes.append(f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
         if errors or unmatched:
             status = "partial"
             notes.append(f"{errors} error(s), {unmatched} unmatched receipt(s) — see pds.delivery_email_log")
@@ -637,18 +669,34 @@ def main() -> int:
     return 0 if status != "failed" else 1
 
 
-if __name__ == "__main__":
+def fatal(e: BaseException) -> None:
+    """Root crash handler: a code on the log; a 'failed' heartbeat ONLY when HEARTBEAT was opened by a
+    write-mode run. --dry-run / --file (or a crash before the mode is known) write nothing."""
+    code = log_failure(log, "fatal", e, level=logging.ERROR)
+    if not HEARTBEAT.allowed:
+        return
     try:
-        sys.exit(main())
+        from supabase import create_client
+        from sync_log_helper import log_sync
+        supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+        log_sync(supa, "delivery", "email", "failed", records=0, error=code)
+    except Exception:
+        pass
+
+
+def cli() -> int:
+    """Entry point: main() with the crash handler (heartbeat on crash, per the Onyx ETL convention)."""
+    HEARTBEAT.close()
+    try:
+        return main()
     except SystemExit:
         raise
-    except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
-        log.exception("fatal")
-        try:
-            from supabase import create_client
-            from sync_log_helper import log_sync
-            supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-            log_sync(supa, "delivery", "email", "failed", records=0, error=repr(e)[:500])
-        except Exception:
-            pass
-        sys.exit(1)
+    except Exception as e:
+        fatal(e)
+        return 1
+    finally:
+        HEARTBEAT.close()
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

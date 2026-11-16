@@ -13,7 +13,8 @@ Schema columns populated:
   date_range_start, date_range_end, error_message
 
 Insert failures are swallowed with a warning — the ETL should never crash
-because the heartbeat write failed.
+because the heartbeat write failed. The warning carries an error category
+(email_log_safety.error_code), never the exception text.
 """
 
 import logging
@@ -73,7 +74,14 @@ def log_sync(
     try:
         supa.schema("pds").table("sync_log").insert(row).execute()
     except Exception as e:
-        log.warning(f"sync_log insert ({source}|{data_type}) failed: {e}")
+        # A category code, never the exception text: a PostgREST error can echo the failing row
+        # or the response body, and these logs are public.
+        try:
+            from email_log_safety import error_code
+            code = error_code(e)
+        except Exception:
+            code = "unexpected_error"
+        log.warning(f"sync_log insert ({source}|{data_type}) failed: {code}")
 
 
 def now_epoch() -> float:
