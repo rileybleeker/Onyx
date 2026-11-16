@@ -16,6 +16,9 @@ applied. This file keeps a later edit from quietly undoing the rules that check 
     old runs,
   * the item guard locks the hour (FOR SHARE) before it reads whether it is verified or who owns it,
     so an item write and a finalization are one after the other,
+  * a run is never settled while one of its staged replacements is incomplete (a repeated delivery of an
+    acknowledged chunk empties the staged items before it stores them again): the check runs after the hour
+    locks and before anything is verified, replaced, removed or deleted,
   * a verified hour is a snapshot an ordinary upload cannot change; a newer run's upload is staged and
     replaces the snapshot only when that run finalizes complete,
   * the view keeps every existing column, in order, and appends the five completeness columns,
@@ -150,6 +153,28 @@ def test_finalization_refuses_unsupported_runs_before_verifying():
     assert "'already', true" in fn
 
 
+def test_run_is_not_settled_while_a_staged_replacement_is_incomplete():
+    fn = _no_comments(_function(_sql(MIGRATION), "finalize_phone_usage_run"))
+    lock = fn.index("FOR UPDATE;")
+    check = fn.index("INTO v_staged_incomplete")
+    settle = fn.index("IF v_staged_incomplete > 0 THEN\n            v_status := 'receiving';")
+    work = fn.index("WITH owned AS")
+    enable = fn.index("set_config('onyx.phone_usage_verified_write', 'on', true)")
+    # Locks first, then the staged-completeness read, then (only if still complete) the work.
+    assert lock < check < settle < enable < work
+    block = fn[check - 60:settle]
+    assert "FROM pds.phone_usage_pending_hours h" in block and "h.run_id = p_run_id" in block
+    # Incomplete = the item count the staged hour claims differs from the items staged for it (a NULL claim too).
+    assert "(h.segment ->> 'last_run_item_count')::int" in block and "IS DISTINCT FROM (SELECT count(*) FROM jsonb_object_keys(h.items))" in block
+    # Nothing that changes usage rows or deletes a staged copy sits between the check and the status decision.
+    before_work = fn[:enable]
+    assert "DELETE FROM" not in before_work and "UPDATE pds.phone_usage" not in before_work
+    # The staged copies are deleted only after the work, i.e. only when the run is settled.
+    assert fn.rindex("DELETE FROM pds.phone_usage_pending_hours h WHERE h.device = p_device AND h.run_id = p_run_id") > work
+    # Every answer carries the count, so a caller and the branch check can tell why a run stayed 'receiving'.
+    assert fn.count("'staged_incomplete'") == 3
+
+
 def test_guards_keep_the_snapshot_and_the_ownership():
     sql = _sql(MIGRATION)
     seg = _no_comments(_function(sql, "phone_usage_segments_guard"))
@@ -246,8 +271,15 @@ def test_branch_check_is_rolled_back_and_refuses_real_data():
                  "items_removed", "'already'", "hours_replaced", "pds.phone_usage_pending_hours",
                  "later_complete_export_replaces_snapshot", "later_incomplete_export_keeps_snapshot",
                  "older_export_not_staged", "stale_source_limits_coverage", "legacy_item_refused",
-                 "source_updated_at", "coverage_end"):
+                 "source_updated_at", "coverage_end", "staged_replacement_not_settled_early",
+                 "repeated_delivery_converges", "'staged_incomplete')::int <> 1"):
         assert case in body, case
+    # Case 18 runs the interleaving in order: hour repeat (staged items emptied), original finalization (refused),
+    # then the repeat's items, acknowledgement and finalization (settled).
+    c18 = body[body.index("snapshot setup"):]
+    order = [c18.index(m) for m in ("repeat setup: the repeated hour write", "a run was settled while a staged replacement was incomplete",
+                                    "the repeat did not settle the run", "the corrected hour did not converge")]
+    assert order == sorted(order)
 
 
 if __name__ == "__main__":

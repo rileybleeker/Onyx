@@ -215,7 +215,7 @@ enum SyncService {
             formatter.dateFormat = "MMM d HH:mm"
             return " · verified complete through \(formatter.string(from: through))"
         case "stream_open"?: return " · not verified: the stream did not end"
-        case "receiving"?: return " · not verified: a chunk is missing"
+        case "receiving"?: return " · not verified: a chunk is missing or still being stored"
         case "inconsistent"?: return " · not verified: the chunks disagree"
         case .some: return " · not verified"
         case .none: return ""

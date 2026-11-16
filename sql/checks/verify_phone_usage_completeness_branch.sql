@@ -31,6 +31,11 @@
 --      is not complete even where no hour row exists (unknown, never "no usage"); a run with no source time covers
 --      nothing; chunks that disagree on the source time are inconsistent
 --  17. a legacy item (no run id) cannot enter an hour a run owns or an hour that is verified
+--  18. a REPEATED delivery of an acknowledged chunk that corrects a verified hour: the repeat's hour write empties
+--      the staged items, the first delivery's acknowledgement stays, and a finalization that runs in between does
+--      NOT settle the run ('receiving', staged_incomplete > 0, nothing verified, replaced, removed or deleted);
+--      the repeat's items, acknowledgement and finalization then settle it with the corrected hour and the
+--      removed-item set (the interleaving the two-session procedure E runs for real)
 --
 -- Not scriptable in one transaction (run by hand on the branch with two sessions after the cases above pass):
 --  A. session 1: BEGIN; the upsert of case 13 for an hour that run X owns and has not verified, but with run Y;
@@ -49,6 +54,16 @@
 --     commit. Session 1: INSERT an item for H with any run id. The insert must WAIT (the trigger's share lock), and
 --     after session 2 commits it must be ignored: H is verified and its items are exactly the snapshot's. Before the
 --     lock existed the trigger read H unverified, the finalization verified it, and the item landed in the snapshot.
+--  E. a repeated delivery against a finalization (case 18, for real). Hour H is verified by an earlier run; run Y
+--     corrected it, its chunk is acknowledged and its finalization has not run (or answered 'receiving').
+--     Session 1: BEGIN; repeat the hour upsert of Y for H (the same row as the first delivery); do not commit. It
+--        has locked H and emptied Y's staged items.
+--     Session 2: SELECT pds.finalize_phone_usage_run(device, Y). It must WAIT on its lock statement; after session 1
+--        commits it must answer 'receiving' with staged_incomplete = 1, H must still be the old snapshot and the staged
+--        row must still exist. Then session 1 upserts the items and the acknowledgement again and finalizes: 'complete',
+--        hours_replaced = 1, H corrected. Run it the other way round too (session 2 finalizes first inside an open
+--        transaction): session 1's hour upsert must wait, and after session 2 commits it must be ignored (H is
+--        verified by Y itself, the same export time is not newer), leaving the corrected hour as it is.
 BEGIN;
 SET LOCAL statement_timeout = '60s';
 DO $check$
@@ -73,11 +88,11 @@ DECLARE
     r_g     constant uuid := '00000000-0000-4000-8000-0000000c000c';
     r_h     constant uuid := '00000000-0000-4000-8000-0000000c000d';
     r_i     constant uuid := '00000000-0000-4000-8000-0000000c000e';
+    r_j     constant uuid := '00000000-0000-4000-8000-0000000c000f';
+    r_k     constant uuid := '00000000-0000-4000-8000-0000000c0010';
     wend2   constant timestamptz := '2001-02-05 15:30:00+00';   -- a later export, the next day
     ans   jsonb;
-    n     int;
     v     numeric;
-    h     int;
 BEGIN
     IF EXISTS (SELECT 1 FROM pds.phone_usage_segments) THEN
         RAISE EXCEPTION 'refusing to run: this database holds Screen Time hours. Run this only on a Supabase branch or a local copy without real data.';
@@ -359,6 +374,100 @@ BEGIN
         RAISE EXCEPTION 'an item without a run id entered a verified hour';
     END IF;
 
+    -- 18. A repeated delivery of an acknowledged correction. Hour 2001-04-03 12:00Z is verified by r_j (600 s,
+    --     two items). Run r_k, read a day later, corrects it (700 s, one item at 690 s) and its only chunk is
+    --     acknowledged: everything the first delivery sends is stored. Then the chunk is delivered AGAIN.
+    INSERT INTO pds.phone_usage_segments (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00', 600, now(), r_j, 2, '2001-04-03 16:00:00+00');
+    INSERT INTO pds.phone_usage_items (device, segment_start, kind, identifier, seconds, last_run_id)
+    VALUES (dev, '2001-04-03 12:00:00+00', 'app', 'com.example.kept', 420, r_j),
+           (dev, '2001-04-03 12:00:00+00', 'app', 'com.example.gone', 180, r_j);
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_j, 0, 1, '2001-04-03 05:00:00+00', '2001-04-03 16:00:00+00', '2001-04-03 16:00:00+00', true, 1, 1,
+            '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00');
+    ans := pds.finalize_phone_usage_run(dev, r_j);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_verified')::int <> 1 THEN RAISE EXCEPTION 'snapshot setup: %', ans; END IF;
+
+    -- The first delivery of the correction: hour, items, acknowledgement. The finalization has not run yet.
+    INSERT INTO pds.phone_usage_segments AS s (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00', 700, now(), r_k, 1, '2001-04-04 16:00:00+00')
+    ON CONFLICT (device, segment_start) DO UPDATE SET segment_end = EXCLUDED.segment_end, total_seconds = EXCLUDED.total_seconds,
+        synced_at = EXCLUDED.synced_at, last_run_id = EXCLUDED.last_run_id, last_run_item_count = EXCLUDED.last_run_item_count,
+        last_export_at = EXCLUDED.last_export_at;
+    INSERT INTO pds.phone_usage_items (device, segment_start, kind, identifier, seconds, last_run_id)
+    VALUES (dev, '2001-04-03 12:00:00+00', 'app', 'com.example.kept', 690, r_k)
+    ON CONFLICT (device, segment_start, kind, identifier) DO UPDATE SET seconds = EXCLUDED.seconds, last_run_id = EXCLUDED.last_run_id;
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_k, 0, 1, '2001-04-03 05:00:00+00', '2001-04-04 16:00:00+00', '2001-04-04 16:00:00+00', true, 1, 1,
+            '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00');
+    IF (SELECT count(*) FROM pds.phone_usage_pending_hours h, jsonb_object_keys(h.items) WHERE h.device = dev AND h.run_id = r_k) <> 1 THEN
+        RAISE EXCEPTION 'repeat setup: the first delivery did not stage the corrected hour and its item';
+    END IF;
+
+    -- The repeat begins: its hour write empties the staged items, the first delivery's acknowledgement stays.
+    INSERT INTO pds.phone_usage_segments AS s (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00', 700, now(), r_k, 1, '2001-04-04 16:00:00+00')
+    ON CONFLICT (device, segment_start) DO UPDATE SET segment_end = EXCLUDED.segment_end, total_seconds = EXCLUDED.total_seconds,
+        synced_at = EXCLUDED.synced_at, last_run_id = EXCLUDED.last_run_id, last_run_item_count = EXCLUDED.last_run_item_count,
+        last_export_at = EXCLUDED.last_export_at;
+    IF (SELECT count(*) FROM pds.phone_usage_pending_hours h, jsonb_object_keys(h.items) WHERE h.device = dev AND h.run_id = r_k) <> 0
+       OR (SELECT count(*) FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_k) <> 1 THEN
+        RAISE EXCEPTION 'repeat setup: the repeated hour write did not empty the staged items';
+    END IF;
+
+    -- The ORIGINAL finalization runs now. It must not settle the run.
+    ans := pds.finalize_phone_usage_run(dev, r_k);
+    IF ans ->> 'status' <> 'receiving' OR (ans ->> 'staged_incomplete')::int <> 1 OR (ans ->> 'hours_verified')::int <> 0
+       OR (ans ->> 'hours_replaced')::int <> 0 OR (ans ->> 'items_removed')::int <> 0 THEN
+        RAISE EXCEPTION 'a run was settled while a staged replacement was incomplete: %', ans;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pds.phone_usage_sync_runs WHERE device = dev AND run_id = r_k AND status = 'complete') THEN
+        RAISE EXCEPTION 'a run with an incomplete staged replacement was recorded complete';
+    END IF;
+    IF (SELECT count(*) FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_k) <> 1 THEN
+        RAISE EXCEPTION 'the staged hour of an unsettled run was deleted';
+    END IF;
+    SELECT total_seconds INTO v FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-04-03 12:00:00+00' AND verified_run_id = r_j;
+    IF v IS DISTINCT FROM 600 OR (SELECT count(*) FROM pds.phone_usage_items WHERE device = dev AND segment_start = '2001-04-03 12:00:00+00') <> 2 THEN
+        RAISE EXCEPTION 'an unsettled run changed the verified snapshot (%)', v;
+    END IF;
+
+    -- The repeat continues: its items, its acknowledgement, its finalization. The run settles with the whole hour.
+    INSERT INTO pds.phone_usage_items (device, segment_start, kind, identifier, seconds, last_run_id)
+    VALUES (dev, '2001-04-03 12:00:00+00', 'app', 'com.example.kept', 690, r_k)
+    ON CONFLICT (device, segment_start, kind, identifier) DO UPDATE SET seconds = EXCLUDED.seconds, last_run_id = EXCLUDED.last_run_id;
+    INSERT INTO pds.phone_usage_sync_chunks AS c (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                                  run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_k, 0, 1, '2001-04-03 05:00:00+00', '2001-04-04 16:00:00+00', '2001-04-04 16:00:00+00', true, 1, 1,
+            '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00')
+    ON CONFLICT (device, run_id, chunk_index) DO UPDATE SET received_at = now();
+    ans := pds.finalize_phone_usage_run(dev, r_k);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_replaced')::int <> 1 OR (ans ->> 'staged_incomplete')::int <> 0 THEN
+        RAISE EXCEPTION 'the repeat did not settle the run: %', ans;
+    END IF;
+    SELECT total_seconds INTO v FROM pds.phone_usage_segments
+     WHERE device = dev AND segment_start = '2001-04-03 12:00:00+00' AND verified_run_id = r_k AND last_run_id = r_k;
+    IF v IS DISTINCT FROM 700 THEN RAISE EXCEPTION 'the corrected hour did not converge (%)', v; END IF;
+    IF (SELECT count(*) FROM pds.phone_usage_items WHERE device = dev AND segment_start = '2001-04-03 12:00:00+00') <> 1
+       OR (SELECT seconds FROM pds.phone_usage_items WHERE device = dev AND segment_start = '2001-04-03 12:00:00+00' AND last_run_id = r_k) IS DISTINCT FROM 690
+       OR EXISTS (SELECT 1 FROM pds.phone_usage_items WHERE device = dev AND identifier = 'com.example.gone') THEN
+        RAISE EXCEPTION 'the removed-item set did not converge';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_k) THEN
+        RAISE EXCEPTION 'a settled run left staged hours behind (repeat)';
+    END IF;
+    -- A repeat after the settlement changes nothing: the hour is verified by this run and the export is not newer.
+    INSERT INTO pds.phone_usage_segments AS s (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-04-03 12:00:00+00', '2001-04-03 13:00:00+00', 700, now(), r_k, 1, '2001-04-04 16:00:00+00')
+    ON CONFLICT (device, segment_start) DO UPDATE SET total_seconds = EXCLUDED.total_seconds, last_run_id = EXCLUDED.last_run_id,
+        last_export_at = EXCLUDED.last_export_at;
+    IF EXISTS (SELECT 1 FROM pds.phone_usage_pending_hours WHERE device = dev AND run_id = r_k)
+       OR (SELECT verified_run_id FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-04-03 12:00:00+00') IS DISTINCT FROM r_k THEN
+        RAISE EXCEPTION 'a repeat after the settlement staged or changed the hour';
+    END IF;
+
     -- 12. Browser roles cannot call the functions.
     EXECUTE 'SET LOCAL ROLE authenticated';
     BEGIN
@@ -375,7 +484,8 @@ BEGIN
         'older_export_refused', true, 'foreign_run_item_refused', true, 'item_mismatch_not_verified', true,
         'verified_columns_guarded', true, 'window_check', true, 'browser_roles_refused', true,
         'later_complete_export_replaces_snapshot', true, 'later_incomplete_export_keeps_snapshot', true,
-        'older_export_not_staged', true, 'stale_source_limits_coverage', true, 'legacy_item_refused', true)::text, true);
+        'older_export_not_staged', true, 'stale_source_limits_coverage', true, 'legacy_item_refused', true,
+        'staged_replacement_not_settled_early', true, 'repeated_delivery_converges', true)::text, true);
 END
 $check$;
 SELECT current_setting('onyx.phone_usage_completeness_verification')::jsonb AS verification;

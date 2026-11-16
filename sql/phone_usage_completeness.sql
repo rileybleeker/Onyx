@@ -19,7 +19,12 @@
 --     run's metadata, the hour counts add up and the stream ended. Then, and
 --     only then, the hours the run still owns that had ended by its COVERAGE END
 --     are marked verified, and items such an hour no longer lists are removed
---     (a completed hour cannot keep stale usage).
+--     (a completed hour cannot keep stale usage). A run is also not settled while
+--     one of its staged replacements is incomplete: a repeated delivery of a chunk
+--     rewrites the staged hour in several requests (hour, then items, then the
+--     acknowledgement, which the first delivery already left in place), and a
+--     finalization that runs in between answers 'receiving' and changes nothing,
+--     so the repeat's own finalization settles the run with the whole hour.
 --   * The coverage end is the earlier of the export time and `source_updated_at`,
 --     the last update Apple itself reports for the data (DeviceActivityData
 --     .lastUpdatedDate; the earliest the stream reported). A stream that ends
@@ -286,8 +291,9 @@ CREATE OR REPLACE TRIGGER phone_usage_items_guard
 --    (a complete run answers 'complete' again and changes nothing), one call per
 --    run at a time (advisory lock), and a run that is not complete changes no
 --    usage row. Answers {status, hours_verified, hours_replaced, items_removed,
---    chunks_received, chunk_count, already}; status is one of 'unknown_run',
---    'inconsistent', 'stream_open', 'receiving', 'complete'.
+--    chunks_received, chunk_count, coverage_end, staged_incomplete, already};
+--    status is one of 'unknown_run', 'inconsistent', 'stream_open', 'receiving',
+--    'complete'.
 --    An hour is verified when this run still owns it (last_run_id), it had ended
 --    by the run's coverage end (segment_end <= coverage_end: the earlier of the
 --    export time and Apple's own last update, so an hour the stale source never
@@ -304,6 +310,18 @@ CREATE OR REPLACE TRIGGER phone_usage_items_guard
 --    (in key order), so a concurrent upload cannot slip between the ownership
 --    check and the marking: it waits, then finds the hour verified and stages or
 --    ignores its copy.
+--    A run whose chunks are all acknowledged is still NOT settled while a staged
+--    replacement of its own is incomplete (the number of items staged for the hour
+--    differs from the item count the hour claims). That is the state in between the
+--    hour write and the item write of a REPEATED delivery of an acknowledged chunk
+--    (the hour write clears the staged items; the first delivery's acknowledgement
+--    stays). It is read after the hour locks are taken, so a repeat that is
+--    mid-write either committed before the finalization looks (it is seen, the run
+--    answers 'receiving' with staged_incomplete > 0 and nothing is changed or
+--    removed) or is still waiting on the hour lock (it runs after the finalization
+--    and finds the hour verified by this very run, so it is ignored). Without this
+--    check the finalization skipped the emptied staged hour, deleted it and settled
+--    the run, and the repeat's items then had no staged hour to land in.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.finalize_phone_usage_run(p_device TEXT, p_run_id UUID)
 RETURNS JSONB
@@ -320,6 +338,7 @@ DECLARE
     v_fix      TIMESTAMPTZ[] := ARRAY[]::timestamptz[];
     v_fixed    INTEGER := 0;
     v_cover    TIMESTAMPTZ;
+    v_staged_incomplete INTEGER := 0;
 BEGIN
     IF p_device IS NULL OR p_run_id IS NULL THEN
         RAISE EXCEPTION 'finalize_phone_usage_run: device and run id are required' USING ERRCODE = '22023';
@@ -331,7 +350,7 @@ BEGIN
         RETURN jsonb_build_object('status', 'complete', 'hours_verified', v_prior.hours_verified, 'hours_replaced', 0,
                                   'items_removed', 0, 'chunks_received', v_prior.chunks_received,
                                   'chunk_count', v_prior.chunk_count, 'coverage_end', v_prior.coverage_end,
-                                  'already', true);
+                                  'staged_incomplete', 0, 'already', true);
     END IF;
 
     SELECT count(*)                       AS n,
@@ -358,7 +377,8 @@ BEGIN
 
     IF c.n = 0 THEN
         RETURN jsonb_build_object('status', 'unknown_run', 'hours_verified', 0, 'hours_replaced', 0, 'items_removed', 0,
-                                  'chunks_received', 0, 'chunk_count', NULL, 'coverage_end', NULL, 'already', false);
+                                  'chunks_received', 0, 'chunk_count', NULL, 'coverage_end', NULL,
+                                  'staged_incomplete', 0, 'already', false);
     END IF;
 
     -- How far the export is known current: the earlier of the export time and Apple's own last update. No
@@ -382,10 +402,9 @@ BEGIN
     END IF;
 
     IF v_status = 'complete' THEN
-        PERFORM set_config('onyx.phone_usage_verified_write', 'on', true);
         -- Lock first, decide second: from here until this transaction ends no other writer can change an
-        -- hour this run owns or has staged (a waiting upload then finds it verified). The ownership test
-        -- below runs in a later statement, so it sees whatever the writers we waited for committed.
+        -- hour this run owns or has staged (a waiting upload then finds it verified). The statements below
+        -- run later, so they see whatever the writers we waited for committed.
         PERFORM 1
           FROM pds.phone_usage_segments s
          WHERE s.device = p_device
@@ -394,6 +413,23 @@ BEGIN
                                         WHERE h.device = p_device AND h.run_id = p_run_id))
          ORDER BY s.segment_start
            FOR UPDATE;
+
+        -- A staged replacement of this run that is still being written (a repeated delivery of an
+        -- acknowledged chunk emptied its staged items and has not stored them again) is not settled: the
+        -- run stays 'receiving', nothing is verified, replaced, removed or deleted, and the repeat's own
+        -- finalization, after its items and acknowledgement, settles the run with the whole hour.
+        SELECT count(*)::int INTO v_staged_incomplete
+          FROM pds.phone_usage_pending_hours h
+         WHERE h.device = p_device AND h.run_id = p_run_id
+           AND (h.segment ->> 'last_run_item_count')::int
+               IS DISTINCT FROM (SELECT count(*) FROM jsonb_object_keys(h.items))::int;
+        IF v_staged_incomplete > 0 THEN
+            v_status := 'receiving';
+        END IF;
+    END IF;
+
+    IF v_status = 'complete' THEN
+        PERFORM set_config('onyx.phone_usage_verified_write', 'on', true);
 
         WITH owned AS (
             SELECT s.device, s.segment_start
@@ -508,7 +544,8 @@ BEGIN
 
     RETURN jsonb_build_object('status', v_status, 'hours_verified', v_verified, 'hours_replaced', v_fixed,
                               'items_removed', v_removed, 'chunks_received', c.chunks,
-                              'chunk_count', c.chunk_count_max, 'coverage_end', v_cover, 'already', false);
+                              'chunk_count', c.chunk_count_max, 'coverage_end', v_cover,
+                              'staged_incomplete', v_staged_incomplete, 'already', false);
 END;
 $$;
 
