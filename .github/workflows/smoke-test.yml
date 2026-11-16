@@ -72,7 +72,8 @@ permissions:
   contents: read
   deployments: read
 
-# A new run for the same commit supersedes an in-flight one (a cancelled run is deferred, never a failure). Keyed
+# A new run for the same commit supersedes an in-flight one (a run cancelled that way is deferred, never a failure;
+# the test step's own time limits keep a hang from ending as a cancelled job). Keyed
 # by commit so an older merge's retry never cancels a newer merge's smoke run: the older one stops by itself at
 # the provenance check once production serves the newer deployment.
 concurrency:
@@ -87,7 +88,7 @@ jobs:
     # deps ("Playwright does not support chromium on ubuntu26.04-x64").
     # Move back to ubuntu-latest once Playwright supports 26.04.
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20 # the test step stops itself after 10 (see "Run smoke tests"), leaving room for the verdict
     env:
       SMOKE_MODE: ${{ inputs.post_merge && 'post-merge' || 'scheduled' }}
     outputs:
@@ -145,10 +146,14 @@ jobs:
 
       # The only step that sees the smoke login. auth.setup.ts records what production serves right after signing
       # in (and stops at once when it is another commit); provenance.teardown.ts records it again after every test.
+      # Time limits: Playwright stops the suite after 8 minutes in CI (globalTimeout), and this step after 10, both
+      # inside the job's limit, so a hanging production ends as a failed or timed-out step that the verdict below
+      # still reads (never a job cancelled by its own time limit, which would read as "pending").
       - name: Run smoke tests
         id: tests
         if: steps.target.outputs.ready == 'true'
         continue-on-error: true
+        timeout-minutes: 10
         env:
           SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
           SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}

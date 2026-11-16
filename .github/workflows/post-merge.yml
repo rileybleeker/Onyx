@@ -9,7 +9,9 @@ name: Post-merge verify
 # counts only when production served exactly that before and after the tests. `receipt` records the result as the
 # commit status post-merge/smoke (pass / fail / pending verification) and reverts only a commit that failed twice on
 # its own deployment while its parent passed on its own within the last 3 h; anything less certain halts without a
-# revert, and so does a failed smoke test whose receipt could not be written.
+# revert, and so does a failed smoke test whose receipt could not be written. A halt is dropped, and a revert never
+# opened, once a newer master commit containing the change (or a later run of the commit itself) passed on its own
+# deployment.
 # `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
 on:
   push:
@@ -123,11 +125,12 @@ jobs:
           --verify "$VERIFY" --verify-detail "$VERIFY_DETAIL"
           --first "$FIRST" --first-result "$FIRST_RESULT" --first-detail "$FIRST_DETAIL"
           --retry "$RETRY" --retry-result "$RETRY_RESULT" --retry-detail "$RETRY_DETAIL"
-  # A build failure (verify fail / halt) or a smoke decision. A smoke test that failed twice while the receipt could
-  # not be written halts without a revert.
+  # A build failure (verify fail / halt) or a smoke decision. A smoke test that failed (and whose retry failed too or
+  # never ran) while the receipt could not be written halts without a revert. A cancelled retry (superseded by a
+  # newer run for the same commit) does nothing: that run decides.
   rollback:
-    needs: [verify, smoke-retry, receipt]
-    if: always() && (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt' || needs.receipt.outputs.action == 'revert' || needs.receipt.outputs.action == 'halt' || (needs.receipt.result == 'failure' && needs.smoke-retry.result == 'failure'))
+    needs: [verify, smoke, smoke-retry, receipt]
+    if: always() && (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt' || needs.receipt.outputs.action == 'revert' || needs.receipt.outputs.action == 'halt' || (needs.receipt.result == 'failure' && needs.smoke.result == 'failure' && (needs.smoke-retry.result == 'failure' || needs.smoke-retry.result == 'skipped')))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Job permissions replace the workflow's, so the reads rollback() makes (deployments for a fixed build, commit
@@ -148,5 +151,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ needs.receipt.outputs.culprit || needs.verify.outputs.sha || github.event.inputs.sha || github.sha }}
-          REASON: ${{ (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt') && needs.verify.outputs.detail || needs.receipt.outputs.reason || 'production smoke test failed twice and its receipt could not be written, so the failure is not attributed' }}
+          REASON: ${{ (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt') && needs.verify.outputs.detail || needs.receipt.outputs.reason || 'production smoke test failed and its receipt could not be written, so the failure is not attributed' }}
           HALT_ONLY: ${{ (needs.verify.outputs.result == 'halt' || (needs.verify.outputs.result == 'ok' && needs.receipt.outputs.action != 'revert')) && '--halt-only' || '' }}

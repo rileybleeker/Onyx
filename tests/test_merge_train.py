@@ -479,29 +479,117 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         self.assertIsNone(mt.smoke_fixed_later("pass", [(self.N, "pass")]))
         self.assertIsNone(mt.smoke_fixed_later("unknown", [(self.N, "pass")]))
 
+    def rows(self, *states):
+        """Synthetic commit statuses, newest first, written by the workflow's own token."""
+        return [self.status(st) for st in states]
+
+    def fixed(self, receipts, own_states=("success",), later=None, unattributed=False):
+        later = [(self.N, ["success"])] if later is None else later
+        with patch.object(mt, "later_chain", return_value=later), \
+                patch.object(mt, "production_states", return_value=list(own_states)), \
+                patch.object(mt, "smoke_rows", side_effect=lambda sha: receipts.get(sha, [])):
+            return mt.already_fixed(self.E, unattributed=unattributed)
+
     def test_already_fixed_checks_the_smoke_receipts_after_the_build(self):
-        later = [(self.N, ["success"])]
-        states = {self.E: "fail", self.N: "pass"}
-        with patch.object(mt, "later_chain", return_value=later), \
-                patch.object(mt, "production_states", return_value=["success"]), \
-                patch.object(mt, "smoke_state", side_effect=states.get):
-            self.assertEqual(mt.already_fixed(self.E), self.N)
-        states = {self.E: "pass", self.N: "pass"}  # smoke passed: nothing to fix
-        with patch.object(mt, "later_chain", return_value=later), \
-                patch.object(mt, "production_states", return_value=["success"]), \
-                patch.object(mt, "smoke_state", side_effect=states.get):
-            self.assertIsNone(mt.already_fixed(self.E))
+        self.assertEqual(self.fixed({self.E: self.rows("failure"), self.N: self.rows("success")}), self.N)
+        # smoke passed (and never failed): nothing to fix
+        self.assertIsNone(self.fixed({self.E: self.rows("success"), self.N: self.rows("success")}))
+
+    def test_a_later_pass_of_the_commit_itself_is_recovery(self):
+        # Codex round 2: the failure did not last, so the queued revert would take a working change off the site
+        self.assertTrue(mt.smoke_recovered(self.rows("success", "failure")))
+        self.assertTrue(mt.smoke_recovered(self.rows("pending", "success", "pending", "failure")))
+        self.assertFalse(mt.smoke_recovered(self.rows("failure", "success")))  # failed again after the pass
+        self.assertFalse(mt.smoke_recovered(self.rows("success")))  # no failure to recover from (a drill)
+        self.assertFalse(mt.smoke_recovered(self.rows("pending", "failure")))
+        self.assertFalse(mt.smoke_recovered([self.status("success", creator="someone"), self.status("failure")]))
+        self.assertFalse(mt.smoke_recovered([]))
+        self.assertEqual(self.fixed({self.E: self.rows("success", "failure")}, later=[]), self.E)
+        # a drill on a commit that only ever passed still opens its revert
+        self.assertIsNone(self.fixed({self.E: self.rows("success")}, later=[]))
+        self.assertIn("did not last", mt.fixed_how(self.E, self.E))
+        self.assertIn(f"fixed by `{self.N[:7]}`", mt.fixed_how(self.E, self.N))
+
+    def test_an_unattributed_halt_is_resolved_by_any_newer_exact_pass(self):
+        # Codex round 2: a newer commit containing this one passed on its own deployment, so production works again
+        self.assertEqual(mt.smoke_fixed_later("unknown", [(self.N, "pass")], unattributed=True), self.N)
+        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "pass")], unattributed=True), self.N)
+        self.assertIsNone(mt.smoke_fixed_later("unknown", [(self.N, "unknown")], unattributed=True))
+        self.assertIsNone(mt.smoke_fixed_later("unknown", [], unattributed=True))
+        receipts = {self.E: self.rows("pending"), self.N: self.rows("success")}  # the halt left only "pending"
+        self.assertEqual(self.fixed(receipts, unattributed=True), self.N)
+        self.assertIsNone(self.fixed(receipts))  # a revert still needs sha's own exact failure first
+        # a build halt: a newer good build containing it settles it, as for a revert
+        self.assertEqual(self.fixed({}, own_states=["failure"], unattributed=True), self.N)
 
     def test_already_fixed_never_reads_receipts_for_a_failed_build_and_survives_an_unreadable_one(self):
-        later = [(self.N, ["failure"])]
-        with patch.object(mt, "later_chain", return_value=later), \
+        with patch.object(mt, "later_chain", return_value=[(self.N, ["failure"])]), \
                 patch.object(mt, "production_states", return_value=["failure"]), \
-                patch.object(mt, "smoke_state", side_effect=AssertionError("not read for a failed build")):
+                patch.object(mt, "smoke_rows", side_effect=AssertionError("not read for a failed build")):
             self.assertIsNone(mt.already_fixed(self.E))
+            self.assertIsNone(mt.already_fixed(self.E, unattributed=True))
         with patch.object(mt, "later_chain", return_value=[(self.N, ["success"])]), \
                 patch.object(mt, "production_states", return_value=["success"]), \
-                patch.object(mt, "smoke_state", side_effect=mt.GhError("HTTP 502")):
+                patch.object(mt, "smoke_rows", side_effect=mt.GhError("HTTP 502")):
             self.assertIsNone(mt.already_fixed(self.E))  # unknown, never a crash before the revert or halt
+            self.assertIsNone(mt.already_fixed(self.E, unattributed=True))
+
+
+class RollbackReconciles(unittest.TestCase):
+    """rollback() and the train re-read the deployment history and the smoke receipts before acting (Codex round 2).
+    GitHub and git are faked; nothing is created or pushed."""
+    E, N = "e" * 40, "f" * 40
+
+    def run_rollback(self, fixer):
+        calls = []
+
+        def fake_gh(*a, check=True):
+            calls.append(a)
+            return ""
+        fixed = fixer if callable(fixer) else (lambda sha, unattributed=False: fixer)
+        subject = type("Proc", (), {"stdout": "feat: synthetic change\n"})()
+        with patch.object(mt, "gh", side_effect=fake_gh), patch.object(mt, "ensure_labels"), \
+                patch.object(mt, "note"), patch.object(mt, "already_fixed", side_effect=fixed), \
+                patch.object(mt.subprocess, "run", return_value=subject):
+            code = mt.rollback(self.E, "synthetic reason", halt_only=True)
+        return code, calls
+
+    def test_a_halt_is_dropped_when_a_newer_commit_already_passed(self):
+        code, calls = self.run_rollback(self.N)
+        self.assertEqual(code, 0)
+        self.assertFalse([c for c in calls if c[:2] == ("issue", "create")])
+
+    def test_a_halt_goes_ahead_without_evidence_or_with_an_unreadable_history(self):
+        def unreadable(sha, unattributed=False):
+            raise mt.GhError("HTTP 502")
+        for fixer in (None, unreadable):
+            code, calls = self.run_rollback(fixer)
+            self.assertEqual(code, 1)
+            self.assertTrue([c for c in calls if c[:2] == ("issue", "create")], fixer)
+
+    def test_the_halt_check_reads_the_unattributed_rule(self):
+        seen = []
+
+        def fixed(sha, unattributed=False):
+            seen.append((sha, unattributed))
+            return None
+        self.run_rollback(fixed)
+        self.assertEqual(seen, [(self.E, True)])
+
+    def test_a_queued_revert_of_a_commit_that_passed_again_is_closed(self):
+        calls = []
+        body = f"Automatic rollback of `{self.E}`.\n\nReason: smoke\n\nCloses #7"
+
+        def fake_gh(*a, check=True):
+            calls.append(a)
+            return body if a[0] == "api" else ""
+        with patch.object(mt, "gh", side_effect=fake_gh), patch.object(mt, "note"), \
+                patch.object(mt, "already_fixed", return_value=self.E):
+            self.assertTrue(mt.retire_fixed_rollback(pr(number=9)))
+        closed = [c for c in calls if c[:2] == ("pr", "close")]
+        self.assertEqual(len(closed), 1)
+        self.assertIn("did not last", " ".join(closed[0]))
+        self.assertTrue([c for c in calls if c[:3] == ("issue", "close", "7")])
 
 
 class SmokeCommands(unittest.TestCase):
@@ -553,7 +641,8 @@ class SmokeCommands(unittest.TestCase):
         unnamed = {"version": self.E, "deployment": None}
         cases = [("success", same, same, "pass", 0), ("failure", same, same, "fail", 1),
                  ("success", same, moved, "deferred", 0), ("failure", same, moved, "deferred", 0),
-                 ("failure", None, None, "unverified", 1), ("cancelled", same, None, "deferred", 0),
+                 ("failure", None, None, "unverified", 1), ("cancelled", same, None, "unverified", 1),
+                 ("cancelled", same, same, "fail", 1),
                  ("success", unnamed, unnamed, "deferred", 0), ("failure", unnamed, same, "unverified", 1)]
         for tests, before, after, verdict, code in cases:
             got, out, calls = self.verdict_cmd(tests, before, after)
@@ -562,6 +651,36 @@ class SmokeCommands(unittest.TestCase):
             self.assertEqual(out["tested_deployment"], self.URL if verdict in ("pass", "fail") else "")
             # every deferral leaves an annotation on the run
             self.assertEqual(any(c[0] == "annotate" for c in calls), verdict == "deferred", (tests, before, after))
+
+    def test_same_commit_on_a_deployment_github_does_not_know_is_unverified_not_deferred(self):
+        # Claude round 2: /api/version and GitHub's environment_url no longer name hosts the same way. A quiet
+        # deferral would leave every later merge unverified and green; this fails loudly instead.
+        host = mt.deployment_host(self.URL)
+        stray = {"version": self.E, "deployment": "frontend-elsewhere-example.vercel.app"}
+        same = {"version": self.E, "deployment": host}
+        with patch.object(mt, "production_deployments", return_value=[("success", self.URL)]):
+            for tests in ("success", "failure"):
+                got, out, calls = self.verdict_cmd(tests, stray, same)
+                self.assertEqual((out["verdict"], got), ("unverified", 1), tests)
+                self.assertIn(("annotate", "error", "Smoke provenance broken"), [c[:3] for c in calls])
+        # a real redeploy or Vercel rollback of the commit is one of its own deployments: still a deferral
+        again = "https://frontend-elsewhere-example.vercel.app"
+        with patch.object(mt, "production_deployments", return_value=[("success", again), ("success", self.URL)]):
+            got, out, _ = self.verdict_cmd("failure", stray, same)
+        self.assertEqual((out["verdict"], got), ("deferred", 0))
+        # an unreadable deployment history proves nothing: a deferral, as before
+        with patch.object(mt, "production_deployments", side_effect=mt.GhError("HTTP 502")):
+            got, out, _ = self.verdict_cmd("failure", stray, same)
+        self.assertEqual((out["verdict"], got), ("deferred", 0))
+        # pure parts
+        self.assertEqual(mt.foreign_deployment(self.E, host, stray, same), stray["deployment"])
+        self.assertIsNone(mt.foreign_deployment(self.E, host, same, same))
+        self.assertIsNone(mt.foreign_deployment(self.E, None, stray, stray))
+        self.assertIsNone(mt.foreign_deployment(self.E, host, {"version": self.N, "deployment": "x.example.app"}, same))
+        self.assertTrue(mt.provenance_broken("a.example.app", {"b.example.app"}))
+        self.assertFalse(mt.provenance_broken("a.example.app", {"a.example.app"}))
+        self.assertFalse(mt.provenance_broken("a.example.app", None))
+        self.assertFalse(mt.provenance_broken(None, set()))
 
     def test_scheduled_run_fails_unless_production_moved_on_to_a_newer_master_commit(self):
         same = {"version": self.E, "deployment": "frontend-abc123-example.vercel.app"}
@@ -786,6 +905,12 @@ class SmokeWorkflowContract(unittest.TestCase):
         self.assertIn("statuses: write", wf)
         # a second smoke failure alone no longer reverts: only the receipt's proven culprit does
         self.assertNotIn("|| needs.smoke-retry.result == 'failure'", wf)
+        # an unwritable receipt after a failed first attempt halts whether the retry failed or never ran
+        # (Claude round 2); a cancelled (superseded) retry does nothing
+        self.assertIn("needs: [verify, smoke, smoke-retry, receipt]", wf)
+        self.assertIn("(needs.receipt.result == 'failure' && needs.smoke.result == 'failure' && "
+                      "(needs.smoke-retry.result == 'failure' || needs.smoke-retry.result == 'skipped'))", wf)
+        self.assertNotIn("needs.smoke-retry.result == 'cancelled'", wf)
         # rollback() reads deployments and commit statuses; job permissions replace the workflow's
         rollback_job = wf.split("\n  rollback:\n", 1)[1]
         self.assertIn("statuses: read", rollback_job)
@@ -818,6 +943,23 @@ class SmokeWorkflowContract(unittest.TestCase):
         setup = self.read("frontend/e2e/auth.setup.ts")
         self.assertIn('readServedRevision(page.request, "before")', setup)
         self.assertIn("staleTarget(served)", setup)
+        # Claude round 2: the session is saved and "before" recorded as soon as the redirect proves a session, and
+        # before anything on Today is checked, so a commit that breaks Today still leaves both records
+        redirect = setup.index('page.waitForURL("**/today"')
+        record = setup.index("const stale = await recordBefore()")
+        self.assertLess(redirect, record)
+        self.assertLess(record, setup.index("await expect(page).toHaveURL"))
+        self.assertLess(record, setup.index('getByRole("heading"'))
+        self.assertLess(setup.index("storageState({ path: authFile })"), setup.index('readServedRevision(page.request'))
+        self.assertIn("} finally {", setup)
+        self.assertIn("await recordBefore().catch(() => null)", setup)
+        # a hang ends as a failed test run the verdict reads, never as a job cancelled by its own time limit
+        self.assertIn("globalTimeout: process.env.CI ? 8 * 60_000 : 0", cfg)
+        smoke = self.code(".github/workflows/smoke-test.yml")
+        tests_step = smoke.split("- name: Run smoke tests", 1)[1].split("- name:", 1)[0]
+        self.assertIn("continue-on-error: true", tests_step)
+        self.assertIn("timeout-minutes: 10", tests_step)
+        self.assertIn("timeout-minutes: 20", smoke.split("- name: Run smoke tests", 1)[0])
         self.assertIn('readServedRevision(page.request, "after")', self.read("frontend/e2e/provenance.teardown.ts"))
 
     def test_version_route_names_the_deployment(self):

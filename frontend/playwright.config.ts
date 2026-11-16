@@ -37,6 +37,11 @@ export default defineConfig({
   testDir: "./e2e",
   // Charts fetch async after first paint; give each assertion room to settle.
   timeout: 60_000,
+  // CI: the whole run stops after 8 minutes (a normal run takes about 1; the job itself takes about 2),
+  // well inside the smoke job's limit. A production that hangs on every page then ends as a FAILED test
+  // run, which the verdict step still reads (unverified or fail, a halt or a revert after the retry),
+  // instead of the job running out of time and ending cancelled, which reads as "pending" (DEL-02).
+  globalTimeout: process.env.CI ? 8 * 60_000 : 0,
   expect: { timeout: 15_000 },
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

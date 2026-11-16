@@ -726,9 +726,13 @@ def check_master(ctx: Ctx) -> list[Finding]:
         newest = last_two[0]
         out.append(Finding(
             'smoke-failed-twice', 'Production Smoke Test failed twice in a row',
-            f'Last two completed runs failed ({last_two[1].get("html_url", "")} and {newest.get("html_url", "")}); '
-            'production is serving an empty or broken panel.',
-            'Open the newest run, download the Playwright report artifact, and fix the page or the data behind it.',
+            f'Last two completed runs failed ({last_two[1].get("html_url", "")} and {newest.get("html_url", "")}): '
+            'production is serving an empty or broken panel, or the run could not confirm which commit production '
+            'serves (a Vercel rollback, a broken /api/version, a deploy that failed).',
+            'Open the newest run. Its job summary (the smoke receipt) names the expected commit, what production '
+            'served before and after the tests and the verdict; a "Smoke target not confirmed" or "Smoke provenance '
+            'broken" annotation means the target, not a page, is the problem. CI keeps no Playwright report: '
+            'reproduce a failing page locally with `npx playwright test` and fix the page or the data behind it.',
             since=parse_ts(last_two[1]['created_at']) if last_two[1].get('created_at') else None))
 
     live = [w for w in ctx.workflows() if w.get('state') == 'active'
