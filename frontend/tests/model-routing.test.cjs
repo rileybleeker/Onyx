@@ -690,13 +690,13 @@ test("label route: a Retry-After that would outlast the function limit ends the 
   assert.equal(short.seen.length, 2);
 });
 
-function dishSupabase(dishes, upserts) {
+function dishSupabase(dishes, upserts, reads = []) {
   return {
     createClient: () => ({
       from: (table) => ({
         select: () => ({
           order: () => ({
-            limit: (n) => ({
+            limit: (n) => (reads.push(n), {
               abortSignal: async (sig) => {
                 assert.ok(sig instanceof AbortSignal, `${table} read gets the request signal`);
                 return { data: dishes.slice(0, n), error: null, count: dishes.length };
@@ -730,21 +730,24 @@ const DISH_ANSWER = (params) => {
   };
 };
 
-async function runDishCase(script, body = { estimate: true }) {
-  const dishes = ["k01", "k02", "k03", "k04"].map((k) => ({
-    est_key: k, store_name: "Generic Diner", merchant_kind: "restaurant", title: "Generic bowl", customizations: null, price: 12, currency: "USD",
-  }));
+const genericDish = (k) => ({
+  est_key: k, store_name: "Generic Diner", merchant_kind: "restaurant", title: "Generic bowl", customizations: null, price: 12, currency: "USD",
+});
+
+async function runDishCase(script, body = { estimate: true }, opts = {}) {
+  const dishes = opts.dishes ?? ["k01", "k02", "k03", "k04"].map(genericDish);
   const seen = [];
   const upserts = [];
-  const { result, lines } = await withPilot("delivery_estimate", async () => {
+  const reads = [];
+  const { result, lines } = await withPilot(opts.pilot ?? "delivery_estimate", async () => {
     const route = loadTs("app/api/delivery/items/import/route.ts", {
       "@anthropic-ai/sdk": stubSdk([...script], seen),
-      "@supabase/supabase-js": dishSupabase(dishes, upserts),
+      "@supabase/supabase-js": dishSupabase(dishes, upserts, reads),
       "next/server": jsonResponse,
     });
     return route.POST({ json: async () => body });
   });
-  return { res: result, lines, seen, upserts };
+  return { res: result, lines, seen, upserts, reads };
 }
 
 test("dish route: a transient error is retried inside the deadline, not failed for the whole batch", async () => {
@@ -782,10 +785,64 @@ test("dish route: a retry inside an arm with no dish left says so, so the harves
   assert.equal("arm_exhausted" in plain.res.body, false);
 });
 
+// OPSMODEL-R3: a batch never exceeds the requested limit (at most 25), however long the queue the
+// route reads to apply per-arm skips, with the pilot off or on, with zero or nonzero skips.
+test("selectEstimateBatch: a long queue still gives at most n dishes, of one arm", () => {
+  const rows = dishes(1000);
+  const off = (r) => R.chooseModel("delivery_estimate", r.est_key, null, NOW).arm;
+  assert.equal(R.selectEstimateBatch(rows, 0, 25, off).todo.length, 25);
+  assert.equal(R.selectEstimateBatch(rows, 40, 25, off).todo[0], rows[40]);
+  assert.equal(R.selectEstimateBatch(rows, 0, 1, off).todo.length, 1);
+  assert.equal(R.selectEstimateBatch(rows, 0, 25, off, "baseline").todo.length, 25);
+  const pilot = on({ ONYX_MODEL_PILOT_SHARE: "0.5" });
+  const onArm = (r) => R.chooseModel("delivery_estimate", r.est_key, pilot, NOW).arm;
+  for (const from of [0, 3, 17]) {
+    const b = R.selectEstimateBatch(rows, from, 25, onArm);
+    assert.equal(b.todo.length, 25, "a 1000-dish queue has 25 of either arm");
+    assert.ok(b.todo.every((r) => onArm(r) === b.arm));
+    assert.equal(b.todo[0], rows[from]);
+    // the harvester's one-dish retries after this batch failed walk exactly its dishes
+    const retried = b.todo.map((_, k) => R.selectEstimateBatch(rows, b.armOffset + k, 1, onArm, b.arm).todo[0]);
+    assert.deepEqual(retried, b.todo);
+    assert.equal(R.selectEstimateBatch(rows, from, 1, onArm).todo.length, 1);
+  }
+});
+
+for (const pilotTask of ["", "delivery_estimate"]) {
+  for (const skips of [{ baseline: 0, pilot: 0 }, { baseline: 3, pilot: 2 }, undefined]) {
+    for (const limit of [25, 1, undefined, 400]) {
+      const name = `dish route, pilot ${pilotTask ? "on" : "off"}, skips ${JSON.stringify(skips)}, limit ${limit}: one call of at most ${limit === 1 ? 1 : 25} dishes`;
+      test(name, async () => {
+        const queued = Array.from({ length: 1000 }, (_, k) => genericDish(`q${String(k).padStart(4, "0")}`));
+        const sent = [];
+        const answer = (params) => {
+          sent.push(JSON.parse(params.messages[0].content).items.length);
+          return DISH_ANSWER(params);
+        };
+        const body = { estimate: true, ...(limit === undefined ? {} : { limit }), ...(skips ? { skips } : {}) };
+        const { res, seen, upserts, reads } = await runDishCase([answer], body, { dishes: queued, pilot: pilotTask });
+        assert.equal(res.status, 200);
+        assert.equal(seen.length, 1, "one model call");
+        const max = limit === 1 ? 1 : 25;
+        assert.ok(sent[0] >= 1 && sent[0] <= max, `sent ${sent[0]} dishes, limit ${max}`);
+        if (!pilotTask) {
+          assert.equal(sent[0], max, "without a pilot a full batch is exactly the limit");
+          const skipped = skips ? skips.baseline + skips.pilot : 0;
+          assert.equal(reads[0], skipped + max, "without a pilot the read stops at the skips plus one batch");
+        }
+        assert.equal(res.body.estimated, sent[0]);
+        assert.equal(upserts.reduce((a, u) => a + u.length, 0), sent[0], "every dish sent is stored");
+      });
+    }
+  }
+}
+
 test("harvester keeps failed dishes per arm, and the route and playlist loop honour the budget", () => {
   const h = fs.readFileSync(path.join(SRC, "../../tools/ubereats_harvest/harvest.mjs"), "utf8");
   assert.match(h, /armSkips\[retryArm\]\+\+/);
   assert.match(h, /skips: \{ \.\.\.armSkips \}/);
+  // full batches ask for 25, one-dish retries for 1: the bodies the route tests above send
+  assert.match(h, /const limit = single > 0 \? 1 : 25;/);
   const route = read("app/api/delivery/items/import/route.ts");
   assert.match(route, /seen\[a\]\+\+ >= skipN\[a\]/);
   const pl = read("app/api/spotify/generate-playlist/route.ts");

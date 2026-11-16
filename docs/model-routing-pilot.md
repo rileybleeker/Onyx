@@ -30,7 +30,8 @@ day even if the variables stay set.
 
 Arms are fixed per unit: each dish by its own `est_key`, a playlist or label request by a random
 id. One estimate call uses one model, so a dish batch holds only the dishes in the first dish's
-arm (the rest stay queued for the next call); a dish gets the same model in a batch and in the
+arm, at most the requested limit (25) however many dishes are queued (the rest stay queued for
+the next call); a dish gets the same model in a batch and in the
 harvester's one-dish retry. A failed batch's error names its arm and where that arm's dishes
 start; the harvester then retries one dish at a time inside that arm only (`arm` + an offset
 within the arm), so a failure never causes calls for the other arm's dishes. When that arm has

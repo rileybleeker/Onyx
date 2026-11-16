@@ -196,14 +196,6 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
   // batch one dish at a time), so one bad dish cannot block the queue forever.
   const n = Math.min(BATCH, Math.max(1, Math.floor(Number(limit)) || BATCH));
   const from = Math.min(500, Math.max(0, Math.floor(Number(offset)) || 0));
-  const { data, error, count } = await supabase
-    .from("delivery_items_unestimated")
-    .select("est_key,store_name,merchant_kind,title,customizations,price,currency", { count: "exact" })
-    .order("est_key")
-    .limit(only || skips ? 1000 : from + n)
-    .abortSignal(deadline.signal);
-  if (error) throw new Error(`delivery_items_unestimated: ${error.message}`);
-
   // Each dish has its own arm (by its est_key), and one call uses one model, so a batch holds only
   // the dishes of the first dish's arm; the others stay queued for a later call. A dish therefore
   // gets the same model in a full batch and in the harvester's one-dish retry, and a failed batch
@@ -215,6 +207,18 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
   // Dishes that failed alone are stepped past per arm, so a failure in one arm never moves the
   // other arm's queue. Their positions count in the arm's offset so a later retry stays aligned.
   const skipN = { baseline: clampSkip(skips?.baseline), pilot: clampSkip(skips?.pilot) };
+  // Rows to read: with a pilot (or a retry inside one arm) the arms interleave, so a long queue is
+  // read to find n dishes of one arm; without one every dish is baseline and the read stops at the
+  // dishes stepped past plus one batch. The batch itself is always at most n (selectEstimateBatch).
+  const readN = only || pilot?.tasks.has("delivery_estimate") ? 1000 : from + skipN.baseline + skipN.pilot + n;
+  const { data, error, count } = await supabase
+    .from("delivery_items_unestimated")
+    .select("est_key,store_name,merchant_kind,title,customizations,price,currency", { count: "exact" })
+    .order("est_key")
+    .limit(readN)
+    .abortSignal(deadline.signal);
+  if (error) throw new Error(`delivery_items_unestimated: ${error.message}`);
+
   let queue = data ?? [];
   if (!only && (skipN.baseline || skipN.pilot)) {
     const seen = { baseline: 0, pilot: 0 };

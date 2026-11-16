@@ -368,9 +368,11 @@ export type Arm = ModelChoice["arm"];
  * Which dishes one estimate call takes. A call uses one model, so a batch holds only dishes of one
  * arm. `rows` is the unestimated queue from its start (at least `from + n` rows when it has that
  * many). Without `only`, the batch is the arm of the dish at `from` plus the later dishes of that
- * arm in the window, and `armOffset` = how many dishes of that arm sit before `from`. With `only`
- * (a retry after that arm's batch failed), `from` counts within that arm's dishes only, so a retry
- * never calls the model for the other arm. Null = nothing at this offset.
+ * arm, at most `n` in all, and `armOffset` = how many dishes of that arm sit before `from`. With
+ * `only` (a retry after that arm's batch failed), `from` counts within that arm's dishes only, so a
+ * retry never calls the model for the other arm. Either way a batch never holds more than `n`
+ * dishes, however long `rows` is (the route reads a long queue to apply per-arm skips). Null =
+ * nothing at this offset.
  */
 export function selectEstimateBatch<T>(
   rows: readonly T[],
@@ -380,14 +382,14 @@ export function selectEstimateBatch<T>(
   only?: Arm,
 ): { todo: T[]; arm: Arm; armOffset: number } | null {
   if (only) {
-    const todo = rows.filter((r) => armOf(r) === only).slice(from, from + n);
+    const todo = rows.filter((r) => armOf(r) === only).slice(from, from + Math.max(1, n));
     return todo.length ? { todo, arm: only, armOffset: from } : null;
   }
   const queue = rows.slice(from);
   if (queue.length === 0) return null;
   const arm = armOf(queue[0]);
   return {
-    todo: queue.filter((r) => armOf(r) === arm),
+    todo: queue.filter((r) => armOf(r) === arm).slice(0, Math.max(1, n)),
     arm,
     armOffset: rows.slice(0, from).filter((r) => armOf(r) === arm).length,
   };
