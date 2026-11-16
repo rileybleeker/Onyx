@@ -535,7 +535,7 @@ def _reviewed(**changes):
             calibration_report={"reference": "synthetic-report-ref", "revision": "synthetic-revision",
                                 "inference_fingerprint": fingerprint, "harness_fingerprint": "synthetic-harness",
                                 "review_ready": True, "suite_run": "synthetic-suite-run"},
-            n_redraws=(10000,), alpha=(0.05,))
+            n_redraws=(10000,), alpha=(0.05,), block_designs=((4, 2),), n_blocks=(7, 58))
         ea.METHOD_REVIEW.update(changes)
         yield
     finally:
@@ -577,6 +577,10 @@ def test_admin_seed_then_register_then_verify():
         assert "cannot be registered yet" in pending and "independent statistical review" in pending
         with _reviewed(n_redraws=(999,)):
             assert "re-draw counts, not this trial's 10000" in _refused(
+                lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
+        # ... and its block design: a calibration that never ran this many blocks does not cover it.
+        with _reviewed(n_blocks=(7, 40)):
+            assert "covers 7 to 40 scheduled blocks, not this trial's 58" in _refused(
                 lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
         assert store.rows["EXP-901"]["status"] == "draft" and store.sched == {}, "a refused registration writes nothing"
 

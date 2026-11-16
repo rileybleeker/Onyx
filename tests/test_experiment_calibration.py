@@ -42,7 +42,12 @@ Covers
     review names the running code's fingerprint; a free-text record, fewer than two reviewers, a
     verdict that is not sound, another fingerprint, an unreadable source, and a calibration record
     without its revision, harness fingerprint, scheduled-suite run or review-ready flag all keep the
-    decision withheld; a report is review-ready only with a revision and a fingerprint.
+    decision withheld; a report is review-ready only with a revision and a fingerprint;
+  * the record covers designs, not only alpha and re-draws: a trial whose block shape or number of
+    scheduled blocks the calibration did not run (or whose design is not given) stays withheld, and
+    the report's `covers` names the block shape and the block range of its supported scenarios;
+  * missing-night checks fail closed: an A/A check without a readable Fisher p, and a treatment
+    trial without a readable 10-point flag, count as failed.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -393,12 +398,14 @@ def test_recorded_method_review_still_withholds_until_the_calibration_report():
     assert record["inference_fingerprint"] == ef.inference_fingerprint()
     assert not ea.METHOD_REVIEW["calibration_report"]
     assert not ea.METHOD_REVIEW["n_redraws"] and not ea.METHOD_REVIEW["alpha"]
-    problem = ea.method_review_problem(0.05, 10000)
+    assert not ea.METHOD_REVIEW["block_designs"] and not ea.METHOD_REVIEW["n_blocks"]
+    problem = ea.method_review_problem(0.05, 10000, **DESIGN)
     assert problem and "calibration report" in problem and "independent statistical review is recorded" in problem
     spec, data = _spec_and_data()
     report = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
     assert report["decision"] == "inconclusive" and report["decision_firm"] is False
-    assert report["decision_withheld"] == [ea.method_review_problem(spec.alpha, spec.n_redraws)]
+    assert report["decision_withheld"] == [ea.method_review_problem(spec.alpha, spec.n_redraws, block_len=spec.block_len,
+                                                                    n_a=spec.n_a, n_blocks=spec.n_days // spec.block_len)]
     assert report["inference"]["review"]["independent_review"] == ea.METHOD_REVIEW["independent_review"]
     saved = dict(ea.METHOD_REVIEW)
     try:
@@ -430,8 +437,9 @@ def test_inference_fingerprint_covers_the_code_not_the_text():
     assert edited("REDRAW_CHUNK = 2000", "REDRAW_CHUNK = 2000  # a comment") == base
     assert edited("Not read by the decision rule", "Never read by the decision rule") == base
     assert edited('"calibration_report": None,', '"calibration_report": "synthetic",') == base
-    assert edited("def method_review_problem(alpha: float, n_redraws: int) -> str | None:",
-                  "def method_review_problem(alpha: float, n_redraws: int, _unused: int = 0) -> str | None:") == base
+    assert edited("def method_review_problem(alpha: float, n_redraws: int, *,",
+                  "def method_review_problem(alpha: float, n_redraws: int, _unused: int = 0, *,") == base
+    assert edited('"block_designs": (),', '"block_designs": ((4, 2),),') == base
     assert edited("def validate_protocol(", "def validate_protocol(_unused, ", in_design=True) == base
     # Code does: an analysis constant, the decision rule, the re-draw seed and the uniform draws.
     assert edited("TIE_TOL = 1e-12", "TIE_TOL = 1e-11") != base
@@ -464,7 +472,7 @@ def test_method_review_records_are_bound_to_the_inference_code():
     live = ef.inference_fingerprint()
     try:
         ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
-        assert ea.method_review_problem(0.05, 10000) is None, "a complete record for this code covers the trial"
+        assert ea.method_review_problem(0.05, 10000, **DESIGN) is None, "a complete record for this code covers the trial"
 
         def problem_with(review_changes=None, report_changes=None, **top):
             ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
@@ -475,7 +483,7 @@ def test_method_review_records_are_bound_to_the_inference_code():
                 ea.METHOD_REVIEW["calibration_report"] = (report_changes if not isinstance(report_changes, dict)
                                                           else {**ea.METHOD_REVIEW["calibration_report"], **report_changes})
             ea.METHOD_REVIEW.update(top)
-            return ea.method_review_problem(0.05, 10000) or ""
+            return ea.method_review_problem(0.05, 10000, **DESIGN) or ""
 
         # The reviewer's finding: a non-empty free text must not satisfy the gate.
         assert "not a structured record" in problem_with(review_changes="synthetic free text review")
@@ -498,16 +506,58 @@ def test_method_review_records_are_bound_to_the_inference_code():
         assert "interval" in problem_with(interval_method="synthetic_other_interval_v9")
         # A changed code base withholds every decision until both halves are recorded again.
         ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,), fingerprint=other))
-        assert "covers other inference code" in (ea.method_review_problem(0.05, 10000) or "")
+        assert "covers other inference code" in (ea.method_review_problem(0.05, 10000, **DESIGN) or "")
         # An unreadable source cannot be checked, so the decision is withheld.
         ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
         original = ef.inference_fingerprint
         try:
             ef.inference_fingerprint = lambda: None
-            assert "cannot be read" in (ea.method_review_problem(0.05, 10000) or "")
+            assert "cannot be read" in (ea.method_review_problem(0.05, 10000, **DESIGN) or "")
         finally:
             ef.inference_fingerprint = original
-        assert ea.method_review_problem(0.05, 10000) is None and ef.inference_fingerprint() == live
+        assert ea.method_review_problem(0.05, 10000, **DESIGN) is None and ef.inference_fingerprint() == live
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
+def test_method_review_covers_only_the_calibrated_designs():
+    # Review finding (round 3): the record checked alpha and re-draws only, so a trial with a block shape
+    # or a number of blocks the calibration never ran would be covered once a report is recorded.
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
+        assert ea.method_review_problem(0.05, 10000, **DESIGN) is None
+        for n_blocks in (7, 58):
+            assert ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_blocks": n_blocks}) is None, n_blocks
+        # A design not given cannot be checked, so it is not covered (fail closed).
+        assert "block design" in (ea.method_review_problem(0.05, 10000) or "")
+        assert "block design" in (ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_blocks": None}) or "")
+        assert "block design" in (ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_a": True}) or "")
+        # Another block shape, or a block count outside the calibrated range.
+        assert "not this trial's 5 days with 2 on arm A" in (
+            ea.method_review_problem(0.05, 10000, **{**DESIGN, "block_len": 5}) or "")
+        assert "not this trial's 4 days with 1 on arm A" in (
+            ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_a": 1}) or "")
+        for n_blocks in (6, 59):
+            assert f"covers 7 to 58 scheduled blocks, not this trial's {n_blocks}" in (
+                ea.method_review_problem(0.05, 10000, **{**DESIGN, "n_blocks": n_blocks}) or ""), n_blocks
+        # A record without designs, or with a malformed range, covers none.
+        for changes in (dict(block_designs=()), dict(block_designs=((4,),)), dict(block_designs=(("4", "2"),))):
+            ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)), **changes)
+            assert "covers no blocks" in (ea.method_review_problem(0.05, 10000, **DESIGN) or ""), changes
+        for changes in (dict(n_blocks=()), dict(n_blocks=(58, 7)), dict(n_blocks=(7,)), dict(n_blocks=("7", "58"))):
+            ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)), **changes)
+            assert "covers no scheduled blocks" in (ea.method_review_problem(0.05, 10000, **DESIGN) or ""), changes
+        # The final report reads the trial's own design: a 40-block trial outside a 50-58 calibration stays pending.
+        ea.METHOD_REVIEW.update(synthetic_method_review(), n_blocks=(50, 58))
+        spec, data = _spec_and_data()
+        report = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
+        assert report["decision_firm"] is False and report["decision"] == "inconclusive"
+        assert report["decision_withheld"] == ["the calibration report covers 50 to 58 scheduled blocks, not this trial's 40"]
+        assert report["decision_if_supported"] == "adopt_A"
+        ea.METHOD_REVIEW.update(synthetic_method_review())
+        assert ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))["decision_firm"] is True
     finally:
         ea.METHOD_REVIEW.clear()
         ea.METHOD_REVIEW.update(saved)
@@ -544,7 +594,10 @@ def synthetic_method_review(n_redraws=(999,), alpha=(0.05,), fingerprint=None):
                 calibration_report={"reference": "synthetic-report-ref", "revision": "synthetic-revision",
                                     "inference_fingerprint": fingerprint, "harness_fingerprint": "synthetic-harness",
                                     "review_ready": True, "suite_run": "synthetic-suite-run"},
-                n_redraws=n_redraws, alpha=alpha)
+                n_redraws=n_redraws, alpha=alpha, block_designs=((4, 2),), n_blocks=(7, 58))
+
+
+DESIGN = dict(block_len=4, n_a=2, n_blocks=58)     # the template's design, inside the synthetic record's range
 
 
 REVIEWED = synthetic_method_review()
@@ -640,6 +693,23 @@ def test_a_trial_without_a_declared_model_never_gets_a_firm_decision():
             assert judged["missing_not_caused_by_arm"]["status"] == status, (missing, kind)
         aa_reason = {c["id"]: c for c in ea.assumption_checks(bounded, tied, spec)}["missing_not_caused_by_arm"]["reason"]
         assert "Fisher exact p < 0.05" in aa_reason and "same instruction" in aa_reason
+        # A check without a readable result fails closed (review round 3: the A/A branch failed open on a
+        # missing fisher_p). Each also marks Fisher's test unsupported, like a failed check.
+        for missing, kind in (({"threat": False}, ed.KIND_AA), ({"threat": False, "fisher_p": None}, ed.KIND_AA),
+                              ({"threat": False, "fisher_p": float("nan")}, ed.KIND_AA),
+                              ({"threat": False, "fisher_p": True}, ed.KIND_AA),
+                              ({"threat": False, "fisher_p": "0.4"}, ed.KIND_AA), (None, ed.KIND_AA),
+                              ({}, ed.KIND_TREATMENT), ({"threat": None}, ed.KIND_TREATMENT),
+                              ({"threat": "no"}, ed.KIND_TREATMENT), (None, ed.KIND_TREATMENT)):
+            judged = ea.assumption_checks(bounded, missing, replace(spec, kind=kind))
+            assert {c["id"]: c for c in judged}["missing_not_caused_by_arm"]["status"] == "failed", (missing, kind)
+            outputs = ea.output_semantics(0.001, 0.05)
+            ea.unsupported_outputs(outputs, judged)
+            assert outputs["p_value_no_effect"]["supported"] is False, (missing, kind)
+        numpy_false = {"threat": np.False_, "fisher_p": 0.4}
+        for kind in (ed.KIND_AA, ed.KIND_TREATMENT):
+            judged = {c["id"]: c for c in ea.assumption_checks(bounded, numpy_false, replace(spec, kind=kind))}
+            assert judged["missing_not_caused_by_arm"]["status"] == "ok", ("a readable result passes", kind)
         # Without a spec nothing is declared, so the protocol checks fail closed.
         closed = {c["id"]: c["status"] for c in ea.assumption_checks({"carryover_set_bounded": True}, {"threat": False})}
         assert closed["model_justified"] == "failed" and closed["registered_method"] == "failed"
@@ -785,6 +855,7 @@ def test_smoke_scenarios_meet_their_prespecified_tolerances():
     assert "direct_power" not in by_name["carryover_only"]["informational"]
     # What the report may back: its own configuration, and a subset run never passes.
     assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [SMOKE_REDRAWS], "alpha": [0.05],
+                                "block_designs": [[cal.BLOCK_LEN, cal.N_A]], "n_blocks": [58, 58],
                                 "inference_fingerprint": ef.inference_fingerprint()}
     assert report["harness_fingerprint"] == ef.harness_fingerprint() and report["revision"] is None
     assert report["all_supported_scenarios"] is False

@@ -232,10 +232,11 @@ def cmd_register(store: Store, protocol_path: str, confirm: str, *, root: Path =
                                       seed_sha256=existing["seed_sha256"],
                                       inference_method=analysis.INFERENCE_METHOD)
     # A final report is written once and never changes, so a treatment trial registered before its
-    # inference method is reviewed for its alpha and re-draw count could never reach a firm decision
-    # (docs/experiment-framework.md 8.1). An A/A check is judged on Fisher's test and may run first.
+    # inference method is reviewed for its alpha, re-draw count and block design could never reach a firm
+    # decision (docs/experiment-framework.md 8.1). An A/A check is judged on Fisher's test and may run first.
     if design.trial_kind(protocol) == design.KIND_TREATMENT:
-        problem = analysis.method_review_problem(fields["alpha"], fields["n_redraws"])
+        problem = analysis.method_review_problem(fields["alpha"], fields["n_redraws"], block_len=fields["block_len"],
+                                                 n_a=fields["n_a_per_block"], n_blocks=fields["n_blocks"])
         if problem:
             raise AdminError(f"a treatment trial cannot be registered yet: {problem}. Its final decision could never "
                              "be firm; record what METHOD_REVIEW is missing first (an A/A check may run before)")

@@ -59,8 +59,9 @@ decision rule's verdict as a firm decision only when every blocking check in ass
 passes: missing nights not tied to the arm, the registered protocol's declaration and
 justification of the untestable parts of M (one-night carryover, constant effects, pre-trial day
 as control), the registered inference method, and a METHOD_REVIEW (calibration report plus
-independent review) covering the trial's alpha and re-draw count and recorded for the inference
-code that is running (its experiment_fingerprint fingerprint). Otherwise the decision is
+independent review) covering the trial's alpha, re-draw count and block design (block length,
+arm-A days per block, scheduled blocks) and recorded for the inference code that is running (its
+experiment_fingerprint fingerprint). Otherwise the decision is
 withheld ("inconclusive"), the reasons are in the report, and every output whose assumptions a
 failed check leaves unsupported is marked so.
 """
@@ -94,10 +95,14 @@ INTERVAL_METHOD = "certified_enclosure_v1"
 # this module and the allocation / re-draw code of experiment_design, with docstrings, comments, this
 # record, its check and the explanation of the outputs left out). A trial's decision is firm only when
 # both halves are recorded, both fingerprints equal the fingerprint of the code that is running, and the
-# trial's alpha and re-draw count are among those calibrated; until then it is withheld. Any change to
-# the fingerprinted code therefore withholds every decision until both halves are recorded again for it.
+# trial's alpha, re-draw count and block design are among those calibrated; until then it is withheld.
+# A design outside them is not covered even though the method is exact for any design under its
+# assumptions: the calibration is the check that the code delivers it, and it ran on its designs only.
+# Any change to the fingerprinted code therefore withholds every decision until both halves are
+# recorded again for it.
 # The review is recorded (doc 8.3). The calibration report is not: the PR that records a review-ready
-# report fills in calibration_report, n_redraws and alpha, with calibration_report =
+# report fills in calibration_report, n_redraws, alpha, block_designs and n_blocks (all copied from the
+# report's `covers`), with calibration_report =
 #   {"reference": where the report is kept, "revision": the commit it ran at (the report's `revision`),
 #    "inference_fingerprint" and "harness_fingerprint": copied from the report, "review_ready": True,
 #    "suite_run": the scheduled-suite run, at that fingerprint, in which tests/test_experiment_calibration.py
@@ -134,15 +139,23 @@ METHOD_REVIEW: dict[str, Any] = {
     },
     "n_redraws": (),                       # re-draw counts the report calibrated
     "alpha": (),                           # alpha levels it calibrated
+    # The designs it calibrated (doc 8.2): (block length, arm-A days per block) pairs, and the inclusive
+    # range (fewest, most) of scheduled blocks across its supported scenarios. A trial outside them is
+    # not covered: the method is exact for any design under the assumptions, but the calibration is the
+    # check that the code delivers that, and it ran only on these designs.
+    "block_designs": (),
+    "n_blocks": (),
 }
 
 
-def method_review_problem(alpha: float, n_redraws: int) -> str | None:
-    """Why a trial with this alpha and re-draw count has no recorded review of INFERENCE_METHOD
-    that covers it, or None when it has one. Both halves of METHOD_REVIEW must be structured records
-    whose inference fingerprint is the running code's (experiment_fingerprint); anything else, an
-    unreadable source included, withholds the decision. Its helpers stay inside it, so they stay
-    outside the fingerprint with it."""
+def method_review_problem(alpha: float, n_redraws: int, *, block_len: int | None = None, n_a: int | None = None,
+                          n_blocks: int | None = None) -> str | None:
+    """Why a trial with this alpha, re-draw count and block design (block length, arm-A days per
+    block, scheduled blocks) has no recorded review of INFERENCE_METHOD that covers it, or None when
+    it has one. Both halves of METHOD_REVIEW must be structured records whose inference fingerprint is
+    the running code's (experiment_fingerprint), and the calibration must cover the trial's alpha,
+    re-draw count and design; anything else, an unreadable source or a design not given included,
+    withholds the decision. Its helpers stay inside it, so they stay outside the fingerprint with it."""
     from experiment_fingerprint import inference_fingerprint
 
     review = METHOD_REVIEW
@@ -213,6 +226,28 @@ def method_review_problem(alpha: float, n_redraws: int) -> str | None:
     levels = [float(x) for x in review.get("alpha") or ()]
     if not any(abs(float(alpha) - level) < 1e-12 for level in levels):
         return f"the calibration report covers alpha {levels or 'none'}, not this trial's {float(alpha):g}"
+
+    def whole(value: Any) -> bool:
+        return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+
+    if not all(whole(v) for v in (block_len, n_a, n_blocks)):
+        return ("the trial's block design (block length, arm-A days per block, scheduled blocks) is not given, so it "
+                "cannot be checked against the designs the calibration report covers")
+    designs = []
+    for pair in review.get("block_designs") or ():
+        if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(whole(v) for v in pair):
+            designs.append((int(pair[0]), int(pair[1])))
+    designs = sorted(set(designs))
+    if (int(block_len), int(n_a)) not in designs:
+        shown = ", ".join(f"{b} days with {a} on arm A" for b, a in designs) or "no"
+        return (f"the calibration report covers {shown} blocks, not this trial's {int(block_len)} days with "
+                f"{int(n_a)} on arm A")
+    span = review.get("n_blocks") or ()
+    bounded = (isinstance(span, (list, tuple)) and len(span) == 2 and all(whole(v) for v in span)
+               and int(span[0]) <= int(span[1]))
+    if not (bounded and int(span[0]) <= int(n_blocks) <= int(span[1])):
+        covered = f"{int(span[0])} to {int(span[1])}" if bounded else "no"
+        return f"the calibration report covers {covered} scheduled blocks, not this trial's {int(n_blocks)}"
     return None
 
 
@@ -1131,10 +1166,16 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
     alpha = spec.alpha if spec is not None else 0.05
 
     def missing_failed(check: dict[str, Any]) -> bool:
+        # Fail closed: a check without a readable result (a malformed or older input) counts as failed.
+        if not isinstance(check, dict):
+            return True
         if kind == design.KIND_AA:
             fisher_p = check.get("fisher_p")
-            return isinstance(fisher_p, (int, float)) and not isinstance(fisher_p, bool) and fisher_p < alpha
-        return bool(check.get("threat"))
+            if not isinstance(fisher_p, (int, float)) or isinstance(fisher_p, bool) or not math.isfinite(fisher_p):
+                return True
+            return fisher_p < alpha
+        threat = check.get("threat")
+        return not isinstance(threat, (bool, np.bool_)) or bool(threat)
 
     if kind == design.KIND_AA:
         missing_rule = (f"missing nights are tied to the arm (Fisher exact p < {alpha:g}) although both arms carry the "
@@ -1155,8 +1196,10 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
     else:
         model_status, model_reason = "ok", "declared and justified in the registered protocol"
     registered = spec.inference_method if spec is not None else None
-    review = method_review_problem(spec.alpha if spec is not None else 0.05,
-                                   spec.n_redraws if spec is not None else 10000)
+    review = method_review_problem(
+        alpha, spec.n_redraws if spec is not None else 10000,
+        **({"block_len": spec.block_len, "n_a": spec.n_a, "n_blocks": spec.n_days // spec.block_len}
+           if spec is not None else {}))
     return [
         {"id": "missing_not_caused_by_arm", "status": "failed" if missing_failed(missingness) else "ok",
          "blocks_decision": True, "covers": ["missing_not_caused_by_arm"],
@@ -1173,7 +1216,7 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
          "reason": (f"the registration recorded the inference method {registered!r}, not {INFERENCE_METHOD}: the "
                     "analysis that ran is not the one registered")},
         {"id": "method_reviewed", "status": "ok" if review is None else "pending", "blocks_decision": True,
-         "covers": [], "reason": review or "recorded for this trial's alpha and re-draw count"},
+         "covers": [], "reason": review or "recorded for this trial's alpha, re-draw count and block design"},
     ] + [
         {"id": secondary_missing_assumption(name), "status": "failed" if missing_failed(check) else "ok",
          "blocks_decision": False, "covers": [secondary_missing_assumption(name)],

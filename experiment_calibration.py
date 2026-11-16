@@ -32,13 +32,14 @@ size and coverage of the deployed rule itself: the analysis's "at most alpha" fo
 pseudo-randomness assumption of doc 8.1 (the Monte Carlo randomization p-value (1 + count) / (R + 1)),
 and this report is the empirical evidence for it.
 
-The report records the configuration it calibrated (method, alpha, re-draw count) and the code
-it ran: the inference fingerprint (experiment_fingerprint) of the analysis it calibrated, the
-harness fingerprint of this file and the revision (--revision, else $GITHUB_SHA). A METHOD_REVIEW
-entry covers exactly that configuration and that inference code, and a trial's decision is firm
-only when its alpha and re-draw count are among them and the running code has the same inference
-fingerprint (experiment_analysis.method_review_problem). A report without a revision or whose
-inference code cannot be fingerprinted is never review-ready.
+The report records the configuration it calibrated (method, alpha, re-draw count, the block shape
+BLOCK_LEN / N_A and the range of scheduled blocks of its supported scenarios) and the code it ran:
+the inference fingerprint (experiment_fingerprint) of the analysis it calibrated, the harness
+fingerprint of this file and the revision (--revision, else $GITHUB_SHA). A METHOD_REVIEW entry
+covers exactly that configuration and that inference code, and a trial's decision is firm only
+when its alpha, re-draw count and block design are among them and the running code has the same
+inference fingerprint (experiment_analysis.method_review_problem). A report without a revision or
+whose inference code cannot be fingerprinted is never review-ready.
 
 Supported scenarios satisfy the working model of experiment_analysis (one-night carryover,
 constant additive effects, missing nights and excluded blocks independent of the arm) and must
@@ -105,6 +106,10 @@ BASELINE = 70.0             # synthetic outcome level (ms)
 # where a missed accepted region would sit, then out to the far tail. Fixed before any run.
 ENCLOSURE_STEPS = (1e-6, 1e-3, 0.05, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 13.0, 20.0, 50.0, 1e2, 1e4, 1e6)
 CALIBRATION_AS_OF = date(2026, 11, 16)   # the synthetic report date given to the deployed seeding rule
+# The block shape every scenario uses: the one experiment_design.validate_protocol registers. The report's
+# `covers` names it with the range of scheduled blocks its supported scenarios ran, and a trial with
+# another design is not covered (experiment_analysis.method_review_problem).
+BLOCK_LEN, N_A = 4, 2
 
 
 @dataclass(frozen=True)
@@ -163,8 +168,8 @@ def _ar1(rng: np.random.Generator, n: int, sigma: float, rho: float) -> np.ndarr
 
 def simulate_trial(s: Scenario, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray, set[int]]:
     """One synthetic trial: (assignment 0/1, outcome with NaN for missing nights, weekday, excluded blocks)."""
-    n = s.n_blocks * 4
-    arms = design.generate_schedule(rng.bytes(design.SEED_BYTES), s.n_blocks)
+    n = s.n_blocks * BLOCK_LEN
+    arms = design.generate_schedule(rng.bytes(design.SEED_BYTES), s.n_blocks, BLOCK_LEN, N_A)
     t = np.array([1.0 if a == "A" else 0.0 for a in arms])
     lag1 = np.concatenate([[0.0], t[:-1]])          # the day before the trial is the control arm
     lag2 = np.concatenate([[0.0, 0.0], t[:-2]])
@@ -207,14 +212,15 @@ def one_trial(s: Scenario, rng: np.random.Generator, *, n_redraws: int, alpha: f
     """Every quantity the metrics need for one synthetic trial; None when the model cannot be fitted."""
     t, y, dow, excluded = simulate_trial(s, rng)
     try:
-        draws, _ = ea.redraw_fit(t, y, dow, excluded_blocks=excluded, n_redraws=n_redraws, redraw_seed=redraw_seed)
+        draws, _ = ea.redraw_fit(t, y, dow, block_len=BLOCK_LEN, n_a=N_A, excluded_blocks=excluded,
+                                 n_redraws=n_redraws, redraw_seed=redraw_seed)
     except ValueError:
         return None
     lo, hi = ea.interval(draws, 0, alpha, beta)
     clo, chi = ea.interval(draws, 1, alpha, beta)
     llo, lhi = legacy_interval(draws, alpha)
     carry_set = ea.nuisance_set(draws, 0, 0.0, beta)
-    in_scope = ~np.isin(np.arange(len(t)) // 4, list(excluded))
+    in_scope = ~np.isin(np.arange(len(t)) // BLOCK_LEN, list(excluded))
     return {
         "p_direct": ea.bb_p_value(draws, 0, 0.0, beta)[0],
         "p_carryover": ea.bb_p_value(draws, 1, 0.0, beta)[0],
@@ -359,10 +365,14 @@ def _assemble(config: dict[str, Any], scenarios: list[dict[str, Any]]) -> dict[s
     supported = [x for x in scenarios if x["supported"]]
     every_supported = {s.name for s in SCENARIOS if s.supported} <= {x["name"] for x in scenarios}
     passed = bool(supported) and every_supported and all(x["ok"] for x in supported)
+    blocks = {s.name: s.n_blocks for s in SCENARIOS}
+    spans = sorted({blocks[x["name"]] for x in supported})
     return {
         **config,
-        # What a METHOD_REVIEW entry may cover once this report passed with every supported scenario.
+        # What a METHOD_REVIEW entry may cover once this report passed with every supported scenario:
+        # its configuration, its block shape and the range of scheduled blocks its supported scenarios ran.
         "covers": {"method": config["method"], "n_redraws": [config["n_redraws"]], "alpha": [config["alpha"]],
+                   "block_designs": [[BLOCK_LEN, N_A]], "n_blocks": [spans[0], spans[-1]] if spans else [],
                    "inference_fingerprint": config.get("inference_fingerprint")},
         "all_supported_scenarios": every_supported,
         "scenarios": scenarios,
