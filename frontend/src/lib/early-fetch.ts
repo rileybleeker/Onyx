@@ -5,8 +5,10 @@
  * URL, while it is fresh; otherwise it fetches as usual. GET only, nothing written; the request options mirror the
  * client's own fetch for that URL.
  *
- * Used by /check-in, Today (`/` and `/today`, lib/today-early.ts) and /status. Only a full page load runs the
- * script: React never runs a script it inserts itself (an in-app navigation, the continuous scroll).
+ * Used by /check-in and /status (an inline script, below) and by Today (`/` and `/today`, lib/today-early.ts), /log
+ * (lib/log-early.ts) and /agents (head script, next paragraph). Only a full page load starts reads: React never runs
+ * an inline script it inserts itself (an in-app navigation, the continuous scroll), and the head script below checks
+ * for itself that the app is not yet running.
  *
  * Today, /log and /agents load theirs from the HEAD instead (`earlyScriptSrc`, PERF-01, 2026-11-16): an inline
  * script in the body waits until every stylesheet before it has loaded (HTML spec: a parser-inserted classic script

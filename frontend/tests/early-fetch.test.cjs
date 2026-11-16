@@ -356,3 +356,18 @@ test("/log: the Drinks section's first read is started with the others and taken
   assert.match(drinks, /cachedJson\(url, \{ check: checkDay, get \}\)/);
   assert.match(drinks, /\.finally\(\(\) => loading\.current\.delete\(url\)\);\s*\}, \[routed\]\);/, "load follows routed");
 });
+
+test("/log: the Uber Eats section's reads start before the frame and the sections are evaluated, on a full page load only", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const read = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
+  const loader = read("app/log/LogLoader.tsx");
+  // ES imports run in order: the starter module must come before ./LogClient, whose evaluation is the slow part.
+  const start = loader.indexOf('import "./early-delivery-start";');
+  const client = loader.indexOf('import "./LogClient";');
+  assert.ok(start !== -1 && client !== -1 && start < client, "early-delivery-start is imported before LogClient");
+  assert.ok(!/startEarlyDeliveryReads|takeLogEarlyMark/.test(loader), "LogLoader's own body no longer starts them late");
+  const starter = read("app/log/early-delivery-start.ts");
+  assert.match(starter, /if \(typeof window !== "undefined" && takeLogEarlyMark\(\)\) startEarlyDeliveryReads\(\);/);
+  assert.ok(!/fetch\(|method:\s*"(POST|PUT|PATCH|DELETE)"/.test(starter), "read-only: nothing is sent from here");
+});
