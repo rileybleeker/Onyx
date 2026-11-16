@@ -209,9 +209,19 @@ export async function cachedMoneyAlerts(now: Date, mode: ServeMode = "stale-ok")
   return { status, alerts, asOf: served.computedAt, ...(served.stale ? { updating: true as const } : {}), ...(partial ? { partial } : {}) };
 }
 
-/** GET /api/procurement/renewals/summary: the stored form, turned into today's summary by the route. */
+/** The stored renewals detection (the "stale-ok" read of cachedRenewalsAheadWithAge, without its age). */
 export async function cachedRenewalsAhead(now: Date): Promise<RenewalsAhead | null> {
-  return serveStored<RenewalsAhead>(
+  return (await cachedRenewalsAheadWithAge(now, "stale-ok"))?.value ?? null;
+}
+
+/**
+ * GET /api/procurement/renewals/summary: the stored form, turned into today's summary by the route, and how current
+ * it is (like the money alerts): "stale-ok" (Today's first read) answers an older stored result at once, marked
+ * stale and recomputed after the response; "fresh-only" (Today's follow-up, ?fresh=1) computes it first, so an
+ * outdated "nothing renews" is never the last word.
+ */
+export async function cachedRenewalsAheadWithAge(now: Date, mode: ServeMode = "stale-ok"): Promise<Served<RenewalsAhead> | null> {
+  return serveStoredWithAge<RenewalsAhead>(
     "renewals",
     now,
     async () => {
@@ -221,7 +231,7 @@ export async function cachedRenewalsAhead(now: Date): Promise<RenewalsAhead | nu
       return { value, store: [{ key: "renewals", body: value }] };
     },
     parseRenewalsAhead,
-    "stale-ok",
+    mode,
   );
 }
 

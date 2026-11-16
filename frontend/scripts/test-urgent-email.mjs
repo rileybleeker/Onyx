@@ -431,6 +431,7 @@ await test("one item per thread even when both labels sit on different messages 
   assert.deepEqual(out.items[0].labels, ["Agent/Action", "Agent/Deadline"]);
   assert.equal(out.items[0].subject, "Re: Lease question, reply by Nov 12", "newest message names the thread");
   assert.equal(out.items[0].deadline.daysLeft, 1);
+  assert.equal(out.items[0].deadline.date, "2026-11-12", "the deadline's own Eastern day, so a copy kept past midnight still names it");
   assert.equal(out.items[0].href, `https://mail.google.com/mail/?authuser=owner%40example.com#all/thread-f:${thread}`);
 });
 
@@ -558,6 +559,18 @@ await test("each merged item says what a Clear removes: its cards and its thread
   assert.deepEqual(solo.clear, { cards: ["Z9"], emails: [] });
 });
 
+await test("each merged item keeps the expiry of every request merged into it (Today never lets a snooze outlast it)", () => {
+  const e = emailItem();
+  const link = `https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:${e.threadId}`;
+  const c = card({}, { name: "Urgent: reply today", link, expires: "2026-11-11T18:00:00Z" });
+  const again = card({ messageId: 998 }, { code: "Q78", name: "Urgent: reply today (again)", link, expires: null });
+  const alone = card({ messageId: 997 }, { code: "Z8", name: "Urgent: other thing", link: "", expires: "2026-11-12" });
+  const out = mergeUrgent([e], [c, again, alone], Infinity, { bySearch: false });
+  assert.deepEqual(out.items.find((i) => i.key === `email:${e.key}`).cardExpires, ["2026-11-11T18:00:00Z"], "a card without an expiry adds none");
+  assert.deepEqual(out.items.find((i) => i.key === "card:Z8").cardExpires, ["2026-11-12"]);
+  assert.deepEqual(mergeUrgent([emailItem()], []).items[0].cardExpires, [], "an email with no request has none");
+});
+
 await test("same thread id in another mailbox does not merge; same Message-ID in both mailboxes does", () => {
   const e = emailItem();
   const other = card({}, { link: `https://mail.google.com/mail/?authuser=second@example.com#all/thread-f:${e.threadId}` });
@@ -593,6 +606,19 @@ await test("a #search card merges into the one labelled email holding every word
   // 6 days 23 h before the card still counts
   const old = emailItem({ subject: "Invoice overdue", receivedAt: "2026-11-04T14:00:00.000Z" });
   assert.equal(mergeUrgent([old], [c]).total, 1);
+});
+
+await test("bySearch: false (Today's attention model) merges by identity only: a #search card stays its own item", () => {
+  const e = emailItem({ subject: "Invoice 42 is overdue, please pay", receivedAt: "2026-11-11T10:00:00.000Z" });
+  const c = card({}, { name: "Urgent: invoice overdue", link: SEARCH("Invoice+overdue") });
+  assert.equal(mergeUrgent([e], [c]).total, 1, "the panel still folds them (default)");
+  const out = mergeUrgent([e], [c], Infinity, { bySearch: false });
+  assert.equal(out.total, 2, "matching words alone never fold two obligations");
+  assert.deepEqual(out.items.map((i) => i.key).sort(), [`card:${c.card.code.toUpperCase()}`, `email:${e.key}`].sort());
+  assert.deepEqual(out.items.find((i) => i.key === `email:${e.key}`).sources, ["Gmail"]);
+  // A link that names the thread is the thread's identity: still one item.
+  const named = card({ messageId: 2001 }, { code: "T1", link: `https://mail.google.com/mail/?authuser=${e.account}#all/thread-f:${e.threadId}` });
+  assert.equal(mergeUrgent([e], [named], Infinity, { bySearch: false }).total, 1);
 });
 
 await test("a #search card stays separate: missing word, ambiguous, other account, wrong time window", () => {

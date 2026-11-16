@@ -84,7 +84,49 @@ test("money alerts: low cash, promo, tax due, budget", () => {
   assert.ok(kinds.includes("tax"));
   assert.ok(kinds.includes("budget"));
   assert.equal(alerts[0].severity, "high");
+  // Each dated alert carries its own date, so Today can rank an imminent deadline as urgent (lib/today-attention.ts).
+  const due = Object.fromEntries(alerts.filter((a) => a.kind !== "budget").map((a) => [a.kind, a.due]));
+  assert.deepEqual(due, { "low-cash": "2030-06-26", promo: "2030-07-20", tax: "2030-06-20" });
+  assert.ok(alerts.filter((a) => a.kind === "budget").every((a) => a.due === undefined), "a budget has no single day");
   assert.equal(A.moneyAlerts(null, null, 0, TODAY).length, 0);
+});
+
+test("money alerts: low cash is dated by the first day below the line; the lowest day is kept for the title", () => {
+  // Below the line on day 1 already, lowest on day 21: Today must treat day 1 as the deadline.
+  const days = Array.from({ length: 30 }, (_, i) => ({
+    date: `2030-06-${String(1 + i).padStart(2, "0")}`,
+    likely: i >= 20 ? -5_000 : 20_000,
+    low: i === 0 ? -1_000 : i === 20 ? -50_000 : i < 20 ? 5_000 : -10_000,
+    high: 90_000,
+  }));
+  const [cash] = A.moneyAlerts({ state: "ok", days, milestones: [], lines: [] }, null, 0, TODAY);
+  assert.equal(cash.kind, "low-cash");
+  assert.equal(cash.due, "2030-06-01", "the first day the cautious path is below the line");
+  assert.equal(cash.lowest, "2030-06-21", "the lowest day, which the title names");
+  assert.match(cash.title, /around Jun 21$/);
+  assert.equal(cash.severity, "high");
+  assert.equal(cash.likelyDue, "2030-06-21", "the first day the likely path is below the line");
+});
+
+test("money alerts: the likely path below the line before the cautious low point is dated and counted as likely", () => {
+  // Likely negative on day 2 only; the cautious path is lowest on day 21, where the likely balance is above the line.
+  const days = Array.from({ length: 30 }, (_, i) => ({
+    date: `2030-06-${String(1 + i).padStart(2, "0")}`,
+    likely: i === 1 ? -2_000 : 20_000,
+    low: i === 1 ? -3_000 : i === 20 ? -40_000 : 5_000,
+    high: 90_000,
+  }));
+  const [cash] = A.moneyAlerts({ state: "ok", days, milestones: [], lines: [] }, null, 0, TODAY);
+  assert.equal(cash.due, "2030-06-02");
+  assert.equal(cash.lowest, "2030-06-21");
+  assert.equal(cash.likelyDue, "2030-06-02");
+  assert.equal(cash.severity, "high", "the likely path breaches, even though not on the lowest cautious day");
+  assert.match(cash.detail, /likely below it around Jun 2\)/);
+  // The likely path never below the line: no likelyDue, medium.
+  const calm = days.map((d) => ({ ...d, likely: 20_000 }));
+  const [cautious] = A.moneyAlerts({ state: "ok", days: calm, milestones: [], lines: [] }, null, 0, TODAY);
+  assert.equal(cautious.likelyDue, undefined);
+  assert.equal(cautious.severity, "medium");
 });
 
 test("savings goals: progress, monthly need and the forecast check", () => {

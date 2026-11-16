@@ -100,7 +100,7 @@ function route(load) {
       NextResponse: { json: (body, init = {}) => ({ body, status: init.status ?? 200, headers: init.headers ?? {} }) },
     },
     "@/lib/finance-result-cache-server": {
-      cachedRenewalsAhead: async () => (load.state === "error" ? null : N.renewalsAhead(load)),
+      cachedRenewalsAheadWithAge: async () => (load.state === "error" ? null : { value: N.renewalsAhead(load), computedAt: new Date().toISOString(), stale: false }),
     },
   };
   return loadTs("app/api/procurement/renewals/summary/route.ts", stubs);

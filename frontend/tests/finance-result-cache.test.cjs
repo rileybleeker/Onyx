@@ -440,6 +440,31 @@ test("renewals route: ready / empty / 500, uncached, from the stored form", asyn
   assert.deepEqual([failed.status, failed.body, failed.headers["Cache-Control"]], [500, { error: "renewals unavailable" }, "no-store"]);
 });
 
+test("renewals route: an older stored detection is marked updating; ?fresh=1 computes before answering", async () => {
+  // An outdated "nothing renews" must never read as current: Today treats `updating` as not confirmed and asks again.
+  const h = harness({ detected: { state: "empty" } });
+  const route = loadTs("app/api/procurement/renewals/summary/route.ts", h.stubs);
+  const a = await route.GET();
+  assert.deepEqual([a.status, a.body], [200, { status: "empty" }], "computed now: current, no marker");
+  await h.drain();
+  h.db.bump(); // the ETL wrote the ledger
+  const b = await route.GET(new Request("http://localhost/api/procurement/renewals/summary"));
+  assert.equal(b.body.status, "empty");
+  assert.equal(b.body.updating, true);
+  assert.ok(Number.isFinite(Date.parse(b.body.asOf)), "says when the stored detection was computed");
+  assert.equal(h.calls.detected, 1, "answered at once from the stored row");
+  h.queue.length = 0; // the background refresh has not landed yet
+  const c = await route.GET(new Request("http://localhost/api/procurement/renewals/summary?fresh=1"));
+  assert.equal(h.calls.detected, 2, "?fresh=1 computed before answering");
+  assert.deepEqual(c.body, { status: "empty" });
+  // The follow-up read fails: a 500, never the outdated answer.
+  h.db.bump();
+  h.state.detected = { state: "error", code: "57014" };
+  h.queue.length = 0;
+  const d = await route.GET(new Request("http://localhost/api/procurement/renewals/summary?fresh=1"));
+  assert.deepEqual([d.status, d.body], [500, { error: "renewals unavailable" }]);
+});
+
 // ─── source and SQL guards ──────────────────────────────────────────────────────────────────────
 const REPO = path.join(SRC, "..", "..");
 const SQL = fs.readFileSync(path.join(REPO, "sql", "finance_result_cache.sql"), "utf8");

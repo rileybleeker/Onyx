@@ -145,7 +145,7 @@ export default function Overview() {
         <div className="min-w-0">
           <div className="flex items-center gap-3">
             <span className="rounded-md border border-border-default px-[7px] py-[5px] text-[10px] tabular-nums text-text-secondary">04</span>
-            <h2 id="overview-heading" className="text-sm font-medium tracking-[-0.01em] text-text-primary">Everything else, at a glance</h2>
+            <h2 id="overview-heading" className="text-lg font-semibold tracking-[-0.02em] text-text-primary sm:text-xl">Everything else, at a glance</h2>
           </div>
           <p className="mt-2 text-xs text-text-secondary">A card for every area, in the same order as the scroll and the side panel.</p>
         </div>
