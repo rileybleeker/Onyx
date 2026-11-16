@@ -753,6 +753,12 @@ async function createKeyedSession(
   return { kind: "created", session, finished: out.finished === true, habit: { marked: out.habit_marked === true, created: out.habit_created === true } };
 }
 
+/** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
+function isConfirmedRefusal(error: { code?: string }): boolean {
+  const code = String(error.code ?? "");
+  return /^(22|23|P0001)/.test(code) || code === "PGRST202" || code === "PGRST204";
+}
+
 async function sessionByClientKey(supabase: Supa, key: string): Promise<ReadingSession | null> {
   const { data, error } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("client_key", key).maybeSingle();
   if (error) return null; // column not there yet, or a read failure: behave as before (plain insert)
@@ -829,7 +835,7 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
 export async function logSession(
   supabase: Supa,
   input: LogSessionInput,
-): Promise<LogSessionResult | { ok: false; error: string; discarded?: true; unavailable?: true }> {
+): Promise<LogSessionResult | { ok: false; error: string; discarded?: true; unavailable?: true; retryable?: true }> {
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
   if (input.require_client_key && !key) return { ok: false, error: SESSION_KEY_REQUIRED };
   /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
@@ -916,7 +922,11 @@ export async function logSession(
       }
       if (error.code === DISCARDED_KEY_CODE) return { ok: false, error: DISCARDED_ENTRY_ERROR, discarded: true };
       if (missingColumn(error)) return { ok: false, error: KEYED_CREATE_NEEDS_COLUMN };
-      return { ok: false, error: error.message ?? "Couldn't save the session." };
+      const message = error.message ?? "Couldn't save the session.";
+      // Only a confirmed refusal (a constraint or a raised error) is a 4xx. A transport failure, a missing code, a
+      // connection / resource / shutdown / internal class or a lost response may have committed the create: the
+      // answer must be retryable (5xx) so the form's unknown-outcome handling replays the same key.
+      return isConfirmedRefusal(error) ? { ok: false, error: message } : { ok: false, error: message, retryable: true };
     }
     // atomic.kind === "unavailable": pds.create_reading_session is not there (the file not applied, or not yet in
     // PostgREST's schema cache). The discard fence may be there all the same (a partly applied file, a stale cache),

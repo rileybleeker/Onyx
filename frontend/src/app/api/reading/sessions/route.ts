@@ -38,12 +38,13 @@ export async function POST(req: NextRequest) {
   });
   // 409 discarded: this client_key's entry was discarded (sql/reading_session_discards.sql), so nothing is created
   // under it again; the /log form continues an entry edited since under a new key.
-  // 503: a keyed create needs pds.create_reading_session (one transaction); until it is there nothing is stored and the
+  // 503 (also `retryable`: a transport or infrastructure failure, where a create whose answer was lost may have
+  // committed; only a confirmed refusal is 400): a keyed create needs pds.create_reading_session (one transaction); until it is there nothing is stored and the
   // form retries (never the create in separate requests, which a Discard could land between).
   if (!result.ok) {
     return result.discarded
       ? NextResponse.json({ error: result.error, discarded: true }, { status: 409 })
-      : result.unavailable
+      : result.unavailable || result.retryable
         ? NextResponse.json({ error: result.error }, { status: 503 })
         : NextResponse.json({ error: result.error }, { status: 400 });
   }
