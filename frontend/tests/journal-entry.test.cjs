@@ -106,7 +106,7 @@ test("the Notion page sets all six properties and writes the words verbatim", ()
 test("the duplicate check looks for the same date and title", () => {
   assert.deepEqual(plain(J.sameEntryQuery({ date: "2031-03-04", title: "Synthetic title" })), {
     filter: { and: [{ property: "Date", date: { equals: "2031-03-04" } }, { property: "Title", title: { equals: "Synthetic title" } }] },
-    page_size: 1,
+    page_size: 5,
   });
 });
 
@@ -118,7 +118,10 @@ test("route rules: POST only, session only (not a CI route), same-origin, Notion
   assert.match(route, /checkVoiceRequest\(req\.headers, req\.nextUrl\.origin, JOURNAL_MAX_REQUEST_BYTES\)/);
   assert.match(route, /validateJournalEntry\(/);
   assert.match(route, /easternDate\(new Date\(\)\)/);
-  assert.match(route, /sameEntryQuery\(/);
+  // A same date + title match is acknowledged only when its words are the same; otherwise 409, never "saved" (#168 P1).
+  assert.match(route, /findSameTitleEntry\(v\.entry\)/);
+  assert.match(route, /same\?\.sameWords\) return NextResponse\.json\(\{ url: same\.url, existing: true \}\)/);
+  assert.match(route, /status: 409/);
   // The Notion calls are shared with POST /api/journal/file (lib/journal-file-server.ts).
   assert.match(route, /from "@\/lib\/journal-file-server"/);
   const server = fs.readFileSync(path.join(SRC, "lib/journal-file-server.ts"), "utf8");

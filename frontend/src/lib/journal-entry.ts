@@ -192,7 +192,8 @@ export function notionJournalPage(entry: JournalEntryInput, databaseId: string) 
   };
 }
 
-/** The query that finds an entry already saved with the same date and title (a retried save must not duplicate). */
+/** The query for entries already saved with the same date and title. A match counts as this save only when its words
+ * are the same too (findSameTitleEntry): a retried save must not duplicate, a different entry must not be "saved". */
 export function sameEntryQuery(entry: Pick<JournalEntryInput, "date" | "title">) {
   return {
     filter: {
@@ -201,6 +202,6 @@ export function sameEntryQuery(entry: Pick<JournalEntryInput, "date" | "title">)
         { property: "Title", title: { equals: entry.title } },
       ],
     },
-    page_size: 1,
+    page_size: 5,
   };
 }

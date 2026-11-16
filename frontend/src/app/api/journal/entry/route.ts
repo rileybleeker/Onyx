@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
-import { easternDate, JOURNAL_MAX_REQUEST_BYTES, sameEntryQuery, validateJournalEntry } from "@/lib/journal-entry";
-import { createJournalPage, notionConfigured, notionPost, notionRefusalMessage, NotionRefused, NOTION_JOURNAL_DB, pageUrl } from "@/lib/journal-file-server";
+import { easternDate, JOURNAL_MAX_REQUEST_BYTES, validateJournalEntry } from "@/lib/journal-entry";
+import { createJournalPage, findSameTitleEntry, notionConfigured, notionRefusalMessage, NotionRefused } from "@/lib/journal-file-server";
 
 // POST /api/journal/entry   Body: { date, title, mood, confidence, source, topics, body }
 //
@@ -13,9 +13,12 @@ import { createJournalPage, notionConfigured, notionPost, notionRefusalMessage, 
 //
 // Journal rules (AGENTS.md "When creating a journal entry in Notion"): Title, Date, Source, Confidence, Mood and
 // Topics are all required here, and the body is written exactly as sent (paragraphs at blank lines).
-// A save repeated with the same date and title returns the entry already there instead of a second copy.
+// A save repeated with the same date, title AND words returns the entry already there instead of a second copy.
+// A different entry under the same date and title is a conflict (409): the draft stays editable, nothing is written
+// and nothing is reported as saved (Onyx#168 P1: it used to answer "already in your journal" for unsaved words).
 //
-// Answers: 200 { url, existing? }, 400 with the reason, 502 when Notion refuses.
+// Answers: 200 { url, existing? }, 400 with the reason, 409 { error, url } on a same-title conflict, 502 when Notion
+// refuses.
 // Privacy: the text goes only to Notion. It is never logged; errors log a short code only.
 // Auth: session only (middleware; NOT in isCiRoute), plus a same-origin JSON check against cross-site posts.
 
@@ -45,10 +48,14 @@ export async function POST(req: NextRequest) {
 
   try {
     // Already saved (a retry after a lost answer, or a second tap)? Return that entry.
-    const found = await notionPost(`databases/${NOTION_JOURNAL_DB}/query`, sameEntryQuery(v.entry));
-    if (!found.ok) return refusedByNotion(found.status);
-    const existing = ((await found.json()) as { results?: unknown[] }).results?.[0];
-    if (existing) return NextResponse.json({ url: pageUrl(existing), existing: true });
+    const same = await findSameTitleEntry(v.entry);
+    if (same?.sameWords) return NextResponse.json({ url: same.url, existing: true });
+    if (same) {
+      return NextResponse.json(
+        { error: "Your journal already has a different entry with this title on this day. Change the title to save this one; your words are still here.", url: same.url },
+        { status: 409 },
+      );
+    }
 
     return NextResponse.json({ url: await createJournalPage(v.entry) });
   } catch (e) {

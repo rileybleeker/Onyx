@@ -1,7 +1,7 @@
 import "server-only";
 import { createHash } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
-import { JOURNAL_TOPICS, notionJournalPage, type JournalEntryInput } from "./journal-entry";
+import { JOURNAL_TOPICS, notionJournalPage, sameEntryQuery, type JournalEntryInput } from "./journal-entry";
 import {
   bodyAsWritten,
   bodyEdit,
@@ -81,6 +81,27 @@ export async function createJournalPageRef(entry: JournalEntryInput): Promise<{ 
 /** Creates the page. Returns its URL. */
 export async function createJournalPage(entry: JournalEntryInput): Promise<string | null> {
   return (await createJournalPageRef(entry)).url;
+}
+
+/**
+ * An entry already saved with this date and title (POST /api/journal/entry). `sameWords` = one of them holds exactly
+ * these words, so the save is a retry and may be answered with that page. `sameWords: false` = a DIFFERENT entry
+ * already uses this title on this day: the caller must not report the new words as saved (Onyx#168, P1). null = none.
+ */
+export async function findSameTitleEntry(entry: JournalEntryInput): Promise<{ url: string | null; sameWords: boolean } | null> {
+  const res = await notionPost(`databases/${NOTION_JOURNAL_DB}/query`, sameEntryQuery(entry));
+  if (!res.ok) throw new NotionRefused(res.status);
+  const pages = ((await res.json()) as { results?: unknown[] }).results ?? [];
+  if (!pages.length) return null;
+  const want = bodyAsWritten(entry.body);
+  for (const page of pages) {
+    const id = (page as { id?: unknown }).id;
+    if (typeof id !== "string") continue;
+    const blocks = await notionGet(`blocks/${encodeURIComponent(id)}/children?page_size=100`);
+    if (!blocks.ok) throw new NotionRefused(blocks.status);
+    if (pageBodyText(((await blocks.json()) as { results?: unknown }).results) === want) return { url: pageUrl(page), sameWords: true };
+  }
+  return { url: pageUrl(pages[0]), sameWords: false };
 }
 
 /**
