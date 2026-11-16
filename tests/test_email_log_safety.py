@@ -108,7 +108,7 @@ class AnySupa:
 
     def __init__(self, fail_with=None, fail_tables=()):
         self.fail_with, self.fail_tables = fail_with, set(fail_tables)
-        self.inserts, self.upserts, self._table = [], [], None
+        self.inserts, self.upserts, self._table, self.created = [], [], None, 0
 
     def __getattr__(self, name):
         if name.startswith("__"):
@@ -146,8 +146,14 @@ class AnySupa:
 
 @contextlib.contextmanager
 def fake_supabase(supa):
+    """Stub `supabase.create_client`; supa.created counts client creations."""
     saved = sys.modules.get("supabase")
-    sys.modules["supabase"] = SimpleNamespace(create_client=lambda url, key: supa)
+    supa.created = 0
+
+    def create_client(url, key):
+        supa.created += 1
+        return supa
+    sys.modules["supabase"] = SimpleNamespace(create_client=create_client)
     try:
         yield supa
     finally:
@@ -205,6 +211,18 @@ class Capture:
 
 
 class Clean(unittest.TestCase):
+    def setUp(self):
+        for module in (u, f, d, o):          # main() opens the gate for write runs; start every test closed
+            module.HEARTBEAT.close()
+
+    @contextlib.contextmanager
+    def write_mode(self, module):
+        module.HEARTBEAT.open()
+        try:
+            yield
+        finally:
+            module.HEARTBEAT.close()
+
     def assertClean(self, text, *extra):
         for secret in ALL + extra:
             self.assertNotIn(secret, text, "public diagnostics carry counts and codes only")
@@ -267,16 +285,51 @@ class HelperTests(Clean):
         self.assertClean(cap.text)
         self.assertNoTracebacks(cap)
 
-    def test_dependency_request_lines_are_dropped_but_warnings_stay(self):
+    def test_dependency_records_are_sanitized_at_every_level(self):
         s.quiet_dependency_loggers()
-        with Capture() as cap:
-            logging.getLogger("httpx").info(f'HTTP Request: GET https://db.example/rest/v1/inbox_emails?account=eq.{ACCOUNT} "200"')
-            logging.getLogger("httpcore.http11").debug(f"send_request_body {SUBJ}")
-            logging.getLogger("postgrest").info(f"request {SUBJ}")
-            logging.getLogger("httpx").warning("pool timeout")
+        s.quiet_dependency_loggers()                      # idempotent: no double wrapping
+        child = logging.getLogger("httpcore.http11")
+        future = logging.getLogger("supabase._sync.client.future_child")
+        child.setLevel(logging.DEBUG)                     # an explicit level below the ancestor's WARNING
+        future.setLevel(logging.INFO)
+        try:
+            with Capture() as cap:
+                logging.getLogger("httpx").info(f'HTTP Request: GET https://db.example/rest/v1/x?account=eq.{ACCOUNT} "200"')
+                child.debug(f"send_request_body {SUBJ}")
+                future.info("row %s", BODY)
+                logging.getLogger("httpx").warning(f"response body: {SUBJ} {ACCOUNT}")
+                logging.getLogger("postgrest").error("failing row %s", ACCOUNT)
+                logging.getLogger("urllib3.connectionpool").critical(EXC, stack_info=True)
+                try:
+                    raise ValueError(f"{EXC} {SUBJ}")
+                except ValueError:
+                    logging.getLogger("postgrest._sync.request").exception(f"request failed {ACCOUNT}")
+                logging.getLogger("httpxish").warning("not a dependency namespace")
+                logging.getLogger("urgent_email_etl").warning("[fp=abcd1234] account_read_failed:imap_auth")
+        finally:
+            child.setLevel(logging.NOTSET)
+            future.setLevel(logging.NOTSET)
         self.assertClean(cap.text)
-        self.assertIn("pool timeout", cap.text, "warnings are not silenced")
+        self.assertNoTracebacks(cap)
+        for marker in ("dependency_log:httpcore:debug", "dependency_log:supabase:info", "dependency_log:httpx:warning",
+                       "dependency_log:postgrest:error", "dependency_log:urllib3:critical"):
+            self.assertIn(marker, cap.text, "that a dependency logged stays visible; what it said does not")
+        self.assertNotIn("dependency_log:httpx:info", cap.text, "INFO request lines stay below the ancestor level")
+        self.assertIn("not a dependency namespace", cap.text, "other loggers are untouched")
+        self.assertIn("account_read_failed:imap_auth", cap.text, "the ETL's own stage codes are untouched")
         self.assertEqual(imaplib.Debug, 0)
+
+    def test_dependency_namespace_matching(self):
+        self.assertEqual(s.dependency_namespace("httpx"), "httpx")
+        self.assertEqual(s.dependency_namespace("httpcore.connection"), "httpcore")
+        self.assertIsNone(s.dependency_namespace("httpxish"))
+        self.assertIsNone(s.dependency_namespace("orders_email_etl"))
+
+    def test_bounded_days(self):
+        self.assertEqual(s.bounded_days("30"), 30)
+        for bad in ("0", "-1", "1000000000", "x", str(s.MAX_DAYS + 1)):
+            with self.subTest(bad=bad), self.assertRaises(Exception):
+                s.bounded_days(bad)
 
     def test_modules_install_the_quiet_levels(self):
         for name in ("httpx", "httpcore", "postgrest", "supabase"):
@@ -285,7 +338,8 @@ class HelperTests(Clean):
 
 class SourceScan(unittest.TestCase):
     """Source-level guard: no traceback logging and no exception text in the four ETLs."""
-    FILES = ("urgent_email_etl.py", "flights_email_etl.py", "delivery_email_etl.py", "orders_email_etl.py")
+    FILES = ("urgent_email_etl.py", "flights_email_etl.py", "delivery_email_etl.py", "orders_email_etl.py",
+             "sync_log_helper.py")
     BANNED = (r"log\.exception\(", r"exc_info\s*=\s*True", r"stack_info\s*=\s*True", r"repr\(e\)", r"str\(e\)",
               r"\{e\}", r"\{e!r\}", r"\{e!s\}", r"traceback\.", r"type\(e\)\.__name__",
               r"\[\{acct\}\]", r"\[\{account\}\]", r"\{acct\}:", r"\{', '\.join\(missing\)\}")
@@ -350,7 +404,7 @@ class UrgentSentinels(Clean):
 
     def test_fatal(self):
         supa = AnySupa()
-        with Capture() as cap, fake_supabase(supa):
+        with Capture() as cap, fake_supabase(supa), self.write_mode(u):
             u.fatal(RuntimeError(f"{EXC} {ACCOUNT} {SUBJ}"))
         self.assertEqual([h["error_message"] for h in supa.heartbeats()], ["fatal:runtime_error"])
         self.assertClean(cap.text)
@@ -418,7 +472,7 @@ class FlightsSentinels(Clean):
 
     def test_fatal(self):
         supa = AnySupa()
-        with Capture() as cap, fake_supabase(supa):
+        with Capture() as cap, fake_supabase(supa), self.write_mode(f):
             f.fatal(KeyError(f"{EXC} {ACCOUNT}"))
         self.assertEqual([h["error_message"] for h in supa.heartbeats()], ["fatal:missing_key"])
         self.assertClean(cap.text)
@@ -496,7 +550,7 @@ class DeliverySentinels(Clean):
 
     def test_fatal(self):
         supa = AnySupa()
-        with Capture() as cap, fake_supabase(supa):
+        with Capture() as cap, fake_supabase(supa), self.write_mode(d):
             d.fatal(OSError(f"{EXC} {ACCOUNT}"))
         self.assertEqual([h["error_message"] for h in supa.heartbeats()], ["fatal:os_error"])
         self.assertClean(cap.text)
@@ -574,7 +628,7 @@ class OrdersSentinels(Clean):
 
     def test_fatal(self):
         supa = AnySupa()
-        with Capture() as cap, fake_supabase(supa):
+        with Capture() as cap, fake_supabase(supa), self.write_mode(o):
             o.fatal(o.RecomputeRefused(f"{EXC}"))
         self.assertEqual([h["error_message"] for h in supa.heartbeats()], ["fatal:recompute_refused"])
         self.assertClean(cap.text)
@@ -587,6 +641,76 @@ class OrdersSentinels(Clean):
                 o.run_file(str(path))
         self.assertIn("parsed", cap.text)
         self.assertClean(cap.text, "Pat Example")
+
+
+class DeliveryRetryWindow(Clean):
+    def test_widened_window_logs_a_stage_not_the_private_date(self):
+        store = d.Store(None, dry_run=True)
+        with Capture() as cap, fake_imap(MailIMAP(delivery_mail()[:1])), \
+                mock.patch.object(d.Store, "oldest_error_day", return_value=date(2024, 2, 29)):
+            stats = d.process_account(ACCOUNT, "pw", store, date(2026, 11, 1), False)
+        self.assertEqual(stats["candidates"], 1)
+        self.assertIn("retry_window_widened", cap.text)
+        self.assertIn("window=widened", cap.text)
+        self.assertClean(cap.text, "2024", "02-28", "02-29")
+
+
+class ReadOnlyCrashPaths(Clean):
+    """--dry-run and --file never create a database client or write a heartbeat, even when they crash;
+    an out-of-range --days is rejected by argparse before anything runs."""
+
+    def _cli(self, module, argv, crash=None):
+        supa = AnySupa()
+        patches = [mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, IMAP_ENV)]
+        if crash:
+            patches.append(mock.patch.object(module, crash, side_effect=RuntimeError(f"{EXC} {ACCOUNT}")))
+        with Capture() as cap, fake_supabase(supa), fake_imap(), contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            try:
+                rc = module.cli()
+            except SystemExit as e:
+                rc = ("exit", e.code)
+        return rc, supa, cap
+
+    def test_dry_run_and_file_crashes_write_nothing(self):
+        missing = str(ROOT / "tests" / "no-such-synthetic-input.eml")
+        cases = [
+            (u, ["urgent_email_etl.py", "--dry-run"], "imap_accounts"),
+            (f, ["flights_email_etl.py", "--dry-run"], "imap_accounts"),
+            (f, ["flights_email_etl.py", "--file", missing], None),
+            (d, ["delivery_email_etl.py", "--dry-run"], "imap_accounts"),
+            (d, ["delivery_email_etl.py", "--file", missing], None),
+            (o, ["orders_email_etl.py", "--dry-run"], "imap_accounts"),
+            (o, ["orders_email_etl.py", "--file", missing], None),
+        ]
+        for module, argv, crash in cases:
+            with self.subTest(argv=argv[1:]):
+                rc, supa, cap = self._cli(module, argv, crash)
+                self.assertEqual(rc, 1)
+                self.assertEqual(supa.heartbeats(), [], "no heartbeat after a read-only invocation")
+                self.assertEqual((supa.inserts, supa.upserts), ([], []))
+                if module is not f or "--file" in argv:
+                    self.assertEqual(supa.created, 0, "no database client at all")
+                self.assertIn("fatal:", cap.text)
+                self.assertClean(cap.text)
+                self.assertFalse(module.HEARTBEAT.allowed)
+
+    def test_out_of_range_days_is_rejected_for_every_etl(self):
+        for module, name in ((u, "urgent"), (f, "flights"), (d, "delivery"), (o, "orders")):
+            for mode in (["--dry-run"], []):
+                with self.subTest(etl=name, mode=mode):
+                    rc, supa, _ = self._cli(module, [f"{name}_email_etl.py", *mode, "--days", "1000000000"])
+                    self.assertEqual(rc, ("exit", 2))
+                    self.assertEqual((supa.created, supa.heartbeats()), (0, []))
+
+    def test_write_mode_crash_still_heartbeats(self):
+        for module, name in ((u, "urgent"), (d, "delivery"), (o, "orders"), (f, "flights")):
+            with self.subTest(etl=name):
+                rc, supa, cap = self._cli(module, [f"{name}_email_etl.py"], "imap_accounts")
+                self.assertEqual(rc, 1)
+                self.assertEqual([h["error_message"] for h in supa.heartbeats()], ["fatal:runtime_error"])
+                self.assertClean(cap.text)
 
 
 if __name__ == "__main__":

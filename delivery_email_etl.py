@@ -59,7 +59,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Optional
 
-from email_log_safety import log_failure, quiet_dependency_loggers
+from email_log_safety import HeartbeatGate, bounded_days, log_failure, quiet_dependency_loggers
 # Shared IMAP / HTML plumbing — one implementation for both email ETLs.
 from flights_email_etl import (
     IMAP_HOST, _fetch_chunks, _imap_date, account_fingerprint, body_lines, decode_hdr,
@@ -70,6 +70,7 @@ log = logging.getLogger("delivery_email_etl")
 # CI logs are public: counts and codes only (email_log_safety.py). No subject, merchant,
 # order key, total, address, account address or exception text is ever logged.
 quiet_dependency_loggers()
+HEARTBEAT = HeartbeatGate()   # opened by main() only for a write-mode run
 
 # Uber receipts go to this mailbox; if it isn't configured the heartbeat says so.
 REQUIRED_ACCOUNTS = ("rileybleeklm@gmail.com",)
@@ -475,15 +476,18 @@ def process_account(account: str, password: str, store: Store, since: date, repr
     try:
         imap.login(account, password)
         box = select_all_mail(imap)
+        window = "default"
         if not reprocess:
             oldest = store.oldest_error_day(account)
             if oldest and oldest - timedelta(days=1) < since:
                 since = oldest - timedelta(days=1)   # one day of slack: the search is date-granular
-                log.info(f"[fp={fp}] widening the search to {since} to retry an errored email")
+                window = "widened"
+                # The widened start comes from a private receipt's date: log the stage, never the date.
+                log.info(f"[fp={fp}] retry_window_widened")
         uids, how = search_uids(imap, since)
         stats["candidates"] = len(uids)
         mailbox = "inbox_fallback" if box == "INBOX" else "all_mail"
-        log.info(f"[fp={fp}] {len(uids)} candidate email(s) since {since} mailbox={mailbox} via {how}")
+        log.info(f"[fp={fp}] {len(uids)} candidate email(s) window={window} mailbox={mailbox} via {how}")
         if not uids:
             return stats
         done = set() if reprocess else store.processed_ids(account)
@@ -598,7 +602,7 @@ def print_dry_summary(store: Store) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"look-back window (default {DEFAULT_DAYS})")
+    ap.add_argument("--days", type=bounded_days, default=DEFAULT_DAYS, help=f"look-back window (default {DEFAULT_DAYS})")
     ap.add_argument("--reprocess", action="store_true", help="re-parse emails already in delivery_email_log")
     ap.add_argument("--dry-run", action="store_true", help="parse and print; touches no database")
     ap.add_argument("--file", help="parse one saved email body and exit")
@@ -610,6 +614,7 @@ def main() -> int:
 
     supa = None
     if not args.dry_run:
+        HEARTBEAT.open()          # write mode, arguments valid: a crash from here on writes a heartbeat
         from supabase import create_client
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
     store = Store(supa, dry_run=args.dry_run)
@@ -665,8 +670,11 @@ def main() -> int:
 
 
 def fatal(e: BaseException) -> None:
-    """Root crash handler: a code on the log and the heartbeat, never the exception text or traceback."""
+    """Root crash handler: a code on the log; a 'failed' heartbeat ONLY when HEARTBEAT was opened by a
+    write-mode run. --dry-run / --file (or a crash before the mode is known) write nothing."""
     code = log_failure(log, "fatal", e, level=logging.ERROR)
+    if not HEARTBEAT.allowed:
+        return
     try:
         from supabase import create_client
         from sync_log_helper import log_sync
@@ -676,11 +684,19 @@ def fatal(e: BaseException) -> None:
         pass
 
 
-if __name__ == "__main__":
+def cli() -> int:
+    """Entry point: main() with the crash handler (heartbeat on crash, per the Onyx ETL convention)."""
+    HEARTBEAT.close()
     try:
-        sys.exit(main())
+        return main()
     except SystemExit:
         raise
-    except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
+    except Exception as e:
         fatal(e)
-        sys.exit(1)
+        return 1
+    finally:
+        HEARTBEAT.close()
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

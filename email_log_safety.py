@@ -20,15 +20,27 @@ error_code() maps an exception to a category by its TYPE (and, for two cases,
 an internal look at a status code that is never emitted). An unknown type is
 "unexpected_error": a third-party class name can itself be descriptive.
 
-quiet_dependency_loggers() keeps HTTP client request lines out of the log.
-httpx logs every request at INFO ("HTTP Request: GET https://.../rest/v1/
-inbox_emails?account=eq.<address>"), and PostgREST filters put the filtered
-values in the URL. Only INFO/DEBUG chatter is dropped: WARNING and above still
-show, and every failure still reaches the ETL's own handler as an exception.
+quiet_dependency_loggers() puts a boundary around the HTTP / database client
+loggers. httpx logs every request at INFO ("HTTP Request: GET https://.../rest/
+v1/inbox_emails?account=eq.<address>"), PostgREST filters put the filtered
+values in the URL, and a dependency WARNING/ERROR (or its traceback) can quote a
+response body. So:
+    * the named namespaces are raised to WARNING (less noise), and
+    * a log-record factory rewrites EVERY record created under those namespaces,
+      any level, any descendant (including ones created later or given an
+      explicit level), to the fixed text "dependency_log:<namespace>:<level>"
+      with no args, exc_info, exc_text or stack_info. That a dependency warned
+      or failed stays visible; what it said does not. Application loggers are
+      untouched, and every failure still reaches the ETL's own handler as an
+      exception, which logs a stage code.
+
+bounded_days() is the argparse type for --days: an absurd value would overflow
+date arithmetic before any per-account handler runs.
 """
 
 from __future__ import annotations
 
+import argparse
 import email.errors
 import imaplib
 import logging
@@ -45,14 +57,69 @@ DEPENDENCY_LOGGERS = ("httpx", "httpcore", "hpack", "h2", "urllib3", "postgrest"
 # PostgREST / Postgres codes for "relation does not exist".
 _MISSING_TABLE_CODES = frozenset({"PGRST205", "42P01"})
 
+MAX_DAYS = 3650
+
+
+def dependency_namespace(name: str) -> Optional[str]:
+    """The DEPENDENCY_LOGGERS namespace a logger name belongs to ('httpcore.http11' -> 'httpcore'), else None."""
+    for ns in DEPENDENCY_LOGGERS:
+        if name == ns or name.startswith(ns + "."):
+            return ns
+    return None
+
+
+_previous_factory = None
+
+
+def _safe_record_factory(*args, **kwargs) -> logging.LogRecord:
+    record = _previous_factory(*args, **kwargs)
+    ns = dependency_namespace(record.name or "")
+    if ns:
+        record.msg = f"dependency_log:{ns}:{record.levelname.lower()}"
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+    return record
+
 
 def quiet_dependency_loggers() -> None:
-    """Raise HTTP/DB client loggers to WARNING and keep imaplib's wire trace off."""
+    """Install the dependency log boundary (idempotent) and keep imaplib's wire trace off."""
+    global _previous_factory
     for name in DEPENDENCY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    if _previous_factory is None:       # install once; re-wrapping a later factory could recurse
+        _previous_factory = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(_safe_record_factory)
     # imaplib prints every command and response (credentials and message data included)
     # when its debug level is raised. Nothing in these ETLs raises it; pin it anyway.
     imaplib.Debug = 0
+
+
+def bounded_days(text: str) -> int:
+    """argparse type: an integer look-back window in 1..MAX_DAYS (rejected before any work or write)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("days must be an integer") from None
+    if not 1 <= n <= MAX_DAYS:
+        raise argparse.ArgumentTypeError(f"days must be between 1 and {MAX_DAYS}")
+    return n
+
+
+class HeartbeatGate:
+    """Whether a crash handler may write a heartbeat. Closed by default: only a write-mode run that
+    parsed its arguments opens it, so a --dry-run / --file invocation (or anything that fails before
+    the mode is known) never creates a database client or writes."""
+
+    def __init__(self) -> None:
+        self.allowed = False
+
+    def open(self) -> None:
+        self.allowed = True
+
+    def close(self) -> None:
+        self.allowed = False
 
 
 def is_missing_table(exc: BaseException) -> bool:

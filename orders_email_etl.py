@@ -54,7 +54,9 @@ from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
-from email_log_safety import error_code, is_missing_table, log_failure, quiet_dependency_loggers
+from email_log_safety import (
+    HeartbeatGate, bounded_days, error_code, is_missing_table, log_failure, quiet_dependency_loggers,
+)
 from flights_email_etl import (
     IMAP_HOST, REQUIRED_ACCOUNTS, _fetch_chunks, account_fingerprint, body_lines, decode_hdr, html_to_lines,
     imap_accounts, plain_to_lines, select_all_mail,
@@ -63,6 +65,7 @@ from flights_email_etl import (
 log = logging.getLogger("orders_email_etl")
 # CI logs are public: counts and codes only (email_log_safety.py).
 quiet_dependency_loggers()
+HEARTBEAT = HeartbeatGate()   # opened by main() only for a write-mode run
 
 
 class RecomputeRefused(RuntimeError):
@@ -1302,7 +1305,7 @@ def run_file(path: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--days", type=int, default=None, help=f"look-back window (default {DEFAULT_DAYS}; {BACKFILL_DAYS} when empty)")
+    ap.add_argument("--days", type=bounded_days, default=None, help=f"look-back window (default {DEFAULT_DAYS}; {BACKFILL_DAYS} when empty)")
     ap.add_argument("--reprocess", action="store_true", help="re-parse emails already stored")
     ap.add_argument("--dry-run", action="store_true", help="read Gmail and print counts; no database access")
     ap.add_argument("--file", help="parse one saved .eml file and print the result")
@@ -1310,6 +1313,8 @@ def main() -> int:
     if args.file:
         run_file(args.file)
         return 0
+    if not args.dry_run:
+        HEARTBEAT.open()          # write mode, arguments valid: a crash from here on writes a heartbeat
     started = time.time()
     accounts = imap_accounts()
     if args.dry_run:
@@ -1335,8 +1340,11 @@ def main() -> int:
 
 
 def fatal(e: BaseException) -> None:
-    """Root crash handler: a code on the log and the heartbeat, never the exception text or traceback."""
+    """Root crash handler: a code on the log; a 'failed' heartbeat ONLY when HEARTBEAT was opened by a
+    write-mode run. --dry-run / --file (or a crash before the mode is known) write nothing."""
     code = log_failure(log, "fatal", e, level=logging.ERROR, extra=ERROR_CODES)
+    if not HEARTBEAT.allowed:
+        return
     try:
         import os
         from supabase import create_client
@@ -1347,11 +1355,19 @@ def fatal(e: BaseException) -> None:
         pass
 
 
-if __name__ == "__main__":
+def cli() -> int:
+    """Entry point: main() with the crash handler (heartbeat on crash, per the Onyx ETL convention)."""
+    HEARTBEAT.close()
     try:
-        sys.exit(main())
+        return main()
     except SystemExit:
         raise
-    except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
+    except Exception as e:
         fatal(e)
-        sys.exit(1)
+        return 1
+    finally:
+        HEARTBEAT.close()
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

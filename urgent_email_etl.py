@@ -38,10 +38,17 @@ Two scopes, kept apart on purpose
    its X-GM-MSGID. The row's gmail_message_id is then absent from that
    complete membership. Anything less (INBOX fallback, a NO/BAD/malformed
    search, a failed or incomplete FETCH, more than MAX_MEMBERSHIP labeled
-   messages, a row without a Gmail message id) makes the account's
+   messages, a SEARCH answer with no untagged SEARCH payload, a mailbox whose
+   LIST flags lack an exact \\All, a row without a Gmail message id) makes the account's
    reconciliation UNKNOWN: nothing is cleared, the rows are counted as kept,
    and the heartbeat is 'partial'. A message that really lost its label is
    cleared by the first run that reconciles completely.
+
+Identity stays (account, message_id). A refreshed message is first matched to
+the stored row with the same Gmail message id and updated under THAT key, so a
+header that lost (or regained) its Message-ID never forks a second row. Only
+Gmail's global id may stand in for a missing Message-ID ('gmail:<id>'); a
+folder-local UID never does, and a message with neither is skipped (kept).
 
 Every run writes ONE pds.sync_log heartbeat (source 'urgent_email',
 data_type 'labels'): success / partial (an account failed or is not
@@ -75,15 +82,16 @@ from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
-from email_log_safety import is_missing_table, log_failure, quiet_dependency_loggers
+from email_log_safety import HeartbeatGate, bounded_days, is_missing_table, log_failure, quiet_dependency_loggers
 # Shared IMAP / HTML plumbing (one implementation for every email ETL).
 from flights_email_etl import (
     IMAP_HOST, REQUIRED_ACCOUNTS, account_fingerprint, body_lines, decode_hdr,
-    imap_accounts, select_all_mail,
+    imap_accounts, select_all_mail_verified,
 )
 
 log = logging.getLogger("urgent_email_etl")
 quiet_dependency_loggers()
+HEARTBEAT = HeartbeatGate()   # opened by main() only for a write-mode run
 
 SOURCE, DATA_TYPE = "urgent_email", "labels"
 AGENT_LABELS = ("Agent/Action", "Agent/Deadline")
@@ -212,7 +220,13 @@ def build_row(account: str, attrs: Optional[dict], header: Optional[email.messag
         return None
     mid = bare_message_id(header.get("Message-ID"))
     if not mid:
-        mid = f"gmail:{attrs.get('gmail_message_id') or attrs['uid'].decode()}"
+        # Only Gmail's global message id may stand in for a missing Message-ID, and store_account
+        # first re-keys to any EXISTING row with that id. A mailbox UID is folder-local and can be
+        # reused: it is never an identity. Neither id -> no row (the stored one is kept).
+        gm = attrs.get("gmail_message_id") or ""
+        if not gm.isdigit():
+            return None
+        mid = f"gmail:{gm}"
     row: dict[str, Any] = {
         "account": account.strip().lower()[:320],
         "message_id": mid[:500],
@@ -243,14 +257,34 @@ def build_row(account: str, attrs: Optional[dict], header: Optional[email.messag
 
 
 def row_gmail_id(row: dict) -> Optional[str]:
-    """The Gmail message id a stored row reconciles by: its gmail_message_id, else a 'gmail:<n>' Message-ID."""
+    """The Gmail message id a stored row reconciles by: its gmail_message_id column only.
+
+    A 'gmail:<n>' Message-ID is NOT parsed: older versions could put a folder-local UID there."""
     gm = (row.get("gmail_message_id") or "").strip()
-    if gm.isdigit():
-        return gm
-    mid = row.get("message_id") or ""
-    if mid.startswith("gmail:") and mid[6:].isdigit():
-        return mid[6:]
-    return None
+    return gm if gm.isdigit() else None
+
+
+def resolve_identities(rows: list[dict], existing: dict[str, list[str]]) -> tuple[list[dict], int]:
+    """Re-key refreshed rows to the PROVEN stored identity of the same Gmail message. Pure.
+
+    existing: gmail_message_id -> message_ids already stored for this account with that id.
+    One stored row  -> the refresh updates it under its stored message_id (a header that lost or
+                       gained its Message-ID never forks a second row).
+    Several rows    -> ambiguous: the refresh is skipped and every stored row kept as it is.
+    None            -> the row keeps the key build_row gave it.
+    Returns (rows to upsert, ambiguous count). Nothing is merged or deleted."""
+    out: dict[str, dict] = {}
+    ambiguous = 0
+    for row in rows:
+        gm = row.get("gmail_message_id")
+        known = sorted(set(existing.get(gm, []))) if gm else []
+        if len(known) > 1:
+            ambiguous += 1
+            continue
+        if known:
+            row = dict(row, message_id=known[0])
+        out[row["message_id"]] = row
+    return list(out.values()), ambiguous
 
 
 def classify_rows(labeled_rows: list[dict], seen_this_run: set[str], membership: Optional[set[str]]) -> dict:
@@ -287,15 +321,15 @@ def classify_rows(labeled_rows: list[dict], seen_this_run: set[str], membership:
 # ---------------------------------------------------------------------------
 
 def _uid_list(data: Any) -> list[bytes]:
-    """UID SEARCH payload → UIDs. Raises SearchMalformed for anything that is not a list of numbers."""
-    if data is None:
-        return []
-    if not isinstance(data, (list, tuple)):
+    """UID SEARCH payload → UIDs. Raises SearchMalformed for anything that is not an explicit answer.
+
+    An empty result is the untagged '* SEARCH' line, which imaplib returns as [b'']. A missing
+    payload (None, [], [None]) means the server sent no SEARCH response at all: that is UNKNOWN,
+    never an authoritative empty result (an empty membership would clear every stored row)."""
+    if not isinstance(data, (list, tuple)) or not data:
         raise SearchMalformed("search payload")
     uids: list[bytes] = []
     for part in data:
-        if part is None:
-            continue
         if not isinstance(part, bytes):
             raise SearchMalformed("search payload")
         for tok in part.split():
@@ -440,7 +474,7 @@ def label_membership(imap: imaplib.IMAP4_SSL, all_mail: bool, chunk: int = 500) 
 def new_stats() -> dict:
     return {"mailbox": None, "search": None, "window_candidates": 0, "dropped_by_cap": 0, "messages": 0,
             "attr_failed_chunks": 0, "header_failed_chunks": 0, "body_failed_chunks": 0,
-            "attrs_missing": 0, "labels_unknown": 0, "headers_missing": 0, "headers_unusable": 0,
+            "attrs_missing": 0, "labels_unknown": 0, "headers_missing": 0, "headers_unusable": 0, "identity_missing": 0,
             "bodies_missing": 0, "body_oversize": 0, "snippet_errors": 0,
             "unlabeled": 0, "skipped": 0, "rows": 0, "action": 0, "deadline": 0,
             "membership": None, "membership_size": 0}
@@ -452,8 +486,7 @@ def process_account(account: str, password: str, since: date, seen_at: str) -> t
     imap = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
         imap.login(account, password)
-        box = select_all_mail(imap)           # SELECT ... readonly
-        all_mail = box != "INBOX"             # select_all_mail only returns another name after a \All box SELECTed OK
+        _box, all_mail = select_all_mail_verified(imap)   # SELECT ... readonly; True only for an exact \All flag
         stats["mailbox"] = "all_mail" if all_mail else "inbox_fallback"
         found, how = search_labeled(imap, since)
         stats["search"] = how
@@ -506,6 +539,12 @@ def process_account(account: str, password: str, since: date, seen_at: str) -> t
                 if h is None:
                     stats["headers_missing"] += 1
                     continue
+                if not (a.get("gmail_message_id") or "").isdigit():
+                    # Even a present RFC Message-ID can be a new key for an old gmail:<id> row.
+                    # Without the global Gmail id we cannot prove identity continuity; keep the
+                    # stored row until a complete attribute response lets us resolve its key.
+                    stats["identity_missing"] += 1
+                    continue
                 try:
                     row = build_row(account, a, h, snippets.get(uid), seen_at, snippet_known=uid in snippets)
                 except Exception:
@@ -519,7 +558,8 @@ def process_account(account: str, password: str, since: date, seen_at: str) -> t
             stats["action"] += "Agent/Action" in row["agent_labels"]
             stats["deadline"] += "Agent/Deadline" in row["agent_labels"]
         stats["rows"] = len(rows)
-        stats["skipped"] = stats["attrs_missing"] + stats["labels_unknown"] + stats["headers_missing"] + stats["headers_unusable"]
+        stats["skipped"] = (stats["attrs_missing"] + stats["labels_unknown"] + stats["headers_missing"]
+                            + stats["headers_unusable"] + stats["identity_missing"])
         membership, stats["membership"], stats["membership_size"] = label_membership(imap, all_mail)
         return rows, stats, membership
     finally:
@@ -564,16 +604,39 @@ def labeled_rows(supa: Any, account: str) -> list[dict]:
         start += 1000
 
 
+def stored_identities(supa: Any, account: str, gmail_ids: Iterable[str]) -> dict[str, list[str]]:
+    """gmail_message_id -> stored message_ids for this account (read-only; any labeled state)."""
+    ids = sorted({g for g in gmail_ids if g and g.isdigit()})
+    out: dict[str, list[str]] = {}
+    for i in range(0, len(ids), 100):
+        start = 0
+        while True:
+            data = (_table(supa).select("message_id,gmail_message_id").eq("account", account)
+                    .in_("gmail_message_id", ids[i:i + 100]).order("message_id")
+                    .range(start, start + 999).execute().data or [])
+            for r in data:
+                if r.get("gmail_message_id") and r.get("message_id"):
+                    out.setdefault(r["gmail_message_id"], []).append(r["message_id"])
+            if len(data) < 1000:
+                break
+            start += 1000
+    return out
+
+
 def store_account(supa: Any, account: str, rows: list[dict], seen_at: str,
                   membership: Optional[set[str]] = None, dry_run: bool = False) -> dict:
     """Upsert what this run read, then clear ONLY rows proven unlabeled by a complete membership.
 
+    Rows are first re-keyed to the stored identity of the same Gmail message (resolve_identities).
     membership None = reconciliation unknown: nothing is cleared. dry_run: reads only, writes nothing,
     and returns the would-clear counts. Returns counts only.
     """
     acct = account.strip().lower()
-    result = {"upserted": 0, "labeled_rows": 0, "seen": 0, "retained": 0, "cleared": 0, "would_clear": 0,
-              "unknown": 0, "unidentified": 0}
+    result = {"refreshed": 0, "upserted": 0, "identity_ambiguous": 0, "labeled_rows": 0, "seen": 0,
+              "retained": 0, "cleared": 0, "would_clear": 0, "unknown": 0, "unidentified": 0}
+    rows, result["identity_ambiguous"] = resolve_identities(
+        rows, stored_identities(supa, acct, (r.get("gmail_message_id") for r in rows)))
+    result["refreshed"] = len(rows)
     if not dry_run:
         result["upserted"] = upsert_rows(supa, rows)
     stored = labeled_rows(supa, acct)
@@ -608,8 +671,11 @@ def _account_notes(fp: str, stats: dict, rec: dict, dry_run: bool) -> list[str]:
     chunks = stats["attr_failed_chunks"] + stats["header_failed_chunks"]
     if unreadable or chunks:
         notes.append(f"account {fp}: {unreadable} message(s) unreadable (attrs {stats['attrs_missing']}, labels "
-                     f"{stats['labels_unknown']}, headers {stats['headers_missing'] + stats['headers_unusable']}), "
-                     f"{chunks} fetch chunk(s) failed (kept)")
+                     f"{stats['labels_unknown']}, headers {stats['headers_missing'] + stats['headers_unusable']}, "
+                     f"identity {stats['identity_missing']}), {chunks} fetch chunk(s) failed (kept)")
+    if rec.get("identity_ambiguous"):
+        notes.append(f"account {fp}: {rec['identity_ambiguous']} message(s) match several stored rows; "
+                     f"not refreshed (kept)")
     snippet_gap = stats["bodies_missing"] + stats["snippet_errors"]
     if snippet_gap or stats["body_failed_chunks"]:
         notes.append(f"account {fp}: {snippet_gap} snippet(s) not refreshed, {stats['body_failed_chunks']} "
@@ -652,8 +718,9 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
         entry["stats"] = {k: v for k, v in stats.items()}
         try:
             if supa is None:            # dry run without a database: nothing is read or written
-                rec = {"upserted": 0, "labeled_rows": None, "seen": None, "retained": None, "cleared": 0,
-                       "would_clear": None, "unknown": None, "unidentified": None}
+                rec = {"refreshed": len(rows), "upserted": 0, "identity_ambiguous": None, "labeled_rows": None,
+                       "seen": None, "retained": None, "cleared": 0, "would_clear": None, "unknown": None,
+                       "unidentified": None}
             else:
                 rec = store_account(supa, account, rows, seen_at, membership, dry_run=dry_run)
         except Exception as e:
@@ -663,11 +730,11 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
             entry["failed"] = code
             continue
         entry["reconcile"] = rec
-        total += len(rows)
+        total += rec["refreshed"]
         cleared_label = "would_clear" if dry_run else "cleared"
         log.info(f"[fp={fp}] mailbox={stats['mailbox']} search={stats['search']} window={days}d "
                  f"candidates={stats['window_candidates']} cap={MAX_MESSAGES} over_cap={stats['dropped_by_cap']} "
-                 f"rows={len(rows)} action={stats['action']} deadline={stats['deadline']} "
+                 f"rows={rec['refreshed']} action={stats['action']} deadline={stats['deadline']} "
                  f"unreadable={stats['skipped']} snippet_gaps={stats['bodies_missing'] + stats['snippet_errors']} "
                  f"reconcile={stats['membership']} labeled_rows={rec['labeled_rows']} "
                  f"{cleared_label}={rec[cleared_label]} retained={rec['retained']} unknown={rec['unknown']} "
@@ -694,9 +761,11 @@ def run(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = F
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help="refresh window (default 30)")
+    ap.add_argument("--days", type=bounded_days, default=DEFAULT_DAYS, help="refresh window (default 30)")
     ap.add_argument("--dry-run", action="store_true", help="read Gmail and print counts; no database access")
     args = ap.parse_args()
+    if not args.dry_run:
+        HEARTBEAT.open()          # write mode, arguments valid: a crash from here on writes a heartbeat
     started = time.time()
     accounts = imap_accounts()
     if args.dry_run:
@@ -715,8 +784,11 @@ def main() -> int:
 
 
 def fatal(e: BaseException) -> None:
-    """Root crash handler: a code on the log and the heartbeat, never the exception text or traceback."""
+    """Root crash handler: a code on the log; a 'failed' heartbeat ONLY when HEARTBEAT was opened by a
+    write-mode run. A --dry-run (or a crash before the mode is known) creates no client and writes nothing."""
     code = log_failure(log, "fatal", e, level=logging.ERROR)
+    if not HEARTBEAT.allowed:
+        return
     try:
         import os
         from supabase import create_client
@@ -727,11 +799,19 @@ def fatal(e: BaseException) -> None:
         pass
 
 
-if __name__ == "__main__":
+def cli() -> int:
+    """Entry point: main() with the crash handler (heartbeat on crash, per the Onyx ETL convention)."""
+    HEARTBEAT.close()
     try:
-        sys.exit(main())
+        return main()
     except SystemExit:
         raise
-    except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
+    except Exception as e:
         fatal(e)
-        sys.exit(1)
+        return 1
+    finally:
+        HEARTBEAT.close()
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

@@ -67,13 +67,19 @@ MESSAGES = {
 }
 
 
+UNSET = object()
+
+
 class FakeIMAP:
     """Read-only Gmail stand-in. `window` = UIDs the dated search returns (defaults to all);
-    the membership search (X-GM-LABELS without SINCE) returns every UID carrying the label, any age."""
+    the membership search (X-GM-LABELS without SINCE) returns every UID carrying the label, any age.
+    `membership_payload` / `window_payload` replace the SEARCH data verbatim (missing / ambiguous answers).
+    `list_lines` replaces the LIST answer; `select_fail` names mailboxes whose SELECT answers NO."""
 
     def __init__(self, messages=None, window=None, fail_login=False, raw_search=True, all_mail=True,
                  fail_fetch=None, drop_labels=(), drop_msgid=(), membership_status="OK",
-                 membership_malformed=False, membership_exclude=()):
+                 membership_malformed=False, membership_exclude=(), membership_payload=UNSET,
+                 window_payload=UNSET, list_lines=None, select_fail=()):
         self.messages = dict(MESSAGES if messages is None else messages)
         self.window = sorted(self.messages if window is None else window, key=int)
         self.fail_login, self.raw_search, self.all_mail = fail_login, raw_search, all_mail
@@ -81,6 +87,8 @@ class FakeIMAP:
         self.drop_labels, self.drop_msgid = set(drop_labels), set(drop_msgid)
         self.membership_status, self.membership_malformed = membership_status, membership_malformed
         self.membership_exclude = set(membership_exclude)
+        self.membership_payload, self.window_payload = membership_payload, window_payload
+        self.list_lines, self.select_fail = list_lines, set(select_fail)
         self.commands, self.selected = [], []
 
     def login(self, user, password):
@@ -89,6 +97,8 @@ class FakeIMAP:
             raise u.imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
 
     def list(self):
+        if self.list_lines is not None:
+            return "OK", list(self.list_lines)
         boxes = [b'(\\HasNoChildren) "/" "INBOX"']
         if self.all_mail:
             boxes.append(b'(\\All \\HasNoChildren) "/" "[Gmail]/All Mail"')
@@ -96,6 +106,8 @@ class FakeIMAP:
 
     def select(self, name, readonly=False):
         self.selected.append((name, readonly))
+        if name in self.select_fail:
+            return "NO", [b"[NONEXISTENT] Unknown Mailbox"]
         return "OK", [str(len(self.messages)).encode()]
 
     def _has(self, uid, label):
@@ -107,12 +119,16 @@ class FakeIMAP:
             if args[1] == "X-GM-RAW":
                 if not self.raw_search:
                     raise u.imaplib.IMAP4.error("unknown search key")
+                if self.window_payload is not UNSET:
+                    return "OK", self.window_payload
                 return "OK", [b" ".join(self.window)]
             label = args[2].strip('"')
             if "SINCE" in args:
                 return "OK", [b" ".join(x for x in self.window if self._has(x, label))]
             if self.membership_status != "OK":
                 return self.membership_status, [b"failure"]
+            if self.membership_payload is not UNSET:
+                return "OK", self.membership_payload
             if self.membership_malformed:
                 return "OK", [b"12 not-a-uid"]
             hits = [x for x in sorted(self.messages, key=int) if self._has(x, label) and x not in self.membership_exclude]
@@ -128,10 +144,11 @@ class FakeIMAP:
                 m = self.messages[uid]
                 if kind == "attrs":
                     labels = b"" if uid in self.drop_labels else b"X-GM-LABELS %s " % m["labels"]
-                    out.append(b"%d (X-GM-THRID %s X-GM-MSGID %s %sUID %s FLAGS %s RFC822.SIZE %d)" % (
-                        n, m["thr"].encode(), m["gm"].encode(), labels, uid, m["flags"], len(m["raw"])))
+                    gmid = b"" if m.get("no_gm") or m.get("no_attrs_gm") else b"X-GM-MSGID %s " % m["gm"].encode()
+                    out.append(b"%d (X-GM-THRID %s %s%sUID %s FLAGS %s RFC822.SIZE %d)" % (
+                        n, m["thr"].encode(), gmid, labels, uid, m["flags"], len(m["raw"])))
                 elif kind == "msgid":
-                    if uid not in self.drop_msgid:
+                    if uid not in self.drop_msgid and not m.get("no_gm"):
                         out.append(b"%d (X-GM-MSGID %s UID %s)" % (n, m["gm"].encode(), uid))
                 elif kind == "headers":
                     header = m["raw"].split(b"\n\n", 1)[0] + b"\n\n"
@@ -174,6 +191,10 @@ class FakeQuery:
         self.filters.append(("lt", col, val))
         return self
 
+    def in_(self, col, vals):
+        self.filters.append(("in", col, list(vals)))
+        return self
+
     def order(self, col):
         return self
 
@@ -186,6 +207,8 @@ class FakeQuery:
             if op == "eq" and row.get(col) != val:
                 return False
             if op == "lt" and not (row.get(col) is not None and row[col] < val):
+                return False
+            if op == "in" and row.get(col) not in val:
                 return False
         return True
 
@@ -212,6 +235,8 @@ class FakeQuery:
             hit = sorted((r for r in self.db.rows.values() if self._match(r)), key=lambda r: r["message_id"])
             if self.rng:
                 hit = hit[self.rng[0]:self.rng[1] + 1]
+            else:
+                hit = hit[:1000]  # PostgREST's default response cap, even for a small IN-filter list.
             return SimpleNamespace(data=[{c: r.get(c) for c in self.cols} for r in hit])
         raise AssertionError(f"unexpected query {self.kind}")
 
@@ -303,9 +328,28 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(row["message_id"], "m@example.org")
         self.assertIsNone(u.build_row(ACCT_A, dict(attrs, agent_labels=None), header, None, "x"), "unknown labels: no row")
 
+    def test_build_row_never_keys_by_mailbox_uid(self):
+        header = EmailMessage()
+        header["From"], header["Date"] = "a@example.org", "Tue, 10 Nov 2026 14:00:00 +0000"   # no Message-ID
+        attrs = {"uid": b"5", "agent_labels": ["Agent/Action"], "gmail_message_id": None}
+        self.assertIsNone(u.build_row(ACCT_A, attrs, header, None, "x"), "no Message-ID and no Gmail id: no row")
+        row = u.build_row(ACCT_A, dict(attrs, gmail_message_id="1777"), header, None, "x")
+        self.assertEqual(row["message_id"], "gmail:1777", "only Gmail's global id may stand in")
+
+    def test_resolve_identities_uses_only_proven_stored_keys(self):
+        rows = [{"message_id": "gmail:11", "gmail_message_id": "11"},      # header lost its Message-ID
+                {"message_id": "new@example.org", "gmail_message_id": "22"},
+                {"message_id": "twice@example.org", "gmail_message_id": "33"},
+                {"message_id": "noid@example.org"}]
+        existing = {"11": ["original@example.org"], "33": ["a@example.org", "b@example.org"]}
+        out, ambiguous = u.resolve_identities(rows, existing)
+        self.assertEqual(sorted(r["message_id"] for r in out), ["new@example.org", "noid@example.org", "original@example.org"])
+        self.assertEqual(ambiguous, 1, "two stored rows for one Gmail id: not refreshed, nothing merged")
+
     def test_row_gmail_id_and_classification(self):
         self.assertEqual(u.row_gmail_id({"gmail_message_id": "77", "message_id": "a@x"}), "77")
-        self.assertEqual(u.row_gmail_id({"gmail_message_id": None, "message_id": "gmail:88"}), "88")
+        self.assertIsNone(u.row_gmail_id({"gmail_message_id": None, "message_id": "gmail:88"}),
+                          "a gmail:<n> key may hold a legacy mailbox UID: never parsed as a Gmail id")
         self.assertIsNone(u.row_gmail_id({"gmail_message_id": None, "message_id": "a@x"}))
         rows = [{"message_id": "seen", "gmail_message_id": "1"}, {"message_id": "kept", "gmail_message_id": "2"},
                 {"message_id": "gone", "gmail_message_id": "3"}, {"message_id": "noid", "gmail_message_id": None}]
@@ -462,15 +506,20 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(supa.row(ACCT_A, "synthetic-602@example.org")["labeled"], "empty window, old label still there")
 
     def test_every_unknown_membership_keeps_rows(self):
-        cases = {
-            "membership_search_failed": dict(membership_status="NO"),
-            "membership_search_malformed": dict(membership_malformed=True),
-            "membership_fetch_failed": dict(fail_fetch={"msgid": {b"101"}}),
-            "membership_fetch_incomplete": dict(drop_msgid={b"102"}),
-            "mailbox_not_all_mail": dict(all_mail=False),
-        }
-        for code, kw in cases.items():
-            with self.subTest(code=code):
+        cases = [
+            ("membership_search_failed", dict(membership_status="NO")),
+            ("membership_search_malformed", dict(membership_malformed=True)),
+            # No untagged SEARCH response at all is NOT an empty result (that is [b'']).
+            ("membership_search_malformed", dict(membership_payload=[None])),
+            ("membership_search_malformed", dict(membership_payload=[])),
+            ("membership_search_malformed", dict(membership_payload=None)),
+            ("membership_search_malformed", dict(membership_payload=[b"", None])),
+            ("membership_fetch_failed", dict(fail_fetch={"msgid": {b"101"}})),
+            ("membership_fetch_incomplete", dict(drop_msgid={b"102"})),
+            ("mailbox_not_all_mail", dict(all_mail=False)),
+        ]
+        for code, kw in cases:
+            with self.subTest(code=code, kw=repr(kw)):
                 supa = FakeSupa([stored(ACCT_A, "unlabeled-elsewhere@example.org", GM(999))])
                 fake = FakeIMAP(**kw)
                 r = run_with([fake], [(ACCT_A, "pw")], supa)
@@ -611,6 +660,189 @@ class RunTests(unittest.TestCase):
         self.assertEqual(supa.rows, before)
         rec = r["accounts"][0]["reconcile"]
         self.assertEqual((rec["would_clear"], rec["retained"], rec["unidentified"], rec["cleared"]), (1, 1, 1, 0))
+
+
+class SearchPayloadTests(unittest.TestCase):
+    def test_uid_list_requires_an_explicit_answer(self):
+        self.assertEqual(u._uid_list([b""]), [], "'* SEARCH' with no numbers is the only empty answer")
+        self.assertEqual(u._uid_list([b"3 1 2"]), [b"3", b"1", b"2"])
+        for bad in (None, [], [None], (None,), [b"", None], [b"1 x"], "1 2", [123]):
+            with self.subTest(bad=repr(bad)), self.assertRaises(u.SearchMalformed):
+                u._uid_list(bad)
+
+    def test_missing_window_payload_reads_nothing_and_clears_nothing(self):
+        for payload in ([None], [], None):
+            with self.subTest(payload=repr(payload)):
+                supa = FakeSupa([stored(ACCT_A, "unlabeled-elsewhere@example.org", GM(999))])
+                r = run_with([FakeIMAP(window_payload=payload)], [(ACCT_A, "pw")], supa)
+                self.assertEqual(r["status"], "failed")
+                self.assertIn("account_read_failed:search_malformed", r["error"])
+                self.assertEqual([op for op in supa.log if op[0] != "select"], [], "no write at all")
+                self.assertTrue(supa.row(ACCT_A, "unlabeled-elsewhere@example.org")["labeled"])
+
+
+class IdentityTests(unittest.TestCase):
+    def test_recovered_header_without_gmail_attribute_cannot_create_a_twin(self):
+        gm = MESSAGES[b"101"]["gm"]
+        old_key = f"gmail:{gm}"
+        supa = FakeSupa([stored(ACCT_A, old_key, gm)])
+        message = dict(MESSAGES[b"101"], no_attrs_gm=True)
+        report = run_with([FakeIMAP(messages={b"101": message})], [(ACCT_A, "pw")], supa)
+        self.assertEqual(set(supa.rows), {(ACCT_A, old_key)})
+        self.assertTrue(supa.row(ACCT_A, old_key)["labeled"])
+        self.assertEqual(supa.row(ACCT_A, old_key)["last_seen_at"], OLD_SEEN)
+        self.assertEqual(report["accounts"][0]["stats"]["identity_missing"], 1)
+        self.assertEqual(report["accounts"][0]["stats"]["membership"], u.RECONCILE_COMPLETE)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(supa.ops("upsert"), [])
+        self.assertEqual(supa.ops("update"), [])
+        # A later complete response updates the original key rather than creating the RFC-key twin.
+        run_with([FakeIMAP(messages={b"101": MESSAGES[b"101"]})], [(ACCT_A, "pw")], supa)
+        self.assertEqual(set(supa.rows), {(ACCT_A, old_key)})
+        self.assertNotEqual(supa.row(ACCT_A, old_key)["last_seen_at"], OLD_SEEN)
+
+    def test_identity_lookup_does_not_hide_ambiguity_after_a_database_page(self):
+        gm = GM(101)
+        mids = [f"copy-{n:04d}@example.org" for n in range(1001)]
+        supa = FakeSupa([stored(ACCT_A, mid, gm) for mid in mids])
+        identities = u.stored_identities(supa, ACCT_A, [gm])
+        self.assertEqual(set(identities[gm]), set(mids))
+        rows, ambiguous = u.resolve_identities([{"message_id": "new@example.org", "gmail_message_id": gm}], identities)
+        self.assertEqual((rows, ambiguous), ([], 1))
+
+    def test_partial_header_without_message_id_updates_the_stored_row(self):
+        messages = {b"801": msg(801, ["Agent/Action"], mid=None, subject="Refreshed subject")}
+        supa = FakeSupa([stored(ACCT_A, "synthetic-801@example.org", GM(801))])
+        r = run_with([FakeIMAP(messages=messages)], [(ACCT_A, "pw")], supa)
+        self.assertEqual(set(supa.rows), {(ACCT_A, "synthetic-801@example.org")}, "no gmail:<id> twin is inserted")
+        row = supa.row(ACCT_A, "synthetic-801@example.org")
+        self.assertEqual(row["subject"], "Refreshed subject")
+        self.assertNotEqual(row["last_seen_at"], OLD_SEEN)
+        self.assertEqual(r["accounts"][0]["reconcile"]["seen"], 1)
+
+    def test_header_regaining_message_id_keeps_the_gmail_keyed_row(self):
+        messages = {b"802": msg(802, ["Agent/Action"])}
+        supa = FakeSupa([stored(ACCT_A, f"gmail:{GM(802)}", GM(802))])
+        run_with([FakeIMAP(messages=messages)], [(ACCT_A, "pw")], supa)
+        self.assertEqual(set(supa.rows), {(ACCT_A, f"gmail:{GM(802)}")}, "the proven stored key wins; no fork")
+
+    def test_neither_identifier_skips_and_keeps(self):
+        m = msg(803, ["Agent/Action"], mid=None)
+        m["no_gm"] = True
+        supa = FakeSupa([stored(ACCT_A, "synthetic-803@example.org", GM(803))])
+        r = run_with([FakeIMAP(messages={b"803": m})], [(ACCT_A, "pw")], supa)
+        self.assertEqual(r["accounts"][0]["stats"]["identity_missing"], 1)
+        self.assertEqual(supa.ops("upsert"), [], "no identity is manufactured (never gmail:<UID>)")
+        self.assertEqual(set(supa.rows), {(ACCT_A, "synthetic-803@example.org")})
+        self.assertTrue(supa.row(ACCT_A, "synthetic-803@example.org")["labeled"])
+        self.assertIn("identity 1", r["error"])
+
+    def test_ambiguous_stored_identity_is_not_refreshed(self):
+        messages = {b"804": msg(804, ["Agent/Action"])}
+        supa = FakeSupa([stored(ACCT_A, "first@example.org", GM(804)), stored(ACCT_A, "second@example.org", GM(804))])
+        r = run_with([FakeIMAP(messages=messages)], [(ACCT_A, "pw")], supa)
+        self.assertEqual(supa.ops("upsert"), [])
+        self.assertEqual(len(supa.rows), 2, "nothing merged, nothing inserted")
+        self.assertTrue(all(row["labeled"] for row in supa.rows.values()), "still labeled per the membership")
+        self.assertEqual(r["accounts"][0]["reconcile"]["identity_ambiguous"], 1)
+        self.assertIn("match several stored rows", r["error"])
+
+
+class MailboxProofTests(unittest.TestCase):
+    def _reconcile(self, **kw):
+        supa = FakeSupa([stored(ACCT_A, "unlabeled-elsewhere@example.org", GM(999))])
+        fake = FakeIMAP(**kw)
+        r = run_with([fake], [(ACCT_A, "pw")], supa)
+        return r, fake, supa
+
+    def test_all_token_in_the_name_is_not_the_all_flag(self):
+        for line in (b'(\\HasNoChildren) "/" "Archive \\\\All"',     # quoted name holding "\All"
+                     b'(\\HasNoChildren) "/" Archive\\All',          # atom name holding "\All"
+                     b'(\\HasNoChildren \\Allmost) "/" "Other"',     # a flag that only starts with \All
+                     b'garbage \\All',                              # malformed line
+                     (b'(\\All) "/" {8}', b"All Mail")):            # literal name: not trusted
+            with self.subTest(line=repr(line)):
+                r, fake, supa = self._reconcile(list_lines=[b'(\\HasNoChildren) "/" "INBOX"', line])
+                self.assertEqual(fake.selected[-1], ("INBOX", True))
+                self.assertEqual(r["accounts"][0]["stats"]["membership"], "mailbox_not_all_mail")
+                self.assertTrue(supa.row(ACCT_A, "unlabeled-elsewhere@example.org")["labeled"])
+
+    def test_failed_select_of_the_all_box_is_not_proof(self):
+        r, fake, supa = self._reconcile(select_fail={'"[Gmail]/All Mail"'})
+        self.assertEqual(fake.selected, [('"[Gmail]/All Mail"', True), ("INBOX", True)])
+        self.assertEqual(r["accounts"][0]["stats"]["membership"], "mailbox_not_all_mail")
+        self.assertTrue(supa.row(ACCT_A, "unlabeled-elsewhere@example.org")["labeled"])
+
+    def test_exact_flag_is_case_insensitive(self):
+        r, fake, supa = self._reconcile(list_lines=[b'(\\HasNoChildren \\all) "/" "[Gmail]/All Mail"'])
+        self.assertEqual(r["accounts"][0]["stats"]["membership"], "complete")
+        self.assertFalse(supa.row(ACCT_A, "unlabeled-elsewhere@example.org")["labeled"])
+
+
+class CliTests(unittest.TestCase):
+    """--dry-run is zero-write on every path, crashes included; write mode still heartbeats on a crash."""
+
+    def _cli(self, argv, **patches):
+        created = []
+        fake_module = SimpleNamespace(create_client=lambda url, key: created.append(1) or FakeSupa())
+        saved = sys.modules.get("supabase")
+        sys.modules["supabase"] = fake_module
+        heartbeats = []
+        import sync_log_helper
+        original_log_sync = sync_log_helper.log_sync
+        sync_log_helper.log_sync = lambda *a, **k: heartbeats.append(k.get("error"))
+        originals = {name: getattr(u, name) for name in patches}
+        for name, value in patches.items():
+            setattr(u, name, value)
+        old_argv = sys.argv
+        sys.argv = argv
+        try:
+            try:
+                rc = u.cli()
+            except SystemExit as e:
+                rc = ("exit", e.code)
+        finally:
+            sys.argv = old_argv
+            for name, value in originals.items():
+                setattr(u, name, value)
+            sync_log_helper.log_sync = original_log_sync
+            if saved is None:
+                sys.modules.pop("supabase", None)
+            else:
+                sys.modules["supabase"] = saved
+        return rc, created, heartbeats
+
+    def _boom(self, *a, **k):
+        raise RuntimeError("synthetic crash")
+
+    def test_out_of_range_days_is_rejected_before_anything(self):
+        with mock_stderr():
+            rc, created, heartbeats = self._cli(["urgent_email_etl.py", "--dry-run", "--days", "1000000000"])
+        self.assertEqual(rc, ("exit", 2))
+        self.assertEqual((created, heartbeats), ([], []))
+
+    def test_dry_run_crash_writes_nothing(self):
+        rc, created, heartbeats = self._cli(["urgent_email_etl.py", "--dry-run"], imap_accounts=self._boom)
+        self.assertEqual(rc, 1)
+        self.assertEqual((created, heartbeats), ([], []), "no client created, no heartbeat")
+        rc, created, heartbeats = self._cli(["urgent_email_etl.py", "--dry-run"], run=self._boom)
+        self.assertEqual((rc, created, heartbeats), (1, [], []))
+        self.assertFalse(u.HEARTBEAT.allowed)
+
+    def test_write_mode_crash_still_heartbeats_a_code(self):
+        rc, created, heartbeats = self._cli(["urgent_email_etl.py"], imap_accounts=lambda: [], run=self._boom)
+        self.assertEqual(rc, 1)
+        self.assertEqual(heartbeats, ["fatal:runtime_error"])
+        self.assertFalse(u.HEARTBEAT.allowed, "the gate closes after every invocation")
+
+
+class mock_stderr:
+    def __enter__(self):
+        self.saved, sys.stderr = sys.stderr, io.StringIO()
+
+    def __exit__(self, *exc):
+        sys.stderr = self.saved
+        return False
 
 
 if __name__ == "__main__":

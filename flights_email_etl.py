@@ -66,7 +66,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from email_log_safety import log_failure, quiet_dependency_loggers
+from email_log_safety import HeartbeatGate, bounded_days, log_failure, quiet_dependency_loggers
 
 load_dotenv()
 
@@ -75,6 +75,7 @@ log = logging.getLogger("flights_email_etl")
 # CI logs are public: counts and codes only (email_log_safety.py). No subject, confirmation,
 # route, passenger, account address or exception text is ever logged.
 quiet_dependency_loggers()
+HEARTBEAT = HeartbeatGate()   # opened by main() only for a write-mode run
 
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com")
 # Both of Riley's Gmail accounts must be wired in (Riley, 2026-11-08). Any of
@@ -961,24 +962,54 @@ def _imap_date(d: date) -> str:
     return f"{d.day:02d}-{['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.month-1]}-{d.year}"
 
 
-def select_all_mail(imap: imaplib.IMAP4_SSL) -> str:
-    """Prefer Gmail's \\All folder so archived (non-INBOX) mail is searched."""
+# One LIST response line: (flags) delimiter name. Quoted strings may carry \" and \\ escapes.
+_LIST_LINE = re.compile(r'^\((?P<flags>[^()]*)\)\s+(?P<delim>"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>"(?:[^"\\]|\\.)*"|[^\s"(){}]+)\s*$',
+                        re.I)
+
+
+def parse_list_line(line: Any) -> Optional[tuple[list[str], str]]:
+    """LIST line -> (flags, mailbox name as it must be sent to SELECT), or None when malformed.
+    A literal (tuple) or undecodable line is malformed: never trusted as All Mail."""
+    if not isinstance(line, bytes):
+        return None
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    m = _LIST_LINE.match(text.strip())
+    if not m:
+        return None
+    name = m.group("name")
+    if not name.startswith('"'):
+        name = f'"{name}"'
+    return m.group("flags").split(), name
+
+
+def select_all_mail_verified(imap: imaplib.IMAP4_SSL) -> tuple[str, bool]:
+    """SELECT (readonly) Gmail's All Mail. Returns (mailbox, verified).
+
+    verified is True only when a well-formed LIST line carries the exact special-use flag \\All
+    (case-insensitive, in the FLAG list, not anywhere in the line) AND its readonly SELECT answered
+    OK. Otherwise INBOX is selected readonly and verified is False: INBOX is never All Mail."""
     try:
         status, boxes = imap.list()
         if status == "OK":
             for b in boxes or []:
-                s = b.decode("utf-8", "replace") if isinstance(b, bytes) else str(b)
-                if "\\All" in s:
-                    name = s.split(' "/" ')[-1].strip()
-                    if not name.startswith('"'):
-                        name = f'"{name}"'
-                    st, _ = imap.select(name, readonly=True)
-                    if st == "OK":
-                        return name
+                parsed = parse_list_line(b)
+                if parsed is None or not any(flag.lower() == "\\all" for flag in parsed[0]):
+                    continue
+                st, _ = imap.select(parsed[1], readonly=True)
+                if st == "OK":
+                    return parsed[1], True
     except Exception as e:
         log_failure(log, "list_failed_inbox_fallback", e)
     imap.select("INBOX", readonly=True)
-    return "INBOX"
+    return "INBOX", False
+
+
+def select_all_mail(imap: imaplib.IMAP4_SSL) -> str:
+    """Prefer Gmail's \\All folder so archived (non-INBOX) mail is searched."""
+    return select_all_mail_verified(imap)[0]
 
 
 def decode_hdr(raw: str | None) -> str:
@@ -1168,7 +1199,7 @@ def run_file(path: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help="look-back window (default 60)")
+    ap.add_argument("--days", type=bounded_days, default=DEFAULT_DAYS, help="look-back window (default 60)")
     ap.add_argument("--reprocess", action="store_true", help="re-parse emails already in flight_email_log")
     ap.add_argument("--dry-run", action="store_true", help="parse but write nothing")
     ap.add_argument("--file", help="parse one saved email body and exit")
@@ -1177,6 +1208,8 @@ def main() -> int:
     if args.file:
         run_file(args.file)
         return 0
+    if not args.dry_run:
+        HEARTBEAT.open()          # write mode, arguments valid: a crash from here on writes a heartbeat
 
     from supabase import create_client
     from sync_log_helper import log_sync
@@ -1239,8 +1272,11 @@ def main() -> int:
 
 
 def fatal(e: BaseException) -> None:
-    """Root crash handler: a code on the log and the heartbeat, never the exception text or traceback."""
+    """Root crash handler: a code on the log; a 'failed' heartbeat ONLY when HEARTBEAT was opened by a
+    write-mode run. --dry-run / --file (or a crash before the mode is known) write nothing."""
     code = log_failure(log, "fatal", e, level=logging.ERROR)
+    if not HEARTBEAT.allowed:
+        return
     try:
         from supabase import create_client
         from sync_log_helper import log_sync
@@ -1250,11 +1286,19 @@ def fatal(e: BaseException) -> None:
         pass
 
 
-if __name__ == "__main__":
+def cli() -> int:
+    """Entry point: main() with the crash handler (heartbeat on crash, per the Onyx ETL convention)."""
+    HEARTBEAT.close()
     try:
-        sys.exit(main())
+        return main()
     except SystemExit:
         raise
-    except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
+    except Exception as e:
         fatal(e)
-        sys.exit(1)
+        return 1
+    finally:
+        HEARTBEAT.close()
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
