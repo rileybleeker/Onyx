@@ -1122,19 +1122,40 @@ export async function readHealthMatrix(sinceStr: string): Promise<Record<string,
   // live view — this page is pure ETL history, staleness is invisible.
   // Paged via .range(): the matrix is at 850+ rows (one/day) and the ALL
   // range would silently truncate at PostgREST's 1000-row cap in ~5 months.
+  // The first page carries count:"exact" and the other pages run in PARALLEL
+  // (the getHabitJournal pattern), so this one /api/derived call stays one
+  // round trip deep as history grows; a page that still comes back full (no
+  // count, or rows added by a refresh in between) is followed serially.
+  // onyx_behavioral_date is unique in the matview, so the order is total.
   const PAGE = 1000;
-  const rows: Record<string, unknown>[] = [];
-  for (let fromIdx = 0; ; fromIdx += PAGE) {
-    const { data, error } = await supabase
+  const page = (fromIdx: number, withCount: boolean) =>
+    supabase
       .from("daily_health_matrix_behavioral_mat")
-      .select(HEALTH_MATRIX_COLS)
+      .select(HEALTH_MATRIX_COLS, withCount ? { count: "exact" } : undefined)
       .gte("onyx_behavioral_date", sinceStr)
       .order("onyx_behavioral_date", { ascending: true })
       .range(fromIdx, fromIdx + PAGE - 1);
-
-    if (error) throw error;
+  const { data: first, error, count } = await page(0, true);
+  if (error) throw error;
+  const rows: Record<string, unknown>[] = [...((first ?? []) as Record<string, unknown>[])];
+  let lastLength = first?.length ?? 0;
+  let nextIdx = PAGE;
+  if (typeof count === "number" && count > PAGE) {
+    const starts = Array.from({ length: Math.ceil(count / PAGE) - 1 }, (_, i) => (i + 1) * PAGE);
+    const rest = await Promise.all(starts.map((fromIdx) => page(fromIdx, false)));
+    for (const { data, error: pageErr } of rest) {
+      if (pageErr) throw pageErr;
+      rows.push(...((data ?? []) as Record<string, unknown>[]));
+      lastLength = data?.length ?? 0;
+    }
+    nextIdx = (starts.length + 1) * PAGE;
+  }
+  while (lastLength === PAGE) {
+    const { data, error: pageErr } = await page(nextIdx, false);
+    if (pageErr) throw pageErr;
     rows.push(...((data ?? []) as Record<string, unknown>[]));
-    if (!data || data.length < PAGE) break;
+    lastLength = data?.length ?? 0;
+    nextIdx += PAGE;
   }
   return rows;
 }

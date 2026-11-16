@@ -453,25 +453,58 @@ function walk(dir, out = []) {
   return out;
 }
 
+/** Every pds materialized view the repo's SQL names (pds.<name>_mat), refresh functions left out. */
+function matviewNames() {
+  const names = new Set();
+  const root = path.join(SRC, "..", "..");
+  for (const dir of [path.join(root, "sql"), path.join(root, "supabase", "migrations")]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const file of fs.readdirSync(dir, { recursive: true })) {
+      if (!String(file).endsWith(".sql")) continue;
+      const text = fs.readFileSync(path.join(dir, String(file)), "utf8");
+      for (const m of text.matchAll(/\bpds\.([a-z_]+_mat)\b/g)) if (!m[1].startsWith("refresh_")) names.add(m[1]);
+    }
+  }
+  return names;
+}
+
 test("guard: outside server-only code, a matview is only read inside a server reader that refuses the browser", () => {
   const SERVER_ONLY_OK = new Set(["lib/travel-server.ts", "app/api/status/route.ts"]);
+  const MATVIEWS = matviewNames();
+  // The six the browser could read before the facade, plus the service-role-only one: the SQL scan found them.
+  for (const name of ["daily_health_matrix_behavioral_mat", "spotify_daily_signature_mat", "recovery_vs_pace_mat",
+    "tz_log_gaps_mat", "hrv_prediction_gaps_mat", "hrv_residuals_mat", "supplement_intake_by_compound_mat"]) {
+    assert.ok(MATVIEWS.has(name), `matview list from sql/: ${name}`);
+  }
   const seen = [];
+  /** One place that names a matview: allowed only in server-only code or inside a server reader. */
+  const checkSite = (rel, src, index, name, what) => {
+    if (SERVER_ONLY_OK.has(rel)) {
+      assert.ok(rel.startsWith("app/api/") || /^import "server-only";/m.test(src), `${rel} must stay server-only`);
+      return;
+    }
+    assert.ok(rel === "lib/queries.ts" || rel === "lib/queries-hrv.ts", `${rel} ${what} ${name} outside a server reader`);
+    const before = src.slice(0, index);
+    const fnStart = before.lastIndexOf("export async function ");
+    assert.ok(fnStart >= 0, `${rel}: ${name} is named outside any function`);
+    const fnName = /export async function (\w+)/.exec(before.slice(fnStart))[1];
+    assert.match(fnName, /^read[A-Z]/, `${rel}: ${name} is used in ${fnName}, not a server reader`);
+    assert.match(before.slice(fnStart), /assertServerRead\("[a-z-]+"\)/, `${rel}: ${fnName} must refuse the browser`);
+  };
   for (const file of walk(SRC)) {
     const rel = path.relative(SRC, file).split(path.sep).join("/");
     const src = fs.readFileSync(file, "utf8");
     for (const m of src.matchAll(/\.from\(\s*["'`]([a-z_]+_mat)["'`]\s*\)/g)) {
       seen.push(`${rel}:${m[1]}`);
-      if (SERVER_ONLY_OK.has(rel)) {
-        assert.ok(rel.startsWith("app/api/") || /^import "server-only";/m.test(src), `${rel} must stay server-only`);
-        continue;
-      }
-      assert.ok(rel === "lib/queries.ts" || rel === "lib/queries-hrv.ts", `${rel} reads ${m[1]} directly`);
-      const before = src.slice(0, m.index);
-      const fnStart = before.lastIndexOf("export async function ");
-      const fnName = /export async function (\w+)/.exec(before.slice(fnStart))[1];
-      assert.match(fnName, /^read[A-Z]/, `${rel}: ${m[1]} is read in ${fnName}, not a server reader`);
-      assert.match(before.slice(fnStart), /assertServerRead\("[a-z-]+"\)/, `${rel}: ${fnName} must refuse the browser`);
+      checkSite(rel, src, m.index, m[1], "reads");
     }
+    // A matview name in any quoted string counts too: a name kept in a constant and read with `.from(T)`
+    // would get past the match above.
+    for (const m of src.matchAll(/["']([a-z_]+_mat)["']/g)) {
+      if (MATVIEWS.has(m[1])) checkSite(rel, src, m.index, m[1], "names");
+    }
+    // A table name built at run time cannot be checked; none may name a matview.
+    assert.ok(!/\.from\(\s*`[^`]*\$\{[^`]*_mat\b/.test(src), `${rel}: a matview name built in a template literal`);
   }
   // The guard actually looked at the readers (it would pass vacuously on a renamed call).
   for (const expected of ["lib/queries.ts:daily_health_matrix_behavioral_mat", "lib/queries.ts:recovery_vs_pace_mat",

@@ -252,18 +252,39 @@ export async function readEnvDoseResponseData(): Promise<SweetSpotRow[]> {
   // this historical chart) through an explicit all-scalar column list (SWEET_SPOT_COLUMNS).
   // Paged: every HRV night is needed (not just temperature nights), which passes PostgREST's
   // 1000-row cap as history grows. onyx_behavioral_date is unique in the matview, so the order
-  // is total (the client's sameJson bailout needs that).
-  const rows: Record<string, unknown>[] = [];
-  for (let from = 0; ; from += 1000) {
-    const { data, error } = await supabase
+  // is total (the client's sameJson bailout needs that). The first page carries count:"exact"
+  // and the other pages run in parallel, so this one /api/derived call stays one round trip
+  // deep; a page that still comes back full (no count, or rows added by a refresh in between)
+  // is followed serially.
+  const PAGE = 1000;
+  const page = (from: number, withCount: boolean) =>
+    supabase
       .from("daily_health_matrix_behavioral_mat")
-      .select(SWEET_SPOT_COLUMNS)
+      .select(SWEET_SPOT_COLUMNS, withCount ? { count: "exact" } : undefined)
       .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null,whoop_hrv_rmssd.not.is.null")
       .order("onyx_behavioral_date", { ascending: true })
-      .range(from, from + 999);
-    if (error) throw error;
+      .range(from, from + PAGE - 1);
+  const { data: first, error, count } = await page(0, true);
+  if (error) throw error;
+  const rows: Record<string, unknown>[] = [...((first ?? []) as unknown as Record<string, unknown>[])];
+  let lastLength = first?.length ?? 0;
+  let nextFrom = PAGE;
+  if (typeof count === "number" && count > PAGE) {
+    const starts = Array.from({ length: Math.ceil(count / PAGE) - 1 }, (_, i) => (i + 1) * PAGE);
+    const rest = await Promise.all(starts.map((from) => page(from, false)));
+    for (const { data, error: pageErr } of rest) {
+      if (pageErr) throw pageErr;
+      rows.push(...((data ?? []) as unknown as Record<string, unknown>[]));
+      lastLength = data?.length ?? 0;
+    }
+    nextFrom = (starts.length + 1) * PAGE;
+  }
+  while (lastLength === PAGE) {
+    const { data, error: pageErr } = await page(nextFrom, false);
+    if (pageErr) throw pageErr;
     rows.push(...((data ?? []) as unknown as Record<string, unknown>[]));
-    if (!data || data.length < 1000) break;
+    lastLength = data?.length ?? 0;
+    nextFrom += PAGE;
   }
   // Compact rows (short keys, nulls dropped): about 420 nights ride in the ISR payload.
   return shapeSweetSpotRows(rows);

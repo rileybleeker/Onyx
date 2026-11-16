@@ -29,8 +29,17 @@ longer reads any `*_mat`; each read is a fixed server query in `lib/queries.ts` 
 middleware, same-origin, no-store, not in `isCiRoute()`; names and date rule in
 `lib/derived-reads.ts`). The `authenticated` SELECT grants on the matviews are
 revoked in a separate reviewed migration, only after that facade is deployed and
-the browser reads are confirmed gone. Future view migrations must preserve
-`security_invoker` and review their entire source graph.
+the browser reads are confirmed gone. In the repo no view reads any of the six
+(the one view over a matview, `pds.daily_micronutrient_totals`, reads
+`supplement_intake_by_compound_mat`, already service-role only); the revoke
+migration re-checks `pg_depend` and function bodies on the live database and
+aborts if anything else reads them. The same change must stop the grants coming
+back: the recreate recipes in `sql/perf_matrix_matview.sql` and
+`sql/perf_tier2_matviews.sql` grant only `service_role` and revoke `anon` /
+`authenticated` (the pds default privileges in `sql/rls_policies.sql` grant
+`authenticated` SELECT on every new relation, matviews included), and PART 1 of
+`sql/pds_owner_only_read.sql` skips matviews. Future view migrations must
+preserve `security_invoker` and review their entire source graph.
 
 Recovery: if preconditions fail, nothing changes. After deployment, repair a
 specific source/caller permission contract while keeping owner RLS intact. Do not
