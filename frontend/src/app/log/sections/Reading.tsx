@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { useInFeed } from "@/components/FeedContext";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
@@ -10,7 +10,7 @@ import { useLogDrafts, type ReadingLogDraft } from "@/lib/log-drafts";
 import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
 import { isBlankSession, newClientKey, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
-import { useAutosave } from "@/lib/use-autosave";
+import { useRetainedAutosave } from "@/lib/use-autosave";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
 /**
@@ -24,6 +24,8 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * Reads GET /api/reading through the client cache (same key as Today and /reading). A Say it draft
  * (ReadingLogDraft) fills the fields Riley has not changed and is saved like his own entry, marked "from what you
  * said"; a new draft after a session was saved starts a new session. Nothing is written on open or on scroll.
+ * An entry not saved yet (incomplete, failed or waiting) survives the section being unmounted: its fields, the session
+ * it made and its client_key stay with its autosaver until it is saved (useRetainedAutosave, PROD-T01).
  */
 
 const READING_URL = LOG_READING_URL;
@@ -102,6 +104,47 @@ function SessionLine({ s }: { s: ReadingSession }) {
 }
 
 type SavedInfo = { xp: number; finished: boolean } | null;
+type DraftMarks = { id: number; fields: Record<Field, boolean> };
+
+/**
+ * The form's own state, kept with its autosaver past this component while the entry is not saved
+ * (lib/autosave-retain.ts, PROD-T01): the scroll dropping the Log page, a navigation, a hidden or moved part. A remount
+ * shows the same fields, the session it made and the same client_key, so a retry after a failure creates the session
+ * once. Memory only (a reload forgets it); forgotten as soon as nothing is left unsaved.
+ */
+type ReadingFormData = {
+  form: Form;
+  touched: Record<Field, boolean>;
+  /** Fields holding a Say it draft's values. */
+  fromDraft: DraftMarks | null;
+  /** The session this form made (POST), edited by every later save (PATCH); null = the next save creates one. */
+  sessionId: number | null;
+  /** Idempotency key of the session being made: a retried create returns the same row. */
+  clientKey: string;
+  /** The day of the habit row that session made, as the server reported it (sent back on a move or removal). */
+  habitCreatedOn: string | null;
+  saved: SavedInfo;
+  heldDraft: boolean;
+  seenDraft: number | null;
+  /** The draft whose values are in the form now (cleared from the store once saved; its marks stay). */
+  pendingDraft: number | null;
+  /** The behavioral day rolled while this entry was not saved: it keeps the day it was made for (sent explicitly). */
+  keptDay: boolean;
+};
+
+const newReadingData = (): ReadingFormData => ({
+  form: blankForm(""),
+  touched: { ...EMPTY_FIELDS },
+  fromDraft: null,
+  sessionId: null,
+  clientKey: "",
+  habitCreatedOn: null,
+  saved: null,
+  heldDraft: false,
+  seenDraft: null,
+  pendingDraft: null,
+  keptDay: false,
+});
 
 export default function ReadingSection() {
   const [data, setData] = useState<ReadingAnswer | null>(() => asReading(clientCache.peek(READING_URL)));
@@ -112,39 +155,100 @@ export default function ReadingSection() {
   const overviewRef = useRef(o);
   overviewRef.current = o;
 
-  const [form, setFormState] = useState<Form>(() => blankForm(today));
-  const formRef = useRef(form);
-  const touched = useRef<Record<Field, boolean>>({ ...EMPTY_FIELDS });
-  const [fromDraft, setFromDraftState] = useState<{ id: number; fields: Record<Field, boolean> } | null>(null);
-  const fromDraftRef = useRef(fromDraft);
-  // The session this form made (POST), edited by every later save (PATCH); null = the next save creates one.
-  const [sessionId, setSessionIdState] = useState<number | null>(null);
-  const sessionRef = useRef<number | null>(null);
-  // Idempotency key of the session being made (a retried create returns the same row), and the day of the habit
-  // row that session made as the server reported it (sent back so a later move or removal can take it back).
-  const clientKey = useRef<string>("");
-  const habitCreatedOn = useRef<string | null>(null);
-  const [saved, setSaved] = useState<SavedInfo>(null);
-  const [heldDraft, setHeldDraft] = useState(false);
+  // The saver and the form's state (`kept`) outlive this component while the entry is not saved. Its save may run
+  // after an unmount (a retry): it reads and writes `kept` only, and touches React state only while mounted.
+  const autosave = useRetainedAutosave<SessionValue, ReadingFormData>(
+    "log-reading",
+    {
+      delayMs: 1500,
+      ready: (v) => v.reason,
+      same: sameReadingValue,
+      save: async (v, { keepalive }) => {
+        // ready() keeps an incomplete value from getting here; never report "Saved" without a request.
+        if (!v.body) throw new AutosaveRefused(v.reason ?? "Enter the chapter you read through to save.");
+        const id = kept.sessionId;
+        const target = readingSaveTarget("sessions", id);
+        const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
+        let json: Record<string, unknown>;
+        try {
+          if (id === null) {
+            if (!kept.clientKey) kept.clientKey = newClientKey();
+            json = await send(target.url, "POST", { ...v.body, client_key: kept.clientKey });
+          } else {
+            json = await send(target.url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+          }
+        } catch (e) {
+          if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+            // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
+            if (kept.sessionId === id) {
+              setSessionId(null);
+              kept.clientKey = newClientKey();
+              kept.habitCreatedOn = null;
+            }
+            throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
+          }
+          throw e;
+        }
+        const session = json.session as ReadingSession | undefined;
+        if (id === null && session?.session_id && kept.sessionId === null) {
+          setSessionId(session.session_id);
+          if (json.replayed) {
+            // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
+            // values on screen now are written onto it.
+            json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+          }
+        }
+        if (typeof json.habit_created_on === "string" || json.habit_created_on === null) kept.habitCreatedOn = (json.habit_created_on as string | null) ?? null;
+        setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
+        showOverview(json.overview as ReadingOverview | null | undefined);
+        const savedDraft = kept.pendingDraft;
+        if (savedDraft !== null) {
+          kept.pendingDraft = null; // first: dropping it from the store must not read as "dismissed before saving"
+          clear(savedDraft);
+        }
+      },
+    },
+    newReadingData,
+  );
+  const kept = autosave.data;
+
+  const [form, setFormState] = useState<Form>(() => kept.form);
+  const [fromDraft, setFromDraftState] = useState<DraftMarks | null>(() => kept.fromDraft);
+  const [sessionId, setSessionIdState] = useState<number | null>(() => kept.sessionId);
+  const [saved, setSavedState] = useState<SavedInfo>(() => kept.saved);
+  const [heldDraft, setHeldDraftState] = useState(() => kept.heldDraft);
   const [removing, setRemoving] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
   const { draft, clear } = useLogDrafts("reading");
-  const seenDraft = useRef<number | null>(null);
-  // The draft whose values are in the form now (cleared from the store once saved; its marks stay).
-  const pendingDraft = useRef<number | null>(null);
+  // The status line under the form: the fields point at it while it says why the entry is not saved.
+  const statusId = `log-reading-status${useId().replace(/:/g, "")}`;
 
   const setForm = (next: Form) => {
-    formRef.current = next;
+    kept.form = next;
     setFormState(next);
   };
-  const setFromDraft = (next: { id: number; fields: Record<Field, boolean> } | null) => {
-    fromDraftRef.current = next;
+  const setFromDraft = (next: DraftMarks | null) => {
+    kept.fromDraft = next;
     setFromDraftState(next);
   };
   const setSessionId = (id: number | null) => {
-    sessionRef.current = id;
-    setSessionIdState(id);
+    kept.sessionId = id;
+    if (alive.current) setSessionIdState(id);
   };
+  const setSaved = (next: SavedInfo) => {
+    kept.saved = next;
+    if (alive.current) setSavedState(next);
+  };
+  const setHeldDraft = (next: boolean) => {
+    kept.heldDraft = next;
+    setHeldDraftState(next);
+  };
+  // A save that was already under way when this copy mounted (a retry while the Log page was away) wrote `kept`
+  // only: show what it made.
+  useEffect(() => {
+    setSessionIdState((prev) => (prev === kept.sessionId ? prev : kept.sessionId));
+    setSavedState((prev) => (prev === kept.saved ? prev : kept.saved));
+  }, [autosave.state, kept]);
 
   const show = useCallback((raw: unknown) => {
     const v = asReading(raw);
@@ -177,62 +281,13 @@ export default function ReadingSection() {
     void cachedJson(READING_URL, { check: checkReading }).then(show).catch(() => {});
   };
 
-  const autosave = useAutosave<SessionValue>("log-reading", {
-    delayMs: 1500,
-    ready: (v) => v.reason,
-    same: sameReadingValue,
-    save: async (v, { keepalive }) => {
-      if (!v.body) return;
-      const id = sessionRef.current;
-      const target = readingSaveTarget("sessions", id);
-      const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
-      let json: Record<string, unknown>;
-      try {
-        if (id === null) {
-          if (!clientKey.current) clientKey.current = newClientKey();
-          json = await send(target.url, "POST", { ...v.body, client_key: clientKey.current });
-        } else {
-          json = await send(target.url, "PATCH", { ...v.body, habit_created_on: habitCreatedOn.current });
-        }
-      } catch (e) {
-        if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
-          // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
-          if (sessionRef.current === id) {
-            setSessionId(null);
-            clientKey.current = newClientKey();
-            habitCreatedOn.current = null;
-          }
-          throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
-        }
-        throw e;
-      }
-      const session = json.session as ReadingSession | undefined;
-      if (id === null && session?.session_id && sessionRef.current === null) {
-        setSessionId(session.session_id);
-        if (json.replayed) {
-          // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
-          // values on screen now are written onto it.
-          json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: habitCreatedOn.current });
-        }
-      }
-      if (typeof json.habit_created_on === "string" || json.habit_created_on === null) habitCreatedOn.current = (json.habit_created_on as string | null) ?? null;
-      if (alive.current) setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
-      showOverview(json.overview as ReadingOverview | null | undefined);
-      const savedDraft = pendingDraft.current;
-      if (savedDraft !== null) {
-        pendingDraft.current = null; // first: dropping it from the store must not read as "dismissed before saving"
-        clear(savedDraft);
-      }
-    },
-  });
-
   /** What the form is worth as a request right now. */
   const valueOf = (f: Form): SessionValue => {
     const cur = overviewRef.current;
-    const marks = fromDraftRef.current?.fields;
+    const marks = kept.fromDraft?.fields;
     const otherBook = cur && f.book && f.book !== cur.book.slug ? f.book : null;
     const day = f.date || cur?.today || "";
-    const chosenDay = touched.current.date || marks?.date ? day : null;
+    const chosenDay = kept.touched.date || kept.keptDay || marks?.date ? day : null;
     return sessionValue(f, { book: otherBook ?? cur?.book.slug ?? "", chosenDay, today: cur?.today ?? "", total: otherBook ? null : cur?.totalChapters || null });
   };
 
@@ -241,41 +296,58 @@ export default function ReadingSection() {
     setForm(next);
     setRemoveError(null);
     const anyBook = !!next.book && next.book !== overviewRef.current?.book.slug;
-    if (sessionRef.current === null && !anyBook && !touched.current.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
+    if (kept.sessionId === null && !anyBook && !kept.touched.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
       autosave.reset(); // back to nothing typed: nothing to save, nothing unsaved
+      if (kept.keptDay) {
+        // Nothing left of the entry that kept its day: the empty form follows today again.
+        kept.keptDay = false;
+        const t = overviewRef.current?.today;
+        if (t && next.date !== t) setForm({ ...next, date: t });
+      }
       return;
     }
     autosave.change(valueOf(next));
   };
 
-  // The behavioral day the server reports: an untouched date follows it (first load, a new day). Not an entry.
+  // The behavioral day the server reports: an untouched date follows it (first load, a new day). Not an entry. An
+  // entry made for the previous day and not saved yet (a create that failed, or is still incomplete; kept across a
+  // remount) keeps that day instead, sent explicitly from now on, so a retry after the rollover never moves it to
+  // the new day. The form shows "For <that day>" and Riley can still change it.
   useEffect(() => {
-    if (!today || touched.current.date || fromDraftRef.current?.fields.date) return;
-    if (formRef.current.date !== today) setForm({ ...formRef.current, date: today });
+    if (!today || kept.touched.date || kept.keptDay || kept.fromDraft?.fields.date) return;
+    const f = kept.form;
+    if (f.date === today) return;
+    if (f.date && f.date < today && kept.sessionId === null && autosave.dirty) {
+      kept.keptDay = true;
+      commit(f);
+      return;
+    }
+    setForm({ ...f, date: today });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [today]);
 
   const set = (field: Field, patch: Partial<Form>) => {
-    touched.current[field] = true;
-    const fd = fromDraftRef.current;
+    kept.touched[field] = true;
+    const fd = kept.fromDraft;
     if (fd?.fields[field]) setFromDraft({ ...fd, fields: { ...fd.fields, [field]: false } });
-    commit({ ...formRef.current, ...patch });
+    commit({ ...kept.form, ...patch });
   };
 
   /** Start the next session: the one on screen is kept as saved. */
   const startNew = useCallback(() => {
     setSessionId(null);
-    clientKey.current = newClientKey();
-    habitCreatedOn.current = null;
+    kept.clientKey = newClientKey();
+    kept.habitCreatedOn = null;
     setHeldDraft(false);
-    touched.current = { ...EMPTY_FIELDS };
+    kept.touched = { ...EMPTY_FIELDS };
+    kept.keptDay = false;
     setFromDraft(null);
     setSaved(null);
     setRemoveError(null);
     autosave.reset();
     setForm(blankForm(overviewRef.current?.today ?? ""));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autosave.reset]);
+  }, [autosave.reset, kept]);
 
   const applyDraft = async (force: boolean) => {
     if (!draft) return;
@@ -283,7 +355,7 @@ export default function ReadingSection() {
     // Words about another session: the session already made from this form keeps its values (anything still
     // waiting is sent first), and the words fill a new one. If that send fails the form stays as it is and the
     // words wait (Use, once it is saved).
-    if (sessionRef.current !== null) {
+    if (kept.sessionId !== null) {
       const ok = await autosave.flush();
       if (!alive.current) return;
       if (!ok) {
@@ -296,42 +368,42 @@ export default function ReadingSection() {
     const applied: Record<Field, boolean> = { ...EMPTY_FIELDS };
     const patch: Partial<Form> = {};
     for (const key of Object.keys(vals) as Field[]) {
-      if (!force && touched.current[key]) continue;
+      if (!force && kept.touched[key]) continue;
       (patch as Record<string, unknown>)[key] = vals[key];
       applied[key] = true;
-      if (force) touched.current[key] = false;
+      if (force) kept.touched[key] = false;
     }
     setFromDraft({ id: d.id, fields: applied });
-    pendingDraft.current = d.id;
-    commit({ ...formRef.current, ...patch });
+    kept.pendingDraft = d.id;
+    commit({ ...kept.form, ...patch });
   };
 
   useEffect(() => {
-    if (!draft || seenDraft.current === draft.id) return;
-    seenDraft.current = draft.id;
+    if (!draft || kept.seenDraft === draft.id) return;
+    kept.seenDraft = draft.id;
     void applyDraft(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
   /** Take the draft's values out of the fields Riley has not changed (they were never kept). */
   const revertDraftFields = () => {
-    const fd = fromDraftRef.current;
+    const fd = kept.fromDraft;
     if (!fd) return;
     const blank = blankForm(overviewRef.current?.today ?? "");
-    const next = { ...formRef.current };
+    const next = { ...kept.form };
     for (const key of Object.keys(fd.fields) as Field[]) {
-      if (fd.fields[key] && !touched.current[key]) (next as Record<string, unknown>)[key] = blank[key];
+      if (fd.fields[key] && !kept.touched[key]) (next as Record<string, unknown>)[key] = blank[key];
     }
     setFromDraft(null);
-    pendingDraft.current = null;
+    kept.pendingDraft = null;
     commit(next);
   };
 
   useEffect(() => {
     // The draft left the store before its values were saved (dismissed elsewhere): they go too, so nothing Riley
     // did not keep is saved. A newer draft is handled by applyDraft above. A saved draft keeps its marks.
-    const f = fromDraftRef.current;
-    if (f && !draft && pendingDraft.current === f.id && sessionRef.current === null) revertDraftFields();
+    const f = kept.fromDraft;
+    if (f && !draft && kept.pendingDraft === f.id && kept.sessionId === null) revertDraftFields();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
@@ -341,13 +413,13 @@ export default function ReadingSection() {
   };
 
   const removeSession = async () => {
-    const id = sessionRef.current;
+    const id = kept.sessionId;
     if (id === null || removing) return;
     autosave.reset(); // an edit still waiting belongs to the session being removed
     setRemoving(true);
     setRemoveError(null);
     try {
-      const day = habitCreatedOn.current;
+      const day = kept.habitCreatedOn;
       const res = await fetch(`/api/reading/sessions/${id}${day ? `?habit_created_on=${encodeURIComponent(day)}` : ""}`, { method: "DELETE" });
       const json = (await res.json().catch(() => ({}))) as { error?: string; overview?: ReadingOverview | null };
       if (!res.ok && res.status !== 404) throw new Error(json.error || `HTTP ${res.status}`);
@@ -406,7 +478,8 @@ export default function ReadingSection() {
   const paceClass = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-down";
   const mediaOptions = form.medium === "kindle" ? [...MEDIA, { key: "kindle" as Medium, label: "Kindle" }] : MEDIA;
   const day = form.date || o.today;
-  const anyTouched = Object.values(touched.current).some(Boolean) || anyMarked;
+  const anyTouched = Object.values(kept.touched).some(Boolean) || anyMarked;
+  const describedBy = (st === "incomplete" && anyTouched) || st === "error" ? statusId : undefined;
   const savedText = `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
 
   const inputCls =
@@ -510,6 +583,7 @@ export default function ReadingSection() {
             <input
               type="number" inputMode="numeric" min={0} max={total || undefined}
               value={form.from}
+              aria-describedby={describedBy}
               onChange={(e) => set("from", { from: e.target.value })}
               placeholder="auto"
               className={inputCls}
@@ -520,6 +594,7 @@ export default function ReadingSection() {
             <input
               type="number" inputMode="numeric" min={0} max={total || undefined}
               value={form.through}
+              aria-describedby={describedBy}
               onChange={(e) => set("through", { through: e.target.value })}
               placeholder={String(next)}
               className={inputCls}
@@ -549,6 +624,7 @@ export default function ReadingSection() {
             <input
               type="number" inputMode="numeric" min={0}
               value={form.minutes}
+              aria-describedby={describedBy}
               onChange={(e) => set("minutes", { minutes: e.target.value })}
               placeholder="30"
               className={inputCls}
@@ -560,6 +636,7 @@ export default function ReadingSection() {
               type="date"
               value={day}
               max={o.today}
+              aria-describedby={describedBy}
               onChange={(e) => set("date", { date: e.target.value || o.today })}
               className={inputCls}
             />
@@ -570,6 +647,7 @@ export default function ReadingSection() {
           <span className={labelCls}>Recall note {marked("recall") && <DraftMark />}</span>
           <textarea
             value={form.recall}
+            aria-describedby={describedBy}
             onChange={(e) => set("recall", { recall: e.target.value })}
             rows={2}
             placeholder="Optional, from memory"
@@ -581,7 +659,7 @@ export default function ReadingSection() {
           <span className="text-[12px] text-text-tertiary">
             {day !== o.today ? `For ${fmtDate(day)}` : "For today"}
             {" · "}
-            <AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyTouched} />
+            <AutosaveStatus id={statusId} state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyTouched} />
           </span>
           {sessionId !== null && (
             <span className="flex items-center gap-1">
@@ -605,7 +683,17 @@ export default function ReadingSection() {
           )}
         </div>
         {removeError && (
-          <p role="alert" className="mt-2 text-[13px] text-down">{removeError}</p>
+          <div className="mt-2 flex flex-wrap items-center gap-x-2 text-[13px] text-down">
+            <p role="alert">{removeError}</p>
+            <button
+              type="button"
+              onClick={() => void removeSession()}
+              disabled={busy}
+              className="min-h-11 px-1 text-text-secondary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
+            >
+              Retry
+            </button>
+          </div>
         )}
       </form>
     </LogCard>

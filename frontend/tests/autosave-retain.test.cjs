@@ -1,0 +1,263 @@
+// Run: node --test tests/autosave-retain.test.cjs (offline; compiles lib/autosave.ts, lib/unsaved-work.ts and
+// lib/autosave-retain.ts only). PROD-T01, 2026-11-16: an autosaving form whose component unmounts (the scroll
+// dropping the Log page, a navigation, a hidden part) keeps its entry, its operation key and its retry until saved.
+// SYNTHETIC DATA ONLY: invented values; no network, no storage.
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const { mkdtempSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
+
+const out = mkdtempSync(path.join(tmpdir(), 'onyx-autosave-retain-'));
+execFileSync(process.execPath, [
+  require.resolve('typescript/bin/tsc'),
+  'src/lib/autosave.ts', 'src/lib/unsaved-work.ts', 'src/lib/autosave-retain.ts',
+  '--outDir', out, '--module', 'commonjs', '--target', 'ES2022', '--skipLibCheck',
+]);
+const { AutosaveRefused } = require(path.join(out, 'autosave.js'));
+const { UnsavedWork } = require(path.join(out, 'unsaved-work.js'));
+const { FormRetainer, MAX_RETAINED } = require(path.join(out, 'autosave-retain.js'));
+
+const settle = () => new Promise((r) => setImmediate(r));
+
+/** Manual clock: timers run only when advance() passes them. */
+function fakeTimers() {
+  let now = 0;
+  let next = 1;
+  const pending = new Map();
+  return {
+    set: (fn, ms) => { const id = next++; pending.set(id, { at: now + ms, fn }); return id; },
+    clear: (id) => { pending.delete(id); },
+    async advance(ms) {
+      const until = now + ms;
+      for (;;) {
+        const due = [...pending.entries()].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        pending.delete(due[0]);
+        now = due[1].at;
+        due[1].fn();
+        await settle();
+      }
+      now = until;
+      await settle();
+    },
+    count: () => pending.size,
+  };
+}
+
+/** A synthetic create endpoint: one row per operation key, like client_key on POST /api/reading/sessions. */
+function endpoint() {
+  const rows = new Map();
+  const calls = [];
+  let mode = 'up'; // 'up' | 'offline' | 'refuse'
+  return {
+    rows, calls,
+    set mode(m) { mode = m; },
+    async create(value, key) {
+      calls.push({ value, key });
+      if (mode === 'offline') throw new TypeError('Failed to fetch');
+      if (mode === 'refuse') throw new AutosaveRefused('Synthetic refusal');
+      if (!rows.has(key)) rows.set(key, value);
+      return rows.get(key);
+    },
+  };
+}
+
+const ready = (v) => (v.through ? null : 'Enter the chapter you read through to save.');
+const data = () => ({ key: 'synthetic-key-1', row: null });
+
+/** One "component": create-or-take-over, attach, and the listener it would hand to setState. */
+function mount(retainer, name, opts, init = data) {
+  const states = [];
+  const form = retainer.find(name) ?? retainer.create(name, init(), opts);
+  const listener = (s) => states.push(s.status);
+  retainer.attach(form, listener);
+  return { form, states, unmount: () => retainer.detach(form, listener) };
+}
+
+function setup({ max } = {}) {
+  const timers = fakeTimers();
+  const work = new UnsavedWork();
+  const retainer = new FormRetainer({ work, timers, max });
+  const api = endpoint();
+  let current = null; // the form whose data the save reads (stands in for the component's `kept`)
+  const opts = {
+    delayMs: 800,
+    ready,
+    save: async (v) => {
+      const d = current.data;
+      d.row = await api.create(v, d.key);
+    },
+  };
+  const show = (name = 'log-reading') => {
+    const m = mount(retainer, name, opts);
+    current = m.form;
+    return m;
+  };
+  return { timers, work, retainer, api, show };
+}
+
+test('an incomplete entry survives its component: kept, counted as unsaved, taken over with its data; nothing is sent', async () => {
+  const { work, retainer, api, show } = setup();
+  const a = show();
+  a.form.data.minutes = '25'; // the component writes its fields into data
+  a.form.saver.change({ minutes: '25' });
+  assert.equal(a.form.saver.state.status, 'incomplete');
+  await a.unmount();
+  assert.equal(api.calls.length, 0, 'an incomplete entry is never sent');
+  assert.equal(retainer.size, 1, 'kept');
+  assert.equal(work.has(), true, 'still unsaved work: the updater never reloads over it');
+
+  const b = show();
+  assert.equal(b.form, a.form, 'the next copy takes the same form over');
+  assert.equal(b.form.data.minutes, '25', 'with its fields');
+  assert.equal(b.form.saver.state.status, 'incomplete');
+  assert.equal(work.has(), false, 'the kept key is cleared while a component shows it (it registers its own)');
+  assert.equal(api.calls.length, 0, 'taking over sends nothing');
+
+  b.form.saver.change({ minutes: '25', through: '3' });
+  await b.form.saver.flush();
+  assert.equal(api.calls.length, 1);
+  assert.equal(b.form.saver.state.status, 'saved');
+});
+
+test('offline: a failed create keeps its operation key across unmount and remount; Retry creates the row once', async () => {
+  const { timers, work, retainer, api, show } = setup();
+  api.mode = 'offline';
+  const a = show();
+  a.form.saver.change({ through: '3' });
+  await timers.advance(800);
+  assert.equal(a.form.saver.state.status, 'error');
+  assert.equal(a.form.saver.state.retrying, true);
+  await a.unmount(); // the unmount sends once more (still offline)
+  assert.equal(retainer.size, 1);
+  assert.equal(work.has(), true, 'a failed entry with nobody showing it is still unsaved work');
+
+  const b = show();
+  assert.equal(b.form, a.form);
+  assert.equal(b.form.saver.state.status, 'error', 'the new copy shows the failure, with Retry');
+  api.mode = 'up';
+  assert.equal(await b.form.saver.retry(), true);
+  assert.equal(b.form.saver.state.status, 'saved');
+  const keys = new Set(api.calls.map((c) => c.key));
+  assert.deepEqual([...keys], ['synthetic-key-1'], 'every attempt carried the same operation key');
+  assert.equal(api.rows.size, 1, 'one row, never two');
+  await b.unmount();
+  assert.equal(retainer.size, 0, 'saved: nothing left to keep');
+  assert.equal(work.has(), false);
+});
+
+test('a kept entry keeps retrying while nobody shows it; the retry that gets through releases it', async () => {
+  const { timers, work, retainer, api, show } = setup();
+  api.mode = 'offline';
+  const a = show();
+  a.form.saver.change({ through: '4' });
+  await timers.advance(800);
+  await a.unmount();
+  const before = api.calls.length;
+  assert.ok(timers.count() > 0, 'its retry timer is still set (not disposed at unmount)');
+  api.mode = 'up';
+  await timers.advance(60_000);
+  assert.equal(api.calls.length, before + 1, 'one more send, by the retry timer');
+  assert.equal(api.rows.size, 1);
+  assert.equal(retainer.size, 0, 'clean now: released');
+  assert.equal(work.has(), false);
+  assert.equal(timers.count(), 0, 'and stopped');
+
+  const b = show();
+  assert.notEqual(b.form, a.form, 'the next copy starts a new form');
+  assert.equal(b.form.saver.state.status, 'idle');
+});
+
+test('a refused entry is kept without retrying, and Retry from the next copy sends it once', async () => {
+  const { timers, retainer, api, show } = setup();
+  api.mode = 'refuse';
+  const a = show();
+  a.form.saver.change({ through: '2' });
+  await timers.advance(800);
+  assert.equal(a.form.saver.state.status, 'error');
+  assert.equal(a.form.saver.state.retrying, false);
+  await a.unmount();
+  const calls = api.calls.length;
+  await timers.advance(120_000);
+  assert.equal(api.calls.length, calls, 'a refusal waits for Riley, also while nobody shows it');
+  assert.equal(retainer.size, 1);
+  api.mode = 'up';
+  const b = show();
+  await b.form.saver.retry();
+  assert.equal(api.calls.length, calls + 1);
+  assert.equal(b.form.saver.state.status, 'saved');
+});
+
+test('a clean form is forgotten at unmount, and a waiting one is sent once then forgotten', async () => {
+  const { work, retainer, api, show } = setup();
+  const a = show();
+  await a.unmount();
+  assert.equal(retainer.size, 0);
+  const b = show();
+  assert.notEqual(b.form, a.form);
+  b.form.saver.change({ through: '5' }); // waiting for its 800 ms
+  await b.unmount();
+  assert.equal(api.calls.length, 1, 'what was waiting is sent at unmount (keepalive)');
+  assert.equal(retainer.size, 0);
+  assert.equal(work.has(), false);
+});
+
+test('development double mount: detach then attach before the send settles keeps the same form', async () => {
+  const { retainer, show } = setup();
+  const a = show();
+  a.form.saver.change({ minutes: '10' }); // incomplete
+  const listener = () => {};
+  const pending = a.unmount();
+  retainer.attach(a.form, listener); // React mounts it again at once
+  await pending;
+  assert.equal(retainer.size, 1);
+  assert.equal(retainer.find('log-reading'), a.form);
+  assert.equal(a.form.mounts, 1);
+});
+
+test('bounded: at most MAX_RETAINED names, one form per name; a second copy shown at the same time is not kept', async () => {
+  const { retainer, show } = setup({ max: 2 });
+  assert.ok(MAX_RETAINED >= 2 && MAX_RETAINED <= 16, 'a small fixed bound');
+  const one = show('one');
+  const two = show('two');
+  const three = show('three');
+  assert.equal(retainer.size, 2, 'the third name is not kept');
+  for (const m of [one, two, three]) m.form.saver.change({ minutes: '1' });
+  await three.unmount();
+  assert.equal(retainer.find('three'), null, 'beyond the bound: not kept past its component');
+  await one.unmount();
+  assert.equal(retainer.find('one'), one.form, 'within the bound: kept');
+
+  // Two copies of one form at once (not how the app draws it): the first copy owns the name.
+  const r2 = setup();
+  const first = r2.show('dup');
+  const second = r2.retainer.create('dup', data(), { ready, save: async () => {} });
+  r2.retainer.attach(second, () => {});
+  second.saver.change({ minutes: '3' });
+  await r2.retainer.detach(second, () => {});
+  assert.equal(r2.retainer.find('dup'), first.form);
+});
+
+test('listeners: every copy hears state changes; a detached listener does not', async () => {
+  const { timers, show } = setup();
+  const a = show();
+  a.form.saver.change({ through: '6' });
+  await timers.advance(800);
+  assert.deepEqual(a.states, ['waiting', 'saving', 'saved']);
+  await a.unmount();
+  a.form.saver.change({ through: '7' });
+  assert.deepEqual(a.states, ['waiting', 'saving', 'saved'], 'nothing after detach');
+});
+
+test('clear() forgets every kept form and its unsaved-work key', async () => {
+  const { work, retainer, show } = setup();
+  const a = show();
+  a.form.saver.change({ minutes: '1' });
+  await a.unmount();
+  assert.equal(work.has(), true);
+  retainer.clear();
+  assert.equal(retainer.size, 0);
+  assert.equal(work.has(), false);
+});

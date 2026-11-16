@@ -1,0 +1,355 @@
+// Run: node --test tests/log-reading-retain.test.cjs (offline). PROD-T01, 2026-11-16: the /log Reading section
+// (app/log/sections/Reading.tsx) keeps an entry that is not saved yet when the section is unmounted (the continuous
+// scroll dropping the Log page, a navigation, a hidden part) and shows it again on the next mount; a create that
+// failed offline keeps its client_key, so Retry creates the session once; opening the section never sends anything;
+// an entry made before the behavioral day rolls keeps its own day.
+// Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
+// tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
+// "server" is the in-memory fetch below.
+const { test } = require("node:test");
+const assert = require("node:assert/strict");
+const { loadTs } = require("./helpers/load-ts.cjs");
+
+// One copy of each shared module: loadTs has no module cache, and a second copy of lib/autosave.ts would give the
+// section its own AutosaveRefused class (the scheduler's instanceof check would not recognise it).
+const autosaveLib = loadTs("lib/autosave.ts");
+const unsavedLib = loadTs("lib/unsaved-work.ts");
+const retainLib = loadTs("lib/autosave-retain.ts", { "./autosave": autosaveLib, "./unsaved-work": unsavedLib });
+
+const D1 = "2031-04-10";
+const D2 = "2031-04-11";
+const answer = (today = D1) => ({
+  overview: {
+    book: { slug: "synthetic-book", title: "A Synthetic Book", status: "reading" },
+    today,
+    totalChapters: 12,
+    chaptersDone: 2,
+    percent: 17,
+    pace: { aheadBy: 0 },
+    streak: { current: 1 },
+    position: null,
+    sessions: [],
+  },
+  books: [],
+});
+
+function manualTimers() {
+  let now = 0;
+  let next = 1;
+  const pending = new Map();
+  return {
+    set: (fn, ms) => { const id = next++; pending.set(id, { at: now + ms, fn }); return id; },
+    clear: (id) => { pending.delete(id); },
+    due(ms) {
+      const until = now + ms;
+      const hit = [...pending.entries()].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!hit) { now = until; return null; }
+      pending.delete(hit[0]);
+      const left = until - hit[1].at;
+      now = hit[1].at;
+      return { fn: hit[1].fn, left };
+    },
+    count: () => pending.size,
+  };
+}
+
+// ---- a tiny renderer: function components, hooks, mount / unmount ----
+const R = { frames: new Map(), frame: null, dirty: true, mounted: false, gen: 0 };
+const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
+const slot = () => [R.frame.slots, R.frame.index++];
+let effects = [];
+const hooks = {
+  useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${i}:`; },
+  useState(initialValue) {
+    const [slots, i] = slot();
+    if (!(i in slots)) slots[i] = typeof initialValue === "function" ? initialValue() : initialValue;
+    const gen = R.gen;
+    return [slots[i], (value) => {
+      if (gen !== R.gen || !R.mounted) return; // an unmounted copy: ignored, like React
+      const next = typeof value === "function" ? value(slots[i]) : value;
+      if (Object.is(next, slots[i])) return;
+      slots[i] = next;
+      R.dirty = true;
+    }];
+  },
+  useRef(value) { const [slots, i] = slot(); return slots[i] ??= { current: value }; },
+  useMemo(create, deps) {
+    const [slots, i] = slot();
+    if (!slots[i] || !equal(slots[i].deps, deps)) slots[i] = { deps, value: create() };
+    return slots[i].value;
+  },
+  useCallback(callback, deps) { return hooks.useMemo(() => callback, deps); },
+  useEffect(effect, deps) {
+    const [slots, i] = slot();
+    if (!slots[i] || deps === undefined || !equal(slots[i].deps, deps)) {
+      const old = slots[i];
+      const cell = { deps, cleanup: undefined };
+      slots[i] = cell;
+      effects.push(() => { old?.cleanup?.(); cell.cleanup = effect(); });
+    }
+  },
+};
+
+function setup(t) {
+  const timers = manualTimers();
+  const work = new unsavedLib.UnsavedWork();
+  const retainer = new retainLib.FormRetainer({ work, timers });
+  let current = answer();
+  const subscribers = new Set();
+  const calls = [];
+  const rows = new Map();
+  let mode = "up";
+  const reply = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
+  const replacements = {
+    document: { visibilityState: "visible", activeElement: null, body: {}, addEventListener() {}, removeEventListener() {} },
+    window: { addEventListener() {}, removeEventListener() {} },
+    fetch: async (url, init = {}) => {
+      const body = init.body ? JSON.parse(init.body) : null;
+      calls.push({ url, method: init.method, body });
+      if (mode === "offline") throw new TypeError("Failed to fetch");
+      if (init.method === "POST" && url === "/api/reading/sessions") {
+        const replayed = rows.has(body.client_key);
+        if (!replayed) rows.set(body.client_key, { session_id: 500 + rows.size + 1, ...body });
+        return reply({ session: rows.get(body.client_key), replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: body.date ?? D1, overview: null });
+      }
+      if (init.method === "PATCH") return reply({ session: { session_id: Number(url.split("/").pop()) }, xp_gained: 0, finished: false, overview: null });
+      throw new Error(`unexpected request ${init.method} ${url}`);
+    },
+  };
+  for (const [name, value] of Object.entries(replacements)) {
+    const prior = Object.getOwnPropertyDescriptor(globalThis, name);
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    t.after(() => (prior ? Object.defineProperty(globalThis, name, prior) : delete globalThis[name]));
+  }
+  const stubs = {
+    react: hooks,
+    "lucide-react": { Check: () => null },
+    "@/components/FeedContext": { useInFeed: () => true },
+    "@/lib/feed-scope": { useFeedScope: () => "/log" },
+    "@/lib/autosave": autosaveLib,
+    "@/lib/unsaved-work": { ...unsavedLib, unsavedWork: work },
+    "@/lib/autosave-retain": { ...retainLib, formRetainer: retainer },
+    "@/lib/client-cache": {
+      cachedJson: async () => structuredClone(current),
+      clientCache: {
+        peek: () => structuredClone(current),
+        read: async () => structuredClone(current),
+        subscribe: (_url, fn) => { subscribers.add(fn); return () => subscribers.delete(fn); },
+      },
+    },
+    "@/lib/format": { sameJson: (a, b) => JSON.stringify(a) === JSON.stringify(b) },
+    "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }) },
+    "@/lib/log-early": { LOG_READING_URL: "/api/reading", logEarlyGet: () => undefined },
+  };
+  const Section = loadTs("app/log/sections/Reading.tsx", stubs).default;
+
+  let tree = null;
+  function expand(node, id = "root") {
+    if (node == null || typeof node === "boolean") return null;
+    if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
+    if (typeof node !== "object") return node;
+    if (typeof node.type === "function") {
+      const key = `${id}:${node.type.name}`;
+      if (!R.frames.has(key)) R.frames.set(key, { slots: [], index: 0 });
+      R.frame = R.frames.get(key);
+      R.frame.index = 0;
+      return expand(node.type(node.props), key);
+    }
+    return { type: node.type, props: { ...node.props, children: expand(node.props.children, id) } };
+  }
+  async function flush() {
+    for (let i = 0; i < 16; i++) {
+      if (R.dirty && R.mounted) {
+        R.dirty = false;
+        effects = [];
+        tree = expand({ type: Section, props: {} });
+        for (const effect of effects) effect();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  const nodes = (node = tree) => (Array.isArray(node) ? node.flatMap((n) => nodes(n)) : !node || typeof node !== "object" ? [] : [node, ...nodes(node.props.children)]);
+  const text = (node = tree) => (Array.isArray(node) ? node.map(text).join("") : node && typeof node === "object" ? text(node.props.children) : node == null ? "" : String(node));
+  const field = (label) => {
+    const holder = nodes().find((n) => n.type === "label" && text(n).startsWith(label));
+    assert.ok(holder, `field exists: ${label}`);
+    const input = nodes(holder).find((n) => n.type === "input" || n.type === "textarea");
+    assert.ok(input, `input in ${label}`);
+    return input;
+  };
+  const button = (label) => {
+    const b = nodes().find((n) => n.type === "button" && text(n) === label);
+    assert.ok(b, `button exists: ${label}`);
+    return b;
+  };
+  const h = {
+    timers, work, retainer, calls, rows,
+    set mode(m) { mode = m; },
+    posts: () => calls.filter((c) => c.method === "POST"),
+    text: () => text(),
+    value: (label) => field(label).props.value,
+    hasButton: (label) => nodes().some((n) => n.type === "button" && text(n) === label),
+    type: async (label, value) => { field(label).props.onChange({ target: { value } }); await flush(); },
+    click: async (label) => { await button(label).props.onClick(); await flush(); },
+    async mount() { R.gen += 1; R.frames = new Map(); R.mounted = true; R.dirty = true; await flush(); },
+    async unmount() {
+      const cells = [...R.frames.values()].flatMap((f) => f.slots.filter((s) => s && typeof s === "object" && "cleanup" in s));
+      R.mounted = false;
+      R.gen += 1;
+      for (const cell of cells) cell.cleanup?.();
+      R.frames = new Map();
+      tree = null;
+      await flush();
+    },
+    /** Advance the autosave clock: run every timer due within `ms`, rendering after each. */
+    async tick(ms) {
+      for (let left = ms; ;) {
+        const hit = timers.due(left);
+        if (!hit) break;
+        left = hit.left;
+        hit.fn();
+        await flush();
+      }
+      await flush();
+    },
+    /** The server's reading answer changes (a new behavioral day): every subscriber hears it. */
+    async serve(next) { current = next; for (const fn of [...subscribers]) fn(structuredClone(next)); await flush(); },
+  };
+  return h;
+}
+
+test("opening the section sends nothing, also after a long wait", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  assert.match(h.text(), /A Synthetic Book/);
+  await h.tick(120_000);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.work.has(), false, "an untouched form is not unsaved work");
+  await h.unmount();
+  assert.equal(h.retainer.size, 0, "nothing to keep");
+});
+
+test("an incomplete entry survives the section being unmounted and comes back as it was", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Minutes", "25");
+  await h.type("Recall note", "Synthetic note, kept verbatim.");
+  assert.match(h.text(), /Enter the chapter you read through to save\./, "the reason is shown next to the form");
+  await h.unmount();
+  assert.equal(h.calls.length, 0, "an incomplete entry is never sent");
+  assert.equal(h.retainer.size, 1);
+  assert.equal(h.work.has(), true, "still unsaved work: the updater never reloads over it");
+
+  await h.mount();
+  assert.equal(h.value("Minutes"), "25");
+  assert.equal(h.value("Recall note"), "Synthetic note, kept verbatim.");
+  assert.match(h.text(), /Enter the chapter you read through to save\./);
+  assert.equal(h.calls.length, 0, "taking the entry over sends nothing");
+
+  await h.type("Through ch.", "3");
+  assert.match(h.text(), /Not saved yet/, "waiting for the pause: not shown as saving or saved");
+  assert.doesNotMatch(h.text(), /Saved/);
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  const body = h.posts()[0].body;
+  assert.equal(body.chapter_through, 3);
+  assert.equal(body.minutes, 25);
+  assert.equal(body.recall, "Synthetic note, kept verbatim.");
+  assert.match(h.text(), /Saved · \+10 XP/);
+  assert.match(h.text(), /This session/);
+});
+
+test("offline: a failed create keeps its client_key through an unmount, and Retry on the next mount creates it once", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\. Trying again…/);
+  assert.ok(h.hasButton("Retry"), "a clear retry next to the form");
+  await h.unmount(); // sends once more on the way out: still offline
+  assert.equal(h.posts().length, 2);
+  assert.equal(h.retainer.size, 1);
+  assert.equal(h.work.has(), true);
+
+  await h.mount();
+  assert.equal(h.value("Through ch."), "3", "the entry is back");
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./, "and so is its failure");
+  h.mode = "up";
+  await h.click("Retry");
+  assert.match(h.text(), /Saved · \+10 XP/, "confirmed only after the server answered");
+  assert.match(h.text(), /This session/);
+  const keys = new Set(h.posts().map((p) => p.body.client_key));
+  assert.equal(keys.size, 1, "every attempt carried the same client_key");
+  assert.ok([...keys][0], "a key was sent");
+  assert.equal(h.rows.size, 1, "one session, never two");
+
+  await h.type("Minutes", "40");
+  await h.tick(1500);
+  const last = h.calls[h.calls.length - 1];
+  assert.equal(last.method, "PATCH", "later edits update the session the retry made");
+  assert.match(last.url, /^\/api\/reading\/sessions\/\d+$/);
+  await h.unmount();
+  assert.equal(h.retainer.size, 0, "all saved: nothing kept");
+  assert.equal(h.work.has(), false);
+});
+
+test("a retry that gets through while the section is away releases the entry; it comes back blank", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "2");
+  await h.tick(1500);
+  await h.unmount();
+  h.mode = "up";
+  await h.tick(60_000); // the kept saver's own retry timer
+  assert.equal(h.rows.size, 1, "created once, by the background retry");
+  assert.equal(new Set(h.posts().map((p) => p.body.client_key)).size, 1);
+  assert.equal(h.retainer.size, 0);
+  assert.equal(h.work.has(), false);
+  const before = h.calls.length;
+  await h.mount();
+  assert.equal(h.value("Through ch."), "", "a new, empty session form");
+  assert.equal(h.calls.length, before, "nothing sent on mount");
+});
+
+test("day boundary: an entry made on one behavioral day and not saved keeps that day after the day rolls", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.serve(answer(D2)); // nothing entered: the day just follows
+  assert.match(h.text(), /For today/);
+  assert.equal(h.calls.length, 0, "a new day alone sends nothing");
+
+  await h.serve(answer(D1));
+  h.mode = "offline";
+  await h.type("Through ch.", "4");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, null, "on its own day the server's behavioral today applies");
+  await h.unmount();
+  await h.serve(answer(D2));
+  h.mode = "up";
+  await h.mount();
+  assert.match(h.text(), /For Apr 10/, "the kept entry still says which day it is for");
+  await h.tick(1500);
+  const last = h.posts()[h.posts().length - 1];
+  assert.equal(last.body.date, D1, "sent with its own day, not the new one");
+  assert.equal(h.rows.size, 1);
+});
+
+test("day boundary: emptying an entry that kept its day lets the form follow today again", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "offline";
+  await h.type("Through ch.", "4");
+  await h.tick(1500);
+  await h.serve(answer(D2)); // the day rolls while the failed entry is on screen
+  assert.match(h.text(), /For Apr 10/);
+  const sent = h.calls.length;
+  await h.type("Through ch.", "");
+  assert.match(h.text(), /For today/, "nothing left of the entry: the day follows again");
+  assert.doesNotMatch(h.text(), /Not saved/);
+  assert.equal(h.work.has(), false, "an emptied form is not unsaved work");
+  await h.tick(60_000);
+  assert.equal(h.calls.length, sent, "and nothing more is sent");
+});

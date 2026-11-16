@@ -357,9 +357,9 @@ const read = (rel) => fs.readFileSync(path.join(SRC, rel), "utf8");
 test("source pins: no Save button on the reading forms; keys and habit days travel; the edit route is owner-session only", () => {
   const log = read("app/log/sections/Reading.tsx");
   assert.doesNotMatch(log, /LogSaveButton/);
-  assert.match(log, /useAutosave/);
-  assert.match(log, /client_key: clientKey\.current/, "every create carries the form's idempotency key");
-  assert.match(log, /habit_created_on: habitCreatedOn\.current/, "edits send back the day of the habit row the session made");
+  assert.match(log, /useRetainedAutosave/, "the entry outlives the section while unsaved (PROD-T01)");
+  assert.match(log, /client_key: kept\.clientKey/, "every create carries the form's idempotency key");
+  assert.match(log, /habit_created_on: kept\.habitCreatedOn/, "edits send back the day of the habit row the session made");
   assert.match(log, /const ok = await autosave\.flush\(\);[\s\S]{0,120}if \(!ok\)/, "a failed send keeps the form (Say it waits)");
   const page = read("app/reading/ReadingClient.tsx");
   assert.doesNotMatch(page, />\s*Add highlight\s*</);
