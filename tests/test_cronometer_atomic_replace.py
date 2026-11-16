@@ -4,7 +4,9 @@ cronometer_import.import_servings used to clear the re-imported dates and then
 insert the fresh rows as separate requests, so a reader (or a crash) in between
 saw days with no servings. It now makes ONE call to
 pds.replace_cronometer_servings (sql/cronometer_replace_servings.sql), which
-does both in a single transaction.
+does both in a single transaction. A manual run_import reaches it through
+pds.replace_cronometer_servings_and_daily (sql/cronometer_replace_servings_window.sql),
+one call that also upserts the daily totals; the fake below models both.
 
 Everything here is faked: no network, no database, no credentials, synthetic
 rows only. The fake database applies the function's contract the way Postgres
@@ -54,14 +56,16 @@ _UNSET = object()
 
 
 class FakeDB:
-    """In-memory pds.cronometer_servings behind the one RPC the importer may use.
+    """In-memory pds.cronometer_servings behind the RPCs the importer may use (the
+    date-set function, and the manual import's combined servings + daily call).
 
     Any direct read or write of cronometer_servings fails the test: the importer
-    must go through the function and nothing else.
+    must go through a function and nothing else.
     """
 
     def __init__(self, stored=(), rpc_error=None, reply=_UNSET):
         self.stored = [dict(r) for r in stored]
+        self.daily: dict[str, dict] = {}
         self.rpc_calls: list[tuple[str, dict]] = []
         self.sync_logs: list[dict] = []
         self.rpc_error = rpc_error
@@ -93,7 +97,29 @@ class _Rpc:
         db.rpc_calls.append((self.fn, self.params))
         if db.rpc_error is not None:
             raise db.rpc_error                      # transaction rolled back: nothing changes
+        if self.fn == "replace_cronometer_servings_and_daily":
+            # The manual import's one call: the date-set replace (when there are rows)
+            # plus the daily upsert, in one transaction.
+            assert set(self.params) == {"p_dates", "p_rows", "p_daily_rows"}, self.params.keys()
+            rows, drows = self.params["p_rows"], self.params["p_daily_rows"]
+            assert rows or drows, "nothing to do"
+            out = {"dates": 0, "deleted": 0, "inserted": 0}
+            if rows:
+                out = _Rpc(db, "replace_cronometer_servings",
+                           {"p_dates": self.params["p_dates"], "p_rows": rows})._replace()
+            for r in drows:
+                db.daily[r["calendar_date"]] = dict(r)
+            if db.reply is not _UNSET:
+                return _Result(db.reply)
+            return _Result({**out, "daily_upserted": len(drows)})
         assert self.fn == "replace_cronometer_servings", self.fn
+        if db.reply is not _UNSET:
+            self._replace()
+            return _Result(db.reply)
+        return _Result(self._replace())
+
+    def _replace(self):
+        db = self.db
         assert set(self.params) == {"p_dates", "p_rows"}, self.params.keys()
         dates, rows = self.params["p_dates"], self.params["p_rows"]
         if not rows:
@@ -104,9 +130,7 @@ class _Rpc:
         before = len(db.stored)
         db.stored = [r for r in db.stored if r["calendar_date"] not in dates] + [dict(r) for r in rows]
         deleted = before - (len(db.stored) - len(rows))
-        if db.reply is not _UNSET:
-            return _Result(db.reply)
-        return _Result({"dates": len(set(dates)), "deleted": deleted, "inserted": len(rows)})
+        return {"dates": len(set(dates)), "deleted": deleted, "inserted": len(rows)}
 
 
 class _Sink:
@@ -277,8 +301,9 @@ def test_run_import_end_to_end_with_a_synthetic_export() -> None:
             "2030-01-02,12:30 AM,Snacks,Test Late Snack,1.00 bar,210.0,,9.0",
         ])
         assert _run_import(db, [path]) == (3, 0)
-    assert len(db.rpc_calls) == 1
+    assert len(db.rpc_calls) == 1 and db.rpc_calls[0][0] == "replace_cronometer_servings_and_daily"
     params = db.rpc_calls[0][1]
+    assert params["p_daily_rows"] == [], "no dailysummary.csv in this export"
     assert params["p_dates"] == ["2030-01-01", "2030-01-02"]
     by_name = {r["food_name"]: r for r in params["p_rows"]}
     assert by_name["Test Coffee"]["caffeine_mg"] == 95.0 and by_name["Test Oats"]["caffeine_mg"] is None

@@ -13,11 +13,18 @@ unchanged. A rolling re-fetch self-heals edits/deletes made in the app.
 This is the one caller that passes run_import the window it requested: a day
 inside it that has no food any more (its last entry removed in Cronometer) is
 emptied in Onyx too, but only when the export passes the importer's
-completeness check and at most --max-empty-days stored days per run (a bigger
-change is refused with a partial heartbeat). A failed login or export never
-reaches the importer, so it changes nothing. --no-empty-days (or the env var
+completeness check, a second such export at least 6 h after the first that
+showed the day empty still does (the twice-daily runs are 10.5 and 13.5 h
+apart), and at most --max-empty-days stored days per run (a bigger change is
+refused with a partial heartbeat). A failed login or export never reaches the
+importer, so it changes nothing. --no-empty-days (or the env var
 CRONOMETER_EMPTY_DAYS=off) turns this off: the run then imports exactly as a
-manual export does (date-set replace, nothing emptied, no completeness check).
+manual export does (nothing emptied, no completeness check).
+
+Neither switch is a workflow input (.github/** changes are Riley's to merge), so
+an override run is a local one, between `python ci_token_helper.py download
+cronometer` and `python ci_token_helper.py upload cronometer`: the run rotates
+the saved session, and without the upload the next scheduled run logs in fresh.
 
 UNOFFICIAL — this replays the web app's own flow (the same one gocronometer /
 cronometer-mcp use):
@@ -354,7 +361,8 @@ def main() -> None:
     ap.add_argument("--max-empty-days", type=int, default=DEFAULT_MAX_EMPTY_DAYS,
                     help="most stored days one run may empty because Cronometer no longer has "
                          f"food on them (default {DEFAULT_MAX_EMPTY_DAYS}; 0 = empty none). More "
-                         "than this and none are emptied (partial heartbeat)")
+                         "than this and none are emptied (partial heartbeat). Only days an "
+                         "earlier export at least 6 h ago also showed empty are emptied")
     ap.add_argument("--no-empty-days", action="store_true",
                     help="import like a manual export: never empty a day, no completeness check "
                          "(same as CRONOMETER_EMPTY_DAYS=off)")

@@ -31,9 +31,11 @@ that window to run_import, the export is checked for completeness
 (check_trusted_export: well formed, inside the window, per-day servings sums equal
 the daily totals), and pds.replace_cronometer_servings_window
 (sql/cronometer_replace_servings_window.sql) then writes servings and daily totals in
-one transaction and also empties the window's inner days that have no food, with a
+one transaction and also empties the window's inner days that have no food, once a
+second export at least EMPTY_CONFIRM_HOURS later still shows them empty, with a
 backup copy and a per-run limit. A manual export (inbox, this CLI) has no window and
-can never empty a day.
+can never empty a day; its servings and daily totals are written in one transaction
+too (pds.replace_cronometer_servings_and_daily, same lock).
 
 Conventions honored (see AGENTS.md):
     - utf-8-sig read (Cronometer exports carry a BOM; micro sign is UTF-8 'µ').
@@ -450,12 +452,18 @@ def build_daily_rows(csv_path: str) -> list[dict]:
 # shows no food on a day without servings). A download cut off between two rows
 # still parses cleanly; the per-day sums are what catch it.
 #
-# Any doubt means nothing is emptied (partial heartbeat). The days in doubt are
-# not written either (their stored rows stay as they are); the days that agree
-# are written as usual. A file that is not well formed writes no servings at all.
-# The reasons are counts and rules only, never a food, an amount or a date.
+# Any doubt means nothing is emptied (partial heartbeat). The days in doubt keep
+# their stored servings (their daily Total row is still upserted); the days that
+# agree are written as usual. A file that is not well formed writes no servings at
+# all. The reasons are counts and rules only, never a food, an amount or a date.
+#
+# One run's two files are ONE look: both can miss the same day, and then they
+# agree with each other. So a day is emptied only on a second look: the database
+# function records the first complete export that shows a stored day empty and
+# empties it when a later one, at least EMPTY_CONFIRM_HOURS after, still does.
 MAX_WINDOW_DAYS = 400           # same bound as pds.replace_cronometer_servings_window
 DEFAULT_MAX_EMPTY_DAYS = 3      # stored days one run may empty; more = refused, partial heartbeat
+EMPTY_CONFIRM_HOURS = 6         # same as pds.replace_cronometer_servings_window (fixed there)
 # Nutrients (normalized header names) whose per-day servings sum must match the
 # daily Total row; only those present in both files are compared. Cronometer's
 # daily total is the sum of that day's servings, so the tolerance only absorbs
@@ -469,7 +477,8 @@ SUM_TOLERANCE_REL = 0.001       # plus 0.1 % of the larger of the two values
 class FileScan:
     ok: bool
     reason: str | None = None
-    # servings: date -> number of entries; daily: date -> largest energy of any row (blank = 0)
+    # servings: date -> number of entries; daily: date -> largest value of ANY nutrient in
+    # any of the day's rows (blank = 0; above 0 = the day has food, even a water-only day)
     by_date: dict[str, float] = field(default_factory=dict)
     # servings: date -> {nutrient: sum of the day's entries}; daily: date -> {nutrient: Total row value}
     totals: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -490,7 +499,6 @@ class ExportCheck:
     servings_empty_dates: tuple[str, ...] = ()
     # Days whose servings are not written (outside the window, or the files disagree).
     skip_dates: tuple[str, ...] = ()
-    food_days: int = 0             # days with at least one serving in the export
 
 
 def scan_export_file(path: str | None, kind: str) -> FileScan:
@@ -525,6 +533,9 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
         return FileScan(False, f"{label} has no date column")
     nutrients = frozenset(n for n in COMPARE_NUTRIENTS if n in col_index)
     group_col = col_index.get("group") if kind == "daily" else None
+    # Every nutrient column of the daily summary decides whether a day has food: a
+    # day with only water or a zero-calorie drink has 0 energy but is not empty.
+    content_cols = [i for n, i in col_index.items() if n in NAME_TO_COL] if kind == "daily" else []
 
     by_date: dict[str, float] = {}
     totals: dict[str, dict[str, float]] = {}
@@ -546,8 +557,8 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
             for n, v in values.items():
                 sums[n] = sums.get(n, 0.0) + v
         else:
-            energy = to_num(cells[col_index["energy"]]) or 0.0
-            by_date[day] = max(by_date.get(day, 0.0), energy)
+            content = max((abs(to_num(cells[i]) or 0.0) for i in content_cols), default=0.0)
+            by_date[day] = max(by_date.get(day, 0.0), content)
             # Same rule as build_daily_rows: the Total row (or the only row) is the day.
             if group_col is None or cells[group_col].strip().lower() == "total":
                 totals[day] = values
@@ -575,9 +586,10 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
     """Decide what an automated export of `window` may write and empty.
 
     Not usable (write no servings) when a file is missing or not well formed.
-    Complete (days without food may be emptied) only when, in addition, every date
-    lies in the window, every servings day has a daily Total row with the same
-    nutrient sums, and the daily summary shows no food on a day without servings.
+    Complete (days without food are passed to the database, which empties a stored
+    one on its second look) only when, in addition, every date lies in the window,
+    every servings day has a daily Total row with the same nutrient sums, and the
+    daily summary shows no food (no nutrient above 0) on a day without servings.
     Otherwise the days in doubt are listed in skip_dates and nothing is emptied.
 
     The first and last day of the window are never emptied: nothing has checked
@@ -597,8 +609,8 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
     no_total = {x for x in inside if x not in d.totals}
     nutrients = s.nutrients & d.nutrients
     mismatch = {x for x in inside - no_total if not _sums_agree(s.totals[x], d.totals[x], nutrients)}
-    food_without_servings = {x for x, kcal in d.by_date.items()
-                             if kcal > 0 and x not in s.by_date and x not in outside}
+    food_without_servings = {x for x, content in d.by_date.items()
+                             if content > 0 and x not in s.by_date and x not in outside}
     reasons = []
     if outside:
         reasons.append(f"{len(outside)} date(s) lie outside the requested window")
@@ -611,14 +623,13 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
                        "that have no servings")
     if reasons:
         return ExportCheck(True, False, "; ".join(reasons), True, None,
-                           skip_dates=tuple(sorted(outside | no_total | mismatch)),
-                           food_days=len(s.by_date))
+                           skip_dates=tuple(sorted(outside | no_total | mismatch)))
 
     inner = _window_dates(start, end)[1:-1]
     empty = tuple(x for x in inner if x not in s.by_date and x not in d.by_date)
     servings_empty = tuple(x for x in inner
                            if x not in s.by_date and x in d.totals and d.by_date.get(x, 0.0) == 0)
-    return ExportCheck(True, True, None, True, None, empty, servings_empty, (), len(s.by_date))
+    return ExportCheck(True, True, None, True, None, empty, servings_empty, ())
 
 
 def trusted_window(window) -> tuple[date, date] | None:
@@ -626,8 +637,11 @@ def trusted_window(window) -> tuple[date, date] | None:
     if window is None:
         return None
     start, end = window
-    if not isinstance(start, date) or not isinstance(end, date) or end < start:
-        raise ValueError("window must be (start_date, end_date) with start <= end")
+    # type(...) is date, not isinstance: a datetime is a date subclass, and its
+    # isoformat() ("YYYY-MM-DDT00:00:00") would match no exported day, so every
+    # inner day would look empty.
+    if type(start) is not date or type(end) is not date or end < start:
+        raise ValueError("window must be (start_date, end_date) of datetime.date with start <= end")
     if (end - start).days + 1 > MAX_WINDOW_DAYS:
         return None   # a very long backfill: replace the dates with rows, empty nothing
     return start, end
@@ -638,6 +652,9 @@ REPLACE_SERVINGS_RPC = "replace_cronometer_servings"
 REPLACE_SERVINGS_SQL = "sql/cronometer_replace_servings.sql"
 REPLACE_WINDOW_RPC = "replace_cronometer_servings_window"
 REPLACE_WINDOW_SQL = "sql/cronometer_replace_servings_window.sql"
+# Defined in the same file as the window function, so both exist or neither does.
+REPLACE_IMPORT_RPC = "replace_cronometer_servings_and_daily"
+EMPTY_CANDIDATES_TABLE = "cronometer_empty_day_candidates"
 
 
 def _is_missing_function(exc: Exception, name: str = REPLACE_SERVINGS_RPC) -> bool:
@@ -719,30 +736,80 @@ def import_daily(rows: list[dict], dry_run: bool, sb=None) -> int:
     return upserted
 
 
+def _is_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def import_servings_and_daily(rows: list[dict], daily_rows: list[dict], dry_run: bool,
+                              sb=None) -> tuple[int, int, str]:
+    """Replace the servings of the dates in `rows` AND upsert `daily_rows`, in ONE
+    transaction (pds.replace_cronometer_servings_and_daily, which takes the same lock
+    as the automated export's write). Used by every import that may not empty a day:
+    a manual export, and the automated export's daily-only write when its servings
+    are not usable. Only dates that have rows are replaced, so nothing is emptied.
+
+    One transaction matters since the automated export can empty a day: with the
+    daily upsert as a separate request, a manual import's servings could land, the
+    automated export empty that day, and the manual daily row then put the day's
+    old total back with no servings under it.
+
+    Returns (servings inserted, daily rows upserted, mode): "combined" (one call),
+    "fallback" (the function is not in the database yet: the failed call changed
+    nothing, so the date-set function replaced the servings and the daily rows were
+    upserted as separate requests, as before), "dry_run" or "none" (no call).
+    """
+    if not rows and not daily_rows:
+        return 0, 0, "none"
+    if dry_run:
+        return len(rows), len(daily_rows), "dry_run"
+    if sb is None:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    params = {"p_dates": sorted({r["calendar_date"] for r in rows}), "p_rows": rows,
+              "p_daily_rows": daily_rows}
+    try:
+        res = sb.schema("pds").rpc(REPLACE_IMPORT_RPC, params).execute()
+    except Exception as e:  # noqa: BLE001
+        if _is_missing_function(e, REPLACE_IMPORT_RPC):
+            return import_servings(rows, False, sb), import_daily(daily_rows, False, sb), "fallback"
+        raise
+    data = res.data
+    ok = isinstance(data, dict) and _is_count(data.get("inserted")) and _is_count(data.get("daily_upserted"))
+    if not ok or data["inserted"] != len(rows) or data["daily_upserted"] != len(daily_rows):
+        raise RuntimeError(
+            f"pds.{REPLACE_IMPORT_RPC} answered {data!r} for {len(rows)} serving and "
+            f"{len(daily_rows)} daily rows sent; the import cannot be confirmed."
+        )
+    return data["inserted"], data["daily_upserted"], "combined"
+
+
 _WINDOW_REPLY_INTS = ("inserted", "daily_upserted", "cleared_days", "cleared_servings",
-                      "cleared_daily", "refused_days")
+                      "cleared_daily", "refused_days", "pending_days")
 
 
 def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tuple[date, date],
                            empty_dates, servings_empty_dates, max_empty_days: int,
                            dry_run: bool, sb=None) -> dict:
     """Automated export only: in ONE transaction (pds.replace_cronometer_servings_window)
-    replace the servings of the dates with rows, upsert the daily totals, and empty
-    the confirmed-empty days.
+    replace the servings of the dates with rows, upsert the daily totals, and handle
+    the days without food.
 
     empty_dates: days in neither file (servings and daily row are emptied).
     servings_empty_dates: days the daily summary lists with no food (servings are
     emptied; their daily row is in daily_rows and is rewritten from the export).
-    Both must come from check_trusted_export on the same files. Writing the daily
-    totals in the same transaction means two overlapping imports can never leave
-    one import's daily total next to the other import's servings.
+    Both must come from check_trusted_export on the same files. A stored one of
+    these days is emptied only on its second look: the function records the first
+    export that shows it empty and empties it when an export at least
+    EMPTY_CONFIRM_HOURS later still does (pending_days = recorded, not emptied yet).
+    Writing the daily totals in the same transaction means two overlapping imports
+    can never leave one import's daily total next to the other import's servings.
 
     Returns a dict with the function's counts plus "mode":
-      "window"   the function ran (cleared_days / refused_days say what it did)
+      "window"   the function ran (cleared_days / pending_days / refused_days say
+                 what it did)
       "fallback" the function is not in the database yet: the failed call changed
-                 nothing, so the date-set function replaced the dates with rows
-                 (one transaction as well), the daily totals were upserted as
-                 before, and nothing was emptied
+                 nothing, so import_servings_and_daily wrote the dates with rows
+                 and the daily totals (falling back further to the date-set
+                 function when that is missing too), and nothing was emptied
       "dry_run" / "none"  no call was made
     """
     if not isinstance(max_empty_days, int) or isinstance(max_empty_days, bool) or max_empty_days < 0:
@@ -750,7 +817,8 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
     empty = sorted(set(empty_dates))
     s_empty = sorted(set(servings_empty_dates))
     base = {"inserted": 0, "daily_upserted": 0, "empty_dates": len(empty) + len(s_empty),
-            "cleared_days": 0, "cleared_servings": 0, "cleared_daily": 0, "refused_days": 0}
+            "cleared_days": 0, "cleared_servings": 0, "cleared_daily": 0, "refused_days": 0,
+            "pending_days": 0}
     if not rows and not daily_rows and not empty and not s_empty:
         return {**base, "mode": "none"}
     if dry_run:
@@ -773,16 +841,13 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
     except Exception as e:  # noqa: BLE001
         if _is_missing_function(e, REPLACE_WINDOW_RPC):
             # Rollout order: the code can ship before the SQL. The failed call was
-            # rejected before it ran, so nothing changed; the date-set function is
-            # its own single transaction and never empties a day.
-            inserted = import_servings(rows, dry_run=False, sb=sb)
-            return {**base, "inserted": inserted, "daily_upserted": import_daily(daily_rows, False, sb),
-                    "mode": "fallback"}
+            # rejected before it ran, so nothing changed; neither fallback can
+            # empty a day.
+            inserted, daily_upserted, _mode = import_servings_and_daily(rows, daily_rows, False, sb)
+            return {**base, "inserted": inserted, "daily_upserted": daily_upserted, "mode": "fallback"}
         raise
     data = res.data
-    ok = isinstance(data, dict) and all(
-        isinstance(data.get(k), int) and not isinstance(data.get(k), bool) and data[k] >= 0
-        for k in _WINDOW_REPLY_INTS)
+    ok = isinstance(data, dict) and all(_is_count(data.get(k)) for k in _WINDOW_REPLY_INTS)
     if not ok or data["inserted"] != len(rows) or data["daily_upserted"] != len(daily_rows):
         raise RuntimeError(
             f"pds.{REPLACE_WINDOW_RPC} answered {data!r} for {len(rows)} serving and "
@@ -791,57 +856,64 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
     return {**base, **{k: data[k] for k in _WINDOW_REPLY_INTS}, "mode": "window"}
 
 
-def window_outcome(result: dict, check: ExportCheck, max_empty_days: int,
-                   blank_export: bool = False) -> tuple[str, str | None]:
+def window_outcome(result: dict, check: ExportCheck, max_empty_days: int) -> tuple[str, str | None]:
     """(servings heartbeat status, note) for an automated import. Counts only.
 
-    A success note (days were emptied) is kept on the servings heartbeat only, so
-    sync_log records the removal without turning the /status card (which reads
-    the daily heartbeat) red.
+    A success note (days emptied, or days waiting for their second look) is kept on
+    the servings heartbeat only, so sync_log records it without turning the /status
+    card (which reads the daily heartbeat) red.
     """
     notes = []
     if not check.complete:
         skipped = len(check.skip_dates)
-        notes.append(f"nothing emptied{f' and {skipped} day(s) not written' if skipped else ''}: "
+        notes.append(f"nothing emptied{f' and the servings of {skipped} day(s) not written' if skipped else ''}: "
                      f"{check.reason}")
     if result.get("mode") == "fallback":
         notes.append(f"days with no food in Cronometer were not emptied: apply {REPLACE_WINDOW_SQL} "
                      "once; days with food were replaced as before")
     refused = result.get("refused_days", 0)
-    if refused and blank_export:
-        notes.append(f"the export has no food anywhere in the window, so {refused} stored day(s) were "
-                     "not emptied; a later export that lists food on another day empties them")
-    elif refused:
+    if refused:
+        # The scheduled workflow has no input for the limit, so the override is a run
+        # on a PC, between the session download and upload (the run rotates the saved
+        # Cronometer session; without the upload the next scheduled run logs in fresh).
         notes.append(f"{refused} stored day(s) have no food in Cronometer any more, more than the limit "
-                     f"of {max_empty_days}, so none were emptied; check them in Cronometer, then run "
-                     f"cronometer_etl.py --max-empty-days {refused} on a PC with the Cronometer and "
-                     "Supabase keys (the scheduled run keeps the limit)")
+                     f"of {max_empty_days} per run, so none were emptied; check them in Cronometer, then "
+                     "on a PC with the Cronometer and Supabase keys run python ci_token_helper.py download "
+                     f"cronometer, python cronometer_etl.py --max-empty-days {refused}, python "
+                     "ci_token_helper.py upload cronometer (the scheduled run keeps the limit; a day is "
+                     f"emptied once exports at least {EMPTY_CONFIRM_HOURS} h apart both showed it empty)")
     if notes:
         return "partial", "; ".join(notes)
+    done = []
     if result.get("cleared_days"):
-        return "success", (f"emptied {result['cleared_days']} day(s) with no food in Cronometer any more "
-                           f"({result['cleared_servings']} serving row(s), {result['cleared_daily']} daily "
-                           "row(s); copies in pds.cronometer_cleared_rows)")
-    return "success", None
+        done.append(f"emptied {result['cleared_days']} day(s) with no food in Cronometer any more, seen "
+                    f"empty by exports at least {EMPTY_CONFIRM_HOURS} h apart ({result['cleared_servings']} "
+                    f"serving row(s), {result['cleared_daily']} daily row(s); copies in "
+                    "pds.cronometer_cleared_rows)")
+    if result.get("pending_days"):
+        done.append(f"{result['pending_days']} stored day(s) have no food in Cronometer any more; each is "
+                    f"emptied once an export at least {EMPTY_CONFIRM_HOURS} h after the first that showed "
+                    "it empty still does")
+    return "success", "; ".join(done) or None
 
 
 def _read_client():
-    """A client for the dry run's read-only count; None when it cannot be made."""
+    """A client for the dry run's read-only counts; None when it cannot be made."""
     try:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception:  # noqa: BLE001
         return None
 
 
-def count_stored_days(sb, empty_dates, servings_empty_dates) -> int | None:
-    """READ ONLY (dry run): how many of these days hold stored rows, i.e. the number
-    pds.replace_cronometer_servings_window compares with the limit. None = could not
+def stored_empty_days(sb, empty_dates, servings_empty_dates) -> set[str] | None:
+    """READ ONLY (dry run): which of these days hold stored rows, i.e. the days
+    pds.replace_cronometer_servings_window counts against the limit. None = could not
     be read. Same rule as the function: a day in empty_dates counts when it has
     servings or a daily row, a day in servings_empty_dates when it has servings.
     """
     empty, s_empty = set(empty_dates), set(servings_empty_dates)
     if not empty and not s_empty:
-        return 0
+        return set()
     if sb is None:
         return None
     try:
@@ -858,7 +930,27 @@ def count_stored_days(sb, empty_dates, servings_empty_dates) -> int | None:
             with_daily = {str(r["calendar_date"]) for r in got}
     except Exception:  # noqa: BLE001
         return None
-    return len({x for x in empty if x in with_servings or x in with_daily}) + len(s_empty & with_servings)
+    return {x for x in empty if x in with_servings or x in with_daily} | (s_empty & with_servings)
+
+
+def confirmed_count(sb, days) -> int | None:
+    """READ ONLY (dry run): how many of these stored empty days an earlier export,
+    at least EMPTY_CONFIRM_HOURS ago, already showed empty (the days a real run
+    would empty now). None = could not be read (e.g. the SQL is not applied yet)."""
+    days = sorted(days)
+    if not days:
+        return 0
+    if sb is None:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=EMPTY_CONFIRM_HOURS)
+    try:
+        got = (sb.schema("pds").table(EMPTY_CANDIDATES_TABLE)
+               .select("calendar_date,first_seen_at").in_("calendar_date", days).execute().data) or []
+        seen = {str(r["calendar_date"]): datetime.fromisoformat(str(r["first_seen_at"]).replace("Z", "+00:00"))
+                for r in got}
+    except Exception:  # noqa: BLE001
+        return None
+    return sum(1 for d in days if d in seen and seen[d] <= cutoff)
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────────
@@ -869,11 +961,14 @@ def run_import(paths: list[str], dry_run: bool = False, window: tuple[date, date
     window: ONLY the automated export passes it: the (start, end) dates it asked
     Cronometer for. With a window the export goes through check_trusted_export and
     one transaction writes the servings and daily totals; if the export is
-    complete, the window's inner days without food are emptied too (at most
-    max_empty_days stored days per run). A file that is not well formed writes no
-    servings; days the two files disagree on are not written; in both cases
-    nothing is emptied (partial heartbeat). Without a window (manual export) the
-    behaviour is the date-set replace, which never empties a day.
+    complete, the window's inner days without food are passed along too, and a
+    stored one is emptied once a second export at least EMPTY_CONFIRM_HOURS after
+    the first look still shows it empty (at most max_empty_days stored days per
+    run). A file that is not well formed writes no servings; days the two files
+    disagree on keep their stored servings; in both cases nothing is emptied
+    (partial heartbeat). Without a window (manual export) the servings of the
+    dates with rows are replaced and the daily totals upserted in one call, which
+    never empties a day.
     """
     trusted = trusted_window(window)
     if window is not None and trusted is None:
@@ -901,35 +996,27 @@ def _log_range(sb, data_type: str, status: str, rows: list[dict], count: int, st
 
 
 def _import_dates(servings_path, daily_path, dry_run, sb, tz_log) -> tuple[int, int]:
-    """Manual export (inbox, CLI, a very long backfill): the date-set replace."""
-    # ── servings ──
+    """Manual export (inbox, CLI, a very long backfill): the date-set replace of the
+    servings plus the daily upsert, in one call (import_servings_and_daily)."""
     t0 = now_epoch()
     try:
         srows = build_serving_rows(servings_path, tz_log) if servings_path else []
-        scount = import_servings(srows, dry_run, sb)
-        print(f"  servings: {scount} entries {'(dry-run)' if dry_run else 'imported'}"
-              f"{' from ' + os.path.basename(servings_path) if servings_path else ' (no file)'}")
-        # Heartbeat on EVERY run, including a zero-row export (no food logged
-        # in the window). Without this the /status card read "no heartbeat
-        # since July" while the workflow itself was green (2026-10-17).
-        _log_range(sb, "servings", "success", srows, scount, t0, None)
-    except Exception as e:  # noqa: BLE001
-        if sb:
-            log_sync(sb, "cronometer", "servings", "error", error=str(e)[:500], started_at=t0)
-        raise
-
-    # ── daily ──
-    t1 = now_epoch()
-    try:
         drows = build_daily_rows(daily_path) if daily_path else []
-        dcount = import_daily(drows, dry_run, sb)
-        print(f"  daily:    {dcount} days   {'(dry-run)' if dry_run else 'imported'}"
-              f"{' from ' + os.path.basename(daily_path) if daily_path else ' (no file)'}")
-        _log_range(sb, "daily", "success", drows, dcount, t1, None)
+        scount, dcount, _mode = import_servings_and_daily(srows, drows, dry_run, sb)
     except Exception as e:  # noqa: BLE001
         if sb:
-            log_sync(sb, "cronometer", "daily", "error", error=str(e)[:500], started_at=t1)
+            for data_type in ("servings", "daily"):
+                log_sync(sb, "cronometer", data_type, "error", error=str(e)[:500], started_at=t0)
         raise
+    print(f"  servings: {scount} entries {'(dry-run)' if dry_run else 'imported'}"
+          f"{' from ' + os.path.basename(servings_path) if servings_path else ' (no file)'}")
+    print(f"  daily:    {dcount} days   {'(dry-run)' if dry_run else 'imported'}"
+          f"{' from ' + os.path.basename(daily_path) if daily_path else ' (no file)'}")
+    # Heartbeat on EVERY run, including a zero-row export (no food logged in the
+    # window). Without this the /status card read "no heartbeat since July" while
+    # the workflow itself was green (2026-10-17).
+    _log_range(sb, "servings", "success", srows, scount, t0, None)
+    _log_range(sb, "daily", "success", drows, dcount, t0, None)
     return scount, dcount
 
 
@@ -938,20 +1025,23 @@ def _import_window(window, servings_path, daily_path, dry_run, sb, tz_log,
     """Automated export: checked, then one transaction (see run_import)."""
     check = check_trusted_export(window, servings_path, daily_path)
     t0 = now_epoch()
+    lo, hi = window[0].isoformat(), window[1].isoformat()
 
     if not check.usable:
         # The export could not prove it is the whole window: write no servings and
         # empty nothing (a replace of a cut-off day would lose its missing rows). A
-        # well-formed daily summary is still upserted the usual way; a garbled one
-        # is not (a short row would write NULL over a stored total).
+        # well-formed daily summary is still upserted, in one call under the shared
+        # lock and only for days inside the window (the same scope the window
+        # function accepts); a garbled one is not (a short row would write NULL over
+        # a stored total).
         servings_note = f"servings not written, nothing emptied: {check.reason}"
         print(f"  servings: {servings_note}")
         _log_range(sb, "servings", "partial", [], 0, t0, servings_note)
         t1 = now_epoch()
         try:
-            if check.daily_ok:
-                drows = build_daily_rows(daily_path) if daily_path else []
-                dcount = import_daily(drows, dry_run, sb)
+            if check.daily_ok and daily_path:
+                drows = [r for r in build_daily_rows(daily_path) if lo <= r["calendar_date"] <= hi]
+                _scount, dcount, _mode = import_servings_and_daily([], drows, dry_run, sb)
                 daily_note = f"servings: {servings_note}"
                 print(f"  daily:    {dcount} days   {'(dry-run)' if dry_run else 'imported'}")
             else:
@@ -967,57 +1057,63 @@ def _import_window(window, servings_path, daily_path, dry_run, sb, tz_log,
             raise
         return 0, dcount
 
-    lo, hi = window[0].isoformat(), window[1].isoformat()
     skip = set(check.skip_dates)
     srows = [r for r in build_serving_rows(servings_path, tz_log) if r["calendar_date"] not in skip]
     drows = [r for r in build_daily_rows(daily_path) if lo <= r["calendar_date"] <= hi]
-    # An export with no food at all in the window is not trusted to empty days (a
-    # blank export from a broken session or another account looks the same).
-    blank = check.complete and check.food_days == 0
-    cap = 0 if blank else max_empty_days
+    # A blank export (no food anywhere in the window) gets no rule of its own: the
+    # real account exports exactly that through a logging pause. What keeps a
+    # broken one from emptying days is the second look and the per-run limit.
     try:
         result = import_servings_window(srows, drows, window, check.empty_dates,
-                                        check.servings_empty_dates, cap, dry_run, sb)
+                                        check.servings_empty_dates, max_empty_days, dry_run, sb)
     except Exception as e:  # noqa: BLE001
         if sb:
             log_sync(sb, "cronometer", "servings", "error", error=str(e)[:500], started_at=t0)
         raise
 
     n_empty = len(check.empty_dates) + len(check.servings_empty_dates)
+    skipped = len(check.skip_dates)
     if dry_run:
         print(f"  servings: {result['inserted']} entries (dry-run); "
-              f"{len(check.skip_dates)} day(s) not written")
+              f"the servings of {skipped} day(s) not written")
         print(f"  daily:    {result['daily_upserted']} days   (dry-run, same transaction)")
         if not check.complete:
             print(f"  empty days: none would be emptied: {check.reason}")
         else:
-            stored = count_stored_days(_read_client(), check.empty_dates, check.servings_empty_dates)
+            client = _read_client()
+            stored = stored_empty_days(client, check.empty_dates, check.servings_empty_dates)
             if stored is None:
                 print(f"  empty days: {n_empty} inner day(s) have no food; the stored days could not "
                       "be read, so the count of days a real run would empty is unknown")
-            elif blank and stored:
-                print(f"  empty days: the export has no food anywhere; {stored} stored day(s) would "
-                      "NOT be emptied (a blank export is not trusted)")
-            elif stored > cap:
-                print(f"  empty days: {stored} stored day(s) have no food any more, more than the limit "
-                      f"of {cap}: a real run would empty none")
+            elif len(stored) > max_empty_days:
+                print(f"  empty days: {len(stored)} stored day(s) have no food any more, more than the "
+                      f"limit of {max_empty_days}: a real run would empty none")
             else:
-                print(f"  empty days: a real run would empty {stored} stored day(s) "
-                      f"(limit {cap}; {n_empty} inner day(s) have no food)")
+                confirmed = confirmed_count(client, stored)
+                if confirmed is None:
+                    print(f"  empty days: {len(stored)} stored day(s) have no food any more (limit "
+                          f"{max_empty_days}); whether an earlier export already showed them empty could "
+                          "not be read")
+                else:
+                    print(f"  empty days: a real run would empty {confirmed} of {len(stored)} stored "
+                          f"day(s) with no food any more (limit {max_empty_days}; {n_empty} inner day(s) "
+                          f"have no food); the other {len(stored) - confirmed} wait for an export at "
+                          f"least {EMPTY_CONFIRM_HOURS} h after the first that showed them empty")
         return result["inserted"], result["daily_upserted"]
 
-    status, note = window_outcome(result, check, max_empty_days, blank)
-    print(f"  servings: {result['inserted']} entries imported"
-          f"{f'; {len(check.skip_dates)} day(s) not written' if check.skip_dates else ''}")
+    status, note = window_outcome(result, check, max_empty_days)
+    not_written = f"; the servings of {skipped} day(s) not written" if skipped else ""
+    print(f"  servings: {result['inserted']} entries imported{not_written}")
     print(f"  daily:    {result['daily_upserted']} days   imported"
           f"{' (same transaction)' if result['mode'] == 'window' else ''}")
     print(f"  emptied {result['cleared_days']} day(s) with no food in Cronometer any more "
-          f"({result['cleared_servings']} serving row(s), {result['cleared_daily']} daily row(s))")
+          f"({result['cleared_servings']} serving row(s), {result['cleared_daily']} daily row(s)); "
+          f"{result['pending_days']} wait for a second look")
     if status != "success" and note:
         print(f"  servings: {note}")
     _log_range(sb, "servings", status, srows, result["inserted"], t0, note)
     # /status reads the daily heartbeat for the Cronometer card: a partial servings
-    # run shows there too; a success note (days emptied) stays on servings only.
+    # run shows there too; a success note (days emptied or waiting) stays on servings only.
     daily_status, daily_note = ("success", None) if status == "success" else ("partial", f"servings: {note}")
     _log_range(sb, "daily", daily_status, drows, result["daily_upserted"], t0, daily_note)
     return result["inserted"], result["daily_upserted"]

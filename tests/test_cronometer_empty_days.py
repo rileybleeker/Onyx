@@ -7,11 +7,13 @@ window it requested; run_import checks the export is the whole window
 (check_trusted_export: well formed, inside the window, per-day sums equal the
 daily totals) and pds.replace_cronometer_servings_window writes the servings and
 daily totals in one transaction and empties the window's inner days that have no
-food, with a backup copy and a per-run limit.
+food, on a second look at least 6 h after the first, with a backup copy and a
+per-run limit. Manual imports write servings and daily totals in one call too
+(pds.replace_cronometer_servings_and_daily) and never empty a day.
 
 Everything is faked: no network, no database, no credentials, synthetic rows
-only. FakeDB applies the SQL function's contract the way Postgres does
-(validate, then change everything or nothing).
+only. FakeDB applies the SQL functions' contracts the way Postgres does
+(validate, then change everything or nothing), with its own clock for now().
 
 Run: python tests/test_cronometer_empty_days.py
 """
@@ -19,12 +21,13 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import csv
 import io
 import os
 import re
 import sys
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +44,13 @@ LEGACY_SQL = ROOT / "sql" / "cronometer_replace_servings.sql"
 W_START, W_END = date(2030, 1, 1), date(2030, 1, 10)
 WINDOW = (W_START, W_END)
 OUTSIDE = "2029-12-20"
+LATER = ci.EMPTY_CONFIRM_HOURS + 1          # hours between two looks that count as two
+SOON = ci.EMPTY_CONFIRM_HOURS - 4           # hours between two looks that do not
+
+LEGACY_FN = "replace_cronometer_servings"
+COMBINED_FN = "replace_cronometer_servings_and_daily"
+WINDOW_FN = "replace_cronometer_servings_window"
+CANDIDATES = "cronometer_empty_day_candidates"
 
 
 # ---------------------------------------------------------------------------
@@ -65,15 +75,18 @@ _UNSET = object()
 
 
 class FakeDB:
-    """pds.cronometer_servings + cronometer_nutrition_daily + cronometer_cleared_rows
-    behind the two replace functions. The importer may change the servings table only
-    through a function (any direct write fails the test); reads are recorded."""
+    """pds.cronometer_servings + cronometer_nutrition_daily + cronometer_cleared_rows +
+    cronometer_empty_day_candidates behind the three import functions. The importer
+    may change the servings table only through a function (any direct write fails
+    the test); reads are recorded. `now` is the database clock (now() in the SQL)."""
 
     def __init__(self, servings=(), daily=(), missing=(), rpc_error=None, reply=_UNSET,
-                 read_error=None):
+                 read_error=None, unreadable=()):
         self.servings = [dict(r) for r in servings]
         self.daily = {r["calendar_date"]: dict(r) for r in daily}
         self.cleared: list[dict] = []
+        self.candidates: dict[str, dict] = {}
+        self.now = datetime(2030, 1, 10, 12, 0, tzinfo=timezone.utc)
         self.rpc_calls: list[tuple[str, dict]] = []
         self.sync_logs: list[dict] = []
         self.reads: list[str] = []
@@ -82,6 +95,10 @@ class FakeDB:
         self.rpc_error = rpc_error
         self.reply = reply
         self.read_error = read_error
+        self.unreadable = set(unreadable)
+
+    def advance(self, hours):
+        self.now += timedelta(hours=hours)
 
     def schema(self, name):
         assert name == "pds", name
@@ -95,13 +112,16 @@ class FakeDB:
             return _Sink(self.sync_logs)
         if name == "user_tz_log":
             return _Empty()
-        if name in ("cronometer_servings", "cronometer_nutrition_daily"):
+        if name in ("cronometer_servings", "cronometer_nutrition_daily", CANDIDATES):
             return _Table(self, name)
         raise AssertionError(f"importer touched pds.{name} directly")
 
     from_ = table
 
-    # ── the two SQL functions ─────────────────────────────────────────────
+    def _has_servings(self, day):
+        return any(r["calendar_date"] == day for r in self.servings)
+
+    # ── the SQL functions ─────────────────────────────────────────────────
     def _legacy(self, p):
         assert set(p) == {"p_dates", "p_rows"}, p.keys()
         dates, rows = p["p_dates"], p["p_rows"]
@@ -109,10 +129,39 @@ class FakeDB:
             raise FakeAPIError("22023", "replace_cronometer_servings: p_rows is empty")
         if sorted(set(dates)) != sorted({r["calendar_date"] for r in rows}):
             raise FakeAPIError("22023", "replace_cronometer_servings: p_dates mismatch")
+        if any(k in ("serving_id", "synced_at") for r in rows for k in r):
+            raise FakeAPIError("22023", "replace_cronometer_servings: keys that are not writable columns")
         before = len(self.servings)
         self.servings = [r for r in self.servings if r["calendar_date"] not in dates] + [dict(r) for r in rows]
         return {"dates": len(set(dates)), "deleted": before - (len(self.servings) - len(rows)),
                 "inserted": len(rows)}
+
+    def _upsert_daily(self, drows):
+        """pds.cronometer_upsert_daily."""
+        bad = lambda msg: FakeAPIError("22023", f"cronometer_upsert_daily: {msg}")  # noqa: E731
+        ddates = [r.get("calendar_date") for r in drows]
+        if any(not d for d in ddates):
+            raise bad("every element of p_daily_rows must be a JSON object with a calendar_date")
+        if len(set(ddates)) != len(ddates):
+            raise bad("a date appears twice in p_daily_rows")
+        if len({tuple(sorted(r)) for r in drows}) > 1:
+            raise bad("the rows of p_daily_rows do not all carry the same keys")
+        for r in drows:   # ON CONFLICT (calendar_date) DO UPDATE: the sent columns win
+            self.daily[r["calendar_date"]] = {**self.daily.get(r["calendar_date"], {}), **r}
+        return len(drows)
+
+    def _combined(self, p):
+        assert set(p) == {"p_dates", "p_rows", "p_daily_rows"}, p.keys()
+        dates, rows, drows = p["p_dates"], p["p_rows"], p["p_daily_rows"]
+        bad = lambda msg: FakeAPIError("22023", f"replace_cronometer_servings_and_daily: {msg}")  # noqa: E731
+        if not rows and dates:
+            raise bad("date(s) but no rows; this function never empties a day")
+        if not rows and not drows:
+            raise bad("no rows; nothing to do")
+        out = {"dates": 0, "deleted": 0, "inserted": 0}
+        if rows:
+            out = self._legacy({"p_dates": dates, "p_rows": rows})
+        return {**out, "daily_upserted": self._upsert_daily(drows)}
 
     def _window(self, p):
         assert set(p) == {"p_window_start", "p_window_end", "p_dates", "p_rows", "p_empty_dates",
@@ -132,8 +181,6 @@ class FakeDB:
             raise bad("no rows and no empty dates; nothing to do")
         if sorted(set(dates)) != sorted({r["calendar_date"] for r in rows}):
             raise bad("p_dates is not the set of calendar_date values in p_rows")
-        if len(set(ddates)) != len(ddates):
-            raise bad("a date appears twice in p_daily_rows")
         if any(not (lo <= d <= hi) for d in (*dates, *empty, *s_empty, *ddates)):
             raise bad("a date lies outside the window")
         if (set(dates) & empty) or (set(dates) & s_empty) or (empty & s_empty):
@@ -142,36 +189,53 @@ class FakeDB:
             raise bad("a date in p_empty_dates has a row in p_daily_rows")
         if not s_empty <= set(ddates):
             raise bad("a date in p_servings_empty_dates has no row in p_daily_rows")
-        if len({tuple(sorted(r)) for r in drows}) > 1:
-            raise bad("the rows of p_daily_rows do not all carry the same keys")
-        has_servings = lambda d: any(r["calendar_date"] == d for r in self.servings)  # noqa: E731
-        populated = (sum(1 for d in empty if d in self.daily or has_servings(d))
-                     + sum(1 for d in s_empty if has_servings(d)))
+        # 5. a day with food in this export starts its count over
+        for d in (set(dates) | set(ddates)) - s_empty:
+            self.candidates.pop(d, None)
+        # 6. stored empty days, and those an earlier look at least 6 h ago confirms
+        stored = sorted([d for d in empty if d in self.daily or self._has_servings(d)]
+                        + [d for d in s_empty if self._has_servings(d)])
+        cutoff = self.now - timedelta(hours=6)
+        confirmed = [d for d in stored if d in self.candidates and self.candidates[d]["first_seen_at"] <= cutoff]
         out = {"dates": len(set(dates)), "deleted": 0, "inserted": 0, "daily_upserted": 0,
                "empty_dates": len(empty), "servings_empty_dates": len(s_empty),
-               "populated_empty_days": populated, "cleared_days": 0, "cleared_servings": 0,
+               "populated_empty_days": len(stored), "confirmed_days": len(confirmed),
+               "pending_days": 0, "cleared_days": 0, "cleared_servings": 0,
                "cleared_daily": 0, "refused_days": 0, "max_cleared_days": cap}
-        if populated > cap:
-            out["refused_days"] = populated
-        elif populated:
-            gone = [r for r in self.servings if r["calendar_date"] in empty | s_empty]
-            self.servings = [r for r in self.servings if r["calendar_date"] not in empty | s_empty]
-            gone_daily = [self.daily.pop(d) for d in sorted(empty) if d in self.daily]
-            for r in gone:
-                self.cleared.append({"source_table": "cronometer_servings", "calendar_date": r["calendar_date"],
-                                     "window_start": lo, "window_end": hi, "row_data": dict(r)})
-            for r in gone_daily:
-                self.cleared.append({"source_table": "cronometer_nutrition_daily",
-                                     "calendar_date": r["calendar_date"],
-                                     "window_start": lo, "window_end": hi, "row_data": dict(r)})
-            out.update(cleared_days=populated, cleared_servings=len(gone), cleared_daily=len(gone_daily))
+        # 7. the limit counts every stored empty day; then all confirmed or none
+        if len(stored) > cap:
+            out["refused_days"] = len(stored)
+            kept = stored
+        else:
+            if confirmed:
+                gone = [r for r in self.servings if r["calendar_date"] in confirmed]
+                self.servings = [r for r in self.servings if r["calendar_date"] not in confirmed]
+                gone_daily = [self.daily.pop(d) for d in confirmed if d in empty and d in self.daily]
+                for r in gone:
+                    self.cleared.append({"source_table": "cronometer_servings",
+                                         "calendar_date": r["calendar_date"],
+                                         "window_start": lo, "window_end": hi, "row_data": dict(r)})
+                for r in gone_daily:
+                    self.cleared.append({"source_table": "cronometer_nutrition_daily",
+                                         "calendar_date": r["calendar_date"],
+                                         "window_start": lo, "window_end": hi, "row_data": dict(r)})
+                out.update(cleared_days=len(confirmed), cleared_servings=len(gone), cleared_daily=len(gone_daily))
+            kept = [d for d in stored if d not in confirmed]
+            out["pending_days"] = len(kept)
+        # 8. keep the record of the days not emptied; forget those holding nothing
+        for d in (empty | s_empty) - set(kept):
+            self.candidates.pop(d, None)
+        for d in kept:
+            if d in self.candidates:
+                self.candidates[d]["last_seen_at"] = self.now
+                self.candidates[d]["times_seen"] += 1
+            else:
+                self.candidates[d] = {"first_seen_at": self.now, "last_seen_at": self.now, "times_seen": 1}
+        # 9. + 10. replace through the date-set function, then the daily upsert
         if rows:
-            before = len(self.servings)
-            self.servings = [r for r in self.servings if r["calendar_date"] not in dates] + [dict(r) for r in rows]
-            out.update(deleted=before - (len(self.servings) - len(rows)), inserted=len(rows))
-        for r in drows:   # ON CONFLICT (calendar_date) DO UPDATE: the sent columns win
-            self.daily[r["calendar_date"]] = {**self.daily.get(r["calendar_date"], {}), **r}
-        out["daily_upserted"] = len(drows)
+            r = self._legacy({"p_dates": dates, "p_rows": rows})
+            out.update(deleted=r["deleted"], inserted=r["inserted"])
+        out["daily_upserted"] = self._upsert_daily(drows)
         return out
 
 
@@ -186,23 +250,25 @@ class _Rpc:
             raise FakeAPIError("PGRST202", f"Could not find the function pds.{self.fn} in the schema cache")
         if db.rpc_error is not None:
             raise db.rpc_error                       # transaction rolled back: nothing changes
-        snapshot = (copy.deepcopy(db.servings), copy.deepcopy(db.daily), copy.deepcopy(db.cleared))
+        snapshot = copy.deepcopy((db.servings, db.daily, db.cleared, db.candidates))
         try:
-            if self.fn == "replace_cronometer_servings":
+            if self.fn == LEGACY_FN:
                 out = db._legacy(self.params)
-            elif self.fn == "replace_cronometer_servings_window":
+            elif self.fn == COMBINED_FN:
+                out = db._combined(self.params)
+            elif self.fn == WINDOW_FN:
                 out = db._window(self.params)
             else:
                 raise AssertionError(f"unexpected function {self.fn}")
         except Exception:
-            db.servings, db.daily, db.cleared = snapshot
+            db.servings, db.daily, db.cleared, db.candidates = snapshot
             raise
         return _Result(out if db.reply is _UNSET else db.reply)
 
 
 class _Table:
-    """Direct access to the two Cronometer tables: reads, and the daily upsert of the
-    manual path / the not-usable path / the rollout fallback. Nothing else."""
+    """Direct access to the Cronometer tables: reads, and the daily upsert of the
+    rollout fallback (the functions not applied yet). Nothing else."""
 
     def __init__(self, db, name):
         self.db, self.name = db, name
@@ -247,6 +313,13 @@ class _Read:
     def execute(self):
         if self.db.read_error is not None:
             raise self.db.read_error
+        if self.name in self.db.unreadable:
+            raise FakeAPIError("42P01", f'relation "pds.{self.name}" does not exist')
+        if self.name == CANDIDATES:
+            got = [{"calendar_date": d, "first_seen_at": c["first_seen_at"].isoformat()}
+                   for d, c in sorted(self.db.candidates.items())
+                   if self.dates is None or d in self.dates]
+            return _Result(got)
         src = self.db.servings if self.name == "cronometer_servings" else list(self.db.daily.values())
         got = [{"calendar_date": r["calendar_date"]} for r in src
                if self.dates is None or r["calendar_date"] in self.dates]
@@ -301,6 +374,10 @@ def _stored():
     return servings, daily
 
 
+UPSTREAM = [("2030-01-02", "test oats", 100.0), ("2030-01-02", "test tea", 100.0),
+            ("2030-01-07", "test soup", 100.0)]          # _stored() with 2030-01-05 emptied
+
+
 def _write(folder, name, lines):
     path = os.path.join(folder, name)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -332,20 +409,33 @@ def _run(db, paths, **kw):
         ci.create_client = saved
 
 
+def _two_looks(db, paths, **kw):
+    """The same export seen by two automated runs far enough apart to count."""
+    _run(db, paths, **kw)
+    db.advance(LATER)
+    return _run(db, paths, **kw)
+
+
 def _names(db, day=None):
     return sorted(r["food_name"] for r in db.servings if day is None or r["calendar_date"] == day)
 
 
 def _hb(db):
-    return {r["data_type"]: r for r in db.sync_logs}
+    return {r["data_type"]: r for r in db.sync_logs}      # the newest heartbeat per data_type
 
 
-def _window_calls(db):
-    return [p for fn, p in db.rpc_calls if fn == "replace_cronometer_servings_window"]
+def _calls(db, fn):
+    return [p for f, p in db.rpc_calls if f == fn]
+
+
+def _consistent(db, days):
+    """A day's servings and its daily row always come from the same import."""
+    for day in days:
+        assert bool(_names(db, day)) == (day in db.daily), (day, _names(db, day), sorted(db.daily))
 
 
 # ---------------------------------------------------------------------------
-# Acceptance: an authoritative empty day is emptied, and only that day
+# Acceptance: an authoritative empty day is emptied (on the second look), and only that day
 # ---------------------------------------------------------------------------
 
 def test_authoritative_empty_day_removes_that_day_only() -> None:
@@ -353,23 +443,34 @@ def test_authoritative_empty_day_removes_that_day_only() -> None:
     db = FakeDB(servings, daily)
     with tempfile.TemporaryDirectory() as tmp:
         # Cronometer now has no food on 2030-01-05; the other two days are unchanged.
-        paths = _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-02", "test tea", 100.0),
-                              ("2030-01-07", "test soup", 100.0)])
+        paths = _export(tmp, UPSTREAM)
+        # First look: recorded, not emptied yet, and the run is a clean success.
+        assert _run(db, paths, window=WINDOW) == (3, 2)
+        assert _names(db, "2030-01-05") == ["test rice"] and "2030-01-05" in db.daily
+        assert sorted(db.candidates) == ["2030-01-05"] and db.cleared == []
+        hb = _hb(db)
+        assert hb["servings"]["status"] == "success" and hb["daily"]["status"] == "success"
+        note = hb["servings"]["error_message"]
+        assert note.startswith("1 stored day(s) have no food") and f"{ci.EMPTY_CONFIRM_HOURS} h" in note, note
+        assert hb["daily"]["error_message"] is None, "the /status card stays clean"
+        # Second look, later: emptied.
+        db.advance(LATER)
         assert _run(db, paths, window=WINDOW) == (3, 2)
     assert _names(db, "2030-01-05") == [] and "2030-01-05" not in db.daily, "the empty day was kept"
     assert _names(db, "2030-01-02") == ["test oats", "test tea"]
     assert _names(db, "2030-01-07") == ["test soup"]
     assert _names(db, OUTSIDE) == ["test outside"] and OUTSIDE in db.daily, "a day outside the window changed"
+    assert db.candidates == {}, "an emptied day is no longer waiting"
     # Every removed row has a backup copy, tagged with its table and the window.
     backed = sorted((c["source_table"], c["calendar_date"]) for c in db.cleared)
     assert backed == [("cronometer_nutrition_daily", "2030-01-05"), ("cronometer_servings", "2030-01-05")]
     assert all(c["window_start"] == "2030-01-01" and c["window_end"] == "2030-01-10" for c in db.cleared)
     assert db.cleared[0]["row_data"]["calendar_date"] == "2030-01-05"
-    # One call, one transaction, daily totals included; the inner food-less days were
-    # passed but held nothing; the first and last day of the window are never passed.
-    calls = _window_calls(db)
-    assert len(db.rpc_calls) == 1 and len(calls) == 1 and db.direct_daily_upserts == 0
-    p = calls[0]
+    # One call per run, one transaction, daily totals included; the inner food-less
+    # days were passed but held nothing; the first and last day are never passed.
+    calls = _calls(db, WINDOW_FN)
+    assert len(db.rpc_calls) == 2 and len(calls) == 2 and db.direct_daily_upserts == 0
+    p = calls[1]
     assert p["p_dates"] == ["2030-01-02", "2030-01-07"]
     assert [r["calendar_date"] for r in p["p_daily_rows"]] == ["2030-01-02", "2030-01-07"]
     assert p["p_empty_dates"] == ["2030-01-03", "2030-01-04", "2030-01-05", "2030-01-06",
@@ -385,20 +486,58 @@ def test_authoritative_empty_day_removes_that_day_only() -> None:
     assert hb["daily"]["status"] == "success" and hb["daily"]["error_message"] is None
 
 
+def test_one_run_is_one_look_even_when_both_files_miss_the_same_day() -> None:
+    """Codex review: servings.csv and dailysummary.csv can both miss a day that has food,
+    and then they agree with each other. Agreement is not coverage, so a day is only
+    emptied when a second export, at least 6 h later, still shows it empty."""
+    servings, daily = _stored()
+    db = FakeDB(servings, daily)
+    with tempfile.TemporaryDirectory() as tmp:
+        partial = _export(tmp, UPSTREAM)                     # both files miss 2030-01-05
+        assert ci.check_trusted_export(WINDOW, *partial).complete, "the pair passes every file check"
+        _run(db, partial, window=WINDOW)
+        first_seen = db.candidates["2030-01-05"]["first_seen_at"]
+        # The same miss again soon after (a manual re-run) is not a second look.
+        db.advance(SOON)
+        _run(db, partial, window=WINDOW)
+        assert _names(db, "2030-01-05") == ["test rice"] and db.cleared == []
+        assert db.candidates["2030-01-05"]["first_seen_at"] == first_seen
+        assert db.candidates["2030-01-05"]["times_seen"] == 2
+        # A complete export that shows the food again: the count starts over.
+        db.advance(LATER)
+        with tempfile.TemporaryDirectory() as tmp2:
+            _run(db, _export(tmp2, UPSTREAM + [("2030-01-05", "test rice", 100.0)]), window=WINDOW)
+        assert db.candidates == {} and _names(db, "2030-01-05") == ["test rice"]
+        # Missed once more: a first look again, so still nothing is emptied.
+        db.advance(LATER)
+        _run(db, partial, window=WINDOW)
+        assert _names(db, "2030-01-05") == ["test rice"] and "2030-01-05" in db.daily and db.cleared == []
+        # Only a second miss, late enough, empties it.
+        db.advance(LATER)
+        _run(db, partial, window=WINDOW)
+    assert _names(db, "2030-01-05") == [] and "2030-01-05" not in db.daily
+    assert {c["calendar_date"] for c in db.cleared} == {"2030-01-05"}
+
+
 def test_moving_the_last_serving_to_another_day_converges_and_a_retry_is_a_no_op() -> None:
     db = FakeDB([_srow("2030-01-03", "test bar")], [_drow("2030-01-03", 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
         paths = _export(tmp, [("2030-01-04", "test bar", 100.0)])      # moved one day later
         _run(db, paths, window=WINDOW)
+        assert _names(db, "2030-01-04") == ["test bar"] and _names(db, "2030-01-03") == ["test bar"]
+        db.advance(LATER)
+        _run(db, paths, window=WINDOW)
         state = (_names(db, "2030-01-03"), _names(db, "2030-01-04"), sorted(db.daily))
         assert state == ([], ["test bar"], ["2030-01-04"]), state
         n_backup = len(db.cleared)
         # A retry (same export, e.g. the next scheduled run) changes nothing more.
+        db.advance(LATER)
         _run(db, paths, window=WINDOW)
     assert (_names(db, "2030-01-03"), _names(db, "2030-01-04"), sorted(db.daily)) == state
     assert len(db.cleared) == n_backup == 2, "a retry backed the same rows up again"
     assert all(_hb(db)[k]["status"] == "success" for k in ("servings", "daily"))
     assert _hb(db)["servings"]["error_message"] is None, "the retry emptied nothing, so no note"
+    assert db.candidates == {}
 
 
 def test_order_of_two_overlapping_imports_does_not_matter() -> None:
@@ -409,54 +548,90 @@ def test_order_of_two_overlapping_imports_does_not_matter() -> None:
                   ((date(2030, 1, 4), date(2030, 1, 12)), WINDOW)):
         servings, daily = _stored()
         db = FakeDB(servings, daily)
-        for window in order:
-            lo, hi = window[0].isoformat(), window[1].isoformat()
-            upstream = [("2030-01-02", "test oats", 100.0), ("2030-01-02", "test tea", 100.0),
-                        ("2030-01-07", "test soup", 100.0)]
-            with tempfile.TemporaryDirectory() as tmp:
-                _run(db, _export(tmp, [r for r in upstream if lo <= r[0] <= hi]), window=window)
+        for _round in range(2):
+            for window in order:
+                lo, hi = window[0].isoformat(), window[1].isoformat()
+                with tempfile.TemporaryDirectory() as tmp:
+                    _run(db, _export(tmp, [r for r in UPSTREAM if lo <= r[0] <= hi]), window=window)
+            if _round == 0:
+                # Two overlapping runs at the same moment are one look, not two.
+                assert _names(db, "2030-01-05") == ["test rice"]
+                db.advance(LATER)
         finals.append((sorted((r["calendar_date"], r["food_name"]) for r in db.servings), sorted(db.daily)))
     assert finals[0] == finals[1], finals
+    assert ("2030-01-05", "test rice") not in finals[0][0]
 
 
 def test_daily_totals_ride_in_the_same_transaction_as_the_servings() -> None:
-    """Codex review: with the daily upsert as a separate request, an older import could
-    put a day's daily total back after a newer import emptied it. Each automated import
-    is now ONE call, so whatever order two imports land in, a day's servings and its
-    daily row always come from the same import."""
+    """With the daily upsert as a separate request, an older import could put a day's
+    daily total back after a newer import emptied it. Each automated import is ONE
+    call, so whatever order imports land in, a day's servings and its daily row
+    always come from the same import."""
     older = [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0)]
     newer = [("2030-01-02", "test oats", 100.0)]                    # 2030-01-05 emptied upstream
-    for order in ((older, newer), (newer, older)):
+    for sequence in ((newer, "later", newer, older), (older, newer, "later", newer, older),
+                     (newer, "later", older, newer)):
         servings, daily = _stored()
         db = FakeDB(servings, daily)
-        for export in order:
+        for step in sequence:
+            if step == "later":
+                db.advance(LATER)
+                continue
             with tempfile.TemporaryDirectory() as tmp:
-                _run(db, _export(tmp, export), window=WINDOW)
-        assert db.direct_daily_upserts == 0 and len(db.rpc_calls) == 2, "one write call per import"
-        for day in ("2030-01-02", "2030-01-05", "2030-01-07"):
-            assert bool(_names(db, day)) == (day in db.daily), (day, _names(db, day), sorted(db.daily))
+                _run(db, _export(tmp, step), window=WINDOW)
+            _consistent(db, ("2030-01-02", "2030-01-05", "2030-01-07"))
+        assert db.direct_daily_upserts == 0 and all(f == WINDOW_FN for f, _ in db.rpc_calls)
 
 
 def test_listed_day_with_no_food_loses_its_servings_and_keeps_the_exported_daily_row() -> None:
     # Cronometer can still list an emptied day in the daily summary (a non-food entry,
-    # a day marked completed) with zero energy. Its servings go; its daily row is
-    # rewritten from the export in the same transaction.
+    # a day marked completed) with every nutrient at zero. Its servings go; its daily
+    # row is rewritten from the export in the same transaction.
     db = FakeDB([_srow("2030-01-02", "test oats"), _srow("2030-01-05", "test rice")],
                 [_drow("2030-01-02", 100.0), _drow("2030-01-05", 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
         paths = _export(tmp, [("2030-01-02", "test oats", 100.0)],
                         daily=[("2030-01-02", 100.0), ("2030-01-05", 0.0)])
-        _run(db, paths, window=WINDOW)
-        p = _window_calls(db)[0]
+        _two_looks(db, paths, window=WINDOW)
+        p = _calls(db, WINDOW_FN)[-1]
         assert p["p_servings_empty_dates"] == ["2030-01-05"] and "2030-01-05" not in p["p_empty_dates"]
         assert _names(db, "2030-01-05") == [], "the stale servings were kept"
         assert db.daily["2030-01-05"]["calories"] == 0.0, "the daily row must be the exported one"
         assert [(c["source_table"], c["calendar_date"]) for c in db.cleared] == \
             [("cronometer_servings", "2030-01-05")], "only the servings are removed (and backed up)"
         # A retry: nothing stored is left to empty, so no new backup and no limit trip.
+        db.advance(LATER)
         _run(db, paths, window=WINDOW, max_empty_days=0)
-    assert len(db.cleared) == 1 and _window_calls(db)[1]["p_servings_empty_dates"] == ["2030-01-05"]
+    assert len(db.cleared) == 1 and _calls(db, WINDOW_FN)[-1]["p_servings_empty_dates"] == ["2030-01-05"]
     assert _hb(db)["servings"]["status"] == "success" and _hb(db)["daily"]["status"] == "success"
+
+
+def test_zero_calorie_day_with_water_or_caffeine_is_not_empty() -> None:
+    """Codex + Claude review: the daily summary's food signal was energy only, so a day
+    holding only water or a zero-calorie caffeinated drink, missing from a cut
+    servings download, read as empty. Every nutrient column now counts."""
+    header_s = "Day,Time,Group,Food Name,Amount,Energy (kcal),Protein (g),Caffeine (mg),Water (g)"
+    header_d = "Date,Group,Energy (kcal),Protein (g),Caffeine (mg),Water (g),Completed"
+    for drink in ("0,0,0,500", "0,0,80,240"):              # water only; a diet drink with caffeine
+        db = FakeDB([_srow("2030-01-02", "test oats"), _srow("2030-01-05", "test drink", 0.0)],
+                    [_drow("2030-01-02", 100.0), _drow("2030-01-05", 0.0)])
+        with tempfile.TemporaryDirectory() as tmp:
+            spath = _write(tmp, "servings.csv", [header_s,
+                                                 "2030-01-02,8:00 AM,Breakfast,test oats,1.00 g,100,1,0,0"])
+            dpath = _write(tmp, "dailysummary.csv", [header_d, "2030-01-02,Total,100,1,0,0,false",
+                                                     f"2030-01-05,Total,{drink},false"])
+            check = ci.check_trusted_export(WINDOW, spath, dpath)
+            assert not check.complete and "shows food on 1 day(s)" in check.reason, check.reason
+            assert "2030-01-05" not in check.servings_empty_dates + check.empty_dates
+            _two_looks(db, [spath, dpath], window=WINDOW)
+        assert _names(db, "2030-01-05") == ["test drink"] and db.cleared == [], drink
+        assert db.candidates == {} and _hb(db)["servings"]["status"] == "partial"
+    # A day whose every nutrient is zero is still a day with no food.
+    with tempfile.TemporaryDirectory() as tmp:
+        spath = _write(tmp, "servings.csv", [header_s, "2030-01-02,8:00 AM,Breakfast,test oats,1.00 g,100,1,0,0"])
+        dpath = _write(tmp, "dailysummary.csv", [header_d, "2030-01-02,Total,100,1,0,0,false",
+                                                 "2030-01-05,Total,0,0,0,0,true"])
+        assert ci.check_trusted_export(WINDOW, spath, dpath).servings_empty_dates == ("2030-01-05",)
 
 
 def test_first_and_last_day_of_the_window_are_never_emptied() -> None:
@@ -466,17 +641,17 @@ def test_first_and_last_day_of_the_window_are_never_emptied() -> None:
                  _srow("2030-01-05", "test rice")],
                 [_drow("2030-01-01", 100.0), _drow("2030-01-10", 100.0), _drow("2030-01-05", 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
-        _run(db, _export(tmp, [("2030-01-05", "test rice", 100.0)],
-                         daily=[("2030-01-05", 100.0), ("2030-01-10", 0.0)]), window=WINDOW)
-    p = _window_calls(db)[0]
-    assert "2030-01-01" not in p["p_empty_dates"] and "2030-01-10" not in p["p_empty_dates"]
-    assert p["p_servings_empty_dates"] == []
+        _two_looks(db, _export(tmp, [("2030-01-05", "test rice", 100.0)],
+                               daily=[("2030-01-05", 100.0), ("2030-01-10", 0.0)]), window=WINDOW)
+    for p in _calls(db, WINDOW_FN):
+        assert "2030-01-01" not in p["p_empty_dates"] and "2030-01-10" not in p["p_empty_dates"]
+        assert p["p_servings_empty_dates"] == []
     assert _names(db, "2030-01-01") == ["test first"] and "2030-01-01" in db.daily
-    assert _names(db, "2030-01-10") == ["test last"] and db.cleared == []
+    assert _names(db, "2030-01-10") == ["test last"] and db.cleared == [] and db.candidates == {}
 
 
 # ---------------------------------------------------------------------------
-# Manual / unknown exports can never empty a day
+# Manual / unknown exports can never empty a day, and write in one call
 # ---------------------------------------------------------------------------
 
 def test_manual_export_without_a_window_never_empties_a_day() -> None:
@@ -485,12 +660,44 @@ def test_manual_export_without_a_window_never_empties_a_day() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         paths = _export(tmp, [("2030-01-02", "test oats", 100.0)])
         _run(db, paths)                                             # inbox / CLI: no window
+        db.advance(LATER)
+        _run(db, paths)
         # A header-only manual export makes no call at all.
         _run(db, _export(tmp, []))
-    assert [fn for fn, _ in db.rpc_calls] == ["replace_cronometer_servings"]
+    assert [fn for fn, _ in db.rpc_calls] == [COMBINED_FN, COMBINED_FN]
     assert _names(db, "2030-01-05") == ["test rice"] and _names(db, "2030-01-07") == ["test soup"]
     assert _names(db, "2030-01-02") == ["test oats"], "the date-set replace still works"
-    assert db.cleared == []
+    assert db.cleared == [] and db.candidates == {} and db.direct_daily_upserts == 0
+    p = db.rpc_calls[0][1]
+    assert p["p_dates"] == ["2030-01-02"] and [r["calendar_date"] for r in p["p_daily_rows"]] == ["2030-01-02"]
+    hb = _hb(db)
+    assert hb["servings"]["status"] == "success" and hb["daily"]["status"] == "success"
+
+
+def test_manual_import_writes_servings_and_daily_together_around_an_emptied_day() -> None:
+    """Codex review: the manual path wrote its daily totals as a separate request, so
+    "manual servings, then the automated export empties the day, then the manual
+    daily row" left an old daily total with no servings under it, and the
+    behavioural view shows that fallback row. Now each import is ONE call under the
+    shared lock, so whichever order they land in, servings and daily row agree."""
+    stale = [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0)]
+    days = ("2030-01-02", "2030-01-05", "2030-01-07")
+    for manual_after in (True, False):
+        servings, daily = _stored()
+        db = FakeDB(servings, daily)
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as tmp2:
+            auto = _export(tmp, UPSTREAM)
+            manual = _export(tmp2, stale)
+            _run(db, auto, window=WINDOW)                   # first look at 2030-01-05
+            db.advance(LATER)
+            steps = [("auto", auto), ("manual", manual)] if manual_after else [("manual", manual), ("auto", auto)]
+            for kind, paths in steps:
+                _run(db, paths, window=WINDOW) if kind == "auto" else _run(db, paths)
+                _consistent(db, days)
+        assert db.direct_daily_upserts == 0
+        manual_calls = _calls(db, COMBINED_FN)
+        assert len(manual_calls) == 1 and manual_calls[0]["p_daily_rows"], "one call, daily rows included"
+        assert bool(_names(db, "2030-01-05")) == manual_after, "the newest import's view of the day wins"
 
 
 def test_window_longer_than_the_bound_is_treated_as_manual() -> None:
@@ -499,9 +706,23 @@ def test_window_longer_than_the_bound_is_treated_as_manual() -> None:
     long_window = (date(2028, 6, 1), date(2030, 1, 10))          # 589 days
     assert ci.trusted_window(long_window) is None
     with tempfile.TemporaryDirectory() as tmp:
-        _run(db, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=long_window)
-    assert [fn for fn, _ in db.rpc_calls] == ["replace_cronometer_servings"]
+        _two_looks(db, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=long_window)
+    assert [fn for fn, _ in db.rpc_calls] == [COMBINED_FN, COMBINED_FN]
     assert _names(db, "2030-01-05") == ["test rice"]
+
+
+def test_window_must_be_plain_dates() -> None:
+    # A datetime is a date subclass; its isoformat() would match no exported day and
+    # make every inner day look empty.
+    for bad in ((datetime(2030, 1, 1), datetime(2030, 1, 10)), (W_START, datetime(2030, 1, 10)),
+                ("2030-01-01", "2030-01-10"), (W_END, W_START)):
+        try:
+            ci.trusted_window(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"window {bad!r} must be refused")
+    assert ci.trusted_window(WINDOW) == WINDOW and ci.trusted_window(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -522,11 +743,20 @@ def test_dry_run_counts_the_stored_days_a_real_run_would_empty() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         paths = _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-07", "test soup", 100.0)])
         result, out = _dry(db, paths)
-    assert result == (2, 2)
-    assert "a real run would empty 1 stored day(s) (limit 3" in out, out
+        assert result == (2, 2)
+        assert "a real run would empty 0 of 1 stored day(s)" in out and "the other 1 wait" in out, out
+        # A day an earlier export already showed empty, long enough ago, counts as emptied.
+        db.candidates["2030-01-05"] = {"first_seen_at": datetime(2000, 1, 1, tzinfo=timezone.utc),
+                                       "last_seen_at": datetime(2000, 1, 1, tzinfo=timezone.utc),
+                                       "times_seen": 1}
+        _result, out = _dry(db, paths)
+        assert "a real run would empty 1 of 1 stored day(s)" in out, out
+        # The record cannot be read (the SQL is not applied yet): says so.
+        _result, out2 = _dry(FakeDB(servings, daily, unreadable={CANDIDATES}), paths)
+        assert "could not be read" in out2, out2
     assert db.rpc_calls == [] and db.sync_logs == [] and db.direct_daily_upserts == 0
     assert (_names(db), db.daily) == before and db.cleared == []
-    assert db.reads, "the dry run must read the stored days"
+    assert set(db.reads) == {"cronometer_servings", "cronometer_nutrition_daily", CANDIDATES}
     assert "test" not in out.split("empty days:", 1)[1], "counts only"
 
 
@@ -550,35 +780,61 @@ def test_more_stored_empty_days_than_the_limit_are_refused_and_say_so() -> None:
     servings += [_srow("2030-01-08", "test extra"), _srow("2030-01-09", "test extra 2")]
     db = FakeDB(servings, daily)
     with tempfile.TemporaryDirectory() as tmp:
-        assert _run(db, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=WINDOW) == (1, 1)
-    assert _names(db, "2030-01-05") == ["test rice"] and _names(db, "2030-01-09") == ["test extra 2"]
-    assert db.cleared == [], "a refused run emptied something"
-    assert _names(db, "2030-01-02") == ["test oats"], "the days with food are still written"
-    hb = _hb(db)
-    assert hb["servings"]["status"] == "partial" and hb["daily"]["status"] == "partial"
-    msg = hb["servings"]["error_message"]
-    assert "4 stored day(s)" in msg and "limit of 3" in msg and "--max-empty-days 4" in msg, msg
-    assert "on a PC" in msg, "the scheduled run cannot take the override; say where to run it"
-    assert hb["daily"]["error_message"].startswith("servings: "), "the /status card must show it"
+        paths = _export(tmp, [("2030-01-02", "test oats", 100.0)])
+        assert _two_looks(db, paths, window=WINDOW) == (1, 1)
+        assert _names(db, "2030-01-05") == ["test rice"] and _names(db, "2030-01-09") == ["test extra 2"]
+        assert db.cleared == [], "a refused run emptied something"
+        assert _names(db, "2030-01-02") == ["test oats"], "the days with food are still written"
+        hb = _hb(db)
+        assert hb["servings"]["status"] == "partial" and hb["daily"]["status"] == "partial"
+        msg = hb["servings"]["error_message"]
+        assert "4 stored day(s)" in msg and "limit of 3" in msg and "--max-empty-days 4" in msg, msg
+        assert "on a PC" in msg, "the scheduled run cannot take the override; say where to run it"
+        # The override run must keep the CI session in step (download before, upload after).
+        assert msg.index("ci_token_helper.py download cronometer") < msg.index("--max-empty-days 4") \
+            < msg.index("ci_token_helper.py upload cronometer"), msg
+        assert len(msg) <= 500, "the heartbeat keeps 500 characters"
+        assert hb["daily"]["error_message"].startswith("servings: "), "the /status card must show it"
+        # A refused day keeps its record, so the override run (after checking Cronometer)
+        # empties the days two looks have confirmed.
+        assert sorted(db.candidates) == ["2030-01-05", "2030-01-07", "2030-01-08", "2030-01-09"]
+        _run(db, paths, window=WINDOW, max_empty_days=4)
+    assert _names(db) == ["test oats", "test outside"] and sorted(db.daily) == [OUTSIDE, "2030-01-02"]
+    assert _hb(db)["servings"]["status"] == "success"
 
 
-def test_blank_export_never_empties_stored_days() -> None:
-    # An export with no food anywhere in the window looks the same as a broken session.
-    servings, daily = _stored()
-    db = FakeDB(servings, daily)
-    before = (_names(db), sorted(db.daily))
+def test_a_blank_export_empties_the_only_serving_on_the_second_look() -> None:
+    """Codex review: an export with no food anywhere used to force the limit to 0, so
+    removing the only serving in the window never reached Onyx. A blank export is
+    what the real account returns through a logging pause; it is trusted like any
+    other, on the second look and within the limit."""
+    db = FakeDB([_srow("2030-01-05", "test rice"), _srow(OUTSIDE, "test outside")],
+                [_drow("2030-01-05", 100.0), _drow(OUTSIDE, 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
-        assert _run(db, _export(tmp, []), window=WINDOW, max_empty_days=10) == (0, 0)
-    assert (_names(db), sorted(db.daily)) == before and db.cleared == []
-    assert _window_calls(db)[0]["p_max_cleared_days"] == 0
-    hb = _hb(db)
-    assert hb["servings"]["status"] == "partial" and hb["daily"]["status"] == "partial"
-    assert "no food anywhere in the window" in hb["servings"]["error_message"]
+        blank = _export(tmp, [])
+        assert _run(db, blank, window=WINDOW, max_empty_days=10) == (0, 0)
+        assert _names(db, "2030-01-05") == ["test rice"], "one look is not enough"
+        assert _calls(db, WINDOW_FN)[0]["p_max_cleared_days"] == 10
+        assert _hb(db)["servings"]["status"] == "success"
+        db.advance(LATER)
+        _run(db, blank, window=WINDOW, max_empty_days=10)
+    assert _names(db) == ["test outside"] and sorted(db.daily) == [OUTSIDE]
+    assert _hb(db)["servings"]["error_message"].startswith("emptied 1 day(s)")
+    # A blank export over more stored days than the limit (5 > 3) is refused, look after look.
+    servings, daily = _stored()
+    servings += [_srow("2030-01-08", "test extra"), _srow("2030-01-09", "test extra 2")]
+    db = FakeDB(servings, daily)
+    with tempfile.TemporaryDirectory() as tmp:
+        _two_looks(db, _export(tmp, []), window=WINDOW)
+    assert _names(db) == _names(FakeDB(servings)) and db.cleared == []
+    msg = _hb(db)["servings"]["error_message"]
+    assert _hb(db)["servings"]["status"] == "partial" and "5 stored day(s)" in msg and "limit of 3" in msg, msg
     # With nothing stored in the window, a blank export is simply a quiet window.
     quiet = FakeDB([_srow(OUTSIDE, "test outside")], [_drow(OUTSIDE, 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
-        _run(quiet, _export(tmp, []), window=WINDOW)
-    assert _hb(quiet)["servings"]["status"] == "success" and _names(quiet) == ["test outside"]
+        _two_looks(quiet, _export(tmp, []), window=WINDOW)
+    assert _hb(quiet)["servings"]["status"] == "success" and _hb(quiet)["servings"]["error_message"] is None
+    assert _names(quiet) == ["test outside"] and quiet.candidates == {}
 
 
 def test_limit_is_inclusive_and_zero_empties_nothing() -> None:
@@ -586,10 +842,10 @@ def test_limit_is_inclusive_and_zero_empties_nothing() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         db = FakeDB(servings, daily)
         # Food only on a new day: the three stored days are exactly the limit.
-        _run(db, _export(tmp, [("2030-01-08", "test new", 100.0)]), window=WINDOW, max_empty_days=3)
+        _two_looks(db, _export(tmp, [("2030-01-08", "test new", 100.0)]), window=WINDOW, max_empty_days=3)
         assert _names(db) == ["test new", "test outside"] and sorted(db.daily) == [OUTSIDE, "2030-01-08"]
         db0 = FakeDB([_srow("2030-01-05", "test rice")])
-        _run(db0, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=WINDOW, max_empty_days=0)
+        _two_looks(db0, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=WINDOW, max_empty_days=0)
         assert _names(db0, "2030-01-05") == ["test rice"] and _hb(db0)["servings"]["status"] == "partial"
     for bad in (-1, 1.5, True, None):
         try:
@@ -605,8 +861,10 @@ def test_limit_is_inclusive_and_zero_empties_nothing() -> None:
 # ---------------------------------------------------------------------------
 
 def _assert_nothing_written(db, before, reason_part):
-    assert db.rpc_calls == [], "a servings function was called for an unusable export"
-    assert _names(db) == before and db.cleared == []
+    assert _calls(db, WINDOW_FN) == [], "the window function was called for an unusable export"
+    assert all(not p["p_rows"] and not p["p_dates"] for p in _calls(db, COMBINED_FN)), "servings were sent"
+    assert _calls(db, LEGACY_FN) == [] and db.direct_daily_upserts == 0
+    assert _names(db) == before and db.cleared == [] and db.candidates == {}
     hb = _hb(db)
     assert hb["servings"]["status"] == "partial" and hb["servings"]["records_synced"] == 0
     assert reason_part in hb["servings"]["error_message"], hb["servings"]["error_message"]
@@ -618,12 +876,18 @@ def test_cut_off_servings_row_writes_no_servings() -> None:
     db = FakeDB(servings, daily)
     before = _names(db)
     with tempfile.TemporaryDirectory() as tmp:
-        spath, dpath = _export(tmp, [("2030-01-02", "test oats", 100.0)])
+        # The daily summary also lists a day outside the requested window.
+        spath, dpath = _export(tmp, [("2030-01-02", "test oats", 100.0)],
+                               daily=[("2030-01-02", 100.0), (OUTSIDE, 50.0)])
         with open(spath, "a", encoding="utf-8") as f:
             f.write("2030-01-07,8:00 AM,Breakfast,test cut\n")        # cut off mid-row
         assert _run(db, [spath, dpath], window=WINDOW) == (0, 1)
     _assert_nothing_written(db, before, "do not have 7 cells")
     assert db.daily["2030-01-02"]["calories"] == 100.0, "a well-formed daily summary is still upserted"
+    # ... in one call under the shared lock, and only inside the window (Claude review).
+    (p,) = _calls(db, COMBINED_FN)
+    assert [r["calendar_date"] for r in p["p_daily_rows"]] == ["2030-01-02"]
+    assert db.daily[OUTSIDE]["calories"] == 100.0, "a daily row outside the window was written"
 
 
 def test_unreadable_date_writes_no_servings() -> None:
@@ -647,7 +911,7 @@ def test_garbled_daily_summary_writes_neither_file() -> None:
             f.write("2030-01-05,Total\n")
         assert _run(db, [spath, dpath], window=WINDOW) == (0, 0)
     _assert_nothing_written(db, before, "dailysummary.csv")
-    assert db.daily == daily_before, "a garbled daily summary overwrote stored totals"
+    assert db.rpc_calls == [] and db.daily == daily_before, "a garbled daily summary overwrote stored totals"
     assert "daily totals not written" in _hb(db)["daily"]["error_message"]
 
 
@@ -679,10 +943,11 @@ def test_days_the_two_files_disagree_on_are_not_written_and_nothing_is_emptied()
         db = FakeDB(servings, daily)
         kept = _names(db, kept_day)
         with tempfile.TemporaryDirectory() as tmp:
-            _run(db, _export(tmp, srows, daily=drows), window=WINDOW)
+            _two_looks(db, _export(tmp, srows, daily=drows), window=WINDOW)
         assert _names(db, kept_day) == kept, (reason, _names(db, kept_day))
         assert db.cleared == [] and _names(db, "2030-01-05") == ["test rice"], reason
-        for p in _window_calls(db):
+        assert db.candidates == {}, reason
+        for p in _calls(db, WINDOW_FN):
             assert p["p_empty_dates"] == [] and p["p_servings_empty_dates"] == [], reason
             assert p["p_dates"] == written, (reason, p["p_dates"])
             assert all("2030-01-01" <= r["calendar_date"] <= "2030-01-10" for r in p["p_daily_rows"]), \
@@ -700,6 +965,68 @@ def test_sums_within_rounding_agree() -> None:
                               ("2030-01-02", "test c", 33.33)], daily=[("2030-01-02", 100.0)])
         check = ci.check_trusted_export(WINDOW, *paths)
     assert check.complete and check.skip_dates == (), check.reason
+
+
+# The shape of a real Cronometer web export (Claude review): a BOM, a wide servings
+# header ending in Category, quoted cells with commas, units in parentheses with µ,
+# and a daily summary with one row per day and NO Group column. Values are synthetic.
+REAL_NUTRIENTS = [
+    "Energy (kcal)", "Alcohol (g)", "Caffeine (mg)", "Oxalate (mg)", "Phytate (mg)", "Water (g)",
+    "B1 (Thiamine) (mg)", "B2 (Riboflavin) (mg)", "B3 (Niacin) (mg)", "B5 (Pantothenic Acid) (mg)",
+    "B6 (Pyridoxine) (mg)", "B12 (Cobalamin) (µg)", "Folate (µg)", "Vitamin A (µg)", "Vitamin C (mg)",
+    "Vitamin D (IU)", "Vitamin E (mg)", "Vitamin K (µg)", "Calcium (mg)", "Copper (mg)", "Iron (mg)",
+    "Magnesium (mg)", "Manganese (mg)", "Phosphorus (mg)", "Potassium (mg)", "Selenium (µg)",
+    "Sodium (mg)", "Zinc (mg)", "Carbs (g)", "Fiber (g)", "Starch (g)", "Sugars (g)",
+    "Added Sugars (g)", "Net Carbs (g)", "Fat (g)", "Cholesterol (mg)", "Monounsaturated (g)",
+    "Polyunsaturated (g)", "Saturated (g)", "Trans-Fats (g)", "Omega-3 (g)", "Omega-6 (g)",
+    "Cystine (g)", "Histidine (g)", "Isoleucine (g)", "Leucine (g)", "Lysine (g)", "Methionine (g)",
+    "Phenylalanine (g)", "Protein (g)", "Threonine (g)", "Tryptophan (g)", "Tyrosine (g)", "Valine (g)",
+]
+
+
+def _csv_text(rows):
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerows(rows)
+    return buf.getvalue().splitlines()
+
+
+def _real_export(folder, servings):
+    """servings: (day, food, kcal); every other nutrient is kcal / 50 per entry."""
+    s_rows = [["Day", "Time", "Group", "Food Name", "Amount", *REAL_NUTRIENTS, "Category"]]
+    totals: dict[str, list[float]] = {}
+    for day, food, kcal in servings:
+        values = [kcal] + [round(kcal / 50, 2)] * (len(REAL_NUTRIENTS) - 1)
+        s_rows.append([day, "8:00 AM", "Breakfast", food, "1.00 x 2.0 pieces", *values, "Snacks, Sweets"])
+        acc = totals.setdefault(day, [0.0] * len(REAL_NUTRIENTS))
+        for i, v in enumerate(values):
+            acc[i] = round(acc[i] + v, 2)
+    d_rows = [["Date", *REAL_NUTRIENTS, "Completed"]]
+    d_rows += [[day, *acc, "false"] for day, acc in sorted(totals.items())]
+    return [_write(folder, "servings.csv", _csv_text(s_rows)),
+            _write(folder, "dailysummary.csv", _csv_text(d_rows))]
+
+
+def test_real_export_shape_is_complete_and_empties_the_right_day() -> None:
+    db = FakeDB([_srow("2030-01-03", "test bar, chocolate"), _srow("2030-01-06", "test old")],
+                [_drow("2030-01-03", 210.0), _drow("2030-01-06", 90.0)])
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _real_export(tmp, [("2030-01-03", "test bar, chocolate", 210.0),
+                                   ("2030-01-03", "test bar, chocolate", 210.0),
+                                   ("2030-01-04", 'test "quoted", food', 55.5)])
+        with open(paths[0], "rb") as f:
+            assert f.read(3) == b"\xef\xbb\xbf", "fixture must carry the BOM"
+        scan = ci.scan_export_file(paths[0], "servings")
+        assert scan.ok and scan.by_date == {"2030-01-03": 2, "2030-01-04": 1}, scan
+        check = ci.check_trusted_export(WINDOW, *paths)
+        assert check.complete and check.skip_dates == (), check.reason
+        assert "2030-01-06" in check.empty_dates and check.servings_empty_dates == ()
+        _two_looks(db, paths, window=WINDOW)
+    assert _names(db, "2030-01-06") == [] and "2030-01-06" not in db.daily
+    assert _names(db, "2030-01-03") == ["test bar, chocolate", "test bar, chocolate"]
+    assert _names(db, "2030-01-04") == ['test "quoted", food']
+    p = _calls(db, WINDOW_FN)[-1]
+    assert sorted(r["calendar_date"] for r in p["p_daily_rows"]) == ["2030-01-03", "2030-01-04"]
+    assert p["p_rows"][0]["food_category"] == "Snacks, Sweets"
 
 
 def test_scan_reasons_never_carry_row_contents() -> None:
@@ -739,6 +1066,7 @@ def test_failed_call_changes_nothing_and_has_no_second_path() -> None:
             raise AssertionError("run_import must re-raise")
     assert len(db.rpc_calls) == 1, "no retry and no fallback after a real failure"
     assert (_names(db), db.daily) == before and db.cleared == [] and db.direct_daily_upserts == 0
+    assert db.candidates == {}
     hb = [r for r in db.sync_logs if r["data_type"] == "servings"]
     assert len(hb) == 1 and hb[0]["status"] == "error"
 
@@ -746,7 +1074,9 @@ def test_failed_call_changes_nothing_and_has_no_second_path() -> None:
 def test_function_raising_mid_transaction_rolls_everything_back() -> None:
     servings, daily = _stored()
     db = FakeDB(servings, daily)
-    before = (_names(db), copy.deepcopy(db.daily))
+    db.candidates["2030-01-05"] = {"first_seen_at": db.now - timedelta(hours=LATER),
+                                   "last_seen_at": db.now - timedelta(hours=LATER), "times_seen": 1}
+    before = (_names(db), copy.deepcopy(db.daily), copy.deepcopy(db.candidates))
     bad_rows = [_srow("2030-01-02", "test oats"), _srow("2030-01-11", "test outside window")]
     try:
         ci.import_servings_window(bad_rows, [_drow("2030-01-02", 100.0)], WINDOW, ["2030-01-05"], [], 3,
@@ -755,52 +1085,71 @@ def test_function_raising_mid_transaction_rolls_everything_back() -> None:
         assert "outside the window" in str(e)
     else:
         raise AssertionError("the function must refuse a row outside the window")
-    assert (_names(db), db.daily) == before and db.cleared == []
+    assert (_names(db), db.daily, db.candidates) == before and db.cleared == []
+    # A key the table does not have fails AFTER the empty day was removed: still nothing changes.
+    try:
+        ci.import_servings_window([{**_srow("2030-01-02", "test oats"), "serving_id": 1}],
+                                  [_drow("2030-01-02", 100.0)], WINDOW, ["2030-01-05"], [], 3,
+                                  dry_run=False, sb=db)
+    except FakeAPIError as e:
+        assert "not writable" in str(e)
+    else:
+        raise AssertionError("a serving_id key must be refused")
+    assert (_names(db), db.daily, db.candidates) == before and db.cleared == []
 
 
-def test_missing_window_function_falls_back_to_the_date_set_replace() -> None:
+def test_missing_functions_fall_back_to_the_date_set_replace() -> None:
+    # Rollout: the code ships before the SQL. Both new functions live in one file, so
+    # they are missing together: the window call, then the combined call, are refused
+    # before they run, and the date-set function plus the usual daily upsert follow.
     servings, daily = _stored()
-    db = FakeDB(servings, daily, missing={"replace_cronometer_servings_window"})
+    db = FakeDB(servings, daily, missing={WINDOW_FN, COMBINED_FN})
     with tempfile.TemporaryDirectory() as tmp:
-        assert _run(db, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=WINDOW) == (1, 1)
-    assert [fn for fn, _ in db.rpc_calls] == ["replace_cronometer_servings_window", "replace_cronometer_servings"]
-    assert db.direct_daily_upserts == 1, "the daily totals go the usual way"
-    assert _names(db, "2030-01-02") == ["test oats"], "days with food were not replaced"
-    assert _names(db, "2030-01-05") == ["test rice"] and db.cleared == [], "the fallback emptied a day"
-    hb = _hb(db)
-    assert hb["servings"]["status"] == "partial"
-    assert ci.REPLACE_WINDOW_SQL in hb["servings"]["error_message"]
-    assert ci.REPLACE_WINDOW_SQL in hb["daily"]["error_message"]
+        assert _two_looks(db, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=WINDOW) == (1, 1)
+        assert [fn for fn, _ in db.rpc_calls] == [WINDOW_FN, COMBINED_FN, LEGACY_FN] * 2
+        assert db.direct_daily_upserts == 2, "the daily totals go the usual way"
+        assert _names(db, "2030-01-02") == ["test oats"], "days with food were not replaced"
+        assert _names(db, "2030-01-05") == ["test rice"] and db.cleared == [], "the fallback emptied a day"
+        hb = _hb(db)
+        assert hb["servings"]["status"] == "partial"
+        assert ci.REPLACE_WINDOW_SQL in hb["servings"]["error_message"]
+        assert ci.REPLACE_WINDOW_SQL in hb["daily"]["error_message"]
+        # A manual import in the same state: the combined call, then the date-set function.
+        db.rpc_calls.clear()
+        _run(db, _export(tmp, [("2030-01-07", "test soup", 100.0)]))
+    assert [fn for fn, _ in db.rpc_calls] == [COMBINED_FN, LEGACY_FN] and db.direct_daily_upserts == 3
+    assert _hb(db)["servings"]["status"] == "success"
 
 
 def test_missing_function_names_are_not_confused() -> None:
-    window_missing = FakeAPIError("PGRST202", "Could not find the function "
-                                              "pds.replace_cronometer_servings_window(p_dates, p_empty_dates) "
-                                              "in the schema cache")
-    legacy_missing = FakeAPIError("PGRST202", "Could not find the function "
-                                              "pds.replace_cronometer_servings(p_dates, p_rows) in the schema cache")
-    assert ci._is_missing_function(window_missing, ci.REPLACE_WINDOW_RPC)
-    assert not ci._is_missing_function(window_missing, ci.REPLACE_SERVINGS_RPC)
-    assert ci._is_missing_function(legacy_missing, ci.REPLACE_SERVINGS_RPC)
-    assert not ci._is_missing_function(legacy_missing, ci.REPLACE_WINDOW_RPC)
-    # Both functions missing: the fallback's own clear error names the legacy SQL file.
-    db = FakeDB([_srow("2030-01-02", "x")],
-                missing={"replace_cronometer_servings_window", "replace_cronometer_servings"})
+    def missing(name, args):
+        return FakeAPIError("PGRST202", f"Could not find the function pds.{name}({args}) in the schema cache")
+
+    errors = {LEGACY_FN: missing(LEGACY_FN, "p_dates, p_rows"),
+              WINDOW_FN: missing(WINDOW_FN, "p_dates, p_empty_dates"),
+              COMBINED_FN: missing(COMBINED_FN, "p_dates, p_daily_rows, p_rows")}
+    for named, err in errors.items():
+        for asked in errors:
+            assert ci._is_missing_function(err, asked) == (named == asked), (named, asked)
+    assert {ci.REPLACE_SERVINGS_RPC, ci.REPLACE_WINDOW_RPC, ci.REPLACE_IMPORT_RPC} == set(errors)
+    # All three missing: the last fallback's own clear error names the legacy SQL file.
+    db = FakeDB([_srow("2030-01-02", "x")], missing={WINDOW_FN, COMBINED_FN, LEGACY_FN})
     try:
         ci.import_servings_window([_srow("2030-01-02", "y")], [], WINDOW, [], [], 3, dry_run=False, sb=db)
     except RuntimeError as e:
         assert ci.REPLACE_SERVINGS_SQL in str(e) and "No servings were changed" in str(e)
     else:
-        raise AssertionError("both functions missing must raise")
+        raise AssertionError("every function missing must raise")
     assert _names(db) == ["x"]
 
 
 def test_reply_that_does_not_confirm_the_import_raises() -> None:
     good = {"inserted": 1, "daily_upserted": 0, "cleared_days": 0, "cleared_servings": 0,
-            "cleared_daily": 0, "refused_days": 0}
+            "cleared_daily": 0, "refused_days": 0, "pending_days": 0}
     for reply in (None, [], "ok", {**good, "inserted": 0}, {**good, "refused_days": "1"},
                   {k: v for k, v in good.items() if k != "cleared_days"}, {**good, "cleared_days": -1},
-                  {**good, "daily_upserted": 1}, {k: v for k, v in good.items() if k != "daily_upserted"}):
+                  {**good, "daily_upserted": 1}, {k: v for k, v in good.items() if k != "daily_upserted"},
+                  {k: v for k, v in good.items() if k != "pending_days"}, {**good, "pending_days": True}):
         db = FakeDB(reply=reply)
         try:
             ci.import_servings_window([_srow("2030-01-02", "a")], [], WINDOW, [], [], 3, dry_run=False, sb=db)
@@ -808,12 +1157,22 @@ def test_reply_that_does_not_confirm_the_import_raises() -> None:
             assert "cannot be confirmed" in str(e)
         else:
             raise AssertionError(f"reply {reply!r} must not count as a confirmed import")
+    for reply in (None, {"inserted": 1}, {"inserted": 1, "daily_upserted": 0},
+                  {"inserted": "1", "daily_upserted": 1}, {"inserted": 1, "daily_upserted": False}):
+        db = FakeDB(reply=reply)
+        try:
+            ci.import_servings_and_daily([_srow("2030-01-02", "a")], [_drow("2030-01-02", 1.0)], False, sb=db)
+        except RuntimeError as e:
+            assert "cannot be confirmed" in str(e)
+        else:
+            raise AssertionError(f"reply {reply!r} must not count as a confirmed manual import")
 
 
 def test_nothing_to_do_makes_no_call() -> None:
     db = FakeDB()
     out = ci.import_servings_window([], [], WINDOW, [], [], 3, dry_run=False, sb=db)
     assert out["mode"] == "none" and db.rpc_calls == []
+    assert ci.import_servings_and_daily([], [], False, sb=db) == (0, 0, "none") and db.rpc_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +1223,7 @@ def test_etl_passes_the_window_it_requested() -> None:
                 export_csv=fake_export, _save_session=lambda *a, **k: None, run_import=fake_run_import):
         etl.fetch_and_import(days=14, dry_run=True, max_empty_days=2)
         start, end = seen["window"]
+        assert type(start) is date and type(end) is date, "the window must be plain dates"
         assert (end - start).days == 14 and seen["max_empty_days"] == 2 and seen["dry_run"] is True
         assert requested == [("servings", start.isoformat(), end.isoformat()),
                              ("dailySummary", start.isoformat(), end.isoformat())]
@@ -935,6 +1295,9 @@ def test_etl_end_to_end_empties_a_day_removed_in_cronometer() -> None:
         with _Patch(etl, authenticate_session=_fake_auth, mint_token=lambda *a, **k: "TOKEN",
                     export_csv=fake_export, _save_session=lambda *a, **k: None):
             assert etl.fetch_and_import(days=30, dry_run=False) == (1, 1)
+            assert _names(db, d_gone) == ["test rice"], "the first scheduled run only records the day"
+            db.advance(LATER)                                  # the next scheduled run
+            assert etl.fetch_and_import(days=30, dry_run=False) == (1, 1)
     finally:
         ci.create_client = saved
     assert _names(db, d_kept) == ["test oats"] and _names(db, d_gone) == []
@@ -952,71 +1315,117 @@ def _code(path):
     return raw, re.sub(r"\s+", " ", code)
 
 
+def _body(flat, name):
+    start = flat.index(f"CREATE OR REPLACE FUNCTION pds.{name}(")
+    end = flat.index("$function$;", start)
+    return flat[start:end]
+
+
+def _args(flat, name):
+    sig = re.search(rf"FUNCTION pds\.{name}\(([^)]*)\) RETURNS", flat)
+    assert sig, f"signature of {name} not found"
+    return sorted(a.strip().split(" ")[0] for a in sig.group(1).split(","))
+
+
 def test_window_sql_contract() -> None:
     raw, flat = _code(WINDOW_SQL)
     upper = flat.upper()
     assert ci.REPLACE_WINDOW_SQL == "sql/cronometer_replace_servings_window.sql" and WINDOW_SQL.is_file()
 
     # The argument names are the keys the importer sends (PostgREST matches by name).
-    sig = re.search(r"FUNCTION pds\.replace_cronometer_servings_window\(([^)]*)\) RETURNS jsonb", flat)
-    assert sig, "function signature not found"
-    args = [a.strip().split(" ")[0] for a in sig.group(1).split(",")]
     db = FakeDB()
     ci.import_servings_window([_srow("2030-01-02", "a")], [_drow("2030-01-02", 100.0)], WINDOW,
                               ["2030-01-03"], [], 3, dry_run=False, sb=db)
-    assert sorted(args) == sorted(db.rpc_calls[0][1]), (args, db.rpc_calls[0][1].keys())
+    ci.import_servings_and_daily([_srow("2030-01-04", "b")], [_drow("2030-01-04", 1.0)], False, sb=db)
+    assert _args(flat, WINDOW_FN) == sorted(db.rpc_calls[0][1]), db.rpc_calls[0][1].keys()
+    assert _args(flat, COMBINED_FN) == sorted(db.rpc_calls[1][1]), db.rpc_calls[1][1].keys()
+    assert _args(flat, "cronometer_upsert_daily") == ["p_daily_rows"]
 
     # The word the Supabase connector refuses never appears, not even in a comment.
     assert "DROP" not in raw.upper()
-    for word in ("TRUNCATE", "SECURITY DEFINER"):
+    for word in ("TRUNCATE", "SECURITY DEFINER", "INFORMATION_SCHEMA"):
         assert word not in upper, f"unexpected {word.strip()}"
-    # The only UPDATE is the daily upsert's ON CONFLICT branch.
-    assert upper.count("UPDATE ") == 1 and "ON CONFLICT (calendar_date) DO UPDATE SET %s" in flat
+    # The only UPDATEs are the two ON CONFLICT branches (daily upsert, candidate record).
+    assert upper.count("UPDATE ") == 2
+    assert "ON CONFLICT (calendar_date) DO UPDATE SET %s" in flat
+    assert ("ON CONFLICT (calendar_date) DO UPDATE SET last_seen_at = now(), times_seen = c.times_seen + 1;"
+            in flat)
 
-    # Exactly three deletes, each scoped to the dates it may touch.
+    # Servings are replaced only through the unchanged date-set function, never here.
+    assert "INSERT INTO pds.cronometer_servings" not in flat
+    assert flat.count("pds.replace_cronometer_servings(") == 2
+
+    # Exactly four deletes, each scoped to the dates it may touch.
     deletes = re.findall(r"DELETE FROM [^;]*?(?:;|RETURNING)", flat)
-    assert len(deletes) == 3 and upper.count("DELETE ") == 3, deletes
-    assert ("DELETE FROM pds.cronometer_servings s WHERE s.calendar_date = ANY (v_empty || v_sempty) "
-            "RETURNING") in flat
-    assert "DELETE FROM pds.cronometer_nutrition_daily n WHERE n.calendar_date = ANY (v_empty) RETURNING" in flat
-    assert "DELETE FROM pds.cronometer_servings WHERE calendar_date = ANY (v_arg_dates);" in flat
+    assert len(deletes) == 4 and upper.count("DELETE ") == 4, deletes
+    assert "DELETE FROM pds.cronometer_servings s WHERE s.calendar_date = ANY (v_confirmed) RETURNING" in flat
+    assert ("DELETE FROM pds.cronometer_nutrition_daily n WHERE n.calendar_date = ANY (v_confirmed) "
+            "AND n.calendar_date = ANY (v_empty) RETURNING") in flat
+    assert ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
+            "(v_arg_dates || v_daily_dates) AND NOT (c.calendar_date = ANY (v_sempty));") in flat
+    assert ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
+            "(v_empty || v_sempty) AND NOT (c.calendar_date = ANY (v_kept));") in flat
     # Every empty-day delete feeds the backup table in the same statement.
     assert flat.count("INSERT INTO pds.cronometer_cleared_rows") == 2
     assert flat.count("RETURNING s.* ) INSERT INTO pds.cronometer_cleared_rows") == 1
     assert flat.count("RETURNING n.* ) INSERT INTO pds.cronometer_cleared_rows") == 1
 
-    # Lock first (same key as the date-set function), then count, then the limit, then
-    # delete, and the daily upsert inside the same locked transaction.
+    # The second look: only days an export at least 6 h earlier recorded, out of the stored ones.
+    assert ci.EMPTY_CONFIRM_HOURS == 6
+    assert ("FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY (v_stored) "
+            "AND c.first_seen_at <= now() - interval '6 hours';") in flat
+    # The limit counts every stored empty day, confirmed or not; a refusal keeps the record.
+    assert "IF v_populated > p_max_cleared_days THEN v_refused := v_populated; v_kept := v_stored;" in flat
+    assert ("SELECT u.d FROM unnest(v_sempty) AS u(d) WHERE EXISTS (SELECT 1 FROM pds.cronometer_servings s "
+            "WHERE s.calendar_date = u.d)) AS x;") in flat
+
+    # Window function order: lock, forget days with food, count, confirm, limit, empty,
+    # record, replace (through the date-set function), daily totals; all under one lock.
     lock = "pg_advisory_xact_lock(hashtext('pds.replace_cronometer_servings'))"
     _legacy_raw, legacy_flat = _code(LEGACY_SQL)
-    assert lock in flat and lock in legacy_flat, "the two functions must share one lock"
-    i_lock, i_count = flat.index(lock), flat.index("SELECT count(*) INTO v_populated")
-    i_limit = flat.index("IF v_populated > p_max_cleared_days THEN v_refused := v_populated;")
-    i_delete = flat.index("DELETE FROM")
-    i_daily = flat.index("INSERT INTO pds.cronometer_nutrition_daily")
-    assert i_lock < i_count < i_limit < i_delete < i_daily
-    # A servings-emptied day counts only when it still holds servings.
-    assert ("SELECT u.d FROM unnest(v_sempty) AS u(d) WHERE EXISTS (SELECT 1 FROM pds.cronometer_servings s "
-            "WHERE s.calendar_date = u.d)) AS stored;") in flat
+    assert lock in legacy_flat and flat.count(lock) == 2, "every writer must share one lock"
+    w = _body(flat, WINDOW_FN)
+    order = [lock, "DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY (v_arg_dates",
+             "INTO v_stored", "INTO v_confirmed", "IF v_populated > p_max_cleared_days",
+             "DELETE FROM pds.cronometer_servings s", "INSERT INTO pds.cronometer_empty_day_candidates",
+             "v_replace := pds.replace_cronometer_servings(v_arg_dates, p_rows);",
+             "v_daily := pds.cronometer_upsert_daily(p_daily_rows);"]
+    positions = [w.index(s) for s in order]
+    assert positions == sorted(positions), list(zip(order, positions))
+
+    # The manual writer: same lock, the date-set function, the daily upsert, no delete.
+    m = _body(flat, COMBINED_FN)
+    assert lock in m and "pds.replace_cronometer_servings(p_dates, p_rows)" in m
+    assert "pds.cronometer_upsert_daily(p_daily_rows)" in m and "DELETE" not in m.upper()
+    assert "this function never empties a day" in m
+    assert m.index(lock) < m.index("pds.replace_cronometer_servings(p_dates, p_rows)")
+
+    # The daily upsert: one row per day, same keys, writable columns from pg_attribute.
+    u = _body(flat, "cronometer_upsert_daily")
+    assert "a date appears twice in p_daily_rows" in u and "do not all carry the same keys" in u
+    assert u.count("'pds.cronometer_nutrition_daily'::regclass") == 2 and "u.key = 'synced_at'" in u
+    assert "IF v_done <> v_n THEN" in u
 
     # Bounded window and dates, same bound as the importer.
     assert f"(p_window_end - p_window_start) + 1 > {ci.MAX_WINDOW_DAYS}" in flat
     assert "p_window_end > current_date + 2" in flat
     assert "WHERE u.d < p_window_start OR u.d > p_window_end" in flat
-    assert "(v_empty && coalesce(v_arg_dates, '{}'::date[]))" in flat and "(v_empty && v_sempty)" in flat
+    assert "(v_empty && v_arg_dates)" in flat and "(v_empty && v_sempty)" in flat
     assert "IF v_empty && v_daily_dates THEN" in flat and "IF NOT (v_sempty <@ v_daily_dates) THEN" in flat
     assert "v_row_dates IS DISTINCT FROM v_arg_dates" in flat
-    assert "a date appears twice in p_daily_rows" in flat
-    assert "do not all carry the same keys" in flat
 
-    # Caller's rights, fixed search_path, service_role only (function and backup table).
-    assert "SECURITY INVOKER" in upper and "SET search_path = pds, pg_temp" in flat
-    fsig = "pds.replace_cronometer_servings_window(date, date, date[], jsonb, date[], date[], jsonb, integer)"
-    assert f"REVOKE ALL ON FUNCTION {fsig} FROM PUBLIC;" in flat
-    assert f"REVOKE ALL ON FUNCTION {fsig} FROM anon, authenticated;" in flat
-    assert f"GRANT EXECUTE ON FUNCTION {fsig} TO service_role;" in flat
-    assert "ALTER TABLE pds.cronometer_cleared_rows ENABLE ROW LEVEL SECURITY;" in flat
-    assert "REVOKE ALL ON pds.cronometer_cleared_rows FROM anon, authenticated;" in flat
+    # Caller's rights, fixed search_path, service_role only (functions and tables).
+    assert upper.count("SECURITY INVOKER") == 3 and flat.count("SET search_path = pds, pg_temp") == 3
+    for fsig in ("pds.replace_cronometer_servings_window(date, date, date[], jsonb, date[], date[], jsonb, integer)",
+                 "pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb)",
+                 "pds.cronometer_upsert_daily(jsonb)"):
+        assert f"REVOKE ALL ON FUNCTION {fsig} FROM PUBLIC;" in flat, fsig
+        assert f"REVOKE ALL ON FUNCTION {fsig} FROM anon, authenticated;" in flat, fsig
+        assert f"GRANT EXECUTE ON FUNCTION {fsig} TO service_role;" in flat, fsig
+    for table in ("pds.cronometer_cleared_rows", "pds.cronometer_empty_day_candidates"):
+        assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;" in flat, table
+        assert f"REVOKE ALL ON {table} FROM anon, authenticated;" in flat, table
+        assert f"REVOKE ALL ON {table} FROM PUBLIC;" in flat, table
     grants = re.findall(r"GRANT [^;]*;", flat)
     assert grants and all(g.endswith("TO service_role;") for g in grants), grants
     assert not re.search(r"\b(TO|FOR\s+\w+\s+TO)\s+(anon|authenticated)\b", flat.replace("FROM anon", "")), \
@@ -1026,7 +1435,7 @@ def test_window_sql_contract() -> None:
 def test_legacy_function_is_unchanged_by_this_feature() -> None:
     _raw, flat = _code(LEGACY_SQL)
     assert "FUNCTION pds.replace_cronometer_servings(p_dates date[], p_rows jsonb)" in flat
-    assert "replace_cronometer_servings_window" not in flat
+    assert "replace_cronometer_servings_window" not in flat and "replace_cronometer_servings_and_daily" not in flat
     assert "p_rows is empty" in flat, "the date-set function must still refuse to wipe days"
 
 
