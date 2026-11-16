@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { ambiguousDbError } from "./write-outcome";
 
 /**
  * Shared logic for recording a stack as consumed: writes one
@@ -18,6 +19,11 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * second call with the same key returns the rows already written instead of
  * writing the stack again, also when two calls race (the unique index fails the
  * whole second insert). Without a key nothing changes.
+ *
+ * A failed insert whose error has no database code may have committed before
+ * its answer was lost (lib/write-outcome.ts): with a key the rows are read back
+ * and returned when they are there; otherwise the result says `incomplete`
+ * ("may be logged, check first"), never a clean "not logged".
  */
 export interface LogStackResult {
   ok: boolean;
@@ -30,7 +36,12 @@ export interface LogStackResult {
   total_doses?: number;
   /** The rows of an earlier call with the same event_key; nothing was written now. */
   replayed?: boolean;
+  /** The insert failed in a way that does not prove nothing was written: the stack may be logged. */
+  incomplete?: boolean;
 }
+
+export const STACK_MAYBE_LOGGED =
+  "The database did not confirm this stack log, and it may have been saved anyway. Do not log it again: tell the user to check /supplements first.";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Pds = SupabaseClient<any, any, any>;
@@ -155,15 +166,21 @@ export async function logStackIntake(
     .from("supplement_intake")
     .insert(keyed)
     .select("intake_id");
-  if (insErr && key && insErr.code === "23505") {
-    // The same event arrived twice at once: the other call wrote the whole set.
-    const prior = await rowsForEvent(supabase, key);
-    if (prior.length > 0) return replayStack(supabase, prior, stack_id);
-  }
+  let unreadable = false;
   if (insErr && key && missingColumn(insErr)) {
     ({ data: inserted, error: insErr } = await supabase.from("supplement_intake").insert(rows).select("intake_id"));
+  } else if (insErr && key) {
+    // The same event arrived twice at once (a 23505 on the key: the other call wrote the whole set), or the answer
+    // was lost after the insert committed: read the rows back under the key.
+    const prior = await rowsForEvent(supabase, key);
+    if (prior.length > 0) return replayStack(supabase, prior, stack_id);
+    unreadable = insErr.code === "23505";
   }
-  if (insErr) return { ok: false, error: insErr.message };
+  if (insErr) {
+    return unreadable || ambiguousDbError(insErr)
+      ? { ok: false, error: STACK_MAYBE_LOGGED, incomplete: true }
+      : { ok: false, error: insErr.message };
+  }
 
   return {
     ok: true,

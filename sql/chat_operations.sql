@@ -13,14 +13,21 @@
 --   pds.chat_requests     one row per (owner, request_id): which conversation
 --                         the id was first sent with (a SHA-256 of it, never
 --                         the text). A retry whose conversation differs is
---                         refused (409).
+--                         refused (409). lease_id / lease_until: the try that
+--                         is running the request now (one try at a time). A
+--                         retry that arrives while another try holds an
+--                         unexpired lease is refused (409) before the model
+--                         runs. The lease (6 min) is longer than the route's
+--                         maxDuration (300 s), so no try outlives it; a try
+--                         gives it back when it ends.
 --   pds.chat_operations   one row per write-tool call of a request, keyed by
 --                         (owner, request_id, tool, n-th call of that tool):
 --                         the call's canonical input and its hash, a status
 --                         (pending -> done | refused | unknown), the result
 --                         the model got, the receipt Riley saw and the context
---                         it first ran with (the behavioral day, so a re-run
---                         after the day rolled over keeps the first day). A
+--                         it first ran with (the behavioral day and the book
+--                         being read, so a re-run after the day rolled over or
+--                         a new book was started keeps the first ones). A
 --                         retry's calls are matched to the stored rows by
 --                         content: a match gets the stored result back (or is
 --                         re-run when nothing was written, or when the write
@@ -45,11 +52,13 @@
 --
 -- Access: service-role only (RLS on, no policy for anon / authenticated, no
 -- grants to them). Only the /api/chat route reads or writes these tables.
--- What is stored: tool inputs, results and receipts of Riley's own chat
--- writes, i.e. the same facts the target tables already hold (a refused or
--- unfinished call keeps only its error line, never the lists it carried).
--- No message text, no model reply, no credentials. There is no retention
--- window yet (a scheduled clean-up needs Riley's approval; roadmap follow-up).
+-- What is stored: the tool inputs of Riley's own chat writes, their results
+-- and receipts. The inputs can include text Riley dictated that the target
+-- tables store too (a reading recall note, a highlight passage and comment,
+-- quiz notes); a refused or unfinished call keeps only its error line, never
+-- the lists it carried. Never the conversation, the model's reply or any
+-- credential. There is no retention window yet (a scheduled clean-up needs
+-- Riley's approval; roadmap follow-up).
 --
 -- Additive and safe to re-run (IF NOT EXISTS everywhere). Until it is applied
 -- the route detects the missing table and runs as before (no ledger); the new
@@ -62,6 +71,8 @@ CREATE TABLE IF NOT EXISTS pds.chat_requests (
     conversation_sha  TEXT        NOT NULL CHECK (conversation_sha ~ '^[0-9a-f]{64}$'),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    lease_id          UUID,
+    lease_until       TIMESTAMPTZ,
     PRIMARY KEY (owner_id, request_id)
 );
 
@@ -87,6 +98,8 @@ CREATE TABLE IF NOT EXISTS pds.chat_operations (
 
 -- For a database where an earlier draft of this file was applied.
 ALTER TABLE pds.chat_operations ADD COLUMN IF NOT EXISTS context JSONB;
+ALTER TABLE pds.chat_requests   ADD COLUMN IF NOT EXISTS lease_id    UUID;
+ALTER TABLE pds.chat_requests   ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_chat_operations_request
     ON pds.chat_operations (owner_id, request_id, created_at);
@@ -164,8 +177,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_reading_sessions_client_key
 -- ---------------------------------------------------------------------------
 -- Spotify playlists created from chat: the audit row carries the operation id,
 -- so a retry whose first try may have created the playlist finds it here
--- (read-only) instead of creating a second one. Rows from /spotify and older
--- rows keep it NULL.
+-- (read-only) instead of creating a second one. From chat the row is written
+-- right after Spotify made the playlist, with track_count NULL until every
+-- track was added. Rows from /spotify and older rows keep client_key NULL.
 -- ---------------------------------------------------------------------------
 ALTER TABLE pds.spotify_playlists ADD COLUMN IF NOT EXISTS client_key UUID;
 

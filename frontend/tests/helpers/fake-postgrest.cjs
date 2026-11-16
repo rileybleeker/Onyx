@@ -1,7 +1,9 @@
 // Test helper (not a test: CI only runs tests/*.test.cjs). A small in-memory stand-in for the supabase-js query
-// builder: insert / update / select with eq / in / gte / order / limit / single / maybeSingle, unique keys per table
-// (all-or-nothing inserts, a 23505 on a clash, keys with a NULL column never clash, like a partial unique index) and
-// injectable failures. Enough to run code that writes through PostgREST offline. Synthetic data only.
+// builder: insert / upsert / update / select with eq / neq / in / gte / lt / is / order / limit / single / maybeSingle,
+// unique keys per table (all-or-nothing inserts, a 23505 on a clash, keys with a NULL column never clash, like a
+// partial unique index) and injectable failures: one that writes nothing (`fail`) and one that writes and then loses
+// the answer (`lose`, e.g. a network error after the commit). Enough to run code that writes through PostgREST
+// offline. Synthetic data only.
 "use strict";
 
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
@@ -12,6 +14,7 @@ const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)
  * options.tables   { table: [rows] }                   starting rows
  * options.rpc      { name: value }                     rpc() answers
  * options.fail     ({ table, op, payload }) => error | null   an error object fails that call (nothing is written)
+ * options.lose     ({ table, op, payload }) => error | null   the call is carried out, then answers with that error
  */
 function createFakePostgrest(options = {}) {
   const unique = options.unique ?? {};
@@ -19,6 +22,7 @@ function createFakePostgrest(options = {}) {
   const data = new Map(Object.entries(options.tables ?? {}).map(([t, rows]) => [t, rows.map(clone)]));
   const log = [];
   let failure = options.fail ?? null;
+  let loss = options.lose ?? null;
   let clock = Date.parse(options.now ?? "2030-01-01T12:00:00.000Z");
   let seq = 0;
   const now = () => new Date((clock += 1000)).toISOString();
@@ -28,7 +32,7 @@ function createFakePostgrest(options = {}) {
   };
 
   function query(table) {
-    const q = { op: "select", filters: [], orders: [], max: null, mode: "many", returning: false, payload: null };
+    const q = { op: "select", filters: [], orders: [], max: null, mode: "many", returning: false, payload: null, conflict: null };
     const shape = (list) => {
       if (q.mode === "single") return list.length === 1 ? { data: clone(list[0]), error: null } : { data: null, error: { code: "PGRST116" } };
       if (q.mode === "maybe") return list.length <= 1 ? { data: clone(list[0] ?? null), error: null } : { data: null, error: { code: "PGRST116" } };
@@ -38,7 +42,28 @@ function createFakePostgrest(options = {}) {
       log.push({ table, op: q.op, payload: clone(q.payload) });
       const injected = failure ? failure({ table, op: q.op, payload: q.payload }) : null;
       if (injected) return { data: null, error: injected };
+      const lost = loss ? loss({ table, op: q.op, payload: q.payload }) : null;
+      const answer = carryOut();
+      return lost ? { data: null, error: lost } : answer;
+    };
+    const carryOut = () => {
       const all = rowsOf(table);
+      if (q.op === "upsert") {
+        const cols = String(q.conflict ?? "").split(",").map((c) => c.trim()).filter(Boolean);
+        const out = [];
+        for (const row of Array.isArray(q.payload) ? q.payload : [q.payload]) {
+          const hit = cols.length ? all.find((r) => cols.every((c) => r[c] === row[c])) : null;
+          if (hit) {
+            Object.assign(hit, clone(row));
+            out.push(hit);
+          } else {
+            const added = { ...(defaults[table] ? defaults[table](now, ++seq) : {}), ...clone(row) };
+            all.push(added);
+            out.push(added);
+          }
+        }
+        return q.returning ? shape(out) : { data: null, error: null };
+      }
       if (q.op === "insert") {
         const batch = (Array.isArray(q.payload) ? q.payload : [q.payload]).map((row) => ({
           ...(defaults[table] ? defaults[table](now, ++seq) : {}),
@@ -82,8 +107,26 @@ function createFakePostgrest(options = {}) {
         q.payload = payload;
         return api;
       },
+      upsert(payload, opts = {}) {
+        q.op = "upsert";
+        q.payload = payload;
+        q.conflict = opts.onConflict ?? null;
+        return api;
+      },
       eq(col, value) {
         q.filters.push((row) => row[col] === value);
+        return api;
+      },
+      neq(col, value) {
+        q.filters.push((row) => row[col] !== value);
+        return api;
+      },
+      is(col, value) {
+        q.filters.push((row) => (value === null ? row[col] === null || row[col] === undefined : row[col] === value));
+        return api;
+      },
+      lt(col, value) {
+        q.filters.push((row) => row[col] !== null && row[col] !== undefined && row[col] < value);
         return api;
       },
       in(col, values) {
@@ -129,6 +172,10 @@ function createFakePostgrest(options = {}) {
     setFailure(fn) {
       failure = fn;
     },
+    /** Carry the matching calls out, then answer them with this error (null = stop). */
+    setLoss(fn) {
+      loss = fn;
+    },
     now,
   };
 }
@@ -141,7 +188,7 @@ function chatLedgerTables(randomUUID) {
       chat_operations: [["owner_id", "request_id", "tool", "ordinal"]],
     },
     defaults: {
-      chat_requests: (now) => ({ created_at: now(), last_attempt_at: now() }),
+      chat_requests: (now) => ({ created_at: now(), last_attempt_at: now(), lease_id: null, lease_until: null }),
       chat_operations: (now) => {
         const at = now();
         return { op_id: randomUUID(), status: "pending", result: null, receipt: null, context: null, created_at: at, updated_at: at };

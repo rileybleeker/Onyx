@@ -587,7 +587,7 @@ test("a response lost after the write but before the ledger recorded it: the ret
   assert.equal(retry.writes(), 1, "re-run, with the same key");
   assert.equal(w.keys[0], w.keys[1]);
   assert.equal(w.effects.size, 1, "one intake");
-  assert.equal(retryBody.receipts[0].status, "saved");
+  assert.equal(retryBody.receipts[0].status, "unchanged", "saved by the first try, nothing new now");
   assert.equal(retryBody.receipts[0].details.at(-1), operations.REPLAY_DETAIL);
   assert.equal(db.rows("chat_operations")[0].status, "done");
 });
@@ -602,7 +602,7 @@ test("a retry whose model asks for something else is refused; a new message stil
   assert.equal(changed.writes(), 0);
   assert.equal(w.effects.size, 1);
   // What the first try saved is listed first, then the refused call, which wrote nothing.
-  assert.deepEqual(changedBody.receipts.map((r) => r.status), ["saved", "not_saved"]);
+  assert.deepEqual(changedBody.receipts.map((r) => r.status), ["unchanged", "not_saved"]);
   assert.deepEqual(changedBody.receipts[0].details, [...firstBody.receipts[0].details, operations.EARLIER_DETAIL]);
   assert.equal(JSON.parse(changed.requests()[1].messages.at(-1).content[0].content).conflict, true);
 
@@ -632,7 +632,7 @@ test("a retry where the model does not repeat the write still shows what the fir
   const quiet = route([{ stop_reason: "end_turn", content: [{ type: "text", text: "Which product did you mean?" }] }], { supabase: db, intake: w.intake });
   const quietBody = await (await quiet.post(body)).json();
   assert.equal(quiet.writes(), 0);
-  assert.deepEqual(quietBody.receipts, [{ ...firstBody.receipts[0], details: [...firstBody.receipts[0].details, operations.EARLIER_DETAIL] }]);
+  assert.deepEqual(quietBody.receipts, [{ ...firstBody.receipts[0], status: "unchanged", details: [...firstBody.receipts[0].details, operations.EARLIER_DETAIL] }]);
 });
 
 test("stack and reading writes get the operation id as their own key; a reading replay mirrors nothing", async () => {
@@ -648,18 +648,20 @@ test("stack and reading writes get the operation id as their own key; a reading 
   assert.deepEqual(seen, [stackOp.op_id]);
   assert.deepEqual(replays, [stackOp.op_id], "the key is looked up before the stack name is resolved");
 
-  const book = { slug: "synthetic-book", title: "Synthetic Book", habit_name: null };
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: null, total_chapters: 20, status: "reading" };
   const keys = [];
   let mirrors = 0;
+  let blockId = null;
   const reading = {
     logSession: async (_client, input) => {
       keys.push(input.client_key);
       const replayed = keys.filter((k) => k === input.client_key).length > 1;
-      return { ok: true, book, session: { session_id: 1, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: null }, xpGained: 20, finished: false, habitMarked: false, habitCreated: replayed ? null : false, replayed };
+      return { ok: true, book, session: { session_id: 1, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: replayed ? blockId : null }, xpGained: 20, finished: false, habitMarked: false, habitCreated: replayed ? null : false, replayed };
     },
     getOverview: async () => null,
   };
-  const readingNotion = { mirrorSession: async () => { mirrors++; return null; }, mirrorProgress: async () => { mirrors++; } };
+  // The first try's Notion entry is stored on the session (notion_block_id), as the route does.
+  const readingNotion = { mirrorSession: async () => { mirrors++; blockId = "synthetic-block"; return blockId; }, mirrorProgress: async () => {} };
   const readingBody = { request_id: "33333333-3333-4333-8333-333333333333", messages: [user("I read chapters 1 and 2 on paper")] };
   // The first try stops before the ledger records the session (its record update fails).
   db.setFailure(({ table, op, payload }) => (table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null));
@@ -667,10 +669,10 @@ test("stack and reading writes get the operation id as their own key; a reading 
   db.setFailure(null);
   const readingOp = db.rows("chat_operations").find((r) => r.tool === "log_reading_session");
   assert.equal(readingOp.status, "pending");
-  assert.equal(mirrors, 2, "the first try mirrored the session and its progress once");
+  assert.equal(mirrors, 1, "the first try mirrored the session once");
   await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
   assert.deepEqual(keys, [readingOp.op_id, readingOp.op_id], "the library client_key is the operation id on both tries");
-  assert.equal(mirrors, 2, "the replayed session made no second Notion entry");
+  assert.equal(mirrors, 1, "the replayed session already had its Notion entry: no second one");
 });
 
 test("a page without request_id runs as before: no ledger, no replay_safe flag", async () => {
@@ -777,4 +779,149 @@ test("a send whose answer never arrived is remembered by hash + id only, for a w
   assert.match(key ?? "", /^[0-9a-f]{64}$/);
   assert.equal(key, await contract.conversationKey([{ ...user("Log Synthetic Focus"), extra: "ignored" }]));
   assert.notEqual(key, await contract.conversationKey([user("Log Synthetic Calm")]));
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2 (SEC-04): one try at a time, lost answers on keyed reading writes, finishing what a stopped try did
+// not reach, the pinned book, and reading a request back by its id alone. Synthetic rows only.
+// ---------------------------------------------------------------------------
+
+test("a retry while another try of the message still runs is a 409 and runs nothing; the lease is given back after", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  assert.equal(db.rows("chat_requests")[0].lease_until, null, "the finished try gave the request back");
+  // Another try holds it now (still running).
+  await db.from("chat_requests").update({ lease_id: "99999999-9999-4999-8999-999999999999", lease_until: new Date(Date.now() + 60_000).toISOString() }).eq("request_id", RID);
+  const busy = route(logFocus, { supabase: db, intake: w.intake });
+  const response = await busy.post(body);
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "request_in_progress");
+  assert.equal(busy.calls(), 0);
+  assert.equal(busy.writes(), 0);
+  // Run out (that try was stopped): the next try goes ahead and answers from the ledger.
+  await db.from("chat_requests").update({ lease_until: new Date(Date.now() - 1000).toISOString() }).eq("request_id", RID);
+  const next = route(logFocus, { supabase: db, intake: w.intake });
+  assert.equal((await next.post(body)).status, 200);
+  assert.equal(w.effects.size, 1);
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /data\?\.code === "request_in_progress"/);
+  const routeSource = readFileSync(new URL("../src/app/api/chat/route.ts", import.meta.url), "utf8");
+  const maxDuration = Number(/export const maxDuration = (\d+);/.exec(routeSource)?.[1]);
+  assert.ok(maxDuration * 1000 < operations.REQUEST_LEASE_MS, "no try outlives its lease");
+});
+
+test("a reading session whose insert committed but lost its answer is found by its key; what it missed is done once", async () => {
+  const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, status: "reading" }] } });
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 2, status: "reading", finished_on: null };
+  const calls = [];
+  let mirrors = 0;
+  const reading = {
+    logSession: async (_client, input) => {
+      calls.push(input);
+      if (calls.length === 1) {
+        // The session row was written under its key; the answer never arrived.
+        db.seed("reading_sessions", [{ session_id: 1, book_id: 4, client_key: input.client_key }]);
+        return { ok: false, error: "TypeError: fetch failed (synthetic)" };
+      }
+      return { ok: true, book, session: { session_id: 1, book_id: 4, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: null }, xpGained: 20, finished: false, habitMarked: false, habitCreated: null, replayed: true };
+    },
+    getOverview: async () => null,
+  };
+  const readingNotion = { mirrorSession: async () => { mirrors++; return "synthetic-block"; }, mirrorProgress: async () => {} };
+  const r = route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion });
+  const out = await (await r.post({ request_id: RID, messages: [user("I finished the synthetic book on paper")] })).json();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].book_id, 4, "the second call names the stored session's book");
+  assert.equal(calls[1].client_key, calls[0].client_key);
+  assert.notEqual(out.receipts[0].status, "not_saved");
+  const result = JSON.parse(r.requests()[1].messages.at(-1).content[0].content);
+  assert.equal(result.success, true);
+  assert.equal(result.finished, true, "the book finish the first call never reached");
+  assert.equal(result.habit_marked, true);
+  assert.equal(db.rows("books")[0].status, "finished");
+  assert.deepEqual(db.rows("habit_journal").map((h) => [h.cycle_date, h.question, h.answer]), [["2026-11-11", "Read synthetic", "Yes"]]);
+  assert.equal(mirrors, 1);
+  assert.equal(db.rows("reading_sessions")[0].notion_block_id, "synthetic-block");
+});
+
+test("a replayed session never overrides an answer given since, and a lost answer with no row found reads 'check this'", async () => {
+  const db = ledgerDb({ tables: { habit_journal: [{ cycle_date: "2026-11-11", question: "Read synthetic", answer: "No" }] } });
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 20, status: "reading", finished_on: null };
+  const reading = {
+    logSession: async () => ({ ok: true, book, session: { session_id: 1, book_id: 4, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, notion_block_id: "b" }, xpGained: 0, finished: false, habitMarked: false, habitCreated: null, replayed: true }),
+    getOverview: async () => null,
+  };
+  const r = route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: db, reading, readingNotion: { mirrorSession: async () => "x", mirrorProgress: async () => {} } });
+  await r.post({ request_id: RID, messages: [user("I read chapter 2")] });
+  assert.deepEqual(db.rows("habit_journal").map((h) => h.answer), ["No"]);
+
+  const lost = route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: ledgerDb(), reading: { logSession: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }), getOverview: async () => null } });
+  const lostBody = await (await lost.post({ request_id: "44444444-4444-4444-8444-444444444444", messages: [user("I read chapter 2")] })).json();
+  assert.equal(lostBody.receipts[0].status, "unknown");
+  assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/);
+  const refused = route(afterTool("log_reading_session", { chapter_through: 99 }), { reading: { logSession: async () => ({ ok: false, error: "chapter_through cannot exceed 20" }) } });
+  assert.equal((await (await refused.post({ messages: [user("I read chapter 99")] })).json()).receipts[0].status, "not_saved");
+});
+
+test("a highlight re-run stays on the book being read when the operation began; one it made earlier is mirrored once", async () => {
+  let failFinish = true;
+  const db = ledgerDb({ fail: ({ table, op, payload }) => (failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null) });
+  let current = 9;
+  const seen = [];
+  let mirrors = 0;
+  const highlights = new Map();
+  const reading = {
+    getBook: async () => ({ book_id: current }),
+    addHighlight: async (_client, input) => {
+      seen.push(input.book_id);
+      const key = `${input.book_id}|${input.passage}`;
+      if (highlights.has(key)) return { ok: true, book: { book_id: input.book_id, title: "Synthetic" }, highlight: highlights.get(key), created: false };
+      const h = { highlight_id: highlights.size + 1, passage: input.passage, chapter: null, comment: null, next_review: "2026-11-12", notion_block_id: null, created_at: new Date().toISOString() };
+      highlights.set(key, h);
+      return { ok: true, book: { book_id: input.book_id, title: "Synthetic" }, highlight: h, created: true };
+    },
+  };
+  // The first try made the highlight and stopped before its Notion entry (the mirror failed) and before the ledger
+  // recorded it.
+  const readingNotion = { mirrorHighlight: async () => { mirrors++; return mirrors === 1 ? null : "synthetic-block"; } };
+  const body = { request_id: RID, messages: [user("Save this synthetic line")] };
+  await route(afterTool("add_book_highlight", { passage: "A synthetic line." }), { supabase: db, reading, readingNotion }).post(body);
+  failFinish = false;
+  current = 10; // a new book was started since
+  const retry = route(afterTool("add_book_highlight", { passage: "A synthetic line." }), { supabase: db, reading, readingNotion });
+  const retryBody = await (await retry.post(body)).json();
+  assert.deepEqual(seen, [9, 9], "both tries used the book being read when the operation began");
+  assert.equal(highlights.size, 1);
+  assert.equal(mirrors, 2, "mirrored again only because the first try's entry was never made");
+  assert.equal(retryBody.receipts[0].status, "unchanged");
+  assert.equal(db.rows("chat_operations")[0].context.book_id, 9);
+});
+
+test("GET /api/chat/operations reads a request back by its id alone, for the signed-in owner only", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  await route(logFocus, { supabase: db, intake: w.intake }).post({ request_id: RID, messages: [user("Log Synthetic Focus")] });
+  const recovery = compile("../src/app/api/chat/operations/route.ts", {
+    "@supabase/supabase-js": { createClient: () => db },
+    "@/lib/chat-contract": contract,
+    "@/lib/chat-receipts": receiptsLib,
+  });
+  const get = (id) => recovery.GET({ nextUrl: new URL(`https://onyx.example/api/chat/operations${id === undefined ? "" : `?request_id=${id}`}`) });
+  const writes = () => db.log.filter((c) => c.op !== "select").length;
+  const writesBefore = writes();
+  const found = await get(RID);
+  assert.equal(found.status, 200);
+  assert.equal(found.headers.get("cache-control"), "private, no-store");
+  const data = await found.json();
+  assert.equal(data.status, "settled");
+  assert.deepEqual(data.receipts.map((r) => r.status), ["saved"]);
+  assert.equal((await (await get("22222222-2222-4222-8222-222222222222")).json()).status, "none");
+  assert.equal((await get("not-a-uuid")).status, 400);
+  assert.equal((await get()).status, 400);
+  assert.equal(writes(), writesBefore, "read-only: nothing written, claimed or released");
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /fetch\(`\/api\/chat\/operations\?request_id=\$\{encodeURIComponent\(id\)\}`/);
+  assert.match(page, /input\.trim\(\) === resendText/, "the resend button only sends the message the composer still holds");
 });

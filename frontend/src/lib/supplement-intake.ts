@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { ambiguousDbError } from "./write-outcome";
 
 /**
  * Log one product from the /supplements list by NAME, with an optional
@@ -71,7 +72,12 @@ export interface LogIntakeResult {
   skipped_duplicates?: string[];
   /** The rows of an earlier call with the same event_key; nothing was written now. */
   replayed?: boolean;
+  /** The insert failed in a way that does not prove nothing was written (lib/write-outcome.ts): it may be logged. */
+  incomplete?: boolean;
 }
+
+export const INTAKE_MAYBE_LOGGED =
+  "The database did not confirm this intake, and it may have been saved anyway. Do not log it again: tell the user to check /supplements first.";
 
 const norm = (s: string | null | undefined) =>
   (s ?? "").toLowerCase().replace(/[^a-z0-9µ.]+/g, " ").trim();
@@ -394,15 +400,22 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       .from("supplement_intake")
       .insert(keyed)
       .select("intake_id,intake_time");
-    if (insErr && key && insErr.code === "23505") {
-      // The same event arrived twice at once: the other call wrote the whole set.
-      const prior = await rowsForEvent(supabase, key);
-      if (prior.length > 0) return replayIntake(supabase, prior);
-    }
+    let unreadable = false;
     if (insErr && key && missingColumn(insErr)) {
       ({ data: inserted, error: insErr } = await supabase.from("supplement_intake").insert(rows).select("intake_id,intake_time"));
+    } else if (insErr && key) {
+      // The same event arrived twice at once (a 23505 on the key: the other call wrote the whole set), or the answer
+      // was lost after the insert committed: read the rows back under the key.
+      const prior = await rowsForEvent(supabase, key);
+      if (prior.length > 0) return replayIntake(supabase, prior);
+      unreadable = insErr.code === "23505";
     }
-    if (insErr) return { ok: false, error: insErr.message };
+    if (insErr) {
+      // A database refusal wrote nothing; an error with no database code may have come after the commit.
+      return unreadable || ambiguousDbError(insErr)
+        ? { ok: false, error: INTAKE_MAYBE_LOGGED, incomplete: true }
+        : { ok: false, error: insErr.message };
+    }
     logged = (inserted ?? []).map((r: { intake_id: number; intake_time: string | null }) => ({ intake_id: r.intake_id, time: local(r.intake_time) }));
   }
 

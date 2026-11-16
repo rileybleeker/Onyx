@@ -100,7 +100,64 @@ test("a failed stack insert writes nothing and says so", async () => {
   const d = db({ fail: ({ table, op }) => (table === "supplement_intake" && op === "insert" ? { code: "23503", message: "synthetic failure" } : null) });
   const out = await stacks.logStackIntake(d, 7, { event_key: KEY });
   assert.equal(out.ok, false);
+  assert.equal(out.incomplete, undefined, "a database refusal (it has a SQLSTATE) is a clean 'not logged'");
   assert.equal(d.rows("supplement_intake").length, 0);
+});
+
+// The insert commits and its answer is lost on the way (supabase-js reports a network failure as an error with no
+// code, not a throw).
+const loseFirstInsert = () => {
+  let lost = false;
+  return ({ table, op }) => {
+    if (lost || table !== "supplement_intake" || op !== "insert") return null;
+    lost = true;
+    return { code: "", message: "TypeError: fetch failed (synthetic)" };
+  };
+};
+
+test("a keyed stack insert that committed but lost its answer is found under its key: success, one set of rows", async () => {
+  const d = db({ lose: loseFirstInsert() });
+  const out = await stacks.logStackIntake(d, 7, { event_key: KEY });
+  assert.equal(out.ok, true);
+  assert.equal(out.replayed, true);
+  assert.equal(out.count, 2);
+  // The model calls it again, or the message is retried: still one set.
+  const again = await stacks.logStackIntake(d, 7, { event_key: KEY });
+  assert.equal(again.replayed, true);
+  assert.equal(d.rows("supplement_intake").length, 2);
+});
+
+test("a lost answer that cannot be read back is 'may be logged' (incomplete), never 'not logged'", async () => {
+  const d = db({ lose: loseFirstInsert() });
+  // The read-back after the lost answer fails too (still offline).
+  d.setFailure(({ table, op }) => (table === "supplement_intake" && op === "select" ? { code: "" } : null));
+  const keyedOut = await stacks.logStackIntake(d, 7, { event_key: KEY });
+  assert.equal(keyedOut.ok, false);
+  assert.equal(keyedOut.incomplete, true);
+  assert.equal(keyedOut.error, stacks.STACK_MAYBE_LOGGED);
+  assert.doesNotMatch(keyedOut.error, /synthetic/, "the transport text is not passed on");
+  d.setFailure(null);
+  // Without a key (the /supplements page) a lost answer is also "may be logged".
+  const d2 = db({ lose: loseFirstInsert() });
+  const plainOut = await stacks.logStackIntake(d2, 7, {});
+  assert.equal(plainOut.incomplete, true);
+  assert.equal(d2.rows("supplement_intake").length, 2, "it was written");
+});
+
+test("a keyed single-product insert that committed but lost its answer: found under its key, written once", async () => {
+  const d = db({ lose: loseFirstInsert() });
+  const out = await intake.logSupplementIntake(d, { product: "Synthetic Calm", event_key: KEY });
+  assert.equal(out.ok, true);
+  assert.equal(out.replayed, true);
+  const again = await intake.logSupplementIntake(d, { product: "Synthetic Calm", event_key: KEY });
+  assert.equal(again.replayed, true);
+  assert.equal(d.rows("supplement_intake").length, 1);
+  // Unkeyed and lost: "may be logged".
+  const d2 = db({ lose: loseFirstInsert() });
+  const plainOut = await intake.logSupplementIntake(d2, { product: "Synthetic Calm" });
+  assert.equal(plainOut.ok, false);
+  assert.equal(plainOut.incomplete, true);
+  assert.equal(plainOut.error, intake.INTAKE_MAYBE_LOGGED);
 });
 
 test("an untimed single-product log with an event key is written once; the repeat returns the stored row", async () => {

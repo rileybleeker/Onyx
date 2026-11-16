@@ -335,6 +335,32 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
 
+  const sb = supabaseAdmin();
+  const audit = {
+    playlist_id: playlistId,
+    name,
+    description: description ?? null,
+    is_public: isPublic,
+    track_count: trackIds.length,
+    track_ids: trackIds,
+    spotify_url: spotifyUrl,
+    created_via: createdVia,
+    prompt: prompt ?? null,
+    raw_json: playlist,
+  };
+  // From chat (with the operation id): the audit row goes in NOW, before any track is added, with track_count NULL
+  // ("tracks not confirmed yet"), so a retry of the chat message finds the playlist by its key even when adding the
+  // tracks fails or the try is stopped half-way (SEC-04, lib/chat-operations.ts). The count is set once every track
+  // is in. Without a key the row is written at the end, as before.
+  let earlyAudit = false;
+  if (clientKey) {
+    const { error } = await sb.from("spotify_playlists").insert({ ...audit, track_count: null, client_key: clientKey });
+    earlyAudit = !error;
+    if (error && error.code !== "42703" && error.code !== "PGRST204") {
+      console.error("Failed to log playlist to pds.spotify_playlists:", { code: error.code });
+    }
+  }
+
   // 1a. Enforce visibility via three layered attempts.
   //
   //     KNOWN ISSUE (audited 2026-05-25): on Spotify Development Mode apps
@@ -414,24 +440,16 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
     }
   }
 
-  // 4. Persist to Supabase audit table
-  const sb = supabaseAdmin();
-  const audit = {
-    playlist_id: playlistId,
-    name,
-    description: description ?? null,
-    is_public: isPublic,
-    track_count: trackIds.length,
-    track_ids: trackIds,
-    spotify_url: spotifyUrl,
-    created_via: createdVia,
-    prompt: prompt ?? null,
-    raw_json: playlist,
-  };
-  let { error: insertErr } = await sb.from("spotify_playlists").insert(clientKey ? { ...audit, client_key: clientKey } : audit);
-  // The client_key column comes with sql/chat_operations.sql; until it is applied the row is written without it.
-  if (insertErr && clientKey && (insertErr.code === "42703" || insertErr.code === "PGRST204")) {
-    ({ error: insertErr } = await sb.from("spotify_playlists").insert(audit));
+  // 4. Persist to Supabase audit table (or, from chat, confirm the tracks on the row written right after the create).
+  let insertErr: { code?: string; message?: string } | null = null;
+  if (earlyAudit) {
+    ({ error: insertErr } = await sb.from("spotify_playlists").update({ track_count: trackIds.length }).eq("playlist_id", playlistId));
+  } else {
+    ({ error: insertErr } = await sb.from("spotify_playlists").insert(clientKey ? { ...audit, client_key: clientKey } : audit));
+    // The client_key column comes with sql/chat_operations.sql; until it is applied the row is written without it.
+    if (insertErr && clientKey && (insertErr.code === "42703" || insertErr.code === "PGRST204")) {
+      ({ error: insertErr } = await sb.from("spotify_playlists").insert(audit));
+    }
   }
   if (insertErr) {
     console.error("Failed to log playlist to pds.spotify_playlists:", insertErr);

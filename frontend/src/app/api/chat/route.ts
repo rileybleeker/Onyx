@@ -10,9 +10,15 @@ import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/supplement-stacks";
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, logSupplementIntake } from "@/lib/supplement-intake";
-import { addHighlight, getOverview, logSession, recordQuiz, summarizeForChat, type HighlightSource, type Medium } from "@/lib/reading";
+import { addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
+
+/**
+ * Set explicitly: the replay ledger's one-try-at-a-time lease (REQUEST_LEASE_MS in lib/chat-operations.ts, 6 min)
+ * relies on the platform stopping a try before its lease runs out. Keep it below that lease.
+ */
+export const maxDuration = 300;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -524,10 +530,100 @@ const QUIZ_MAYBE_RECORDED =
  * a retry that re-runs the tool finds what an earlier try already wrote. `day` = the behavioral day the operation
  * first ran on, `today` = this request's: a re-run on a later day keeps an omitted date on the first day.
  */
-interface OpContext { id: string; day: string; today: string }
+interface OpContext {
+  id: string;
+  day: string;
+  today: string;
+  /** The book being read when the operation first ran (a reading call that names no book): re-runs keep it. */
+  bookId?: number;
+  /** When the operation first ran (ISO): a highlight created since then was created by this operation. */
+  startedAt?: string;
+}
 
 /** The date to use when the model gave none: the operation's first day, when that is not today (a re-run). */
 const pinnedDate = (op?: OpContext): string | null => (op && op.day !== op.today ? op.day : null);
+
+/** The book a reading call uses when it names none: the one pinned when the operation first ran. */
+const pinnedBook = (op: OpContext | undefined, input: Record<string, unknown>): { book_id: number } | Record<string, never> =>
+  op?.bookId !== undefined && !(typeof input.book === "string" && input.book.trim()) ? { book_id: op.bookId } : {};
+
+/** Reading tools that resolve "the book being read" when the model names no book. */
+const READING_BOOK_TOOLS = new Set(["log_reading_session", "add_book_highlight", "record_reading_quiz"]);
+
+/** The book being read right now (lib/reading.ts getBook), for a new reading operation that names no book. */
+async function currentBookId(): Promise<number | undefined> {
+  try {
+    const book = await getBook(supabase, null);
+    return typeof book?.book_id === "number" ? book.book_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** logSession / addHighlight refusals from before anything was written. Any other error came from a write. */
+const SESSION_NOT_WRITTEN = /^(No active book found|chapter_through must be|chapter_through cannot exceed)/;
+const SESSION_MAYBE_WRITTEN =
+  "The database did not confirm this reading session, and it may have been saved anyway. Do not log it again: tell the user to check /reading first.";
+const HIGHLIGHT_NOT_WRITTEN = /^(No active book found|passage is required)/;
+const HIGHLIGHT_MAYBE_WRITTEN =
+  "The database did not confirm this highlight, and it may have been saved anyway. Do not add it again: tell the user to check /reading first.";
+
+/** A highlight created no earlier than this before the operation began counts as created by it (clock skew). */
+const OWN_HIGHLIGHT_MARGIN_MS = 5_000;
+
+const createdSince = (createdAt: string | null | undefined, startedAt: string | undefined): boolean => {
+  const made = createdAt ? Date.parse(createdAt) : NaN;
+  const began = startedAt ? Date.parse(startedAt) : NaN;
+  return Number.isFinite(made) && Number.isFinite(began) && made >= began - OWN_HIGHLIGHT_MARGIN_MS;
+};
+
+/** The book of the reading session written under this operation id, or null (none, or the read failed). */
+async function sessionBookByKey(opId: string): Promise<number | null> {
+  const { data, error } = await supabase.from("reading_sessions").select("book_id").eq("client_key", opId).maybeSingle();
+  const id = error ? undefined : (data as { book_id?: unknown } | null)?.book_id;
+  return typeof id === "number" ? id : null;
+}
+
+/**
+ * The steps logSession takes after its insert, for a session an earlier try wrote and then stopped: the book is
+ * marked finished when the session reached its last chapter and it is not finished yet, and the book's habit gets a
+ * Yes for the session day only when that day has no answer for it at all (an answer given since is never changed).
+ */
+async function completeReplayedSession(book: Book, session: ReadingSession): Promise<{ book: Book; finished: boolean; habitMarked: boolean }> {
+  let current = book;
+  let finished = false;
+  const total = book.total_chapters;
+  if (total && (session.chapter_through ?? 0) >= total && book.status !== "finished") {
+    const { data, error } = await supabase
+      .from("books")
+      .update({ status: "finished", finished_on: session.session_date })
+      .eq("book_id", book.book_id)
+      .neq("status", "finished")
+      .select("book_id");
+    if (!error && Array.isArray(data) && data.length > 0) {
+      finished = true;
+      current = { ...book, status: "finished", finished_on: session.session_date };
+    }
+  }
+  let habitMarked = false;
+  if (book.habit_name) {
+    const { data: had, error } = await supabase
+      .from("habit_journal")
+      .select("answer")
+      .eq("cycle_date", session.session_date)
+      .eq("question", book.habit_name)
+      .maybeSingle();
+    if (!error && !had) {
+      const { error: stampError } = await supabase
+        .from("habit_journal")
+        .upsert({ cycle_date: session.session_date, question: book.habit_name, category: "learning", answer: "Yes" }, { onConflict: "cycle_date,question" });
+      habitMarked = !stampError;
+    } else if (!error) {
+      habitMarked = (had as { answer?: unknown }).answer === "Yes";
+    }
+  }
+  return { book: current, finished, habitMarked };
+}
 
 async function executeTool(name: string, input: Record<string, unknown>, op?: OpContext): Promise<string> {
   const opId = op?.id;
@@ -952,14 +1048,10 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
   if (name === "log_reading_session") {
     // A re-run of an operation that already wrote its session: name that session's book, so logSession finds it by
     // its key even when the book is no longer the one being read (it resolves the book before it checks the key).
-    let priorBook: number | null = null;
-    if (opId) {
-      const { data: prior } = await supabase.from("reading_sessions").select("book_id").eq("client_key", opId).maybeSingle();
-      const id = (prior as { book_id?: unknown } | null)?.book_id;
-      if (typeof id === "number") priorBook = id;
-    }
-    const result = await logSession(supabase, {
-      ...(priorBook !== null ? { book_id: priorBook } : {}),
+    // Otherwise the book pinned when the operation first ran, so a re-run never logs to a book started since.
+    const priorBook = opId ? await sessionBookByKey(opId) : null;
+    const sessionInput = {
+      ...(priorBook !== null ? { book_id: priorBook } : pinnedBook(op, input)),
       slug: (input.book as string) || null,
       date: (input.date as string) || pinnedDate(op),
       chapter_through: Number(input.chapter_through),
@@ -968,31 +1060,47 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       medium: (input.medium as Medium) || null,
       recall: (input.recall as string) || null,
       question: (input.question as string) || null,
-      source: "chat",
+      source: "chat" as const,
       // The library's own idempotency key (sql/reading_sessions_client_key.sql): a retry gets the stored session back.
       ...(opId ? { client_key: opId } : {}),
-    });
-    if (!result.ok) return JSON.stringify({ error: result.error });
-    // A replay (same client_key) wrote nothing: no second Notion entry or progress update. Mirror inline otherwise
-    // (the chat loop has no after() boundary worth protecting).
+    };
+    let result = await logSession(supabase, sessionInput);
+    if (!result.ok && opId && !SESSION_NOT_WRITTEN.test(result.error)) {
+      // The insert failed in a way that may have committed (its answer lost on the way): find it by its key.
+      const found = await sessionBookByKey(opId);
+      if (found !== null) result = await logSession(supabase, { ...sessionInput, book_id: found });
+    }
+    if (!result.ok) {
+      // A refusal wrote nothing; a failed insert may have committed: never "not logged".
+      return JSON.stringify(SESSION_NOT_WRITTEN.test(result.error) ? { error: result.error } : { error: SESSION_MAYBE_WRITTEN, incomplete: true });
+    }
+    // A replay (same client_key): an earlier try of this operation wrote the session and stopped before the ledger
+    // recorded it, possibly before the book finish, the habit stamp or the Notion entry. Each is done now only when it
+    // is still missing, so nothing happens twice. (One try at a time: the earlier try is no longer running.)
     const replayed = result.replayed === true;
-    const blockId = replayed ? result.session.notion_block_id : await mirrorSession(result.book, result.session);
-    if (blockId && !replayed) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
-    const o = await getOverview(supabase, result.book.slug).catch(() => null);
-    if (!replayed) await mirrorProgress(result.book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    const completed = replayed ? await completeReplayedSession(result.book, result.session) : null;
+    const book = completed?.book ?? result.book;
+    const finished = completed ? completed.finished : result.finished;
+    const habitMarked = completed ? completed.habitMarked : result.habitMarked;
+    // Mirror inline (the chat loop has no after() boundary worth protecting).
+    const blockId = result.session.notion_block_id ?? (await mirrorSession(book, result.session));
+    if (blockId && !result.session.notion_block_id) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    const o = await getOverview(supabase, book.slug).catch(() => null);
+    // Rewrites one progress line in Notion: the same text when it is already up to date.
+    await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
     return JSON.stringify({
       success: true,
-      book: result.book.title,
+      book: book.title,
       session_date: result.session.session_date,
       chapter_from: result.session.chapter_from,
       chapter_through: result.session.chapter_through,
       minutes: result.session.minutes,
       medium: result.session.medium,
       recall_chars: (result.session.recall ?? "").length,
-      habit: result.habitMarked ? result.book.habit_name : null,
+      habit: habitMarked ? book.habit_name : null,
       xp_gained: result.xpGained,
-      finished: result.finished,
-      habit_marked: result.habitMarked,
+      finished,
+      habit_marked: habitMarked,
       chapters_done: o?.chaptersDone,
       total_chapters: o?.totalChapters,
       pace: o?.pace,
@@ -1005,6 +1113,8 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
 
   if (name === "add_book_highlight") {
     const result = await addHighlight(supabase, {
+      // The book pinned when the operation first ran (a call that names no book): a re-run stays on it.
+      ...pinnedBook(op, input),
       slug: (input.book as string) || null,
       passage: String(input.passage ?? ""),
       comment: (input.comment as string) || null,
@@ -1014,9 +1124,17 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       // A re-run on a later day schedules the first review from the day the highlight was first sent.
       ...(pinnedDate(op) ? { date: pinnedDate(op) } : {}),
     });
-    if (!result.ok) return JSON.stringify({ error: result.error });
+    if (!result.ok) {
+      // A refusal wrote nothing; a failed write may have committed. A re-run is safe either way (one highlight per
+      // book + passage), but the model and the receipt must not read it as "not saved".
+      return JSON.stringify(HIGHLIGHT_NOT_WRITTEN.test(result.error) ? { error: result.error } : { error: HIGHLIGHT_MAYBE_WRITTEN, incomplete: true });
+    }
+    // Already there, created since this operation began and never mirrored: an earlier try of this operation made it
+    // and stopped before the Notion entry. Mirror it now and report it as that earlier write.
+    const ownEarlier =
+      !result.created && !result.highlight.notion_block_id && createdSince(result.highlight.created_at, op?.startedAt);
     let mirrored = false;
-    if (result.created) {
+    if (result.created || ownEarlier) {
       const blockId = await mirrorHighlight(result.book, result.highlight);
       if (blockId) {
         await supabase.from("book_highlights").update({ notion_block_id: blockId }).eq("highlight_id", result.highlight.highlight_id);
@@ -1025,7 +1143,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     }
     return JSON.stringify({
       success: true,
-      created: result.created,
+      created: result.created || ownEarlier,
       highlight_id: result.highlight.highlight_id,
       book: result.book.title,
       chapter: result.highlight.chapter,
@@ -1033,11 +1151,13 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       has_comment: !!result.highlight.comment,
       next_review: result.highlight.next_review,
       notion_mirrored: mirrored,
+      ...(ownEarlier ? { replayed: true } : {}),
     });
   }
 
   if (name === "record_reading_quiz") {
     const result = await recordQuiz(supabase, {
+      ...pinnedBook(op, input),
       slug: (input.book as string) || null,
       checkpoint: String(input.checkpoint ?? ""),
       score: Number(input.score),
@@ -1100,7 +1220,8 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       const event = opId ? { event_key: opId } : {};
       result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...event });
     }
-    if (!result.ok) return JSON.stringify({ error: result.error });
+    // incomplete = the insert may have committed before its answer was lost: "check first", never "not logged".
+    if (!result.ok) return JSON.stringify({ error: result.error, ...(result.incomplete ? { incomplete: true } : {}) });
     const written = await describeStackIntakes(result.intake_ids ?? []);
     return JSON.stringify({
       success: true,
@@ -1225,6 +1346,8 @@ export async function POST(req: NextRequest) {
     earlierAdded = true;
     receipts.unshift(...(await ledger.earlierReceipts()));
   };
+  // The ledger being opened (it takes this try's lease on the request), so `finally` can give the lease back.
+  let opening: Promise<OpenedLedger> | null = null;
   try {
     let body: unknown;
     try { body = await req.json(); } catch {
@@ -1246,16 +1369,22 @@ export async function POST(req: NextRequest) {
     // behavioral day so "today", "yesterday" and "this morning" resolve.
     // The request is recorded in the replay ledger at the same time (one insert; nothing is added to the wait).
     const now = new Date();
+    // Kept so the lease is given back in `finally` even when the other two reads fail.
+    opening = requestId ? openRequestLedger(requestId, messages) : null;
     const [opened, tz, bday] = await Promise.all([
-      requestId ? openRequestLedger(requestId, messages) : Promise.resolve(null),
+      opening ?? Promise.resolve(null),
       currentTimeZone(supabase, now),
       behavioralToday(supabase),
     ]);
     if (opened?.kind === "conflict") {
       return Response.json({ error: "This retry does not match the message it was first sent with, so nothing was run. Send your message again.", code: "request_conflict" }, { status: 409 });
     }
+    if (opened?.kind === "busy") {
+      // Another try of this same message is still running: one try at a time, so nothing runs now.
+      return Response.json({ error: "An earlier try of this message is still running. Wait a moment, then send it again unchanged.", code: "request_in_progress" }, { status: 409 });
+    }
     if (opened?.kind === "ledger") ledger = opened.ledger;
-    else if (opened) {
+    else if (opened && "code" in opened) {
       logLedger("open", opened.code);
       // Tables not there yet (sql/chat_operations.sql not applied): run as before. Any other failure: no write runs
       // without a record of it.
@@ -1309,12 +1438,19 @@ export async function POST(req: NextRequest) {
           let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
           if (isWriteTool(block.name) && ledger) {
             // Through the ledger: a retry of this message gets the stored result instead of writing again. A re-run
-            // of a stored call gets the day that call first ran on (its context), not today.
+            // of a stored call gets what that call first ran with (its context: the day, the book), not today's.
+            const bookId = READING_BOOK_TOOLS.has(block.name) && !(typeof input.book === "string" && input.book.trim()) ? await currentBookId() : undefined;
             outcome = await ledger.run(
               block.name,
               input,
-              (id, context) => runTool(block.name, input, { id, day: typeof context.behavioral_today === "string" ? context.behavioral_today : bday, today: bday }),
-              { behavioral_today: bday },
+              (id, context) => runTool(block.name, input, {
+                id,
+                day: typeof context.behavioral_today === "string" ? context.behavioral_today : bday,
+                today: bday,
+                ...(typeof context.book_id === "number" ? { bookId: context.book_id } : {}),
+                ...(typeof context.started_at === "string" ? { startedAt: context.started_at } : {}),
+              }),
+              { behavioral_today: bday, started_at: new Date().toISOString(), ...(bookId !== undefined ? { book_id: bookId } : {}) },
             );
           } else if (isWriteTool(block.name) && writesPaused) {
             const result = JSON.stringify({ error: WRITES_PAUSED });
@@ -1376,5 +1512,9 @@ export async function POST(req: NextRequest) {
       withReceipts({ error: "Unable to finish this request. If you asked to log or create something, check the relevant page before retrying." }),
       { status: 500 }
     );
+  } finally {
+    // One try at a time: give the request back so a retry of this message can run (never throws).
+    const held = opening ? await (opening as Promise<OpenedLedger>).catch(() => null) : null;
+    if (held?.kind === "ledger") await held.ledger.release();
   }
 }

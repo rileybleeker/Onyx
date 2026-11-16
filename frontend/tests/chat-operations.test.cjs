@@ -21,7 +21,11 @@ function setup(extra = {}) {
   const db = createFakePostgrest({ ...chatLedgerTables(randomUUID), ...extra });
   const store = ops.supabaseLedgerStore(db);
   const errors = [];
-  const open = async ({ owner = OWNER, request = REQUEST, conversation = CONVERSATION, reconcilers } = {}) => {
+  const held = [];
+  // Each open() is a new try of the request. The tries before it have ended (the route gives the lease back in
+  // `finally`), unless the test keeps them running.
+  const open = async ({ owner = OWNER, request = REQUEST, conversation = CONVERSATION, reconcilers, keepRunning = false } = {}) => {
+    if (!keepRunning) while (held.length) await held.pop().release();
     const opened = await ops.openLedger(store, {
       ownerId: owner,
       requestId: request,
@@ -31,9 +35,15 @@ function setup(extra = {}) {
       onError: (stage, code) => errors.push([stage, code]),
     });
     assert.equal(opened.kind, "ledger");
+    held.push(opened.ledger);
     return opened.ledger;
   };
   return { db, store, open, errors };
+}
+
+/** A try that was stopped without giving its lease back, once the lease has run out. */
+async function expireLeases(db) {
+  await db.from("chat_requests").update({ lease_until: new Date(Date.now() - 1000).toISOString() }).eq("owner_id", OWNER);
 }
 
 /** A keyed write, like the supplement event key or the reading client_key: the same key never writes twice. */
@@ -117,24 +127,55 @@ test("lost after the write but before the ledger recorded it: the retry re-runs 
 
 test("lost right after the claim (the try died before writing): the retry runs the write once", async () => {
   const { db, store, open } = setup();
-  await store.claimRequest(OWNER, REQUEST, CONVERSATION);
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
   const sha = ops.intentSha(STACK, input());
   await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: STACK, ordinal: 1 }, sha, input());
+  await expireLeases(db);
   const write = keyedWrite();
   const again = await (await open()).run(STACK, input(), write.execute());
   assert.equal(write.effects.size, 1);
   assert.equal(again.replayed, false);
-  assert.equal(again.receipt.status, "saved");
+  assert.equal(again.receipt.status, "saved", "written now, by this try");
   assert.equal(db.rows("chat_operations")[0].status, "done");
 });
 
-test("two tries of one message at the same moment still write once", async () => {
-  const { open } = setup();
+test("two tries of one message at the same moment: one runs, the other is turned away before anything runs", async () => {
+  const { store } = setup();
+  const openOne = () => ops.openLedger(store, { ownerId: OWNER, requestId: REQUEST, conversationSha: CONVERSATION, buildReceipt: receipts.buildWriteReceipt });
+  const kinds = (await Promise.all([openOne(), openOne()])).map((o) => o.kind).sort();
+  assert.deepEqual(kinds, ["busy", "ledger"]);
+});
+
+test("one try at a time: a retry waits for the lease; given back or run out, the next try takes it", async () => {
+  const { db, store } = setup();
+  const openOne = () => ops.openLedger(store, { ownerId: OWNER, requestId: REQUEST, conversationSha: CONVERSATION, buildReceipt: receipts.buildWriteReceipt });
+  const first = await openOne();
+  assert.equal(first.kind, "ledger");
+  assert.equal(first.ledger.retry, false);
+  assert.equal((await openOne()).kind, "busy", "the first try still holds it");
+  await first.ledger.release();
+  const second = await openOne();
+  assert.equal(second.kind, "ledger");
+  assert.equal(second.ledger.retry, true);
+  // The second try is stopped without giving it back: busy until the lease runs out, then the next try takes it.
+  assert.equal((await openOne()).kind, "busy");
+  await expireLeases(db);
+  const third = await openOne();
+  assert.equal(third.kind, "ledger");
+  // A late release by the stopped try does not free the lease the third try holds.
+  await second.ledger.release();
+  assert.equal((await openOne()).kind, "busy");
+  assert.ok(ops.REQUEST_LEASE_MS > 300_000, "longer than the chat route's maxDuration");
+});
+
+test("two ledgers on one request (no lease between them) still write once", async () => {
+  const { store } = setup();
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  const ledger = () => new ops.ChatLedger({ store, ownerId: OWNER, requestId: REQUEST, retry: true, buildReceipt: receipts.buildWriteReceipt });
   const write = keyedWrite();
-  const [a, b] = await Promise.all([open(), open()]);
-  const results = await Promise.all([a.run(STACK, input(), write.execute()), b.run(STACK, input(), write.execute())]);
+  const [a, b] = [ledger(), ledger()];
+  await Promise.all([a.run(STACK, input(), write.execute()), b.run(STACK, input(), write.execute())]);
   assert.equal(write.effects.size, 1);
-  assert.ok(results.every((r) => r.receipt.status === "saved"));
 });
 
 test("a retry that asks for different details is refused; what the first try saved is still listed once", async () => {
@@ -223,10 +264,12 @@ test("one request id under another owner is a separate request and never sees th
 
 test("the same request id with another conversation is a conflict", async () => {
   const { store } = setup();
-  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION), "new");
-  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION), "retry");
+  const a = randomUUID();
+  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION, a), "new");
+  await store.releaseRequest(OWNER, REQUEST, a);
+  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID()), "retry");
   const other = ops.conversationSha([{ role: "user", content: "Log my other synthetic stack" }]);
-  assert.equal(await store.claimRequest(OWNER, REQUEST, other), "conflict");
+  assert.equal(await store.claimRequest(OWNER, REQUEST, other, randomUUID()), "conflict");
   const opened = await ops.openLedger(store, { ownerId: OWNER, requestId: REQUEST, conversationSha: other, buildReceipt: receipts.buildWriteReceipt });
   assert.equal(opened.kind, "conflict");
 });
@@ -277,7 +320,7 @@ test("a playlist left unconfirmed is looked up read-only and never created again
   const found = await (await open({ reconcilers })).run(PLAYLIST, call, create);
   assert.equal(creates, 1, "still one create call in total");
   assert.equal(found.replayed, true);
-  assert.equal(found.receipt.status, "saved");
+  assert.equal(found.receipt.status, "unchanged", "made by the earlier try, nothing new now");
   assert.equal(found.receipt.link.href, "https://open.spotify.com/playlist/pl1", "found by its key, not by its name");
   assert.equal(db.rows("chat_operations")[0].status, "done");
 
@@ -298,8 +341,9 @@ test("a quiz result left pending is confirmed from pds.reading_quizzes, never re
   });
   const QUIZ = "record_reading_quiz";
   const call = { checkpoint: "ch12", score: 4, total: 5 };
-  await store.claimRequest(OWNER, REQUEST, CONVERSATION);
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
   const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call);
+  await expireLeases(db);
   let records = 0;
   const record = async () => { records++; return { failed: false, result: JSON.stringify({ success: true }) }; };
   const reconcilers = ops.supabaseReconcilers(db);
@@ -312,7 +356,7 @@ test("a quiz result left pending is confirmed from pds.reading_quizzes, never re
   db.seed("reading_quizzes", [{ quiz_id: 9, book_id: 3, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
   const found = await (await open({ reconcilers })).run(QUIZ, call, record);
   assert.equal(records, 0);
-  assert.equal(found.receipt.status, "saved");
+  assert.equal(found.receipt.status, "unchanged");
   assert.deepEqual(plain(found.receipt.details.slice(0, 2)), ["ch12: 4/5 (passed)", "Day: 2030-01-01"]);
 });
 
@@ -441,4 +485,121 @@ test("an unfinished call keeps only its error line in the ledger", () => {
   assert.deepEqual(plain(ops.storedResult("refused", { error: "x", candidates: ["a", "b"] })), { error: "x" });
   assert.deepEqual(plain(ops.storedResult("unknown", { error: "x", incomplete: true, available: ["a"] })), { error: "x", incomplete: true });
   assert.deepEqual(plain(ops.storedResult("done", { success: true, items: [1] })), { success: true, items: [1] });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2: wording-tolerant matching, a repeat of an unconfirmed call in the same try, partial reconciles,
+// the pinned book, and reading a request's outcome back by its id alone (the page after a reload).
+// ---------------------------------------------------------------------------
+
+test("matching ignores what the tools ignore: case of resolved names, padding of times, empty fields, numeric strings", () => {
+  const a = ops.intentSha(INTAKE, { product: "Synthetic Focus", amount: 2, unit: "mg", times: ["8:30", "8:30 PM"], date: null });
+  const b = ops.intentSha(INTAKE, { product: "  synthetic focus ", amount: "2", unit: "MG", times: ["08:30", "08:30pm"] });
+  assert.equal(a, b);
+  assert.notEqual(a, ops.intentSha(INTAKE, { product: "Synthetic Calm", amount: 2, unit: "mg", times: ["08:30", "08:30pm"] }));
+  assert.notEqual(a, ops.intentSha(INTAKE, { product: "Synthetic Focus", amount: 3, unit: "mg", times: ["08:30", "08:30pm"] }));
+  // Free text keeps its case: a passage is the highlight itself.
+  assert.notEqual(ops.intentSha("add_book_highlight", { passage: "Synthetic Line" }), ops.intentSha("add_book_highlight", { passage: "synthetic line" }));
+});
+
+test("a retry worded slightly differently by the model is answered from the stored row", async () => {
+  const { open } = setup();
+  const write = keyedWrite();
+  await (await open()).run(STACK, { stack: "Synthetic Morning" }, write.execute());
+  let ran = 0;
+  const again = await (await open()).run(STACK, { stack: "synthetic morning " }, async (opId) => { ran++; return write.execute()(opId); });
+  assert.equal(ran, 0);
+  assert.equal(again.replayed, true);
+  assert.equal(again.receipt.status, "unchanged");
+});
+
+test("in one try, the model asking again for a call whose outcome was unclear re-runs the SAME operation", async () => {
+  const { db, open } = setup();
+  const keys = [];
+  let calls = 0;
+  const execute = async (opId) => {
+    keys.push(opId);
+    calls++;
+    // The first answer was lost after the write: the keyed write reports it may be done.
+    return calls === 1
+      ? { failed: false, result: JSON.stringify({ error: "The database did not confirm this.", incomplete: true }) }
+      : { failed: false, result: JSON.stringify({ success: true, stack: "Synthetic Morning", replayed: true }) };
+  };
+  const ledger = await open();
+  const first = await ledger.run(STACK, input(), execute);
+  assert.equal(first.receipt.status, "unknown");
+  const second = await ledger.run(STACK, input(), execute);
+  assert.equal(keys.length, 2);
+  assert.equal(keys[0], keys[1], "the repeat used the first call's operation id, so its key finds the rows");
+  assert.equal(second.replayed, true);
+  assert.equal(db.rows("chat_operations").length, 1, "one operation, not two");
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+});
+
+test("a playlist found with its tracks unconfirmed is never made again and its receipt says to check it", async () => {
+  const { db, store, open } = setup();
+  const PLAYLIST = "create_spotify_playlist";
+  const call = { name: "Synthetic run mix", track_ids: ["t1"] };
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: PLAYLIST, ordinal: 1 }, ops.intentSha(PLAYLIST, call), call);
+  await expireLeases(db);
+  // createPlaylist wrote the audit row right after Spotify made the playlist; the try stopped before the tracks.
+  db.seed("spotify_playlists", [{ playlist_id: "pl2", name: call.name, spotify_url: "https://open.spotify.com/playlist/pl2", track_count: null, client_key: row.op_id }]);
+  let creates = 0;
+  const create = async () => { creates++; return { failed: false, result: '{"success":true}' }; };
+  const found = await (await open({ reconcilers: ops.supabaseReconcilers(db) })).run(PLAYLIST, call, create);
+  assert.equal(creates, 0);
+  assert.equal(found.receipt.status, "unknown");
+  assert.ok(found.receipt.details.includes(ops.PLAYLIST_TRACKS_UNCONFIRMED));
+  assert.equal(found.receipt.link.href, "https://open.spotify.com/playlist/pl2");
+  assert.equal(db.rows("chat_operations")[0].status, "done", "it exists: a later retry replays it and never creates");
+});
+
+test("a quiz is looked up under the book pinned when the operation began, not the one being read now", async () => {
+  const { db, store, open } = setup({
+    tables: {
+      books: [
+        { book_id: 3, slug: "synthetic-book", status: "finished", created_at: "2029-06-01T00:00:00.000Z" },
+        { book_id: 5, slug: "newer-synthetic-book", status: "reading", created_at: "2029-09-01T00:00:00.000Z" },
+      ],
+    },
+  });
+  const QUIZ = "record_reading_quiz";
+  const call = { checkpoint: "ch3", score: 5, total: 5 };
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call, { book_id: 3 });
+  await expireLeases(db);
+  db.seed("reading_quizzes", [
+    { quiz_id: 21, book_id: 5, checkpoint: "ch3", score: 5, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at },
+    { quiz_id: 22, book_id: 3, checkpoint: "ch3", score: 5, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at },
+  ]);
+  const found = await (await open({ reconcilers: ops.supabaseReconcilers(db) })).run(QUIZ, call, async () => ({ failed: false, result: "{}" }));
+  assert.equal(JSON.parse(found.result).quiz_id, 22);
+});
+
+test("a request read back by its id alone: none, running, then what it saved (refused calls left out)", async () => {
+  const { store, open } = setup();
+  const outcome = (now) => ops.requestOutcome(store, OWNER, REQUEST, receipts.buildWriteReceipt, now);
+  assert.deepEqual(plain(await outcome()), { status: "none", receipts: [] });
+
+  const write = keyedWrite();
+  const ledger = await open();
+  await ledger.run(STACK, input("synthetic morning"), write.execute("Synthetic Morning"));
+  await ledger.run(STACK, input("synthetic nothing"), async () => ({ failed: false, result: JSON.stringify({ error: 'No stack named "synthetic nothing".' }) }));
+  const running = plain(await outcome());
+  assert.equal(running.status, "running", "the try still holds the lease");
+  assert.deepEqual(running.receipts.map((r) => r.status), ["saved"]);
+
+  await ledger.release();
+  const settled = plain(await outcome());
+  assert.equal(settled.status, "settled");
+  assert.deepEqual(settled.receipts.map((r) => r.status), ["saved"]);
+  // Another owner never sees it.
+  assert.equal((await ops.requestOutcome(store, OTHER_OWNER, REQUEST, receipts.buildWriteReceipt)).status, "none");
+  // A call that was claimed but never finished reads "check this".
+  await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: STACK, ordinal: 9 }, ops.intentSha(STACK, input("x")), input("x"));
+  assert.deepEqual(plain(await outcome()).receipts.map((r) => r.status), ["saved", "unknown"]);
+  // Missing tables: "unavailable", with the code only.
+  const missing = ops.supabaseLedgerStore(createFakePostgrest({ fail: () => ({ code: "PGRST205" }) }));
+  assert.deepEqual(plain(await ops.requestOutcome(missing, OWNER, REQUEST, receipts.buildWriteReceipt)), { status: "unavailable", code: "PGRST205", receipts: [] });
 });

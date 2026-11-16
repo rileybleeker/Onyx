@@ -16,19 +16,28 @@
  *   - only once every earlier write is matched does a new call run (the earlier try stopped before reaching it).
  *
  * The operation id is passed into the write (supplement event key, reading client_key, playlist audit key), so a
- * write that happened before the ledger could record it is found again rather than repeated. The behavioral day the
- * operation first ran on is stored with it (`context`) and a re-run uses that day, so a retry after midnight / 06:00
- * never moves an omitted "today" to the next day.
+ * write that happened before the ledger could record it is found again rather than repeated. What the call depended
+ * on when it first ran is stored with it (`context`: the behavioral day, the book being read) and a re-run uses that,
+ * so a retry after midnight / 06:00 never moves an omitted "today" to the next day, and a highlight or session never
+ * moves to a book started since.
  *
- * Known gaps (follow-ups): a playlist that exists on Spotify but never reached pds.spotify_playlists stays "unknown"
- * (no read-only Spotify lookup yet); a reading session or highlight replay does not redo the Notion mirror, habit
- * stamp or book finish the first try never reached (lib/reading.ts); a quiz result has no operation key and is
- * matched by book, checkpoint, score and time; a highlight re-run resolves "the book being read" again; the ledger
+ * One try at a time: each try of a request holds a lease on its chat_requests row (REQUEST_LEASE_MS, longer than the
+ * route's maxDuration, so no try outlives its lease) and a retry that arrives while another try still holds it is
+ * turned away before the model runs (openLedger -> "busy"). Two tries can therefore never pick different tools for
+ * the same intent at the same time.
+ *
+ * Matching uses a normalised form of the input (matchingForm: trimmed, the names the tools resolve case-insensitively
+ * in lower case, "8:30" = "08:30", empty fields left out), so a retry worded slightly differently by the model still
+ * matches; the stored intent is the input as sent.
+ *
+ * Known gaps (follow-ups): a playlist created on Spotify whose audit row could not be written stays "unknown" (no
+ * read-only Spotify lookup yet); a Notion entry made by a try that died before it stored the block id is made again
+ * by the re-run; a quiz result has no operation key and is matched by book, checkpoint, score and time; the ledger
  * keeps tool inputs and results with no retention window yet.
  *
  * Errors are reported by code only (never a message, which can echo user text). No personal data in this file.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { WriteReceipt } from "@/lib/chat-receipts";
 
@@ -55,12 +64,27 @@ export interface OperationRow extends OperationKey {
   created_at: string;
 }
 
-export type RequestClaim = "new" | "retry" | "conflict";
+export type RequestClaim = "new" | "retry" | "conflict" | "busy";
+
+/**
+ * How long one try holds its request (one try at a time). It MUST be longer than the chat route's maxDuration
+ * (app/api/chat/route.ts, 300 s): the platform stops a try at maxDuration, so a try never outlives its lease, and a
+ * lease left by a try that was stopped before it could give it back frees itself a minute later.
+ */
+export const REQUEST_LEASE_MS = 6 * 60 * 1000;
 
 /** Storage behind the ledger (Supabase in production, an in-memory map in the tests). Methods throw Ledger* errors. */
 export interface LedgerStore {
-  /** "new" = first time this id is seen; "retry" = seen with the same conversation; "conflict" = seen with another one. */
-  claimRequest(owner_id: string, request_id: string, conversation_sha: string): Promise<RequestClaim>;
+  /**
+   * "new" = first time this id is seen; "retry" = seen with the same conversation and no other try is running it;
+   * "busy" = another try of it holds the lease; "conflict" = seen with another conversation. "new" and "retry" give
+   * this try (attempt_id) the lease.
+   */
+  claimRequest(owner_id: string, request_id: string, conversation_sha: string, attempt_id: string): Promise<RequestClaim>;
+  /** Give the lease back (only while attempt_id still holds it). */
+  releaseRequest(owner_id: string, request_id: string, attempt_id: string): Promise<void>;
+  /** The request's row, or null when this id was never seen for this owner. */
+  getRequest(owner_id: string, request_id: string): Promise<{ lease_until: string | null } | null>;
   /** Insert a pending row for this call, or return the row already in that place (created = false). Atomic. */
   claim(key: OperationKey, intent_sha: string, intent: unknown, context?: OperationContext | null): Promise<{ row: OperationRow; created: boolean }>;
   listForRequest(owner_id: string, request_id: string): Promise<OperationRow[]>;
@@ -108,7 +132,37 @@ export function canonicalJson(value: unknown): string {
 
 export const sha256Hex = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
-export const intentSha = (tool: string, input: unknown): string => sha256Hex(`${tool}\n${canonicalJson(input)}`);
+/** Fields the tools resolve case-insensitively, or read as a fixed word (medium, answer, source). */
+const CASELESS_FIELDS = new Set(["stack", "product", "unit", "habit", "book", "medium", "source", "answer"]);
+/** Fields the tools read with Number(...): "2" and 2 are the same request. */
+const NUMERIC_FIELDS = new Set(["amount", "chapter_through", "chapter_from", "minutes", "chapter", "score", "total"]);
+
+/** "8:30" and "08:30" (and "8:30 PM" / "08:30pm") are the same clock time. */
+function clockTime(value: string): string {
+  const m = /^(\d{1,2}):(\d{2})\s*([ap])\.?\s*m\.?$/i.exec(value) ?? /^(\d{1,2}):(\d{2})()$/.exec(value);
+  return m ? `${m[1].padStart(2, "0")}:${m[2]}${m[3] ? `${m[3].toLowerCase()}m` : ""}` : value;
+}
+
+/**
+ * The form two calls are compared in: strings trimmed, the fields the tools resolve case-insensitively in lower case,
+ * clock times zero-padded, numeric strings as numbers for the numeric fields, and empty / null fields left out (the
+ * tools treat them as not given). Only the hash uses it; the stored intent is the input as sent.
+ */
+export function matchingForm(input: unknown): unknown {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return input ?? {};
+  const out: Record<string, unknown> = {};
+  for (const [k, raw] of Object.entries(input as Record<string, unknown>)) {
+    let v: unknown = typeof raw === "string" ? raw.trim() : raw;
+    if (v === null || v === undefined || v === "") continue;
+    if (typeof v === "string" && CASELESS_FIELDS.has(k)) v = v.toLowerCase();
+    if (typeof v === "string" && NUMERIC_FIELDS.has(k) && Number.isFinite(Number(v))) v = Number(v);
+    if (Array.isArray(v)) v = v.map((t) => (typeof t !== "string" ? t : k === "times" ? clockTime(t.trim().toLowerCase()) : t.trim()));
+    out[k] = v;
+  }
+  return out;
+}
+
+export const intentSha = (tool: string, input: unknown): string => sha256Hex(`${tool}\n${canonicalJson(matchingForm(input))}`);
 
 /** Hash of the whole conversation as sent (role + text only): a retry sends exactly the same messages. */
 export const conversationSha = (messages: ReadonlyArray<{ role: string; content: string }>): string =>
@@ -148,9 +202,11 @@ const UNCERTAIN: Record<string, string> = {
   record_reading_quiz:
     "An earlier try of this message started recording this quiz result and Onyx cannot confirm it. Nothing was recorded now. Check /reading before asking again in a new message.",
 };
+export const PLAYLIST_TRACKS_UNCONFIRMED = "The playlist exists; Onyx cannot confirm all its tracks were added. Check it in Spotify.";
 const UNCERTAIN_DEFAULT =
   "An earlier try of this message started this and Onyx cannot confirm it finished. Nothing was written now. Check the relevant page before asking again in a new message.";
 export const uncertainText = (tool: string): string => UNCERTAIN[tool] ?? UNCERTAIN_DEFAULT;
+export const RUNNING_TEXT = "This was still being saved when Onyx checked. Check again in a minute before sending anything again.";
 
 /* ------------------------------------------------------------------ */
 /* The ledger                                                          */
@@ -179,6 +235,8 @@ export interface LedgerOptions {
   requestId: string;
   /** This request id was seen before (a retry). */
   retry: boolean;
+  /** This try's lease on the request (openLedger sets it; release() gives it back). */
+  attemptId?: string;
   buildReceipt: ReceiptBuilder;
   reconcilers?: Partial<Record<string, Reconciler>>;
   /** Stage + error code only. */
@@ -197,6 +255,21 @@ function parseResult(result: string): Record<string, unknown> | null {
 }
 
 const withDetail = (receipt: WriteReceipt, line: string): WriteReceipt => ({ ...receipt, details: [...receipt.details, line] });
+
+/** A receipt of something an earlier try saved, shown again: nothing new was written now, so "saved" reads "unchanged". */
+const asReplay = (receipt: WriteReceipt, line: string): WriteReceipt =>
+  withDetail(receipt.status === "saved" ? { ...receipt, status: "unchanged" } : receipt, line);
+
+/**
+ * The receipt for a stored row as it stands (null for a refused row: nothing was written): done = its stored receipt,
+ * pending / unknown = "check this", with `running` when a try is still on it.
+ */
+function rowReceipt(row: OperationRow, buildReceipt: ReceiptBuilder, running = false): WriteReceipt | null {
+  if (row.status === "refused") return null;
+  if (row.status === "done") return row.receipt ?? buildReceipt(row.tool, row.intent, JSON.stringify(asObject(row.result) ?? {}));
+  const text = running ? RUNNING_TEXT : uncertainText(row.tool);
+  return buildReceipt(row.tool, row.intent, JSON.stringify({ error: text, incomplete: true }));
+}
 
 /** done = the tool confirmed the write; refused = a clean error, nothing written; unknown = it threw or says it may be incomplete. */
 export function classifyOutcome(outcome: ToolOutcome): OperationStatus {
@@ -237,6 +310,8 @@ export class ChatLedger {
   private readonly used = new Set<string>();
   /** Calls (by intent hash) this retry refused as a possible change of an earlier write: refused again if repeated. */
   private readonly conflicted = new Set<string>();
+  /** Calls (by intent hash) of this try whose outcome is unknown: a repeat of one runs as the same operation. */
+  private readonly unsettled = new Map<string, OperationRow>();
 
   constructor(opts: LedgerOptions) {
     this.opts = opts;
@@ -253,12 +328,25 @@ export class ChatLedger {
    * into an "incomplete" result), but a throw is still treated as unknown here.
    */
   async run(tool: string, input: unknown, execute: Execute, context: OperationContext = {}): Promise<LedgerOutcome> {
-    const canonical = canonicalJson(input ?? {});
-    const intent: unknown = JSON.parse(canonical);
-    const sha = sha256Hex(`${tool}\n${canonical}`);
+    const intent: unknown = JSON.parse(canonicalJson(input ?? {}));
+    const sha = intentSha(tool, input ?? {});
+    // The model asks again, in this same try, for a call whose outcome this try could not confirm: the same operation
+    // (same key), never a second one.
+    const unsettled = this.unsettled.get(sha);
+    if (unsettled) return this.resume(unsettled, tool, input, execute);
     return this.retry
       ? this.runRetry(tool, input, sha, intent, execute, context)
       : this.runFirst(tool, input, sha, intent, execute, context);
+  }
+
+  /** Give the request's lease back so the next try of it can run. Never throws. */
+  async release(): Promise<void> {
+    if (!this.opts.attemptId) return;
+    try {
+      await this.opts.store.releaseRequest(this.opts.ownerId, this.opts.requestId, this.opts.attemptId);
+    } catch (e) {
+      this.report("release", e);
+    }
   }
 
   /** A first try: every call takes the next place of its tool. */
@@ -334,14 +422,9 @@ export class ChatLedger {
     }
     const out: WriteReceipt[] = [];
     for (const row of rows) {
-      if (this.used.has(row.op_id) || row.status === "refused") continue;
-      if (row.status === "done") {
-        const receipt = row.receipt ?? this.opts.buildReceipt(row.tool, row.intent, JSON.stringify(asObject(row.result) ?? {}));
-        if (receipt) out.push(withDetail(receipt, EARLIER_DETAIL));
-      } else {
-        const receipt = this.opts.buildReceipt(row.tool, row.intent, JSON.stringify({ error: uncertainText(row.tool), incomplete: true }));
-        if (receipt) out.push(receipt);
-      }
+      if (this.used.has(row.op_id)) continue;
+      const receipt = rowReceipt(row, this.opts.buildReceipt);
+      if (receipt) out.push(row.status === "done" ? asReplay(receipt, EARLIER_DETAIL) : receipt);
     }
     return out;
   }
@@ -396,13 +479,15 @@ export class ChatLedger {
     } catch (e) {
       this.report("finish", e);
     }
+    if (status === "unknown") this.unsettled.set(row.intent_sha, { ...row, status });
+    else this.unsettled.delete(row.intent_sha);
     // A re-run whose keyed write found the rows an earlier try had already written (the earlier try stopped before the
     // ledger recorded it): say so, to the model and on the receipt.
     if (parsed?.replayed === true && parsed.success === true) {
       return {
         result: JSON.stringify({ ...parsed, note: REPLAY_NOTE }),
         failed: false,
-        receipt: receipt ? withDetail(receipt, REPLAY_DETAIL) : null,
+        receipt: receipt ? asReplay(receipt, REPLAY_DETAIL) : null,
         replayed: true,
       };
     }
@@ -410,12 +495,13 @@ export class ChatLedger {
   }
 
   private replay(row: OperationRow, tool: string): LedgerOutcome {
+    this.unsettled.delete(row.intent_sha);
     const stored = asObject(row.result) ?? {};
     const base = row.receipt ?? this.opts.buildReceipt(tool, row.intent, JSON.stringify(stored));
     return {
       result: JSON.stringify({ ...stored, replayed: true, note: REPLAY_NOTE }),
       failed: false,
-      receipt: base ? withDetail(base, REPLAY_DETAIL) : null,
+      receipt: base ? asReplay(base, REPLAY_DETAIL) : null,
       replayed: true,
     };
   }
@@ -431,7 +517,12 @@ export class ChatLedger {
       }
     }
     if (!found) return this.uncertain(row, tool, input);
-    const receipt = this.opts.buildReceipt(tool, row.intent ?? input, JSON.stringify(found));
+    let receipt = this.opts.buildReceipt(tool, row.intent ?? input, JSON.stringify(found));
+    // Found, but only part of it is confirmed (a playlist whose tracks were not confirmed): it exists, so it is never
+    // made again, and the receipt says what to check.
+    if (receipt && typeof found.partly_confirmed === "string") {
+      receipt = { ...receipt, status: "unknown", details: [...receipt.details, found.partly_confirmed] };
+    }
     try {
       await this.opts.store.finish(row, "done", found, receipt);
     } catch (e) {
@@ -469,21 +560,60 @@ export class ChatLedger {
 export type OpenedLedger =
   | { kind: "ledger"; ledger: ChatLedger }
   | { kind: "conflict" }
+  /** Another try of this request is still running (it holds the lease): nothing runs now. */
+  | { kind: "busy" }
   | { kind: "unavailable"; code: string }
   | { kind: "failed"; code: string };
 
-/** Record the request (first try or retry) and return its ledger; never throws. */
+/**
+ * Record the request (first try or retry), take its lease for this try and return its ledger; never throws. The
+ * caller MUST call ledger.release() when the try ends (a lease that is not given back frees itself after
+ * REQUEST_LEASE_MS).
+ */
 export async function openLedger(
   store: LedgerStore,
-  opts: Omit<LedgerOptions, "store" | "retry"> & { conversationSha: string },
+  opts: Omit<LedgerOptions, "store" | "retry" | "attemptId"> & { conversationSha: string },
 ): Promise<OpenedLedger> {
+  const attemptId = randomUUID();
   try {
-    const claim = await store.claimRequest(opts.ownerId, opts.requestId, opts.conversationSha);
+    const claim = await store.claimRequest(opts.ownerId, opts.requestId, opts.conversationSha, attemptId);
     if (claim === "conflict") return { kind: "conflict" };
-    return { kind: "ledger", ledger: new ChatLedger({ ...opts, store, retry: claim === "retry" }) };
+    if (claim === "busy") return { kind: "busy" };
+    return { kind: "ledger", ledger: new ChatLedger({ ...opts, store, retry: claim === "retry", attemptId }) };
   } catch (e) {
     if (e instanceof LedgerUnavailable) return { kind: "unavailable", code: e.code };
     return { kind: "failed", code: errorCode(e) };
+  }
+}
+
+/**
+ * What a request saved, read back by its id alone (the /chat page asks after a reload lost the conversation):
+ * "none" = this id never reached the ledger (nothing was written under it); "running" = a try still holds it;
+ * "settled" = no try is running. Receipts: one per write that was saved or may have been (refused calls wrote
+ * nothing and are left out). Read-only. Never throws.
+ */
+export type RequestOutcome =
+  | { status: "none" | "running" | "settled"; receipts: WriteReceipt[] }
+  | { status: "unavailable" | "failed"; code: string; receipts: [] };
+
+export async function requestOutcome(
+  store: LedgerStore,
+  ownerId: string,
+  requestId: string,
+  buildReceipt: ReceiptBuilder,
+  now: number = Date.now(),
+): Promise<RequestOutcome> {
+  try {
+    const request = await store.getRequest(ownerId, requestId);
+    if (!request) return { status: "none", receipts: [] };
+    const until = request.lease_until ? Date.parse(request.lease_until) : NaN;
+    const running = Number.isFinite(until) && until > now;
+    const rows = await store.listForRequest(ownerId, requestId);
+    const receipts = rows.map((r) => rowReceipt(r, buildReceipt, running)).filter((r): r is WriteReceipt => r !== null);
+    return { status: running ? "running" : "settled", receipts };
+  } catch (e) {
+    if (e instanceof LedgerUnavailable) return { status: "unavailable", code: e.code, receipts: [] };
+    return { status: "failed", code: errorCode(e), receipts: [] };
   }
 }
 
@@ -506,13 +636,14 @@ function fail(error: { code?: unknown } | null | undefined): never {
 /** The production store. The client MUST be the service-role client scoped to schema "pds". */
 export function supabaseLedgerStore(supabase: Pds): LedgerStore {
   const ops = () => supabase.from("chat_operations");
+  const requests = () => supabase.from("chat_requests");
+  const leaseUntil = () => new Date(Date.now() + REQUEST_LEASE_MS).toISOString();
   return {
-    async claimRequest(owner_id, request_id, conversation_sha) {
-      const { error } = await supabase.from("chat_requests").insert({ owner_id, request_id, conversation_sha });
+    async claimRequest(owner_id, request_id, conversation_sha, attempt_id) {
+      const { error } = await requests().insert({ owner_id, request_id, conversation_sha, lease_id: attempt_id, lease_until: leaseUntil() });
       if (!error) return "new";
       if (error.code !== "23505") fail(error);
-      const { data, error: readError } = await supabase
-        .from("chat_requests")
+      const { data, error: readError } = await requests()
         .select("conversation_sha")
         .eq("owner_id", owner_id)
         .eq("request_id", request_id)
@@ -520,9 +651,45 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
       if (readError) fail(readError);
       if (!data) fail({ code: "missing_after_conflict" });
       if ((data as { conversation_sha?: unknown }).conversation_sha !== conversation_sha) return "conflict";
-      // Informational only; a failure here does not matter.
-      await supabase.from("chat_requests").update({ last_attempt_at: new Date().toISOString() }).eq("owner_id", owner_id).eq("request_id", request_id);
-      return "retry";
+      // The lease is taken only when it is free (the last try gave it back) or has run out (the last try was stopped
+      // before it could); each is one conditional update, so two tries arriving together cannot both take it.
+      const nowIso = new Date().toISOString();
+      const take = { lease_id: attempt_id, lease_until: leaseUntil(), last_attempt_at: nowIso };
+      const free = await requests()
+        .update(take)
+        .eq("owner_id", owner_id)
+        .eq("request_id", request_id)
+        .eq("conversation_sha", conversation_sha)
+        .is("lease_until", null)
+        .select("request_id");
+      if (free.error) fail(free.error);
+      if (((free.data as unknown[] | null) ?? []).length > 0) return "retry";
+      const expired = await requests()
+        .update(take)
+        .eq("owner_id", owner_id)
+        .eq("request_id", request_id)
+        .eq("conversation_sha", conversation_sha)
+        .lt("lease_until", nowIso)
+        .select("request_id");
+      if (expired.error) fail(expired.error);
+      return ((expired.data as unknown[] | null) ?? []).length > 0 ? "retry" : "busy";
+    },
+
+    async releaseRequest(owner_id, request_id, attempt_id) {
+      const { error } = await requests()
+        .update({ lease_id: null, lease_until: null })
+        .eq("owner_id", owner_id)
+        .eq("request_id", request_id)
+        .eq("lease_id", attempt_id);
+      if (error) fail(error);
+    },
+
+    async getRequest(owner_id, request_id) {
+      const { data, error } = await requests().select("lease_until").eq("owner_id", owner_id).eq("request_id", request_id).maybeSingle();
+      if (error) fail(error);
+      if (!data) return null;
+      const until = (data as { lease_until?: unknown }).lease_until;
+      return { lease_until: typeof until === "string" ? until : null };
     },
 
     async claim(key, intent_sha, intent, context) {
@@ -608,7 +775,17 @@ export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Recon
         .limit(2);
       if (error || !Array.isArray(data) || data.length !== 1) return null;
       const p = data[0] as { playlist_id: string; name: string; spotify_url: string | null; track_count: number | null };
-      return { success: true, playlist_id: p.playlist_id, spotify_url: p.spotify_url, name: p.name, track_count: p.track_count, reconciled: true };
+      // createPlaylist writes the audit row as soon as Spotify made the playlist (track_count NULL) and sets the count
+      // once every track was added: a NULL count = the playlist exists, its tracks are not confirmed.
+      return {
+        success: true,
+        playlist_id: p.playlist_id,
+        spotify_url: p.spotify_url,
+        name: p.name,
+        track_count: p.track_count,
+        reconciled: true,
+        ...(p.track_count == null ? { partly_confirmed: PLAYLIST_TRACKS_UNCONFIRMED } : {}),
+      };
     },
 
     record_reading_quiz: async (row) => {
@@ -617,12 +794,17 @@ export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Recon
       const score = Math.round(Number(intent.score));
       const total = Math.round(Number(intent.total));
       if (!checkpoint || !Number.isFinite(score) || !Number.isFinite(total) || total <= 0) return null;
-      // The book the tool would have used: the named one, else the book being read (lib/reading.ts getBook).
+      // The book the tool used: the named one, else the book being read when the operation first ran (its context),
+      // else the book being read now (lib/reading.ts getBook).
       const slug = typeof intent.book === "string" && intent.book.trim() ? intent.book.trim() : null;
-      let books = supabase.from("books").select("book_id");
-      books = slug ? books.eq("slug", slug) : books.eq("status", "reading");
-      const { data: book, error: bookError } = await books.order("created_at", { ascending: false }).limit(1);
-      const bookId = !bookError && Array.isArray(book) ? (book[0] as { book_id?: unknown } | undefined)?.book_id : undefined;
+      const pinned = asObject(row.context)?.book_id;
+      let bookId: unknown = !slug && typeof pinned === "number" ? pinned : undefined;
+      if (bookId === undefined) {
+        let books = supabase.from("books").select("book_id");
+        books = slug ? books.eq("slug", slug) : books.eq("status", "reading");
+        const { data: book, error: bookError } = await books.order("created_at", { ascending: false }).limit(1);
+        bookId = !bookError && Array.isArray(book) ? (book[0] as { book_id?: unknown } | undefined)?.book_id : undefined;
+      }
       if (typeof bookId !== "number") return null;
       const { data, error } = await supabase
         .from("reading_quizzes")

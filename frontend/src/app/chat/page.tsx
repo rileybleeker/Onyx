@@ -44,6 +44,20 @@ function settlePendingSend(requestId: string) {
   if (readPendingSend()?.id === requestId) writePendingSend(null);
 }
 
+/**
+ * A send whose answer never arrived, found after a reload: the conversation is gone, so the same message sent again
+ * would be a new request. The page asks the server what that request saved, by its id alone (GET
+ * /api/chat/operations), and shows it, so nothing is logged twice by mistake. Read-only.
+ */
+type Recovery = { state: "running" | "settled" | "none" | "unknown"; receipts: WriteReceipt[] };
+
+const RECOVERY_TEXT: Record<Recovery["state"], string> = {
+  running: "Your last message before the reload is still running.",
+  settled: "Your last message before the reload got this far:",
+  none: "Your last message before the reload did not reach Onyx, so nothing was saved.",
+  unknown: "Onyx could not check your last message before the reload. If it asked to log something, check the relevant page before sending it again.",
+};
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<ShownMessage[]>([]);
   const [input, setInput] = useState("");
@@ -57,6 +71,9 @@ export default function ChatPage() {
   const [resendText, setResendText] = useState<string | null>(null);
   // The server said it keeps a replay ledger for this chat (replay_safe), so a retry cannot log anything twice.
   const [replaySafe, setReplaySafe] = useState(false);
+  // What the send that was pending at the last reload saved (null = nothing to show).
+  const [recovery, setRecovery] = useState<Recovery | null>(null);
+  const recoveryId = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const loading = pending !== null;
@@ -71,6 +88,35 @@ export default function ChatPage() {
     }
   }, [loading, messages.length]);
 
+  async function checkPendingSend(id: string) {
+    let next: Recovery = { state: "unknown", receipts: [] };
+    try {
+      const res = await fetch(`/api/chat/operations?request_id=${encodeURIComponent(id)}`, { cache: "no-store" });
+      const data = res.redirected ? null : await res.json().catch(() => null);
+      const status = data?.status;
+      if (status === "running" || status === "settled" || status === "none") next = { state: status, receipts: parseReceipts(data?.receipts) };
+    } catch {
+      /* offline: "could not check" */
+    }
+    // Dismissed, or a new message was sent meanwhile.
+    if (recoveryId.current === id) setRecovery(next);
+  }
+
+  function dismissRecovery() {
+    // The remembered send itself stays (until it expires or a new send replaces it): the same message sent again
+    // from a fresh chat is still recognised as that request.
+    recoveryId.current = null;
+    setRecovery(null);
+  }
+
+  // A send was still waiting for its answer when this page was last left: show what it saved.
+  useEffect(() => {
+    const pendingSend = readPendingSend();
+    if (!pendingSend) return;
+    recoveryId.current = pendingSend.id;
+    void checkPendingSend(pendingSend.id);
+  }, []);
+
   async function send(again?: string) {
     const text = (again ?? input).trim();
     if (!text || sending.current) return;
@@ -83,6 +129,8 @@ export default function ChatPage() {
     let requestId: string | null = previous && previous.text === text && previous.at === messages.length ? previous.requestId : null;
     failedSend.current = null;
     setResendText(null);
+    recoveryId.current = null;
+    setRecovery(null);
     sending.current = true;
     setPending(text);
     setInput("");
@@ -107,7 +155,8 @@ export default function ChatPage() {
       });
       const data = await res.json().catch(() => null);
       written = parseReceipts(data?.receipts);
-      if (data?.replay_safe === true) safe = true;
+      // A busy answer comes from the ledger itself (another try of this message is still running).
+      if (data?.replay_safe === true || (res.status === 409 && data?.code === "request_in_progress")) safe = true;
       else if (res.ok) safe = false;
       setReplaySafe(safe);
       if (res.redirected || res.status === 401) throw new Error("Your session may have expired. Sign in again.");
@@ -201,12 +250,29 @@ export default function ChatPage() {
       {error && (
         <div role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3 max-h-[40dvh] overflow-y-auto">
           <p>{error}</p>
-          {resendText !== null && (
+          {/* Only while the composer still holds that exact message: an edited message is a new request. */}
+          {resendText !== null && input.trim() === resendText && (
             <button type="button" onClick={() => void send(resendText)} disabled={loading} className="mt-2 text-sm text-accent border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
               Send the same message again
             </button>
           )}
           <ChatReceipts receipts={errorReceipts} heading="Before it stopped, this request had already done the following" />
+        </div>
+      )}
+      {recovery && (
+        <div role="status" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3 max-h-[40dvh] overflow-y-auto">
+          <p>{recovery.state === "settled" && recovery.receipts.length === 0 ? "Your last message before the reload saved nothing." : RECOVERY_TEXT[recovery.state]}</p>
+          <ChatReceipts receipts={recovery.receipts} heading="Your last message before the reload" />
+          <div className="mt-2 flex gap-2">
+            {recovery.state === "running" && (
+              <button type="button" onClick={() => { if (recoveryId.current) void checkPendingSend(recoveryId.current); }} className="text-sm text-accent border border-border-subtle rounded-control px-3 py-1.5">
+                Check again
+              </button>
+            )}
+            <button type="button" onClick={dismissRecovery} className="text-sm text-text-secondary border border-border-subtle rounded-control px-3 py-1.5">
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
       <form onSubmit={(event) => { event.preventDefault(); void send(); }} className="flex gap-2 shrink-0">
