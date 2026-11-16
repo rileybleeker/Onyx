@@ -158,7 +158,8 @@ def test_reachability_graph_starts_from_all_six_on_every_run() -> None:
     # Step 1 collects the six it verified; the graph starts from them, never from the matviews that
     # still carry a grant (that list is empty on a re-run, which would skip every check).
     assert "six := six || rel;" in body
-    checks = body[body.index("WITH RECURSIVE reach(cls, obj)"):body.index("EXECUTE format('REVOKE")]
+    # The checks end where step 4 starts: the revoke loop itself walks the grant list (targets), which is right.
+    checks = body[body.index("WITH RECURSIVE reach(cls, obj)"):body.index("FOREACH rel IN ARRAY targets LOOP")]
     assert "unnest(six)" in checks
     assert "targets" not in checks, "a reachability check uses the grant list instead of all six"
     graph = _graph(body)
