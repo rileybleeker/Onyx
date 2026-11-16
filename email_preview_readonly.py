@@ -108,7 +108,7 @@ class ReadOnlyTransport(httpx.BaseTransport):
         try:
             if request.content:
                 return False
-        except httpx.StreamNotRead:
+        except httpx.RequestNotRead:
             return False
         return True
 
