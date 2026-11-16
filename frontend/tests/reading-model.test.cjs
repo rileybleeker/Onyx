@@ -49,7 +49,44 @@ test("the request: server-side fallback beta + fallbacks default, explicit effor
   assert.deepEqual(p.tools[1].citations, { enabled: true });
   assert.equal(p.tools[1].max_content_tokens, 12000);
   assert.ok(p.tools.every((t) => t.blocked_domains.length > 0 && t.blocked_domains.length <= 64));
-  assert.deepEqual(calls[0].options, { timeout: 120000 });
+  assert.equal(calls[0].options.timeout, 120000);
+  assert.equal(typeof calls[0].options.signal?.aborted, "boolean", "one abort signal bounds the whole call, SDK retries included");
+});
+
+test("the deadline: timeoutMs, else the step's STEP_MAX_SECONDS, else the longest step's; never the SDK's 10 minutes", async () => {
+  const B = loadTs("lib/reading-bank.ts");
+  assert.equal(M.callDeadlineMs({ timeoutMs: 45000 }), 45000);
+  assert.equal(M.callDeadlineMs({ step: "grade" }), B.STEP_MAX_SECONDS.grade * 1000);
+  assert.equal(M.callDeadlineMs({ step: "build" }), B.STEP_MAX_SECONDS.build * 1000);
+  assert.equal(M.callDeadlineMs({}), Math.max(...Object.values(B.STEP_MAX_SECONDS)) * 1000);
+  const { client, calls } = fakeClient([msg("end_turn")]);
+  await M.bankModelCall(client, spec({ step: "highlights" }));
+  assert.equal(calls[0].options.timeout, B.STEP_MAX_SECONDS.highlights * 1000);
+});
+
+test("a timed-out or dropped call may have been billed: it says so (the worker charges the reservation); a 4xx does not", async () => {
+  const timeout = await M.bankModelCall(fakeClient([{ __throw: Object.assign(new Error("Synthetic"), { name: "APIConnectionTimeoutError" }) }]).client, spec());
+  assert.deepEqual([timeout.code, timeout.maybeBilled], ["timeout", true]);
+  const aborted = await M.bankModelCall(fakeClient([{ __throw: Object.assign(new Error("Synthetic"), { name: "APIUserAbortError" }) }]).client, spec());
+  assert.deepEqual([aborted.code, aborted.maybeBilled], ["timeout", true]);
+  const drop = await M.bankModelCall(fakeClient([{ __throw: Object.assign(new Error("Synthetic"), { name: "APIConnectionError" }) }]).client, spec());
+  assert.deepEqual([drop.code, drop.maybeBilled], ["connection", true]);
+  const bad = await M.bankModelCall(fakeClient([{ __throw: { status: 400, message: "Synthetic" } }]).client, spec());
+  assert.deepEqual([bad.code, bad.maybeBilled], ["bad_request", false]);
+  const refused = await M.bankModelCall(fakeClient([msg("refusal")]).client, spec());
+  assert.equal(refused.maybeBilled, false, "a refusal reports its usage");
+});
+
+test("maxCostCents: no continuation once the next turn could pass it (the claim's headroom)", async () => {
+  // Each turn costs 100 cents (500k input tokens on Sonnet 5.5).
+  const paused = () => msg("pause_turn", [], { usage: usage({ input_tokens: 500_000 }) });
+  const { client, calls } = fakeClient([paused(), paused(), msg("end_turn")]);
+  const r = await M.bankModelCall(client, spec({ maxCostCents: 150 }));
+  assert.deepEqual([r.ok, r.code, r.retryable], [false, "cost_limit", true]);
+  assert.equal(calls.length, 1, "the second turn (re-sending the first) would pass 150");
+  assert.equal(r.costCents, 100);
+  const roomy = await M.bankModelCall(fakeClient([paused(), msg("end_turn")]).client, spec({ maxCostCents: 1000 }));
+  assert.equal(roomy.ok, true);
 });
 
 test("structured output: the schema goes in output_config.format and the JSON is parsed", async () => {

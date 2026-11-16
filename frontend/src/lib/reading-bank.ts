@@ -485,6 +485,8 @@ export interface StoreSource {
   title?: string | null;
   cited_text?: string;
   highlight_id?: number;
+  /** sha256 of the passage the build read: the store refuses (409 highlight_changed) when it changed since. */
+  passage_sha?: string;
 }
 export interface StoreQuestion {
   format: QuestionFormat;
@@ -507,6 +509,9 @@ export interface StoreIdea {
 export interface StorePayload {
   book_id: number;
   chapter: number;
+  /** The edition the job was planned for: the store refuses (409 chapter_changed) when the TOC changed since. */
+  chapter_hash: string;
+  /** Required by the store: its receipt makes a repeated store of the same job a replay. */
   job_id: number | null;
   prompt_version: string;
   replace: boolean;
@@ -516,6 +521,8 @@ export interface StorePayload {
   sources: StoreSource[];
   ideas: StoreIdea[];
   links: { idea_id: number; source_ref: string }[];
+  /** Every highlight the job sent to the model (id + passage sha256), so the planner offers it again only once edited. */
+  seen: { highlight_id: number; passage_sha: string }[];
 }
 
 /** Why something was left out (counted, never logged with text). */
@@ -573,6 +580,8 @@ export function applyVerify(
 export interface BuildInput {
   bookId: number;
   chapter: number;
+  /** pds.reading_bank_chapter_hash of the chapter when the job was planned (its input hash carries it). */
+  chapterHash: string;
   totalChapters: number;
   target: number;
   jobId: number | null;
@@ -783,13 +792,14 @@ export function validateBuild(input: BuildInput): BuildResult {
     const e = ev.get(ref);
     if (e) sources.push({ ref, kind: "web", url: e.url, domain: e.domain, title: e.title, cited_text: e.cited_text });
     const h = hl.get(ref);
-    if (h) sources.push({ ref, kind: "highlight", highlight_id: h.highlight_id });
+    if (h) sources.push({ ref, kind: "highlight", highlight_id: h.highlight_id, passage_sha: sha256Hex(h.passage) });
   }
   const status = chapterResult(kept, input.target);
   const rejected = Object.values(reasons).reduce((s, n) => s + (n ?? 0), 0) + Math.max(0, Math.trunc(input.structure?.rejected ?? 0));
   const payload: StorePayload = {
     book_id: input.bookId,
     chapter: input.chapter,
+    chapter_hash: input.chapterHash,
     job_id: input.jobId,
     prompt_version: input.promptVersion,
     replace: input.replace,
@@ -798,6 +808,7 @@ export function validateBuild(input: BuildInput): BuildResult {
     sources,
     ideas: kept,
     links,
+    seen: input.highlights.map((h) => ({ highlight_id: h.highlight_id, passage_sha: sha256Hex(h.passage) })),
   };
   if (input.replace) payload.status = status;
   return { payload, status, kept: kept.length, questions, rejected, reasons };
@@ -831,11 +842,15 @@ export interface PlanJob {
   status: "queued" | "running" | "done" | "failed" | "skipped";
   result: string | null;
 }
+/**
+ * A highlight to offer the highlights step. The database decides (pds.reading_bank_plan_input): live, not cited by
+ * an active idea for its current passage, and whose content (id + sha256 of the passage) no job has looked at yet.
+ * Freshness is keyed on content, never on updated_at, which a review or a Kindle re-import touches for free.
+ */
 export interface PlanHighlight {
   highlight_id: number;
   chapter: number | null;
   passage_sha: string;
-  changed_at: string;
 }
 export interface PlanInput {
   book_id: number;
@@ -893,8 +908,9 @@ export function chapterBuilt(bank: PlanBank | undefined, chapterHashHex: string)
  * The jobs a book needs now (docs "Triggers and worker"). Nothing when the book is off. The source map first
  * (again when the table of contents changed); then, per chapter up to quiz_through + 2 that has no current bank,
  * research then build (build waits for its research job, except with an uncertain mapping, where chapters are
- * built from Riley's highlights only); a highlights job for a built chapter with new or edited unlinked
- * highlights; a whole-book chapter 0 once an uncertainly mapped book is finished. Queued jobs that are no longer
+ * built from Riley's highlights only); a highlights job for a built chapter with highlights whose content no job
+ * has looked at (new or edited; the database lists only those); a whole-book chapter 0 once an uncertainly mapped
+ * book is finished. Queued jobs that are no longer
  * planned are skipped (an obsolete input hash, a chapter that left the window).
  */
 export function planBankJobs(input: PlanInput, promptVersion: string): Plan {
@@ -942,7 +958,7 @@ export function planBankJobs(input: PlanInput, promptVersion: string): Plan {
       const bank = bankBy.get(n);
       const ch = chapterBy.get(n)?.chapter_hash ?? chapterHash(n, chapterBy.get(n)?.title);
       if (!chapterBuilt(bank, ch)) continue;
-      const fresh = input.highlights.filter((h) => h.chapter === n && (!bank!.built_at || h.changed_at > bank!.built_at));
+      const fresh = input.highlights.filter((h) => h.chapter === n);
       if (fresh.length) add("highlights", n, highlightsInputHash(v, n, fresh), PRIORITY.highlights);
     }
     // Whole-book ideas once an uncertainly mapped book is finished.
@@ -982,7 +998,8 @@ export const BANK_CODES: ReadonlySet<string> = new Set([
   "refusal", "max_tokens", "bad_output", "pause_limit", "rate_limited", "overloaded", "server_error", "connection", "timeout",
   "auth", "bad_request", "web_search_disabled", "failed", "budget", "monthly_cap", "uncertain", "schema_checks",
   "schema_missing", "lease_expired", "lease_lost", "not_running", "raced", "thin", "no_sources", "anchors_only", "ready",
-  "no_citations", "store_failed", "verify_failed", "no_research", "invalidated", "already_graded", "other",
+  "no_citations", "store_failed", "verify_failed", "no_research", "invalidated", "already_graded", "cost_limit",
+  "chapter_changed", "highlight_changed", "job_mismatch", "other",
 ]);
 
 /** A safe error / outcome code from BANK_CODES ("other" for anything else), never message text. */

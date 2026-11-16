@@ -10,6 +10,12 @@
  * - stop_reason is read before the content: refusal -> code `refusal`, max_tokens -> `max_tokens`, pause_turn ->
  *   continued (the answer so far sent back) up to 3 times;
  * - cost from usage (input, output, cache read / write, web searches) with PRICES;
+ * - ONE deadline for the whole call (every continuation and every SDK retry): the step's STEP_MAX_SECONDS unless
+ *   timeoutMs says otherwise, enforced with an abort signal, so a call cannot outlive the worker's budget (an
+ *   unbounded call is what lets a lease run out after a billed request);
+ * - maxCostCents: a continuation is not sent once the next turn could pass it (the claim's headroom_cents);
+ * - a failure that may have been billed without a usage report (timeout, connection, abort) says so
+ *   (maybeBilled), so the worker charges the job's reservation instead of 0;
  * - errors leave as codes only: no prompt, book text or API message is ever returned or logged.
  *
  * SDK note: the installed @anthropic-ai/sdk (0.80) types the web_*_20260209 tools but not `fallbacks`, so the
@@ -18,7 +24,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { BLOCKED_DOMAINS, type ContentBlockLike } from "./reading-bank";
+import { BLOCKED_DOMAINS, STEP_MAX_SECONDS, type BankStep, type ContentBlockLike } from "./reading-bank";
 
 export const BANK_OPUS = "claude-opus-5-5";
 export const BANK_SONNET = "claude-sonnet-5-5";
@@ -26,6 +32,10 @@ export type BankModel = typeof BANK_OPUS | typeof BANK_SONNET;
 export type BankEffort = "low" | "medium" | "high";
 export const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 export const MAX_CONTINUATIONS = 3;
+/** The deadline of a call that names no step and no timeoutMs (the longest step's budget). */
+export const DEFAULT_CALL_MS = Math.max(...Object.values(STEP_MAX_SECONDS)) * 1000;
+/** A continuation is sent only with at least this much of the deadline left. */
+export const MIN_TURN_MS = 5000;
 
 /* ------------------------------------------------------------------ */
 /* Prices and cost                                                      */
@@ -149,8 +159,12 @@ export interface BankMessage {
 export interface BankStream {
   finalMessage(): Promise<unknown>;
 }
+export interface BankRequestOptions {
+  timeout?: number;
+  signal?: AbortSignal;
+}
 export interface BankClient {
-  beta: { messages: { stream(params: Record<string, unknown>, options?: { timeout?: number }): BankStream } };
+  beta: { messages: { stream(params: Record<string, unknown>, options?: BankRequestOptions): BankStream } };
 }
 
 /** The SDK client (or a fake) as a BankClient: the one typed widening for the fields 0.80 does not know. */
@@ -178,8 +192,13 @@ export interface BankCallSpec {
   tools?: BankTool[];
   /** JSON schema for output_config.format (not combinable with citations, so never with the web tools). */
   schema?: Record<string, unknown>;
+  /** The step: its STEP_MAX_SECONDS is the call's deadline unless timeoutMs is given. */
+  step?: BankStep;
+  /** The whole call's deadline in ms (every continuation and SDK retry inside it). */
   timeoutMs?: number;
   maxContinuations?: number;
+  /** The most the call may cost in all (the claim's headroom_cents): no continuation that could pass it. */
+  maxCostCents?: number;
 }
 
 export type BankCallCode =
@@ -195,14 +214,24 @@ export type BankCallCode =
   | "auth"
   | "bad_request"
   | "web_search_disabled"
+  | "cost_limit"
   | "failed";
 
 /** Codes worth another try later (the worker's retry ladder); the rest fail the job. */
-export const RETRYABLE_CODES = new Set<BankCallCode>(["max_tokens", "bad_output", "pause_limit", "rate_limited", "overloaded", "server_error", "connection", "timeout"]);
+export const RETRYABLE_CODES = new Set<BankCallCode>(["max_tokens", "bad_output", "pause_limit", "rate_limited", "overloaded", "server_error", "connection", "timeout", "cost_limit"]);
+/** Failures after which a request may have been billed with no usage reported (the worker charges the reservation). */
+export const MAYBE_BILLED_CODES = new Set<BankCallCode>(["timeout", "connection", "failed"]);
 
 export type BankCallResult =
   | { ok: true; content: ContentBlockLike[]; text: string; json: unknown; model: string; continuations: number; usage: UsageTotals; costCents: number }
-  | { ok: false; code: BankCallCode; retryable: boolean; usage: UsageTotals; costCents: number };
+  | { ok: false; code: BankCallCode; retryable: boolean; usage: UsageTotals; costCents: number; maybeBilled: boolean };
+
+/** The deadline of a call in ms: timeoutMs, else the step's STEP_MAX_SECONDS, else DEFAULT_CALL_MS. */
+export function callDeadlineMs(spec: Pick<BankCallSpec, "timeoutMs" | "step">): number {
+  if (typeof spec.timeoutMs === "number" && Number.isFinite(spec.timeoutMs) && spec.timeoutMs > 0) return Math.trunc(spec.timeoutMs);
+  if (spec.step && STEP_MAX_SECONDS[spec.step]) return STEP_MAX_SECONDS[spec.step] * 1000;
+  return DEFAULT_CALL_MS;
+}
 
 /** The request body (plain data; see the SDK note at the top). */
 export function bankParams(spec: BankCallSpec, messages: unknown[]): Record<string, unknown> {
@@ -226,7 +255,7 @@ export function classifyError(err: unknown): { code: BankCallCode; retryable: bo
   const name = `${typeof e.name === "string" ? e.name : ""} ${e.constructor?.name ?? ""}`;
   const mentionsWeb = typeof e.message === "string" && /web[ _-]?(search|fetch)/i.test(e.message) && /(enabl|not (allowed|permitted|available))/i.test(e.message);
   const out = (code: BankCallCode) => ({ code, retryable: RETRYABLE_CODES.has(code) });
-  if (/Timeout/i.test(name) || status === 408) return out("timeout");
+  if (/Timeout|Abort/i.test(name) || status === 408) return out("timeout");
   if (/Connection/i.test(name) && status === null) return out("connection");
   if (status === 429) return out("rate_limited");
   if (status === 529) return out("overloaded");
@@ -247,47 +276,72 @@ const asMessage = (raw: unknown): BankMessage | null => {
 export const messageText = (content: ContentBlockLike[]) =>
   content.filter((b) => b.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("");
 
-/** One bank call, with pause_turn continued, stop reasons checked first, and the cost of every response counted. */
+/**
+ * One bank call, with pause_turn continued, stop reasons checked first, and the cost of every response counted.
+ * The whole call (continuations and the SDK's own retries) ends by one deadline (callDeadlineMs); a continuation is
+ * not sent when less than MIN_TURN_MS is left or when the next turn could pass maxCostCents (it re-sends everything
+ * so far, so it is assumed to cost at least what the last turn did).
+ */
 export async function bankModelCall(client: BankClient, spec: BankCallSpec): Promise<BankCallResult> {
   const max = spec.maxContinuations ?? MAX_CONTINUATIONS;
+  const budgetMs = callDeadlineMs(spec);
+  const deadline = Date.now() + budgetMs;
+  const cap = typeof spec.maxCostCents === "number" && Number.isFinite(spec.maxCostCents) ? Math.max(0, spec.maxCostCents) : null;
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), budgetMs);
+  (timer as { unref?: () => void }).unref?.();
   let usage: UsageTotals = { ...ZERO_USAGE };
   let cost = 0;
+  let lastTurnCost = 0;
   const content: ContentBlockLike[] = [];
   let served = spec.model as string;
-  for (let turn = 0; turn <= max; turn++) {
-    const messages: unknown[] = [{ role: "user", content: spec.user }];
-    if (content.length) messages.push({ role: "assistant", content: [...content] });
-    let msg: BankMessage | null;
-    try {
-      msg = asMessage(await client.beta.messages.stream(bankParams(spec, messages), spec.timeoutMs ? { timeout: spec.timeoutMs } : undefined).finalMessage());
-    } catch (err) {
-      const c = classifyError(err);
-      return { ok: false, code: c.code, retryable: c.retryable, usage, costCents: Math.round(cost * 100) / 100 };
-    }
-    if (!msg) return { ok: false, code: "bad_output", retryable: true, usage, costCents: Math.round(cost * 100) / 100 };
-    served = typeof msg.model === "string" && msg.model ? msg.model : spec.model;
-    usage = addUsage(usage, msg.usage);
-    cost += costCents(served, msg.usage);
-    const totalCost = Math.round(cost * 100) / 100;
-    if (msg.stop_reason === "refusal") return { ok: false, code: "refusal", retryable: false, usage, costCents: totalCost };
-    if (msg.stop_reason === "max_tokens") return { ok: false, code: "max_tokens", retryable: true, usage, costCents: totalCost };
-    content.push(...msg.content);
-    if (msg.stop_reason === "pause_turn") {
-      if (turn === max) return { ok: false, code: "pause_limit", retryable: true, usage, costCents: totalCost };
-      continue;
-    }
-    if (msg.stop_reason !== "end_turn") return { ok: false, code: "bad_output", retryable: true, usage, costCents: totalCost };
-    const text = messageText(content);
-    let json: unknown = null;
-    if (spec.schema) {
-      try {
-        json = JSON.parse(text);
-      } catch {
-        return { ok: false, code: "bad_output", retryable: true, usage, costCents: totalCost };
+  const cents = () => Math.round(cost * 100) / 100;
+  const fail = (code: BankCallCode, retryable = RETRYABLE_CODES.has(code), maybeBilled = false): BankCallResult => ({
+    ok: false, code, retryable, usage, costCents: cents(), maybeBilled,
+  });
+  try {
+    for (let turn = 0; turn <= max; turn++) {
+      if (turn > 0) {
+        if (deadline - Date.now() < MIN_TURN_MS) return fail("timeout");
+        if (cap !== null && cost + lastTurnCost > cap) return fail("cost_limit");
       }
-      if (!json || typeof json !== "object") return { ok: false, code: "bad_output", retryable: true, usage, costCents: totalCost };
+      const messages: unknown[] = [{ role: "user", content: spec.user }];
+      if (content.length) messages.push({ role: "assistant", content: [...content] });
+      let msg: BankMessage | null;
+      try {
+        const timeout = turn === 0 ? budgetMs : Math.max(1, deadline - Date.now());
+        msg = asMessage(await client.beta.messages.stream(bankParams(spec, messages), { timeout, signal: abort.signal }).finalMessage());
+      } catch (err) {
+        const c = abort.signal.aborted ? { code: "timeout" as BankCallCode, retryable: true } : classifyError(err);
+        return fail(c.code, c.retryable, MAYBE_BILLED_CODES.has(c.code));
+      }
+      if (!msg) return fail("bad_output", true);
+      served = typeof msg.model === "string" && msg.model ? msg.model : spec.model;
+      usage = addUsage(usage, msg.usage);
+      lastTurnCost = costCents(served, msg.usage);
+      cost += lastTurnCost;
+      if (msg.stop_reason === "refusal") return fail("refusal", false);
+      if (msg.stop_reason === "max_tokens") return fail("max_tokens", true);
+      content.push(...msg.content);
+      if (msg.stop_reason === "pause_turn") {
+        if (turn === max) return fail("pause_limit", true);
+        continue;
+      }
+      if (msg.stop_reason !== "end_turn") return fail("bad_output", true);
+      const text = messageText(content);
+      let json: unknown = null;
+      if (spec.schema) {
+        try {
+          json = JSON.parse(text);
+        } catch {
+          return fail("bad_output", true);
+        }
+        if (!json || typeof json !== "object") return fail("bad_output", true);
+      }
+      return { ok: true, content, text, json, model: served, continuations: turn, usage, costCents: cents() };
     }
-    return { ok: true, content, text, json, model: served, continuations: turn, usage, costCents: totalCost };
+    return fail("pause_limit", true);
+  } finally {
+    clearTimeout(timer);
   }
-  return { ok: false, code: "pause_limit", retryable: true, usage, costCents: Math.round(cost * 100) / 100 };
 }

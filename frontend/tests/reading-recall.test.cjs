@@ -85,6 +85,21 @@ test("buildRound: core before supporting, earliest chapter first, but one slot f
   assert.ok(!r.cards.some((c) => c.idea?.idea_id === 21), "supporting waits behind core");
 });
 
+test("buildRound: the newest chapter's slot is reserved inside the room left, so a full round never drops it", () => {
+  // 1 chapter recall + 5 due leave 2 slots of 8: one goes to the earliest core idea, the other to the newest chapter.
+  const ideas = [
+    ...[1, 2, 3, 4, 5].map((i) => due(i, 1 + (i % 2), i)),
+    idea(11, 1), idea(12, 1), idea(13, 2),
+    idea(31, 4), // newest unlocked chapter
+  ];
+  const r = R.buildRound(deck({ ideas, chapter_recall: [recall(2, { due_on: day(-1) })] }));
+  assert.equal(r.cards.length, R.ROUND_SIZE);
+  assert.equal(count(r, "recall") + count(r, "due"), 6);
+  const fresh = r.cards.filter((c) => c.slot === "new" || c.slot === "newest").map((c) => c.idea.idea_id).sort((a, b) => a - b);
+  assert.deepEqual(fresh, [11, 31]);
+  assert.equal(r.cards.find((c) => c.idea?.idea_id === 31).slot, "newest");
+});
+
 test("buildRound: detail ideas only fill leftover slots", () => {
   const ideas = [due(1, 1), idea(11, 1), idea(12, 2), idea(41, 1, { importance: "detail" }), due(42, 2, 2, { importance: "detail" })];
   const r = R.buildRound(deck({ ideas }));
@@ -183,6 +198,11 @@ test("variants by stage; never one of the last 2 when another exists; Again uses
   assert.equal(R.pickQuestion({ ...base, stage: 4, last_question_ids: [c1.question_id] }).format, "explain");
   assert.equal(R.pickQuestion({ ...base, stage: 0, last_question_ids: [o1.question_id, c1.question_id] }).question_id, c2.question_id);
   assert.notEqual(R.pickQuestion({ ...base, importance: "detail", stage: 2 }).format, "explain", "detail never explain");
+  // The last-2 rule outranks the stage's preferred format: a stage-2 idea whose only explain was just asked gets
+  // its cued variant, not the same explanation again.
+  const [e2, c3] = [q("explain"), q("cued")];
+  assert.equal(R.pickQuestion({ importance: "core", stage: 2, questions: [e2, c3], last_question_ids: [e2.question_id] }).question_id, c3.question_id);
+  assert.equal(R.pickQuestion({ importance: "core", stage: 2, questions: [e2], last_question_ids: [e2.question_id] }).question_id, e2.question_id, "the only variant is still asked");
   const card = R.buildRound(deck({ ideas: [idea(11, 1, { questions: [c1, e1] })] })).cards[0];
   const again = R.againCard(card);
   assert.notEqual(again.question.question_id, card.question.question_id);

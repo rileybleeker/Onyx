@@ -46,10 +46,11 @@ const okVerify = (structure) => ({
     questions: i.questions.map((_, qi) => ({ index: qi, ok: true, problem: "none" })),
   })),
 });
+const CH3 = B.chapterHash(3, "Synthetic chapter 3");
 const build = (ideas, o = {}) => {
   const structure = { ideas, highlight_links: [], rejected: 0 };
   return B.validateBuild({
-    bookId: 7, chapter: 3, totalChapters: 12, target: 4, jobId: 91, promptVersion: V, rebuilds: 0, replace: true,
+    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, promptVersion: V, rebuilds: 0, replace: true,
     structure, verify: o.verify ?? okVerify(structure), evidence: [E1, E2], highlights: [H5], existingTitles: [], ...o,
   });
 };
@@ -100,9 +101,17 @@ test("an idea needs evidence that exists in this build; only cited evidence goes
   const r = build([idea({ support: ["E9", "H77"] }), idea({ title: "Backed by a highlight", support: ["H5"] })]);
   assert.equal(r.kept, 1);
   assert.equal(r.reasons.no_evidence, 1);
-  assert.deepEqual(r.payload.sources, [{ ref: "H5", kind: "highlight", highlight_id: 5 }]);
+  assert.deepEqual(r.payload.sources, [{ ref: "H5", kind: "highlight", highlight_id: 5, passage_sha: sha(H5.passage) }]);
   assert.equal(r.payload.ideas[0].origin, "highlight");
   assert.deepEqual(r.payload.ideas[0].evidence, ["H5"]);
+});
+
+test("the store payload carries the planned edition, the job, and every highlight the job looked at (by content)", () => {
+  const r = build([idea()]);
+  assert.equal(r.payload.chapter_hash, CH3, "the store refuses it when the table of contents changed since");
+  assert.equal(r.payload.job_id, 91, "the store's receipt makes a repeated store a replay");
+  assert.deepEqual(r.payload.seen, [{ highlight_id: 5, passage_sha: sha(H5.passage) }], "seen even when no idea cites it");
+  assert.doesNotMatch(JSON.stringify(r.payload.seen), /ledger is only/i, "a hash, never the passage");
 });
 
 test("exact-fact gate: digits and number words unified, units kept, the value must be in the idea's own snippet or highlight", () => {
@@ -223,7 +232,7 @@ test("chapter status: ready at 60% of target, thin below, anchors_only when ever
 test("the highlights step: a link to an existing idea of the chapter adds that highlight as evidence", () => {
   const r = build([], { replace: false, links: [{ highlight: "H5", idea_id: 301 }, { highlight: "H5", idea_id: 999 }, { highlight: "H9", idea_id: 301 }], existingIdeaIds: [301] });
   assert.deepEqual(r.payload.links, [{ idea_id: 301, source_ref: "H5" }]);
-  assert.deepEqual(r.payload.sources, [{ ref: "H5", kind: "highlight", highlight_id: 5 }]);
+  assert.deepEqual(r.payload.sources, [{ ref: "H5", kind: "highlight", highlight_id: 5, passage_sha: sha(H5.passage) }]);
 });
 
 test("chapter quota from the print page span", () => {
@@ -363,16 +372,20 @@ test("planBankJobs: build after its research is done; a built chapter is left al
   assert.equal(changedToc.step, "research", "a bank built for another edition is rebuilt");
 });
 
-test("planBankJobs: a highlights job for new or edited unlinked highlights; its hash follows the highlight content", () => {
+test("planBankJobs: a highlights job for highlights whose content no job has seen; its hash follows the highlight content", () => {
+  // pds.reading_bank_plan_input lists only highlights whose (id, sha256 of the passage) no build or highlights job
+  // has looked at, so a review or a Kindle re-import (updated_at only) never shows up here and costs nothing.
   const built = { chapter: 3, status: "ready", chapter_hash: hashOf(3), rebuilds: 0, built_rebuilds: 0, built_at: "2026-03-01T00:00:00Z", quizzable_since: "2026-03-01" };
-  const hl = (passage_sha, changed_at = "2026-03-05T00:00:00Z") => ({ highlight_id: 5, chapter: 3, passage_sha, changed_at });
-  const before = B.planBankJobs(planInput({ bank: [built], highlights: [hl("1".repeat(64), "2026-02-01T00:00:00Z")] }), V);
-  assert.ok(!before.jobs.some((j) => j.step === "highlights"), "older than the build");
+  const hl = (passage_sha, chapter = 3) => ({ highlight_id: 5, chapter, passage_sha });
+  assert.ok(!B.planBankJobs(planInput({ bank: [built], highlights: [] }), V).jobs.some((j) => j.step === "highlights"));
   const a = B.planBankJobs(planInput({ bank: [built], highlights: [hl("1".repeat(64))] }), V).jobs.find((j) => j.step === "highlights");
   const b = B.planBankJobs(planInput({ bank: [built], highlights: [hl("2".repeat(64))] }), V).jobs.find((j) => j.step === "highlights");
   assert.equal(a.priority, 60);
   assert.equal(a.input_hash, sha(`${V}|3|5:${"1".repeat(64)}`));
-  assert.notEqual(a.input_hash, b.input_hash, "an edited passage is linked again");
+  assert.notEqual(a.input_hash, b.input_hash, "an edited passage is new content, so it is offered again");
+  const unbuilt = B.planBankJobs(planInput({ highlights: [hl("1".repeat(64))] }), V);
+  assert.ok(!unbuilt.jobs.some((j) => j.step === "highlights"), "a chapter without a current bank gets its highlights in the build");
+  assert.ok(!("changed_at" in hl("1".repeat(64))), "freshness is the database's content check, not a timestamp");
 });
 
 test("planBankJobs: obsolete queued jobs are skipped; a planned one is not", () => {

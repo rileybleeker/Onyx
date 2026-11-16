@@ -10,15 +10,24 @@
 --   * a job queue that meters model spending (cost reserved at claim, charged at finish, per-book and monthly caps);
 --   * flags that void scores openly (answers are kept, marked invalidated, never removed).
 -- The spoiler boundary is ONE function, pds.reading_bank_quiz_through(book): every read here (round, summary,
--- chapter map, chapter sheet) and the attempt function serve only ideas and questions whose unlock_chapter is at
--- or below it and whose chapter_hash is the current one, so locked or stale rows never leave the server.
+-- chapter map, chapter sheet, T07's export) and the attempt function serve only ideas and questions whose
+-- unlock_chapter is at or below it and whose chapter_hash is the current one, so locked or stale rows never leave
+-- the server. A chapter recall rubric lists only ideas that unlock with that chapter, and it gets a new version
+-- whenever a flag moves or retires one of them.
+-- An idea is served only while it has valid evidence: a web citation, or a highlight whose passage still has the
+-- sha256 it had when it was stored (pds.reading_bank_idea_supported). An edited highlight is offered to the
+-- highlights step again; the idea it supported pauses until it is linked again or has other evidence.
 --
 -- APPLY ORDER: sql/reading_practice_receipts.sql, sql/reading_learning_questions.sql, then (only when
 -- pds.reading_bank_schema_ok() reports a check missing) sql/reading_question_bank_checks.sql in the dashboard,
--- then this file. Re-apply this file whenever reading_learning_questions.sql is applied again: it re-defines
--- pds.reading_source_text with an added 'idea' branch, and that file's own definition has only three branches.
+-- then this file. Re-apply this file whenever reading_learning_questions.sql is applied again: it re-defines two
+-- T07 functions, pds.reading_source_text (an added 'idea' branch) and pds.reading_questions_export (bank rows above
+-- the spoiler gate left out), and that file's own definitions lack both.
+-- T07 paths are fenced off from bank rows by two triggers: a bank question takes answers only through
+-- pds.reading_bank_attempt and grades only through the bank's grade functions (T07's 'grade' kind would leave the
+-- verdict, score and schedule unset), and a new version of a bank question is made only by this file's functions.
 --
--- Additive only, so it can go through the Supabase MCP: new tables, added columns, indexes, functions, one trigger.
+-- Additive only, so it can go through the Supabase MCP: new tables, added columns, indexes, functions, triggers.
 -- Every new table: row level security on, no policies, service_role only (the browser never reads them; an
 -- owner-readable table would let a signed-in browser read locked chapters through PostgREST).
 -- Every write function takes the advisory lock pds.reading_practice (questions, attempts, grades, flags, states)
@@ -78,14 +87,28 @@ CREATE TABLE IF NOT EXISTS pds.reading_bank_sources (
     title        TEXT        CHECK (title IS NULL OR length(title) <= 300),
     cited_text   TEXT        CHECK (cited_text IS NULL OR length(cited_text) <= 300),
     highlight_id BIGINT      REFERENCES pds.book_highlights(highlight_id),
+    passage_sha  TEXT        CHECK (passage_sha IS NULL OR passage_sha ~ '^[0-9a-f]{64}$'), -- the passage it was stored against
     content_hash TEXT        NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
     job_id       BIGINT,
     retrieved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CHECK ((kind = 'web' AND url IS NOT NULL AND cited_text IS NOT NULL AND highlight_id IS NULL)
-        OR (kind = 'highlight' AND url IS NULL AND cited_text IS NULL AND highlight_id IS NOT NULL)),
+    CHECK ((kind = 'web' AND url IS NOT NULL AND cited_text IS NOT NULL AND highlight_id IS NULL AND passage_sha IS NULL)
+        OR (kind = 'highlight' AND url IS NULL AND cited_text IS NULL AND highlight_id IS NOT NULL AND passage_sha IS NOT NULL)),
     UNIQUE (book_id, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_reading_bank_sources_highlight ON pds.reading_bank_sources (highlight_id) WHERE highlight_id IS NOT NULL;
+
+-- Highlight contents a build or a highlights step has already looked at (a pair id + sha256 of the passage), so the
+-- planner offers a highlight again only when it is new or its passage changed: a review or a Kindle re-import
+-- touches updated_at but not the content, and costs nothing.
+CREATE TABLE IF NOT EXISTS pds.reading_bank_highlight_seen (
+    highlight_id BIGINT      NOT NULL REFERENCES pds.book_highlights(highlight_id),
+    passage_sha  TEXT        NOT NULL CHECK (passage_sha ~ '^[0-9a-f]{64}$'),
+    book_id      BIGINT      NOT NULL REFERENCES pds.books(book_id),
+    chapter      INTEGER,
+    job_id       BIGINT,
+    seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (highlight_id, passage_sha)
+);
 
 -- 4. Ideas: immutable once stored (a correction retires the row and stores a new one) ----------------------------
 CREATE TABLE IF NOT EXISTS pds.reading_ideas (
@@ -164,6 +187,7 @@ CREATE TABLE IF NOT EXISTS pds.reading_bank_jobs (
     result          TEXT          CHECK (result IS NULL OR result IN ('ready', 'thin', 'anchors_only', 'no_sources')),
     counts          JSONB,
     output          JSONB         CHECK (output IS NULL OR length(output::text) <= 60000),
+    store_receipt   JSONB,        -- what pds.reading_bank_store answered for this job (a repeated store replays it)
     error_code      TEXT          CHECK (error_code IS NULL OR error_code ~ '^[a-z0-9_]{1,40}$'),
     created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     started_at      TIMESTAMPTZ,
@@ -190,6 +214,7 @@ CREATE TABLE IF NOT EXISTS pds.reading_question_flags (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_reading_question_flags_question ON pds.reading_question_flags (question_id);
+CREATE INDEX IF NOT EXISTS idx_reading_question_flags_wrong_idea ON pds.reading_question_flags (idea_id) WHERE kind = 'wrong';
 
 -- 8. PROD-T07 tables: added columns only ----------------------------------------------------------------------------
 ALTER TABLE pds.reading_questions
@@ -242,6 +267,42 @@ END $fn$;
 CREATE OR REPLACE TRIGGER trg_reading_ideas_guard BEFORE UPDATE ON pds.reading_ideas
     FOR EACH ROW EXECUTE FUNCTION pds.reading_ideas_guard();
 
+-- 9a. T07's own paths stay off bank rows (the /api/reading/questions route takes answer / grade / correct):
+--   * an answer to a bank question (format set) is stored only by pds.reading_bank_attempt (it sets ext_hash);
+--   * a bank answer is graded only with a verdict (pds.reading_bank_attempt / _grade / _override set it): T07's
+--     'grade' kind would mark it graded with no verdict, score or schedule, and the bank could never repair it.
+-- A refusal raises, so the whole T07 call rolls back (including a version its answer path made first).
+CREATE OR REPLACE FUNCTION pds.reading_bank_attempt_guard()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = pds, pg_temp AS $fn$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.ext_hash IS NULL AND EXISTS (SELECT 1 FROM pds.reading_questions q WHERE q.question_id = NEW.question_id AND q.format IS NOT NULL) THEN
+      RAISE EXCEPTION USING ERRCODE = 'OXB12', MESSAGE = 'a bank question is answered only through pds.reading_bank_attempt';
+    END IF;
+  ELSIF NEW.ext_hash IS NOT NULL AND NEW.grading_status = 'graded' AND OLD.grading_status IS DISTINCT FROM 'graded'
+        AND NEW.verdict IS NULL THEN
+    RAISE EXCEPTION USING ERRCODE = 'OXB13', MESSAGE = 'a bank answer is graded only through the bank''s grade functions';
+  END IF;
+  RETURN NEW;
+END $fn$;
+CREATE OR REPLACE TRIGGER trg_reading_bank_attempt_guard BEFORE INSERT OR UPDATE ON pds.reading_question_attempts
+    FOR EACH ROW EXECUTE FUNCTION pds.reading_bank_attempt_guard();
+
+--   * a new version of a bank question (T07's 'correct' kind, or its answer path when the source text moved) is
+--     made only while this file's functions say so (the transaction-local setting pds.reading_bank_write), because
+--     the version T07 inserts carries none of the bank's columns and would take the question out of the bank.
+CREATE OR REPLACE FUNCTION pds.reading_bank_question_guard()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = pds, pg_temp AS $fn$
+BEGIN
+  IF NEW.format IS NULL AND COALESCE(current_setting('pds.reading_bank_write', true), '') <> 'on'
+     AND EXISTS (SELECT 1 FROM pds.reading_questions q WHERE q.question_key = NEW.question_key AND q.format IS NOT NULL) THEN
+    RAISE EXCEPTION USING ERRCODE = 'OXB14', MESSAGE = 'a bank question gets new versions only from the bank';
+  END IF;
+  RETURN NEW;
+END $fn$;
+CREATE OR REPLACE TRIGGER trg_reading_bank_question_guard BEFORE INSERT ON pds.reading_questions
+    FOR EACH ROW EXECUTE FUNCTION pds.reading_bank_question_guard();
+
 -- 10. Hashes, book lookup, the spoiler boundary ---------------------------------------------------------------------
 -- The active book: the same rule as lib/reading.ts getBook (the slug, else the newest book being read).
 CREATE OR REPLACE FUNCTION pds.reading_bank_book_id(p_slug TEXT)
@@ -271,7 +332,10 @@ $fn$;
 -- The highest chapter Riley may be quizzed on (docs/reading-question-bank.md "Spoiler gate"):
 --   stated = highest chapter_through of a session he logged himself (Log or chat, source <> 'kindle');
 --   kindle = highest chapter whose NEXT chapter (by start position) the reading position or a highlight reached;
---   last   = total_chapters when the book is finished or any session reached the last chapter;
+--   last   = total_chapters when the book is finished or a session he logged himself reached the last chapter
+--            (a Kindle-made session can count a chapter done up to 800 positions before its end, so it never
+--            unlocks the last chapter; the book's `finished` status still does, by D9, even when the Kindle sync
+--            set it inside that margin);
 --   capped at total_chapters, and at hold_chapter - 1 while a "Not read yet" hold stands.
 CREATE OR REPLACE FUNCTION pds.reading_bank_quiz_through(p_book BIGINT)
 RETURNS INTEGER LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
@@ -299,7 +363,8 @@ RETURNS INTEGER LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_t
   ),
   last_ch AS (
     SELECT CASE WHEN (SELECT total FROM b) > 0 AND ((SELECT status FROM b) = 'finished'
-                  OR EXISTS (SELECT 1 FROM pds.reading_sessions s WHERE s.book_id = p_book AND s.chapter_through >= (SELECT total FROM b)))
+                  OR EXISTS (SELECT 1 FROM pds.reading_sessions s WHERE s.book_id = p_book AND s.source <> 'kindle'
+                               AND s.chapter_through >= (SELECT total FROM b)))
                 THEN (SELECT total FROM b) ELSE 0 END AS n
   ),
   raw AS (SELECT GREATEST((SELECT n FROM stated), (SELECT n FROM kindle), (SELECT n FROM last_ch)) AS n),
@@ -364,6 +429,59 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
     'grader_local',     EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'pds.reading_question_attempts'::regclass AND contype = 'c'
                                   AND pg_get_constraintdef(oid) LIKE '%grader%' AND pg_get_constraintdef(oid) LIKE '%''local''%'),
     'idea_source_branch', position('reading_ideas' IN pg_get_functiondef('pds.reading_source_text(bigint,text,bigint)'::regprocedure)) > 0)
+$fn$;
+
+-- Whether an idea still rests on valid evidence: a web citation, or a live highlight whose passage has the sha256
+-- it had when the evidence was stored (an edited or archived highlight no longer supports what was built on it).
+-- Every read and the attempt serve an idea only while this holds (acceptance: no served idea without evidence).
+CREATE OR REPLACE FUNCTION pds.reading_bank_idea_supported(p_idea BIGINT)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
+  SELECT EXISTS (
+    SELECT 1 FROM pds.reading_idea_evidence e
+      JOIN pds.reading_bank_sources src ON src.source_id = e.source_id
+      LEFT JOIN pds.book_highlights h ON h.highlight_id = src.highlight_id
+     WHERE e.idea_id = p_idea
+       AND (src.kind = 'web' OR (h.highlight_id IS NOT NULL AND NOT h.archived AND pds.reading_sha256(h.passage) = src.passage_sha)))
+$fn$;
+
+-- T07's export (GET /api/reading/questions?book=), re-defined with the spoiler gate: a bank question version
+-- (format set) is listed only when its unlock_chapter is at or below pds.reading_bank_quiz_through, and so are the
+-- attempts on it. Everything else is T07's definition unchanged (frontend/tests/reading-bank-sql.test.cjs compares
+-- the fields), so T07's questions and answers export exactly as before.
+CREATE OR REPLACE FUNCTION pds.reading_questions_export(p_book BIGINT)
+RETURNS JSONB
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = pds, pg_temp
+AS $fn$
+  WITH t AS (SELECT pds.reading_bank_quiz_through(p_book) AS through)
+  SELECT jsonb_build_object(
+    'questions', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+               'question_id', q.question_id, 'question_key', q.question_key, 'version', q.version,
+               'prompt', q.prompt, 'rubric', q.rubric, 'source_kind', q.source_kind, 'source_ref', q.source_ref,
+               'source_hash', q.source_hash,
+               'source_status', CASE WHEN s.t IS NULL THEN 'removed'
+                                     WHEN pds.reading_sha256(s.t) = q.source_hash THEN 'same' ELSE 'changed' END,
+               'created_at', q.created_at, 'superseded_at', q.superseded_at, 'superseded_reason', q.superseded_reason)
+             ORDER BY q.question_key, q.version)
+        FROM pds.reading_questions q
+        CROSS JOIN LATERAL (SELECT pds.reading_source_text(q.book_id, q.source_kind, q.source_ref) AS t) s
+       WHERE q.book_id = p_book
+         AND (q.format IS NULL OR q.unlock_chapter <= (SELECT through FROM t))), '[]'::jsonb),
+    'attempts', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+               'attempt_key', a.attempt_key, 'question_id', a.question_id, 'quiz_key', a.quiz_key,
+               'attempt_date', a.attempt_date, 'answer', a.answer, 'answered_at', a.answered_at,
+               'grading_status', a.grading_status, 'correct', a.correct, 'grader', a.grader, 'feedback', a.feedback,
+               'graded_at', a.graded_at, 'invalidated_at', a.invalidated_at, 'invalidated_reason', a.invalidated_reason,
+               'answer_cleared_at', a.answer_cleared_at)
+             ORDER BY a.answered_at, a.attempt_key)
+        FROM pds.reading_question_attempts a
+        JOIN pds.reading_questions q ON q.question_id = a.question_id
+       WHERE q.book_id = p_book
+         AND (q.format IS NULL OR q.unlock_chapter <= (SELECT through FROM t))), '[]'::jsonb))
 $fn$;
 
 -- 12. Idea state: compare-and-set check + write ------------------------------------------------------------------
@@ -432,16 +550,124 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
     FROM pds.reading_question_attempts a WHERE a.attempt_key = p_key
 $fn$;
 
--- 13. Store one verified chapter batch atomically ---------------------------------------------------------------
--- p: {book_id, chapter, job_id, prompt_version, replace (bool), status?, rebuilds?, counts: {rejected},
---     sources: [{ref, kind, url?, domain?, title?, cited_text?, highlight_id?}],
+-- 13. The chapter recall question of one chapter, kept in step with its ideas -----------------------------------
+-- Its rubric lists the chapter's active core + supporting ideas that unlock WITH the chapter (unlock_chapter = the
+-- chapter: an unsure, whole-book or "Not in this chapter" idea unlocks at the end of the book and is never listed,
+-- so its title cannot reach the browser early), of the current edition and with valid evidence; at most 12, fewer
+-- when the titles are long, so the rubric stays within T07's 2,000 characters. Called by the store (a build, or a
+-- chapter without one) and by the flags that move or retire one of those ideas (and their Restore):
+--   * no question yet, or the last one retired -> a new question (version 1);
+--   * the rubric or prompt differs -> a new version through T07's 'correct' kind. p_invalidate NULL = T07's default
+--     (answers to older versions are invalidated: a rebuild, whose ideas were all retired); false = they keep
+--     counting (a flag: the other ideas' recall is what it was; the flagged idea's own events are the flag's);
+--   * nothing left to recall -> the live question is retired (its answers stay as they are);
+--   * a question Riley flagged Wrong / Unclear is left alone (Restore brings it back), unless p_rebuild.
+-- Returns 1 when a question was created or given a new version, else 0.
+CREATE OR REPLACE FUNCTION pds.reading_bank_recall_refresh(p_book BIGINT, p_ch INTEGER, p_job BIGINT, p_pv TEXT,
+                                                           p_reason TEXT, p_invalidate BOOLEAN, p_rebuild BOOLEAN)
+RETURNS INTEGER LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
+DECLARE
+  v_hash   TEXT;
+  v_old    pds.reading_questions%ROWTYPE;
+  v_found  BOOLEAN;
+  v_rj     JSONB;
+  v_rub    TEXT;
+  v_prompt TEXT;
+  v_title  TEXT;
+  v_shash  TEXT;
+  v_limit  INTEGER := 12;
+  v_r      JSONB;
+BEGIN
+  IF p_book IS NULL OR p_ch IS NULL OR p_ch < 1 THEN RETURN 0; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext('pds.reading_practice'));
+  v_hash := pds.reading_bank_chapter_hash(p_book, p_ch);
+  SELECT * INTO v_old FROM pds.reading_questions
+   WHERE book_id = p_book AND format = 'chapter_recall' AND bank_chapter = p_ch AND superseded_at IS NULL
+   ORDER BY question_id DESC LIMIT 1;
+  v_found := FOUND;
+  IF v_found AND v_old.retired_reason IN ('wrong', 'unclear') AND NOT COALESCE(p_rebuild, false) THEN RETURN 0; END IF;
+
+  LOOP
+    SELECT jsonb_build_object('v', 1, 'format', 'chapter_recall', 'ideas',
+             COALESCE(jsonb_agg(jsonb_build_object('idea_id', x.idea_id, 'title', x.title, 'importance', x.importance) ORDER BY x.ord, x.idea_id), '[]'::jsonb))
+      INTO v_rj
+      FROM (SELECT i.idea_id, i.title, i.importance, CASE i.importance WHEN 'core' THEN 0 ELSE 1 END AS ord
+              FROM pds.reading_ideas i
+             WHERE i.book_id = p_book AND i.chapter = p_ch AND i.unlock_chapter = p_ch AND i.chapter_hash = v_hash
+               AND i.status = 'active' AND i.importance IN ('core', 'supporting')
+               AND pds.reading_bank_idea_supported(i.idea_id)
+             ORDER BY ord, i.idea_id LIMIT v_limit) x;
+    EXIT WHEN length(v_rj::text) <= 2000 OR v_limit <= 4;
+    v_limit := v_limit - 2;
+  END LOOP;
+  v_rub := v_rj::text;
+  SELECT c.title INTO v_title FROM pds.book_chapters c WHERE c.book_id = p_book AND c.chapter = p_ch;
+  v_prompt := 'In your own words: what happens and what is argued in chapter ' || p_ch::text ||
+              COALESCE(' ("' || NULLIF(btrim(v_title), '') || '")', '') || '?';
+
+  IF jsonb_array_length(v_rj->'ideas') = 0 OR length(v_rub) > 2000 THEN
+    UPDATE pds.reading_questions SET retired_at = NOW(), retired_reason = 'rebuilt'
+     WHERE book_id = p_book AND format = 'chapter_recall' AND bank_chapter = p_ch AND superseded_at IS NULL AND retired_at IS NULL;
+    RETURN 0;
+  END IF;
+
+  IF NOT v_found OR v_old.retired_at IS NOT NULL THEN
+    v_shash := pds.reading_sha256(pds.reading_source_text(p_book, 'chapter', p_ch));
+    IF v_shash IS NULL THEN RETURN 0; END IF;
+    -- Same content hash formula as pds.reading_question_apply (T07); pds.reading_bank_attempt re-checks it.
+    INSERT INTO pds.reading_questions (question_key, version, book_id, prompt, rubric, source_kind, source_ref, source_hash,
+                                       content_hash, bank_chapter, format, unlock_chapter, chapter_hash, bank_job_id, prompt_version)
+    VALUES (gen_random_uuid(), 1, p_book, v_prompt, v_rub, 'chapter', p_ch, v_shash,
+            pds.reading_sha256(jsonb_build_object('prompt', v_prompt, 'rubric', v_rub, 'source_kind', 'chapter',
+              'source_ref', p_ch, 'source_hash', v_shash)::text),
+            p_ch, 'chapter_recall', p_ch, v_hash, p_job, COALESCE(p_pv, v_old.prompt_version, 'unknown'));
+    RETURN 1;
+  END IF;
+
+  IF v_old.rubric IS DISTINCT FROM v_rub OR v_old.prompt IS DISTINCT FROM v_prompt THEN
+    -- A new version through T07's correction path (the question guard admits it while this setting is on).
+    PERFORM set_config('pds.reading_bank_write', 'on', true);
+    v_r := pds.reading_question_apply(jsonb_build_object('kind', 'correct', 'op_key', gen_random_uuid(),
+             'question_key', v_old.question_key, 'expected_version', v_old.version, 'prompt', v_prompt, 'rubric', v_rub,
+             'source_kind', 'chapter', 'source_ref', p_ch, 'reason', COALESCE(NULLIF(btrim(p_reason), ''), 'chapter questions changed'),
+             'invalidate', p_invalidate));
+    PERFORM set_config('pds.reading_bank_write', 'off', true);
+    IF NOT COALESCE((v_r->>'ok')::boolean, false) THEN RETURN 0; END IF;
+    UPDATE pds.reading_questions
+       SET bank_chapter = p_ch, format = 'chapter_recall', unlock_chapter = p_ch, chapter_hash = v_hash,
+           bank_job_id = COALESCE(p_job, v_old.bank_job_id), prompt_version = COALESCE(p_pv, v_old.prompt_version)
+     WHERE question_key = v_old.question_key AND superseded_at IS NULL;
+    RETURN 1;
+  END IF;
+
+  -- Same prompt and rubric: only the bank's own columns follow.
+  UPDATE pds.reading_questions
+     SET chapter_hash = v_hash, bank_job_id = COALESCE(p_job, bank_job_id), prompt_version = COALESCE(p_pv, prompt_version)
+   WHERE question_id = v_old.question_id;
+  RETURN 0;
+END $fn$;
+
+-- 13a. Store one verified chapter batch atomically --------------------------------------------------------------
+-- p: {book_id, chapter, chapter_hash, job_id, prompt_version, replace (bool), status?, rebuilds?, counts: {rejected},
+--     sources: [{ref, kind, url?, domain?, title?, cited_text?, highlight_id?, passage_sha?}],
 --     ideas: [{ref, unlock_chapter, kind, importance, title, statement, key_points, facts, origin, evidence: [ref],
 --              questions: [{format: 'cued'|'explain'|'order', prompt, rubric (jsonb)}]}],
---     links?: [{idea_id, source_ref}]}   (a highlight that states an idea already stored in this chapter)
+--     links?: [{idea_id, source_ref}],   (a highlight that states an idea already stored in this chapter)
+--     seen?: [{highlight_id, passage_sha}]}   (the highlights the job sent to the model)
+-- job_id is required: the job's receipt (reading_bank_jobs.store_receipt) makes a repeated store (a crash between
+-- store and finish, a worker whose lease ran out) answer what the first one stored, with nothing retired or
+-- inserted again. chapter_hash is required: the edition the job was planned for; when the table of contents
+-- changed since, the answer is 409 chapter_changed and nothing is written (the planner queues the new edition).
+-- A highlight source's passage_sha, when sent, must still be the passage's (409 highlight_changed otherwise).
 -- replace = true (a build or a rebuild): the chapter's active ideas and their questions are retired first, and the
--- chapter recall question gets a new T07 version when its rubric changed. replace = false (the highlights step):
+-- chapter recall question gets a new T07 version when its rubric changed. A replace that kept no idea while the
+-- chapter has a working bank for this edition leaves that bank in place (a transient search failure must not
+-- empty a chapter): only the rebuild counter and the rejected count move. replace = false (the highlights step):
 -- ideas are added; the chapter recall question is only created when the chapter has none (an added idea never
 -- re-versions it, which would void the chapter recall answers already given).
+-- Every highlight the job looked at is recorded in pds.reading_bank_highlight_seen with its passage hash (`seen`;
+-- without it: a build's chapter highlights, a highlights step's cited ones), so the planner offers a highlight
+-- again only once its content changes.
 CREATE OR REPLACE FUNCTION pds.reading_bank_store(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
@@ -450,8 +676,11 @@ DECLARE
   v_job     BIGINT;
   v_rebuild INTEGER;
   v_replace BOOLEAN;
+  v_keep    BOOLEAN := false;
   v_pv      TEXT := p->>'prompt_version';
+  v_chash   TEXT := p->>'chapter_hash';
   v_hash    TEXT;
+  v_jobrow  pds.reading_bank_jobs%ROWTYPE;
   v_src     JSONB;
   v_idea    JSONB;
   v_q       JSONB;
@@ -462,14 +691,11 @@ DECLARE
   v_ideas   INTEGER := 0;
   v_qs      INTEGER := 0;
   v_text    TEXT;
+  v_psha    TEXT;
   v_shash   TEXT;
   v_prompt  TEXT;
   v_rub     TEXT;
-  v_rj      JSONB;
-  v_limit   INTEGER;
-  v_old     pds.reading_questions%ROWTYPE;
-  v_r       JSONB;
-  v_title   TEXT;
+  v_receipt JSONB;
 BEGIN
   BEGIN
     v_book := (p->>'book_id')::bigint;
@@ -480,9 +706,11 @@ BEGIN
   EXCEPTION WHEN others THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END;
-  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR v_pv IS NULL OR btrim(v_pv) = ''
+  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR v_job IS NULL OR v_pv IS NULL OR btrim(v_pv) = ''
+     OR v_chash IS NULL OR v_chash !~ '^[0-9a-f]{64}$'
      OR (p->'ideas' IS NOT NULL AND jsonb_typeof(p->'ideas') <> 'array')
-     OR (p->'sources' IS NOT NULL AND jsonb_typeof(p->'sources') <> 'array') THEN
+     OR (p->'sources' IS NOT NULL AND jsonb_typeof(p->'sources') <> 'array')
+     OR (p->'seen' IS NOT NULL AND jsonb_typeof(p->'seen') <> 'array') THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pds.books WHERE book_id = v_book) THEN
@@ -490,9 +718,28 @@ BEGIN
   END IF;
 
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_practice'));
+  SELECT * INTO v_jobrow FROM pds.reading_bank_jobs WHERE job_id = v_job FOR UPDATE;
+  IF NOT FOUND OR v_jobrow.book_id <> v_book OR v_jobrow.chapter <> v_ch OR v_jobrow.step NOT IN ('build', 'highlights') THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'job_mismatch');
+  END IF;
+  IF v_jobrow.store_receipt IS NOT NULL THEN
+    RETURN v_jobrow.store_receipt || jsonb_build_object('replayed', true);
+  END IF;
   v_hash := pds.reading_bank_chapter_hash(v_book, v_ch);
+  IF v_chash <> v_hash THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'chapter_changed');
+  END IF;
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(p->'sources', '[]'::jsonb)) s
+               LEFT JOIN pds.book_highlights h ON h.highlight_id = NULLIF(s->>'highlight_id', '')::bigint AND h.book_id = v_book
+              WHERE s->>'kind' = 'highlight' AND s->>'passage_sha' IS NOT NULL
+                AND (h.highlight_id IS NULL OR pds.reading_sha256(h.passage) <> s->>'passage_sha')) THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'highlight_changed');
+  END IF;
 
-  IF v_replace THEN
+  v_keep := v_replace AND jsonb_array_length(COALESCE(p->'ideas', '[]'::jsonb)) = 0
+            AND EXISTS (SELECT 1 FROM pds.reading_ideas WHERE book_id = v_book AND chapter = v_ch AND status = 'active' AND chapter_hash = v_hash);
+
+  IF v_replace AND NOT v_keep THEN
     UPDATE pds.reading_questions q SET retired_at = NOW(), retired_reason = 'rebuilt'
       FROM pds.reading_ideas i
      WHERE q.idea_id = i.idea_id AND i.book_id = v_book AND i.chapter = v_ch AND i.status = 'active' AND q.retired_at IS NULL;
@@ -506,24 +753,45 @@ BEGIN
     IF v_src->>'ref' IS NULL OR v_src->>'kind' IS NULL OR v_src->>'kind' NOT IN ('web', 'highlight') THEN
       RAISE EXCEPTION USING ERRCODE = 'OXB01', MESSAGE = 'a source needs a ref and a kind';
     END IF;
-    IF v_src->>'kind' = 'highlight' AND NOT EXISTS (
-         SELECT 1 FROM pds.book_highlights h WHERE h.highlight_id = (v_src->>'highlight_id')::bigint AND h.book_id = v_book AND NOT h.archived) THEN
-      RAISE EXCEPTION USING ERRCODE = 'OXB02', MESSAGE = 'highlight evidence is not a live highlight of this book';
+    v_psha := NULL;
+    IF v_src->>'kind' = 'highlight' THEN
+      SELECT pds.reading_sha256(h.passage) INTO v_psha FROM pds.book_highlights h
+       WHERE h.highlight_id = (v_src->>'highlight_id')::bigint AND h.book_id = v_book AND NOT h.archived;
+      IF v_psha IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = 'OXB02', MESSAGE = 'highlight evidence is not a live highlight of this book';
+      END IF;
     END IF;
+    -- A highlight's evidence row is bound to the passage it was stored against (an edit makes another row).
     v_text := CASE WHEN v_src->>'kind' = 'web' THEN 'web|' || (v_src->>'url') || '|' || (v_src->>'cited_text')
-                   ELSE 'highlight|' || (v_src->>'highlight_id') END;
-    INSERT INTO pds.reading_bank_sources (book_id, chapter, kind, url, domain, title, cited_text, highlight_id, content_hash, job_id)
+                   ELSE 'highlight|' || (v_src->>'highlight_id') || '|' || v_psha END;
+    INSERT INTO pds.reading_bank_sources (book_id, chapter, kind, url, domain, title, cited_text, highlight_id, passage_sha, content_hash, job_id)
     VALUES (v_book, v_ch, v_src->>'kind',
             CASE WHEN v_src->>'kind' = 'web' THEN v_src->>'url' END,
             CASE WHEN v_src->>'kind' = 'web' THEN v_src->>'domain' END,
             CASE WHEN v_src->>'kind' = 'web' THEN v_src->>'title' END,
             CASE WHEN v_src->>'kind' = 'web' THEN v_src->>'cited_text' END,
             CASE WHEN v_src->>'kind' = 'highlight' THEN (v_src->>'highlight_id')::bigint END,
-            pds.reading_sha256(v_text), v_job)
+            v_psha, pds.reading_sha256(v_text), v_job)
     ON CONFLICT (book_id, content_hash) DO UPDATE SET retrieved_at = EXCLUDED.retrieved_at
     RETURNING source_id INTO v_sid;
     v_map := v_map || jsonb_build_object(v_src->>'ref', v_sid);
   END LOOP;
+
+  -- What the job looked at: the pairs it sent, else a build's live chapter highlights / a highlights step's cited ones.
+  INSERT INTO pds.reading_bank_highlight_seen (highlight_id, passage_sha, book_id, chapter, job_id)
+  SELECT DISTINCT h.highlight_id, s.sha, v_book, v_ch, v_job
+    FROM (SELECT NULLIF(e->>'highlight_id', '')::bigint AS id, e->>'passage_sha' AS sha
+            FROM jsonb_array_elements(COALESCE(p->'seen', '[]'::jsonb)) e
+          UNION ALL
+          SELECT h2.highlight_id, pds.reading_sha256(h2.passage)
+            FROM pds.book_highlights h2
+           WHERE p->'seen' IS NULL AND h2.book_id = v_book AND NOT h2.archived
+             AND ((v_replace AND h2.chapter = v_ch)
+                  OR h2.highlight_id IN (SELECT NULLIF(x->>'highlight_id', '')::bigint
+                                           FROM jsonb_array_elements(COALESCE(p->'sources', '[]'::jsonb)) x WHERE x->>'kind' = 'highlight'))) s
+    JOIN pds.book_highlights h ON h.highlight_id = s.id AND h.book_id = v_book
+   WHERE s.sha ~ '^[0-9a-f]{64}$'
+  ON CONFLICT (highlight_id, passage_sha) DO NOTHING;
 
   FOR v_idea IN SELECT * FROM jsonb_array_elements(COALESCE(p->'ideas', '[]'::jsonb)) LOOP
     IF CASE WHEN jsonb_typeof(v_idea->'evidence') = 'array' THEN jsonb_array_length(v_idea->'evidence') = 0 ELSE true END THEN
@@ -544,7 +812,7 @@ BEGIN
             v_pv, v_job)
     ON CONFLICT (book_id, content_hash) WHERE status = 'active' DO NOTHING
     RETURNING idea_id INTO v_iid;
-    IF v_iid IS NULL THEN CONTINUE; END IF;   -- the same idea is already active (a replayed store)
+    IF v_iid IS NULL THEN CONTINUE; END IF;   -- the same idea is already active (the highlights step)
     v_ideas := v_ideas + 1;
     INSERT INTO pds.reading_idea_evidence (idea_id, source_id)
     SELECT DISTINCT v_iid, (v_map->>e)::bigint FROM jsonb_array_elements_text(v_idea->'evidence') e
@@ -582,68 +850,16 @@ BEGIN
     UPDATE pds.reading_ideas SET origin = 'both' WHERE idea_id = (v_q->>'idea_id')::bigint AND origin = 'web';
   END LOOP;
 
-  -- The chapter recall question: its rubric lists this chapter's active core + supporting ideas (at most 12, fewer
-  -- when the titles are long, so the rubric stays within T07's 2,000 characters).
-  IF v_ch >= 1 THEN
-    SELECT * INTO v_old FROM pds.reading_questions
-     WHERE book_id = v_book AND format = 'chapter_recall' AND bank_chapter = v_ch AND superseded_at IS NULL AND retired_at IS NULL
-     ORDER BY question_id DESC LIMIT 1;
-    IF v_replace OR NOT FOUND THEN
-      v_limit := 12;
-      LOOP
-        SELECT jsonb_build_object('v', 1, 'format', 'chapter_recall', 'ideas',
-                 COALESCE(jsonb_agg(jsonb_build_object('idea_id', x.idea_id, 'title', x.title, 'importance', x.importance) ORDER BY x.ord, x.idea_id), '[]'::jsonb))
-          INTO v_rj
-          FROM (SELECT idea_id, title, importance, CASE importance WHEN 'core' THEN 0 ELSE 1 END AS ord
-                  FROM pds.reading_ideas
-                 WHERE book_id = v_book AND chapter = v_ch AND status = 'active' AND importance IN ('core', 'supporting')
-                 ORDER BY ord, idea_id LIMIT v_limit) x;
-        EXIT WHEN length(v_rj::text) <= 2000 OR v_limit <= 4;
-        v_limit := v_limit - 2;
-      END LOOP;
-      SELECT c.title INTO v_title FROM pds.book_chapters c WHERE c.book_id = v_book AND c.chapter = v_ch;
-      v_prompt := 'In your own words: what happens and what is argued in chapter ' || v_ch::text ||
-                  COALESCE(' ("' || NULLIF(btrim(v_title), '') || '")', '') || '?';
-      v_rub := v_rj::text;
-      IF jsonb_array_length(v_rj->'ideas') = 0 OR length(v_rub) > 2000 THEN
-        -- Nothing left to recall: a stale chapter recall question is retired (its answers stay as they are).
-        UPDATE pds.reading_questions SET retired_at = NOW(), retired_reason = 'rebuilt'
-         WHERE book_id = v_book AND format = 'chapter_recall' AND bank_chapter = v_ch AND superseded_at IS NULL AND retired_at IS NULL;
-      ELSIF v_old.question_id IS NULL THEN
-        v_shash := pds.reading_sha256(pds.reading_source_text(v_book, 'chapter', v_ch));
-        IF v_shash IS NOT NULL THEN
-          INSERT INTO pds.reading_questions (question_key, version, book_id, prompt, rubric, source_kind, source_ref, source_hash,
-                                             content_hash, bank_chapter, format, unlock_chapter, chapter_hash, bank_job_id, prompt_version)
-          VALUES (gen_random_uuid(), 1, v_book, v_prompt, v_rub, 'chapter', v_ch, v_shash,
-                  pds.reading_sha256(jsonb_build_object('prompt', v_prompt, 'rubric', v_rub, 'source_kind', 'chapter',
-                    'source_ref', v_ch, 'source_hash', v_shash)::text),
-                  v_ch, 'chapter_recall', v_ch, v_hash, v_job, v_pv);
-          v_qs := v_qs + 1;
-        END IF;
-      ELSIF v_old.rubric IS DISTINCT FROM v_rub OR v_old.prompt IS DISTINCT FROM v_prompt THEN
-        -- A new version through T07's correction path: answers to older versions become invalidated (kept). The
-        -- ideas they covered were retired by this rebuild, so no live schedule depends on them.
-        v_r := pds.reading_question_apply(jsonb_build_object('kind', 'correct', 'op_key', gen_random_uuid(),
-                 'question_key', v_old.question_key, 'expected_version', v_old.version, 'prompt', v_prompt, 'rubric', v_rub,
-                 'source_kind', 'chapter', 'source_ref', v_ch, 'reason', 'chapter questions rebuilt'));
-        IF COALESCE((v_r->>'ok')::boolean, false) THEN
-          UPDATE pds.reading_questions
-             SET bank_chapter = v_ch, format = 'chapter_recall', unlock_chapter = v_ch, chapter_hash = v_hash,
-                 bank_job_id = v_job, prompt_version = v_pv
-           WHERE question_key = v_old.question_key AND superseded_at IS NULL;
-          v_qs := v_qs + 1;
-        END IF;
-      ELSE
-        -- Same prompt and rubric: only the bank's own columns follow the rebuild.
-        UPDATE pds.reading_questions SET chapter_hash = v_hash, bank_job_id = v_job, prompt_version = v_pv
-         WHERE question_id = v_old.question_id;
-      END IF;
-    END IF;
+  -- The chapter recall question (section 13): rebuilt with a build, created by the highlights step when missing.
+  IF v_ch >= 1 AND NOT v_keep AND (v_replace OR NOT EXISTS (
+       SELECT 1 FROM pds.reading_questions WHERE book_id = v_book AND format = 'chapter_recall' AND bank_chapter = v_ch
+          AND superseded_at IS NULL AND retired_at IS NULL)) THEN
+    v_qs := v_qs + pds.reading_bank_recall_refresh(v_book, v_ch, v_job, v_pv, 'chapter questions rebuilt', NULL, v_replace);
   END IF;
 
   INSERT INTO pds.reading_bank_chapters AS c (book_id, chapter, status, chapter_hash, ideas, questions, sources, rejected,
                                              built_rebuilds, built_at, prompt_version)
-  VALUES (v_book, v_ch, COALESCE(p->>'status', 'ready'), v_hash,
+  VALUES (v_book, v_ch, CASE WHEN v_keep THEN 'ready' ELSE COALESCE(p->>'status', 'ready') END, v_hash,
           (SELECT count(*) FROM pds.reading_ideas WHERE book_id = v_book AND chapter = v_ch AND status = 'active'),
           (SELECT count(*) FROM pds.reading_questions WHERE book_id = v_book AND bank_chapter = v_ch AND superseded_at IS NULL AND retired_at IS NULL),
           (SELECT count(DISTINCT e.source_id) FROM pds.reading_idea_evidence e
@@ -651,13 +867,16 @@ BEGIN
             WHERE i.book_id = v_book AND i.chapter = v_ch AND i.status = 'active'),
           COALESCE((p->'counts'->>'rejected')::int, 0), COALESCE(v_rebuild, 0), NOW(), v_pv)
   ON CONFLICT (book_id, chapter) DO UPDATE SET
-    status = COALESCE(p->>'status', c.status), chapter_hash = EXCLUDED.chapter_hash, ideas = EXCLUDED.ideas,
+    status = CASE WHEN v_keep THEN c.status ELSE COALESCE(p->>'status', c.status) END,
+    chapter_hash = EXCLUDED.chapter_hash, ideas = EXCLUDED.ideas,
     questions = EXCLUDED.questions, sources = EXCLUDED.sources, rejected = c.rejected + EXCLUDED.rejected,
     built_rebuilds = CASE WHEN v_replace THEN COALESCE(v_rebuild, c.rebuilds) ELSE c.built_rebuilds END,
-    built_at = CASE WHEN v_replace THEN EXCLUDED.built_at ELSE c.built_at END,
-    prompt_version = EXCLUDED.prompt_version;
+    built_at = CASE WHEN v_replace AND NOT v_keep THEN EXCLUDED.built_at ELSE c.built_at END,
+    prompt_version = CASE WHEN v_keep THEN c.prompt_version ELSE EXCLUDED.prompt_version END;
 
-  RETURN jsonb_build_object('ok', true, 'ideas', v_ideas, 'questions', v_qs);
+  v_receipt := jsonb_build_object('ok', true, 'ideas', v_ideas, 'questions', v_qs, 'kept_existing', v_keep);
+  UPDATE pds.reading_bank_jobs SET store_receipt = v_receipt WHERE job_id = v_job;
+  RETURN v_receipt || jsonb_build_object('replayed', false);
 END $fn$;
 
 -- 14. One answer: a T07 attempt row + (when code can grade) the grade and the schedule, in one transaction -----
@@ -681,6 +900,8 @@ DECLARE
   v_today  DATE := pds.behavioral_today_now();
   v_hash   TEXT;
   v_src    TEXT;
+  v_covers BIGINT[];
+  v_need   BIGINT[];
   v_q      pds.reading_questions%ROWTYPE;
   v_a      pds.reading_question_attempts%ROWTYPE;
 BEGIN
@@ -731,14 +952,32 @@ BEGIN
   IF v_q.chapter_hash IS DISTINCT FROM pds.reading_bank_chapter_hash(v_q.book_id, v_q.bank_chapter) THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'chapter_changed');
   END IF;
+  -- An idea question needs its idea to rest on valid evidence still (an edited highlight pauses it).
+  IF v_q.idea_id IS NOT NULL AND NOT pds.reading_bank_idea_supported(v_q.idea_id) THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'retired');
+  END IF;
+  -- A chapter recall answer covers the ideas its rubric lists. None of them may unlock later than the gate (the
+  -- store and the flags keep the rubric to ideas that unlock with the chapter; this is the check at answer time).
+  IF v_q.format = 'chapter_recall' THEN
+    v_covers := ARRAY(SELECT (e->>'idea_id')::bigint FROM jsonb_array_elements(v_q.rubric::jsonb->'ideas') e);
+    IF EXISTS (SELECT 1 FROM pds.reading_ideas i WHERE i.idea_id = ANY(v_covers)
+                 AND i.unlock_chapter > pds.reading_bank_quiz_through(v_q.book_id)) THEN
+      RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'locked');
+    END IF;
+  END IF;
   -- Code grades explain / chapter recall answers only as "I don't know"; everything else there is the model's.
   IF v_local IS NOT NULL AND v_q.format IN ('explain', 'chapter_recall') AND v_local->>'verdict' <> 'dont_know' THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END IF;
-  -- A code-graded idea answer carries that idea's replayed schedule (lib/reading-recall.ts replayIdeaState).
-  IF v_local IS NOT NULL AND v_q.idea_id IS NOT NULL AND NOT EXISTS (
-       SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p->'states') = 'array' THEN p->'states' ELSE '[]'::jsonb END) st
-        WHERE st->>'idea_id' = v_q.idea_id::text) THEN
+  -- A code-graded answer carries the replayed schedule of every idea it moves (lib/reading-recall.ts
+  -- replayIdeaState): the idea, or each active idea a chapter recall answer covers.
+  v_need := CASE WHEN v_q.format = 'chapter_recall'
+                 THEN ARRAY(SELECT i.idea_id FROM pds.reading_ideas i WHERE i.idea_id = ANY(v_covers) AND i.status = 'active')
+                 WHEN v_q.idea_id IS NOT NULL THEN ARRAY[v_q.idea_id] ELSE '{}'::bigint[] END;
+  IF v_local IS NOT NULL AND EXISTS (
+       SELECT 1 FROM unnest(v_need) n(id)
+        WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p->'states') = 'array' THEN p->'states' ELSE '[]'::jsonb END) st
+                           WHERE st->>'idea_id' = n.id::text)) THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'states_missing');
   END IF;
   IF v_local IS NOT NULL AND NOT pds.reading_bank_states_ok(p->'states') THEN
@@ -746,7 +985,11 @@ BEGIN
   END IF;
 
   -- PROD-T07's answer rules, applied here because pds.reading_question_apply accepts only the source kinds
-  -- highlight | session | chapter. Same refusal codes, same hash formulas, same columns.
+  -- highlight | session | chapter: the same refusal codes, hash formulas and columns. One deliberate difference:
+  -- T07 answers a question whose source TEXT moved by making the next version itself ("source text changed");
+  -- here that is 409 question_changed. An idea's text is immutable (a change is a new idea), and a chapter's text
+  -- moves only with its table of contents title, which the edition check above already refuses, so this branch
+  -- is a guard; the bank never versions a question from inside an answer.
   IF v_quiz IS NOT NULL AND EXISTS (SELECT 1 FROM pds.reading_quizzes WHERE op_key = v_quiz) THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'quiz_closed');
   END IF;
@@ -777,10 +1020,7 @@ BEGIN
           pds.reading_sha256(jsonb_build_object(
             'book_id', v_q.book_id, 'question_key', v_q.question_key, 'prompt', v_q.prompt, 'rubric', v_q.rubric, 'source_kind', v_q.source_kind,
             'source_ref', v_q.source_ref, 'answer', v_answer, 'quiz_key', v_quiz)::text),
-          v_round, v_kind, v_q.idea_id,
-          CASE WHEN v_q.format = 'chapter_recall'
-               THEN ARRAY(SELECT (e->>'idea_id')::bigint FROM jsonb_array_elements(v_q.rubric::jsonb->'ideas') e) END,
-          v_hinted, v_ms, v_hash);
+          v_round, v_kind, v_q.idea_id, v_covers, v_hinted, v_ms, v_hash);
 
   IF v_local IS NOT NULL THEN
     -- The bank's code grade is written here, not through T07's 'grade' kind (which accepts only model | self).
@@ -832,9 +1072,14 @@ BEGIN
     END IF;
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'already_graded');
   END IF;
-  IF v_a.idea_id IS NOT NULL AND NOT EXISTS (
-       SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p->'states') = 'array' THEN p->'states' ELSE '[]'::jsonb END) st
-        WHERE st->>'idea_id' = v_a.idea_id::text) THEN
+  -- The replayed schedule of every idea the grade moves: the idea, or each active idea a chapter recall answer covers
+  -- (a missed core idea there must come back as due tomorrow).
+  IF EXISTS (
+       SELECT 1 FROM unnest(CASE WHEN v_a.idea_id IS NOT NULL THEN ARRAY[v_a.idea_id]
+                                 ELSE ARRAY(SELECT i.idea_id FROM pds.reading_ideas i
+                                             WHERE i.idea_id = ANY(COALESCE(v_a.covers, '{}'::bigint[])) AND i.status = 'active') END) n(id)
+        WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p->'states') = 'array' THEN p->'states' ELSE '[]'::jsonb END) st
+                           WHERE st->>'idea_id' = n.id::text)) THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'states_missing');
   END IF;
   IF NOT pds.reading_bank_states_ok(p->'states') THEN
@@ -877,6 +1122,11 @@ BEGIN
   IF v_a.quiz_key IS NOT NULL AND EXISTS (SELECT 1 FROM pds.reading_quizzes WHERE op_key = v_a.quiz_key) THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'quiz_closed');
   END IF;
+  IF v_a.idea_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p->'states') = 'array' THEN p->'states' ELSE '[]'::jsonb END) st
+        WHERE st->>'idea_id' = v_a.idea_id::text) THEN
+    RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'states_missing');
+  END IF;
   IF NOT pds.reading_bank_states_ok(p->'states') THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'raced'); END IF;
   UPDATE pds.reading_question_attempts
      SET model_verdict = v_a.verdict, model_score = v_a.score, verdict = v_verdict,
@@ -891,11 +1141,16 @@ END $fn$;
 -- p: {flag_key, question_id, kind, via?}  or  {flag_key, restore: true}
 -- wrong          : the idea is retired with all its questions (a chapter recall question: that question only); every
 --                  answer to them is invalidated (kept, with the reason); quiz results that counted them say so;
---                  the affected ideas' states are marked dirty (the caller replays them).
+--                  the chapter recall answers that covered the idea stop counting for it (pds.reading_bank_events:
+--                  the rest of each such answer stays valid) and the chapter recall question gets a new version
+--                  without it; the affected ideas' states are marked dirty (the caller replays them).
 -- unclear        : that question is retired and its answers invalidated; the idea stays.
--- not_in_chapter : the idea and its questions unlock at the end of the book; answers stay valid.
+-- not_in_chapter : the idea and its questions unlock at the end of the book; answers stay valid; the chapter recall
+--                  question gets a new version without it (its title must not stay listed for the chapter).
 -- not_read_yet   : a hold on that chapter (pds.reading_bank_quiz_through); nothing else changes.
--- Restore un-retires / un-holds; answers a flag voided stay voided.
+-- Restore un-retires / un-holds (and puts the idea back into the chapter recall question); answers a flag voided
+-- stay voided. Marking states dirty also moves state_version, so a replay computed before the flag cannot pass
+-- the compare-and-set and write back what the flag voided.
 CREATE OR REPLACE FUNCTION pds.reading_bank_flag(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
@@ -940,14 +1195,19 @@ BEGIN
        WHERE idea_id = v_f.idea_id AND retired_reason = 'wrong';
       UPDATE pds.reading_questions SET retired_at = NULL, retired_reason = NULL
        WHERE idea_id = v_f.idea_id AND retired_reason IN ('wrong', 'idea_retired') AND superseded_at IS NULL;
-      UPDATE pds.reading_idea_state SET dirty = true WHERE idea_id = v_f.idea_id;
+      UPDATE pds.reading_idea_state SET dirty = true, state_version = state_version + 1 WHERE idea_id = v_f.idea_id;
       v_ideas := ARRAY[v_f.idea_id];
+      PERFORM pds.reading_bank_recall_refresh(v_i.book_id, v_i.chapter, NULL, NULL, 'flag restored', false, false);
     ELSIF v_f.kind IN ('wrong', 'unclear') THEN
       UPDATE pds.reading_questions SET retired_at = NULL, retired_reason = NULL
        WHERE question_id = v_f.question_id AND retired_reason IN ('wrong', 'unclear') AND superseded_at IS NULL;
+      IF v_q.format = 'chapter_recall' THEN   -- back in step with ideas that changed while it was retired
+        PERFORM pds.reading_bank_recall_refresh(v_q.book_id, v_q.bank_chapter, NULL, NULL, 'flag restored', false, false);
+      END IF;
     ELSIF v_f.kind = 'not_in_chapter' THEN
       UPDATE pds.reading_ideas SET unlock_chapter = GREATEST(chapter, COALESCE(v_f.prev_unlock, chapter)) WHERE idea_id = v_f.idea_id;
       UPDATE pds.reading_questions SET unlock_chapter = GREATEST(bank_chapter, COALESCE(v_f.prev_unlock, bank_chapter)) WHERE idea_id = v_f.idea_id;
+      PERFORM pds.reading_bank_recall_refresh(v_q.book_id, v_q.bank_chapter, NULL, NULL, 'flag restored', false, false);
     ELSE
       -- Only the hold this flag set (a later hold stays).
       UPDATE pds.reading_bank_books SET hold_chapter = NULL, hold_position = NULL, hold_at = NULL, updated_at = NOW()
@@ -1002,13 +1262,17 @@ BEGIN
       FROM (SELECT quiz_key, count(*)::int AS n FROM pds.reading_question_attempts
              WHERE attempt_key = ANY(v_hit) AND quiz_key IS NOT NULL GROUP BY quiz_key) x
      WHERE qz.op_key = x.quiz_key;
-    UPDATE pds.reading_idea_state SET dirty = true WHERE idea_id = ANY(v_ideas);
+    UPDATE pds.reading_idea_state SET dirty = true, state_version = state_version + 1 WHERE idea_id = ANY(v_ideas);
+    IF v_kind = 'wrong' AND v_q.idea_id IS NOT NULL THEN
+      PERFORM pds.reading_bank_recall_refresh(v_q.book_id, v_q.bank_chapter, NULL, NULL, 'an idea was flagged wrong', false, false);
+    END IF;
   ELSIF v_kind = 'not_in_chapter' THEN
     SELECT COALESCE(total_chapters, 0) INTO v_total FROM pds.books WHERE book_id = v_q.book_id;
     SELECT unlock_chapter INTO v_prev FROM pds.reading_ideas WHERE idea_id = v_q.idea_id;
     UPDATE pds.reading_ideas SET unlock_chapter = GREATEST(chapter, v_total) WHERE idea_id = v_q.idea_id;
     UPDATE pds.reading_questions SET unlock_chapter = GREATEST(bank_chapter, v_total) WHERE idea_id = v_q.idea_id;
     v_ideas := ARRAY[v_q.idea_id];
+    PERFORM pds.reading_bank_recall_refresh(v_q.book_id, v_q.bank_chapter, NULL, NULL, 'an idea was moved out of the chapter', false, false);
   ELSE -- not_read_yet
     SELECT last_position INTO v_pos FROM pds.books WHERE book_id = v_q.book_id;
     INSERT INTO pds.reading_bank_books (book_id, hold_chapter, hold_position, hold_at)
@@ -1023,7 +1287,9 @@ BEGIN
 END $fn$;
 
 -- 18. Answer events per idea (input to the replay; invalidated answers excluded; pending ones keep their day slot) -
--- A chapter recall answer is one event for every idea it covered, with that idea's rubric hit as the verdict.
+-- A chapter recall answer is one event for every idea it covered, with that idea's rubric hit as the verdict,
+-- except for an idea flagged Wrong after the answer: that hit was graded against a wrong statement, so it is void
+-- for that idea (and stays void after a Restore), while the answer keeps counting for the other ideas.
 CREATE OR REPLACE FUNCTION pds.reading_bank_events(p_book BIGINT, p_ideas BIGINT[] DEFAULT NULL)
 RETURNS TABLE (idea_id BIGINT, attempt_key UUID, question_id BIGINT, attempt_date DATE, answered_at TIMESTAMPTZ,
                grading_status TEXT, verdict TEXT, format TEXT, hinted BOOLEAN, round_kind TEXT)
@@ -1044,6 +1310,8 @@ LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
                         WHERE e->>'id' = 'i' || c.idea_id::text OR e->>'idea_id' = c.idea_id::text LIMIT 1) h ON true
    WHERE q.book_id = p_book AND q.format = 'chapter_recall' AND a.ext_hash IS NOT NULL AND a.grading_status <> 'invalidated'
      AND (p_ideas IS NULL OR c.idea_id = ANY(p_ideas))
+     AND NOT EXISTS (SELECT 1 FROM pds.reading_question_flags f
+                      WHERE f.kind = 'wrong' AND f.idea_id = c.idea_id AND f.created_at > a.answered_at)
    ORDER BY 1, 5, 2
 $fn$;
 
@@ -1072,6 +1340,7 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
       LEFT JOIN pds.reading_idea_state s ON s.idea_id = i.idea_id
      WHERE i.book_id = p_book AND i.status = 'active' AND i.unlock_chapter <= (SELECT through FROM t)
        AND (p_chapter IS NULL OR i.chapter = p_chapter)
+       AND pds.reading_bank_idea_supported(i.idea_id)
   ),
   pick AS (
     (SELECT idea_id, 'due' AS why FROM live WHERE p_chapter IS NULL AND next_review IS NOT NULL AND next_review <= p_today
@@ -1103,7 +1372,8 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
          FROM pds.reading_idea_evidence e
          JOIN pds.reading_bank_sources src ON src.source_id = e.source_id
          LEFT JOIN pds.book_highlights h ON h.highlight_id = src.highlight_id AND NOT h.archived
-        WHERE e.idea_id = l.idea_id AND (src.kind = 'web' OR h.highlight_id IS NOT NULL)) AS sources
+        WHERE e.idea_id = l.idea_id
+          AND (src.kind = 'web' OR (h.highlight_id IS NOT NULL AND pds.reading_sha256(h.passage) = src.passage_sha))) AS sources
       FROM live l WHERE l.idea_id IN (SELECT idea_id FROM pick)
   ),
   recall AS (
@@ -1117,6 +1387,10 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
                                   AND q.superseded_at IS NULL AND q.retired_at IS NULL
      WHERE p_chapter IS NULL AND c.book_id = p_book AND c.chapter >= 1 AND c.chapter <= (SELECT through FROM t)
        AND c.quizzable_since IS NOT NULL AND q.chapter_hash = pds.reading_bank_chapter_hash(p_book, c.chapter)
+       -- never a rubric that lists an idea unlocking later (the store and the flags keep it so; this is the backstop)
+       AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(q.rubric::jsonb->'ideas') e
+                         JOIN pds.reading_ideas i ON i.idea_id = (e->>'idea_id')::bigint
+                        WHERE i.unlock_chapter > (SELECT through FROM t))
   ),
   hl AS (   -- unlinked highlights due today, plus those already reviewed today (so a resumed round counts them as done)
     SELECT h.highlight_id, h.chapter, h.passage, h.comment, h.location, h.page, h.review_count, h.interval_days, h.ease,
@@ -1127,7 +1401,7 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
        AND NOT EXISTS (SELECT 1 FROM pds.reading_bank_sources src
                          JOIN pds.reading_idea_evidence e ON e.source_id = src.source_id
                          JOIN pds.reading_ideas i ON i.idea_id = e.idea_id AND i.status = 'active'
-                        WHERE src.highlight_id = h.highlight_id)
+                        WHERE src.highlight_id = h.highlight_id AND src.passage_sha = pds.reading_sha256(h.passage))
      ORDER BY (h.last_reviewed = p_today) DESC NULLS LAST, h.next_review NULLS FIRST, h.highlight_id LIMIT 5
   )
   SELECT jsonb_build_object(
@@ -1168,15 +1442,21 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
       JOIN cur ON cur.chapter = i.chapter AND cur.h = i.chapter_hash
       LEFT JOIN pds.reading_idea_state s ON s.idea_id = i.idea_id
      WHERE i.book_id = (SELECT book_id FROM bk) AND i.status = 'active' AND i.unlock_chapter <= (SELECT through FROM t)
+       AND pds.reading_bank_idea_supported(i.idea_id)
   ),
   ev AS (SELECT e.*, row_number() OVER (PARTITION BY e.idea_id, e.attempt_date ORDER BY e.answered_at, e.attempt_key) AS rn
            FROM pds.reading_bank_events((SELECT book_id FROM bk), NULL) e),
   firsts AS (SELECT * FROM ev WHERE rn = 1 AND grading_status = 'graded'),
+  -- One row per idea and day, so the preceding rows are the earlier days: the last right answer before this one.
+  gaps AS (
+    SELECT f.verdict, f.attempt_date, f.round_kind,
+           f.attempt_date - max(CASE WHEN f.verdict = 'correct' THEN f.attempt_date END)
+                              OVER (PARTITION BY f.idea_id ORDER BY f.attempt_date ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS gap
+      FROM firsts f
+  ),
   delayed AS (
-    SELECT f.verdict,
-           f.attempt_date - (SELECT max(f2.attempt_date) FROM firsts f2
-                              WHERE f2.idea_id = f.idea_id AND f2.attempt_date < f.attempt_date AND f2.verdict = 'correct') AS gap
-      FROM firsts f WHERE f.attempt_date >= (SELECT d FROM today) - 30 AND f.round_kind IS DISTINCT FROM 'checkpoint'
+    SELECT g.verdict, g.gap FROM gaps g
+     WHERE g.attempt_date >= (SELECT d FROM today) - 30 AND g.round_kind IS DISTINCT FROM 'checkpoint'
   )
   SELECT CASE WHEN (SELECT book_id FROM bk) IS NULL THEN NULL ELSE jsonb_build_object(
     'book_id', (SELECT book_id FROM bk),
@@ -1230,6 +1510,7 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
       JOIN cur ON cur.chapter = i.chapter AND cur.h = i.chapter_hash
       LEFT JOIN pds.reading_idea_state s ON s.idea_id = i.idea_id
      WHERE i.book_id = (SELECT book_id FROM bk) AND i.status = 'active' AND i.unlock_chapter <= (SELECT through FROM t)
+       AND pds.reading_bank_idea_supported(i.idea_id)
      GROUP BY i.chapter
   )
   SELECT CASE WHEN (SELECT book_id FROM bk) IS NULL THEN NULL ELSE jsonb_build_object(
@@ -1238,6 +1519,13 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
     'approved_cents', (SELECT approved_cents FROM bb), 'spent_cents', COALESCE((SELECT spent_cents FROM bb), 0),
     'paused_reason', (SELECT paused_reason FROM bb), 'mapping', COALESCE((SELECT mapping FROM bb), 'unknown'),
     'narrative', (SELECT narrative FROM bb), 'hold_chapter', (SELECT hold_chapter FROM bb),
+    -- The "Not read yet" flag behind the standing hold, so the map can offer Restore (the held chapter's own sheet
+    -- is locked by that hold). The key and the chapter number only, never the question.
+    'hold_flag_key', (SELECT f.flag_key FROM pds.reading_question_flags f
+                        JOIN pds.reading_questions q ON q.question_id = f.question_id
+                       WHERE q.book_id = (SELECT book_id FROM bk) AND f.kind = 'not_read_yet' AND f.restored_at IS NULL
+                         AND f.created_at = (SELECT hold_at FROM bb)
+                       ORDER BY f.created_at DESC LIMIT 1),
     'chapters', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'chapter', g.n,
         'title', CASE WHEN g.n > (SELECT through FROM t) AND COALESCE((SELECT narrative FROM bb), false) THEN NULL ELSE bc.title END,
@@ -1271,11 +1559,15 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
                'stage', COALESCE(s.stage, 0),
                'statement', CASE WHEN COALESCE(s.stage, 0) >= 1 THEN i.statement END,
                'sources', (SELECT count(DISTINCT COALESCE(src.domain, 'highlight')) FROM pds.reading_idea_evidence e
-                             JOIN pds.reading_bank_sources src ON src.source_id = e.source_id WHERE e.idea_id = i.idea_id))
+                             JOIN pds.reading_bank_sources src ON src.source_id = e.source_id
+                             LEFT JOIN pds.book_highlights h ON h.highlight_id = src.highlight_id AND NOT h.archived
+                            WHERE e.idea_id = i.idea_id
+                              AND (src.kind = 'web' OR (h.highlight_id IS NOT NULL AND pds.reading_sha256(h.passage) = src.passage_sha))))
                ORDER BY CASE i.importance WHEN 'core' THEN 0 WHEN 'supporting' THEN 1 ELSE 2 END, i.idea_id)
                FROM pds.reading_ideas i LEFT JOIN pds.reading_idea_state s ON s.idea_id = i.idea_id
               WHERE i.book_id = p_book AND i.chapter = p_chapter AND i.status = 'active'
-                AND i.unlock_chapter <= (SELECT through FROM t) AND i.chapter_hash = (SELECT h FROM t)), '[]'::jsonb),
+                AND i.unlock_chapter <= (SELECT through FROM t) AND i.chapter_hash = (SELECT h FROM t)
+                AND pds.reading_bank_idea_supported(i.idea_id)), '[]'::jsonb),
     'flags', COALESCE((SELECT jsonb_agg(jsonb_build_object('flag_key', f.flag_key, 'kind', f.kind, 'prompt', q.prompt, 'created_at', f.created_at)
                ORDER BY f.created_at DESC)
                FROM pds.reading_question_flags f JOIN pds.reading_questions q ON q.question_id = f.question_id
@@ -1329,14 +1621,20 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
     'jobs', COALESCE((SELECT jsonb_agg(jsonb_build_object('job_id', j.job_id, 'step', j.step, 'chapter', j.chapter,
                 'input_hash', j.input_hash, 'status', j.status, 'result', j.result) ORDER BY j.job_id)
                 FROM pds.reading_bank_jobs j WHERE j.book_id = p_book AND j.step <> 'grade'), '[]'::jsonb),
-    'highlights', COALESCE((SELECT jsonb_agg(jsonb_build_object('highlight_id', h.highlight_id, 'chapter', h.chapter,
-                'passage_sha', pds.reading_sha256(h.passage), 'changed_at', GREATEST(h.created_at, h.updated_at)) ORDER BY h.highlight_id)
-                FROM pds.book_highlights h
-               WHERE h.book_id = p_book AND NOT h.archived
+    -- Highlights to offer the highlights step: live, not cited by an active idea for their current passage, and whose
+    -- current content (id + sha256 of the passage) no build or highlights job has looked at yet. Freshness is keyed
+    -- on content, never on a row timestamp (a review or a Kindle re-import touches the row and must cost nothing);
+    -- an edited passage is new content, so an edited highlight (linked or not) is offered again.
+    'highlights', COALESCE((SELECT jsonb_agg(jsonb_build_object('highlight_id', x.highlight_id, 'chapter', x.chapter,
+                'passage_sha', x.sha) ORDER BY x.highlight_id)
+                FROM (SELECT h.highlight_id, h.chapter, pds.reading_sha256(h.passage) AS sha
+                        FROM pds.book_highlights h WHERE h.book_id = p_book AND NOT h.archived) x
+               WHERE NOT EXISTS (SELECT 1 FROM pds.reading_bank_highlight_seen sn
+                                  WHERE sn.highlight_id = x.highlight_id AND sn.passage_sha = x.sha)
                  AND NOT EXISTS (SELECT 1 FROM pds.reading_bank_sources src
                                    JOIN pds.reading_idea_evidence e ON e.source_id = src.source_id
                                    JOIN pds.reading_ideas i ON i.idea_id = e.idea_id AND i.status = 'active'
-                                  WHERE src.highlight_id = h.highlight_id)), '[]'::jsonb)
+                                  WHERE src.highlight_id = x.highlight_id AND src.passage_sha = x.sha)), '[]'::jsonb)
   ) END
 $fn$;
 
@@ -1374,11 +1672,22 @@ BEGIN
 END $fn$;
 
 -- p: {lease_seconds, month_cap_cents, estimates: {step: cents}, job_id?, steps?: [step]}
--- -> {ok, job} (the claimed job, or null with code 'monthly_cap' | 'budget' when spending stops it)
+-- -> {ok, job, headroom_cents} (the claimed job, or null with code 'monthly_cap' | 'budget' when spending stops it)
+-- A running job whose lease ran out (a crash, a function stopped at its maxDuration) most likely made a billed
+-- call that never reported: its reservation is CHARGED (cost_cents, this month's spend and, for generation, the
+-- book's spent_cents) before the job is offered again, or failed after 3 attempts, so neither cap leaks. A late
+-- finish from that run is refused (not_running / lease_lost), so the charge is never doubled.
+-- A claimed job whose store_receipt is set has stored its batch already (its earlier run stopped before finish):
+-- the worker finishes it without a new model call.
+-- headroom_cents = what the claimed job may spend in all, its reservation included, before a cap is reached (the
+-- smaller of the monthly and, for generation, the book's): bankModelCall's maxCostCents, which stops continuing a
+-- call (pause_turn) past it.
 CREATE OR REPLACE FUNCTION pds.reading_bank_claim(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
   v_job   pds.reading_bank_jobs%ROWTYPE;
+  v_exp   RECORD;
+  v_head  NUMERIC;
   v_jid   BIGINT := NULLIF(p->>'job_id', '')::bigint;
   v_lease INTEGER := LEAST(GREATEST(COALESCE(NULLIF(p->>'lease_seconds', '')::int, 300), 30), 1800);
   v_capm  NUMERIC := COALESCE(NULLIF(p->>'month_cap_cents', '')::numeric, 3000);
@@ -1388,11 +1697,27 @@ DECLARE
   v_cap   INTEGER;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
-  UPDATE pds.reading_bank_jobs SET status = 'failed', error_code = 'lease_expired', lease_until = NULL, reserved_cents = 0, finished_at = NOW()
-   WHERE status = 'running' AND lease_until < NOW() AND attempts >= 3;
+  FOR v_exp IN SELECT j.job_id, j.book_id, j.step, j.chapter, j.attempts, j.reserved_cents, j.attempt_key
+                 FROM pds.reading_bank_jobs j WHERE j.status = 'running' AND j.lease_until < NOW() FOR UPDATE LOOP
+    UPDATE pds.reading_bank_jobs
+       SET status = CASE WHEN v_exp.attempts >= 3 THEN 'failed' ELSE 'queued' END, error_code = 'lease_expired',
+           lease_until = NULL, cost_cents = cost_cents + reserved_cents, reserved_cents = 0,
+           finished_at = NOW()   -- so the charge counts in this month's spend at once
+     WHERE job_id = v_exp.job_id;
+    IF v_exp.step <> 'grade' AND v_exp.reserved_cents > 0 THEN
+      UPDATE pds.reading_bank_books SET spent_cents = spent_cents + v_exp.reserved_cents, updated_at = NOW() WHERE book_id = v_exp.book_id;
+    END IF;
+    IF v_exp.attempts >= 3 AND v_exp.step = 'grade' THEN
+      UPDATE pds.reading_question_attempts SET grade_tries = grade_tries + 1, grade_error = 'lease_expired'
+       WHERE attempt_key = v_exp.attempt_key;
+    ELSIF v_exp.attempts >= 3 AND v_exp.step IN ('build', 'research') THEN
+      INSERT INTO pds.reading_bank_chapters AS c (book_id, chapter, status) VALUES (v_exp.book_id, v_exp.chapter, 'failed')
+      ON CONFLICT (book_id, chapter) DO UPDATE SET status = CASE WHEN c.status = 'pending' THEN 'failed' ELSE c.status END;
+    END IF;
+  END LOOP;
   SELECT j.* INTO v_job FROM pds.reading_bank_jobs j
    WHERE (v_jid IS NULL OR j.job_id = v_jid)
-     AND (j.status = 'queued' OR (j.status = 'running' AND j.lease_until < NOW()))
+     AND j.status = 'queued'
      AND j.next_attempt_at <= NOW()
      AND (p->'steps' IS NULL OR j.step IN (SELECT jsonb_array_elements_text(p->'steps')))
      AND (j.step = 'grade' OR EXISTS (SELECT 1 FROM pds.reading_bank_books b WHERE b.book_id = j.book_id AND b.approved_at IS NOT NULL AND b.paused_at IS NULL))
@@ -1408,6 +1733,7 @@ BEGIN
   IF v_month + v_est > v_capm THEN
     RETURN jsonb_build_object('ok', true, 'job', NULL, 'code', 'monthly_cap');
   END IF;
+  v_head := v_capm - v_month;
   IF v_job.step <> 'grade' THEN
     SELECT b.spent_cents + COALESCE((SELECT sum(r.reserved_cents) FROM pds.reading_bank_jobs r
                                       WHERE r.book_id = b.book_id AND r.status = 'running' AND r.lease_until >= NOW()), 0),
@@ -1418,18 +1744,20 @@ BEGIN
        WHERE book_id = v_job.book_id AND paused_at IS NULL;
       RETURN jsonb_build_object('ok', true, 'job', NULL, 'code', 'budget', 'book_id', v_job.book_id);
     END IF;
+    v_head := LEAST(v_head, v_cap - v_used);
   END IF;
   UPDATE pds.reading_bank_jobs
      SET status = 'running', attempts = attempts + 1, started_at = NOW(),
          lease_until = NOW() + make_interval(secs => v_lease), reserved_cents = v_est
    WHERE job_id = v_job.job_id RETURNING * INTO v_job;
-  RETURN jsonb_build_object('ok', true, 'job', to_jsonb(v_job));
+  RETURN jsonb_build_object('ok', true, 'job', to_jsonb(v_job), 'headroom_cents', GREATEST(v_head, v_est));
 END $fn$;
 
--- p: {job_id, attempts?, outcome: 'done'|'retry'|'failed'|'skipped', cost_cents, usage?, result?, counts?, output?,
+-- p: {job_id, attempts, outcome: 'done'|'retry'|'failed'|'skipped', cost_cents, usage?, result?, counts?, output?,
 --     error_code?, retry_minutes?}
--- attempts = the attempt number the claim answered: a worker whose lease ran out and was claimed again by another
--- one answers 409 lease_lost instead of finishing the other worker's run.
+-- attempts (required) = the attempt number the claim answered: a worker whose lease ran out answers 409
+-- not_running (its reservation was charged when the lease was settled) or, once another worker claimed the job
+-- again, 409 lease_lost, instead of finishing the other worker's run.
 CREATE OR REPLACE FUNCTION pds.reading_bank_finish(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
@@ -1442,14 +1770,14 @@ BEGIN
     v_cost := COALESCE((p->>'cost_cents')::numeric, 0);
     v_att := NULLIF(p->>'attempts', '')::int;
   EXCEPTION WHEN others THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END;
-  IF v_out IS NULL OR v_out NOT IN ('done', 'retry', 'failed', 'skipped') OR v_cost < 0 THEN
+  IF v_out IS NULL OR v_out NOT IN ('done', 'retry', 'failed', 'skipped') OR v_cost < 0 OR v_att IS NULL THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
   SELECT * INTO v_job FROM pds.reading_bank_jobs WHERE job_id = (p->>'job_id')::bigint FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('ok', false, 'http', 404, 'code', 'not_found'); END IF;
   IF v_job.status <> 'running' THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running'); END IF;
-  IF v_att IS NOT NULL AND v_att <> v_job.attempts THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
+  IF v_att <> v_job.attempts THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
   UPDATE pds.reading_bank_jobs SET
     status = CASE v_out WHEN 'retry' THEN CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END ELSE v_out END,
     next_attempt_at = CASE WHEN v_out = 'retry' THEN NOW() + make_interval(mins => LEAST(GREATEST(COALESCE((p->>'retry_minutes')::int, 30), 1), 1440)) ELSE next_attempt_at END,
@@ -1549,21 +1877,27 @@ ALTER TABLE pds.reading_idea_evidence  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.reading_idea_state     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.reading_bank_jobs      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.reading_question_flags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.reading_bank_highlight_seen ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON pds.reading_bank_books, pds.reading_bank_chapters, pds.reading_bank_sources, pds.reading_ideas,
-              pds.reading_idea_evidence, pds.reading_idea_state, pds.reading_bank_jobs, pds.reading_question_flags
+              pds.reading_idea_evidence, pds.reading_idea_state, pds.reading_bank_jobs, pds.reading_question_flags,
+              pds.reading_bank_highlight_seen
   FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT, UPDATE ON pds.reading_bank_books, pds.reading_bank_chapters, pds.reading_bank_sources, pds.reading_ideas,
-              pds.reading_idea_evidence, pds.reading_idea_state, pds.reading_bank_jobs, pds.reading_question_flags TO service_role;
+              pds.reading_idea_evidence, pds.reading_idea_state, pds.reading_bank_jobs, pds.reading_question_flags,
+              pds.reading_bank_highlight_seen TO service_role;
 GRANT USAGE, SELECT ON SEQUENCE pds.reading_bank_sources_source_id_seq, pds.reading_ideas_idea_id_seq, pds.reading_bank_jobs_job_id_seq TO service_role;
 
 DO $grants$
 DECLARE f TEXT;
 BEGIN
   FOREACH f IN ARRAY ARRAY[
-    'pds.reading_ideas_guard()', 'pds.reading_bank_book_id(text)', 'pds.reading_bank_chapter_hash(bigint,integer)',
+    'pds.reading_ideas_guard()', 'pds.reading_bank_attempt_guard()', 'pds.reading_bank_question_guard()',
+    'pds.reading_bank_book_id(text)', 'pds.reading_bank_chapter_hash(bigint,integer)',
     'pds.reading_bank_toc_hash(bigint)', 'pds.reading_bank_quiz_through(bigint)', 'pds.reading_source_text(bigint,text,bigint)',
-    'pds.reading_bank_schema_ok()', 'pds.reading_bank_states_ok(jsonb)', 'pds.reading_bank_states_write(jsonb)',
-    'pds.reading_bank_write_states(jsonb)', 'pds.reading_bank_receipt(uuid)', 'pds.reading_bank_store(jsonb)',
+    'pds.reading_bank_schema_ok()', 'pds.reading_bank_idea_supported(bigint)', 'pds.reading_questions_export(bigint)',
+    'pds.reading_bank_states_ok(jsonb)', 'pds.reading_bank_states_write(jsonb)',
+    'pds.reading_bank_write_states(jsonb)', 'pds.reading_bank_receipt(uuid)',
+    'pds.reading_bank_recall_refresh(bigint,integer,bigint,text,text,boolean,boolean)', 'pds.reading_bank_store(jsonb)',
     'pds.reading_bank_attempt(jsonb)', 'pds.reading_bank_grade(jsonb)', 'pds.reading_bank_override(jsonb)',
     'pds.reading_bank_flag(jsonb)', 'pds.reading_bank_events(bigint,bigint[])', 'pds.reading_bank_deck(bigint,date,integer)',
     'pds.reading_bank_round(text,integer)', 'pds.reading_bank_summary(text)', 'pds.reading_bank_overview(text)',

@@ -673,8 +673,9 @@ const tieHash = (id: string | number, today: string) => sha256Hex(`${id}|${today
 
 /**
  * The question to ask for an idea, by stage: 0-1 cued (or order), 2 explain, 3-4 explain and cued alternating;
- * detail ideas never get explain. Never one of the last 2 questions asked when another exists, and a format other
- * than the last one used is preferred.
+ * detail ideas never get explain. Never one of the last 2 questions asked when another exists (that rule ranks
+ * above the stage's preferred format, so a variant just asked is not repeated because its format fits), and a
+ * format other than the last one used is preferred.
  */
 export function pickQuestion(idea: Pick<DeckIdea, "stage" | "importance" | "questions" | "last_question_ids">, exclude: number[] = []): DeckQuestion | null {
   const qs = (idea.questions ?? []).filter((q) => !(idea.importance === "detail" && q.format === "explain"));
@@ -689,8 +690,8 @@ export function pickQuestion(idea: Pick<DeckIdea, "stage" | "importance" | "ques
     const d = desired.indexOf(q.format);
     return [
       exclude.includes(q.question_id) ? 1 : 0,
-      d < 0 ? 1 : 0,
       last.includes(q.question_id) ? 1 : 0,
+      d < 0 ? 1 : 0,
       q.format === lastFormat ? 1 : 0,
       d < 0 ? 9 : d,
       q.question_id,
@@ -892,7 +893,9 @@ export function buildRound(deck: Deck, opts: RoundOptions = {}): Round {
   const dueCount = doneDue.length + p.due.length;
   const newCap = dueCount < ROUND_LOW_DUE ? ROUND_MAX_NEW_LOW_DUE : ROUND_MAX_NEW;
   cards.push(...doneNew);
-  const newSlots = newCap - doneNew.length;
+  // The slots new ideas can still take: the cap, and the room the recall and due cards left. The newest chapter's
+  // slot is reserved inside that space (it takes the last pick), so it is never pushed out of a full round.
+  const newSlots = Math.min(newCap - doneNew.length, room());
   if (newSlots > 0) {
     const newest = p.newest[0];
     const doneHasNewest = doneNew.some((c) => c.idea && c.idea.chapter === newestChapter && c.idea.importance === "core");
