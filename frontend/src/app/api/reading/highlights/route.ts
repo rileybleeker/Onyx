@@ -2,10 +2,14 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { HIGHLIGHT_COLS, addHighlight, getBook, type Highlight, type HighlightSource } from "@/lib/reading";
 import { highlightMirrorDiffers, mirrorHighlight, updateMirroredHighlight } from "@/lib/reading-notion";
+import { HIGHLIGHT_EDIT_STEPS, kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
 });
+
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
 
 /** GET /api/reading/highlights?book=<slug>&include_archived=1 */
 export async function GET(req: NextRequest) {
@@ -48,6 +52,14 @@ export async function POST(req: NextRequest) {
       const { data: fresh } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", id).maybeSingle();
       const now = fresh as Highlight | null;
       if (now && !now.archived && highlightMirrorDiffers(result.highlight, now)) await updateMirroredHighlight({ ...now, notion_block_id: blockId });
+    });
+  }
+  // The question bank (READ-QUIZ-01): plan the book after the response. The highlights step itself waits for the
+  // Kindle import kick or the hourly worker (HIGHLIGHT_EDIT_STEPS): this form autosaves while Riley types.
+  if (result.created) {
+    const bookId = result.book.book_id;
+    after(async () => {
+      await kickBank(supabase, { bookId, reason: "highlight", steps: HIGHLIGHT_EDIT_STEPS });
     });
   }
   return NextResponse.json({ success: true, created: result.created, highlight: result.highlight });

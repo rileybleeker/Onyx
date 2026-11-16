@@ -2,10 +2,14 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { HIGHLIGHT_COLS, type Highlight } from "@/lib/reading";
 import { updateMirroredHighlight } from "@/lib/reading-notion";
+import { HIGHLIGHT_EDIT_STEPS, kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
 });
+
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
 
 type Ctx = { params: Promise<{ id: string }> };
 
@@ -44,6 +48,8 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   }
   const h = data as Highlight;
   if (h.notion_block_id && !("archived" in patch)) after(() => updateMirroredHighlight(h));
+  // The question bank (READ-QUIZ-01): an edited, moved or archived highlight changes what its ideas rest on.
+  if ("passage" in patch || "chapter" in patch || "archived" in patch) kickAfter(h.book_id);
   return NextResponse.json({ success: true, highlight: h });
 }
 
@@ -52,7 +58,20 @@ export async function DELETE(_req: NextRequest, ctx: Ctx) {
   const { id } = await ctx.params;
   const highlight_id = Number(id);
   if (!Number.isFinite(highlight_id)) return NextResponse.json({ error: "bad id" }, { status: 400 });
-  const { error } = await supabase.from("book_highlights").update({ archived: true }).eq("highlight_id", highlight_id);
+  const { data, error } = await supabase.from("book_highlights").update({ archived: true }).eq("highlight_id", highlight_id).select("book_id");
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  const bookId = Number((data as { book_id?: unknown }[] | null)?.[0]?.book_id);
+  if (Number.isInteger(bookId) && bookId > 0) kickAfter(bookId);
   return NextResponse.json({ success: true });
+}
+
+/**
+ * Plan the book's question bank after the response (lib/reading-bank-server.ts kickBank), without the highlights
+ * step: the highlight form autosaves while Riley types, so that step waits for the Kindle import kick or the hourly
+ * worker. Quiet while the book's bank is off or the SQL is not applied.
+ */
+function kickAfter(bookId: number) {
+  after(async () => {
+    await kickBank(supabase, { bookId, reason: "highlight", steps: HIGHLIGHT_EDIT_STEPS });
+  });
 }

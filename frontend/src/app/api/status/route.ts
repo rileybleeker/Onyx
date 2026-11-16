@@ -7,6 +7,8 @@ import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
+import { readingBankCard, type ReadingBankHeartbeat, type ReadingBankStatusCounts } from "@/lib/reading-bank-status";
+import { monthlyCapCents } from "@/lib/reading-bank";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -30,6 +32,8 @@ export interface SourceStatus {
   methodLabel: string;
   /** Spotify card only, from day 165 after the authorization: the date (YYYY-MM-DD, ET) to reconnect by. */
   reconnectBy?: string | null;
+  /** Extra detail rows (Reading Questions: this month's model spend against the cap). Counts and amounts only. */
+  extraRows?: { label: string; value: string }[];
 }
 
 // Human-readable sync cadence per source. "Manual" means user-triggered;
@@ -57,6 +61,9 @@ const CADENCE: Record<string, string> = {
   procurement: "Manual",
   photo_meals: "Manual (a plate photo on /nutrition)",
   kindle:"Every 3h (Riley's PC, while logged on)",
+  // Question bank generator (READ-QUIZ-01): kicked after each Kindle import and each reading write, plus the hourly
+  // Reading Question Bank workflow (frontend/scripts/reading-bank-run.cjs) while Riley's PC is off.
+  reading_bank: "With each Kindle harvest + hourly",
   amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
@@ -114,6 +121,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   procurement:    { method: "manual",         label: "Manual entry" },
   photo_meals:    { method: "manual",         label: "Photo + Claude estimate" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
+  reading_bank:   { method: "automated",      label: "Claude + web sources" },
   amazon_orders:  { method: "automated",      label: "Local Chrome harvest" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
   notion_journal: { method: "automated",      label: "Notion sync" },
@@ -306,6 +314,14 @@ export async function GET() {
     // which holds timestamps, counts and a short code only (never pds.ci_tokens, never an item).
     // Inert until set up: without the two Google variables nothing is read, as in care-google-server.ts.
     const careCalendarIsSetUp = careCalendarConfigured(process.env);
+    // Reading question bank (READ-QUIZ-01): its own limit-1 heartbeat read (hourly at most, so the shared window can
+    // lose it) and pds.reading_bank_status() (counts only: books turned on, queued / failed jobs, chapters waiting,
+    // this month's spend, the schema checks). A missing function (SQL not applied) is shown as "not set up".
+    const readingBankPromise = Promise.all([
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "reading_bank").eq("data_type", "generate")
+        .order("sync_start", { ascending: false }).limit(1).then((res) => res),
+      supabase.rpc("reading_bank_status").then((res) => res),
+    ]);
     const careCalendarPromise = careCalendarIsSetUp
       ? supabase.from("care_calendar_sync").select(CARE_CALENDAR_SYNC_COLUMNS).eq("id", 1).limit(1).then((res) => res)
       : Promise.resolve(null);
@@ -592,6 +608,7 @@ export async function GET() {
     const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
     const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
     const careCalendarRes = await careCalendarPromise;
+    const [readingBankHbRes, readingBankStatusRes] = await readingBankPromise;
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -932,6 +949,22 @@ export async function GET() {
           methodLabel: METHOD.kindle.label,
         };
       })(),
+      // Reading question bank generator (READ-QUIZ-01, lib/reading-bank-status.ts): unknown while off or not set up;
+      // red on a failed run, a chapter waiting > 24 h, jobs queued with no run for 24 h, or a failed job in 24 h;
+      // degraded on a partial run, a chapter waiting > 6 h, jobs queued and no run for 3 h, or T07's checks not
+      // widened. Shows this month's model spend against the cap. Counts and codes only.
+      reading_bank: {
+        ...readingBankCard({
+          heartbeat: ((readingBankHbRes.data?.[0] as ReadingBankHeartbeat | undefined) ?? (latestBySrcType["reading_bank|generate"] as ReadingBankHeartbeat | undefined) ?? null),
+          counts: (readingBankStatusRes.data as ReadingBankStatusCounts | null) ?? null,
+          countsError: readingBankStatusRes.error ? { code: readingBankStatusRes.error.code ?? null } : null,
+          monthCapCents: monthlyCapCents(process.env.READING_BANK_MONTHLY_CAP_CENTS),
+          nowMs: Date.now(),
+        }),
+        cadence: CADENCE.reading_bank,
+        integrationMethod: METHOD.reading_bank.method,
+        methodLabel: METHOD.reading_bank.label,
+      },
       // Personal Amazon orders (tools/kindle_harvest/amazon-orders.mjs): the Kindle harvester's
       // 3-hourly pass on Riley's PC reads the "Your Orders" list and posts to
       // /api/orders/amazon/import, which writes an amazon|orders heartbeat on every call. PC-bound,

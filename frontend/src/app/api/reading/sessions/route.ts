@@ -2,10 +2,14 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { BOOK_COLS, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
+import { kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
 });
+
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
 
 /**
  * POST /api/reading/sessions
@@ -62,6 +66,15 @@ export async function POST(req: NextRequest) {
       result.session.session_date,
     );
   });
+
+  // The question bank (READ-QUIZ-01): a chapter Riley logged through may now be quizzable; plan and build after the
+  // response (a replayed create changed nothing).
+  if (!result.replayed) {
+    const bookId = result.book.book_id;
+    after(async () => {
+      await kickBank(supabase, { bookId, reason: "session" });
+    });
+  }
 
   return NextResponse.json({
     success: true,

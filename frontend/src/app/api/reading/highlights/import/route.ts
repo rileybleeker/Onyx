@@ -12,10 +12,14 @@ import {
 } from "@/lib/reading-kindle";
 import { parseKindleExport, type ParsedHighlight } from "@/lib/kindle-import";
 import { mirrorHighlight, mirrorProgress, mirrorSession, updateMirroredSession } from "@/lib/reading-notion";
+import { kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
 });
+
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
 
 interface ImportItem {
   passage?: string;
@@ -218,6 +222,13 @@ export async function POST(req: NextRequest) {
       }
     });
   }
+
+  // The question bank (READ-QUIZ-01): a new position, chapter map or highlight may unlock a chapter or add evidence.
+  // Plans the book and runs its queued steps after the response; quiet while the book is off or the SQL is missing.
+  const kickBookId = book.book_id;
+  after(async () => {
+    await kickBank(supabase, { bookId: kickBookId, reason: "kindle" });
+  });
 
   if (body.harvest) {
     await heartbeat(

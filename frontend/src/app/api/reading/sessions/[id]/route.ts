@@ -3,10 +3,14 @@ import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
+import { kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
 });
+
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
 
 /**
  * PATCH  /api/reading/sessions/[id]  Body: { chapter_through, chapter_from?, minutes?, medium?, recall?, question?,
@@ -90,6 +94,15 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
     }
     await mirrorProgress(r.book, overview?.chaptersDone ?? r.session.chapter_through ?? 0, newestDate(overview, r.session.session_date));
   });
+
+  // The question bank (READ-QUIZ-01): only when the chapter reached (or the book) changed, which can move the
+  // quizzable chapter; plan and build after the response.
+  if (r.session.chapter_through !== r.previous.chapter_through || r.book.book_id !== r.previousBook.book_id) {
+    const bookIds = [...new Set([r.book.book_id, r.previousBook.book_id])];
+    after(async () => {
+      for (const bookId of bookIds) await kickBank(supabase, { bookId, reason: "session" });
+    });
+  }
 
   return NextResponse.json({
     success: true,
