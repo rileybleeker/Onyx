@@ -62,6 +62,10 @@ function makeDb(o = {}) {
     throwOn: null,
     /** A code pds.reading_bank_finish answers instead of finishing (a lease that was lost meanwhile). */
     refuseFinish: null,
+    /** The next finish commits, but its answer never arrives (a transport error). */
+    loseFinishAnswer: false,
+    /** The next finish never commits: the lease ran out first and the claim settled the job (queued again, lease_expired). */
+    expireOnFinish: false,
     ...o,
   };
   db.now = () => db.clock;
@@ -188,6 +192,14 @@ function rpcs(db) {
       const j = db.jobs.find((x) => x.job_id === p.job_id);
       if (!j) return { ok: false, http: 404, code: "not_found" };
       if (db.refuseFinish) return { ok: false, http: 409, code: db.refuseFinish };
+      if (db.expireOnFinish && j.status === "running") {
+        db.expireOnFinish = false;
+        j.cost_cents += j.reserved_cents;
+        if (j.step !== "grade") book().spent_cents += j.reserved_cents;
+        Object.assign(j, { status: j.attempts >= 3 ? "failed" : "queued", error_code: "lease_expired", lease_until: null, reserved_cents: 0 });
+        db.clock += 10 * 60000; // the lease ran out: time has passed, so the run's own deadline is over too
+        throw Object.assign(new Error("synthetic transport error"), { code: "08006" });
+      }
       if (j.status !== "running") return { ok: false, http: 409, code: "not_running" };
       if (p.attempts !== j.attempts) return { ok: false, http: 409, code: "lease_lost" };
       const status = p.outcome === "retry" ? (j.attempts >= 3 ? "failed" : "queued") : p.outcome;
@@ -201,6 +213,10 @@ function rpcs(db) {
         const c = db.chapters.get(j.chapter) ?? { status: "pending", rebuilds: 0, built_rebuilds: 0 };
         if (c.status === "pending") c.status = "failed";
         db.chapters.set(j.chapter, c);
+      }
+      if (db.loseFinishAnswer) {
+        db.loseFinishAnswer = false;
+        throw Object.assign(new Error("synthetic transport error"), { code: "08006" });
       }
       return { ok: true, status };
     },
@@ -255,6 +271,7 @@ function rpcs(db) {
       const c = db.chapters.get(p.chapter) ?? { status: "pending", rebuilds: 0, built_rebuilds: 0 };
       c.rebuilds = (c.rebuilds ?? 0) + 1;
       db.chapters.set(p.chapter, c);
+      if (p.chapter === 0) db.bb.map_rebuilds = (db.bb.map_rebuilds ?? 0) + 1;
       return { ok: true, chapter: p.chapter, rebuilds: c.rebuilds };
     },
     reading_clear_question_answers: ({ p_days }) => (db.cleared.push(p_days), 3),
@@ -528,6 +545,17 @@ test("mapVerdict: count and title checks; unknown counts are uncertain", () => {
   assert.equal(env.S.mapVerdict(null, input), "uncertain");
   assert.equal(env.S.mapVerdict(map([]), { total_chapters: 0, chapters: [] }), "uncertain");
   assert.equal(env.S.titlesMatch("Part 2 - Fog over the bay", "Fog Over the Bay"), true);
+  assert.equal(env.S.titlesMatch("Chapter IV. Fog Over the Bay", "Fog Over the Bay"), true, "a Roman numeral prefix is removed");
+});
+
+test("titlesMatch removes a chapter / part prefix only when the next word is a number, not an ordinary word that looks like one", () => {
+  const env = load(makeDb());
+  // "Book Value" must keep "book": with the old pattern it became "alue", which sits inside "value chains".
+  assert.equal(env.S.titlesMatch("Book Value", "Value Chains"), false);
+  assert.equal(env.S.titlesMatch("Part Lighthouse Keepers", "Lighthouse Keepers"), true, "the title is still found inside the longer one");
+  assert.equal(env.S.titlesMatch("Section Civil Law", "Section Civil Law"), true);
+  assert.equal(env.S.titlesMatch("Section Civil Law", "Law"), false, "'civil' is a word here, not a numeral: it is not stripped");
+  assert.equal(env.S.titlesMatch("Part xiv the lamp", "The Lamp"), true);
 });
 
 test("a map that cites nothing leaves the mapping uncertain (highlights only) without a second call", async () => {
@@ -739,6 +767,45 @@ test("invalid JSON from the structure call retries once, then fails bad_output",
   job.next_attempt_at = db.clock;
   await kick(env);
   assert.equal(job.status, "failed");
+});
+
+test("a retry that the database fails at the job's third attempt is counted as failed (the heartbeat agrees with the row)", async () => {
+  const db = makeDb();
+  seedBuilt(db, [2]);
+  addJob(db, { step: "research", chapter: 2, input_hash: B.researchInputHash(P.BANK_PROMPT_VERSION, chHash(db, 2), db.bb.map_urls, 0), priority: 20, attempts: 2, error_code: "server_error" });
+  const env = load(db, fakeModel({ research: () => ({ __throw: { status: 500, message: "Synthetic" } }) }));
+  await kick(env);
+  const job = db.jobs.find((j) => j.step === "research");
+  assert.equal(job.attempts, 3);
+  assert.equal(job.status, "failed", "pds.reading_bank_finish turns the third retry into failed");
+  const hb = db.sync.at(-1);
+  assert.equal(hb.status, "failed", "and so does the run's summary");
+  assert.match(hb.error_message, /failed 1/);
+});
+
+test("a finish whose answer never arrived: recorded when it had committed, not recorded when the lease was settled meanwhile", async () => {
+  // The first call commits, its answer is lost; the second answers not_running; the job's own row shows done.
+  const db = makeDb({ loseFinishAnswer: true });
+  seedBuild(db);
+  const env = load(db);
+  await kick(env);
+  assert.equal(db.jobs.find((j) => j.step === "build").status, "done");
+  assert.match(db.sync.at(-1).error_message, /ch 2 (ready|thin|anchors_only|no_sources) /, "the chapter is reported: its finish was recorded");
+  assert.equal(/not recorded/.test(db.sync.at(-1).error_message), false);
+
+  // The first call never commits: the lease ran out and the claim settled the job (queued again, lease_expired). The
+  // second finish also answers not_running, but the row is not this attempt's finish, so nothing is counted.
+  const db2 = makeDb({ expireOnFinish: true });
+  seedBuild(db2);
+  const env2 = load(db2);
+  await kick(env2);
+  const job = db2.jobs.find((j) => j.step === "build");
+  assert.equal(job.status, "queued");
+  assert.equal(job.error_code, "lease_expired");
+  const hb = db2.sync.at(-1);
+  assert.match(hb.error_message, /build ch 2 not recorded/);
+  assert.match(hb.error_message, /not_running/);
+  assert.equal(/ch 2 (ready|thin|anchors_only|no_sources) /.test(hb.error_message), false, "no stored chapter is reported");
 });
 
 /* ------------------------------------------------------------------ */
@@ -1159,13 +1226,78 @@ test("chapter sheet: a chapter above the spoiler gate is 404 locked; GETs write 
   assert.equal(db.rpc.some((n) => /enqueue|claim|store|approve|rebuild/.test(n)), false);
 });
 
+test("a book-level Rebuild on a mapped book plans a fresh source map once; a done or failed one is not planned again", async () => {
+  const db = makeDb();
+  seedBuilt(db);
+  const env = load(db);
+  const v = P.BANK_PROMPT_VERSION;
+  const route = loadTs("app/api/reading/bank/run/route.ts", env.stubs);
+  const maps = (plan) => plan.jobs.filter((j) => j.step === "map");
+  assert.equal(maps(env.S.planForBook(planInput(db), v)).length, 0, "a mapped book plans no map");
+  assert.equal(maps(B.planBankJobs({ ...planInput(db), map_rebuilds: 1 }, v)).length, 0, "the planner alone: a Rebuild would count and plan nothing");
+
+  const r = await route.POST(req({ rebuild: true }));
+  assert.equal(r.status, 202);
+  assert.equal(db.bb.map_rebuilds, 1, "the Rebuild counts a map rebuild");
+  const job = db.jobs.find((j) => j.step === "map");
+  assert.ok(job && job.status === "queued", "and queues the map job");
+  assert.equal(job.input_hash, B.mapInputHash(v, planInput(db)));
+  assert.ok(r.body.queued >= 1, "the map is among the planned jobs");
+
+  // Planned again while it is queued: not skipped (a skip then re-queue would reset its attempts), not doubled.
+  const again = env.S.planForBook(planInput(db), v);
+  assert.equal(maps(again).length, 1);
+  assert.deepEqual(again.skip_jobs, []);
+  await env.supabase.rpc("reading_bank_enqueue", { p: again });
+  assert.equal(db.jobs.filter((j) => j.step === "map").length, 1);
+
+  // The kick runs it; the book is then planned again and no second map is queued.
+  await kick(env, { steps: ["map"] });
+  assert.equal(job.status, "done");
+  assert.deepEqual(db.bb.map_urls, [`${GUIDE}/guide`, `${GUIDE}/about`]);
+  assert.equal(maps(env.S.planForBook(planInput(db), v)).length, 0);
+  job.status = "failed";
+  assert.equal(maps(env.S.planForBook(planInput(db), v)).length, 0, "failed for good: the old map stays in use until the next Rebuild");
+
+  // The next Rebuild is a new hash.
+  db.bb.map_rebuilds = 2;
+  const next = maps(env.S.planForBook(planInput(db), v));
+  assert.equal(next.length, 1);
+  assert.notEqual(next[0].input_hash, job.input_hash);
+  // A book that is off plans nothing.
+  db.bb.paused_reason = "owner";
+  assert.equal(env.S.planForBook(planInput(db), v).jobs.length, 0);
+});
+
+test("a requeued job keeps its charge in the month's spend: pds.reading_bank_enqueue does not clear finished_at", () => {
+  const sql = fs.readFileSync(path.join(__dirname, "..", "..", "sql", "reading_question_bank.sql"), "utf8");
+  const start = sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_bank_enqueue");
+  const body = sql.slice(start, sql.indexOf("$fn$;", sql.indexOf("$fn$", start) + 4));
+  const update = /ON CONFLICT \(book_id, step, chapter, input_hash\) DO UPDATE\s+SET ([^;]*?)\s+WHERE jb\.status = 'skipped'/.exec(body);
+  assert.ok(update, "the requeue clause is found");
+  assert.match(update[1], /status = 'queued'/);
+  assert.doesNotMatch(update[1], /finished_at/, "this month's spend is summed over jobs by finished_at: a requeued job with a charge must stay in it");
+  // Every charge is dated by the same column, so a requeue that cleared it would lower the month's spend.
+  assert.match(sql, /sum\(cost_cents\) FILTER \(WHERE finished_at >= \(date_trunc\('month'/);
+});
+
 test("the write routes kick in after(), each with maxDuration 300; the session PATCH only when the chapter reached changed", () => {
   const dir = path.join(__dirname, "..", "src", "app", "api", "reading");
-  const files = ["highlights/import/route.ts", "highlights/route.ts", "highlights/[id]/route.ts", "sessions/route.ts", "sessions/[id]/route.ts", "bank/approval/route.ts", "bank/run/route.ts"];
-  for (const f of files) {
+  const lazy = ["highlights/import/route.ts", "highlights/route.ts", "highlights/[id]/route.ts", "sessions/route.ts", "sessions/[id]/route.ts"];
+  for (const f of lazy) {
     const src = fs.readFileSync(path.join(dir, f), "utf8");
     assert.match(src, /export const maxDuration = 300;/, f);
-    assert.match(src, /after\(async \(\) => \{\s*(for \(const bookId of bookIds\) )?await kickBank\(/, f);
+    // The bank (and the Anthropic SDK graph it pulls in) loads inside after(), never at the route's cold start.
+    assert.doesNotMatch(src, /^import .* from "@\/lib\/reading-bank-server";/m, `${f} has no static import of the bank`);
+    assert.match(src, /after\(async \(\) => \{\s*const \{[^}]*\} = await import\("@\/lib\/reading-bank-server"\);[^\n]*\s*(for \(const bookId of bookIds\) )?await kickBank\(/, f);
+  }
+  const edit = fs.readFileSync(path.join(dir, "highlights/[id]/route.ts"), "utf8");
+  assert.match(edit, /kickAfter\(h\.book_id, requestStartedAt\)/, "an edit's kick ends 280 s after its request started");
+  assert.match(edit, /kickAfter\(bookId, requestStartedAt\)/, "so does a removal's");
+  for (const f of ["bank/approval/route.ts", "bank/run/route.ts"]) {
+    const src = fs.readFileSync(path.join(dir, f), "utf8");
+    assert.match(src, /export const maxDuration = 300;/, f);
+    assert.match(src, /after\(async \(\) => \{\s*await kickBank\(/, f);
   }
   const patch = fs.readFileSync(path.join(dir, "sessions/[id]/route.ts"), "utf8");
   assert.match(patch, /r\.session\.chapter_through !== r\.previous\.chapter_through/);

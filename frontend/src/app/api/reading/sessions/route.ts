@@ -2,7 +2,6 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { BOOK_COLS, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
-import { kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -73,6 +72,7 @@ export async function POST(req: NextRequest) {
   if (!result.replayed) {
     const bookId = result.book.book_id;
     after(async () => {
+      const { kickBank } = await import("@/lib/reading-bank-server"); // inside after(): keeps the SDK graph out of the cold start
       await kickBank(supabase, { bookId, reason: "session", requestStartedAt });
     });
   }

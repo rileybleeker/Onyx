@@ -1877,12 +1877,15 @@ BEGIN
      AND job_id IN (SELECT j::bigint FROM jsonb_array_elements_text(COALESCE(p->'skip_jobs', '[]'::jsonb)) j);
   -- A job skipped earlier (its chapter left the planning window, e.g. under a hold) is queued again when planned again.
   -- Its cost_cents and charged_at stay as they were: what it already spent keeps counting in its month.
+  -- finished_at is left as it is: it dates the charge in cost_cents, which this month's spend is summed from, so a job
+  -- that was charged earlier (a retry, then a refusal at a cap) keeps counting toward the monthly cap when it is queued
+  -- again (clearing it let that spend fall out of the month's sum and reopened the headroom).
   INSERT INTO pds.reading_bank_jobs AS jb (book_id, step, chapter, input_hash, prompt_version, priority)
   SELECT v_book, j->>'step', (j->>'chapter')::int, j->>'input_hash', j->>'prompt_version', COALESCE((j->>'priority')::int, 100)
     FROM jsonb_array_elements(COALESCE(p->'jobs', '[]'::jsonb)) j
    WHERE j->>'step' IN ('map', 'research', 'build', 'highlights')
   ON CONFLICT (book_id, step, chapter, input_hash) DO UPDATE
-     SET status = 'queued', attempts = 0, next_attempt_at = NOW(), finished_at = NULL, error_code = NULL, priority = EXCLUDED.priority
+     SET status = 'queued', attempts = 0, next_attempt_at = NOW(), error_code = NULL, priority = EXCLUDED.priority
    WHERE jb.status = 'skipped'
       OR (jb.status = 'failed' AND jb.error_code = 'web_search_disabled' AND jb.finished_at < NOW() - interval '6 hours');
   GET DIAGNOSTICS v_n = ROW_COUNT;

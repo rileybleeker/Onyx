@@ -3,7 +3,6 @@ import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
-import { kickBank } from "@/lib/reading-bank-server";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -101,6 +100,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   if (r.session.chapter_through !== r.previous.chapter_through || r.book.book_id !== r.previousBook.book_id) {
     const bookIds = [...new Set([r.book.book_id, r.previousBook.book_id])];
     after(async () => {
+      const { kickBank } = await import("@/lib/reading-bank-server"); // inside after(): keeps the SDK graph out of the cold start
       for (const bookId of bookIds) await kickBank(supabase, { bookId, reason: "session", requestStartedAt });
     });
   }

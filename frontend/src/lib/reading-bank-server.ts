@@ -25,6 +25,7 @@ import {
   normalizeTocTitle,
   PER_CHAPTER_CENTS,
   planBankJobs,
+  PRIORITY,
   researchInputHash,
   STEP_ESTIMATE_CENTS,
   STEP_MAX_SECONDS,
@@ -36,6 +37,7 @@ import {
   type BuildHighlight,
   type ChapterRunCount,
   type CitedNotes,
+  type Plan,
   type PlanInput,
   type StructureOutput,
   type VerifyOutput,
@@ -91,7 +93,8 @@ import { sha256Hex } from "./reading-recall";
  * "Generation pipeline"). The client MUST be the service-role client scoped to schema "pds" (every bank table is
  * service-role only).
  *
- * - planBook: pds.reading_bank_plan_input -> lib/reading-bank.ts planBankJobs -> pds.reading_bank_enqueue.
+ * - planBook: pds.reading_bank_plan_input -> planForBook (lib/reading-bank.ts planBankJobs + a pending map rebuild) ->
+ *   pds.reading_bank_enqueue.
  * - runBank: claim -> step -> finish, while the step's budget (stepBudgetMs: STEP_MAX_SECONDS x scale, a build at
  *   least 225 s) still fits before the deadline; after a map, research or build is done, the book is planned again so
  *   the next stage can be claimed in the same run. A finish the database did not record is never counted. The claim
@@ -241,12 +244,19 @@ export function retryMinutes(attempts: number): number {
   return RETRY_MINUTES[Math.min(Math.max(Math.trunc(attempts) || 1, 1), RETRY_MINUTES.length) - 1];
 }
 
-/** A chapter title for matching: the "Chapter 3:" style prefix and a leading number removed, then normalized. */
+/** A whole-word Roman numeral up to 99 (lower case): "iv", "xl", "xcix". Not "civil" or "mix" (an ordinary word). */
+const ROMAN_NUMERAL = /^(?=[ivxlc])(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$/;
+
+/**
+ * A chapter title for matching: the "Chapter 3:" style prefix and a leading number removed, then normalized. The
+ * word after "chapter / part / book / section" is removed only when the whole word is a number (digits or a Roman
+ * numeral), so "Section Civil Law" or "Book Value" keep their first word.
+ */
 function bareTitle(t: string | null | undefined): string {
-  return normalizeTocTitle(t)
-    .replace(/^(chapter|part|book|section)\s+[\divxlc]+\s*[:.\-–—]?\s*/i, "")
-    .replace(/^\d+\s*[:.\-–—]\s*/, "")
-    .trim();
+  let out = normalizeTocTitle(t);
+  const m = /^(?:chapter|part|book|section)\s+([^\s:.\-–—]+)\s*[:.\-–—]?\s*/i.exec(out);
+  if (m && (/^\d+$/.test(m[1]) || ROMAN_NUMERAL.test(m[1]))) out = out.slice(m[0].length);
+  return out.replace(/^\d+\s*[:.\-–—]\s*/, "").trim();
 }
 
 /** Whether a source's chapter title and the Kindle table of contents title name the same chapter. */
@@ -399,12 +409,35 @@ export type PlanResult =
   | { ok: true; off: boolean; input: PlanInput; jobs: number; enqueued: number }
   | { ok: false; code: string };
 
+/**
+ * The jobs a book needs (lib/reading-bank.ts planBankJobs) plus a pending map rebuild. Riley's book-level Rebuild
+ * (chapter 0) counts a map rebuild (pds.reading_bank_rebuild), which is part of the map job's hash; but the planner
+ * plans the map only for an unmapped book or a changed table of contents, so on a mapped book the Rebuild would count
+ * and plan nothing (202, no work). Here the map job of the current count is added while none is stored yet for it, or
+ * it is still waiting / running; the other stages keep going on the old map meanwhile (the map has the top priority,
+ * and a book runs one job at a time). Once it is done, or failed for good (the old map stays in use; the next Rebuild
+ * tries again), nothing more is planned for it. A queued map job of this very hash is not skipped by the same call
+ * (a skip then re-queue would reset its attempts).
+ */
+export function planForBook(input: PlanInput, promptVersion: string): Plan {
+  const plan = planBankJobs(input, promptVersion);
+  const rebuilds = Math.max(0, Math.trunc(Number(input.map_rebuilds) || 0));
+  if (!input.approved || input.paused_reason === "owner" || rebuilds === 0) return plan;
+  const hash = mapInputHash(promptVersion, input);
+  if (plan.jobs.some((j) => j.step === "map" && j.chapter === 0 && j.input_hash === hash)) return plan;
+  const mine = input.jobs.find((j) => j.step === "map" && j.chapter === 0 && j.input_hash === hash);
+  if (mine && (mine.status === "done" || mine.status === "failed")) return plan;
+  plan.jobs.unshift({ step: "map", chapter: 0, input_hash: hash, prompt_version: promptVersion, priority: PRIORITY.map });
+  if (mine) plan.skip_jobs = plan.skip_jobs.filter((id) => id !== mine.job_id);
+  return plan;
+}
+
 /** Plan one book and enqueue its jobs. A book that is off is not enqueued (nothing to do, nothing written). */
 export async function planBook(supabase: Supa, bookId: number): Promise<PlanResult> {
   const { input, error } = await readPlanInput(supabase, bookId);
   if (error) return { ok: false, code: errCode(error) };
   if (!input) return { ok: false, code: "other" };
-  const plan = planBankJobs(input, BANK_PROMPT_VERSION);
+  const plan = planForBook(input, BANK_PROMPT_VERSION);
   if (!input.approved || input.paused_reason === "owner") return { ok: true, off: true, input, jobs: 0, enqueued: 0 };
   const { data, error: e2 } = await supabase.rpc("reading_bank_enqueue", { p: plan });
   if (e2) return { ok: false, code: errCode(e2) };
@@ -534,21 +567,26 @@ class JobRun {
       error_code: outcome === "done" ? null : safe,
       retry_minutes: outcome === "retry" ? retryMinutes(this.job.attempts) : null,
     };
-    const send = async (): Promise<{ answered: boolean; ok: boolean; code: string }> => {
+    type Sent = { answered: boolean; ok: boolean; code: string; status: string | null };
+    const send = async (): Promise<Sent> => {
       try {
         const { data, error } = await this.supabase.rpc("reading_bank_finish", { p });
-        if (error) return { answered: false, ok: false, code: errCode(error) };
-        if (plainObject(data) && data.ok === true) return { answered: true, ok: true, code: "" };
-        return { answered: true, ok: false, code: plainObject(data) && typeof data.code === "string" ? bankCode(data.code) : "other" };
+        if (error) return { answered: false, ok: false, code: errCode(error), status: null };
+        if (plainObject(data) && data.ok === true) return { answered: true, ok: true, code: "", status: typeof data.status === "string" ? data.status : null };
+        return { answered: true, ok: false, code: plainObject(data) && typeof data.code === "string" ? bankCode(data.code) : "other", status: null };
       } catch {
-        return { answered: false, ok: false, code: "other" };
+        return { answered: false, ok: false, code: "other", status: null };
       }
     };
     let r = await send();
     if (!r.answered) {
-      // No answer (a transport error): one more try. When the first one did commit, this one answers not_running.
+      // No answer (a transport error): one more try. When the first one did commit, this one answers not_running; so
+      // does a job whose lease ran out and was settled meanwhile, which the job's own row tells apart.
       const again = await send();
-      r = again.answered && !again.ok && again.code === "not_running" ? { answered: true, ok: true, code: "" } : again;
+      if (again.answered && !again.ok && again.code === "not_running") {
+        const status = await this.recordedStatus(outcome);
+        r = status ? { answered: true, ok: true, code: "", status } : again;
+      } else r = again;
     }
     if (!r.ok) {
       // Not recorded: the job stays running until its lease runs out (its reservation is then charged) and is
@@ -557,7 +595,28 @@ class JobRun {
       const lostCode = r.code === "lease_lost" || r.code === "not_running" || r.code === "schema_missing" ? r.code : "other";
       return { step: this.job.step, outcome: "retry", code: lostCode, costCents: round2(this.cost), lost: true, note: `${this.job.step} ch ${this.job.chapter} not recorded` };
     }
-    return { step: this.job.step, outcome, code: safe, costCents: round2(this.cost) };
+    // pds.reading_bank_finish fails a retry at the job's third attempt: report what the database stored, so the run's
+    // summary counts it as failed (the heartbeat, and the card's failed_24h, agree).
+    const settled = outcome === "retry" && r.status === "failed" ? "failed" : outcome;
+    return { step: this.job.step, outcome: settled, code: safe, costCents: round2(this.cost) };
+  }
+
+  /**
+   * Whether the job's own row shows THIS attempt's finish (the first, unanswered call committed): the status it would
+   * have stored, else null. A done, skipped or failed row can only come from a finish; a retry shows as queued (or
+   * failed at the third attempt), and a lease that ran out is told by its own error code (and a new attempt number once
+   * the job was claimed again), so a settled-by-expiry job is never taken for a recorded one.
+   */
+  private async recordedStatus(outcome: StepOutcome["outcome"]): Promise<string | null> {
+    try {
+      const { data, error } = await this.supabase.from("reading_bank_jobs").select("status,attempts,error_code").eq("job_id", this.job.job_id).limit(1);
+      const row = (data as { status?: unknown; attempts?: unknown; error_code?: unknown }[] | null)?.[0];
+      if (error || !row || Number(row.attempts) !== this.job.attempts || row.error_code === "lease_expired") return null;
+      const status = String(row.status ?? "");
+      return (outcome === "retry" ? status === "queued" || status === "failed" : status === outcome) ? status : null;
+    } catch {
+      return null;
+    }
   }
 
   /** A model call that did not answer, as the job's outcome (spec §7.5). */
