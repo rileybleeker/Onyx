@@ -238,8 +238,7 @@ def cmd_register(store: Store, protocol_path: str, confirm: str, *, root: Path =
         problem = analysis.method_review_problem(fields["alpha"], fields["n_redraws"])
         if problem:
             raise AdminError(f"a treatment trial cannot be registered yet: {problem}. Its final decision could never "
-                             "be firm; record the calibration report and the independent review first (an A/A check "
-                             "may run before)")
+                             "be firm; record what METHOD_REVIEW is missing first (an A/A check may run before)")
     seed_hex = store.seed_hex(experiment_id)
     if not seed_hex or design.seed_commitment(bytes.fromhex(seed_hex)) != existing["seed_sha256"]:
         raise AdminError("GUARD experiment_schedule: the stored seed does not match its commitment")

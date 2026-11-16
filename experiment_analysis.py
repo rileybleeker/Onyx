@@ -28,7 +28,8 @@ the observed yesterday's assignment. So the joint test needs one pass of re-draw
 (tau, gamma). The reported same-night p-value tests tau = 0 with gamma unknown (a nuisance) by
 Berger & Boos (1994): the largest joint p-value over a 1 - beta randomization confidence set for
 gamma, plus beta (nuisance_beta_for(R): 0.001, or 5 / (R + 1) with fewer re-draws). Its type I
-error is at most alpha whatever gamma is, whenever M holds. The interval is a certified enclosure
+error is at most alpha whatever gamma is, whenever M holds (a Monte Carlo test's guarantee, qualified
+below). The interval is a certified enclosure
 of every value that test does not reject (interval(), INTERVAL_METHOD: the accepted values need
 not form an interval, so nothing beyond its ends is accepted, by a bound proved strip by strip);
 the carryover p-value and interval are the same construction with the roles swapped. A value is
@@ -37,6 +38,20 @@ on any night is reported too (p_value_no_effect): exact without the effect model
 needs the randomized schedule and missing nights not caused by the arm, and rejecting it does not
 say which night. The re-drawing never assumes anything about the HRV series, so autocorrelation
 does not break it.
+
+The re-draws are a Monte Carlo sample of R schedules from the registered design, and every p-value
+is (1 + extreme re-draws) / (R + 1): the standard Monte Carlo randomization test (Dwass 1957,
+Phipson and Smyth 2010). With re-draws drawn at random, independently of the observed schedule,
+its size is at most alpha. The deployed re-draws are not random: experiment_design.redraw_seed is a
+deterministic SHA-256 hash of the experiment id and the report date, public values that never touch
+the secret allocation seed (os.urandom, committed before the trial), and the final report is
+computed once, so the re-draws cannot be re-chosen after a p-value is seen. Every "at most alpha"
+and "at least 1 - alpha" in this module therefore rests on a pseudo-randomness assumption, the same
+one every seeded Monte Carlo test makes: the hash is treated as a random draw independent of the
+allocation. For the one fixed re-draw set a report uses, the size is alpha only up to Monte Carlo
+error, about sqrt(alpha (1 - alpha) / R) (0.002 at R = 10,000, alpha 0.05). The calibration report
+seeds its re-draws with the same deterministic rule, so it is the empirical evidence for the size
+and coverage that rule gives.
 
 analyze_trial() REFUSES to run before the pre-registered end (Riley's decision 1, doc section 13:
 analyse only at the pre-registered end). A trial stopped early is reported as such. It reports the
@@ -71,14 +86,25 @@ MIN_NUISANCE_TAIL = design.MIN_NUISANCE_TAIL
 nuisance_beta_for = design.nuisance_beta_for
 INFERENCE_METHOD = "joint_sharp_null_berger_boos_v1"
 INTERVAL_METHOD = "certified_enclosure_v1"
-# Filled in by the PR that records the seeded calibration report (experiment_calibration.py, run in
-# the scheduled validation phase) and the independent statistical review of INFERENCE_METHOD, with
-# the configuration the report calibrated. A trial's decision is firm only when its alpha and
-# re-draw count are among those (docs/experiment-framework.md 8.1); until then it is withheld.
+# The method record a firm decision needs (docs/experiment-framework.md 8.1 and 8.3): the independent
+# statistical review of INFERENCE_METHOD and the seeded calibration report (experiment_calibration.py,
+# run in the scheduled validation phase), with the configuration the report calibrated. A trial's
+# decision is firm only when both are recorded and its alpha and re-draw count are among those;
+# until then it is withheld. The review is recorded (doc 8.3). The calibration report is not: the PR
+# that records a review-ready report fills in calibration_report, n_redraws and alpha.
 METHOD_REVIEW: dict[str, Any] = {
-    "method": None,               # the INFERENCE_METHOD the report and the review cover
-    "calibration_report": None,   # reference to the passing seeded report (experiment_calibration.py)
-    "independent_review": None,   # reference to the independent statistical review
+    "method": INFERENCE_METHOD,   # the INFERENCE_METHOD the report and the review cover
+    "calibration_report": None,   # reference to the passing, review-ready seeded report (experiment_calibration.py)
+    # Reference to the independent statistical review (doc 8.3). It reviews the method; it is not an
+    # approval of any trial's outcome.
+    "independent_review": (
+        "docs/experiment-framework.md 8.3: independent statistical challenge of joint_sharp_null_berger_boos_v1 / "
+        "certified_enclosure_v1 by two non-Anthropic models (openai/gpt-5.2, google/gemini-2.5-pro) on "
+        "2026-11-16, of the analysis at ce76f720, the synthetic calibration design and the changes recorded in "
+        "doc 8.3; final verdicts SOUND (both). Adopted: the enclosure metric and the deployed re-draw seeding rule "
+        "in the calibration, the Monte Carlo qualification of every guarantee. Rejected with reasons: "
+        "float-tolerance snapping in _sets_moving / _piece (it would narrow the sets), a fresh random re-draw "
+        "seed at analysis time (once drawn it is as fixed as the public-hash seed)"),
     "n_redraws": (),              # re-draw counts the report calibrated
     "alpha": (),                  # alpha levels it calibrated
 }
@@ -88,9 +114,18 @@ def method_review_problem(alpha: float, n_redraws: int) -> str | None:
     """Why a trial with this alpha and re-draw count has no recorded review of INFERENCE_METHOD
     that covers it, or None when it has one."""
     review = METHOD_REVIEW
-    if not (review.get("calibration_report") and review.get("independent_review")):
+    has_report, has_review = bool(review.get("calibration_report")), bool(review.get("independent_review"))
+    if not (has_report or has_review):
         return (f"the calibration report and the independent statistical review of {INFERENCE_METHOD} are not "
                 "recorded yet (experiment_analysis.METHOD_REVIEW)")
+    if not has_report:
+        return (f"the seeded calibration report of {INFERENCE_METHOD} is not recorded yet "
+                "(experiment_analysis.METHOD_REVIEW): the independent statistical review is recorded, and a firm "
+                "decision needs both")
+    if not has_review:
+        return (f"the independent statistical review of {INFERENCE_METHOD} is not recorded yet "
+                "(experiment_analysis.METHOD_REVIEW): the calibration report is recorded, and a firm decision "
+                "needs both")
     if review.get("method") != INFERENCE_METHOD:
         return f"the recorded review covers {review.get('method')!r}, not {INFERENCE_METHOD}"
     counts = sorted({int(x) for x in review.get("n_redraws") or ()})
@@ -332,8 +367,10 @@ def redraw_fit(
 
 
 def joint_p_value(draws: Draws, comp: int, tau: float, gamma: float) -> float:
-    """Exact randomization p-value of component `comp` (0 = same night, 1 = next night) under the
-    joint sharp null H(tau, gamma) of model M. A singular re-draw counts as extreme (conservative)."""
+    """Monte Carlo randomization p-value of component `comp` (0 = same night, 1 = next night) under
+    the joint sharp null H(tau, gamma) of model M, on this re-draw sample: its size is at most alpha
+    as a Monte Carlo test, under the pseudo-randomness assumption of the module docstring and up to
+    Monte Carlo error for a fixed sample. A singular re-draw counts as extreme (conservative)."""
     stat = draws.a[:, comp] - tau * draws.g[:, comp] - gamma * draws.h[:, comp]
     observed = draws.obs[comp] - (tau if comp == 0 else gamma)
     extreme = np.isnan(stat) | (np.abs(stat) >= abs(observed) - TIE_TOL)
@@ -739,7 +776,9 @@ class _Certifier:
 def interval(draws: Draws, comp: int, alpha: float, beta: float | None = None) -> tuple[float, float]:
     """Interval for coefficient `comp`: a certified enclosure of every value its Berger-Boos test
     does not reject (p >= alpha), so it covers the true value with probability at least 1 - alpha
-    under model M. An end is infinite when the data cannot bound it or it could not be certified."""
+    under model M, as the Monte Carlo test's interval (the pseudo-randomness assumption of the module
+    docstring, up to Monte Carlo error for the report's fixed re-draw sample). An end is infinite when
+    the data cannot bound it or it could not be certified."""
     beta = nuisance_beta_for(draws.n) if beta is None else beta
     side = _Certifier(draws, comp, alpha, beta)
     low = side.end(-1.0)
@@ -842,7 +881,15 @@ def days_for_power(noise_sd: float, n_days: int, effect_ms: float) -> int:
 ASSUMPTIONS: dict[str, str] = {
     "randomized_schedule": (
         "The arms followed the registered permuted-block schedule drawn from the committed seed. The report "
-        "job checks the stored schedule against the seed before analysing (GUARD experiment_schedule)."),
+        "job checks the stored schedule against the seed before analysing (GUARD experiment_schedule). The "
+        "re-draws are a Monte Carlo sample from the same design, seeded deterministically by a hash of public "
+        "values (the experiment id and the report date) that never touches the allocation seed, and the final "
+        "report is computed once. The p-values' 'at most alpha' (and the intervals' 'at least 1 - alpha') is "
+        "the Monte Carlo randomization test's guarantee for random re-draws, so here it rests on a "
+        "pseudo-randomness assumption: the hash is treated as a random draw independent of the allocation. For "
+        "the one fixed re-draw set of a report the size is alpha only up to Monte Carlo error (about "
+        "sqrt(alpha (1 - alpha) / R)). The calibration report uses the same seeding rule and is the empirical "
+        "evidence for it."),
     "one_night_carryover": (
         "The arm acts on the same night and the next night only: night D's outcome depends on the schedule "
         "through t_D and t_(D-1). Not tested by the analysis; the protocol must declare it "
@@ -896,12 +943,16 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
     secondary    the names of its secondary outcomes; each gets "secondary_outcomes.<name>"
     An entry with approximate True is not certified even when every assumption it lists holds."""
     level = f"{100 * (1 - beta):g}%"
+    # Every guarantee below is a Monte Carlo randomization test's (module docstring, randomized_schedule).
+    mc = ("; as for every seeded Monte Carlo randomization test, this rests on the pseudo-randomness assumption "
+          "of randomized_schedule (the re-draws' hashed seed treated as random) and holds for the report's one "
+          "fixed re-draw set only up to Monte Carlo error")
     ols = ("OLS coefficient; approximately unbiased over the randomization when the assumptions hold (exact only "
            "with complete nights and a symmetric design: missing nights, the lag term and the fixed pre-trial day "
            "break the symmetry slightly)")
     enclosure = (f"a certified enclosure ({INTERVAL_METHOD}) of every value the test does not reject (p >= alpha), "
-                 f"so it covers the true value with probability at least {1 - alpha:g} when the assumptions hold; an "
-                 "infinite end means the nights cannot bound it, or it could not be certified. The accepted values "
+                 f"so it covers the true value with probability at least {1 - alpha:g} when the assumptions hold{mc}; "
+                 "an infinite end means the nights cannot bound it, or it could not be certified. The accepted values "
                  "need not form one piece, so the interval can contain 0 while the p-value rejects 0; the reverse "
                  "cannot happen")
     out: dict[str, dict[str, Any]] = {
@@ -913,14 +964,14 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
             "null": "tau = 0 (no same-night effect), any carryover gamma", "needs": _MODEL,
             "method": (f"Berger-Boos: the largest joint sharp-null randomization p-value over a {level} randomization "
                        f"confidence set for gamma, plus {beta:g}"),
-            "validity": "type I error at most alpha when the assumptions hold, whatever gamma is"},
+            "validity": f"type I error at most alpha when the assumptions hold, whatever gamma is{mc}"},
         "ci_low / ci_high": {
             "null": "the tau0 values the p_value test of tau = tau0 does not reject", "needs": _MODEL,
             "validity": enclosure},
         "p_carryover": {
             "null": "gamma = 0 (no carryover), any same-night effect tau", "needs": _MODEL,
             "method": f"Berger-Boos as for p_value, with a {level} confidence set for tau",
-            "validity": "type I error at most alpha when the assumptions hold, whatever tau is"},
+            "validity": f"type I error at most alpha when the assumptions hold, whatever tau is{mc}"},
         "carryover_ci_low / carryover_ci_high": {
             "null": "the gamma0 values the p_carryover test of gamma = gamma0 does not reject", "needs": _MODEL,
             "validity": enclosure},
@@ -928,12 +979,12 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
             "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
             "validity": ("exact without the effect model (one-night carryover, constant effects), but still only "
                          "with the randomized schedule and missing nights not caused by the arm; rejecting it says "
-                         "the arm acts on some night, not that the same-night effect is non-zero. Not read by the "
-                         "decision rule")},
+                         f"the arm acts on some night, not that the same-night effect is non-zero{mc}. Not read by "
+                         "the decision rule")},
         "p_carryover_no_effect": {
             "null": "Fisher's sharp null, tested with the carryover coefficient", "needs": _FISHER,
             "validity": ("exact without the effect model, with the randomized schedule and missing nights not caused "
-                         "by the arm. Not read by the decision rule")},
+                         f"by the arm{mc}. Not read by the decision rule")},
         "hac_se / hac_se_carryover": {
             "validity": "approximate Newey-West cross-check (lags count observed nights). Not read by the decision rule"},
     }
@@ -946,7 +997,7 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
                 "needs": _LOG_MODEL,
                 "validity": (f"{berger_boos}, on ln(HRV): type I error at most alpha and coverage at least "
                              f"{1 - alpha:g} when the model holds on the log scale (constant_multiplicative_effects), "
-                             "which it cannot do together with the primary model unless the effects are zero. A "
+                             f"which it cannot do together with the primary model unless the effects are zero{mc}. A "
                              "sensitivity check, not read by the decision rule")}
         elif key == "per_protocol":
             out["sensitivity.per_protocol"] = {
@@ -968,7 +1019,7 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
                 "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
                 "validity": (f"exact: under that null the outcomes, and so {covariate}, are the same under every "
                              "schedule, so holding it fixed is right. Rejecting it says the arm acts on some night, "
-                             "not which. Not read by the decision rule")}
+                             f"not which{mc}. Not read by the decision rule")}
     for name in secondary:
         out[f"secondary_outcomes.{name}"] = {
             "estimand": f"tau and gamma for {name}: its own same-night effect and carryover",
@@ -976,8 +1027,8 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
             "needs": [*_MODEL, secondary_missing_assumption(name)],
             "validity": (f"{berger_boos}, for this series: valid when the model holds for it (one-night carryover, "
                          "its own constant effects) and its own missing nights are not caused by the arm (checked "
-                         "per series). A failed primary missingness check marks it too, the excluded blocks being "
-                         "shared. Reported next to the primary result; the decision rule never reads it")}
+                         f"per series){mc}. A failed primary missingness check marks it too, the excluded blocks "
+                         "being shared. Reported next to the primary result; the decision rule never reads it")}
     return out
 
 

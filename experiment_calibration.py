@@ -11,11 +11,26 @@ value, against Monte Carlo tolerances fixed here before any run:
   carryover_type1     p_carryover < alpha when gamma = 0                rate <= alpha + Z_MC * se
   carryover_coverage  carryover_ci_low <= gamma <= carryover_ci_high    rate >= 1 - alpha - Z_MC * se
   joint_type1         joint sharp-null p at the true (tau, gamma)       rate <= alpha + Z_MC * se
+  enclosure           an accepted value outside its interval            rate == 0 (no Monte Carlo slack)
 
   se = sqrt(alpha * (1 - alpha) / n), n = trials analysed in that scenario. The joint test is exact
   up to the discreteness of the re-draws, so its rate is also reported against alpha +- Z_MC * se
   (informational: a discrete or degenerate design may reject less often, which is not invalid).
   Power at the planted effect is informational too (the planning check overstates it, doc 7.3).
+
+  enclosure checks the defining property of the certified interval (INTERVAL_METHOD) directly, not
+  only its coverage: in every trial bb_p_value is probed at ENCLOSURE_STEPS scales beyond each
+  finite end of both intervals, and at the true value and 0. Any of them accepted (p >= alpha)
+  outside its interval is a violation. A finite set of probes is a strong regression check, not a
+  proof (the proof is the strip bound, checked in tests/test_experiment_calibration.py). The share
+  of trials with an infinite interval end is reported as information.
+
+Each trial's re-draws use the deployed seeding rule, experiment_design.redraw_seed, on a synthetic
+experiment id (calibration_redraw_seed). Like a real report's, that seed is a deterministic SHA-256
+hash of public values, never derived from the secret allocation seed, so the report measures the
+size and coverage of the deployed rule itself: the analysis's "at most alpha" for it rests on the
+pseudo-randomness assumption of doc 8.1 (the Monte Carlo randomization p-value (1 + count) / (R + 1)),
+and this report is the empirical evidence for it.
 
 The report records the configuration it calibrated (method, alpha, re-draw count): a
 METHOD_REVIEW entry covers exactly those, and a trial's decision is firm only when its alpha
@@ -35,8 +50,9 @@ reads the database, the clock or a credential; the output holds rates and counts
 Run in the scheduled validation phase, never before a merge (AGENTS.md "Read this first"), at the
 registered re-draw count (10,000 in the template). A full run is many hours in one process, more
 than one Actions job allows, so it runs on the PC or as one job per scenario, merged afterwards.
-Scenario j's trial i always draws from default_rng([seed, j, i]), so a shard holds exactly the rows
-a full run would; --merge refuses shards of different configurations or a scenario twice:
+Scenario j's trial i always draws from default_rng([seed, j, i]) and calibration_redraw_seed(seed, j, i),
+so a shard holds exactly the rows a full run would; --merge refuses shards of different
+configurations or a scenario twice:
     python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --out calibration.json
     python experiment_calibration.py --sims 1000 --redraws 10000 --seed 20261116 --scenario no_effect --out s1.json
     python experiment_calibration.py --merge s1.json s2.json ... --out calibration.json
@@ -49,6 +65,7 @@ import json
 import math
 import sys
 from dataclasses import asdict, dataclass
+from datetime import date
 from typing import Any
 
 import numpy as np
@@ -63,6 +80,10 @@ REVIEW_MIN_SIMS = 1000      # trials per scenario a report needs before it may b
 DEFAULT_REDRAWS = 10000     # the template's registered count; a trial is covered only at a calibrated count
 DEFAULT_SEED = 20261116
 BASELINE = 70.0             # synthetic outcome level (ms)
+# Probes of the enclosure metric, in scales (Draws.scale) beyond an interval end: dense near the end,
+# where a missed accepted region would sit, then out to the far tail. Fixed before any run.
+ENCLOSURE_STEPS = (1e-6, 1e-3, 0.05, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 13.0, 20.0, 50.0, 1e2, 1e4, 1e6)
+CALIBRATION_AS_OF = date(2026, 11, 16)   # the synthetic report date given to the deployed seeding rule
 
 
 @dataclass(frozen=True)
@@ -134,12 +155,31 @@ def legacy_interval(draws: ea.Draws, alpha: float) -> tuple[float, float]:
     return ea.invert_p_value(lambda c: ea.joint_p_value(draws, 0, c, 0.0), float(draws.obs[0]), alpha, draws.scale(0))
 
 
-def one_trial(s: Scenario, rng: np.random.Generator, *, n_redraws: int, alpha: float, beta: float) -> dict[str, Any] | None:
+def calibration_redraw_seed(seed: int, scenario_index: int, trial_index: int) -> int:
+    """The re-draw seed of synthetic trial i of scenario j: the deployed rule (experiment_design.redraw_seed)
+    on a synthetic experiment id, so the calibration samples re-draws the way a real report does."""
+    return design.redraw_seed(f"CAL-{seed}-{scenario_index}-{trial_index}", CALIBRATION_AS_OF)
+
+
+def enclosure_violation(draws: ea.Draws, comp: int, low: float, high: float, alpha: float, beta: float,
+                        also: tuple[float, ...] = ()) -> bool:
+    """True when the Berger-Boos test of coefficient `comp` accepts (p >= alpha) a value outside
+    [low, high]: a probe ENCLOSURE_STEPS scales beyond a finite end, or one of `also` (the true value,
+    0). The certified interval must never allow it; the stepped-out interval of the previous method can."""
+    scale = draws.scale(comp)
+    probes = [float(v) for v in also if not (low <= v <= high)]
+    for end, direction in ((low, -1.0), (high, 1.0)):
+        if math.isfinite(end):
+            probes += [end + direction * scale * k for k in ENCLOSURE_STEPS]
+    return any(ea.bb_p_value(draws, comp, v, beta)[0] >= alpha for v in probes)
+
+
+def one_trial(s: Scenario, rng: np.random.Generator, *, n_redraws: int, alpha: float, beta: float,
+              redraw_seed: int) -> dict[str, Any] | None:
     """Every quantity the metrics need for one synthetic trial; None when the model cannot be fitted."""
     t, y, dow, excluded = simulate_trial(s, rng)
     try:
-        draws, _ = ea.redraw_fit(t, y, dow, excluded_blocks=excluded, n_redraws=n_redraws,
-                                 redraw_seed=int(rng.integers(0, 2 ** 62)))
+        draws, _ = ea.redraw_fit(t, y, dow, excluded_blocks=excluded, n_redraws=n_redraws, redraw_seed=redraw_seed)
     except ValueError:
         return None
     lo, hi = ea.interval(draws, 0, alpha, beta)
@@ -155,6 +195,9 @@ def one_trial(s: Scenario, rng: np.random.Generator, *, n_redraws: int, alpha: f
         "direct_covered": lo <= s.direct <= hi,
         "carryover_covered": clo <= s.carryover <= chi,
         "legacy_covered": llo <= s.direct <= lhi,
+        "enclosure_violation": (enclosure_violation(draws, 0, lo, hi, alpha, beta, (s.direct, 0.0))
+                                or enclosure_violation(draws, 1, clo, chi, alpha, beta, (s.carryover, 0.0))),
+        "interval_unbounded": not all(math.isfinite(v) for v in (lo, hi, clo, chi)),
         "carryover_set_unbounded": not (math.isfinite(carry_set[0]) and math.isfinite(carry_set[1])),
         "missingness_withholds": bool(ea.missingness_check(t[in_scope], np.isnan(y[in_scope]))["threat"]),
     }
@@ -194,12 +237,17 @@ def summarize(s: Scenario, rows: list[dict[str, Any]], skipped: int, alpha: floa
     metrics["carryover_coverage"] = _metric(r, (r >= tol["coverage_min"]) if judged else None, min=tol["coverage_min"])
     joint = rate("p_joint_truth", lambda p: p < alpha)
     metrics["joint_type1"] = _metric(joint, (joint <= tol["rejection_max"]) if judged else None, max=tol["rejection_max"])
+    # The certificate is exact, not a Monte Carlo rate: one accepted value outside its interval fails it.
+    r = rate("enclosure_violation")
+    metrics["enclosure"] = _metric(r, (r == 0.0) if judged else None, max=0.0)
     informational = {
         "joint_within_exact_band": bool(tol["exact_low"] <= joint <= tol["exact_high"]) if n else None,
         "exact_band": [round(tol["exact_low"], 4), round(tol["exact_high"], 4)],
         "no_effect_test_rejects": round(rate("p_no_effect", lambda p: p < alpha), 4),
         "legacy_interval_coverage": round(rate("legacy_covered"), 4),
         "carryover_set_unbounded": round(rate("carryover_set_unbounded"), 4),
+        # An interval end left infinite: the nights cannot bound it, or its certification budget ran out.
+        "interval_unbounded": round(rate("interval_unbounded"), 4),
         "missingness_check_withholds": round(rate("missingness_withholds"), 4),
     }
     if s.direct != 0:
@@ -219,7 +267,8 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
                     names: list[str] | None = None, alpha: float = ALPHA,
                     beta: float | None = None) -> dict[str, Any]:
     """The calibration report. Deterministic in (seed, n_sims, n_redraws, names): trial i of scenario
-    j draws from numpy's default_rng([seed, j, i]). beta None = the registered level for n_redraws."""
+    j draws its synthetic trial from numpy's default_rng([seed, j, i]) and its re-draws from
+    calibration_redraw_seed(seed, j, i). beta None = the registered level for n_redraws."""
     beta = ea.nuisance_beta_for(n_redraws) if beta is None else beta
     chosen = [(j, s) for j, s in enumerate(SCENARIOS) if names is None or s.name in names]
     unknown = set(names or ()) - {s.name for s in SCENARIOS}
@@ -229,7 +278,8 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
     for j, s in chosen:
         rows, skipped = [], 0
         for i in range(n_sims):
-            row = one_trial(s, np.random.default_rng([seed, j, i]), n_redraws=n_redraws, alpha=alpha, beta=beta)
+            row = one_trial(s, np.random.default_rng([seed, j, i]), n_redraws=n_redraws, alpha=alpha, beta=beta,
+                            redraw_seed=calibration_redraw_seed(seed, j, i))
             if row is None:
                 skipped += 1
             else:

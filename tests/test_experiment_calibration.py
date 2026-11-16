@@ -29,7 +29,12 @@ Covers
     trials, the unsupported scenarios reported without a verdict (the missingness check withholding
     the decision when the arm causes missing nights), shards merging into the report a full run
     would give, and review_ready counting analysed trials. The full-tolerance report (1,000 trials
-    per scenario at the registered re-draw count) is the CLI's job (doc 8.2), not this file's.
+    per scenario at the registered re-draw count) is the CLI's job (doc 8.2), not this file's;
+  * the review findings of doc 8.3: the calibration's enclosure probe flags an interval that misses
+    an accepted region (the stepped-out one on the rejected-gap re-draws) and passes the certified
+    one; the calibration seeds its re-draws with the deployed rule (experiment_design.redraw_seed);
+    the recorded METHOD_REVIEW holds the independent review but no calibration report, so the
+    decision stays withheld with a reason naming the missing report, and each half alone is named.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -343,6 +348,56 @@ def test_strip_bound_is_at_least_the_p_value_everywhere_in_the_strip():
     assert ea._strip_bound(gap, 0, 0.0, 1 / 50.0, True, beta, m) < 0.05, "past 50 only the 3 far re-draws are extreme"
 
 
+def test_enclosure_probe_flags_a_missed_accepted_region():
+    # Doc 8.3 (review finding): the calibration checks the enclosure property itself, not only coverage.
+    draws = _gap_draws()
+    beta = ea.nuisance_beta_for(draws.n)
+    p = lambda v: ea.bb_p_value(draws, 0, v, beta)[0]  # noqa: E731
+    stepped = ea.invert_p_value(p, 0.0, 0.05, draws.scale(0))      # stops near 10, before [30, 40]
+    assert cal.enclosure_violation(draws, 0, *stepped, 0.05, beta), "the probes must reach the far region"
+    certified = ea.interval(draws, 0, 0.05, beta)
+    assert not cal.enclosure_violation(draws, 0, *certified, 0.05, beta, (0.0,))
+    # An accepted value handed in explicitly (the true value, 0) counts when it is outside the interval.
+    assert cal.enclosure_violation(draws, 0, 50.0, 60.0, 0.05, beta, (35.0,))
+    assert not cal.enclosure_violation(draws, 0, -np.inf, np.inf, 0.05, beta, (35.0,)), "nothing is outside"
+
+
+def test_calibration_seeds_its_redraws_with_the_deployed_rule():
+    # Doc 8.3 (review finding): a real report's re-draw seed is experiment_design.redraw_seed, a hash
+    # of public values; the calibration must measure that rule, not a different random seed.
+    assert cal.calibration_redraw_seed(5, 0, 3) == ed.redraw_seed("CAL-5-0-3", cal.CALIBRATION_AS_OF)
+    assert cal.calibration_redraw_seed(5, 0, 3) != cal.calibration_redraw_seed(5, 0, 4)
+    assert cal.calibration_redraw_seed(5, 0, 3) != cal.calibration_redraw_seed(5, 1, 3)
+    assert cal.calibration_redraw_seed(5, 0, 3) != cal.calibration_redraw_seed(6, 0, 3)
+
+
+def test_recorded_method_review_still_withholds_until_the_calibration_report():
+    # Doc 8.3: the independent review is recorded, the calibration report is not, so no trial's
+    # decision is firm yet and the register step still refuses a treatment trial.
+    assert ea.METHOD_REVIEW["method"] == ea.INFERENCE_METHOD
+    assert ea.METHOD_REVIEW["independent_review"] and "8.3" in ea.METHOD_REVIEW["independent_review"]
+    assert not ea.METHOD_REVIEW["calibration_report"]
+    assert not ea.METHOD_REVIEW["n_redraws"] and not ea.METHOD_REVIEW["alpha"]
+    problem = ea.method_review_problem(0.05, 10000)
+    assert problem and "calibration report" in problem and "independent statistical review is recorded" in problem
+    spec, data = _spec_and_data()
+    report = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
+    assert report["decision"] == "inconclusive" and report["decision_firm"] is False
+    assert report["decision_withheld"] == [ea.method_review_problem(spec.alpha, spec.n_redraws)]
+    assert report["inference"]["review"]["independent_review"] == ea.METHOD_REVIEW["independent_review"]
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        ea.METHOD_REVIEW.update(calibration_report="synthetic-report-ref", independent_review=None)
+        only_report = ea.method_review_problem(0.05, 10000)
+        assert "independent statistical review" in only_report and "calibration report is recorded" in only_report
+        ea.METHOD_REVIEW.update(calibration_report=None, independent_review=None)
+        neither = ea.method_review_problem(0.05, 10000)
+        assert "calibration report and the independent statistical review" in neither
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
 # ---------------------------------------------------------------------------
 # The report: firm decisions only when nothing withholds them
 # ---------------------------------------------------------------------------
@@ -582,7 +637,9 @@ def test_smoke_scenarios_meet_their_prespecified_tolerances():
         scenario = by_name[name]
         assert scenario["supported"] is True and scenario["n_analysed"] >= SMOKE_SIMS - 4, name
         metrics = scenario["metrics"]
-        assert {"direct_coverage", "carryover_coverage", "joint_type1"} <= set(metrics), name
+        assert {"direct_coverage", "carryover_coverage", "joint_type1", "enclosure"} <= set(metrics), name
+        assert metrics["enclosure"]["rate"] == 0.0, (name, "an accepted value outside its interval")
+        assert 0.0 <= scenario["informational"]["interval_unbounded"] <= 1.0, name
         assert all(m["ok"] is True for m in metrics.values()), (name, json.dumps(metrics))
         assert scenario["ok"] is True, name
         assert scenario["informational"]["joint_within_exact_band"] in (True, False)
