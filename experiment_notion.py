@@ -282,6 +282,28 @@ def aa_lines(report: dict[str, Any]) -> list[str]:
     return ["A/A check NOT PASSED: " + "; ".join(reasons or ["see the report payload"]) + "."]
 
 
+def inference_lines(report: dict[str, Any]) -> list[str]:
+    """Why the decision is (not) firm and what the p-values assume (docs/experiment-framework.md 8.1).
+    Empty for a report written before the inference block existed."""
+    inference = report.get("inference")
+    if not isinstance(inference, dict):
+        return []
+    lines = []
+    if report.get("decision_firm") is False:
+        rule = DECISION_NAMES.get(str(report.get("decision_if_supported")), str(report.get("decision_if_supported")))
+        reasons = "; ".join(str(x) for x in report.get("decision_withheld") or []) or "see the report payload"
+        lines.append(f"No firm decision yet, so it reads Inconclusive: {reasons}. The rule on its own gives: {rule}.")
+    lines.append(
+        f"The p-values and intervals allow for carryover ({inference.get('method')}): they assume the arm acts on the "
+        "same night and the next night only, by the same amount every night, and that missing nights are not caused "
+        f"by the arm. Without any of that, 'the arm changes no night' has randomization p = "
+        f"{_fmt(report.get('p_value_no_effect'), 4)} (it does not say which night).")
+    if report.get("carryover_ci_low") is not None:
+        lines.append(f"Carryover interval: {_fmt(report.get('carryover_ci_low'))} to "
+                     f"{_fmt(report.get('carryover_ci_high'))} ms.")
+    return lines
+
+
 def report_blocks(report: dict[str, Any]) -> list[dict]:
     """The children of the "Report (auto)" heading for a final report."""
     if report.get("report_kind") != "final":
@@ -311,6 +333,7 @@ def report_blocks(report: dict[str, Any]) -> list[dict]:
                     f"{_count(r.get('n_nights_b'))} arm B) of {_count(r.get('days_in_scope'))} days in scope; "
                     f"{_count(r.get('days_scheduled'))} days scheduled, last day analysed {_count(r.get('last_day_analysed'))}."),
         ]
+        blocks += [_bullet(line) for line in inference_lines(r)]
     excluded = r.get("exclusions") or {}
     if excluded.get("blocks"):
         reasons = "; ".join(f"{b.get('reason')} x{b.get('count')}" for b in excluded.get("by_reason", []))

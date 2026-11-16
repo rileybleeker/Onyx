@@ -306,6 +306,27 @@ def test_aa_verdict_leads_the_report_and_an_unanalysable_trial_prints_no_none():
     assert props["Estimate (ms)"] == {"number": None} and props["Decision"] == {"select": None}
 
 
+def test_a_withheld_decision_and_the_inference_assumptions_are_on_the_page():
+    def body(report):
+        return " ".join(b[b["type"]]["rich_text"][0]["text"]["content"] for b in en.report_blocks(report))
+
+    inference = {"method": "joint_sharp_null_berger_boos_v1", "checks": [], "outputs": {}}
+    withheld = _final(decision="inconclusive", decision_if_supported="adopt_A", decision_firm=False,
+                      decision_withheld=["the synthetic review is not recorded yet"], inference=inference,
+                      p_value_no_effect=0.0004, carryover_ci_low=-3.25, carryover_ci_high="inf")
+    text = body(withheld)
+    assert "Decision: Inconclusive" in text
+    assert "No firm decision yet, so it reads Inconclusive: the synthetic review is not recorded yet." in text
+    assert "The rule on its own gives: Adopt A." in text
+    assert "allow for carryover (joint_sharp_null_berger_boos_v1)" in text and "p = 0.0004" in text
+    assert "Carryover interval: -3.25 to unbounded ms." in text and "None" not in text
+
+    firm = body(_final(decision_if_supported="adopt_A", decision_firm=True, decision_withheld=[], inference=inference))
+    assert "No firm decision" not in firm and "allow for carryover" in firm
+    # A report stored before the inference block existed renders exactly as it did.
+    assert "allow for carryover" not in body(_final()) and en.inference_lines(_final()) == []
+
+
 # ---------------------------------------------------------------------------
 # HTTP transport
 # ---------------------------------------------------------------------------

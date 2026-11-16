@@ -5,12 +5,13 @@ Covers
     stream or SeedSequence ever changes), balance and uniformity, the re-draws use the same
     procedure, seed commitment, protocol template + validation rules (8 ms floor, future start,
     alignment version, seed commitment, supported objective source);
-  * experiment_analysis: on synthetic AR(1) nights with missing data, the randomization test's
-    type I error is near nominal, it detects a planted effect, the carryover term keeps the
-    same-night estimate unbiased when the effect lingers, slow drift is absorbed, the interval
-    covers the truth and agrees with the p-value, missing nights are never imputed, the
-    missingness check flags arm-dependent gaps, and analyze_trial REFUSES before the
-    pre-registered end;
+  * experiment_analysis: on synthetic AR(1) nights with missing data, Fisher's no-effect test is
+    exact and the same-night test (Berger-Boos, carryover as a nuisance) keeps its type I error at
+    or under nominal, it detects a planted effect, the carryover term keeps the same-night
+    estimate unbiased when the effect lingers, slow drift is absorbed, the interval covers the
+    truth and agrees with the p-value, missing nights are never imputed, the missingness check
+    flags arm-dependent gaps, and analyze_trial REFUSES before the pre-registered end (the
+    inference under carryover and its calibration: tests/test_experiment_calibration.py);
   * experiment_admin: seed / register / verify / stop against an in-memory store: nothing
     printed contains a seed or an arm, registration needs a merged clean protocol and a matching
     commitment, a tampered schedule is a GUARD failure, every write leaves a heartbeat;
@@ -145,21 +146,25 @@ def test_schedule_rows():
 # ---------------------------------------------------------------------------
 
 def test_type_one_error_is_near_nominal_on_null_data():
-    fits = _simulate(seed=11, reps=400)
-    rate = np.mean([f["p_value"] < 0.05 for f in fits])
+    fits = _simulate(seed=11, reps=400, n_redraws=999)
     # 400 trials: one standard error of a true 5% rate is 1.1 points.
-    assert 0.02 <= rate <= 0.085, f"type I error {rate:.3f} is not near 0.05"
+    exact = np.mean([f["p_value_no_effect"] < 0.05 for f in fits])
+    assert 0.02 <= exact <= 0.085, f"Fisher's no-effect test rejects {exact:.3f} of the time, not about 0.05"
+    # The same-night test allows for any carryover, so it may be conservative but never above nominal.
+    rate = np.mean([f["p_value"] < 0.05 for f in fits])
+    assert rate <= 0.085, f"same-night type I error {rate:.3f} is above 0.05"
+    assert all(f["p_value"] >= f["nuisance_beta"] for f in fits), "a Berger-Boos p-value is never below beta"
     assert abs(np.mean([f["estimate"] for f in fits])) < 0.6, "no effect must estimate to about zero"
     carry_rate = np.mean([f["p_carryover"] < 0.05 for f in fits])
     assert carry_rate <= 0.085, f"carryover test rejects too often under the null ({carry_rate:.3f})"
 
 
 def test_detects_a_planted_effect():
-    fits = _simulate(seed=12, reps=300, effect=8.0)
+    fits = _simulate(seed=12, reps=300, effect=8.0, n_redraws=999)
     power = np.mean([f["p_value"] < 0.05 for f in fits])
     assert power > 0.65, f"power {power:.2f} at +8 ms over 232 days (the design assumes about 0.8)"
     assert abs(np.mean([f["estimate"] for f in fits]) - 8.0) < 0.8
-    weak = np.mean([f["p_value"] < 0.05 for f in _simulate(seed=13, reps=200, effect=1.0)])
+    weak = np.mean([f["p_value"] < 0.05 for f in _simulate(seed=13, reps=200, effect=1.0, n_redraws=999)])
     assert weak < 0.25, "a 1 ms effect must not look detectable"
 
 
@@ -259,6 +264,11 @@ def test_report_is_deterministic_and_complete():
         assert key in first, key
     assert first["days_scheduled"] == N_DAYS and first["n_nights"] == int((~np.isnan(data.outcome)).sum())
     assert first["decision"] in ("adopt_A", "no_meaningful_effect", "inconclusive")
+    for key in ("p_value_no_effect", "p_carryover_no_effect", "carryover_ci_low", "carryover_ci_high",
+                "decision_if_supported", "decision_firm", "decision_withheld", "inference"):
+        assert key in first, key
+    assert first["inference"]["method"] == ea.INFERENCE_METHOD and first["nuisance_beta"] == ea.nuisance_beta_for(999)
+    assert first["decision"] == (first["decision_if_supported"] if first["decision_firm"] else "inconclusive")
     assert "ln_outcome" in first["sensitivity"] and "per_protocol" not in first["sensitivity"]
     assert np.sign(first["sensitivity"]["ln_outcome"]["estimate_pct"]) == np.sign(first["estimate"])
 

@@ -462,8 +462,16 @@ def test_final_report_at_the_end_is_written_once():
     assert "FINAL report written" in text and "not in this log" in text
     assert store.exp["status"] == "complete" and store.calls.count("matrix") == 1
 
-    # The registered analysis found the planted effect.
-    assert abs(report["estimate"] - EFFECT) < 4 and report["p_value"] < 0.01 and report["decision"] == "adopt_A"
+    # The registered analysis found the planted effect. Until the inference method's calibration and
+    # independent review are recorded (experiment_analysis.METHOD_REVIEW) the verdict is withheld:
+    # the decision reads inconclusive and the rule's verdict and the reason travel with the report.
+    assert abs(report["estimate"] - EFFECT) < 4 and report["p_value"] < 0.01
+    assert report["decision_if_supported"] == "adopt_A" and report["decision_firm"] is False
+    assert report["decision"] == "inconclusive" and any("independent statistical review" in reason
+                                                        for reason in report["decision_withheld"])
+    assert report["inference"]["method"] and "p_value" in report["inference"]["outputs"]
+    carry_low, carry_high = (float(report[k]) for k in ("carryover_ci_low", "carryover_ci_high"))  # "inf" text parses
+    assert carry_low < report["carryover"] < carry_high
     assert report["ci_low"] < EFFECT < report["ci_high"] and report["n_redraws"] == 999
     assert report["report_kind"] == "final" and report["as_of"] == today.isoformat() and report["stopped_early"] is False
     assert report["excluded_blocks"] == [3, 5, 8]
@@ -802,9 +810,9 @@ def test_aa_trials_rarely_report_a_false_effect():
     from experiment_analysis import TrialData, TrialSpec, analyze_trial
 
     rng = np.random.default_rng(20261114)
-    spec = TrialSpec(experiment_id="EXP-900", start=START, planned_end=AA_END, mid_ms=8.0, n_redraws=199)
+    spec = TrialSpec(experiment_id="EXP-900", start=START, planned_end=AA_END, mid_ms=8.0, n_redraws=999)
     sigma, rho, n = 21.4, 0.476, 28
-    significant = adopted = analysed = 0
+    significant = exact = adopted = analysed = 0
     for _ in range(300):
         e = np.empty(n)
         e[0] = rng.normal(0, sigma)
@@ -819,10 +827,14 @@ def test_aa_trials_rarely_report_a_false_effect():
             continue
         analysed += 1
         significant += report["p_value"] < 0.05
-        adopted += report["decision"] == "adopt_A"
+        exact += report["p_value_no_effect"] < 0.05
+        adopted += report["decision_if_supported"] == "adopt_A"
     assert analysed >= 290
+    # Identical arms satisfy Fisher's no-effect null exactly: about 5%. The registered same-night
+    # test also allows for any carryover, so on 28 days it is conservative: at most about 5%.
+    assert 0.01 <= exact / analysed <= 0.09, f"no-effect test rejects {exact / analysed:.3f} on identical arms"
     rate = significant / analysed
-    assert 0.01 <= rate <= 0.09, f"false-positive rate {rate:.3f} on identical arms"
+    assert rate <= 0.09, f"false-positive rate {rate:.3f} on identical arms"
     assert adopted <= significant, "adopt_A needs a significant result"
 
 
