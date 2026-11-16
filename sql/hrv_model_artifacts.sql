@@ -10,16 +10,20 @@
 -- The forecast job reads this table and never writes it. It serves the newest row it can serve
 -- (same alignment rule, a preprocessing version it knows, compatible package versions), newest
 -- by provenance: training commit time, then data cutoff, then training time. When a row is
--- published, or when its cache entry was saved, never decides. A pinned row beats every
--- unpinned one; a retired row is never served.
+-- published, or when its cache entry was saved, never decides. A retired row is never served.
+-- A pin decides BEFORE compatibility: the newest pinned row is the artifact, and when this code
+-- or these packages cannot serve it (another alignment rule, an unknown preprocessing version,
+-- other xgboost / scikit-learn releases) the forecast STOPS with a failed heartbeat instead of
+-- serving another row, so a dependency upgrade can never undo an explicit rollback.
 --
 -- Rollback / recovery (service role, e.g. the Supabase SQL editor):
 --   * serve a known-good artifact:  UPDATE pds.hrv_model_artifacts SET pinned = true, note = '...'
 --                                   WHERE artifact_sha256 = '<checksum>';
 --     (its cache entry must still exist: GitHub removes an entry 7 days after its last restore, and
---     a pinned artifact that is gone STOPS the forecast with a failed hrv_predict|model_artifact
---     heartbeat; no other model is trained or served in its place, so the rollback is never
---     silently replaced. Clear the pin, SET pinned = false, or retire it, then retrain)
+--     a pinned artifact that is gone, or one this code cannot serve, STOPS the forecast with a
+--     failed hrv_predict|model_artifact heartbeat; no other model is trained or served in its
+--     place, so the rollback is never silently replaced. SET pinned = false, or retire it, then
+--     retrain)
 --   * stop serving a bad one:       UPDATE ... SET retired_at = now(), note = '...' WHERE ...;
 -- Only pinned, retired_at and note can change; every provenance column is fixed once published
 -- (trigger below). Rows are never removed by any job.
@@ -74,7 +78,7 @@ COMMENT ON COLUMN pds.hrv_model_artifacts.artifact_sha256 IS 'SHA-256 of the pic
 COMMENT ON COLUMN pds.hrv_model_artifacts.cache_key IS 'GitHub Actions cache key holding exactly this artifact (content-addressed).';
 COMMENT ON COLUMN pds.hrv_model_artifacts.data_cutoff IS 'Last calendar_date the model trained on.';
 COMMENT ON COLUMN pds.hrv_model_artifacts.training_commit_time IS 'Commit time of the training code; first ordering key when choosing the artifact to serve.';
-COMMENT ON COLUMN pds.hrv_model_artifacts.pinned IS 'Rollback lever: a pinned row beats every unpinned row.';
+COMMENT ON COLUMN pds.hrv_model_artifacts.pinned IS 'Rollback lever: the newest pinned row is served before any compatibility check; if it cannot be served the forecast stops (nothing else is served or trained).';
 COMMENT ON COLUMN pds.hrv_model_artifacts.retired_at IS 'Set to stop serving this artifact.';
 
 CREATE INDEX IF NOT EXISTS hrv_model_artifacts_trained_at_idx

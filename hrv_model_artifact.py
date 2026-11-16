@@ -20,10 +20,12 @@ Now:
     checksum (sql/hrv_model_artifacts.sql), so publishing again changes nothing;
   * a forecast run reads the registry and never writes it. It serves the newest COMPATIBLE
     published artifact by provenance (training commit time, then data cutoff, then training
-    time), never by when an entry was saved; pinned rows win, retired rows are never served.
-    It fails closed: a registry that cannot be read (anything but "table not applied yet"), or
-    a pinned artifact that is no longer in the Actions cache, skips the forecast with a failed
-    heartbeat instead of serving or training some other model;
+    time), never by when an entry was saved; a retired row is never served. A pin decides
+    BEFORE compatibility: the newest pinned row is the artifact, and when this code or these
+    packages cannot serve it nothing else is served or trained in its place. It fails closed:
+    a registry that cannot be read (anything but "table not applied yet"), a pinned artifact
+    this code cannot serve, or a pinned artifact that is no longer in the Actions cache, skips
+    the forecast with a failed heartbeat instead of serving or training some other model;
   * before unpickling, hrv_predict.py checks the file against the selected checksum and against
     its manifest (checksum, alignment, preprocessing, packages), and every forecast row records the
     checksum of the artifact that produced it (pds.hrv_predictions.model_artifact_sha256).
@@ -375,14 +377,23 @@ def serving_refusal(env: Mapping[str, str] | None = None) -> str | None:
     Fail closed, never serve or train another model in its place:
       * registry "error": the registry could not be read, so the model cannot be checked against
         publication, retirement or a pin (a retired model must not come back during an outage);
+      * a pin this code cannot serve (another alignment rule, an unknown preprocessing version,
+        other xgboost / scikit-learn packages, another runner): the pin is an explicit rollback,
+        so an unpinned dependency upgrade must not silently select another model;
       * a pinned artifact that the exact-key restore did not bring back (GitHub evicts a cache
-        entry after seven days without a restore): the pin is an explicit rollback, so a model
-        trained in its place would defeat it, and would be trained again on every run."""
+        entry after seven days without a restore): a model trained in its place would defeat
+        the pin, and would be trained again on every run."""
     env = os.environ if env is None else env
     if env.get("HRV_MODEL_REGISTRY", "") == "error":
         return (f"GUARD model_artifact: the model registry pds.{REGISTRY_TABLE} could not be read, so "
                 "the model cannot be checked against publication, retirement or a pin. Forecast "
                 "skipped (no model is served or trained in its place).")
+    if env.get("HRV_MODEL_PIN_BLOCKED", "") == "true":
+        reason = (env.get("HRV_MODEL_PIN_REASON") or "the pinned artifact cannot be served").strip()[:300]
+        return (f"GUARD model_artifact: {reason}. Forecast skipped (a pin is never replaced by another "
+                "model, and nothing is trained in its place). Unpin or retire it "
+                f"(UPDATE pds.{REGISTRY_TABLE} ...), then retrain "
+                "(gh workflow run hrv-retrain-on-backfill.yml).")
     if env.get("HRV_MODEL_PINNED", "") == "true" and env.get("HRV_MODEL_RESTORED", "") != "true":
         selected = (env.get("HRV_MODEL_SELECTED_SHA256") or "")[:12]
         return (f"GUARD model_artifact: pinned artifact {selected} is no longer in the Actions cache. "
@@ -396,9 +407,9 @@ def serving_report(loaded: LoadedArtifact, env: Mapping[str, str] | None = None)
     """Heartbeat status + message for the artifact a forecast is made with.
 
     The workflow passes HRV_MODEL_REGISTRY (ok | not_applied | error), HRV_MODEL_SELECTED_SHA256,
-    HRV_MODEL_PINNED and HRV_MODEL_RESTORED (the exact-key restore hit). Outside the workflow
-    none is set. Registry "error" and a lost pinned artifact never get this far
-    (serving_refusal)."""
+    HRV_MODEL_PINNED, HRV_MODEL_PIN_BLOCKED / HRV_MODEL_PIN_REASON and HRV_MODEL_RESTORED (the
+    exact-key restore hit). Outside the workflow none is set. Registry "error", a pin this code
+    cannot serve and a lost pinned artifact never get this far (serving_refusal)."""
     env = os.environ if env is None else env
     sha = loaded.sha256[:12]
     registry = env.get("HRV_MODEL_REGISTRY", "")
@@ -465,29 +476,56 @@ def provenance_order(row: Mapping) -> tuple:
             _as_datetime(row.get("trained_at")), str(row.get("artifact_sha256") or ""))
 
 
+def pinned_rows(rows: Iterable[Mapping]) -> list[Mapping]:
+    """Rows an operator pinned (rollback) that are not retired, whether or not this code can
+    serve them: a pin is an explicit decision and is read before any compatibility check."""
+    return [r for r in rows if not r.get("retired_at") and r.get("pinned") is True]
+
+
+def _unservable(row: Mapping, *, alignment_version: str, preprocessing_versions: tuple,
+                runtime_deps: Mapping | None, os_name: str) -> str | None:
+    """None when this runner can restore and serve the registry row, else the reason."""
+    sha = row.get("artifact_sha256")
+    if not _is_hex(sha, _HEX64) or row.get("cache_key") != cache_key(sha, os_name):
+        return "cache key for another runner or malformed row"
+    return incompatibility(row, alignment_version=alignment_version,
+                           preprocessing_versions=preprocessing_versions, runtime_deps=runtime_deps)
+
+
 def select_artifact(rows: Iterable[Mapping], *, alignment_version: str,
                     preprocessing_versions: Iterable[str], runtime_deps: Mapping | None,
                     os_name: str) -> tuple[dict | None, list[str]]:
-    """The registry row to serve (None if no row can be served) and why rows were skipped."""
+    """The registry row to serve (None if no row can be served) and why rows were skipped.
+
+    A pin decides before compatibility: when any row is pinned the newest pinned row (by
+    provenance) is THE artifact. If this code, these packages or this runner cannot serve it the
+    answer is None with the reason, never another row: otherwise an unpinned dependency upgrade
+    would silently undo an explicit rollback (the caller tells a blocked pin from an empty
+    registry with pinned_rows)."""
+    rows = list(rows)
     known = tuple(preprocessing_versions)
+    check = dict(alignment_version=alignment_version, preprocessing_versions=known,
+                 runtime_deps=runtime_deps, os_name=os_name)
+    pins = pinned_rows(rows)
+    if pins:
+        target = max(pins, key=provenance_order)
+        why = _unservable(target, **check)
+        if why:
+            sha = str(target.get("artifact_sha256") or "")[:12]
+            return None, [f"pinned artifact {sha} cannot be served by this code ({why})"]
+        return dict(target), []
     candidates, skipped = [], []
     for row in rows:
         if row.get("retired_at"):
             continue
-        sha = row.get("artifact_sha256")
-        if not _is_hex(sha, _HEX64) or row.get("cache_key") != cache_key(sha, os_name):
-            skipped.append("cache key for another runner or malformed row")
-            continue
-        why = incompatibility(row, alignment_version=alignment_version,
-                              preprocessing_versions=known, runtime_deps=runtime_deps)
+        why = _unservable(row, **check)
         if why:
             skipped.append(why)
             continue
         candidates.append(dict(row))
-    pool = [r for r in candidates if r.get("pinned") is True] or candidates
-    if not pool:
+    if not candidates:
         return None, skipped
-    return max(pool, key=provenance_order), skipped
+    return max(candidates, key=provenance_order), skipped
 
 
 def registry_row(manifest: Mapping) -> dict:
@@ -536,6 +574,12 @@ def run_problem(manifest: Mapping, env: Mapping[str, str]) -> str | None:
         return "Model not published: publishing runs only in GitHub Actions (the artifact must be in its cache)."
     if not _trained_in_this_run(manifest, env):
         return ("GUARD model_publish: the artifact on disk was not trained by this workflow run; "
+                "not published.")
+    if not _utc_iso(manifest["provenance"].get("training_commit_time")):
+        # The registry orders artifacts by training commit time first; an artifact without one
+        # would rank below every older artifact, so a newer training could never be served.
+        return ("GUARD model_publish: the artifact has no training commit time (git metadata was "
+                "not readable at training), so it cannot be ordered against other artifacts; "
                 "not published.")
     return None
 
@@ -647,8 +691,10 @@ def cmd_select(_args, db=None) -> int:
     """Picks the artifact to restore. Never fails the job itself: registry=ok (a normal answer,
     found or not), registry=not_applied (table missing: legacy restore) or registry=error (the
     registry could not be read: the workflow restores and trains nothing, and hrv_predict.py
-    refuses to forecast, see serving_refusal)."""
-    out = {"found": "false", "key": "", "sha": "", "pinned": "false", "registry": "error"}
+    refuses to forecast, see serving_refusal). pin_blocked=true: an active pin this code cannot
+    serve (pinned=true too, so nothing is trained in its place; pin_reason says why)."""
+    out = {"found": "false", "key": "", "sha": "", "pinned": "false", "pin_blocked": "false",
+           "pin_reason": "", "registry": "error"}
     try:
         import hrv_alignment as al
         from hrv_analysis import SPARSE_FILL_VERSIONS
@@ -664,6 +710,11 @@ def cmd_select(_args, db=None) -> int:
             log.info(f"Selected model artifact {chosen['artifact_sha256'][:12]} (trained "
                      f"{chosen.get('trained_at')}, data through {chosen.get('data_cutoff')}"
                      f"{', pinned' if pinned else ''}).")
+        elif pinned_rows(rows):
+            reason = " ".join((skipped or ["the pinned artifact cannot be served"])[0].split())
+            out.update(pinned="true", pin_blocked="true", pin_reason=reason)
+            log.error(f"{reason}: no model is restored or trained in its place, and the forecast "
+                      "is skipped with a failed heartbeat.")
         else:
             log.warning(f"No published model this code can serve ({len(rows)} published, "
                         f"{len(skipped)} not compatible); the missing-model training step trains one.")

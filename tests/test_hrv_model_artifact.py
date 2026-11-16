@@ -12,14 +12,17 @@ These tests pin:
      object proves nothing was unpickled): wrong checksum, pickle/manifest mismatch, another
      alignment rule, an unknown preprocessing version, another xgboost / scikit-learn release
      (exact match: not even a patch release), another numpy major or Python minor;
-  3. selection is by provenance, never by save or publish time; pinned wins, retired never;
-     the forecast fails closed when the registry cannot be read (anything but "table not applied
-     yet") and when a pinned artifact is gone from the cache (no other model is served or
-     trained in its place);
+  3. selection is by provenance, never by save or publish time; a retired row is never served;
+     a pin decides BEFORE compatibility, so a pin this code cannot serve (a dependency upgrade,
+     another alignment rule) stops the forecast instead of selecting another row; the forecast
+     also fails closed when the registry cannot be read (anything but "table not applied yet")
+     and when a pinned artifact is gone from the cache (no other model is served or trained in
+     its place);
   4. a synthetic interleaving of an old forecast run and a new training cannot put the old
      model back as the served one (the forecast workflow has no save step for a restored model,
      and the publish command refuses an artifact another run trained);
-  5. a failed or unsaved training never advances the registry, and publishing again is a no-op;
+  5. a failed or unsaved training never advances the registry (nor one with no training commit
+     time, which could not be ordered), and publishing again is a no-op;
   6. each forecast row names the artifact that produced it (hrv_predict.py and the retrain's
      own live row), with a fallback while the column does not exist yet, and a model-artifact
      heartbeat for every way a forecast can be made without the registry check;
@@ -64,7 +67,7 @@ T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 ENV_KEYS = ("GITHUB_ACTIONS", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REF", "GITHUB_SHA",
             "GITHUB_WORKFLOW", "GITHUB_JOB", "GITHUB_OUTPUT", "RUNNER_OS",
             "HRV_MODEL_REGISTRY", "HRV_MODEL_SELECTED_SHA256", "HRV_MODEL_PINNED",
-            "HRV_MODEL_RESTORED")
+            "HRV_MODEL_PIN_BLOCKED", "HRV_MODEL_PIN_REASON", "HRV_MODEL_RESTORED")
 
 
 # ── synthetic pieces ─────────────────────────────────────────────────────────────────────────
@@ -124,7 +127,8 @@ def _workspace():
 
 
 def _provenance(*, run_id="100", commit_offset_h=0, cutoff="2026-11-01", trained_offset_h=0,
-                alignment=None, preprocessing=CURRENT_FILL, deps=None, attempt="1"):
+                alignment=None, preprocessing=CURRENT_FILL, deps=None, attempt="1",
+                commit_time_known=True):
     return ma.build_provenance(
         model_version="2026-11-01_behavioral_v1", data_cutoff=cutoff, training_rows=400,
         feat_cols=["f_a", "f_b"], input_data_hash="ab" * 32,
@@ -132,7 +136,8 @@ def _provenance(*, run_id="100", commit_offset_h=0, cutoff="2026-11-01", trained
         now=T0 + timedelta(hours=trained_offset_h), env=_run_env(run_id, attempt=attempt),
         deps=deps or DEPS,
         git={"training_sha": "c" * 40,
-             "training_commit_time": (T0 + timedelta(hours=commit_offset_h)).isoformat(),
+             "training_commit_time": ((T0 + timedelta(hours=commit_offset_h)).isoformat()
+                                      if commit_time_known else None),
              "training_ref": MASTER})
 
 
@@ -481,10 +486,11 @@ def test_pinned_retired_and_incompatible_rows():
     retired = _row("3", commit_h=20, retired_at=T0.isoformat())
     assert _select([newest, retired])[0]["artifact_sha256"] == "1" * 64, "retired is never served"
     assert _select([newest, pinned, retired])[0]["artifact_sha256"] == "2" * 64, "pinned wins"
-    # a pinned row this code cannot serve falls back to the newest servable one
-    bad_pin = _row("4", commit_h=1, pinned=True, alignment_version="other_rule_v0")
-    chosen, skipped = _select([newest, bad_pin])
-    assert chosen["artifact_sha256"] == "1" * 64 and any("alignment" in s for s in skipped)
+    # a retired pin is no pin: the newest servable row is served again
+    old_pin = _row("b", commit_h=2, pinned=True, retired_at=T0.isoformat(),
+                   alignment_version="other_rule_v0")
+    assert _select([newest, old_pin])[0]["artifact_sha256"] == "1" * 64
+    assert not ma.pinned_rows([newest, old_pin]) and len(ma.pinned_rows([newest, pinned])) == 1
     incompatible = [
         _row("5", commit_h=30, preprocessing_version="unknown_fill_v9"),
         _row("6", commit_h=31, dependencies={**DEPS, "numpy": "3.0.0"}),
@@ -498,6 +504,38 @@ def test_pinned_retired_and_incompatible_rows():
     assert _select(incompatible)[0] is None
     assert _select([])[0] is None
     print("PASS: pinned beats newer, retired and incompatible rows are never served")
+
+
+def test_a_pin_decides_before_compatibility():
+    """An unpinned dependency upgrade (or another alignment rule) must not turn a rollback pin
+    into 'serve the newest other row'; the caller stops the forecast instead."""
+    newest = _row("1", commit_h=9)
+    other_pin_target = {
+        "alignment": {"alignment_version": "other_rule_v0"},
+        "xgboost release": {"dependencies": {**DEPS, "xgboost": "2.1.3"}},
+        "scikit-learn release": {"dependencies": {**DEPS, "scikit-learn": "1.5.3"}},
+        "preprocessing": {"preprocessing_version": "unknown_fill_v9"},
+        "runner": {"cache_key": ma.cache_key("4" * 64, "Windows")},
+    }
+    for label, change in other_pin_target.items():
+        bad_pin = _row("4", commit_h=1, pinned=True, **change)
+        chosen, skipped = _select([newest, bad_pin])
+        assert chosen is None, f"{label}: the pin must not fall back to another row"
+        assert len(skipped) == 1 and skipped[0].startswith("pinned artifact " + "4" * 12), skipped
+        assert ma.pinned_rows([newest, bad_pin]), "the caller can tell a blocked pin from no model"
+    # a malformed pinned row blocks too
+    chosen, skipped = _select([newest, _row("4", pinned=True, artifact_sha256="not-a-checksum")])
+    assert chosen is None and "malformed" in skipped[0]
+    # the same pin servable again (the upgrade is undone): it is served, not the newest row
+    good_pin = _row("4", commit_h=1, pinned=True)
+    assert _select([newest, good_pin])[0]["artifact_sha256"] == "4" * 64
+    # several pins: the newest by provenance is THE pin, even when an older one is servable
+    older_ok = _row("5", commit_h=1, pinned=True)
+    newer_bad = _row("6", commit_h=3, pinned=True, alignment_version="other_rule_v0")
+    chosen, skipped = _select([newest, older_ok, newer_bad])
+    assert chosen is None and skipped[0].startswith("pinned artifact " + "6" * 12)
+    assert _select([newest, older_ok, _row("7", commit_h=3, pinned=True)])[0]["artifact_sha256"] == "7" * 64
+    print("PASS: a pin this code cannot serve selects nothing; no other row takes its place")
 
 
 # ── 4: the interleaving that used to shadow a retrain ────────────────────────────────────────
@@ -528,7 +566,7 @@ def test_old_forecast_run_cannot_shadow_a_newer_training():
         out = dict(line.split("=", 1) for line in
                    Path(os.environ["GITHUB_OUTPUT"]).read_text().splitlines())
         assert out == {"found": "true", "key": a["cache_key"], "sha": a["artifact_sha256"],
-                       "pinned": "false", "registry": "ok"}
+                       "pinned": "false", "pin_blocked": "false", "pin_reason": "", "registry": "ok"}
         assert cache.restore(out["key"], ws_forecast)
 
         # ... a retrain finishes meanwhile: artifact B (newer code and data), published
@@ -605,6 +643,18 @@ def test_a_failed_or_unsaved_training_never_advances_the_registry():
         assert ma.cmd_publish(_Args("true"), db=db) == 0
         assert [r["artifact_sha256"] for r in db.registry()] == [manifest["artifact_sha256"]]
 
+    # no training commit time (git metadata unreadable): it could not be ordered against other
+    # artifacts, so it is neither cached under a key nor published
+    db4 = _FakeDb()
+    with _workspace(), _environ(**_run_env("650")):
+        ma.write_artifact(_bundle(), _provenance(run_id="650", commit_time_known=False),
+                          Path("analysis_output") / "xgboost_hrv_model.pkl")
+        assert ma.cmd_key(None, db=db4) == 1
+        assert ma.cmd_publish(_Args("true"), db=db4) == 1
+        assert db4.registry() == []
+        last = db4.beats(*ma.RETRAIN_HEARTBEAT)[-1]
+        assert last["status"] == "partial" and "no training commit time" in last["error_message"]
+
     # trained on a branch: its cache entry is not visible to master, so never published
     db2 = _FakeDb()
     with _workspace(), _environ(**_run_env("700", ref="refs/heads/feature")):
@@ -618,7 +668,7 @@ def test_a_failed_or_unsaved_training_never_advances_the_registry():
         ma.write_artifact(_bundle(), _provenance(run_id="800"), Path("analysis_output") / "xgboost_hrv_model.pkl")
         assert ma.cmd_publish(_Args("true"), db=db3) == 1
         assert db3.registry() == [] and db3.tables.get("sync_log") is None
-    print("PASS: a failed, unsaved or tampered training never reaches the registry")
+    print("PASS: a failed, unsaved, tampered or unorderable training never reaches the registry")
 
 
 def test_publishing_again_changes_nothing():
@@ -661,7 +711,8 @@ def _select_output(db) -> dict:
 def test_select_reports_the_registry_state_and_never_fails():
     db = _FakeDb()
     out = _select_output(db)                                    # empty registry: train one
-    assert out == {"found": "false", "key": "", "sha": "", "pinned": "false", "registry": "ok"}
+    assert out == {"found": "false", "key": "", "sha": "", "pinned": "false",
+                   "pin_blocked": "false", "pin_reason": "", "registry": "ok"}
 
     db.missing_tables.add(ma.REGISTRY_TABLE)                    # SQL not applied: legacy restore
     out = _select_output(db)
@@ -682,8 +733,24 @@ def test_select_reports_the_registry_state_and_never_fails():
     assert out["found"] == "true" and out["pinned"] == "false" and out["registry"] == "ok"
     db.registry()[0]["pinned"] = True
     out = _select_output(db)
-    assert out["found"] == "true" and out["pinned"] == "true"
-    print("PASS: select says ok / not_applied / error and pinned, and never fails the job")
+    assert out["found"] == "true" and out["pinned"] == "true" and out["pin_blocked"] == "false"
+
+    # a pin this code cannot serve (e.g. a dependency upgrade after the pin was set): nothing is
+    # restored, and pinned=true keeps the workflow from training a replacement
+    with tempfile.TemporaryDirectory() as tmp:
+        newer = _write(Path(tmp) / "xgboost_hrv_model.pkl", run_id="1200", commit_offset_h=48,
+                       deps=ma.dependency_versions())
+        assert ma.publish(db, newer) == "published"
+    db.registry()[0]["alignment_version"] = "other_rule_v0"
+    out = _select_output(db)
+    assert out["found"] == "false" and out["key"] == "" and out["sha"] == ""
+    assert out["pinned"] == "true" and out["pin_blocked"] == "true" and out["registry"] == "ok"
+    assert out["pin_reason"].startswith("pinned artifact ") and "alignment" in out["pin_reason"]
+    db.registry()[0]["pinned"] = False                       # unpinned: the newest servable row
+    out = _select_output(db)
+    assert out["found"] == "true" and out["sha"] == newer["artifact_sha256"]
+    assert out["pinned"] == "false" and out["pin_blocked"] == "false"
+    print("PASS: select says ok / not_applied / error / pin_blocked and never fails the job")
 
 
 def test_registry_not_applied_is_only_the_missing_table():
@@ -710,6 +777,12 @@ def test_forecast_fails_closed_without_a_checked_registry_or_a_pinned_artifact()
         ({**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "true",
           "HRV_MODEL_RESTORED": "false"}, "pinned artifact " + "a" * 12),
         ({**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "true"}, "pinned artifact"),
+        # a pin this code cannot serve: the reason is the select step's, and nothing is trained
+        ({**ok, "HRV_MODEL_PINNED": "true", "HRV_MODEL_PIN_BLOCKED": "true",
+          "HRV_MODEL_PIN_REASON": "pinned artifact " + "a" * 12 + " cannot be served by this code "
+                                  "(packages: xgboost 2.1.2 at training, 2.1.3 here)"},
+         "xgboost 2.1.2 at training"),
+        ({**ok, "HRV_MODEL_PIN_BLOCKED": "true"}, "never replaced by another model"),
     ]
     for env, fragment in cases:
         why = ma.serving_refusal(env)
@@ -719,9 +792,10 @@ def test_forecast_fails_closed_without_a_checked_registry_or_a_pinned_artifact()
         {**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "true", "HRV_MODEL_RESTORED": "true"},
         # an unpinned selected artifact that was evicted is replaced by this run's own training
         {**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "false", "HRV_MODEL_RESTORED": "false"},
+        {**ok, "HRV_MODEL_PIN_BLOCKED": "false"},
     ):
         assert ma.serving_refusal(env) is None, env
-    print("PASS: an unreadable registry or a lost pinned artifact refuses the forecast outright")
+    print("PASS: an unreadable registry, an unservable pin or a lost pinned artifact refuses the forecast outright")
 
 
 # ── 6: forecasts name their artifact ─────────────────────────────────────────────────────────
@@ -865,6 +939,16 @@ def test_each_forecast_names_the_artifact_that_made_it():
         assert stored == []
         assert beats()[-1]["status"] == "failed" and "pinned artifact" in beats()[-1]["error_message"]
         assert "never replaced" in beats()[-1]["error_message"]
+        # (e3b) a pin this code cannot serve (dependency upgrade): no forecast, whatever file is
+        # on disk, and the heartbeat carries the select step's reason
+        reason = ("pinned artifact " + sha[:12] + " cannot be served by this code "
+                  "(packages: xgboost 2.1.2 at training, 2.1.3 here)")
+        with _environ(HRV_MODEL_REGISTRY="ok", HRV_MODEL_PINNED="true", HRV_MODEL_PIN_BLOCKED="true",
+                      HRV_MODEL_PIN_REASON=reason, RUNNER_OS=OS):
+            assert _run_main(hp) == 1
+        assert stored == []
+        assert beats()[-1]["status"] == "failed" and reason in beats()[-1]["error_message"]
+        assert beats()[-1]["error_message"].startswith("GUARD model_artifact:")
         # the same pin, restored: served as selected, the heartbeat clears
         with _environ(**{**selected, "HRV_MODEL_PINNED": "true"}):
             assert _run_main(hp) == 0
@@ -949,6 +1033,7 @@ def test_forecast_workflow_never_saves_a_restored_model():
     # is gone from the cache (hrv_predict.py then refuses the forecast, see serving_refusal)
     assert "steps.select.outputs.registry != 'error'" in steps[train]["if"]
     assert "steps.select.outputs.pinned != 'true'" in steps[train]["if"]
+    assert "steps.select.outputs.pin_blocked != 'true'" in steps[train]["if"]
     assert steps[key]["if"] == "steps.self-train.outcome == 'success'"
     saves = [(i, s) for i, s in model if s["uses"].startswith("actions/cache/save@")]
     assert len(saves) == 1, "one save: the model trained in this run"
@@ -966,6 +1051,8 @@ def test_forecast_workflow_never_saves_a_restored_model():
             assert _paths(s) == MODEL_PATHS, f"same paths = same cache version: {s.get('name')}"
     env = steps[predict]["env"]
     assert env["HRV_MODEL_PINNED"] == "${{ steps.select.outputs.pinned }}"
+    assert env["HRV_MODEL_PIN_BLOCKED"] == "${{ steps.select.outputs.pin_blocked }}"
+    assert env["HRV_MODEL_PIN_REASON"] == "${{ steps.select.outputs.pin_reason }}"
     assert env["HRV_MODEL_SELECTED_SHA256"] == "${{ steps.select.outputs.sha }}"
     assert env["HRV_MODEL_RESTORED"] == "${{ steps.model-cache.outputs.cache-hit }}"
     assert env["HRV_MODEL_REGISTRY"] == "${{ steps.select.outputs.registry }}"

@@ -117,6 +117,9 @@ jobs:
         # Adds the artifact to pds.hrv_model_artifacts, which the hourly forecast reads. Runs only
         # after the whole analysis succeeded and the artifact restores from the cache; publishing
         # the same artifact again changes nothing. A failure leaves the served model unchanged
-        # and turns the HRV Retrain card partial.
+        # and turns the HRV Retrain card partial. The hard alignment guard raises and fails the
+        # run before this step; a soft guard warning (the alcohol canary: a partial heartbeat,
+        # exit 0) still publishes, because it says something about the analysis, not about this
+        # model's integrity, and the model was cached on every successful run before PIPE-08 too.
         if: steps.decide.outputs.retrain == 'true'
         run: python hrv_model_artifact.py publish --saved "${{ steps.saved.outputs.cache-hit }}"

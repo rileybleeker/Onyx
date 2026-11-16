@@ -81,7 +81,9 @@ jobs:
         # (hrv-retrain-on-backfill.yml, or the missing-model step below) adds one.
         # registry=ok | not_applied (table missing: the legacy restore below) | error (unreadable:
         # nothing is restored or trained and hrv_predict.py refuses to forecast, so a retired or
-        # unpinned model can never come back during an outage).
+        # unpinned model can never come back during an outage). A pin decides before
+        # compatibility: pin_blocked=true means the pinned artifact cannot be served by this code
+        # or these packages (pinned=true as well), so again nothing else is restored or trained.
         id: select
         run: python hrv_model_artifact.py select
 
@@ -124,10 +126,11 @@ jobs:
         # The one training path in this workflow: nothing servable was published, or the selected
         # artifact is no longer in the cache. The model trained here is saved and published below
         # exactly like the retrain workflow's. Never when the registry could not be read, and
-        # never in place of a PINNED artifact that is gone from the cache: a pin is an explicit
-        # rollback, so hrv_predict.py skips the forecast with a failed heartbeat instead.
+        # never in place of a PINNED artifact, whether it is gone from the cache or this code
+        # cannot serve it (pin_blocked): a pin is an explicit rollback, so hrv_predict.py skips
+        # the forecast with a failed heartbeat instead.
         id: self-train
-        if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == '' && steps.select.outputs.registry != 'error' && steps.select.outputs.pinned != 'true'
+        if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == '' && steps.select.outputs.registry != 'error' && steps.select.outputs.pinned != 'true' && steps.select.outputs.pin_blocked != 'true'
         run: |
           echo "Model pickle missing - running hrv_analysis.py to retrain"
           python hrv_analysis.py --skip-analysis
@@ -173,5 +176,7 @@ jobs:
           HRV_MODEL_REGISTRY: ${{ steps.select.outputs.registry }}
           HRV_MODEL_SELECTED_SHA256: ${{ steps.select.outputs.sha }}
           HRV_MODEL_PINNED: ${{ steps.select.outputs.pinned }}
+          HRV_MODEL_PIN_BLOCKED: ${{ steps.select.outputs.pin_blocked }}
+          HRV_MODEL_PIN_REASON: ${{ steps.select.outputs.pin_reason }}
           HRV_MODEL_RESTORED: ${{ steps.model-cache.outputs.cache-hit }}
         run: python hrv_predict.py --predict
