@@ -13,7 +13,9 @@
  * - Urgent (and pinned) items bypass the ordinary budget and say so (`selectQuiet`: `overBudget`, `urgentOver`).
  * - Snooze and "hide here" are display marks on this device, keyed by a hash of the id and of the obligation's
  *   `version`; a mark stops applying when its snooze ends or the circumstance changes (new message, nearer
- *   deadline, higher urgency ...). A marked item stays open: the full Today view lists it as before. An
+ *   deadline, higher urgency ...), and never outlives the item's own due time: from `resurfaceAt` (the start of a
+ *   date-only deadline's day, or DUE_LEAD_MS before a timed one) no mark applies, and an item already there cannot
+ *   be set aside (`canSetAside`). A marked item stays open: the full Today view lists it as before. An
  *   `aggregate` (a count of items Today cannot name one by one) is never set aside: hiding a count would also hide
  *   a different item that later takes the same count. A `pinned` item (today's experiment arm: opening Today
  *   reveals it, so it must be seen) is never set aside and never cut by the budget.
@@ -58,6 +60,11 @@ export interface Obligation {
   urgency: Urgency;
   /** When it is due (ms), null when it has no due time. */
   dueAt: number | null;
+  /**
+   * From this instant (ms) a snooze or "hide here" no longer sets the item aside, and it cannot be set aside again:
+   * the start of a date-only deadline's day, or DUE_LEAD_MS before a timed one. Absent / null: no due time.
+   */
+  resurfaceAt?: number | null;
   /** Why it is in its tier, in plain words. */
   reason: string;
   /** Changes when the circumstance changes materially; a snooze or "hide here" made on another version lapses. */
@@ -102,6 +109,8 @@ export interface SourceStatus {
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
+/** A mark on an item with a timed deadline (a request's expiry, an event's start) lapses this long before it. */
+export const DUE_LEAD_MS = HOUR;
 
 function ago(iso: string | null | undefined, now: Date): string | null {
   const t = iso ? Date.parse(iso) : NaN;
@@ -174,6 +183,19 @@ function endOfLocalDay(now: Date, days: number): number {
   const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, 23, 59, 59, 999);
   return d.getTime();
 }
+/** The start (00:00) of the local day `days` after `now` (0 = today). */
+function startOfLocalDay(now: Date, days: number): number {
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, 0, 0, 0, 0).getTime();
+}
+/** A "YYYY-MM-DD" date as the local day it names: whole days from `now`'s day (0 = today) and its start; null otherwise. */
+function localDay(date: string | null | undefined, now: Date): { daysLeft: number; start: number } | null {
+  const m = date ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(date) : null;
+  if (!m) return null;
+  const start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();
+  if (!Number.isFinite(start)) return null;
+  // Rounded: a day with a clock change is 23 or 25 hours long.
+  return { daysLeft: Math.round((start - startOfLocalDay(now, 0)) / (24 * HOUR)), start };
+}
 
 /** The part of an Agent Inbox card (lib/agents-api.ts) a request obligation reads. */
 export interface RequestLike {
@@ -207,6 +229,7 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
       external: false,
       urgency,
       dueAt: due,
+      resurfaceAt: due === null ? null : due - DUE_LEAD_MS,
       reason,
       // The message and everything the card says: a re-posted or edited card (same code and title, new details,
       // link or message) is a new circumstance.
@@ -217,10 +240,11 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
 }
 
 /**
- * Urgent email as Today merged it (lib/urgent-email.ts mergeUrgent: labelled threads + inbox-triage's questions,
- * each once). `emails` are the label answer's items, read for their deadline. `unreturned`: labelled threads the
- * answer counted but did not return (GET /api/urgent-email returns only the most pressing ITEMS_RETURNED), listed
- * as one aggregate so "All open items" never leaves them out without saying so.
+ * Urgent email as Today merged it BY IDENTITY ONLY (lib/urgent-email.ts mergeUrgent with `bySearch: false`:
+ * labelled threads + inbox-triage's questions, a question folded into a thread only when its link names that thread
+ * or message, never because a Gmail search's words match). `emails` are the label answer's items, read for their
+ * deadline. `unreturned`: labelled threads the answer counted but did not return (GET /api/urgent-email returns only
+ * the most pressing ITEMS_RETURNED), listed as one aggregate so "All open items" never leaves them out without saying so.
  */
 export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails: readonly EmailItemLike[], now: Date, unreturned = 0): Obligation[] {
   const byKey = new Map<string, EmailItemLike>();
@@ -245,10 +269,13 @@ export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails
       external: !item.requestHref && !!item.gmailHref,
       urgency,
       dueAt: deadline ? endOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
+      // A date-only deadline is due from the start of its day: a deadline today cannot be set aside.
+      resurfaceAt: deadline ? startOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
       reason,
       // The deadline's date, not its countdown: the next morning is not a new circumstance; crossing into a higher
-      // tier (urgency), a new message (at) or a new deadline date is.
-      version: [urgency, deadline ? deadline.label : "", item.at, item.sources.join("+")].join("|"),
+      // tier (urgency), a new message (at), a new deadline date, or a request posted on the thread (a new card
+      // code, or the first request posted again) is.
+      version: [urgency, deadline ? deadline.label : "", item.at, item.sources.join("+"), item.clear.cards.slice().sort().join(","), item.requestHref ?? ""].join("|"),
       learning: false,
     };
   });
@@ -314,6 +341,7 @@ export function calendarObligations(events: readonly CalendarEvent[], now: Date)
       external: false,
       urgency: "high",
       dueAt: start,
+      resurfaceAt: start - DUE_LEAD_MS,
       reason: `Starts in ${left < HOUR ? `${Math.max(1, Math.round(left / MIN))} min` : `${Math.round((left / HOUR) * 10) / 10} h`}${e.status === "tentative" ? " (tentative)" : ""}`,
       // What Riley acts on: a moved, renamed or relocated event is a new circumstance.
       version: [e.startAt, e.endAt ?? "", e.status, e.title, e.location ?? ""].join("|"),
@@ -329,14 +357,25 @@ const MONEY_REASON: Readonly<Record<MoneyAlert["kind"], string>> = {
   promo: "A 0% promo is ending",
   tax: "A tax payment is due",
 };
+/** The urgent reason of a money alert whose date is today or tomorrow (`when`). */
+const MONEY_URGENT_REASON: Readonly<Record<MoneyAlert["kind"], (when: string) => string>> = {
+  "low-cash": (when) => `Cash is likely to drop below your line ${when}`,
+  budget: () => "A budget is over",
+  promo: (when) => `A 0% promo ends ${when}`,
+  tax: (when) => `A tax payment is due ${when}`,
+};
 /**
  * Money alerts. They carry no id of their own, so the identity is the alert kind plus what it names (the text
  * before the first ": ": the category, card or payment), numbered when two alerts of one answer share it, so
  * they are never folded together. Amounts are left out of the version: a dollar of drift is not a new
- * circumstance, a change of severity, status or date is. `period` ("YYYY-MM"): the month a budget alert is for, in
- * its version, so a budget hidden this month comes back when it is over again next month.
+ * circumstance, a change of severity, status, date or tier is. `period` ("YYYY-MM"): the month a budget alert is
+ * for, in its version, so a budget hidden this month comes back when it is over again next month.
+ * The alert's own date (`due`: a tax payment's due date, the day a 0% promo ends, the day cash is lowest) is its
+ * deadline: today, tomorrow or already past is URGENT (shown past the budget), except a low-cash alert whose likely
+ * path stays above the line (severity medium), which keeps its ordinary tier. A mark lapses at the start of that
+ * day. An alert without a readable `due` (an answer stored before the field existed) has no deadline.
  */
-export function moneyObligations(alerts: readonly MoneyAlert[], period = ""): Obligation[] {
+export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now: Date = new Date()): Obligation[] {
   const seen = new Map<string, number>();
   return alerts.map((a) => {
     const colon = a.title.indexOf(": ");
@@ -344,6 +383,10 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = ""): Ob
     const base = `money:${a.kind}:${subject}`;
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
+    const due = localDay(a.due, now);
+    const imminent = !!due && due.daysLeft <= 1 && (a.kind !== "low-cash" || a.severity === "high");
+    const urgency: Urgency = imminent ? "urgent" : a.severity === "high" ? "high" : "normal";
+    const urgentReason = MONEY_URGENT_REASON[a.kind];
     return {
       id: n === 1 ? base : `${base}#${n}`,
       source: "money",
@@ -351,10 +394,11 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = ""): Ob
       detail: a.detail,
       href: a.href,
       external: false,
-      urgency: a.severity === "high" ? "high" : "normal",
-      dueAt: null,
-      reason: MONEY_REASON[a.kind] ?? "Money alert",
-      version: `${a.severity}|${a.title.replace(/-?\$[\d,]+(?:\.\d+)?/g, "$")}${a.kind === "budget" ? `|${period}` : ""}`,
+      urgency,
+      dueAt: due ? endOfLocalDay(now, Math.max(0, due.daysLeft)) : null,
+      resurfaceAt: due ? due.start : null,
+      reason: imminent && urgentReason ? urgentReason(due && due.daysLeft <= 0 ? "today" : "tomorrow") : MONEY_REASON[a.kind] ?? "Money alert",
+      version: `${urgency}|${a.severity}|${a.title.replace(/-?\$[\d,]+(?:\.\d+)?/g, "$")}|${due ? a.due : ""}${a.kind === "budget" ? `|${period}` : ""}`,
       learning: false,
     };
   });
@@ -378,6 +422,8 @@ export function renewalObligations(summary: RenewalSummary | null): Obligation[]
       external: false,
       urgency: r.days <= 0 ? "high" : "normal",
       dueAt: /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? new Date(`${r.date}T00:00:00`).getTime() : null,
+      // Due on its day: a renewal today cannot be set aside.
+      resurfaceAt: /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? new Date(`${r.date}T00:00:00`).getTime() : null,
       reason: r.days <= 0 ? "Renews today" : `Renews within ${summary.withinDays} days`,
       // The daily countdown is not a new circumstance; reaching the renewal day is.
       version: r.days <= 0 ? "due" : "soon",
@@ -568,11 +614,43 @@ export function markFor(o: Pick<Obligation, "version">, kind: "snooze" | "hide",
   return kind === "hide" ? { v, hidden: true, at: nowMs } : { v, until: untilMs ?? nowMs, at: nowMs };
 }
 
-/** Does this mark still set the obligation aside? Not once its snooze ended or the obligation's version changed. */
-export function markApplies(mark: AttentionMark | undefined, o: Pick<Obligation, "version">, nowMs: number): "snoozed" | "hidden" | null {
+/** The instant from which nothing may set this item aside (its due time, or the lead before it); null = none. */
+function resurfaceOf(o: Pick<Obligation, "resurfaceAt">): number | null {
+  return typeof o.resurfaceAt === "number" && Number.isFinite(o.resurfaceAt) ? o.resurfaceAt : null;
+}
+
+/**
+ * Does this mark still set the obligation aside? Not once its snooze ended, the obligation's version changed, or the
+ * obligation is due (`resurfaceAt`): a snooze or hide never keeps an item out of sight past its own due time.
+ */
+export function markApplies(mark: AttentionMark | undefined, o: Pick<Obligation, "version" | "resurfaceAt">, nowMs: number): "snoozed" | "hidden" | null {
   if (!mark || mark.v !== attentionHash(o.version)) return null;
+  const due = resurfaceOf(o);
+  if (due !== null && nowMs >= due) return null;
   if (mark.hidden) return "hidden";
   return typeof mark.until === "number" && nowMs < mark.until ? "snoozed" : null;
+}
+
+/** Can Riley snooze or hide this item now? Never a count, today's experiment arm, or an item that is already due. */
+export function canSetAside(o: Pick<Obligation, "aggregate" | "pinned" | "resurfaceAt">, nowMs: number): boolean {
+  if (o.aggregate || o.pinned) return false;
+  const due = resurfaceOf(o);
+  return due === null || nowMs < due;
+}
+
+/** Until when a snooze set now lasts: 06:00 on the next behavioral day (`snoozeUntil`), or sooner when the item is due first. */
+export function snoozeEnd(o: Pick<Obligation, "resurfaceAt">, now: Date): number {
+  const due = resurfaceOf(o);
+  const until = snoozeUntil(now);
+  return due !== null && due < until ? due : until;
+}
+
+/** When a mark on this item stops applying at the latest (the snooze end or the due time, whichever is first). */
+function markEnd(mark: AttentionMark | undefined, o: Pick<Obligation, "resurfaceAt">, state: "snoozed" | "hidden"): number | null {
+  const due = resurfaceOf(o);
+  const until = state === "snoozed" && typeof mark?.until === "number" ? mark.until : null;
+  if (until === null) return due;
+  return due !== null && due < until ? due : until;
 }
 
 /** Stored marks, checked: junk entries are dropped, never trusted. */
@@ -628,6 +706,7 @@ export interface QuietItem {
 export interface SetAside {
   item: Obligation;
   state: "snoozed" | "hidden";
+  /** When it comes back at the latest: the snooze end, or (also for a hidden item) its due time. */
   until: number | null;
 }
 export interface QuietSelection {
@@ -643,6 +722,11 @@ export interface QuietSelection {
   /** Sources that could not confirm their answer. */
   unknown: SourceStatus[];
   notConnected: SourceStatus[];
+  /**
+   * The next instant (ms) the selection changes by itself (a snooze ends, or an item becomes due and so stops being
+   * set aside or snoozable); null when none. The page renders again then.
+   */
+  nextChange: number | null;
   /**
    * Judged on obligations only. items: something to show. unknown: nothing to show and at least one source could
    * not confirm its answer: never a clear day. set_aside: nothing to show, but open obligations are snoozed,
@@ -664,11 +748,17 @@ export function selectQuiet(obligations: readonly Obligation[], sources: readonl
   const ranked = rankObligations(obligations);
   const open: Obligation[] = [];
   const setAside: SetAside[] = [];
+  let nextChange: number | null = null;
+  const later = (t: number | null) => { if (t !== null && t > opts.nowMs && (nextChange === null || t < nextChange)) nextChange = t; };
   for (const o of ranked) {
     const mark = o.aggregate || o.pinned ? undefined : opts.marks[markKey(o)];
     const state = markApplies(mark, o, opts.nowMs);
-    if (state) setAside.push({ item: o, state, until: state === "snoozed" ? mark?.until ?? null : null });
+    if (state) setAside.push({ item: o, state, until: markEnd(mark, o, state) });
     else open.push(o);
+    if (!o.aggregate && !o.pinned) {
+      later(resurfaceOf(o));
+      if (state === "snoozed" && typeof mark?.until === "number") later(mark.until);
+    }
   }
   const always = (o: Obligation) => (o.urgency === "urgent" || o.pinned === true) && !o.learning;
   const first = open.filter(always);
@@ -688,13 +778,14 @@ export function selectQuiet(obligations: readonly Obligation[], sources: readonl
     : unknown.length > 0
       ? "unknown"
       : setAsideObligations + more > 0 ? "set_aside" : "clear";
-  return { shown, learning, more, setAside, urgentOver: Math.max(0, urgent.length - budget), unknown, notConnected, verdict };
+  return { shown, learning, more, setAside, urgentOver: Math.max(0, urgent.length - budget), unknown, notConnected, nextChange, verdict };
 }
 
 export interface ListedItem {
   item: Obligation;
   /** open, or set aside on this device (still open at its source). */
   state: "open" | "snoozed" | "hidden";
+  /** When a set-aside item comes back at the latest (snooze end or due time); null when open or not known. */
   until: number | null;
 }
 /** The full list: every open obligation and learning action, ranked, each with its display state. Nothing is left out. */
@@ -702,7 +793,7 @@ export function fullList(obligations: readonly Obligation[], marks: AttentionMar
   return rankObligations(obligations).map((item) => {
     const mark = item.aggregate || item.pinned ? undefined : marks[markKey(item)];
     const state = markApplies(mark, item, nowMs);
-    return { item, state: state ?? "open", until: state === "snoozed" ? mark?.until ?? null : null };
+    return { item, state: state ?? "open", until: state ? markEnd(mark, item, state) : null };
   });
 }
 
@@ -711,7 +802,10 @@ export function fullList(obligations: readonly Obligation[], marks: AttentionMar
 export interface TodayAttentionInput {
   now: Date;
   requests: { probe: SourceProbe; items: readonly RequestLike[] };
-  /** `unreturned`: labelled threads the answer counted but did not return (its `total` minus its items). */
+  /**
+   * `items`: mergeUrgent(..., Infinity, { bySearch: false }).items (identity only). `unreturned`: labelled threads the
+   * answer counted but did not return (its `total` minus its items).
+   */
   urgentEmail: { probe: SourceProbe; items: readonly TodayUrgentItem[]; emails: readonly EmailItemLike[]; unreturned?: number };
   /** Omitted when no trial is registered or the check is not made here (the scroll's copy of Today). */
   experiment?: { probe: SourceProbe; trial: TrialLike | null };
@@ -740,7 +834,7 @@ export function todayAttention(input: TodayAttentionInput): { obligations: Oblig
     requestObligations(input.requests.items, now),
     experimentObligations(input.experiment?.trial ?? null),
     calendarObligations(input.calendar.events, now),
-    moneyObligations(input.money.alerts, input.money.period ?? ""),
+    moneyObligations(input.money.alerts, input.money.period ?? "", now),
     renewalObligations(input.renewals.summary),
     packageObligations(input.packages.summary),
     readingObligations(input.reading.overview),

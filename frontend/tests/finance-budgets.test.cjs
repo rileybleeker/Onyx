@@ -84,6 +84,10 @@ test("money alerts: low cash, promo, tax due, budget", () => {
   assert.ok(kinds.includes("tax"));
   assert.ok(kinds.includes("budget"));
   assert.equal(alerts[0].severity, "high");
+  // Each dated alert carries its own date, so Today can rank an imminent deadline as urgent (lib/today-attention.ts).
+  const due = Object.fromEntries(alerts.filter((a) => a.kind !== "budget").map((a) => [a.kind, a.due]));
+  assert.deepEqual(due, { "low-cash": "2030-06-26", promo: "2030-07-20", tax: "2030-06-20" });
+  assert.ok(alerts.filter((a) => a.kind === "budget").every((a) => a.due === undefined), "a budget has no single day");
   assert.equal(A.moneyAlerts(null, null, 0, TODAY).length, 0);
 });
 

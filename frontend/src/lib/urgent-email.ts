@@ -574,12 +574,18 @@ function emailRank(item: EmailItemLike): number {
  * Merge the label-sourced emails and the email cards of the Agent Inbox into one list,
  * each thing once: same Gmail thread (card link ↔ email thread id, same account when the
  * link names one) or same Message-ID in two mailboxes. Best first, bounded to `limit`.
+ * `bySearch` (default true, the Urgent email panel): a card whose link is a Gmail search is also
+ * folded into the one labelled email that search would find. false (Today's attention model,
+ * lib/today-attention.ts): identity only, so such a card always stays its own item; matching words
+ * never fold two obligations into one.
  */
 export function mergeUrgent(
   emails: readonly EmailItemLike[],
   cards: readonly InboxCardLike[],
   limit: number = MAX_URGENT_SHOWN,
+  opts: { bySearch?: boolean } = {},
 ): { items: TodayUrgentItem[]; total: number } {
+  const bySearch = opts.bySearch !== false;
   type Entry = { item: TodayUrgentItem; rank: number; threadId: string | null; account: string | null };
   const entries: Entry[] = [];
   const byMessageId = new Map<string, Entry>();
@@ -627,7 +633,7 @@ export function mergeUrgent(
     let match: Entry | undefined;
     if (ref?.threadId) {
       match = entries.find((x) => x.threadId === ref.threadId && (!ref.account || !x.account || x.account === ref.account));
-    } else if (ref) {
+    } else if (ref && bySearch) {
       // A Gmail search link names no thread: merge only into the ONE labelled email the search
       // would find (every word in its subject or sender name; searchMatchesEmail), from the
       // same account, received up to 7 days before the card. Two candidates = no merge.

@@ -11,6 +11,11 @@ export interface MoneyAlert {
   title: string;
   detail: string;
   href: string;
+  /**
+   * The alert's own date ("YYYY-MM-DD", ET): when cash is lowest, the 0% promo ends, or the tax payment is due.
+   * Absent for budgets (no single day) and in answers stored before it existed. Today ranks by it (lib/today-attention.ts).
+   */
+  due?: string;
 }
 
 const usd = (cents: number) => `$${Math.round(Math.abs(cents) / 100).toLocaleString("en-US")}`;
@@ -31,6 +36,7 @@ export function moneyAlerts(forecast: ForecastResult | null, budgets: BudgetsRes
         title: `Cash may drop to ${low.cents < 0 ? "-" : ""}${usd(low.cents)} around ${day(low.date)}`,
         detail: `${line > 0 ? `Below your ${usd(line)} line` : "Below $0"} on the cautious path (likely ${likelyThen < 0 ? "-" : ""}${usd(likelyThen)}). Move money or delay a payment.`,
         href: "/financials/forecast",
+        due: low.date,
       });
     }
     for (const m of forecast.milestones) {
@@ -41,12 +47,13 @@ export function moneyAlerts(forecast: ForecastResult | null, budgets: BudgetsRes
         title: `${m.label}: 0% ends ${day(m.date)}`,
         detail: `About ${usd(m.owedAtEndCents)} would still be owed, costing about ${usd(m.interestPerMonthAfterCents)} a month after.`,
         href: "/financials/forecast",
+        due: m.date,
       });
     }
     const horizon = addDays(today, 14);
     for (const l of forecast.lines) {
       if (!l.sourceId.startsWith("tax:") || l.amountCents >= 0 || l.date > horizon) continue;
-      out.push({ kind: "tax", severity: "high", title: `${l.label.replace(/ \(calculated\)$/, "")}: ${usd(l.amountCents)} due ${day(l.date)}`, detail: "Your employer does not withhold it; pay it as an estimated payment.", href: "/financials/forecast" });
+      out.push({ kind: "tax", severity: "high", title: `${l.label.replace(/ \(calculated\)$/, "")}: ${usd(l.amountCents)} due ${day(l.date)}`, detail: "Your employer does not withhold it; pay it as an estimated payment.", href: "/financials/forecast", due: l.date });
     }
   }
   if (budgets) {

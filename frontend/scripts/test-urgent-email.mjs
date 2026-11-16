@@ -595,6 +595,19 @@ await test("a #search card merges into the one labelled email holding every word
   assert.equal(mergeUrgent([old], [c]).total, 1);
 });
 
+await test("bySearch: false (Today's attention model) merges by identity only: a #search card stays its own item", () => {
+  const e = emailItem({ subject: "Invoice 42 is overdue, please pay", receivedAt: "2026-11-11T10:00:00.000Z" });
+  const c = card({}, { name: "Urgent: invoice overdue", link: SEARCH("Invoice+overdue") });
+  assert.equal(mergeUrgent([e], [c]).total, 1, "the panel still folds them (default)");
+  const out = mergeUrgent([e], [c], Infinity, { bySearch: false });
+  assert.equal(out.total, 2, "matching words alone never fold two obligations");
+  assert.deepEqual(out.items.map((i) => i.key).sort(), [`card:${c.card.code.toUpperCase()}`, `email:${e.key}`].sort());
+  assert.deepEqual(out.items.find((i) => i.key === `email:${e.key}`).sources, ["Gmail"]);
+  // A link that names the thread is the thread's identity: still one item.
+  const named = card({ messageId: 2001 }, { code: "T1", link: `https://mail.google.com/mail/?authuser=${e.account}#all/thread-f:${e.threadId}` });
+  assert.equal(mergeUrgent([e], [named], Infinity, { bySearch: false }).total, 1);
+});
+
 await test("a #search card stays separate: missing word, ambiguous, other account, wrong time window", () => {
   const link = SEARCH("Invoice+overdue");
   const c = card({}, { link });

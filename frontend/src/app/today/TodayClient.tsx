@@ -25,7 +25,7 @@ import { earlyOr } from "@/lib/early-fetch";
 import TodayOverview from "@/components/overview/TodayOverview";
 // Import-free too (bundled by name in the same test): the attention model (PROD-T04) and the quiet view settings,
 // snooze / hide marks and row widths (PROD-T05).
-import { MAX_BUDGET, MIN_BUDGET, SOURCE_LABEL, URGENCY_LABEL, fullList, markFor, markKey, parseMarks, pruneMarks, selectQuiet, snoozeUntil, syncLateness, todayAttention,
+import { MAX_BUDGET, MIN_BUDGET, SOURCE_LABEL, URGENCY_LABEL, canSetAside, fullList, markFor, markKey, parseMarks, pruneMarks, selectQuiet, snoozeEnd, syncLateness, todayAttention,
   type AttentionMark, type Obligation, type SourceProbe, type SourceStatus } from "@/lib/today-attention";
 import { adoptQuiet, lifeLayout, pushQuiet, quietBootScript, quietUnsent, readMarks, readQuiet, removeQuietBoot, serverQuiet, setQuiet, subscribeQuiet, syncQuiet,
   writeMarks, type QuietSettings } from "@/lib/today-view";
@@ -238,6 +238,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const [quietNote, setQuietNote] = useState("");
   const [quietSave, setQuietSave] = useState<"idle" | "saving" | "failed">("idle");
   const quietHeading = useRef<HTMLHeadingElement>(null);
+  // Bumped when a snooze ends or an item becomes due, so the quiet view renders again on time (no request).
+  const [, setLapseTick] = useState(0);
   const load = useCallback(() => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -495,7 +497,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
-  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, "reading"]
+  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, "reading", "check-in"]
     .filter((id): id is string => id !== null);
   const renderedParts = TODAY_HEAD_PARTS.concat(experiment.state === "error" || trial ? ["experiment"] : [], TODAY_MID_PARTS, lifeParts);
   const lifeW = lifeLayout(usePartOrder("/today", renderedParts), lifeParts);
@@ -524,7 +526,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     requests: { probe: probe(inbox, "agents"), items: requests },
     urgentEmail: {
       probe: probe(urgent, "urgent-email", { connected: !(urgent.state === "ready" && urgent.value.status === "not_connected"), syncLate: syncStale, syncAt: lastSync?.at ?? null, partial: inbox.state === "error" }),
-      items: allUrgent,
+      // Merged by identity only (same thread or message): a request whose Gmail search merely matches an email's
+      // words stays its own obligation here (the Urgent email panel still shows them together).
+      items: mergeUrgent(emailItems, emailCards, Infinity, { bySearch: false }).items,
       emails: emailItems,
       unreturned: email ? Math.max(0, email.total - email.items.length) : 0,
     },
@@ -544,9 +548,23 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   }) : null;
   const selection = attention ? selectQuiet(attention.obligations, attention.sources, { budget: quiet.budget, learning: quiet.learning, marks, nowMs }) : null;
   const listed = attention ? fullList(attention.obligations, marks, nowMs) : [];
+  // Render again when the selection changes by itself (a snooze ends, an item becomes due): a set-aside item comes
+  // back on time even while Today stays open between refreshes. Only a render: nothing is read or written.
+  const nextChange = selection?.nextChange ?? null;
+  useEffect(() => {
+    if (nextChange === null) return undefined;
+    const timer = setTimeout(() => setLapseTick((n) => n + 1), Math.min(Math.max(0, nextChange - Date.now()) + 250, 6 * 3_600_000));
+    return () => clearTimeout(timer);
+  }, [nextChange]);
   const statusOf = new Map<string, SourceStatus>((attention?.sources ?? []).map((st) => [st.source, st] as const));
   const sourceList = (list: SourceStatus[]) => list.map((st) => `${st.label} (${st.note})`).join("; ");
-  const clockTime = (t: number | null) => (t ? new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "later");
+  // A time on another day than today names the day too ("Wed 6:00 AM").
+  const clockTime = (t: number | null) => {
+    if (!t) return "later";
+    const d = new Date(t);
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return localDate(d) === todayDate ? time : `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
+  };
   // A settings change shows at once and is stored under the UI preference today.quiet (never on open).
   function changeQuiet(next: QuietSettings) {
     setQuietSave("saving");
@@ -556,14 +574,21 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     setQuietSave("saving");
     void pushQuiet().then((ok) => setQuietSave(ok ? "idle" : "failed"));
   }
-  // Snooze / hide: display only, on this device. The item stays open at its source and in All open items.
+  // Snooze / hide: display only, on this device. The item stays open at its source and in All open items. Never past
+  // its own due time: a snooze ends by then, a hide lapses then, and an item already due cannot be set aside.
   function setAside(o: Obligation, kind: "snooze" | "hide") {
     const at = Date.now();
-    const until = kind === "snooze" ? snoozeUntil(new Date(at)) : undefined;
+    if (!canSetAside(o, at)) {
+      setQuietNote(`${o.title} is due now, so it stays on the list.`);
+      quietHeading.current?.focus();
+      return;
+    }
+    const until = kind === "snooze" ? snoozeEnd(o, new Date(at)) : undefined;
     const next = pruneMarks({ ...marks, [markKey(o)]: markFor(o, kind, at, until) }, at);
     setMarks(next);
     const kept = writeMarks(next);
-    setQuietNote(`${kind === "snooze" ? `Snoozed until ${clockTime(until ?? null)}` : "Hidden here until it changes"}. Still open, and listed under All open items.${kept ? "" : " This device couldn't keep that, so it comes back when Today reloads."}`);
+    const back = o.resurfaceAt ? `, back by ${clockTime(o.resurfaceAt)} when it is due` : "";
+    setQuietNote(`${kind === "snooze" ? `Snoozed until ${clockTime(until ?? null)}` : `Hidden here until it changes${back}`}. Still open, and listed under All open items.${kept ? "" : " This device couldn't keep that, so it comes back when Today reloads."}`);
     quietHeading.current?.focus();
   }
   function showAgain(o: Obligation) {
@@ -592,11 +617,11 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       <div className="min-w-0 flex-1">
         {quietMeta(o)}
         <p className="mt-1">{itemLink(o)}</p>
-        <p className="mt-1 break-words text-xs text-text-secondary">Why: {o.reason}{overBudget ? (o.pinned ? ". Today's instruction, so it is always shown" : ". Urgent, so it is shown past your number") : ""}</p>
+        <p className="mt-1 break-words text-xs text-text-secondary">Why: {o.reason}{overBudget ? (o.pinned ? ". Today's instruction, so it is always shown" : ". Urgent, so it is shown past your number") : ""}{!o.aggregate && !o.pinned && !canSetAside(o, nowMs) ? ". Due now, so it can't be snoozed or hidden" : ""}</p>
         {o.detail && <p className="mt-0.5 break-words text-xs text-text-secondary">{o.detail}</p>}
       </div>
-      {!o.aggregate && !o.pinned && <div className="flex shrink-0 flex-col items-end sm:flex-row sm:items-center">
-        <button type="button" onClick={() => setAside(o, "snooze")} aria-label={`Snooze until tomorrow: ${o.title}`} className={quietAction}>Snooze</button>
+      {canSetAside(o, nowMs) && <div className="flex shrink-0 flex-col items-end sm:flex-row sm:items-center">
+        <button type="button" onClick={() => setAside(o, "snooze")} aria-label={`Snooze until ${clockTime(snoozeEnd(o, now))}: ${o.title}`} className={quietAction}>Snooze</button>
         <button type="button" onClick={() => setAside(o, "hide")} aria-label={`Hide here: ${o.title}`} className={quietAction}>Hide</button>
       </div>}
     </li>;
@@ -657,7 +682,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
                 <div className="min-w-0 flex-1">
                   {quietMeta(item)}
                   <p className="mt-1">{itemLink(item)}</p>
-                  <p className="mt-1 break-words text-xs text-text-secondary">{state === "snoozed" ? `Snoozed until ${clockTime(until)}. ` : state === "hidden" ? "Hidden here until it changes. " : ""}{item.learning ? "Optional. " : ""}Why: {item.reason}</p>
+                  <p className="mt-1 break-words text-xs text-text-secondary">{state === "snoozed" ? `Snoozed until ${clockTime(until)}. ` : state === "hidden" ? `Hidden here until it changes${until ? `, back by ${clockTime(until)} when it is due` : ""}. ` : ""}{item.learning ? "Optional. " : ""}Why: {item.reason}</p>
                 </div>
                 {state !== "open" && <button type="button" onClick={() => showAgain(item)} aria-label={`Show again: ${item.title}`} className={quietAction}>Show again</button>}
               </li>)}
@@ -932,6 +957,14 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
           <p className="mt-1 text-xs text-text-secondary">Recorded progress may lag your latest reading.</p>
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>
+      </section>
+      </Part>
+      <Part id="check-in" title="A moment to check in" width={lifeWidth("check-in")}>
+      <section className={panelStyle} aria-labelledby="checkin-heading">
+        <div className="flex items-center gap-2"><ClipboardCheck aria-hidden="true" className={iconStyle} />
+          <h3 id="checkin-heading" className={titleStyle}>A moment to check in</h3></div>
+        <p className="mt-3 text-sm text-text-secondary">Start or continue your check-in. Answer what you know; leave the rest blank.</p>
+        <Link href="/log#log-part-check-in" className={`${linkStyle} mt-4 inline-block`}>Open check-in</Link>
       </section>
       </Part>
       </PartGrid>

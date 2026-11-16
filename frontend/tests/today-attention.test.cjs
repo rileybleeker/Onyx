@@ -412,3 +412,93 @@ test("versions: a budget alert is per month, a calendar event follows what it sa
   assert.deepEqual(ren.map((o) => o.id), ["renewals:Synthetic plan:2030-03-06", "renewals:Synthetic plan:2030-03-06#2"], "same name and date: still two");
   assert.equal(A.collectObligations([ren]).length, 2);
 });
+
+test("due time: a snooze or hide never keeps an item out of sight past its own due time", () => {
+  const req = (code, expiresMs) => ({ thread: "fixture-agent", messageId: 7, created_at: "2030-03-05 12:00:00", card: { code, agent: "Planning assistant", name: "Synthetic choice " + code, expires: iso(expiresMs), updated: false } });
+  // Expires in 2 h (urgent): a snooze ends DUE_LEAD_MS before the expiry, not at 06:00 tomorrow.
+  const soon = A.requestObligations([req("d1", 2 * H)], NOW)[0];
+  assert.equal(soon.urgency, "urgent");
+  assert.equal(A.canSetAside(soon, MS), true);
+  assert.equal(A.snoozeEnd(soon, NOW), MS + 2 * H - A.DUE_LEAD_MS);
+  const snooze = { [A.markKey(soon)]: A.markFor(soon, "snooze", MS, A.snoozeEnd(soon, NOW)) };
+  assert.equal(A.markApplies(snooze[A.markKey(soon)], soon, MS + H - 1), "snoozed");
+  assert.equal(A.markApplies(snooze[A.markKey(soon)], soon, MS + H), null, "back before it expires");
+  // A hide lapses at the same instant, and so does a snooze stored with a later end.
+  const hide = { [A.markKey(soon)]: A.markFor(soon, "hide", MS) };
+  assert.equal(A.markApplies(hide[A.markKey(soon)], soon, MS + H - 1), "hidden");
+  assert.equal(A.markApplies(hide[A.markKey(soon)], soon, MS + H), null);
+  const late = { [A.markKey(soon)]: A.markFor(soon, "snooze", MS, A.snoozeUntil(NOW)) };
+  assert.equal(A.markApplies(late[A.markKey(soon)], soon, MS + H), null, "a snooze from before the cap still ends at the due time");
+  assert.deepEqual(A.fullList([soon], hide, MS).map((l) => [l.state, l.until]), [["hidden", MS + H]], "the full list says when it comes back");
+  const sel = quiet([soon], [], { marks: hide });
+  assert.deepEqual(sel.setAside.map((s) => [s.state, s.until]), [["hidden", MS + H]]);
+  assert.equal(sel.nextChange, MS + H, "the page renders again when it is due");
+  assert.deepEqual(quiet([soon], [], { marks: hide, nowMs: MS + H }).shown.map((s) => s.item.id), [soon.id]);
+  // Expires in 30 min: already inside the lead, so it cannot be set aside and an old mark does not apply.
+  const now30 = A.requestObligations([req("d2", 30 * 60_000)], NOW)[0];
+  assert.equal(A.canSetAside(now30, MS), false);
+  assert.equal(A.markApplies(A.markFor(now30, "hide", MS - H), now30, MS), null);
+  // An email whose deadline is today is due now; one due tomorrow snoozes until the start of that day at the latest.
+  const item = (key) => ({ key, sources: ["Gmail"], sourceDetail: "Gmail", title: "Synthetic " + key, from: null, reasons: [], nextStep: "Reply", at: iso(-H), atVerb: "Received", gmailHref: null, requestHref: null, clear: { cards: [], emails: [] } });
+  const email = (key, daysLeft) => ({ key, threadId: "1", messageId: "m" + key, account: "owner@example.com", from: "x", subject: "s", receivedAt: iso(-H), labels: ["Agent/Deadline"], deadline: { daysLeft, label: "Synthetic day " + daysLeft }, reasons: [], nextStep: "x", href: null });
+  const [today, tomorrow] = A.urgentEmailObligations([item("email:t0"), item("email:t1")], [email("t0", 0), email("t1", 1)], NOW);
+  assert.equal(A.canSetAside(today, MS), false, "a deadline today cannot be snoozed or hidden");
+  assert.equal(A.markApplies(A.markFor(today, "hide", MS - 24 * H), today, MS), null, "nor stay hidden from yesterday");
+  assert.equal(A.snoozeEnd(tomorrow, NOW), new Date(2030, 2, 6, 0, 0, 0).getTime(), "back at the start of the deadline day, before 06:00");
+  // A calendar event: back DUE_LEAD_MS before it starts; inside that, it stays.
+  const ev = (key, startMs) => ({ key, title: "Synthetic " + key, allDay: false, startAt: iso(startMs), endAt: iso(startMs + H), startDate: "2030-03-05", endDate: "2030-03-05", calendar: "main", account: "acct", location: null, status: "confirmed", recurring: false });
+  const [in90, in45] = A.calendarObligations([ev("e90", 90 * 60_000), ev("e45", 45 * 60_000)], NOW);
+  assert.equal(A.snoozeEnd(in90, NOW), MS + 30 * 60_000);
+  assert.equal(A.canSetAside(in45, MS), false);
+  // No due time: the ordinary snooze, and nothing to wait for.
+  const plain = base({ id: "agents:P1" });
+  assert.equal(A.snoozeEnd(plain, NOW), A.snoozeUntil(NOW));
+  assert.equal(A.canSetAside(plain, MS), true);
+  assert.equal(quiet([plain], []).nextChange, null);
+});
+
+test("money: an alert dated today or tomorrow is urgent and bypasses the budget", () => {
+  const alert = (kind, due, severity = "high", title = `Synthetic ${kind}: due soon`) => ({ kind, severity, title, detail: "Synthetic.", href: "/financials/forecast", ...(due ? { due } : {}) });
+  const out = A.moneyObligations([
+    alert("tax", "2030-03-06"),
+    alert("tax", "2030-03-05", "high", "Synthetic other tax: due today"),
+    alert("tax", "2030-03-10", "high", "Synthetic later tax: due later"),
+    alert("promo", "2030-03-06", "medium"),
+    alert("low-cash", "2030-03-06", "medium"),
+    alert("low-cash", "2030-03-06", "high", "Synthetic cash: likely below the line"),
+    alert("tax", null, "high", "Synthetic undated tax: stored before the field"),
+  ], "2030-03", NOW);
+  assert.deepEqual(out.map((o) => o.urgency), ["urgent", "urgent", "high", "urgent", "normal", "urgent", "high"]);
+  assert.deepEqual([out[0].reason, out[1].reason, out[3].reason, out[5].reason], ["A tax payment is due tomorrow", "A tax payment is due today", "A 0% promo ends tomorrow", "Cash is likely to drop below your line tomorrow"]);
+  assert.equal(out[0].dueAt, new Date(2030, 2, 6, 23, 59, 59, 999).getTime(), "ranked by the end of its day, like an email deadline");
+  assert.equal(out[0].resurfaceAt, new Date(2030, 2, 6, 0, 0, 0).getTime());
+  assert.equal(A.canSetAside(out[1], MS), false, "due today: cannot be set aside");
+  assert.equal(out[6].dueAt, null, "no readable date: no deadline (as before)");
+  // Crossing into the urgent tier is a new circumstance: a mark made two days before lapses.
+  const tax = alert("tax", "2030-03-07");
+  const before = A.moneyObligations([tax], "", NOW)[0];
+  const after = A.moneyObligations([tax], "", new Date(2030, 2, 6, 9, 0, 0))[0];
+  assert.deepEqual([before.urgency, after.urgency], ["high", "urgent"]);
+  assert.notEqual(before.version, after.version);
+  // Budget 1 with two ordinary items: the tax payment due tomorrow is still shown, first.
+  const list = [base({ id: "agents:N1", urgency: "high" }), base({ id: "agents:N2" }), out[0]];
+  const sel = quiet(list, [], { budget: 1 });
+  assert.deepEqual(sel.shown.map((s) => s.item.id), [out[0].id]);
+  assert.equal(sel.more, 2);
+});
+
+test("urgent email: a request posted on a merged thread is a new circumstance; codes in any order are the same one", () => {
+  const item = (cards, requestHref = null) => ({ key: "email:t1", sources: cards.length ? ["Gmail", "Agent Inbox"] : ["Gmail"], sourceDetail: "Gmail", title: "Synthetic subject", from: null, reasons: [], nextStep: "Reply", at: iso(-H), atVerb: "Received", gmailHref: null, requestHref, clear: { cards, emails: [] } });
+  const v = (it) => A.urgentEmailObligations([it], [], NOW)[0].version;
+  const one = v(item(["E1"], "/agents?t=inbox-triage#m1"));
+  assert.notEqual(v(item([])), one, "the first request on the thread");
+  assert.notEqual(v(item(["E1", "E2"], "/agents?t=inbox-triage#m1")), one, "a second request on the same thread");
+  assert.equal(v(item(["E2", "E1"], "/agents?t=inbox-triage#m1")), v(item(["E1", "E2"], "/agents?t=inbox-triage#m1")));
+  assert.notEqual(v(item(["E1"], "/agents?t=inbox-triage#m9")), one, "the request posted again");
+  // A hide made before the new request no longer applies.
+  const hidden = A.urgentEmailObligations([item(["E1"], "/agents?t=inbox-triage#m1")], [], NOW)[0];
+  const marks = { [A.markKey(hidden)]: A.markFor(hidden, "hide", MS) };
+  const next = A.urgentEmailObligations([item(["E1", "E2"], "/agents?t=inbox-triage#m1")], [], NOW)[0];
+  assert.equal(next.id, hidden.id);
+  assert.equal(A.markApplies(marks[A.markKey(next)], next, MS), null);
+});

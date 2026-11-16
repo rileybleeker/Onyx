@@ -132,7 +132,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert.equal(await page.getByRole('link', { name: 'Continue reading' }).getAttribute('href'), '/reading');
         assert.equal(await page.getByRole('link', { name: 'Start your check-in' }).getAttribute('href'), '/log', 'the one primary action opens Log');
         assert.equal(await page.getByRole('link', { name: /^Habit/ }).getAttribute('href'), '/log#log-part-check-in');
-        assert.equal(await page.getByRole('link', { name: 'Open check-in' }).count(), 0, 'the card that repeated the primary action is gone');
+        assert.equal(await page.getByRole('link', { name: 'Open check-in' }).getAttribute('href'), '/log#log-part-check-in', 'the "A moment to check in" card stays');
         assert(await page.getByText('3 of 12 chapters recorded.').isVisible());
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         await page.setViewportSize({ width: 1440, height: 1000 });
@@ -516,7 +516,9 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         // with the full list one tap away; Snooze / Hide are display marks that never close anything.
         page = await setup('email-cards', 390, false, 'items', 'active');
         await settled(page);
-        const quietPanel = page.locator('section[aria-labelledby="quiet-heading"]');
+        // A locator belongs to one page: made again after every setup() (an older one still points at a closed page).
+        const quietOf = (p) => p.locator('section[aria-labelledby="quiet-heading"]');
+        let quietPanel = quietOf(page);
         assert.equal(await quietPanel.count(), 0, 'off by default');
         assert(await page.locator('section[aria-labelledby="requests-heading"]').isVisible(), 'the full page is unchanged while off');
         assert.equal(await page.getByRole('button', { name: 'Quiet view' }).getAttribute('aria-pressed'), 'false');
@@ -559,7 +561,8 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await quietPanel.getByText('1 urgent item is shown past your 1.').isVisible());
         // Snooze: leaves the list, stays open in All open items, comes back with Show again. Nothing is sent anywhere.
         const before = await page.evaluate(() => [window.dismissCalls.length, window.clearCalls.length, window.quietPuts.length]);
-        await quietPanel.getByRole('button', { name: 'Snooze until tomorrow: Synthetic labelled email 1' }).click();
+        // Email 1's deadline is tomorrow, so its snooze ends by the start of that day (never past its own due time).
+        await quietPanel.getByRole('button', { name: /^Snooze until .+: Synthetic labelled email 1$/ }).click();
         assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.id), 'quiet-heading', 'focus moves to the list heading, not the page top');
         assert(await quietPanel.getByText(/^Snoozed until .+\. Still open, and listed under All open items\./).isVisible());
         assert.equal(await priorities.getByText('Synthetic labelled email 1').count(), 0);
@@ -589,6 +592,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await close(page);
         // Nothing open and every source answered: a clear day. A source that failed: not an all-clear.
         page = await setup('empty', 390, false, 'none');
+        quietPanel = quietOf(page);
         await settled(page);
         // A full load with the quiet view on: the pre-paint style (run before React, here on a device copy that says
         // on) hides the full page and shows the quiet slot, against the compiled CSS (Tailwind's [hidden] rule
@@ -607,6 +611,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await quietPanel.getByText('Nothing needs you right now. Every source answered.').isVisible());
         await close(page);
         page = await setup('empty', 390, false, 'error');
+        quietPanel = quietOf(page);
         await settled(page);
         await page.getByRole('button', { name: 'Quiet view' }).click();
         await quietPanel.waitFor();
@@ -616,6 +621,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await close(page);
         // A label sync that never reported a run: the answer is not confirmed either.
         page = await setup('empty', 390, false, 'never_synced');
+        quietPanel = quietOf(page);
         await settled(page);
         await page.getByRole('button', { name: 'Quiet view' }).click();
         await quietPanel.waitFor();
@@ -625,6 +631,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await close(page);
         // A failed save stays on this device and says so; Retry (Riley's tap) sends it.
         page = await setup('empty', 390, false, 'none');
+        quietPanel = quietOf(page);
         await settled(page);
         await page.evaluate(() => { window.quietPutMode = 'error'; });
         await page.getByRole('button', { name: 'Quiet view' }).click();
