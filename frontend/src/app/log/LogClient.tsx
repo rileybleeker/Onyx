@@ -44,11 +44,12 @@ const Weight = dynamic(() => import("./sections/Weight"), { ssr: false, loading:
 const Reading = dynamic(() => import("./sections/Reading"), { ssr: false, loading: () => <SectionSkeleton section="reading" /> });
 
 /**
- * The top of a part: `/log#log-part-<id>` (Today's quick links) and the Say it box's "go to" buttons land here. Clears
- * the fixed phone header.
+ * The top of a part: `/log#log-part-<id>` (Today's quick links) and the Say it box's "go to" buttons land here. On a
+ * phone the page's scroll padding (globals.css: safe area + 3.5rem) already clears the fixed header; the 0.75rem
+ * margin keeps the landing spot where it was (safe area + 4.25rem below the top).
  */
 function Anchor({ part }: { part: LogPartId }) {
-  return <span id={logAnchorId(part)} aria-hidden="true" className="block h-0 scroll-mt-[calc(env(safe-area-inset-top)+4.25rem)] md:scroll-mt-6" />;
+  return <span id={logAnchorId(part)} aria-hidden="true" className="block h-0 scroll-mt-3 md:scroll-mt-6" />;
 }
 
 export default function LogClient({ headingTestId = "page-heading" }: { headingTestId?: string }) {

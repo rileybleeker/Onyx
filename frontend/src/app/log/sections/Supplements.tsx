@@ -235,8 +235,9 @@ const pill =
   "inline-flex max-w-full min-h-11 items-center gap-1.5 rounded-control border px-3 text-left text-[13px] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent";
 const pillOn = "border-accent bg-accent/15 text-text-primary";
 const pillOff = "border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-hover";
+// Focus shows the accent border, as on Weight and Reading (a grey border change was too faint to see).
 const input =
-  "min-h-11 rounded-control border border-border-subtle bg-transparent px-3 text-[14px] text-text-primary placeholder:text-text-disabled focus:outline-none focus:border-border-emphasis";
+  "min-h-11 rounded-control border border-border-subtle bg-transparent px-3 text-[14px] text-text-primary placeholder:text-text-disabled focus:outline-none focus:border-accent/60";
 
 export default function SupplementsSection() {
   // Painted from the memory cache on the first render (the warm-up and other screens fill it); same rules as the

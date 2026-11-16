@@ -281,7 +281,8 @@ export default function MobileNav() {
       >
         <div className="px-5 py-5 border-b border-border-subtle flex items-center justify-between pt-[max(1.25rem,env(safe-area-inset-top))]">
           <div>
-            <h1 className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+            {/* The wordmark, not a heading: the page's own title is its one h1 (the dialog is named by aria-label). */}
+            <p className="flex items-center gap-2 text-base font-semibold text-text-primary tracking-tight"><img src="/icons/logo-mark-64.png?v=4" width={26} height={26} alt="" aria-hidden="true" className="shrink-0" />Onyx</p>
             <p className="text-[11px] text-text-tertiary mt-0.5 font-mono">Personal OS</p>
           </div>
           <button

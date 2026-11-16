@@ -1,11 +1,23 @@
 import { startPersonalize } from "@/lib/personalize-registry";
 
+/** The control that started the current Personalize session (focus goes back to it when the banner closes). */
+let opener: HTMLElement | null = null;
+
+export function personalizeOpener(): HTMLElement | null {
+  return opener;
+}
+
 /**
  * "Personalize" from the sidebar, the phone drawer or the command palette, on any page: the page's own parts when
  * it has some, otherwise the app-wide arrangement (side panel order, which the continuous scroll follows). The
  * code for that loads only now.
  */
 export function personalizeNow(): "page" | "app" {
+  // Read before the session starts: the Personalize button turns disabled then, which takes focus off it.
+  if (typeof document !== "undefined") {
+    const active = document.activeElement;
+    opener = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
   if (startPersonalize()) return "page";
   void import("./app-session").then((m) => m.startAppSession()).catch((e: unknown) => logFailure("start", e));
   return "app";

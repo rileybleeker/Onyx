@@ -49,6 +49,8 @@ import { clearAndEnd, editingSession, endEdit, subscribe, updateDraftFor } from 
 import { AREAS_KEY } from "@/lib/nav-areas";
 import type { GridApi } from "./PartGrid";
 import { announce, setSpeaker } from "./editor-shared";
+import { createBannerHost, returnFocusTarget } from "./banner-focus";
+import { personalizeOpener } from "./start";
 
 export { SidebarArranger, DrawerArranger } from "./NavArranger";
 
@@ -862,23 +864,56 @@ export function Banner() {
     return () => setSpeaker(null);
   }, []);
 
-  // Room for the banner above the page, as long as it is open.
+  // The banner's host is the first child of <body>, so the banner comes first in the Tab order (banner-focus.ts).
+  const [host, setHost] = useState<HTMLElement | null>(null);
+  const isOpen = session !== null;
   useEffect(() => {
-    const el = ref.current;
-    const body = document.body;
-    body.classList.add("pz-editing");
-    const size = () => body.style.setProperty("--pz-banner-h", `${el?.offsetHeight ?? 0}px`);
-    size();
-    const ro = typeof ResizeObserver === "function" && el ? new ResizeObserver(size) : null;
-    if (el) ro?.observe(el);
-    return () => {
-      ro?.disconnect();
-      body.classList.remove("pz-editing");
-      body.style.removeProperty("--pz-banner-h");
-    };
+    const el = createBannerHost(document);
+    setHost(el);
+    return () => el.remove();
   }, []);
 
-  if (!session) return null;
+  // Room for the banner above the page, as long as it is open. The height is set on <html>: <body> inherits it for
+  // its padding, and the phone's scroll padding (globals.css) adds it so a focused control never sits under the banner.
+  useEffect(() => {
+    const el = ref.current;
+    if (!host || !el) return;
+    const root = document.documentElement;
+    document.body.classList.add("pz-editing");
+    const size = () => root.style.setProperty("--pz-banner-h", `${el.offsetHeight}px`);
+    size();
+    const ro = typeof ResizeObserver === "function" ? new ResizeObserver(size) : null;
+    ro?.observe(el);
+    return () => {
+      ro?.disconnect();
+      document.body.classList.remove("pz-editing");
+      root.style.removeProperty("--pz-banner-h");
+    };
+  }, [host, isOpen]);
+
+  // Keyboard: the banner takes focus when it opens and gives it back when it closes (banner-focus.ts). After the
+  // commit's own effects (the phone drawer that held Personalize puts focus on its More tab while it closes).
+  useEffect(() => {
+    const el = ref.current;
+    if (!host || !el) return;
+    let before: Element | null = null;
+    const raf = requestAnimationFrame(() => {
+      before = document.activeElement === document.body ? null : document.activeElement;
+      el.focus({ preventScroll: true });
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      const candidates = [personalizeOpener(), before];
+      // The session has ended: wait one frame for the Personalize button to be enabled again.
+      requestAnimationFrame(() => {
+        const active = document.activeElement;
+        if (active && active !== document.body && active.isConnected) return; // Riley has already moved on
+        returnFocusTarget(candidates)?.focus({ preventScroll: true });
+      });
+    };
+  }, [host, isOpen]);
+
+  if (!session || !host) return null;
   const pageTitle = session.title;
 
   const addItems = (): MenuItem[] =>
@@ -893,7 +928,7 @@ export function Banner() {
     }));
 
   return createPortal(
-    <div ref={ref} role="region" aria-label={`Personalizing ${pageTitle}`} className="pz-banner">
+    <div ref={ref} role="region" aria-label={`Personalizing ${pageTitle}`} tabIndex={-1} className="pz-banner outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-6">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <Settings2 className="h-4 w-4 shrink-0 text-accent" strokeWidth={1.75} aria-hidden />
@@ -961,7 +996,7 @@ export function Banner() {
         {message}
       </p>
     </div>,
-    document.body,
+    host,
   );
 }
 

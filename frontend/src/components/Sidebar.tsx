@@ -24,6 +24,25 @@ const NAV_BOOT = navBootScript(NAV_SECTIONS);
 const noPrefs = () => null;
 const none = () => null;
 
+/**
+ * Where "Skip to page content" puts focus: the opened (routed) page's title, else that page, else <main>. The
+ * routed page is the continuous scroll's `div[data-feed-route]`; the pages around it are <section>s.
+ */
+export function pageContentTarget(doc: Pick<Document, "querySelector">): HTMLElement | null {
+  const page = doc.querySelector<HTMLElement>("[data-feed-root] > div[data-feed-route]") ?? doc.querySelector<HTMLElement>("main");
+  if (!page) return null;
+  return page.querySelector<HTMLElement>('[data-testid="page-heading"]') ?? page;
+}
+
+function skipToPage(event: React.MouseEvent<HTMLAnchorElement>) {
+  const target = pageContentTarget(document);
+  if (!target) return;
+  event.preventDefault();
+  if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+  target.focus({ preventScroll: true });
+  target.scrollIntoView({ block: "start" });
+}
+
 export default function Sidebar() {
   // The page in view: the routed page, or the page the continuous scroll has reached ("/" counts as Today).
   const current = useActiveRoute();
@@ -94,8 +113,18 @@ export default function Sidebar() {
   return (
     <aside className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-sunken border-r border-border-subtle flex flex-col max-md:hidden">
       <script dangerouslySetInnerHTML={{ __html: NAV_BOOT }} />
+      {/* First in the Tab order: past the side panel straight to the opened page (the continuous scroll puts the
+          previous page above it, so plain Tab from here walked through that whole page first). */}
+      <a
+        href="#page-content"
+        onClick={skipToPage}
+        className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[60] focus:rounded-control focus:bg-accent focus:px-3 focus:py-2 focus:text-[13px] focus:font-semibold focus:text-on-accent"
+      >
+        Skip to page content
+      </a>
       <div className="shrink-0 px-5 py-5 border-b border-border-subtle">
-        <h1 className="flex items-center gap-2 text-[20px] font-bold lowercase leading-none tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={30} height={30} alt="" aria-hidden="true" className="shrink-0" />Onyx</h1>
+        {/* The wordmark, not a heading: each page's own title is its one h1. */}
+        <p className="flex items-center gap-2 text-[20px] font-bold lowercase leading-none tracking-[0.01em] text-text-primary"><img src="/icons/logo-mark-64.png?v=4" width={30} height={30} alt="" aria-hidden="true" className="shrink-0" />Onyx</p>
         <p className="text-[11px] text-text-tertiary mt-1.5 font-mono">Personal OS</p>
       </div>
 
