@@ -21,7 +21,17 @@ import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist, CreatePlaylistResult } from "@/lib/spotify-server";
-import { chooseModel, effortConfig, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
+import {
+  callWithCountedRetries,
+  chooseModel,
+  effortConfig,
+  isRetryableStatus,
+  logPilotObservation,
+  MODEL_CALL_RETRIES,
+  pilotFromEnv,
+  pilotObservation,
+  PLAYLIST_CALL_TIMEOUT_MS,
+} from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -216,8 +226,9 @@ export async function POST(req: NextRequest) {
   const choice = chooseModel("playlist", crypto.randomUUID(), pilot, now);
   const usage: Anthropic.Usage[] = [];
   const started = Date.now();
-  // Model calls attempted (counted before each create, so a call that throws still counts) and a
-  // flag so each request is observed exactly once, even when sending the last event throws.
+  // Provider attempts (counted before each one, retries included, so an attempt that throws still
+  // counts) and a flag so each request is observed exactly once, even when sending the last event
+  // throws.
   let attempts = 0;
   let observed = false;
   let finalResult: CreatePlaylistResult | null = null;
@@ -233,6 +244,33 @@ export async function POST(req: NextRequest) {
       }),
     );
   };
+
+  // Every model call of the tool loop. The SDK's own retries are off (they would hide attempts
+  // from the count) and the route retries the same errors the SDK would, at most
+  // MODEL_CALL_RETRIES times, counting each attempt; a hung call ends at the deadline.
+  const callModel = (messages: Anthropic.MessageParam[]) =>
+    callWithCountedRetries(
+      () =>
+        anthropic.messages.create(
+          {
+            model: choice.model,
+            max_tokens: 1024,
+            system: systemPrompt,
+            tools,
+            messages,
+            ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
+          },
+          { timeout: PLAYLIST_CALL_TIMEOUT_MS, maxRetries: 0 },
+        ),
+      {
+        retries: MODEL_CALL_RETRIES,
+        isRetryable: (e) =>
+          e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && isRetryableStatus(e.status)),
+        onAttempt: () => {
+          attempts++;
+        },
+      },
+    );
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -252,15 +290,7 @@ export async function POST(req: NextRequest) {
           { role: "user", content: "Generate the playlist now per the constraints in the system prompt." },
         ];
 
-        attempts++;
-        let response = await anthropic.messages.create({
-          model: choice.model,
-          max_tokens: 1024,
-          system: systemPrompt,
-          tools,
-          messages,
-          ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
-        });
+        let response = await callModel(messages);
         usage.push(response.usage);
 
         let iter = 0;
@@ -333,15 +363,7 @@ export async function POST(req: NextRequest) {
 
           messages.push({ role: "user", content: toolResults });
 
-          attempts++;
-          response = await anthropic.messages.create({
-            model: choice.model,
-            max_tokens: 1024,
-            system: systemPrompt,
-            tools,
-            messages,
-            ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
-          });
+          response = await callModel(messages);
           usage.push(response.usage);
         }
 

@@ -120,7 +120,7 @@ test("observations: none outside a pilot, attempted calls counted apart from ans
   });
   assert.deepEqual(line, {
     event: "model_pilot", task: "playlist", arm: "baseline", model: "claude-sonnet-5-5", effort: "default",
-    ok: true, calls: 3, answered: 2, units: 1, accepted: 1, latency_ms: 1234,
+    ok: true, calls: 3, answered: 2, unpriced: 1, units: 1, accepted: 1, latency_ms: 1234,
     input_tokens: 250, output_tokens: 50, cache_read_tokens: 50, cache_write_tokens: 10,
   });
   for (const v of Object.values(line)) assert.ok(["string", "number", "boolean"].includes(typeof v));
@@ -163,7 +163,10 @@ test("dish batches hold one arm, and the observation is written after the estima
 
 test("playlist and label requests count attempted calls before each create, observed once", () => {
   const pl = read("app/api/spotify/generate-playlist/route.ts");
-  assert.equal((pl.match(/attempts\+\+;\s*(let )?response = await anthropic\.messages\.create\(/g) ?? []).length, createCalls(pl).length);
+  // One create, inside callWithCountedRetries, which counts every attempt (retries included).
+  assert.equal(createCalls(pl).length, 1);
+  assert.match(pl, /callWithCountedRetries\(\s*\(\) =>\s*anthropic\.messages\.create\(/);
+  assert.match(pl, /onAttempt: \(\) => \{\s*attempts\+\+;/);
   assert.match(pl, /if \(observed\) return;/);
   const ph = read("app/api/supplements/extract-from-photo/route.ts");
   assert.match(ph, /attempts = 1;\s*const resp = await anthropic\.messages\.create\(/);
@@ -283,6 +286,8 @@ test("model calls end inside the 60 s function budget", () => {
     const src = read(rel);
     assert.match(src, /timeout: callTimeoutMs\(routeStart, Date\.now\(\)\), maxRetries: 0/);
   }
+  // The playlist route has no function limit; its calls get a fixed deadline, SDK retries off.
+  assert.match(read("app/api/spotify/generate-playlist/route.ts"), /timeout: PLAYLIST_CALL_TIMEOUT_MS, maxRetries: 0/);
 });
 
 test("a failed estimate batch answers with its arm first, so the harvester can read it", () => {
@@ -318,4 +323,173 @@ test("the label route records success only through isUsableLabel", () => {
   const src = read("app/api/supplements/extract-from-photo/route.ts");
   assert.match(src, /observe\(isUsableLabel\(product\)\)/);
   assert.equal(/observe\(true\)/.test(src), false);
+});
+
+// --- OPSMODEL-R2: every provider attempt is counted, and missing usage is unknown, not free -------
+
+test("callWithCountedRetries counts every attempt, retries only retryable errors, and stops at the limit", async () => {
+  const noWait = { sleep: async () => {}, waitMs: () => 0 };
+  const retryable = (e) => Boolean(e && e.retry === true);
+  const run = async (outcomes, retries = 2) => {
+    let attempts = 0;
+    const queue = [...outcomes];
+    let result;
+    let error;
+    try {
+      result = await R.callWithCountedRetries(
+        async () => {
+          const o = queue.shift();
+          if (o instanceof Error) throw o;
+          return o;
+        },
+        { retries, isRetryable: retryable, onAttempt: () => { attempts++; }, ...noWait },
+      );
+    } catch (e) {
+      error = e;
+    }
+    return { attempts, result, error };
+  };
+  const soft = () => Object.assign(new Error("soft"), { retry: true });
+  const hard = () => Object.assign(new Error("hard"), { retry: false });
+  assert.deepEqual(await run(["ok"]), { attempts: 1, result: "ok", error: undefined });
+  const r2 = await run([soft(), "ok"]);
+  assert.equal(r2.attempts, 2);
+  assert.equal(r2.result, "ok");
+  const r3 = await run([soft(), soft(), soft(), "never"]);
+  assert.equal(r3.attempts, 3, "1 + MODEL_CALL_RETRIES attempts, then the error");
+  assert.equal(r3.error.message, "soft");
+  const r4 = await run([hard(), "never"]);
+  assert.equal(r4.attempts, 1, "a non-retryable error is not retried");
+  assert.equal(R.MODEL_CALL_RETRIES, 2);
+});
+
+test("retryable statuses match the SDK's own rule", () => {
+  for (const s of [408, 409, 429, 500, 503, 529]) assert.equal(R.isRetryableStatus(s), true, String(s));
+  for (const s of [400, 401, 403, 404, 413, 422, undefined, null, "500"]) assert.equal(R.isRetryableStatus(s), false, String(s));
+});
+
+test("pilotCostEvidence: an arm's cost is computable only when every attempt reported usage", () => {
+  assert.deepEqual(R.pilotCostEvidence([]), { attempts: 0, answered: 0, unpriced: 0, complete: true });
+  assert.deepEqual(R.pilotCostEvidence([{ calls: 2, answered: 2 }, { calls: 1, answered: 1 }]), {
+    attempts: 3, answered: 3, unpriced: 0, complete: true,
+  });
+  assert.deepEqual(R.pilotCostEvidence([{ calls: 3, answered: 2 }]), { attempts: 3, answered: 2, unpriced: 1, complete: false });
+  // A line without counts is never treated as free.
+  assert.equal(R.pilotCostEvidence([{ calls: 1, answered: 1 }, {}]).complete, false);
+  assert.equal(R.pilotCostEvidence([{ calls: "x", answered: 0 }]).unpriced, 1);
+});
+
+// The real playlist route, driven by a stub SDK through each scripted case in the fixture file.
+const FX = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "model-routing-pilot.json"), "utf8"));
+
+class StubAPIError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+class StubConnectionError extends StubAPIError {
+  constructor(message = "Connection error.") {
+    super(undefined, message);
+  }
+}
+class StubTimeoutError extends StubConnectionError {
+  constructor() {
+    super("Request timed out.");
+  }
+}
+
+function stubSdk(script, seenOptions) {
+  const USAGE = { input_tokens: 100, output_tokens: 20 };
+  class FakeAnthropic {
+    constructor() {
+      this.messages = {
+        create: async (_params, options) => {
+          seenOptions.push(options);
+          const step = script.shift();
+          if (step === "timeout") throw new StubTimeoutError();
+          if (step === "http_529") throw new StubAPIError(529, "Overloaded");
+          if (step === "http_400") throw new StubAPIError(400, "Bad request");
+          if (step === "answer_tool") {
+            return {
+              stop_reason: "tool_use",
+              content: [{ type: "tool_use", id: "tu1", name: "create_spotify_playlist", input: { name: "Generic mix", track_ids: Array(12).fill("trk") } }],
+              usage: { ...USAGE },
+            };
+          }
+          if (step === "answer_end") return { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }], usage: { ...USAGE } };
+          throw new Error(`script ran out (${String(step)})`);
+        },
+      };
+    }
+  }
+  FakeAnthropic.APIError = StubAPIError;
+  FakeAnthropic.APIConnectionError = StubConnectionError;
+  return FakeAnthropic;
+}
+
+async function runPlaylistCase(attempts) {
+  const until = new Date(Date.now() + 3 * DAY).toISOString().slice(0, 10);
+  const saved = { p: process.env.ONYX_MODEL_PILOT, u: process.env.ONYX_MODEL_PILOT_UNTIL, s: process.env.ONYX_MODEL_PILOT_SHARE };
+  process.env.ONYX_MODEL_PILOT = "playlist";
+  process.env.ONYX_MODEL_PILOT_UNTIL = until;
+  delete process.env.ONYX_MODEL_PILOT_SHARE;
+  const seenOptions = [];
+  const lines = [];
+  const origInfo = console.info;
+  const origSetTimeout = global.setTimeout;
+  console.info = (msg) => lines.push(JSON.parse(msg));
+  // The route's retry wait goes through setTimeout; run it at once so the test does not sleep.
+  global.setTimeout = (fn) => origSetTimeout(fn, 0);
+  try {
+    const route = loadTs("app/api/spotify/generate-playlist/route.ts", {
+      "@anthropic-ai/sdk": stubSdk([...attempts], seenOptions),
+      "@supabase/supabase-js": { createClient: () => ({}) },
+      "next/server": { NextRequest: class {} },
+      "@/lib/spotify-server": {
+        searchTracks: async () => [],
+        createPlaylist: async ({ name, trackIds }) => ({ playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length }),
+      },
+    });
+    const res = await route.POST({ json: async () => ({ prompt: "Upbeat songs for a morning run", source_pool: "discovery" }) });
+    await res.text();
+  } finally {
+    console.info = origInfo;
+    global.setTimeout = origSetTimeout;
+    for (const [k, v] of [["ONYX_MODEL_PILOT", saved.p], ["ONYX_MODEL_PILOT_UNTIL", saved.u], ["ONYX_MODEL_PILOT_SHARE", saved.s]]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  return { lines, seenOptions };
+}
+
+for (const c of FX.playlist_measurement.cases) {
+  test(`playlist route, ${c.id} (${c.attempts.join(" > ")}): every attempt logged, missing usage unpriced`, async () => {
+    const { lines, seenOptions } = await runPlaylistCase(c.attempts);
+    assert.equal(seenOptions.length, c.attempts.length, "the route made exactly the scripted attempts");
+    for (const o of seenOptions) {
+      assert.equal(o.maxRetries, 0, "SDK retries off, so no attempt is hidden from the count");
+      assert.equal(o.timeout, R.PLAYLIST_CALL_TIMEOUT_MS);
+    }
+    assert.equal(lines.length, 1, "one observation per request");
+    const line = lines[0];
+    assert.equal(line.event, "model_pilot");
+    assert.equal(line.task, "playlist");
+    for (const k of ["ok", "calls", "answered", "unpriced", "input_tokens"]) assert.equal(line[k], c.expect[k], k);
+    assert.equal(R.pilotCostEvidence([line]).complete, c.expect.cost_complete);
+  });
+}
+
+test("the playlist measurement fixtures are internally consistent", () => {
+  const known = new Set(["answer_tool", "answer_end", "timeout", "http_529", "http_400"]);
+  assert.ok(FX.playlist_measurement.cases.length >= 5);
+  assert.equal(typeof FX.playlist_measurement.evaluation_rule, "string");
+  for (const c of FX.playlist_measurement.cases) {
+    for (const a of c.attempts) assert.ok(known.has(a), a);
+    assert.equal(c.expect.calls, c.attempts.length);
+    assert.equal(c.expect.answered, c.attempts.filter((a) => a.startsWith("answer")).length);
+    assert.equal(c.expect.unpriced, c.expect.calls - c.expect.answered);
+    assert.equal(c.expect.cost_complete, c.expect.unpriced === 0);
+  }
 });

@@ -44,11 +44,17 @@ back to the baseline. Estimates already stored keep the model they were made wit
 While a task is in the pilot, each request logs one JSON line `{"event":"model_pilot", ...}` to
 the Vercel function log for BOTH arms: task, arm, model, effort, ok, calls, units, accepted,
 latency in ms and the input / output / cache read / cache write token counts. `calls` is the
-number of model calls attempted (counted before each call, so one that threw still counts) and
-`answered` the number that returned usage. The line is written once per request, after the
+number of provider attempts (counted before each attempt, so one that threw still counts),
+`answered` the number that returned usage and `unpriced` the difference. Every routed call runs
+with the SDK's own retries off (`maxRetries: 0`), so no attempt happens out of sight of the
+count: the dish and label routes make one attempt per request (the harvester's retries are
+separate, observed requests), and the playlist route retries the errors the SDK would retry
+(connection errors and timeouts, 408, 409, 429, 5xx) itself, at most twice per call, counting
+each attempt (`callWithCountedRetries`). The line is written once per request, after the
 outcome is known: a dish batch only after its estimates are stored (a failed save is logged with
-0 accepted). Each model call is given a deadline inside the 60 s function limit (the SDK default is longer),
-so a slow call ends as a failed, observed request rather than a killed one with no line. Never prompt,
+0 accepted). Each model call has a deadline: inside the 60 s function limit for the dish and
+label routes (the SDK default is longer), 60 s per attempt for the playlist route, so a slow call
+ends as a failed, observed attempt rather than a killed request with no line. Never prompt,
 reply, dish, product or track text. Outside a pilot nothing is logged.
 
 Accepted results per task: a dish batch whose every dish got an estimate (and the count of
@@ -71,7 +77,13 @@ window:
 | `supplement_photo` | 10 | 95% | 30 s | at most 0.9x | every fixture label's ingredients, amounts and units exact |
 
 Cost = the logged token counts at the Anthropic price list current on the evaluation day
-(cache reads and writes priced separately), divided by accepted results. A candidate that misses
+(cache reads and writes priced separately), divided by accepted results. An attempt that ended
+without usage (timeout, connection error, error status) may still have been billed, so its cost
+is unknown, never zero: the logged tokens give the cost only when `pilotCostEvidence(lines)`
+is `complete` for both arms of the window. Otherwise the cost criterion stays unmet until the
+window's cost per arm is reconciled with Anthropic's own usage report for the same models and
+dates (Console usage, or the Usage and Cost API), and the reconciled figure is linked in the
+promotion PR. A candidate that misses
 any threshold stays a candidate.
 
 ## Fixtures
@@ -79,6 +91,10 @@ any threshold stays a candidate.
 `frontend/tests/fixtures/model-routing-pilot.json`: synthetic cases for each task (generic
 dish names with kcal bands, label panels drawn as images at evaluation time, playlist prompts run
 against a stub catalog). No personal data. Both arms run every case; the pass rule is in the file.
+`playlist_measurement` holds scripted attempt sequences (answers, timeouts, overloaded and
+non-retryable errors) that `frontend/tests/model-routing.test.cjs` runs through the real
+playlist route with a stub SDK, checking the attempt count, `answered`, `unpriced` and whether
+the line's cost is computable.
 
 ## Widening
 

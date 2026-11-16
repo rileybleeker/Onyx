@@ -7,8 +7,9 @@
 // back to the baseline. Widening a candidate to all calls is a code change to BASELINE, made only
 // after the pilot's observations meet PILOT_CRITERIA (docs/model-routing-pilot.md).
 //
-// No imports and no clock: the routes pass the time in. Only pilotFromEnv (reads process.env) and
-// logPilotObservation (console) touch anything outside the function arguments.
+// No imports and no clock: the routes pass the time in. Only pilotFromEnv (reads process.env),
+// logPilotObservation (console) and the default wait between retries in callWithCountedRetries
+// (setTimeout) touch anything outside the function arguments.
 
 export type RoutedTask = "delivery_estimate" | "playlist" | "supplement_photo";
 export type Effort = "low" | "medium" | "high";
@@ -47,7 +48,10 @@ export const CANDIDATE: Record<RoutedTask, ModelConfig> = {
  *    harvester's one-dish retries count against it.
  *  - p90LatencyMs: 90th percentile of the model call time (playlist: the whole tool loop).
  *  - maxCostRatio: candidate cost per accepted result / baseline cost per accepted result, from
- *    the logged token counts at the price list current when the pilot is evaluated.
+ *    the logged token counts at the price list current when the pilot is evaluated. Only valid
+ *    when every attempt of both arms reported usage (pilotCostEvidence(...).complete); otherwise
+ *    the cost of the unpriced attempts is unknown, never zero, and the cost check cannot pass
+ *    until the window is reconciled with Anthropic's own usage report for the same models.
  *  - fixture: the offline fixture check in tests/fixtures/model-routing-pilot.json.
  */
 export const PILOT_CRITERIA: Record<
@@ -153,9 +157,11 @@ export interface UsageLike {
  * One observation line for the pilot (counts only: never prompt, reply, dish, product or track
  * text). Returns null when no pilot covers the task, so nothing is logged outside a pilot.
  *
- * `calls` = model calls ATTEMPTED for the request (counted before each create), so a call that
- * threw before returning usage still counts; `usage` holds only the calls that answered. `ok` /
- * `accepted` describe the request's outcome after its result was stored, not the model reply.
+ * `calls` = provider attempts for the request (counted before each attempt, retries included, with
+ * the SDK's own retries switched off), so an attempt that threw before returning usage still
+ * counts; `usage` holds only the attempts that answered. `unpriced` = attempts with no usage: the
+ * provider may still have billed them, so their cost is UNKNOWN, not zero (see pilotCostEvidence).
+ * `ok` / `accepted` describe the request's outcome after its result was stored, not the model reply.
  */
 export function pilotObservation(
   task: RoutedTask,
@@ -174,6 +180,7 @@ export function pilotObservation(
     ok: o.ok,
     calls: Math.max(0, Math.floor(o.calls)),
     answered: o.usage.length,
+    unpriced: Math.max(0, Math.floor(o.calls) - o.usage.length),
     units: o.units ?? 1,
     accepted: o.accepted ?? (o.ok ? 1 : 0),
     latency_ms: Math.max(0, Math.round(o.latencyMs)),
@@ -182,6 +189,75 @@ export function pilotObservation(
     cache_read_tokens: sum("cache_read_input_tokens"),
     cache_write_tokens: sum("cache_creation_input_tokens"),
   };
+}
+
+/**
+ * Whether one arm's logged token counts cover every provider attempt. Cost per accepted result
+ * may be computed from the logs only when `complete` is true for BOTH arms; with any unpriced
+ * attempt the cost criterion stays unmet until the window is reconciled with the provider's usage
+ * report (docs/model-routing-pilot.md, "Evaluating").
+ */
+export function pilotCostEvidence(lines: ReadonlyArray<{ calls?: unknown; answered?: unknown }>): {
+  attempts: number;
+  answered: number;
+  unpriced: number;
+  complete: boolean;
+} {
+  let attempts = 0;
+  let answered = 0;
+  for (const l of lines) {
+    const c = Number(l?.calls);
+    const a = Number(l?.answered);
+    // A line without valid counts cannot be priced: count it as one unpriced attempt.
+    if (!Number.isFinite(c) || !Number.isFinite(a) || c < 0 || a < 0) {
+      attempts += 1;
+      continue;
+    }
+    attempts += Math.max(c, a);
+    answered += a;
+  }
+  const unpriced = attempts - answered;
+  return { attempts, answered, unpriced, complete: unpriced === 0 };
+}
+
+/** Retries a route makes itself (SDK retries off), the same number the SDK would make by default. */
+export const MODEL_CALL_RETRIES = 2;
+/** Deadline for one playlist model call (the SDK default is 10 minutes, so a hung call would never be observed). */
+export const PLAYLIST_CALL_TIMEOUT_MS = 60_000;
+
+/** HTTP statuses the SDK itself retries (request timeout, conflict, rate limit, server errors). */
+export function isRetryableStatus(status: unknown): boolean {
+  return typeof status === "number" && (status === 408 || status === 409 || status === 429 || status >= 500);
+}
+
+/**
+ * Run one model call with bounded retries done HERE, so every provider attempt is counted
+ * (`onAttempt` fires before each one). The call must be made with the SDK's `maxRetries: 0`; a
+ * retry happens only when `isRetryable` says so, after a short exponential wait. The last error is
+ * thrown when the retries run out or the error is not retryable.
+ */
+export async function callWithCountedRetries<T>(
+  call: () => Promise<T>,
+  o: {
+    retries: number;
+    isRetryable: (e: unknown) => boolean;
+    onAttempt: () => void;
+    waitMs?: (retry: number) => number;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<T> {
+  const retries = Math.max(0, Math.floor(o.retries));
+  const waitMs = o.waitMs ?? ((r: number) => Math.min(8_000, 500 * 2 ** r));
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt++) {
+    o.onAttempt();
+    try {
+      return await call();
+    } catch (e) {
+      if (attempt >= retries || !o.isRetryable(e)) throw e;
+      await sleep(waitMs(attempt));
+    }
+  }
 }
 
 /** Function limit of the routes that call a model (their `maxDuration`), and the part of it kept for the rest of the request. */

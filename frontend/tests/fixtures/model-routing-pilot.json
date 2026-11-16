@@ -54,6 +54,17 @@
       }
     ]
   },
+  "playlist_measurement": {
+    "about": "Scripted provider attempts for one playlist request, run through the real POST /api/spotify/generate-playlist route with a stub SDK (tests/model-routing.test.cjs). Each attempt is 'answer_tool' (a create_spotify_playlist tool call), 'answer_end' (end_turn), 'timeout' (connection timeout, no usage), 'http_529' (overloaded, no usage) or 'http_400' (not retryable). Usage per answered attempt is input 100 / output 20.",
+    "evaluation_rule": "Cost per accepted result is computed from logged tokens only when pilotCostEvidence(lines).complete is true for both arms; any unpriced attempt leaves the cost criterion unmet until the window is reconciled with the provider's usage report.",
+    "cases": [
+      { "id": "m01", "attempts": ["answer_tool", "answer_end"], "expect": { "ok": true, "calls": 2, "answered": 2, "unpriced": 0, "input_tokens": 200, "cost_complete": true } },
+      { "id": "m02", "attempts": ["timeout", "answer_tool", "answer_end"], "expect": { "ok": true, "calls": 3, "answered": 2, "unpriced": 1, "input_tokens": 200, "cost_complete": false } },
+      { "id": "m03", "attempts": ["http_529", "http_529", "http_529"], "expect": { "ok": false, "calls": 3, "answered": 0, "unpriced": 3, "input_tokens": 0, "cost_complete": false } },
+      { "id": "m04", "attempts": ["http_400"], "expect": { "ok": false, "calls": 1, "answered": 0, "unpriced": 1, "input_tokens": 0, "cost_complete": false } },
+      { "id": "m05", "attempts": ["answer_tool", "timeout", "timeout", "timeout"], "expect": { "ok": true, "calls": 4, "answered": 1, "unpriced": 3, "input_tokens": 100, "cost_complete": false } }
+    ]
+  },
   "playlist": {
     "pass_rule": "a playlist is created within MAX_ITERATIONS, only the source pool's tools are called, track count between 10 and 50",
     "note": "Run against a stub catalog (generic track ids and audio features), never the real listening history or a real Spotify account.",
