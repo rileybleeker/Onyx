@@ -65,7 +65,7 @@ function parseLeftOut(x: unknown): LeftOutAccount | null {
  * `now`, a result read after its `validUntil` is not eligible either (EXPIRED_REASON).
  */
 export function eligibilityOf(r: { eligibility?: unknown } | null | undefined, now?: Date | number): ForecastEligibility {
-  const e = r?.eligibility as { eligible?: unknown; reasons?: unknown; validUntil?: unknown; leftOut?: unknown; cashAsOf?: unknown } | undefined;
+  const e = r?.eligibility as { eligible?: unknown; reasons?: unknown; validUntil?: unknown; leftOut?: unknown; leftOutCents?: unknown; cashAsOf?: unknown } | undefined;
   if (!e || typeof e.eligible !== "boolean" || !Array.isArray(e.reasons)) return unverified();
   const reasons = e.reasons.map(parseReason);
   if (reasons.some((x) => x === null)) return unverified();
@@ -74,9 +74,15 @@ export function eligibilityOf(r: { eligibility?: unknown } | null | undefined, n
   if (e.leftOut !== undefined && !Array.isArray(e.leftOut)) return unverified();
   const leftOut = Array.isArray(e.leftOut) ? e.leftOut.map(parseLeftOut) : [];
   if (leftOut.some((x) => x === null)) return unverified();
+  // The left-out accounts' positive balance comes with them (the low-cash alert takes it out of the projection):
+  // missing or malformed = never eligible.
+  const cents = e.leftOutCents;
+  if (cents !== undefined && !(typeof cents === "number" && Number.isFinite(cents) && cents >= 0)) return unverified();
+  if (leftOut.length && cents === undefined) return unverified();
   const out: ForecastEligibility = { eligible: e.eligible && reasons.length === 0, reasons: reasons as EligibilityReason[] };
   if (typeof e.validUntil === "string") out.validUntil = e.validUntil;
   if (Array.isArray(e.leftOut)) out.leftOut = leftOut as LeftOutAccount[];
+  if (typeof cents === "number") out.leftOutCents = cents;
   if (typeof e.cashAsOf === "string") out.cashAsOf = e.cashAsOf;
   const nowMs = now === undefined ? null : typeof now === "number" ? now : now.getTime();
   if (nowMs !== null && Number.isFinite(nowMs) && out.validUntil && Date.parse(out.validUntil) <= nowMs) {
@@ -84,6 +90,15 @@ export function eligibilityOf(r: { eligibility?: unknown } | null | undefined, n
     if (!out.reasons.some((x) => x.text === EXPIRED_REASON.text)) out.reasons.unshift({ ...EXPIRED_REASON });
   }
   return out;
+}
+
+/**
+ * The positive balance of the accounts Riley left out (cents, 0 when none, or when the stored check is not well
+ * formed: it is then not eligible, and Today says so). The low-cash alert takes it out of the projection, as the
+ * safe-to-move amount does.
+ */
+export function leftOutCentsOf(r: { eligibility?: unknown } | null | undefined): number {
+  return eligibilityOf(r).leftOutCents ?? 0;
 }
 
 /** The actionable safe-to-move amount, or null when the inputs do not support one (now: see eligibilityOf). */

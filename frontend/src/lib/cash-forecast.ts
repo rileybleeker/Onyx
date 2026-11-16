@@ -201,6 +201,12 @@ export interface ForecastEligibility {
   validUntil?: string;
   /** Pool accounts the amount does not count (named next to it). Absent when none. */
   leftOut?: LeftOutAccount[];
+  /**
+   * The positive balance of the `leftOut` accounts (cents, >= 0; present with `leftOut`). Every ACTIONABLE number
+   * takes it out of the projection the same way: the safe-to-move amount and Today's low-cash alert (lib/finance-alerts.ts),
+   * so an account Riley left out never props up either. The projection itself still counts it.
+   */
+  leftOutCents?: number;
   /** The oldest balance the amount counts (ISO). Absent when none was checked. */
   cashAsOf?: string;
 }
@@ -580,6 +586,37 @@ function latestBalances(balances: readonly ForecastBalance[]): Map<string, Forec
  */
 function supersededByOtherCurrency(balances: readonly ForecastBalance[], account: string, atMs: number): boolean {
   return balances.some((x) => x.account_key === account && (x.currency ?? "USD").toUpperCase() !== "USD" && !(Date.parse(x.captured_at) < atMs));
+}
+/** What a balance row says about debt: "debt" (overdrawn or owed), "unknown" (no usable amount: it could be), or null. */
+function debtKind(x: ForecastBalance): "debt" | "unknown" | null {
+  if (!Number.isFinite(x.balance_cents)) return "unknown";
+  return x.balance_cents < 0 || (x.kind === "liability" && x.balance_cents !== 0) ? "debt" : null;
+}
+/**
+ * Whether `account`'s newest snapshot that cannot be valued in US dollars (another currency, or no usable amount) is,
+ * or could be, a debt. Only rows not older than the US-dollar balance in use count (`usdAtMs`; null = there is none,
+ * so every such row counts); a row whose date cannot be compared counts too (it may be the current one). The amount
+ * cannot value that debt, so leaving the account out would count it as $0: it withholds the amount even then.
+ */
+function unvaluedDebt(balances: readonly ForecastBalance[], account: string, usdAtMs: number | null): "debt" | "unknown" | null {
+  let newest: ForecastBalance | null = null;
+  let newestMs = Number.NEGATIVE_INFINITY;
+  let undated: "debt" | "unknown" | null = null;
+  for (const x of balances) {
+    if (x.account_key !== account) continue;
+    if ((x.currency ?? "USD").toUpperCase() === "USD" && Number.isFinite(x.balance_cents)) continue;
+    const ms = Date.parse(x.captured_at);
+    if (!Number.isFinite(ms)) {
+      undated = undated ?? debtKind(x);
+      continue;
+    }
+    if (usdAtMs !== null && ms < usdAtMs) continue;
+    if (ms > newestMs) {
+      newest = x;
+      newestMs = ms;
+    }
+  }
+  return (newest ? debtKind(newest) : null) ?? undated;
 }
 /** Owed on a card (positive) from its balance row: liabilities are stored as their size, sometimes negative. */
 const owedFrom = (b: ForecastBalance | undefined): number => (b ? Math.abs(b.balance_cents) : 0);
@@ -985,7 +1022,8 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   // Eligibility: every reason the inputs do not support an actionable amount. Any reason withholds safe to move.
   const reasons: EligibilityReason[] = [];
   const reason = (code: EligibilityCode, text: string, account?: string) => {
-    if (!reasons.some((r) => r.text === text)) reasons.push(account ? { code, text, account } : { code, text });
+    // One reason per sentence and account: two pool accounts with the same label each keep their own Leave it out.
+    if (!reasons.some((r) => r.text === text && r.account === account)) reasons.push(account ? { code, text, account } : { code, text });
   };
   const notEligible = (): ForecastEligibility => ({ eligible: false, reasons: [...reasons] });
   const quality = input.quality ?? {};
@@ -1046,11 +1084,20 @@ export function forecastCash(input: ForecastInput): ForecastResult {
       // A balance read that failed: the balance is unknown (it could be an overdraft), so the amount is withheld
       // whether or not Riley left the account out, and the reason carries no account (leaving it out cannot clear it).
       if (unreadable.has(k)) reason("balance-unreadable", `The balance for ${label} could not be read.`);
-      if (!b || !Number.isFinite(b.balance_cents)) {
+      const usable = !!b && Number.isFinite(b.balance_cents);
+      const usdAt = b && usable ? Date.parse(b.captured_at) : Number.NaN;
+      // A debt the amount cannot value in US dollars (an overdraft or a card balance in another currency, or a row
+      // with no usable amount): withheld the same way, whether or not Riley left the account out (leaving it out
+      // would count the debt as $0), so the reason carries no account. It replaces the account's other balance reasons:
+      // Leave it out could clear those but not this one.
+      const debt = unvaluedDebt(input.balances, k, Number.isFinite(usdAt) ? usdAt : null);
+      if (debt === "debt") reason("invalid-balance", `The newest balance for ${label} is a debt in another currency, so it cannot be counted.`);
+      else if (debt === "unknown") reason("invalid-balance", `The balance for ${label} has no usable amount and could be a debt.`);
+      if (!b || !usable) {
         warnings.push(`No balance for ${label}: counted as $0.`);
         if (chosen) leftOut.push({ account: k, label, asOf: null, why: "chosen" });
-        // An unreadable one is already named above: not "missing", the read did not answer.
-        else if (!unreadable.has(k)) {
+        // An unreadable one is already named above: not "missing", the read did not answer. A debt is named above too.
+        else if (!unreadable.has(k) && !debt) {
           // A row in another currency (or with no usable amount) is there but cannot be counted: invalid, not missing.
           if (b || input.balances.some((x) => x.account_key === k)) reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`, k);
           else reason("missing-balance", `No recent balance for ${label}.`, k);
@@ -1072,6 +1119,11 @@ export function forecastCash(input: ForecastInput): ForecastResult {
       if (chosen) {
         leftOut.push({ account: k, label, asOf: b.captured_at, why: "chosen" });
         leftOutCents += Math.max(0, signedCents);
+        continue;
+      }
+      // A newer debt in another currency (named above) decides: this US-dollar balance is not the current one.
+      if (debt) {
+        warnings.push(`The newest balance for ${label} is not in US dollars: the estimate uses its last US-dollar balance.`);
         continue;
       }
       if (!Number.isFinite(at)) {
@@ -1357,7 +1409,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     eligible: reasons.length === 0,
     reasons: [...reasons],
     ...(Number.isFinite(validUntilMs) ? { validUntil: new Date(validUntilMs).toISOString() } : {}),
-    ...(leftOut.length ? { leftOut } : {}),
+    ...(leftOut.length ? { leftOut, leftOutCents } : {}),
     ...(cashAsOf ? { cashAsOf } : {}),
   };
   const headlines: ForecastResult["headlines"] = {

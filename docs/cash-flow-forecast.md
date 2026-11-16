@@ -78,7 +78,7 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 | Reason code | When |
 |---|---|
 | `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small or negative older one (counted as $0 in the estimate) |
-| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future |
+| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future. When that newest row is a DEBT (negative, or a card balance owed) in another currency, or has no usable amount (so it could be one), the reason offers no Leave it out and leaving the account out does not clear it: the amount cannot value that debt in US dollars, and leaving it out would count it as $0 |
 | `stale-balance` | a pool balance of ANY size older than 48 h (`staleBalanceHours`; an old small or zero balance is no proof the account is not overdrawn now), or a stored result read after its `validUntil` |
 | `balance-unreadable` | the read of a pool account's older balance failed (not "no row": the read itself errored), so its balance is unknown. Leaving the account out does not clear it, and the reason offers no Leave it out |
 | `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
@@ -103,7 +103,10 @@ again; at most 5 tries, then 409 and nothing saved). So two tabs changing differ
 keep their change, and two changes to the same account are applied in turn, the last one to commit deciding. A
 left-out account's positive balance is taken out of the opening and the lowest point, so the amount never rests on
 it; an overdraft keeps lowering the amount, also once it is older than the 60-day read. Leaving an account out never
-clears `balance-unreadable`.
+clears `balance-unreadable`, nor an `invalid-balance` debt in another currency. The low-cash alert (Today, the
+finance pages) uses the same cash: the left-out accounts' positive balance (`eligibility.leftOutCents`) is taken out
+of the cautious and likely paths before the alert is checked, so a left-out savings balance cannot keep a low-cash
+alert from firing on the accounts that are counted; the alert then says so ("not counting the accounts you left out").
 
 **When the check stops holding.** `eligibility.validUntil` = the first counted balance's time + 48 h. The stored
 results (`pds.finance_result_cache`) are served up to an hour fresh and longer while a refresh is pending or

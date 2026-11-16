@@ -153,6 +153,57 @@ test("the newest snapshot decides in any currency: a newer row in another curren
   assert.deepEqual(left.eligibility.leftOut, [{ account: "sav", label: "Demo Savings", asOf: ago(3), why: "chosen" }]);
 });
 
+test("a debt in another currency, or a balance with no usable amount, withholds the amount even when Riley left the account out", () => {
+  const leave = { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] };
+  const why = (r) => r.eligibility.reasons.map((x) => [x.code, x.account]);
+  // Only an overdraft in another currency: withheld, with no Leave it out (leaving it out would count the debt as $0).
+  const eurDebt = [bal("chk", 400_000), bal("sav", -50_000, ago(2), { currency: "EUR" })];
+  const open = run({ balances: eurDebt });
+  assert.deepEqual(why(open), [["invalid-balance", undefined]]);
+  assert.match(open.eligibility.reasons[0].text, /Demo Savings is a debt in another currency/);
+  assert.equal(open.headlines.safeToMoveCents, null);
+  assert.deepEqual(E.safeToMoveTile(open, 50_000).reasons.map((r) => r.account), [undefined], "the tile offers no Leave it out for it");
+  const left = run({ balances: eurDebt, settings: leave });
+  assert.equal(left.eligibility.eligible, false);
+  assert.deepEqual(why(left), [["invalid-balance", undefined]]);
+  assert.equal(left.headlines.safeToMoveCents, null);
+  assert.equal(E.safeToMoveOf(JSON.parse(JSON.stringify(left))), null, "also when stored");
+  assert.deepEqual(left.eligibility.leftOut.map((l) => [l.account, l.why]), [["sav", "chosen"]], "still named as left out, and can be counted again");
+  // A balance owed (liability, stored as its size) in another currency is a debt too.
+  const owed = run({ balances: [bal("chk", 400_000), bal("sav", 30_000, ago(2), { currency: "EUR", kind: "liability" })], settings: leave });
+  assert.deepEqual(why(owed), [["invalid-balance", undefined]]);
+  // A debt in another currency NEWER than a fresh US-dollar balance: the newest snapshot decides, left out or not.
+  const newerRows = [bal("chk", 400_000), bal("sav", 900_000, ago(3)), bal("sav", -80_000, ago(1), { currency: "EUR" }), bal("card", 50_000)];
+  const newer = run({ balances: newerRows, settings: leave });
+  assert.deepEqual(why(newer), [["invalid-balance", undefined]]);
+  assert.equal(newer.headlines.safeToMoveCents, null);
+  const newerOpen = run({ balances: newerRows });
+  assert.deepEqual(why(newerOpen), [["invalid-balance", undefined]], "one reason, no Leave it out that could not clear it");
+  assert.equal(newerOpen.opening.cents, 1_300_000, "the estimate keeps the last US-dollar balance");
+  // A debt row whose date cannot be compared may be the current one: withheld too.
+  assert.equal(run({ balances: [bal("chk", 400_000), bal("sav", 900_000), bal("sav", -80_000, "not a time", { currency: "EUR" })], settings: leave }).eligibility.eligible, false);
+  // No usable amount: it could be a debt, so the same.
+  const nan = run({ balances: [bal("chk", 400_000), bal("sav", Number.NaN)], settings: leave });
+  assert.deepEqual(why(nan), [["invalid-balance", undefined]]);
+  assert.match(nan.eligibility.reasons[0].text, /Demo Savings has no usable amount and could be a debt/);
+  // A debt OLDER than the US-dollar balance changes nothing; a positive balance in another currency can be left out.
+  const older = run({ balances: [bal("chk", 400_000), bal("sav", 900_000, ago(3)), bal("sav", -80_000, ago(30), { currency: "EUR" }), bal("card", 50_000)] });
+  assert.deepEqual(gate(older.eligibility), { eligible: true, reasons: [] });
+  assert.equal(run({ balances: [bal("chk", 400_000), bal("sav", 900_000, ago(2), { currency: "EUR" })], settings: leave }).eligibility.eligible, true);
+  // Recovery: a newer US-dollar snapshot is the current one again; left out, the amount comes back.
+  const next = run({ balances: [...eurDebt, bal("sav", 20_000, ago(1))], settings: leave });
+  assert.equal(next.eligibility.eligible, true);
+  assert.equal(typeof next.headlines.safeToMoveCents, "number");
+});
+
+test("two pool accounts with the same label each keep their own reason and Leave it out", () => {
+  const twins = [...ACCOUNTS, { account_key: "sav2", account_type: "Cash", label: "Demo Savings" }];
+  const out = run({ accounts: twins, balances: [bal("chk", 400_000), bal("sav", 900_000, ago(60)), bal("sav2", 10_000, ago(60))] });
+  assert.deepEqual(out.eligibility.reasons.map((r) => [r.code, r.account]), [["stale-balance", "sav"], ["stale-balance", "sav2"]]);
+  // A reason with no account is still listed once.
+  assert.equal(run({ accounts: twins, balances: [bal("chk", 400_000), bal("sav", 900_000), bal("sav2", 10_000)], quality: { historyTruncated: true } }).eligibility.reasons.length, 1);
+});
+
 test("without a clock the freshness cannot be verified; a backtest opening needs no balance rows", () => {
   const noClock = run({ now: undefined });
   assert.deepEqual(codes(noClock), ["freshness-unknown"]);
@@ -272,6 +323,35 @@ test("Today reads the same gate: cashForecastCheck mirrors the forecast's eligib
   assert.deepEqual(check.reasons, stale.eligibility.reasons.map((r) => r.text));
   assert.deepEqual(A.cashForecastCheck(JSON.parse(JSON.stringify(stale))), check, "the stored copy gives the same check");
   assert.equal(A.cashForecastCheck({ ...run(), eligibility: undefined }).eligible, false, "an older stored forecast is not an all-clear");
+});
+
+test("the low-cash alert counts the same cash as the amount: an account Riley left out cannot hide it", () => {
+  const leave = { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] };
+  // Checking under the $500 line; savings stale (the feed stopped) and left out, so the amount is eligible again.
+  const rows = [bal("chk", 40_000), bal("sav", 900_000, ago(24 * 30))];
+  const out = run({ balances: rows, settings: leave });
+  assert.equal(out.eligibility.eligible, true);
+  assert.equal(out.eligibility.leftOutCents, 900_000);
+  assert.equal(out.headlines.safeToMoveCents, 0);
+  // The projection still counts the savings balance, so on its own it never comes near the line...
+  assert.ok(Math.min(...out.days.slice(0, 30).map((d) => d.low)) > 50_000);
+  // ...but the alert takes it out, the way the amount does, and says so.
+  const alert = A.moneyAlerts(out, null, 50_000, TODAY).find((a) => a.kind === "low-cash");
+  assert.ok(alert, "Today is not told there is nothing to act on");
+  assert.match(alert.detail, /not counting the accounts you left out/);
+  assert.deepEqual(A.moneyAlerts(JSON.parse(JSON.stringify(out)), null, 50_000, TODAY), A.moneyAlerts(out, null, 50_000, TODAY), "the same from a stored result");
+  // Counted (a fresh savings balance, not left out): no low-cash alert, and no left-out total.
+  const counted = run({ balances: [bal("chk", 40_000), bal("sav", 900_000)] });
+  assert.equal("leftOutCents" in counted.eligibility, false);
+  assert.equal(A.moneyAlerts(counted, null, 50_000, TODAY).some((a) => a.kind === "low-cash"), false);
+  // An overdraft left out keeps lowering both (only a positive balance is taken out).
+  assert.equal(run({ balances: [bal("chk", 400_000), bal("sav", -30_000, ago(24 * 30))], settings: leave }).eligibility.leftOutCents, 0);
+  // A stored check with left-out accounts but no (or a malformed) total is never eligible.
+  const stored = JSON.parse(JSON.stringify(out));
+  const { leftOutCents: _drop, ...noTotal } = stored.eligibility;
+  assert.equal(E.eligibilityOf({ ...stored, eligibility: noTotal }).reasons[0].code, "unverified");
+  assert.equal(E.eligibilityOf({ ...stored, eligibility: { ...stored.eligibility, leftOutCents: -1 } }).reasons[0].code, "unverified");
+  assert.equal(E.eligibilityOf(stored).leftOutCents, 900_000);
 });
 
 // ─── stale small balances, accounts Riley leaves out, unreadable balances, a check that stops holding ──

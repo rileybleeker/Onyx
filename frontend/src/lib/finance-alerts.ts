@@ -3,7 +3,7 @@
  * over, a 0% promo ending soon, a tax payment due soon. PURE: no I/O. Shown on Today and on the finance pages.
  */
 import type { ForecastResult } from "./cash-forecast";
-import { EXPIRED_REASON, eligibilityOf } from "./cash-forecast-eligibility";
+import { EXPIRED_REASON, eligibilityOf, leftOutCentsOf } from "./cash-forecast-eligibility";
 import type { BudgetsResult } from "./finance-budgets";
 
 export interface MoneyAlert {
@@ -66,7 +66,11 @@ export function moneyAlerts(forecast: ForecastResult | null, budgets: BudgetsRes
   const out: MoneyAlert[] = [];
   if (forecast && forecast.state === "ok") {
     const line = Math.max(0, bufferCents);
-    const soon = forecast.days.slice(0, 30);
+    // The same cash the safe-to-move amount counts: the positive balance of the accounts Riley left out (a savings
+    // account the feed no longer refreshes) is taken out of the projection, so a stale balance there can never hide a
+    // low-cash alert on the accounts that are counted. The projection on the forecast page still includes it.
+    const leftOut = leftOutCentsOf(forecast);
+    const soon = forecast.days.slice(0, 30).map((d) => ({ date: d.date, low: d.low - leftOut, likely: d.likely - leftOut }));
     const low = soon.reduce<{ date: string; cents: number } | null>((m, d) => (!m || d.low < m.cents ? { date: d.date, cents: d.low } : m), null);
     // The day it first crosses the line is when Riley has to act, even when the lowest point is later.
     const firstBelow = soon.find((d) => d.low < line);
@@ -80,7 +84,7 @@ export function moneyAlerts(forecast: ForecastResult | null, budgets: BudgetsRes
         kind: "low-cash",
         severity: likelyThen < line || firstLikely ? "high" : "medium",
         title: `Cash may drop to ${low.cents < 0 ? "-" : ""}${usd(low.cents)} around ${day(low.date)}`,
-        detail: `${line > 0 ? `Below your ${usd(line)} line` : "Below $0"} on the cautious path (likely ${likelyThen < 0 ? "-" : ""}${usd(likelyThen)}${likelyElsewhere}). Move money or delay a payment.`,
+        detail: `${line > 0 ? `Below your ${usd(line)} line` : "Below $0"} on the cautious path (likely ${likelyThen < 0 ? "-" : ""}${usd(likelyThen)}${likelyElsewhere})${leftOut > 0 ? ", not counting the accounts you left out" : ""}. Move money or delay a payment.`,
         href: "/financials/forecast",
         due: firstBelow?.date ?? low.date,
         lowest: low.date,

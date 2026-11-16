@@ -285,6 +285,22 @@ test("an overdraft older than the 60-day read still lowers the amount, even when
   assert.equal(owed.result.headlines.safeToMoveCents, debt.result.headlines.safeToMoveCents);
 });
 
+test("an older overdraft in another currency is never left out as $0: no amount, and no Leave it out on it", async () => {
+  const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
+  const old = (cents, currency) => ({ account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - 90 * 86_400_000).toISOString(), balance_cents: cents, currency, kind: "asset" });
+  const leave = [{ key: "safe-to-move", value: { leaveOut: ["demo-wallet"] } }];
+  for (const drivers of [[], leave]) {
+    const load = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(-400_000, "EUR")], drivers })(AT, { otherIncome: 6_000 });
+    assert.equal(load.kind, "ok");
+    assert.deepEqual(load.result.eligibility.reasons.map((r) => [r.code, r.account]), [["invalid-balance", undefined]], `left out: ${drivers.length > 0}`);
+    assert.equal(load.result.headlines.safeToMoveCents, null);
+    assert.deepEqual(load.scenario.result.eligibility.reasons.map((r) => r.code), ["invalid-balance"], "the what-if reads the same inputs");
+  }
+  // The same account with an older POSITIVE balance in another currency: Riley can leave it out, and the amount comes back.
+  const positive = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(4_000, "EUR")], drivers: leave })(AT);
+  assert.equal(positive.result.eligibility.eligible, true);
+});
+
 test("a failed older-balance read is unknown, not $0: no amount even when Riley left the account out; a good read recovers", async () => {
   const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
   const overdraft = { account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - 90 * 86_400_000).toISOString(), balance_cents: -400_000, currency: "USD", kind: "asset" };

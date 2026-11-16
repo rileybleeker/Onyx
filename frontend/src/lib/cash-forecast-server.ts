@@ -359,7 +359,9 @@ export async function saveDriver(key: string, value: Record<string, unknown> | n
  * The "safe-to-move" driver row as a compare-and-swap store (lib/cash-forecast-store.ts applyLeaveOut): the version is
  * the row's updated_at as read, and every write is conditional on it (an UPDATE / DELETE whose WHERE also names that
  * updated_at, an INSERT that fails on the primary key), so a write that lost a race changes nothing and is retried.
- * Logs a database code only.
+ * Invariant this relies on: only this store writes the "safe-to-move" row (saveDriver refuses that key through
+ * parseDriverBody) and pds.finance_plan_drivers has no trigger that rewrites updated_at, so updated_at changes exactly
+ * when this store writes (nextLeaveOutVersion keeps it moving forward). Logs a database code only.
  */
 export function leaveOutStore(db: ReturnType<typeof serviceClient>): LeaveOutStore {
   const KEY = "safe-to-move";
