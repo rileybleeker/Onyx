@@ -12,9 +12,9 @@
 --       over a stored daily row that has food (both writers leave those out).
 --
 -- Why: pds.replace_cronometer_servings (sql/cronometer_replace_servings.sql)
--- only replaces the dates that HAVE rows in an export. When Riley removed the
--- last food of a day in Cronometer, that date was simply missing from the next
--- export, so its old servings (and its old daily total) stayed in Onyx for good.
+-- only replaces the dates that HAVE rows in an export. When the last food of a
+-- day is removed in Cronometer, that date is simply missing from the next
+-- export, so its old servings (and its old daily total) would stay in Onyx for good.
 -- The daily total matters as much as the servings: pds.cronometer_nutrition_
 -- behavioral_daily falls back to the cronometer_nutrition_daily row of a day
 -- with no servings, so emptying the servings alone would still show the old
