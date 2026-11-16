@@ -91,7 +91,7 @@ test("the card: free text in a failed heartbeat is never shown; an empty failed 
   assert.equal(S.simplefinLedgerCard(beat({ status: "failed" }), beat(), now).errorMessage, "The latest transactions import failed (no error text recorded).");
   // Several codes at once (Codex review): the note passes 300 characters and its later codes are tokens only. The
   // card shows it whole, so a trailing warning such as cutover_review is never cut off.
-  const counts = { sf_reauth: 1, sf_account_failed: 2, account_unmatched: 1, account_type_unset: 1, cutover_review: 3 };
+  const counts = { etl_error: 1, sf_reauth: 1, sf_account_failed: 2, account_unmatched: 1, account_type_unset: 1, cutover_review: 3 };
   const long = S.formatSimplefinNotes(counts);
   assert.ok(long.length > S.SIMPLEFIN_NOTE_LIMIT && long.length > S.FINANCE_TEXT_LIMIT, long);
   const shown = S.simplefinLedgerCard(beat({ status: "partial", error_message: long }), beat(), now).errorMessage;
