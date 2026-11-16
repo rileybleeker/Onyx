@@ -2142,6 +2142,39 @@ def test_window_sql_contract() -> None:
         "nothing may be granted to anon or authenticated"
 
 
+def test_restore_block_replaces_the_zero_row_from_one_copy() -> None:
+    """The restore block at the end of the window SQL (run by hand; executed verbatim by
+    tests/test_cronometer_window_sql_postgres.py). Codex review, round 2: a day the daily
+    summary listed with no food keeps a zero Total row after it is emptied, and an
+    ON CONFLICT DO NOTHING insert left that zero row in place of the copied totals."""
+    raw, _flat = _code(WINDOW_SQL)
+    section = raw[raw.index("-- 6. Putting an emptied day back"):]
+    block = "\n".join(line[len("--   "):] for line in section.splitlines() if line.startswith("--   "))
+    code = re.sub(r"\s+", " ", "\n".join(line.split("--", 1)[0] for line in block.splitlines()))
+    # One statement (all or nothing), under the import lock every writer takes.
+    assert code.startswith("DO $restore$ ") and code.rstrip().endswith("$restore$;"), code[:80]
+    assert code.count("$restore$") == 2
+    lock = "PERFORM pg_advisory_xact_lock(hashtext('pds.replace_cronometer_servings'));"
+    assert code.count(lock) == 1
+    # The copied daily row takes the place of the row there now; nothing is skipped on conflict.
+    assert "ON CONFLICT" not in code.upper()
+    replace = "DELETE FROM pds.cronometer_nutrition_daily n WHERE n.calendar_date = v_day;"
+    ins_s, ins_d = "INSERT INTO pds.cronometer_servings ", "INSERT INTO pds.cronometer_nutrition_daily "
+    assert code.count(replace) == 1 and code.count(ins_s) == 1 and code.count(ins_d) == 1
+    assert code.index(lock) < code.index(replace) < code.index(ins_s) < code.index(ins_d)
+    # One copy: the newest unless v_at names another, the same copy for both tables.
+    assert "SELECT max(c.cleared_at) INTO v_at" in code and code.count("AND c.cleared_at = v_at") == 4
+    # It refuses before any change when there is nothing to put back or food is back.
+    guards = ["no copy of %", "has servings again", "has food again"]
+    for g in guards:
+        assert g in code and code.index(g) < code.index(replace), g
+    assert "jsonb_typeof(kv.value) = 'number' AND kv.value <> '0'::jsonb" in code
+    # The day's empty-day record is forgotten; the copies are never removed.
+    assert "DELETE FROM pds.cronometer_empty_day_candidates e WHERE e.calendar_date = v_day;" in code
+    assert code.upper().count("DELETE ") == 2 and "cronometer_cleared_rows c WHERE" in code
+    assert "DELETE FROM pds.cronometer_cleared_rows" not in code and "UPDATE " not in code.upper()
+
+
 def test_legacy_function_is_unchanged_by_this_feature() -> None:
     _raw, flat = _code(LEGACY_SQL)
     assert "FUNCTION pds.replace_cronometer_servings(p_dates date[], p_rows jsonb)" in flat

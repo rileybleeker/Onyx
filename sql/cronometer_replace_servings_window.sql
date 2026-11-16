@@ -708,17 +708,72 @@ GRANT EXECUTE ON FUNCTION pds.replace_cronometer_servings_window(date, date, dat
 -- --no-empty-days, the CRONOMETER_EMPTY_DAYS=off env var, or by reverting the
 -- importer change).
 --
---   INSERT INTO pds.cronometer_servings
---   SELECT (jsonb_populate_record(NULL::pds.cronometer_servings, c.row_data)).*
---     FROM pds.cronometer_cleared_rows c
---    WHERE c.source_table = 'cronometer_servings' AND c.calendar_date = '<YYYY-MM-DD>'
---   ON CONFLICT (serving_id) DO NOTHING;
+-- The block below is one statement, so it changes everything or nothing. Put the
+-- day in v_day and run it. It waits for the import lock (imports and the restore
+-- take turns), picks ONE copy of the day (by default the newest: every row one call
+-- removed carries the same cleared_at) and puts it back: the copied servings, and
+-- the copied daily row in place of the row there now. That row is the zero Total
+-- row a day keeps when the daily summary listed it with no food (the copy holds the
+-- totals it replaced), or there is none. It refuses, with nothing changed, when the
+-- day has no such copy, when the day has servings again, or when its daily row has
+-- food again: a later import wrote the day, so there is nothing to put back. It
+-- also forgets the day's empty-day record, so emptying it again takes two new looks.
+-- The copies stay; no code removes them.
 --
---   INSERT INTO pds.cronometer_nutrition_daily
---   SELECT (jsonb_populate_record(NULL::pds.cronometer_nutrition_daily, c.row_data)).*
---     FROM pds.cronometer_cleared_rows c
---    WHERE c.source_table = 'cronometer_nutrition_daily' AND c.calendar_date = '<YYYY-MM-DD>'
---   ON CONFLICT (calendar_date) DO NOTHING;
+--   DO $restore$
+--   DECLARE
+--       v_day       date        := '<YYYY-MM-DD>';
+--       v_at        timestamptz := NULL;  -- NULL = the newest copy; an older one: see below
+--       v_servings  integer;
+--       v_daily     integer;
+--   BEGIN
+--       PERFORM pg_advisory_xact_lock(hashtext('pds.replace_cronometer_servings'));
+--       IF v_at IS NULL THEN
+--           SELECT max(c.cleared_at) INTO v_at
+--             FROM pds.cronometer_cleared_rows c
+--            WHERE c.calendar_date = v_day;
+--       END IF;
+--       IF NOT EXISTS (SELECT 1 FROM pds.cronometer_cleared_rows c
+--                       WHERE c.calendar_date = v_day AND c.cleared_at = v_at) THEN
+--           RAISE EXCEPTION 'restore: no copy of % made at %; nothing changed', v_day, v_at
+--               USING ERRCODE = 'P0002';
+--       END IF;
+--       IF EXISTS (SELECT 1 FROM pds.cronometer_servings s WHERE s.calendar_date = v_day) THEN
+--           RAISE EXCEPTION 'restore: % has servings again; nothing changed', v_day
+--               USING ERRCODE = '55000';
+--       END IF;
+--       IF EXISTS (SELECT 1
+--                    FROM pds.cronometer_nutrition_daily n
+--                   CROSS JOIN LATERAL jsonb_each(to_jsonb(n)) AS kv(key, value)
+--                   WHERE n.calendar_date = v_day
+--                     AND jsonb_typeof(kv.value) = 'number'
+--                     AND kv.value <> '0'::jsonb) THEN
+--           RAISE EXCEPTION 'restore: the daily row of % has food again; nothing changed', v_day
+--               USING ERRCODE = '55000';
+--       END IF;
+--       IF EXISTS (SELECT 1 FROM pds.cronometer_cleared_rows c
+--                   WHERE c.source_table = 'cronometer_nutrition_daily'
+--                     AND c.calendar_date = v_day AND c.cleared_at = v_at) THEN
+--           DELETE FROM pds.cronometer_nutrition_daily n WHERE n.calendar_date = v_day;
+--       END IF;
+--       INSERT INTO pds.cronometer_servings
+--       SELECT (jsonb_populate_record(NULL::pds.cronometer_servings, c.row_data)).*
+--         FROM pds.cronometer_cleared_rows c
+--        WHERE c.source_table = 'cronometer_servings'
+--          AND c.calendar_date = v_day AND c.cleared_at = v_at;
+--       GET DIAGNOSTICS v_servings = ROW_COUNT;
+--       INSERT INTO pds.cronometer_nutrition_daily
+--       SELECT (jsonb_populate_record(NULL::pds.cronometer_nutrition_daily, c.row_data)).*
+--         FROM pds.cronometer_cleared_rows c
+--        WHERE c.source_table = 'cronometer_nutrition_daily'
+--          AND c.calendar_date = v_day AND c.cleared_at = v_at;
+--       GET DIAGNOSTICS v_daily = ROW_COUNT;
+--       DELETE FROM pds.cronometer_empty_day_candidates e WHERE e.calendar_date = v_day;
+--       RAISE NOTICE 'restored %: % serving(s) and % daily row(s) from the copy made at %',
+--           v_day, v_servings, v_daily, v_at;
+--   END
+--   $restore$;
 --
--- If a day was emptied more than once, add `AND c.cleared_at = (SELECT max(...))`
--- for the copy you want; the backup rows are never removed by any code.
+-- An older copy (a day emptied more than once): set v_at to its cleared_at, from
+-- SELECT DISTINCT cleared_at FROM pds.cronometer_cleared_rows WHERE calendar_date =
+-- <the day> ORDER BY 1; and copy the whole value, every digit of the seconds.

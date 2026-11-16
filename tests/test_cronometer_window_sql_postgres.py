@@ -11,15 +11,20 @@ socket inside that folder, no TCP port) and checks what only the database can sh
   * the importer's own calls (cronometer_import.run_import, through a small client
     that turns its RPC calls into SQL) record a day with no food on the first look,
     empty it only on a second look at least 6 h later, copy every removed row to
-    pds.cronometer_cleared_rows first, and the restore recipe at the end of the SQL
+    pds.cronometer_cleared_rows first, and the restore block at the end of the SQL
     file puts the day back exactly;
+  * the restore block also puts back a day the daily summary listed with no food: the
+    copied totals replace the zero Total row the emptying left (Codex review, round 2),
+    all or nothing (a failure inside it changes nothing), from one copy (the newest, or
+    the one named), never over food a later import wrote, and in turn with an import
+    that holds the lock;
   * a servings file whose header lost its Food Name column still starts the day's
     empty-day count over (Codex review PIPE03-R7), end to end;
   * a failure after the emptying (a test trigger that raises later in the same call)
     rolls back all four tables, and the retry then does the work once;
   * two overlapping sessions take turns on the shared advisory lock: the second one
     waits until the first commits and then sees its rows (window + manual writer,
-    window + window, an emptying window + manual writer);
+    window + window, an emptying window + manual writer, an emptying window + a restore);
   * food seen starts the count over (a food-dates-only call, the manual writer), the
     function refuses dates it may not empty with nothing changed, and a daily row with
     no food never replaces stored food except on the day the function empties.
@@ -288,6 +293,13 @@ def upstream_call(empty=tuple(EMPTY_BETWEEN), tz=CSV_DATE, daily_tz=CSV_DATE) ->
                          food=[D(2), D(7)])
 
 
+def servings_empty_call() -> dict:
+    """The same export, but the daily summary lists D5 with zero totals (and no servings)."""
+    rows = [srow(D(2), "test oats"), srow(D(2), "test tea"), srow(D(7), "test soup")]
+    return window_params(rows, [drow(D(2), 200.0), drow(D(5), 0.0), drow(D(7), 100.0)],
+                         empty=[D(3), D(4), D(6)], s_empty=[D(5)], food=[D(2), D(7)])
+
+
 STATE_SQL = """SELECT jsonb_build_object(
   'servings',   (SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.serving_id), '[]'::jsonb) FROM pds.cronometer_servings s),
   'daily',      (SELECT coalesce(jsonb_agg(to_jsonb(n) ORDER BY n.calendar_date), '[]'::jsonb) FROM pds.cronometer_nutrition_daily n),
@@ -303,6 +315,11 @@ def state(pg: Cluster) -> dict:
 
 def names(st, day=None):
     return sorted(r["food_name"] for r in st["servings"] if day is None or r["calendar_date"] == day)
+
+
+def day_rows(st, table, day):
+    """Every stored row of one day ('servings' or 'daily'), exactly as stored."""
+    return [r for r in st[table] if r["calendar_date"] == day]
 
 
 def daily_days(st):
@@ -355,14 +372,22 @@ def expect_error(pg: Cluster, sql: str, code: str, text: str) -> PgError:
     raise AssertionError(f"expected {code} ({text})")
 
 
-def restore_sql(day: str) -> str:
-    """The restore recipe at the end of the SQL file, for one day, exactly as written there."""
+AT_DEFAULT = re.compile(r"(v_at\s+timestamptz := )NULL;")
+
+
+def restore_sql(day: str, cleared_at: str | None = None) -> str:
+    """The restore block at the end of the SQL file, for one day, exactly as written
+    there. cleared_at: put back that copy instead of the newest (as the file says to)."""
     text = WINDOW_SQL.read_text(encoding="utf-8")
     start = text.index("-- 6. Putting an emptied day back")
-    end = text.index("-- If a day was emptied more than once", start)
-    lines = [line[len("--   "):] for line in text[start:end].splitlines() if line.startswith("--   ")]
-    sql = "\n".join(lines).replace("'<YYYY-MM-DD>'", q(day))
-    assert sql.count("INSERT INTO") == 2 and "<YYYY-MM-DD>" not in sql, sql
+    lines = [line[len("--   "):] for line in text[start:].splitlines() if line.startswith("--   ")]
+    sql = "\n".join(lines)
+    assert sql.startswith("DO $restore$") and sql.rstrip().endswith("$restore$;"), sql
+    assert sql.count("'<YYYY-MM-DD>'") == 1 and len(AT_DEFAULT.findall(sql)) == 1, sql
+    sql = sql.replace("'<YYYY-MM-DD>'", q(day))
+    if cleared_at is not None:
+        sql = AT_DEFAULT.sub(lambda m: m.group(1) + q(cleared_at) + ";", sql)
+    assert "<YYYY-MM-DD>" not in sql and sql.count("INSERT INTO") == 2, sql
     return sql + "\n"
 
 
@@ -737,6 +762,18 @@ def test_overlapping_sessions_take_turns_on_the_import_lock(pg: Cluster) -> None
     assert names(st, D(5)) == ["test rice"] and daily_kcal(st, D(5)) == 100.0 and cands(st) == {}
     assert sorted(c["source_table"] for c in st["cleared"]) == ["cronometer_nutrition_daily", "cronometer_servings"]
 
+    # 4. A restore of D5 started while an automated run is emptying it waits for that
+    # run, then puts the day back (without the shared lock it would find no copy yet).
+    seed(pg, candidates=[(D(5), ci.EMPTY_CONFIRM_HOURS + 1)])
+    before = state(pg)
+    a, b, during = overlap(pg, call_sql(WINDOW_FN, upstream_call()),
+                           restore_sql(D(5)) + "SELECT jsonb_build_object('restored', true)::text;\n")
+    assert during == before and a["cleared_days"] == 1 and b == {"restored": True}, (a, b)
+    st = state(pg)
+    assert day_rows(st, "servings", D(5)) == day_rows(before, "servings", D(5))
+    assert day_rows(st, "daily", D(5)) == day_rows(before, "daily", D(5)) and cands(st) == {}
+    assert len(st["cleared"]) == 2, "the copies stay"
+
 
 def test_food_seen_resets_the_count_and_refused_calls_change_nothing(pg: Cluster) -> None:
     seed(pg, candidates=[(D(5), 9), (OUTSIDE, 9)])
@@ -777,9 +814,7 @@ def test_a_daily_row_with_no_food_replaces_stored_food_only_on_the_emptied_day(p
     # The automated export lists D5 with zero totals and no servings: kept on the first
     # look, emptied (stored servings and daily row copied away, the zero row written) on
     # the second.
-    rows = [srow(D(2), "test oats"), srow(D(2), "test tea"), srow(D(7), "test soup")]
-    call = window_params(rows, [drow(D(2), 200.0), drow(D(5), 0.0), drow(D(7), 100.0)],
-                         empty=[D(3), D(4), D(6)], s_empty=[D(5)], food=[D(2), D(7)])
+    call = servings_empty_call()
     first = pg.value(call_sql(WINDOW_FN, call))
     assert (first["daily_upserted"], first["daily_kept"], first["pending_days"]) == (2, 1, 1), first
     st = state(pg)
@@ -793,12 +828,87 @@ def test_a_daily_row_with_no_food_replaces_stored_food_only_on_the_emptied_day(p
     assert sorted(c["source_table"] for c in st["cleared"]) == ["cronometer_nutrition_daily", "cronometer_servings"]
 
 
+def tag_serving_copies(pg: Cluster, tz: str) -> None:
+    """Set onyx_tz_source in every copied serving (FAIL makes putting it back raise)."""
+    pg.psql("UPDATE pds.cronometer_cleared_rows SET row_data = jsonb_set(row_data, '{onyx_tz_source}', "
+            f"to_jsonb({q(tz)}::text)) WHERE source_table = 'cronometer_servings';")
+
+
+def test_restore_puts_a_servings_empty_day_back_over_its_zero_row(pg: Cluster) -> None:
+    """Codex review (round 2): a day the daily summary listed with no food keeps a zero
+    Total row once it is emptied. The restore block must put the copied daily row back
+    in its place (an ON CONFLICT DO NOTHING insert kept the zero row), all or nothing,
+    from one copy only, and never over food a later import wrote."""
+    seed(pg, candidates=[(D(5), ci.EMPTY_CONFIRM_HOURS + 1)])
+    original = state(pg)
+    expect_error(pg, restore_sql(D(5)), "P0002", "no copy of")          # nothing emptied yet
+    assert state(pg) == original
+
+    out = pg.value(call_sql(WINDOW_FN, servings_empty_call()))           # D5 confirmed: emptied
+    assert (out["cleared_days"], out["cleared_servings"], out["cleared_daily"]) == (1, 1, 1), out
+    emptied = state(pg)
+    assert names(emptied, D(5)) == [] and daily_kcal(emptied, D(5)) == 0.0
+
+    # All or nothing: the restore takes the zero row out and then fails on the copied
+    # serving (the test trigger); the zero row and everything else stay as they were.
+    tag_serving_copies(pg, FAIL)
+    broken = state(pg)
+    expect_error(pg, restore_sql(D(5)), "P0001", "onyx test failure")
+    assert state(pg) == broken, "a failed restore left a change behind"
+    tag_serving_copies(pg, CSV_DATE)
+    assert state(pg) == emptied
+
+    # A stray empty-day record is forgotten too, so emptying the day again takes two new looks.
+    pg.psql("INSERT INTO pds.cronometer_empty_day_candidates (calendar_date, first_seen_at, last_seen_at) "
+            f"VALUES ({q(D(5))}::date, now() - interval '30 hours', now() - interval '30 hours');")
+    pg.psql(restore_sql(D(5)))
+    st = state(pg)
+    assert day_rows(st, "servings", D(5)) == day_rows(original, "servings", D(5))
+    assert day_rows(st, "daily", D(5)) == day_rows(original, "daily", D(5)), "the zero row stayed"
+    assert daily_kcal(st, D(5)) == 100.0 and cands(st) == {} and st["cleared"] == emptied["cleared"]
+    rest = lambda s: [r for t in ("servings", "daily") for r in s[t] if r["calendar_date"] != D(5)]  # noqa: E731
+    assert rest(st) == rest(emptied), "only the restored day may change"
+    first = pg.value(call_sql(WINDOW_FN, servings_empty_call()))         # still empty upstream: a first look
+    assert (first["cleared_days"], first["pending_days"], first["daily_kept"]) == (0, 1, 1), first
+    assert daily_kcal(state(pg), D(5)) == 100.0 and names(state(pg), D(5)) == ["test rice"]
+
+    again = state(pg)
+    expect_error(pg, restore_sql(D(5)), "55000", "has servings again")
+    assert state(pg) == again
+
+    # The day changes (a manual import writes it) and is emptied a second time: two
+    # copies. The block takes the newest by default and the older one when told to.
+    pg.value(call_sql(COMBINED_FN, {"p_dates": [D(5)], "p_rows": [srow(D(5), "test rice v2", 150.0)],
+                                    "p_daily_rows": [drow(D(5), 150.0)]}))
+    pg.value(call_sql(WINDOW_FN, servings_empty_call()))
+    age(pg)
+    second = pg.value(call_sql(WINDOW_FN, servings_empty_call()))
+    assert second["cleared_days"] == 1, second
+    twice = state(pg)
+    assert len(twice["cleared"]) == 4 and len({c["cleared_at"] for c in twice["cleared"]}) == 2, twice["cleared"]
+    peek = pg.value("BEGIN;\n" + restore_sql(D(5)) + STATE_SQL + "\nROLLBACK;\n")
+    assert names(peek, D(5)) == ["test rice v2"] and daily_kcal(peek, D(5)) == 150.0, peek
+    assert state(pg) == twice, "the rolled-back restore left a change behind"
+    (older,) = {c["cleared_at"] for c in twice["cleared"] if c["row_data"].get("food_name") == "test rice"}
+    pg.psql(restore_sql(D(5), cleared_at=older))
+    st = state(pg)
+    assert day_rows(st, "servings", D(5)) == day_rows(original, "servings", D(5))
+    assert day_rows(st, "daily", D(5)) == day_rows(original, "daily", D(5)) and len(st["cleared"]) == 4
+
+    # Food a later import wrote is never replaced: a daily row with food and no servings.
+    pg.psql(f"DELETE FROM pds.cronometer_servings WHERE calendar_date = {q(D(5))}::date;")
+    daily_only = state(pg)
+    expect_error(pg, restore_sql(D(5)), "55000", "has food again")
+    assert state(pg) == daily_only
+
+
 TESTS = [test_migration_applies_twice_and_is_service_role_only,
          test_importer_empties_a_day_on_the_second_look_and_the_recipe_restores_it,
          test_failure_after_emptying_rolls_back_all_four_tables_and_the_retry_works,
          test_overlapping_sessions_take_turns_on_the_import_lock,
          test_food_seen_resets_the_count_and_refused_calls_change_nothing,
-         test_a_daily_row_with_no_food_replaces_stored_food_only_on_the_emptied_day]
+         test_a_daily_row_with_no_food_replaces_stored_food_only_on_the_emptied_day,
+         test_restore_puts_a_servings_empty_day_back_over_its_zero_row]
 
 
 def main() -> int:
