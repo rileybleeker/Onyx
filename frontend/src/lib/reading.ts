@@ -507,7 +507,11 @@ function computeCheckpoints(
     const reached = !!reachedOn;
     const onTime = reached ? reachedOn! <= due : today > due ? false : null;
     const key = `ch${chapter}`;
-    const quiz = quizzes.find((q) => q.checkpoint === key) ?? null;
+    // Newest first (the read orders by taken_at desc): the newest result still counted, else the newest corrected one.
+    const quiz =
+      quizzes.find((q) => q.checkpoint === key && q.verification !== "invalidated") ??
+      quizzes.find((q) => q.checkpoint === key) ??
+      null;
     return { key, chapter, due, reached, onTime, quiz };
   });
 }
@@ -1202,7 +1206,9 @@ export type QuizResult = { ok: true; quiz: Quiz; passed: boolean; replayed: bool
 /**
  * Record a checkpoint quiz result: ONE call of pds.reading_record_quiz (quiz row + receipt, one transaction). Each
  * stored row is one durable attempt and counts toward XP; a retry under the same op_key stores nothing new.
- * Without a key (chat, an older page) one is made here, so that call is atomic but a retry of it is a new attempt.
+ * Without a key (an older page, and the chat tool until it passes its operation id) one is made here, so that call is
+ * atomic but a retry of it is a new attempt. A caller that retries must hold one op_key across its tries, and must
+ * classify a failure with failureMayHaveWritten (lib/reading-practice.ts), never by the message text.
  */
 export async function recordQuiz(supabase: Supa, input: QuizInput): Promise<QuizResult> {
   if (input.op_key != null && !isOpKey(input.op_key)) return { ok: false, status: 400, error: "bad_op_key" };

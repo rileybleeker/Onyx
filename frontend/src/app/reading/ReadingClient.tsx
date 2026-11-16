@@ -380,8 +380,9 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
         {c.quiz ? (
           <span className={c.quiz.verification !== "invalidated" && c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
             quiz {c.quiz.score}/{c.quiz.total}
-            {/* A question in it was corrected later (lib/reading-questions.ts): kept, earns no XP. */}
-            {c.quiz.verification === "invalidated" ? " · corrected" : ""}
+            {/* A question in it was corrected later (lib/reading-questions.ts): kept, earns no XP. Unverified = recorded
+                without its per-question answers, so the score can't be checked (still counted). */}
+            {c.quiz.verification === "invalidated" ? " · corrected" : c.quiz.verification === "unverified" ? " · unverified" : ""}
           </span>
         ) : c.reached ? (
           <Link href="/chat" className="text-accent/80 underline underline-offset-2">

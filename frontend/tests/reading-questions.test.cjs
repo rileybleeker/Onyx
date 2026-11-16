@@ -138,6 +138,32 @@ test("quiz results: legacy = unverifiable (still counted), corrected = shown but
   assert.equal(R.summarizeForChat(onlyCorrected).quizzes[0].verification, "invalidated");
   assert.deepEqual(P.rpcFailure(null, { code: "OXQ01" }), { ok: false, status: 409, error: "attempts_pending" });
   assert.deepEqual(P.rpcFailure(null, { code: "OXQ02" }), { ok: false, status: 409, error: "score_mismatch" });
+  assert.deepEqual(P.rpcFailure(null, { code: "OXQ03" }), { ok: false, status: 409, error: "quiz_other_book" });
+});
+
+test("checkpoint tile: the newest result still counted wins over a newer corrected one", () => {
+  const book = { book_id: 7, slug: "synthetic-book", title: "Synthetic Book", author: null, total_chapters: 10, start_date: "2026-03-01", target_date: "2026-03-31", status: "reading", finished_on: null, notion_page_id: null, habit_name: null, asin: null, last_position: null, last_position_at: null, total_positions: null };
+  const base = { book_id: 7, notes: null, quiz_date: "2026-03-05", total: 5, checkpoint: "ch3" };
+  // Newest first, as the overview read orders them (taken_at desc).
+  const corrected = { ...base, quiz_id: 9, score: 5, question_count: 5, invalidated_count: 1 };
+  const older = { ...base, quiz_id: 4, score: 4 };
+  const o = R.computeOverview({ book, today: "2026-03-10", sessions: [], highlights: [], reviews: [], quizzes: [corrected, older] });
+  assert.equal(o.checkpoints.find((c) => c.key === "ch3").quiz.quiz_id, 4);
+  const only = R.computeOverview({ book, today: "2026-03-10", sessions: [], highlights: [], reviews: [], quizzes: [corrected] });
+  assert.equal(only.checkpoints.find((c) => c.key === "ch3").quiz.verification, "invalidated", "a corrected result alone is still shown");
+  const tile = read("app/reading/ReadingClient.tsx");
+  assert.match(tile, /verification === "unverified" \? " · unverified"/, "an unverified score is labelled, not shown like a verified one");
+});
+
+test("SQL: one book per quiz, at answer time and when the result is recorded", () => {
+  const apply = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_question_apply"), sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts"));
+  assert.ok(apply.indexOf("'code', 'quiz_other_book'") > 0 && apply.indexOf("'code', 'quiz_other_book'") < apply.indexOf("INSERT INTO pds.reading_question_attempts"));
+  assert.match(apply, /WHERE a\.quiz_key = v_quiz AND q\.book_id <> v_book/);
+  const trig = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts"), sql.indexOf("CREATE OR REPLACE TRIGGER"));
+  assert.match(trig, /JOIN pds\.reading_questions q ON q\.question_id = a\.question_id/);
+  assert.match(trig, /count\(\*\) FILTER \(WHERE q\.book_id <> NEW\.book_id\)/);
+  assert.match(trig, /ERRCODE = 'OXQ03'/);
+  assert.ok(trig.indexOf("ERRCODE = 'OXQ03'") < trig.indexOf("NEW.question_count := v_total"), "refused before it is marked verified");
 });
 
 test("raw answers stay off the disk: the questions route is a memory-only cache key; the overview is unchanged", () => {

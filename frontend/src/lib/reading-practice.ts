@@ -17,7 +17,11 @@ export const PRACTICE_GRADES: readonly PracticeGrade[] = ["again", "good", "easy
 /** Request caps (the routes also refuse a larger body before reading it). */
 export const PRACTICE_MAX_BODY_BYTES = 8 * 1024;
 export const QUIZ_CHECKPOINT_MAX = 40;
-export const QUIZ_NOTES_MAX = 4000;
+/**
+ * Fits inside PRACTICE_MAX_BODY_BYTES whatever the text: JSON takes at most 6 bytes per character (a six-character
+ * escape), so a valid note is answered bad_notes or stored, never 413.
+ */
+export const QUIZ_NOTES_MAX = 1000;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const isOpKey = (v: unknown): v is string => typeof v === "string" && UUID_RE.test(v);
@@ -193,12 +197,23 @@ export function rpcFailure(data: RpcAnswer | null | undefined, error: { code?: s
     // A quiz result checked against its per-question answers (sql/reading_learning_questions.sql trigger).
     if (error.code === "OXQ01") return { ok: false, status: 409, error: "attempts_pending" };
     if (error.code === "OXQ02") return { ok: false, status: 409, error: "score_mismatch" };
+    if (error.code === "OXQ03") return { ok: false, status: 409, error: "quiz_other_book" };
     return isMissingSchema(error) ? { ok: false, status: 503, error: "practice_unavailable" } : { ok: false, status: 500, error: "failed" };
   }
   if (!data || typeof data !== "object") return { ok: false, status: 500, error: "failed" };
   if (data.ok === true) return null;
   const status = Number.isInteger(data.http) && (data.http as number) >= 400 && (data.http as number) < 600 ? (data.http as number) : 500;
   return { ok: false, status, error: typeof data.code === "string" ? data.code : "failed" };
+}
+
+/**
+ * Whether a failed grade / quiz call may still have been stored. Every 4xx and the 503 (functions not applied) wrote
+ * nothing: the functions refuse before writing, and a trigger refusal rolls the whole call back. A 500 is a database
+ * error or an answer that never arrived (supabase-js reports a lost response as an error), so the write may have
+ * committed: a caller must not report it as "not recorded" and must retry only with the same op_key.
+ */
+export function failureMayHaveWritten(f: { status: number }): boolean {
+  return f.status >= 500 && f.status !== 503;
 }
 
 /* ------------------------------------------------------------------ */

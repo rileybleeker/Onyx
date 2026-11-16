@@ -16,7 +16,8 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * result through the same lib call. The result is stored with an operation receipt in ONE database call
  * (pds.reading_record_quiz): the same op_key and result answers that receipt again (`replayed: true`), so a retried
  * request never stores a second attempt or a second set of points; the same key with another result is 409
- * key_reused.
+ * key_reused. `xp_gained` is the award of the stored result: on a replay that is the original award, not points earned
+ * again (a replay is only reached after the first answer was lost, so it was never shown).
  *
  * Auth: owner session only (middleware; NOT in isCiRoute), plus same-origin, JSON only, 8 KB cap, unknown fields
  * refused. 503 practice_unavailable until sql/reading_practice_receipts.sql is applied (nothing is written).

@@ -82,6 +82,15 @@ test("parsing: unknown fields, bad keys, bad grades and fractional scores are re
   ]) assert.equal(P.parseQuizBody(bad).ok, false, JSON.stringify(bad));
 });
 
+test("a valid quiz note always fits the body cap; failures that may have been stored are told apart by status", () => {
+  const worst = JSON.stringify({ book: "b".repeat(80), checkpoint: "\u0001".repeat(P.QUIZ_CHECKPOINT_MAX), score: 1000, total: 1000, notes: "\u0001".repeat(P.QUIZ_NOTES_MAX), op_key: key() });
+  assert.ok(Buffer.byteLength(worst, "utf8") <= P.PRACTICE_MAX_BODY_BYTES, `worst-case body ${Buffer.byteLength(worst, "utf8")} bytes`);
+  for (const status of [400, 404, 409, 413, 503]) assert.equal(P.failureMayHaveWritten({ status }), false, `${status} wrote nothing`);
+  assert.equal(P.failureMayHaveWritten({ status: 500 }), true, "a 500 (or a lost answer) may have committed");
+  assert.equal(P.failureMayHaveWritten(P.rpcFailure(null, { code: "" })), true, "supabase-js reports a lost answer as an error without a code");
+  assert.equal(P.failureMayHaveWritten(P.rpcFailure(null, { code: "PGRST202" })), false, "the function is not applied: nothing written");
+});
+
 test("a grade is ONE call of the atomic function, carrying the state its schedule was computed from", async () => {
   const f = fakeClient({ answers: [applied()] });
   const k = key();
@@ -250,6 +259,10 @@ test("SQL: lock, then receipt, then row lock, then review + schedule + receipt i
   assert.ok(at("'code', 'raced'") < at("INSERT INTO pds.reading_reviews"));
   assert.ok(at("INSERT INTO pds.reading_reviews") < at("UPDATE pds.book_highlights") && at("UPDATE pds.book_highlights") < at("INSERT INTO pds.reading_practice_ops"));
   assert.match(review, /v_next IS DISTINCT FROM v_date \+ v_interval/, "the stored next review must follow from the stored interval");
+  const casts = review.slice(0, review.indexOf("EXCEPTION WHEN others"));
+  for (const c of ["client_review_count", "'basis'->>'review_count'", "'basis'->>'ease'", "'schedule'->>'interval_days'", "'schedule'->>'next_review'"]) {
+    assert.ok(casts.includes(c), `${c} is cast inside the block that answers 400 bad_request`);
+  }
   const quiz = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_record_quiz"));
   assert.ok(quiz.indexOf("pg_advisory_xact_lock") < quiz.indexOf("INSERT INTO pds.reading_quizzes"));
   assert.ok(quiz.indexOf("v_prior.payload_hash <> v_hash") < quiz.indexOf("INSERT INTO pds.reading_quizzes"));

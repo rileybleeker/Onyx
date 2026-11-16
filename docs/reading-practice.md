@@ -3,6 +3,20 @@
 Spaced-repetition review grades (`/reading` Review card) and checkpoint quiz results (recorded by the chat's
 `record_reading_quiz` tool or `POST /api/reading/quiz`).
 
+## Rollout order (read before merging)
+
+`master` deploys on merge, and the new code has no direct-write fallback, so the SQL goes first:
+
+1. Apply `sql/reading_practice_receipts.sql`, then `sql/reading_learning_questions.sql` (Riley's approval: a
+   production schema write). Both are additive; the code already deployed keeps working with them applied (the new
+   columns are nullable, and the quiz trigger passes any row whose `op_key` is NULL).
+2. Read-only check that all three are not null: `to_regprocedure('pds.reading_grade_review(jsonb)')`,
+   `to_regprocedure('pds.reading_record_quiz(jsonb)')`, `to_regprocedure('pds.reading_question_apply(jsonb)')`.
+3. Merge the code (a held `[Riley merge]` PR).
+
+Merged before step 1, every review grade and every chat quiz result answers `503 practice_unavailable` (nothing is
+written, the review card keeps the card with Retry) until the SQL is applied.
+
 ## One operation, one receipt (PROD-T02)
 
 - `sql/reading_practice_receipts.sql` adds a nullable `op_key` to `pds.reading_reviews` and `pds.reading_quizzes`
@@ -25,8 +39,14 @@ Spaced-repetition review grades (`/reading` Review card) and checkpoint quiz res
 - Existing reviews and quizzes stay as they are. Rows stored before keys existed keep counting for XP; nothing is
   deduplicated after the fact. A stored quiz row is one durable attempt; a replay adds none.
 - Callers without a key (the chat tool, a page loaded before the change) get a key made on the server: the write is
-  atomic, but a retry of that request is a new attempt. The chat's replay ledger (SEC-04) can pass its operation id
-  as `op_key` to `recordQuiz` to make chat quiz retries exact.
+  atomic, but a retry of that request is a new attempt. **Open:** the chat tool is the only quiz writer today and
+  holds no key across retries, so "a lost-answer retry creates one quiz" is met for review grades and the route, not
+  yet for chat quiz results. It needs the chat replay ledger (SEC-04): whichever change merges second passes the
+  operation id as `op_key` to `recordQuiz` and classifies a failure with `failureMayHaveWritten`
+  (`lib/reading-practice.ts`: every 4xx and the 503 wrote nothing; a 500 may have), never by the message text.
+- `xp_gained` in an answer is the award of the stored row: on a replay it is the original award (the first answer
+  was lost, so it was never shown), not points earned again. Quiz notes are at most 1000 characters, so a valid
+  body always fits the 8 KB cap.
 
 Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 KB cap, unknown fields refused,
 errors are short codes.
@@ -71,13 +91,15 @@ Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under t
   material cannot be a source: the column's check allows nothing else.
 - **Attempts.** `pds.reading_question_attempts` keys each answer by the client's UUID. The same key and answer
   replays; another answer under that key is `409 key_reused`, and a second answer to the same question in one quiz
-  under a new key is `409 already_answered` (it would raise the quiz's total). The answer is stored as `pending`;
+  under a new key is `409 already_answered` (it would raise the quiz's total). All answers under one quiz key are
+  about one book (`409 quiz_other_book`). The answer is stored as `pending`;
   grading (`correct`, `grader` model | self, feedback, `graded_at`) is a separate call, so an answer whose grading
   never finished stays visible. Grading again with the same grade replays, another grade is `409 already_graded`.
 - **Quiz results.** A quiz result recorded under op_key K (`/api/reading/quiz`, `recordQuiz`) is checked against
   the answers given with `quiz_key` K: refused while any is ungraded (`409 attempts_pending`) or when its score /
   total differ from the graded answers (`409 score_mismatch`, also when every answer was invalidated by a
-  correction, leaving nothing to check against); `question_count` is then set. A result without such
+  correction, leaving nothing to check against), or when any answer is about another book than the result
+  (`409 quiz_other_book`); `question_count` is then set. A result without such
   answers (every result stored before this change, and the chat's results until its tool sends questions) has
   `question_count` NULL and is shown as `unverified` in the overview and the chat summary; it still counts for XP.
 - **Corrections.** `op: "correct"` with the version on screen (`expected_version`) makes the next version and
@@ -115,5 +137,9 @@ recovery); never delete reviews, quizzes or receipts to roll back.
 
 `frontend/tests/reading-practice.test.cjs` (synthetic data): request parsing, the single RPC per operation with no
 direct table writes, replay, the `raced` re-read, failure mapping without fallback, and SQL ordering / grant guards.
-The guards complement SQL review; real rollback and concurrency behaviour is checked after release with an
-authorized fixture, never with production data.
+The guards complement SQL review. The real functions are exercised by `tests/sql/reading_practice_fixture.sql`
+(replay after a lost answer, `key_reused`, `changed` / `raced`, a failing schedule write rolling the review back,
+quiz refusals for ungraded answers, a wrong score and another book's answers, and a correction invalidating and
+keeping the old answer), plus a two-session concurrency check in its last comment. It runs on a disposable copy of
+the database only (it refuses without `onyx.fixture_db = disposable` and ends in ROLLBACK), never on production, so
+it is a manual check after the SQL is reviewed, not a scheduled job.

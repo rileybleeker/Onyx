@@ -26,8 +26,13 @@
 -- Grants: both functions are SECURITY INVOKER and executable by service_role only; the receipt table is
 -- service_role only (row level security on, no policies). Grants on the existing tables are unchanged.
 --
--- Until applied, POST /api/reading/review and /api/reading/quiz answer 503 practice_unavailable (no direct-write
--- fallback) and the review card keeps the card with Retry.
+-- ROLLOUT ORDER (master deploys on merge): apply this file, then sql/reading_learning_questions.sql, and only then
+-- merge the code that calls them. The code has no direct-write fallback: merged first, every review grade and every
+-- quiz result answers 503 practice_unavailable (nothing written) until the SQL is applied. Applied first, the code
+-- already deployed keeps working (op_key is nullable, and the quiz trigger passes a row whose op_key is NULL).
+-- Read-only check before merging: to_regprocedure('pds.reading_grade_review(jsonb)'),
+-- to_regprocedure('pds.reading_record_quiz(jsonb)') and to_regprocedure('pds.reading_question_apply(jsonb)') are
+-- all not null.
 -- ============================================================
 
 ALTER TABLE pds.reading_reviews ADD COLUMN IF NOT EXISTS op_key UUID;
@@ -78,6 +83,10 @@ DECLARE
   v_interval  INTEGER;
   v_ease      NUMERIC;
   v_next      DATE;
+  v_client_rc INTEGER;
+  v_b_rc      INTEGER;
+  v_b_int     INTEGER;
+  v_b_ease    NUMERIC;
   v_hash      TEXT;
   v_prior     pds.reading_practice_ops%ROWTYPE;
   v_h         pds.book_highlights%ROWTYPE;
@@ -85,10 +94,18 @@ DECLARE
   v_review_id BIGINT;
   v_result    JSONB;
 BEGIN
+  -- Every cast is here, so a malformed call is 400 bad_request, never an uncaught error.
   BEGIN
     v_key := (p->>'op_key')::uuid;
     v_hid := (p->>'highlight_id')::bigint;
     v_date := (p->>'review_date')::date;
+    v_client_rc := NULLIF(p->>'client_review_count', '')::int;
+    v_b_rc := (p->'basis'->>'review_count')::int;
+    v_b_int := (p->'basis'->>'interval_days')::int;
+    v_b_ease := (p->'basis'->>'ease')::numeric;
+    v_interval := (p->'schedule'->>'interval_days')::int;
+    v_ease := (p->'schedule'->>'ease')::numeric;
+    v_next := (p->'schedule'->>'next_review')::date;
   EXCEPTION WHEN others THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END;
@@ -112,19 +129,16 @@ BEGIN
   IF v_h.archived THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'archived'); END IF;
 
   -- The card on screen was an older state of this highlight: another screen graded it in between.
-  IF NULLIF(p->>'client_review_count', '') IS NOT NULL AND v_h.review_count <> (p->>'client_review_count')::int THEN
+  IF v_client_rc IS NOT NULL AND v_h.review_count <> v_client_rc THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'changed', 'review_count', v_h.review_count);
   END IF;
   -- The schedule was computed from another state than the locked row (a write landed between the read and now).
-  IF v_h.review_count IS DISTINCT FROM (p->'basis'->>'review_count')::int
-     OR v_h.interval_days IS DISTINCT FROM (p->'basis'->>'interval_days')::int
-     OR v_h.ease IS DISTINCT FROM (p->'basis'->>'ease')::numeric THEN
+  IF v_h.review_count IS DISTINCT FROM v_b_rc
+     OR v_h.interval_days IS DISTINCT FROM v_b_int
+     OR v_h.ease IS DISTINCT FROM v_b_ease THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'raced');
   END IF;
 
-  v_interval := (p->'schedule'->>'interval_days')::int;
-  v_ease := (p->'schedule'->>'ease')::numeric;
-  v_next := (p->'schedule'->>'next_review')::date;
   IF v_interval IS NULL OR v_interval < 1 OR v_interval > 365 OR v_ease IS NULL OR v_ease < 1.3 OR v_ease > 3.0
      OR v_next IS DISTINCT FROM v_date + v_interval THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_schedule');

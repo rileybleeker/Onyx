@@ -16,7 +16,7 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * (pds.reading_grade_review): the review row, the schedule and an operation receipt commit together or not at all.
  * The review card sends one op_key per card until it hears a definite answer, so a retry after a lost answer gets
  * the same receipt (`replayed: true`) and stores nothing new. The first review of a behavioral day earns the day's
- * review XP (decided inside the same transaction).
+ * review XP (decided inside the same transaction); on a replay `xp_gained` is that original award, not earned again.
  *
  * Auth: owner session only (middleware; NOT in isCiRoute), plus same-origin, JSON only, 8 KB cap, unknown fields
  * refused. Answers: 200 { success, highlight, xp_gained, next_review, interval_days, review_date, op_key,
