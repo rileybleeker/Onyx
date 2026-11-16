@@ -1,10 +1,11 @@
 """TZ derivation edge cases: date-only rows and journal entries (offline, synthetic only).
 
 Roadmap row "TZ derivation edge-cases + centralize fallback labeling" (2026-11-14), audit
-item HIST-TZ-01 (2026-11-16). Four SQL files are checked:
+item HIST-TZ-01 (2026-11-16). Five SQL files are checked:
 
   sql/tz_derivation_edge_cases.sql         the migration (date-only + journal derivation)
   sql/rollback_tz_derivation_2026-11-16.sql  the live definitions it replaces, byte for byte
+  sql/tz_derivation_preapply_counts.sql    the SELECT-only impact counts run before applying
   sql/tz_derivation_postdeploy_checks.sql  the SELECT-only checks run right after applying
   sql/tz_derivation_whoop_followups.sql    the WHOOP parts split out (not applied)
 
@@ -45,6 +46,7 @@ SQL_DIR = ROOT / "sql"
 SQL_PATH = SQL_DIR / "tz_derivation_edge_cases.sql"
 ROLLBACK_PATH = SQL_DIR / "rollback_tz_derivation_2026-11-16.sql"
 CHECKS_PATH = SQL_DIR / "tz_derivation_postdeploy_checks.sql"
+PREAPPLY_PATH = SQL_DIR / "tz_derivation_preapply_counts.sql"
 FOLLOWUPS_PATH = SQL_DIR / "tz_derivation_whoop_followups.sql"
 ALIGNMENT_PY = ROOT / "hrv_alignment.py"
 
@@ -112,6 +114,7 @@ SQL = _read(SQL_PATH)
 FUNCS = _functions(SQL)
 ROLLBACK = _read(ROLLBACK_PATH)
 CHECKS = _read(CHECKS_PATH)
+PREAPPLY = _read(PREAPPLY_PATH)
 FOLLOWUPS = _read(FOLLOWUPS_PATH)
 
 
@@ -266,7 +269,7 @@ class FileShape(unittest.TestCase):
         # AGENTS.md: the Supabase MCP declines any migration whose text contains it,
         # comments included. The same goes for the rollback and the checks.
         for name, text in (("migration", SQL), ("rollback", ROLLBACK), ("checks", CHECKS),
-                           ("followups", FOLLOWUPS)):
+                           ("preapply", PREAPPLY), ("followups", FOLLOWUPS)):
             self.assertIsNone(re.search(r"drop", text, re.I), name)
 
     def test_matrix_view_untouched(self) -> None:
@@ -588,6 +591,30 @@ class ModelJournal(unittest.TestCase):
                 entry = written.astimezone(ET).date() - timedelta(days=lag)
                 self.assertEqual(journal_entry_onyx_dates(entry, written, TRIP_LOG)[1], entry)
 
+    def test_travel_check_entries(self) -> None:
+        # The post-deploy journal_travel_* checks: for an instant abroad, entry = local date
+        # and entry = local behavioral date are real time; entry = local date - 3 never is
+        # (it is never the ET, local or behavioral date of the instant), so it is date-only.
+        base = at("2031-06-01T00:00:00+00:00")
+        for off_h in range(-12, 15):
+            off = f"{'-' if off_h < 0 else '+'}{abs(off_h):02d}:00"
+
+            def cyc(_ts, o=off):  # tier 2 resolves every instant to this offset
+                return o
+
+            for h in range(0, 48):
+                ts = base + timedelta(hours=h)
+                local = ts.replace(tzinfo=None) + _offset(off)
+                et, loc, beh = ts.astimezone(ET).date(), local.date(), (local - SIX_H).date()
+                self.assertEqual(journal_entry_onyx_dates(loc, ts, NO_LOG, cyc),
+                                 (et, loc, loc, "cycle_anchor"), (off, h))
+                self.assertEqual(journal_entry_onyx_dates(beh, ts, NO_LOG, cyc),
+                                 (et, beh, loc, "cycle_anchor"), (off, h))
+                back = loc - timedelta(days=3)
+                self.assertNotIn(back, (et, loc, beh))
+                self.assertEqual(journal_entry_onyx_dates(back, ts, NO_LOG, cyc),
+                                 (back, back, back, "default_et_fallback"), (off, h))
+
     def test_real_time_dates_come_from_the_instant(self) -> None:
         base = at("2031-03-08T00:00:00-05:00")
         for h in range(0, 24 * 250, 5):
@@ -718,6 +745,99 @@ class PostDeployChecks(unittest.TestCase):
         block = CHECKS[CHECKS.index("bindings (tbl"):CHECKS.index("live_body AS")]
         bound = set(re.findall(r"'(set_onyx_dates_\w+)'\)", block))
         self.assertEqual({n for n in REPLACED_LIVE if n.startswith("set_onyx_dates_")} - bound, set())
+
+
+def _baseline_predicates(text: str) -> dict[str, str]:
+    """check name -> the NOT EXISTS (...) predicate of each baseline row, whitespace-normalised."""
+    code = _strip_comments(text)
+    out: dict[str, str] = {}
+    for m in re.finditer(r"SELECT '(\w+)', 'baseline',", code):
+        i = code.index("NOT EXISTS (", m.end())
+        depth, k = 0, i + len("NOT EXISTS ")
+        while True:
+            if code[k] == "(":
+                depth += 1
+            elif code[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        out[m.group(1)] = re.sub(r"\s+", " ", code[i:k + 1])
+    return out
+
+
+class PreApplyCounts(unittest.TestCase):
+    CODE = _strip_comments(PREAPPLY).strip()
+
+    def test_select_only(self) -> None:
+        self.assertTrue(self.CODE.startswith("WITH"))
+        self.assertEqual(self.CODE.count(";"), 1)
+        for kw in (r"\bUPDATE\b", r"\bINSERT\b", r"\bDELETE\b", r"\bCREATE\b", r"\bALTER\b",
+                   r"\bGRANT\b", r"\bTRUNCATE\b"):
+            self.assertNotRegex(self.CODE, re.compile(kw, re.I), kw)
+
+    def test_runs_before_the_migration(self) -> None:
+        # It must work on the current database, so it may not call a function the
+        # migration adds.
+        for helper in NEW_HELPERS:
+            self.assertNotIn(f"pds.{helper}(", self.CODE, helper)
+
+    def test_covers_every_date_only_table(self) -> None:
+        for table in ("garmin_hrv", "habit_journal", "journal_entries", "supplement_intake",
+                      "meal_events", "cronometer_servings"):
+            self.assertIn(f"pds.{table}", self.CODE, table)
+
+    def test_inline_rules_match_the_migration(self) -> None:
+        # Day label at the last instant of the ET day, as derive_onyx_dates_for_day reads it.
+        self.assertIn("+ 1)::timestamp AT TIME ZONE 'America/New_York')", self.CODE)
+        self.assertIn("INTERVAL '1 microsecond'", self.CODE)
+        self.assertIn("INTERVAL '1 microsecond'", FUNCS["derive_onyx_dates_for_day"])
+        # The journal real-time test, as in journal_entry_onyx_dates.
+        self.assertIn("pds.derive_onyx_dates(je.notion_created_at, NULL, NULL)", self.CODE)
+        self.assertIn("je.entry_date IN (i.onyx_et_date, i.onyx_local_date, i.onyx_behavioral_date)",
+                      self.CODE)
+        self.assertIn("p_entry_date IN (d.onyx_et_date, d.onyx_local_date, d.onyx_behavioral_date)",
+                      FUNCS["journal_entry_onyx_dates"])
+        # garmin_hrv: calendar_date + 'source_field', as the new trigger.
+        self.assertIn("'source_field'", self.CODE)
+        self.assertIn("derive_onyx_dates_for_day(NEW.calendar_date, 'source_field')",
+                      FUNCS["set_onyx_dates_garmin_hrv"])
+
+    def test_frozen_whoop_era_not_counted(self) -> None:
+        self.assertIn("WHERE NOT (h.source = 'whoop' AND h.cycle_date <= DATE '2026-06-08')", self.CODE)
+        self.assertNotIn("whoop_journal", self.CODE)
+
+    def test_gate_column_on_every_impact_row(self) -> None:
+        impacts = re.findall(r"SELECT '(\w+)'(?: \|\| t\.tbl)?, 'impact',", self.CODE)
+        self.assertGreaterEqual(len(impacts), 5)
+        self.assertIn("outside_intended", self.CODE)
+
+    def test_baseline_predicates_identical_in_both_files(self) -> None:
+        pre, post = _baseline_predicates(PREAPPLY), _baseline_predicates(CHECKS)
+        self.assertGreaterEqual(len(pre), 3)
+        self.assertEqual(pre, post)
+
+
+class PostDeployKinds(unittest.TestCase):
+    def test_every_check_has_a_gated_kind(self) -> None:
+        code = _strip_comments(CHECKS)
+        kinds = set(re.findall(r"^\s+SELECT [^\n]*?, '(\w+)',\s*$", code, re.M))
+        self.assertEqual(kinds, {"definition", "synthetic", "live_context", "rederived", "baseline"})
+        self.assertNotIn("'data'", CHECKS)
+
+    def test_journal_travel_uses_the_helper_zone_lookup(self) -> None:
+        # Two arguments: the helper resolves the zone itself (WHOOP cycle, then user_tz_log).
+        self.assertIn("pds.journal_entry_onyx_dates(e.entry_date, c.ts)", CHECKS)
+        self.assertIn("pds.cycle_offset_for_instant(c.start_time + make_interval(hours => g.k))"
+                      " = c.timezone_offset", CHECKS)
+        self.assertIn("pds.cycle_offset_for_instant(u.effective_from + make_interval(hours => g.k))"
+                      " IS NULL", CHECKS)
+        self.assertIn("(VALUES ('cycle_anchor'), ('user_tz_log')) AS tr (tier)", CHECKS)
+
+    def test_rederived_compares_with_both_rules(self) -> None:
+        self.assertIn("pds.journal_entry_onyx_dates(je.entry_date, je.notion_created_at)", CHECKS)
+        self.assertIn("WHERE je.archived IS NOT TRUE", CHECKS)
+        self.assertIn("(je.notion_created_at AT TIME ZONE 'America/New_York')::date", CHECKS)
 
 
 # =============================================================================

@@ -167,7 +167,7 @@ END;
 $function$;
 
 COMMENT ON FUNCTION pds.refresh_next_transition_day() IS
-'AFTER INSERT / UPDATE OF start_time, timezone_offset / row removal on whoop_cycles: recomputes onyx_is_transition_day of the cycle that follows NEW (and OLD, when start_time moved or the row was removed) against its actual predecessor. One hop: it only writes onyx_is_transition_day, which fires no trigger; pg_trigger_depth() > 1 is a backstop. Full repair: SELECT pds.recompute_whoop_transition_flags(); (sql/tz_derivation_edge_cases.sql, 2026-11-14).';
+'AFTER INSERT / UPDATE OF start_time, timezone_offset / row removal on whoop_cycles: recomputes onyx_is_transition_day of the cycle that follows NEW (and OLD, when start_time moved or the row was removed) against its actual predecessor. One hop: it only writes onyx_is_transition_day, which fires no trigger; pg_trigger_depth() > 1 is a backstop. Full repair: SELECT pds.recompute_whoop_transition_flags(); (sql/tz_derivation_whoop_followups.sql, staged 2026-11-14).';
 
 CREATE OR REPLACE TRIGGER whoop_cycles_refresh_next_transition_day
     AFTER INSERT OR UPDATE OF timezone_offset, start_time OR DELETE
@@ -202,7 +202,7 @@ END;
 $function$;
 
 COMMENT ON FUNCTION pds.recompute_whoop_transition_flags() IS
-'Manual repair: recomputes every whoop_cycles.onyx_is_transition_day with one LAG() pass (offset differs from the previous cycle''s). Returns the number of flags changed. Run after bulk out-of-order cycle writes (sql/tz_derivation_edge_cases.sql, 2026-11-14).';
+'Manual repair: recomputes every whoop_cycles.onyx_is_transition_day with one LAG() pass (offset differs from the previous cycle''s). Returns the number of flags changed. Run after bulk out-of-order cycle writes (sql/tz_derivation_whoop_followups.sql, staged 2026-11-14).';
 
 REVOKE ALL ON FUNCTION pds.recompute_whoop_transition_flags() FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION pds.recompute_whoop_transition_flags() TO service_role;

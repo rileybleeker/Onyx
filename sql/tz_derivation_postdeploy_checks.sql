@@ -2,11 +2,22 @@
 -- Post-deploy checks for sql/tz_derivation_edge_cases.sql (SELECT only)
 -- =============================================================================
 -- Run right after applying the migration (Supabase SQL editor or execute_sql).
--- One statement; it writes nothing and returns one row per check:
+-- Before applying, run sql/tz_derivation_preapply_counts.sql and note its
+-- results. One statement; it writes nothing and returns one row per check:
 --   check_name, kind, passed, note
--- Every row must have passed = true. passed = NULL means the check could not be
--- decided (its note says why); false is a failure: run
--- sql/rollback_tz_derivation_2026-11-16.sql and investigate.
+-- passed = NULL means the check could not be decided (its note says why).
+--
+-- What must hold, by kind (a failure = run
+-- sql/rollback_tz_derivation_2026-11-16.sql and investigate):
+--   definition, synthetic, live_context: passed = true right after applying.
+--   rederived: true once journal_etl.py has run after applying (hourly at :35).
+--     NULL before that is expected (live entries still carry the old rule's
+--     values), false = an entry matches neither the old nor the new rule.
+--   baseline: stored rows the migration does not rewrite (no backfill). Compare
+--     with the value the pre-apply file reported under the same name: the same
+--     value, or false -> true, is fine. true -> false is a failure. A false that
+--     was already false before applying is historical: report it for the
+--     separate backfill plan, it is not a deployment failure.
 --
 -- kind = 'synthetic': the date-only, awake-tail, backdate, far-east / far-west,
 --   both-DST-transition and NULL cases, on made-up 1990 inputs. No real row is
@@ -20,8 +31,19 @@
 --   these hashes against the migration file), the WHOOP journal archive and the
 --   other functions the migration must not touch still have their 2026-11-16
 --   bodies, and every trigger still calls its function.
--- kind = 'data': read-only consistency of stored rows, reported as booleans
---   only (no value leaves the database).
+-- kind = 'live_context': the deployed functions on made-up inputs in a real
+--   time-zone context. The journal_travel_* checks pick instants abroad (inside
+--   a closed WHOOP cycle whose offset is not ET's, resolved through
+--   pds.cycle_offset_for_instant, which the migration leaves untouched; or in a
+--   non-ET user_tz_log period with no WHOOP cycle near) and run the journal
+--   helper through its own zone lookup (no offset passed) on three entries per
+--   instant: written in real time (entry_date = local date), the awake tail
+--   (entry_date = local behavioral date) and backdated 3 days. Expected values
+--   come from the cycle's offset or the log zone directly. Each check needs at
+--   least one instant whose local date differs from its ET date (the case the
+--   old ET-only journal rule got wrong), else it is NULL.
+-- kind = 'rederived' / 'baseline': stored rows, see above. Booleans only: no
+--   value or row leaves the database.
 -- =============================================================================
 WITH
 pre AS (
@@ -103,7 +125,89 @@ live_body AS (
      WHERE ns.nspname = 'pds'
 ),
 first_log AS (
-    SELECT (min(effective_from) AT TIME ZONE 'America/New_York')::date AS d FROM pds.user_tz_log
+    SELECT (min(effective_from) AT TIME ZONE 'America/New_York')::date AS d,
+           min(effective_from) AS t
+      FROM pds.user_tz_log
+),
+-- Instants abroad, tier 2: inside a closed WHOOP cycle whose offset is not ET's
+-- at that instant, and which pds.cycle_offset_for_instant resolves to it.
+travel_cycle AS (
+    SELECT c.start_time + make_interval(hours => g.k) AS ts, c.timezone_offset::interval AS off
+      FROM pds.whoop_cycles c
+     CROSS JOIN generate_series(0, 23) AS g (k)
+     WHERE c.end_time IS NOT NULL AND c.timezone_offset IS NOT NULL
+       AND c.start_time + make_interval(hours => g.k) < c.end_time
+       AND c.timezone_offset::interval
+           <> ((c.start_time + make_interval(hours => g.k)) AT TIME ZONE 'America/New_York')
+            - ((c.start_time + make_interval(hours => g.k)) AT TIME ZONE 'UTC')
+       AND pds.cycle_offset_for_instant(c.start_time + make_interval(hours => g.k)) = c.timezone_offset
+),
+-- Instants abroad, tier 3: within a day after a non-ET user_tz_log row (before
+-- the next one) with no WHOOP cycle near, so the log decides.
+travel_log AS (
+    SELECT u.effective_from + make_interval(hours => g.k) AS ts, u.tz
+      FROM pds.user_tz_log u
+     CROSS JOIN generate_series(1, 24) AS g (k)
+     WHERE ((u.effective_from + make_interval(hours => g.k)) AT TIME ZONE u.tz)
+           <> ((u.effective_from + make_interval(hours => g.k)) AT TIME ZONE 'America/New_York')
+       AND NOT EXISTS (SELECT 1 FROM pds.user_tz_log u2
+                        WHERE u2.effective_from > u.effective_from
+                          AND u2.effective_from <= u.effective_from + make_interval(hours => g.k))
+       AND pds.cycle_offset_for_instant(u.effective_from + make_interval(hours => g.k)) IS NULL
+),
+travel AS (
+    SELECT 'cycle_anchor' AS tier, t.ts,
+           (t.ts AT TIME ZONE 'America/New_York')::date AS et,
+           ((t.ts AT TIME ZONE 'UTC') + t.off)::date AS loc,
+           ((t.ts AT TIME ZONE 'UTC') + t.off - INTERVAL '6 hours')::date AS beh
+      FROM travel_cycle t
+    UNION ALL
+    SELECT 'user_tz_log', t.ts,
+           (t.ts AT TIME ZONE 'America/New_York')::date,
+           (t.ts AT TIME ZONE t.tz)::date,
+           ((t.ts AT TIME ZONE t.tz) - INTERVAL '6 hours')::date
+      FROM travel_log t
+),
+-- Per instant: real time (local date), awake tail (local behavioral date),
+-- backdated 3 days (date-only: the date itself, label = log coverage of the
+-- day at its last ET instant; never equal to the ET, local or behavioral date
+-- of the instant, so never read as real time).
+travel_results AS (
+    SELECT c.tier, c.et, c.loc,
+           (r.onyx_et_date, r.onyx_behavioral_date, r.onyx_local_date, r.onyx_tz_source)
+           IS NOT DISTINCT FROM (e.want_et, e.want_beh, e.want_local, e.want_src) AS ok
+      FROM travel c
+     CROSS JOIN first_log f
+     CROSS JOIN LATERAL (VALUES
+         (c.loc,     c.et,      c.loc,     c.loc,     c.tier),
+         (c.beh,     c.et,      c.beh,     c.loc,     c.tier),
+         (c.loc - 3, c.loc - 3, c.loc - 3, c.loc - 3,
+          CASE WHEN f.t IS NOT NULL
+                AND f.t <= ((c.loc - 2)::timestamp AT TIME ZONE 'America/New_York')
+                           - INTERVAL '1 microsecond'
+               THEN 'user_tz_log' ELSE 'default_et_fallback' END)
+     ) AS e (entry_date, want_et, want_beh, want_local, want_src)
+     CROSS JOIN LATERAL pds.journal_entry_onyx_dates(e.entry_date, c.ts) r
+),
+-- Live journal entries (journal_etl.py re-upserts these hourly, archived ones
+-- are not re-upserted): stored values vs the new rule and vs the old one.
+journal_now AS (
+    SELECT (je.onyx_et_date, je.onyx_behavioral_date, je.onyx_local_date, je.onyx_tz_source)
+           IS NOT DISTINCT FROM (n.onyx_et_date, n.onyx_behavioral_date, n.onyx_local_date, n.onyx_tz_source)
+               AS is_new,
+           (je.onyx_et_date, je.onyx_behavioral_date, je.onyx_local_date, je.onyx_tz_source)
+           IS NOT DISTINCT FROM (CASE WHEN o.rt THEN d.onyx_et_date ELSE je.entry_date END,
+                                 je.entry_date,
+                                 CASE WHEN o.rt THEN d.onyx_local_date ELSE je.entry_date END,
+                                 CASE WHEN o.rt THEN d.onyx_tz_source ELSE 'default_et_fallback' END)
+               AS is_old
+      FROM pds.journal_entries je
+     CROSS JOIN LATERAL pds.journal_entry_onyx_dates(je.entry_date, je.notion_created_at) n
+     CROSS JOIN LATERAL pds.derive_onyx_dates(je.notion_created_at, NULL, NULL) d
+     CROSS JOIN LATERAL (SELECT COALESCE(je.entry_date
+                                         = (je.notion_created_at AT TIME ZONE 'America/New_York')::date,
+                                         FALSE) AS rt) o
+     WHERE je.archived IS NOT TRUE
 ),
 checks (check_name, kind, passed, note) AS (
     SELECT c.name, 'synthetic',
@@ -155,27 +259,45 @@ checks (check_name, kind, passed, note) AS (
            'trigger exists, is enabled and calls its function'
       FROM bindings x
     UNION ALL
-    SELECT 'garmin_hrv_dates_are_wake_day', 'data',
+    SELECT 'garmin_hrv_dates_are_wake_day', 'baseline',
            NOT EXISTS (SELECT 1 FROM pds.garmin_hrv
                         WHERE onyx_et_date IS DISTINCT FROM calendar_date
                            OR onyx_behavioral_date IS DISTINCT FROM calendar_date
                            OR onyx_local_date IS DISTINCT FROM calendar_date),
-           'every garmin_hrv row keyed by calendar_date (hrv_alignment.py does the one-day shift)'
+           'stored rows keyed by calendar_date (hrv_alignment.py does the one-day shift), compare with the pre-apply value'
     UNION ALL
-    SELECT 'journal_entries_behavioral_is_entry_date', 'data',
+    SELECT 'journal_entries_behavioral_is_entry_date', 'baseline',
            NOT EXISTS (SELECT 1 FROM pds.journal_entries
                         WHERE onyx_behavioral_date IS DISTINCT FROM entry_date),
-           'the HRV pipeline groups journal entries by entry_date'
+           'the HRV pipeline groups journal entries by entry_date, compare with the pre-apply value'
     UNION ALL
-    SELECT 'habit_journal_writable_rows_on_cycle_date', 'data',
+    SELECT 'habit_journal_writable_rows_on_cycle_date', 'baseline',
            NOT EXISTS (SELECT 1 FROM pds.habit_journal
                         WHERE NOT (source = 'whoop' AND cycle_date <= DATE '2026-06-08')
                           AND (onyx_et_date IS DISTINCT FROM cycle_date
                                OR onyx_behavioral_date IS DISTINCT FROM cycle_date
                                OR onyx_local_date IS DISTINCT FROM cycle_date)),
-           'rows outside the frozen WHOOP era carry cycle_date in all three dates'
+           'stored rows outside the frozen WHOOP era carry cycle_date in all three dates, compare with the pre-apply value'
     UNION ALL
-    SELECT 'same_day_landing_first_log_day', 'data',
+    SELECT 'journal_entries_rederived', 'rederived',
+           CASE WHEN bool_and(j.is_new OR j.is_old) IS FALSE THEN FALSE
+                WHEN bool_and(j.is_new) THEN TRUE END,
+           CASE WHEN count(*) = 0 THEN 'undecidable: no live journal entries'
+                WHEN bool_and(j.is_new OR j.is_old) IS FALSE THEN 'an entry matches neither the old nor the new rule'
+                WHEN bool_and(j.is_new) THEN 'every live entry carries the new rule (pds.journal_entry_onyx_dates)'
+                ELSE 'pending: some entries still carry the old rule, run again after the next journal sync (:35)' END
+      FROM journal_now j
+    UNION ALL
+    SELECT 'journal_travel_' || tr.tier, 'live_context',
+           CASE WHEN COALESCE(bool_or(x.loc <> x.et), FALSE) THEN bool_and(x.ok) END,
+           CASE WHEN COALESCE(bool_or(x.loc <> x.et), FALSE)
+                THEN 'pds.journal_entry_onyx_dates abroad (' || tr.tier || '): real time, awake tail, backdated'
+                ELSE 'undecidable: no ' || tr.tier || ' instant abroad whose local date differs from its ET date' END
+      FROM (VALUES ('cycle_anchor'), ('user_tz_log')) AS tr (tier)
+      LEFT JOIN travel_results x ON x.tier = tr.tier
+     GROUP BY tr.tier
+    UNION ALL
+    SELECT 'same_day_landing_first_log_day', 'live_context',
            CASE WHEN f.d IS NULL THEN NULL ELSE
                (SELECT r.onyx_tz_source FROM pds.derive_onyx_dates_for_day(f.d) r) = 'user_tz_log'
                AND (SELECT r.onyx_tz_source FROM pds.derive_onyx_dates_for_day(f.d - 1) r) = 'default_et_fallback'
@@ -184,7 +306,7 @@ checks (check_name, kind, passed, note) AS (
                 ELSE 'the ET day the first log row starts on counts as covered, the day before does not' END
       FROM first_log f
     UNION ALL
-    SELECT 'log_days_keep_their_date', 'data',
+    SELECT 'log_days_keep_their_date', 'live_context',
            NOT EXISTS (SELECT 1
                          FROM pds.user_tz_log u
                         CROSS JOIN LATERAL pds.derive_onyx_dates_for_day(
@@ -194,4 +316,5 @@ checks (check_name, kind, passed, note) AS (
 )
 SELECT check_name, kind, passed, note
   FROM checks
- ORDER BY CASE kind WHEN 'definition' THEN 1 WHEN 'synthetic' THEN 2 ELSE 3 END, check_name;
+ ORDER BY CASE kind WHEN 'definition' THEN 1 WHEN 'synthetic' THEN 2 WHEN 'live_context' THEN 3
+                   WHEN 'rederived' THEN 4 ELSE 5 END, check_name;

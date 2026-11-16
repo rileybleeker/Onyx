@@ -9,9 +9,10 @@
 -- replaces a function whose LIVE definition (pg_get_functiondef, 2026-11-16) is
 -- saved in sql/rollback_tz_derivation_2026-11-16.sql.
 --
--- STATUS: NOT applied. Apply only after its reviews pass. Run the DRY RUN
--- queries first and the post-deploy checks
--- (sql/tz_derivation_postdeploy_checks.sql) right after.
+-- STATUS: NOT applied. Apply only after its reviews pass. Run
+-- sql/tz_derivation_preapply_counts.sql first (SELECT only, counts of the
+-- stored rows the new rule would derive differently) and
+-- sql/tz_derivation_postdeploy_checks.sql right after.
 --
 -- Scope: this file changes how FUTURE trigger runs derive the onyx_* dates and
 -- labels. It contains no UPDATE of stored rows (no backfill; that is a separate
@@ -21,8 +22,9 @@
 -- Heads-up: journal_etl.py upserts every Notion page each hour (entry_date and
 -- notion_created_at are in the payload, which fires the trigger), so within an
 -- hour of applying, journal_entries rows are re-derived by the new rule; the
--- DRY RUN (c) query shows exactly which rows change. garmin_etl.py re-upserts its
--- recent days the same way (labels only, see (a)).
+-- journal_entries row of sql/tz_derivation_preapply_counts.sql counts exactly
+-- which rows change. garmin_etl.py re-upserts its recent days the same way
+-- (labels only).
 --
 -- What changes, in plain words
 --   1. One helper decides the label when a TZ comes from pds.user_tz_log:
@@ -84,43 +86,16 @@
 
 
 -- =============================================================================
--- DRY RUN (SELECT only; run before applying). Each query counts the stored
--- rows the new rule would derive differently. Report counts, never rows.
+-- BEFORE APPLYING: sql/tz_derivation_preapply_counts.sql (one SELECT, counts
+-- and booleans only, runs on the current database: it writes the new rules out
+-- inline and needs none of the functions below). Gate: outside_intended = 0 on
+-- every impact row. Expected: garmin_hrv label-only (dates unchanged); writable
+-- habit_journal rows, untimed meal_events / supplement_intake rows label-only;
+-- journal_entries date changes only on entries newly read as real time (awake
+-- tail, abroad: et/local become the clock day written, onyx_behavioral_date
+-- unchanged); cronometer_servings rows with a NULL onyx_* column: none. Note
+-- its baseline rows: the post-deploy checks report them again.
 -- =============================================================================
--- Label a date-only day gets from the new helper:
---   CASE WHEN EXISTS (SELECT 1 FROM pds.user_tz_log u
---                      WHERE u.effective_from <= ((d + 1)::timestamp
---                            AT TIME ZONE 'America/New_York') - INTERVAL '1 microsecond')
---        THEN 'user_tz_log' ELSE 'default_et_fallback' END
---
--- (a) garmin_hrv: expected label-only (dates unchanged)
---   SELECT count(*) FILTER (WHERE onyx_et_date IS DISTINCT FROM calendar_date
---                              OR onyx_behavioral_date IS DISTINCT FROM calendar_date
---                              OR onyx_local_date IS DISTINCT FROM calendar_date) AS date_changes,
---          count(*) FILTER (WHERE onyx_tz_source IS DISTINCT FROM 'source_field') AS label_changes,
---          count(*) FILTER (WHERE start_timestamp IS NOT NULL) AS instant_rows
---     FROM pds.garmin_hrv;
--- (b) supplement_intake without intake_time: expected label-only
---   SELECT count(*) FILTER (WHERE onyx_et_date IS DISTINCT FROM intake_date
---                              OR onyx_local_date IS DISTINCT FROM intake_date) AS date_changes,
---          count(*) FILTER (WHERE onyx_tz_source IS DISTINCT FROM <label for intake_date>) AS label_changes
---     FROM pds.supplement_intake WHERE intake_time IS NULL;
--- (c) journal_entries: date changes only on awake-tail entries (+1 day to the
---     clock day written, onyx_behavioral_date unchanged); the rest label-only.
---   SELECT count(*) FILTER (WHERE je.onyx_et_date IS DISTINCT FROM n.onyx_et_date
---                              OR je.onyx_local_date IS DISTINCT FROM n.onyx_local_date) AS date_changes,
---          count(*) FILTER (WHERE je.onyx_behavioral_date IS DISTINCT FROM n.onyx_behavioral_date) AS behavioral_changes,
---          count(*) FILTER (WHERE je.onyx_tz_source IS DISTINCT FROM n.onyx_tz_source) AS label_changes
---     FROM pds.journal_entries je
---     CROSS JOIN LATERAL (<pds.journal_entry_onyx_dates written inline with
---                          pds.derive_onyx_dates(je.notion_created_at, NULL, NULL)
---                          and the label above>) n;
--- (d) habit_journal rows outside the frozen WHOOP era (source = 'whoop' AND
---     cycle_date <= '2026-06-08'): expected no change; frozen rows cannot be
---     rewritten and are not counted.
--- (e) meal_events / cronometer_servings rows with no time: meal_events expected
---     none; Cronometer rows carry labels from cronometer_import.py, which the
---     trigger keeps (it only fills NULLs), so expected no change.
 
 
 -- =============================================================================
@@ -443,7 +418,8 @@ COMMENT ON FUNCTION pds.set_onyx_dates_journal_entries() IS
 
 -- =============================================================================
 -- 6. After applying: run sql/tz_derivation_postdeploy_checks.sql (SELECT only).
---    Every row must have passed = true; a NULL means its precondition failed
---    (read the note). It also confirms the live function bodies are exactly
---    the bodies in this file.
+--    definition / synthetic / live_context rows must have passed = true; the
+--    rederived row turns true after the next journal sync (:35); baseline rows
+--    must keep their pre-apply value or turn true. Its header has the details.
+--    It also confirms the live function bodies are exactly the bodies here.
 -- =============================================================================
