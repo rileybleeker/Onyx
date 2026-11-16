@@ -197,3 +197,809 @@ test('report passes the planned navigation count to the budget and orders in-app
   assert.deepEqual(stats.budgetViolations(run.pages), ['/sleep: only 2 of 4 navigations were measured']);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Harness version 2: cache state, fixed window by purpose and origin, robust percentiles with n, the measured
+// production revision, the observe-only phone scenario. Synthetic numbers and example.test hosts only.
+// ---------------------------------------------------------------------------
+
+test('robust percentiles carry n and a low-n warning, and never throw on empty input', () => {
+  const r = stats.robust([400, 410, 420, null, NaN, 1300]);
+  assert.equal(r.n, 4);
+  assert.equal(r.p50, 415);
+  assert.equal(r.max, 1300);
+  assert.equal(r.lowN, true, `n=4 is below LOW_N=${stats.LOW_N}`);
+  assert.equal(r.mad, 10, 'median absolute deviation ignores the one slow view');
+  const big = stats.robust(Array.from({ length: 20 }, (_, i) => 100 + i));
+  assert.equal(big.lowN, false);
+  assert.equal(big.iqr, 9.5);
+  const none = stats.robust([]);
+  assert.equal(none.n, 0);
+  assert.equal(none.p50, null);
+  assert.equal(none.lowN, true);
+});
+
+test('viaOf: service worker, memory / disk / prefetch cache, network, and unknown when the browser did not say', () => {
+  assert.equal(stats.viaOf(undefined), 'unknown', 'probe unavailable or request not in the log');
+  assert.equal(stats.viaOf({}), 'unknown', 'still open: no response seen');
+  assert.equal(stats.viaOf({ responded: true }), 'network');
+  assert.equal(stats.viaOf({ servedFromCache: true, responded: true }), 'memory-cache');
+  assert.equal(stats.viaOf({ fromDiskCache: true, responded: true }), 'disk-cache');
+  assert.equal(stats.viaOf({ fromPrefetchCache: true, responded: true }), 'prefetch-cache');
+  assert.equal(stats.viaOf({ fromServiceWorker: true, fromDiskCache: true, responded: true }), 'service-worker');
+});
+
+test('purposeOf: prefetch wins, then before / after data-ready, unknown when the page never got ready', () => {
+  assert.equal(stats.purposeOf({ startMs: 50, prefetch: true }, 400), 'prefetch');
+  assert.equal(stats.purposeOf({ startMs: 50 }, 400), 'routed');
+  assert.equal(stats.purposeOf({ startMs: 400 }, 400), 'background', 'started at the ready moment = after it');
+  assert.equal(stats.purposeOf({ startMs: 50 }, null), 'unknown');
+});
+
+function rec(cls, startMs, over = {}) {
+  return { cls, key: `/${cls}`, startMs, endMs: startMs + 100, durMs: 100, bytes: 1000, failed: false, prefetch: false, via: 'network', ...over };
+}
+
+test('foldWindow counts only requests that started inside the fixed window, split by purpose and origin', () => {
+  const records = [
+    rec('document', 0),
+    rec('static', 20, { via: 'disk-cache' }),
+    rec('static', 25, { via: 'memory-cache' }),
+    rec('rest', 100),
+    rec('api', 120, { via: 'unknown' }),
+    rec('rsc', 3000, { prefetch: true }),
+    rec('api', 2500),
+    rec('rest', 2600, { via: 'service-worker' }),
+    rec('rest', 6000), // starts exactly at the window end: outside
+    rec('api', 9000),
+  ];
+  const w = stats.foldWindow(records, { windowMs: 6000, readyAtMs: 450, observedMs: 6100 });
+  assert.equal(w.complete, true);
+  assert.equal(w.total.n, 8);
+  assert.deepEqual(
+    { n: w.purpose.routed.n, data: w.purpose.routed.data, network: w.purpose.routed.network, cached: w.purpose.routed.cached, unknownVia: w.purpose.routed.unknownVia },
+    { n: 5, data: 2, network: 2, cached: 2, unknownVia: 1 }
+  );
+  assert.deepEqual(
+    { n: w.purpose.background.n, data: w.purpose.background.data, network: w.purpose.background.network, serviceWorker: w.purpose.background.serviceWorker },
+    { n: 2, data: 2, network: 1, serviceWorker: 1 }
+  );
+  assert.equal(w.purpose.prefetch.n, 1);
+  assert.equal(w.via['disk-cache'], 1);
+  assert.equal(w.via['memory-cache'], 1);
+  assert.equal(w.via.unknown, 1);
+  assert.equal(w.purpose.routed.cls.static, 2);
+});
+
+test('foldWindow: a window not observed to its end is incomplete, and an unknown origin is never counted as network', () => {
+  const w = stats.foldWindow([rec('api', 10, { via: undefined })], { windowMs: 6000, readyAtMs: 300, observedMs: 2500 });
+  assert.equal(w.complete, false);
+  assert.equal(w.purpose.routed.network, 0);
+  assert.equal(w.purpose.routed.unknownVia, 1);
+  const neverReady = stats.foldWindow([rec('api', 10)], { windowMs: 6000, readyAtMs: null, observedMs: 6000 });
+  assert.equal(neverReady.purpose.unknown.n, 1, 'no data-ready: nothing is called routed or background');
+});
+
+test('foldWindow: an in-app window starts at the click; earlier records are counted apart and a full window follows the input', () => {
+  // Click at 1500 ms on the request clock (after scrolling to the link and marking the old page), window 4000 ms:
+  // [1500, 5500). The rsc and api requests before the click are the previous page's or the preparation's, not this page's.
+  const records = [rec('rsc', 100), rec('api', 900), rec('rsc', 1500, { prefetch: true }), rec('rest', 1600), rec('api', 5400), rec('api', 5600)];
+  const w = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5550, anchorMs: 1500, anchorKind: 'input' });
+  assert.equal(w.anchor, 'input');
+  assert.equal(w.anchorMs, 1500);
+  assert.deepEqual(w.beforeAnchor, { n: 2, data: 1 });
+  assert.equal(w.total.n, 3, 'the hover prefetch at the click, the routed read, one background read; 5600 is past the window');
+  assert.equal(w.purpose.prefetch.n, 1);
+  assert.equal(w.purpose.routed.n, 1);
+  assert.equal(w.purpose.background.n, 1);
+  assert.equal(w.readyAtMs, 400, 'reported from the window start');
+  assert.equal(w.observedMs, 4050);
+  assert.equal(w.complete, true, 'observed 4050 ms after the click');
+  const cut = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000, anchorMs: 1500, anchorKind: 'input' });
+  assert.equal(cut.complete, false, 'only 3500 ms after the click: a late click never passes for a full window');
+  const fromStart = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000 });
+  assert.equal(fromStart.anchorMs, 0);
+  assert.equal(fromStart.anchor, 'navigation-start');
+  assert.deepEqual(fromStart.beforeAnchor, { n: 0, data: 0 }, 'a full load anchors at navigation start');
+});
+
+// In-app windows start at the click's observed input. When the input was not seen (the pointer read failed or saw no
+// event, or the click loaded a new document), the window's start is unknown: it is recorded as such and never counted,
+// and the click call's time is never used in its place (Playwright's actionability wait comes after it).
+const CLICK_ORIGIN = 1_700_000_000_000.25;
+
+test('inputAnchorOf: only a pointer event seen on the same document after the mark anchors the window', () => {
+  const at = (pointer) => stats.inputAnchorOf({ pointer, clickOrigin: CLICK_ORIGIN, markedAt: 30_000, clickAtMs: 1_200 });
+  assert.deepEqual(at([30_450, CLICK_ORIGIN]), { kind: 'input', reason: null, anchorMs: 1_650, clickWaitMs: 450 },
+    'the actionability wait (450 ms) moves the window start past the click call');
+  // Missing pointer: the listener saw no event on the link.
+  assert.deepEqual(at([null, CLICK_ORIGIN]), { kind: 'unobserved', reason: 'no pointer event seen on the link', anchorMs: null, clickWaitMs: null });
+  // The pointer read itself failed (the evaluate threw, e.g. while the page was navigating).
+  assert.deepEqual(at(null), { kind: 'unobserved', reason: 'pointer read failed', anchorMs: null, clickWaitMs: null });
+  // Changed document: the click loaded a new document, whose clock restarted and which never saw the pointer.
+  assert.deepEqual(at([null, CLICK_ORIGIN + 41_000]), { kind: 'unobserved', reason: 'the click loaded a new document', anchorMs: null, clickWaitMs: null });
+  assert.equal(at([120, CLICK_ORIGIN + 41_000]).kind, 'unobserved', 'a pointer time from another document is never used');
+  assert.equal(at([29_000, CLICK_ORIGIN]).kind, 'unobserved', 'an event before the mark is not this click');
+  assert.equal(stats.inputAnchorOf({ pointer: [30_450, CLICK_ORIGIN], clickOrigin: CLICK_ORIGIN, markedAt: 30_000, clickAtMs: undefined }).kind, 'unobserved',
+    'no click moment on the request clock: nothing to put the input on');
+});
+
+test('foldWindow: an unobserved in-app input gives an unknown window, never a complete one, however long it was observed', () => {
+  // The click call at 1000 ms; Playwright's actionability wait took 3500 ms before the real click, so a window counted
+  // from the click call would have only 500 ms of the navigation in it. It must not read as a full 4 s window.
+  const records = [rec('rsc', 900), rec('rsc', 4600), rec('rest', 4700), rec('api', 5200)];
+  for (const observedMs of [5100, 9000, 15000]) {
+    const w = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs, anchorMs: 1000, settleByMs: 7000,
+      anchorKind: 'unobserved', anchorReason: 'no pointer event seen on the link' });
+    assert.equal(w.anchor, 'unobserved');
+    assert.equal(w.anchorReason, 'no pointer event seen on the link');
+    assert.equal(w.complete, false, `observed to ${observedMs}: still not a measurement`);
+    assert.equal(w.costComplete, null, 'cost unknown, not complete');
+    assert.equal(w.anchorMs, null, 'the click call is not reported as the window start');
+    for (const k of ['readyAtMs', 'observedMs', 'settleByMs', 'total', 'purpose', 'via', 'beforeAnchor']) assert.equal(w[k], null, `${k} unknown, never 0`);
+    assert.equal(w.windowMs, 4000, 'the window length asked for is kept');
+  }
+  // An anchor after 0 that does not say it was an observed input is unobserved too (fails closed).
+  const unlabelled = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs: 9000, anchorMs: 1000 });
+  assert.equal(unlabelled.anchor, 'unobserved');
+  assert.equal(unlabelled.complete, false);
+  assert.equal(stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs: 9000, anchorMs: 1000, anchorKind: 'navigation-start' }).anchor, 'unobserved',
+    'navigation start is request clock 0 only');
+  assert.equal(stats.comparableWindow(unlabelled), false);
+  assert.equal(stats.comparableWindow(stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs: 9000, anchorMs: 4500, anchorKind: 'input' })), true);
+  assert.equal(stats.comparableWindow({ complete: true, anchorMs: 1000 }), false, 'a window without an anchor kind is never comparable');
+});
+
+test('sinceClickMs: same document unchanged; a click that loaded a new document is timed on the shared clock, never negative', () => {
+  assert.equal(stats.sinceClickMs(30_640, CLICK_ORIGIN, 30_000, CLICK_ORIGIN), 640, 'same document: the version 1 difference');
+  // New document 1.2 s after the mark (its clock restarted at 0); ready 800 ms into it = 2000 ms after the mark.
+  const newOrigin = CLICK_ORIGIN + 30_000 + 1_200;
+  assert.equal(stats.sinceClickMs(800, newOrigin, 30_000, CLICK_ORIGIN), 2_000);
+  assert.ok(800 - 30_000 < 0, 'the version 1 difference across documents would be negative, and a negative time would pass');
+  assert.equal(stats.sinceClickMs(800, undefined, 30_000, CLICK_ORIGIN), null, 'unknown document clock: not measured');
+  assert.equal(stats.sinceClickMs(null, CLICK_ORIGIN, 30_000, CLICK_ORIGIN), null);
+});
+
+test('foldWindow: a request still open when observation stopped is unfinished, its cost unknown, never zero', () => {
+  const open = rec('api', 3000, { endMs: undefined, durMs: undefined, bytes: 0, via: undefined });
+  const w = stats.foldWindow([rec('api', 100), open], { windowMs: 6000, readyAtMs: 500, observedMs: 6000 });
+  assert.equal(w.complete, true);
+  assert.equal(w.total.n, 2, 'it started in the window, so it is counted');
+  assert.equal(w.total.pending, 1);
+  assert.equal(w.costComplete, false);
+  assert.equal(w.purpose.background.pending, 1);
+  assert.equal(w.purpose.background.ms, 0, 'no duration is invented for the open request');
+  assert.equal(w.purpose.background.unknownVia, 1, 'no response seen: origin unknown, not network');
+  assert.equal(w.purpose.routed.ms, 100);
+  assert.equal(w.total.bytes, 1000, 'only the finished request has a size');
+  assert.equal(stats.foldWindow([rec('api', 100)], { windowMs: 6000, readyAtMs: 500, observedMs: 6000 }).costComplete, true);
+});
+
+test('foldWindow: the cost is decided at the window end plus the drain, whatever the quiet wait did afterwards', () => {
+  // Window [0, 6000), cost decided at 8000. A request finishing at 9000 is unfinished whether observation stopped at
+  // 8000 or a long network-quiet wait kept it going to 15000; one finishing at 7900 is measured either way.
+  const records = () => [rec('rest', 1000, { endMs: 7900, durMs: 6900 }), rec('api', 5000, { endMs: 9000, durMs: 4000 })];
+  for (const observedMs of [8000, 15000]) {
+    const w = stats.foldWindow(records(), { windowMs: 6000, readyAtMs: 2000, observedMs, settleByMs: 8000 });
+    assert.equal(w.settleByMs, 8000);
+    assert.equal(w.total.pending, 1, `observed to ${observedMs}`);
+    assert.equal(w.costComplete, false);
+    assert.equal(w.purpose.routed.ms, 6900, 'the request that finished by 8000 is measured');
+    assert.equal(w.purpose.background.pending, 1);
+    assert.equal(w.purpose.background.ms, 0, 'the late one adds no duration');
+    assert.equal(w.total.bytes, 1000, 'and no size');
+  }
+  const inApp = stats.foldWindow(records(), { windowMs: 4000, readyAtMs: 2000, observedMs: 15000, anchorMs: 1000, settleByMs: 7000, anchorKind: 'input' });
+  assert.equal(inApp.settleByMs, 6000, 'reported from the window start');
+  assert.equal(inApp.total.pending, 1);
+  const noCut = stats.foldWindow(records(), { windowMs: 6000, readyAtMs: 2000, observedMs: 15000 });
+  assert.equal(noCut.total.pending, 0, 'without a decision moment, every finished request counts (older callers)');
+  assert.equal(noCut.settleByMs, null);
+});
+
+test('windowTable: unfinished requests, the service-worker count and a window anchored at the click are shown', () => {
+  const pend = (i, ready) => v2sample(i, ready, {
+    window: stats.foldWindow([rec('rest', 50), rec('api', ready + 100, { via: 'service-worker' }), rec('api', ready + 300, { endMs: undefined, durMs: undefined, via: undefined })],
+      { windowMs: 6000, readyAtMs: ready, observedMs: 6050 }),
+  });
+  const s = stats.summarizePage([pend(0, 900), pend(1, 400), pend(2, 420), v2sample(3, 410)]);
+  const md = stats.windowTable([{ label: '/x', summary: s }]);
+  assert.match(md, /\| \/x \| 6000 from navigation start \| 4 \/ 4 \(4\) \|/);
+  assert.match(md, /\| 0 \/ 0 \/ 1 \/ 1 \|/, 'background: network / cached / SW / unknown');
+  assert.match(md, /\| 0 \| 1 \(2 of 3 windows\) \| - \|/, 'prefetch n, unfinished, before the click (n/a for a full load)');
+  // In-app: round 1 has no fixed window (version 1 spacing), later rounds start the window at the click.
+  const click = (i, ready) => ({
+    ...v2sample(i, ready),
+    cacheState: stats.cacheStateOf({ mode: 'click', first: false }),
+    window: stats.foldWindow([rec('rsc', 10), rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1200 + ready, observedMs: 5300, anchorMs: 1200, anchorKind: 'input' }),
+  });
+  const first = { ...sample(0, 500, 2), cacheState: stats.cacheStateOf({ mode: 'click', first: true }) };
+  const nav = stats.summarizePage([first, click(1, 300), click(2, 310), click(3, 320)]);
+  assert.equal(nav.coldWindow, null, 'the first in-app visit has no fixed window');
+  const navMd = stats.windowTable([{ label: '/x (in-app)', summary: nav }]);
+  assert.match(navMd, /\| \/x \(in-app\) \| 4000 from the click \| 3 \/ 3 \(4\) \|/);
+  assert.match(navMd, /\| 0 \| 0 \| 1 \| /, 'prefetch n, unfinished, one request before the click');
+  assert.match(navMd, /\| - \|$/, 'no first-navigation window');
+  assert.ok(!/NaN|undefined/.test(md + navMd));
+});
+
+test('foldLongTasks: blocking time is the part over 50 ms, bounded by the window, split at data-ready', () => {
+  const t = stats.foldLongTasks([[100, 120], [300, 60], [700, 200], [7000, 500], [null, 90]], 0, 6000, 500);
+  assert.equal(t.n, 3);
+  assert.equal(t.totalMs, 380);
+  assert.equal(t.blockingMs, 70 + 10 + 150);
+  assert.equal(t.maxMs, 200);
+  assert.equal(t.blockingBeforeReadyMs, 80);
+  assert.equal(stats.foldLongTasks([], 0, 6000, null).blockingBeforeReadyMs, null);
+});
+
+test('cacheStateOf: the empty browser cache is told apart from CDN and function, which stay unknown without headers', () => {
+  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: true, vercelCache: 'HIT', vercelId: 'iad1::abcd1-1700000000000-0123456789ab' }),
+    { browser: 'empty', cdn: 'HIT', fn: 'not-run', fnWarmth: 'n/a' });
+  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: false, vercelCache: 'miss', vercelId: 'iad1::iad1::abcd1-1700000000000-0123456789ab' }),
+    { browser: 'warm', cdn: 'MISS', fn: 'ran', fnWarmth: 'unknown' }, 'whether the function was cold is never visible');
+  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: true }), { browser: 'empty', cdn: 'unknown', fn: 'unknown', fnWarmth: 'n/a' });
+  assert.equal(stats.cacheStateOf({ mode: 'click', first: true }).browser, 'prewarmed', 'an in-app first visit is never cold');
+});
+
+test('revisionOf and scenarioOf: version 1 files have no revision and keep the old enforcement', () => {
+  assert.equal(stats.revisionOf({}), null);
+  assert.equal(stats.revisionOf({ deployed: { start: 'a'.repeat(40), end: 'a'.repeat(40) } }), 'a'.repeat(40));
+  assert.equal(stats.revisionOf({ deployed: { start: 'a'.repeat(40), end: 'b'.repeat(40) } }), 'mixed');
+  assert.equal(stats.revisionOf({ deployed: { start: null, end: null } }), 'unknown');
+  // Only one of the two /api/version reads succeeded: a deploy may have landed unseen, so the result is unbound.
+  assert.equal(stats.revisionOf({ deployed: { start: 'a'.repeat(40), end: null } }), 'partial', 'end read failed');
+  assert.equal(stats.revisionOf({ deployed: { start: null, end: 'b'.repeat(40) } }), 'partial', 'start read failed');
+  assert.equal(stats.isExactRevision('a'.repeat(40)), true);
+  for (const r of ['mixed', 'partial', 'unknown', null, undefined]) assert.equal(stats.isExactRevision(r), false, String(r));
+  assert.deepEqual(['a'.repeat(40), 'mixed', 'partial', 'unknown', null].map(stats.revisionTag), ['aaaaaaa', 'mixed', 'partial', 'unknown', 'not recorded']);
+  assert.deepEqual(stats.scenarioOf({ slug: 'nav-sleep' }), { name: 'in-app-prewarmed', enforced: true, harness: 1, detail: null });
+  assert.deepEqual(stats.scenarioOf({ slug: 'sleep' }), { name: 'full-load', enforced: true, harness: 1, detail: null });
+  assert.equal(stats.scenarioOf({ harness: 2, scenario: { name: 'phone-full-load', enforced: false } }).enforced, false);
+});
+
+function v2sample(i, ready, over = {}) {
+  const s = sample(i, ready, 2);
+  const window = stats.foldWindow([rec('document', 0), rec('rest', 50), rec('api', ready + 100), rec('rsc', ready + 200, { prefetch: true })],
+    { windowMs: 6000, readyAtMs: ready, observedMs: 6050 });
+  return { ...s, cacheState: stats.cacheStateOf({ mode: 'load', first: i === 0, vercelCache: 'HIT' }), readyAtMs: ready, window,
+    longTasks: stats.foldLongTasks([[10, 80]], 0, 6000, ready), feedAtMs: 2100, firstPrefetchAtMs: ready + 200, ...over };
+}
+
+test('summarizePage: version 2 aggregates use complete windows only; a version 1 sample yields nulls, never zeros', () => {
+  const incomplete = v2sample(3, 410);
+  const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), { ...incomplete, window: { ...incomplete.window, complete: false } }];
+  const s = stats.summarizePage(samples);
+  assert.equal(s.harness2, true);
+  assert.deepEqual(s.windows, { recorded: 4, complete: 3, unobserved: 0 });
+  assert.equal(s.window.n, 2, 'the incomplete warm window is not averaged in');
+  assert.equal(s.window.purpose.routed.n, 2);
+  assert.equal(s.window.purpose.background.n, 1);
+  assert.equal(s.window.purpose.prefetch.n, 1);
+  assert.equal(s.coldWindow.n, 1);
+  assert.equal(s.cacheStates.first.browser, 'empty');
+  assert.deepEqual(s.cacheStates.rest, { 'warm cdn:HIT fn:unknown': 3 });
+  assert.equal(s.readyRobust.n, 3);
+  assert.equal(s.blocking.p50, 30);
+  const legacy = stats.summarizePage([sample(0, 500, 2), sample(1, 400, 2)]);
+  assert.equal(legacy.harness2, false);
+  assert.equal(legacy.window, null);
+  assert.equal(legacy.cacheStates.first, null);
+  assert.equal(legacy.blocking.n, 0);
+});
+
+test('summarizePage and windowTable: an in-app click with an unobserved input is named, never averaged in', () => {
+  const click = (i, ready, over = {}) => ({
+    ...v2sample(i, ready),
+    cacheState: stats.cacheStateOf({ mode: 'click', first: false }),
+    window: stats.foldWindow([rec('rsc', 10), rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1200 + ready, observedMs: 5300, anchorMs: 1200, anchorKind: 'input' }),
+    ...over,
+  });
+  // Missing pointer on one click, a changed document on another: both windows unknown; their long tasks (if any had
+  // been recorded) never join the blocking time either.
+  const missing = click(2, 310, {
+    window: stats.foldWindow([rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1510, observedMs: 9000, anchorMs: 1200, anchorKind: 'unobserved', anchorReason: 'no pointer event seen on the link' }),
+    longTasks: stats.foldLongTasks([[1300, 2050]], 1200, 5200, 1510), feedAtMs: 10, firstPrefetchAtMs: 5,
+  });
+  const reloaded = click(3, 2000, {
+    newDocument: true,
+    window: stats.foldWindow([rec('document', 1250)], { windowMs: 4000, readyAtMs: 3200, observedMs: 9000, anchorMs: 1200, anchorKind: 'unobserved', anchorReason: 'the click loaded a new document' }),
+  });
+  const first = { ...sample(0, 500, 2), cacheState: stats.cacheStateOf({ mode: 'click', first: true }) };
+  const s = stats.summarizePage([first, click(1, 300), missing, reloaded]);
+  assert.deepEqual(s.windows, { recorded: 3, complete: 1, unobserved: 2 });
+  assert.equal(s.window.n, 1, 'only the observed click window is counted');
+  assert.equal(s.window.anchored, true);
+  assert.equal(s.blocking.n, 1, 'blocking time comes from comparable windows only');
+  assert.equal(s.blocking.p50, 30);
+  assert.equal(s.feedAt.n, 1);
+  assert.equal(s.readyRobust.n, 3, 'data ready keeps its version 1 timing for every warm click');
+  assert.equal(s.newDocument, 1);
+  const md = stats.windowTable([{ label: '/x (in-app)', summary: s }]);
+  assert.match(md, /\| \/x \(in-app\) \| 4000 from the click \| 1 \/ 3 \(4\); 2 with the click input not observed \(window unknown, not counted\) \|/);
+  assert.ok(!/NaN|undefined/.test(md));
+  // All clicks unobserved: no window medians at all, still named.
+  const none = stats.summarizePage([first, missing, reloaded]);
+  assert.equal(none.window, null);
+  assert.equal(none.blocking.n, 0);
+  assert.match(stats.windowTable([{ label: '/y (in-app)', summary: none }]), /\| \/y \(in-app\) \| - \| 0 \/ 2 \(3\); 2 with the click input not observed/);
+});
+
+test('speed budget: an observe-only scenario never breaks it but is reported; enforced pages are unchanged', () => {
+  const phone = { ...budgetPage('phone-today', { timing: { ready: { p95: 2900, max: 3000, n: 3, values: [2800, 2900, 3000] } } }), enforced: false };
+  const desk = budgetPage('today');
+  assert.deepEqual(stats.budgetViolations([desk, phone]), [], 'the phone page is not enforced yet');
+  assert.deepEqual(stats.observedViolations([desk, phone], []),
+    ['/phone-today: data ready 3000 ms in the slowest warm view (repeatable: 3 of 3 warm views, warm p95 2900 ms)']);
+  // The same page enforced (a version 1 file, or after promotion) is a breach as before.
+  assert.equal(stats.budgetViolations([{ ...phone, enforced: true }]).length, 1);
+});
+
+test('speed budget: an observe-only page that was not measured is listed as missing, not as a pass', () => {
+  const phone = { ...budgetPage('phone-log', { total: 1, ok: 0, failed: 1, cold: null, timing: { ready: { n: 0, values: [] } } }), enforced: false };
+  const lines = stats.observedViolations([phone], []);
+  assert.ok(lines.some((l) => l.includes('only 1 of 4 navigations were measured')));
+  assert.ok(lines.some((l) => l.includes('never reached data-ready')));
+  assert.ok(lines.some((l) => l.includes('no warm navigation reached data-ready')));
+});
+
+test('speed budget: an in-app first visit is labelled prewarmed, a full load keeps "cold first visit"', () => {
+  const nav = { ...budgetPage('nav-log', { cold: { ready: 1200 }, coldEndpoints: [] }), label: '/log (in-app)', scenario: 'in-app-prewarmed' };
+  assert.deepEqual(stats.budgetViolations([nav]), ['/log (in-app): data ready 1200 ms on the first in-app visit (session prewarmed by Today)']);
+  const legacyNav = { ...budgetPage('nav-log', { cold: { ready: 1200 }, coldEndpoints: [] }), label: '/log (in-app)' };
+  assert.deepEqual(stats.budgetViolations([legacyNav]), ['/log (in-app): data ready 1200 ms on the first in-app visit (session prewarmed by Today)'],
+    'a version 1 nav- file is recognised by its slug');
+});
+
+function tap(i, action, over = {}) {
+  return { i, round: Math.floor(i / 2), action, ok: true, inputMs: 40 + i, eventMs: 24, readyMs: 300 + i * 10, longTasks: { blockingMs: 5 }, ...over };
+}
+
+test('summarizeInput: per action n and robust stats; failed taps never contribute a number', () => {
+  const s = stats.summarizeInput([
+    tap(0, 'tap Log tab'), tap(1, 'open More menu'),
+    tap(2, 'tap Log tab', { ok: false, error: 'ready-timeout', readyMs: null }), tap(3, 'open More menu', { eventMs: null }),
+    tap(4, 'tap Log tab', { ok: false, error: 'control not on screen', inputMs: null, readyMs: null }),
+  ]);
+  assert.equal(s.total, 5);
+  assert.equal(s.ok, 3);
+  const log = s.actions.find((a) => a.action === 'tap Log tab');
+  assert.equal(log.total, 3);
+  assert.equal(log.ok, 1);
+  assert.deepEqual(log.errors, { 'ready-timeout': 1, 'control not on screen': 1 });
+  assert.equal(log.readyMs.n, 1, 'the timed-out tap is not counted as a time');
+  const more = s.actions.find((a) => a.action === 'open More menu');
+  assert.equal(more.eventMs.n, 1, 'below the Event Timing threshold = no value, not 0');
+  assert.deepEqual(s.actions.map((a) => a.action), ['tap Log tab', 'open More menu']);
+});
+
+test('observedViolations: untried, unmeasured and slow phone taps are reported', () => {
+  const summary = stats.summarizeInput([
+    tap(0, 'tap Today tab', { readyMs: 1400, inputMs: 260 }),
+    tap(1, 'open More menu', { ok: false, error: 'no input recorded', inputMs: null, readyMs: null }),
+  ]);
+  const taps = { label: 'Phone taps, 390 px', expected: 12, summary, enforced: false };
+  const lines = stats.observedViolations([], [taps]);
+  const expected = [
+    'Phone taps, 390 px: only 2 of 12 taps were tried',
+    'Phone taps, 390 px: tap Today tab: tap to ready 1400 ms (slowest of 1)',
+    `Phone taps, 390 px: tap Today tab: input to next paint 260 ms (slowest of 1, over ${stats.INPUT_PAINT_MS} ms)`,
+    'Phone taps, 390 px: open More menu: 1 of 1 taps not measured (no input recorded), not a pass',
+  ];
+  assert.deepEqual(lines, expected);
+  assert.deepEqual(stats.inputBudgetViolations([taps]), [], 'observe-only taps are never enforced');
+  // Promoted (`enforced: true` on the phone-input scenario): the same lines become enforced breaches, and are not
+  // listed again as observed.
+  const promoted = { ...taps, enforced: true };
+  assert.deepEqual(stats.inputBudgetViolations([promoted]), expected);
+  assert.deepEqual(stats.observedViolations([], [promoted]), []);
+  assert.deepEqual(stats.inputBreaches(promoted), expected, 'one rule set, whether enforced or observed');
+});
+
+function writeRun(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'perf-report-v2-'));
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), JSON.stringify(body));
+  return dir;
+}
+const SHA_A = 'a'.repeat(40);
+const SHA_B = 'b'.repeat(40);
+const v2meta = (slug, label, over = {}) => ({ slug, label, navigations: 4, startedAt: 'T', harness: 2, github: {}, runner: {},
+  scenario: { name: 'full-load', viewport: '1280x720', cpuSlowdown: 1, enforced: true }, deployed: { start: SHA_A, end: SHA_A },
+  fixedWindowMs: 6000, windowRule: 'navigations 1-4 of each page', ...over });
+
+test('report: a version 1 artifact still loads as the baseline, its new columns read "not recorded", never 0', () => {
+  const samples = [sample(0, 600, 2), sample(1, 400, 2), sample(2, 410, 2), sample(3, 420, 2)];
+  const dir = writeRun({
+    'sleep.json': { meta: { slug: 'sleep', label: '/sleep', navigations: 4, startedAt: 'T', github: {}, runner: {} }, samples },
+    'nav-sleep.json': { meta: { slug: 'nav-sleep', label: '/sleep (in-app)', navigations: 4, startedAt: 'T', github: {}, runner: {} }, samples },
+  });
+  const run = report.loadRun(dir);
+  assert.equal(run.harness, 1);
+  assert.deepEqual(run.missing, [], 'a version 1 run never had the phone scenario');
+  assert.deepEqual(run.pages.map((p) => [p.slug, p.scenario, p.enforced, p.revision]), [
+    ['sleep', 'full-load', true, null], ['nav-sleep', 'in-app-prewarmed', true, null],
+  ]);
+  const md = report.render([run]);
+  assert.match(md, /Harness version 1/);
+  assert.match(md, /not recorded \(harness 1\)/);
+  assert.match(md, /\| \/sleep \(in-app\) \| 4\/4 \|.*\| 600 \(first visit, prewarmed\) \|/);
+  assert.match(md, /low n \(3 < 10\)/);
+  assert.ok(!/NaN|undefined/.test(md));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('report: version 2 files show scenario, revision, the fixed window and the phone taps, observe-only', () => {
+  const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const dir = writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false } }), samples },
+    'phone-input.json': { meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 4, scenario: { name: 'phone-input', enforced: false } }),
+      samples: [tap(0, 'tap Log tab'), tap(1, 'open More menu')] },
+  });
+  const run = report.loadRun(dir);
+  assert.equal(run.harness, 2);
+  assert.deepEqual(run.pages.map((p) => p.slug), ['today', 'phone-today'], 'phone pages after the desktop ones; taps are not a page');
+  assert.equal(run.inputs.length, 1);
+  assert.equal(run.inputs[0].expected, 4);
+  assert.equal(report.revisionLine(run), 'aaaaaaa (3 results)');
+  const md = report.render([run]);
+  assert.match(md, /\| \/ \(Today\), 390 px \| phone-full-load \| 390x664, CPU 4x slower \| observed only \|/);
+  assert.match(md, /\| \/ \(Today\) \| full-load \| 1280x720 \| enforced \| empty \/ HIT \/ unknown \|/);
+  assert.match(md, /\| \/ \(Today\) \| 6000 from navigation start \| 4 \/ 4 \(4\) \|/);
+  // phone-log.json was not written: reported as not measured, in the report and in the observed lines.
+  assert.deepEqual(run.missing.map((x) => x.slug), ['phone-log']);
+  assert.deepEqual(report.missingObserved(run), ['/log, 390 px: no result file written (not measured, not a pass)']);
+  assert.match(md, /Observe-only results not recorded/);
+  assert.match(md, /Phone input responsiveness \(observed, not enforced yet\)/);
+  assert.match(md, /\| Phone taps, 390 px \| tap Log tab \| 1\/1 \|/);
+  assert.ok(!/NaN|undefined/.test(md));
+  assert.deepEqual(stats.budgetViolations(run.pages), [], 'the slow cold phone load is not enforced');
+  assert.ok(stats.observedViolations(run.pages, run.inputs).some((l) => l.startsWith('Phone taps, 390 px: only 2 of 4 taps')));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('report: a deep run skips the phone scenario and says so once, never as a measurement', () => {
+  const n = stats.PHONE_MAX_RUN_NAVIGATIONS + 1;
+  const samples = Array.from({ length: n }, (_, i) => v2sample(i, i === 0 ? 900 : 400 + i));
+  const dir = writeRun({ 'today.json': { meta: v2meta('today', '/ (Today)', { navigations: n }), samples } });
+  const run = report.loadRun(dir);
+  assert.deepEqual(run.missing, [], 'no phone file is listed as missing');
+  assert.equal(run.phoneSkipped, true);
+  const lines = report.missingObserved(run);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^Phone scenario, 390 px: not run on a deep run/);
+  assert.match(report.render([run]), /Observe-only results not recorded/);
+  // The hourly run (4 navigations) still lists an absent phone file as not measured.
+  const hourly = writeRun({ 'today.json': { meta: v2meta('today', '/ (Today)'), samples: samples.slice(0, 4) } });
+  const h = report.loadRun(hourly);
+  assert.equal(h.phoneSkipped, false);
+  assert.equal(h.missing.length, report.OBSERVED_SLUGS.length);
+  for (const d of [dir, hourly]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('observeOnlyStop: a bounce to the login page or an error line, with how far the loop got; never an address', () => {
+  assert.equal(stats.isLoginBounce(new Error('bounced-to-login: saved session is not valid')), true);
+  assert.equal(stats.isLoginBounce('bounced-to-login: saved session is not valid'), true);
+  assert.equal(stats.isLoginBounce(new Error('page.goto: Timeout 45000ms exceeded')), false);
+  assert.equal(stats.isLoginBounce(null), false);
+  assert.equal(stats.observeOnlyStop(new Error('bounced-to-login: saved session is not valid'), 1, 4, 'navigations'),
+    'bounced to the login page (the saved session was not accepted): 1 of 4 navigations tried');
+  assert.equal(stats.observeOnlyStop('bounced-to-login: saved session is not valid', 0, 12, 'taps'),
+    'bounced to the login page (the saved session was not accepted): 0 of 12 taps tried');
+  const other = stats.observeOnlyStop(new Error('page.goto: net::ERR_FAILED at https://app.example.test/log?x=1\nCall log:\n  - navigating'), 2, 4, 'navigations');
+  assert.equal(other, 'stopped by an error (page.goto: net::ERR_FAILED at <url>): 2 of 4 navigations tried');
+  assert.ok(!/example\.test|Call log/.test(other), 'one line, no address');
+  assert.equal(stats.errorLine(undefined), 'unknown error');
+  assert.equal(stats.errorLine({ message: '' }), 'unknown error');
+  assert.equal(stats.errorLine('x'.repeat(300)).length, 200);
+});
+
+test('report: a phone result that stopped on a bounce is listed as cut short, not a pass, and never enters the enforced budget', () => {
+  const desktop = [v2sample(0, 600), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phoneScenario = { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false };
+  const bounced = { i: 1, cold: false, ok: false, error: 'bounced-to-login: saved session is not valid' };
+  const dir = writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples: desktop },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: phoneScenario,
+      stopped: 'bounced to the login page (the saved session was not accepted): 2 of 4 navigations tried' }), samples: [v2sample(0, 700), bounced] },
+    'phone-log.json': { meta: v2meta('phone-log', '/log, 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-input.json': { meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 12, scenario: { name: 'phone-input', enforced: false },
+      stopped: 'bounced to the login page (the saved session was not accepted): 0 of 12 taps tried' }), samples: [] },
+  });
+  const run = report.loadRun(dir);
+  assert.deepEqual(run.missing, [], 'every phone file was written');
+  const lines = report.missingObserved(run);
+  assert.deepEqual(lines, [
+    '/ (Today), 390 px: stopped early, bounced to the login page (the saved session was not accepted): 2 of 4 navigations tried; the rest not measured, not a pass',
+    'Phone taps, 390 px: stopped early, bounced to the login page (the saved session was not accepted): 0 of 12 taps tried; the rest not measured, not a pass',
+  ]);
+  const observed = stats.observedViolations(run.pages, run.inputs);
+  assert.ok(observed.includes('/ (Today), 390 px: only 2 of 4 navigations were measured'));
+  assert.ok(observed.some((l) => l.startsWith('/ (Today), 390 px: 1 of 2 navigations never reached data-ready')), 'the bounced navigation is not measured, never fast');
+  assert.ok(observed.includes('Phone taps, 390 px: only 0 of 12 taps were tried'));
+  assert.deepEqual(stats.budgetViolations(run.pages), [], 'observe-only results never decide the enforced budget');
+  const md = report.render([run]);
+  assert.match(md, /### Observe-only results not recorded or cut short/);
+  assert.match(md, /- Phone taps, 390 px: stopped early, bounced to the login page/);
+  assert.ok(!/NaN|undefined/.test(md));
+  // A `stopped` reason on an enforced page is not an observe-only line: an enforced page is judged by the budget alone.
+  const enforced = writeRun({ 'today.json': { meta: v2meta('today', '/ (Today)', { stopped: 'anything' }), samples: desktop.slice(0, 2) } });
+  const e = report.loadRun(enforced);
+  assert.ok(!report.missingObserved(e).some((l) => l.includes('stopped early')));
+  assert.ok(stats.budgetViolations(e.pages).includes('/ (Today): only 2 of 4 navigations were measured'));
+  for (const d of [dir, enforced]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('budgetOutcome: a phone-tap scenario promoted to enforced turns the run red on an unmeasured or slow tap', () => {
+  const desktop = [v2sample(0, 600), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phoneScenario = { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false };
+  const tapsFile = (enforced, samples) => ({
+    meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 2, scenario: { name: 'phone-input', enforced } }), samples,
+  });
+  const run = (enforced, samples) => report.loadRun(writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples: desktop },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-log.json': { meta: v2meta('phone-log', '/log, 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-input.json': tapsFile(enforced, samples),
+  }));
+  const fast = [tap(0, 'tap Log tab'), tap(1, 'open More menu')];
+  const bad = [tap(0, 'tap Log tab', { readyMs: 1200 }), tap(1, 'open More menu', { ok: false, error: 'ready-timeout', readyMs: null })];
+
+  // Observe-only (today): the bad taps are printed, never in the exit code.
+  const observeOnly = run(false, bad);
+  const o = report.budgetOutcome([observeOnly]);
+  assert.deepEqual(o.over, [], 'observe-only taps never decide the exit code');
+  assert.ok(o.observed.includes('Phone taps, 390 px: tap Log tab: tap to ready 1200 ms (slowest of 1)'));
+  assert.ok(o.observed.some((l) => l.startsWith('Phone taps, 390 px: open More menu: 1 of 1 taps not measured')));
+
+  // Promoted: the same taps are enforced breaches (exit code 1), and are not listed again as observed.
+  const promoted = run(true, bad);
+  assert.equal(promoted.inputs[0].enforced, true);
+  const p = report.budgetOutcome([promoted]);
+  assert.deepEqual(p.over, [
+    'Phone taps, 390 px: tap Log tab: tap to ready 1200 ms (slowest of 1)',
+    'Phone taps, 390 px: open More menu: 1 of 1 taps not measured (ready-timeout), not a pass',
+  ]);
+  assert.ok(!p.observed.some((l) => l.startsWith('Phone taps, 390 px')));
+  assert.match(report.render([promoted]), /### Phone input responsiveness \(enforced\)/);
+
+  // Promoted and fast, but fewer taps than planned: an untried tap is a breach too, never a pass.
+  const short = run(true, fast.slice(0, 1));
+  assert.deepEqual(report.budgetOutcome([short]).over, ['Phone taps, 390 px: only 1 of 2 taps were tried']);
+  // Promoted, every tap measured and fast: the budget is met.
+  const good = run(true, fast);
+  assert.deepEqual(report.budgetOutcome([good]).over, []);
+  for (const r of [observeOnly, promoted, short, good]) fs.rmSync(r.dir, { recursive: true, force: true });
+});
+
+test('interruptedStop: a step that did not finish before the deadline, with how far the loop got', () => {
+  assert.equal(stats.interruptedStop(255_000, 3, 4, 'navigations'),
+    "interrupted at the test's deadline (255 s; a step did not finish): 3 of 4 navigations tried");
+  assert.equal(stats.interruptedStop(undefined, 0, 12, 'taps'), "interrupted at the test's deadline (unknown; a step did not finish): 0 of 12 taps tried");
+  assert.match(stats.INTERRUPTED_ERROR, /^interrupted\b/);
+  assert.equal(stats.isLoginBounce(stats.INTERRUPTED_ERROR), false, 'an interruption is never read as a bounce');
+});
+
+// withDeadline with tiny real timers: the observe-only deadline that Playwright's own test timeout cannot give.
+const DL = { deadlineMs: 30, cleanupMs: 30 };
+const never = () => new Promise(() => {});
+
+test('withDeadline: a body that finishes or throws in time is returned as it is; the deadline never fires', async () => {
+  let fired = 0;
+  const done = await stats.withDeadline(async () => {}, { ...DL, onDeadline: () => { fired++; } });
+  assert.deepEqual(done, { outcome: 'done' });
+  const err = new Error('bounced-to-login: saved session is not valid');
+  const failed = await stats.withDeadline(async () => { throw err; }, { ...DL, onDeadline: () => { fired++; } });
+  assert.equal(failed.outcome, 'failed');
+  assert.equal(failed.error, err);
+  const sync = await stats.withDeadline(() => { throw new Error('setup'); }, { ...DL, onDeadline: () => { fired++; } });
+  assert.equal(sync.outcome, 'failed', 'a synchronous throw is a failure, never a crash');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(fired, 0, 'the deadline timer was cancelled');
+});
+
+test('withDeadline: a body that never returns is interrupted at the deadline, its cleanup and unwind both bounded', async () => {
+  // The stalled page.evaluate(): the body never settles, and even the cleanup (closing the context) never returns.
+  let fired = 0;
+  const began = Date.now();
+  const r = await stats.withDeadline(never, { ...DL, onDeadline: () => { fired++; return never(); } });
+  const took = Date.now() - began;
+  assert.deepEqual(r, { outcome: 'interrupted' });
+  assert.equal(fired, 1, 'the deadline runs its cleanup once');
+  assert.ok(took >= DL.deadlineMs - 5, `not before the deadline (${took} ms)`);
+  assert.ok(took < 2_000, `bounded: deadline + two cleanup bounds, not the body (${took} ms)`);
+  // A cleanup that throws is bounded and swallowed the same way.
+  const t = await stats.withDeadline(never, { ...DL, onDeadline: () => { throw new Error('close failed'); } });
+  assert.deepEqual(t, { outcome: 'interrupted' });
+});
+
+test('withDeadline: closing the context at the deadline ends the stalled call; its late failure is swallowed, still interrupted', async () => {
+  // The body's pending call rejects once the context is closed (as Playwright's calls do): no unhandled rejection,
+  // and the outcome stays "interrupted" (the result file written at the deadline stands).
+  let close;
+  const stalled = new Promise((_, reject) => { close = () => reject(new Error('Target page, context or browser has been closed')); });
+  const order = [];
+  const body = async () => {
+    try {
+      await stalled;
+    } finally {
+      order.push('body unwound');
+    }
+  };
+  const r = await stats.withDeadline(body, { ...DL, onDeadline: async () => { order.push('deadline'); close(); } });
+  assert.deepEqual(r, { outcome: 'interrupted' });
+  assert.deepEqual(order, ['deadline', 'body unwound'], 'the body unwound inside the bounded wait, after the deadline wrote the file');
+});
+
+test('report: a phone result interrupted at its deadline is cut short, its step in progress not measured, unbound, never enforced', () => {
+  const desktop = [v2sample(0, 600), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phoneScenario = { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false };
+  // What the deadline writes: the navigations done, the one in progress as interrupted, no end-of-page /api/version read.
+  const series = [v2sample(0, 700), v2sample(1, 450), { i: 2, cold: false, ok: false, error: stats.INTERRUPTED_ERROR }];
+  const interrupted = (tried, planned, unit) => stats.interruptedStop(255_000, tried, planned, unit);
+  const dir = writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples: desktop },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: phoneScenario, deployed: { start: SHA_A, end: null },
+      stopped: interrupted(3, 4, 'navigations') }), samples: series },
+    'phone-log.json': { meta: v2meta('phone-log', '/log, 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-input.json': { meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 12, scenario: { name: 'phone-input', enforced: false },
+      deployed: { start: SHA_A, end: null }, stopped: interrupted(2, 12, 'taps') }),
+      samples: [tap(0, 'tap Today tab'), { i: 1, round: 0, action: 'open More menu', ok: false, error: stats.INTERRUPTED_ERROR }] },
+  });
+  const run = report.loadRun(dir);
+  const phone = run.pages.find((p) => p.slug === 'phone-today');
+  assert.equal(phone.revision, 'partial', 'no end read: not bound to a build');
+  assert.equal(phone.summary.failed, 1, 'the navigation in progress is not measured, never fast');
+  assert.ok(report.missingObserved(run).includes(
+    "/ (Today), 390 px: stopped early, interrupted at the test's deadline (255 s; a step did not finish): 3 of 4 navigations tried; the rest not measured, not a pass"));
+  const { observed, over } = report.budgetOutcome([run]);
+  assert.deepEqual(over, [], 'an interrupted observe-only result never decides the exit code');
+  assert.ok(observed.includes('/ (Today), 390 px: only 3 of 4 navigations were measured'));
+  assert.ok(observed.some((l) => l.startsWith('/ (Today), 390 px: 1 of 3 navigations never reached data-ready')));
+  assert.ok(observed.includes('Phone taps, 390 px: only 2 of 12 taps were tried'));
+  assert.ok(observed.some((l) => l.startsWith('Phone taps, 390 px: open More menu: 1 of 1 taps not measured (interrupted')));
+  assert.ok(!/NaN|undefined/.test(report.render([run])));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('report: pooled table keeps revisions and harness versions apart and never pools an unbound result', () => {
+  const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const legacy = [sample(0, 600, 2), sample(1, 300, 2), sample(2, 310, 2), sample(3, 320, 2)];
+  const dirs = [
+    writeRun({ 'sleep.json': { meta: { slug: 'sleep', label: '/sleep', navigations: 4, startedAt: 'T', github: {}, runner: {} }, samples: legacy } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { deployed: { start: SHA_A, end: SHA_B } }), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { deployed: { start: SHA_A, end: SHA_B } }), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { deployed: { start: null, end: SHA_A } }), samples } }),
+  ];
+  const runs = dirs.map(report.loadRun);
+  assert.equal(report.revisionLine(runs[5]), 'partial (1 result)');
+  const md = report.render(runs);
+  assert.match(md, /different harness versions \(1, 2\)/);
+  assert.match(md, /not evidence of a speed-up/);
+  assert.match(md, /\| \/sleep \| 1 \| full-load \| not recorded \/ CPU not recorded \| not recorded \| not recorded \| 1 \| 3 \|.*no build recorded \(harness 1\): not pooled/);
+  assert.match(md, /\| \/sleep \| 2 \| full-load \| 1280x720 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/, 'two runs of the same build and method pool to n=6');
+  const mixedRows = md.split('\n').filter((l) => l.includes('| mixed (deploy during the page) |'));
+  assert.equal(mixedRows.length, 2, 'two runs that each spanned a deploy stay one row per run');
+  for (const row of mixedRows) assert.match(row, /\| 1 \| 3 \|.*not bound to one build, not pooled/);
+  assert.match(md, /\| unbound \(only one of the start \/ end reads succeeded\) \| 1 \| 3 \|.*only one \/api\/version read succeeded: not bound to one build, not pooled/,
+    'a one-sided read is shown as unbound, never as the SHA it did read');
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('report: pooled table keeps the CPU slowdown actually in force apart (a failed 4x throttle measured at 1x never pools with 4x)', () => {
+  const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phone = (cpu) => ({
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: cpu, enforced: false } }), samples },
+  });
+  const dirs = [writeRun(phone(4)), writeRun(phone(1)), writeRun(phone(4))];
+  const md = report.render(dirs.map(report.loadRun));
+  const rows = md.split('\n').filter((l) => l.startsWith('| / (Today), 390 px | 2 | phone-full-load |'));
+  assert.equal(rows.length, 2, 'one row for 4x, one for 1x');
+  assert.match(md, /\| 390x664 \/ CPU 4x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/, 'the two 4x runs pool');
+  assert.match(md, /\| 390x664 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/, 'the 1x run stays on its own');
+  // A different fixed window is a different method too.
+  const other = writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { fixedWindowMs: 8000 }), samples } });
+  const same = writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples } });
+  const md2 = report.render([other, same].map(report.loadRun));
+  assert.match(md2, /\| 8000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/);
+  assert.match(md2, /\| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/);
+  for (const d of [...dirs, other, same]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+// A manual deep run (15 navigations per page) gives only the first four a fixed window; the later ones are spaced by
+// the network-quiet wait alone, so the next view starts from a different warm-up state. They are a different method.
+const quietSample = (i, ready, over = {}) => ({ ...sample(i, ready, 2), cadence: 'network-quiet', ...over });
+// The first four navigations of a deep run are exactly an hourly run's; the rest are quiet-spaced and much slower here
+// so that any mixing would show in the percentiles.
+const deepSamples = () => [v2sample(0, 900), v2sample(1, 430), v2sample(2, 440), v2sample(3, 450),
+  ...Array.from({ length: 11 }, (_, k) => quietSample(4 + k, 1500 + k * 10))];
+const cellsOf = (line) => line.split('|').slice(1, -1).map((c) => c.trim());
+// | Page | Harness | Scenario | Viewport / CPU | Window | Revision | Runs | Warm n | p50 | p90 | p95 | max | Not reached | Note |
+const poolRow = (md, label, quiet) => md.split('\n').filter((l) => l.startsWith(`| ${label} | 2 | full-load |`) && l.includes('none: network-quiet spacing only') === quiet).map(cellsOf);
+
+test('cadenceFor / cadenceOf: a recorded cadence wins, else a recorded window means fixed-window', () => {
+  assert.deepEqual(stats.CADENCES, ['fixed-window', 'network-quiet']);
+  assert.equal(stats.cadenceFor(6000), 'fixed-window');
+  assert.equal(stats.cadenceFor(0), 'network-quiet');
+  assert.equal(stats.cadenceFor(undefined), 'network-quiet');
+  assert.equal(stats.cadenceOf({ cadence: 'network-quiet', window: {} }), 'network-quiet', 'the recorded cadence wins');
+  assert.equal(stats.cadenceOf({ cadence: 'fixed-window' }), 'fixed-window');
+  assert.equal(stats.cadenceOf(v2sample(1, 400)), 'fixed-window', 'older or hand-built sample: a window was recorded');
+  assert.equal(stats.cadenceOf(sample(1, 400, 2)), 'network-quiet', 'a version 1 sample never had a fixed window');
+  assert.equal(stats.cadenceOf({ cadence: 'whatever' }), 'network-quiet', 'an unknown value is not trusted');
+});
+
+test('summarizePage: data ready and not-reached counts are split by observation cadence; the budget inputs still see every warm view', () => {
+  const samples = deepSamples();
+  samples[2] = { i: 2, cold: false, ok: false, error: 'ready-timeout', cadence: 'fixed-window' };
+  samples[9] = { i: 9, cold: false, ok: false, error: 'ready-timeout', cadence: 'network-quiet' };
+  const s = stats.summarizePage(samples);
+  assert.deepEqual(s.byCadence['fixed-window'].ready, [430, 450], 'warm views of navigations 1-4 (the cold one and the failed one are not in it)');
+  assert.equal(s.byCadence['fixed-window'].failed, 1);
+  assert.equal(s.byCadence['fixed-window'].total, 4);
+  assert.equal(s.byCadence['network-quiet'].ready.length, 10, 'eleven later views, one of them failed');
+  assert.equal(s.byCadence['network-quiet'].failed, 1);
+  assert.equal(s.byCadence['network-quiet'].total, 11);
+  assert.equal(s.failed, 2, 'the page total is the sum of both');
+  // Budget and per-run percentiles are unchanged: they read every warm view, whatever its cadence.
+  assert.equal(s.timing.ready.n, 12);
+  assert.equal(s.readyRobust.n, 12);
+  assert.equal(s.timing.ready.max, 1600);
+  // A failed navigation with no recorded cadence and no window cannot be placed: it counts as network-quiet.
+  const bare = stats.summarizePage([v2sample(0, 900), { i: 1, cold: false, ok: false, error: 'ready-timeout' }]);
+  assert.equal(bare.byCadence['network-quiet'].failed, 1);
+});
+
+test('report: pooling never mixes a 15-navigation run\'s later views into the 4-navigation (hourly) views of the same page', () => {
+  const hourly = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const deep = (extra = {}) => writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { navigations: 15, ...extra }), samples: deepSamples() } });
+  const dirs = [writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples: hourly } }), deep(), deep()];
+  const md = report.render(dirs.map(report.loadRun));
+
+  // Fixed-window views: the hourly run's three warm views and the two deep runs' first four navigations pool (3 + 3 + 3).
+  const fixed = poolRow(md, '/sleep', false);
+  assert.equal(fixed.length, 1, 'one row for the fixed-window cadence');
+  const [, , , , window1, rev, runs, n, p50, , p95, max, failed, note] = fixed[0];
+  assert.equal(window1, '6000 (navigations 1-4 of each page)');
+  assert.equal(rev, 'aaaaaaa');
+  assert.equal(runs, '3');
+  assert.equal(n, '9');
+  assert.ok(Number(p50) >= 400 && Number(p50) <= 450, `p50 ${p50} comes from the fixed-window views only`);
+  assert.ok(Number(p95) <= 450 && Number(max) <= 450, `no later (network-quiet) view in p95 ${p95} / max ${max}`);
+  assert.equal(failed, '0');
+  assert.match(note, /low n \(9 < 10\)/);
+  assert.ok(!/network-quiet/.test(note), 'the fixed-window row carries no quiet-spacing note');
+
+  // Network-quiet views: only the two deep runs have them (11 each), on their own row, labelled, never given the window.
+  const quiet = poolRow(md, '/sleep', true);
+  assert.equal(quiet.length, 1, 'one row for the network-quiet cadence');
+  const [, , , , window2, rev2, runs2, n2, p50q, , , maxq, , note2] = quiet[0];
+  assert.equal(window2, 'none: network-quiet spacing only');
+  assert.equal(rev2, 'aaaaaaa');
+  assert.equal(runs2, '2');
+  assert.equal(n2, '22');
+  assert.ok(Number(p50q) >= 1500 && Number(maxq) <= 1600);
+  assert.match(note2, /not pooled with the fixed-window views/);
+
+  // A 4-navigation hourly run alone has no quiet row at all; two hourly runs pool exactly as before.
+  const two = [writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples: hourly } }), writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples: hourly } })];
+  const md2 = report.render(two.map(report.loadRun));
+  assert.equal(poolRow(md2, '/sleep', true).length, 0);
+  assert.match(md2, /\| \/sleep \| 2 \| full-load \| 1280x720 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/);
+  assert.ok(!/NaN|undefined/.test(md));
+  for (const d of [...dirs, ...two]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('report: a deep run\'s mixed percentiles say so, and its failed views are counted in the cadence they were taken in', () => {
+  const samples = deepSamples();
+  samples[9] = { i: 9, cold: false, ok: false, error: 'ready-timeout', cadence: 'network-quiet' };
+  const dirs = [writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { navigations: 15 }), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { navigations: 15 }), samples: deepSamples() } })];
+  const md = report.render(dirs.map(report.loadRun));
+  assert.match(md, /mixes 3 fixed-window and 11 network-quiet-spaced views.*pooling across runs keeps them apart/);
+  assert.equal(poolRow(md, '/sleep', false)[0][12], '0', 'a failure in a later navigation is not charged to the fixed-window row');
+  assert.equal(poolRow(md, '/sleep', true)[0][12], '1');
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+});
