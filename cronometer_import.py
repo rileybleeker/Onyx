@@ -474,11 +474,25 @@ def build_daily_rows(csv_path: str) -> list[dict]:
 # formed writes no servings at all. The reasons are counts and rules only, never a
 # food, an amount or a date.
 #
+# Every nutrient column both files carry is compared, not a short list: a serving
+# that only carries micronutrients (a vitamin pill: 0 kcal, 0 g of every macro)
+# lost from a cut download changes no macro, only its own columns. Checked against
+# the stored data on 2026-11-16: on every day held in both tables, every one of the
+# 67 shared nutrient columns agrees to within 0.01.
+#
 # A cell that cannot be read is never a zero. Every nutrient cell must be blank (a
 # value Cronometer does not have, which adds nothing to a total) or a finite
 # number; a day with any other cell, or with a daily Total row that has no Energy
 # value, is in doubt. Both files must have an Energy column, so the per-day
 # comparison always has at least that to compare.
+#
+# Food seen is food seen, whether or not it is written: every day either file
+# shows food on (an entry in servings.csv, a nutrient above 0 or a cell that
+# cannot be read in dailysummary.csv; in a file that is not well formed, any row
+# with a readable date) is sent along as food_dates, and the database forgets
+# its empty-day record. Otherwise an export with food on a day whose rows are not
+# written (the files disagree, a value cannot be read) would leave an older first
+# look behind, and the next export that missed the day would empty it on one look.
 #
 # Elapsed time is not coverage. A day is only offered for emptying when the same
 # export has food on a day before it AND on a day after it: then the export itself
@@ -492,17 +506,17 @@ def build_daily_rows(csv_path: str) -> list[dict]:
 # agree with each other. So a day is emptied only on a second look: the database
 # function records the first complete export that shows a stored day empty and
 # empties it when a later one, at least EMPTY_CONFIRM_HOURS after, still does.
-# Any write of that day in between (an automated export with food on it, a manual
-# import, a daily-only write) forgets the record, so the count starts over.
+# Food on that day in between (any automated export that shows food on it, written
+# or not, and every manual import that writes it) forgets the record, so the count
+# starts over.
 MAX_WINDOW_DAYS = 400           # same bound as pds.replace_cronometer_servings_window
 DEFAULT_MAX_EMPTY_DAYS = 3      # stored days one run may empty; more = refused, partial heartbeat
 EMPTY_CONFIRM_HOURS = 6         # same as pds.replace_cronometer_servings_window (fixed there)
-# Nutrients (normalized header names) whose per-day servings sum must match the
-# daily Total row; only those present in both files are compared, and Energy must
-# be one of them (both files are refused without it). Cronometer's daily total is
-# the sum of that day's servings, so the tolerance only absorbs per-row rounding.
+# Every recognized nutrient (NAME_TO_COL) present in both files is compared: its
+# per-day servings sum must match the daily Total row. Energy must be one of them
+# (both files are refused without it). Cronometer's daily total is the sum of that
+# day's servings, so the tolerance only absorbs per-row rounding.
 REQUIRED_NUTRIENT = "energy"
-COMPARE_NUTRIENTS = (REQUIRED_NUTRIENT, "protein", "carbs", "fat", "caffeine", "water")
 SUM_TOLERANCE_ABS = 0.5         # in the nutrient's own unit
 SUM_TOLERANCE_REL = 0.001       # plus 0.1 % of the larger of the two values
 
@@ -521,6 +535,12 @@ class FileScan:
     invalid_dates: frozenset = frozenset()
     # daily: days whose Total row (or only row) has no Energy value.
     no_energy_dates: frozenset = frozenset()
+    # Days the file shows (or may show) food on, filled in whether or not the file is
+    # well formed: servings = every row with a readable date; daily = a row with a
+    # nutrient above 0 or an unreadable cell, a Total row with no Energy value, and
+    # any row of a file that is not well formed. Forgetting a day's empty-day record
+    # can only delay emptying it, so anything that may be food counts.
+    food_dates: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -543,6 +563,10 @@ class ExportCheck:
     # nutrient cell or no Energy value for them (the stored row is kept, not
     # overwritten with blanks).
     daily_skip_dates: tuple[str, ...] = ()
+    # Days either file shows (or may show) food on, written or not (FileScan.food_dates
+    # of both files, inside the window or not). Never overlaps the two empty lists.
+    # Each loses its empty-day record in the same transaction as the write.
+    food_dates: tuple[str, ...] = ()
 
 
 def scan_export_file(path: str | None, kind: str) -> FileScan:
@@ -557,7 +581,12 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
     Cronometer does not have for that food or day), a finite number counts, and
     any other cell puts its day in invalid_dates instead of counting as 0. A daily
     Total row with a blank Energy cell puts its day in no_energy_dates: a day can
-    only be "listed with no food" by an explicit 0.
+    only be "listed with no food" by an explicit 0. Every recognized nutrient
+    column (NAME_TO_COL) is read and summed, so the comparison covers them all.
+
+    food_dates is filled in even when the file is not well formed (any row with a
+    readable date then counts), so food seen in a broken download still starts
+    that day's empty-day count over.
     """
     label = "servings.csv" if kind == "servings" else "dailysummary.csv"
     if not path:
@@ -571,37 +600,48 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
         return FileScan(False, f"{label} could not be read")
     norm = [norm_header(h) for h in headers]
     col_index = {n: i for i, n in enumerate(norm)}
-    if kind == "servings":
-        date_cols = ("day", "date")
-        if "food name" not in col_index:
-            return FileScan(False, f"{label} has no Food Name column")
-    else:
-        date_cols = ("date", "day")
+    date_cols = ("day", "date") if kind == "servings" else ("date", "day")
+    date_col = next((col_index[c] for c in date_cols if c in col_index), None)
+
+    def dated_rows() -> frozenset:
+        # A file that is not well formed: every row whose date cell reads counts as
+        # possible food (it only makes a day wait longer before it is emptied).
+        if date_col is None:
+            return frozenset()
+        return frozenset(d for d in (parse_date(cells[date_col]) if len(cells) > date_col else None
+                                     for cells in raw_rows if any(c.strip() for c in cells)) if d)
+
+    if kind == "servings" and "food name" not in col_index:
+        return FileScan(False, f"{label} has no Food Name column", food_dates=dated_rows())
     # Both files: without Energy the two could share no nutrient, and two files
     # that compare nothing agree on everything.
     if REQUIRED_NUTRIENT not in col_index:
-        return FileScan(False, f"{label} has no Energy column")
-    date_col = next((col_index[c] for c in date_cols if c in col_index), None)
+        return FileScan(False, f"{label} has no Energy column", food_dates=dated_rows())
     if date_col is None:
         return FileScan(False, f"{label} has no date column")
-    nutrients = frozenset(n for n in COMPARE_NUTRIENTS if n in col_index)
     group_col = col_index.get("group") if kind == "daily" else None
-    # Every nutrient column is checked; in the daily summary every one also decides
+    # Every recognized nutrient column is read and compared (a pill that only carries
+    # micronutrients changes no macro); in the daily summary every one also decides
     # whether a day has food: a day with only water or a zero-calorie drink has 0
     # energy but is not empty.
     nutrient_cols = [(n, i) for n, i in col_index.items() if n in NAME_TO_COL]
+    nutrients = frozenset(n for n, _i in nutrient_cols)
     energy_col = col_index[REQUIRED_NUTRIENT]
 
     by_date: dict[str, float] = {}
     totals: dict[str, dict[str, float]] = {}
     invalid: set[str] = set()
     no_energy: set[str] = set()
+    food: set[str] = set()
     bad_width = bad_date = 0
     for cells in raw_rows:
         if not any(c.strip() for c in cells):
             continue
         if len(cells) != len(headers):
             bad_width += 1
+            day = parse_date(cells[date_col]) if len(cells) > date_col else None
+            if day:
+                food.add(day)
             continue
         day = parse_date(cells[date_col])
         if not day:
@@ -610,13 +650,17 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
         # name -> number, for the cells that hold one; blank cells are left out, and
         # an unreadable cell is left out AND marks the day (it is never a 0).
         values: dict[str, float] = {}
+        unreadable = False
         for n, i in nutrient_cols:
             ok, num = strict_num(cells[i])
             if not ok:
-                invalid.add(day)
+                unreadable = True
             elif num is not None:
                 values[n] = num
+        if unreadable:
+            invalid.add(day)
         if kind == "servings":
+            food.add(day)                     # every entry is food, whatever its values
             by_date[day] = by_date.get(day, 0) + 1
             sums = totals.setdefault(day, {})
             for n in nutrients:
@@ -624,16 +668,23 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
         else:
             content = max((abs(v) for v in values.values()), default=0.0)
             by_date[day] = max(by_date.get(day, 0.0), content)
+            if content > 0 or unreadable:
+                food.add(day)
             # Same rule as build_daily_rows: the Total row (or the only row) is the day.
             if group_col is None or cells[group_col].strip().lower() == "total":
                 if cells[energy_col].strip() == "":
                     no_energy.add(day)
+                    food.add(day)             # unknown, so it may be food
                 totals[day] = {n: values.get(n, 0.0) for n in nutrients}
+    food_dates = frozenset(food)
     if bad_width:
-        return FileScan(False, f"{bad_width} row(s) of {label} do not have {len(headers)} cells")
+        return FileScan(False, f"{bad_width} row(s) of {label} do not have {len(headers)} cells",
+                        food_dates=food_dates)
     if bad_date:
-        return FileScan(False, f"{bad_date} row(s) of {label} have no readable date")
-    return FileScan(True, None, by_date, totals, nutrients, frozenset(invalid), frozenset(no_energy))
+        return FileScan(False, f"{bad_date} row(s) of {label} have no readable date",
+                        food_dates=food_dates)
+    return FileScan(True, None, by_date, totals, nutrients, frozenset(invalid), frozenset(no_energy),
+                    food_dates)
 
 
 def _window_dates(start: date, end: date) -> list[str]:
@@ -657,10 +708,14 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
     one on its second look) only when, in addition, every date lies in the window,
     every nutrient cell the files carry for the window is blank or a finite number,
     every daily Total row has an Energy value, every servings day has a daily Total
-    row with the same nutrient sums (Energy always among them), and the daily
-    summary shows no food (no nutrient above 0) on a day without servings.
-    Otherwise the days in doubt are listed in skip_dates and nothing is emptied;
-    days whose daily row is the doubt are listed in daily_skip_dates too.
+    row whose every nutrient the two files share (Energy always among them) equals
+    the day's servings summed, and the daily summary shows no food (no nutrient
+    above 0) on a day without servings. Otherwise the days in doubt are listed in
+    skip_dates and nothing is emptied; days whose daily row is the doubt are listed
+    in daily_skip_dates too.
+
+    food_dates (every return): the days either file shows or may show food on,
+    whether or not they are written, so each loses its empty-day record.
 
     Only a day strictly between the first and last day with servings in this
     export is offered for emptying: the export shows food on both sides of it, so
@@ -673,14 +728,15 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
     s = scan_export_file(servings_path, "servings")
     d = scan_export_file(daily_path, "daily")
     daily_skip = tuple(sorted(d.invalid_dates | d.no_energy_dates)) if d.ok else ()
+    food = tuple(sorted(s.food_dates | d.food_dates))
     if not s.ok or not d.ok:
         reason = s.reason if not s.ok else d.reason
         return ExportCheck(False, False, reason or "the export is not usable", d.ok, d.reason,
-                           daily_skip_dates=daily_skip)
+                           daily_skip_dates=daily_skip, food_dates=food)
     nutrients = s.nutrients & d.nutrients
     if REQUIRED_NUTRIENT not in nutrients:     # both scans refuse a file without it; belt and braces
         return ExportCheck(False, False, "the two files have no Energy column to compare", True, None,
-                           daily_skip_dates=daily_skip)
+                           daily_skip_dates=daily_skip, food_dates=food)
 
     lo, hi = start.isoformat(), end.isoformat()
     outside = {x for x in (*s.by_date, *d.by_date) if not (lo <= x <= hi)}
@@ -710,17 +766,23 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
     if reasons:
         return ExportCheck(True, False, "; ".join(reasons), True, None,
                            skip_dates=tuple(sorted(outside | doubt | no_total | mismatch)),
-                           daily_skip_dates=daily_skip)
+                           daily_skip_dates=daily_skip, food_dates=food)
 
     food_days = sorted(s.by_date)
     if len(food_days) < 2:
-        return ExportCheck(True, True, None, True, None)
+        return ExportCheck(True, True, None, True, None, food_dates=food)
     first, last = food_days[0], food_days[-1]
     between = [x for x in _window_dates(start, end) if first < x < last]
-    empty = tuple(x for x in between if x not in s.by_date and x not in d.by_date)
+    # A day with food (food_dates) is never offered: disjoint by construction (an
+    # empty day is in neither file; a servings-empty day has no entry, no nutrient
+    # above 0 and, the export being complete, nothing unreadable), and filtered
+    # anyway, since the database function refuses an overlap.
+    seen = set(food)
+    empty = tuple(x for x in between if x not in s.by_date and x not in d.by_date and x not in seen)
     servings_empty = tuple(x for x in between
-                           if x not in s.by_date and x in d.totals and d.by_date.get(x, 0.0) == 0)
-    return ExportCheck(True, True, None, True, None, empty, servings_empty, ())
+                           if x not in s.by_date and x in d.totals and d.by_date.get(x, 0.0) == 0
+                           and x not in seen)
+    return ExportCheck(True, True, None, True, None, empty, servings_empty, (), food_dates=food)
 
 
 def trusted_window(window) -> tuple[date, date] | None:
@@ -835,9 +897,10 @@ def import_servings_and_daily(rows: list[dict], daily_rows: list[dict], dry_run:
                               sb=None) -> tuple[int, int, str]:
     """Replace the servings of the dates in `rows` AND upsert `daily_rows`, in ONE
     transaction (pds.replace_cronometer_servings_and_daily, which takes the same lock
-    as the automated export's write). Used by every import that may not empty a day:
-    a manual export, and the automated export's daily-only write when its servings
-    are not usable. Only dates that have rows are replaced, so nothing is emptied.
+    as the automated export's write). Used by every import without a window (a
+    manual export, a run with emptying off, a very long backfill), and by the
+    automated export while the window function is not applied yet. Only dates that
+    have rows are replaced, so nothing is emptied.
     Every date it writes (servings or a daily row) also loses its empty-day record,
     so a day an earlier automated export showed empty needs two new looks again.
 
@@ -881,7 +944,7 @@ _WINDOW_REPLY_INTS = ("inserted", "daily_upserted", "cleared_days", "cleared_ser
 
 def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tuple[date, date],
                            empty_dates, servings_empty_dates, max_empty_days: int,
-                           dry_run: bool, sb=None) -> dict:
+                           dry_run: bool, sb=None, food_dates=()) -> dict:
     """Automated export only: in ONE transaction (pds.replace_cronometer_servings_window)
     replace the servings of the dates with rows, upsert the daily totals, and handle
     the days without food.
@@ -891,7 +954,11 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
     emptied; their daily row is in daily_rows and is rewritten from the export).
     Both must come from check_trusted_export on the same files, and every one of
     them must lie strictly between the first and last date of `rows` (the function
-    refuses the call otherwise). A stored one of
+    refuses the call otherwise).
+    food_dates: every day the export shows (or may show) food on, written or not
+    (check_trusted_export's food_dates, for every export, usable or not): each loses
+    its empty-day record, so food seen on a day whose rows are not written still
+    starts its count over. A call may carry nothing else. A stored one of
     these days is emptied only on its second look: the function records the first
     export that shows it empty and empties it when an export at least
     EMPTY_CONFIRM_HOURS later still does (pending_days = recorded, not emptied yet).
@@ -911,10 +978,11 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
         raise ValueError("max_empty_days must be an integer >= 0")
     empty = sorted(set(empty_dates))
     s_empty = sorted(set(servings_empty_dates))
+    food = sorted(set(food_dates))
     base = {"inserted": 0, "daily_upserted": 0, "empty_dates": len(empty) + len(s_empty),
             "cleared_days": 0, "cleared_servings": 0, "cleared_daily": 0, "refused_days": 0,
             "pending_days": 0}
-    if not rows and not daily_rows and not empty and not s_empty:
+    if not rows and not daily_rows and not empty and not s_empty and not food:
         return {**base, "mode": "none"}
     if dry_run:
         return {**base, "inserted": len(rows), "daily_upserted": len(daily_rows), "mode": "dry_run"}
@@ -928,6 +996,7 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
         "p_rows": rows,
         "p_empty_dates": empty,
         "p_servings_empty_dates": s_empty,
+        "p_food_dates": food,
         "p_daily_rows": daily_rows,
         "p_max_cleared_days": max_empty_days,
     }
@@ -937,7 +1006,8 @@ def import_servings_window(rows: list[dict], daily_rows: list[dict], window: tup
         if _is_missing_function(e, REPLACE_WINDOW_RPC):
             # Rollout order: the code can ship before the SQL. The failed call was
             # rejected before it ran, so nothing changed; neither fallback can
-            # empty a day.
+            # empty a day (and without this file there is no empty-day record to
+            # forget: the candidates table is created by the same file).
             inserted, daily_upserted, _mode = import_servings_and_daily(rows, daily_rows, False, sb)
             return {**base, "inserted": inserted, "daily_upserted": daily_upserted, "mode": "fallback"}
         raise
@@ -1062,9 +1132,11 @@ def run_import(paths: list[str], dry_run: bool = False, window: tuple[date, date
     max_empty_days stored days per run). A file that is not well formed writes no
     servings; days the two files disagree on, or with a value that cannot be read,
     keep their stored servings; in both cases nothing is emptied (partial
-    heartbeat). Without a window (manual export) the servings of the dates with
-    rows are replaced and the daily totals upserted in one call, which never
-    empties a day and starts the empty-day count of every day it writes over.
+    heartbeat). Every day either file shows food on, written or not, loses its
+    empty-day record in the same call. Without a window (manual export) the
+    servings of the dates with rows are replaced and the daily totals upserted in
+    one call, which never empties a day and starts the empty-day count of every
+    day it writes over.
     """
     trusted = trusted_window(window)
     if window is not None and trusted is None:
@@ -1134,21 +1206,22 @@ def _import_window(window, servings_path, daily_path, dry_run, sb, tz_log,
     if not check.usable:
         # The export could not prove it is the whole window: write no servings and
         # empty nothing (a replace of a cut-off day would lose its missing rows). A
-        # well-formed daily summary is still upserted, in one call under the shared
-        # lock; a garbled one is not (a short row would write NULL over a stored
-        # total).
+        # well-formed daily summary is still upserted; a garbled one is not (a short
+        # row would write NULL over a stored total). Either way the days the export
+        # shows food on lose their empty-day record: one call under the shared lock.
         servings_note = f"servings not written, nothing emptied: {check.reason}"
         print(f"  servings: {servings_note}")
         _log_range(sb, "servings", "partial", [], 0, t0, servings_note)
         t1 = now_epoch()
         try:
+            drows = window_daily_rows() if check.daily_ok and daily_path else []
+            result = import_servings_window([], drows, window, (), (), max_empty_days, dry_run, sb,
+                                            food_dates=check.food_dates)
+            dcount = result["daily_upserted"]
             if check.daily_ok and daily_path:
-                drows = window_daily_rows()
-                _scount, dcount, _mode = import_servings_and_daily([], drows, dry_run, sb)
                 daily_note = f"servings: {servings_note}"
                 print(f"  daily:    {dcount} days   {'(dry-run)' if dry_run else 'imported'}")
             else:
-                drows, dcount = [], 0
                 daily_note = f"daily totals not written: {check.daily_reason}"
                 print(f"  daily:    {daily_note}")
             # /status reads the daily heartbeat for the Cronometer card, so a
@@ -1164,10 +1237,13 @@ def _import_window(window, servings_path, daily_path, dry_run, sb, tz_log,
     srows = [r for r in build_serving_rows(servings_path, tz_log) if r["calendar_date"] not in skip]
     drows = window_daily_rows()
     # A blank export (no food anywhere in the window, e.g. a logging pause) offers no
-    # day for emptying: nothing in it shows which dates it covered.
+    # day for emptying: nothing in it shows which dates it covered. The days left out
+    # of srows / drows still go along in food_dates (their empty-day record is
+    # forgotten even though their rows are not written).
     try:
         result = import_servings_window(srows, drows, window, check.empty_dates,
-                                        check.servings_empty_dates, max_empty_days, dry_run, sb)
+                                        check.servings_empty_dates, max_empty_days, dry_run, sb,
+                                        food_dates=check.food_dates)
     except Exception as e:  # noqa: BLE001
         if sb:
             log_sync(sb, "cronometer", "servings", "error", error=str(e)[:500], started_at=t0)
