@@ -3,6 +3,13 @@ import { CALENDAR_MAX_RANGE_DAYS, validRange, type CalendarEventsResponse } from
 import { loadCalendarEvents } from "@/lib/calendar-events-server";
 
 export const dynamic = "force-dynamic";
+// Edge runtime, next to the database (PERF-01, 2026-11-16), for the same reason as /api/urgent-email: its queries are
+// small (EXPLAIN, read-only: a table of a few dozen rows and an index scan) and it was slow only on the cold first
+// visit, which points at the start of a new Node function instance. Not yet measured on production: the next
+// perf-timing runs after the deploy decide it, and without a gain on the cold first visit this goes back to Node.
+// lib/calendar-events-server.ts uses supabase-js over fetch and no Node API. Same middleware, same answer.
+export const runtime = "edge";
+export const preferredRegion = "iad1";
 
 const NO_STORE = { "Cache-Control": "no-store" };
 

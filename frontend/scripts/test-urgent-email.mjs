@@ -480,6 +480,74 @@ await test("a failed heartbeat read only drops the sync line", async () => {
   assert.equal(out.items.length, 1);
 });
 
+// ---- Speed (PERF-01): one round trip, hashes together, an edge route ------------------------
+await test("the three reads go out together: none waits for another", async () => {
+  // A fake whose reads stay open until released: all three must be requested before any answers.
+  const calls = [];
+  const gates = [];
+  const from = (table) => {
+    const chain = {
+      select() { return chain; }, eq() { return chain; }, gte() { return chain; }, lte() { return chain; }, order() { return chain; },
+      limit() {
+        calls.push(table);
+        return new Promise((resolve) => gates.push(() => resolve(
+          table === "inbox_emails" ? { data: [row({ subject: "Parallel" })], error: null } : { data: [], error: null },
+        )));
+      },
+    };
+    return chain;
+  };
+  const pending = getUrgentEmail({ from }, NOW);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(calls.slice().sort(), ["inbox_emails", "sync_log", "today_cleared_emails"], "every read is under way before any answers");
+  for (const open of gates) open();
+  const out = await pending;
+  assert.deepEqual(out.items.map((i) => i.subject), ["Parallel"]);
+});
+
+await test("many cleared threads: each mark hides exactly its own thread (hashes computed together keep their order)", async () => {
+  const { clearKeyHash } = await import("../src/lib/today-clear.ts");
+  const rows = Array.from({ length: 30 }, (_, i) => row({ subject: `Synthetic ${i}`, received_at: hoursAgo(2 + i / 10) }));
+  const key = (r) => `thread:${ACCT}:${r.gmail_thread_id}`;
+  // Every third thread is cleared through its newest message; one more mark is for a thread not in the window.
+  const cleared = await Promise.all(rows.filter((_, i) => i % 3 === 0).map(async (r) => ({ key_hash: await clearKeyHash(key(r)), cleared_through: r.received_at })));
+  cleared.push({ key_hash: await clearKeyHash(`thread:${ACCT}:1999999999999999999`), cleared_through: hoursAgo(1) });
+  const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT, cleared }).client, NOW);
+  assert.equal(out.cleared, 10);
+  assert.equal(out.total, 20);
+  const shown = new Set(out.items.map((i) => i.subject));
+  rows.forEach((r, i) => assert.equal(shown.has(r.subject), i % 3 !== 0, r.subject));
+});
+
+await test("/api/urgent-email and /api/calendar/events run on the edge runtime next to the database, with no Node API", async () => {
+  const fs = await import("node:fs");
+  const src = (f) => fs.readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
+  for (const f of ["app/api/urgent-email/route.ts", "app/api/calendar/events/route.ts"]) {
+    const route = src(f);
+    assert.match(route, /export const runtime = "edge";/, f);
+    assert.match(route, /export const preferredRegion = "iad1";/, `${f}: the region of Supabase (us-east-1) and the Node functions`);
+    assert.match(route, /export const dynamic = "force-dynamic";/, f);
+  }
+  // The edge runtime has no Node built-ins: every module these routes load (followed through their @/lib imports)
+  // must do without them, and nothing outside @/lib but next/server, supabase-js and the server-only marker is loaded.
+  const seen = new Set();
+  const visit = (f) => {
+    if (seen.has(f)) return;
+    seen.add(f);
+    const code = src(f).replace(/^\s*(\*|\/\/).*$/gm, "");
+    assert.ok(!/from "node:|require\(|\bBuffer\b|\bprocess\.(cwd|versions|nextTick)\b|from "(fs|path|crypto|os|stream|zlib|http|https|net|child_process)"/.test(code), `${f} uses no Node API`);
+    for (const [, spec] of code.matchAll(/(?:from|import) "([^"]+)"/g)) {
+      if (spec.startsWith("@/lib/")) visit(`lib/${spec.slice(6)}.ts`);
+      else assert.ok(["next/server", "@supabase/supabase-js", "server-only"].includes(spec), `${f} imports ${spec}`);
+    }
+  };
+  visit("app/api/urgent-email/route.ts");
+  visit("app/api/calendar/events/route.ts");
+  for (const f of ["lib/urgent-email-query.ts", "lib/urgent-email.ts", "lib/today-clear.ts", "lib/calendar-events-server.ts", "lib/calendar-events.ts"]) {
+    assert.ok(seen.has(f), `${f} is checked`);
+  }
+});
+
 // ---- /status card ---------------------------------------------------------------------
 await test("status card: unknown before the first run, then heartbeat age and run status", async () => {
   const card = async (beat, beatError = null) => (await getUrgentEmailStatusCard(fakeClient({ beat, beatError }).client, NOW)).status;
