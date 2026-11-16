@@ -879,8 +879,12 @@ def smoke_culprit(sha: str, parent_state: str, parent_age_s: float | None) -> st
     (attempt times, so a receipt job that ran late changes nothing): then the change that broke it is sha. A parent
     that was never verified on its own deployment (superseded, deferred, unverified) may hold the breaking change, a
     parent that already failed was handled by its own verification, and an old pass does not rule out live data that
-    changed since (the suite reads production data); all of these halt for a person."""
-    if parent_state != "pass" or parent_age_s is None or parent_age_s > SMOKE_PARENT_MAX_AGE_S:
+    changed since (the suite reads production data); all of these halt for a person.
+
+    parent_age_s = failure time minus the parent pass's attempt time. It must lie in [0, SMOKE_PARENT_MAX_AGE_S]: a
+    negative age is a parent pass that started AFTER this failure (a receipt job that ran late can read one), which
+    says nothing about the deployment that was live when sha failed, so it halts too."""
+    if parent_state != "pass" or parent_age_s is None or not 0 <= parent_age_s <= SMOKE_PARENT_MAX_AGE_S:
         return None
     return sha
 
@@ -1223,7 +1227,8 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
                 when = f" from {parent_at}" if parent_at else ""
                 reason = (f"production smoke test failed twice on {host} serving {sha[:7]}, but its parent "
                           f"{parent[:7] if known else '(unreadable)'} has smoke receipt '{parent_state}'{when} (a "
-                          f"revert needs a pass within {SMOKE_PARENT_MAX_AGE_S // 3600} h), so the breaking commit "
+                          f"revert needs a pass in the {SMOKE_PARENT_MAX_AGE_S // 3600} h before this failure), so "
+                          f"the breaking commit "
                           f"is not known: nothing is reverted")
         elif outcome == "halt":
             action = "halt"

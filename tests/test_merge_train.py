@@ -490,6 +490,10 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         # an older pass does not rule out live data that changed since: a person decides
         self.assertIsNone(mt.smoke_culprit(self.E, "pass", mt.SMOKE_PARENT_MAX_AGE_S + 1))
         self.assertIsNone(mt.smoke_culprit(self.E, "pass", None))  # no readable time
+        # a parent pass that started AFTER the failure (negative age) says nothing about the deployment that failed
+        self.assertEqual(mt.smoke_culprit(self.E, "pass", 0), self.E)
+        self.assertIsNone(mt.smoke_culprit(self.E, "pass", -1))
+        self.assertIsNone(mt.smoke_culprit(self.E, "pass", -mt.SMOKE_PARENT_MAX_AGE_S))
         # the parent was superseded / deferred: it may hold the breaking change, so no unrelated revert
         self.assertIsNone(mt.smoke_culprit(self.E, "unknown", 600))
         # the parent already failed: its own verification acted; a person decides
@@ -1131,6 +1135,13 @@ class SmokeCommands(unittest.TestCase):
         # a parent pass more than 3 h before the failure (NOW-100) still halts
         code, out, _ = self.receipt([fail1, fail2], parent_age=mt.SMOKE_PARENT_MAX_AGE_S + 200)
         self.assertEqual(out["action"], "halt")
+        # a late receipt job can read a parent pass that started AFTER the failure ended (NOW-50 > NOW-100): a negative
+        # age proves nothing about the deployment that failed, so it halts, however late the job ran
+        for late in (0, 3600):
+            code, out, status = self.receipt([fail1, fail2], parent_age=50, now=self.NOW + late,
+                                             clock=lambda: self.NOW + late + 5)
+            self.assertEqual((code, out["action"], out["culprit"]), (0, "halt", ""), late)
+            self.assertIn("state=failure", status)  # the deployment did fail; only the culprit is unknown
 
     def test_receipt_marks_follow_the_attempt_that_decided(self):
         t = mt.iso_utc
