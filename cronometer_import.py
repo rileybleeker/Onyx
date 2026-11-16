@@ -552,9 +552,8 @@ def build_daily_rows(csv_path: str) -> list[dict]:
 # so 0.005 per serving cell plus 0.005 for the total). A flat tolerance (it was 0.5
 # in every column) would let a lost low-dose entry, say 0.4 mg of one vitamin and
 # nothing else, pass the check, and the day would then be replaced without it
-# (Codex review). Checked against the stored data on 2026-11-16: on every day held in
-# both tables, all 1,241 day-and-nutrient pairs (67 columns) agree within this bound,
-# the largest difference at two thirds of it.
+# (Codex review). The bound was checked read-only against the stored data: every
+# day-and-nutrient pair held in both tables agrees within it.
 #
 # A cell that cannot be read is never a zero. Every nutrient cell must be blank (a
 # value Cronometer does not have, which adds nothing to a total) or a finite
