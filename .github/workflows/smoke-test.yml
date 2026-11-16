@@ -3,18 +3,67 @@ name: Production Smoke Test
 # Loads each dashboard page against PRODUCTION with real data and fails when a
 # panel that should have data shows its empty-state fallback — the class of
 # regression that tsc + lint pass but only surfaces by clicking around prod.
-# A failed run = red X + GitHub's failure email. The Playwright HTML report is
-# uploaded as an artifact on failure for triage.
+# A failed run = red X + GitHub's failure email. CI keeps no trace, screenshot,
+# video or HTML report and uploads no artifact: the repo is public and those hold
+# signed-in pages (playwright.config.ts). Reproduce a failure locally.
+#
+# Provenance (DEL-02). The browser loads the production ALIAS (generated deployment
+# URLs sit behind Vercel's sign-in), and the alias moves to every newer deployment.
+# So each run is bound to ONE commit + immutable deployment: the expected commit must
+# be on master and have a live successful Production deployment (else nothing runs),
+# the tests of that exact commit are checked out, and production must serve that
+# commit and deployment (signed-in /api/version) before AND after the tests. Verdict:
+# pass / fail = exact target; deferred = it served something else or could not be
+# confirmed with tests passing (pending verification, never a pass); unverified =
+# tests failed and the target was not confirmed (never attributed to the commit).
+# The job fails only on fail and unverified. The receipt is the job summary; post-merge
+# also records it as the commit status post-merge/smoke.
 
 on:
   schedule:
     - cron: "0 */6 * * *" # every 6 hours
-  workflow_dispatch: {}
-  workflow_call: {} # post-merge.yml runs this after every merge
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Master commit whose Production deployment to smoke-test (default master head)
+        required: false
+  workflow_call: # post-merge.yml runs this after every merge, with the commit and deployment it verified
+    inputs:
+      expected_sha:
+        type: string
+        required: false
+        default: ""
+      deployment_url:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      SMOKE_BASE_URL:
+        required: false
+      SMOKE_TEST_EMAIL:
+        required: false
+      SMOKE_TEST_PASSWORD:
+        required: false
+    outputs:
+      verdict:
+        value: ${{ jobs.smoke.outputs.verdict }}
+      detail:
+        value: ${{ jobs.smoke.outputs.detail }}
+      tested_sha:
+        value: ${{ jobs.smoke.outputs.tested_sha }}
+      tested_deployment:
+        value: ${{ jobs.smoke.outputs.tested_deployment }}
 
-# A new run supersedes an in-flight one rather than piling up.
+# Read-only: this workflow holds the smoke login, so its token can change nothing.
+permissions:
+  contents: read
+  deployments: read
+
+# A new run for the same commit supersedes an in-flight one (a cancelled run is deferred, never a failure). Keyed
+# by commit so an older merge's retry never cancels a newer merge's smoke run: the older one stops by itself at
+# the provenance check once production serves the newer deployment.
 concurrency:
-  group: smoke-test-${{ github.event_name }}
+  group: smoke-test-${{ github.event_name }}-${{ inputs.expected_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -26,28 +75,82 @@ jobs:
     # Move back to ubuntu-latest once Playwright supports 26.04.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      detail: ${{ steps.verdict.outputs.detail }}
+      tested_sha: ${{ steps.verdict.outputs.tested_sha }}
+      tested_deployment: ${{ steps.verdict.outputs.tested_deployment }}
     defaults:
       run:
-        working-directory: frontend
+        working-directory: target/frontend
     steps:
-      - uses: actions/checkout@v6
+      # The verdict code comes from the commit this workflow file belongs to, never from the commit under test.
+      - name: Check out the merge-train tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .tooling
+          sparse-checkout: tools
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - name: Resolve the exact target
+        id: target
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.expected_sha || github.sha }}
+          DEPLOYMENT_URL: ${{ inputs.deployment_url }}
+        run: python3 .tooling/tools/merge_train.py smoke-target --sha "$SHA" --deployment-url "$DEPLOYMENT_URL"
+
+      - name: Check out the tests of that commit
+        if: steps.target.outputs.ready == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          path: target
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.target.outputs.ready == 'true'
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: target/frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        if: steps.target.outputs.ready == 'true'
+        run: npm ci --ignore-scripts
 
       - name: Install Playwright (chromium)
-        run: npx playwright install --with-deps chromium
+        if: steps.target.outputs.ready == 'true'
+        run: npx --no-install playwright install --with-deps chromium
 
+      # The only step that sees the smoke login. auth.setup.ts records what production serves right after signing
+      # in (and stops at once when it is another commit); provenance.teardown.ts records it again after every test.
       - name: Run smoke tests
+        id: tests
+        if: steps.target.outputs.ready == 'true'
+        continue-on-error: true
         env:
           SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
           SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
           SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
-        run: npx playwright test
+          SMOKE_EXPECTED_SHA: ${{ steps.target.outputs.sha }}
+          SMOKE_EXPECTED_DEPLOYMENT: ${{ steps.target.outputs.deployment_url }}
+          SMOKE_PROVENANCE_DIR: ${{ runner.temp }}/smoke-provenance
+        run: npx --no-install playwright test
 
+      - name: Verdict and receipt
+        id: verdict
+        if: ${{ !cancelled() }}
+        working-directory: ${{ github.workspace }}
+        env:
+          SHA: ${{ steps.target.outputs.sha || inputs.expected_sha || github.sha }}
+          DEPLOYMENT_URL: ${{ steps.target.outputs.deployment_url }}
+          READY: ${{ steps.target.outputs.ready }}
+          TARGET_DETAIL: ${{ steps.target.outputs.detail }}
+          TESTS: ${{ steps.tests.outcome }}
+          PROVENANCE_DIR: ${{ runner.temp }}/smoke-provenance
+        run: >-
+          python3 .tooling/tools/merge_train.py smoke-verdict --sha "$SHA" --deployment-url "$DEPLOYMENT_URL"
+          --ready "$READY" --target-detail "$TARGET_DETAIL" --tests "$TESTS" --provenance-dir "$PROVENANCE_DIR"

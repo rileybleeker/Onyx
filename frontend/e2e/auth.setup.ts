@@ -1,5 +1,6 @@
 import { test as setup, expect } from "@playwright/test";
 import path from "path";
+import { provenanceDir, readServedRevision, staleTarget, writeServedRevision } from "./provenance";
 
 // Persist the logged-in session here; playwright.config.ts points the
 // `chromium` project's storageState at the same file. Gitignored.
@@ -36,4 +37,14 @@ setup("authenticate against the app", async ({ page }) => {
   ).toBeVisible({ timeout: 15_000 });
 
   await page.context().storageState({ path: authFile });
+
+  // Smoke provenance (DEL-02, e2e/provenance.ts): record which commit and deployment production serves now.
+  // When it is not the one this run was started for, stop here: every result would belong to another
+  // deployment. CI only (SMOKE_PROVENANCE_DIR); the perf run and local runs skip it.
+  if (provenanceDir()) {
+    const served = await readServedRevision(page.request, "before");
+    writeServedRevision(served);
+    const stale = staleTarget(served);
+    if (stale) throw new Error(stale);
+  }
 });

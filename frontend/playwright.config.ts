@@ -47,27 +47,38 @@ export default defineConfig({
   // a real bug, caused the heaviest page (/bland-altman) to flake. retries: 1
   // absorbs the occasional genuine transient blip on top of that.
   workers: 2,
-  // The repo is public, so CI keeps no trace, screenshot or HTML report: each one holds
+  // The repo is public, so CI keeps no trace, screenshot, video or HTML report: each one holds
   // the signed-in pages and API answers (health data, calendar titles, finances) and an
   // uploaded artifact can be downloaded by anyone. The list output names the failing check.
-  // Locally (not CI) the debugging aids stay on.
+  // In CI each test's output folder (error-context page snapshots) is also deleted when the test
+  // ends, so no later upload step could pick one up. Locally (not CI) the debugging aids stay on.
   reporter: [["list"]],
+  preserveOutput: process.env.CI ? "never" : "always",
   use: {
     baseURL,
     actionTimeout: 15_000,
     navigationTimeout: 30_000,
     trace: process.env.CI ? "off" : "on-first-retry",
     screenshot: process.env.CI ? "off" : "only-on-failure",
+    video: "off",
   },
   projects: [
-    // 1. Authenticate once, persist the session to e2e/.auth/state.json.
-    { name: "setup", testMatch: /auth\.setup\.ts/ },
+    // 1. Authenticate once, persist the session to e2e/.auth/state.json. In CI it also records
+    //    which commit + deployment production serves, and stops when it is not the expected one
+    //    (smoke provenance, DEL-02: e2e/provenance.ts).
+    { name: "setup", testMatch: /auth\.setup\.ts/, teardown: "provenance" },
     // 2. Smoke specs reuse that saved session (no per-test login).
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"], storageState: authFile },
       dependencies: ["setup"],
       testMatch: /smoke\.spec\.ts/,
+    },
+    // 3. After every smoke test: record what production serves again (CI only).
+    {
+      name: "provenance",
+      use: { ...devices["Desktop Chrome"], storageState: authFile },
+      testMatch: /provenance\.teardown\.ts/,
     },
   ],
 });
