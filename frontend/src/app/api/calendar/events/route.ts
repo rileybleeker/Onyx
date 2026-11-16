@@ -3,6 +3,11 @@ import { CALENDAR_MAX_RANGE_DAYS, validRange, type CalendarEventsResponse } from
 import { loadCalendarEvents } from "@/lib/calendar-events-server";
 
 export const dynamic = "force-dynamic";
+// Edge runtime, next to the database (PERF-01, 2026-11-16): on a cold Today load this call and /api/urgent-email both
+// waited for a new Node function instance to start before their first query. lib/calendar-events-server.ts uses
+// supabase-js over fetch and no Node API. Same middleware, same answer.
+export const runtime = "edge";
+export const preferredRegion = "iad1";
 
 const NO_STORE = { "Cache-Control": "no-store" };
 

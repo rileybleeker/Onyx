@@ -3,6 +3,14 @@ import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmail } from "@/lib/urgent-email-query";
 
 export const dynamic = "force-dynamic";
+// Edge runtime, in the region of the database (Supabase us-east-1) and the Node functions (PERF-01, 2026-11-16).
+// On a cold Today load this call went over the one-second budget while its three queries (indexed, run in parallel)
+// took tens of milliseconds at the database: the request only reached Supabase once a new Node function instance had
+// started. An edge isolate starts in milliseconds. Everything here runs on the edge runtime: supabase-js over fetch,
+// Web Crypto for the clear-mark hashes (lib/today-clear.ts), Intl for the Eastern day; no Node API. Same middleware
+// (owner session), same answer.
+export const runtime = "edge";
+export const preferredRegion = "iad1";
 
 /**
  * GET /api/urgent-email

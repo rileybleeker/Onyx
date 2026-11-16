@@ -311,13 +311,18 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
 
   const shown: UrgentEmailItem[] = [];
   let cleared = 0;
+  const described: UrgentEmailItem[] = [];
   for (const t of threads.values()) {
     const item = describeThread(t, now);
-    if (!item) continue;
-    const through = clearedThrough.size > 0 ? clearedThrough.get(await clearKeyHash(item.key)) : undefined;
+    if (item) described.push(item);
+  }
+  // The clear-mark hashes are computed together (one await, not one per thread in a row), only when a mark exists.
+  const hashes = clearedThrough.size > 0 ? await Promise.all(described.map((item) => clearKeyHash(item.key))) : null;
+  described.forEach((item, i) => {
+    const through = hashes ? clearedThrough.get(hashes[i]) : undefined;
     if (through && stillCleared(item.receivedAt, through)) cleared++;
     else shown.push(item);
-  }
+  });
   shown.sort((a, b) => rank(a) - rank(b) || time(b.receivedAt) - time(a.receivedAt) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   return {
     status: "ready",

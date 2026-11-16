@@ -1,5 +1,5 @@
 /**
- * The Log screen's first reads (AGENTS.md "Log screen"), started by an inline script in the HTML of /log
+ * The Log screen's first reads (AGENTS.md "Log screen"), started by a script in the head of /log
  * (app/log/EarlyReads.tsx) instead of after the page's JavaScript, the section chunks and their mount (speed budget,
  * 2026-11-15: the cold first visit took about 1.4 s, its 9 reads only starting at about 670 ms). Each section takes
  * its answer once on its first load, on the routed page only (never a copy in the continuous scroll), through
@@ -23,6 +23,11 @@ export const LOG_SUPPLEMENTS_PRODUCTS_URL = "/api/supplements/products";
 export const LOG_SUPPLEMENTS_HISTORY_URL = "/api/supplements/history?days=30&perPage=200";
 /** Same as BEHAVIORAL_TODAY_URL in lib/log-ubereats.ts (the Uber Eats section's day). */
 export const LOG_BEHAVIORAL_TODAY_URL = "/api/behavioral-today";
+/**
+ * The Drinks section's first read: behavioral today's drinks (DRINKS_URL in lib/drink-capture.ts, no `?day=`). GET
+ * only, read-only (PERF-01: it used to start only once the section had mounted, the last read of a cold /log).
+ */
+export const LOG_DRINKS_URL = "/api/nutrition/drinks";
 /** Prefix of journalTodayUrl() in lib/journal-file.ts: `?from=<New York date>&to=<same>&limit=20`. */
 export const LOG_JOURNAL_LIST_PATH = "/api/journal/list";
 
@@ -42,10 +47,11 @@ export const LOG_EARLY_GETS = [
   LOG_WEIGHT_URL,
   LOG_READING_URL,
   LOG_BEHAVIORAL_TODAY_URL,
+  LOG_DRINKS_URL,
 ] as const;
 
 /**
- * Plain-ES5 inline script for /log: the mark above, the fixed GETs, then today's journal list for the New York date
+ * Plain-ES5 script for /log: the mark above, the fixed GETs, then today's journal list for the New York date
  * (the same Intl call as easternDate() in lib/journal-entry.ts). Never throws; a failure leaves a read to its section.
  */
 export function logEarlyScript(): string {

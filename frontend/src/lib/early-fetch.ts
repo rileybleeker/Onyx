@@ -8,6 +8,15 @@
  * Used by /check-in, Today (`/` and `/today`, lib/today-early.ts) and /status. Only a full page load runs the
  * script: React never runs a script it inserts itself (an in-app navigation, the continuous scroll).
  *
+ * Today, /log and /agents load theirs from the HEAD instead (`earlyScriptSrc`, PERF-01, 2026-11-16): an inline
+ * script in the body waits until every stylesheet before it has loaded (HTML spec: a parser-inserted classic script
+ * waits for script-blocking style sheets), and the sidebar's inline boot script stops the parser even earlier, so on
+ * a cold first visit those reads only left the browser once the CSS had arrived over the network.
+ * `<script async src="data:...">` is hoisted into the head by React and an async script never waits for a
+ * stylesheet, so they start as soon as the head is parsed. React does run an async script it inserts on an in-app
+ * navigation, so every script built by `earlyFetchWrap` does nothing once the app is running and the document is
+ * parsed.
+ *
  * Import-free on purpose: the script text is built here so the page and the client agree on the key and the URLs.
  */
 
@@ -33,16 +42,39 @@ function initText(init: EarlyInit = {}): string {
 
 /**
  * The start of every early-fetch script: `m` is the map of started GETs (URL -> {at, p}) and `go(url, init)` starts
- * one. Plain ES5, never throws.
+ * one, unless the same URL was started and not yet taken within EARLY_FETCH_MAX_AGE_MS (a script that runs twice in
+ * one page load never sends a read twice or orphans the first answer). Plain ES5, never throws.
  */
 export function earlyFetchPrelude(): string {
   const k = JSON.stringify(EARLY_FETCH_KEY);
-  return `var w=window,m=w[${k}]||(w[${k}]={}),go=function(u,o){try{m[u]={at:Date.now(),p:fetch(u,o)};}catch(e){}};`;
+  return (
+    `var w=window,m=w[${k}]||(w[${k}]={}),go=function(u,o){try{var s=m[u];` +
+    `if(s&&Date.now()-s.at<${EARLY_FETCH_MAX_AGE_MS})return;m[u]={at:Date.now(),p:fetch(u,o)};}catch(e){}};`
+  );
 }
+
+/**
+ * Plain-ES5 condition (uses the prelude's `w`): true once the app is running, so the script was inserted by React on
+ * an in-app navigation, where the page reads for itself and an early read would only be a second, unused request.
+ * `window.next` is set by Next's client bootstrap (before hydration) and readyState leaves "loading" once the HTML is
+ * parsed. During a full page load it is false: an inline script runs while the parser runs ("loading"), and the
+ * head's async script runs long before the body is parsed. If it ever were true on a full load, the page simply reads
+ * for itself, as without an early script.
+ */
+export const EARLY_APP_RUNNING = `w.next&&document.readyState!=="loading"`;
 
 /** Wraps a script body (which may use `m` and `go`) so nothing it does can break the page. */
 export function earlyFetchWrap(body: string): string {
-  return `(function(){try{${earlyFetchPrelude()}${body}}catch(e){}})();`;
+  return `(function(){try{${earlyFetchPrelude()}if(${EARLY_APP_RUNNING})return;${body}}catch(e){}})();`;
+}
+
+/**
+ * The `src` for `<script async src={...} />`: the script as a data: URL. React hoists an async script with a src into
+ * the head, where it runs as soon as it is parsed instead of after the stylesheets (see the top of this file). Same
+ * script text, so the same URLs and keys as the inline form.
+ */
+export function earlyScriptSrc(script: string): string {
+  return `data:text/javascript;charset=utf-8,${encodeURIComponent(script)}`;
 }
 
 /**
