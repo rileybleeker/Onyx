@@ -216,6 +216,23 @@ export async function POST(req: NextRequest) {
   const choice = chooseModel("playlist", crypto.randomUUID(), pilot, now);
   const usage: Anthropic.Usage[] = [];
   const started = Date.now();
+  // Model calls attempted (counted before each create, so a call that throws still counts) and a
+  // flag so each request is observed exactly once, even when sending the last event throws.
+  let attempts = 0;
+  let observed = false;
+  let finalResult: CreatePlaylistResult | null = null;
+  const observe = () => {
+    if (observed) return;
+    observed = true;
+    logPilotObservation(
+      pilotObservation("playlist", choice, pilot, {
+        usage,
+        latencyMs: Date.now() - started,
+        ok: finalResult != null,
+        calls: attempts,
+      }),
+    );
+  };
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -235,6 +252,7 @@ export async function POST(req: NextRequest) {
           { role: "user", content: "Generate the playlist now per the constraints in the system prompt." },
         ];
 
+        attempts++;
         let response = await anthropic.messages.create({
           model: choice.model,
           max_tokens: 1024,
@@ -246,7 +264,6 @@ export async function POST(req: NextRequest) {
         usage.push(response.usage);
 
         let iter = 0;
-        let finalResult: CreatePlaylistResult | null = null;
 
         while (response.stop_reason === "tool_use" && iter < MAX_ITERATIONS) {
           iter++;
@@ -316,6 +333,7 @@ export async function POST(req: NextRequest) {
 
           messages.push({ role: "user", content: toolResults });
 
+          attempts++;
           response = await anthropic.messages.create({
             model: choice.model,
             max_tokens: 1024,
@@ -336,13 +354,7 @@ export async function POST(req: NextRequest) {
           send({ type: "message", text: finalText });
         }
 
-        logPilotObservation(
-          pilotObservation("playlist", choice, pilot, {
-            usage,
-            latencyMs: Date.now() - started,
-            ok: finalResult != null,
-          }),
-        );
+        observe();
         if (finalResult) {
           send({ type: "done", result: finalResult });
         } else {
@@ -355,9 +367,8 @@ export async function POST(req: NextRequest) {
           });
         }
       } catch (e) {
-        logPilotObservation(
-          pilotObservation("playlist", choice, pilot, { usage, latencyMs: Date.now() - started, ok: false }),
-        );
+        // A playlist already created counts as accepted even if a later call failed.
+        observe();
         send({
           type: "error",
           message: e instanceof Error ? e.message : String(e),

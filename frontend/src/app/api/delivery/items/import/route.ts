@@ -161,9 +161,19 @@ async function estimateBatch(limit?: number, offset?: number) {
     .order("est_key")
     .limit(from + n);
   if (error) throw new Error(`delivery_items_unestimated: ${error.message}`);
-  const todo = (data ?? []).slice(from);
+  const queue = (data ?? []).slice(from);
   // Nothing at this offset: the dishes stepped past are still in the queue, so report them.
-  if (todo.length === 0) return { estimated: 0, remaining: count ?? 0 };
+  if (queue.length === 0) return { estimated: 0, remaining: count ?? 0 };
+
+  // Each dish has its own arm (by its est_key), and one call uses one model, so a batch holds only
+  // the dishes of the first dish's arm; the others stay queued for a later call. A dish therefore
+  // gets the same model in a full batch and in the harvester's one-dish retry, and a failed batch
+  // is counted against the arm that ran it. Without a pilot every dish is baseline (no filtering).
+  const now = Date.now();
+  const pilot = pilotFromEnv(now);
+  const armOf = (r: (typeof queue)[number]) => chooseModel("delivery_estimate", String(r.est_key), pilot, now);
+  const choice = armOf(queue[0]);
+  const todo = queue.filter((r, i) => i === 0 || armOf(r).arm === choice.arm);
 
   const input = todo.map((r, id) => ({
     id,
@@ -173,13 +183,21 @@ async function estimateBatch(limit?: number, offset?: number) {
     price: r.price != null ? `${r.price} ${r.currency ?? ""}`.trim() : undefined,
   }));
 
-  // One model per call; the arm is fixed by the batch's first dish, so a dish retried on its own
-  // (limit 1) lands in its own arm every time.
-  const now = Date.now();
-  const pilot = pilotFromEnv(now);
-  const choice = chooseModel("delivery_estimate", String(todo[0].est_key), pilot, now);
   const started = Date.now();
   let res: Anthropic.Message | null = null;
+  // One observation per request, written once the outcome is known: after the estimates are
+  // stored, or with 0 accepted when the call, the reply or the save failed.
+  const observe = (accepted: number) =>
+    logPilotObservation(
+      pilotObservation("delivery_estimate", choice, pilot, {
+        usage: res ? [res.usage] : [],
+        latencyMs: Date.now() - started,
+        ok: accepted === todo.length,
+        units: todo.length,
+        accepted,
+        calls: 1,
+      }),
+    );
   let parsed: { items: Estimate[] };
   try {
     res = await anthropic.messages.create({
@@ -196,16 +214,7 @@ async function estimateBatch(limit?: number, offset?: number) {
     if (!text) throw new Error("estimator returned no text block");
     parsed = JSON.parse(text) as { items: Estimate[] };
   } catch (e) {
-    logPilotObservation(
-      pilotObservation("delivery_estimate", choice, pilot, {
-        usage: res ? [res.usage] : [],
-        latencyMs: Date.now() - started,
-        ok: false,
-        units: todo.length,
-        accepted: 0,
-        calls: 1,
-      }),
-    );
+    observe(0);
     throw e;
   }
 
@@ -232,23 +241,17 @@ async function estimateBatch(limit?: number, offset?: number) {
       model: choice.model,
     });
   }
-  logPilotObservation(
-    pilotObservation("delivery_estimate", choice, pilot, {
-      usage: [res.usage],
-      latencyMs: Date.now() - started,
-      ok: rows.length === todo.length,
-      units: todo.length,
-      accepted: rows.length,
-      calls: 1,
-    }),
-  );
   if (rows.length) {
     // ignoreDuplicates: a row someone hand-corrected is never overwritten by a re-estimate
     const { error: upErr } = await supabase
       .from("delivery_item_nutrition")
       .upsert(rows, { onConflict: "est_key", ignoreDuplicates: true });
-    if (upErr) throw new Error(`delivery_item_nutrition upsert: ${upErr.message}`);
+    if (upErr) {
+      observe(0);
+      throw new Error(`delivery_item_nutrition upsert: ${upErr.message}`);
+    }
   }
+  observe(rows.length);
   return { estimated: rows.length, remaining: Math.max(0, (count ?? todo.length) - rows.length) };
 }
 

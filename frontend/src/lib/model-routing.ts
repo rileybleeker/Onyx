@@ -152,12 +152,16 @@ export interface UsageLike {
 /**
  * One observation line for the pilot (counts only: never prompt, reply, dish, product or track
  * text). Returns null when no pilot covers the task, so nothing is logged outside a pilot.
+ *
+ * `calls` = model calls ATTEMPTED for the request (counted before each create), so a call that
+ * threw before returning usage still counts; `usage` holds only the calls that answered. `ok` /
+ * `accepted` describe the request's outcome after its result was stored, not the model reply.
  */
 export function pilotObservation(
   task: RoutedTask,
   choice: ModelChoice,
   pilot: PilotConfig | null,
-  o: { usage: UsageLike[]; latencyMs: number; ok: boolean; units?: number; accepted?: number; calls?: number },
+  o: { usage: UsageLike[]; latencyMs: number; ok: boolean; calls: number; units?: number; accepted?: number },
 ): Record<string, string | number | boolean> | null {
   if (!pilot || !pilot.tasks.has(task)) return null;
   const sum = (k: keyof UsageLike) => o.usage.reduce((a, u) => a + (Number(u?.[k]) || 0), 0);
@@ -168,7 +172,8 @@ export function pilotObservation(
     model: choice.model,
     effort: choice.effort ?? "default",
     ok: o.ok,
-    calls: o.calls ?? o.usage.length,
+    calls: Math.max(0, Math.floor(o.calls)),
+    answered: o.usage.length,
     units: o.units ?? 1,
     accepted: o.accepted ?? (o.ok ? 1 : 0),
     latency_ms: Math.max(0, Math.round(o.latencyMs)),

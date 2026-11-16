@@ -28,8 +28,10 @@ Anything missing or out of bounds (no task, no or bad date, a date already past 
 21 days ahead, a share of 0) leaves the pilot off. The pilot stops by itself after its last
 day even if the variables stay set.
 
-Arms are fixed per unit: a dish batch is assigned by its first dish's `est_key` (a dish
-retried alone always lands in the same arm), a playlist or label request by a random id.
+Arms are fixed per unit: each dish by its own `est_key`, a playlist or label request by a random
+id. One estimate call uses one model, so a dish batch holds only the dishes in the first dish's
+arm (the rest stay queued for the next call); a dish gets the same model in a batch and in the
+harvester's one-dish retry.
 
 **Rollback:** delete `ONYX_MODEL_PILOT` (or let the end date pass) and redeploy. Every call goes
 back to the baseline. Estimates already stored keep the model they were made with
@@ -39,13 +41,18 @@ back to the baseline. Estimates already stored keep the model they were made wit
 
 While a task is in the pilot, each request logs one JSON line `{"event":"model_pilot", ...}` to
 the Vercel function log for BOTH arms: task, arm, model, effort, ok, calls, units, accepted,
-latency in ms and the input / output / cache read / cache write token counts. Never prompt,
+latency in ms and the input / output / cache read / cache write token counts. `calls` is the
+number of model calls attempted (counted before each call, so one that threw still counts) and
+`answered` the number that returned usage. The line is written once per request, after the
+outcome is known: a dish batch only after its estimates are stored (a failed save is logged with
+0 accepted). Never prompt,
 reply, dish, product or track text. Outside a pilot nothing is logged.
 
 Accepted results per task: a dish batch whose every dish got an estimate (and the count of
 estimated dishes); a playlist created; a label parsed into the product shape. The harvester's
-one-dish retries after a failed batch appear as their own lines, so failures and retries count
-against the arm that caused them. Dish estimates and saved custom products also store the model
+one-dish retries after a failed batch appear as their own lines, each in its dish's own arm,
+which is the arm of the batch that failed, so failures and retries count against the arm that
+caused them. Dish estimates and saved custom products also store the model
 (`delivery_item_nutrition.model`, `supplement_products.raw_json.model`).
 
 ## Criteria (set before the pilot runs)

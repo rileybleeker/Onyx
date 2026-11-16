@@ -105,9 +105,9 @@ test("a task left out of the pilot stays on the baseline", () => {
 
 // --- observations carry counts only, and only during a pilot ------------------------------------
 
-test("observations: none outside a pilot, token counts summed across the calls of one request", () => {
+test("observations: none outside a pilot, attempted calls counted apart from answered ones, tokens summed", () => {
   const choice = R.chooseModel("playlist", "x", null, NOW);
-  assert.equal(R.pilotObservation("playlist", choice, null, { usage: [], latencyMs: 1, ok: true }), null);
+  assert.equal(R.pilotObservation("playlist", choice, null, { usage: [], latencyMs: 1, ok: true, calls: 1 }), null);
   const pilot = on();
   const line = R.pilotObservation("playlist", choice, pilot, {
     usage: [
@@ -116,10 +116,11 @@ test("observations: none outside a pilot, token counts summed across the calls o
     ],
     latencyMs: 1234.4,
     ok: true,
+    calls: 3,
   });
   assert.deepEqual(line, {
     event: "model_pilot", task: "playlist", arm: "baseline", model: "claude-sonnet-5-5", effort: "default",
-    ok: true, calls: 2, units: 1, accepted: 1, latency_ms: 1234,
+    ok: true, calls: 3, answered: 2, units: 1, accepted: 1, latency_ms: 1234,
     input_tokens: 250, output_tokens: 50, cache_read_tokens: 50, cache_write_tokens: 10,
   });
   for (const v of Object.values(line)) assert.ok(["string", "number", "boolean"].includes(typeof v));
@@ -150,6 +151,24 @@ for (const [rel, task] of Object.entries(ROUTED)) {
     assert.match(src, /pilotObservation\(/);
   });
 }
+
+test("dish batches hold one arm, and the observation is written after the estimates are stored", () => {
+  const src = read("app/api/delivery/items/import/route.ts");
+  assert.match(src, /queue\.filter\([^)]*\)\s*=>\s*i === 0 \|\| armOf\(r\)\.arm === choice\.arm\)/);
+  const save = src.indexOf(".upsert(rows, { onConflict: \"est_key\"");
+  const accepted = src.indexOf("observe(rows.length)");
+  assert.ok(save > 0 && accepted > save, "accepted count logged only after the upsert");
+  assert.match(src, /if \(upErr\) \{\s*observe\(0\);/);
+});
+
+test("playlist and label requests count attempted calls before each create, observed once", () => {
+  const pl = read("app/api/spotify/generate-playlist/route.ts");
+  assert.equal((pl.match(/attempts\+\+;\s*(let )?response = await anthropic\.messages\.create\(/g) ?? []).length, createCalls(pl).length);
+  assert.match(pl, /if \(observed\) return;/);
+  const ph = read("app/api/supplements/extract-from-photo/route.ts");
+  assert.match(ph, /attempts = 1;\s*const resp = await anthropic\.messages\.create\(/);
+  for (const src of [pl, ph]) assert.match(src, /calls: attempts/);
+});
 
 test("dish estimates record the model of the arm that made them", () => {
   assert.match(read("app/api/delivery/items/import/route.ts"), /model: choice\.model,\n\s+\}\);/);

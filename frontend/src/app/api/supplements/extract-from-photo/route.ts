@@ -266,12 +266,16 @@ export async function POST(req: NextRequest) {
   const choice = chooseModel("supplement_photo", crypto.randomUUID(), pilot, now);
   const started = Date.now();
   let usage: Anthropic.Usage | null = null;
+  // 1 once the model call is attempted (also when it throws); 0 when the request failed before it
+  // (e.g. the reference table read), so those failures are not charged to the model.
+  let attempts = 0;
   const observe = (ok: boolean) =>
     logPilotObservation(
       pilotObservation("supplement_photo", choice, pilot, {
         usage: usage ? [usage] : [],
         latencyMs: Date.now() - started,
         ok,
+        calls: attempts,
       }),
     );
 
@@ -279,6 +283,7 @@ export async function POST(req: NextRequest) {
     const reference = await buildReferenceTable();
     const prompt = buildPrompt(reference);
 
+    attempts = 1;
     const resp = await anthropic.messages.create({
       model: choice.model,
       max_tokens: 4096,
