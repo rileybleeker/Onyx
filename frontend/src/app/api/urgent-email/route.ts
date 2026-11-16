@@ -12,6 +12,7 @@ export const dynamic = "force-dynamic";
 // back to Node. Everything here runs on the edge runtime: supabase-js over fetch (the middleware already bundles it on
 // the edge), Web Crypto for the clear-mark hashes (lib/today-clear.ts), Intl for the Eastern day; no Node API. Same
 // middleware (owner session), same answer.
+export const runtime = "edge";
 export const preferredRegion = "iad1";
 
 /**
