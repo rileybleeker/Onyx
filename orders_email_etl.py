@@ -31,7 +31,7 @@ Usage:
     python orders_email_etl.py --days 400      # backfill
     python orders_email_etl.py --reprocess     # re-parse emails already stored
     python orders_email_etl.py --dry-run       # read Gmail, print counts, no database access
-    python orders_email_etl.py --file x.eml    # parse one saved email and print the result
+    python orders_email_etl.py --file x.eml    # parse one saved email; prints classifications and counts only
 
 Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, IMAP_HOST and the IMAP_EMAIL* /
      IMAP_APP_PASSWORD* pairs shared with flights_email_etl.py.
@@ -54,12 +54,26 @@ from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
+from email_log_safety import error_code, is_missing_table, log_failure, quiet_dependency_loggers
 from flights_email_etl import (
     IMAP_HOST, REQUIRED_ACCOUNTS, _fetch_chunks, account_fingerprint, body_lines, decode_hdr, html_to_lines,
     imap_accounts, plain_to_lines, select_all_mail,
 )
 
 log = logging.getLogger("orders_email_etl")
+# CI logs are public: counts and codes only (email_log_safety.py).
+quiet_dependency_loggers()
+
+
+class RecomputeRefused(RuntimeError):
+    """The recompute produced no orders while the table holds many: the table is left alone."""
+
+
+class SearchFailed(RuntimeError):
+    """The Gmail search answered something other than OK."""
+
+
+ERROR_CODES = {RecomputeRefused: "recompute_refused", SearchFailed: "search_failed"}
 
 SOURCE, DATA_TYPE = "online_orders", "email"
 PARSER_VERSION = 1
@@ -1055,7 +1069,7 @@ def search_candidates(imap: imaplib.IMAP4_SSL, since: date) -> list[bytes]:
     q = gmail_query(since).replace("\\", "\\\\").replace('"', '\\"')
     status, data = imap.uid("SEARCH", None, "X-GM-RAW", f'"{q}"')
     if status != "OK":
-        raise RuntimeError(f"Gmail search failed ({status})")
+        raise SearchFailed("gmail search")
     return data[0].split() if data and data[0] else []
 
 
@@ -1073,7 +1087,7 @@ def error_row(base: dict, header: Optional[email.message.Message], synced_at: st
         except Exception:
             pass
     return {**base, "received_at": received, "sender_address": "", "sender_name": None, "subject": None,
-            "parse_status": "error", "note": type(err).__name__[:200], "kind": None, "merchant_key": None,
+            "parse_status": "error", "note": f"parse_error:{error_code(err, ERROR_CODES)}", "kind": None, "merchant_key": None,
             "merchant_name": None, "order_number": None, "tracking": [], "status": None,
             "expected_date": None, "items": [], "item_count": None, "parser_version": PARSER_VERSION}
 
@@ -1192,7 +1206,7 @@ def recompute_orders(supa: Any, now_iso: str) -> int:
             break
         start += 1000
     if not orders and len(existing) > 10:
-        raise RuntimeError(f"recompute produced 0 orders but {len(existing)} exist; refusing to clear the table")
+        raise RecomputeRefused("recompute produced 0 orders; refusing to clear the table")
     for r in orders:
         r["updated_at"] = now_iso
     for i in range(0, len(orders), 200):
@@ -1236,8 +1250,8 @@ def run(supa: Any, accounts: list[tuple[str, str]], days: Optional[int], reproce
                 notes.append(f"account {fp}: {stats['dropped_by_cap']} older email(s) not read (cap {MAX_MESSAGES}); "
                              f"raise MAX_MESSAGES to read them")
         except Exception as e:
-            log.error(f"[fp={fp}] account failed: {type(e).__name__}")
-            failures.append(f"account {fp}: {type(e).__name__}: {str(e)[:120]}")
+            code = log_failure(log, "account_failed", e, fp=fp, level=logging.ERROR, extra=ERROR_CODES)
+            failures.append(f"account {fp}: {code}")
     if len(failures) == len(accounts):
         return "failed", 0, "; ".join(failures)
     parsed = sum(1 for r in new_rows if r["parse_status"] == "parsed")
@@ -1259,11 +1273,30 @@ def run(supa: Any, accounts: list[tuple[str, str]], days: Optional[int], reproce
     return status, orders, ("; ".join(failures + notes) or None)
 
 
+def file_summary(ev: dict) -> dict:
+    """A parsed event as classifications and counts only: never the subject, sender, store,
+    order number, tracking number, items or dates (a saved .eml is someone's real mail)."""
+    return {
+        "parse_status": ev.get("parse_status"),
+        "note": ev.get("note") if ev.get("note") in ("no date", "not an order update", "no order or tracking number") else None,
+        "status": ev.get("status"),
+        "kind": ev.get("kind"),
+        "received_at": "found" if ev.get("received_at") else "missing",
+        "merchant": "found" if ev.get("merchant_name") else "missing",
+        "order_number": "found" if ev.get("order_number") else "missing",
+        "tracking": len(ev.get("tracking") or []),
+        "carriers": sorted({t.get("carrier") for t in ev.get("tracking") or [] if t.get("carrier")}),
+        "expected_date": "found" if ev.get("expected_date") else "missing",
+        "items": len(ev.get("items") or []),
+        "item_count": "found" if ev.get("item_count") else "missing",
+    }
+
+
 def run_file(path: str) -> None:
     with open(path, "rb") as f:
         msg = email.message_from_bytes(f.read())
     ev = parse_message(msg, body_lines(msg), html_hrefs(msg))
-    for k, v in ev.items():
+    for k, v in file_summary(ev).items():
         print(f"{k:16s} {v}")
 
 
@@ -1290,16 +1323,28 @@ def main() -> int:
     try:
         status, total, error = run(supa, accounts, args.days, reprocess=args.reprocess)
     except Exception as e:
-        missing_table = "online_order" in str(e) and ("does not exist" in str(e) or "PGRST205" in str(e))
         status, total = "failed", 0
-        error = ("tables missing: apply sql/online_orders_schema.sql" if missing_table
-                 else f"{type(e).__name__}: {str(e)[:300]}")
-        log.error(f"run failed: {error}")
+        error = log_failure(log, "run_failed", e, level=logging.ERROR, extra=ERROR_CODES)
+        if is_missing_table(e):
+            error += " (tables missing: apply sql/online_orders_schema.sql)"
     log.info(f"Done: {status}, {total} order(s)")
     window = args.days or DEFAULT_DAYS
     log_sync(supa, SOURCE, DATA_TYPE, status, records=total, started_at=started, error=error,
              date_range_start=et_today() - timedelta(days=window), date_range_end=et_today())
     return 0 if status != "failed" else 1
+
+
+def fatal(e: BaseException) -> None:
+    """Root crash handler: a code on the log and the heartbeat, never the exception text or traceback."""
+    code = log_failure(log, "fatal", e, level=logging.ERROR, extra=ERROR_CODES)
+    try:
+        import os
+        from supabase import create_client
+        from sync_log_helper import log_sync
+        supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+        log_sync(supa, SOURCE, DATA_TYPE, "failed", records=0, error=code)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
@@ -1308,13 +1353,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
-        log.exception("fatal")
-        try:
-            import os
-            from supabase import create_client
-            from sync_log_helper import log_sync
-            supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-            log_sync(supa, SOURCE, DATA_TYPE, "failed", records=0, error=f"{type(e).__name__}: {str(e)[:300]}")
-        except Exception:
-            pass
+        fatal(e)
         sys.exit(1)

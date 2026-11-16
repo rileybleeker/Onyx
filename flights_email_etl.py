@@ -37,7 +37,8 @@ Usage:
     python flights_email_etl.py --days 730      # history backfill
     python flights_email_etl.py --reprocess     # re-parse emails already in flight_email_log
     python flights_email_etl.py --dry-run       # parse + print, no DB writes
-    python flights_email_etl.py --file x.html   # parse one saved email body (parser dev/QA)
+    python flights_email_etl.py --file x.html   # parse one saved email body (parser dev/QA; prints
+                                                # found/missing flags and counts, never parsed values)
 
 Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, IMAP_HOST (default imap.gmail.com),
      IMAP_EMAIL + IMAP_APP_PASSWORD (account 1), IMAP_EMAIL_2 + IMAP_APP_PASSWORD_2
@@ -65,10 +66,15 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+from email_log_safety import log_failure, quiet_dependency_loggers
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("flights_email_etl")
+# CI logs are public: counts and codes only (email_log_safety.py). No subject, confirmation,
+# route, passenger, account address or exception text is ever logged.
+quiet_dependency_loggers()
 
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com")
 # Both of Riley's Gmail accounts must be wired in (Riley, 2026-11-08). Any of
@@ -132,7 +138,7 @@ def airports() -> dict[str, dict]:
             import airportsdata  # type: ignore
             _AIRPORTS = airportsdata.load("IATA")
         except Exception as e:  # pragma: no cover — missing dep is a config error, not a parse error
-            log.warning(f"airportsdata unavailable ({e}); timezones will be NULL")
+            log_failure(log, "airportsdata_unavailable", e)   # timezones will be NULL
             _AIRPORTS = {}
     return _AIRPORTS
 
@@ -704,6 +710,8 @@ class Store:
         self.upserted = 0
         self.cancelled = 0
         self.changed = 0
+        self.superseded = 0
+        self.dry_writes = 0
 
     def pds(self, table: str):
         return self.supa.schema("pds").from_(table)
@@ -739,7 +747,7 @@ class Store:
                         if city and iata:
                             m.setdefault(city.split(",")[0].strip().upper(), iata)
             except Exception as e:
-                log.warning(f"learned_city_map failed: {e}")
+                log_failure(log, "learned_city_map_failed", e)
             self._learned_cities = m
         return self._learned_cities
 
@@ -769,8 +777,7 @@ class Store:
             if old:
                 old_date = datetime.fromisoformat(old["source_email_date"].replace("Z", "+00:00"))
                 if old_date > email_date:
-                    log.info(f"    {conf} {key[0]} {key[1]}: skipped (newer email already applied)")
-                    skipped += 1
+                    skipped += 1             # a newer email already applied (counted, not logged)
                     continue
                 # keep what the new email doesn't carry
                 for col in ("dep_iata", "arr_iata", "dep_city", "arr_city", "cabin", "seat", "passenger_name",
@@ -786,13 +793,10 @@ class Store:
                         row[col] = row2[col]
             elif parsed["kind"] == "checkin" and not (row["dep_iata"] and row["arr_iata"]):
                 # No receipt/trip-details row to update and the cities can't be resolved to airports.
-                log.info(f"    {conf} {key[0]} {key[1]}: check-in only, airports unresolved "
-                         f"({row['dep_city']!r} → {row['arr_city']!r}) — skipped")
                 unplaced += 1
                 continue
             if self.dry_run:
-                log.info(f"    DRY {conf} {row['flight_number']} {row['dep_iata']}→{row['arr_iata']} "
-                         f"{row['dep_local']} → {row['arr_local']} [{row['source_email_kind']}]")
+                self.dry_writes += 1          # counted only: a dry run prints no flight, route or time
             else:
                 self.pds("flights").upsert(row, on_conflict="confirmation_number,flight_number,dep_local_date").execute()
             written += 1
@@ -803,7 +807,7 @@ class Store:
                     continue
                 old_date = datetime.fromisoformat(old["source_email_date"].replace("Z", "+00:00"))
                 if old_date < email_date:
-                    log.info(f"    {conf} {key[0]} {key[1]}: superseded by newer receipt")
+                    self.superseded += 1
                     if not self.dry_run:
                         self.pds("flights").update({"status": "superseded"}).eq("flight_id", old["flight_id"]).execute()
         self.upserted += written
@@ -887,7 +891,7 @@ def propose_tz_entries(store: Store, since: date) -> list[dict]:
         try:
             db_tz = store.supa.schema("pds").rpc("tz_for_instant", {"ts": arr_time.isoformat()}).execute().data
         except Exception as e:
-            log.warning(f"tz_for_instant failed: {e}")
+            log_failure(log, "tz_for_instant_failed", e)
             continue
         in_run = [p for p in proposals if datetime.fromisoformat(p["effective_from"]) <= arr_time]
         resolved = in_run[-1]["tz"] if in_run else (db_tz or "America/New_York")
@@ -910,7 +914,7 @@ def propose_tz_entries(store: Store, since: date) -> list[dict]:
             if any(r["tz"] == arr_tz for r in near):
                 continue
         except Exception as e:
-            log.warning(f"user_tz_log window lookup failed: {e}")
+            log_failure(log, "user_tz_log_lookup_failed", e)
             continue
         proposals.append({
             "effective_from": arr_time.isoformat(),
@@ -921,16 +925,18 @@ def propose_tz_entries(store: Store, since: date) -> list[dict]:
 
 
 def apply_tz_entries(store: Store, proposals: list[dict]) -> int:
+    """Insert the proposals. Logs counts only: a proposal's time, zone and notes describe a trip."""
     n = 0
+    if proposals:
+        log.info(f"  user_tz_log: {len(proposals)} proposal(s){' (dry run, not inserted)' if store.dry_run else ''}")
     for p in proposals:
-        log.info(f"  user_tz_log += {p['effective_from']} → {p['tz']}  ({p['notes']})")
         if store.dry_run:
             continue
         try:
             store.pds("user_tz_log").insert(p).execute()
             n += 1
         except Exception as e:
-            log.warning(f"  skipped user_tz_log insert at {p['effective_from']}: {e}")
+            log_failure(log, "user_tz_log_insert_skipped", e)
     return n
 
 
@@ -970,7 +976,7 @@ def select_all_mail(imap: imaplib.IMAP4_SSL) -> str:
                     if st == "OK":
                         return name
     except Exception as e:
-        log.warning(f"LIST failed ({e}); falling back to INBOX")
+        log_failure(log, "list_failed_inbox_fallback", e)
     imap.select("INBOX", readonly=True)
     return "INBOX"
 
@@ -1025,8 +1031,8 @@ def search_uids(imap: imaplib.IMAP4_SSL, since: date) -> tuple[list[bytes], str]
         status, data = imap.uid("SEARCH", None, "X-GM-RAW", f'"from:{SENDER_DOMAIN} after:{since:%Y/%m/%d}"')
         if status == "OK":
             return (data[0].split() if data and data[0] else []), "X-GM-RAW"
-    except imaplib.IMAP4.error as e:
-        log.info(f"X-GM-RAW search unavailable ({e}); using IMAP FROM")
+    except imaplib.IMAP4.error:
+        log.info("search: X-GM-RAW unavailable; using IMAP FROM")
     status, data = imap.uid("SEARCH", None, f'(FROM "{SENDER_DOMAIN}" SINCE {_imap_date(since)})')
     return (data[0].split() if status == "OK" and data and data[0] else []), "FROM"
 
@@ -1038,14 +1044,17 @@ def account_fingerprint(account: str) -> str:
 
 
 def process_account(account: str, password: str, store: Store, since: date, reprocess: bool) -> dict:
-    stats = {"account": account, "candidates": 0, "operational": 0, "parsed": 0, "segments": 0, "errors": 0, "skipped_done": 0}
+    stats = {"fp": account_fingerprint(account), "candidates": 0, "operational": 0, "parsed": 0, "segments": 0,
+             "errors": 0, "skipped_done": 0, "kinds": {}}
+    fp = stats["fp"]
     imap = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
         imap.login(account, password)
         box = select_all_mail(imap)
         uids, how = search_uids(imap, since)
         stats["candidates"] = len(uids)
-        log.info(f"[{account}] fp={account_fingerprint(account)} {len(uids)} email(s) from {SENDER_DOMAIN} since {since} in {box} via {how}")
+        mailbox = "inbox_fallback" if box == "INBOX" else "all_mail"
+        log.info(f"[fp={fp}] {len(uids)} candidate email(s) since {since} mailbox={mailbox} via {how}")
         if not uids:
             return stats
         done = set() if reprocess else store.processed_ids(account)
@@ -1069,7 +1078,7 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                 edate = datetime.now(timezone.utc)
             wanted.append((uid, {"message_id": mid, "subject": subject, "kind": kind, "email_date": edate, "account": account}))
         wanted.sort(key=lambda w: w[1]["email_date"])  # chronological: receipts before the trip-details that refine them
-        log.info(f"[{account}] {stats['operational']} operational, {stats['skipped_done']} already processed, {len(wanted)} to parse")
+        log.info(f"[fp={fp}] {stats['operational']} operational, {stats['skipped_done']} already processed, {len(wanted)} to parse")
         by_uid = {u: m for u, m in wanted}
         bodies: dict[bytes, bytes] = {}
         for uid, raw in _fetch_chunks(imap, [u for u, _ in wanted], "(BODY.PEEK[])", chunk=10):
@@ -1084,7 +1093,7 @@ def process_account(account: str, password: str, store: Store, since: date, repr
             try:
                 lines = body_lines(email.message_from_bytes(raw))
                 parsed = parse_email(kind, lines, meta["email_date"])
-                log.info(f"  [{kind}] {meta['email_date']:%Y-%m-%d} {meta['subject'][:60]!r} conf={parsed['confirmation']} segs={len(parsed['segments'])}")
+                stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1   # counted, never the subject or confirmation
                 if kind in ("receipt", "award_receipt", "trip_details", "checkin"):
                     if not parsed["confirmation"] or not parsed["segments"]:
                         store.log_email(meta, kind, parsed, 0, "unmatched", "no confirmation or no segments parsed")
@@ -1105,8 +1114,11 @@ def process_account(account: str, password: str, store: Store, since: date, repr
                 stats["parsed"] += 1
             except Exception as e:  # one bad email must not sink the run
                 stats["errors"] += 1
-                log.exception(f"  parse failed for {meta['subject']!r}")
-                store.log_email(meta, kind, None, 0, "error", repr(e))
+                code = log_failure(log, f"message_failed:{kind}", e, fp=fp)
+                try:
+                    store.log_email(meta, kind, None, 0, "error", code)
+                except Exception as log_e:   # the error row itself failed: count it, keep going
+                    log_failure(log, "email_log_write_failed", log_e, fp=fp)
         return stats
     finally:
         try:
@@ -1119,8 +1131,29 @@ def process_account(account: str, password: str, store: Store, since: date, repr
 # main
 # ---------------------------------------------------------------------------
 
+SEGMENT_FIELDS = ("flight_number", "dep_local_date", "dep_iata", "arr_iata", "dep_city", "arr_city",
+                  "arr_local_date", "cabin", "seat", "operated_by")
+
+
+def file_summary(kind: str, parsed: dict) -> dict:
+    """What the parser found, as counts and present/missing flags only (no confirmation, name, route or time)."""
+    return {
+        "kind": kind,
+        "confirmation": "found" if parsed.get("confirmation") else "missing",
+        "passenger": "found" if parsed.get("passenger") else "missing",
+        "tickets": len(parsed.get("tickets") or []),
+        "segments": len(parsed.get("segments") or []),
+        "segment_fields": [{f: ("found" if seg.get(f) else "missing") for f in SEGMENT_FIELDS}
+                           for seg in parsed.get("segments") or []],
+    }
+
+
 def run_file(path: str) -> None:
-    """Parser dev aid: parse a saved .html/.txt body and print the result."""
+    """Parser dev aid: parse a saved .html/.txt body and print what was found (counts and flags only).
+
+    The output is safe to paste into an issue or CI log; inspect parsed values in a local
+    debugger or a unit test with a synthetic body instead.
+    """
     text = open(path, encoding="utf-8", errors="replace").read()
     lines = html_to_lines(text) if "<" in text[:2000] else plain_to_lines(text)
     kind = None
@@ -1130,10 +1163,7 @@ def run_file(path: str) -> None:
             break
     kind = kind or "receipt"
     parsed = parse_email(kind, lines, datetime.now(timezone.utc))
-    print(json.dumps(parsed, indent=2, default=str))
-    for seg in parsed["segments"]:
-        row = build_row(seg, parsed, {"message_id": "<file>", "email_date": datetime.now(timezone.utc), "account": "file", "subject": path})
-        print(json.dumps({k: v for k, v in row.items() if k not in ("raw_json", "source_message_id", "source_email_date", "source_account")}, indent=2, default=str))
+    print(json.dumps(file_summary(kind, parsed), indent=2))
 
 
 def main() -> int:
@@ -1159,11 +1189,12 @@ def main() -> int:
     per_account: list[dict] = []
     failures: list[str] = []
     for acct, pw in accounts:
+        fp = account_fingerprint(acct)
         try:
             per_account.append(process_account(acct, pw, store, since, args.reprocess))
         except Exception as e:
-            log.exception(f"[{acct}] account failed")
-            failures.append(f"{acct}: {e!r}"[:200])
+            code = log_failure(log, "account_failed", e, fp=fp, level=logging.ERROR)
+            failures.append(f"account {fp}: {code}")
 
     tz_added = 0
     if not args.dry_run or True:
@@ -1171,11 +1202,16 @@ def main() -> int:
             props = propose_tz_entries(store, since)
             tz_added = apply_tz_entries(store, props)
         except Exception as e:
-            log.warning(f"tz_log proposal step failed: {e}")
+            log_failure(log, "tz_log_proposal_failed", e)
 
     total_segments = sum(s["segments"] for s in per_account)
     errors = sum(s["errors"] for s in per_account)
-    log.info(f"Done: {len(per_account)}/{len(accounts)} account(s) ok, {total_segments} segment write(s), "
+    kinds: dict[str, int] = {}
+    for s in per_account:
+        for k, v in s["kinds"].items():
+            kinds[k] = kinds.get(k, 0) + v
+    log.info(f"Done: {len(per_account)}/{len(accounts)} account(s) ok, {total_segments} segment write(s) "
+             f"{dict(sorted(kinds.items()))}, {store.dry_writes} dry-run segment(s), {store.superseded} superseded, "
              f"{store.changed} changed, {store.cancelled} cancelled, {tz_added} user_tz_log row(s), {errors} parse error(s)")
 
     if args.dry_run:
@@ -1193,7 +1229,7 @@ def main() -> int:
         missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
         if missing:
             status = "partial"
-            notes.append(f"Gmail account(s) not configured: {', '.join(missing)} (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
+            notes.append(f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
         if errors:
             status = "partial"
             notes.append(f"{errors} email(s) failed to parse — see pds.flight_email_log status='error'")
@@ -1202,18 +1238,23 @@ def main() -> int:
     return 0 if status != "failed" else 1
 
 
+def fatal(e: BaseException) -> None:
+    """Root crash handler: a code on the log and the heartbeat, never the exception text or traceback."""
+    code = log_failure(log, "fatal", e, level=logging.ERROR)
+    try:
+        from supabase import create_client
+        from sync_log_helper import log_sync
+        supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+        log_sync(supa, "flights", "email", "failed", records=0, error=code)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except SystemExit:
         raise
     except Exception as e:  # heartbeat on crash, per the Onyx ETL convention
-        log.exception("fatal")
-        try:
-            from supabase import create_client
-            from sync_log_helper import log_sync
-            supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-            log_sync(supa, "flights", "email", "failed", records=0, error=repr(e)[:500])
-        except Exception:
-            pass
+        fatal(e)
         sys.exit(1)

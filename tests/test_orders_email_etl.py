@@ -418,5 +418,76 @@ class ReviewFindings(unittest.TestCase):
         self.assertEqual(o.parse_date_text("Thurs", date(2026, 3, 10)), date(2026, 3, 12))
 
 
+class _Rows:
+    """Minimal pds table stand-in: select pages return `rows`; writes are recorded."""
+
+    def __init__(self, rows):
+        self.rows, self.writes = rows, []
+
+    def schema(self, name):
+        return self
+
+    def table(self, name):
+        self.name = name
+        return self
+
+    def select(self, cols):
+        self.kind = "select"
+        return self
+
+    def order(self, col):
+        return self
+
+    def range(self, a, b):
+        self.rng = (a, b)
+        return self
+
+    def upsert(self, rows, on_conflict=None):
+        self.kind = "upsert"
+        return self
+
+    def delete(self):
+        self.kind = "delete"
+        return self
+
+    def execute(self):
+        if self.kind != "select":
+            self.writes.append((self.kind, self.name))
+            return self
+        self.data = self.rows.get(self.name, [])[self.rng[0]:self.rng[1] + 1]
+        return self
+
+
+class Diagnostics(unittest.TestCase):
+    """Counts and codes only: no subject, sender, order number, tracking number or exception text."""
+
+    def test_error_row_note_is_a_category_not_exception_text(self):
+        row = o.error_row({"message_id": "m@example.com", "account_fp": "abcd1234", "synced_at": "2026-03-10T00:00:00+00:00"},
+                          msg("Your order 55555 shipped", "Store <orders@store.example>"), "2026-03-10T00:00:00+00:00",
+                          ValueError("Failing row contains (pat@example.com, 55555)"))
+        self.assertEqual(row["note"], "parse_error:value_error")
+        self.assertIsNone(row["subject"])
+        self.assertEqual(row["sender_address"], "")
+
+    def test_recompute_refusal_is_a_typed_error_without_counts(self):
+        supa = _Rows({"online_order_events": [], "online_orders": [{"order_key": f"o:k:{i}"} for i in range(11)]})
+        with self.assertRaises(o.RecomputeRefused) as ctx:
+            o.recompute_orders(supa, "2026-03-10T00:00:00+00:00")
+        self.assertEqual(supa.writes, [], "the table is left alone")
+        self.assertNotIn("11", str(ctx.exception))
+
+    def test_file_summary_is_flags_and_counts(self):
+        m = msg("Your order 77881 has shipped", "Example Store <orders@store.example>")
+        ev = o.parse_message(m, ["Order number: 77881", "Tracking number: 1Z999AA10123456784",
+                                 "Arriving Saturday, March 14", "Blue Widget x 1"], [])
+        self.assertEqual(ev["parse_status"], "parsed")
+        summary = o.file_summary(ev)
+        text = repr(summary)
+        for value in ("77881", "1Z999AA10123456784", "Blue Widget", "store.example", "Example Store", "Pat"):
+            self.assertNotIn(value, text)
+        self.assertEqual((summary["order_number"], summary["tracking"], summary["status"]), ("found", 1, "shipped"))
+        self.assertEqual(summary["carriers"], ["UPS"])
+
+
 if __name__ == "__main__":
     unittest.main()
