@@ -20,6 +20,7 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * through PATCH /api/reading/sessions/[id]. It sends `client_key` (a UUID per
  * new session): a create retried after a lost answer returns the stored
  * session (`replayed: true`) with no second XP, habit stamp or Notion entry.
+ * A key whose entry was discarded (DELETE below) answers 409 `discarded`.
  */
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -34,7 +35,13 @@ export async function POST(req: NextRequest) {
     question: (body.question as string) || null,
     client_key: typeof body.client_key === "string" ? body.client_key : null,
   });
-  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
+  // 409 discarded: this client_key's entry was discarded (sql/reading_session_discards.sql), so nothing is created
+  // under it again; the /log form continues an entry edited since under a new key.
+  if (!result.ok) {
+    return result.discarded
+      ? NextResponse.json({ error: result.error, discarded: true }, { status: 409 })
+      : NextResponse.json({ error: result.error }, { status: 400 });
+  }
 
   const overview = await getOverview(supabase, result.book.slug).catch(() => null);
 
@@ -94,12 +101,15 @@ function originRefused(req: NextRequest): { status: number; error: string } | nu
  * DELETE /api/reading/sessions?client_key=<uuid>
  *
  * Discard of an autosaving /log Reading entry whose create may have been stored although its answer never arrived
- * (PROD-T01): the form knows no session id, only the create's client_key, so the session that key made (if any) is
- * removed here like DELETE /api/reading/sessions/[id] (lib/reading.ts deleteSessionByClientKey: finish undone, habit
- * Yes left because whether the create made it is unknown). Nothing is created: a key no session has answers
- * `removed: null`, which tells the form nothing of the entry is stored. Repeating it is safe.
+ * (PROD-T01): the form knows no session id, only the create's client_key. The key is recorded as discarded first
+ * (sql/reading_session_discards.sql), so a create of it still running on the server is either found or refused, then
+ * the session that key made (if any) is removed here like DELETE /api/reading/sessions/[id] (lib/reading.ts
+ * deleteSessionByClientKey: finish undone, habit Yes left because whether the create made it is unknown). Nothing is
+ * created: `removed: null` tells the form nothing of the entry is stored, and nothing can be stored under that key
+ * any more. Repeating it is safe.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check.
- * Answers: 200 { success, removed: id | null, unfinished, overview }, 400 for a key that is not a UUID.
+ * Answers: 200 { success, removed: id | null, unfinished, overview }, 400 for a key that is not a UUID, 503 while the
+ * discard cannot be recorded (SQL not applied), 500 on a database failure (the form retries both).
  */
 export async function DELETE(req: NextRequest) {
   const refused = originRefused(req);

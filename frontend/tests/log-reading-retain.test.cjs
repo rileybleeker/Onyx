@@ -12,7 +12,9 @@
 // and changing it back to the last confirmed values is sent to the same session (before the retry and after a
 // remount), never shown as "Saved" while the server holds the lost edit (Codex T01-R3); a create whose answer was
 // lost is never dropped by Discard or by emptying the form: its kept key finds the stored session and removes it
-// (DELETE /api/reading/sessions?client_key=, nothing created), and the entry goes only once the server confirms.
+// (DELETE /api/reading/sessions?client_key=, nothing created), and the entry goes only once the server confirms; a
+// discard the server carried out but whose answer was lost, then an edit, continues the entry under a new key (the
+// server refuses the discarded key with 409).
 // Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
 // tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
 // "server" is the in-memory fetch below.
@@ -128,6 +130,9 @@ function setup(t) {
   let readMode = "up";
   /** "up", or "lost": the server removes what a DELETE names, but its answer never arrives. */
   let deleteMode = "up";
+  // Keys whose entry was discarded (sql/reading_session_discards.sql): a create under one is refused with 409, so a
+  // create that reaches the server after its Discard stores nothing.
+  const discardedKeys = new Set();
   let nextSessionId = 500;
   /** Reads of the reading overview through cachedJson (the mount's load, and the refetch after every save). */
   let reads = 0;
@@ -160,6 +165,10 @@ function setup(t) {
       if (hold && (init.method === "POST" || init.method === "PATCH" || init.method === "DELETE")) await hold.promise;
       if (mode === "offline") throw new TypeError("Failed to fetch");
       if (init.method === "POST" && url === "/api/reading/sessions") {
+        if (discardedKeys.has(body.client_key)) {
+          if (mode === "lost") throw new TypeError("Failed to fetch");
+          return reply({ error: "This reading entry was discarded.", discarded: true }, 409);
+        }
         const replayed = rows.has(body.client_key);
         if (!replayed) rows.set(body.client_key, { session_id: ++nextSessionId, session_date: body.date ?? serverToday, ...body });
         if (mode === "lost") throw new TypeError("Failed to fetch");
@@ -178,6 +187,7 @@ function setup(t) {
       if (init.method === "DELETE" && url.startsWith("/api/reading/sessions?client_key=")) {
         // Discard after a lost create answer: the session that key made, if any, is removed; nothing is created.
         const key = decodeURIComponent(url.slice(url.indexOf("=") + 1));
+        discardedKeys.add(key);
         const row = rows.get(key);
         rows.delete(key);
         if (deleteMode === "lost") throw new TypeError("Failed to fetch");
@@ -185,7 +195,11 @@ function setup(t) {
       }
       if (init.method === "DELETE" && url.startsWith("/api/reading/sessions/")) {
         const sid = Number(url.split("/").pop().split("?")[0]);
-        for (const [k, r] of rows) if (r.session_id === sid) rows.delete(k);
+        for (const [k, r] of rows) {
+          if (r.session_id !== sid) continue;
+          discardedKeys.add(k); // a removal by id records the session's key as discarded too
+          rows.delete(k);
+        }
         if (deleteMode === "lost") throw new TypeError("Failed to fetch");
         return reply({ overview: null });
       }
@@ -298,7 +312,7 @@ function setup(t) {
     await flush();
   };
   const h = {
-    timers, work, retainer, calls, rows,
+    timers, work, retainer, calls, rows, discardedKeys,
     get reads() { return reads; },
     set mode(m) { mode = m; },
     /** "lost": the next edits are stored on the server, but their answers never arrive. */
@@ -888,6 +902,43 @@ test("lost create answer, then the form emptied: the stored session is removed b
   assert.notEqual(last.body.client_key, key, "a new entry gets its own key");
   assert.equal(h.rows.size, 1);
   assert.match(h.text(), /Saved · \+10 XP/);
+});
+
+test("a Discard the server carried out but whose answer was lost, then an edit: the entry continues under a new key (PR 376 review)", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "lost";
+  await h.type("Through ch.", "4");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1, "stored on the server");
+  const key = h.posts()[0].body.client_key;
+
+  h.mode = "up";
+  h.deleteMode = "lost"; // the server removes the session and records the key as discarded; the answer is lost
+  await h.type("Through ch.", "");
+  await h.tick(1500);
+  assert.deepEqual(h.deletes().map((c) => c.url), [`/api/reading/sessions?client_key=${key}`]);
+  assert.equal(h.rows.size, 0, "removed on the server");
+  assert.ok(h.discardedKeys.has(key), "and its key can create nothing any more");
+  assert.match(h.text(), /Discard not confirmed: Couldn't reach Onyx\./);
+  assert.equal(h.work.has(), true, "not confirmed: still unsaved work");
+
+  h.deleteMode = "up";
+  await h.type("Through ch.", "6"); // an edit before the discard's retry: it continues the entry
+  await h.tick(1500);
+  const keys = h.posts().map((p) => p.body.client_key);
+  assert.equal(keys[keys.length - 2], key, "the old key is tried first and refused (409 discarded)");
+  const fresh = keys[keys.length - 1];
+  assert.notEqual(fresh, key, "then the entry is created under a new key, at once");
+  assert.equal(h.rows.size, 1);
+  assert.equal(h.rows.get(fresh).chapter_through, 6, "with the values on screen");
+  assert.equal(h.rows.has(key), false, "nothing is stored under the discarded key");
+  assert.match(h.text(), /Saved · \+10 XP/);
+  assert.equal(h.work.has(), false);
+  const sent = h.calls.length;
+  await h.tick(120_000);
+  assert.equal(h.calls.length, sent, "nothing more is sent");
+  assert.equal(h.rows.size, 1, "one session");
 });
 
 test("no book in progress and nothing kept: only the line, no form", async (t) => {

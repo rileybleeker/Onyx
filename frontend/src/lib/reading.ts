@@ -607,11 +607,40 @@ export interface LogSessionResult {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * The client_key column is new (sql/reading_sessions_client_key.sql): until it is applied, keys are ignored.
- * Codes only: a unique violation (23505) also names the client_key index and must never read as "no column".
+ * The client_key column (sql/reading_sessions_client_key.sql, applied 2026-11-15). Without it a keyed create is
+ * refused (logSession) rather than stored without its key. Codes only: a unique violation (23505) also names the
+ * client_key index and must never read as "no column".
  */
 function missingColumn(error: { code?: string } | null | undefined): boolean {
   return !!error && (error.code === "42703" || error.code === "PGRST204");
+}
+
+/**
+ * Discarded entries (sql/reading_session_discards.sql, PROD-T01): a client_key whose entry was discarded can never
+ * create a session again. The insert trigger refuses one with this SQLSTATE; the POST route answers 409 with
+ * DISCARDED_ENTRY_ERROR, and the /log form then continues the entry under a new key.
+ */
+const DISCARDED_KEY_CODE = "OXR01";
+export const DISCARDED_ENTRY_ERROR = "This reading entry was discarded.";
+
+/** sql/reading_session_discards.sql (or the client_key column it reads) is not applied yet. */
+function discardsMissing(error: { code?: string } | null | undefined): boolean {
+  return !!error && (["PGRST202", "42883", "42P01"].includes(String(error.code)) || missingColumn(error));
+}
+
+/**
+ * Record that `key`'s entry was discarded, then answer the session that key made (null = none). One database call
+ * (pds.discard_reading_session_key) holding the key's lock: a create of the key still committing is waited for and
+ * found, and a create arriving after it is refused, so "none" is final (Codex review of PR 376).
+ */
+async function discardKey(
+  supabase: Supa,
+  key: string,
+): Promise<{ ok: true; sessionId: number | null } | { ok: false; missing: boolean; error: string }> {
+  const { data, error } = await supabase.rpc("discard_reading_session_key", { p_key: key });
+  if (error) return { ok: false, missing: discardsMissing(error), error: error.message };
+  const id = data === null || data === undefined ? null : Number(data);
+  return { ok: true, sessionId: id !== null && Number.isFinite(id) && id > 0 ? id : null };
 }
 
 async function sessionByClientKey(supabase: Supa, key: string): Promise<ReadingSession | null> {
@@ -687,7 +716,10 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
   return !error;
 }
 
-export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
+export async function logSession(
+  supabase: Supa,
+  input: LogSessionInput,
+): Promise<LogSessionResult | { ok: false; error: string; discarded?: true }> {
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
   if (input.require_client_key && !key) return { ok: false, error: SESSION_KEY_REQUIRED };
   /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
@@ -753,11 +785,14 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     const replayed = prior ? await replay(prior, book) : null;
     if (replayed) return replayed;
   }
+  // The key's entry was discarded (an earlier Discard reached the server): never created again under it.
+  if (error && key && error.code === DISCARDED_KEY_CODE) return { ok: false, error: DISCARDED_ENTRY_ERROR, discarded: true };
+  // A keyed create is never stored without its key: a retry could not find it (a second session) and a Discard
+  // could not remove it (Codex review of PR 376). Keyed creates need sql/reading_sessions_client_key.sql applied.
+  // Chat needs the key (a retry finds the session only by it): refused with its own message.
   if (error && key && missingColumn(error)) {
-    // The key column is not there: the insert above was refused, so nothing was written. Chat needs the key (a retry
-    // finds the session only by it): refused. Any other caller writes the session without the key, as before.
     if (input.require_client_key) return { ok: false, error: SESSION_KEY_REQUIRED };
-    ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
+    return { ok: false, error: "Reading sessions can't be saved here until sql/reading_sessions_client_key.sql is applied." };
   }
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
@@ -1025,11 +1060,24 @@ export async function deleteSession(
   supabase: Supa,
   sessionId: number,
   habitCreatedOn: string | null = null,
+  opts: { keyDiscarded?: boolean } = {},
 ): Promise<{ ok: true; book: Book; session: ReadingSession; unfinished: boolean; habitRemoved: boolean } | { ok: false; status: number; error: string }> {
   const cur = await editableSession(supabase, sessionId);
   if (!cur.ok) return cur;
   const { session } = cur;
   let book = cur.book;
+  if (!opts.keyDiscarded) {
+    // The session's client_key (a /log entry's) is recorded as discarded first: a create of that key still under
+    // way (an earlier send whose answer was lost) is then refused instead of bringing the session back. Before
+    // sql/reading_session_discards.sql is applied the removal goes ahead as before; any other failure stops it.
+    const { data: k, error: kErr } = await supabase.from("reading_sessions").select("client_key").eq("session_id", sessionId).maybeSingle();
+    if (kErr && !missingColumn(kErr)) return { ok: false, status: 500, error: kErr.message };
+    const key = (k as { client_key?: string | null } | null)?.client_key ?? null;
+    if (key) {
+      const d = await discardKey(supabase, key);
+      if (!d.ok && !d.missing) return { ok: false, status: 500, error: d.error };
+    }
+  }
   const { error } = await supabase.from("reading_sessions").delete().eq("session_id", sessionId);
   if (error) return { ok: false, status: 500, error: error.message };
 
@@ -1041,12 +1089,14 @@ export async function deleteSession(
 
 /**
  * Discard of an autosaving /log entry whose create may have been stored although its answer never arrived (PROD-T01):
- * the session a POST with this `client_key` made, if any, is removed exactly like DELETE /api/reading/sessions/[id]
- * (a finish it caused goes back to reading, its Notion entry is trashed by the route). Whether that create made the
- * day's habit row is unknown (its answer was lost), so the habit Yes stays, the same rule as an edit of a replayed
- * create. `removed: null` = no session has this key: nothing of the entry is stored. Until
- * sql/reading_sessions_client_key.sql is applied keys are not stored, so nothing can be found by one (null too).
- * A read failure is an error (500), never "nothing stored": the form retries instead of dropping the entry.
+ * the key is first recorded as discarded (pds.discard_reading_session_key, under the key's lock), so a create of it
+ * that is still running on the server either committed before (and is found here) or is refused after; then the
+ * session that key made, if any, is removed exactly like DELETE /api/reading/sessions/[id] (a finish it caused goes
+ * back to reading, its Notion entry is trashed by the route). Whether that create made the day's habit row is unknown
+ * (its answer was lost), so the habit Yes stays, the same rule as an edit of a replayed create.
+ * `removed: null` = no session has this key and none can be created with it any more: nothing of the entry is stored.
+ * When the discard cannot be recorded (sql/reading_session_discards.sql or the client_key column not applied: 503;
+ * a database failure: 500) the answer is an error, never "nothing stored": the form keeps the entry and retries.
  */
 export async function deleteSessionByClientKey(
   supabase: Supa,
@@ -1057,11 +1107,14 @@ export async function deleteSessionByClientKey(
   | { ok: false; status: number; error: string }
 > {
   if (!UUID_RE.test(clientKey)) return { ok: false, status: 400, error: "client_key must be a UUID" };
-  const { data, error } = await supabase.from("reading_sessions").select("session_id").eq("client_key", clientKey.toLowerCase()).maybeSingle();
-  if (error) return missingColumn(error) ? { ok: true, removed: null } : { ok: false, status: 500, error: error.message };
-  const id = (data as { session_id?: number } | null)?.session_id;
-  if (!id) return { ok: true, removed: null };
-  const r = await deleteSession(supabase, id, null);
+  const d = await discardKey(supabase, clientKey.toLowerCase());
+  if (!d.ok) {
+    return d.missing
+      ? { ok: false, status: 503, error: "Discard isn't available until sql/reading_session_discards.sql is applied." }
+      : { ok: false, status: 500, error: d.error };
+  }
+  if (d.sessionId === null) return { ok: true, removed: null };
+  const r = await deleteSession(supabase, d.sessionId, null, { keyDiscarded: true });
   if (!r.ok) return r.status === 404 ? { ok: true, removed: null } : r;
   return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished };
 }

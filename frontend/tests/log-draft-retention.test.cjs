@@ -44,13 +44,17 @@ test("/log Reading keeps its entry, the session it made and its client_key with 
   assert.match(reading, /if \(v\.discard\) return discardStored\(/);
   assert.match(reading, /`\/api\/reading\/sessions\?client_key=\$\{encodeURIComponent\(kept\.clientKey\)\}`/);
   const discard = reading.slice(reading.indexOf("const discardEntry = () =>"), reading.indexOf("const applyDraft = async"));
-  assert.match(discard, /if \(kept\.sessionId === null && !kept\.entrySent\) \{\s*startNew\(\);/, "dropped at once only when no create went out");
+  // createSent, not entrySent: a create with a chosen day goes out too (entrySent covers creates with no day only).
+  assert.match(discard, /if \(kept\.sessionId === null && !kept\.createSent\) \{\s*startNew\(\);/, "dropped at once only when no create went out");
   assert.match(discard, /autosave\.change\(DISCARD\);/);
   const commitFn = reading.slice(reading.indexOf("const commit = (next: Form) =>"), reading.indexOf("// The behavioral day the server reports"));
-  assert.ok(commitFn.indexOf("if (kept.entrySent) {") < commitFn.indexOf("autosave.reset();"), "emptying after a sent create saves DISCARD, not a reset");
+  assert.ok(commitFn.indexOf("if (kept.createSent) {") > -1, "emptying checks whether a create went out");
+  assert.ok(commitFn.indexOf("if (kept.createSent) {") < commitFn.indexOf("autosave.reset();"), "emptying after a sent create saves DISCARD, not a reset");
+  assert.match(reading, /kept\.createSent = true;\s*json = await send\(target\.url, "POST", body\);/, "marked before the create goes out");
   const stored = reading.slice(reading.indexOf("const discardStored = async"), reading.indexOf("const autosave = useRetainedAutosave"));
   assert.ok(stored.indexOf("if (cancelled()) return;") < stored.indexOf("forgetEntry();"), "a session end stops it before the entry is touched");
   assert.doesNotMatch(stored, /method: "POST"|saveRequest\(/, "a discard never creates a session to find one");
+  assert.match(stored, /kept\.clientKey = newClientKey\(\);/, "a confirmed discard retires the key: the server refuses it from then on");
   assert.match(reading, /aria-describedby=\{describedBy\}/, "fields point at the status line while it says why");
 });
 

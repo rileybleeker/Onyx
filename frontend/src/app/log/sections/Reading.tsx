@@ -35,7 +35,10 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * the last confirmed values is sent, never shown as "Saved" while the server may hold the lost edit. Likewise an entry
  * whose create went out without a confirmed answer is never dropped locally: Discard, or emptying the form, removes the
  * session that create may have made (by its client_key; nothing is created) and the entry goes only once the server
- * says nothing of it is stored ("Discarded"); until then it is kept and retried like a save.
+ * says nothing of it is stored ("Discarded"); until then it is kept and retried like a save. The server records that
+ * key as discarded before it looks (sql/reading_session_discards.sql), so a create of it still running there is
+ * found or refused, never stored after the answer; an entry edited after its Discard reached the server continues
+ * under a new key.
  */
 
 const READING_URL = LOG_READING_URL;
@@ -166,8 +169,13 @@ type ReadingFormData = {
   entryBook: string | null;
   /** Something was entered: entryBook and entryDay were taken then (cleared when the form is emptied or reset). */
   entryStarted: boolean;
-  /** The first send of this create went out. */
+  /** The first send of this create went out (a create with no day chosen: the day rules below). */
   entrySent: boolean;
+  /**
+   * A create under this entry's client_key went out, with or without a day (its outcome may be unknown): from then on
+   * Discard and emptying the form go through the server, which may hold that session. Cleared with a new key.
+   */
+  createSent: boolean;
   /**
    * The day this entry is for when no day was chosen: the day on screen when it was started, if that day was current
    * then (the server's last answer said so and the day has not rolled since on the Eastern or this device's clock, or
@@ -243,6 +251,7 @@ const newReadingData = (): ReadingFormData => ({
   entryBook: null,
   entryStarted: false,
   entrySent: false,
+  createSent: false,
   entryDay: null,
 });
 
@@ -268,7 +277,8 @@ export default function ReadingSection() {
   // after an unmount (a retry): it reads and writes `kept` only, and touches React state only while mounted.
   // saveSession is one save of the session form (the create, or an edit of the session it made); the autosaver's save
   // below wraps it to remember whether a failure may have been stored anyway.
-  const saveSession = async (v: FormValue, { keepalive, cancelled }: RetainedSaveContext): Promise<void> => {
+  const saveSession = async (v: FormValue, ctx: RetainedSaveContext, rekeyed = false): Promise<void> => {
+    const { keepalive, cancelled } = ctx;
     // ready() keeps an incomplete value from getting here; never report "Saved" without a request.
     // cancelled(): the session ended while this save was under way (sign-out, a 401): it stops after the request
     // that is out, before any further request (a replay's PATCH), any write to `kept` and any refetch.
@@ -292,17 +302,27 @@ export default function ReadingSection() {
           kept.entrySent = true;
           if (kept.entryDay && !(first && isCurrentDay(kept.entryDay))) body.date = kept.entryDay;
         }
+        kept.createSent = true;
         json = await send(target.url, "POST", body);
       } else {
         json = await send(target.url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
       }
     } catch (e) {
       if (cancelled()) return;
+      if (id === null && !rekeyed && e instanceof AutosaveRefused && /was discarded/i.test(e.message)) {
+        // 409 discarded: an earlier Discard of this entry reached the server although its answer was lost, and the
+        // entry was edited since (the edit continues it). Nothing is stored under the old key and nothing can be any
+        // more, so the entry is created under a new key, at once.
+        kept.clientKey = newClientKey();
+        kept.createSent = false;
+        return saveSession(v, ctx, true);
+      }
       if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
         // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
         if (kept.sessionId === id) {
           setSessionId(null);
           kept.clientKey = newClientKey();
+          kept.createSent = false;
           kept.habitCreatedOn = null;
         }
         throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
@@ -365,9 +385,12 @@ export default function ReadingSection() {
       overview = json.overview;
     }
     if (cancelled()) return;
-    // Nothing of the entry is stored now. An edit made while this was out continues the entry (created again with
-    // the same key next); otherwise the entry goes, with the Say it words it was made from.
+    // Nothing of the entry is stored now, and the server will create nothing more under its key (recorded as
+    // discarded). An edit made while this was out continues the entry, created under a new key next; otherwise the
+    // entry goes, with the Say it words it was made from.
     setSessionId(null);
+    kept.clientKey = newClientKey();
+    kept.createSent = false;
     kept.habitCreatedOn = null;
     setSaved(null);
     if (kept.discarding) {
@@ -530,7 +553,7 @@ export default function ReadingSection() {
     const cur = overviewRef.current;
     const anyBook = !!next.book && next.book !== cur?.book.slug;
     if (kept.sessionId === null && !anyBook && !kept.touched.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
-      if (kept.entrySent) {
+      if (kept.createSent) {
         // Back to nothing typed after a create of this entry went out with no confirmed answer: the server may hold
         // that session, so emptying the form is saved like any edit (DISCARD removes it by its client_key) instead of
         // being dropped as nothing to save (the create's version of Codex T01-R3). The form is clean once it is gone.
@@ -542,6 +565,7 @@ export default function ReadingSection() {
       kept.entryBook = null;
       kept.entryStarted = false;
       kept.entrySent = false;
+      kept.createSent = false;
       kept.entryDay = null;
       if (kept.keptDay) {
         // Nothing left of the entry that kept its day: the empty form follows today again.
@@ -603,6 +627,7 @@ export default function ReadingSection() {
     kept.entryBook = null;
     kept.entryStarted = false;
     kept.entrySent = false;
+    kept.createSent = false;
     kept.entryDay = null;
     kept.pendingDraft = null;
     setFromDraft(null);
@@ -630,7 +655,7 @@ export default function ReadingSection() {
   const discardEntry = () => {
     const d = draft;
     const words = d && (d.id === kept.pendingDraft || d.id === kept.fromDraft?.id) ? d.id : null;
-    if (kept.sessionId === null && !kept.entrySent) {
+    if (kept.sessionId === null && !kept.createSent) {
       startNew(); // first: the marks and pendingDraft go, so dropping the draft below reverts nothing
       if (words !== null) clear(words);
       return;

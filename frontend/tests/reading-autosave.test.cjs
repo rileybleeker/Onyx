@@ -1,8 +1,11 @@
 // Run: node --test tests/reading-autosave.test.cjs (offline). The autosaving reading forms (2026-11-15): what a
 // form's fields are worth as a request (lib/reading-autosave.ts), the idempotent create (client_key) and the
 // session PATCH / DELETE rules incl. undoing a finish or habit Yes an earlier value caused (lib/reading.ts against
-// an in-memory database), the Notion mirror's race check (lib/reading-notion.ts), and source pins for the /log
-// session form, the /reading highlight form, the routes and sql/reading_sessions_client_key.sql.
+// an in-memory database), the discard record of a /log entry (sql/reading_session_discards.sql: a create of a
+// discarded key, also one still under way when the discard lands, is refused; a discard that cannot be recorded is
+// an error, never "nothing stored"), the Notion mirror's race check (lib/reading-notion.ts), and source pins for the
+// /log session form, the /reading highlight form, the routes, sql/reading_sessions_client_key.sql and
+// sql/reading_session_discards.sql.
 // SYNTHETIC DATA ONLY: invented books, chapters and dates; no network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -100,11 +103,18 @@ test("parseSessionUpdate: strict body", () => {
 
 /** `noClientKey`: the column is not there yet (sql/reading_sessions_client_key.sql not applied). */
 /** `missFirstKeyLookup`: the first client_key read finds nothing (another create with the key is still in flight). */
-function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false } = {}) {
+/**
+ * `noDiscards`: sql/reading_session_discards.sql is not applied (no function, no trigger). `discardError`: the discard
+ * call fails with this code. Otherwise pds.discard_reading_session_key records the key and answers the session it made,
+ * and the insert trigger refuses a discarded key (OXR01), as the SQL does. `hooks.beforeInsert` runs right before an
+ * insert reaches the table: what the database does while a create is still under way on the server.
+ */
+function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null } = {}) {
   let keyLookups = 0;
   const tables = JSON.parse(JSON.stringify(seed));
-  for (const t of ["books", "reading_sessions", "habit_journal"]) tables[t] ??= [];
+  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards"]) tables[t] ??= [];
   const log = [];
+  const hooks = { beforeInsert: null };
   let nextId = 1000;
   function builder(table) {
     const st = { table, filters: [], op: "select", payload: null, order: null, limit: null, single: null };
@@ -134,6 +144,10 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false } = {}) 
         else rows().push({ ...p });
         out = [p];
       } else if (st.op === "insert") {
+        // The BEFORE INSERT trigger of sql/reading_session_discards.sql runs before the unique index.
+        if (!noDiscards && table === "reading_sessions" && st.payload.client_key && tables.reading_session_discards.some((d) => d.client_key === st.payload.client_key)) {
+          return { data: null, error: { code: "OXR01", message: "this reading entry was discarded" } };
+        }
         if (st.payload.client_key && rows().some((r) => r.client_key === st.payload.client_key)) {
           return { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint" } };
         }
@@ -148,6 +162,14 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false } = {}) 
       if (st.single === "maybe") return { data: out[0] ?? null, error: null };
       return { data: out, error: null };
     };
+    const go = async () => {
+      const pre = st.op === "insert" ? hooks.beforeInsert : null;
+      if (pre) {
+        hooks.beforeInsert = null;
+        await pre();
+      }
+      return run();
+    };
     const b = {
       select() { return b; },
       eq(k, v) { st.filters.push([k, "eq", v]); return b; },
@@ -160,17 +182,32 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false } = {}) 
       upsert(p) { st.op = "upsert"; st.payload = p; return b; },
       insert(p) { st.op = "insert"; st.payload = p; return b; },
       delete() { st.op = "delete"; return b; },
-      single() { st.single = "single"; return Promise.resolve(run()); },
-      maybeSingle() { st.single = "maybe"; return Promise.resolve(run()); },
-      then(res, rej) { return Promise.resolve(run()).then(res, rej); },
+      single() { st.single = "single"; return go(); },
+      maybeSingle() { st.single = "maybe"; return go(); },
+      then(res, rej) { return go().then(res, rej); },
     };
     return b;
   }
+  const discard = (key) => {
+    log.push({ table: "reading_session_discards", op: "rpc", payload: { client_key: key } });
+    if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
+    if (discardError) return { data: null, error: { code: discardError, message: "database failure" } };
+    if (noClientKey) return { data: null, error: { code: "42703", message: "column client_key does not exist" } };
+    if (!tables.reading_session_discards.some((d) => d.client_key === key)) tables.reading_session_discards.push({ client_key: key });
+    const row = tables.reading_sessions.find((r) => r.client_key === key);
+    return { data: row ? row.session_id : null, error: null };
+  };
   return {
     tables,
     log,
+    hooks,
     from: (t) => builder(t),
-    rpc: async (name) => (name === "behavioral_today_now" ? { data: "2026-11-15", error: null } : { data: null, error: null }),
+    rpc: async (name, args) =>
+      name === "behavioral_today_now"
+        ? { data: "2026-11-15", error: null }
+        : name === "discard_reading_session_key"
+          ? discard(args.p_key)
+          : { data: null, error: null },
   };
 }
 
@@ -215,12 +252,17 @@ test("logSession: two creates with one key at once (unique index) end as one ses
   assert.equal("client_key" in plain.tables.reading_sessions[0], false);
 });
 
-test("logSession: before sql/reading_sessions_client_key.sql is applied the key is ignored and the insert still works", async () => {
+test("logSession: before sql/reading_sessions_client_key.sql is applied a keyed create is refused, never stored without its key", async () => {
+  // Stored without its key, a retry could not find it (a second session) and a Discard could not remove it.
   const db = fakeDb({ books: [BOOK] }, { noClientKey: true });
   const r = await R.logSession(db, create());
-  assert.equal(r.ok, true);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /reading_sessions_client_key\.sql/);
+  assert.equal(db.tables.reading_sessions.length, 0);
+  assert.equal(db.tables.habit_journal.length, 0, "no habit stamp either");
+  const plain = await R.logSession(db, create({ client_key: null }));
+  assert.equal(plain.ok, true, "callers without a key (chat) are unaffected");
   assert.equal(db.tables.reading_sessions.length, 1);
-  assert.equal("client_key" in db.tables.reading_sessions[0], false);
 });
 
 test("logSession with require_client_key (Onyx Chat) never writes a session without its key", async () => {
@@ -356,16 +398,88 @@ test("deleteSessionByClientKey (Discard after a lost create answer): removes the
   assert.deepEqual(db.tables.reading_sessions.map((s) => s.session_id), [42], "only that session goes");
   assert.equal(db.tables.habit_journal.length, 1, "whether that create made the habit row is unknown: the Yes stays");
   assert.equal(db.log.some((l) => l.op === "insert" || l.op === "upsert"), false, "nothing is created to find out");
+  assert.deepEqual(db.tables.reading_session_discards.map((d) => d.client_key), [KEY], "the key is recorded as discarded (lower case)");
 
   const again = await R.deleteSessionByClientKey(db, KEY);
   assert.deepEqual(again, { ok: true, removed: null }, "repeating it is safe: nothing of the entry is stored");
+  assert.equal(db.tables.reading_session_discards.length, 1);
   const empty = fakeDb({ books: [BOOK] });
   assert.deepEqual(await R.deleteSessionByClientKey(empty, KEY), { ok: true, removed: null }, "a create that never arrived");
-  assert.equal(empty.log.some((l) => l.op !== "select"), false, "and nothing is written");
-  const noColumn = fakeDb({ books: [BOOK], reading_sessions: [session({})] }, { noClientKey: true });
-  assert.deepEqual(await R.deleteSessionByClientKey(noColumn, KEY), { ok: true, removed: null }, "keys not stored yet: none can be found");
-  assert.equal(noColumn.tables.reading_sessions.length, 1);
+  assert.deepEqual(
+    empty.log.filter((l) => l.op !== "select").map((l) => `${l.table}:${l.op}`),
+    ["reading_session_discards:rpc"],
+    "only the discard is recorded: no session, habit or book write",
+  );
   assert.equal((await R.deleteSessionByClientKey(db, "not-a-key")).status, 400);
+});
+
+test("deleteSessionByClientKey: a create of that key arriving after the discard is refused, so 'nothing stored' stays true (PR 376 review)", async () => {
+  // The create's connection failed in the browser, but the request is still under way on the server. Discard lands
+  // first and finds nothing; the create reaches the insert afterwards and is refused by the trigger.
+  const db = fakeDb({ books: [BOOK] });
+  const r = await R.deleteSessionByClientKey(db, KEY);
+  assert.deepEqual(r, { ok: true, removed: null });
+  const late = await R.logSession(db, create());
+  assert.equal(late.ok, false);
+  assert.equal(late.discarded, true, "the route answers 409 discarded");
+  assert.equal(late.error, R.DISCARDED_ENTRY_ERROR);
+  assert.equal(db.tables.reading_sessions.length, 0, "no session after Onyx said nothing was stored");
+  assert.equal(db.tables.habit_journal.length, 0, "and no habit stamp");
+  assert.equal(db.tables.books[0].status, "reading");
+
+  // The same create already past its replay check when the discard lands (its insert is the next step).
+  const racing = fakeDb({ books: [BOOK] });
+  let during = null;
+  racing.hooks.beforeInsert = async () => {
+    during = await R.deleteSessionByClientKey(racing, KEY);
+  };
+  const raced = await R.logSession(racing, create());
+  assert.deepEqual(during, { ok: true, removed: null });
+  assert.equal(raced.ok, false);
+  assert.equal(raced.discarded, true);
+  assert.equal(racing.tables.reading_sessions.length, 0);
+  assert.equal(racing.tables.habit_journal.length, 0);
+
+  // A new key (the entry continued after its discard) creates normally.
+  const fresh = await R.logSession(db, create({ client_key: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d" }));
+  assert.equal(fresh.ok, true);
+  assert.equal(db.tables.reading_sessions.length, 1);
+});
+
+test("deleteSessionByClientKey: when the discard cannot be recorded it is an error, never 'nothing stored' (PR 376 review)", async () => {
+  for (const [opts, status] of [
+    [{ noDiscards: true }, 503], // sql/reading_session_discards.sql not applied
+    [{ noClientKey: true }, 503], // the client_key column not applied
+    [{ discardError: "XX000" }, 500], // a database failure
+  ]) {
+    const db = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, opts);
+    const r = await R.deleteSessionByClientKey(db, KEY);
+    assert.equal(r.ok, false, JSON.stringify(opts));
+    assert.equal(r.status, status, JSON.stringify(opts));
+    assert.equal(db.tables.reading_sessions.length, 1, "nothing removed: the form keeps the entry and retries");
+  }
+});
+
+test("deleteSession by id records the session's key as discarded: a create of it still under way cannot bring it back", async () => {
+  const db = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] });
+  const r = await R.deleteSession(db, 41, null);
+  assert.equal(r.ok, true);
+  assert.equal(db.tables.reading_sessions.length, 0);
+  assert.deepEqual(db.tables.reading_session_discards.map((d) => d.client_key), [KEY]);
+  const late = await R.logSession(db, create());
+  assert.equal(late.discarded, true);
+  assert.equal(db.tables.reading_sessions.length, 0);
+  // Before sql/reading_session_discards.sql is applied the removal still goes ahead; another failure stops it.
+  const before = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { noDiscards: true });
+  assert.equal((await R.deleteSession(before, 41, null)).ok, true);
+  assert.equal(before.tables.reading_sessions.length, 0);
+  const failing = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { discardError: "XX000" });
+  assert.equal((await R.deleteSession(failing, 41, null)).status, 500);
+  assert.equal(failing.tables.reading_sessions.length, 1);
+  // A session with no key (chat, an older create) is removed with no discard call.
+  const keyless = fakeDb({ books: [BOOK], reading_sessions: [session({})] });
+  assert.equal((await R.deleteSession(keyless, 41, null)).ok, true);
+  assert.equal(keyless.log.some((l) => l.op === "rpc"), false);
 });
 
 test("Notion mirror race check: only a change that alters the entry counts", () => {
@@ -403,10 +517,29 @@ test("source pins: no Save button on the reading forms; keys and habit days trav
   assert.match(del, /originRefused\(req\)/, "same-origin only");
   assert.match(del, /deleteSessionByClientKey\(/);
   assert.doesNotMatch(del, /logSession\(/, "it never creates a session to find one");
+  const postFn = post.slice(post.indexOf("export async function POST"), post.indexOf("export async function DELETE"));
+  assert.match(postFn, /result\.discarded[\s\S]{0,160}status: 409/, "a discarded key's create answers 409");
+  assert.match(log, /was discarded/, "the /log form continues an entry edited after its discard under a new key");
   const mw = read("middleware.ts");
   const ci = mw.slice(mw.indexOf("function isCiRoute"), mw.indexOf("}", mw.indexOf("function isCiRoute")));
   assert.doesNotMatch(ci, /\/api\/reading\/sessions/);
   assert.doesNotMatch(ci, /startsWith\("\/api\/reading/);
+});
+
+test("sql/reading_session_discards.sql: additive, service-role only, one lock per key for the create and the discard", () => {
+  const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "reading_session_discards.sql"), "utf8");
+  assert.doesNotMatch(sql, /drop/i, "the Supabase connector refuses any DROP");
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.reading_session_discards/);
+  assert.match(sql, /ENABLE ROW LEVEL SECURITY/);
+  assert.match(sql, /REVOKE ALL ON pds\.reading_session_discards FROM anon, authenticated/);
+  assert.doesNotMatch(sql, /TO (anon|authenticated)/);
+  assert.match(sql, /BEFORE INSERT OR UPDATE OF client_key ON pds\.reading_sessions/);
+  assert.match(sql, /ERRCODE = 'OXR01'/);
+  const locks = sql.match(/pg_advisory_xact_lock\(\s*pg_catalog\.hashtextextended\('pds\.reading_sessions\.client_key:' \|\|/g) ?? [];
+  assert.equal(locks.length, 2, "the trigger and the discard take the same lock");
+  const lib = read("lib/reading.ts");
+  assert.match(lib, /DISCARDED_KEY_CODE = "OXR01"/, "lib/reading.ts maps the trigger's code");
+  assert.match(lib, /rpc\("discard_reading_session_key", \{ p_key: key \}\)/);
 });
 
 test("sql/reading_sessions_client_key.sql: additive only (the Supabase connector refuses any DROP)", () => {
