@@ -55,7 +55,8 @@ Covers
   * archived calibration shards never take coverage from another harness (review
     PIPE06-FOLLOWUP-R2): the merge refuses shards whose harness fingerprint is missing or not the
     running harness's (or when the running one cannot be read), and scenarios whose stored inputs
-    differ from SCENARIOS; a report without a harness fingerprint is not review-ready.
+    differ from SCENARIOS, and shards of other inference code; a report without a harness
+    fingerprint is not review-ready.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -1005,6 +1006,9 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
     for bad, words in (([{**x, "harness_fingerprint": "0" * 64} for x in shards], "another calibration harness"),
                        ([{**x, "harness_fingerprint": None} for x in shards], "no harness fingerprint"),
                        ([{**x, "harness_fingerprint": " "} for x in shards], "no harness fingerprint"),
+                       # Shards of other inference code could never back METHOD_REVIEW, so they are refused too.
+                       ([{**x, "inference_fingerprint": "0" * 64} for x in shards], "other inference code"),
+                       ([{**x, "inference_fingerprint": None} for x in shards], "other inference code"),
                        (edited, "other inputs"), (flipped, "other inputs")):
         try:
             cal.merge_reports(bad)
@@ -1012,17 +1016,18 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
             assert words in str(exc), (words, str(exc))
         else:
             raise AssertionError(f"merge must refuse: {words}")
-    original = ef.harness_fingerprint
-    try:
-        ef.harness_fingerprint = lambda: None
+    for name in ("harness_fingerprint", "inference_fingerprint"):
+        original = getattr(ef, name)
         try:
-            cal.merge_reports(shards)
-        except ValueError as exc:
-            assert "cannot be read" in str(exc), str(exc)
-        else:
-            raise AssertionError("merge must refuse when the running harness cannot be fingerprinted")
-    finally:
-        ef.harness_fingerprint = original
+            setattr(ef, name, lambda: None)
+            try:
+                cal.merge_reports(shards)
+            except ValueError as exc:
+                assert "cannot be read" in str(exc), (name, str(exc))
+            else:
+                raise AssertionError(f"merge must refuse when the running code cannot be fingerprinted ({name})")
+        finally:
+            setattr(ef, name, original)
     assert cal.merge_reports(shards) == whole, "the refusals leave the valid merge unchanged"
 
 

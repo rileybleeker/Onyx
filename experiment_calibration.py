@@ -73,7 +73,8 @@ so a shard holds exactly the rows a full run would; --merge refuses shards of di
 configurations or a scenario twice, and shards that another calibration harness ran: the merged
 report's `covers` and review readiness come from this file's SCENARIOS, BLOCK_LEN / N_A and review
 limits, so the shards' harness fingerprint must be the running one and each scenario's stored inputs
-must equal its entry in SCENARIOS (merge at the revision the shards ran, or run them again):
+must equal its entry in SCENARIOS; their inference fingerprint must be the running code's too (merge
+at the revision the shards ran, or run them again):
     python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --revision <commit> --out calibration.json
     python experiment_calibration.py --sims 1000 --redraws 10000 --seed 20261116 --revision <commit> --scenario no_effect --out s1.json
     python experiment_calibration.py --merge s1.json s2.json ... --out calibration.json
@@ -403,7 +404,8 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
     review readiness from this file's SCENARIOS, BLOCK_LEN / N_A and review limits, so archived shards
     merged after a harness change would claim designs and limits they never ran. Their harness
     fingerprint must therefore be the running one (a missing or unreadable one refuses too), and each
-    scenario's stored inputs must equal its entry in SCENARIOS."""
+    scenario's stored inputs must equal its entry in SCENARIOS. Their inference fingerprint must be
+    the running code's as well, since only such a report can back METHOD_REVIEW."""
     if not reports:
         raise ValueError("nothing to merge")
     config = {key: reports[0].get(key) for key in CONFIG_KEYS}
@@ -429,6 +431,18 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
                          f"is {running[:12]}): the merged report would take its coverage and review readiness from "
                          "this harness's scenarios, block design and limits, so merge them at the revision that ran "
                          "them or run them again")
+    # Refused here too (method review, round 6): METHOD_REVIEW would refuse such a report anyway, since its
+    # inference fingerprint must be the running code's, so a merge under other inference code is never useful.
+    live = fingerprint.inference_fingerprint()
+    calibrated = config["inference_fingerprint"]
+    if not live:
+        raise ValueError("the running inference code's source cannot be read, so the shards' inference fingerprint "
+                         "cannot be checked against it")
+    if calibrated != live:
+        shown = calibrated[:12] if isinstance(calibrated, str) and calibrated.strip() else "none"
+        raise ValueError(f"the shards calibrated other inference code (fingerprint {shown}; the running code is "
+                         f"{live[:12]}), so the merged report could never back METHOD_REVIEW for it: merge them at the "
+                         "revision that ran them or run them again")
     names = [x["name"] for x in scenarios]
     repeated = sorted({name for name in names if names.count(name) > 1})
     if repeated:
