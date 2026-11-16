@@ -131,6 +131,8 @@ export function rpcArgs(op: ListOp): Record<string, unknown> {
       title_key: titleKey(op.title),
       resolve: op.resolve === null ? null : op.resolve === "distinct" ? "distinct" : "reuse",
       reuse_id: op.resolve && op.resolve !== "distinct" ? op.resolve.reuse : null,
+      reuse_version: op.resolve && op.resolve !== "distinct" ? op.resolve.expected_version : null,
+      reuse_listed: op.resolve && op.resolve !== "distinct" ? op.resolve.expected_listed : null,
       slug: slugFor(op.title, op.op_key, false),
       slug_long: slugFor(op.title, op.op_key, true),
     });

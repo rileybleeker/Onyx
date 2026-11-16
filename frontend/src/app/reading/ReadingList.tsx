@@ -448,6 +448,7 @@ function DraftBox({
         case "conflict":
           throw new AutosaveRefused(listErrorText("changed"));
         default:
+          if (outcome.code === "changed") setDup(null);
           throw new AutosaveRefused(listErrorText(outcome.code));
       }
     }
@@ -580,7 +581,7 @@ function DraftBox({
                 <span className="text-text-primary">{titleOf(c.book_id) ?? "A book"}</span>
                 <span className="text-text-tertiary">({statusText(c)})</span>
                 {c.status === "queued" && (
-                  <button type="button" className={btn} onClick={() => choose({ reuse: c.book_id })}>
+                  <button type="button" className={btn} onClick={() => choose({ reuse: c.book_id, expected_version: c.version, expected_listed: c.listed })}>
                     Use this one
                   </button>
                 )}

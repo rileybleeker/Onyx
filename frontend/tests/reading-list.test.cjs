@@ -111,6 +111,21 @@ test('duplicate decision is a new payload and operation key after a definite ref
   assert.notEqual(next.body.op_key,first.body.op_key);assert.equal(next.body.resolve,'distinct');
 });
 
+test('reuse binds observed candidate version and membership, and stale choice requires choosing again',()=>{
+  const k=key();
+  const body={op:'create',op_key:k,title:'Synthetic',resolve:{reuse:7,expected_version:1,expected_listed:true}};
+  const op=parse(body);const args=S.rpcArgs(op);
+  assert.equal(args.reuse_version,1);assert.equal(args.reuse_listed,true);
+  assert.equal(L.parseListOp({...body,resolve:{reuse:7}}).ok,false);
+  const observedRemoved=parse({...body,resolve:{reuse:7,expected_version:2,expected_listed:false}});
+  assert.notEqual(S.payloadHash(op),S.payloadHash(observedRemoved),'a spent key cannot be rebound to a later removal');
+  const d={...L.newDraft(),fields:{title:'Synthetic',author:'',edition:''},sent:body,resolve:body.resolve};
+  const refused=L.applyAnswer(d,body,409,{error:'changed',item:item({version:2,listed:false})});
+  assert.equal(refused.outcome.kind,'refused');assert.equal(refused.draft.resolve,null);
+  assert.equal(refused.draft.conflict,null,'no Keep mine path silently accepts the fresh tombstone');
+  const retry=L.nextSend(refused.draft,key);assert.equal(retry.body.resolve,undefined);
+});
+
 function fakeServer(result,error=null,readError=null){
   const calls=[];
   const row={book_id:7,slug:'synthetic-book',title:'Synthetic Book',author:null,status:'queued',edition_identifier:null,list_position:1024,list_removed_at:null,list_version:1,created_at:'2026-01-01'};
@@ -162,6 +177,13 @@ test('SQL mutation boundary retains serialization, immutable receipt and restric
   assert.ok(sql.indexOf('pg_advisory_xact_lock')<sql.indexOf('SELECT * INTO v_prior'));
   assert.match(sql,/v_ids IS DISTINCT FROM v_expect/);
   assert.match(sql,/v_prior\.payload_hash <> v_hash/);
+  const lock=sql.indexOf("WHERE book_id = (p->>'reuse_id')::bigint FOR UPDATE");
+  const guard=sql.indexOf("v_row.list_version IS DISTINCT FROM (p->>'reuse_version')::int");
+  const restore=sql.indexOf('UPDATE pds.books SET list_removed_at = NULL');
+  assert.ok(lock<guard && guard<restore,'stale choice is refused under target lock before restoration');
+  assert.match(sql,/IS DISTINCT FROM \(p->>'reuse_listed'\)::boolean/);
+  assert.ok(sql.indexOf("RETURN v_prior.result || jsonb_build_object('replayed', true)")<lock,
+    'an applied reuse replay after later removal returns its receipt without restoring again');
   assert.ok(sql.indexOf('INSERT INTO pds.reading_list_ops')>sql.indexOf('ELSIF v_kind = \'move\''));
   assert.doesNotMatch(sql,/DELETE FROM pds\.books|UPDATE pds\.book_highlights|UPDATE pds\.reading_sessions/i);
   // Real rollback/concurrency behavior is an independent SQL-review and post-release fixture obligation.

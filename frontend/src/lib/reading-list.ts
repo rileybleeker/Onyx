@@ -40,12 +40,13 @@ export interface ListItem {
 
 export interface DuplicateCandidate {
   book_id: number;
+  version: number;
   status: BookStatus;
   listed: boolean;
   match: "identifier" | "title";
 }
 
-export type Resolve = "distinct" | { reuse: number };
+export type Resolve = "distinct" | { reuse: number; expected_version: number; expected_listed: boolean };
 
 export type ListOp =
   | { op: "create"; op_key: string; title: string; author: string | null; edition: string | null; resolve: Resolve | null }
@@ -206,8 +207,9 @@ export function parseListOp(raw: unknown): { ok: true; op: ListOp } | { ok: fals
     else if (b.resolve && typeof b.resolve === "object" && !Array.isArray(b.resolve)) {
       const r = b.resolve as Record<string, unknown>;
       const id = posInt(r.reuse, 1);
-      if (Object.keys(r).length !== 1 || id === null) return { ok: false, error: "bad_request" };
-      resolve = { reuse: id };
+      const version = posInt(r.expected_version, 0);
+      if (Object.keys(r).length !== 3 || id === null || version === null || typeof r.expected_listed !== "boolean") return { ok: false, error: "bad_request" };
+      resolve = { reuse: id, expected_version: version, expected_listed: r.expected_listed };
     } else if (b.resolve !== undefined && b.resolve !== null) return { ok: false, error: "bad_request" };
     return { ok: true, op: { op: "create", op_key, ...f.fields, resolve } };
   }
@@ -245,7 +247,7 @@ export function canonicalPayload(op: ListOp): string {
   const parts: Array<[string, unknown]> = [["op", op.op]];
   if (op.op === "create") {
     parts.push(["title", op.title], ["author", op.author], ["edition", op.edition]);
-    parts.push(["resolve", op.resolve === null ? null : op.resolve === "distinct" ? "distinct" : `reuse:${op.resolve.reuse}`]);
+    parts.push(["resolve", op.resolve === null ? null : op.resolve === "distinct" ? "distinct" : ["reuse", op.resolve.reuse, op.resolve.expected_version, op.resolve.expected_listed]]);
   } else {
     parts.push(["book_id", op.book_id]);
     if (op.op === "move") parts.push(["direction", op.direction], ["expected_order", op.expected_order]);
@@ -382,6 +384,8 @@ export function applyAnswer(d: Draft, body: Body, status: number, json: Record<s
     return { draft: { ...cleared, base_version: version ?? d.base_version, saved: stored }, outcome: { kind: "applied" } };
   }
   const code = typeof json.error === "string" ? json.error : "failed";
+  // A stale duplicate choice must be presented again; it is not an editor whose words can be rebased.
+  if (body.op === "create" && code === "changed") return { draft: { ...cleared, resolve: null }, outcome: { kind: "refused", code } };
   if (code === "changed" && item) return { draft: { ...cleared, conflict: item }, outcome: { kind: "conflict" } };
   if (code === "duplicate") {
     return {

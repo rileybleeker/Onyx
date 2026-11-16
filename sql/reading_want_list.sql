@@ -59,7 +59,7 @@ REVOKE ALL ON pds.reading_list_ops FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT ON pds.reading_list_ops TO service_role;
 
 -- p: {op_key, kind, payload_hash, book_id, expected_version, title, author, edition,
---     identity_forms[], title_key, resolve ('distinct'|'reuse'|null), reuse_id, slug, slug_long,
+--     identity_forms[], title_key, resolve ('distinct'|'reuse'|null), reuse_id, reuse_version, reuse_listed, slug, slug_long,
 --     direction, expected_order[], start_date}
 -- Answers {ok: true, book_id, version, replayed, started?, reused?, removed?}
 --      or {ok: false, http, code, book_id?, candidates?, distinct_allowed?, book_status?}.
@@ -99,7 +99,7 @@ BEGIN
 
   IF v_kind IN ('create', 'edit') THEN
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
-             'book_id', b.book_id, 'status', b.status,
+             'book_id', b.book_id, 'version', b.list_version, 'status', b.status,
              'listed', (b.status = 'queued' AND b.list_removed_at IS NULL), 'match', m.match)
              ORDER BY m.rank, b.book_id), '[]'::jsonb),
            COALESCE(bool_or(m.match = 'identifier'), false)
@@ -127,6 +127,11 @@ BEGIN
     IF p->>'resolve' = 'reuse' THEN
       SELECT * INTO v_row FROM pds.books WHERE book_id = (p->>'reuse_id')::bigint FOR UPDATE;
       IF NOT FOUND THEN RETURN jsonb_build_object('ok', false, 'http', 404, 'code', 'not_found'); END IF;
+      -- The duplicate choice is based on the candidate Riley actually saw. Never restore a row removed later.
+      IF v_row.list_version IS DISTINCT FROM (p->>'reuse_version')::int
+         OR (v_row.status = 'queued' AND v_row.list_removed_at IS NULL) IS DISTINCT FROM (p->>'reuse_listed')::boolean THEN
+        RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'changed', 'book_id', v_row.book_id);
+      END IF;
       IF v_row.status <> 'queued' THEN
         RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_queued', 'book_id', v_row.book_id, 'book_status', v_row.status);
       END IF;
