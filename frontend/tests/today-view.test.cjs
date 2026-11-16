@@ -290,3 +290,17 @@ test("Today: opening reads the setting, never writes it; the quiet view hides (n
   assert.match(regression, /lib\/today-attention\.ts/);
   assert.match(regression, /lib\/today-view\.ts/);
 });
+
+test("row widths follow the layout: a part hidden in Personalize is not counted, each run fills its rows", () => {
+  const V = fresh();
+  const life = ["also-checked", "packages", "money", "renewals", "reading"];
+  const head = ["heading-keep-moving"];
+  // Default: five panels after the heading.
+  assert.deepEqual(V.lifeLayout(head.concat(life), life), { "also-checked": "third", packages: "third", money: "third", renewals: "half", reading: "half" });
+  // "reading" hidden in Personalize (not in the visible order): four panels, two full rows of halves.
+  assert.deepEqual(V.lifeLayout(head.concat(life.slice(0, 4)), life), { "also-checked": "half", packages: "half", money: "half", renewals: "half" });
+  // Two shown, one of them hidden: the other fills the row.
+  assert.deepEqual(V.lifeLayout(["heading-keep-moving", "also-checked"], ["also-checked", "reading"]), { "also-checked": "full" });
+  // A panel moved elsewhere is its own run.
+  assert.deepEqual(V.lifeLayout(["reading", "heading-keep-moving", "also-checked", "packages"], ["also-checked", "packages", "reading"]), { reading: "full", "also-checked": "half", packages: "half" });
+});

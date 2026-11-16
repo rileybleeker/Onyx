@@ -10,12 +10,13 @@
  *   same wording but different ids always stay two (`collectObligations`).
  * - Ranking is deterministic and explainable: urgency tier, then due time, then a fixed source order, then id;
  *   every obligation carries the plain-words reason for its tier (`rankObligations`).
- * - Urgent items bypass the ordinary budget and say so (`selectQuiet`: `overBudget`, `urgentOver`).
+ * - Urgent (and pinned) items bypass the ordinary budget and say so (`selectQuiet`: `overBudget`, `urgentOver`).
  * - Snooze and "hide here" are display marks on this device, keyed by a hash of the id and of the obligation's
  *   `version`; a mark stops applying when its snooze ends or the circumstance changes (new message, nearer
  *   deadline, higher urgency ...). A marked item stays open: the full Today view lists it as before. An
  *   `aggregate` (a count of items Today cannot name one by one) is never set aside: hiding a count would also hide
- *   a different item that later takes the same count.
+ *   a different item that later takes the same count. A `pinned` item (today's experiment arm: opening Today
+ *   reveals it, so it must be seen) is never set aside and never cut by the budget.
  * - A source that is checking, failed, stale or partial is "unknown": the quiet view never calls such a day clear.
  *
  * IMPORT-FREE at run time (tests/today-regression.cjs bundles it by name; type imports only).
@@ -65,6 +66,8 @@ export interface Obligation {
   learning: boolean;
   /** A count of items Today cannot name one by one ("3 more ..."): listed, never snoozed or hidden. */
   aggregate?: true;
+  /** Always shown, like an urgent item, and never snoozed or hidden (today's experiment arm). */
+  pinned?: true;
 }
 
 export type SourceState = "ok" | "checking" | "stale" | "partial" | "failed" | "not_connected";
@@ -79,8 +82,10 @@ export interface SourceProbe {
   checking?: boolean;
   /** false: the source is not connected yet (a normal answer, not a failure). */
   connected?: boolean;
-  /** The sync behind the answer is late or failing (email labels, calendar): newer items may be missing. */
+  /** The sync behind the answer is late, failing or has not reported a run: newer items may be missing. */
   syncLate?: boolean;
+  /** When that sync last ran (ISO), when known. */
+  syncAt?: string | null;
   /** Part of the answer could not be read (or was cut off): an item may be missing. */
   partial?: boolean;
   /** When the source's data was last confirmed (ISO), when known. */
@@ -123,9 +128,22 @@ export function sourceStatus(source: AttentionSource, p: SourceProbe, now: Date)
   if (p.connected === false) {
     return p.checking ? { source, label, state: "checking", note: "checking; showing an earlier check" } : { source, label, state: "not_connected", note: "not connected yet" };
   }
-  if (p.syncLate) return { source, label, state: "stale", note: `its sync is late${at ? ` (last ${at})` : ""}; newer items may be missing` };
+  if (p.syncLate) {
+    const ran = ago(p.syncAt, now);
+    return { source, label, state: "stale", note: ran ? `its sync is late (last ran ${ran}); newer items may be missing` : "its sync hasn't reported a run, so items may be missing" };
+  }
   if (p.checking) return { source, label, state: "checking", note: "checking; showing an earlier check" };
   return { source, label, state: "ok", note: at ? `checked ${at}` : "checked" };
+}
+
+/**
+ * Is the sync behind an answer late? Missing (never ran, or its heartbeat could not be read), unreadable, older than
+ * `staleMs` or not a success all count: missing freshness is never taken for a current answer.
+ */
+export function syncLateness(lastSync: { at: string; status: string } | null | undefined, nowMs: number, staleMs: number): boolean {
+  if (!lastSync) return true;
+  const at = Date.parse(lastSync.at);
+  return !Number.isFinite(at) || nowMs - at > staleMs || lastSync.status !== "success";
 }
 
 /** A source state that cannot confirm "nothing here". */
@@ -270,6 +288,9 @@ export function experimentObligations(trial: TrialLike | null): Obligation[] {
     reason: "Today's experiment arm",
     version: `${trial.arm ?? ""}|${trial.instruction ?? ""}`,
     learning: false,
+    // Opening Today reveals the arm (the check-in then asks whether it was followed), so it is never budgeted out,
+    // snoozed or hidden.
+    pinned: true,
   }];
 }
 
@@ -294,7 +315,8 @@ export function calendarObligations(events: readonly CalendarEvent[], now: Date)
       urgency: "high",
       dueAt: start,
       reason: `Starts in ${left < HOUR ? `${Math.max(1, Math.round(left / MIN))} min` : `${Math.round((left / HOUR) * 10) / 10} h`}${e.status === "tentative" ? " (tentative)" : ""}`,
-      version: `${e.startAt}|${e.status}`,
+      // What Riley acts on: a moved, renamed or relocated event is a new circumstance.
+      version: [e.startAt, e.endAt ?? "", e.status, e.title, e.location ?? ""].join("|"),
       learning: false,
     });
   }
@@ -311,9 +333,10 @@ const MONEY_REASON: Readonly<Record<MoneyAlert["kind"], string>> = {
  * Money alerts. They carry no id of their own, so the identity is the alert kind plus what it names (the text
  * before the first ": ": the category, card or payment), numbered when two alerts of one answer share it, so
  * they are never folded together. Amounts are left out of the version: a dollar of drift is not a new
- * circumstance, a change of severity, status or date is.
+ * circumstance, a change of severity, status or date is. `period` ("YYYY-MM"): the month a budget alert is for, in
+ * its version, so a budget hidden this month comes back when it is over again next month.
  */
-export function moneyObligations(alerts: readonly MoneyAlert[]): Obligation[] {
+export function moneyObligations(alerts: readonly MoneyAlert[], period = ""): Obligation[] {
   const seen = new Map<string, number>();
   return alerts.map((a) => {
     const colon = a.title.indexOf(": ");
@@ -331,7 +354,7 @@ export function moneyObligations(alerts: readonly MoneyAlert[]): Obligation[] {
       urgency: a.severity === "high" ? "high" : "normal",
       dueAt: null,
       reason: MONEY_REASON[a.kind] ?? "Money alert",
-      version: `${a.severity}|${a.title.replace(/-?\$[\d,]+(?:\.\d+)?/g, "$")}`,
+      version: `${a.severity}|${a.title.replace(/-?\$[\d,]+(?:\.\d+)?/g, "$")}${a.kind === "budget" ? `|${period}` : ""}`,
       learning: false,
     };
   });
@@ -340,20 +363,27 @@ export function moneyObligations(alerts: readonly MoneyAlert[]): Obligation[] {
 /** Renewals due within the summary's window, named one by one; the unnamed rest as one count. */
 export function renewalObligations(summary: RenewalSummary | null): Obligation[] {
   if (!summary || summary.status !== "ready" || summary.count <= 0) return [];
-  const out: Obligation[] = summary.soon.map((r) => ({
-    id: `renewals:${r.merchant}:${r.date}`,
-    source: "renewals",
-    title: `${r.merchant} ${r.label}`,
-    detail: null,
-    href: "/procurement",
-    external: false,
-    urgency: r.days <= 0 ? "high" : "normal",
-    dueAt: /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? new Date(`${r.date}T00:00:00`).getTime() : null,
-    reason: r.days <= 0 ? "Renews today" : `Renews within ${summary.withinDays} days`,
-    // The daily countdown is not a new circumstance; reaching the renewal day is.
-    version: r.days <= 0 ? "due" : "soon",
-    learning: false,
-  }));
+  // Merchant + date, numbered when two renewals of one answer share them, so they are never folded together.
+  const seen = new Map<string, number>();
+  const out: Obligation[] = summary.soon.map((r) => {
+    const base = `renewals:${r.merchant}:${r.date}`;
+    const n = (seen.get(base) ?? 0) + 1;
+    seen.set(base, n);
+    return {
+      id: n === 1 ? base : `${base}#${n}`,
+      source: "renewals",
+      title: `${r.merchant} ${r.label}`,
+      detail: null,
+      href: "/procurement",
+      external: false,
+      urgency: r.days <= 0 ? "high" : "normal",
+      dueAt: /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? new Date(`${r.date}T00:00:00`).getTime() : null,
+      reason: r.days <= 0 ? "Renews today" : `Renews within ${summary.withinDays} days`,
+      // The daily countdown is not a new circumstance; reaching the renewal day is.
+      version: r.days <= 0 ? "due" : "soon",
+      learning: false,
+    };
+  });
   const rest = summary.count - summary.soon.length;
   if (rest > 0) {
     out.push({
@@ -376,12 +406,14 @@ export function renewalObligations(summary: RenewalSummary | null): Obligation[]
 
 /**
  * GET /api/orders/summary (what Today reads). `attentionVersion` / `arrivingVersion`: opaque fingerprints of WHICH
- * orders are in each group and their status / due date / reason (app/api/orders/summary/route.ts), so a different
+ * orders are in each group and their state / status / due date (app/api/orders/summary/route.ts), so a different
  * package with the same count is a new circumstance. An older answer without them falls back to what it lists.
  */
 export type PackagesLike = { status: "not_connected" } | {
   status: "ready"; attention: number; arrivingToday: number; onTheWay: number; top: { merchant: string; label: string; reason: string }[];
   attentionVersion?: string; arrivingVersion?: string;
+  /** The package email check's last run (absent in an answer from before it was added). */
+  lastSync?: { at: string; status: string } | null;
 };
 /** Packages as two counts the orders page keeps (needs attention, arriving today): the orders themselves live there. */
 export function packageObligations(summary: PackagesLike | null): Obligation[] {
@@ -590,7 +622,7 @@ export interface QuietOptions {
 }
 export interface QuietItem {
   item: Obligation;
-  /** An urgent item shown beyond the budget. */
+  /** An urgent (or pinned) item shown beyond the budget. */
   overBudget: boolean;
 }
 export interface SetAside {
@@ -633,16 +665,18 @@ export function selectQuiet(obligations: readonly Obligation[], sources: readonl
   const open: Obligation[] = [];
   const setAside: SetAside[] = [];
   for (const o of ranked) {
-    const mark = o.aggregate ? undefined : opts.marks[markKey(o)];
+    const mark = o.aggregate || o.pinned ? undefined : opts.marks[markKey(o)];
     const state = markApplies(mark, o, opts.nowMs);
     if (state) setAside.push({ item: o, state, until: state === "snoozed" ? mark?.until ?? null : null });
     else open.push(o);
   }
-  const urgent = open.filter((o) => o.urgency === "urgent" && !o.learning);
-  const ordinary = open.filter((o) => o.urgency !== "urgent" && !o.learning);
-  // Urgent items are never cut by the budget: each one past it is shown and says so.
-  const shown: QuietItem[] = urgent.map((item, i) => ({ item, overBudget: i >= budget }));
-  const room = Math.max(0, budget - urgent.length);
+  const always = (o: Obligation) => (o.urgency === "urgent" || o.pinned === true) && !o.learning;
+  const first = open.filter(always);
+  const urgent = first.filter((o) => o.urgency === "urgent");
+  const ordinary = open.filter((o) => !always(o) && !o.learning);
+  // Urgent and pinned items are never cut by the budget: each one past it is shown and says so (urgent first).
+  const shown: QuietItem[] = first.map((item, i) => ({ item, overBudget: i >= budget }));
+  const room = Math.max(0, budget - first.length);
   for (const item of ordinary.slice(0, room)) shown.push({ item, overBudget: false });
   const learning = opts.learning ? open.find((o) => o.learning) ?? null : null;
   const more = Math.max(0, ordinary.length - room);
@@ -666,7 +700,7 @@ export interface ListedItem {
 /** The full list: every open obligation and learning action, ranked, each with its display state. Nothing is left out. */
 export function fullList(obligations: readonly Obligation[], marks: AttentionMarks, nowMs: number): ListedItem[] {
   return rankObligations(obligations).map((item) => {
-    const mark = item.aggregate ? undefined : marks[markKey(item)];
+    const mark = item.aggregate || item.pinned ? undefined : marks[markKey(item)];
     const state = markApplies(mark, item, nowMs);
     return { item, state: state ?? "open", until: state === "snoozed" ? mark?.until ?? null : null };
   });
@@ -682,7 +716,8 @@ export interface TodayAttentionInput {
   /** Omitted when no trial is registered or the check is not made here (the scroll's copy of Today). */
   experiment?: { probe: SourceProbe; trial: TrialLike | null };
   calendar: { probe: SourceProbe; events: readonly CalendarEvent[] };
-  money: { probe: SourceProbe; alerts: readonly MoneyAlert[] };
+  /** `period`: the month ("YYYY-MM") the budget alerts are for. */
+  money: { probe: SourceProbe; alerts: readonly MoneyAlert[]; period?: string };
   renewals: { probe: SourceProbe; summary: RenewalSummary | null };
   packages: { probe: SourceProbe; summary: PackagesLike | null };
   reading: { probe: SourceProbe; overview: ReadingLike | null };
@@ -705,7 +740,7 @@ export function todayAttention(input: TodayAttentionInput): { obligations: Oblig
     requestObligations(input.requests.items, now),
     experimentObligations(input.experiment?.trial ?? null),
     calendarObligations(input.calendar.events, now),
-    moneyObligations(input.money.alerts),
+    moneyObligations(input.money.alerts, input.money.period ?? ""),
     renewalObligations(input.renewals.summary),
     packageObligations(input.packages.summary),
     readingObligations(input.reading.overview),

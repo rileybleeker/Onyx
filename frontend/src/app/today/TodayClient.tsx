@@ -25,20 +25,22 @@ import { earlyOr } from "@/lib/early-fetch";
 import TodayOverview from "@/components/overview/TodayOverview";
 // Import-free too (bundled by name in the same test): the attention model (PROD-T04) and the quiet view settings,
 // snooze / hide marks and row widths (PROD-T05).
-import { MAX_BUDGET, MIN_BUDGET, SOURCE_LABEL, URGENCY_LABEL, fullList, markFor, markKey, parseMarks, pruneMarks, selectQuiet, snoozeUntil, todayAttention,
+import { MAX_BUDGET, MIN_BUDGET, SOURCE_LABEL, URGENCY_LABEL, fullList, markFor, markKey, parseMarks, pruneMarks, selectQuiet, snoozeUntil, syncLateness, todayAttention,
   type AttentionMark, type Obligation, type SourceProbe, type SourceStatus } from "@/lib/today-attention";
-import { adoptQuiet, lifeWidths, pushQuiet, quietBootScript, quietUnsent, readMarks, readQuiet, removeQuietBoot, serverQuiet, setQuiet, subscribeQuiet, syncQuiet,
+import { adoptQuiet, lifeLayout, pushQuiet, quietBootScript, quietUnsent, readMarks, readQuiet, removeQuietBoot, serverQuiet, setQuiet, subscribeQuiet, syncQuiet,
   writeMarks, type QuietSettings } from "@/lib/today-view";
+import InfoHint from "@/components/InfoHint";
 // Personalize: every panel of Today is a part. Today is rendered on the server (static) and hydrates, so the grid
 // runs in CSS mode: the DOM keeps the default order and a saved order / hidden part is painted before React runs.
 // One container holds every panel and the three section headings, so a panel can be moved into another section.
-import { Part, PartGrid } from "@/components/personalize/PartGrid";
+import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
 // GET /api/orders/summary (online orders read from shipping emails; see /orders).
 type OrdersSummary = { status: "not_connected" } | { status: "ready"; attention: number; arrivingToday: number; onTheWay: number;
-  top: { merchant: string; label: string; reason: string }[]; attentionVersion?: string; arrivingVersion?: string };
+  top: { merchant: string; label: string; reason: string }[]; attentionVersion?: string; arrivingVersion?: string;
+  lastSync?: { at: string; status: string } | null };
 // Roles (PROD-T05): the page title, then section headings (Today.module.css .sectionLabel), then card titles
 // (titleStyle), then metadata (text-xs, secondary). Secondary links are plain underlined text; the one filled
 // accent control is the primary Log action. Every card has the same padding (20 px on a phone, 24 px wider).
@@ -75,6 +77,11 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
 }
 // The email label sync runs hourly; older than this and Today says newer labels may be missing.
 const LABEL_SYNC_STALE_MS = 3 * 3_600_000;
+// The package email check runs every 3 h (same threshold as /orders).
+const ORDERS_SYNC_STALE_MS = 6 * 3_600_000;
+// Today's parts in default order (the "Keep life moving" ones are added when the data shows them).
+const TODAY_HEAD_PARTS = ["start-here", "quick-log", "jump-links"];
+const TODAY_MID_PARTS = ["heading-needs-you", "requests", "urgent-email", "heading-your-day", "calendar", "heading-keep-moving"];
 // While Today stays on screen it checks again this often (the app is often left open on the desktop).
 const VISIBLE_REFRESH_MS = 5 * 60_000;
 // The three "Keep life moving" checks that show a panel only when something is due. Their state is tracked so
@@ -439,9 +446,14 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const allUrgent = merged.total > merged.items.length ? mergeUrgent(emailItems, emailCards, Infinity).items : merged.items;
   const now = new Date();
   const lastSync = email?.lastSync ?? null;
-  const syncStale = !!lastSync && (now.getTime() - new Date(lastSync.at).getTime() > LABEL_SYNC_STALE_MS || lastSync.status !== "success");
+  // A sync that never ran, or whose heartbeat could not be read (lastSync null), is not a current answer either.
+  const syncStale = !!email && syncLateness(lastSync, now.getTime(), LABEL_SYNC_STALE_MS);
   const book = reading.state === "ready" ? reading.value : null;
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
+  // The package email check behind the summary is late or failing (an older answer without the field: not known yet,
+  // and its fresh read is already running).
+  const ordersLate = orders?.status === "ready" && orders.lastSync !== undefined && syncLateness(orders.lastSync, now.getTime(), ORDERS_SYNC_STALE_MS);
+  const ordersLateText = "The package email check is late, so newer packages may be missing.";
   // The table can exist before the first sync run: no run and no events is "not connected yet", not "nothing on".
   const agenda = calendar.state === "ready" && calendar.value.status === "ready" && (calendar.value.lastSync || calendar.value.events.length > 0) ? calendar.value : null;
   const calendarOff = calendar.state === "ready" && !agenda;
@@ -467,9 +479,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   }
   const checkLines: CheckLine[] = [];
   if (!packages) {
-    checkLines.push(checkLine("orders", "Packages", "/orders", !!orders, orders?.status === "not_connected"
+    const line = checkLine("orders", "Packages", "/orders", !!orders, orders?.status === "not_connected"
       ? "Package tracking isn't connected yet."
-      : `Nothing needs attention or arrives today${orders?.status === "ready" && orders.onTheWay > 0 ? `; ${orders.onTheWay} on the way` : ""}.`));
+      : `Nothing needs attention or arrives today${orders?.status === "ready" && orders.onTheWay > 0 ? `; ${orders.onTheWay} on the way` : ""}.`);
+    checkLines.push(ordersLate && orders ? { ...line, text: `${line.text} ${ordersLateText}`, warn: true } : line);
   }
   if (!renewing) {
     checkLines.push(checkLine("renewals", "Renewals", "/procurement", !!renewals, renewals?.status === "ready"
@@ -480,11 +493,13 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     checkLines.push(checkLine("money", "Money", "/financials/budgets", !!money, moneyStatus ? `No alerts to act on. ${moneyStatus.text}` : "No alerts to act on."));
   }
   const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
-  // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts).
+  // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
+  // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
   const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, "reading"]
     .filter((id): id is string => id !== null);
-  const lifeW = lifeWidths(lifeParts.length);
-  const lifeWidth = (id: string) => lifeW[lifeParts.indexOf(id)] ?? "third";
+  const renderedParts = TODAY_HEAD_PARTS.concat(experiment.state === "error" || trial ? ["experiment"] : [], TODAY_MID_PARTS, lifeParts);
+  const lifeW = lifeLayout(usePartOrder("/today", renderedParts), lifeParts);
+  const lifeWidth = (id: string) => lifeW[id] ?? "third";
 
   // ─── Quiet view (PROD-T05): a few ranked obligations from every source (lib/today-attention.ts), each with its
   // source and how current it is. Computed only while it is on; the full page is unchanged either way.
@@ -508,21 +523,23 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     now,
     requests: { probe: probe(inbox, "agents"), items: requests },
     urgentEmail: {
-      probe: probe(urgent, "urgent-email", { connected: !(urgent.state === "ready" && urgent.value.status === "not_connected"), syncLate: syncStale, partial: inbox.state === "error" }),
+      probe: probe(urgent, "urgent-email", { connected: !(urgent.state === "ready" && urgent.value.status === "not_connected"), syncLate: syncStale, syncAt: lastSync?.at ?? null, partial: inbox.state === "error" }),
       items: allUrgent,
       emails: emailItems,
       unreturned: email ? Math.max(0, email.total - email.items.length) : 0,
     },
     experiment: experimentSource ? { probe: probe(experiment, "experiment"), trial } : undefined,
-    calendar: { probe: probe(calendar, "calendar", { connected: !calendarOff, syncLate: !!agenda && calendarSync !== "ok", partial: !!agenda?.truncated }), events: agenda?.events ?? [] },
+    calendar: { probe: probe(calendar, "calendar", { connected: !calendarOff, syncLate: !!agenda && calendarSync !== "ok", syncAt: agenda?.lastSync?.at ?? null, partial: !!agenda?.truncated }), events: agenda?.events ?? [] },
     money: {
       probe: money
         ? { load: "ready", refreshFailed: money.refreshFailed, checking: (money.updating && !money.refreshFailed) || lifeChecks.money.state === "checking", partial: money.partial !== null, asOf: money.asOf ?? iso(lifeChecks.money.at) }
         : lifeProbe("money", false),
       alerts: money?.alerts ?? [],
+      // Budgets are monthly: a budget alert hidden this month comes back next month.
+      period: todayDate.slice(0, 7),
     },
     renewals: { probe: lifeProbe("renewals", !!renewals), summary: renewals },
-    packages: { probe: lifeProbe("orders", !!orders, { connected: orders?.status !== "not_connected" }), summary: orders },
+    packages: { probe: lifeProbe("orders", !!orders, { connected: orders?.status !== "not_connected", syncLate: ordersLate, syncAt: orders?.status === "ready" ? orders.lastSync?.at ?? null : null }), summary: orders },
     reading: { probe: probe(reading, "reading"), overview: book },
   }) : null;
   const selection = attention ? selectQuiet(attention.obligations, attention.sources, { budget: quiet.budget, learning: quiet.learning, marks, nowMs }) : null;
@@ -555,6 +572,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     setMarks(next);
     writeMarks(next);
     setQuietNote(`Shown again: ${o.title}`);
+    // The button goes once the item is open again: keep focus on the list, not the page top.
+    quietHeading.current?.focus();
   }
   const quietAction = "inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-control px-3 text-xs text-text-secondary hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent";
   const itemTitle = "break-words text-sm font-medium text-text-primary underline decoration-text-secondary underline-offset-4 hover:text-accent";
@@ -573,10 +592,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       <div className="min-w-0 flex-1">
         {quietMeta(o)}
         <p className="mt-1">{itemLink(o)}</p>
-        <p className="mt-1 break-words text-xs text-text-secondary">Why: {o.reason}{overBudget ? ". Urgent, so it is shown past your number" : ""}</p>
+        <p className="mt-1 break-words text-xs text-text-secondary">Why: {o.reason}{overBudget ? (o.pinned ? ". Today's instruction, so it is always shown" : ". Urgent, so it is shown past your number") : ""}</p>
         {o.detail && <p className="mt-0.5 break-words text-xs text-text-secondary">{o.detail}</p>}
       </div>
-      {!o.aggregate && <div className="flex shrink-0 flex-col items-end sm:flex-row sm:items-center">
+      {!o.aggregate && !o.pinned && <div className="flex shrink-0 flex-col items-end sm:flex-row sm:items-center">
         <button type="button" onClick={() => setAside(o, "snooze")} aria-label={`Snooze until tomorrow: ${o.title}`} className={quietAction}>Snooze</button>
         <button type="button" onClick={() => setAside(o, "hide")} aria-label={`Hide here: ${o.title}`} className={quietAction}>Hide</button>
       </div>}
@@ -608,7 +627,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       {quietSave === "failed" && !quiet.on && <p className="text-xs text-mid">Couldn&apos;t save the quiet view setting to your account; it is kept on this device. <button type="button" onClick={retryQuiet} className="underline underline-offset-4">Retry</button></p>}
       {selection ? <section data-today-quiet="" aria-labelledby="quiet-heading" aria-busy={pending} className={`${panelStyle} ${styles.quiet}`}>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-          <h2 id="quiet-heading" ref={quietHeading} tabIndex={-1} className={styles.quietTitle}>Your priorities</h2>
+          <div className="flex items-center gap-1">
+            <h2 id="quiet-heading" ref={quietHeading} tabIndex={-1} className={styles.quietTitle}>Your priorities</h2>
+            <InfoHint label="the quiet view">Snooze and Hide apply on this device only and never close anything: the item stays listed under All open items. Notifications are not affected.</InfoHint>
+          </div>
           <p className="text-xs text-text-secondary">Top {quiet.budget}, most pressing first. Urgent items are always shown.</p>
         </div>
         <p aria-live="polite" className="mt-1 text-xs text-text-secondary">{quietNote}</p>
@@ -660,7 +682,6 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
               <input type="checkbox" checked={quiet.learning} onChange={(e) => changeQuiet({ ...quiet, learning: e.target.checked })} className="h-5 w-5 accent-accent" />
               Suggest one reading action
             </label>
-            <p className="text-xs text-text-secondary">Snooze and Hide apply on this device only and never close anything. Notifications are not affected.</p>
             <button type="button" onClick={() => changeQuiet({ ...quiet, on: false })} className={`${linkStyle} min-h-11 self-start`}>Turn off the quiet view</button>
           </div>
         </details>
@@ -864,6 +885,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         {packages.top.length > 0 && <ul className="mt-2 space-y-2" aria-label="Packages that need attention">
           {packages.top.map((t, i) => <li key={i} className="text-xs text-text-secondary"><span className="text-text-primary">{t.merchant}: {t.label}.</span> {t.reason}</li>)}
         </ul>}
+        {ordersLate && <p className="mt-3 text-sm text-mid">{ordersLateText}</p>}
         {lifeFailed("orders") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh packages. Showing {clock(lifeChecks.orders.at) ? `the check at ${clock(lifeChecks.orders.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/orders" className={`${linkStyle} mt-4 inline-block`}>Open orders</Link>
       </section>

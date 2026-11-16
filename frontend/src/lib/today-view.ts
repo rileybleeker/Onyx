@@ -303,12 +303,34 @@ export type LifeWidth = "full" | "half" | "third";
  * Widths for the N panels "Keep life moving" shows (which ones depends on the day), so every desktop row is full
  * (three thirds or two halves) instead of ending in an empty track: 1 full, 2 halves, 3 thirds, 4 halves,
  * 5 = three thirds then two halves; in general thirds, with the last 2 or 4 as halves when N is not a multiple
- * of 3. Today's grid offers no width choice (CSS mode), so these defaults are the widths; a panel hidden in
- * Personalize is not counted (a known limit).
+ * of 3. Today's grid offers no width choice (CSS mode), so these defaults are the widths (see `lifeLayout`).
  */
 export function lifeWidths(n: number): LifeWidth[] {
   const count = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
   if (count === 1) return ["full"];
   const halves = count % 3 === 0 ? 0 : count % 3 === 2 ? 2 : 4;
   return Array.from({ length: count }, (_, i) => (i >= count - halves ? "half" : "third"));
+}
+
+/**
+ * The life panels' widths as Riley's layout shows them. `order`: the parts Today renders now that are not hidden in
+ * Personalize, in layout order (components/personalize/PartGrid usePartOrder). `life`: which of them are "Keep life
+ * moving" panels. Each run of life panels with no other part between them fills its own rows (`lifeWidths`), so a
+ * panel hidden or moved in Personalize leaves no empty track. A life panel not in `order` gets no width.
+ */
+export function lifeLayout(order: readonly string[], life: readonly string[]): Record<string, LifeWidth> {
+  const isLife = new Set(life);
+  const out: Record<string, LifeWidth> = {};
+  let run: string[] = [];
+  const flush = () => {
+    const widths = lifeWidths(run.length);
+    run.forEach((id, i) => { out[id] = widths[i]; });
+    run = [];
+  };
+  for (const id of order) {
+    if (isLife.has(id)) run.push(id);
+    else flush();
+  }
+  flush();
+  return out;
 }

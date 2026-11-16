@@ -359,3 +359,56 @@ test("todayAttention: every source in one call, the experiment only when given",
   assert.ok(b.sources.some((s) => s.source === "experiment"));
   assert.equal(A.selectQuiet(b.obligations, b.sources, { budget: 3, learning: true, marks: {}, nowMs: MS }).verdict, "unknown", "an arm still being checked is not a clear day");
 });
+
+test("pinned: today's experiment arm is never cut by the budget, snoozed or hidden", () => {
+  const arm = A.experimentObligations({ status: "active", experimentId: "EXP-901", behavioralDate: "2030-03-05", arm: "A", instruction: "Synthetic instruction." })[0];
+  assert.equal(arm.pinned, true);
+  const list = [
+    base({ id: "urgent-email:email:t1", source: "urgent-email", urgency: "urgent" }),
+    base({ id: "urgent-email:email:t2", source: "urgent-email", urgency: "urgent" }),
+    arm,
+    base({ id: "agents:N1" }),
+  ];
+  const one = quiet(list, [], { budget: 1 });
+  assert.deepEqual(one.shown.map((s) => [s.item.id, s.overBudget]), [["urgent-email:email:t1", false], ["urgent-email:email:t2", true], [arm.id, true]], "urgent first, then the arm, both past the budget");
+  assert.equal(one.urgentOver, 1);
+  assert.equal(one.more, 1, "the ordinary item waits in the full list");
+  const marks = { [A.markKey(arm)]: A.markFor(arm, "hide", MS) };
+  const marked = quiet([arm], [], { marks });
+  assert.deepEqual(marked.shown.map((s) => s.item.id), [arm.id], "a mark never applies to the arm");
+  assert.deepEqual(marked.setAside, []);
+  assert.equal(A.fullList([arm], marks, MS)[0].state, "open");
+});
+
+test("sync freshness: missing, unreadable, old or failed is late, never a current answer", () => {
+  const STALE = 3 * H;
+  assert.equal(A.syncLateness(null, MS, STALE), true, "never ran, or its heartbeat could not be read");
+  assert.equal(A.syncLateness(undefined, MS, STALE), true);
+  assert.equal(A.syncLateness({ at: "not a time", status: "success" }, MS, STALE), true);
+  assert.equal(A.syncLateness({ at: iso(-4 * H), status: "success" }, MS, STALE), true);
+  assert.equal(A.syncLateness({ at: iso(-10 * 60_000), status: "failed" }, MS, STALE), true);
+  assert.equal(A.syncLateness({ at: iso(-10 * 60_000), status: "success" }, MS, STALE), false);
+  const never = A.sourceStatus("urgent-email", { load: "ready", syncLate: true, syncAt: null, asOf: iso(-60_000) }, NOW);
+  assert.equal(never.state, "stale");
+  assert.equal(never.note, "its sync hasn't reported a run, so items may be missing");
+  const late = A.sourceStatus("packages", { load: "ready", syncLate: true, syncAt: iso(-7 * H), asOf: iso(-60_000) }, NOW);
+  assert.equal(late.note, "its sync is late (last ran 7 h ago); newer items may be missing", "the note names the sync's own time, not the check's");
+  assert.equal(quiet([], [never]).verdict, "unknown");
+});
+
+test("versions: a budget alert is per month, a calendar event follows what it says, repeated renewals stay apart", () => {
+  const alert = { kind: "budget", severity: "high", title: "Synthetic A: $40 over budget", detail: "Synthetic.", href: "/financials/budgets" };
+  const nov = A.moneyObligations([alert], "2030-11")[0];
+  assert.equal(A.moneyObligations([alert], "2030-11")[0].version, nov.version);
+  assert.notEqual(A.moneyObligations([alert], "2030-12")[0].version, nov.version, "next month's alert is a new circumstance");
+  const promo = { ...alert, kind: "promo", title: "Synthetic card: 0% ends Aug 1" };
+  assert.equal(A.moneyObligations([promo], "2030-11")[0].version, A.moneyObligations([promo], "2030-12")[0].version, "only budgets are monthly");
+  const ev = (over = {}) => ({ key: "e1", title: "Synthetic meeting", allDay: false, startAt: iso(30 * 60_000), endAt: iso(90 * 60_000), startDate: "2030-03-05", endDate: "2030-03-05", calendar: "main", account: "acct", location: "Room 1", status: "confirmed", recurring: false, ...over });
+  const v = (e) => A.calendarObligations([e], NOW)[0].version;
+  assert.notEqual(v(ev({ location: "Room 2" })), v(ev()), "a new place is a new circumstance");
+  assert.notEqual(v(ev({ title: "Synthetic meeting (moved)" })), v(ev()), "a new title is");
+  const same = { merchant: "Synthetic plan", days: 1, date: "2030-03-06", label: "renews tomorrow" };
+  const ren = A.renewalObligations({ status: "ready", count: 2, withinDays: 3, soon: [same, { ...same }] });
+  assert.deepEqual(ren.map((o) => o.id), ["renewals:Synthetic plan:2030-03-06", "renewals:Synthetic plan:2030-03-06#2"], "same name and date: still two");
+  assert.equal(A.collectObligations([ren]).length, 2);
+});
