@@ -16,6 +16,7 @@ Requirements:
 """
 
 import os
+import re
 import json
 import time
 import argparse
@@ -96,6 +97,30 @@ def quiet_http_logs(level: int = logging.ERROR):
     finally:
         for lg, lvl in zip(loggers, saved):
             lg.setLevel(lvl)
+
+
+# A database error code worth keeping: a PostgREST code (PGRST205), a Postgres
+# SQLSTATE (42P01) or the HTTP status postgrest-py puts in `code` when the
+# response body is not JSON (502). Anything else is dropped.
+_SAFE_ERROR_CODE = re.compile(r"^(?:PGRST\d{3}|[0-9A-Z]{5}|\d{3})$")
+
+
+def _safe_error(exc: BaseException) -> str:
+    """An exception as text safe for the public Actions log and the heartbeat.
+
+    The type name, plus the HTTP status of a provider error or the code of a
+    database error when it has one. Never str(exc): a provider error quotes
+    its request URL (user and session ids), and a database error can carry
+    the response body (postgrest-py puts a non-JSON body in `details`, and
+    its message is part of str()).
+    """
+    name = type(exc).__name__
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{name} {exc.response.status_code}"
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and _SAFE_ERROR_CODE.match(code):
+        return f"{name} {code}"
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -822,8 +847,9 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
     is public); the caller logs the counters. That covers the HTTP clients
     too: httpx's per-request INFO lines, whose URLs carry the user and session
     ids and the healed row's date, are turned down while it runs
-    (quiet_http_logs). Returns counters; `scan_error` is set if the candidate
-    query failed.
+    (quiet_http_logs), and an error is reported by type and code only
+    (_safe_error), never its text. Returns counters; `scan_error` is set if
+    the candidate query failed.
     """
     stats = _new_heal_stats()
     if max_rows <= 0:
@@ -843,7 +869,10 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
             .execute()
         ).data or []
     except Exception as e:  # noqa: BLE001 — heal must never fail the ETL
-        stats["scan_error"] = f"candidate query failed: {e}"
+        # Type and code only (_safe_error): scan_error goes to the public log
+        # and into both heartbeats, and the error text can carry the response
+        # body or the request URL.
+        stats["scan_error"] = f"candidate query failed ({_safe_error(e)})"
         log.warning(f"Self-heal: {stats['scan_error']}")
         return stats
 
@@ -905,9 +934,10 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
             stats["healed"] += 1
         except Exception as e:  # noqa: BLE001 — row stays NULL, retried next run
             stats["failed"] += 1
-            # Type only: the Actions log is public, and the message of a
-            # provider error can carry the user and session ids in its URL.
-            log.warning(f"  Self-heal: a lookup failed ({type(e).__name__})")
+            # Type and status / code only: the Actions log is public, and the
+            # message of a provider error can carry the user and session ids
+            # in its URL.
+            log.warning(f"  Self-heal: a lookup failed ({_safe_error(e)})")
     return stats
 
 
@@ -1096,8 +1126,10 @@ def main():
                                    max_rows=args.selfheal_max,
                                    lookback_days=args.selfheal_days)
         except Exception as e:  # noqa: BLE001 — never fail the ETL on the heal step
-            log.warning(f"Temp self-heal crashed: {e}")
-            heal["scan_error"] = f"self-heal crashed: {e}"
+            # Type and code only, no traceback: this text reaches the public
+            # log and both heartbeats (the heal's URLs carry provider ids).
+            heal["scan_error"] = f"self-heal crashed ({_safe_error(e)})"
+            log.warning(f"Temp {heal['scan_error']}")
         summary = _selfheal_summary(heal, args.selfheal_max)
         log.info(f"Temp self-heal: {summary}" if heal["candidates"] or heal["scan_error"]
                  else "Temp self-heal: nothing to heal")

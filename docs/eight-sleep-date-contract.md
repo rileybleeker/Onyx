@@ -141,14 +141,18 @@ date the `/intervals` list returned last.
   temperatures or a session id (the Actions log is public), and it turns the HTTP client
   loggers down while it runs (`quiet_http_logs`): httpx logs every request URL at INFO, and the
   heal's URLs carry the user and session ids (`/intervals/{id}`) and the healed row's date (the
-  `calendar_date=eq.<date>` filter of its UPDATE). Its counters are unchanged.
+  `calendar_date=eq.<date>` filter of its UPDATE). A failed candidate query, a failed lookup
+  or a crash of the step is reported by its type and HTTP status or database code only
+  (`_safe_error`), never the error text, which can quote a request URL or a response body;
+  that text went to the public log and both heartbeats. Its counters are unchanged.
 - `eight_sleep_temp_backfill.py --compare [--max-lookups N]`: the read-only comparison in the
   plan below.
 - Comments in `sql/adr_0001_04_other_onyx_dates.sql`, `eight_sleep_schema.sql`, `hrv_alignment.py`
   and the ADR-0001 addendum. **No SQL to apply, no schema change, no date shifted, no backfill.**
 - Tests: `tests/test_eight_sleep_date_contract.py` (synthetic payloads and fakes) and
   `tests/test_eight_sleep_selfheal.py` (updated for the new `sync_user` result and id pairing,
-  plus the GUARD heartbeat through `main()`).
+  plus the GUARD heartbeat through `main()` and the heal's failure paths, which must log and
+  report no error text).
 
 ## The historical claims
 

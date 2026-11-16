@@ -119,6 +119,8 @@ class _Query:
     def execute(self):
         if self.mode == "select":
             if self.db.fail_select:
+                if isinstance(self.db.fail_select, BaseException):
+                    raise self.db.fail_select
                 raise RuntimeError("select boom")
             out = [dict(r) for r in self.db.rows if self._match(r)]
             out.sort(key=lambda r: r["calendar_date"], reverse=self._order_desc)
@@ -507,9 +509,92 @@ def test_today_and_stale_rows_are_out_of_scope() -> None:
 def test_candidate_query_failure_is_reported_not_raised() -> None:
     sb = FakeSupabase([_trend_row("2026-11-01", sid="S1")], fail_select=True)
     stats = _heal(sb, FakeClient({"S1": _interval()}))
-    assert stats["scan_error"] and "select boom" in stats["scan_error"], stats
+    assert stats["scan_error"] == "candidate query failed (RuntimeError)", stats
+    assert "select boom" not in stats["scan_error"], "the error text must never be reported"
     assert stats["healed"] == 0
     assert "candidate query failed" in es._selfheal_summary(stats, 20)
+
+
+# Text an error can carry that must never reach the log or a heartbeat: a
+# request URL with provider ids and a row's date, a response body.
+_LEAKY = ("u-left", "SID-9", "2026-11-01", "stub.supabase.co", "<html>", "secret body")
+
+
+def _leaky_db_error(code="PGRST205"):
+    from postgrest.exceptions import APIError
+    return APIError({"code": code, "message": "GET https://stub.supabase.co/rest/v1/"
+                     "eight_sleep_trends?calendar_date=eq.2026-11-01",
+                     "hint": None, "details": "<html>secret body for u-left SID-9</html>"})
+
+
+def _leaky_http_error(status=503):
+    import httpx
+    url = "https://client-api.8slp.net/v1/users/u-left/intervals/SID-9?d=2026-11-01"
+    req = httpx.Request("GET", url)
+    return httpx.HTTPStatusError(f"Server error '{status}' for url '{url}'", request=req,
+                                 response=httpx.Response(status, request=req,
+                                                         text="<html>secret body</html>"))
+
+
+def test_safe_error_keeps_type_and_code_only() -> None:
+    assert es._safe_error(_leaky_db_error()) == "APIError PGRST205"
+    assert es._safe_error(_leaky_db_error("42P01")) == "APIError 42P01"
+    assert es._safe_error(_leaky_db_error("502")) == "APIError 502"
+    # A `code` that is not a known code shape is dropped, not echoed.
+    assert es._safe_error(_leaky_db_error("u-left/SID-9")) == "APIError"
+    assert es._safe_error(_leaky_http_error(503)) == "HTTPStatusError 503"
+    assert es._safe_error(RuntimeError("GET /users/u-left/intervals/SID-9")) == "RuntimeError"
+    for exc in (_leaky_db_error(), _leaky_http_error(), RuntimeError("u-left SID-9")):
+        text = es._safe_error(exc)
+        for token in _LEAKY:
+            assert token not in text, (token, text)
+
+
+def _capture_es_log():
+    import logging
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+            if record.exc_info:
+                seen.append("TRACEBACK")
+
+    handler = _Capture(level=logging.DEBUG)
+    logger = logging.getLogger("eight_sleep_etl")
+    saved = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    def restore():
+        logger.removeHandler(handler)
+        logger.setLevel(saved)
+    return seen, restore
+
+
+def test_heal_failure_paths_log_no_error_text() -> None:
+    """Scan failure (database or HTTP error) and a failing lookup are logged and
+    reported by type and code only: no URL, id, date or response body."""
+    seen, restore = _capture_es_log()
+    try:
+        scan_db = _heal(FakeSupabase([_trend_row("2026-11-01", sid="SID-9")],
+                                     fail_select=_leaky_db_error()),
+                        FakeClient({"SID-9": _interval()}))
+        scan_http = _heal(FakeSupabase([_trend_row("2026-11-01", sid="SID-9")],
+                                       fail_select=_leaky_http_error(502)),
+                          FakeClient({"SID-9": _interval()}))
+        lookup = _heal(FakeSupabase([_trend_row("2026-11-01", sid="SID-9")]),
+                       FakeClient({"SID-9": _leaky_http_error(503)}))
+    finally:
+        restore()
+    assert scan_db["scan_error"] == "candidate query failed (APIError PGRST205)", scan_db
+    assert scan_http["scan_error"] == "candidate query failed (HTTPStatusError 502)", scan_http
+    assert lookup["failed"] == 1, lookup
+    text = " | ".join(seen + [es._selfheal_summary(s, 20) for s in (scan_db, scan_http, lookup)])
+    assert "HTTPStatusError 503" in text, text
+    assert "TRACEBACK" not in text, "no exc_info on a heal failure"
+    for token in _LEAKY:
+        assert token not in text, (token, text)
 
 
 def test_client_get_interval_maps_404_to_none_and_raises_other_errors() -> None:
@@ -660,13 +745,37 @@ def test_main_heal_crash_or_scan_failure_is_partial_not_fatal() -> None:
     sb = MainDB([])
     by_type = _run_main(sb, FakeClient({}), [], heal=crash)
     assert by_type["trends"]["status"] == "partial" and by_type["trends"]["records_synced"] == 5
-    assert "self-heal crashed: heal exploded" in by_type["trends"]["error_message"]
+    assert "self-heal crashed (RuntimeError)" in by_type["trends"]["error_message"]
+    assert "heal exploded" not in by_type["trends"]["error_message"], "never the error text"
     assert by_type["temp_selfheal"]["status"] == "partial"
     # Candidate query fails (PostgREST down for that one read).
     sb2 = MainDB([_trend_row("2026-11-01", sid="S1")], fail_select=True)
     by_type2 = _run_main(sb2, FakeClient({"S1": _interval()}), [])
     assert by_type2["trends"]["status"] == "partial"
     assert "candidate query failed" in by_type2["trends"]["error_message"]
+
+
+def test_main_heal_failures_keep_error_text_out_of_log_and_heartbeats() -> None:
+    """main(): a heal crash and a failed candidate query reach the public log
+    and both heartbeats as type and code only."""
+    def crash(*_a, **_k):
+        raise _leaky_http_error(503)
+    seen, restore = _capture_es_log()
+    try:
+        crashed = _run_main(MainDB([]), FakeClient({}), [], heal=crash)
+        scanned = _run_main(MainDB([_trend_row("2026-11-01", sid="SID-9")],
+                                   fail_select=_leaky_db_error("42P01")),
+                            FakeClient({"SID-9": _interval()}), [])
+    finally:
+        restore()
+    assert "self-heal crashed (HTTPStatusError 503)" in crashed["trends"]["error_message"]
+    assert "candidate query failed (APIError 42P01)" in scanned["trends"]["error_message"]
+    messages = [r["error_message"] or "" for by in (crashed, scanned)
+                for r in (by["trends"], by["temp_selfheal"])]
+    text = " | ".join(seen + messages)
+    assert "TRACEBACK" not in text, "no exc_info on a heal failure"
+    for token in _LEAKY:
+        assert token not in text, (token, text)
 
 
 def test_main_reports_sync_errors_and_heal_problems_together() -> None:
