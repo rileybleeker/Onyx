@@ -1,4 +1,15 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import {
+  isOpKey,
+  newOpKey,
+  PRACTICE_GRADES,
+  QUIZ_CHECKPOINT_MAX,
+  rpcFailure,
+  scheduleAfterGrade,
+  type PracticeFailure,
+  type PracticeGrade,
+  type RpcAnswer,
+} from "@/lib/reading-practice";
 
 /**
  * Reading module — shared server logic for /api/reading/* and the chat tools.
@@ -16,7 +27,7 @@ type Supa = SupabaseClient<any, any, any>;
 
 export type Medium = "audio" | "kindle" | "paper" | "other";
 export type HighlightSource = "manual" | "kindle" | "audible" | "paper" | "photo";
-export type Grade = "again" | "good" | "easy";
+export type Grade = PracticeGrade;
 
 export interface Book {
   book_id: number;
@@ -1070,78 +1081,150 @@ export async function addHighlight(
 }
 
 /**
- * SM-2 lite. again → interval 1 day, ease −0.2 (floor 1.3). good → first review 3 days,
- * then interval × ease. easy → interval × ease × 1.3, ease +0.15. Returns the updated row.
+ * The review scheduler lives in lib/reading-practice.ts (SM-2 lite), shared by the commit below and the review
+ * card's previews, so the interval shown under a grade button is the one the server stores.
  */
-export function scheduleAfterGrade(h: Pick<Highlight, "ease" | "interval_days" | "review_count">, grade: Grade, today: string) {
-  let ease = Number(h.ease) || 2.5;
-  let interval = h.interval_days || 0;
-  if (grade === "again") {
-    ease = Math.max(1.3, ease - 0.2);
-    interval = 1;
-  } else if (grade === "good") {
-    interval = interval === 0 ? 1 : interval === 1 ? 3 : Math.round(interval * ease);
-  } else {
-    ease = Math.min(3.0, ease + 0.15);
-    interval = interval === 0 ? 3 : Math.round(interval * ease * 1.3);
+export { scheduleAfterGrade };
+
+export interface GradeInput {
+  highlight_id: number;
+  grade: Grade;
+  /** Operation key from the review card (one per card until a definite answer); absent = one is made here. */
+  op_key?: string | null;
+  /** The card's review count on screen: another grade in between answers 409 changed. */
+  expected_review_count?: number | null;
+  /** Behavioral day override (tests); default pds.behavioral_today_now(). */
+  date?: string | null;
+}
+
+export interface GradeReceipt {
+  op_key: string;
+  review_id: number;
+  review_date: string;
+  grade: Grade;
+  interval_days: number;
+  next_review: string;
+  review_count: number;
+}
+
+export type GradeResult =
+  | { ok: true; highlight: Highlight | null; firstReviewToday: boolean; replayed: boolean; receipt: GradeReceipt }
+  | PracticeFailure;
+
+/**
+ * Grade one highlight: ONE call of pds.reading_grade_review (sql/reading_practice_receipts.sql), which locks the
+ * highlight, stores the review, writes the schedule computed here and records the receipt in one transaction. The
+ * same op_key answers the stored receipt again (a retry after a lost answer); there is no direct-write fallback
+ * (a missing function is 503 practice_unavailable). When another write lands between the read and the lock
+ * (`raced`), the row is read again and the schedule recomputed, at most three times.
+ */
+export async function gradeHighlight(supabase: Supa, input: GradeInput): Promise<GradeResult> {
+  if (!PRACTICE_GRADES.includes(input.grade)) return { ok: false, status: 400, error: "bad_grade" };
+  if (!(Number.isInteger(input.highlight_id) && input.highlight_id > 0)) return { ok: false, status: 400, error: "bad_highlight" };
+  if (input.op_key != null && !isOpKey(input.op_key)) return { ok: false, status: 400, error: "bad_op_key" };
+  const opKey = input.op_key ?? newOpKey();
+  const today = input.date ?? (await behavioralToday(supabase));
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data: h, error } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", input.highlight_id).maybeSingle();
+    if (error) return { ok: false, status: 500, error: "failed" };
+    const row = (h as Highlight | null) ?? null;
+    // A missing row still goes to the function: the receipt of an earlier try answers first, else 404.
+    const basis = row ? { review_count: row.review_count, interval_days: row.interval_days, ease: Number(row.ease) } : null;
+    const schedule = row ? scheduleAfterGrade(row, input.grade, today) : null;
+    const { data, error: rpcError } = await supabase.rpc("reading_grade_review", {
+      p: {
+        op_key: opKey,
+        highlight_id: input.highlight_id,
+        grade: input.grade,
+        review_date: today,
+        basis,
+        schedule: schedule && { ease: schedule.ease, interval_days: schedule.interval_days, next_review: schedule.next_review },
+        client_review_count: input.expected_review_count ?? null,
+      },
+    });
+    const answer = data as RpcAnswer | null;
+    const failed = rpcFailure(answer, rpcError);
+    if (failed) {
+      if (failed.error === "raced" && attempt < 2) continue;
+      return failed.error === "raced" ? { ok: false, status: 409, error: "changed" } : failed;
+    }
+    const a = answer as RpcAnswer;
+    let highlight = (a.highlight as Highlight | undefined) ?? null;
+    if (a.replayed) {
+      // The receipt holds the schedule as committed; the row itself may have moved on since. Best effort.
+      const { data: now } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", input.highlight_id).maybeSingle();
+      highlight = (now as Highlight | null) ?? null;
+    }
+    if (highlight) highlight = { ...highlight, ease: Number(highlight.ease) };
+    return {
+      ok: true,
+      highlight,
+      firstReviewToday: a.first_review_today === true,
+      replayed: a.replayed === true,
+      receipt: {
+        op_key: opKey,
+        review_id: Number(a.review_id),
+        review_date: String(a.review_date),
+        grade: a.grade as Grade,
+        interval_days: Number(a.interval_days),
+        next_review: String(a.next_review),
+        review_count: Number(a.review_count),
+      },
+    };
   }
-  interval = Math.max(1, Math.min(interval, 365));
-  return {
-    ease: Math.round(ease * 100) / 100,
-    interval_days: interval,
-    next_review: addDays(today, interval),
-    last_reviewed: today,
-    review_count: (h.review_count ?? 0) + 1,
-  };
+  return { ok: false, status: 409, error: "changed" };
 }
 
-export async function gradeHighlight(
-  supabase: Supa,
-  highlight_id: number,
-  grade: Grade,
-  date?: string | null,
-): Promise<{ ok: true; highlight: Highlight; firstReviewToday: boolean } | { ok: false; error: string }> {
-  if (!["again", "good", "easy"].includes(grade)) return { ok: false, error: "grade must be again | good | easy" };
-  const { data: h, error } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", highlight_id).maybeSingle();
-  if (error) return { ok: false, error: error.message };
-  if (!h) return { ok: false, error: "highlight not found" };
-  const today = date ?? (await behavioralToday(supabase));
-
-  const { count } = await supabase
-    .from("reading_reviews")
-    .select("review_id", { count: "exact", head: true })
-    .eq("review_date", today);
-  const firstReviewToday = (count ?? 0) === 0;
-
-  const { error: rErr } = await supabase.from("reading_reviews").insert({ highlight_id, review_date: today, grade });
-  if (rErr) return { ok: false, error: rErr.message };
-  const patch = scheduleAfterGrade(h as Highlight, grade, today);
-  const { data: updated, error: uErr } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select(HIGHLIGHT_COLS).single();
-  if (uErr) return { ok: false, error: uErr.message };
-  return { ok: true, highlight: updated as Highlight, firstReviewToday };
+export interface QuizInput {
+  slug?: string | null;
+  book_id?: number | null;
+  checkpoint: string;
+  score: number;
+  total: number;
+  notes?: string | null;
+  date?: string | null;
+  /** Operation key: the same key + result answers the stored receipt (no second row, no second points). */
+  op_key?: string | null;
 }
 
-export async function recordQuiz(
-  supabase: Supa,
-  input: { slug?: string | null; book_id?: number | null; checkpoint: string; score: number; total: number; notes?: string | null; date?: string | null },
-): Promise<{ ok: true; quiz: Quiz; passed: boolean } | { ok: false; error: string }> {
+export type QuizResult = { ok: true; quiz: Quiz; passed: boolean; replayed: boolean; op_key: string } | PracticeFailure;
+
+/**
+ * Record a checkpoint quiz result: ONE call of pds.reading_record_quiz (quiz row + receipt, one transaction). Each
+ * stored row is one durable attempt and counts toward XP; a retry under the same op_key stores nothing new.
+ * Without a key (chat, an older page) one is made here, so that call is atomic but a retry of it is a new attempt.
+ */
+export async function recordQuiz(supabase: Supa, input: QuizInput): Promise<QuizResult> {
+  if (input.op_key != null && !isOpKey(input.op_key)) return { ok: false, status: 400, error: "bad_op_key" };
   const book = input.book_id
     ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
-  if (!book) return { ok: false, error: "No active book found" };
+  if (!book) return { ok: false, status: 404, error: "No active book found" };
   const score = Math.round(Number(input.score));
   const total = Math.round(Number(input.total));
-  if (!(total > 0) || !(score >= 0) || score > total) return { ok: false, error: "score must be between 0 and total" };
+  if (!(total > 0) || !(score >= 0) || score > total) return { ok: false, status: 400, error: "score must be between 0 and total" };
   const checkpoint = input.checkpoint?.trim();
-  if (!checkpoint) return { ok: false, error: "checkpoint is required (e.g. ch12)" };
-  const quiz_date = input.date ?? (await behavioralToday(supabase));
-  const { data, error } = await supabase
-    .from("reading_quizzes")
-    .insert({ book_id: book.book_id, checkpoint, score, total, notes: input.notes?.trim() || null, quiz_date })
-    .select(QUIZ_COLS)
-    .single();
-  if (error) return { ok: false, error: error.message };
-  return { ok: true, quiz: data as Quiz, passed: score / total >= 0.8 };
+  if (!checkpoint) return { ok: false, status: 400, error: "checkpoint is required (e.g. ch12)" };
+  if (checkpoint.length > QUIZ_CHECKPOINT_MAX) return { ok: false, status: 400, error: "checkpoint is too long" };
+  const notes = input.notes?.trim() || null;
+  const opKey = input.op_key ?? newOpKey();
+  const { data, error } = await supabase.rpc("reading_record_quiz", {
+    p: { op_key: opKey, book_id: book.book_id, checkpoint, score, total, notes, quiz_date: input.date ?? null },
+  });
+  const failed = rpcFailure(data as RpcAnswer | null, error);
+  if (failed) return failed;
+  const a = data as RpcAnswer;
+  const quiz: Quiz = {
+    quiz_id: Number(a.quiz_id),
+    book_id: Number(a.book_id),
+    checkpoint: String(a.checkpoint),
+    score: Number(a.score),
+    total: Number(a.total),
+    notes,
+    quiz_date: String(a.quiz_date),
+  };
+  return { ok: true, quiz, passed: a.passed === true, replayed: a.replayed === true, op_key: opKey };
 }
 
 /** Compact text summary for the chat tool (so the model can coach and quiz). */
