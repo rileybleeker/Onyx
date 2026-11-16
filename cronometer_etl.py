@@ -343,12 +343,16 @@ def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False,
         # The window is what WE asked Cronometer for; it is what lets the importer
         # treat a day missing from the export as empty (never the first or last
         # day: nothing has checked that both ends are inclusive). Without it the
-        # import is the manual one, which never empties a day.
+        # import is the manual one, which never empties a day. The roles say which
+        # file is which: each is checked as the file it is meant to be, so one whose
+        # header was damaged in transit is refused as that file and the dates it
+        # shows still count as food seen, instead of it being classified by its
+        # header as the other file or as nothing.
         if not empty_days:
             log.info("Emptying days with no food is off (--no-empty-days / CRONOMETER_EMPTY_DAYS)")
             return run_import([spath, dpath], dry_run=dry_run)
         return run_import([spath, dpath], dry_run=dry_run, window=(start, end),
-                          max_empty_days=max_empty_days)
+                          max_empty_days=max_empty_days, roles=("servings", "daily"))
 
 
 def main() -> None:

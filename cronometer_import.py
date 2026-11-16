@@ -16,6 +16,8 @@ Usage:
     - servings.csv and/or dailysummary.csv directly
 
 Files are classified by their header row (not filename), so renamed exports work.
+The automated export (cronometer_etl.py) names its two files instead (run_import
+roles), so a file whose header was damaged is checked as the file it is meant to be.
 
 Idempotency:
     - cronometer_nutrition_daily : upsert on calendar_date (from dailysummary "Total" rows).
@@ -341,8 +343,50 @@ def classify(path: str) -> str | None:
     return None
 
 
-def resolve_inputs(paths: list[str], tmpdir: str) -> tuple[str | None, str | None]:
-    """Expand zips/dirs/csvs into (servings_path, daily_path)."""
+ROLES = ("servings", "daily")
+
+
+@dataclass(frozen=True)
+class ExportInputs:
+    servings: str | None
+    daily: str | None
+    # CSV inputs taken as neither file (only when the files are classified by header):
+    # a header classify() does not recognize, e.g. a servings file that lost its Food
+    # Name column, or a second file of a kind already taken, e.g. a servings file with
+    # a Date column and no Food Name, which reads as a daily summary. The automated
+    # export treats them as possible food on any day of its window.
+    rejected: tuple[str, ...] = ()
+
+
+def check_roles(paths: list[str], roles) -> tuple[str, ...] | None:
+    """Validate the roles a caller names for its files: None, or one role per path,
+    exactly one "servings" and one "daily"."""
+    if roles is None:
+        return None
+    roles = tuple(roles)
+    if len(roles) != len(paths) or sorted(roles) != sorted(ROLES):
+        raise ValueError('roles must name each path once: one "servings" and one "daily"')
+    return roles
+
+
+def resolve_export_inputs(paths: list[str], tmpdir: str, roles=None) -> ExportInputs:
+    """Pick servings.csv and dailysummary.csv out of the inputs.
+
+    roles (one per path, see check_roles): the caller wrote the files itself and
+    knows which is which (the automated export). Each path then IS that file,
+    whatever its header says, so a file whose header was damaged in transit is
+    checked, and refused, as the file it is meant to be, and the dates it shows
+    still count as food seen. Classified by header instead, such a file was either
+    dropped (no Food Name) or taken for the other file (a Date column), and the
+    food it showed was never seen (Codex review).
+
+    Without roles (manual exports, renamed files, zips, folders) the files are
+    classified by header; every CSV not taken is listed in `rejected`.
+    """
+    roles = check_roles(paths, roles)
+    if roles is not None:
+        by_role = dict(zip(roles, paths))
+        return ExportInputs(by_role["servings"], by_role["daily"])
     candidates: list[str] = []
     for p in paths:
         if p.lower().endswith(".zip"):
@@ -361,13 +405,22 @@ def resolve_inputs(paths: list[str], tmpdir: str) -> tuple[str | None, str | Non
             print(f"  ! skipping unrecognized input: {p}")
 
     servings_path = daily_path = None
+    rejected: list[str] = []
     for c in candidates:
         kind = classify(c)
         if kind == "servings" and servings_path is None:
             servings_path = c
         elif kind == "daily" and daily_path is None:
             daily_path = c
-    return servings_path, daily_path
+        else:
+            rejected.append(c)
+    return ExportInputs(servings_path, daily_path, tuple(rejected))
+
+
+def resolve_inputs(paths: list[str], tmpdir: str) -> tuple[str | None, str | None]:
+    """Expand zips/dirs/csvs into (servings_path, daily_path), classified by header."""
+    inputs = resolve_export_inputs(paths, tmpdir)
+    return inputs.servings, inputs.daily
 
 
 # ── Row builders ────────────────────────────────────────────────────────────────
@@ -516,6 +569,12 @@ def build_daily_rows(csv_path: str) -> list[dict]:
 # its empty-day record. Otherwise an export with food on a day whose rows are not
 # written (the files disagree, a value cannot be read) would leave an older first
 # look behind, and the next export that missed the day would empty it on one look.
+# The same holds for a file whose header was damaged: the automated export names
+# which file is which (run_import roles), so a servings file that lost its Food Name
+# column is still read as the servings file (not usable, its dated rows are food
+# seen) instead of being dropped or taken for the daily summary by its header; and
+# when files are classified by header, a file taken as neither may hold food on any
+# day, so every day of the window forgets its record (Codex review).
 #
 # Elapsed time is not coverage. A day is only offered for emptying when the same
 # export has food on a day before it AND on a day after it: then the export itself
@@ -611,10 +670,10 @@ class ExportCheck:
 def scan_export_file(path: str | None, kind: str) -> FileScan:
     """Structural check of one automated-export file ('servings' or 'daily').
 
-    Well formed = the expected header columns exist (Food Name for servings, and
-    Energy in both files) and every non-blank row has exactly as many cells as the
-    header and a readable date. A row with fewer or more cells is how a garbled
-    download shows up in a CSV.
+    Well formed = the expected header columns exist (Food Name in servings and not
+    in the daily summary, and Energy in both files) and every non-blank row has
+    exactly as many cells as the header and a readable date. A row with fewer or
+    more cells is how a garbled download shows up in a CSV.
 
     Every nutrient cell is read with strict_num: blank adds nothing (a value
     Cronometer does not have for that food or day), a finite number counts, and
@@ -625,8 +684,9 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
     and every cell also adds its own rounding (half_unit) to the day's slack.
 
     food_dates is filled in even when the file is not well formed (any row with a
-    readable date then counts), so food seen in a broken download still starts
-    that day's empty-day count over; a row whose date cannot be read sets undated.
+    readable date then counts, also in a file whose header lost a column), so food
+    seen in a broken download still starts that day's empty-day count over; a row
+    whose date cannot be read (or a file with no date column) sets undated.
     """
     label = "servings.csv" if kind == "servings" else "dailysummary.csv"
     if not path:
@@ -660,6 +720,11 @@ def scan_export_file(path: str | None, kind: str) -> FileScan:
     if kind == "servings" and "food name" not in col_index:
         days, undated = dated_rows()
         return FileScan(False, f"{label} has no Food Name column", food_dates=days, undated=undated)
+    # A file handed over as the daily summary that has a Food Name column is a servings
+    # file (the two were swapped): its rows are food entries, not daily totals.
+    if kind == "daily" and "food name" in col_index:
+        days, undated = dated_rows()
+        return FileScan(False, f"{label} has a Food Name column", food_dates=days, undated=undated)
     # Both files: without Energy the two could share no nutrient, and two files
     # that compare nothing agree on everything.
     if REQUIRED_NUTRIENT not in col_index:
@@ -762,10 +827,14 @@ def _sums_agree(servings: dict[str, float], daily: dict[str, float], nutrients,
 
 
 def check_trusted_export(window: tuple[date, date], servings_path: str | None,
-                         daily_path: str | None) -> ExportCheck:
+                         daily_path: str | None, rejected: tuple[str, ...] = ()) -> ExportCheck:
     """Decide what an automated export of `window` may write and empty.
 
     Not usable (write no servings) when a file is missing or not well formed.
+    rejected: input files taken as neither file (ExportInputs.rejected). Any of
+    them makes the export unusable for both files (which one is the real daily
+    summary is then in doubt, so neither is written), and since such a file may
+    hold food on any day, every day of the window is in food_dates.
     Complete (days without food are passed to the database, which empties a stored
     one on its second look) only when, in addition, every date lies in the window,
     every nutrient cell the files carry for the window is blank or a finite number,
@@ -793,9 +862,12 @@ def check_trusted_export(window: tuple[date, date], servings_path: str | None,
     d = scan_export_file(daily_path, "daily")
     daily_skip = tuple(sorted(d.invalid_dates | d.no_energy_dates)) if d.ok else ()
     food_seen = s.food_dates | d.food_dates
-    if s.undated or d.undated:
+    if s.undated or d.undated or rejected:
         food_seen |= frozenset(_window_dates(start, end))
     food = tuple(sorted(food_seen))
+    if rejected:
+        reason = f"{len(rejected)} input file(s) could not be read as servings.csv or dailysummary.csv"
+        return ExportCheck(False, False, reason, False, reason, food_dates=food)
     if not s.ok or not d.ok:
         reason = s.reason if not s.ok else d.reason
         return ExportCheck(False, False, reason or "the export is not usable", d.ok, d.reason,
@@ -1219,7 +1291,7 @@ def confirmed_count(sb, days) -> int | None:
 
 # ── Orchestration ────────────────────────────────────────────────────────────────
 def run_import(paths: list[str], dry_run: bool = False, window: tuple[date, date] | None = None,
-               max_empty_days: int = DEFAULT_MAX_EMPTY_DAYS) -> tuple[int, int]:
+               max_empty_days: int = DEFAULT_MAX_EMPTY_DAYS, roles=None) -> tuple[int, int]:
     """Return (servings_count, daily_count). Emits a sync_log heartbeat per data_type.
 
     window: ONLY the automated export passes it: the (start, end) dates it asked
@@ -1236,19 +1308,32 @@ def run_import(paths: list[str], dry_run: bool = False, window: tuple[date, date
     servings of the dates with rows are replaced and the daily totals upserted in
     one call, which never empties a day and starts the empty-day count of every
     day it writes over.
+
+    roles: one of "servings" / "daily" per path (check_roles), from the automated
+    export, which wrote both files itself. With a window each path is then read as
+    that file, never classified by its header (resolve_export_inputs). A manual
+    import (no window, or a window longer than MAX_WINDOW_DAYS) still classifies
+    by header: it never empties a day, and a file that does not look like its
+    role is left unwritten rather than written to the wrong table.
     """
     trusted = trusted_window(window)
+    roles = check_roles(paths, roles)
     if window is not None and trusted is None:
         print(f"  note: window longer than {MAX_WINDOW_DAYS} days; days with no food are not emptied")
     sb = None if dry_run else create_client(SUPABASE_URL, SUPABASE_KEY)
     tz_log = load_tz_log(sb)  # materialized TZ ladder for Gold-timestamp localization
     with tempfile.TemporaryDirectory() as tmp:
-        servings_path, daily_path = resolve_inputs(paths, tmp)
-        if not servings_path and not daily_path:
-            raise SystemExit("No Cronometer servings.csv or dailysummary.csv found in inputs.")
+        inputs = resolve_export_inputs(paths, tmp, roles if trusted is not None else None)
         if trusted is None:
-            return _import_dates(servings_path, daily_path, dry_run, sb, tz_log)
-        return _import_window(trusted, servings_path, daily_path, dry_run, sb, tz_log, max_empty_days)
+            if not inputs.servings and not inputs.daily:
+                raise SystemExit("No Cronometer servings.csv or dailysummary.csv found in inputs.")
+            return _import_dates(inputs.servings, inputs.daily, dry_run, sb, tz_log)
+        # An automated export whose files are all rejected still goes through the
+        # check: those files may hold food on any day of the window, and their
+        # empty-day records must be forgotten even though nothing is written.
+        if not inputs.servings and not inputs.daily and not inputs.rejected:
+            raise SystemExit("No Cronometer servings.csv or dailysummary.csv found in inputs.")
+        return _import_window(trusted, inputs, dry_run, sb, tz_log, max_empty_days)
 
 
 def _log_range(sb, data_type: str, status: str, rows: list[dict], count: int, started: float,
@@ -1294,10 +1379,11 @@ def _import_dates(servings_path, daily_path, dry_run, sb, tz_log) -> tuple[int, 
     return scount, dcount
 
 
-def _import_window(window, servings_path, daily_path, dry_run, sb, tz_log,
+def _import_window(window, inputs: ExportInputs, dry_run, sb, tz_log,
                    max_empty_days) -> tuple[int, int]:
     """Automated export: checked, then one transaction (see run_import)."""
-    check = check_trusted_export(window, servings_path, daily_path)
+    servings_path, daily_path = inputs.servings, inputs.daily
+    check = check_trusted_export(window, servings_path, daily_path, rejected=inputs.rejected)
     t0 = now_epoch()
     lo, hi = window[0].isoformat(), window[1].isoformat()
     daily_skip = set(check.daily_skip_dates)

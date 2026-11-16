@@ -1479,6 +1479,149 @@ def test_a_row_without_a_readable_date_forgets_every_window_day() -> None:
         assert not ci.scan_export_file(_export(tmp, UPSTREAM)[0], "servings").undated
 
 
+AS_THE_ETL = ("servings", "daily")      # the roles cronometer_etl.py names for [servings.csv, dailysummary.csv]
+RESTORED = UPSTREAM + [("2030-01-05", "test rice", 100.0)]
+DAMAGED_HEADERS = {
+    "no Food Name column": "Day,Time,Group,Food,Amount,Energy (kcal),Protein (g)",
+    "no Food Name column, Date instead of Day": "Date,Time,Group,Food,Amount,Energy (kcal),Protein (g)",
+    "no Food Name and no date column": "When,Time,Group,Food,Amount,Energy (kcal),Protein (g)",
+}
+
+
+def _damaged_export(folder, header):
+    """Food back on 2030-01-05 in servings.csv, whose header was damaged in transit, and
+    a daily summary that misses that day (so only the servings file shows the food)."""
+    spath, dpath = _export(folder, RESTORED, daily=[("2030-01-02", 200.0), ("2030-01-07", 100.0)])
+    lines = Path(spath).read_text(encoding="utf-8-sig").splitlines()
+    _write(folder, "servings.csv", [header] + lines[1:])
+    return [spath, dpath]
+
+
+def test_a_servings_file_with_a_damaged_header_still_counts_as_food_seen() -> None:
+    """Codex review (PIPE03-R7): the files were sorted into servings / daily by header
+    only. A servings file that lost its Food Name column was dropped, or with a Date
+    column taken for the daily summary, so the food it showed was never seen: an older
+    first look survived it and the next export that missed the day emptied it on the
+    old count. The automated export now names which file is which (roles), so the file
+    is refused as the servings file it is and its dated rows are food seen; files
+    classified by header that are taken as neither reset every day of the window."""
+    for (label, header), roles in ((h, r) for h in DAMAGED_HEADERS.items() for r in (AS_THE_ETL, None)):
+        name = f"{label}, {'roles' if roles else 'classified by header'}"
+        servings, daily = _stored()
+        db = FakeDB(servings, daily)
+        kw = {"window": WINDOW, "roles": roles}
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as tmp2:
+            missed = _export(tmp, UPSTREAM)
+            _run(db, missed, **kw)                                   # first look at 2030-01-05
+            first_seen = db.candidates["2030-01-05"]["first_seen_at"]
+            db.advance(LATER)
+            paths = _damaged_export(tmp2, header)
+            scan = ci.scan_export_file(paths[0], "servings")
+            assert not scan.ok and scan.reason == "servings.csv has no Food Name column", (name, scan.reason)
+            assert "2030-01-05" in scan.food_dates or scan.undated, name
+            _run(db, paths, **kw)                                    # food on the day, nothing written
+            p = _calls(db, WINDOW_FN)[-1]
+            assert p["p_rows"] == [] and p["p_empty_dates"] == [] and p["p_servings_empty_dates"] == [], name
+            assert "2030-01-05" in p["p_food_dates"], (name, p["p_food_dates"])
+            assert db.candidates == {}, f"{name}: the old first look survived food seen on the day"
+            hb = _hb(db)
+            assert hb["servings"]["status"] == "partial" and hb["daily"]["status"] == "partial", name
+            if roles:
+                # The daily summary is still well formed and written, under the same lock.
+                assert [r["calendar_date"] for r in p["p_daily_rows"]] == ["2030-01-02", "2030-01-07"], name
+                assert "has no Food Name column" in hb["servings"]["error_message"], name
+            else:
+                # Which file is the real daily summary is in doubt: neither is written.
+                assert p["p_daily_rows"] == [], name
+                assert set(ci._window_dates(*WINDOW)) <= set(p["p_food_dates"]), name
+                assert "could not be read as servings.csv or dailysummary.csv" in hb["servings"]["error_message"]
+            assert "test rice" not in hb["servings"]["error_message"], "reasons carry counts only"
+            _run(db, missed, **kw)               # missed again, past the old look's 6 h: a first look only
+            assert _names(db, "2030-01-05") == ["test rice"] and "2030-01-05" in db.daily, name
+            assert db.cleared == [], f"{name}: emptied on the count from before the food was seen"
+            assert db.candidates["2030-01-05"]["first_seen_at"] == db.now != first_seen, name
+            db.advance(LATER)
+            _run(db, missed, **kw)                                   # the real second look
+        assert _names(db, "2030-01-05") == [] and "2030-01-05" not in db.daily, name
+        assert {c["calendar_date"] for c in db.cleared} == {"2030-01-05"}, name
+
+
+def test_input_roles_are_checked_and_files_given_the_wrong_role_write_nothing() -> None:
+    for bad in (("servings",), ("servings", "servings"), ("daily", "daily"), ("servings", "daily", "daily"),
+                ("servings", "summary")):
+        try:
+            ci.check_roles(["a.csv", "b.csv"], bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"roles {bad!r} must be refused")
+    assert ci.check_roles(["a.csv", "b.csv"], ["daily", "servings"]) == ("daily", "servings")
+    with tempfile.TemporaryDirectory() as tmp:
+        spath, dpath = _export(tmp, RESTORED)
+        # Roles decide, not headers or names.
+        got = ci.resolve_export_inputs([dpath, spath], tmp, ("servings", "daily"))
+        assert (got.servings, got.daily, got.rejected) == (dpath, spath, ())
+        # A servings file handed over as the daily summary is refused as that file, and
+        # its rows still count as food seen.
+        scan = ci.scan_export_file(spath, "daily")
+        assert not scan.ok and scan.reason == "dailysummary.csv has a Food Name column", scan.reason
+        assert {"2030-01-02", "2030-01-05", "2030-01-07"} <= scan.food_dates
+        servings, daily = _stored()
+        db = FakeDB(servings, daily)
+        db.candidates["2030-01-05"] = {"first_seen_at": db.now - timedelta(hours=LATER),
+                                       "last_seen_at": db.now - timedelta(hours=LATER), "times_seen": 1}
+        before, daily_before = _names(db), copy.deepcopy(db.daily)
+        _run(db, [spath, dpath], window=WINDOW, roles=("daily", "servings"))      # swapped
+        (p,) = _calls(db, WINDOW_FN)
+        assert p["p_rows"] == [] and p["p_daily_rows"] == [] and p["p_empty_dates"] == []
+        assert _names(db) == before and db.daily == daily_before and db.candidates == {}
+        # Classified by header: the extra file is listed, not silently dropped.
+        extra = _write(tmp, "notes.csv", ["Day,Note", "2030-01-05,synthetic"])
+        got = ci.resolve_export_inputs([spath, dpath, extra], tmp)
+        assert (got.servings, got.daily, got.rejected) == (spath, dpath, (extra,))
+        assert ci.resolve_inputs([spath, dpath, extra], tmp) == (spath, dpath)
+        check = ci.check_trusted_export(WINDOW, got.servings, got.daily, rejected=got.rejected)
+        assert not check.usable and not check.daily_ok and set(ci._window_dates(*WINDOW)) <= set(check.food_dates)
+        assert "notes" not in check.reason and "synthetic" not in check.reason, "counts only"
+
+
+def test_etl_end_to_end_a_damaged_servings_header_starts_the_count_over() -> None:
+    etl = _etl()
+    today = date.today()
+    d_kept, d_gone, d_after = ((today - timedelta(days=n)).isoformat() for n in (3, 2, 1))
+    db = FakeDB([_srow(d_kept, "test oats"), _srow(d_gone, "test rice"), _srow(d_after, "test soup")],
+                [_drow(d_kept, 100.0), _drow(d_gone, 100.0), _drow(d_after, 100.0)])
+    damaged = {"on": False}
+
+    def fake_export(_client, _token, generate, _start, _end):
+        if generate == "servings":
+            header = S_HEADER.replace("Food Name", "Food") if damaged["on"] else S_HEADER
+            back = f"\n{d_gone},8:00 AM,Breakfast,test rice,1.00 g,100.0,1.0" if damaged["on"] else ""
+            return ("﻿" + header + f"\n{d_kept},8:00 AM,Breakfast,test oats,1.00 g,100.0,1.0" + back
+                    + f"\n{d_after},8:00 AM,Breakfast,test soup,1.00 g,100.0,1.0\n")
+        return "﻿" + D_HEADER + f"\n{d_kept},Total,100.0,1.0,false\n{d_after},Total,100.0,1.0,false\n"
+
+    saved = ci.create_client
+    ci.create_client = lambda *_a, **_k: db
+    try:
+        with _Patch(etl, authenticate_session=_fake_auth, mint_token=lambda *a, **k: "TOKEN",
+                    export_csv=fake_export, _save_session=lambda *a, **k: None):
+            etl.fetch_and_import(days=30, dry_run=False)                   # first look at d_gone
+            assert d_gone in db.candidates
+            db.advance(LATER)
+            damaged["on"] = True
+            assert etl.fetch_and_import(days=30, dry_run=False) == (0, 2)  # food back, header damaged
+            assert db.candidates == {}, "the damaged file's food did not start the count over"
+            damaged["on"] = False
+            etl.fetch_and_import(days=30, dry_run=False)                   # missed again: a first look
+            assert _names(db, d_gone) == ["test rice"] and db.cleared == []
+            db.advance(LATER)
+            etl.fetch_and_import(days=30, dry_run=False)                   # the second look
+    finally:
+        ci.create_client = saved
+    assert _names(db, d_gone) == [] and {c["calendar_date"] for c in db.cleared} == {d_gone}
+
+
 def test_food_seen_on_a_day_that_is_not_written_starts_its_count_over() -> None:
     """Codex review (round 2 of the fix): an export with food on a day whose rows are not
     written (its daily total cannot be read, it has no daily Total row, or the file is
@@ -1729,8 +1872,8 @@ def test_etl_passes_the_window_it_requested() -> None:
     etl = _etl()
     seen = {}
 
-    def fake_run_import(paths, dry_run=False, window=None, max_empty_days=None):
-        seen.update(paths=paths, dry_run=dry_run, window=window, max_empty_days=max_empty_days)
+    def fake_run_import(paths, dry_run=False, window=None, max_empty_days=None, roles=None):
+        seen.update(paths=paths, dry_run=dry_run, window=window, max_empty_days=max_empty_days, roles=roles)
         return 0, 0
 
     requested = []
@@ -1745,12 +1888,15 @@ def test_etl_passes_the_window_it_requested() -> None:
         start, end = seen["window"]
         assert type(start) is date and type(end) is date, "the window must be plain dates"
         assert (end - start).days == 14 and seen["max_empty_days"] == 2 and seen["dry_run"] is True
+        # It names which file is which, so neither is classified by its header (Codex PIPE03-R7).
+        assert seen["roles"] == ("servings", "daily"), seen["roles"]
+        assert [os.path.basename(x) for x in seen["paths"]] == ["servings.csv", "dailysummary.csv"]
         assert requested == [("servings", start.isoformat(), end.isoformat()),
                              ("dailySummary", start.isoformat(), end.isoformat())]
         # The switch off: imported like a manual export (no window, nothing emptied).
         seen.clear()
         etl.fetch_and_import(days=14, dry_run=True, empty_days=False)
-        assert seen["window"] is None
+        assert seen["window"] is None and seen["roles"] is None
 
 
 def test_etl_switch_reads_the_flag_and_the_environment() -> None:
