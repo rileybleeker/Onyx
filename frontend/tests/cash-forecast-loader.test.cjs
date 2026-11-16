@@ -1,7 +1,9 @@
 // Run: node --test tests/cash-forecast-loader.test.cjs
 // The cash forecast loader (lib/cash-forecast-server.ts loadForecast) end to end against an in-memory stand-in
 // for the finance tables: which tax years reach the forecast across New Year, and the full what-if result of the
-// other-income lever. SYNTHETIC DATA ONLY: invented accounts, salary, dates and amounts. No network, no database.
+// other-income lever, and the safe-to-move gate (a failed plan read, a truncated read, a stale balance withhold the
+// amount in the base plan and the what-if alike). SYNTHETIC DATA ONLY: invented accounts, salary, dates and amounts.
+// No network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
@@ -19,8 +21,9 @@ const PROFILE = {
   estimatesPaid: [],
 };
 
-// Every table the loader reads; each query resolves to the table's rows (filters are not needed here).
-function fakeDb(now, { profile = PROFILE, txns = [] } = {}) {
+// Every table the loader reads; each query resolves to the table's rows (filters are not needed here). A table in
+// `failing` answers a database error instead.
+function fakeDb(now, { profile = PROFILE, txns = [], failing = [] } = {}) {
   const tables = {
     finance_accounts: [{ account_key: "demo-checking", institution: "Demo Bank", account_name: "Checking", account_type: "Cash", mask: "0001" }],
     finance_balance_snapshots: [{ account_key: "demo-checking", captured_at: new Date(now.getTime() - 3_600_000).toISOString(), balance_cents: 5_000_000, currency: "USD", kind: "asset" }],
@@ -36,8 +39,9 @@ function fakeDb(now, { profile = PROFILE, txns = [] } = {}) {
     from(table) {
       assert.ok(table in tables, `unexpected table ${table}`);
       const rows = tables[table];
+      const answer = failing.includes(table) ? { data: null, error: { code: "57014", message: "synthetic failure" }, count: null } : { data: rows, error: null, count: rows.length };
       const b = new Proxy({}, {
-        get: (_, k) => (k === "then" ? (res, rej) => Promise.resolve({ data: rows, error: null, count: rows.length }).then(res, rej) : () => b),
+        get: (_, k) => (k === "then" ? (res, rej) => Promise.resolve(answer).then(res, rej) : () => b),
       });
       return b;
     },
@@ -51,7 +55,7 @@ function loader(opts) {
       serviceClient: () => fakeDb(box.now, opts),
       fetchPaged: async (build) => {
         const r = await build(0, 999, true);
-        return { rows: r.data ?? [], truncated: false };
+        return { rows: r.data ?? [], truncated: !!opts?.truncated };
       },
       loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map() }),
     },
@@ -137,4 +141,66 @@ test("other income the tax profile already has is not added again; no tax profil
   const gross = noProfile.scenario.result.lines.filter((l) => l.sourceId.startsWith("wi:other:"));
   assert.equal(gross[0].date, "2027-02-26");
   assert.ok(noProfile.scenario.result.warnings.some((w) => /before tax/.test(w)));
+});
+
+// ─── the safe-to-move gate (lib/cash-forecast.ts eligibility) through the loader ─────────────────
+/** Synthetic everyday debits from checking, every 3 days for 16 weeks before `iso` (enough history for the baseline). */
+function everyday(iso) {
+  const out = [];
+  for (let i = 1; i <= 37; i++) {
+    const d = new Date(Date.parse(iso) - i * 3 * 86_400_000).toISOString().slice(0, 10);
+    out.push({ txn_key: `e${i}`, account_key: "demo-checking", txn_date: d, name: `Demo Shop ${String.fromCharCode(65 + (i % 26))}`, custom_name: null, amount_cents: 3_000 + (i % 4) * 500, currency: "USD", category: "Shopping", ignored_from: null });
+  }
+  return out;
+}
+const AT = "2026-11-14T17:00:00Z";
+
+test("complete, fresh reads: the base plan and the what-if both carry an amount, from the same gate", async () => {
+  const load = await loader({ txns: everyday(AT) })(AT, { otherIncome: 6_000 });
+  assert.equal(load.setupPending, false);
+  assert.deepEqual(load.result.eligibility, { eligible: true, reasons: [] });
+  assert.equal(typeof load.result.headlines.safeToMoveCents, "number");
+  assert.deepEqual(load.scenario.result.eligibility, load.result.eligibility, "the what-if reads the same inputs");
+  assert.equal(typeof load.scenario.result.headlines.safeToMoveCents, "number");
+});
+
+test("a failed plan read: setupPending, and no amount in the base plan or the what-if", async () => {
+  for (const failing of [["finance_plan_items"], ["finance_plan_drivers"]]) {
+    const load = await loader({ txns: everyday(AT), failing })(AT, { otherIncome: 6_000 });
+    assert.equal(load.setupPending, true, failing[0]);
+    assert.deepEqual(load.result.eligibility.reasons.map((r) => r.code), ["plan-unavailable"], failing[0]);
+    assert.equal(load.result.headlines.safeToMoveCents, null);
+    assert.deepEqual(load.scenario.result.eligibility, load.result.eligibility);
+    assert.equal(load.scenario.result.headlines.safeToMoveCents, null);
+    assert.ok(load.result.days.length > 0, "the projection is still drawn");
+  }
+  // The goals or the snapshots failing does not touch the gate (they are not inputs to the amount).
+  const goals = await loader({ txns: everyday(AT), failing: ["finance_goals", "finance_forecast_snapshots"] })(AT);
+  assert.equal(goals.result.eligibility.eligible, true);
+});
+
+test("a truncated history read: no amount, and the warning appears once", async () => {
+  const load = await loader({ txns: everyday(AT), truncated: true })(AT);
+  assert.deepEqual(load.result.eligibility.reasons.map((r) => r.code), ["history-truncated"]);
+  assert.equal(load.result.headlines.safeToMoveCents, null);
+  assert.equal(load.result.warnings.filter((w) => /page limit/.test(w)).length, 1);
+});
+
+test("a balance older than 48 hours at load time: no amount until the next sync", async () => {
+  const fresh = await loader({ txns: everyday(AT) })(AT);
+  assert.equal(fresh.result.eligibility.eligible, true);
+  // Three days on with no new snapshot: the stand-in's balance stays dated 1 h before AT.
+  const later = new Date(Date.parse(AT) + 3 * 86_400_000).toISOString();
+  const S = loadTs("lib/cash-forecast-server.ts", {
+    "server-only": {},
+    "@/lib/finance-ledger-server": {
+      serviceClient: () => fakeDb(new Date(AT), { txns: everyday(AT) }),
+      fetchPaged: async (build) => ({ rows: (await build(0, 999, true)).data ?? [], truncated: false }),
+      loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map() }),
+    },
+  });
+  const stale = await S.loadForecast(new Date(later));
+  assert.equal(stale.kind, "ok");
+  assert.deepEqual(stale.result.eligibility.reasons.map((r) => r.code), ["stale-balance"]);
+  assert.equal(stale.result.headlines.safeToMoveCents, null);
 });

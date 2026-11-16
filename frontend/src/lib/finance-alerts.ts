@@ -3,6 +3,7 @@
  * over, a 0% promo ending soon, a tax payment due soon. PURE: no I/O. Shown on Today and on the finance pages.
  */
 import type { ForecastResult } from "./cash-forecast";
+import { eligibilityOf } from "./cash-forecast-eligibility";
 import type { BudgetsResult } from "./finance-budgets";
 
 export interface MoneyAlert {
@@ -24,6 +25,21 @@ export interface MoneyAlert {
    * the cautious path's lowest day, so Today treats a likely breach today or tomorrow as urgent from this date.
    */
   likelyDue?: string;
+}
+
+/**
+ * The cash forecast's input check, as Today shows it: the SAME gate that withholds the safe-to-move amount on the
+ * forecast page and in the what-if (eligibilityOf). Not eligible = a stale, missing or unreadable input, so "no
+ * low-cash alert" is not an all-clear. Reasons are short sentences (account labels, never amounts).
+ */
+export interface CashForecastCheck {
+  eligible: boolean;
+  reasons: string[];
+}
+export function cashForecastCheck(forecast: ForecastResult | null): CashForecastCheck | null {
+  if (!forecast) return null;
+  const e = eligibilityOf(forecast);
+  return { eligible: e.eligible, reasons: e.reasons.slice(0, 3).map((r) => r.text) };
 }
 
 const usd = (cents: number) => `$${Math.round(Math.abs(cents) / 100).toLocaleString("en-US")}`;

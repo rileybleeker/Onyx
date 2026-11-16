@@ -102,10 +102,10 @@ function world() {
   out.push(ftx("card", "2030-06-07", 1_599, "DEMO STREAMING", "Entertainment"), ftx("card", "2030-06-10", 45_000, "DEMO GROCER", "Groceries"));
   return out;
 }
-function synthForecast() {
+function synthForecast(now = NOW) {
   return F.forecastCash({
     today: TODAY,
-    now: NOW,
+    now,
     accounts: ACCOUNTS,
     txns: world(),
     balances: [
@@ -317,6 +317,35 @@ test("half-failed alerts are answered marked partial, and never stored", async (
   assert.equal(await h.S.cachedMoneyAlerts(NOW), null, "both failed: unavailable");
   h.state.forecast = { kind: "empty" };
   assert.equal((await h.S.cachedMoneyAlerts(NOW)).partial, "budgets");
+});
+
+test("the alerts answer carries the cash forecast's input check, and the stored copy serves it back unchanged", async () => {
+  const forecastLoad = (result) => ({ kind: "ok", result, items: [], drivers: [], accounts: [], setupPending: false, profile: null, tax: [], scenario: null, saved: [], accuracy: [], goals: [], move: null });
+  const fresh = synthForecast();
+  assert.equal(fresh.eligibility.eligible, true);
+  const h = harness({ forecast: forecastLoad(fresh), budgets: { kind: "empty" } });
+  const first = await h.S.cachedMoneyAlerts(NOW);
+  assert.deepEqual(first.cash, { eligible: true, reasons: [] });
+  await h.drain();
+  assert.deepEqual(h.db.rows.get("alerts").body.cash, { eligible: true, reasons: [] }, "stored with the alerts");
+  assert.deepEqual(await h.S.cachedMoneyAlerts(addMs(NOW, 60_000)), first, "served from the stored row, same check");
+
+  // The same ledger read three days later with no new balance: Today is told the forecast is incomplete.
+  const later = addMs(NOW, 3 * 86_400_000);
+  const stale = synthForecast(later);
+  assert.equal(stale.headlines.safeToMoveCents, null);
+  const h2 = harness({ forecast: forecastLoad(stale), budgets: { kind: "empty" } });
+  const answer = await h2.S.cachedMoneyAlerts(NOW);
+  assert.equal(answer.cash.eligible, false);
+  assert.deepEqual(answer.cash.reasons, stale.eligibility.reasons.map((r) => r.text));
+  assert.match(answer.cash.reasons[0], /Demo Checking.*older than 48 hours/);
+  assert.doesNotMatch(JSON.stringify(answer.cash), /\$\d|cents/, "no amounts in the check");
+  // No ledger at all: nothing to check, no field (the existing answer shape).
+  const none = await harness().S.cachedMoneyAlerts(NOW);
+  assert.equal("cash" in none, false);
+  // A failed forecast is `partial`, not a cash check.
+  const failed = await harness({ forecast: { kind: "error", code: "57014" }, budgets: { kind: "empty" } }).S.cachedMoneyAlerts(NOW);
+  assert.deepEqual([failed.partial, "cash" in failed], ["forecast", false]);
 });
 
 test("an older stored answer is marked updating with the time it was computed; fresh-only computes before answering", async () => {

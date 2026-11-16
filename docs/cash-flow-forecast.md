@@ -70,6 +70,28 @@ pool for a card, a brokerage or an outside account is an outflow, even though `/
 Opening balance = the latest `finance_balance_snapshots` row per pool account. A balance older than
 `STALE_BALANCE_HOURS` puts a stale badge on the whole forecast.
 
+**Safe-to-move gate (2026-11-16).** "Safe to move" is the one number Riley could act on, so it is shown only
+when every input it rests on was read, complete and fresh (`ForecastResult.eligibility`, decided in
+`lib/cash-forecast.ts`, read through `lib/cash-forecast-eligibility.ts`). Any of these withholds it
+(`headlines.safeToMoveCents` = null) while the projection is still drawn as an estimate:
+
+| Reason code | When |
+|---|---|
+| `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read (counted as $0 in the estimate) |
+| `invalid-balance` | only a non-USD row, no usable amount, an unreadable date, or a date more than 1 h in the future |
+| `stale-balance` | a pool balance of $100 or more older than 48 h (`smallBalanceCents`, `staleBalanceHours`) |
+| `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
+| `history-truncated` | a paged read of the balances or the history stopped at its page limit |
+| `plan-unavailable` | the planned items or the plan drivers could not be read (`setupPending`) |
+| `short-history` | fewer than `minBaselineWeeks` of history, so everyday spending is not projected |
+| `invalid-input` | an input that is not a number reached the projection |
+| `unverified` | a stored result from before the gate (no `eligibility`): never eligible |
+
+The tile shows the reasons (at most three) inside the same Personalize part as the amount, with the time of the
+oldest cash balance used. The what-if comparison and Today read the same result: `/api/finance/alerts` answers
+`cash: {eligible, reasons}` and Today shows the Money panel with the reason instead of "No alerts to act on".
+The amount itself is unchanged when the inputs are complete.
+
 ### 4.2 Sign convention
 
 The ledger is expense-positive. Forecast lines use **balance-positive** amounts (money in is +, money out is −).

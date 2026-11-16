@@ -7,6 +7,8 @@
  * and recomputed after the response; Today then asks once more with ?fresh=1 (computed before answering when the
  * background refresh has not landed yet), so old alerts are never shown as current and a new alert shows within
  * seconds. `partial` = the forecast or the budgets could not be read, so an alert from that part may be missing.
+ * `cash` = the cash forecast's input check (the same gate that withholds safe to move on the forecast page): when it
+ * is not eligible, "no low-cash alert" is not an all-clear, so the panel shows the reason.
  */
 import type { MoneyAlert } from "./finance-alerts";
 
@@ -27,11 +29,21 @@ export interface MoneyView {
   partial: MoneyPart | null;
   /** The newer answer could not be fetched: what is shown may be out of date. */
   refreshFailed: boolean;
+  /** The cash forecast's input check; null when the answer does not say (no ledger, or an older answer). */
+  cash: { eligible: boolean; reasons: string[] } | null;
+}
+
+function parseCash(raw: unknown): MoneyView["cash"] {
+  if (!raw || typeof raw !== "object") return null;
+  const c = raw as { eligible?: unknown; reasons?: unknown };
+  if (typeof c.eligible !== "boolean") return null;
+  const reasons = Array.isArray(c.reasons) ? c.reasons.filter((r): r is string => typeof r === "string" && r.length > 0).slice(0, 3) : [];
+  return { eligible: c.eligible && reasons.length === 0, reasons };
 }
 
 /** Check a GET /api/finance/alerts answer (throws on anything else). */
 export function parseMoneyAnswer(data: unknown): MoneyView {
-  const v = data as { status?: unknown; alerts?: unknown; asOf?: unknown; updating?: unknown; partial?: unknown } | null;
+  const v = data as { status?: unknown; alerts?: unknown; asOf?: unknown; updating?: unknown; partial?: unknown; cash?: unknown } | null;
   if (!v || v.status !== "ready" || !Array.isArray(v.alerts)) throw new Error("Invalid money alerts");
   return {
     alerts: v.alerts as MoneyAlert[],
@@ -39,13 +51,14 @@ export function parseMoneyAnswer(data: unknown): MoneyView {
     updating: v.updating === true,
     partial: v.partial === "forecast" || v.partial === "budgets" ? v.partial : null,
     refreshFailed: false,
+    cash: parseCash(v.cash),
   };
 }
 
 /** The panel is shown when there is something to act on, or when "nothing to act on" is not verified. */
 export function showMoneyPanel(v: MoneyView | null): boolean {
   if (!v) return false;
-  return v.alerts.length > 0 || v.partial !== null || (v.updating && v.refreshFailed);
+  return v.alerts.length > 0 || v.partial !== null || (v.updating && v.refreshFailed) || (v.cash !== null && !v.cash.eligible);
 }
 
 function age(iso: string | null, now: Date): string {
@@ -75,6 +88,10 @@ export function moneyNote(v: MoneyView, now: Date): { text: string; tone: "muted
   if (v.partial) {
     tone = "warn";
     parts.push(`Your ${v.partial} couldn't be read, so an alert from it may be missing.`);
+  }
+  if (v.cash && !v.cash.eligible) {
+    tone = "warn";
+    parts.push(["Cash forecast incomplete.", ...v.cash.reasons.slice(0, 2), "A low-cash alert may be off or missing."].join(" "));
   }
   return parts.length ? { text: parts.join(" "), tone } : null;
 }

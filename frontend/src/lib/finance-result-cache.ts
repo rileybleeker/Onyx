@@ -18,8 +18,9 @@ export type ResultKey = "alerts" | "renewals" | "forecast" | "budgets";
 export const FRESH_MS = 60 * 60_000;
 /** Older than this (Riley has not opened the app for days), a stored result is not served at all. */
 export const MAX_STALE_MS = 72 * 3_600_000;
-/** Bump when the stored form of a result changes, so rows written by older code are never served as fresh. */
-export const CACHE_FORMAT = 1;
+/** Bump when the stored form of a result changes, so rows written by older code are never served as fresh.
+ *  2: the forecast result carries `eligibility` and the alerts answer `cash` (the safe-to-move gate). */
+export const CACHE_FORMAT = 2;
 
 /** The deployment a result was computed by: a stored result is fresh only for the same build. */
 export function cacheBuild(env: Record<string, string | undefined> = process.env): string {

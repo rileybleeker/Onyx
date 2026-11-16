@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Area, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/lib/chart-theme";
 import type { ForecastResult } from "@/lib/cash-forecast";
+import { safeToMoveTile } from "@/lib/cash-forecast-eligibility";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { AccuracyRow, ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
 import type { ScenarioParams } from "@/lib/cash-forecast-scenario";
@@ -82,6 +83,8 @@ export default function ForecastView({
   const [error, setError] = useState<string | null>(null);
   const h = result.headlines;
   const buffer = Number((drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0);
+  // Safe to move: an amount only when the inputs were complete and fresh (result.eligibility), else the reasons.
+  const safe = safeToMoveTile(result, buffer);
 
   const run = async (fn: () => Promise<string | null>) => {
     setBusy(true);
@@ -133,12 +136,30 @@ export default function ForecastView({
             </div>
           </Part>
           <Part id="safe-to-move" title="Safe to move to savings" width="quarter">
-            <div className={card}>
+            {/* The amount and the reason it is withheld live in ONE part, so Personalize cannot hide one without the other. */}
+            <div className={`${card} ${safe.kind === "unavailable" ? "border-mid/40" : ""}`} data-testid="safe-to-move">
               <p className="text-[12px] text-text-tertiary">Safe to move to savings / investing</p>
-              <p className="text-xl font-semibold">{usd(h.safeToMoveCents)}</p>
-              <p className="text-[12px] text-text-secondary">
-                keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks{h.safeToMoveCents > 0 ? ` · or about ${usd(Math.floor(h.safeToMoveCents / 13))} a week` : ""}
-              </p>
+              {safe.kind === "amount" ? (
+                <>
+                  <p className="text-xl font-semibold">{usd(safe.cents)}</p>
+                  <p className="text-[12px] text-text-secondary">
+                    keeps the cautious path above {safe.bufferSet ? `${usd(safe.bufferCents)} (your buffer)` : "$0"} for 13 weeks
+                    {safe.perWeekCents !== null ? ` · or about ${usd(safe.perWeekCents)} a week` : ""}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-xl font-semibold text-mid">Not available</p>
+                  <ul className="mt-1 space-y-0.5 text-[12px] text-mid" aria-label="Why there is no amount">
+                    {safe.reasons.map((r) => (
+                      <li key={r}>{r}</li>
+                    ))}
+                    {safe.more > 0 && <li>{`and ${safe.more} more (see the warnings)`}</li>}
+                  </ul>
+                  <p className="mt-1 text-[12px] text-text-secondary">The projection below is an estimate.</p>
+                </>
+              )}
+              {safe.asOf && <p className="mt-1 text-[12px] text-text-tertiary">Cash as of {safe.asOf}</p>}
             </div>
           </Part>
           <Part id="cash-13w" title="Cash in 13 weeks" width="quarter">

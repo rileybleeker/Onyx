@@ -21,6 +21,10 @@ import { classifyTxn, isNonSpendingCategory } from "./finance-ledger";
 import { addDays, addMonths, daysBetween, displayMerchant, merchantKey, rowLabel, stableId } from "./procurement-recurring";
 import { FORECAST } from "./cash-forecast-config";
 import { wordKey } from "./finance-categories";
+import { UNVERIFIED } from "./cash-forecast-eligibility";
+
+// The eligibility readers live in a small module so client views can use them without bundling the engine.
+export { eligibilityOf, safeToMoveOf } from "./cash-forecast-eligibility";
 
 // ─── Types ────────────────────────────────────────────────────────────────────────────────────
 
@@ -117,6 +121,43 @@ export interface ForecastInput {
   /** What-ifs: extra payments to a card on a date (lower its balance and interest in the net worth side). */
   extraCardPayments?: readonly { account_key: string; date: string; cents: number }[];
   settings?: ForecastSettings;
+  /** What the caller knows about its own reads (the engine cannot see them); feeds `eligibility`. */
+  quality?: InputQuality;
+}
+
+/** What the caller's reads could not deliver. Each one withholds the safe-to-move amount. */
+export interface InputQuality {
+  /** A paged read stopped at its page limit: part of the balances or the transaction history is missing. */
+  historyTruncated?: boolean;
+  /** The planned items or the plan drivers (settings, tax profile, move, stream changes) could not be read. */
+  planUnavailable?: boolean;
+}
+/** Why the forecast's inputs do not support an actionable amount. */
+export type EligibilityCode =
+  | "no-pool"
+  | "no-balance"
+  | "missing-balance"
+  | "invalid-balance"
+  | "stale-balance"
+  | "freshness-unknown"
+  | "short-history"
+  | "history-truncated"
+  | "plan-unavailable"
+  | "invalid-input"
+  | "unverified";
+export interface EligibilityReason {
+  code: EligibilityCode;
+  /** One short sentence, shown next to the withheld amount and on Today. */
+  text: string;
+}
+/**
+ * Whether the inputs were complete and fresh enough for the ACTIONABLE number (safe to move). When false the
+ * projection is still drawn as an estimate; only `headlines.safeToMoveCents` is withheld (null). The forecast page,
+ * the what-if comparison and Today all read this one result (eligibilityOf / safeToMoveOf).
+ */
+export interface ForecastEligibility {
+  eligible: boolean;
+  reasons: EligibilityReason[];
 }
 
 export interface ForecastLine {
@@ -221,10 +262,13 @@ export interface ForecastResult {
   planned: PlannedStatus[];
   weeks: Rollup[];
   months: Rollup[];
+  /** Whether the inputs support the actionable amount; read it through eligibilityOf() (stored results may predate it). */
+  eligibility: ForecastEligibility;
   headlines: {
     lowest: { date: string; cents: number } | null;
     lowestLikely: { date: string; cents: number } | null;
-    safeToMoveCents: number;
+    /** null = withheld: the inputs were incomplete, stale or unreadable (see `eligibility`). Read it through safeToMoveOf(). */
+    safeToMoveCents: number | null;
     end13w: { likely: number; low: number; high: number } | null;
     end12m: { likely: number; low: number; high: number } | null;
     nextPromoEnd: PromoMilestone | null;
@@ -870,7 +914,7 @@ function expandPlanned(items: readonly PlannedItem[]): PlannedOcc[] {
 
 // ─── The forecast ─────────────────────────────────────────────────────────────────────────────
 
-const EMPTY_HEADLINES: ForecastResult["headlines"] = { lowest: null, lowestLikely: null, safeToMoveCents: 0, end13w: null, end12m: null, nextPromoEnd: null };
+const EMPTY_HEADLINES: ForecastResult["headlines"] = { lowest: null, lowestLikely: null, safeToMoveCents: null, end13w: null, end12m: null, nextPromoEnd: null };
 
 export function forecastCash(input: ForecastInput): ForecastResult {
   const { today } = input;
@@ -885,11 +929,25 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   const pool = poolKeys.map((k) => ({ account_key: k, label: accountsByKey.get(k)?.label ?? k }));
   const latest = latestBalances(input.balances);
 
+  // Eligibility: every reason the inputs do not support an actionable amount. Any reason withholds safe to move.
+  const reasons: EligibilityReason[] = [];
+  const reason = (code: EligibilityCode, text: string) => {
+    if (!reasons.some((r) => r.text === text)) reasons.push({ code, text });
+  };
+  const notEligible = (): ForecastEligibility => ({ eligible: false, reasons: [...reasons] });
+  const quality = input.quality ?? {};
+  if (quality.historyTruncated) {
+    warnings.push("Part of the history was not read (page limit), so the forecast may be off.");
+    reason("history-truncated", "Part of the balance or transaction history was not read.");
+  }
+  if (quality.planUnavailable) reason("plan-unavailable", "Planned items or plan settings could not be read, so planned payments and taxes may be missing.");
+
   const base: ForecastResult = {
     state: "ok",
     today,
     pool,
     opening: { cents: 0, asOf: null, stale: false },
+    eligibility: UNVERIFIED,
     days: [],
     lines: [],
     streams: [],
@@ -904,7 +962,10 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     notes,
     warnings,
   };
-  if (!poolKeys.length) return { ...base, state: "no-pool" };
+  if (!poolKeys.length) {
+    reason("no-pool", "No checking or savings account found.");
+    return { ...base, state: "no-pool", eligibility: notEligible() };
+  }
 
   // Opening balance.
   let opening = 0;
@@ -916,18 +977,37 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   } else {
     let found = 0;
     for (const k of poolKeys) {
+      const label = accountsByKey.get(k)?.label ?? k;
       const b = latest.get(k);
-      if (!b) {
-        warnings.push(`No balance for ${accountsByKey.get(k)?.label ?? k}: counted as $0.`);
+      if (!b || !Number.isFinite(b.balance_cents)) {
+        warnings.push(`No balance for ${label}: counted as $0.`);
+        // A row in another currency (or with no usable amount) is there but cannot be counted: invalid, not missing.
+        if (b || input.balances.some((x) => x.account_key === k)) reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`);
+        else reason("missing-balance", `No recent balance for ${label}.`);
         continue;
       }
       found++;
       opening += b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
       if (!asOf || b.captured_at < asOf) asOf = b.captured_at;
+      const at = Date.parse(b.captured_at);
+      if (!Number.isFinite(at)) {
+        reason("invalid-balance", `The balance for ${label} has no readable date.`);
+        continue;
+      }
+      if (!input.now) continue;
+      const age = input.now.getTime() - at;
+      if (age < -FORECAST.futureBalanceSkewMs) reason("invalid-balance", `The balance for ${label} is dated in the future.`);
       // A small balance that rarely updates (Apple Cash) should not flag the whole forecast.
-      if (input.now && Math.abs(b.balance_cents) >= 10_000 && input.now.getTime() - Date.parse(b.captured_at) > FORECAST.staleBalanceHours * 3_600_000) stale = true;
+      else if (Math.abs(b.balance_cents) >= FORECAST.smallBalanceCents && age > FORECAST.staleBalanceHours * 3_600_000) {
+        stale = true;
+        reason("stale-balance", `The balance for ${label} is older than ${FORECAST.staleBalanceHours} hours.`);
+      }
     }
-    if (!found) return { ...base, state: "no-balance" };
+    if (!found) {
+      reason("no-balance", "No balance yet for your cash accounts.");
+      return { ...base, state: "no-balance", eligibility: notEligible() };
+    }
+    if (!input.now) reason("freshness-unknown", "The balance dates could not be checked.");
     if (stale) warnings.push(`A cash balance is older than ${FORECAST.staleBalanceHours} hours, so the starting point may be off.`);
   }
 
@@ -1024,7 +1104,10 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   }
   const baselineProjected = weeklySeries.length >= FORECAST.minBaselineWeeks;
   const weeklyMean = baselineProjected ? Math.round(mean(weeklySeries)) : 0;
-  if (!baselineProjected) warnings.push(`Fewer than ${FORECAST.minBaselineWeeks} weeks of history: everyday spending is not projected.`);
+  if (!baselineProjected) {
+    warnings.push(`Fewer than ${FORECAST.minBaselineWeeks} weeks of history: everyday spending is not projected.`);
+    reason("short-history", `Fewer than ${FORECAST.minBaselineWeeks} weeks of history, so everyday spending is not in the forecast.`);
+  }
 
   // Stream adjustments (stop / new amount from a date).
   const adjustments = input.adjustments ?? [];
@@ -1165,10 +1248,16 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   const lowestLikely = minBy((d) => d.likely);
   const buffer = Math.max(0, settings.bufferCents ?? 0);
   const at = (n: number) => (days[n - 1] ? { likely: days[n - 1].likely, low: days[n - 1].low, high: days[n - 1].high } : null);
+  if (!Number.isFinite(opening) || !Number.isFinite(buffer) || days.some((d) => !Number.isFinite(d.low) || !Number.isFinite(d.likely))) {
+    reason("invalid-input", "Some forecast inputs are not valid numbers.");
+  }
+  const eligibility: ForecastEligibility = { eligible: reasons.length === 0, reasons: [...reasons] };
   const headlines: ForecastResult["headlines"] = {
     lowest,
     lowestLikely,
-    safeToMoveCents: lowest ? Math.max(0, Math.min(opening, lowest.cents) - buffer) : 0,
+    // Withheld unless every input was read, complete and fresh: an amount Riley could act on must not rest on a
+    // stale balance or on planned obligations that could not be read.
+    safeToMoveCents: eligibility.eligible && lowest ? Math.max(0, Math.min(opening, lowest.cents) - buffer) : null,
     end13w: at(Math.min(91, H)),
     end12m: at(Math.min(365, H)),
     nextPromoEnd: null,
@@ -1211,6 +1300,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   return {
     ...base,
     opening: { cents: opening, asOf, stale },
+    eligibility,
     days,
     lines,
     baseline: { weeklyMeanCents: weeklyMean, weeksUsed: weeklySeries.length, projected: baselineProjected, oneOffs: oneOffs.length },

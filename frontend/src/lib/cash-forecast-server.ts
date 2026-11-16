@@ -127,7 +127,8 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
       });
     }
 
-    // Plan inputs: a missing table (migration not applied) shows the forecast without them.
+    // Plan inputs: a missing table (migration not applied) or a failed read shows the forecast without them, as an
+    // estimate: setupPending withholds the safe-to-move amount (quality.planUnavailable below).
     let setupPending = false;
     const [itemsRes, driversRes] = await planRead;
     if (itemsRes.error || driversRes.error) setupPending = true;
@@ -148,7 +149,10 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const taxFor = (p: TaxProfile | null) => (p ? taxYears.map((y) => computeTaxYear(p, y, today)) : []);
     const tax = taxFor(profile);
     const manual = itemRows.map(itemRowToPlanned);
-    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS } };
+    // What the reads could not deliver: each withholds the safe-to-move amount in the base plan AND the what-if,
+    // because both are computed from this one input (result.eligibility, lib/cash-forecast.ts).
+    const quality = { historyTruncated: bal.truncated || txn.truncated, planUnavailable: setupPending };
+    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS }, quality };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
     let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
     // Annual raise: the paycheck stream grows each January (net pay scaled with gross; a planning approximation).
@@ -233,7 +237,6 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const saved = drivers
       .filter((d) => d.key.startsWith("scenario:"))
       .map((d) => ({ slug: d.key.slice(9), name: String((d.value as { name?: unknown }).name ?? d.key.slice(9)), params: ((d.value as { params?: ScenarioParams }).params ?? {}) as ScenarioParams }));
-    if (bal.truncated || txn.truncated) result.warnings.push("Part of the history was not read (page limit), so the forecast may be off.");
     const accountLabelsByKey = new Map<string, string>([
       ...parsedAccounts.map((a) => [a.account_key, accountLabel(a)] as [string, string]),
       ...drivers.filter((d) => d.key.startsWith("growth:virtual-")).map((d) => [d.key.slice(7), String((d.value as { label?: unknown }).label ?? d.key.slice(7))] as [string, string]),

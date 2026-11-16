@@ -4,7 +4,7 @@ import { etDate } from "@/lib/format";
 import { serviceClient } from "@/lib/finance-ledger-server";
 import { loadForecast, type ForecastLoad } from "@/lib/cash-forecast-server";
 import { loadBudgets, type BudgetsLoad } from "@/lib/finance-budgets-server";
-import { moneyAlerts, type MoneyAlert } from "@/lib/finance-alerts";
+import { cashForecastCheck, moneyAlerts, type CashForecastCheck, type MoneyAlert } from "@/lib/finance-alerts";
 import { loadDetectedSubscriptions } from "@/lib/procurement-recurring-server";
 import { parseRenewalsAhead, renewalsAhead, type RenewalsAhead } from "@/lib/procurement-renewals";
 import { INPUTS_KEY, cacheBuild, decide, jsonSafe, parseAlertsBody, parseLoadBody, parseRow, type ResultKey, type StoredRow } from "@/lib/finance-result-cache";
@@ -162,8 +162,8 @@ export async function serveStoredWithAge<T>(
 
 // ─── The stored results ───────────────────────────────────────────────────────────────────────────
 
-/** The stored form of the money alerts. */
-export type MoneyAlertsBody = { status: "ready"; alerts: MoneyAlert[] };
+/** The stored form of the money alerts. `cash` = the forecast's input check (absent when there is no ledger). */
+export type MoneyAlertsBody = { status: "ready"; alerts: MoneyAlert[]; cash?: CashForecastCheck };
 /**
  * What GET /api/finance/alerts answers: the alerts and how current and complete they are (Today shows it;
  * lib/money-alerts-view.ts).
@@ -193,6 +193,10 @@ export async function cachedMoneyAlerts(now: Date, mode: ServeMode = "stale-ok")
       if (f.kind === "error" && b.kind === "error") return { value: null, store: [] };
       const buffer = f.kind === "ok" ? Number((f.drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0) : 0;
       const body: MoneyAlertsBody = { status: "ready", alerts: moneyAlerts(f.kind === "ok" ? f.result : null, b.kind === "ok" ? b.result : null, buffer, etDate(now.toISOString())) };
+      // The same eligibility the forecast page uses for safe to move: Today never reads "nothing to act on" as an
+      // all-clear when the forecast rests on a stale, missing or unreadable input.
+      const cash = cashForecastCheck(f.kind === "ok" ? f.result : null);
+      if (cash) body.cash = cash;
       const store: StoreEntry[] = [];
       if (f.kind !== "error") store.push({ key: "forecast", body: f });
       if (b.kind !== "error") store.push({ key: "budgets", body: b });
@@ -205,8 +209,8 @@ export async function cachedMoneyAlerts(now: Date, mode: ServeMode = "stale-ok")
     mode,
   );
   if (!served) return null;
-  const { status, alerts, partial } = served.value;
-  return { status, alerts, asOf: served.computedAt, ...(served.stale ? { updating: true as const } : {}), ...(partial ? { partial } : {}) };
+  const { status, alerts, partial, cash } = served.value;
+  return { status, alerts, ...(cash ? { cash } : {}), asOf: served.computedAt, ...(served.stale ? { updating: true as const } : {}), ...(partial ? { partial } : {}) };
 }
 
 /** The stored renewals detection (the "stale-ok" read of cachedRenewalsAheadWithAge, without its age). */
