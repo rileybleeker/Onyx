@@ -32,6 +32,12 @@ const answer = (today = D1) => ({
   },
   books: [],
 });
+/** The same day with another current book (the first one finished, or a Kindle harvest moved on). */
+const otherBookAnswer = (today = D1) => {
+  const a = answer(today);
+  a.overview.book = { slug: "another-synthetic-book", title: "Another Synthetic Book", status: "reading" };
+  return a;
+};
 
 function manualTimers() {
   let now = 0;
@@ -352,4 +358,59 @@ test("day boundary: emptying an entry that kept its day lets the form follow tod
   assert.equal(h.work.has(), false, "an emptied form is not unsaved work");
   await h.tick(60_000);
   assert.equal(h.calls.length, sent, "and nothing more is sent");
+});
+
+test("day boundary without a remount: a failed create keeps its day on every later send, mounted or away", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, null, "the first send lets the server's behavioral today apply");
+  await h.unmount(); // sends once more on the way out: still offline
+  await h.serve(answer(D2)); // the day rolls while the Log page is away; nothing re-reads it for the kept form
+  h.mode = "up";
+  await h.tick(60_000); // the kept saver's own retry timer, with no copy mounted
+  assert.equal(h.rows.size, 1, "created once, by the background retry");
+  const later = h.posts().slice(1);
+  assert.ok(later.length >= 2, "the unmount send and the retry");
+  assert.ok(later.every((p) => p.body.date === D1), "every later send carries the day the entry was made for");
+  assert.equal(new Set(h.posts().map((p) => p.body.client_key)).size, 1);
+  assert.equal(h.retainer.size, 0);
+});
+
+test("day boundary while mounted: a background retry keeps the entry's day before the overview is read again", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "6");
+  await h.tick(1500);
+  h.mode = "up";
+  await h.tick(60_000);
+  const sent = h.posts();
+  assert.equal(sent[0].body.date, null);
+  assert.equal(sent[sent.length - 1].body.date, D1, "the retry is sent for the day of the first send");
+  assert.equal(h.rows.size, 1);
+});
+
+test("a restored entry and the session it made keep their book when the current book changes", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Minutes", "20"); // incomplete: no chapter yet
+  await h.unmount();
+  await h.serve(otherBookAnswer()); // the current book changed while the section was away
+  await h.mount();
+  assert.equal(h.value("Minutes"), "20", "the entry is back");
+  assert.match(h.text(), /Book: synthetic-book/, "and says which book it is for");
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.book, "synthetic-book", "created for its own book, not the new current one");
+
+  await h.type("Minutes", "35");
+  await h.tick(1500);
+  const last = h.calls[h.calls.length - 1];
+  assert.equal(last.method, "PATCH");
+  assert.equal(last.body.book, "synthetic-book", "a later edit never moves the session to another book");
 });

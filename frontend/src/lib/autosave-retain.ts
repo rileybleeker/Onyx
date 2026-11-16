@@ -14,9 +14,11 @@
  *    takes it over (state, data and all). A kept form that becomes clean while nobody shows it (a retry got through)
  *    is forgotten then.
  *  - Taking a form over never sends anything (opening or scrolling never saves).
- *  - Memory only: nothing is written to storage, so a reload or a sign-out (a full load) forgets it. Bounded: one form
- *    per name, at most MAX_RETAINED names; a copy beyond that, or a second copy shown at the same time as the first,
- *    is not kept past its component.
+ *  - Memory only: nothing is written to storage, so a reload forgets it. A session end forgets it too, also without a
+ *    reload: every wipe of the client's data (sign-out, a 401, a load without a session: wipeClientData in
+ *    lib/client-cache.ts) fires CLIENT_WIPE_EVENT, and every kept form is dropped with its retry timer stopped.
+ *    Bounded: one form per name, at most MAX_RETAINED names; a copy beyond that, or a second copy shown at the same
+ *    time as the first, is not kept past its component.
  * No React, no DOM; React side in lib/use-autosave.ts (useRetainedAutosave). Unit-tested in tests/autosave-retain.test.cjs.
  */
 import { Autosaver, type AutosaveState, type AutosaverOptions, type Timers } from "./autosave";
@@ -135,7 +137,10 @@ export class FormRetainer {
     return this.forms.size;
   }
 
-  /** Forget every kept form (tests; a sign-out reloads the page, which forgets them anyway). */
+  /**
+   * Forget every kept form, shown or not: its retry timer stops, its unsaved-work key goes, and the next mount starts
+   * empty (session end, CLIENT_WIPE_EVENT below). A copy still on screen keeps its fields but sends nothing more.
+   */
   clear(): void {
     for (const form of [...this.forms.values()]) this.release(form);
   }
@@ -160,3 +165,13 @@ export class FormRetainer {
 
 /** The app's one retainer (memory only). */
 export const formRetainer = new FormRetainer();
+
+/** CLIENT_WIPE_EVENT of lib/client-cache.ts (that module stays import-free, so the name is repeated here). */
+export const CLIENT_WIPE_EVENT = "onyx:client-wipe";
+
+// Session end: the client's data is wiped (sign-out, a 401, a load without a session), so every kept entry goes too,
+// with its pending retries; nothing typed in this session is sent or shown after it.
+{
+  const target = globalThis as unknown as { addEventListener?: (type: string, fn: () => void) => void };
+  if (typeof target.addEventListener === "function") target.addEventListener(CLIENT_WIPE_EVENT, () => formRetainer.clear());
+}

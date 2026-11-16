@@ -5,7 +5,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { mkdtempSync } = require('node:fs');
+const { mkdtempSync, readFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 
@@ -260,4 +260,53 @@ test('clear() forgets every kept form and its unsaved-work key', async () => {
   retainer.clear();
   assert.equal(retainer.size, 0);
   assert.equal(work.has(), false);
+});
+
+test('session end: the wipe event of lib/client-cache.ts drops every kept form of the app retainer and stops its retries', async () => {
+  // A fresh copy of the module with a window-like global, so its app retainer registers its listener.
+  const file = path.join(out, 'autosave-retain.js');
+  const listeners = new Map();
+  const prior = Object.getOwnPropertyDescriptor(globalThis, 'addEventListener');
+  globalThis.addEventListener = (type, fn) => listeners.set(type, fn);
+  delete require.cache[require.resolve(file)];
+  let fresh;
+  try {
+    fresh = require(file);
+  } finally {
+    if (prior) Object.defineProperty(globalThis, 'addEventListener', prior);
+    else delete globalThis.addEventListener;
+    delete require.cache[require.resolve(file)];
+  }
+  const cacheSource = readFileSync(path.join(__dirname, '..', 'src', 'lib', 'client-cache.ts'), 'utf8');
+  const name = /export const CLIENT_WIPE_EVENT = "([^"]+)"/.exec(cacheSource)?.[1];
+  assert.ok(name, 'lib/client-cache.ts names the event');
+  assert.equal(fresh.CLIENT_WIPE_EVENT, name, 'the retainer listens for the same name');
+  assert.match(cacheSource, /dispatchEvent\(new Event\(CLIENT_WIPE_EVENT\)\)/, 'wipeClientData fires it');
+  const onWipe = listeners.get(name);
+  assert.equal(typeof onWipe, 'function', 'the app retainer listens');
+
+  const timers = fakeTimers();
+  const api = endpoint();
+  api.mode = 'offline';
+  const retainer = fresh.formRetainer;
+  const opts = { delayMs: 800, ready, timers, save: async (v) => { await api.create(v, 'synthetic-key-9'); } };
+  const failed = mount(retainer, 'synthetic-failed', opts);
+  failed.form.saver.change({ through: '4' });
+  await timers.advance(800);
+  await failed.unmount();
+  const incomplete = mount(retainer, 'synthetic-incomplete', opts);
+  incomplete.form.saver.change({ minutes: '9' });
+  await incomplete.unmount();
+  assert.equal(retainer.size, 2, 'both kept before the session ends');
+  assert.ok(timers.count() > 0, 'a retry is waiting');
+
+  onWipe();
+  assert.equal(retainer.size, 0, 'nothing kept after the session ended');
+  assert.equal(timers.count(), 0, 'its retry timer is stopped');
+  const sent = api.calls.length;
+  api.mode = 'up';
+  await timers.advance(120_000);
+  assert.equal(api.calls.length, sent, 'nothing is sent after the session ended');
+  assert.equal(api.rows.size, 0);
+  assert.equal(retainer.find('synthetic-incomplete'), null, 'the next mount starts empty');
 });

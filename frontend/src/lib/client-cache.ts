@@ -677,11 +677,22 @@ function defaultDeleteDatabase(name: string): Promise<void> {
 }
 
 /**
+ * Fired (on window) at the start of every wipe: memory outside this cache that holds the session's entries listens
+ * and forgets them (lib/autosave-retain.ts: forms kept past their component, with their retries). An event because
+ * this module stays import-free; the retainer repeats the name.
+ */
+export const CLIENT_WIPE_EVENT = "onyx:client-wipe";
+
+/**
  * Sign-out / session end: wipe the in-memory cache, the IndexedDB store, every Cache Storage cache on this
- * origin and this app's localStorage keys (unrelated keys stay). Bounded by a timeout so a blocked delete
- * never holds up signing out. Never throws.
+ * origin and this app's localStorage keys (unrelated keys stay), and tell kept forms to forget their entries
+ * (CLIENT_WIPE_EVENT). Bounded by a timeout so a blocked delete never holds up signing out. Never throws.
  */
 export async function wipeClientData(deps: WipeDeps = {}): Promise<void> {
+  try {
+    const target = globalThis as unknown as { dispatchEvent?: (e: Event) => boolean };
+    if (typeof target.dispatchEvent === "function" && typeof Event === "function") target.dispatchEvent(new Event(CLIENT_WIPE_EVENT));
+  } catch { /* a listener's failure never holds up signing out */ }
   const g = globalThis as unknown as { localStorage?: Storage; caches?: CacheStorage };
   const cache = deps.cache ?? clientCache;
   let storage: WipeDeps["storage"] = null;
