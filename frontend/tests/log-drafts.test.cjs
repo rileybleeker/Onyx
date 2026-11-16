@@ -103,9 +103,9 @@ test("the frame: nav item, Quick access, scroll entry, bottom bar, warm-up", () 
 test("the sections are Personalize parts in the default order, each its own file", () => {
   const client = read("app/log/LogClient.tsx");
   const ids = [...client.matchAll(/<Part id="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(ids, ["say-it", "check-in", "journal", "supplements", "uber-eats", "weight", "reading"]);
+  assert.deepEqual(ids, ["say-it", "check-in", "journal", "supplements", "drinks", "uber-eats", "weight", "reading"]);
   assert.match(client, /<PartGrid page="\/log" title="Log">/);
-  for (const f of ["SayIt", "CheckIn", "Journal", "Supplements", "UberEats", "Weight", "Reading"]) {
+  for (const f of ["SayIt", "CheckIn", "Journal", "Supplements", "Drinks", "UberEats", "Weight", "Reading"]) {
     assert.match(client, new RegExp(`import\\("\\./sections/${f}"\\)`), f);
     assert.ok(fs.existsSync(path.join(SRC, "app/log/sections", `${f}.tsx`)), f);
   }
