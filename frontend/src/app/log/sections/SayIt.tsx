@@ -44,15 +44,28 @@ let keptCheckinSent = false;
  * while the words stay the same, so Fill again on the same words (a retry, a lost answer) gives the same drink keys
  * and the server answers with the drinks already saved. Changed words are a new capture: new keys. Memory only.
  */
-let keptCapture: { text: string; id: string; at: number } | null = null;
+interface Capture {
+  text: string;
+  id: string;
+  at: number;
+  /**
+   * The drinks of the FIRST answer accepted for these words, with their keys, frozen: Fill again on the same words
+   * replays exactly these (a model that now reads "two cans" as two items of one can, or resolves what it left
+   * unresolved, can never add keys). Riley corrects them in the Drinks section; a new drink is a new capture
+   * (changed words, Clear, or a "+ can" tap there). null until an answer was accepted.
+   */
+  drinks: DrinkLogDraft[] | null;
+  drinkLines: string[];
+}
+let keptCapture: Capture | null = null;
 
-function captureFor(words: string): { id: string; at: number } {
-  if (!keptCapture || keptCapture.text !== words) keptCapture = { text: words, id: newUuid(), at: Date.now() };
+function captureFor(words: string): Capture {
+  if (!keptCapture || keptCapture.text !== words) keptCapture = { text: words, id: newUuid(), at: Date.now(), drinks: null, drinkLines: [] };
   return keptCapture;
 }
 
 /** The route's drinks with their stable keys (derived from the capture id, never fresh per answer). */
-async function drinkDrafts(items: DrinkVoiceItem[], capture: { id: string; at: number }): Promise<DrinkLogDraft[]> {
+async function drinkDrafts(items: DrinkVoiceItem[], capture: Capture): Promise<DrinkLogDraft[]> {
   const slots = itemSlots(items);
   const keys = await Promise.all(slots.map((s) => itemKey(capture.id, s)));
   return items.map((d, i) => ({ ...d, key: keys[i], captured_at: capture.at }));
@@ -115,10 +128,18 @@ export default function SayItSection() {
       if (json.ubereats.length) drafts.ubereats = json.ubereats;
       if (json.weight) drafts.weight = json.weight;
       if (json.reading) drafts.reading = json.reading;
-      // Drinks: resolved or not, each is shown in the Drinks section (an unknown one is never dropped).
-      if (Array.isArray(json.drinks) && json.drinks.length) drafts.drinks = await drinkDrafts(json.drinks, capture);
+      // Drinks: resolved or not, each is shown in the Drinks section (an unknown one is never dropped). The first
+      // accepted interpretation of these words is frozen and replayed on every later Fill of the same words.
+      if (capture.drinks == null) {
+        capture.drinks = await drinkDrafts(Array.isArray(json.drinks) ? json.drinks : [], capture);
+        capture.drinkLines = json.summary?.drinks ?? [];
+      }
+      if (capture.drinks.length) drafts.drinks = capture.drinks;
       setLogDrafts(drafts, words);
-      show({ kind: "filled", result: json });
+      show({
+        kind: "filled",
+        result: { ...json, drinks: capture.drinks, summary: { ...json.summary, drinks: capture.drinkLines } },
+      });
     } catch {
       const message = "Couldn't reach Onyx. Your words are still here.";
       if (!offerPrefixedJournal(words, message)) show({ kind: "error", message });

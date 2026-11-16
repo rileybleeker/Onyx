@@ -60,8 +60,8 @@ test("Today in the scroll never reads the experiment arm (the read stamps it as 
 test("Log Drinks: opening or scrolling never saves (drinks exist only after a Fill or a tap; GETs only on mount)", () => {
   const src = read("app/log/sections/Drinks.tsx");
   // The mount effects read (cachedJson GET) and adopt Say it drafts; no write is started from an effect.
-  const effects = src.split("useEffect(").slice(1).map((s) => s.slice(0, s.indexOf("}, [")));
-  for (const body of effects) assert.ok(!/call\("(POST|PATCH|DELETE)"|saveDrink\(/.test(body), `no write from an effect: ${body.slice(0, 80)}`);
+  const effects = src.split("useEffect(").slice(1).map((s) => s.slice(0, s.search(/[})]\s*,\s*\[/)));
+  for (const body of effects) assert.ok(!/call\(|saveDrinkWith|undoDrinkWith/.test(body), `no write from an effect: ${body.slice(0, 80)}`);
   // The warm-up only GETs the drinks list.
   assert.match(read("components/AppData.tsx"), /json\("\/api\/nutrition\/drinks"\)/);
 });

@@ -163,6 +163,12 @@ export interface DrinkLogDraft {
   time: string | null;
   /** Behavioral day when another day was said; null = the Say it day. */
   date: string | null;
+  /**
+   * A day or time WAS said but cannot be used (malformed, impossible, in the future, more than 6 days back): the
+   * Drinks editor waits for Riley to set it and never falls back to today or Now. null = nothing unusable was said
+   * (null `date` / `time` then really mean "not said").
+   */
+  when_issue: "bad_date" | "bad_time" | "bad_date_time" | null;
   /** Date.now() of the Fill tap that produced it: the "Now" instant of a today drink with no time said. */
   captured_at: number;
 }

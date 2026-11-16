@@ -4,8 +4,10 @@
 -- Prepared for independent SQL / security review. NOT applied by the builder.
 -- Additive only: ADD COLUMN IF NOT EXISTS, guarded ADD CONSTRAINT, CREATE INDEX
 -- IF NOT EXISTS, CREATE OR REPLACE (function, views). Nothing for the anon role,
--- nothing removed, no dependent object touched. Turning it off: APPENDIX A at the
--- end (stops new drink rows and takes drinks out of both projections; keeps rows).
+-- nothing removed, no dependent object touched. Turning it off:
+-- sql/direct_drink_capture_off.sql (stops new drink rows and takes drinks out of
+-- both projections; keeps every row). Post-apply check (rolls back):
+-- sql/checks/verify_direct_drink_capture.sql.
 --
 -- One said or tapped drink (Log > Say it / Drinks) = ONE row in pds.photo_meals
 -- with capture_kind = 'drink'. Existing photo meals keep capture_kind = 'photo'
@@ -21,10 +23,15 @@
 --   deleted_at    tombstone (Undo / Remove). The row stays so a late retry with
 --                 the same client_key cannot bring it back (trigger refuses to
 --                 clear it). Counted nowhere.
---   diary_overlap 'in_diary' = Riley said this drink is already in Cronometer /
---                 a supplement / an order: kept for the record, counted nowhere.
---                 Independent of cronometer_servings.serving_id (that id is
---                 replaced on every re-import, sql/cronometer_replace_servings.sql).
+--   diary_overlap 'in_diary' = Riley said this drink is already a Cronometer
+--                 serving that day which counts in BOTH channels (named for
+--                 the brand, with caffeine_mg > 0; the route verifies it).
+--                 Kept for the record, counted nowhere. A supplement (caffeine
+--                 only) or an Uber Eats dish (Nutrition only) can never stand
+--                 in for both, so it is never stored as in_diary. Independent
+--                 of cronometer_servings.serving_id (that id is replaced on
+--                 every re-import, sql/cronometer_replace_servings.sql): a
+--                 later deletion of that serving is NOT detected.
 --   revision      starts at 1; every drink UPDATE must set exactly old + 1 (the
 --                 route sends expected_revision; a stale edit changes nothing).
 --
@@ -39,8 +46,9 @@
 --                 time is never saved (no sentinel): the Log editor asks for it.
 --
 -- Known limits, kept open on PROD-CAFF-01: no automatic link to later Cronometer
--- imports (a drink logged here and later also in Cronometer counts twice until
--- Riley marks it in_diary); unknown-time drinks are not storable; drinks reach
+-- imports (a drink logged here and later also in Cronometer counts twice; no
+-- reconciliation exists); supplement / Uber Eats overlap is only a prompt (count
+-- here or do not add); unknown-time drinks are not storable; drinks reach
 -- pds.daily_health_matrix_behavioral_mat (caffeine x HRV) at its next refresh.
 -- ============================================================
 
@@ -64,7 +72,7 @@ COMMENT ON COLUMN pds.photo_meals.capture_kind IS
 COMMENT ON COLUMN pds.photo_meals.drink_label IS
     'Drink rows: frozen per-container label snapshot {product_id, version, name, label{kcal, protein_g, carbs_g, fat_g, sugar_g, sodium_mg, caffeine_mg, serving, serving_fl_oz}, source{page, label_image, read_on}} from frontend/src/lib/drink-products.ts at capture time.';
 COMMENT ON COLUMN pds.photo_meals.diary_overlap IS
-    'Drink rows: none = counted; in_diary = Riley said it is already logged in Cronometer / supplements / an order, so neither Nutrition nor Caffeine counts it.';
+    'Drink rows: none = counted; in_diary = already a Cronometer serving that day counting in both Nutrition and Caffeine (verified by /api/nutrition/drinks), so neither projection counts this row.';
 COMMENT ON COLUMN pds.photo_meals.deleted_at IS
     'Drink rows: tombstone set by Undo / Remove. Counted nowhere; never cleared (a late retry cannot resurrect it).';
 
@@ -83,22 +91,35 @@ BEGIN
         ALTER TABLE pds.photo_meals ADD CONSTRAINT photo_meals_revision_check CHECK (revision >= 1);
     END IF;
     -- Photo rows carry none of the drink fields; drink rows carry all of them.
+    -- A CHECK passes when its expression is NULL, so every required drink field
+    -- is tested with an explicit IS NOT NULL and the whole expression is wrapped
+    -- in COALESCE(..., false): a NULL anywhere fails the row instead of passing
+    -- it. Ranges match the API (lib/drink-capture.ts): servings 0.25 to 6 in
+    -- quarter steps; every number has an upper bound, which NaN fails (NaN sorts
+    -- above every number in PostgreSQL).
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'pds.photo_meals'::regclass AND conname = 'photo_meals_kind_fields_check') THEN
         ALTER TABLE pds.photo_meals ADD CONSTRAINT photo_meals_kind_fields_check CHECK (
-            (capture_kind = 'photo'
-             AND drink_product_id IS NULL AND drink_product_version IS NULL AND drink_servings IS NULL
-             AND drink_label IS NULL AND caffeine_mg IS NULL AND deleted_at IS NULL
-             AND diary_overlap = 'none')
-            OR
-            (capture_kind = 'drink'
-             AND drink_product_id IS NOT NULL AND drink_product_version >= 1
-             AND drink_servings > 0 AND drink_servings <= 6
-             AND jsonb_typeof(drink_label) = 'object'
-             AND caffeine_mg IS NOT NULL AND caffeine_mg >= 0 AND caffeine_mg <= 2000
-             AND (sugar_g IS NULL OR sugar_g >= 0) AND (sodium_mg IS NULL OR sodium_mg >= 0)
-             AND time_zone IS NOT NULL AND eaten_at IS NOT NULL
-             AND time_source IN ('now', 'manual')
-             AND est_kcal IS NULL AND model IS NULL)
+            COALESCE(
+                (capture_kind = 'photo'
+                 AND drink_product_id IS NULL AND drink_product_version IS NULL AND drink_servings IS NULL
+                 AND drink_label IS NULL AND caffeine_mg IS NULL AND sugar_g IS NULL AND sodium_mg IS NULL
+                 AND deleted_at IS NULL AND diary_overlap = 'none')
+                OR
+                (capture_kind = 'drink'
+                 AND drink_product_id IS NOT NULL AND drink_product_id ~ '^[a-z0-9-]{3,80}$'
+                 AND drink_product_version IS NOT NULL AND drink_product_version >= 1
+                 AND drink_servings IS NOT NULL AND drink_servings >= 0.25 AND drink_servings <= 6
+                 AND drink_servings * 4 = round(drink_servings * 4)
+                 AND drink_label IS NOT NULL AND jsonb_typeof(drink_label) = 'object'
+                 AND jsonb_typeof(drink_label -> 'label') = 'object'
+                 AND caffeine_mg IS NOT NULL AND caffeine_mg >= 0 AND caffeine_mg <= 2000
+                 AND kcal <= 5000 AND protein_g <= 500 AND carbs_g <= 500 AND fat_g <= 500
+                 AND (sugar_g IS NULL OR (sugar_g >= 0 AND sugar_g <= 500))
+                 AND (sodium_mg IS NULL OR (sodium_mg >= 0 AND sodium_mg <= 20000))
+                 AND time_zone IS NOT NULL AND eaten_at IS NOT NULL
+                 AND time_source IN ('now', 'manual')
+                 AND est_kcal IS NULL AND model IS NULL),
+                false)
         );
     END IF;
 END
@@ -109,8 +130,8 @@ CREATE INDEX IF NOT EXISTS idx_photo_meals_drink_date
 
 -- ── Trigger: photo branch unchanged, drink branch validates ──
 -- Error codes: OXP01 future (as before), OXD00 drink capture turned off (only
--- set by the off switch), OXD01 inconsistent drink time, OXD02 kind change,
--- OXD03 tombstone cleared, OXD04 revision not old + 1.
+-- set by sql/direct_drink_capture_off.sql), OXD01 inconsistent drink time,
+-- OXD02 kind change, OXD03 tombstone cleared, OXD04 revision not old + 1.
 CREATE OR REPLACE FUNCTION pds.photo_meals_set_eaten_at()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -251,196 +272,3 @@ UNION ALL
 
 -- Existing grants on pds.caffeine_events (authenticated SELECT, service_role) are
 -- kept by CREATE OR REPLACE; nothing is granted to anon.
-
--- ============================================================
--- APPENDIX A (commented out, NOT part of the migration): OFF SWITCH.
--- Run separately only to stop drink capture without losing records:
--- new drink INSERTs are refused (OXD00 -> route 503 "turned off"), edits and
--- Undo of existing drinks keep working, drinks leave both projections, every
--- row / column / grant stays. Re-running this file turns it back on.
--- (Kept here because the builder could only write this one SQL file; move it
--- to its own file during review.)
--- ============================================================
--- CREATE OR REPLACE FUNCTION pds.photo_meals_set_eaten_at()
--- RETURNS TRIGGER AS $$
--- DECLARE
---     tz TEXT;
---     local_ts TIMESTAMP;
--- BEGIN
---     IF TG_OP = 'UPDATE' AND NEW.capture_kind IS DISTINCT FROM OLD.capture_kind THEN
---         RAISE EXCEPTION 'a capture keeps its kind' USING ERRCODE = 'OXD02';
---     END IF;
---     IF NEW.capture_kind = 'drink' THEN
---         IF TG_OP = 'INSERT' THEN
---             RAISE EXCEPTION 'drink capture is turned off' USING ERRCODE = 'OXD00';
---         END IF;
---         IF OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL THEN
---             RAISE EXCEPTION 'a removed drink stays removed' USING ERRCODE = 'OXD03';
---         END IF;
---         IF NEW.revision <> OLD.revision + 1 THEN
---             RAISE EXCEPTION 'drink revision must advance by one' USING ERRCODE = 'OXD04';
---         END IF;
---         IF NEW.eaten_at IS NULL OR NEW.time_zone IS NULL THEN
---             RAISE EXCEPTION 'a drink needs its instant and time zone' USING ERRCODE = 'OXD01';
---         END IF;
---         local_ts := NEW.eaten_at AT TIME ZONE NEW.time_zone;
---         IF (local_ts - interval '6 hours')::date <> NEW.eaten_date
---            OR date_trunc('minute', local_ts)::time <> date_trunc('minute', NEW.eaten_time::interval)::time THEN
---             RAISE EXCEPTION 'drink day / clock do not match its instant' USING ERRCODE = 'OXD01';
---         END IF;
---         IF NEW.eaten_at > NOW() + interval '5 minutes' THEN
---             RAISE EXCEPTION 'that time has not happened yet' USING ERRCODE = 'OXP01';
---         END IF;
---         NEW.updated_at := NOW();
---         RETURN NEW;
---     END IF;
---     tz := COALESCE(pds.tz_for_instant((NEW.eaten_date + time '12:00') AT TIME ZONE 'America/New_York'),
---                    'America/New_York');
---     NEW.eaten_at := ((NEW.eaten_date + CASE WHEN NEW.eaten_time < time '06:00' THEN 1 ELSE 0 END)
---                      + NEW.eaten_time) AT TIME ZONE tz;
---     IF NEW.eaten_at > NOW() + interval '5 minutes' THEN
---         RAISE EXCEPTION 'that time has not happened yet' USING ERRCODE = 'OXP01';
---     END IF;
---     NEW.updated_at := NOW();
---     RETURN NEW;
--- END;
--- $$ LANGUAGE plpgsql;
---
--- CREATE OR REPLACE VIEW pds.direct_drink_daily WITH (security_invoker = true) AS
--- SELECT eaten_date AS behavioral_date, count(*)::int AS drink_count,
---        sum(kcal) AS kcal, sum(protein_g) AS protein_g, sum(carbs_g) AS carbs_g, sum(fat_g) AS fat_g,
---        CASE WHEN count(sugar_g) = count(*) THEN sum(sugar_g) END AS sugar_g,
---        CASE WHEN count(sodium_mg) = count(*) THEN sum(sodium_mg) END AS sodium_mg,
---        sum(caffeine_mg) AS caffeine_mg, min(eaten_at) AS first_drink_at, max(eaten_at) AS last_drink_at
---   FROM pds.photo_meals
---  WHERE false
---  GROUP BY eaten_date;
---
--- -- pds.caffeine_events: re-create with ONLY the first two branches of the
--- -- definition above (supplement + cronometer_serving, the deployed 2026-11-16
--- -- snapshot), keeping WITH (security_invoker = true).
-
--- ============================================================
--- APPENDIX B (commented out, NOT part of the migration): POST-APPLY CHECK.
--- Run after review + application with privileged SQL access. One transaction
--- ending in ROLLBACK: the synthetic rows (far-past day 2001-01-03, fixed
--- synthetic keys) never persist; no real record changes.
--- ============================================================
--- BEGIN;
--- SET LOCAL statement_timeout = '45s';
--- DO $check$
--- DECLARE
---     owner_id uuid; initial_role text := current_user; d constant date := '2001-01-03';
---     a_id bigint; b_id bigint; c_id bigint; n integer; total numeric; kcal_total numeric;
---     photo_before bigint; photo_after bigint; leaked boolean;
--- BEGIN
---     -- 0. Shape: invoker views, no anon access, deployed column order.
---     IF has_schema_privilege('anon', 'pds', 'USAGE') THEN RAISE EXCEPTION 'anon has pds usage'; END IF;
---     IF EXISTS (SELECT 1 FROM unnest(ARRAY['pds.direct_drink_daily','pds.caffeine_events','pds.photo_meal_daily']) v
---                WHERE NOT EXISTS (SELECT 1 FROM pg_class c, pg_options_to_table(c.reloptions) o
---                                  WHERE c.oid = v::regclass AND o.option_name = 'security_invoker' AND o.option_value::boolean)) THEN
---         RAISE EXCEPTION 'a projection lost security_invoker';
---     END IF;
---     IF has_table_privilege('anon', 'pds.direct_drink_daily', 'SELECT') OR has_table_privilege('anon', 'pds.caffeine_events', 'SELECT') THEN
---         RAISE EXCEPTION 'anon can read a drink projection';
---     END IF;
---     IF (SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
---         WHERE attrelid = 'pds.caffeine_events'::regclass AND attnum > 0)
---        <> 'source,event_key,behavioral_date,event_time,caffeine_mg,time_trusted' THEN
---         RAISE EXCEPTION 'caffeine_events column order changed';
---     END IF;
---     IF (SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
---         WHERE attrelid = 'pds.photo_meal_daily'::regclass AND attnum > 0)
---        <> 'behavioral_date,meal_count,est_kcal,est_protein_g,est_carbs_g,est_fat_g,first_meal_at,last_meal_at' THEN
---         RAISE EXCEPTION 'photo_meal_daily column order changed';
---     END IF;
---     SELECT count(*) INTO photo_before FROM pds.photo_meals WHERE capture_kind = 'photo';
---
---     -- 1. One drink = one caffeine event + one Nutrition contribution, not a photo meal.
---     INSERT INTO pds.photo_meals (client_key, capture_kind, eaten_date, eaten_time, eaten_at, time_zone, time_source,
---         items, kcal, protein_g, carbs_g, fat_g, sugar_g, sodium_mg, caffeine_mg,
---         drink_product_id, drink_product_version, drink_servings, drink_label)
---     VALUES ('00000000-0000-4000-8000-00000000d001', 'drink', d, '14:05', timestamptz '2001-01-03 14:05:00-05', 'America/New_York', 'manual',
---         '[{"name":"synthetic","portion":"1 can","kcal":5,"protein_g":0,"carbs_g":1,"fat_g":0}]', 5, 0, 1, 0, 0, 25, 200,
---         'synthetic', 1, 1, '{"product_id":"synthetic","version":1,"name":"synthetic","label":{}}')
---     RETURNING meal_id INTO a_id;
---     SELECT count(*) INTO n FROM pds.caffeine_events WHERE event_key = 'direct_capture:' || a_id;
---     IF n <> 1 THEN RAISE EXCEPTION 'expected one caffeine event, got %', n; END IF;
---     SELECT total_caffeine_mg INTO total FROM pds.caffeine_timing_daily WHERE calendar_date = d;
---     IF total IS DISTINCT FROM 200 THEN RAISE EXCEPTION 'caffeine total %', total; END IF;
---     SELECT kcal INTO kcal_total FROM pds.direct_drink_daily WHERE behavioral_date = d;
---     IF kcal_total IS DISTINCT FROM 5 THEN RAISE EXCEPTION 'drink kcal %', kcal_total; END IF;
---     IF EXISTS (SELECT 1 FROM pds.photo_meal_daily WHERE behavioral_date = d) THEN RAISE EXCEPTION 'drink in photo projection'; END IF;
---
---     -- 2. A second can adds; a zero-kcal drink still counts caffeine; unknown sugar stays NULL.
---     INSERT INTO pds.photo_meals (client_key, capture_kind, eaten_date, eaten_time, eaten_at, time_zone, time_source,
---         items, kcal, protein_g, carbs_g, fat_g, caffeine_mg, drink_product_id, drink_product_version, drink_servings, drink_label)
---     VALUES ('00000000-0000-4000-8000-00000000d002', 'drink', d, '16:00', timestamptz '2001-01-03 16:00:00-05', 'America/New_York', 'manual',
---         '[{"name":"zero","portion":"1 can","kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0}]', 0, 0, 0, 0, 100,
---         'synthetic-zero', 1, 1, '{"product_id":"synthetic-zero","version":1,"name":"zero","label":{}}')
---     RETURNING meal_id INTO b_id;
---     SELECT total_caffeine_mg INTO total FROM pds.caffeine_timing_daily WHERE calendar_date = d;
---     IF total IS DISTINCT FROM 300 THEN RAISE EXCEPTION 'two drinks: caffeine %', total; END IF;
---     IF (SELECT drink_count FROM pds.direct_drink_daily WHERE behavioral_date = d) <> 2 THEN RAISE EXCEPTION 'two drinks: count'; END IF;
---     IF (SELECT sugar_g FROM pds.direct_drink_daily WHERE behavioral_date = d) IS NOT NULL THEN RAISE EXCEPTION 'unknown sugar summed as 0'; END IF;
---
---     -- 3. in_diary and the tombstone leave BOTH projections.
---     UPDATE pds.photo_meals SET diary_overlap = 'in_diary', revision = revision + 1 WHERE meal_id = b_id;
---     SELECT total_caffeine_mg INTO total FROM pds.caffeine_timing_daily WHERE calendar_date = d;
---     IF total IS DISTINCT FROM 200 THEN RAISE EXCEPTION 'in_diary counted in caffeine'; END IF;
---     IF (SELECT drink_count FROM pds.direct_drink_daily WHERE behavioral_date = d) <> 1 THEN RAISE EXCEPTION 'in_diary counted in nutrition'; END IF;
---     UPDATE pds.photo_meals SET deleted_at = now(), revision = revision + 1 WHERE meal_id = a_id;
---     IF EXISTS (SELECT 1 FROM pds.caffeine_timing_daily WHERE calendar_date = d) THEN RAISE EXCEPTION 'tombstone in caffeine'; END IF;
---     IF EXISTS (SELECT 1 FROM pds.direct_drink_daily WHERE behavioral_date = d) THEN RAISE EXCEPTION 'tombstone in nutrition'; END IF;
---
---     -- 4. Trigger guards.
---     BEGIN UPDATE pds.photo_meals SET deleted_at = NULL, revision = revision + 1 WHERE meal_id = a_id;
---           RAISE EXCEPTION 'resurrection allowed'; EXCEPTION WHEN SQLSTATE 'OXD03' THEN NULL; END;
---     BEGIN UPDATE pds.photo_meals SET drink_servings = 2 WHERE meal_id = b_id;
---           RAISE EXCEPTION 'edit without new revision allowed'; EXCEPTION WHEN SQLSTATE 'OXD04' THEN NULL; END;
---     BEGIN UPDATE pds.photo_meals SET capture_kind = 'photo', revision = revision + 1 WHERE meal_id = b_id;
---           RAISE EXCEPTION 'kind change allowed'; EXCEPTION WHEN SQLSTATE 'OXD02' THEN NULL; END;
---     BEGIN INSERT INTO pds.photo_meals (client_key, capture_kind, eaten_date, eaten_time, eaten_at, time_zone, time_source,
---               items, kcal, protein_g, carbs_g, fat_g, caffeine_mg, drink_product_id, drink_product_version, drink_servings, drink_label)
---           VALUES ('00000000-0000-4000-8000-00000000d003', 'drink', d, '12:00', timestamptz '2001-01-03 14:05:00-05', 'America/New_York', 'manual',
---               '[{"name":"x","portion":null,"kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0}]', 0, 0, 0, 0, 1, 'x', 1, 1, '{}');
---           RAISE EXCEPTION 'mismatched clock allowed'; EXCEPTION WHEN SQLSTATE 'OXD01' THEN NULL; END;
---     BEGIN INSERT INTO pds.photo_meals (client_key, eaten_date, eaten_time, time_source, items, kcal, protein_g, carbs_g, fat_g, caffeine_mg)
---           VALUES ('00000000-0000-4000-8000-00000000d005', d, '12:00', 'manual',
---               '[{"name":"x","portion":null,"kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0}]', 0, 0, 0, 0, 50);
---           RAISE EXCEPTION 'photo row with caffeine allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
---
---     -- 5. Existing photo meals untouched.
---     SELECT count(*) INTO photo_after FROM pds.photo_meals WHERE capture_kind = 'photo';
---     IF photo_after <> photo_before THEN RAISE EXCEPTION 'photo rows changed'; END IF;
---
---     -- 6. Access: owner reads; another identity and no identity read nothing; authenticated cannot write.
---     INSERT INTO pds.photo_meals (client_key, capture_kind, eaten_date, eaten_time, eaten_at, time_zone, time_source,
---         items, kcal, protein_g, carbs_g, fat_g, caffeine_mg, drink_product_id, drink_product_version, drink_servings, drink_label)
---     VALUES ('00000000-0000-4000-8000-00000000d006', 'drink', d, '18:00', timestamptz '2001-01-03 18:00:00-05', 'America/New_York', 'manual',
---         '[{"name":"x","portion":null,"kcal":5,"protein_g":0,"carbs_g":1,"fat_g":0}]', 5, 0, 1, 0, 200, 'x', 1, 1, '{}')
---     RETURNING meal_id INTO c_id;
---     SELECT substring(qual from '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')::uuid
---       INTO owner_id FROM pg_policies WHERE schemaname = 'pds' AND tablename = 'photo_meals' AND policyname = 'owner_read';
---     PERFORM set_config('request.jwt.claim.sub', owner_id::text, true);
---     PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', owner_id, 'role', 'authenticated')::text, true);
---     EXECUTE 'SET LOCAL ROLE authenticated';
---     IF NOT EXISTS (SELECT 1 FROM pds.caffeine_events WHERE event_key = 'direct_capture:' || c_id) THEN RAISE EXCEPTION 'owner cannot read'; END IF;
---     PERFORM set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000001', true);
---     PERFORM set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000001","role":"authenticated"}', true);
---     SELECT exists(SELECT 1 FROM pds.photo_meals WHERE meal_id = c_id)
---         OR exists(SELECT 1 FROM pds.direct_drink_daily WHERE behavioral_date = d)
---         OR exists(SELECT 1 FROM pds.caffeine_events WHERE event_key = 'direct_capture:' || c_id) INTO leaked;
---     IF leaked THEN RAISE EXCEPTION 'non-owner can read drink rows'; END IF;
---     PERFORM set_config('request.jwt.claim.sub', '', true);
---     PERFORM set_config('request.jwt.claims', '{}', true);
---     IF exists(SELECT 1 FROM pds.photo_meals WHERE meal_id = c_id) THEN RAISE EXCEPTION 'no-identity read'; END IF;
---     BEGIN INSERT INTO pds.photo_meals (client_key, eaten_date, eaten_time, time_source, items, kcal, protein_g, carbs_g, fat_g)
---           VALUES ('00000000-0000-4000-8000-00000000d007', d, '12:00', 'manual', '[{"name":"x","portion":null,"kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0}]', 0, 0, 0, 0);
---           RAISE EXCEPTION 'authenticated could write'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
---     EXECUTE format('SET LOCAL ROLE %I', initial_role);
---     PERFORM set_config('onyx.direct_drink_verification', '{"passed":true}', true);
--- END
--- $check$;
--- SELECT current_setting('onyx.direct_drink_verification')::jsonb AS verification;
--- ROLLBACK;

@@ -67,8 +67,8 @@ test("drinks: several drafts at once, each with its stable key; memory only like
   const key = "0b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b";
   D.setLogDrafts({
     drinks: [
-      { key, product_id: "gorilla-mind-energy-wild-grape-16oz", said: "one wild grape Gorilla Mind", issue: null, servings: 1, time: null, date: null, captured_at: 1 },
-      { key: "1b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b", product_id: null, said: "Gorilla Mind", issue: "flavor", servings: null, time: null, date: null, captured_at: 1 },
+      { key, product_id: "gorilla-mind-energy-wild-grape-16oz", said: "one wild grape Gorilla Mind", issue: null, servings: 1, time: null, date: null, when_issue: null, captured_at: 1 },
+      { key: "1b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b", product_id: null, said: "Gorilla Mind", issue: "flavor", servings: null, time: null, date: null, when_issue: "bad_date", captured_at: 1 },
     ],
   }, "one wild grape Gorilla Mind and a Gorilla Mind");
   const d = D.getLogDraft("drinks");

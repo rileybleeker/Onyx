@@ -9,10 +9,12 @@
 //     chosen zone with DST gaps refused and repeated hours resolved only by an explicit earlier / later choice;
 //     an unknown historical time is never saved (the section asks for it);
 //   - replay identity: the same client_key + the same normalized capture is the same event; anything else is a
-//     conflict or a revision-checked edit;
+//     conflict (shown, never auto-overwritten) or a revision-checked edit;
 //   - the Nutrition merge: distinct direct drinks ADD to a Cronometer day and to an estimate day, and alone make a
-//     "DRINKS" day; a drink marked "in the diary" counts nowhere (same rule as the SQL projections);
-//   - a small in-memory session (acknowledged saves, removed keys, editor state) that outlives a remounted section.
+//     "DRINKS" day; a drink marked "in the diary" (only for a Cronometer entry that counts in both channels)
+//     counts nowhere (same rule as the SQL projections);
+//   - the editor item's readiness (itemSave). The session store with its pending-operation recovery is
+//     lib/drink-session.ts.
 // No network, no React, no Node built-ins (WebCrypto only for item keys).
 
 import { shiftYmd } from "./delivery-portion";
@@ -189,26 +191,39 @@ export const TIME_PROBLEM_TEXT: Record<TimeProblem, string> = {
 const fail = (problem: TimeProblem, choices?: string[]): ResolvedTime => ({ ok: false, problem, error: TIME_PROBLEM_TEXT[problem], ...(choices ? { choices } : {}) });
 
 /**
+ * A full ISO instant with an explicit zone designator: "2026-11-15T19:05:30Z", "...30.123Z", "...30-05:00". A
+ * date-only or zone-less string ("2026-11-15", "2026-11-15T14:05") is refused: the host's zone would decide it.
+ */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d{1,6})?)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$/;
+export function isIsoInstant(s: unknown): s is string {
+  return typeof s === "string" && s.length <= 40 && ISO_INSTANT.test(s) && isYmd(s.slice(0, 10)) && Number.isFinite(Date.parse(s));
+}
+
+/**
  * A capture's time -> the instant, behavioral day and local clock to store. `today` = behavioral today (server:
  * pds.behavioral_today_now()); `nowMs` = the server's clock. Never invents a time: an unresolved manual time is a
  * problem, never noon or now.
+ *
+ * `bounds: false` resolves the instant only (zone, ISO syntax, DST gap / repeated hour still apply) without the
+ * new-capture window (future, 48 h, 6 days): used to compare a retried request with a drink ALREADY stored under
+ * its key, so a replay days later still answers the stored drink (or its removal) instead of "too old".
  */
-export function resolveDrinkTime(t: DrinkTime, nowMs: number, today: string): ResolvedTime {
+export function resolveDrinkTime(t: DrinkTime, nowMs: number, today: string, { bounds = true }: { bounds?: boolean } = {}): ResolvedTime {
   if (!isValidZone(t.zone)) return fail("bad_zone");
   const earliest = shiftYmd(today, -DRINK_DAYS_BACK);
   if (t.mode === "now") {
+    if (!isIsoInstant(t.at)) return fail("bad_time");
     const ms = Date.parse(t.at);
-    if (!Number.isFinite(ms)) return fail("bad_time");
-    if (ms > nowMs + FUTURE_SLACK_MS) return fail("future");
-    if (ms < nowMs - NOW_MAX_AGE_MS) return fail("too_old");
+    if (bounds && ms > nowMs + FUTURE_SLACK_MS) return fail("future");
+    if (bounds && ms < nowMs - NOW_MAX_AGE_MS) return fail("too_old");
     const day = behavioralDayAt(ms, t.zone);
     // The device zone may put the instant a day either side of the server's behavioral today on a travel day.
-    if (day < earliest || day > shiftYmd(today, 1)) return fail("too_old");
+    if (bounds && (day < earliest || day > shiftYmd(today, 1))) return fail("too_old");
     return { ok: true, eaten_at: new Date(ms).toISOString(), eaten_ms: ms, eaten_date: day, eaten_time: localClockAt(ms, t.zone).time, time_source: "now", time_zone: t.zone };
   }
   if (!isYmd(t.day) || !isHhmm(t.time)) return fail("bad_time");
-  if (t.day > today) return fail("future");
-  if (t.day < earliest) return fail("too_old");
+  if (bounds && t.day > today) return fail("future");
+  if (bounds && t.day < earliest) return fail("too_old");
   const instants = instantsForWallClock(clockDateOf(t.day, t.time), t.time, t.zone);
   if (instants.length === 0) return fail("nonexistent");
   let ms = instants[0];
@@ -216,8 +231,16 @@ export function resolveDrinkTime(t: DrinkTime, nowMs: number, today: string): Re
     if (t.fold == null) return fail("ambiguous", instants.map((i) => new Date(i).toISOString()));
     ms = t.fold === "later" ? instants[instants.length - 1] : instants[0];
   }
-  if (ms > nowMs + FUTURE_SLACK_MS) return fail("future");
+  if (bounds && ms > nowMs + FUTURE_SLACK_MS) return fail("future");
   return { ok: true, eaten_at: new Date(ms).toISOString(), eaten_ms: ms, eaten_date: t.day, eaten_time: t.time, time_source: "manual", time_zone: t.zone };
+}
+
+/**
+ * Behavioral today without the database: the Eastern WALL clock, then the 06:00 rule (never "now minus 6 elapsed
+ * hours", which is off by an hour across a DST change).
+ */
+export function fallbackBehavioralToday(nowMs: number): string {
+  return behavioralDayAt(nowMs, "America/New_York");
 }
 
 // ---- request bodies ------------------------------------------------------------------------------------------
@@ -227,7 +250,7 @@ function parseTime(v: unknown): Parsed<DrinkTime> {
   if (!t) return { ok: false, error: "time must be an object" };
   if (t.mode === "now") {
     if (Object.keys(t).sort().join(",") !== "at,mode,zone") return { ok: false, error: "time must be exactly {mode, at, zone}" };
-    if (typeof t.at !== "string" || !Number.isFinite(Date.parse(t.at)) || t.at.length > 40) return { ok: false, error: "time.at must be an ISO instant" };
+    if (!isIsoInstant(t.at)) return { ok: false, error: "time.at must be an ISO instant with Z or an offset" };
     if (!isValidZone(t.zone)) return { ok: false, error: "time.zone must be an IANA time zone" };
     return { ok: true, value: { mode: "now", at: t.at, zone: t.zone } };
   }
@@ -243,9 +266,14 @@ function parseTime(v: unknown): Parsed<DrinkTime> {
   return { ok: false, error: "time.mode must be now or manual" };
 }
 
+/**
+ * The body's shape only. Whether product_id is in the CURRENT catalogue is checked by the route for a new drink or
+ * a product change, after a stored drink under the key was compared: a retry of a drink captured before a
+ * catalogue change still answers that drink.
+ */
 function parseCapture(b: Record<string, unknown>): Parsed<DrinkSave> {
   if (!isUuid(b.client_key)) return { ok: false, error: "client_key must be a UUID" };
-  if (!drinkProduct(b.product_id)) return { ok: false, error: "product_id is not a known drink" };
+  if (typeof b.product_id !== "string" || !PRODUCT_ID.test(b.product_id)) return { ok: false, error: "product_id must be a drink id" };
   if (!isServings(b.servings)) return { ok: false, error: `servings must be 0.25 to ${MAX_SERVINGS} in quarter steps` };
   if (b.overlap !== "none" && b.overlap !== "in_diary") return { ok: false, error: "overlap must be none or in_diary" };
   const time = parseTime(b.time);
@@ -256,6 +284,7 @@ function parseCapture(b: Record<string, unknown>): Parsed<DrinkSave> {
   };
 }
 
+const PRODUCT_ID = /^[a-z0-9-]{3,80}$/;
 const CREATE_KEYS = "client_key,overlap,product_id,servings,time";
 const EDIT_KEYS = "client_key,expected_revision,overlap,product_id,servings,time";
 
@@ -443,6 +472,21 @@ export interface OverlapCandidate {
   name: string;
   /** Local "HH:MM" when known. */
   time: string | null;
+  /** Cronometer: the serving's caffeine (null = none logged), which decides whether it counts in Caffeine. */
+  caffeine_mg: number | null;
+  /** Explicit proof of the nutrition rollup's attribution and known nutrient values. Missing is unverified. */
+  counts_in_nutrition?: boolean;
+}
+
+export function cronometerNutritionCoverage(s: {
+  onyx_behavioral_date: unknown; calories: unknown; protein_g: unknown; carbs_g: unknown;
+  fat_g: unknown; sugars_g: unknown; sodium_mg: unknown;
+}, day: string): boolean {
+  // Unlike caffeine's COALESCE day, the nutrition rollup excludes rows without behavioral attribution.
+  if (s.onyx_behavioral_date !== day) return false;
+  return [s.calories, s.protein_g, s.carbs_g, s.fat_g, s.sugars_g, s.sodium_mg].every((v) =>
+    (typeof v === "number" || (typeof v === "string" && v.trim() !== "")) && Number.isFinite(Number(v)) && Number(v) >= 0,
+  );
 }
 
 /** Same-product drinks already saved near this one (another capture key): "that one, or another can?" */
@@ -473,8 +517,9 @@ type Row = Record<string, unknown> & { calendar_date: string };
  * getNutrition's last step. The Cronometer-or-estimate rows are final; a direct drink (pds.direct_drink_daily:
  * active, not marked as already in the diary) is a distinct item, so it ADDS to that day's row whatever its
  * source (it never goes through the fallback-only estimate merge, which a diary day suppresses). A day with only
- * drinks gets its own row tagged DRINK_SOURCE. Zero-kcal drinks still count (direct_drink_count). An unknown
- * drink sugar / sodium makes that day's total unknown (null), never a silent 0.
+ * drinks gets its own row tagged DRINK_SOURCE. Zero-kcal drinks still count (direct_drink_count). An unknown on
+ * either side (the day's own protein, say, or a drink's sugar) keeps that day's total unknown (null): adding a
+ * drink never turns an unknown diary value into a drink-only "known" total.
  */
 export function addDirectDrinks(rows: ReadonlyArray<Row>, days: ReadonlyArray<DrinkDay>): Row[] {
   const out: Row[] = rows.map((r) => ({ ...r }));
@@ -503,17 +548,15 @@ export function addDirectDrinks(rows: ReadonlyArray<Row>, days: ReadonlyArray<Dr
       continue;
     }
     const add = (k: string, v: number | null) => {
-      row[k] = r1((n(row[k]) ?? 0) + (v ?? 0));
+      const have = n(row[k]);
+      row[k] = have == null || v == null ? null : r1(have + v);
     };
     add("calories", n(d.kcal));
     add("protein_g", n(d.protein_g));
     add("carbs_g", n(d.carbs_g));
     add("fat_g", n(d.fat_g));
-    for (const k of ["sugar_g", "sodium_mg"] as const) {
-      const have = n(row[k]);
-      const extra = n(d[k]);
-      row[k] = have == null || extra == null ? null : r1(have + extra);
-    }
+    add("sugar_g", n(d.sugar_g));
+    add("sodium_mg", n(d.sodium_mg));
     row.direct_drink_count = (Number(row.direct_drink_count) || 0) + count;
   }
   out.sort((a, b) => (a.calendar_date < b.calendar_date ? -1 : a.calendar_date > b.calendar_date ? 1 : 0));
@@ -579,12 +622,19 @@ export function onDrinkChange(fn: () => void): () => void {
   return () => window.removeEventListener(DRINK_CHANGED_EVENT, fn);
 }
 
-// ---- the session: outlives a remounted section, gone on reload ----------------------------------------------
+// ---- one drink in the editor (state kept by lib/drink-session.ts) ---------------------------------------------
 
-/** What the editor holds for one drink item (memory only: no words beyond the short `said`, no storage). */
+/** A request whose answer has not been seen yet: kept (and persisted) BEFORE it is sent, cleared on an answer. */
+export type PendingOp =
+  | { op: "create"; body: DrinkSave }
+  | { op: "edit"; body: DrinkEdit }
+  | { op: "remove"; body: { client_key: string; expected_revision: number } };
+
+/** What the editor holds for one drink item. */
 export interface DrinkItemState {
   key: string;
   product_id: string | null;
+  /** The short words the item came from: memory only, never persisted ("" after a reload). */
   said: string;
   issue: string | null;
   servings: number | null;
@@ -595,13 +645,75 @@ export interface DrinkItemState {
   time: string | null;
   fold: "earlier" | "later" | null;
   zone: string;
+  /**
+   * A day or time was SAID but is not usable (malformed, impossible, future, too far back): the item never falls
+   * back to today or Now; it waits until Riley picks the day / time himself (which clears this).
+   */
+  whenIssue: string | null;
   /** null = not asked yet / not needed; set by Riley's tap. */
   overlap: Overlap | null;
   /** "another" once Riley said a same-product drink nearby is a different one. */
   recent: "another" | null;
   status: "open" | "dismissed" | "removed";
-  /** The capture the server acknowledged last (the autosave baseline after a remount). */
+  /** The capture the server acknowledged last (the autosave baseline after a remount or reload). */
   saved: DrinkSave | null;
+  /**
+   * Nothing is sent while set. "recover": restored after a reload, reading its key to see what the server holds.
+   * "retry": restored and not found on the server (or the read failed): sent again only on Riley's explicit tap.
+   * "conflict": the server holds a different version (shown); a new deliberate change or Undo is needed.
+   */
+  hold: "recover" | "retry" | "conflict" | null;
+  /** A line for Riley about the last answer (conflict, removed elsewhere, recovered). */
+  note: string | null;
+  /** The request in flight or with an unknown outcome (see PendingOp). */
+  pending: PendingOp | null;
+}
+
+/** What the editor says when a SAID day / time cannot be used (never replaced by today or Now). */
+export const WHEN_ISSUE = {
+  day: "The day said can't be used. Pick the day.",
+  time: "The time said can't be used. Set the time.",
+  both: "The day and time said can't be used. Pick both.",
+} as const;
+
+export function whenIssueOf(code: "bad_date" | "bad_time" | "bad_date_time" | null | undefined): string | null {
+  return code === "bad_date" ? WHEN_ISSUE.day : code === "bad_time" ? WHEN_ISSUE.time : code === "bad_date_time" ? WHEN_ISSUE.both : null;
+}
+
+/** Riley set the day (or the time) himself: what is still unresolved. */
+export function afterWhenEdit(issue: string | null, edited: "day" | "time"): string | null {
+  if (issue === WHEN_ISSUE.both) return edited === "day" ? WHEN_ISSUE.time : WHEN_ISSUE.day;
+  if (issue === WHEN_ISSUE.day) return edited === "day" ? null : issue;
+  if (issue === WHEN_ISSUE.time) return edited === "time" ? null : issue;
+  return issue;
+}
+
+/** Two save bodies describe the same capture (instants compared as instants, not strings). */
+export function sameSave(a: DrinkSave | null | undefined, b: DrinkSave | null | undefined): boolean {
+  if (!a || !b) return false;
+  const t = (x: DrinkTime) =>
+    x.mode === "now" ? `now|${Date.parse(x.at)}|${x.zone}` : `manual|${x.day}|${x.time}|${x.zone}|${x.fold ?? ""}`;
+  return a.client_key === b.client_key && a.product_id === b.product_id && Math.abs(a.servings - b.servings) < 1e-9 && a.overlap === b.overlap && t(a.time) === t(b.time);
+}
+
+/** The editor fields of a stored drink (after a conflict or a recovery read: the server's version is shown). */
+export function itemFieldsFromRecord(rec: DrinkRecord): Pick<DrinkItemState, "product_id" | "servings" | "timeMode" | "capturedAt" | "day" | "time" | "fold" | "zone" | "overlap" | "saved" | "whenIssue" | "issue"> {
+  const save = saveFromRecord(rec);
+  const now = save.time.mode === "now";
+  return {
+    product_id: rec.product_id,
+    servings: rec.servings,
+    timeMode: now ? "now" : "manual",
+    capturedAt: Date.parse(rec.eaten_at),
+    day: save.time.mode === "manual" ? save.time.day : null,
+    time: save.time.mode === "manual" ? save.time.time : null,
+    fold: save.time.mode === "manual" ? save.time.fold : null,
+    zone: rec.time_zone,
+    overlap: rec.overlap,
+    saved: save,
+    whenIssue: null,
+    issue: null,
+  };
 }
 
 /** A stored drink as a save body again (for edits of a listed drink: overlap toggle, amount). */
@@ -620,66 +732,10 @@ export function saveFromRecord(rec: DrinkRecord): DrinkSave {
 /** What the drinks GET says is already logged that day (null = not loaded yet). */
 export interface DayCheck {
   candidates: OverlapCandidate[];
-  /** Sources that could not be checked: never read as "nothing there". */
+  /** Sources that could not be checked completely (failed or truncated): never read as "nothing there". */
   unchecked: string[];
   drinks: DrinkRecord[];
 }
-
-const items = new Map<string, DrinkItemState>();
-const acks = new Map<string, DrinkRecord>();
-const listeners = new Set<() => void>();
-let version = 0;
-
-function emit() {
-  version += 1;
-  for (const fn of Array.from(listeners)) {
-    try { fn(); } catch { /* a listener never breaks another */ }
-  }
-}
-
-export const drinkSession = {
-  version: () => version,
-  subscribe(fn: () => void): () => void {
-    listeners.add(fn);
-    return () => { listeners.delete(fn); };
-  },
-  items(): DrinkItemState[] {
-    return Array.from(items.values());
-  },
-  get(key: string): DrinkItemState | undefined {
-    return items.get(key);
-  },
-  /** Add an item once: the same key again (a repeated Fill of the same words) keeps the existing state. */
-  adopt(item: DrinkItemState): boolean {
-    if (items.has(item.key)) return false;
-    items.set(item.key, item);
-    emit();
-    return true;
-  },
-  update(key: string, patch: Partial<DrinkItemState>): void {
-    const cur = items.get(key);
-    if (!cur) return;
-    items.set(key, { ...cur, ...patch });
-    emit();
-  },
-  ack(key: string): DrinkRecord | undefined {
-    return acks.get(key);
-  },
-  remember(rec: DrinkRecord): void {
-    acks.set(rec.client_key, rec);
-    emit();
-  },
-  forget(key: string): void {
-    acks.delete(key);
-    emit();
-  },
-  /** Tests only. */
-  reset(): void {
-    items.clear();
-    acks.clear();
-    emit();
-  },
-};
 
 /** The device's IANA zone (falls back to New York, the project's home zone). */
 export function deviceZone(): string {
@@ -691,21 +747,36 @@ export function deviceZone(): string {
   }
 }
 
+/**
+ * "Already counted there" is only offered (and only accepted by the route) when the logged entry counts in BOTH
+ * channels a drink capture would: a Cronometer serving on that behavioral day counts in Nutrition (the diary day)
+ * AND in Caffeine (when its caffeine_mg > 0). A supplement intake counts caffeine only and an Uber Eats dish
+ * Nutrition only, so for those (or a Cronometer entry without caffeine) Onyx cannot exclude the drink truthfully
+ * from both: Riley either counts this drink here or does not add it. Not a durable link to that serving (its id is
+ * replaced on re-import): a later import of the same drink is not detected.
+ */
+export function dualChannelOverlaps(p: DrinkProduct, check: DayCheck): OverlapCandidate[] {
+  return check.candidates.filter((o) => o.source === "cronometer" && o.counts_in_nutrition === true && (o.caffeine_mg ?? 0) > 0 && likelySameDrink(p, o.name));
+}
+
 /** The save body an item stands for, or why it cannot be saved yet (shown, nothing sent). */
 export function itemSave(
   it: DrinkItemState,
-  ctx: { today: string | null; nowMs: number; dayCheck: (day: string) => DayCheck | null },
+  ctx: { today: string | null; nowMs: number; dayCheck: (day: string) => DayCheck | null; acknowledged: boolean; blocked?: string | null },
 ):
   | { ok: true; save: DrinkSave; resolved: Extract<ResolvedTime, { ok: true }> }
   | { ok: false; reason: string; problem?: TimeProblem; choices?: string[]; ask?: "overlap" | "recent"; day?: string } {
   const p = drinkProduct(it.product_id);
   if (!p) return { ok: false, reason: it.issue ?? "Pick the drink." };
   if (it.servings == null || !isServings(it.servings)) return { ok: false, reason: "How much? Pick an amount." };
+  if (ctx.blocked) return { ok: false, reason: ctx.blocked };
   if (!ctx.today) return { ok: false, reason: "Loading today…" };
+  // A day or time that was said but is not usable never becomes today or Now.
+  if (it.whenIssue) return { ok: false, reason: it.whenIssue, problem: "bad_time" };
   let time: DrinkTime;
   if (it.timeMode === "now") time = { mode: "now", at: new Date(it.capturedAt).toISOString(), zone: it.zone };
   else {
-    // A clock time said for the Say it day (no other day said) is today's.
+    // A clock time said with NO day (absent, not invalid) is for the Say it day: today.
     const day = it.day ?? ctx.today;
     if (!it.time) return { ok: false, reason: "When? Set the time.", problem: "bad_time" };
     time = { mode: "manual", day, time: it.time, zone: it.zone, fold: it.fold };
@@ -714,10 +785,13 @@ export function itemSave(
   if (!resolved.ok) return { ok: false, reason: resolved.error, problem: resolved.problem, choices: resolved.choices };
   const check = ctx.dayCheck(resolved.eaten_date);
   if (check == null) return { ok: false, reason: "Checking what is already logged…", day: resolved.eaten_date };
-  if (!acks.has(it.key)) {
+  if (!ctx.acknowledged) {
     const likely = check.candidates.some((o) => likelySameDrink(p, o.name));
     if (it.overlap == null && (likely || check.unchecked.length > 0)) {
       return { ok: false, reason: likely ? "Already logged elsewhere? Choose below." : "Couldn't check the other logs. Choose below.", ask: "overlap", day: resolved.eaten_date };
+    }
+    if (it.overlap === "in_diary" && dualChannelOverlaps(p, check).length === 0) {
+      return { ok: false, reason: "Only a Cronometer entry with caffeine can count instead. Choose below.", ask: "overlap", day: resolved.eaten_date };
     }
     if (it.recent == null && recentSameProduct(check.drinks, p.id, it.key, resolved.eaten_ms, resolved.eaten_date).length > 0) {
       return { ok: false, reason: "Same drink logged earlier. Choose below.", ask: "recent", day: resolved.eaten_date };

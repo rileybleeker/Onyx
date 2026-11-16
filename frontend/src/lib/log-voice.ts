@@ -600,6 +600,7 @@ function drinkLine(d: DrinkVoiceItem, c: VoiceClock): string {
   const day = d.date && d.date !== c.day ? shortDay(d.date) : "";
   if (!p) return `"${d.said}": ${DRINK_ISSUE_SHORT[d.issue ?? "unknown"]}`;
   const amount = d.servings != null ? servingsText(d.servings) : "how much?";
+  if (d.when_issue) return `${p.name}, ${amount}: when? (the day or time said can't be used)`;
   return `${p.name}, ${amount}${d.time ? ` at ${formatClock(d.time)}` : ""}${day}`;
 }
 
@@ -619,14 +620,48 @@ function parseDrinks(raw: unknown, c: VoiceClock): DrinkVoiceItem[] {
     const product = match?.kind === "match" ? match.product : null;
     const unit = typeof d.unit === "string" ? d.unit.toLowerCase() : "none";
     const servings = servingsFrom(num(d.amount), unit === "can" || unit === "fl_oz" ? unit : null, product);
+    const when = drinkWhen(d.date, d.time, c);
     out.push({
       product_id: product ? product.id : null,
       said,
       issue: product ? null : match?.kind === "unresolved" ? match.issue : "unknown",
       servings,
-      time: clock(d.time),
-      date: draftDate(d.date, c),
+      time: when.time,
+      date: when.date,
+      when_issue: when.issue,
     });
   }
   return out;
+}
+
+/**
+ * A drink's day and time as said. ABSENT (missing, "" or only spaces) is "not said": null, so the editor uses the
+ * Say it day / visible Now. PRESENT but unusable (not YYYY-MM-DD, an impossible date, after today, more than 6 days
+ * back; a clock that is not HH:MM) is never erased into "not said": it becomes `when_issue` and the drink waits.
+ * (draftDate / clock above map such values to null, which for a drink would log an old drink as today.)
+ */
+export function drinkWhen(rawDate: unknown, rawTime: unknown, c: VoiceClock): { date: string | null; time: string | null; issue: DrinkVoiceItem["when_issue"] } {
+  const said = (v: unknown) => typeof v === "string" && v.trim() !== "";
+  let date: string | null = null;
+  let badDate = false;
+  if (said(rawDate)) {
+    const v = (rawDate as string).trim();
+    const asDate = YMD.test(v) ? new Date(`${v}T12:00:00Z`) : null;
+    const real = !!asDate && !Number.isNaN(asDate.getTime()) && asDate.toISOString().slice(0, 10) === v;
+    if (!real || v > c.today || v < shiftYmd(c.today, -6)) badDate = true;
+    else date = v === c.day ? null : v;
+  } else if (rawDate != null && typeof rawDate !== "string") {
+    badDate = true;
+  }
+  if (!badDate && date == null && c.day !== c.today) date = c.day;
+  let time: string | null = null;
+  let badTime = false;
+  if (said(rawTime)) {
+    time = clock(rawTime);
+    if (!time) badTime = true;
+  } else if (rawTime != null && typeof rawTime !== "string") {
+    badTime = true;
+  }
+  const issue = badDate && badTime ? "bad_date_time" : badDate ? "bad_date" : badTime ? "bad_time" : null;
+  return { date: badDate ? null : date, time, issue };
 }

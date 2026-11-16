@@ -513,8 +513,9 @@ export async function getNutrition(days: number = 30) {
   // Photo meals are an add-on: until sql/photo_meals.sql is applied the view does not exist, and no other
   // failure there may take the macro charts down with it.
   if (photo.error && !isMissingRelation(photo.error.code)) console.error("photo_meal_daily:", photo.error.message);
-  // Same for drinks (sql/direct_drink_capture.sql not applied yet: missing view).
-  if (drinks.error && !isMissingRelation(drinks.error.code)) console.error("direct_drink_daily:", drinks.error.message);
+  // Drinks: only "not set up yet" (sql/direct_drink_capture.sql not applied: missing view) means none. Any other
+  // failure propagates (the page's stale / error path): totals without saved drinks must not look complete.
+  if (drinks.error && !isMissingRelation(drinks.error.code)) throw drinks.error;
 
   type NutritionRow = Record<string, unknown> & { calendar_date: string };
   const estimates = combineEstimateDays(delivery.data ?? [], photo.error ? [] : (photo.data ?? []));
@@ -538,6 +539,7 @@ export async function getDirectDrinksForDays(dates: string[]): Promise<DrinkReco
     .order("eaten_at", { ascending: true })
     .order("meal_id", { ascending: true });
   if (error) {
+    // Not set up yet (no drink columns): no drinks exist. Anything else is an error the page shows.
     if (isMissingRelation(error.code) || error.code === "42703") return [];
     throw error;
   }

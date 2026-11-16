@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Re
 import { Check } from "lucide-react";
 import InfoHint from "@/components/InfoHint";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
-import { AutosaveRefused } from "@/lib/autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { shiftYmd } from "@/lib/delivery-portion";
@@ -13,9 +12,10 @@ import { DRINK_ISSUE_TEXT, DRINK_PRODUCTS, drinkProduct } from "@/lib/drink-prod
 import {
   DRINKS_URL,
   DRINK_DAYS_BACK,
+  afterWhenEdit,
   announceDrinkChange,
   deviceZone,
-  drinkSession,
+  dualChannelOverlaps,
   itemSave,
   likelySameDrink,
   localClockAt,
@@ -24,12 +24,14 @@ import {
   recentSameProduct,
   saveFromRecord,
   servingsText,
+  whenIssueOf,
   type DayCheck,
   type DrinkItemState,
   type DrinkRecord,
   type DrinkSave,
   type OverlapCandidate,
 } from "@/lib/drink-capture";
+import { drinkSession, saveDrinkWith, undoDrinkWith, type Call, type KeyRead } from "@/lib/drink-session";
 import { useLogDrafts, type DrinkLogDraft } from "@/lib/log-drafts";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
@@ -40,15 +42,19 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * Saving (autosave, lib/autosave.ts; no Save button): a drink with a known product, an amount and a time saves on
  * its own, like Riley's own input. It waits, with the reason shown, while any of these is open: the product (the
  * powder, another flavor or an unknown drink stays here unresolved, never dropped, never zero caffeine), the amount
- * (not said), the time (another day without a clock time is never saved; a repeated DST hour needs earlier / later),
- * a likely overlap with something already logged that day (Cronometer, a supplement, an order: "already counted
- * there" or "another one"), or the same drink logged nearby ("that one" or "another can"). "Saved" appears only
- * after the server acknowledged the drink; a missing migration is a concrete error and the drink stays here.
+ * (not said), the time (another day without a clock time is never saved; a day or time that was said but cannot be
+ * used never becomes today or Now; a repeated DST hour needs earlier / later), a likely overlap with something
+ * already logged that day, or the same drink logged nearby. "Saved" appears only after the server acknowledged the
+ * drink; a missing migration is a concrete error and the drink stays here.
  *
- * Identity: each drink has a stable key (the Say it capture's derived key, or a new UUID for a tap here), kept with
- * the editor state in lib/drink-capture.ts drinkSession (memory only, outside this component), so scrolling away,
- * a remount or a retry never makes a second drink. Undo removes that same drink (a tombstone; a late retry cannot
- * bring it back). Nothing is sent on open or on scroll: items exist only after a Fill or a tap.
+ * Overlap: "Already counted in Cronometer" (the drink then counts nowhere) is offered only for a Cronometer entry
+ * that carries caffeine, which counts in both Nutrition and Caffeine. A supplement (caffeine only) or an Uber Eats
+ * dish (Nutrition only) cannot stand in for both: Riley counts the drink here or does not add it.
+ *
+ * Identity and recovery: lib/drink-session.ts. Each drink has a stable key; the request in flight is kept on the
+ * device before it is sent; a conflict is shown, never written over; after a reload each kept drink is READ by its
+ * key and only an explicit tap sends again. Nothing is sent on open or on scroll: drinks exist only after a Fill or
+ * a tap, and restored ones are only read.
  */
 
 interface DayAnswer {
@@ -70,8 +76,17 @@ function checkDay(raw: unknown) {
 }
 
 const SERVING_CHOICES = [0.5, 1, 1.5, 2, 3];
-const SOURCE_NAMES: Record<OverlapCandidate["source"], string> = { cronometer: "Cronometer", supplement: "Supplements", delivery: "Uber Eats" };
 const UNCHECKED_NAMES: Record<string, string> = { cronometer: "Cronometer", supplements: "supplements", delivery: "Uber Eats" };
+const UNAVAILABLE = "Drinks are not set up yet: the database migration is pending.";
+
+/** What a logged entry counts in, so the choice offered is truthful. */
+function countsIn(o: OverlapCandidate): string {
+  if (o.source === "cronometer") {
+    const caffeine = (o.caffeine_mg ?? 0) > 0 ? `${Math.round(o.caffeine_mg!)} mg caffeine` : "caffeine not verified";
+    return `Cronometer, ${caffeine} (${o.counts_in_nutrition === true ? "nutrition verified" : "nutrition not verified"})`;
+  }
+  return o.source === "supplement" ? "Supplements (caffeine only)" : "Uber Eats (Nutrition only, on days without Cronometer)";
+}
 
 const fmtMg = (mg: number) => `${Math.round(mg)} mg caffeine`;
 const fmtKcal = (k: number) => `${Math.round(k * 10) / 10} kcal`;
@@ -83,67 +98,44 @@ function shortDay(day: string, today: string | null): string {
 
 // ---- requests ------------------------------------------------------------------------------------------------
 
-type Answer = { ok: boolean; status: number; json: Record<string, unknown> };
-
-async function call(method: "POST" | "PATCH" | "DELETE", body: unknown, keepalive = false): Promise<Answer> {
+const call: Call = async (method, body, keepalive = false) => {
   const res = await fetch(DRINKS_URL, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), keepalive });
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   return { ok: res.ok, status: res.status, json };
+};
+
+/** Read one stored drink by its key (GET, read-only): the recovery after a reload. */
+async function readKey(key: string): Promise<KeyRead | "failed"> {
+  try {
+    const res = await fetch(`${DRINKS_URL}?key=${encodeURIComponent(key)}`, { cache: "no-store" });
+    if (!res.ok) return "failed";
+    const j = (await res.json()) as { status?: string; record?: DrinkRecord };
+    if (j.status === "found" && j.record) return { status: "found", record: j.record };
+    if (j.status === "removed") return { status: "removed" };
+    if (j.status === "none") return { status: "none" };
+    return "failed";
+  } catch {
+    return "failed";
+  }
 }
 
-const recordOf = (a: Answer) => (a.json.record && typeof a.json.record === "object" ? (a.json.record as DrinkRecord) : null);
-
-/** A refusal the autosave shows and does not retry; anything else is retried with backoff. */
-function failure(a: Answer, key: string): Error {
-  const text = typeof a.json.error === "string" && a.json.error ? a.json.error : `Save failed (${a.status}).`;
-  if (a.status === 410) {
-    drinkSession.forget(key);
-    drinkSession.update(key, { status: "removed", saved: null });
-    return new AutosaveRefused("This drink was removed.");
-  }
-  // Not set up / turned off: shown with Retry, not retried every few seconds.
-  if (a.status === 503) return new AutosaveRefused(text);
-  if (a.status >= 400 && a.status < 500 && a.status !== 408 && a.status !== 429) return new AutosaveRefused(text);
-  return new Error(text);
-}
-
-function acknowledged(rec: DrinkRecord, save: DrinkSave | null) {
-  drinkSession.remember(rec);
-  drinkSession.update(rec.client_key, { saved: save });
-  announceDrinkChange();
-}
-
-/**
- * Create, or edit with the revision last seen. A create whose key exists with other details (an earlier version
- * of this same drink, its answer lost) becomes a revision-checked edit of that drink, never a second one.
- */
-async function saveDrink(v: DrinkSave, keepalive: boolean): Promise<void> {
-  let ack = drinkSession.ack(v.client_key);
-  if (!ack) {
-    const created = await call("POST", v, keepalive);
-    const rec = recordOf(created);
-    if (created.ok && rec) return acknowledged(rec, v);
-    if (created.status === 409 && created.json.code === "changed" && rec) {
-      drinkSession.remember(rec);
-      ack = rec;
-    } else throw failure(created, v.client_key);
-  }
-  const edited = await call("PATCH", { ...v, expected_revision: ack.revision }, keepalive);
-  const rec = recordOf(edited);
-  if (edited.ok && rec) return acknowledged(rec, v);
-  if (edited.status === 409 && edited.json.code === "stale" && rec) {
-    // Changed on another screen: adopt the stored version (the next change edits that revision).
-    drinkSession.remember(rec);
-    throw new AutosaveRefused("This drink changed on another screen. Change it again to replace that version.");
-  }
-  throw failure(edited, v.client_key);
+const reading = new Set<string>();
+function recover(key: string) {
+  if (reading.has(key)) return;
+  reading.add(key);
+  void readKey(key).then((r) => {
+    reading.delete(key);
+    drinkSession.reconcile(key, r);
+  });
 }
 
 // ---- the session from a draft ----------------------------------------------------------------------------------
 
 function itemFromDraft(d: DrinkLogDraft, zone: string): DrinkItemState {
   const product = drinkProduct(d.product_id);
-  const manual = !!d.time || !!d.date;
+  const whenIssue = whenIssueOf(d.when_issue);
+  // Now only when NO day and NO time were said (an unusable one counts as said: it waits instead).
+  const manual = !!d.time || !!d.date || !!whenIssue;
   return {
     key: d.key,
     product_id: product ? product.id : null,
@@ -156,10 +148,14 @@ function itemFromDraft(d: DrinkLogDraft, zone: string): DrinkItemState {
     time: d.time,
     fold: null,
     zone,
+    whenIssue,
     overlap: null,
     recent: null,
     status: "open",
     saved: null,
+    hold: null,
+    note: null,
+    pending: null,
   };
 }
 
@@ -176,10 +172,14 @@ function newItem(productId: string): DrinkItemState {
     time: null,
     fold: null,
     zone: deviceZone(),
+    whenIssue: null,
     overlap: null,
     recent: null,
     status: "open",
     saved: null,
+    hold: null,
+    note: null,
+    pending: null,
   };
 }
 
@@ -224,9 +224,12 @@ export default function DrinksSection() {
       .finally(() => loading.current.delete(url));
   }, []);
 
+  // Open: read today's drinks, and READ each drink kept on the device after a reload (never a write).
   useEffect(() => {
     alive.current = true;
     load(null);
+    for (const key of drinkSession.restore()) recover(key);
+    for (const it of drinkSession.items()) if (it.hold === "recover" && !it.note) recover(it.key);
     return () => { alive.current = false; };
   }, [load]);
 
@@ -263,10 +266,12 @@ export default function DrinksSection() {
 
   const sessionKeys = new Set(items.map((i) => i.key));
   const shownDay = today ?? Object.keys(days)[0] ?? null;
+  const shownCheck = shownDay ? dayCheck(shownDay) : null;
   const listed = shownDay ? (days[shownDay]?.drinks ?? []).filter((r) => !sessionKeys.has(r.client_key)) : [];
   const counted = shownDay ? (days[shownDay]?.drinks ?? []).filter((r) => r.overlap === "none") : [];
   const mg = counted.reduce((s, r) => s + r.caffeine_mg, 0);
   const kcal = counted.reduce((s, r) => s + r.kcal, 0);
+  const blocked = baseState === "unavailable" ? UNAVAILABLE : null;
 
   if (baseState === "loading" && !shownDay && items.length === 0) return <SectionSkeleton section="drinks" />;
 
@@ -283,10 +288,10 @@ export default function DrinksSection() {
       }
     >
       {baseState === "unavailable" ? (
-        <p role="alert" className="mb-3 text-[13px] text-down">Drinks are not set up yet: the database migration is pending.</p>
+        <p role="alert" className="mb-3 text-[13px] text-down">{UNAVAILABLE}</p>
       ) : baseState === "failed" ? (
         <div className="mb-3 flex items-center gap-3">
-          <p className="text-[13px] text-down">Couldn&apos;t load drinks.</p>
+          <p role="alert" className="text-[13px] text-down">Couldn&apos;t load drinks.</p>
           <button type="button" onClick={() => load(null)} className="min-h-11 px-3 text-[13px] text-text-secondary hover:text-text-primary underline underline-offset-2">
             Retry
           </button>
@@ -301,7 +306,7 @@ export default function DrinksSection() {
         <ul className="space-y-3">
           {items.map((it) => (
             <li key={it.key}>
-              <DrinkItem item={it} today={today} dayCheck={dayCheck} ensureDay={load} />
+              <DrinkItem item={it} today={today} dayCheck={dayCheck} ensureDay={load} blocked={blocked} />
             </li>
           ))}
         </ul>
@@ -311,7 +316,7 @@ export default function DrinksSection() {
         <ul className="mt-3 divide-y divide-border-subtle" aria-label="Drinks logged today">
           {listed.map((r) => (
             <li key={r.client_key}>
-              <SavedDrink rec={r} />
+              <SavedDrink rec={r} check={shownCheck} />
             </li>
           ))}
         </ul>
@@ -358,33 +363,33 @@ function DrinkItem({
   today,
   dayCheck,
   ensureDay,
+  blocked,
 }: {
   item: DrinkItemState;
   today: string | null;
   dayCheck: (day: string) => DayCheck | null;
   ensureDay: (day: string) => void;
+  blocked: string | null;
 }) {
   const key = item.key;
-  const set = (patch: Partial<DrinkItemState>) => drinkSession.update(key, patch);
+  // Riley's own change: a conflict hold ends (his deliberate correction replaces the version shown).
+  const set = (patch: Partial<DrinkItemState>) =>
+    drinkSession.update(key, item.hold === "conflict" ? { ...patch, hold: null, note: null } : patch);
   const product = drinkProduct(item.product_id);
   const ack = drinkSession.ack(key);
-  // Drinks said in the same Fill ("two cans, at 2 and at 5") are not "the same drink logged earlier" for each other.
-  const siblings = new Set(drinkSession.items().filter((i) => i.capturedAt === item.capturedAt && i.key !== key).map((i) => i.key));
-  const checkFor = (day: string): DayCheck | null => {
-    const c = dayCheck(day);
-    return c && { ...c, drinks: c.drinks.filter((r) => !siblings.has(r.client_key)) };
-  };
-  const prep = itemSave(item, { today, nowMs: Date.now(), dayCheck: checkFor });
+  const prep = itemSave(item, { today, nowMs: Date.now(), dayCheck, acknowledged: !!ack, blocked });
   const reason = useRef<string | null>(null);
   reason.current = prep.ok ? null : prep.reason;
   const [undoing, setUndoing] = useState(false);
-  const [undoErr, setUndoErr] = useState<string | null>(null);
+  const [undoMsg, setUndoMsg] = useState<string | null>(null);
 
   const saver = useAutosave<DrinkSave | null>(
     `drink:${key}`,
     {
       save: async (v, ctx) => {
-        if (v) await saveDrink(v, ctx.keepalive);
+        if (!v) return;
+        await saveDrinkWith(call, v, ctx.keepalive);
+        announceDrinkChange();
       },
       ready: (v) => (v ? null : reason.current ?? "Not ready."),
       delayMs: 600,
@@ -392,70 +397,66 @@ function DrinkItem({
     item.saved ?? undefined,
   );
 
+  // What the server holds (after a conflict or a recovery read) is the baseline: showing it sends nothing.
+  const savedJson = JSON.stringify(item.saved);
+  const { change, setBaseline } = saver;
+  useEffect(() => {
+    if (item.saved) setBaseline(item.saved);
+    // savedJson stands for item.saved.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedJson, setBaseline]);
+
   // The day this drink falls on must be read (overlaps, same drink nearby) before it can save.
   const needDay = !prep.ok && prep.day && !dayCheck(prep.day) && today ? prep.day : null;
   useEffect(() => {
     if (needDay) ensureDay(needDay);
   }, [needDay, ensureDay]);
 
-  const value = prep.ok && item.status === "open" ? prep.save : null;
+  // Autosave only for an open drink that is not held (recovering, waiting for an explicit retry, or in conflict).
+  const live = item.status === "open" && item.hold == null;
+  const value = prep.ok && live ? prep.save : null;
   const valueJson = JSON.stringify(value);
-  const { change } = saver;
   useEffect(() => {
-    if (item.status !== "open") return;
+    if (!live) return;
     change(value);
     // valueJson stands for value (a new object each render).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [valueJson, item.status, change]);
+  }, [valueJson, live, change]);
 
   const undo = async () => {
-    const a = drinkSession.ack(key);
-    if (!a) return;
     setUndoing(true);
-    setUndoErr(null);
-    try {
-      let r = await call("DELETE", { client_key: key, expected_revision: a.revision });
-      const rec = recordOf(r);
-      if (r.status === 409 && rec) {
-        drinkSession.remember(rec);
-        r = await call("DELETE", { client_key: key, expected_revision: rec.revision });
-      }
-      if (!r.ok) {
-        setUndoErr(typeof r.json.error === "string" ? `Not undone: ${r.json.error}` : `Not undone (${r.status}).`);
-        return;
-      }
-      drinkSession.forget(key);
-      set({ status: "removed", saved: null });
+    setUndoMsg(null);
+    const r = await undoDrinkWith(call, key);
+    setUndoing(false);
+    if (r.ok) {
       saver.reset();
       announceDrinkChange();
-    } catch {
-      setUndoErr("Couldn't reach Onyx: the drink is still saved.");
-    } finally {
-      setUndoing(false);
-    }
+    } else setUndoMsg(r.message);
   };
 
   const now = localClockAt(item.capturedAt, item.zone).time;
-  const check = prep.ok ? checkFor(prep.resolved.eaten_date) : prep.day ? checkFor(prep.day) : null;
+  const check = prep.ok ? dayCheck(prep.resolved.eaten_date) : prep.day ? dayCheck(prep.day) : null;
   const askDay = prep.ok ? prep.resolved.eaten_date : prep.day ?? null;
   const overlaps = product && check ? check.candidates.filter((o) => likelySameDrink(product, o.name)) : [];
+  const dual = product && check ? dualChannelOverlaps(product, check) : [];
   const nearby = product && check && !prep.ok && prep.ask === "recent" ? recentSameProduct(check.drinks, product.id, key, null, askDay ?? "") : [];
-  const name = product ? product.name : `“${item.said}”`;
+  const name = product ? product.name : item.said ? `“${item.said}”` : "Drink";
   const saving = saver.state.status === "waiting" || saver.state.status === "saving";
   // "Saved" only for what the server acknowledged and nothing newer is waiting.
-  const settled = !!ack && (saver.state.status === "idle" || saver.state.status === "saved");
+  const settled = !!ack && item.hold == null && (saver.state.status === "idle" || saver.state.status === "saved");
   const dayChoices = today ? Array.from({ length: DRINK_DAYS_BACK + 1 }, (_, i) => shiftYmd(today, -i)) : [];
+  const needsDay = item.whenIssue != null && item.whenIssue !== afterWhenEdit(item.whenIssue, "day");
 
   if (item.status === "removed") {
     return (
       <div className="rounded-control border border-border-subtle p-3 flex flex-wrap items-center gap-x-3 text-[13px]">
-        <span className="text-text-secondary">{name}: removed.</span>
+        <span className="text-text-secondary" role="status">{name}: removed.</span>
         <button
           type="button"
           className={LINK}
           onClick={() => {
             set({ status: "dismissed" });
-            drinkSession.adopt({ ...item, key: newUuid(), status: "open", saved: null, recent: null, capturedAt: item.timeMode === "now" ? Date.now() : item.capturedAt });
+            drinkSession.adopt({ ...item, key: newUuid(), status: "open", saved: null, pending: null, hold: null, note: null, recent: null, capturedAt: item.timeMode === "now" ? Date.now() : item.capturedAt });
           }}
         >
           Log as a new drink
@@ -471,11 +472,29 @@ function DrinkItem({
         <span className="text-[14px] text-text-primary">{name}</span>
         <span className="flex items-center gap-2">
           {item.said ? <DraftMark /> : null}
-          {!ack && !saving && (
+          {!ack && !saving && !item.pending && (
             <button type="button" className={LINK} onClick={() => set({ status: "dismissed" })}>Dismiss</button>
           )}
         </span>
       </div>
+
+      {item.note && (
+        <p role={item.hold === "conflict" ? "alert" : "status"} className={`mt-1 text-[12px] ${item.hold === "conflict" ? "text-mid" : "text-text-secondary"}`}>
+          {item.note}
+        </p>
+      )}
+      {item.hold === "recover" && (
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 text-[12px] text-text-secondary">
+          <span role="status">{item.note ? "Not checked yet." : "Checking whether it was saved…"}</span>
+          {item.note && <button type="button" className={LINK} onClick={() => recover(key)}>Check again</button>}
+        </div>
+      )}
+      {item.hold === "retry" && (
+        <div className="mt-1 flex flex-wrap items-center gap-x-3">
+          <button type="button" className={LINK} onClick={() => set({ hold: null, note: null })}>Save it</button>
+          <button type="button" className={LINK} onClick={() => set({ status: "dismissed" })}>Discard</button>
+        </div>
+      )}
 
       {!product && (
         <div className="mt-2">
@@ -514,10 +533,11 @@ function DrinkItem({
                 <label className="sr-only" htmlFor={`drink-day-${key}`}>Day</label>
                 <select
                   id={`drink-day-${key}`}
-                  value={item.day ?? today ?? ""}
-                  onChange={(e) => set({ day: e.target.value, fold: null })}
+                  value={needsDay ? item.day ?? "" : item.day ?? today ?? ""}
+                  onChange={(e) => set({ day: e.target.value || null, fold: null, whenIssue: e.target.value ? afterWhenEdit(item.whenIssue, "day") : item.whenIssue })}
                   className="min-h-11 px-2 text-[16px] bg-surface-sunken border border-border-subtle rounded-control text-text-primary"
                 >
+                  {needsDay && <option value="">Pick a day</option>}
                   {dayChoices.map((d) => (
                     <option key={d} value={d}>{shortDay(d, today)}</option>
                   ))}
@@ -527,13 +547,14 @@ function DrinkItem({
                   id={`drink-time-${key}`}
                   type="time"
                   value={item.time ?? ""}
-                  onChange={(e) => set({ time: e.target.value || null, fold: null })}
+                  onChange={(e) => set({ time: e.target.value || null, fold: null, whenIssue: e.target.value ? afterWhenEdit(item.whenIssue, "time") : item.whenIssue })}
                   className="min-h-11 px-2 text-[16px] font-mono bg-surface-sunken border border-border-subtle rounded-control text-text-primary"
                 />
-                {!item.time && <span className="text-[12px] text-mid">time not said</span>}
+                {!item.time && !item.whenIssue && <span className="text-[12px] text-mid">time not said</span>}
               </>
             )}
           </div>
+          {item.whenIssue && <p className="mt-1 text-[12px] text-mid">{item.whenIssue}</p>}
 
           {!prep.ok && prep.problem === "ambiguous" && (
             <div className="mt-2 flex flex-wrap items-center gap-2" role="group" aria-label="Which one">
@@ -545,23 +566,25 @@ function DrinkItem({
 
           {!prep.ok && prep.ask === "overlap" && (
             <div className="mt-2 rounded-control bg-white/[0.03] p-2 text-[13px]" role="group" aria-label="Already logged?">
-              {overlaps.length > 0 ? (
+              {overlaps.length > 0 && (
                 <ul className="mb-1 text-text-secondary">
                   {overlaps.map((o, i) => (
                     <li key={i}>
-                      In {SOURCE_NAMES[o.source]}: {o.name}
-                      {o.time ? ` at ${formatClock(o.time)}` : ""}
+                      {o.name}
+                      {o.time ? ` at ${formatClock(o.time)}` : ""}: {countsIn(o)}
                     </li>
                   ))}
                 </ul>
-              ) : (
+              )}
+              {(check?.unchecked.length ?? 0) > 0 && (
                 <p className="mb-1 text-mid">
-                  Couldn&apos;t check {(check?.unchecked ?? []).map((u) => UNCHECKED_NAMES[u] ?? u).join(", ")} for this drink.
+                  Couldn&apos;t check all of {(check?.unchecked ?? []).map((u) => UNCHECKED_NAMES[u] ?? u).join(", ")} for this drink.
                 </p>
               )}
               <div className="flex flex-wrap gap-2">
-                <Chip on={false} onClick={() => set({ overlap: "in_diary" })}>Already counted there</Chip>
-                <Chip on={false} onClick={() => set({ overlap: "none" })}>It&apos;s another one</Chip>
+                {dual.length > 0 && <Chip on={false} onClick={() => set({ overlap: "in_diary" })}>Already counted in Cronometer</Chip>}
+                <Chip on={false} onClick={() => set({ overlap: "none" })}>{dual.length > 0 ? "It's another one" : "Count it here"}</Chip>
+                <Chip on={false} onClick={() => set({ status: "dismissed" })}>Don&apos;t add</Chip>
               </div>
             </div>
           )}
@@ -580,7 +603,7 @@ function DrinkItem({
 
           {item.overlap === "in_diary" && (
             <p className="mt-2 text-[12px] text-text-tertiary">
-              Kept as already in your diary: not counted again.{" "}
+              Already counted in Cronometer: not counted again.{" "}
               <button type="button" className={LINK} onClick={() => set({ overlap: "none" })}>Count it here</button>
             </p>
           )}
@@ -592,39 +615,40 @@ function DrinkItem({
           <span role="status" aria-live="polite" className="inline-flex items-center gap-1 text-[12px] text-up">
             <Check size={13} aria-hidden="true" />
             {ack!.overlap === "in_diary"
-              ? "Saved, not counted (already in diary)"
+              ? "Saved, not counted (already in Cronometer)"
               : `Saved: ${fmtMg(ack!.caffeine_mg)}, ${fmtKcal(ack!.kcal)} · ${shortDay(ack!.eaten_date, today)} ${formatClock(ack!.eaten_time)}`}
           </span>
-        ) : (
+        ) : item.hold == null ? (
           <AutosaveStatus state={saver.state} onRetry={() => void saver.retry()} showIncomplete={!!product} />
-        )}
-        {settled && (
+        ) : null}
+        {ack && item.status === "open" && item.hold !== "recover" && !saving && (
           <button type="button" onClick={() => void undo()} disabled={undoing} className={LINK}>
             {undoing ? "Undoing…" : "Undo"}
           </button>
         )}
       </div>
-      {undoErr && <p role="alert" className="mt-1 text-[13px] text-down">{undoErr}</p>}
+      {undoMsg && <p role="alert" className="mt-1 text-[13px] text-down">{undoMsg}</p>}
     </div>
   );
 }
 
 // ---- a drink already saved (listed for the day) -------------------------------------------------------------------
 
-function SavedDrink({ rec }: { rec: DrinkRecord }) {
+function SavedDrink({ rec, check }: { rec: DrinkRecord; check: DayCheck | null }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const product = drinkProduct(rec.product_id);
+  // Moving a listed drink to "already counted" is offered only when that day holds a Cronometer entry for it that
+  // counts in both channels (the route verifies it again).
+  const canMarkCounted = rec.overlap === "none" && !!product && !!check && dualChannelOverlaps(product, check).length > 0;
 
   const run = async (method: "PATCH" | "DELETE", body: unknown) => {
     setBusy(true);
     setErr(null);
     try {
       const r = await call(method, body);
-      if (!r.ok) {
-        setErr(typeof r.json.error === "string" ? r.json.error : `Failed (${r.status}).`);
-        if (r.status === 409 || r.status === 410) announceDrinkChange();
-        return;
-      }
+      // A conflict is shown (the list re-reads the newer version); never repeated with a fresh revision.
+      if (!r.ok) setErr(typeof r.json.error === "string" ? r.json.error : `Failed (${r.status}).`);
       announceDrinkChange();
     } catch {
       setErr("Couldn't reach Onyx.");
@@ -645,13 +669,15 @@ function SavedDrink({ rec }: { rec: DrinkRecord }) {
         <span className="font-mono text-text-tertiary">{formatClock(rec.eaten_time)}</span>
         <span className="text-text-primary">{rec.name}</span>
         <span className="font-mono text-text-secondary">
-          {servingsText(rec.servings)} · {rec.overlap === "in_diary" ? "not counted (in diary)" : `${fmtMg(rec.caffeine_mg)} · ${fmtKcal(rec.kcal)}`}
+          {servingsText(rec.servings)} · {rec.overlap === "in_diary" ? "not counted (in Cronometer)" : `${fmtMg(rec.caffeine_mg)} · ${fmtKcal(rec.kcal)}`}
         </span>
       </div>
       <div className="flex flex-wrap items-center gap-x-3">
-        <button type="button" onClick={() => void toggle()} disabled={busy} className={LINK}>
-          {rec.overlap === "none" ? "Already in diary" : "Count it here"}
-        </button>
+        {(rec.overlap === "in_diary" || canMarkCounted) && (
+          <button type="button" onClick={() => void toggle()} disabled={busy} className={LINK}>
+            {rec.overlap === "none" ? "Already counted in Cronometer" : "Count it here"}
+          </button>
+        )}
         <button type="button" onClick={remove} disabled={busy} className={LINK} aria-label={`Remove ${rec.name} at ${formatClock(rec.eaten_time)}`}>
           Remove
         </button>
