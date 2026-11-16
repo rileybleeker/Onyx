@@ -284,7 +284,8 @@ test('foldWindow: an in-app window starts at the click; earlier records are coun
   // Click at 1500 ms on the request clock (after scrolling to the link and marking the old page), window 4000 ms:
   // [1500, 5500). The rsc and api requests before the click are the previous page's or the preparation's, not this page's.
   const records = [rec('rsc', 100), rec('api', 900), rec('rsc', 1500, { prefetch: true }), rec('rest', 1600), rec('api', 5400), rec('api', 5600)];
-  const w = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5550, anchorMs: 1500 });
+  const w = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5550, anchorMs: 1500, anchorKind: 'input' });
+  assert.equal(w.anchor, 'input');
   assert.equal(w.anchorMs, 1500);
   assert.deepEqual(w.beforeAnchor, { n: 2, data: 1 });
   assert.equal(w.total.n, 3, 'the hover prefetch at the click, the routed read, one background read; 5600 is past the window');
@@ -294,11 +295,69 @@ test('foldWindow: an in-app window starts at the click; earlier records are coun
   assert.equal(w.readyAtMs, 400, 'reported from the window start');
   assert.equal(w.observedMs, 4050);
   assert.equal(w.complete, true, 'observed 4050 ms after the click');
-  const cut = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000, anchorMs: 1500 });
+  const cut = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000, anchorMs: 1500, anchorKind: 'input' });
   assert.equal(cut.complete, false, 'only 3500 ms after the click: a late click never passes for a full window');
   const fromStart = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000 });
   assert.equal(fromStart.anchorMs, 0);
+  assert.equal(fromStart.anchor, 'navigation-start');
   assert.deepEqual(fromStart.beforeAnchor, { n: 0, data: 0 }, 'a full load anchors at navigation start');
+});
+
+// In-app windows start at the click's observed input. When the input was not seen (the pointer read failed or saw no
+// event, or the click loaded a new document), the window's start is unknown: it is recorded as such and never counted,
+// and the click call's time is never used in its place (Playwright's actionability wait comes after it).
+const CLICK_ORIGIN = 1_700_000_000_000.25;
+
+test('inputAnchorOf: only a pointer event seen on the same document after the mark anchors the window', () => {
+  const at = (pointer) => stats.inputAnchorOf({ pointer, clickOrigin: CLICK_ORIGIN, markedAt: 30_000, clickAtMs: 1_200 });
+  assert.deepEqual(at([30_450, CLICK_ORIGIN]), { kind: 'input', reason: null, anchorMs: 1_650, clickWaitMs: 450 },
+    'the actionability wait (450 ms) moves the window start past the click call');
+  // Missing pointer: the listener saw no event on the link.
+  assert.deepEqual(at([null, CLICK_ORIGIN]), { kind: 'unobserved', reason: 'no pointer event seen on the link', anchorMs: null, clickWaitMs: null });
+  // The pointer read itself failed (the evaluate threw, e.g. while the page was navigating).
+  assert.deepEqual(at(null), { kind: 'unobserved', reason: 'pointer read failed', anchorMs: null, clickWaitMs: null });
+  // Changed document: the click loaded a new document, whose clock restarted and which never saw the pointer.
+  assert.deepEqual(at([null, CLICK_ORIGIN + 41_000]), { kind: 'unobserved', reason: 'the click loaded a new document', anchorMs: null, clickWaitMs: null });
+  assert.equal(at([120, CLICK_ORIGIN + 41_000]).kind, 'unobserved', 'a pointer time from another document is never used');
+  assert.equal(at([29_000, CLICK_ORIGIN]).kind, 'unobserved', 'an event before the mark is not this click');
+  assert.equal(stats.inputAnchorOf({ pointer: [30_450, CLICK_ORIGIN], clickOrigin: CLICK_ORIGIN, markedAt: 30_000, clickAtMs: undefined }).kind, 'unobserved',
+    'no click moment on the request clock: nothing to put the input on');
+});
+
+test('foldWindow: an unobserved in-app input gives an unknown window, never a complete one, however long it was observed', () => {
+  // The click call at 1000 ms; Playwright's actionability wait took 3500 ms before the real click, so a window counted
+  // from the click call would have only 500 ms of the navigation in it. It must not read as a full 4 s window.
+  const records = [rec('rsc', 900), rec('rsc', 4600), rec('rest', 4700), rec('api', 5200)];
+  for (const observedMs of [5100, 9000, 15000]) {
+    const w = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs, anchorMs: 1000, settleByMs: 7000,
+      anchorKind: 'unobserved', anchorReason: 'no pointer event seen on the link' });
+    assert.equal(w.anchor, 'unobserved');
+    assert.equal(w.anchorReason, 'no pointer event seen on the link');
+    assert.equal(w.complete, false, `observed to ${observedMs}: still not a measurement`);
+    assert.equal(w.costComplete, null, 'cost unknown, not complete');
+    assert.equal(w.anchorMs, null, 'the click call is not reported as the window start');
+    for (const k of ['readyAtMs', 'observedMs', 'settleByMs', 'total', 'purpose', 'via', 'beforeAnchor']) assert.equal(w[k], null, `${k} unknown, never 0`);
+    assert.equal(w.windowMs, 4000, 'the window length asked for is kept');
+  }
+  // An anchor after 0 that does not say it was an observed input is unobserved too (fails closed).
+  const unlabelled = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs: 9000, anchorMs: 1000 });
+  assert.equal(unlabelled.anchor, 'unobserved');
+  assert.equal(unlabelled.complete, false);
+  assert.equal(stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs: 9000, anchorMs: 1000, anchorKind: 'navigation-start' }).anchor, 'unobserved',
+    'navigation start is request clock 0 only');
+  assert.equal(stats.comparableWindow(unlabelled), false);
+  assert.equal(stats.comparableWindow(stats.foldWindow(records, { windowMs: 4000, readyAtMs: 4800, observedMs: 9000, anchorMs: 4500, anchorKind: 'input' })), true);
+  assert.equal(stats.comparableWindow({ complete: true, anchorMs: 1000 }), false, 'a window without an anchor kind is never comparable');
+});
+
+test('sinceClickMs: same document unchanged; a click that loaded a new document is timed on the shared clock, never negative', () => {
+  assert.equal(stats.sinceClickMs(30_640, CLICK_ORIGIN, 30_000, CLICK_ORIGIN), 640, 'same document: the version 1 difference');
+  // New document 1.2 s after the mark (its clock restarted at 0); ready 800 ms into it = 2000 ms after the mark.
+  const newOrigin = CLICK_ORIGIN + 30_000 + 1_200;
+  assert.equal(stats.sinceClickMs(800, newOrigin, 30_000, CLICK_ORIGIN), 2_000);
+  assert.ok(800 - 30_000 < 0, 'the version 1 difference across documents would be negative, and a negative time would pass');
+  assert.equal(stats.sinceClickMs(800, undefined, 30_000, CLICK_ORIGIN), null, 'unknown document clock: not measured');
+  assert.equal(stats.sinceClickMs(null, CLICK_ORIGIN, 30_000, CLICK_ORIGIN), null);
 });
 
 test('foldWindow: a request still open when observation stopped is unfinished, its cost unknown, never zero', () => {
@@ -330,7 +389,7 @@ test('foldWindow: the cost is decided at the window end plus the drain, whatever
     assert.equal(w.purpose.background.ms, 0, 'the late one adds no duration');
     assert.equal(w.total.bytes, 1000, 'and no size');
   }
-  const inApp = stats.foldWindow(records(), { windowMs: 4000, readyAtMs: 2000, observedMs: 15000, anchorMs: 1000, settleByMs: 7000 });
+  const inApp = stats.foldWindow(records(), { windowMs: 4000, readyAtMs: 2000, observedMs: 15000, anchorMs: 1000, settleByMs: 7000, anchorKind: 'input' });
   assert.equal(inApp.settleByMs, 6000, 'reported from the window start');
   assert.equal(inApp.total.pending, 1);
   const noCut = stats.foldWindow(records(), { windowMs: 6000, readyAtMs: 2000, observedMs: 15000 });
@@ -352,7 +411,7 @@ test('windowTable: unfinished requests, the service-worker count and a window an
   const click = (i, ready) => ({
     ...v2sample(i, ready),
     cacheState: stats.cacheStateOf({ mode: 'click', first: false }),
-    window: stats.foldWindow([rec('rsc', 10), rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1200 + ready, observedMs: 5300, anchorMs: 1200 }),
+    window: stats.foldWindow([rec('rsc', 10), rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1200 + ready, observedMs: 5300, anchorMs: 1200, anchorKind: 'input' }),
   });
   const first = { ...sample(0, 500, 2), cacheState: stats.cacheStateOf({ mode: 'click', first: true }) };
   const nav = stats.summarizePage([first, click(1, 300), click(2, 310), click(3, 320)]);
@@ -412,7 +471,7 @@ test('summarizePage: version 2 aggregates use complete windows only; a version 1
   const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), { ...incomplete, window: { ...incomplete.window, complete: false } }];
   const s = stats.summarizePage(samples);
   assert.equal(s.harness2, true);
-  assert.deepEqual(s.windows, { recorded: 4, complete: 3 });
+  assert.deepEqual(s.windows, { recorded: 4, complete: 3, unobserved: 0 });
   assert.equal(s.window.n, 2, 'the incomplete warm window is not averaged in');
   assert.equal(s.window.purpose.routed.n, 2);
   assert.equal(s.window.purpose.background.n, 1);
@@ -427,6 +486,43 @@ test('summarizePage: version 2 aggregates use complete windows only; a version 1
   assert.equal(legacy.window, null);
   assert.equal(legacy.cacheStates.first, null);
   assert.equal(legacy.blocking.n, 0);
+});
+
+test('summarizePage and windowTable: an in-app click with an unobserved input is named, never averaged in', () => {
+  const click = (i, ready, over = {}) => ({
+    ...v2sample(i, ready),
+    cacheState: stats.cacheStateOf({ mode: 'click', first: false }),
+    window: stats.foldWindow([rec('rsc', 10), rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1200 + ready, observedMs: 5300, anchorMs: 1200, anchorKind: 'input' }),
+    ...over,
+  });
+  // Missing pointer on one click, a changed document on another: both windows unknown; their long tasks (if any had
+  // been recorded) never join the blocking time either.
+  const missing = click(2, 310, {
+    window: stats.foldWindow([rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1510, observedMs: 9000, anchorMs: 1200, anchorKind: 'unobserved', anchorReason: 'no pointer event seen on the link' }),
+    longTasks: stats.foldLongTasks([[1300, 2050]], 1200, 5200, 1510), feedAtMs: 10, firstPrefetchAtMs: 5,
+  });
+  const reloaded = click(3, 2000, {
+    newDocument: true,
+    window: stats.foldWindow([rec('document', 1250)], { windowMs: 4000, readyAtMs: 3200, observedMs: 9000, anchorMs: 1200, anchorKind: 'unobserved', anchorReason: 'the click loaded a new document' }),
+  });
+  const first = { ...sample(0, 500, 2), cacheState: stats.cacheStateOf({ mode: 'click', first: true }) };
+  const s = stats.summarizePage([first, click(1, 300), missing, reloaded]);
+  assert.deepEqual(s.windows, { recorded: 3, complete: 1, unobserved: 2 });
+  assert.equal(s.window.n, 1, 'only the observed click window is counted');
+  assert.equal(s.window.anchored, true);
+  assert.equal(s.blocking.n, 1, 'blocking time comes from comparable windows only');
+  assert.equal(s.blocking.p50, 30);
+  assert.equal(s.feedAt.n, 1);
+  assert.equal(s.readyRobust.n, 3, 'data ready keeps its version 1 timing for every warm click');
+  assert.equal(s.newDocument, 1);
+  const md = stats.windowTable([{ label: '/x (in-app)', summary: s }]);
+  assert.match(md, /\| \/x \(in-app\) \| 4000 from the click \| 1 \/ 3 \(4\); 2 with the click input not observed \(window unknown, not counted\) \|/);
+  assert.ok(!/NaN|undefined/.test(md));
+  // All clicks unobserved: no window medians at all, still named.
+  const none = stats.summarizePage([first, missing, reloaded]);
+  assert.equal(none.window, null);
+  assert.equal(none.blocking.n, 0);
+  assert.match(stats.windowTable([{ label: '/y (in-app)', summary: none }]), /\| \/y \(in-app\) \| - \| 0 \/ 2 \(3\); 2 with the click input not observed/);
 });
 
 test('speed budget: an observe-only scenario never breaks it but is reported; enforced pages are unchanged', () => {

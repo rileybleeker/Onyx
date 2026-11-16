@@ -131,7 +131,7 @@ function render(runs) {
     out.push(stats.scenarioTable(run.pages) + "\n");
     out.push(`### Routed readiness and background work (fixed window from navigation start or the click, warm median)\n`);
     out.push(
-      "Routed = started before data-ready, background = after it. The split is by start time only, so on a slow page routed also holds continuous-scroll neighbour and warm-up reads that started before data-ready.\n"
+      "Routed = started before data-ready, background = after it. The split is by start time only, so on a slow page routed also holds continuous-scroll neighbour and warm-up reads that started before data-ready. An in-app window starts at the click's observed input; a click whose input was not observed has an unknown window, listed in the count column and never in the medians.\n"
     );
     out.push(stats.windowTable(run.pages) + "\n");
     out.push("### Requests per page view (warm median)\n");

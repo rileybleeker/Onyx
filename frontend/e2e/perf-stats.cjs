@@ -193,10 +193,74 @@ function purposeOf(rec, readyAtMs) {
 const DATA_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
 
 /**
+ * How a fixed window's start was found. It is part of the method: only the first two give a comparable window.
+ *   navigation-start  a full load: request clock 0;
+ *   input             an in-app click: the first pointer event on the link, seen on the same document at or after the
+ *                     click was prepared (`inputAnchorOf`);
+ *   unobserved        an in-app click whose input was not seen (the pointer read failed or saw no event, or the click
+ *                     loaded a new document). Where its window starts is unknown, so the window is recorded as
+ *                     unknown (`complete: false`, no counts) and never counted. The click call's own time is NOT used
+ *                     as a stand-in: it comes before Playwright's actionability wait, which can use the window up.
+ */
+const ANCHOR_KINDS = ["navigation-start", "input", "unobserved"];
+
+/** The anchor kind a foldWindow() call gets: an anchor after 0 must say it was an observed input, else it is unobserved. */
+function anchorKindOf(anchorMs, anchorKind) {
+  if (anchorKind === "input" && finite(anchorMs)) return "input";
+  const at = finite(anchorMs) ? anchorMs : 0;
+  if ((anchorKind == null || anchorKind === "navigation-start") && at === 0) return "navigation-start";
+  return "unobserved";
+}
+
+/**
+ * Where an in-app click's fixed window starts, from the pointer read made after the click (perf-timing.spec.ts):
+ *   pointer      [page time of the first pointer event on the link or null, that document's time origin], or null
+ *                when the read itself failed;
+ *   clickOrigin  time origin of the document the click was prepared on;
+ *   markedAt     page time on that document just before the click call;
+ *   clickAtMs    the same moment on the request clock.
+ * Only a pointer event seen on the SAME document, at or after the mark, is an observed input: the window starts there
+ * (`kind: "input"`, `anchorMs` on the request clock, `clickWaitMs` = Playwright's actionability wait). Anything else
+ * is `kind: "unobserved"` with the reason and no anchor; see ANCHOR_KINDS.
+ */
+function inputAnchorOf({ pointer, clickOrigin, markedAt, clickAtMs }) {
+  const unobserved = (reason) => ({ kind: "unobserved", reason, anchorMs: null, clickWaitMs: null });
+  if (!Array.isArray(pointer)) return unobserved("pointer read failed");
+  const [at, origin] = pointer;
+  if (!finite(origin) || origin !== clickOrigin) return unobserved("the click loaded a new document");
+  if (!finite(at)) return unobserved("no pointer event seen on the link");
+  if (!finite(markedAt) || !finite(clickAtMs) || at < markedAt) return unobserved("pointer event before the click was prepared");
+  const wait = at - markedAt;
+  return { kind: "input", reason: null, anchorMs: clickAtMs + wait, clickWaitMs: wait };
+}
+
+/**
+ * Page time `pageMs` on the document with time origin `docOrigin`, as ms since the click was prepared (`markedAt` on
+ * the document with time origin `clickOrigin`): how version 1 times an in-app click's data ready and first chart.
+ * Same document: the plain difference, exactly as version 1. When the click loaded a new document, its page clock
+ * restarted at 0, so both moments go on the shared clock (time origin + page time): the reload is counted, and the
+ * result is never a negative time that would pass the budget. Null (not measured) when a moment is missing.
+ */
+function sinceClickMs(pageMs, docOrigin, markedAt, clickOrigin) {
+  if (!finite(pageMs) || !finite(markedAt)) return null;
+  if (docOrigin === clickOrigin) return pageMs - markedAt;
+  if (!finite(docOrigin) || !finite(clickOrigin)) return null;
+  return docOrigin + pageMs - (clickOrigin + markedAt);
+}
+
+/** A window that may be counted: observed to its end, from a known start (never an unobserved or unlabelled one). */
+function comparableWindow(w) {
+  return !!(w && w.complete && (w.anchor === "navigation-start" || w.anchor === "input"));
+}
+
+/**
  * The requests that STARTED inside a fixed window [anchorMs, anchorMs + windowMs) on the request clock, split by
- * purpose and by origin. The anchor is the navigation itself: 0 (navigation start) for a full load, the click for an
- * in-app navigation, so preparing the click (scrolling to the link, marking the old page) never uses up the window and
- * the previous page's leftover work is counted apart as `beforeAnchor`, never in this page's buckets. A fixed window
+ * purpose and by origin. The anchor is the navigation itself: 0 (navigation start) for a full load, the observed input
+ * for an in-app navigation (`anchorKind: "input"`), so preparing the click (scrolling to the link, marking the old
+ * page, Playwright's actionability checks) never uses up the window and the previous page's leftover work is counted
+ * apart as `beforeAnchor`, never in this page's buckets. An anchor after 0 that is not an observed input (no
+ * `anchorKind`, or `"unobserved"` with `anchorReason`) gives an unknown window: `anchor: "unobserved"`,
+ * `complete: false`, no counts and no times, whatever was observed (see ANCHOR_KINDS). A fixed window
  * makes request totals comparable between pages and runs (the network-quiet window closes at a different moment on
  * every page). `observedMs` = how long the navigation was observed (request clock); a window not observed to its end
  * after the anchor is `complete: false` and is never counted as a measurement. A request still open when observation
@@ -207,7 +271,26 @@ const DATA_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
  * whatever else was on the network. In the result, `readyAtMs`, `observedMs` and `settleByMs` are relative to the
  * window start.
  */
-function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0, settleByMs = null }) {
+function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0, settleByMs = null, anchorKind = null, anchorReason = null }) {
+  const kind = anchorKindOf(anchorMs, anchorKind);
+  if (kind === "unobserved") {
+    // Where the window starts is unknown, so what started in it is too: nothing is counted, nothing is complete.
+    return {
+      windowMs,
+      anchor: kind,
+      anchorReason: anchorReason || "the window's start was not observed",
+      anchorMs: null,
+      readyAtMs: null,
+      observedMs: null,
+      settleByMs: null,
+      complete: false,
+      costComplete: null,
+      beforeAnchor: null,
+      total: null,
+      purpose: null,
+      via: null,
+    };
+  }
   const anchor = finite(anchorMs) ? anchorMs : 0;
   const end = anchor + windowMs;
   const settleBy = finite(settleByMs) ? settleByMs : null;
@@ -254,6 +337,8 @@ function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0, se
   }
   return {
     windowMs,
+    anchor: kind,
+    anchorReason: null,
     anchorMs: anchor,
     readyAtMs: finite(readyAtMs) ? readyAtMs - anchor : null,
     observedMs: finite(observedMs) ? observedMs - anchor : null,
@@ -417,9 +502,10 @@ function summarizePage(samples) {
     return t;
   };
 
-  // Harness 2 fields. A version 1 sample has none of them, so each is then null / empty (never zero).
+  // Harness 2 fields. A version 1 sample has none of them, so each is then null / empty (never zero). Only comparable
+  // windows count (observed to their end from a known start): an incomplete or unobserved one is never averaged in.
   const windowOf = (xs) => {
-    const ws = xs.map((s) => s.window).filter((w) => w && w.complete);
+    const ws = xs.map((s) => s.window).filter(comparableWindow);
     if (ws.length === 0) return null;
     const purpose = {};
     for (const p of PURPOSES) {
@@ -431,8 +517,8 @@ function summarizePage(samples) {
     return {
       windowMs: ws[0].windowMs,
       n: ws.length,
-      // Anchored at the click (in-app) rather than at navigation start: what started before it is shown apart.
-      anchored: ws.some((w) => finite(w.anchorMs) && w.anchorMs > 0),
+      // Anchored at the observed click input (in-app) rather than at navigation start: what started before it is shown apart.
+      anchored: ws.some((w) => w.anchor === "input"),
       beforeAnchor: median(ws.map((w) => w.beforeAnchor?.n)),
       total: median(ws.map((w) => w.total?.n)),
       bytes: median(ws.map((w) => w.total?.bytes)),
@@ -450,23 +536,32 @@ function summarizePage(samples) {
     if (k) restStates[k] = (restStates[k] || 0) + 1;
   }
 
+  // Blocking time and the window's moments are relative to the window start: only comparable windows' are pooled.
+  const windowed = warm.filter((s) => comparableWindow(s.window));
+
   return {
     harness2: samples.some((s) => s.window || s.cacheState),
-    windows: { recorded: samples.filter((s) => s.window).length, complete: samples.filter((s) => s.window && s.window.complete).length },
+    windows: {
+      recorded: samples.filter((s) => s.window).length,
+      complete: samples.filter((s) => comparableWindow(s.window)).length,
+      // In-app clicks whose input was not seen: their window is unknown (not measured), never counted as one.
+      unobserved: samples.filter((s) => s.window && s.window.anchor === "unobserved").length,
+    },
     window: windowOf(warm),
     coldWindow: cold && cold.ok ? windowOf([cold]) : null,
     cacheStates: { first: samples[0] && samples[0].cacheState ? samples[0].cacheState : null, rest: restStates },
     readyRobust: robust(warm.map((s) => s.ready)),
-    blocking: robust(warm.map((s) => s.longTasks?.blockingMs)),
-    blockingBeforeReady: robust(warm.map((s) => s.longTasks?.blockingBeforeReadyMs)),
-    feedAt: robust(warm.map((s) => s.feedAtMs)),
-    firstPrefetchAt: robust(warm.map((s) => s.firstPrefetchAtMs)),
+    blocking: robust(windowed.map((s) => s.longTasks?.blockingMs)),
+    blockingBeforeReady: robust(windowed.map((s) => s.longTasks?.blockingBeforeReadyMs)),
+    feedAt: robust(windowed.map((s) => s.feedAtMs)),
+    firstPrefetchAt: robust(windowed.map((s) => s.firstPrefetchAtMs)),
     total: samples.length,
     ok: ok.length,
     failed: samples.length - ok.length,
     degraded: samples.filter((s) => s.degraded).length,
     emptyState: samples.filter((s) => s.emptyState).length,
     quietTimedOut: samples.filter((s) => s.quietTimedOut).length,
+    newDocument: samples.filter((s) => s.newDocument).length,
     cold: cold && cold.ok ? pickCold(cold) : null,
     coldEndpoints,
     timing,
@@ -602,6 +697,7 @@ function runNotes(pages) {
     if (s.degraded) bits.push(`${s.degraded} showed an error/degraded state`);
     if (s.emptyState) bits.push(`${s.emptyState} ended on the page's empty state (no chart drawn)`);
     if (s.quietTimedOut) bits.push(`${s.quietTimedOut} never went network-quiet within the window cap`);
+    if (s.newDocument) bits.push(`${s.newDocument} in-app click(s) loaded a new document (a full reload, timed from the click on the shared clock)`);
     const cache = Object.entries(s.cache).map(([k, v]) => `${k}:${v}`).join(" ");
     const region = Object.entries(s.region).map(([k, v]) => `${k}:${v}`).join(" ");
     if (cache) bits.push(`document x-vercel-cache ${cache}`);
@@ -636,8 +732,9 @@ function scenarioTable(pages) {
 
 /**
  * Routed readiness against background work, in the fixed window (warm median). The window starts at navigation start
- * for a full load and at the click for an in-app navigation; requests that started before the click (the previous
- * page's leftovers, preparing the click) are counted apart and excluded. Routed = started before data-ready,
+ * for a full load and at the click's observed input for an in-app navigation; requests that started before it (the
+ * previous page's leftovers, preparing the click) are counted apart and excluded. A click whose input was not observed
+ * has an unknown window: it is counted in "recorded" and named in the same cell, never in the medians. Routed = started before data-ready,
  * background = after it (continuous-scroll neighbours, warm-up data, revalidation), prefetch = router prefetches; the
  * split is by start time only, so on a slow page routed also holds neighbour and warm-up reads that began early. Each
  * count is split into network / browser cache / service worker / unknown; requests whose origin the browser did not
@@ -653,7 +750,8 @@ function windowTable(pages) {
     const w = s.window;
     const rr = s.readyRobust || { n: 0 };
     const readyCell = rr.n ? `${ms(rr.p50)} / ${ms(rr.p90)} (${rr.n})` : "-";
-    const counts = s.harness2 && s.windows ? `${s.windows.complete} / ${s.windows.recorded} (${s.total})` : "not recorded (harness 1)";
+    const unobserved = s.windows && s.windows.unobserved > 0 ? `; ${s.windows.unobserved} with the click input not observed (window unknown, not counted)` : "";
+    const counts = s.harness2 && s.windows ? `${s.windows.complete} / ${s.windows.recorded} (${s.total})${unobserved}` : "not recorded (harness 1)";
     const cw = s.coldWindow;
     const firstCell = cw ? `${num(cw.purpose.routed.n)} / ${num(cw.purpose.background.n)} / ${num(cw.purpose.prefetch.n)}` : "-";
     if (!w) {
@@ -882,8 +980,12 @@ module.exports = {
   robust,
   viaOf,
   purposeOf,
+  ANCHOR_KINDS,
   foldWindow,
   foldLongTasks,
+  inputAnchorOf,
+  sinceClickMs,
+  comparableWindow,
   cacheStateOf,
   revisionOf,
   isExactRevision,

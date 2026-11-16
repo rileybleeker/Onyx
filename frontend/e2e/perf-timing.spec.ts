@@ -26,7 +26,8 @@ const stats = require("./perf-stats.cjs");
  *     speed budget, use it;
  *   - a FIXED window (harness version 2, `window`) from the navigation itself (navigation start for a full load; for
  *     an in-app navigation, the first pointer event on the link, so Playwright's actionability checks before the click
- *     never use the window up): every request that started in it, split by purpose (routed = before data-ready,
+ *     never use the window up; a click whose pointer event was not seen on the same document gets an unknown window,
+ *     recorded with the reason and never counted): every request that started in it, split by purpose (routed = before data-ready,
  *     background = after it, prefetch = router prefetch) and by origin (network, memory / disk / prefetch cache,
  *     service worker, or unknown, from the browser's own network log). A fixed window makes request totals comparable
  *     between pages and runs; the quiet window closes at a different moment on each. The window's cost is decided at
@@ -43,8 +44,10 @@ const stats = require("./perf-stats.cjs");
  * cache. Its first round is the first visit of a session Today already PREWARMED (client cache, router prefetch,
  * HTTP cache), never a cold visit, and is labelled that way; each click records how long Today had been open
  * (`sinceTodayMs`). The first round keeps version 1 spacing (no fixed window), so the prewarm before each first visit
- * is as long as under version 1; later rounds get the fixed window from the click. `ready` is still timed from just
- * before Playwright's click (version 1, unchanged). Written as nav-<slug>.json, labelled "<route> (in-app)".
+ * is as long as under version 1; later rounds get the fixed window from the click's observed input. `ready` is still
+ * timed from just before Playwright's click (version 1, unchanged; a click that loaded a new document is timed on the
+ * shared clock, so the reload counts and a negative time can never pass). Written as nav-<slug>.json, labelled
+ * "<route> (in-app)".
  *
  * A phone scenario (390 px, Chromium iPhone emulation, CPU slowed 4x) loads Today and Log and times taps on the
  * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): reported on
@@ -371,10 +374,15 @@ interface Sample {
   /** Request clock (ms since this navigation started): data-ready, the click, the network-quiet close. */
   readyAtMs?: number | null;
   clickAtMs?: number | null;
-  /** In-app only: the first pointer event on the link (request clock), where the fixed window starts. */
+  /**
+   * In-app only: the first pointer event on the link (request clock), where the fixed window starts. Null when it was
+   * not observed: the window is then recorded as unknown (`window.anchor: "unobserved"` and its reason), never counted.
+   */
   pointerAtMs?: number | null;
   /** In-app only: Playwright's actionability wait, from just before the click call to that pointer event (ms). */
   clickWaitMs?: number | null;
+  /** In-app only: the click loaded a new document (a full reload); its times are on the shared clock. */
+  newDocument?: boolean;
   /** In-app only: ms since Today was opened (its load and warm-up) when this click was made. */
   sinceTodayMs?: number | null;
   quietAtMs?: number | null;
@@ -626,7 +634,15 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
         polling: "raf",
       });
       const [at, timeOrigin] = (await handle.jsonValue()) as [number, number];
-      sample.ready = at - clickedAt;
+      // In-app: from just before the click call (version 1). A click that loaded a new document is timed on the shared
+      // clock (its page clock restarted at 0), so the reload is counted and the time is never negative.
+      if (mode === "click") {
+        sample.newDocument = timeOrigin !== clickOrigin;
+        sample.ready = stats.sinceClickMs(at, timeOrigin, clickedAt, clickOrigin);
+        if (sample.ready == null) sample.error = "ready-not-timed"; // a clock was missing: not measured, never a pass
+      } else {
+        sample.ready = at;
+      }
       const onRequestClock = timeOrigin + at - t0;
       sample.readyAtMs = Number.isFinite(onRequestClock) && onRequestClock >= 0 ? onRequestClock : Date.now() - t0;
     } catch (e) {
@@ -638,9 +654,14 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     // the cost of a page view; harness 1, unchanged) AND, in harness 2, the fixed window is over. The window starts at
     // the navigation itself: navigation start for a full load; for an in-app one, the first pointer event on the link
     // (scrolling to the link, marking the old page and Playwright's actionability checks come before it and never use
-    // the window up), else just before the click call. The quiet moment is kept: the version 1 totals count only
-    // requests that started before it.
-    let anchor = mode === "click" ? sample.clickAtMs ?? 0 : 0;
+    // the window up). When that input was not observed (the read failed, no event was seen, or the click loaded a new
+    // document) the window's start is unknown: it is recorded as unknown with the reason and nothing is counted in it
+    // (perf-stats.cjs ANCHOR_KINDS). The click call's time is never used instead, because Playwright's actionability
+    // wait comes after it and could use the window up. The quiet moment is kept: the version 1 totals count only
+    // requests that started before it, and data ready keeps its version 1 timing either way.
+    let anchor = 0;
+    let anchorKind = "navigation-start";
+    let anchorReason: string | null = null;
     if (mode === "click") {
       const pointer = await page
         .evaluate(() => {
@@ -651,15 +672,16 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
         })
         .catch(() => null);
       // Same document only, measured on the page's own clock from the mark, then put on the request clock.
-      if (pointer && pointer[0] != null && pointer[1] === clickOrigin && pointer[0] >= clickedAt) {
-        sample.clickWaitMs = pointer[0] - clickedAt;
-        anchor += sample.clickWaitMs;
-        sample.pointerAtMs = anchor;
-      } else {
-        sample.clickWaitMs = null;
-        sample.pointerAtMs = null;
-      }
+      const input = stats.inputAnchorOf({ pointer, clickOrigin, markedAt: clickedAt, clickAtMs: sample.clickAtMs });
+      anchorKind = input.kind;
+      anchorReason = input.reason;
+      sample.clickWaitMs = input.clickWaitMs;
+      sample.pointerAtMs = input.anchorMs;
+      // Unobserved: observation still runs to the click call plus the window, so the spacing before the next click is
+      // unchanged; nothing in that span is counted.
+      anchor = input.anchorMs ?? sample.clickAtMs ?? 0;
     }
+    const windowed = windowMs > 0 && anchorKind !== "unobserved";
     const winEnd = anchor + windowMs;
     const winStart = Date.now();
     let quietAt: number | null = null;
@@ -682,7 +704,7 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     // the network-quiet wait above went on (that wait closes at a different moment on every navigation, so it must not
     // decide which requests count as finished). Observation goes on to that moment only while such a request is open.
     const settleBy = winEnd + DRAIN_MS;
-    if (windowMs > 0) {
+    if (windowed) {
       const openInWindow = () => [...open.values()].some((r) => r.startMs >= anchor && r.startMs < winEnd);
       while (openInWindow() && Date.now() - t0 < settleBy) await page.waitForTimeout(100);
     }
@@ -732,8 +754,10 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     );
     const { timeOrigin, feedAt, long, ...timings } = m;
     if (mode === "click") {
-      // The document was loaded before the click: its TTFB / FCP / LCP belong to Today, not to this page.
-      Object.assign(sample, { degraded: timings.degraded, emptyState: timings.emptyState, firstChart: timings.firstChart == null ? null : timings.firstChart - clickedAt });
+      // The document was loaded before the click: its TTFB / FCP / LCP belong to Today, not to this page. The first chart
+      // is timed like data ready (shared clock when the click loaded a new document).
+      const firstChart = timings.firstChart == null ? null : stats.sinceClickMs(timings.firstChart, timeOrigin, clickedAt, clickOrigin);
+      Object.assign(sample, { degraded: timings.degraded, emptyState: timings.emptyState, firstChart });
     } else {
       Object.assign(sample, timings);
     }
@@ -758,10 +782,14 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     sample.total = folded.total;
     sample.endpoints = folded.endpoints;
     if (windowMs > 0) {
-      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs, anchorMs: anchor, settleByMs: settleBy });
-      sample.longTasks = stats.foldLongTasks(long.map((x) => [toRequestClock(x[0]), x[1]]), anchor, winEnd, sample.readyAtMs);
-      sample.feedAtMs = feedAt == null ? null : inWindow(toRequestClock(feedAt));
-      sample.firstPrefetchAtMs = prefetchStarts.length ? Math.min(...prefetchStarts) - anchor : null;
+      // An unobserved click input gives a window of unknown start: foldWindow records it as such (no counts, never
+      // complete), and the moments measured from the window start are left unset (not measured, never zero).
+      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs, anchorMs: anchor, settleByMs: settleBy, anchorKind, anchorReason });
+      if (windowed) {
+        sample.longTasks = stats.foldLongTasks(long.map((x) => [toRequestClock(x[0]), x[1]]), anchor, winEnd, sample.readyAtMs);
+        sample.feedAtMs = feedAt == null ? null : inWindow(toRequestClock(feedAt));
+        sample.firstPrefetchAtMs = prefetchStarts.length ? Math.min(...prefetchStarts) - anchor : null;
+      }
     }
     sample.ok = !sample.error && sample.ready != null;
   } catch (e) {
