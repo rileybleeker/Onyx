@@ -218,6 +218,33 @@ BEGIN
     ASSERT v_count = 0, 'no discard recorded either';
     SELECT count(*) INTO v_count FROM pds.reading_session_removals WHERE client_key = '00000000-0000-4000-8000-000000000019';
     ASSERT v_count = 0, 'no removal on record';
+
+    -- 17. Two sessions reach the last chapter on different days and are removed oldest first: the finish day moves to
+    --     the remaining one, then the book goes back to reading when that one goes (it used to stay finished).
+    INSERT INTO pds.books (slug, title, total_chapters, status)
+    VALUES ('sql-regression-finish-book', 'Synthetic', 3, 'reading') RETURNING book_id INTO v_book;
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000020', v_book, DATE '2030-02-01', 1, 3, NULL, NULL, NULL, NULL, 'manual');
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000021', v_book, DATE '2030-02-02', 3, 3, NULL, NULL, NULL, NULL, 'manual');
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000020', NULL);
+    ASSERT NOT (r->>'unfinished')::boolean, 'still finished: another session reaches the last chapter';
+    SELECT status INTO v_status FROM pds.books WHERE book_id = v_book;
+    ASSERT v_status = 'finished', 'book stays finished';
+    ASSERT (SELECT finished_on FROM pds.books WHERE book_id = v_book) = DATE '2030-02-02', 'the finish day moved to the remaining session';
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000021', NULL);
+    ASSERT (r->>'unfinished')::boolean, 'the last finishing session going takes the finish back';
+    SELECT status INTO v_status FROM pds.books WHERE book_id = v_book;
+    ASSERT v_status = 'reading', 'book is back to reading';
+
+    -- 18. A habit row that already exists is recorded as existing (the stamp tells insertion from conflict).
+    INSERT INTO pds.books (slug, title, total_chapters, status, habit_name)
+    VALUES ('sql-regression-habit-book-2', 'Synthetic', 30, 'reading', 'SQL regression habit?') RETURNING book_id INTO v_book;
+    INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
+    VALUES (DATE '2030-02-10', 'SQL regression habit?', 'other', 'No');
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000022', v_book, DATE '2030-02-10', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    ASSERT NOT (r->>'habit_created')::boolean, 'the row was already there';
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000022', NULL);
+    SELECT answer INTO v_status FROM pds.habit_journal WHERE cycle_date = DATE '2030-02-10' AND question = 'SQL regression habit?';
+    ASSERT v_status = 'No', 'the earlier answer comes back';
 END $$;
 
 ROLLBACK;

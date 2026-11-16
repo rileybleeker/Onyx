@@ -208,27 +208,43 @@ DECLARE
     v_prov    pds.reading_habit_provenance%ROWTYPE;
     v_keep    boolean;
     v_version text;
+    v_n       integer;
 BEGIN
     IF p_cycle_date IS NULL OR p_question IS NULL THEN
         RETURN pg_catalog.jsonb_build_object('marked', false, 'created', false);
     END IF;
     PERFORM pds.reading_habit_lock(p_cycle_date, p_question);
 
-    SELECT h.answer, h.category, h.xmin::text INTO v_ans, v_cat, v_cur FROM pds.habit_journal AS h
-     WHERE h.cycle_date = p_cycle_date AND h.question = p_question
-     FOR UPDATE;
-    v_had := FOUND;
+    -- Insert first and tell insertion from conflict by the row count, then lock the row that was there. A SELECT ...
+    -- FOR UPDATE before the upsert locks nothing when the row is absent, so a check-in answer inserted in between
+    -- would have been recorded as "no row" and taken away again by a Discard (review of PR 376, round 3). The loop
+    -- covers a row deleted between the conflict and the lock.
+    LOOP
+        INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
+        VALUES (p_cycle_date, p_question, 'learning', 'Yes')
+        ON CONFLICT (cycle_date, question) DO NOTHING;
+        GET DIAGNOSTICS v_n = ROW_COUNT;
+        IF v_n > 0 THEN
+            v_had := false;
+            EXIT;
+        END IF;
+        SELECT h.answer, h.category, h.xmin::text INTO v_ans, v_cat, v_cur FROM pds.habit_journal AS h
+         WHERE h.cycle_date = p_cycle_date AND h.question = p_question
+         FOR UPDATE;
+        IF FOUND THEN
+            v_had := true;
+            UPDATE pds.habit_journal AS h SET category = 'learning', answer = 'Yes'
+             WHERE h.cycle_date = p_cycle_date AND h.question = p_question;
+            EXIT;
+        END IF;
+    END LOOP;
+    SELECT h.xmin::text INTO v_version FROM pds.habit_journal AS h
+     WHERE h.cycle_date = p_cycle_date AND h.question = p_question;
     SELECT * INTO v_prov FROM pds.reading_habit_provenance AS p
      WHERE p.cycle_date = p_cycle_date AND p.question = p_question
      FOR UPDATE;
     -- An earlier reading stamp's record still describes this row only while nothing else wrote it since.
     v_keep := FOUND AND v_had AND v_prov.row_version = v_cur;
-
-    INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
-    VALUES (p_cycle_date, p_question, 'learning', 'Yes')
-    ON CONFLICT (cycle_date, question) DO UPDATE SET category = EXCLUDED.category, answer = EXCLUDED.answer;
-    SELECT h.xmin::text INTO v_version FROM pds.habit_journal AS h
-     WHERE h.cycle_date = p_cycle_date AND h.question = p_question;
 
     IF v_keep THEN
         UPDATE pds.reading_habit_provenance AS p SET row_version = v_version, stamped_at = now()
@@ -348,6 +364,7 @@ DECLARE
     v_unfinished boolean := false;
     v_habit_gone boolean := false;
     v_restored   boolean := false;
+    v_next       date;
 BEGIN
     IF (p_session_id IS NULL) = (p_client_key IS NULL) THEN
         RAISE EXCEPTION 'exactly one of session_id and client_key is required' USING ERRCODE = '22023';
@@ -396,16 +413,25 @@ BEGIN
 
     DELETE FROM pds.reading_sessions AS s WHERE s.session_id = v_row.session_id;
 
+    -- The finish this session may have made. finished_on names the first session that reached the last chapter, so
+    -- when that session goes: back to reading if no other session reaches the last chapter, else the finish day moves
+    -- to the earliest remaining one (two sessions finishing on different days, removed oldest first, used to leave the
+    -- book finished for good; review of PR 376, round 3).
     IF v_book.status = 'finished'
        AND v_book.total_chapters IS NOT NULL AND v_book.total_chapters > 0
        AND COALESCE(v_row.chapter_through, 0) >= v_book.total_chapters
-       AND v_book.finished_on = v_row.session_date
-       AND NOT EXISTS (SELECT 1 FROM pds.reading_sessions AS s
-                        WHERE s.book_id = v_book.book_id AND s.chapter_through >= v_book.total_chapters) THEN
-        UPDATE pds.books AS b SET status = 'reading', finished_on = NULL WHERE b.book_id = v_book.book_id;
-        v_unfinished := true;
-        v_book.status := 'reading';
-        v_book.finished_on := NULL;
+       AND v_book.finished_on = v_row.session_date THEN
+        SELECT pg_catalog.min(s.session_date) INTO v_next FROM pds.reading_sessions AS s
+         WHERE s.book_id = v_book.book_id AND s.chapter_through >= v_book.total_chapters;
+        IF v_next IS NULL THEN
+            UPDATE pds.books AS b SET status = 'reading', finished_on = NULL WHERE b.book_id = v_book.book_id;
+            v_unfinished := true;
+            v_book.status := 'reading';
+            v_book.finished_on := NULL;
+        ELSIF v_next IS DISTINCT FROM v_book.finished_on THEN
+            UPDATE pds.books AS b SET finished_on = v_next WHERE b.book_id = v_book.book_id;
+            v_book.finished_on := v_next;
+        END IF;
     END IF;
 
     -- No exception block: a failed habit part rolls the removal back (the caller answers an error and is retried).

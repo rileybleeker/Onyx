@@ -199,7 +199,8 @@ export async function removeMirroredBlock(blockId: string | null): Promise<boole
   if (!blockId || !NOTION_API_KEY) return false;
   try {
     const res = await notion(`/blocks/${blockId}`, { method: "DELETE" });
-    return res.ok;
+    // A block that is already gone counts as removed, so a replayed cleanup can finish.
+    return res.ok || res.status === 404;
   } catch (e) {
     console.error("reading-notion: removeMirroredBlock failed:", e);
     return false;

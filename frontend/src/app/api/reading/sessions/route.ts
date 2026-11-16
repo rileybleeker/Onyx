@@ -2,7 +2,7 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
-import { removalAnswer, runRemovalCleanup } from "@/lib/reading-removal";
+import { removalAnswer, runRemovalCleanup, sweepPendingRemovals, trashLateBlock } from "@/lib/reading-removal";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -61,7 +61,9 @@ export async function POST(req: NextRequest) {
       // before the block id was stored could not update the entry, so compare with the row as it is now.
       const { data: fresh } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("session_id", id).maybeSingle();
       const now = fresh as ReadingSession | null;
-      if (!now) await removeMirroredBlock(blockId);
+      // A removal that ran meanwhile found no block id in its cleanup row: record this one there first (so the
+      // sweep owes it if the trash below fails), then trash it.
+      if (!now) await trashLateBlock(supabase, id, blockId);
       else if (now.book_id !== result.session.book_id) {
         await removeMirroredBlock(blockId);
         const { data: other } = await supabase.from("books").select(BOOK_COLS).eq("book_id", now.book_id).maybeSingle();
@@ -69,11 +71,13 @@ export async function POST(req: NextRequest) {
         await supabase.from("reading_sessions").update({ notion_block_id: moved }).eq("session_id", id);
       } else if (sessionMirrorDiffers(result.session, now)) await updateMirroredSession({ ...now, notion_block_id: blockId });
     }
-    await mirrorProgress(
-      { ...result.book, finished_on: result.finished ? result.session.session_date : result.book.finished_on },
-      overview?.chaptersDone ?? result.session.chapter_through ?? 0,
-      result.session.session_date,
-    );
+    // The progress line is written from the database as it is NOW, not from the values this request saw: a removal
+    // or an edit that ran during the mirroring above has changed them (review of PR 376, round 3).
+    const { data: freshBook } = await supabase.from("books").select(BOOK_COLS).eq("book_id", result.book.book_id).maybeSingle();
+    const book = (freshBook as Book | null) ?? null;
+    const current = book ? await getOverview(supabase, book.slug).catch(() => null) : null;
+    if (book && current) await mirrorProgress(book, current.chaptersDone ?? 0, current.sessions?.[0]?.session_date ?? null);
+    await sweepPendingRemovals(supabase);
   });
 
   return NextResponse.json({
@@ -134,7 +138,10 @@ export async function DELETE(req: NextRequest) {
   // once it sees the row gone.
   const answer = await removalAnswer(supabase, r);
   const { overview, removedId } = answer;
-  if (answer.owed) after(() => runRemovalCleanup(supabase, r, answer));
+  after(async () => {
+    if (answer.owed) await runRemovalCleanup(supabase, r, answer);
+    await sweepPendingRemovals(supabase);
+  });
 
   return NextResponse.json({ ...receipt, removed: removedId, unfinished: r.unfinished, overview });
 }

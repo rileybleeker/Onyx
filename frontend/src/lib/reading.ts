@@ -893,12 +893,19 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
   if (book.status !== "finished" || !total || (previous.chapter_through ?? 0) < total || book.finished_on !== previous.session_date) return false;
   const { data: rest } = await supabase
     .from("reading_sessions")
-    .select("session_id")
+    .select("session_date")
     .eq("book_id", book.book_id)
     .gte("chapter_through", total)
     .neq("session_id", exceptSession)
+    .order("session_date", { ascending: true })
     .limit(1);
-  if (rest?.length) return false;
+  if (rest?.length) {
+    // Another session still reaches the last chapter: the finish day moves to the earliest of them, so removing the
+    // sessions oldest first cannot leave the book finished with nothing behind it (review of PR 376, round 3).
+    const next = (rest[0] as { session_date: string }).session_date;
+    if (next && next !== book.finished_on) await supabase.from("books").update({ finished_on: next }).eq("book_id", book.book_id);
+    return false;
+  }
   const { error } = await supabase.from("books").update({ status: "reading", finished_on: null }).eq("book_id", book.book_id);
   return !error;
 }

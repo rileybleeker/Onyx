@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { BOOK_COLS, getOverview, markRemovalMirrored, type Book, type ReadingOverview, type SessionRemoval } from "./reading";
+import { BOOK_COLS, getOverview, markRemovalMirrored, type Book, type ReadingOverview, type RemovalCleanup, type SessionRemoval } from "./reading";
 import { mirrorProgress, removeMirroredBlock } from "./reading-notion";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -61,4 +61,70 @@ export async function runRemovalCleanup(supabase: Supa, r: Extract<SessionRemova
   else progressDone = await mirrorProgress(book, overview.chaptersDone ?? 0, overview.sessions?.[0]?.session_date ?? null);
   const sessionId = r.cleanup?.sessionId ?? null;
   if (trashed && progressDone && sessionId !== null) await markRemovalMirrored(supabase, sessionId);
+}
+
+/**
+ * A create's own Notion callback wrote an entry for a session that a removal had already taken out (review of PR 376,
+ * round 3). The block id goes into the removal's cleanup row FIRST, with the cleanup reopened, so it is owed and
+ * found by the sweep below even if the trash call or this process fails; then it is trashed and the row closed.
+ * Returns true when the entry is gone.
+ */
+export async function trashLateBlock(supabase: Supa, sessionId: number, blockId: string): Promise<boolean> {
+  const { error } = await supabase
+    .from("reading_session_removals")
+    .update({ notion_block_id: blockId, mirror_done_at: null })
+    .eq("session_id", sessionId);
+  if (error) console.error("reading: late block record failed:", error.code ?? "unknown");
+  const trashed = await removeMirroredBlock(blockId);
+  // The book's progress line is rewritten by the create callback's last step from the database as it is then.
+  if (trashed && !error) await markRemovalMirrored(supabase, sessionId);
+  return trashed;
+}
+
+let lastSweep = 0;
+const SWEEP_EVERY_MS = 60_000;
+const SWEEP_MIN_AGE_MS = 2 * 60_000;
+const SWEEP_LIMIT = 5;
+
+/**
+ * Durable retry of Notion cleanup a removal still owes (review of PR 376, round 3): a removal answers before its
+ * cleanup runs, and a cleanup that failed (or a process that ended first) used to wait for the client to repeat the
+ * DELETE, which it never does once the entry is gone from the screen. Every reading route that already runs after()
+ * calls this: it takes the removals whose cleanup row is still open and older than two minutes (so one still running
+ * is left alone), at most five, at most once a minute per server instance, and runs the same cleanup for each.
+ * Trashing a block twice is harmless, so two sweeps meeting do no damage. Never throws.
+ */
+export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
+  const now = Date.now();
+  if (now - lastSweep < SWEEP_EVERY_MS) return 0;
+  lastSweep = now;
+  try {
+    const { data, error } = await supabase
+      .from("reading_session_removals")
+      .select("session_id,book_id,session_date,notion_block_id,unfinished,mirror_done_at")
+      .is("mirror_done_at", null)
+      .lt("removed_at", new Date(now - SWEEP_MIN_AGE_MS).toISOString())
+      .order("removed_at", { ascending: true })
+      .limit(SWEEP_LIMIT);
+    if (error || !data?.length) return 0;
+    let done = 0;
+    for (const row of data as Record<string, unknown>[]) {
+      const cleanup: RemovalCleanup = {
+        sessionId: Number(row.session_id),
+        bookId: Number(row.book_id),
+        sessionDate: typeof row.session_date === "string" ? row.session_date : null,
+        notionBlockId: typeof row.notion_block_id === "string" && row.notion_block_id ? row.notion_block_id : null,
+        unfinished: row.unfinished === true,
+        done: false,
+      };
+      const r: Extract<SessionRemoval, { ok: true }> = { ok: true, removed: null, unfinished: cleanup.unfinished, cleanup };
+      const answer = await removalAnswer(supabase, r);
+      await runRemovalCleanup(supabase, r, answer);
+      done++;
+    }
+    return done;
+  } catch (e) {
+    console.error("reading: removal sweep failed:", e instanceof Error ? e.name : "unknown");
+    return 0;
+  }
 }

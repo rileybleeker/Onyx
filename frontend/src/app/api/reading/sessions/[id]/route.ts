@@ -3,7 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
-import { removalAnswer, runRemovalCleanup } from "@/lib/reading-removal";
+import { removalAnswer, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
 import { SESSION_GONE_CODE } from "@/lib/reading-removal-receipt";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -127,7 +127,10 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   if (!r.ok) return NextResponse.json(r.gone ? { error: r.error, code: SESSION_GONE_CODE } : { error: r.error }, { status: r.status });
   const answer = await removalAnswer(supabase, r);
   const { overview, removedId } = answer;
-  if (answer.owed) after(() => runRemovalCleanup(supabase, r, answer));
+  after(async () => {
+    if (answer.owed) await runRemovalCleanup(supabase, r, answer);
+    await sweepPendingRemovals(supabase);
+  });
 
   return NextResponse.json({
     success: true,
