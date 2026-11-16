@@ -264,6 +264,29 @@ test("stack editor: a new stack is created once it has a name and a product; lat
   assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version, s.description]), [[41, 2, "Synthetic description"]], "one stack, written twice");
 });
 
+test("stack editor: a product without a name is not a stack yet; a blank name counts as none, and the name is sent trimmed", async (t) => {
+  // Master's text check (`if (!f.name.trim()) return "Give the stack a name."`) as behaviour: what is sent and shown.
+  const server = stackServer();
+  const h = await mountStack(t, { answer: server.answer });
+  change(one(h, (n) => n.type === "select", "the product picker"), "synthetic-product-1");
+  await h.flush();
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0, "a product alone is not a stack yet");
+  assert.match(h.text(), /Give the stack a name\./, "the editor says what is missing");
+  change(one(h, STACK_NAME, "the name field"), "   ");
+  await h.flush();
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0, "a name of spaces is no name");
+  assert.match(h.text(), /Give the stack a name\./);
+  change(one(h, STACK_NAME, "the name field"), "  Synthetic stack  ");
+  await h.flush();
+  await h.tick(1200);
+  assert.deepEqual(methods(h), ["POST /api/supplements/stacks"], "created once it has a name");
+  assert.equal(h.net.writes()[0].body.name, "Synthetic stack", "the name is sent trimmed");
+  assert.match(h.text(), /Stack created/);
+  assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.name]), [[41, "Synthetic stack"]]);
+});
+
 test("stack editor: a create whose answer is lost is shown, retried with the same key, and then edited in place", async (t) => {
   // The editor's half: the failure is shown and the create is resent with the same key and save id. The first create
   // reaches the synthetic server and is stored there; only its answer is lost. The resend is then answered as a
