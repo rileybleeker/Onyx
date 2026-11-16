@@ -29,6 +29,7 @@ export async function GET(req: NextRequest) {
  * Idempotent on (book, passage). Mirrors to the Notion page after the response.
  */
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const result = await addHighlight(supabase, {
     slug: (body.book as string) || null,
@@ -59,7 +60,7 @@ export async function POST(req: NextRequest) {
   if (result.created) {
     const bookId = result.book.book_id;
     after(async () => {
-      await kickBank(supabase, { bookId, reason: "highlight", steps: HIGHLIGHT_EDIT_STEPS });
+      await kickBank(supabase, { bookId, reason: "highlight", steps: HIGHLIGHT_EDIT_STEPS, requestStartedAt });
     });
   }
   return NextResponse.json({ success: true, created: result.created, highlight: result.highlight });

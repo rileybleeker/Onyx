@@ -6,20 +6,21 @@
 // The Actions log is public: it prints ONE line of counts and codes, never a title, an idea or an answer.
 // Env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY,
 //      READING_BANK_MONTHLY_CAP_CENTS (default 3000), READING_BANK_CLEAR_ANSWERS_DAYS (default 180).
-process.env.NEXT_PUBLIC_SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+// (Only a set value is copied: assigning undefined to process.env stores the string "undefined".)
+if (!process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_URL) process.env.NEXT_PUBLIC_SUPABASE_URL = process.env.SUPABASE_URL;
 const { createClient } = require("@supabase/supabase-js");
 const { loadTs } = require("../tests/helpers/load-ts.cjs");
 
 async function main() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) {
     console.log("reading bank: failed missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
     process.exit(1);
   }
-  const db = createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
   let result;
   try {
+    const db = createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
     const S = loadTs("lib/reading-bank-server.ts", { "server-only": {} });
     result = await S.runWorker(db);
     console.log(S.workerLogLine(result));

@@ -27,6 +27,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * bank_off (the book is not turned on), 503 bank_unavailable.
  */
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const read = await readBankBody(req, SMALL_MAX_BODY_BYTES);
   if (!read.ok) return NextResponse.json({ error: read.error }, { status: read.status, headers: NO_STORE });
   const parsed = parseRunBody(read.body);
@@ -34,7 +35,7 @@ export async function POST(req: NextRequest) {
   const r = await requestRun(supabase, parsed.input);
   const bookId = r.kickBookId;
   if (bookId) after(async () => {
-    await kickBank(supabase, { bookId, reason: "run", plan: false });
+    await kickBank(supabase, { bookId, reason: "run", plan: false, requestStartedAt });
   });
   return NextResponse.json(r.body, { status: r.status, headers: NO_STORE });
 }

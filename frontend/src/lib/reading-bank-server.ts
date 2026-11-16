@@ -92,7 +92,9 @@ import { sha256Hex } from "./reading-recall";
  * service-role only).
  *
  * - planBook: pds.reading_bank_plan_input -> lib/reading-bank.ts planBankJobs -> pds.reading_bank_enqueue.
- * - runBank: claim -> step -> finish, while the step's longest duration still fits before the deadline. The claim
+ * - runBank: claim -> step -> finish, while the step's budget (stepBudgetMs: STEP_MAX_SECONDS x scale, a build at
+ *   least 225 s) still fits before the deadline; after a map, research or build is done, the book is planned again so
+ *   the next stage can be claimed in the same run. A finish the database did not record is never counted. The claim
  *   reserves the step's estimate; every model request is reserved again first (pds.reading_bank_reserve through
  *   bankModelCall's `reserve`), so neither the book's cap nor the monthly cap can be passed; finish charges the real
  *   cost (a call that may have been billed without a usage report is charged its reservation).
@@ -124,20 +126,45 @@ export const HEARTBEAT_SOURCE = "reading_bank";
 export const HEARTBEAT_TYPE = "generate";
 /** A heartbeat with nothing claimed repeats the last one at most this often (same status). */
 export const HEARTBEAT_MIN_GAP_MS = 50 * 60 * 1000;
-/** A kick's run budget (the routes' maxDuration is 300 s). */
+/** A kick's run budget from its own start (the routes' maxDuration is 300 s). */
 export const KICK_DEADLINE_MS = 240_000;
+/**
+ * A kick also ends this long after the REQUEST started: after() shares the route's maxDuration (300 s) with the
+ * request itself and the route's other after() callbacks (a long Kindle import, a Notion mirror, a second kick), and a
+ * function stopped mid-call loses the model's work and charges its reservation. 20 s are left for the repairs and the
+ * heartbeat.
+ */
+export const KICK_REQUEST_BUDGET_MS = 280_000;
 /** The worker's generation budget (the job's timeout is 20 minutes). */
 export const WORKER_DEADLINE_MS = 10 * 60_000;
 /** The worker gives each step twice its STEP_MAX_SECONDS (an Opus build can be slow); a kick gives it once. */
 export const WORKER_STEP_SCALE = 2;
+/**
+ * The least time a step is given in any run. STEP_MAX_SECONDS.build (150 s) has to hold the Opus structure call (a
+ * long JSON answer at medium effort) AND the Sonnet verify call, which a kick's single scale does not fit: a build
+ * stopped by its deadline is charged its whole reservation and tried again. So a kick claims a build only with 225 s
+ * left (in practice its first claim) and gives it all of them; the worker's 2x gives 300 s.
+ */
+export const STEP_FLOOR_SECONDS: Partial<Record<BankStep, number>> = { build: 225 };
 /** The worker grades answers still pending this long after they were stored (the attempt route's after() runs first). */
 export const GRADE_SWEEP_AGE_MS = 2 * 60_000;
 export const GRADE_SWEEP_MAX = 20;
-/** Minutes before a failed step is tried again, by attempt (the third failure fails the job: pds.reading_bank_finish). */
+/**
+ * Minutes before a failed step is tried again, by attempt. pds.reading_bank_finish fails a retry at its third attempt
+ * (and pds.reading_bank_claim an expired lease at its third), so only 5 and 30 are used today; the 180 is the next
+ * rung if that limit is raised to 4 (docs/reading-question-bank.md "Failure handling" lists 5 min / 30 min / 3 h).
+ */
 export const RETRY_MINUTES = [5, 30, 180] as const;
+/** The steps whose finish can unlock the next stage (research after the map, the build after research, highlights after the build). */
+const REPLAN_AFTER: ReadonlySet<BankStep> = new Set<BankStep>(["map", "research", "build"]);
+/** Ideas of one chapter read to find Riley's Wrong flags (active and retired, every rebuild). */
+const NOT_IN_BOOK_SCAN = 1000;
 /** The source map: at most this many URLs (pds.reading_bank_books.map_urls allows 8). */
 export const MAP_URLS_MAX = 8;
-/** reading_bank_jobs.output is at most 60,000 characters as JSON; notes are trimmed to stay below this. */
+/**
+ * reading_bank_jobs.output is at most 60,000 characters as `output::text` (jsonb's own spacing, measured by
+ * jsonbTextLength); notes are trimmed to stay below this.
+ */
 export const OUTPUT_MAX_CHARS = 55_000;
 /** Highlights a build sends (the chapter's newest live highlights). */
 export const BUILD_HIGHLIGHTS_MAX = 80;
@@ -173,6 +200,41 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 const uniqueInts = (vs: Iterable<unknown>) => [...new Set([...vs].map(Number).filter((n) => Number.isInteger(n) && n > 0))];
 type DbError = { code?: string; message?: string } | null | undefined;
 const errCode = (e: DbError) => (isMissingSchema(e) ? "schema_missing" : "other");
+const chunks = <T>(list: T[], size: number) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, i * size + size));
+
+/** A step's time budget in a run (ms): STEP_MAX_SECONDS x scale, never below the step's floor (STEP_FLOOR_SECONDS). */
+export function stepBudgetMs(step: BankStep, scale = 1): number {
+  return Math.max((STEP_MAX_SECONDS[step] ?? 60) * scale, STEP_FLOOR_SECONDS[step] ?? 0) * 1000;
+}
+
+/** A kick's deadline: 240 s after it started, and never later than 280 s after the request that kicked it started. */
+export function kickDeadline(startedAtMs: number, requestStartedAtMs?: number | null): number {
+  const own = startedAtMs + KICK_DEADLINE_MS;
+  return typeof requestStartedAtMs === "number" && Number.isFinite(requestStartedAtMs) ? Math.min(own, requestStartedAtMs + KICK_REQUEST_BUDGET_MS) : own;
+}
+
+/**
+ * The length of a value as Postgres prints jsonb (`output::text`, which the column CHECK measures): JSON with a space
+ * after every ':' and every ','. JavaScript counts UTF-16 units, at least Postgres's characters, so this never
+ * undercounts.
+ */
+export function jsonbTextLength(value: unknown): number {
+  const json = JSON.stringify(value);
+  if (json === undefined) return 0;
+  let separators = 0;
+  const walk = (x: unknown) => {
+    if (Array.isArray(x)) {
+      if (x.length > 1) separators += x.length - 1;
+      x.forEach(walk);
+    } else if (x && typeof x === "object") {
+      const values = Object.values(x).filter((y) => y !== undefined && typeof y !== "function");
+      if (values.length) separators += values.length * 2 - 1;
+      values.forEach(walk);
+    }
+  };
+  walk(value);
+  return json.length + separators;
+}
 
 /** The minutes a failed step waits before its next try, by the attempt that failed. */
 export function retryMinutes(attempts: number): number {
@@ -239,7 +301,7 @@ export function trimOutput(cited: Pick<CitedNotes, "notes" | "sources" | "unsure
   let notes = cited.notes.map((n) => ({ text: cutAtWord(n.text, 2000), sources: n.sources }));
   let sources = cited.sources;
   const unsure = cutAtWord(cited.unsure ?? "", 1000);
-  const size = () => JSON.stringify({ v: 1, notes, sources, unsure }).length;
+  const size = () => jsonbTextLength({ v: 1, notes, sources, unsure });
   while (size() > OUTPUT_MAX_CHARS && sources.length > 1) {
     const keep = Math.max(1, Math.floor(sources.length * 0.8));
     sources = sources.slice(0, keep);
@@ -378,6 +440,12 @@ export interface StepOutcome {
   /** Ideas a highlights step added (counted in records_synced). */
   ideasAdded?: number;
   costCents: number;
+  /**
+   * The finish was not recorded (pds.reading_bank_finish refused it, not_running / lease_lost, or never answered):
+   * the job is still running until its lease runs out, then claimed again. Reported as a retry with that code, never
+   * as done, and nothing it produced is counted.
+   */
+  lost?: boolean;
 }
 
 export interface RunCtx {
@@ -389,7 +457,7 @@ export interface RunCtx {
   stepScale: number;
 }
 
-const stepMs = (step: BankStep, scale: number) => (STEP_MAX_SECONDS[step] ?? 60) * 1000 * scale;
+const stepMs = (step: BankStep, scale: number) => stepBudgetMs(step, scale);
 
 /**
  * Money and the finish of one job: every request is reserved first (pds.reading_bank_reserve: both caps, every
@@ -453,24 +521,41 @@ class JobRun {
     extra: { result?: string | null; counts?: Record<string, unknown> | null; output?: unknown } = {},
   ): Promise<StepOutcome> {
     const safe = code ? bankCode(code) : null;
-    try {
-      await this.supabase.rpc("reading_bank_finish", {
-        p: {
-          job_id: this.job.job_id,
-          attempts: this.job.attempts,
-          outcome,
-          cost_cents: round2(this.cost),
-          usage: this.usage,
-          result: extra.result ?? null,
-          counts: extra.counts ?? null,
-          output: extra.output ?? null,
-          // A done job carries no error code (pds.reading_bank_enqueue reads it to decide what to try again).
-          error_code: outcome === "done" ? null : safe,
-          retry_minutes: outcome === "retry" ? retryMinutes(this.job.attempts) : null,
-        },
-      });
-    } catch {
-      /* the lease runs out and the next claim settles the job (its reservation is charged) */
+    const p = {
+      job_id: this.job.job_id,
+      attempts: this.job.attempts,
+      outcome,
+      cost_cents: round2(this.cost),
+      usage: this.usage,
+      result: extra.result ?? null,
+      counts: extra.counts ?? null,
+      output: extra.output ?? null,
+      // A done job carries no error code (pds.reading_bank_enqueue reads it to decide what to try again).
+      error_code: outcome === "done" ? null : safe,
+      retry_minutes: outcome === "retry" ? retryMinutes(this.job.attempts) : null,
+    };
+    const send = async (): Promise<{ answered: boolean; ok: boolean; code: string }> => {
+      try {
+        const { data, error } = await this.supabase.rpc("reading_bank_finish", { p });
+        if (error) return { answered: false, ok: false, code: errCode(error) };
+        if (plainObject(data) && data.ok === true) return { answered: true, ok: true, code: "" };
+        return { answered: true, ok: false, code: plainObject(data) && typeof data.code === "string" ? bankCode(data.code) : "other" };
+      } catch {
+        return { answered: false, ok: false, code: "other" };
+      }
+    };
+    let r = await send();
+    if (!r.answered) {
+      // No answer (a transport error): one more try. When the first one did commit, this one answers not_running.
+      const again = await send();
+      r = again.answered && !again.ok && again.code === "not_running" ? { answered: true, ok: true, code: "" } : again;
+    }
+    if (!r.ok) {
+      // Not recorded: the job stays running until its lease runs out (its reservation is then charged) and is
+      // claimed again; a build or highlights batch already stored is then finished from its store receipt without a
+      // model call. Never reported as done.
+      const lostCode = r.code === "lease_lost" || r.code === "not_running" || r.code === "schema_missing" ? r.code : "other";
+      return { step: this.job.step, outcome: "retry", code: lostCode, costCents: round2(this.cost), lost: true, note: `${this.job.step} ch ${this.job.chapter} not recorded` };
     }
     return { step: this.job.step, outcome, code: safe, costCents: round2(this.cost) };
   }
@@ -493,8 +578,17 @@ class JobRun {
   }
 }
 
-/** The previous try ran out of tokens or time: research halves its web tool uses, a build halves its target. */
-const halveAfter = (job: ClaimedJob) => job.error_code === "max_tokens" || job.error_code === "timeout";
+/**
+ * The previous try ran out of tokens or time: the map and research halve their web tool uses (fewer searches and
+ * fetches = a shorter call).
+ */
+const halveTools = (job: ClaimedJob) => job.error_code === "max_tokens" || job.error_code === "timeout";
+/**
+ * A build halves its target only after max_tokens (spec §7.5). A timeout says the run's budget was short (a kick),
+ * not that the answer was too long: the next try (a kick's first claim, or the worker's 300 s) keeps the full target,
+ * so the chapter is not stored with half its ideas for good.
+ */
+const halveTarget = (job: ClaimedJob) => job.error_code === "max_tokens";
 
 /* ---- map ---- */
 
@@ -511,7 +605,7 @@ async function runMapJob(supabase: Supa, run: JobRun): Promise<StepOutcome> {
     system: MAP_SYSTEM,
     user: mapUser({ title: input.title, author: input.author, total_chapters: input.total_chapters, toc_titles: toc }),
     maxTokens: 16000,
-    tools: [webSearchTool(halveAfter(job) ? 3 : 6), webFetchTool(halveAfter(job) ? 2 : 3, 12000)],
+    tools: [webSearchTool(halveTools(job) ? 3 : 6), webFetchTool(halveTools(job) ? 2 : 3, 12000)],
     step: "map",
   });
   if (!r1.ok) return run.failCall(r1);
@@ -554,6 +648,7 @@ async function runMapJob(supabase: Supa, run: JobRun): Promise<StepOutcome> {
     counts: { sources: cited.sources.length, urls: urls.length, chapters: map?.chapters.length ?? 0, dropped: cited.dropped, tool_errors: cited.tool_errors.length },
     output: trimOutput(cited),
   });
+  if (out.lost) return out;
   return { ...out, code: mapping === "uncertain" ? "uncertain" : null, note: `map ${mapping} ${urls.length} urls` };
 }
 
@@ -570,7 +665,7 @@ async function runResearchJob(supabase: Supa, run: JobRun): Promise<StepOutcome>
   const rebuilds = input.bank.find((b) => b.chapter === n)?.rebuilds ?? 0;
   if (researchInputHash(job.prompt_version, hash, input.map_urls, rebuilds) !== job.input_hash) return run.finish("skipped", "superseded");
   const titleOf = (k: number) => input.chapters.find((c) => c.chapter === k)?.title ?? null;
-  const uses = halveAfter(job) ? 1 : 2;
+  const uses = halveTools(job) ? 1 : 2;
   const r = await run.call({
     model: BANK_SONNET,
     effort: "medium",
@@ -596,6 +691,7 @@ async function runResearchJob(supabase: Supa, run: JobRun): Promise<StepOutcome>
     counts: { sources: cited.sources.length, notes: cited.notes.length, dropped: cited.dropped, tool_errors: cited.tool_errors.length },
     output: trimOutput(cited),
   });
+  if (out.lost) return out;
   return { ...out, code: cited.sources.length ? null : "no_citations", note: `research ch ${n} ${cited.sources.length} src` };
 }
 
@@ -648,21 +744,38 @@ async function existingTitles(supabase: Supa, bookId: number, chapter: number, i
   return ((data ?? []) as { title: unknown }[]).map((r) => String(r.title ?? "")).filter(Boolean);
 }
 
-/** Statements of this chapter's ideas Riley flagged Wrong (and did not restore): the build must not restate them. */
+/**
+ * Statements of this chapter's ideas Riley flagged Wrong (and did not restore): the build must not restate them.
+ * This chapter's ideas are read first (any status: a Wrong flag retires its idea), then only their flags, so flags on
+ * other books and chapters can never push this chapter's out of the list. Newest ideas first.
+ */
 async function notInBook(supabase: Supa, bookId: number, chapter: number): Promise<string[]> {
-  const { data: flags, error } = await supabase
-    .from("reading_question_flags")
-    .select("idea_id")
-    .eq("kind", "wrong")
-    .is("restored_at", null)
-    .order("created_at", { ascending: false })
-    .limit(200);
+  const { data: rows, error } = await supabase
+    .from("reading_ideas")
+    .select("idea_id,statement")
+    .eq("book_id", bookId)
+    .eq("chapter", chapter)
+    .order("idea_id", { ascending: false })
+    .limit(NOT_IN_BOOK_SCAN);
   if (error) throw Object.assign(new Error("read"), { code: errCode(error) });
-  const ids = uniqueInts(((flags ?? []) as { idea_id: unknown }[]).map((f) => f.idea_id));
-  if (!ids.length) return [];
-  const { data, error: e2 } = await supabase.from("reading_ideas").select("statement").eq("book_id", bookId).eq("chapter", chapter).in("idea_id", ids).limit(NOT_IN_BOOK_MAX);
-  if (e2) throw Object.assign(new Error("read"), { code: errCode(e2) });
-  return ((data ?? []) as { statement: unknown }[]).map((r) => String(r.statement ?? "")).filter(Boolean);
+  const statementOf = new Map<number, string>();
+  for (const r of (rows ?? []) as { idea_id: unknown; statement: unknown }[]) {
+    const id = Number(r.idea_id);
+    if (Number.isInteger(id) && id > 0 && typeof r.statement === "string" && r.statement) statementOf.set(id, r.statement);
+  }
+  if (!statementOf.size) return [];
+  const flagged = new Set<number>();
+  for (const part of chunks([...statementOf.keys()], 200)) {
+    const { data: flags, error: e2 } = await supabase
+      .from("reading_question_flags")
+      .select("idea_id")
+      .in("idea_id", part)
+      .eq("kind", "wrong")
+      .is("restored_at", null);
+    if (e2) throw Object.assign(new Error("read"), { code: errCode(e2) });
+    for (const f of (flags ?? []) as { idea_id: unknown }[]) flagged.add(Number(f.idea_id));
+  }
+  return [...statementOf].filter(([id]) => flagged.has(id)).map(([, s]) => s).slice(0, NOT_IN_BOOK_MAX);
 }
 
 /** What the build reads: the research job its input hash names, the map (chapter 0), or highlights only. */
@@ -725,6 +838,8 @@ async function storeAndFinish(
   }
   const counts = { ...built.payload.counts, links: built.payload.links.length, reasons: built.reasons };
   const out = await run.finish("done", null, { result: kind === "build" ? built.status : null, counts });
+  // The batch is stored (its receipt is on the job), but the job was not finished: counted when it is finished.
+  if (out.lost) return out;
   if (kind === "highlights") {
     return { ...out, ideasAdded: num(data.ideas, built.kept), note: `highlights ch ${built.payload.chapter} +${num(data.ideas, built.kept)} ideas ${built.payload.links.length} links` };
   }
@@ -746,7 +861,7 @@ async function runBuildJob(supabase: Supa, run: JobRun): Promise<StepOutcome> {
   if (!source) return run.finish("skipped", "superseded");
   const { evidence, notes } = evidenceFrom(source.output);
   const highlights = n > 0 ? await chapterHighlights(supabase, job.book_id, n) : [];
-  const target = chapterTarget(c.span, halveAfter(job));
+  const target = chapterTarget(c.span, halveTarget(job));
   const titles = await existingTitles(supabase, job.book_id, n, false);
   const base = {
     bookId: job.book_id,
@@ -1034,7 +1149,8 @@ export async function runBank(supabase: Supa, opts: RunBankOptions = {}): Promis
       break;
     }
     claimed += 1;
-    const out = await runClaimedJob(supabase, { job: answer.job as unknown as ClaimedJob, headroom_cents: answer.headroom_cents }, {
+    const job = answer.job as unknown as ClaimedJob;
+    const out = await runClaimedJob(supabase, { job, headroom_cents: answer.headroom_cents }, {
       client,
       monthCapCents: monthCap,
       now,
@@ -1045,6 +1161,17 @@ export async function runBank(supabase: Supa, opts: RunBankOptions = {}): Promis
     cost += out.costCents;
     recordOutcome(summary, out);
     if (out.code === "monthly_cap") break;
+    // The planner adds a stage only once the one before it is stored (research after the map, the build after its
+    // research job is done, highlights after the build): plan the book again, so the next claim of this same run can
+    // take it instead of waiting for the next trigger. One plan read + one enqueue, under the claim lock.
+    if (out.outcome === "done" && REPLAN_AFTER.has(job.step)) {
+      try {
+        const p = await planBook(supabase, job.book_id);
+        if (!p.ok) summary.codes.push(p.code);
+      } catch {
+        summary.codes.push("other");
+      }
+    }
   }
   return { summary, claimed, outcomes, costCents: round2(cost) };
 }
@@ -1130,6 +1257,12 @@ export interface KickOptions {
   client?: BankClient;
   now?: () => number;
   monthCapCents?: number;
+  /**
+   * When the request that kicks started (epoch ms; the route's Date.now() at its top). The kick then also ends by
+   * requestStartedAt + KICK_REQUEST_BUDGET_MS, so a slow request (a long Kindle import), the route's other after()
+   * callbacks or a second kick cannot push a step past the route's maxDuration.
+   */
+  requestStartedAt?: number;
 }
 export interface KickResult {
   ran: boolean;
@@ -1139,8 +1272,10 @@ export interface KickResult {
 }
 
 /**
- * What a write route runs in after(): preflight, plan the book, run for up to 240 s, repair up to 20 dirty states,
- * heartbeat. Quiet (no heartbeat) while the SQL is not applied or the book is off. Never throws.
+ * What a write route runs in after(): preflight, plan the book, run for up to 240 s (and never past 280 s after the
+ * request started: kickDeadline), repair up to 20 dirty states, heartbeat. Each finished stage plans the book again
+ * (runBank), so one kick can take a chapter from the source map to its research and, given a build's 225 s, its build.
+ * Quiet (no heartbeat) while the SQL is not applied or the book is off. Never throws.
  */
 export async function kickBank(supabase: Supa, opts: KickOptions): Promise<KickResult> {
   const now = opts.now ?? Date.now;
@@ -1163,7 +1298,7 @@ export async function kickBank(supabase: Supa, opts: KickOptions): Promise<KickR
     const r = await runBank(supabase, {
       client: opts.client,
       now,
-      deadline: startedAt.getTime() + KICK_DEADLINE_MS,
+      deadline: kickDeadline(startedAt.getTime(), opts.requestStartedAt),
       steps: opts.steps ?? GENERATION_STEPS,
       monthCapCents: opts.monthCapCents,
     });
@@ -1205,24 +1340,49 @@ export interface WorkerResult {
   heartbeat: "written" | "skipped" | "failed" | null;
 }
 
-/** Sweep: grade jobs still queued 2 minutes after their answer (the attempt route's after() did not run them). */
+/**
+ * Sweep: grade jobs still queued 2 minutes after their answer (the attempt route's after() did not run them), and
+ * grade jobs whose run stopped (a crash, a function at its maxDuration) and whose lease ran out. Those stay `running`
+ * until a claim settles their lease, and claims otherwise run only in kicks and generation runs, so with every book
+ * off nothing would: claimed here by id, pds.reading_bank_claim settles the lease first (queued again, or failed after
+ * 3 attempts) and then claims it.
+ */
 async function sweepGrades(supabase: Supa, ctx: { client: BankClient; monthCap: number; now: () => number; deadline: number }, summary: BankRunSummary, outcomes: StepOutcome[]): Promise<number> {
   const nowMs = ctx.now();
-  const { data, error } = await supabase
-    .from("reading_bank_jobs")
-    .select("job_id")
-    .eq("step", "grade")
-    .eq("status", "queued")
-    .lt("created_at", new Date(nowMs - GRADE_SWEEP_AGE_MS).toISOString())
-    .lte("next_attempt_at", new Date(nowMs).toISOString())
-    .order("created_at", { ascending: true })
-    .limit(GRADE_SWEEP_MAX);
-  if (error) {
-    summary.codes.push(errCode(error));
-    return 0;
-  }
+  const nowIso = new Date(nowMs).toISOString();
+  const [queued, expired] = await Promise.all([
+    supabase
+      .from("reading_bank_jobs")
+      .select("job_id,created_at")
+      .eq("step", "grade")
+      .eq("status", "queued")
+      .lt("created_at", new Date(nowMs - GRADE_SWEEP_AGE_MS).toISOString())
+      .lte("next_attempt_at", nowIso)
+      .order("created_at", { ascending: true })
+      .limit(GRADE_SWEEP_MAX),
+    supabase
+      .from("reading_bank_jobs")
+      .select("job_id,created_at")
+      .eq("step", "grade")
+      .eq("status", "running")
+      .lt("lease_until", nowIso)
+      .order("created_at", { ascending: true })
+      .limit(GRADE_SWEEP_MAX),
+  ]);
+  const error = queued.error ?? expired.error;
+  if (error) summary.codes.push(errCode(error));
+  const seen = new Set<number>();
+  const rows = ([...((queued.data ?? []) as { job_id: unknown; created_at: unknown }[]), ...((expired.data ?? []) as { job_id: unknown; created_at: unknown }[])])
+    .filter((r) => {
+      const id = Number(r.job_id);
+      if (!Number.isInteger(id) || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")))
+    .slice(0, GRADE_SWEEP_MAX);
   let claimed = 0;
-  for (const row of (data ?? []) as { job_id: unknown }[]) {
+  for (const row of rows) {
     if (ctx.deadline - ctx.now() < stepMs("grade", 1)) break;
     const { data: claim, error: e2 } = await supabase.rpc("reading_bank_claim", {
       p: { job_id: Number(row.job_id), steps: ["grade"], lease_seconds: STEP_MAX_SECONDS.grade + 30, month_cap_cents: ctx.monthCap, estimates: { grade: STEP_ESTIMATE_CENTS.grade } },
@@ -1444,11 +1604,24 @@ export function bookEstimate(input: PlanInput, spentCents: number) {
   };
 }
 
-/** GET /api/reading/bank?book=: the chapter map (pds.reading_bank_overview, spoiler gate in SQL) + the estimate. */
+/**
+ * GET /api/reading/bank?book=: the chapter map (pds.reading_bank_overview, spoiler gate in SQL) + the estimate.
+ * The overview and the planner input the estimate needs are read in parallel (the planner input's book through
+ * pds.reading_bank_book_id, the overview's own rule), so the page's warm-up read waits for the slower of the two, not
+ * their sum; if the active book changed between the two reads, the overview's book is read again.
+ */
 export async function getBankOverview(supabase: Supa, slug: string | null): Promise<BankAnswer> {
-  const { row, failure } = await readOverview(supabase, slug);
+  const planned = (async (): Promise<{ input: PlanInput | null; error: DbError; bookId: number | null }> => {
+    const { data: id, error } = await supabase.rpc("reading_bank_book_id", { p_slug: slug });
+    if (error) return { input: null, error, bookId: null };
+    if (id == null) return { input: null, error: null, bookId: null };
+    const r = await readPlanInput(supabase, Number(id));
+    return { ...r, bookId: Number(id) };
+  })();
+  const [{ row, failure }, plan] = await Promise.all([readOverview(supabase, slug), planned]);
   if (failure || !row) return failure ?? fail(404, "book_not_found");
-  const { input, error } = await readPlanInput(supabase, row.book_id);
+  let { input, error } = plan;
+  if (!error && (!input || plan.bookId !== Number(row.book_id))) ({ input, error } = await readPlanInput(supabase, row.book_id));
   if (error) {
     const f = bankFailure(null, error)!;
     return fail(f.status, f.error);
@@ -1492,6 +1665,10 @@ export async function setApproval(supabase: Supa, input: ApprovalInput): Promise
 /**
  * POST /api/reading/bank/run: "Build now" (plan + enqueue) and "Rebuild chapter" (the rebuild counter first: new job
  * hashes, so a fresh research + build is queued; chapter 0 or none = the source map and the whole-book build).
+ * A rebuild is counted once per round of work: while the chapter's research or build (for chapter 0, the map or the
+ * whole-book build) is still queued or running, another Rebuild (a double tap, a retry after a lost answer) answers the
+ * same 202 with `pending: true` and does not count again, which would make the first rebuild's jobs obsolete and pay
+ * for its research and build twice.
  * Answers 202 at once; the work runs in after() (kickBookId).
  */
 export async function requestRun(supabase: Supa, input: RunInput): Promise<BankAnswer & { kickBookId: number | null }> {
@@ -1501,15 +1678,32 @@ export async function requestRun(supabase: Supa, input: RunInput): Promise<BankA
   const total = num(row.total_chapters, 0);
   if (input.chapter !== null && total > 0 && input.chapter > total) return { ...fail(400, "bad_chapter"), kickBookId: null };
   let rebuilds: number | null = null;
+  let pending = false;
   if (input.rebuild) {
-    const { data, error } = await supabase.rpc("reading_bank_rebuild", { p: { book_id: row.book_id, chapter: input.chapter ?? 0 } });
-    const f = bankFailure(data, error);
-    if (f) return { ...fail(f.status, f.error), kickBookId: null };
-    rebuilds = num((data as { rebuilds?: unknown }).rebuilds, 0);
+    const chapter = input.chapter ?? 0;
+    const { data: open, error: e0 } = await supabase
+      .from("reading_bank_jobs")
+      .select("job_id")
+      .eq("book_id", row.book_id)
+      .eq("chapter", chapter)
+      .in("step", chapter === 0 ? ["map", "build"] : ["research", "build"])
+      .in("status", ["queued", "running"])
+      .limit(1);
+    if (e0) {
+      const f = bankFailure(null, e0)!;
+      return { ...fail(f.status, f.error), kickBookId: null };
+    }
+    if (((open ?? []) as unknown[]).length) pending = true;
+    else {
+      const { data, error } = await supabase.rpc("reading_bank_rebuild", { p: { book_id: row.book_id, chapter } });
+      const f = bankFailure(data, error);
+      if (f) return { ...fail(f.status, f.error), kickBookId: null };
+      rebuilds = num((data as { rebuilds?: unknown }).rebuilds, 0);
+    }
   }
   const plan = await planBook(supabase, row.book_id);
   if (!plan.ok) return { ...fail(plan.code === "schema_missing" ? 503 : 500, plan.code === "schema_missing" ? "bank_unavailable" : "failed"), kickBookId: null };
-  return { ...ok({ success: true, book_id: row.book_id, queued: plan.jobs, enqueued: plan.enqueued, rebuilds }, 202), kickBookId: row.book_id };
+  return { ...ok({ success: true, book_id: row.book_id, queued: plan.jobs, enqueued: plan.enqueued, rebuilds, pending }, 202), kickBookId: row.book_id };
 }
 
 /** GET /api/reading/bank/chapter/[n]?book=: one chapter's sheet (pds.reading_bank_chapter; null = locked -> 404). */
@@ -1546,8 +1740,6 @@ async function pagedSelect<T>(
   return { rows, error: null };
 }
 
-const chunks = <T>(list: T[], size: number) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, i * size + size));
-
 /**
  * GET /api/reading/bank/export?book=: the book's ideas (active and retired) at or below the spoiler gate and of the
  * current edition, their evidence and sources, and job counts by step and status (never the research notes).
@@ -1567,8 +1759,10 @@ export async function getBankExport(supabase: Supa, slug: string | null): Promis
     return fail(f.status, f.error);
   }
   const through = Math.max(0, Math.trunc(input.quiz_through) || 0);
+  // The current edition of each chapter: its table of contents row's hash, else the hash of a chapter with no row
+  // (a book tracked by hand has none), the same fallback as generation and pds.reading_bank_chapter_hash.
   const hashOf = new Map(input.chapters.map((c) => [c.chapter, c.chapter_hash]));
-  hashOf.set(0, input.chapter0_hash);
+  const currentHash = (n: number) => (n === 0 ? input.chapter0_hash : (hashOf.get(n) ?? chapterHash(n, null)));
   type IdeaRow = { idea_id: number; chapter: number; unlock_chapter: number; chapter_hash: string; [k: string]: unknown };
   const ideasRead = await pagedSelect<IdeaRow>((from, to) =>
     supabase
@@ -1584,7 +1778,7 @@ export async function getBankExport(supabase: Supa, slug: string | null): Promis
     const f = bankFailure(null, ideasRead.error)!;
     return fail(f.status, f.error);
   }
-  const ideas = ideasRead.rows.filter((i) => hashOf.get(Number(i.chapter)) === i.chapter_hash);
+  const ideas = ideasRead.rows.filter((i) => currentHash(Number(i.chapter)) === i.chapter_hash);
   const evidence: { idea_id: number; source_id: number }[] = [];
   for (const part of chunks(ideas.map((i) => Number(i.idea_id)), 200)) {
     const { data, error: e2 } = await supabase.from("reading_idea_evidence").select("idea_id,source_id").in("idea_id", part);

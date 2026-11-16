@@ -63,6 +63,7 @@ async function refreshProgress(book: Book, fallbackDate: string | null): Promise
 }
 
 export async function PATCH(req: NextRequest, ctx: Ctx) {
+  const requestStartedAt = Date.now();
   const refused = checkVoiceRequest(req.headers, req.nextUrl.origin, MAX_BYTES);
   if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
   const id = sessionIdOf((await ctx.params).id);
@@ -100,7 +101,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   if (r.session.chapter_through !== r.previous.chapter_through || r.book.book_id !== r.previousBook.book_id) {
     const bookIds = [...new Set([r.book.book_id, r.previousBook.book_id])];
     after(async () => {
-      for (const bookId of bookIds) await kickBank(supabase, { bookId, reason: "session" });
+      for (const bookId of bookIds) await kickBank(supabase, { bookId, reason: "session", requestStartedAt });
     });
   }
 

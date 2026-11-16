@@ -74,6 +74,19 @@ test("a heartbeat message that is not counts and codes is never shown", () => {
   assert.equal(c.errorMessage.includes("script"), false);
 });
 
+test("a book paused at its budget reads degraded with the way out, never as a stalled workflow", () => {
+  // Its jobs stay queued (claims skip a paused book) and quiet runs may be far apart: not a workflow problem.
+  const paused = card(hb("success", 30), counts({ paused_budget: 1, queued: 4 }));
+  assert.equal(paused.status, "partial");
+  assert.match(paused.errorMessage, /Paused · budget: Allow more on Reading\./);
+  assert.equal(/workflow/.test(paused.errorMessage), false);
+  assert.equal(card(hb("success", 1), counts({ paused_budget: 1 })).status, "partial", "also right after a healthy run");
+  // With every turned-on book paused, an answer waiting for its grade still means the worker is not running.
+  const grading = card(hb("success", 30), counts({ paused_budget: 1, queued: 4, pending_grades: 1 }));
+  assert.equal(grading.status, "failed");
+  assert.match(grading.errorMessage, /1 job queued and no run for 30 h/);
+});
+
 test("paused books and pending grades are extra rows; money is formatted plainly", () => {
   const c = card(hb("partial", 1, "codes budget"), counts({ paused_budget: 1, pending_grades: 2 }));
   assert.deepEqual(c.extraRows.map((r) => r.label), ["Spend", "Paused", "Grading"]);

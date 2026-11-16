@@ -27,6 +27,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * bad_cap, 404 book_not_found, 409 estimate_changed, 503 bank_unavailable.
  */
 export async function PUT(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const read = await readBankBody(req, SMALL_MAX_BODY_BYTES);
   if (!read.ok) return NextResponse.json({ error: read.error }, { status: read.status, headers: NO_STORE });
   const parsed = parseApprovalBody(read.body);
@@ -34,7 +35,7 @@ export async function PUT(req: NextRequest) {
   const r = await setApproval(supabase, parsed.input);
   const bookId = r.kickBookId;
   if (bookId) after(async () => {
-    await kickBank(supabase, { bookId, reason: "approval" });
+    await kickBank(supabase, { bookId, reason: "approval", requestStartedAt });
   });
   return NextResponse.json(r.body, { status: r.status, headers: NO_STORE });
 }

@@ -26,6 +26,7 @@ export const maxDuration = 300;
  * session (`replayed: true`) with no second XP, habit stamp or Notion entry.
  */
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const result = await logSession(supabase, {
     slug: (body.book as string) || null,
@@ -72,7 +73,7 @@ export async function POST(req: NextRequest) {
   if (!result.replayed) {
     const bookId = result.book.book_id;
     after(async () => {
-      await kickBank(supabase, { bookId, reason: "session" });
+      await kickBank(supabase, { bookId, reason: "session", requestStartedAt });
     });
   }
 

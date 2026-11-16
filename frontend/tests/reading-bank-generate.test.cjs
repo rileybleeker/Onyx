@@ -60,6 +60,8 @@ function makeDb(o = {}) {
     stores: [],
     cleared: [],
     throwOn: null,
+    /** A code pds.reading_bank_finish answers instead of finishing (a lease that was lost meanwhile). */
+    refuseFinish: null,
     ...o,
   };
   db.now = () => db.clock;
@@ -185,6 +187,7 @@ function rpcs(db) {
     reading_bank_finish: ({ p }) => {
       const j = db.jobs.find((x) => x.job_id === p.job_id);
       if (!j) return { ok: false, http: 404, code: "not_found" };
+      if (db.refuseFinish) return { ok: false, http: 409, code: db.refuseFinish };
       if (j.status !== "running") return { ok: false, http: 409, code: "not_running" };
       if (p.attempts !== j.attempts) return { ok: false, http: 409, code: "lease_lost" };
       const status = p.outcome === "retry" ? (j.attempts >= 3 ? "failed" : "queued") : p.outcome;
@@ -272,6 +275,8 @@ function fakeSupabase(db) {
     reading_bank_jobs: () => db.jobs,
     reading_bank_books: () => (db.bb ? [{ book_id: BOOK, ...db.bb }] : []),
     reading_idea_state: () => [],
+    reading_idea_evidence: () => db.evidence,
+    reading_bank_sources: () => db.sources,
   };
   return {
     rpc: (name, args) => {
@@ -493,7 +498,7 @@ const researchOutput = () => ({
 test("map: two calls (web tools, then JSON without tools), only cited URLs kept, mapping ok, notes stored", async () => {
   const db = makeDb();
   const env = load(db);
-  const r = await kick(env);
+  const r = await kick(env, { steps: ["map"] });
   assert.equal(r.ran, true);
   assert.equal(r.claimed, 1);
   const [c1, c2] = env.model.calls;
@@ -528,7 +533,7 @@ test("mapVerdict: count and title checks; unknown counts are uncertain", () => {
 test("a map that cites nothing leaves the mapping uncertain (highlights only) without a second call", async () => {
   const db = makeDb();
   const env = load(db, fakeModel({ map1: () => textMsg([{ type: "text", text: "Nothing could be confirmed." }]) }));
-  await kick(env);
+  await kick(env, { steps: ["map"] });
   assert.deepEqual(env.model.calls.map((c) => c.role), ["map1"]);
   assert.equal(db.bb.mapping, "uncertain");
   assert.deepEqual(db.bb.map_urls, []);
@@ -555,8 +560,8 @@ test("research: citations become sources, uncited sentences are thrown away, a w
   const call = env.model.calls.find((c) => c.role === "research");
   assert.ok(call.params.messages[0].content.includes(`${GUIDE}/guide`), "the map URLs are in the user turn (web_fetch can open them)");
   assert.deepEqual(call.params.tools.map((t) => t.max_uses), [2, 2]);
-  // Research done -> the build is planned on the next kick.
-  await kick(env);
+  // Research done -> the book is planned again and the build runs in the same kick (it was the run's second claim, with
+  // a build's 225 s still left).
   assert.ok(db.jobs.some((j) => j.step === "build" && j.chapter === 2 && j.status === "done"));
 });
 
@@ -855,9 +860,9 @@ test("highlights step: a link is stored only when the verifier confirms it; a ne
 test("privacy: web-enabled calls never see a highlight; no call ever sees a comment", async () => {
   const db = makeDb();
   const env = load(db);
-  await kick(env); // map
-  await kick(env); // research
-  await kick(env); // builds
+  await kick(env); // map, then research (each finished stage plans the book again)
+  await kick(env); // a build (a kick claims a build only as its first claim: 225 s)
+  await kick(env); // another build
   const roles = new Set(env.model.calls.map((c) => c.role));
   for (const r of ["map1", "research", "structure", "verify"]) assert.ok(roles.has(r), `ran ${r}`);
   for (const c of env.model.calls) {
@@ -866,6 +871,134 @@ test("privacy: web-enabled calls never see a highlight; no call ever sees a comm
     if (c.params.tools) assert.equal(text.includes(PASSAGE_MARKER), false, `${c.role} (web tools) saw a highlight`);
   }
   assert.ok(env.model.calls.some((c) => c.role === "structure" && JSON.stringify(c.params).includes(PASSAGE_MARKER)), "the structure call sees chapter 2's highlight");
+});
+
+/* ------------------------------------------------------------------ */
+/* one trigger, several stages; time budgets                            */
+/* ------------------------------------------------------------------ */
+
+test("one kick goes from the source map to research to a stored build when its deadline allows (planned again after each stage)", async () => {
+  const db = makeDb();
+  const env = load(db);
+  const t0 = db.clock;
+  // A clock that does not move: every step fits the kick's deadline (the fake model answers at once).
+  const r = await kick(env, { now: () => t0 });
+  assert.equal(r.ran, true);
+  const roles = env.model.calls.map((c) => c.role);
+  const at = (role) => roles.indexOf(role);
+  assert.ok(at("map1") === 0 && at("map2") === 1, "the source map first");
+  assert.ok(at("research") > at("map2"), "research in the same kick, once the map is stored");
+  assert.ok(at("structure") > at("research") && at("verify") > at("structure"), "and the build once its research is done");
+  const build2 = db.jobs.find((j) => j.step === "build" && j.chapter === 2);
+  assert.equal(build2?.status, "done", "chapter 2 (the newest quizzable chapter) is built in the approval kick");
+  assert.ok(db.stores.some((p) => p.chapter === 2), "and stored");
+});
+
+test("a kick claims a build only with 225 s left: the approval kick maps and researches, the next trigger builds", async () => {
+  const db = makeDb();
+  const env = load(db);
+  assert.equal(env.S.stepBudgetMs("build", 1), 225000, "a kick gives a build 225 s, not STEP_MAX_SECONDS' 150");
+  assert.equal(env.S.stepBudgetMs("build", 2), 300000, "the worker's 2x");
+  assert.equal(env.S.stepBudgetMs("map", 1), 120000);
+  await kick(env); // the fake's clock moves 1 s per database call
+  assert.equal(db.jobs.find((j) => j.step === "map").status, "done");
+  assert.equal(db.jobs.find((j) => j.step === "research" && j.chapter === 2).status, "done", "research ran in the same kick");
+  const build = db.jobs.find((j) => j.step === "build" && j.chapter === 2);
+  assert.equal(build?.status, "queued", "the build is planned, but less than 225 s are left");
+  assert.equal(env.model.calls.some((c) => c.role === "structure"), false);
+  await kick(env);
+  assert.equal(build && db.jobs.find((j) => j.job_id === build.job_id).status, "done", "the next kick's first claim is the build");
+});
+
+test("a build that timed out keeps its full target on the next try; only max_tokens halves it", async () => {
+  const target = (env) => Number(/"target":(\d+)/.exec(env.model.calls.find((c) => c.role === "structure").params.messages[0].content)[1]);
+  const full = B.chapterTarget({ start_page: 31, end_page: 60 });
+  for (const [code, want] of [["timeout", full], ["max_tokens", B.chapterTarget({ start_page: 31, end_page: 60 }, true)]]) {
+    const db = makeDb();
+    const research = seedBuild(db);
+    addJob(db, { step: "build", chapter: 2, input_hash: B.buildInputHash(P.BANK_PROMPT_VERSION, chHash(db, 2), research.job_id, 0), priority: 20, attempts: 1, error_code: code });
+    const env = load(db);
+    await kick(env);
+    assert.equal(target(env), want, `after ${code}`);
+  }
+  assert.ok(B.chapterTarget({ start_page: 31, end_page: 60 }, true) < full);
+});
+
+test("a finish the database does not record is never counted: a retry with lease_lost, no chapter, no next stage", async () => {
+  const db = makeDb({ refuseFinish: "lease_lost" });
+  seedBuild(db);
+  const env = load(db);
+  const r = await kick(env);
+  assert.equal(r.claimed, 1, "the job stays running (leased), so nothing else of the book is claimed");
+  const job = db.jobs.find((j) => j.step === "build");
+  assert.equal(job.status, "running", "left for its lease to run out and a later claim");
+  const hb = db.sync.at(-1);
+  assert.match(hb.error_message, /lease_lost/);
+  assert.match(hb.error_message, /build ch 2 not recorded/);
+  assert.equal(/ch 2 (ready|thin|anchors_only|no_sources) /.test(hb.error_message), false, "no stored chapter is reported");
+  assert.equal(hb.records_synced, 0);
+});
+
+test("a kick ends 280 s after its request started, however late after() began", async () => {
+  const db = makeDb();
+  const env = load(db);
+  assert.equal(env.S.kickDeadline(0, null), 240000);
+  assert.equal(env.S.kickDeadline(100000, 0), 280000, "a request that took 100 s leaves the kick 180 s");
+  const r = await kick(env, { requestStartedAt: db.clock - 200000 });
+  assert.equal(r.claimed, 0, "80 s left: the source map (120 s) is not claimed");
+  assert.equal(env.model.calls.length, 0);
+  assert.equal(db.jobs.find((j) => j.step === "map").status, "queued");
+});
+
+test("the worker settles and grades an answer whose grade run stopped, even with every book off", async () => {
+  const db = makeDb();
+  db.bb.approved_at = null;
+  const grade = addJob(db, {
+    step: "grade", attempt_key: "00000000-0000-4000-8000-000000000003", input_hash: "c".repeat(64), priority: 5,
+    status: "running", attempts: 1, lease_until: db.clock - 1000, reserved_cents: 1, next_attempt_at: db.clock - 600000,
+    created_at: new Date(db.clock - 10 * 60000).toISOString(),
+  });
+  const env = load(db);
+  const w = await env.S.runWorker(env.supabase, { client: env.model.client, now: db.now, clearAnswersDays: 0 });
+  assert.equal(w.books, 0, "no book turned on: no generation run (and so no other claim)");
+  assert.deepEqual(env.grades, [grade.job_id], "the expired lease is settled by the claim and the grade runs");
+});
+
+test("a build's not_in_book lists this chapter's Wrong flags, however many newer flags other chapters have", async () => {
+  const db = makeDb();
+  seedBuild(db);
+  db.ideas.push({ idea_id: 901, book_id: BOOK, chapter: 2, unlock_chapter: 2, chapter_hash: chHash(db, 2), title: "Flagged", statement: "Synthetic statement flagged wrong in chapter two", importance: "core", status: "retired" });
+  db.ideas.push({ idea_id: 902, book_id: BOOK, chapter: 3, unlock_chapter: 3, chapter_hash: chHash(db, 3), title: "Elsewhere", statement: "Synthetic statement flagged wrong in chapter three", importance: "core", status: "retired" });
+  const flag = (idea_id, minutesAgo) => ({ flag_key: `f-${idea_id}`, question_id: 1, idea_id, kind: "wrong", restored_at: null, created_at: new Date(db.clock - minutesAgo * 60000).toISOString() });
+  db.flags.push(flag(901, 600), flag(902, 500));
+  for (let i = 0; i < 250; i++) db.flags.push(flag(5000 + i, i));
+  const env = load(db);
+  await kick(env);
+  const user = env.model.calls.find((c) => c.role === "structure").params.messages[0].content;
+  assert.ok(user.includes("Synthetic statement flagged wrong in chapter two"), "an older flag on this chapter still reaches the build");
+  assert.equal(user.includes("chapter three"), false, "another chapter's flag does not");
+});
+
+test("export keeps the ideas of a chapter with no table of contents row, and leaves out another edition's", async () => {
+  const db = makeDb();
+  db.toc = db.toc.filter((c) => c.chapter !== 2);
+  db.ideas.push({ idea_id: 11, book_id: BOOK, chapter: 2, unlock_chapter: 2, chapter_hash: B.chapterHash(2, null), title: "Kept", statement: "s", importance: "core", status: "active" });
+  db.ideas.push({ idea_id: 12, book_id: BOOK, chapter: 2, unlock_chapter: 2, chapter_hash: "f".repeat(64), title: "Stale", statement: "s", importance: "core", status: "active" });
+  const env = load(db);
+  const r = await env.S.getBankExport(env.supabase, null);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.ideas.map((i) => i.idea_id), [11]);
+});
+
+test("research notes are trimmed to the column's limit as Postgres prints jsonb (a space after every ':' and ',')", () => {
+  const env = load(makeDb());
+  assert.equal(env.S.jsonbTextLength({ a: 1, b: [1, 2] }), '{"a": 1, "b": [1, 2]}'.length);
+  assert.equal(env.S.jsonbTextLength([]), 2);
+  const sources = Array.from({ length: 3000 }, (_, i) => ({ url: `${GUIDE}/p${i}`, domain: "example.org", title: "T", cited_text: "Short synthetic snippet." }));
+  const notes = sources.map((_, i) => ({ text: "A short synthetic note.", sources: [i] }));
+  const out = env.S.trimOutput({ notes, sources, unsure: "" });
+  assert.ok(env.S.jsonbTextLength(out) <= env.S.OUTPUT_MAX_CHARS);
+  assert.ok(out.sources.length > 0 && out.sources.length < sources.length);
 });
 
 /* ------------------------------------------------------------------ */
@@ -998,6 +1131,12 @@ test("run: 409 bank_off for a book that is off; a rebuild bumps the counter and 
   assert.equal(db.chapters.get(2).rebuilds, 1);
   assert.ok(db.jobs.some((j) => j.step === "research" && j.chapter === 2 && j.status === "queued"), "a fresh research job for the rebuilt chapter");
   assert.equal(env.queue.length, 1);
+  // A double tap (or a retry after a lost answer) while that research is still queued is not counted again.
+  const again = await route.POST(req({ chapter: 2, rebuild: true }));
+  assert.equal(again.status, 202);
+  assert.equal(again.body.pending, true);
+  assert.equal(db.chapters.get(2).rebuilds, 1, "the first rebuild's jobs stay current");
+  assert.equal(db.jobs.filter((j) => j.step === "research" && j.chapter === 2).length, 1);
   db.bb.paused_reason = "owner";
   const off = await route.POST(req({}));
   assert.equal(off.status, 409);

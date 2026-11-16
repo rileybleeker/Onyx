@@ -227,7 +227,7 @@ export async function POST(req: NextRequest) {
   // Plans the book and runs its queued steps after the response; quiet while the book is off or the SQL is missing.
   const kickBookId = book.book_id;
   after(async () => {
-    await kickBank(supabase, { bookId: kickBookId, reason: "kindle" });
+    await kickBank(supabase, { bookId: kickBookId, reason: "kindle", requestStartedAt: startedAt.getTime() });
   });
 
   if (body.harvest) {
