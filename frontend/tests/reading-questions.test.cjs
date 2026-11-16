@@ -59,6 +59,65 @@ test("parsing: only highlight / session / chapter sources; unknown fields, bad k
   ]) assert.equal(Q.parseQuestionOp(bad).ok, false, JSON.stringify(bad)?.slice(0, 80));
 });
 
+test("corrections: `invalidate` is optional (true / false / default), carried to the function, nothing else accepted", () => {
+  const base = { op: "correct", op_key: key(), question_key: key(), expected_version: 2, prompt: "Synthetic prompt", source_kind: "highlight", source_ref: 41, reason: "Synthetic reason" };
+  assert.equal(Q.parseQuestionOp(base).op.invalidate, null, "omitted = the database's default");
+  assert.equal(Q.parseQuestionOp({ ...base, invalidate: null }).op.invalidate, null);
+  assert.equal(Q.parseQuestionOp({ ...base, invalidate: true }).op.invalidate, true);
+  assert.equal(Q.parseQuestionOp({ ...base, invalidate: false }).op.invalidate, false);
+  for (const bad of ["yes", 1, 0, "true"]) assert.equal(Q.parseQuestionOp({ ...base, invalidate: bad }).ok, false, String(bad));
+  assert.equal(Q.questionRpcArgs(Q.parseQuestionOp({ ...base, invalidate: false }).op, null).invalidate, false);
+  assert.equal(Q.questionRpcArgs(Q.parseQuestionOp(base).op, null).invalidate, null);
+  assert.equal(Q.parseQuestionOp(answerBody({ invalidate: true })).ok, false, "an answer has no invalidate field");
+});
+
+test("a valid request always fits the body cap, whatever its text", () => {
+  // JSON.stringify writes a control character as a six-byte \u00XX escape: the worst case per character.
+  const worst = (n) => "\u0001".repeat(n);
+  const bodies = [
+    { op: "answer", op_key: key(), book: "b".repeat(80), question_key: key(), prompt: worst(Q.PROMPT_MAX), rubric: worst(Q.RUBRIC_MAX), source_kind: "highlight", source_ref: Number.MAX_SAFE_INTEGER, answer: worst(Q.ANSWER_MAX), quiz_key: key() },
+    { op: "correct", op_key: key(), question_key: key(), expected_version: 2147483647, prompt: worst(Q.PROMPT_MAX), rubric: worst(Q.RUBRIC_MAX), source_kind: "session", source_ref: Number.MAX_SAFE_INTEGER, reason: worst(Q.REASON_MAX), invalidate: false },
+    { op: "grade", attempt_key: key(), correct: false, grader: "model", feedback: worst(Q.FEEDBACK_MAX) },
+  ];
+  for (const b of bodies) {
+    const bytes = Buffer.byteLength(JSON.stringify(b), "utf8");
+    assert.ok(bytes <= Q.QUESTIONS_MAX_BODY_BYTES, `${b.op}: worst-case body ${bytes} bytes`);
+  }
+  // Limits count characters before trimming, so padding cannot make an over-long field pass.
+  assert.equal(Q.parseQuestionOp(answerBody({ prompt: "x" + " ".repeat(Q.PROMPT_MAX) })).ok, false);
+  assert.equal(Q.parseQuestionOp(answerBody({ prompt: "  padded synthetic prompt  " })).op.prompt, "padded synthetic prompt");
+});
+
+test("SQL: an edit of the source's text alone makes a new version and keeps earlier answers counted", () => {
+  const apply = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_question_apply"), sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts"));
+  const answer = apply.slice(apply.indexOf("IF v_kind = 'answer' THEN"), apply.indexOf("ELSIF v_kind = 'grade' THEN"));
+  // The question itself (prompt, rubric, source reference) must match; only then may the source's text differ.
+  const changed = answer.indexOf("'code', 'question_changed'");
+  assert.ok(changed > 0);
+  assert.match(answer.slice(0, changed), /v_q\.prompt <> v_prompt OR v_q\.rubric IS DISTINCT FROM v_rubric\s+OR v_q\.source_kind <> v_skind OR v_q\.source_ref <> v_sref/);
+  assert.doesNotMatch(answer.slice(0, changed), /content_hash <> v_chash THEN\s+RETURN/, "a moved source is no longer a refusal");
+  const revise = answer.slice(answer.indexOf("IF v_q.content_hash <> v_chash THEN"), answer.indexOf("INSERT INTO pds.reading_question_attempts"));
+  assert.match(revise, /superseded_reason = 'source text changed'/);
+  assert.match(revise, /v_q\.version \+ 1/);
+  assert.match(revise, /v_revised := true/);
+  assert.doesNotMatch(answer, /grading_status = 'invalidated'|invalidated_count/, "answering never invalidates anything");
+  // A correction invalidates by default only when the question changed; `invalidate` overrides; it is in the replay hash.
+  const corr = apply.slice(apply.indexOf("ELSE -- correct"));
+  assert.match(corr, /'reason', v_reason, 'invalidate', v_inval\)::text\)/);
+  assert.match(corr, /v_wrong := v_q\.prompt <> v_prompt OR v_q\.rubric IS DISTINCT FROM v_rubric\s+OR v_q\.source_kind <> v_skind OR v_q\.source_ref <> v_sref;/);
+  assert.match(corr, /v_inval := COALESCE\(v_inval, v_wrong\);/);
+  assert.match(corr, /WHERE v_inval AND q\.question_key = v_qkey/);
+  assert.ok(corr.indexOf("v_rhash := pds.reading_sha256") < corr.indexOf("v_inval := COALESCE"), "the request hash holds the value as sent, so a replay matches");
+});
+
+test("SQL: a grade replay still matches after retention cleared its feedback", () => {
+  const apply = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_question_apply"), sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts"));
+  const grade = apply.slice(apply.indexOf("ELSIF v_kind = 'grade' THEN"), apply.indexOf("ELSE -- correct"));
+  assert.match(grade, /\(v_a\.answer_cleared_at IS NOT NULL OR v_a\.feedback IS NOT DISTINCT FROM v_feedback\)/);
+  const ret = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_clear_question_answers"));
+  assert.match(ret, /SET answer = NULL, feedback = NULL, answer_cleared_at = NOW\(\)/, "clearing always stamps answer_cleared_at");
+});
+
 test("an answer is one atomic call carrying the book, the source reference and the quiz key; no direct writes", async () => {
   const f = fakeClient({ answer: { ok: true, attempt_key: "k", question_id: 3, question_key: "q", version: 1, source_hash: "0".repeat(64), grading_status: "pending", replayed: false } });
   const op = Q.parseQuestionOp(answerBody({ quiz_key: key() })).op;

@@ -81,8 +81,11 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         setOverview((prev) => (sameJson(prev, json.overview) ? prev : json.overview));
         setBooks((prev) => (sameJson(prev, json.books ?? []) ? prev : json.books ?? []));
         if (json.overview && !which) setSlug(json.overview.book.slug);
+        return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Couldn't load");
+        // The Review card's Refresh keeps its card blocked and says so (ReviewCard.tsx).
+        return false;
       } finally {
         setLoading(false);
       }

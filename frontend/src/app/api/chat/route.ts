@@ -10,6 +10,7 @@ import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, 
 import { behavioralToday, currentTimeZone, logSupplementIntake } from "@/lib/supplement-intake";
 import { addHighlight, getOverview, logSession, recordQuiz, summarizeForChat, type HighlightSource, type Medium } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
+import { failureMayHaveWritten } from "@/lib/reading-practice";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -985,7 +986,12 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       total: Number(input.total),
       notes: (input.notes as string) || null,
     });
-    if (!result.ok) return JSON.stringify({ error: result.error });
+    // A 500 may have committed (the answer was lost): never "not recorded" then (lib/reading-practice.ts).
+    if (!result.ok) {
+      return JSON.stringify(failureMayHaveWritten(result)
+        ? { error: "Onyx could not confirm this quiz result and it may have been recorded. Do not record it again: tell the user to check /reading first.", incomplete: true }
+        : { error: result.error });
+    }
     return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint, quiz_date: result.quiz.quiz_date });
   }
 

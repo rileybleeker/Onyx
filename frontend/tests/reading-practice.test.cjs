@@ -91,6 +91,20 @@ test("a valid quiz note always fits the body cap; failures that may have been st
   assert.equal(P.failureMayHaveWritten(P.rpcFailure(null, { code: "PGRST202" })), false, "the function is not applied: nothing written");
 });
 
+test("chat quiz tool: a failure that may have been stored is reported as incomplete, never as not recorded", () => {
+  const src = read("app/api/chat/route.ts");
+  const branch = src.slice(src.indexOf('if (name === "record_reading_quiz")'), src.indexOf("if (name ===", src.indexOf('if (name === "record_reading_quiz")') + 10));
+  assert.match(src, /import \{ failureMayHaveWritten \} from "@\/lib\/reading-practice";/);
+  assert.match(branch, /failureMayHaveWritten\(result\)/, "classified by status, never by the message text");
+  assert.match(branch, /incomplete: true/, "the receipt then says 'may be incomplete' and to check before repeating");
+  assert.doesNotMatch(branch, /if \(!result\.ok\) return JSON\.stringify\(\{ error: result\.error \}\);/);
+  const receipts = loadTs("lib/chat-receipts.ts");
+  const maybe = receipts.buildWriteReceipt("record_reading_quiz", { checkpoint: "ch3", score: 4, total: 5 }, JSON.stringify({ error: "Synthetic failure", incomplete: true }));
+  assert.equal(maybe.status, "unknown", "not 'not_saved': the result may be stored");
+  const refused = receipts.buildWriteReceipt("record_reading_quiz", { checkpoint: "ch3", score: 9, total: 5 }, JSON.stringify({ error: "score must be between 0 and total" }));
+  assert.equal(refused.status, "not_saved", "a refusal wrote nothing");
+});
+
 test("a grade is ONE call of the atomic function, carrying the state its schedule was computed from", async () => {
   const f = fakeClient({ answers: [applied()] });
   const k = key();

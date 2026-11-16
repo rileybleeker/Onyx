@@ -39,17 +39,19 @@ written, the review card keeps the card with Retry) until the SQL is applied.
 - Existing reviews and quizzes stay as they are. Rows stored before keys existed keep counting for XP; nothing is
   deduplicated after the fact. A stored quiz row is one durable attempt; a replay adds none.
 - Callers without a key (the chat tool, a page loaded before the change) get a key made on the server: the write is
-  atomic, but a retry of that request is a new attempt. **Open:** the chat tool is the only quiz writer today and
-  holds no key across retries, so "a lost-answer retry creates one quiz" is met for review grades and the route, not
-  yet for chat quiz results. It needs the chat replay ledger (SEC-04): whichever change merges second passes the
-  operation id as `op_key` to `recordQuiz` and classifies a failure with `failureMayHaveWritten`
-  (`lib/reading-practice.ts`: every 4xx and the 503 wrote nothing; a 500 may have), never by the message text.
+  atomic, but a retry of that request is a new attempt. The chat tool already classifies a failure with
+  `failureMayHaveWritten` (`lib/reading-practice.ts`: every 4xx and the 503 wrote nothing; a 500 may have), so a
+  result that may be stored is reported as `incomplete` ("check /reading before repeating"), never as "not
+  recorded". **Open:** the chat tool is the only quiz writer today and holds no key across retries, so "a
+  lost-answer retry creates one quiz" is met for review grades and the route, not yet for chat quiz results. It
+  needs the chat replay ledger (SEC-04): whichever change merges second passes the ledger's operation id as `op_key`
+  to `recordQuiz`.
 - `xp_gained` in an answer is the award of the stored row: on a replay it is the original award (the first answer
   was lost, so it was never shown), not points earned again. Quiz notes are at most 1000 characters, so a valid
   body always fits the 8 KB cap.
 
-Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 KB cap, unknown fields refused,
-errors are short codes.
+Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 KB cap (48 KB for
+`/api/reading/questions`; in both every valid request fits), unknown fields refused, errors are short codes.
 
 ## The Review card (PROD-T03)
 
@@ -65,13 +67,15 @@ errors are short codes.
   key) counts as graded. A reload loses the key, which stays safe: every grade carries the card's review count, and
   a grade on an older state of the row is `409 changed`, so a card is still graded once.
 - A refusal (4xx) wrote nothing: no Retry, any grade can be picked, the next try gets a new key. Graded on another
-  screen, archived or gone (409 / 404): grades are blocked and Refresh re-reads the overview.
+  screen, archived or gone (409 / 404): grades are blocked and Refresh re-reads the overview. While it re-reads, a
+  status line says "Refreshing" and the grades stay blocked; a re-read that leaves the same card on top unblocks
+  it, one that fails keeps the card stale with its own message and Refresh.
 - Success advances exactly once: the card's graded highlight ids are kept for the day, so a reload that raced the
   grade cannot bring a card back. Focus moves to the next card's reveal button or to the "Nothing due" line; the
   reveal moves focus to the note. Each failure is announced once (the alert is removed while a retry is saving).
-  Retry and Refresh leave the screen while they work, so focus never drops to the page: a Retry that fails again
-  puts focus on the new Retry button, and Refresh puts it on the note, then on the next card once the re-read
-  overview replaces this one.
+  Retry and Refresh leave the screen while they work, so focus never drops to the page: both put it on the note
+  (which stays on screen) while they work; a Retry that fails again then puts it on the new Retry button, a Refresh
+  on the next card once the re-read overview replaces this one, or back on Refresh when the re-read failed.
 - Controls are at least 44 px high with 12 px between grade buttons, on desktop and at 390 px.
 
 Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under the hook harness, synthetic cards).
@@ -103,10 +107,19 @@ Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under t
   answers (every result stored before this change, and the chat's results until its tool sends questions) has
   `question_count` NULL and is shown as `unverified` in the overview and the chat summary; it still counts for XP.
 - **Corrections.** `op: "correct"` with the version on screen (`expected_version`) makes the next version and
-  supersedes the old one (kept, with the reason). Every answer to an older version is marked `invalidated` (kept,
-  with its grade and the reason), and a recorded result that counted one gets `invalidated_count` > 0: the
-  checkpoint tile shows it as "corrected", and it earns no XP and no pass badge. Answering a question whose prompt,
-  rubric or source text no longer matches the stored version is `409 question_changed`, never silently accepted.
+  supersedes the old one (kept, with the reason). When the prompt, rubric or source reference changed, every answer
+  to an older version is marked `invalidated` (kept, with its grade and the reason), and a recorded result that
+  counted one gets `invalidated_count` > 0: the checkpoint tile shows it as "corrected", and it earns no XP and no
+  pass badge. `invalidate: true | false` overrides that default (true when the source text itself was wrong; false
+  for a wording fix that changes nothing for the answers given). Answering a question whose prompt, rubric or
+  source reference no longer matches the stored version is `409 question_changed`, never silently accepted.
+- **Source edits.** When only the source's text moved (a highlight comment edited on /reading, a Kindle note
+  re-imported, a recall note edited on /log), the next answer makes the next version itself (superseded reason
+  "source text changed", `source_revised: true`) and is stored against it. Earlier answers were graded against their
+  own version, whose source hash is kept, so they stay counted and their quiz stays verified.
+- **Whole-quiz invalidation (known limit).** One corrected question marks its whole quiz result as corrected (no
+  XP, no pass). Re-scoring a result from the answers that are still valid would change its pass mark and the
+  checkpoint's on-time badge, so it is left to the quiz flow that writes questions (READ-QUIZ-01).
 - **Inspection and export.** `GET /api/reading/questions?book=<slug>` (owner session, `no-store`) returns every
   version with its source reference, hash and `source_status` now (`same`, `changed` or `removed`) and every
   attempt with its raw answer. It is the export. The client cache keeps this key in memory only
@@ -120,9 +133,11 @@ Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under t
   for Riley; nothing runs it yet. Pending (ungraded) answers are never cleared.
 - Access: tables and functions are service_role only (row level security on, no policies, nothing granted to anon
   or authenticated). Errors are codes; no prompt, answer or feedback text is logged.
-- **Not wired yet:** no screen or chat tool writes questions. The chat quiz flow (`record_reading_quiz`, chat
-  route) should record each question with `op: "answer"` / `"grade"` and the quiz's op_key as `quiz_key`, then the
-  result under that op_key; that change waits for the chat replay work (SEC-04) to land.
+- **Not wired yet (PROD-T07 stays In Progress):** this is the storage layer only. No screen or chat tool writes
+  questions, so the questions the chat asks today have no stored source or version, and every chat quiz result is
+  `unverified`. The chat quiz flow (`record_reading_quiz`, chat route) should record each question with
+  `op: "answer"` / `"grade"` and the quiz's op_key as `quiz_key`, then the result under that op_key; that change
+  (READ-QUIZ-01) waits for the chat replay work (SEC-04) to land.
 
 Tests: `frontend/tests/reading-questions.test.cjs` (synthetic): parsing (only permitted sources), the single RPC
 per operation, replay / conflict codes, export, verification and XP rules, the memory-only cache key, and SQL
@@ -139,7 +154,9 @@ recovery); never delete reviews, quizzes or receipts to roll back.
 direct table writes, replay, the `raced` re-read, failure mapping without fallback, and SQL ordering / grant guards.
 The guards complement SQL review. The real functions are exercised by `tests/sql/reading_practice_fixture.sql`
 (replay after a lost answer, `key_reused`, `changed` / `raced`, a failing schedule write rolling the review back,
-quiz refusals for ungraded answers, a wrong score and another book's answers, and a correction invalidating and
-keeping the old answer), plus a two-session concurrency check in its last comment. It runs on a disposable copy of
+quiz refusals for ungraded answers, a wrong score and another book's answers, a correction invalidating and
+keeping the old answer, a source edit making a new version while the old quiz stays verified, a wording fix with
+`invalidate = false`, and a grade replay after retention cleared its feedback), plus a two-session concurrency check
+in its last comment. It runs on a disposable copy of
 the database only (it refuses without `onyx.fixture_db = disposable` and ends in ROLLBACK), never on production, so
 it is a manual check after the SQL is reviewed, not a scheduled job.

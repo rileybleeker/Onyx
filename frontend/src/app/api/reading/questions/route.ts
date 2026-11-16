@@ -15,15 +15,16 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * POST /api/reading/questions               One operation (lib/reading-questions.ts parseQuestionOp):
  *   { op: "answer",  op_key, book?, question_key, prompt, rubric?, source_kind, source_ref, answer, quiz_key? }
  *   { op: "grade",   attempt_key, correct, grader: "model"|"self", feedback? }
- *   { op: "correct", op_key, question_key, expected_version, prompt, rubric?, source_kind, source_ref, reason }
+ *   { op: "correct", op_key, question_key, expected_version, prompt, rubric?, source_kind, source_ref, reason,
+ *     invalidate? }   (invalidate: default true when prompt / rubric / source reference change, false otherwise)
  *
  * Storage and rules: sql/reading_learning_questions.sql (pds.reading_question_apply / pds.reading_questions_export).
  * Auth: owner session only (middleware covers /api/reading/*; NEVER add this to isCiRoute). POST: same-origin, JSON
- * only, 16 KB cap, unknown fields refused. Everything is no-store, and the client cache keeps this key in memory
- * only. Errors are short codes (no question or answer text): 400 bad_*, 404 not_found / book_not_found, 409
- * key_reused / already_answered / already_graded / invalidated / question_changed / source_not_permitted /
- * quiz_closed / quiz_other_book / changed,
- * 503 practice_unavailable (SQL not applied; nothing is written).
+ * only, 48 KB cap (every valid request fits), unknown fields refused. Everything is no-store, and the client cache
+ * keeps this key in memory only. Errors are short codes (no question or answer text): 400 bad_* / no_change, 404
+ * not_found / book_not_found, 409 key_reused / already_answered / already_graded / invalidated / question_changed /
+ * source_not_permitted / quiz_closed / quiz_other_book / changed, 503 practice_unavailable (SQL not applied;
+ * nothing is written).
  */
 export async function GET(req: NextRequest) {
   const slug = req.nextUrl.searchParams.get("book") || null;

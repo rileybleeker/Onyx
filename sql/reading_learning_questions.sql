@@ -9,12 +9,15 @@
 --   * pds.reading_questions          one row per VERSION of a question: prompt, optional rubric (the expected
 --                                    answer / grading guide), the permitted source it is drawn from, and a sha-256
 --                                    of that source's text when the version was written. A correction is a new
---                                    version; the old one is kept and marked superseded.
+--                                    version; the old one is kept and marked superseded. An edit of the SOURCE's
+--                                    text alone (a highlight comment, a recall note) is also a new version, made
+--                                    when the question is next answered, and leaves earlier answers valid.
 --   * pds.reading_question_attempts  one row per answer, keyed by the client's UUID (attempt_key): the raw answer
 --                                    (cleared by the retention function below), when it was answered, and, as a
 --                                    SEPARATE later step, the grading (status pending -> graded, correct, grader,
---                                    feedback, graded_at). A correction marks the attempts on older versions
---                                    invalidated (kept, never deleted).
+--                                    feedback, graded_at). A correction of the question (prompt, rubric or source
+--                                    reference) marks the attempts on older versions invalidated (kept, never
+--                                    deleted); a version made because only the source's text moved does not.
 --   * pds.reading_quizzes            two nullable columns: question_count (NULL = recorded without per-question
 --                                    attempts, so the score is unverifiable; every row stored before this change)
 --                                    and invalidated_count (answers in it whose question was corrected later).
@@ -29,6 +32,12 @@
 -- replay safe: an answer or correction with the same key and request answers what was stored (replayed); the same
 -- key with another request is 409 key_reused; a second answer to the same question in one quiz under a NEW key is
 -- 409 already_answered; grading an attempt again with the same grade replays, another grade is 409 already_graded.
+-- An answer whose prompt, rubric or source reference differs from the current version is 409 question_changed
+-- (correct it first); one where only the source's TEXT differs makes the next version itself ("source text changed")
+-- and is stored against it: the earlier answers were graded against their own version, whose source hash is kept,
+-- so they stay counted. A correction invalidates the answers to older versions when the prompt, rubric or source
+-- reference changes; `invalidate` (true | false) overrides that default, e.g. true when the source text itself was
+-- wrong, false for a wording fix that changes nothing for the answers already given.
 -- A quiz result recorded under quiz key K (pds.reading_quizzes.op_key) links the attempts answered with
 -- quiz_key K: the trigger below refuses the quiz while any of them is ungraded (OXQ01), when its score / total
 -- differ from the graded answers (OXQ02) or when any of them is about another book (OXQ03), and stores
@@ -148,11 +157,11 @@ $fn$;
 -- -----------------------------------------------------------
 -- Every question / attempt write.
 -- answer : {kind, op_key (= attempt_key), book_id, question_key, prompt, rubric?, source_kind, source_ref, answer, quiz_key?}
---          -> {ok, attempt_key, question_id, question_key, version, source_hash, grading_status, replayed}
+--          -> {ok, attempt_key, question_id, question_key, version, source_hash, grading_status, source_revised, replayed}
 -- grade  : {kind, op_key (= the attempt_key graded), correct, grader ('model'|'self'), feedback?}
 --          -> {ok, attempt_key, grading_status, correct, replayed}
--- correct: {kind, op_key, question_key, expected_version, prompt, rubric?, source_kind, source_ref, reason}
---          -> {ok, question_key, version, invalidated_attempts, affected_quizzes, replayed}
+-- correct: {kind, op_key, question_key, expected_version, prompt, rubric?, source_kind, source_ref, reason, invalidate?}
+--          -> {ok, question_key, version, invalidated, invalidated_attempts, affected_quizzes, replayed}
 -- Refusals {ok: false, http, code} are not recorded. Any error rolls the whole call back.
 -- -----------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.reading_question_apply(p JSONB)
@@ -170,6 +179,9 @@ DECLARE
   v_sref     BIGINT;
   v_expected INTEGER;
   v_correct  BOOLEAN;
+  v_inval    BOOLEAN;
+  v_wrong    BOOLEAN;
+  v_revised  BOOLEAN := false;
   v_prompt   TEXT := btrim(COALESCE(p->>'prompt', ''));
   v_rubric   TEXT := NULLIF(btrim(COALESCE(p->>'rubric', '')), '');
   v_skind    TEXT := p->>'source_kind';
@@ -195,6 +207,7 @@ BEGIN
     v_sref := NULLIF(p->>'source_ref', '')::bigint;
     v_expected := NULLIF(p->>'expected_version', '')::int;
     v_correct := NULLIF(p->>'correct', '')::boolean;
+    v_inval := NULLIF(p->>'invalidate', '')::boolean;
   EXCEPTION WHEN others THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END;
@@ -257,9 +270,20 @@ BEGIN
 
     SELECT * INTO v_q FROM pds.reading_questions WHERE question_key = v_qkey AND superseded_at IS NULL FOR UPDATE;
     IF FOUND THEN
-      -- The question (or the text of its source) is not the version stored: correct it first, never silently.
-      IF v_q.book_id <> v_book OR v_q.content_hash <> v_chash THEN
+      -- The question itself is not the version stored: correct it first, never silently.
+      IF v_q.book_id <> v_book OR v_q.prompt <> v_prompt OR v_q.rubric IS DISTINCT FROM v_rubric
+         OR v_q.source_kind <> v_skind OR v_q.source_ref <> v_sref THEN
         RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'question_changed', 'version', v_q.version);
+      END IF;
+      -- Only the source's text moved (a highlight comment or recall note was edited): the next version records the
+      -- text this answer is given against. Earlier answers were graded against their own version and stay valid.
+      IF v_q.content_hash <> v_chash THEN
+        UPDATE pds.reading_questions SET superseded_at = NOW(), superseded_reason = 'source text changed'
+         WHERE question_id = v_q.question_id;
+        INSERT INTO pds.reading_questions (question_key, version, book_id, prompt, rubric, source_kind, source_ref, source_hash, content_hash)
+        VALUES (v_qkey, v_q.version + 1, v_book, v_prompt, v_rubric, v_skind, v_sref, v_shash, v_chash)
+        RETURNING * INTO v_q;
+        v_revised := true;
       END IF;
     ELSE
       INSERT INTO pds.reading_questions (question_key, version, book_id, prompt, rubric, source_kind, source_ref, source_hash, content_hash)
@@ -272,7 +296,7 @@ BEGIN
     RETURNING * INTO v_a;
     RETURN jsonb_build_object('ok', true, 'attempt_key', v_a.attempt_key, 'question_id', v_q.question_id,
       'question_key', v_q.question_key, 'version', v_q.version, 'source_hash', v_q.source_hash,
-      'grading_status', v_a.grading_status, 'replayed', false);
+      'grading_status', v_a.grading_status, 'source_revised', v_revised, 'replayed', false);
 
   ELSIF v_kind = 'grade' THEN
     IF v_correct IS NULL OR v_grader IS NULL OR v_grader NOT IN ('model', 'self') OR length(COALESCE(v_feedback, '')) > 2000 THEN
@@ -284,7 +308,9 @@ BEGIN
       RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'invalidated');
     END IF;
     IF v_a.grading_status = 'graded' THEN
-      IF v_a.correct = v_correct AND v_a.grader = v_grader AND v_a.feedback IS NOT DISTINCT FROM v_feedback THEN
+      -- Feedback cleared by the retention function can no longer be compared: the grade and grader decide then.
+      IF v_a.correct = v_correct AND v_a.grader = v_grader
+         AND (v_a.answer_cleared_at IS NOT NULL OR v_a.feedback IS NOT DISTINCT FROM v_feedback) THEN
         RETURN jsonb_build_object('ok', true, 'attempt_key', v_a.attempt_key, 'grading_status', 'graded', 'correct', v_a.correct, 'replayed', true);
       END IF;
       RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'already_graded');
@@ -301,7 +327,7 @@ BEGIN
     END IF;
     v_rhash := pds.reading_sha256(jsonb_build_object(
       'question_key', v_qkey, 'expected_version', v_expected, 'prompt', v_prompt, 'rubric', v_rubric,
-      'source_kind', v_skind, 'source_ref', v_sref, 'reason', v_reason)::text);
+      'source_kind', v_skind, 'source_ref', v_sref, 'reason', v_reason, 'invalidate', v_inval)::text);
 
     SELECT * INTO v_new FROM pds.reading_questions WHERE op_key = v_key;
     IF FOUND THEN
@@ -326,17 +352,23 @@ BEGIN
     IF v_chash = v_q.content_hash THEN
       RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'no_change');
     END IF;
+    -- The question itself changed (prompt, rubric or source reference): the answers given to it were judged against
+    -- a wrong question, so by default they are invalidated. A change of the source's text alone is not.
+    v_wrong := v_q.prompt <> v_prompt OR v_q.rubric IS DISTINCT FROM v_rubric
+               OR v_q.source_kind <> v_skind OR v_q.source_ref <> v_sref;
+    v_inval := COALESCE(v_inval, v_wrong);
 
     UPDATE pds.reading_questions SET superseded_at = NOW(), superseded_reason = v_reason WHERE question_id = v_q.question_id;
     INSERT INTO pds.reading_questions (question_key, version, book_id, prompt, rubric, source_kind, source_ref, source_hash, content_hash, op_key, request_hash)
     VALUES (v_qkey, v_q.version + 1, v_q.book_id, v_prompt, v_rubric, v_skind, v_sref, v_shash, v_chash, v_key, v_rhash)
     RETURNING * INTO v_new;
 
-    -- Answers to every older version are invalidated (kept, with the reason); results that counted them say so.
+    -- Invalidating: answers to every older version are marked (kept, with the reason); results that counted them
+    -- say so. Not invalidating: nothing is marked, every earlier answer keeps counting.
     SELECT COALESCE(array_agg(a.attempt_key), '{}') INTO v_hit
       FROM pds.reading_question_attempts a
       JOIN pds.reading_questions q ON q.question_id = a.question_id
-     WHERE q.question_key = v_qkey AND q.question_id <> v_new.question_id AND a.grading_status <> 'invalidated';
+     WHERE v_inval AND q.question_key = v_qkey AND q.question_id <> v_new.question_id AND a.grading_status <> 'invalidated';
     UPDATE pds.reading_question_attempts
        SET grading_status = 'invalidated', invalidated_at = NOW(),
            invalidated_reason = 'question corrected to version ' || v_new.version
@@ -348,7 +380,7 @@ BEGIN
      WHERE qz.op_key = x.quiz_key;
     GET DIAGNOSTICS v_quizzes = ROW_COUNT;
 
-    RETURN jsonb_build_object('ok', true, 'question_key', v_qkey, 'version', v_new.version,
+    RETURN jsonb_build_object('ok', true, 'question_key', v_qkey, 'version', v_new.version, 'invalidated', v_inval,
       'invalidated_attempts', cardinality(v_hit), 'affected_quizzes', v_quizzes, 'replayed', false);
   END IF;
 END

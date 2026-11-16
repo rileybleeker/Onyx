@@ -25,12 +25,15 @@ import {
  * - A failure keeps the card. No answer / a server error: "Not saved" with Retry, which sends the SAME operation
  *   key (lib/reading-practice.ts attemptFor), so a grade that did land is answered from its receipt instead of
  *   being stored twice. A refusal: nothing was written, any grade can be picked again. Graded on another screen
- *   (409): Refresh. The message is a role=alert line with a word and an icon, not color alone.
+ *   (409): Refresh, which keeps the grades blocked ("Refreshing") until the re-read lands; a re-read that fails
+ *   keeps the card stale with its own message and Refresh. The message is a role=alert line with a word and an icon,
+ *   not color alone.
  * - Success advances exactly once (this card's graded ids are kept, so a reload that raced the grade cannot bring
  *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line.
- * - Retry and Refresh leave the screen while they work, so focus never drops to the page: a Retry that fails again
- *   puts focus on the new Retry button (or on the note when there is none), a Refresh puts it on the note and then
- *   on the next card once the re-read overview replaces this one.
+ * - Retry and Refresh leave the screen while they work, so focus never drops to the page: both put it on the note
+ *   (which stays on screen) while they work; a Retry that fails again then puts it on the new Retry button, a
+ *   Refresh on the next card once the re-read overview replaces this one, or back on Refresh when the re-read
+ *   failed.
  */
 
 const fmtDate = (d: string | null | undefined) =>
@@ -39,6 +42,8 @@ const fmtDate = (d: string | null | undefined) =>
 type Status =
   | { kind: "idle" }
   | { kind: "saving"; grade: PracticeGrade }
+  /** Refresh was pressed: the overview is being re-read. Grades stay blocked until it lands. */
+  | { kind: "refreshing"; grade: PracticeGrade }
   | { kind: "unknown" | "refused" | "stale"; grade: PracticeGrade; message: string };
 
 const GRADE_CLASS: Record<PracticeGrade, string> = {
@@ -55,8 +60,8 @@ export default function ReviewCard({
   o: ReadingOverview;
   /** After a stored grade: the XP the server reported (0 on a replay of an earlier try). */
   onGraded: (xp: number) => void;
-  /** Re-read the overview (the card changed on another screen). */
-  onRefresh: () => void;
+  /** Re-read the overview (the card changed on another screen). `false` = the re-read failed. */
+  onRefresh: () => Promise<boolean> | boolean | void;
 }) {
   const [graded, setGraded] = useState<number[]>([]);
   const [revealedId, setRevealedId] = useState<number | null>(null);
@@ -119,12 +124,15 @@ export default function ReviewCard({
   }, [o.highlights, o.today]);
 
   const saving = status.kind === "saving";
-  const blocked = saving || status.kind === "stale";
+  const refreshing = status.kind === "refreshing";
+  const blocked = saving || refreshing || status.kind === "stale";
 
   // `fromRetry`: the Retry button that was pressed leaves the screen while this request is out.
   const grade = async (g: PracticeGrade, fromRetry = false) => {
-    if (!cur || inFlight.current || status.kind === "stale") return;
+    if (!cur || inFlight.current || status.kind === "stale" || status.kind === "refreshing") return;
     const attempt = attemptFor(pending, cur, g);
+    // A Refresh that left this card on top must not move focus when a later answer changes it.
+    focusNextCard.current = false;
     inFlight.current = true;
     setPending(attempt);
     setStatus({ kind: "saving", grade: g });
@@ -163,6 +171,39 @@ export default function ReviewCard({
     }
     setStatus({ kind: out.kind, grade: g, message: out.message });
     if (fromRetry) setFocus("retry");
+  };
+
+  // Refresh: grades stay blocked until the re-read lands. A re-read that puts another card on top resets the status
+  // and moves focus to that card (the cardKey effect); one that leaves this card unblocks it; a failed one keeps it
+  // stale, with focus back on Refresh.
+  const refresh = (g: PracticeGrade) => {
+    setStatus({ kind: "refreshing", grade: g });
+    focusNextCard.current = true;
+    setFocus("note");
+    let reread: Promise<boolean> | boolean | void;
+    try {
+      reread = onRefresh();
+    } catch {
+      reread = false;
+    }
+    void Promise.resolve(reread)
+      .then(
+        (r) => r !== false,
+        () => false,
+      )
+      .then((ok) => {
+        if (!alive.current) return;
+        // Queued after the re-read's own state updates, so a card that changed has already reset this.
+        setStatus((s) => {
+          if (s.kind !== "refreshing") return s;
+          if (ok) return { kind: "idle" };
+          return { kind: "stale", grade: s.grade, message: "Couldn't refresh this card. Check the connection, then try again." };
+        });
+        if (!ok) {
+          focusNextCard.current = false;
+          setFocus("retry");
+        }
+      });
   };
 
   const header = queue.length
@@ -226,6 +267,11 @@ export default function ReviewCard({
                   Saving your {GRADE_LABEL[status.grade]} grade. The grade buttons wait until Onyx answers.
                 </p>
               )}
+              {refreshing && (
+                <p role="status" className="mt-2 text-[12px] text-text-secondary">
+                  Refreshing this card. The grade buttons wait until it is re-read.
+                </p>
+              )}
               {(status.kind === "unknown" || status.kind === "refused" || status.kind === "stale") && (
                 <div role="alert" className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-[12px] text-text-primary">
                   <span className="inline-flex items-center gap-1.5">
@@ -239,7 +285,11 @@ export default function ReviewCard({
                     <button
                       ref={retryRef}
                       type="button"
-                      onClick={() => void grade(status.grade, true)}
+                      onClick={() => {
+                        // The Retry button leaves the screen while it saves: focus waits on the note.
+                        setFocus("note");
+                        void grade(status.grade, true);
+                      }}
                       className="min-h-11 px-3 rounded-control border border-border-default text-text-primary"
                     >
                       Retry {GRADE_LABEL[status.grade]}
@@ -247,13 +297,9 @@ export default function ReviewCard({
                   )}
                   {status.kind === "stale" && (
                     <button
+                      ref={retryRef}
                       type="button"
-                      onClick={() => {
-                        setStatus({ kind: "idle" });
-                        focusNextCard.current = true;
-                        setFocus("note");
-                        onRefresh();
-                      }}
+                      onClick={() => refresh(status.grade)}
                       className="min-h-11 px-3 rounded-control border border-border-default text-text-primary">
                       Refresh
                     </button>

@@ -10,8 +10,11 @@
  * - An answer is an attempt keyed by the client's UUID: the same key and answer replays, another answer under that
  *   key is 409 key_reused. Grading is a separate step (pending -> graded), so a stored answer whose grading never
  *   finished stays visible as pending.
- * - A correction makes a new version, supersedes the old one, and invalidates the answers given to older versions
- *   (kept, with the reason); a quiz result that counted one of them is shown as corrected and not counted.
+ * - A correction makes a new version, supersedes the old one and, when the prompt, rubric or source reference
+ *   changed (or `invalidate: true` says so), invalidates the answers given to older versions (kept, with the reason);
+ *   a quiz result that counted one of them is shown as corrected and not counted. An edit of the source's TEXT alone
+ *   (a highlight comment, a recall note) makes the next version when the question is next answered and invalidates
+ *   nothing: those answers were graded against their own version, whose source hash is kept.
  * - A quiz result recorded under op_key K is checked against the answers given with quiz_key K; results without
  *   such answers (all results stored before 2026-11-16) are unverifiable.
  *
@@ -19,7 +22,12 @@
  * client cache keeps in memory only (lib/client-cache.ts isSensitiveKey).
  */
 
-export const QUESTIONS_MAX_BODY_BYTES = 16 * 1024;
+/**
+ * Fits every valid request whatever the text: each text field is limited in characters BEFORE trimming, and JSON
+ * takes at most 6 bytes per character (a six-character \uXXXX escape), so the largest operation, an answer (prompt +
+ * rubric + answer = 7000 characters, 42000 bytes, plus keys and ids), stays under 48 KB.
+ */
+export const QUESTIONS_MAX_BODY_BYTES = 48 * 1024;
 export const PROMPT_MAX = 1000;
 export const RUBRIC_MAX = 2000;
 export const ANSWER_MAX = 4000;
@@ -56,6 +64,11 @@ export type QuestionOp =
       source_kind: SourceKind;
       source_ref: number;
       reason: string;
+      /**
+       * Whether the answers to older versions stop counting. null = the default: yes when the prompt, rubric or
+       * source reference changes, no when only the source's text moved.
+       */
+      invalidate: boolean | null;
     };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -63,16 +76,14 @@ const uuid = (v: unknown): string | null => (typeof v === "string" && UUID_RE.te
 const plainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const text = (v: unknown, max: number): string | null | undefined => {
   if (v == null) return null;
-  if (typeof v !== "string") return undefined;
-  const t = v.trim();
-  if (t.length > max) return undefined;
-  return t || null;
+  if (typeof v !== "string" || v.length > max) return undefined;
+  return v.trim() || null;
 };
 
 const KEYS: Record<QuestionOp["op"], Set<string>> = {
   answer: new Set(["op", "op_key", "book", "question_key", "prompt", "rubric", "source_kind", "source_ref", "answer", "quiz_key"]),
   grade: new Set(["op", "attempt_key", "correct", "grader", "feedback"]),
-  correct: new Set(["op", "op_key", "question_key", "expected_version", "prompt", "rubric", "source_kind", "source_ref", "reason"]),
+  correct: new Set(["op", "op_key", "question_key", "expected_version", "prompt", "rubric", "source_kind", "source_ref", "reason", "invalidate"]),
 };
 
 function questionFields(raw: Record<string, unknown>) {
@@ -117,7 +128,9 @@ export function parseQuestionOp(raw: unknown): { ok: true; op: QuestionOp } | { 
   const reason = text(raw.reason, REASON_MAX);
   const v = raw.expected_version;
   if (!reason || typeof v !== "number" || !Number.isInteger(v) || v < 1) return { ok: false, error: "bad_request" };
-  return { ok: true, op: { op: "correct", op_key, ...q, expected_version: v, reason } };
+  if (raw.invalidate != null && typeof raw.invalidate !== "boolean") return { ok: false, error: "bad_request" };
+  const invalidate = typeof raw.invalidate === "boolean" ? raw.invalidate : null;
+  return { ok: true, op: { op: "correct", op_key, ...q, expected_version: v, reason, invalidate } };
 }
 
 /** The function's argument for one parsed operation (pure). `bookId` is resolved by the server for answers. */
@@ -135,7 +148,7 @@ export function questionRpcArgs(op: QuestionOp, bookId: number | null): Record<s
     source_ref: op.source_ref,
   };
   if (op.op === "answer") return { ...base, book_id: bookId, answer: op.answer, quiz_key: op.quiz_key };
-  return { ...base, expected_version: op.expected_version, reason: op.reason };
+  return { ...base, expected_version: op.expected_version, reason: op.reason, invalidate: op.invalidate };
 }
 
 /* ------------------------------------------------------------------ */

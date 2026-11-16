@@ -232,6 +232,84 @@ test("Refresh puts focus on the note, then on the next card once the re-read ove
   assert.equal(h.find((n) => n.props.role === "alert").length, 0, "the next card starts without the old message");
 });
 
+test("Retry keeps focus on the note while it saves, then on the new Retry button when it fails again", async (t) => {
+  const focused = [];
+  const gate = deferred();
+  const { h, sent, alerts } = mount(t, {
+    answer: (body, n) => {
+      if (n === 1) throw new TypeError("offline");
+      return gate.promise;
+    },
+  });
+  await h.flush();
+  h.click(REVEAL);
+  await h.flush();
+  recordFocus(h.find((n) => n.type === "p" && n.props.tabIndex === -1 && /Synthetic note 1/.test(h.text(n)))[0], "note", focused);
+  h.click("Good, next review in 1 day");
+  await h.flush();
+  recordFocus(h.button("Retry Good"), "retry", focused);
+  focused.length = 0;
+  h.click("Retry Good");
+  await h.flush();
+  assert.equal(h.buttons("Retry Good").length, 0, "the pressed Retry button is gone while it saves");
+  assert.match(h.text(), /Saving your Good grade/);
+  assert.match(h.text(), /Synthetic note 1/, "the note, the focus target, stays on screen");
+  assert.deepEqual(focused, ["note"], "focus waits on the note instead of dropping to the page");
+  gate.resolve(response({ error: "failed" }, 500));
+  await h.flush();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].op_key, sent[0].op_key);
+  assert.deepEqual(focused, ["note", "retry"], "then on the new Retry button");
+  assert.equal(alerts().length, 1);
+});
+
+test("Refresh blocks every grade until the re-read lands; a failed re-read says so, then a re-read that keeps the card unblocks it", async (t) => {
+  const focused = [];
+  let posts = 0;
+  withGlobals(t, { fetch: async () => (posts++, response({ error: "changed" }, 409)) });
+  const reread = deferred();
+  const answers = [reread.promise, Promise.resolve(true)];
+  let refreshes = 0;
+  const props = { o: overview([card(1), card(2)]), onGraded: () => {}, onRefresh: () => answers[refreshes++] };
+  const h = mountClient("app/reading/ReviewCard.tsx", { props, stubs: { "lucide-react": { AlertTriangle: () => null } } });
+  const alerts = () => h.find((n) => n.props.role === "alert").map((n) => h.text(n));
+  const GRADES = ["Again, next review in 1 day", "Good, next review in 1 day", "Easy, next review in 3 days"];
+  await h.flush();
+  h.click(REVEAL);
+  await h.flush();
+  recordFocus(h.find((n) => n.type === "p" && n.props.tabIndex === -1 && /Synthetic note 1/.test(h.text(n)))[0], "note", focused);
+  h.click("Good, next review in 1 day");
+  await h.flush();
+  assert.match(alerts()[0], /graded on another screen/);
+  recordFocus(h.button("Refresh"), "refresh", focused);
+  focused.length = 0;
+  h.click("Refresh");
+  await h.flush();
+  assert.equal(refreshes, 1);
+  assert.match(h.text(), /Refreshing this card\. The grade buttons wait until it is re-read\./);
+  assert.equal(alerts().length, 0, "the old message is not announced again while it works");
+  for (const label of GRADES) {
+    const b = h.button(label);
+    assert.equal(b.props["aria-disabled"], true, `${label} stays blocked while the card is re-read`);
+    b.props.onClick();
+  }
+  await h.flush();
+  assert.equal(posts, 1, "no grade is sent for a card known to be stale");
+  reread.resolve(false);
+  await h.flush();
+  assert.equal(alerts().length, 1);
+  assert.match(alerts()[0], /Couldn't refresh this card\. Check the connection, then try again\./);
+  assert.equal(h.buttons("Refresh").length, 1, "Refresh is offered again");
+  assert.equal(h.button("Good, next review in 1 day").props["aria-disabled"], true, "still blocked: the card is still stale");
+  assert.deepEqual(focused, ["note", "refresh"], "the note while it works, then Refresh again");
+  h.click("Refresh");
+  await h.flush();
+  assert.equal(refreshes, 2);
+  assert.equal(alerts().length, 0);
+  assert.doesNotMatch(h.text(), /Refreshing this card/);
+  for (const label of GRADES) assert.equal(h.button(label).props["aria-disabled"], undefined, `${label} can be used again`);
+});
+
 test("pure helpers: answer classification, key reuse, and a graded card never returns from a stale reload", () => {
   assert.equal(P.classifyReviewAnswer(null, null).kind, "unknown");
   assert.equal(P.classifyReviewAnswer(500, { error: "failed" }).kind, "unknown");
