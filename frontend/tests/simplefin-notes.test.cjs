@@ -12,7 +12,8 @@ const path = require("node:path");
 const { loadTs, SRC } = require("./helpers/load-ts.cjs");
 
 const S = loadTs("lib/finance-status.ts");
-const ETL = fs.readFileSync(path.join(SRC, "..", "..", "simplefin_etl.py"), "utf8");
+// Normalized: a Windows checkout (core.autocrlf) has CRLF line ends, which the line-anchored regexes below miss.
+const ETL = fs.readFileSync(path.join(SRC, "..", "..", "simplefin_etl.py"), "utf8").replace(/\r\n/g, "\n");
 
 const PII = ["Demo Bank", "Jane Q Example", "jane@example.com", "https://bank.example.com/login?u=42", "www.demo-bank.example", "12345678", "acct 42", "ACT-0042"];
 const piiMsg = (i = 0) => `Reconnect ${PII[0]} for ${PII[1]} <${PII[2]}> at ${PII[3]} (${PII[4]}) account ${PII[5]} / ${PII[6]} / ${PII[7]} #${i}`;
