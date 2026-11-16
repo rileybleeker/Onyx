@@ -128,7 +128,7 @@ METHOD_REVIEW: dict[str, Any] = {
         "date": "2026-11-16",
         "reviewers": ("openai/gpt-5.2", "google/gemini-2.5-pro"),
         "verdicts": ("sound", "sound"),
-        "reviewed_revision": "7ac3cf32458b7f4ce854314688405b579be70411",
+        "reviewed_revision": "0a3d37123eb2bea7e79c0e70ccb6431534641aca",
         "inference_fingerprint": "25ea4dad9d45b77197af2e8bb909d70fb7a3d7f2ab2489f7cd1c4a31b0be2a7c",
         "method_reviewed_revision": "ce76f720d8ff127cc90a012cc4ca7491ce2d9734",
         "method_reviewed_fingerprint": "7a79a1a4cc2f89a1d5f9a8a5547e1e4ca63ad3b38de01cb9cc25783761969da0",
@@ -153,9 +153,10 @@ METHOD_REVIEW: dict[str, Any] = {
             "estimator, p-value, interval or re-draw code changed",
             "2026-11-16: review round 6 (an early stop withholds the decision and marks the model and Fisher outputs "
             "unsupported, stopping_not_outcome_dependent; calibration shards merge only under the harness and the "
-            "inference code that ran them) reviewed by both models at 0a3d3712, final verdicts sound; adopted: the "
-            "merge-time inference fingerprint check (7ac3cf32, harness only); no estimator, p-value, interval or "
-            "re-draw code changed"),
+            "inference code that ran them) reviewed by both models at 0a3d3712, final verdicts sound; adopted "
+            "afterwards from gpt-5.2's recommendation: the merge-time inference fingerprint check (7ac3cf32, "
+            "harness only, outside the inference fingerprint, not itself reviewed); no estimator, p-value, "
+            "interval or re-draw code changed"),
     },
     "n_redraws": (),                       # re-draw counts the report calibrated
     "alpha": (),                           # alpha levels it calibrated
