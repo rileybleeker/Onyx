@@ -114,15 +114,20 @@ METHOD_REVIEW: dict[str, Any] = {
     "calibration_report": None,            # the passing, review-ready seeded report (fields above)
     # The independent statistical review (doc 8.3). It reviews the method; it is not an approval of any
     # trial's outcome. Its fingerprint is the one experiment_fingerprint gives the reviewed revision, which
-    # is also the fingerprint of every later revision until the inference code changes (doc 8.3 records
-    # that the analysis changes after ce76f720 left it unchanged).
+    # is also the fingerprint of every later revision until the inference code changes. The method was
+    # reviewed at ce76f720 (fingerprint 7a79a1a4...); review round 5 changed the review gate and the
+    # missing-night checks inside the fingerprint, the same two models reviewed that change (doc 8.3,
+    # "Follow-up: design scope and fail-closed missing-night checks"), and the record names the revision
+    # and fingerprint of that review.
     "independent_review": {
         "reference": "docs/experiment-framework.md 8.3",
         "date": "2026-11-16",
         "reviewers": ("openai/gpt-5.2", "google/gemini-2.5-pro"),
         "verdicts": ("sound", "sound"),
-        "reviewed_revision": "ce76f720d8ff127cc90a012cc4ca7491ce2d9734",
-        "inference_fingerprint": "7a79a1a4cc2f89a1d5f9a8a5547e1e4ca63ad3b38de01cb9cc25783761969da0",
+        "reviewed_revision": "29161919dac63e11e6110d545e50cbec0d76e954",
+        "inference_fingerprint": "02808939ca0a678be6c597d9929274810a585a85034d8b9679e251b9f74ef671",
+        "method_reviewed_revision": "ce76f720d8ff127cc90a012cc4ca7491ce2d9734",
+        "method_reviewed_fingerprint": "7a79a1a4cc2f89a1d5f9a8a5547e1e4ca63ad3b38de01cb9cc25783761969da0",
         "summary": (
             "independent statistical challenge of joint_sharp_null_berger_boos_v1 / certified_enclosure_v1 by two "
             "non-Anthropic models on the analysis at ce76f720, the synthetic calibration design and the changes "
@@ -130,12 +135,17 @@ METHOD_REVIEW: dict[str, Any] = {
             "seeding rule in the calibration, the Monte Carlo qualification of every guarantee. Rejected with "
             "reasons: float-tolerance snapping in _sets_moving / _piece (it would narrow the sets), a fresh random "
             "re-draw seed at analysis time (once drawn it is as fixed as the public-hash seed)"),
-        # Doc 8.3 "Follow-up": the same two models reviewed every change after ce76f720 and this fingerprint
-        # binding; final verdicts sound (both), with source order, the narrowed claim and the skip bound in.
-        "follow_up": ("2026-11-16: binding to the code by experiment_fingerprint reviewed by both models, final "
-                      "verdicts sound; adopted: source-order hashing, imports in the design closure, the skip-share "
-                      "bound in review_ready, the near_singular stress scenario; the method-review check itself is "
-                      "outside the fingerprint by design (held by its tests)"),
+        # Doc 8.3 "Follow-up" sections: the same two models reviewed every change after ce76f720, the
+        # fingerprint binding and the round-5 gate changes; final verdicts sound (both) each time.
+        "follow_up": (
+            "2026-11-16: binding to the code by experiment_fingerprint reviewed by both models, final verdicts sound; "
+            "adopted: source-order hashing, imports in the design closure, the skip-share bound in review_ready, the "
+            "near_singular stress scenario; the method-review check itself is outside the fingerprint by design "
+            "(held by its tests)",
+            "2026-11-16: review round 5 (the gate covers the calibrated block designs and the blocks a trial "
+            "analyses; missing-night checks fail closed) reviewed by both models, final verdicts sound; adopted: "
+            "numpy scalar p-values read, a Fisher p outside [0, 1] fails closed, the analysed-block lower bound; no "
+            "estimator, p-value, interval or re-draw code changed"),
     },
     "n_redraws": (),                       # re-draw counts the report calibrated
     "alpha": (),                           # alpha levels it calibrated
