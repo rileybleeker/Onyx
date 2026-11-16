@@ -384,7 +384,7 @@ test("only keyed write tools are re-run; habit and highlight re-run in check mod
 
 test("uncertain-outcome texts fit the receipt without being cut", () => {
   for (const tool of receipts.WRITE_TOOLS) assert.ok(ops.uncertainText(tool).length <= 240, tool);
-  for (const text of [ops.CONFLICT_ERROR, ops.REPEAT_ERROR, ops.FRESH_ERROR, ops.LEDGER_ERROR]) assert.ok(text.length <= 240);
+  for (const text of [ops.CONFLICT_ERROR, ops.REPEAT_ERROR, ops.FRESH_ERROR, ops.UNSETTLED_ERROR, ops.LEDGER_ERROR]) assert.ok(text.length <= 240);
 });
 
 // ---------------------------------------------------------------------------
@@ -721,13 +721,13 @@ test("a playlist from chat checks its key before Spotify is asked for anything",
 });
 
 test("a keyed call left unfinished is re-run read-back only when another earlier call wrote; alone it re-runs as before", async () => {
-  // A stack the first try could not confirm (it may or may not have written), then its products logged one by one.
+  // A product logged, then a stack the first try could not confirm (it may or may not have written).
   const { db, open } = setup();
   const write = keyedWrite();
   const first = await open();
-  await first.run(STACK, input(), async () => ({ failed: false, result: JSON.stringify({ error: "The database did not confirm this.", incomplete: true }) }));
   await first.run(INTAKE, { product: "synthetic x" }, write.execute("X"));
-  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["unknown", "done"]);
+  await first.run(STACK, input(), async () => ({ failed: false, result: JSON.stringify({ error: "The database did not confirm this.", incomplete: true }) }));
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["done", "unknown"]);
   const checks = [];
   const retry = await open();
   const stack = await retry.run(STACK, input(), async (opId, _ctx, check) => {
@@ -751,4 +751,74 @@ test("a keyed call left unfinished is re-run read-back only when another earlier
   await (await solo.open()).run(STACK, input(), async (opId, _ctx, check) => { soloChecks.push(check); return soloWrite.execute()(opId); });
   assert.deepEqual(soloChecks, [false]);
   assert.equal(soloWrite.effects.size, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Inside one try (review round 6): the calls of the try count like an earlier try's. While a call of the try is
+// unconfirmed nothing new starts, and a keyed re-run of it next to another write of the try only reads back.
+// ---------------------------------------------------------------------------
+const unconfirmedStack = async () => ({ failed: false, result: JSON.stringify({ error: "The database did not confirm this.", incomplete: true }) });
+
+test("in one try, an unconfirmed stack blocks its products one by one; once a re-run confirms it, new calls run again", async () => {
+  const { db, open } = setup();
+  const write = keyedWrite();
+  const first = await open();
+  assert.equal((await first.run(STACK, input(), unconfirmedStack)).receipt.status, "unknown");
+  let ran = 0;
+  const count = (name) => async (opId) => { ran++; return write.execute(name)(opId); };
+  for (const product of ["synthetic x", "synthetic y"]) {
+    const refused = await first.run(INTAKE, { product }, count(product));
+    const forModel = JSON.parse(refused.result);
+    assert.equal(forModel.error, ops.UNSETTLED_ERROR);
+    assert.equal(forModel.earlier_tool, STACK);
+    assert.equal(forModel.earlier_outcome, "unknown");
+    assert.equal(refused.receipt.status, "not_saved");
+  }
+  assert.equal(ran, 0, "no product was logged next to a stack that may have been logged");
+  assert.equal(db.rows("chat_operations").length, 1, "the refused calls made no row");
+  // The model asks for the stack again: the same operation, re-run under its key (nothing else was written).
+  const checks = [];
+  const again = await first.run(STACK, input(), async (opId, _ctx, check) => { checks.push(check); return write.execute()(opId); });
+  assert.deepEqual(checks, [false]);
+  assert.equal(again.receipt.status, "saved");
+  // Confirmed: the try is settled, so another call runs as usual.
+  assert.equal((await first.run("mark_habit_complete", { habit: "Synthetic habit" }, async () => ({ failed: false, result: JSON.stringify({ success: true, entry: { question: "Synthetic habit", answer: "Yes", cycle_date: "2030-01-01" } }) }))).receipt.status, "saved");
+  assert.deepEqual(db.rows("chat_operations").map((r) => [r.tool, r.status]), [[STACK, "done"], ["mark_habit_complete", "done"]]);
+});
+
+test("in one try, products logged then an unconfirmed stack asked again: the re-run only reads back, never logs the stack on top", async () => {
+  const { db, open } = setup();
+  const write = keyedWrite();
+  const first = await open();
+  await first.run(INTAKE, { product: "synthetic x" }, write.execute("X"));
+  await first.run(INTAKE, { product: "synthetic y" }, write.execute("Y"));
+  assert.equal((await first.run(STACK, input(), unconfirmedStack)).receipt.status, "unknown");
+  const checks = [];
+  const again = await first.run(STACK, input(), async (opId, _ctx, check) => {
+    checks.push(check);
+    return check
+      ? { failed: false, result: JSON.stringify({ error: ops.uncertainText(STACK), incomplete: true, uncertain: true }) }
+      : write.execute()(opId);
+  });
+  assert.deepEqual(checks, [true], "read back only: X and Y were written in this try");
+  assert.equal(again.receipt.status, "unknown");
+  assert.equal(write.effects.size, 2, "the stack was not logged next to its products");
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["done", "done", "unknown"]);
+  // Still unconfirmed: nothing new starts in this try.
+  assert.equal(JSON.parse((await first.run(INTAKE, { product: "synthetic z" }, write.execute("Z"))).result).error, ops.UNSETTLED_ERROR);
+  assert.equal(write.effects.size, 2);
+});
+
+test("a retry whose earlier calls were all refused runs a repeated call twice, as a first try would", async () => {
+  const { db, store, open } = setup();
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: INTAKE, ordinal: 1 }, ops.intentSha(INTAKE, { product: "synthetic a" }), { product: "synthetic a" });
+  await store.finish(row, "refused", { error: "No product named that." }, null);
+  await expireLeases(db);
+  const write = keyedWrite();
+  const retry = await open();
+  assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).receipt.status, "saved");
+  assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).receipt.status, "saved", "a second copy runs: nothing earlier was written");
+  assert.equal(write.effects.size, 2);
+  assert.deepEqual(db.rows("chat_operations").map((r) => [r.ordinal, r.status]), [[1, "done"], [2, "done"]]);
 });

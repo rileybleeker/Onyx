@@ -687,7 +687,11 @@ async function highlightsChangedSince(bookId: number, startedAt: string | undefi
 }
 
 /** The tool's answer for a highlight, after making its Notion entry when `mirrorNow` (none was made yet). */
-async function highlightReply(book: Book, highlight: Highlight, opts: { created: boolean; replayed: boolean; mirrorNow: boolean }): Promise<string> {
+async function highlightReply(
+  book: Book,
+  highlight: Highlight,
+  opts: { created: boolean; replayed: boolean; mirrorNow: boolean; unconfirmed?: string[] },
+): Promise<string> {
   let mirrored = false;
   if (opts.mirrorNow) {
     const blockId = await mirrorHighlight(book, highlight);
@@ -708,6 +712,8 @@ async function highlightReply(book: Book, highlight: Highlight, opts: { created:
     notion_mirrored: mirrored,
     // Nothing was written to the highlight now: it is what an earlier try (or Riley) left.
     ...(opts.replayed ? { replayed: true } : {}),
+    // Steps an earlier call may or may not have done, not done now: tell the user each one.
+    ...(opts.unconfirmed && opts.unconfirmed.length > 0 ? { unconfirmed: opts.unconfirmed } : {}),
   });
 }
 
@@ -737,11 +743,45 @@ async function sessionByKey(opId: string): Promise<{ book: number } | "none" | "
   return typeof id === "number" ? { book: id } : "none";
 }
 
+/** What a session or highlight an earlier call wrote may lack, named on the receipt (nothing is written for it now). */
+const FINISH_UNCONFIRMED = "The book is not marked finished, and Onyx did not change it now. Check /reading.";
+const habitUnconfirmed = (day: string): string =>
+  `Onyx cannot confirm a reading-habit Yes for ${day} and did not mark it now (it may have been cleared since). Check /habits.`;
+const NOTION_UNCONFIRMED =
+  "No Notion entry is recorded for it, and Onyx made none now: an earlier try may have made one. Check the book's Notion page.";
+
 /**
- * The steps logSession takes after its insert, for a session an earlier try wrote and then stopped: the book is
- * marked finished when the session reached its last chapter and it is not finished yet, and the book's habit gets a
- * Yes for the session day only when that day has no answer for it at all. The stamp is one insert that does nothing
- * on a conflict (never a read, then a write), so an answer given since, also at the same moment, is never changed.
+ * A session an EARLIER call wrote (an earlier try of the message, or an earlier call of this try) and that stopped
+ * before the ledger recorded it. Whether that call also finished the book, stamped the habit and made the Notion entry
+ * cannot be told from what is stored, and Riley may have changed any of them since (a habit answer cleared on purpose
+ * would come back with a new stamp, which no conflict rule can stop). So nothing is written: what is there now is
+ * reported, and each step that shows nothing is named for Riley to check.
+ */
+async function inspectReplayedSession(book: Book, session: ReadingSession): Promise<{ habitMarked: boolean; unconfirmed: string[] }> {
+  const unconfirmed: string[] = [];
+  const total = book.total_chapters;
+  if (total && (session.chapter_through ?? 0) >= total && book.status !== "finished") unconfirmed.push(FINISH_UNCONFIRMED);
+  let habitMarked = false;
+  if (book.habit_name) {
+    const { data, error } = await supabase
+      .from("habit_journal")
+      .select("answer")
+      .eq("cycle_date", session.session_date)
+      .eq("question", book.habit_name)
+      .maybeSingle();
+    habitMarked = !error && (data as { answer?: unknown } | null)?.answer === "Yes";
+    if (!habitMarked) unconfirmed.push(habitUnconfirmed(session.session_date));
+  }
+  if (!session.notion_block_id) unconfirmed.push(NOTION_UNCONFIRMED);
+  return { habitMarked, unconfirmed };
+}
+
+/**
+ * The steps logSession takes after its insert, for a session THIS call's own insert wrote (no session carried the key
+ * when the call began) and whose answer was lost: logSession returned before any of them, so none of them happened.
+ * The book is marked finished when the session reached its last chapter and it is not finished yet, and the book's
+ * habit gets a Yes for the session day only when that day has no answer for it at all. The stamp is one insert that
+ * does nothing on a conflict (never a read, then a write), so an answer given meanwhile is never changed.
  */
 async function completeReplayedSession(book: Book, session: ReadingSession): Promise<{ book: Book; finished: boolean; habitMarked: boolean }> {
   let current = book;
@@ -1259,16 +1299,23 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       // A refusal wrote nothing; a failed insert may have committed: never "not logged".
       return JSON.stringify(SESSION_NOT_WRITTEN.test(result.error) ? { error: result.error } : { error: SESSION_MAYBE_WRITTEN, incomplete: true });
     }
-    // A replay (same client_key): an earlier try of this operation wrote the session and stopped before the ledger
-    // recorded it, possibly before the book finish, the habit stamp or the Notion entry. Each is done now only when it
-    // is still missing, so nothing happens twice. (One try at a time: the earlier try is no longer running.)
+    // A replay (same client_key): the session exists under this operation id. Two cases:
+    //  - this very call wrote it: no session carried the key when the call began (`prior` "none"), its own insert
+    //    committed and the answer was lost, so logSession stopped before the book finish, the habit stamp and the
+    //    Notion entry. They are done now, each only when still missing. (One try at a time: no other try runs.)
+    //  - an earlier call wrote it (`prior` held it): whether that call also did those steps cannot be told, and Riley
+    //    may have undone one since (a cleared habit answer). Read only: what is there is reported, nothing written.
     const replayed = result.replayed === true;
-    const completed = replayed ? await completeReplayedSession(result.book, result.session) : null;
+    const ownInsert = replayed && prior === "none";
+    const completed = ownInsert ? await completeReplayedSession(result.book, result.session) : null;
+    const inspected = replayed && !ownInsert ? await inspectReplayedSession(result.book, result.session) : null;
     const book = completed?.book ?? result.book;
-    const finished = completed ? completed.finished : result.finished;
-    const habitMarked = completed ? completed.habitMarked : result.habitMarked;
-    // Mirror inline (the chat loop has no after() boundary worth protecting).
-    const blockId = result.session.notion_block_id ?? (await mirrorSession(book, result.session));
+    const finished = completed ? completed.finished : inspected ? false : result.finished;
+    const habitMarked = completed ? completed.habitMarked : inspected ? inspected.habitMarked : result.habitMarked;
+    // Mirror inline (the chat loop has no after() boundary worth protecting). An earlier call's session with no block
+    // id stored may still have its Notion entry (the call can stop between the append and storing the id), so none is
+    // made for it now: inspectReplayedSession names it for Riley to check instead.
+    const blockId = result.session.notion_block_id ?? (inspected ? null : await mirrorSession(book, result.session));
     if (blockId && !result.session.notion_block_id) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
     const o = await getOverview(supabase, book.slug).catch(() => null);
     // Rewrites one progress line in Notion: the same text when it is already up to date.
@@ -1293,6 +1340,8 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       level: o?.level,
       notion_mirrored: !!blockId,
       ...(replayed ? { replayed: true } : {}),
+      // Steps an earlier call may or may not have done, not done now: tell the user each one.
+      ...(inspected && inspected.unconfirmed.length > 0 ? { unconfirmed: inspected.unconfirmed } : {}),
     });
   }
 
@@ -1312,13 +1361,20 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     if (opId) {
       // The highlight this operation created, found by its key: an earlier try made it and stopped before the ledger
       // recorded it. It is that earlier write, whatever was edited since (its passage included), so nothing is written
-      // to it now; only its Notion entry is made when the earlier try stopped before it. Removed (archived) since:
-      // never written again. A key column that cannot be read: refused, never written without its key.
+      // to it now, its Notion entry included (below). Removed (archived) since: never written again. A key column that
+      // cannot be read: refused, never written without its key.
       const own = await highlightByKey(opId);
       if (own === "missing" || own === "error") return JSON.stringify({ error: KEY_UNAVAILABLE });
       if (own !== "none") {
         if (own.highlight.archived) return REMOVED_RESULT;
-        return highlightReply(own.book, own.highlight, { created: true, replayed: true, mirrorNow: !own.highlight.notion_block_id });
+        // Its Notion entry: an earlier call can stop between the append and storing the block id, so a missing id does
+        // not prove there is no entry; none is made now, and the receipt names it for Riley to check.
+        return highlightReply(own.book, own.highlight, {
+          created: true,
+          replayed: true,
+          mirrorNow: false,
+          unconfirmed: own.highlight.notion_block_id ? [] : [NOTION_UNCONFIRMED],
+        });
       }
     }
     let checked: { book: Book; highlight: Highlight } | null = null;

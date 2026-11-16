@@ -23,6 +23,12 @@
  *   - only when nothing earlier was written (no rows, or every earlier call was refused) does a new call run, as it
  *     would on a first try.
  *
+ * Inside one try (a first try too) the same two rules hold for the calls of that try: while a call of the try is
+ * unconfirmed (it threw, or says it may be incomplete) no new write starts (UNSETTLED_ERROR: the next write could be
+ * that one in another form, e.g. a stack whose log failed part-way followed by its products one by one), until a
+ * re-run of the same call confirms it; and a keyed re-run of an unconfirmed call only reads back what its key holds
+ * when any other call, of an earlier try or of this one, wrote or may have written.
+ *
  * The operation id is passed into the write (supplement event key, reading client_key, highlight client_key, playlist
  * audit key), so a write that happened before the ledger could record it is found again rather than repeated. When
  * Riley removed such a write afterwards, the removal leaves a tombstone (sql/chat_operations.sql) and the re-run
@@ -44,11 +50,17 @@
  * in lower case, "8:30" = "08:30", empty fields left out), so a retry worded slightly differently by the model still
  * matches; the stored intent is the input as sent.
  *
+ * A session or highlight an EARLIER call wrote (found under its key) is only read by a re-run: its book finish, habit
+ * Yes and Notion entry are never made then (the call may have made them, and Riley may have undone one since, such as
+ * a cleared habit answer); each one that shows nothing is listed as `unconfirmed` on the result and the receipt.
+ *
  * Known gaps (follow-ups): a playlist created on Spotify whose audit row could not be written stays "unknown" (no
- * read-only Spotify lookup yet); a Notion entry made by a try that died before it stored the block id is made again
- * by the re-run; a quiz result has no operation key yet (PR #362 adds one), so a quiz left pending is never
- * confirmed and stays "check this"; the ledger keeps tool inputs and results with no retention window yet; a request
- * with no request_id (a page loaded before this change) still runs its writes without the ledger, as before.
+ * read-only Spotify lookup yet); a Notion entry (or habit Yes, or book finish) the earlier call never made stays
+ * missing, named on the receipt for Riley to check; a quiz result has no operation key yet (PR #362 adds one), so a
+ * quiz left pending is never confirmed and stays "check this"; a call the earlier try never reached (it died after
+ * another call wrote) is refused on the retry and must be sent as a new message; the ledger keeps tool inputs and
+ * results with no retention window yet; a request with no request_id (a page loaded before this change) still runs
+ * its writes without the ledger, as before.
  *
  * Errors are reported by code only (never a message, which can echo user text). No personal data in this file.
  */
@@ -192,10 +204,10 @@ export const conversationSha = (messages: ReadonlyArray<{ role: string; content:
 
 /**
  * Write tools whose write carries the operation id as its own key (a supplement intake, a stack log, a reading
- * session): re-run under the same id, the write finds what an earlier try wrote and never happens twice. When
- * another call of the earlier tries also wrote (or may have written), the re-run is in CHECK mode: it only reads back
- * what its key holds and never writes, because a write that never happened would now be a new write next to that
- * other one (possibly the same thing in another form: a stack whose products were then logged one by one).
+ * session): re-run under the same id, the write finds what an earlier try wrote and never happens twice. When any
+ * other call (of an earlier try, or of this try) also wrote or may have written, the re-run is in CHECK mode: it only
+ * reads back what its key holds and never writes, because a write that never happened would now be a new write next
+ * to that other one (possibly the same thing in another form: a stack whose products were then logged one by one).
  */
 export const RERUN_SAFE: ReadonlySet<string> = new Set([
   "log_supplement_intake",
@@ -220,6 +232,9 @@ export const CHECK_ON_RERUN: ReadonlySet<string> = new Set(["mark_habit_complete
 export const REPLAY_NOTE =
   "An earlier try of this same message already did this, so nothing was written again. Tell the user it was already saved, using this result.";
 export const REPLAY_DETAIL = "Saved by an earlier try of this message, not written again.";
+/** Added to REPLAY_NOTE when the result lists follow-up steps the earlier write may lack (`unconfirmed`). */
+export const UNCONFIRMED_NOTE =
+  "Some follow-up steps of that earlier write could not be confirmed and were not done now: tell the user each line in `unconfirmed`.";
 export const EARLIER_DETAIL = "Saved by an earlier try of this message.";
 export const CONFLICT_ERROR =
   "An earlier try of this same message already did this with different details, so nothing new was written. To log something different, the user should send it as a new message.";
@@ -227,6 +242,8 @@ export const REPEAT_ERROR =
   "An earlier try of this same message did this once and that was already reported in this answer, so nothing more was written. To do it again, the user should send it as a new message.";
 export const FRESH_ERROR =
   "An earlier try of this same message already saved something, so this retry starts nothing new and nothing was written. If this is still wanted, the user should send it as a new message.";
+export const UNSETTLED_ERROR =
+  "Another action in this message could not be confirmed and may have been saved, so Onyx started nothing new and nothing was written for this. Tell the user to check that one first; anything still wanted can then be sent as a new message.";
 export const LEDGER_ERROR =
   "Onyx could not record this action safely, so it was not done and nothing was written. Tell the user to try again in a moment.";
 const UNCERTAIN: Record<string, string> = {
@@ -364,6 +381,18 @@ export class ChatLedger {
   private earlierWritten: boolean | null = null;
   /** A retry: the rows as this try first read them (every one an earlier try's); empty on a first try. */
   private earlierRows: OperationRow[] = [];
+  /**
+   * Rows of calls this try ran (or answered from a stored write) that wrote, or may have written, something. Together
+   * with earlierRows they decide whether a keyed re-run may write (othersWritten): a stack this try could not confirm,
+   * then its products logged one by one, then the stack again must only read back, never log the stack on top.
+   */
+  private readonly wroteNow = new Set<string>();
+  /**
+   * Calls of this try whose outcome is unknown (they may have written, possibly in part), by row. While one is open no
+   * new write starts in this try (a first try too): the next write could be the same thing in another form (the
+   * products of a stack whose log failed part-way). Settled (confirmed by a re-run of the same call), it is removed.
+   */
+  private readonly openNow = new Map<string, OperationRow>();
 
   constructor(opts: LedgerOptions) {
     this.opts = opts;
@@ -405,6 +434,8 @@ export class ChatLedger {
   private async runFirst(
     tool: string, input: unknown, sha: string, intent: unknown, execute: Execute, context: OperationContext,
   ): Promise<LedgerOutcome> {
+    // Another call of this try may have written (part of) its work: nothing new starts next to it.
+    if (this.openNow.size > 0) return this.blockAfterOpen(tool, input);
     const ordinal = (this.ordinals.get(tool) ?? 0) + 1;
     this.ordinals.set(tool, ordinal);
     return this.claimAndRun(tool, input, sha, intent, ordinal, execute, context);
@@ -438,13 +469,21 @@ export class ChatLedger {
     // call wrote (or may have written) something it is refused too. It may be that same thing in another form (a
     // stack refused, its products then logged one by one, now the stack again).
     if (same?.status === "refused" && this.earlierWritten) return this.blockNew(tool, input, sha, rows, FRESH_ERROR);
+    // Running a refused call again is a new write too: not next to a call of this try that may have written.
+    if (same?.status === "refused" && this.openNow.size > 0) return this.blockAfterOpen(tool, input);
     if (same) return this.resume(same, tool, input, execute);
-    // One more copy of a call already answered from a stored row: the earlier try made it fewer times.
-    if (rows.some((r) => r.tool === tool && r.intent_sha === sha)) return this.conflict(tool, input, null, REPEAT_ERROR);
+    // One more copy of a call an earlier try made and that was already answered from its stored row: the earlier try
+    // made it fewer times. (Copies of a call this retry itself started, when nothing earlier was written, run as they
+    // would on a first try.)
+    if (this.earlierWritten && this.earlierRows.some((r) => r.tool === tool && r.intent_sha === sha)) {
+      return this.conflict(tool, input, null, REPEAT_ERROR);
+    }
     // The model asks again for a call this retry already refused.
     if (this.conflicted.has(sha)) return this.conflict(tool, input, null, this.earlierWritten ? FRESH_ERROR : CONFLICT_ERROR);
     // Something was (or may have been) written by an earlier try: never a new write next to it.
     if (this.earlierWritten) return this.blockNew(tool, input, sha, rows);
+    // Nor next to a call of this try that may have written.
+    if (this.openNow.size > 0) return this.blockAfterOpen(tool, input);
     // Nothing earlier was written (no rows, or only refused ones): this call runs as on a first try.
     const ordinal = rows.filter((r) => r.tool === tool).reduce((n, r) => Math.max(n, r.ordinal), 0) + 1;
     return this.claimAndRun(tool, input, sha, intent, ordinal, execute, context);
@@ -461,6 +500,15 @@ export class ChatLedger {
     const unmatched = earlier.filter((r) => !this.used.has(r.op_id));
     const named = unmatched.find((r) => r.tool === tool) ?? unmatched[0] ?? earlier.find((r) => r.tool === tool) ?? earlier[0] ?? null;
     return this.conflict(tool, input, named, error ?? (unmatched.length > 0 ? CONFLICT_ERROR : FRESH_ERROR));
+  }
+
+  /**
+   * A new write while a call of this try is unconfirmed (it may have written, possibly in part): refused, and the
+   * unconfirmed call is named. It is refused again if the model repeats it while that call stays unconfirmed.
+   */
+  private blockAfterOpen(tool: string, input: unknown): LedgerOutcome {
+    const open = [...this.openNow.values()];
+    return this.conflict(tool, input, open.find((r) => r.tool === tool) ?? open[0] ?? null, UNSETTLED_ERROR);
   }
 
   private async claimAndRun(
@@ -519,9 +567,21 @@ export class ChatLedger {
     return this.reconcile(row, tool, input);
   }
 
-  /** Did an earlier try write, or may it have written, anything other than this row? (Only a retry has earlier rows.) */
+  /**
+   * Did any call other than this row write, or may it have written, something: a call of an earlier try (a retry's
+   * earlierRows) or one of this try (wroteNow, a first try too)?
+   */
   private othersWritten(row: OperationRow): boolean {
-    return this.earlierRows.some((r) => r.op_id !== row.op_id && r.status !== "refused");
+    if (this.earlierRows.some((r) => r.op_id !== row.op_id && r.status !== "refused")) return true;
+    for (const id of this.wroteNow) if (id !== row.op_id) return true;
+    return false;
+  }
+
+  /** Record what this call's outcome means for the rest of this try (see wroteNow and openNow). */
+  private settle(row: OperationRow, status: OperationStatus) {
+    if (status === "done" || status === "unknown") this.wroteNow.add(row.op_id);
+    if (status === "unknown") this.openNow.set(row.op_id, row);
+    else this.openNow.delete(row.op_id);
   }
 
   /** The earlier try's call was refused (nothing written): run the same call again under the same operation id. */
@@ -568,6 +628,7 @@ export class ChatLedger {
         this.report("finish", e);
       }
       this.unsettled.set(row.intent_sha, { ...row, status: "unknown" });
+      this.settle(row, "unknown");
       return unconfirmed;
     }
     const parsed = parseResult(outcome.result);
@@ -581,11 +642,13 @@ export class ChatLedger {
     }
     if (status === "unknown") this.unsettled.set(row.intent_sha, { ...row, status });
     else this.unsettled.delete(row.intent_sha);
+    this.settle(row, status);
     // A re-run whose keyed write found the rows an earlier try had already written (the earlier try stopped before the
     // ledger recorded it): say so, to the model and on the receipt.
     if (parsed?.replayed === true && parsed.success === true) {
+      const unconfirmed = Array.isArray(parsed.unconfirmed) && parsed.unconfirmed.length > 0;
       return {
-        result: JSON.stringify({ ...parsed, note: REPLAY_NOTE }),
+        result: JSON.stringify({ ...parsed, note: unconfirmed ? `${REPLAY_NOTE} ${UNCONFIRMED_NOTE}` : REPLAY_NOTE }),
         failed: false,
         receipt: receipt ? asReplay(receipt, REPLAY_DETAIL) : null,
         replayed: true,
@@ -596,11 +659,18 @@ export class ChatLedger {
 
   private replay(row: OperationRow, tool: string): LedgerOutcome {
     this.unsettled.delete(row.intent_sha);
+    this.settle(row, "done");
     const stored = asObject(row.result) ?? {};
     const base = row.receipt ?? this.opts.buildReceipt(tool, row.intent, JSON.stringify(stored));
     return {
       // Removed since: its own error line tells the model and the receipt what to say (not "it was already saved").
-      result: JSON.stringify({ ...stored, replayed: true, ...(removedSince(row) ? {} : { note: REPLAY_NOTE }) }),
+      result: JSON.stringify({
+        ...stored,
+        replayed: true,
+        ...(removedSince(row)
+          ? {}
+          : { note: Array.isArray(stored.unconfirmed) && stored.unconfirmed.length > 0 ? `${REPLAY_NOTE} ${UNCONFIRMED_NOTE}` : REPLAY_NOTE }),
+      }),
       failed: false,
       receipt: base ? (removedSince(row) ? base : asReplay(base, REPLAY_DETAIL)) : null,
       replayed: true,
@@ -632,7 +702,9 @@ export class ChatLedger {
     return this.replay({ ...row, status: "done", result: found, receipt }, tool);
   }
 
+  /** The row's outcome cannot be confirmed: it may have written, so it stays open for the rest of this try. */
   private uncertain(row: OperationRow, tool: string, input: unknown): LedgerOutcome {
+    this.settle(row, "unknown");
     const result = JSON.stringify({ error: uncertainText(tool), incomplete: true, uncertain: true });
     return { result, failed: false, receipt: this.opts.buildReceipt(tool, row.intent ?? input, result), replayed: false };
   }

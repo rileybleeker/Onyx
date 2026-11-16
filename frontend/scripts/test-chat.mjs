@@ -898,6 +898,57 @@ test("a replayed session never overrides an answer given since, and a lost answe
   assert.equal((await (await refused.post({ messages: [user("I read chapter 99")] })).json()).receipts[0].status, "not_saved");
 });
 
+test("a session an earlier try wrote is only read on the retry: a habit answer cleared since stays cleared, no second finish or Notion entry", async () => {
+  const state = { failFinish: true };
+  const db = ledgerDb({
+    tables: { habit_journal: [], reading_sessions: [], books: [{ book_id: 4, status: "reading" }] },
+    fail: ({ table, op, payload }) => (state.failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null),
+  });
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 2, status: "reading", finished_on: null };
+  let mirrors = 0;
+  const reading = {
+    // Like lib/reading.ts logSession: a key that holds a session replays it; otherwise the session is inserted, the
+    // book finished on its last chapter and the habit stamped Yes for the session day.
+    logSession: async (_client, input) => {
+      const stored = db.rows("reading_sessions").find((x) => x.client_key === input.client_key);
+      if (stored) return { ok: true, book, session: stored, xpGained: 20, finished: false, habitMarked: false, habitCreated: null, replayed: true };
+      const session = { session_id: 1, book_id: 4, client_key: input.client_key, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: null };
+      db.seed("reading_sessions", [session]);
+      await db.from("books").update({ status: "finished" }).eq("book_id", 4);
+      db.seed("habit_journal", [{ cycle_date: "2026-11-11", question: "Read synthetic", answer: "Yes" }]);
+      return { ok: true, book: { ...book, status: "finished" }, session, xpGained: 20, finished: true, habitMarked: true, habitCreated: true, replayed: false };
+    },
+    getOverview: async () => null,
+  };
+  // The first try's Notion append never answered (no block id stored), then the try stopped before the ledger
+  // recorded the session.
+  const readingNotion = { mirrorSession: async () => { mirrors++; return null; }, mirrorProgress: async () => {} };
+  const call = { chapter_through: 2, medium: "paper" };
+  const body = { request_id: RID, messages: [user("I finished the synthetic book on paper")] };
+  await route(afterTool("log_reading_session", call), { supabase: db, reading, readingNotion }).post(body);
+  assert.equal(db.rows("chat_operations")[0].status, "pending");
+  assert.equal(mirrors, 1);
+  state.failFinish = false;
+  // Since then Riley cleared that day's reading habit and set the book back to reading.
+  await db.from("habit_journal").delete().eq("question", "Read synthetic");
+  await db.from("books").update({ status: "reading" }).eq("book_id", 4);
+  const r = route(afterTool("log_reading_session", call), { supabase: db, reading, readingNotion });
+  const out = await (await r.post(body)).json();
+  assert.equal(db.rows("habit_journal").length, 0, "the cleared answer is not stamped again");
+  assert.equal(db.rows("books")[0].status, "reading", "the book is not finished again");
+  assert.equal(mirrors, 1, "no second Notion entry");
+  assert.equal(db.rows("reading_sessions").length, 1);
+  const result = JSON.parse(r.requests()[1].messages.at(-1).content[0].content);
+  assert.equal(result.success, true);
+  assert.equal(result.replayed, true);
+  assert.equal(result.habit_marked, false);
+  assert.equal(result.unconfirmed.length, 3, "finish, habit and Notion entry are each named");
+  assert.match(result.note, /unconfirmed/);
+  assert.equal(out.receipts[0].status, "unknown");
+  assert.match(out.receipts[0].details.join(" "), /Check \/habits/);
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+});
+
 /** Like lib/reading.ts addHighlight: one highlight per book + passage, a given comment is written over the stored one
  * (which moves updated_at), and the client_key (the operation id) goes on a highlight it CREATES. */
 function highlightLibrary(db, { current = () => 9, seen = [] } = {}) {
@@ -924,7 +975,7 @@ function highlightLibrary(db, { current = () => 9, seen = [] } = {}) {
 const highlightBooks = () => [{ book_id: 9, slug: "synthetic-nine", title: "Synthetic Nine" }, { book_id: 10, slug: "synthetic-ten", title: "Synthetic Ten" }];
 const finishFails = (state) => ({ table, op, payload }) => (state.failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null);
 
-test("a highlight re-run finds the highlight its earlier try made by its key, on the pinned book, and writes nothing to it", async () => {
+test("a highlight re-run finds the highlight its earlier try made by its key, on the pinned book, and writes nothing to it, its Notion entry included", async () => {
   const state = { failFinish: true };
   const db = ledgerDb({ tables: { books: highlightBooks() }, fail: finishFails(state) });
   let current = 9;
@@ -944,9 +995,12 @@ test("a highlight re-run finds the highlight its earlier try made by its key, on
   const retryBody = await (await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body)).json();
   assert.deepEqual(seen, [9], "addHighlight did not run on the retry");
   assert.equal(db.rows("book_highlights").length, 1);
-  assert.equal(mirrors, 2, "mirrored again only because the first try's entry was never made");
-  assert.equal(db.rows("book_highlights")[0].notion_block_id, "synthetic-block");
-  assert.equal(retryBody.receipts[0].status, "unchanged");
+  // No block id stored does not prove there is no Notion entry (a try can stop between the append and storing the
+  // id), so none is made now and the receipt says to check it.
+  assert.equal(mirrors, 1, "no second Notion entry");
+  assert.equal(db.rows("book_highlights")[0].notion_block_id, null);
+  assert.equal(retryBody.receipts[0].status, "unknown");
+  assert.match(retryBody.receipts[0].details.join(" "), /No Notion entry is recorded for it/);
   assert.equal(db.rows("chat_operations")[0].context.book_id, 9);
   assert.equal(db.rows("chat_operations")[0].status, "done");
 });
@@ -1199,17 +1253,39 @@ test("a stack left unconfirmed next to products the first try logged is only rea
   };
   const w = keyedIntake();
   const firstTry = [
-    { stop_reason: "tool_use", content: [toolUse("log_supplement_stack", { stack: "synthetic morning" }, "s1")] },
     { stop_reason: "tool_use", content: [toolUse("log_supplement_intake", { product: "Synthetic Focus" }, "i1")] },
+    { stop_reason: "tool_use", content: [toolUse("log_supplement_stack", { stack: "synthetic morning" }, "s1")] },
     { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
   ];
   const body = { request_id: RID, messages: [user("Log my synthetic morning stack")] };
   await route(firstTry, { supabase: db, stacks, intake: w.intake }).post(body);
-  assert.deepEqual(db.rows("chat_operations").map((r) => [r.tool, r.status]), [["log_supplement_stack", "unknown"], ["log_supplement_intake", "done"]]);
+  assert.deepEqual(db.rows("chat_operations").map((r) => [r.tool, r.status]), [["log_supplement_intake", "done"], ["log_supplement_stack", "unknown"]]);
   // The retry asks for the stack again: its key holds nothing, and a product was logged next to it, so nothing is
   // logged now (it would repeat that product).
   const retry = await (await route(afterTool("log_supplement_stack", { stack: "synthetic morning" }), { supabase: db, stacks, intake: w.intake }).post(body)).json();
   assert.equal(stackLogs, 1, "logStackIntake did not run on the retry");
   assert.equal(retry.receipts.find((r) => r.tool === "log_supplement_stack").status, "unknown");
   assert.equal(w.effects.size, 1);
+});
+
+test("in one message, a product asked for after a stack that could not be confirmed is not logged", async () => {
+  const db = ledgerDb({ tables: { supplement_stack: [{ stack_id: 7, name: "Synthetic Morning", is_active: true }] } });
+  const stacks = {
+    stackEventReplay: async () => null,
+    logStackIntake: async () => ({ ok: false, error: "The database did not confirm this stack log.", incomplete: true }),
+  };
+  const w = keyedIntake();
+  const oneTry = [
+    { stop_reason: "tool_use", content: [toolUse("log_supplement_stack", { stack: "synthetic morning" }, "s1")] },
+    { stop_reason: "tool_use", content: [toolUse("log_supplement_intake", { product: "Synthetic Focus" }, "i1")] },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
+  ];
+  const r = route(oneTry, { supabase: db, stacks, intake: w.intake });
+  const out = await (await r.post({ request_id: RID, messages: [user("Log my synthetic morning stack")] })).json();
+  assert.equal(w.effects.size, 0, "the product was not logged next to a stack that may have been logged in part");
+  assert.deepEqual(db.rows("chat_operations").map((r) => [r.tool, r.status]), [["log_supplement_stack", "unknown"]]);
+  const refused = JSON.parse(r.requests()[2].messages.at(-1).content[0].content);
+  assert.equal(refused.error, operations.UNSETTLED_ERROR);
+  assert.equal(out.receipts.find((x) => x.tool === "log_supplement_intake").status, "not_saved");
+  assert.equal(out.receipts.find((x) => x.tool === "log_supplement_stack").status, "unknown");
 });

@@ -84,6 +84,10 @@ function createFakePostgrest(options = {}) {
         return q.returning ? shape(batch) : { data: null, error: null };
       }
       let list = all.filter((row) => q.filters.every((f) => f(row)));
+      if (q.op === "delete") {
+        for (const row of list) all.splice(all.indexOf(row), 1);
+        return q.returning ? shape(list) : { data: null, error: null };
+      }
       if (q.op === "update") {
         for (const row of list) Object.assign(row, clone(q.payload));
         return q.returning ? shape(list) : { data: null, error: null };
@@ -107,6 +111,10 @@ function createFakePostgrest(options = {}) {
       update(payload) {
         q.op = "update";
         q.payload = payload;
+        return api;
+      },
+      delete() {
+        q.op = "delete";
         return api;
       },
       upsert(payload, opts = {}) {
