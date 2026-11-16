@@ -27,6 +27,9 @@ name: Production Smoke Test
 # so a Vercel rollback or a broken provenance read cannot keep the tripwire green.
 # The receipt is the job summary; post-merge also records it as the commit status
 # post-merge/smoke while the repository variable SMOKE_RECEIPT_STATUS is "on".
+# Each run also outputs its own identity and times (attempt_id, started_at = when production
+# was confirmed before the tests, ended_at = when the verdict ran, this runner's clock), so the
+# receipt dates the attempt as it happened even when the receipt job runs late or is re-run.
 
 on:
   schedule:
@@ -50,6 +53,10 @@ on:
         type: boolean
         required: false
         default: false
+      attempt: # first | retry: names this attempt in its identity (attempt_id)
+        type: string
+        required: false
+        default: ""
     secrets:
       SMOKE_BASE_URL:
         required: false
@@ -66,6 +73,12 @@ on:
         value: ${{ jobs.smoke.outputs.tested_sha }}
       tested_deployment:
         value: ${{ jobs.smoke.outputs.tested_deployment }}
+      attempt_id:
+        value: ${{ jobs.smoke.outputs.attempt_id }}
+      started_at:
+        value: ${{ jobs.smoke.outputs.started_at }}
+      ended_at:
+        value: ${{ jobs.smoke.outputs.ended_at }}
 
 # Read-only: this workflow holds the smoke login, so its token can change nothing.
 permissions:
@@ -96,6 +109,9 @@ jobs:
       detail: ${{ steps.verdict.outputs.detail }}
       tested_sha: ${{ steps.verdict.outputs.tested_sha }}
       tested_deployment: ${{ steps.verdict.outputs.tested_deployment }}
+      attempt_id: ${{ steps.verdict.outputs.attempt_id }}
+      started_at: ${{ steps.verdict.outputs.started_at }}
+      ended_at: ${{ steps.verdict.outputs.ended_at }}
     defaults:
       run:
         working-directory: target/frontend
@@ -175,7 +191,8 @@ jobs:
           TARGET_DETAIL: ${{ steps.target.outputs.detail }}
           TESTS: ${{ steps.tests.outcome }}
           PROVENANCE_DIR: ${{ runner.temp }}/smoke-provenance
+          ATTEMPT: ${{ inputs.attempt }}
         run: >-
           python3 .tooling/tools/merge_train.py smoke-verdict --mode "$SMOKE_MODE" --sha "$SHA"
           --deployment-url "$DEPLOYMENT_URL" --ready "$READY" --target-detail "$TARGET_DETAIL" --tests "$TESTS"
-          --provenance-dir "$PROVENANCE_DIR"
+          --provenance-dir "$PROVENANCE_DIR" --attempt "$ATTEMPT"

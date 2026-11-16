@@ -454,8 +454,13 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
     E, P, N = "e" * 40, "d" * 40, "f" * 40
     NOW = 1_800_000_000.0
 
-    def status(self, state, creator="github-actions[bot]", context=mt.SMOKE_CONTEXT, created_at=""):
-        return dict(context=context, state=state, creator=creator, created_at=created_at)
+    def status(self, state, creator="github-actions[bot]", context=mt.SMOKE_CONTEXT, created_at="", at=None,
+               attempt="9.1.first"):
+        """A synthetic commit status. at = the attempt time its receipt carries (None = no attempt mark)."""
+        row = dict(context=context, state=state, creator=creator, created_at=created_at)
+        if at is not None:
+            row["description"] = mt.receipt_description(at, attempt, f"{state}: synthetic")
+        return row
 
     def test_receipt_reads_only_the_workflows_own_newest_exact_smoke_status(self):
         self.assertEqual(mt.smoke_state_of([self.status("success")]), "pass")
@@ -528,10 +533,12 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         for bad in ("", None, "not a time", "2027-01-15T08:00:00"):
             self.assertIsNone(mt.receipt_time(bad), bad)
 
-    def rows(self, *states, newest=0):
-        """Synthetic commit statuses, newest first, written by the workflow's own token. The newest is recorded
-        `newest` seconds after NOW, each older one a minute before the one above it."""
-        return [self.status(st, created_at=self.at(newest - 60 * i)) for i, st in enumerate(states)]
+    def rows(self, *states, newest=0, delay=0):
+        """Synthetic commit statuses, newest first, written by the workflow's own token. The newest attempt is
+        `newest` seconds after NOW, each older one a minute before the one above it; each receipt is written `delay`
+        seconds after its attempt (a receipt job that ran late)."""
+        return [self.status(st, at=self.NOW + newest - 60 * i, created_at=self.at(newest - 60 * i + delay))
+                for i, st in enumerate(states)]
 
     def fixed(self, receipts, own_states=("success",), later=None, unattributed=False, failed_at=None):
         later = [(self.N, ["success"])] if later is None else later
@@ -604,6 +611,79 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         self.assertEqual(self.fixed({self.E: history, self.N: self.rows("success", newest=300)},
                                     unattributed=True, failed_at=failed_at), self.N)
 
+    def test_receipt_marks_carry_the_attempts_own_time_and_identity(self):
+        # Codex round 5: a receipt dates the attempt it records, never the receipt job
+        d = mt.receipt_description(self.NOW, "123.1.retry", "fail: failed on host " + "x" * 300)
+        self.assertTrue(d.startswith(f"[{mt.iso_utc(self.NOW)} 123.1.retry] fail: failed on host"))
+        self.assertLessEqual(len(d), 140)
+        self.assertEqual(mt.receipt_mark({"description": d}), (self.NOW, "123.1.retry"))
+        self.assertEqual(mt.receipt_mark({"description": mt.receipt_description(None, "", "pending")}), (None, ""))
+        self.assertEqual(mt.receipt_mark({"description": mt.receipt_description(self.NOW, "bad id;", "x")}),
+                         (self.NOW, ""))
+        for bad in ("", "fail: no mark", "[2027-01-15T08:00:00 1.1.first] naive time", None):
+            self.assertEqual(mt.receipt_mark({"description": bad}), (None, ""), bad)
+        # a pass proves something only with its own attempt time; an undated failure falls back to when GitHub
+        # recorded it, which can only make it look later
+        self.assertIsNone(mt.receipt_at(self.status("success", created_at=self.at(60))))
+        self.assertEqual(mt.receipt_at(self.status("failure", created_at=self.at(60))), self.NOW + 60)
+        self.assertEqual(mt.receipt_at(self.status("failure", at=self.NOW, created_at=self.at(60))), self.NOW)
+        # a smoke runner whose clock ran ahead of GitHub's: an attempt dated well after its own receipt was written
+        # is not believed (a pass would look later than it was); a failure then falls back to when GitHub recorded it
+        slack = mt.RECEIPT_CLOCK_SLACK_S
+        ahead = self.status("success", at=self.NOW + slack + 60, created_at=self.at(0))
+        self.assertIsNone(mt.receipt_at(ahead))
+        self.assertEqual(mt.receipt_at(self.status("success", at=self.NOW + slack, created_at=self.at(0))),
+                         self.NOW + slack)
+        self.assertEqual(mt.receipt_at(self.status("failure", at=self.NOW + slack + 60, created_at=self.at(0))),
+                         self.NOW)
+        self.assertFalse(mt.smoke_recovered([ahead, self.status("failure", at=self.NOW - 60, created_at=self.at(-50))]))
+
+    def test_receipts_are_ordered_by_attempt_not_by_when_they_were_written(self):
+        # a receipt job that ran late writes its receipt after a later attempt's: GitHub lists it first, but the
+        # later attempt decides (GitHub's order is newest written first)
+        late_fail = self.status("failure", at=self.NOW, created_at=self.at(300))
+        later_pass = self.status("success", at=self.NOW + 60, created_at=self.at(120))
+        self.assertEqual(mt.smoke_state_of([late_fail, later_pass]), "pass")
+        self.assertTrue(mt.smoke_recovered([late_fail, later_pass]))
+        late_pass = self.status("success", at=self.NOW, created_at=self.at(300))
+        later_fail = self.status("failure", at=self.NOW + 60, created_at=self.at(120))
+        self.assertEqual(mt.smoke_state_of([late_pass, later_fail]), "fail")
+        self.assertFalse(mt.smoke_recovered([late_pass, later_fail]))
+        self.assertEqual(mt.failure_time([late_pass, later_fail]), self.NOW + 60)
+        # equal attempt times keep GitHub's order
+        same = [self.status("failure", at=self.NOW, created_at=self.at(9)),
+                self.status("success", at=self.NOW, created_at=self.at(5))]
+        self.assertEqual(mt.smoke_state_of(same), "fail")
+
+    def test_a_late_receipt_never_rejects_a_pass_that_came_after_the_failure(self):
+        # Codex round 5: E failed twice, its retry ending at NOW; N, which contains it, then passed in a run that
+        # started at NOW+30 (receipt written at NOW+40); E's receipt job ran only at NOW+90. The failure is dated by
+        # its attempt, so N's pass resolves it: no revert, no halt, and a queued rollback PR is closed.
+        receipts = {self.E: [self.status("failure", at=self.NOW, created_at=self.at(90))],
+                    self.N: [self.status("success", at=self.NOW + 30, created_at=self.at(40))]}
+        self.assertEqual(self.fixed(receipts, failed_at=self.NOW), self.N)  # rollback, with the receipt's observed_at
+        self.assertEqual(self.fixed(receipts), self.N)  # a queued rollback PR: E's own failure receipt dates it
+        self.assertEqual(self.fixed({self.E: [self.status("pending", at=self.NOW, created_at=self.at(90))],
+                                     self.N: receipts[self.N]}, unattributed=True, failed_at=self.NOW), self.N)
+        # the same on the commit itself: a later run of E that started after the failure ended
+        own = [self.status("failure", at=self.NOW, created_at=self.at(90)),
+               self.status("success", at=self.NOW + 30, created_at=self.at(40))]
+        self.assertTrue(mt.smoke_recovered(own, self.NOW))
+        self.assertEqual(self.fixed({self.E: own}, later=[]), self.E)
+        # the other way round: a pass whose run started BEFORE the failure ended proves nothing, however late its
+        # receipt was written (Codex R6 again, now on attempt times)
+        early = {self.E: receipts[self.E],
+                 self.N: [self.status("success", at=self.NOW - 30, created_at=self.at(120))]}
+        self.assertIsNone(self.fixed(early, failed_at=self.NOW))
+        self.assertIsNone(self.fixed(early))
+        self.assertIsNone(self.fixed({self.E: [self.status("pending")], self.N: early[self.N]}, unattributed=True,
+                                     failed_at=self.NOW))
+        self.assertFalse(mt.smoke_recovered([self.status("success", at=self.NOW - 30, created_at=self.at(120)),
+                                             self.status("failure", at=self.NOW, created_at=self.at(90))], self.NOW))
+        # a pass that cannot be dated never resolves anything
+        undated = {self.E: receipts[self.E], self.N: [self.status("success", created_at=self.at(120))]}
+        self.assertIsNone(self.fixed(undated, failed_at=self.NOW))
+
     def test_already_fixed_never_reads_receipts_for_a_failed_build_and_survives_an_unreadable_one(self):
         with patch.object(mt, "later_chain", return_value=[(self.N, ["failure"])]), \
                 patch.object(mt, "production_states", return_value=["failure"]), \
@@ -665,7 +745,8 @@ class RollbackReconciles(unittest.TestCase):
         # its own deployment, and now failed twice without confirmed provenance (its receipt stayed the old pass).
         def status(state, offset):
             return dict(context=mt.SMOKE_CONTEXT, state=state, creator="github-actions[bot]",
-                        created_at=mt.iso_utc(self.NOW + offset))
+                        created_at=mt.iso_utc(self.NOW + offset),
+                        description=mt.receipt_description(self.NOW + offset, "9.1.first", f"{state}: synthetic"))
         history = {self.E: [status("success", -600), status("failure", -660)]}
 
         def run(receipts, failed_at, later=()):
@@ -691,6 +772,40 @@ class RollbackReconciles(unittest.TestCase):
         # a pass recorded after the new failure does
         code, issues = run(dict(history, **{self.N: [status("success", 300)]}), self.NOW, [(self.N, ["success"])])
         self.assertEqual((code, len(issues)), (0, 0))
+
+    def test_a_late_receipt_reverts_nothing_a_later_pass_already_cleared(self):
+        # Codex round 5, end to end through rollback(): E failed twice (retry ended at NOW), N containing it passed
+        # in a run that started at NOW+30, and E's receipt job ran at NOW+90. rollback gets the attempt's time, so
+        # neither the revert nor the halt goes ahead; a pass that started before NOW still lets the revert go ahead.
+        def status(state, at, written):
+            return dict(context=mt.SMOKE_CONTEXT, state=state, creator="github-actions[bot]",
+                        created_at=mt.iso_utc(self.NOW + written),
+                        description=mt.receipt_description(self.NOW + at, "9.1.retry", f"{state}: synthetic"))
+
+        def run(n_pass_at, halt_only):
+            calls = []
+
+            def fake_gh(*a, check=True):
+                calls.append(a)
+                if a[:2] == ("api", f"repos/{mt.REPO}/issues"):
+                    return '{"number": 5}'
+                return "https://github.com/example/repo/pull/9\n" if a[:2] == ("pr", "create") else ""
+            receipts = {self.E: [status("failure", 0, 90)], self.N: [status("success", n_pass_at, 120)]}
+            subject = type("Proc", (), {"stdout": "feat: synthetic change\n"})()
+            with patch.object(mt, "gh", side_effect=fake_gh), patch.object(mt, "ensure_labels"), \
+                    patch.object(mt, "note"), patch.object(mt.subprocess, "run", return_value=subject), \
+                    patch.object(mt, "later_chain", return_value=[(self.N, ["success"])]), \
+                    patch.object(mt, "production_states", return_value=["success"]), \
+                    patch.object(mt, "halted", return_value=False), patch.object(mt, "open_prs", return_value=[]), \
+                    patch.object(mt, "smoke_rows", side_effect=lambda sha: receipts.get(sha, [])):
+                code = mt.rollback(self.E, "synthetic reason", halt_only=halt_only, failed_at=self.NOW)
+            acted = [c for c in calls if c[:2] in (("issue", "create"), ("pr", "create"))
+                     or c[:2] == ("api", f"repos/{mt.REPO}/issues")]
+            return code, acted
+        for halt_only in (False, True):
+            self.assertEqual(run(30, halt_only), (0, []), halt_only)
+            code, acted = run(-30, halt_only)
+            self.assertTrue(acted, halt_only)  # the halt issue (and, for a revert, the revert PR) goes ahead
 
     def test_rollback_reads_the_failure_time_from_the_command_line(self):
         seen = []
@@ -909,7 +1024,7 @@ class SmokeCommands(unittest.TestCase):
         self.assertEqual(out["ready"], "false")
 
     def receipt(self, attempts, parent_state="pass", verify="ok", parent_age=600, existing="unknown",
-                compare="ahead", post_error=False, record=True, clock=None):
+                compare="ahead", post_error=False, record=True, clock=None, now=None):
         from datetime import datetime, timezone
         stamp = datetime.fromtimestamp(self.NOW - parent_age, timezone.utc).isoformat().replace("+00:00", "Z")
         receipts = {self.P: (parent_state, stamp if parent_state != "unknown" else ""), self.E: (existing, "")}
@@ -924,7 +1039,8 @@ class SmokeCommands(unittest.TestCase):
             return self.P + "\n" if a[1].startswith(f"repos/{mt.REPO}/commits/") else ""
         with patch.object(mt, "smoke_receipt_of", side_effect=receipts.get):
             code, out, calls = self.run_cmd(mt.smoke_receipt, self.E, self.URL, verify, "detail", attempts,
-                                            self.NOW, gh=fake, record=record, clock=clock or (lambda: self.NOW))
+                                            self.NOW if now is None else now, gh=fake, record=record,
+                                            clock=clock or (lambda: self.NOW))
         status = next((c for c in calls if c[:3] == ("api", "-X", "POST")), None)
         return code, out, status
 
@@ -973,7 +1089,8 @@ class SmokeCommands(unittest.TestCase):
         self.assertNotIn("observed_at", out)  # and with no failure time, no smoke pass can cancel that halt
 
     def test_observed_at_is_read_after_the_status_is_written(self):
-        # Claude round 4: a time taken before the write would let a pass recorded in between count as after it
+        # Claude round 4, now only the fallback: when the failing attempt left no time of its own, this job's clock
+        # is read after the write, so a pass recorded in between never counts as after the failure
         fail = ("fail", "failure", "failed on host")
         posted = []
 
@@ -988,6 +1105,117 @@ class SmokeCommands(unittest.TestCase):
                                         gh=fake, clock=lambda: self.NOW + 3 if posted else self.NOW)
         self.assertEqual((code, out["action"], len(posted)), (0, "revert", 1))
         self.assertEqual(out["observed_at"], mt.iso_utc(self.NOW + 3))
+
+    @staticmethod
+    def description(status):
+        return next(a for a in status if a.startswith("description="))[len("description="):]
+
+    def test_receipt_dates_the_attempts_not_the_receipt_job(self):
+        # Codex round 5: a receipt job that runs late (queued, or re-run the next day) records each attempt's own time
+        # and identity and hands rollback the failing attempt's own end, so it decides exactly as an on-time one,
+        # including the parent's age (an hour late would otherwise make a 2 h 57 min old parent pass "too old")
+        t = mt.iso_utc
+        fail1 = ("fail", "failure", "failed on host", t(self.NOW - 400), t(self.NOW - 300), "77.1.first")
+        fail2 = ("fail", "failure", "failed on host", t(self.NOW - 200), t(self.NOW - 100), "77.1.retry")
+        seen = set()
+        for late in (0, 3600, 86400):
+            code, out, status = self.receipt([fail1, fail2], now=self.NOW + late, clock=lambda: self.NOW + late + 5,
+                                             parent_age=mt.SMOKE_PARENT_MAX_AGE_S - 60)
+            self.assertEqual((code, out["action"], out["culprit"]), (0, "revert", self.E), late)
+            self.assertEqual(out["observed_at"], t(self.NOW - 100), late)  # the retry's own end
+            desc = self.description(status)
+            self.assertTrue(desc.startswith(f"[{t(self.NOW - 100)} 77.1.retry] fail: "), (late, desc))
+            self.assertLessEqual(len(desc), 140)
+            seen.add((out["observed_at"], desc))
+        self.assertEqual(len(seen), 1)  # identical however late the receipt job ran
+        # a parent pass more than 3 h before the failure (NOW-100) still halts
+        code, out, _ = self.receipt([fail1, fail2], parent_age=mt.SMOKE_PARENT_MAX_AGE_S + 200)
+        self.assertEqual(out["action"], "halt")
+
+    def test_receipt_marks_follow_the_attempt_that_decided(self):
+        t = mt.iso_utc
+        ok1 = ("pass", "success", "ok", t(self.NOW - 500), t(self.NOW - 400), "78.1.first")
+        ok2 = ("pass", "success", "ok", t(self.NOW - 250), t(self.NOW - 150), "78.1.retry")
+        failed = ("fail", "failure", "x", t(self.NOW - 900), t(self.NOW - 800), "78.1.first")
+        unv = ("unverified", "failure", "y", t(self.NOW - 700), t(self.NOW - 600), "78.1.retry")
+        late = lambda: self.NOW + 999  # noqa: E731 - this job's clock, far later than every attempt
+        # a pass is dated by when its run STARTED
+        _, out, status = self.receipt([ok1, ("", "skipped", "")], now=self.NOW + 999, clock=late)
+        self.assertTrue(self.description(status).startswith(f"[{t(self.NOW - 500)} 78.1.first] pass: "))
+        _, out, status = self.receipt([failed, ok2], now=self.NOW + 999, clock=late)
+        self.assertTrue(self.description(status).startswith(f"[{t(self.NOW - 250)} 78.1.retry] pass: "))
+        # a halt by when the last attempt that ran and failed ENDED
+        _, out, status = self.receipt([failed, unv], now=self.NOW + 999, clock=late)
+        self.assertEqual((out["action"], out["observed_at"]), ("halt", t(self.NOW - 600)))
+        self.assertTrue(self.description(status).startswith(f"[{t(self.NOW - 600)} 78.1.retry] "))
+        _, out, status = self.receipt([failed, ("", "skipped", "")], now=self.NOW + 999, clock=late)
+        self.assertEqual((out["action"], out["observed_at"]), ("halt", t(self.NOW - 800)))  # the retry never ran
+        # the retry ran but left no time (its job died before the verdict step): this job's clock, after the write
+        _, out, status = self.receipt([failed, ("", "failure", "")], now=self.NOW + 999, clock=late)
+        self.assertEqual((out["action"], out["observed_at"]), ("halt", t(self.NOW + 999)))
+        self.assertTrue(self.description(status).startswith("[- -] "))
+        # pending verification carries no time; nor does an attempt without the new outputs
+        _, out, status = self.receipt([("deferred", "success", "moved", t(self.NOW), t(self.NOW), "78.1.first"),
+                                       ("", "skipped", "")])
+        self.assertTrue(self.description(status).startswith("[- -] pending verification: "))
+        _, out, status = self.receipt([("pass", "success", "ok"), ("", "skipped", "")])
+        self.assertTrue(self.description(status).startswith("[- -] pass: "))
+        self.assertEqual(mt.attempt_fields(("pass", "success")), ("pass", "success", "", "", "", ""))
+
+    def test_verdict_command_outputs_the_attempts_own_identity_and_times(self):
+        import os
+        import tempfile
+        host = mt.deployment_host(self.URL)
+        same = {"version": self.E, "deployment": host}
+        end = mt.receipt_time("2027-01-15T08:06:00Z")
+
+        def verdict(before_at, run_id="4242", attempt="retry", mode="post-merge"):
+            with tempfile.TemporaryDirectory() as d:
+                before = dict(same, checkedAt=before_at) if before_at is not None else dict(same)
+                self.write_provenance(d, before, dict(same, checkedAt="2027-01-15T08:05:00.000Z"))
+                with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": "2"}):
+                    _, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, self.URL, True, "", "failure", d, mode,
+                                             attempt=attempt, clock=lambda: end)
+            return out
+        out = verdict("2027-01-15T08:00:00.250Z")
+        self.assertEqual((out["verdict"], out["attempt_id"], out["started_at"], out["ended_at"]),
+                         ("fail", "4242.2.retry", "2027-01-15T08:00:00Z", "2027-01-15T08:06:00Z"))
+        self.assertEqual(verdict(None)["started_at"], "")  # no time in the "before" record
+        self.assertEqual(verdict("2027-01-15T08:07:00Z")["started_at"], "")  # later than the verdict: not believed
+        self.assertEqual(verdict("2027-01-15T08:00:00")["started_at"], "")  # no time zone
+        self.assertEqual(verdict("2027-01-15T08:00:00Z", run_id="")["attempt_id"], "")
+        self.assertEqual(verdict("2027-01-15T08:00:00Z", attempt="", mode="scheduled")["attempt_id"],
+                         "4242.2.scheduled")
+        # not ready: nothing was tested, so no start, but the attempt still names itself and its end
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "1"}):
+            _, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, "", False, "no live deployment", "skipped", "",
+                                     attempt="first", clock=lambda: end)
+        self.assertEqual((out["attempt_id"], out["started_at"], out["ended_at"]),
+                         ("4242.1.first", "", "2027-01-15T08:06:00Z"))
+        # pure parts
+        self.assertEqual(mt.attempt_identity("", "1", "first"), "")
+        self.assertEqual(mt.attempt_identity("7", "", "first"), "7.1.first")
+        self.assertEqual(mt.attempt_identity("7", "1", "bad name"), "")
+        self.assertEqual(mt.attempt_window(None, 5.0), (None, 5.0))
+        self.assertEqual(mt.attempt_window(6.0, 5.0), (None, 5.0))
+        self.assertEqual(mt.attempt_window(4.0, 5.0), (4.0, 5.0))
+
+    def test_receipt_and_verdict_commands_forward_the_attempt_fields(self):
+        seen = []
+        with patch.object(mt, "smoke_receipt", side_effect=lambda *a, **k: seen.append(a[4]) or 0):
+            mt.main(["smoke-receipt", "--sha", self.E, "--first", "fail", "--first-result", "failure",
+                     "--first-detail", "d1", "--first-started-at", "s1", "--first-ended-at", "e1",
+                     "--first-attempt-id", "i1", "--retry", "fail", "--retry-result", "failure", "--retry-detail", "d2",
+                     "--retry-started-at", "s2", "--retry-ended-at", "e2", "--retry-attempt-id", "i2"])
+            mt.main(["smoke-receipt", "--sha", self.E])
+        self.assertEqual(seen, [[("fail", "failure", "d1", "s1", "e1", "i1"),
+                                 ("fail", "failure", "d2", "s2", "e2", "i2")],
+                                [("",) * 6, ("",) * 6]])
+        got = []
+        with patch.object(mt, "smoke_verdict_cmd", side_effect=lambda *a, **k: got.append(k.get("attempt")) or 0):
+            mt.main(["smoke-verdict", "--sha", self.E, "--attempt", "retry"])
+            mt.main(["smoke-verdict", "--sha", self.E])
+        self.assertEqual(got, ["retry", ""])
 
     def test_with_recording_off_nothing_is_written_and_nothing_is_reverted(self):
         # Codex round 4: no post-merge/smoke status until every reader of master's combined status reads the
@@ -1107,6 +1335,26 @@ class SmokeWorkflowContract(unittest.TestCase):
         rollback_job = wf.split("\n  rollback:\n", 1)[1]
         self.assertIn("statuses: read", rollback_job)
         self.assertIn("deployments: read", rollback_job)
+
+    def test_each_attempt_carries_its_own_identity_and_times_to_the_receipt(self):
+        # Codex round 5: the receipt dates the attempts from their own outputs, never from when the receipt job ran
+        smoke = self.code(".github/workflows/smoke-test.yml")
+        for name in ("attempt_id", "started_at", "ended_at"):
+            self.assertIn(f"value: ${{{{ jobs.smoke.outputs.{name} }}}}", smoke)
+            self.assertIn(f"{name}: ${{{{ steps.verdict.outputs.{name} }}}}", smoke)
+        verdict_step = smoke.split("- name: Verdict and receipt", 1)[1]
+        self.assertIn("ATTEMPT: ${{ inputs.attempt }}", verdict_step)
+        self.assertIn('--attempt "$ATTEMPT"', verdict_step)
+        wf = self.code(".github/workflows/post-merge.yml")
+        self.assertIn("attempt: first", wf.split("\n  smoke:\n", 1)[1].split("\n  smoke-retry:\n", 1)[0])
+        self.assertIn("attempt: retry", wf.split("\n  smoke-retry:\n", 1)[1].split("\n  receipt:\n", 1)[0])
+        receipt_job = wf.split("\n  receipt:\n", 1)[1].split("\n  rollback:\n", 1)[0]
+        for job, prefix in (("smoke", "FIRST"), ("smoke-retry", "RETRY")):
+            for name in ("started_at", "ended_at", "attempt_id"):
+                env = f"{prefix}_{name.upper()}"
+                self.assertIn(f"{env}: ${{{{ needs.{job}.outputs.{name} }}}}", receipt_job)
+                flag = f"--{prefix.lower()}-{name.replace('_', '-')}"
+                self.assertIn(f'{flag} "${env}"', receipt_job)
 
     def test_smoke_workflow_is_bound_read_only_and_keeps_no_artifact(self):
         wf = self.code(".github/workflows/smoke-test.yml")

@@ -12,14 +12,17 @@ enforced for admins) stays the final gate: this script only does the clicking a 
              [--mode MODE]       successful Production deployment and (post-merge) not be superseded by a deployed
                                  newer head; scheduled: the newest deployed master commit; print ready, sha, URL
     smoke-verdict --sha SHA      (smoke-test.yml) pass | fail | deferred | unverified from the test outcome and the
-             [--mode MODE]       revision production served before and after the run; writes the receipt. A
-                                 scheduled run also fails when it could not test what production serves
+             [--mode MODE]       revision production served before and after the run; writes the receipt and the
+             [--attempt NAME]    attempt's own identity and start / end times. A scheduled run also fails when it
+                                 could not test what production serves
     smoke-receipt --sha SHA      (post-merge.yml) decide none | revert | halt, with the culprit read from the smoke
-             [--record-status V] receipts; V=on also records the attempts as the commit status post-merge/smoke,
-                                 otherwise nothing is written and a smoke failure always halts (no revert)
+             [--record-status V] receipts; V=on also records the attempts (with their own times and identity)
+                                 as the commit status post-merge/smoke, otherwise nothing is written and a smoke
+                                 failure always halts (no revert)
     rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting);
              [--halt-only]       with --halt-only (failure provenance unknown) halt and file the issue, no revert;
-             [--failed-at T]     only a smoke pass recorded after T (the receipt's observed_at) cancels either
+             [--failed-at T]     only a smoke pass whose run started after T (the receipt's observed_at: when
+                                 the failing attempt ended) cancels either
     ensure-labels                create the hold / rollback / train-halt labels
 """
 from __future__ import annotations
@@ -467,13 +470,14 @@ def already_fixed(sha: str, unattributed: bool = False, failed_at: float | None 
     shows sha's failed build is fixed, sha itself when a later smoke run on its own deployment passed after its
     failure, or the newer master commit whose exact smoke pass shows sha's failure is fixed (DEL-02).
 
-    failed_at = when the failure being reconciled was observed (the receipt job's time, epoch s): every smoke pass
-    that resolves it must be recorded after it, so a recovery or a newer commit's pass from before a NEW failure never
-    hides that failure (Codex R6). None: for a revert or a queued rollback PR, the commit's newest exact failure
-    receipt is that failure (the receipt job always records a failure before it asks for a revert); for a halt
-    (unattributed) nothing shows when it failed, so only a fixed build can resolve it and the halt goes ahead.
-    unattributed = a halt without a revert (the receipt may be "pending" or not written): any newer exact pass
-    recorded after failed_at resolves it."""
+    failed_at = when the failing attempt being reconciled ended (the receipt job's observed_at, on the smoke runner's
+    clock, epoch s): every smoke pass that resolves it must have started after it, so a recovery or a newer commit's
+    pass from before a NEW failure never hides that failure (Codex R6), and a receipt job that ran late never hides
+    a pass that came after the failure (Codex round 5). None: for a revert or a queued rollback PR, the commit's
+    newest exact failure receipt is that failure (the receipt job always records a failure before it asks for a
+    revert); for a halt (unattributed) nothing shows when it failed, so only a fixed build can resolve it and the halt
+    goes ahead. unattributed = a halt without a revert (the receipt may be "pending" or not written): any newer exact
+    pass that started after failed_at resolves it."""
     later = later_chain(sha)
     own_states = production_states(sha)
     fixer = fixed_later(own_states, later)
@@ -768,15 +772,75 @@ def smoke_outcome(first: str, retry: str) -> str:
     return "halt"
 
 
+# A receipt carries the time and identity of the smoke ATTEMPT it records, at the start of its description:
+# "[<attempt time> <attempt id>] <label>: <detail>" (receipt_description). The time is the smoke runner's own clock,
+# never when the receipt job ran: a receipt job that runs late (queued, or re-run) must neither move a failure after a
+# newer commit's pass nor move a pass after a newer failure (Codex round 5). A pass is dated when its attempt STARTED
+# (production confirmed to serve the target, before the tests), a failure when its last failing attempt ENDED, so "a
+# pass after the failure" means the passing run began after the failing one was over.
+RECEIPT_MARK = re.compile(r"\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ|-) ([A-Za-z0-9._-]{1,80}|-)\] ")
+ATTEMPT_ID = re.compile(r"[A-Za-z0-9._-]{1,80}")
+# An attempt cannot end after GitHub recorded its receipt. An attempt time more than this past the receipt's
+# created_at is a smoke runner whose clock ran ahead, and is not believed (receipt_at).
+RECEIPT_CLOCK_SLACK_S = 120
+
+
+def receipt_description(at: float | None, attempt: str, text: str) -> str:
+    """Pure: a post-merge/smoke status description: the attempt's time (or -) and identity (or -) first, then the
+    text, cut to GitHub's 140 characters. receipt_mark reads it back."""
+    ident = attempt if ATTEMPT_ID.fullmatch(attempt or "") else "-"
+    mark = f"[{iso_utc(at) if at is not None else '-'} {ident}] "
+    return (mark + " ".join(str(text).split()))[:140]
+
+
+def receipt_mark(row: dict) -> tuple[float | None, str]:
+    """Pure: (attempt time in epoch s or None, attempt id or "") from a receipt's description."""
+    m = RECEIPT_MARK.match(row.get("description") or "")
+    if not m:
+        return None, ""
+    return (receipt_time(m.group(1)) if m.group(1) != "-" else None), ("" if m.group(2) == "-" else m.group(2))
+
+
+def attempt_time_of(row: dict) -> float | None:
+    """Pure: the attempt time a receipt carries, or None when it has none or it lies more than RECEIPT_CLOCK_SLACK_S
+    after GitHub recorded the receipt (the smoke runner's clock ran ahead: a pass would look later than it was)."""
+    at = receipt_mark(row)[0]
+    written = receipt_time(row.get("created_at"))
+    if at is not None and written is not None and at > written + RECEIPT_CLOCK_SLACK_S:
+        return None
+    return at
+
+
+def receipt_at(row: dict) -> float | None:
+    """Pure: when the attempt a receipt records happened, for comparisons. A pass: only its own attempt time (a pass
+    that cannot be dated proves nothing). A failure: its attempt time, else when GitHub recorded the receipt, which
+    is never earlier than the attempt, so an undated failure can only look later, never hide behind an older pass."""
+    at = attempt_time_of(row)
+    if at is not None or row.get("state") != "failure":
+        return at
+    return receipt_time(row.get("created_at"))
+
+
+def smoke_receipts(rows: list[dict]) -> list[dict]:
+    """Pure: rows = sha's commit statuses (GitHub lists them newest first). -> the exact smoke receipts (success /
+    failure) the workflow's own token wrote, newest ATTEMPT first: a receipt written late for an earlier attempt sorts
+    below one for a later attempt. A row without an attempt time sorts by when GitHub recorded it; ties keep GitHub's
+    order. Pending rows are skipped: a later re-run that only reached "pending verification" does not erase an exact
+    pass or fail recorded earlier. A status another account posted is ignored."""
+    exact = [r for r in rows if r.get("context") == SMOKE_CONTEXT and r.get("creator") in BOT_LOGINS
+             and r.get("state") in ("success", "failure")]
+
+    def key(r: dict) -> float:
+        at = attempt_time_of(r)
+        at = receipt_time(r.get("created_at")) if at is None else at
+        return float("-inf") if at is None else at
+    return sorted(exact, key=key, reverse=True)  # stable: equal keys keep GitHub's newest-first order
+
+
 def smoke_receipt_row(rows: list[dict]) -> dict | None:
-    """Pure: rows = sha's commit statuses newest first. -> the newest exact smoke receipt (success / failure) the
-    workflow's own token wrote. Pending rows are skipped: a later re-run that only reached "pending verification" does
-    not erase an exact pass or fail recorded earlier. A status another account posted is ignored."""
-    for r in rows:
-        if (r.get("context") == SMOKE_CONTEXT and r.get("creator") in BOT_LOGINS
-                and r.get("state") in ("success", "failure")):
-            return r
-    return None
+    """Pure: the newest exact smoke receipt (smoke_receipts), or None."""
+    exact = smoke_receipts(rows)
+    return exact[0] if exact else None
 
 
 def smoke_state_of(rows: list[dict]) -> str:
@@ -786,8 +850,9 @@ def smoke_state_of(rows: list[dict]) -> str:
 
 
 def receipt_time(created_at: str | None) -> float | None:
-    """Pure: epoch seconds of an ISO 8601 time (a status's created_at, the receipt job's observed_at), or None when
-    it cannot be read or names no time zone (a naive time would be read in the runner's zone)."""
+    """Pure: epoch seconds of an ISO 8601 time (a status's created_at, an attempt time, the receipt job's
+    observed_at), or None when it cannot be read or names no time zone (a naive time would be read in the runner's
+    zone)."""
     try:
         at = datetime.fromisoformat(str(created_at).strip().replace("Z", "+00:00"))
     except ValueError:
@@ -796,22 +861,25 @@ def receipt_time(created_at: str | None) -> float | None:
 
 
 def iso_utc(ts: float) -> str:
-    """Pure: epoch seconds -> ISO 8601 UTC with a Z, the form GitHub writes created_at in (receipt_time reads it)."""
+    """Pure: epoch seconds -> ISO 8601 UTC with a Z, whole seconds (the form GitHub writes created_at in; receipt_time
+    reads it). Dropping the fraction never reorders two times, and every comparison is strict, so two attempts in
+    the same second never count as one after the other."""
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def receipt_age_s(created_at: str | None, now: float) -> float | None:
-    """Pure: seconds from a status's created_at (ISO 8601) to now, or None when it cannot be read."""
+    """Pure: seconds from an ISO 8601 time (a receipt's attempt time) to now, or None when it cannot be read."""
     at = receipt_time(created_at)
     return None if at is None else now - at
 
 
 def smoke_culprit(sha: str, parent_state: str, parent_age_s: float | None) -> str | None:
     """Pure: the commit to revert after BOTH smoke attempts failed on sha's own deployment. Only sha itself, and only
-    when its parent passed the smoke test on its own deployment within SMOKE_PARENT_MAX_AGE_S: then the change that
-    broke it is sha. A parent that was never verified on its own deployment (superseded, deferred, unverified) may
-    hold the breaking change, a parent that already failed was handled by its own verification, and an old pass does
-    not rule out live data that changed since (the suite reads production data); all of these halt for a person."""
+    when its parent passed the smoke test on its own deployment within SMOKE_PARENT_MAX_AGE_S before this failure
+    (attempt times, so a receipt job that ran late changes nothing): then the change that broke it is sha. A parent
+    that was never verified on its own deployment (superseded, deferred, unverified) may hold the breaking change, a
+    parent that already failed was handled by its own verification, and an old pass does not rule out live data that
+    changed since (the suite reads production data); all of these halt for a person."""
     if parent_state != "pass" or parent_age_s is None or parent_age_s > SMOKE_PARENT_MAX_AGE_S:
         return None
     return sha
@@ -821,46 +889,49 @@ def smoke_fixed_later(own_state: str, later: list[tuple[str, str, str]], since: 
                       unattributed: bool = False) -> str | None:
     """Pure: a failed smoke test is already fixed when a newer master commit that contains it passed the smoke test
     on its own deployment AFTER the failure. Reverting then would take a working change off the site.
-    later = [(commit, its newest exact receipt pass | fail | unknown, that receipt's created_at)] newest first;
-    since = when the failure being reconciled was observed (epoch s). A pass recorded at or before it says nothing
-    about that failure (an older descendant pass, then a Vercel rollback or changed live data and a new failure), and
-    no time or an unreadable created_at proves nothing: None.
+    later = [(commit, its newest exact receipt pass | fail | unknown, that receipt's attempt time (receipt_at))]
+    newest first; since = when the failing attempt ended (epoch s). A pass whose run started at or before it says
+    nothing about that failure (an older descendant pass, then a Vercel rollback or changed live data and a new
+    failure), and no time or an unreadable one proves nothing: None. Attempt times, not receipt times: a receipt job
+    that ran late never decides (Codex round 5).
     unattributed (a halt without a revert, whose own receipt may be only "pending"): the same newer pass shows
     production works again, so halting would only block the train."""
     if (own_state != "fail" and not unattributed) or since is None:
         return None
-    for commit, state, created_at in later:
-        at = receipt_time(created_at)
+    for commit, state, attempt_at in later:
+        at = receipt_time(attempt_at)
         if state == "pass" and at is not None and at > since:
             return commit
     return None
 
 
 def smoke_recovered(rows: list[dict], failed_at: float | None = None) -> bool:
-    """Pure: rows = a commit's statuses newest first. True when its newest exact smoke receipt is a pass recorded
-    after the failure being reconciled: a later run on its own deployment passed (the failure was live data or a
+    """Pure: rows = a commit's statuses. True when its newest exact smoke receipt is a pass whose run started after
+    the failure being reconciled ended: a later run on its own deployment passed (the failure was live data or a
     transient error), so a queued revert of it would take a working change off the site.
 
-    failed_at (epoch s) = when that failure was observed: the pass must be recorded strictly later. A recovery from an
-    OLDER failure never clears a new one: fail, pass, then a run that failed twice without confirmed provenance leaves
-    the old pass as the newest exact receipt (pending never overwrites it), and that pass predates the new failure
-    (Codex R6). None = the failure is the commit's newest exact failure receipt (a revert: the receipt job always
-    records it), so the pass must be newer than that row. A pass with no earlier failure is no recovery (a drill on a
-    passing commit still opens its revert), nor is a pass whose time cannot be read."""
-    exact = [r for r in rows if smoke_receipt_row([r])]
+    failed_at (epoch s) = when the failing attempt ended: the pass must have started strictly later. A recovery from
+    an OLDER failure never clears a new one: fail, pass, then a run that failed twice without confirmed provenance
+    leaves the old pass as the newest exact receipt (pending never overwrites it), and that pass predates the new
+    failure (Codex R6). None = the failure is the commit's newest exact failure receipt (a revert: the receipt job
+    always records it), so the pass must be later than that receipt's attempt. A pass with no earlier failure is no
+    recovery (a drill on a passing commit still opens its revert), nor is a pass that cannot be dated."""
+    exact = smoke_receipts(rows)
     if not exact or exact[0]["state"] != "success":
         return False
     if failed_at is None:
-        return any(r["state"] == "failure" for r in exact[1:])
-    at = receipt_time(exact[0].get("created_at"))
+        failed_at = failure_time(rows)
+        if failed_at is None:
+            return False
+    at = receipt_at(exact[0])
     return at is not None and at > failed_at
 
 
 def failure_time(rows: list[dict]) -> float | None:
-    """Pure: rows = a commit's statuses newest first. -> when its newest exact smoke FAILURE receipt was recorded
-    (epoch s), or None when there is none or its time cannot be read."""
-    row = next((r for r in rows if smoke_receipt_row([r]) and r["state"] == "failure"), None)
-    return receipt_time(row.get("created_at")) if row else None
+    """Pure: rows = a commit's statuses. -> when the attempt of its newest exact smoke FAILURE receipt ended (epoch
+    s, receipt_at), or None when there is none or it cannot be dated."""
+    row = next((r for r in smoke_receipts(rows) if r["state"] == "failure"), None)
+    return receipt_at(row) if row else None
 
 
 def smoke_status(outcome: str) -> str:
@@ -871,14 +942,16 @@ def smoke_status(outcome: str) -> str:
 def smoke_rows(sha: str) -> list[dict]:
     """sha's commit statuses, newest first (the receipt fields only)."""
     return api_items(f"repos/{REPO}/commits/{sha}/statuses?per_page=100",
-                     ".[]|{context,state,created_at,creator:(.creator.login // \"\")}")
+                     ".[]|{context,state,created_at,description:(.description // \"\"),"
+                     "creator:(.creator.login // \"\")}")
 
 
 def smoke_receipt_of(sha: str) -> tuple[str, str]:
-    """-> (pass | fail | unknown, created_at of that receipt or "")."""
+    """-> (pass | fail | unknown, the attempt time of that receipt (receipt_at) as ISO 8601, or "")."""
     rows = smoke_rows(sha)
     r = smoke_receipt_row(rows)
-    return smoke_state_of(rows), (r or {}).get("created_at") or ""
+    at = receipt_at(r) if r else None
+    return smoke_state_of(rows), iso_utc(at) if at is not None else ""
 
 
 def smoke_state(sha: str) -> str:
@@ -952,6 +1025,31 @@ def load_provenance(directory: str, phase: str) -> dict | None:
         return None
 
 
+def load_checked_at(directory: str, phase: str) -> float | None:
+    """When a provenance record was taken (its checkedAt, written by e2e/provenance.ts on the smoke runner), epoch s,
+    or None when the record or its time cannot be read."""
+    try:
+        with open(os.path.join(directory, f"{phase}.json"), encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    checked = raw.get("checkedAt") if isinstance(raw, dict) else None
+    return receipt_time(checked) if isinstance(checked, str) else None
+
+
+def attempt_identity(run_id: str, run_attempt: str, name: str) -> str:
+    """Pure: one smoke attempt's identity, `<workflow run id>.<run attempt>.<first | retry | mode>`, or "" when it
+    cannot be formed (no run id, or characters a receipt cannot carry)."""
+    ident = f"{run_id}.{run_attempt or '1'}.{name}"
+    return ident if run_id and ATTEMPT_ID.fullmatch(ident) else ""
+
+
+def attempt_window(began: float | None, ended: float) -> tuple[float | None, float]:
+    """Pure: (started, ended) of one smoke attempt on the smoke runner's clock. started = when production was
+    confirmed to serve the target before the tests (the "before" record), None when unknown or later than ended."""
+    return (began if began is not None and began <= ended else None), ended
+
+
 def newer_master_commit(sha: str, other: str) -> bool:
     """Whether `other` is a master commit that contains sha (production moved on to a newer merge)."""
     try:
@@ -963,8 +1061,14 @@ def newer_master_commit(sha: str, other: str) -> bool:
 
 
 def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests: str, directory: str,
-                      mode: str = "post-merge") -> int:
-    """smoke-test.yml: the verdict and the receipt (job summary). Exit 1 = the smoke job fails (smoke_exit)."""
+                      mode: str = "post-merge", attempt: str = "", clock=time.time) -> int:
+    """smoke-test.yml: the verdict and the receipt (job summary). Exit 1 = the smoke job fails (smoke_exit).
+    Also outputs the attempt's own identity and times (attempt_id, started_at, ended_at, this runner's clock):
+    post-merge.yml records them in the receipt, so a receipt job that runs late, or is re-run, dates the attempt
+    exactly as it happened (Codex round 5). attempt = first | retry (post-merge), else the mode names it."""
+    started, ended = attempt_window(load_checked_at(directory, "before") if ready and directory else None, clock())
+    attempt_id = attempt_identity(os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+                                  attempt or mode)
     scheduled = mode == "scheduled"
     host = deployment_host(url)
     before = load_provenance(directory, "before") if ready and directory else None
@@ -1010,9 +1114,13 @@ def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests
         tested_deployment = f"https://{before['deployment']}"
     else:
         tested_deployment = ""
-    set_outputs(verdict=verdict, detail=detail, tested_sha=sha if exact else "", tested_deployment=tested_deployment)
+    set_outputs(verdict=verdict, detail=detail, tested_sha=sha if exact else "", tested_deployment=tested_deployment,
+                attempt_id=attempt_id, started_at=iso_utc(started) if started is not None else "",
+                ended_at=iso_utc(ended))
     note("\n".join([
         f"### Smoke receipt ({mode})",
+        f"- attempt: `{attempt_id or 'unknown'}`, started {iso_utc(started) if started is not None else 'unknown'}, "
+        f"ended {iso_utc(ended)}",
         f"- expected commit: `{sha or 'none'}`",
         f"- expected deployment: `{host or ('any deployment of the commit' if scheduled else 'none')}`",
         f"- production served before the run: {served_label(before)}",
@@ -1023,33 +1131,61 @@ def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests
     return code
 
 
-def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts: list[tuple[str, str, str]],
+def attempt_fields(attempt) -> tuple[str, str, str, str, str, str]:
+    """Pure: (verdict, job result, detail, started_at, ended_at, attempt id) of one smoke attempt from its job's
+    outputs; fields a caller leaves out are empty."""
+    return tuple((list(attempt) + [""] * 6)[:6])
+
+
+def receipt_attempt(outcome: str, first_failed: bool, a1: tuple, a2: tuple) -> tuple[float | None, str]:
+    """Pure: (attempt time, attempt id) a receipt records, from the attempts' own outputs (attempt_fields).
+    pass = when the passing attempt STARTED; fail / halt = when the last attempt that ran and failed ENDED (the retry
+    unless it never ran); pending = no time. None = that attempt left no readable time."""
+    if outcome == "pass":
+        a = a2 if first_failed else a1
+        return (receipt_time(a[3]) if a[3] else None), a[5]
+    if outcome in ("fail", "halt"):
+        a = a2 if a2[1] not in ("skipped", "") else a1
+        return (receipt_time(a[4]) if a[4] else None), a[5]
+    return None, ""
+
+
+def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts: list[tuple],
                   now: float | None = None, record: bool = True, clock=time.time) -> int:
     """post-merge.yml: record the smoke attempts on the commit and decide the action. attempts = [(verdict, job
-    result, detail)] for the first run and the retry. Outputs action = none | revert | halt, culprit, reason, and
-    only once the receipt is recorded: when it cannot be written (or sha cannot be checked against master) the job
-    fails with no action, and post-merge.yml halts without a revert if the smoke test failed.
+    result, detail, started_at, ended_at, attempt id)] for the first run and the retry (attempt_fields; the last
+    three are the smoke job's own outputs). Outputs action = none | revert | halt, culprit, reason, and only once the
+    receipt is recorded: when it cannot be written (or sha cannot be checked against master) the job fails with no
+    action, and post-merge.yml halts without a revert if the smoke test failed.
+
+    The receipt and observed_at carry the ATTEMPTS' times, never this job's (Codex round 5): a receipt job that ran
+    late, or was re-run, would otherwise date a failure after a newer commit's pass and revert or halt for nothing.
 
     record = write the receipt as the commit status post-merge/smoke (post-merge.yml: the repository variable
     SMOKE_RECEIPT_STATUS is "on"). Off: nothing is written and nothing is reverted (a revert needs its failure
     recorded as a receipt, which a queued rollback PR is later reconciled against), so every smoke failure halts for
     a person; the job summary still carries the receipt. It stays off until every reader of master's combined commit
     status reads the `Vercel` context instead, because a pending or failed receipt changes that combined state
-    (docs/ci-cd.md). clock = the time source of observed_at, read after the status is written (tests pass a fake)."""
+    (docs/ci-cd.md). clock = the fallback time source of observed_at, only when the failing attempt left no time,
+    read after the status is written (tests pass a fake)."""
     host = deployment_host(url) or "production"
     now = clock() if now is None else now
     if not HEX40.fullmatch(sha or ""):
         set_outputs(action="none", culprit="", reason="", outcome="pending")
         note(f"smoke receipt: no commit to record ({sha!r})")
         return 0
+    mark_at, mark_id = None, ""
     if verify != "ok":
         outcome, detail = "pending", f"not smoke-tested: {verify_detail or verify}"
     else:
-        (v1, r1, d1), (v2, r2, d2) = attempts
-        first = attempt_verdict(v1, r1)
-        retry = retry_verdict(v2, r2) if first in FAILED else ""
+        a1, a2 = (attempt_fields(a) for a in attempts)
+        first = attempt_verdict(a1[0], a1[1])
+        retry = retry_verdict(a2[0], a2[1]) if first in FAILED else ""
         outcome = smoke_outcome(first, retry)
-        detail = (d2 if first in FAILED else d1) or f"smoke job {r2 if first in FAILED else r1}"
+        detail = (a2[2] if first in FAILED else a1[2]) or f"smoke job {a2[1] if first in FAILED else a1[1]}"
+        mark_at, mark_id = receipt_attempt(outcome, first in FAILED, a1, a2)
+    # the failure the decision is about, on the smoke runner's clock; None = unknown (then this job's clock, below)
+    failed_at = mark_at if outcome in ("fail", "halt") else None
     action, culprit, reason = "none", "", ""
     state = smoke_status(outcome)
     label = {"pass": "pass", "fail": "fail", "pending": "pending verification",
@@ -1074,7 +1210,9 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
                 parent_state, parent_at = smoke_receipt_of(parent) if known else ("unknown", "")
             except GhError:  # an unreadable receipt proves nothing about the parent
                 parent_state, parent_at = "unknown", ""
-            age = receipt_age_s(parent_at, now) if parent_at else None
+            # the parent's passing attempt to this failure, both on the smoke runners' clocks: a receipt job that ran
+            # late never makes the parent's pass look too old (an unknown failure time falls back to now: older)
+            age = receipt_age_s(parent_at, failed_at if failed_at is not None else now) if parent_at else None
             culprit = smoke_culprit(sha, parent_state, age) or ""
             if culprit:
                 action = "revert"
@@ -1103,35 +1241,39 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
             run = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{REPO}/actions/runs/"
                    f"{os.environ.get('GITHUB_RUN_ID', '')}")
             gh("api", "-X", "POST", f"repos/{REPO}/statuses/{sha}", "-f", f"state={state}",
-               "-f", f"context={SMOKE_CONTEXT}", "-f", f"description={(label + ': ' + detail)[:140]}",
+               "-f", f"context={SMOKE_CONTEXT}",
+               "-f", f"description={receipt_description(mark_at, mark_id, label + ': ' + detail)}",
                "-f", f"target_url={run}")
     except GhError as e:
         note(f"smoke receipt {sha[:7]}: could not record the receipt ({e}); no action published, so a failed smoke "
              f"test halts the train without a revert")
         return 1
-    # observed_at = when this receipt was settled, read AFTER the status was written (Claude round 4: a time taken
-    # before the write would let a pass recorded in between, such as a newer commit's run, count as after the
-    # failure). rollback only lets a smoke pass recorded after it resolve this failure. GitHub's created_at and
-    # iso_utc both drop fractions of a second and the comparison is strict, so a pass in the same second never
-    # counts. It is published with the decision, so a receipt that could not be written leaves no time and the halt
-    # goes ahead.
-    observed = max(now, clock())
+    # observed_at = when the failure the decision is about happened: the end of the last attempt that ran and failed,
+    # on the smoke runner's clock, so a receipt job that ran late or was re-run hands rollback the same time (Codex
+    # round 5). rollback lets only a smoke pass whose run STARTED after it resolve this failure. When the failing
+    # attempt left no time (its job died before the verdict step), this job's clock is used, read AFTER the status
+    # was written, so the failure can only look later (Claude round 4). Seconds are whole and every comparison is
+    # strict, so a pass in the same second never counts. It is published with the decision, so a receipt that could
+    # not be written leaves no time and the halt goes ahead.
+    observed = failed_at if failed_at is not None else max(now, clock())
     set_outputs(action=action, culprit=culprit, reason=reason, outcome=outcome, observed_at=iso_utc(observed))
     recorded = state if record else f"{state}, not written"
+    attempt_note = f"; attempt {mark_id or 'unknown'} at {iso_utc(mark_at)}" if mark_at is not None else ""
     note(f"smoke receipt {sha[:7]}: {recorded} ({label}): {detail}; action {action}"
-         + (f" {culprit[:7]}" if culprit else ""))
+         + (f" {culprit[:7]}" if culprit else "") + attempt_note)
     return 0
 
 
 # ---------- rollback ----------
 def rollback(sha: str, reason: str, halt_only: bool = False, failed_at: float | None = None) -> int:
-    """failed_at = when the failure was observed (the receipt job's observed_at, epoch s), None when unknown."""
+    """failed_at = when the failing smoke attempt ended (the receipt job's observed_at, the smoke runner's clock,
+    epoch s), None when unknown."""
     ensure_labels()
     short = sha[:7]
     subject = subprocess.run(["git", "log", "-1", "--format=%s", sha], capture_output=True, text=True).stdout.strip()
     if halt_only:  # failure provenance unknown: halt and diagnose, never revert a change that is not proven bad
         # Unless production works again: a newer master commit containing sha built (a build halt), or passed the
-        # smoke test on its own deployment after this failure was observed, or sha itself passed again after it.
+        # smoke test on its own deployment in a run that started after this failure, or sha itself passed again.
         # Then the halt would only block the train. An unreadable history, or no failure time (a receipt that could
         # not be written, a build halt), proves nothing, so the halt goes ahead.
         try:
@@ -1231,6 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("--tests", default="")
     sv.add_argument("--provenance-dir", default="")
     sv.add_argument("--mode", choices=MODES, default="post-merge")
+    sv.add_argument("--attempt", default="", help="first | retry (post-merge); empty = the mode names the attempt")
     sr = sub.add_parser("smoke-receipt")
     sr.add_argument("--sha", required=True)
     sr.add_argument("--deployment-url", default="")
@@ -1240,6 +1383,9 @@ def main(argv: list[str] | None = None) -> int:
         sr.add_argument(f"--{n}", default="")
         sr.add_argument(f"--{n}-result", default="")
         sr.add_argument(f"--{n}-detail", default="")
+        sr.add_argument(f"--{n}-started-at", default="", help="the attempt's own start (smoke job output started_at)")
+        sr.add_argument(f"--{n}-ended-at", default="", help="the attempt's own end (smoke job output ended_at)")
+        sr.add_argument(f"--{n}-attempt-id", default="", help="the attempt's identity (smoke job output attempt_id)")
     sr.add_argument("--record-status", default="", help='"on" = write the post-merge/smoke commit status (the '
                     'repository variable SMOKE_RECEIPT_STATUS); anything else = job summary only, and a smoke '
                     'failure halts')
@@ -1247,7 +1393,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--sha", required=True)
     r.add_argument("--reason", required=True)
     r.add_argument("--halt-only", action="store_true", help="halt the train and file the issue, no revert")
-    r.add_argument("--failed-at", default="", help="when the failure was observed (ISO 8601, the receipt's observed_at)")
+    r.add_argument("--failed-at", default="", help="when the failing attempt ended (ISO 8601, the receipt's "
+                   "observed_at)")
     sub.add_parser("ensure-labels")
     a = ap.parse_args(argv)
     if a.cmd == "train":
@@ -1258,10 +1405,13 @@ def main(argv: list[str] | None = None) -> int:
         return smoke_target(a.sha, a.deployment_url, a.mode)
     if a.cmd == "smoke-verdict":
         return smoke_verdict_cmd(a.sha, a.deployment_url, a.ready == "true", a.target_detail, a.tests, a.provenance_dir,
-                                 a.mode)
+                                 a.mode, attempt=a.attempt)
     if a.cmd == "smoke-receipt":
         return smoke_receipt(a.sha, a.deployment_url, a.verify, a.verify_detail,
-                             [(a.first, a.first_result, a.first_detail), (a.retry, a.retry_result, a.retry_detail)],
+                             [(a.first, a.first_result, a.first_detail, a.first_started_at, a.first_ended_at,
+                               a.first_attempt_id),
+                              (a.retry, a.retry_result, a.retry_detail, a.retry_started_at, a.retry_ended_at,
+                               a.retry_attempt_id)],
                              record=a.record_status.strip().lower() == "on")
     if a.cmd == "rollback":
         return rollback(a.sha, a.reason, a.halt_only, receipt_time(a.failed_at) if a.failed_at else None)
