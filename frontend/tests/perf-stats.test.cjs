@@ -668,6 +668,59 @@ test('report: a deep run skips the phone scenario and says so once, never as a m
   for (const d of [dir, hourly]) fs.rmSync(d, { recursive: true, force: true });
 });
 
+test('observeOnlyStop: a bounce to the login page or an error line, with how far the loop got; never an address', () => {
+  assert.equal(stats.isLoginBounce(new Error('bounced-to-login: saved session is not valid')), true);
+  assert.equal(stats.isLoginBounce('bounced-to-login: saved session is not valid'), true);
+  assert.equal(stats.isLoginBounce(new Error('page.goto: Timeout 45000ms exceeded')), false);
+  assert.equal(stats.isLoginBounce(null), false);
+  assert.equal(stats.observeOnlyStop(new Error('bounced-to-login: saved session is not valid'), 1, 4, 'navigations'),
+    'bounced to the login page (the saved session was not accepted): 1 of 4 navigations tried');
+  assert.equal(stats.observeOnlyStop('bounced-to-login: saved session is not valid', 0, 12, 'taps'),
+    'bounced to the login page (the saved session was not accepted): 0 of 12 taps tried');
+  const other = stats.observeOnlyStop(new Error('page.goto: net::ERR_FAILED at https://app.example.test/log?x=1\nCall log:\n  - navigating'), 2, 4, 'navigations');
+  assert.equal(other, 'stopped by an error (page.goto: net::ERR_FAILED at <url>): 2 of 4 navigations tried');
+  assert.ok(!/example\.test|Call log/.test(other), 'one line, no address');
+  assert.equal(stats.errorLine(undefined), 'unknown error');
+  assert.equal(stats.errorLine({ message: '' }), 'unknown error');
+  assert.equal(stats.errorLine('x'.repeat(300)).length, 200);
+});
+
+test('report: a phone result that stopped on a bounce is listed as cut short, not a pass, and never enters the enforced budget', () => {
+  const desktop = [v2sample(0, 600), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phoneScenario = { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false };
+  const bounced = { i: 1, cold: false, ok: false, error: 'bounced-to-login: saved session is not valid' };
+  const dir = writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples: desktop },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: phoneScenario,
+      stopped: 'bounced to the login page (the saved session was not accepted): 2 of 4 navigations tried' }), samples: [v2sample(0, 700), bounced] },
+    'phone-log.json': { meta: v2meta('phone-log', '/log, 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-input.json': { meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 12, scenario: { name: 'phone-input', enforced: false },
+      stopped: 'bounced to the login page (the saved session was not accepted): 0 of 12 taps tried' }), samples: [] },
+  });
+  const run = report.loadRun(dir);
+  assert.deepEqual(run.missing, [], 'every phone file was written');
+  const lines = report.missingObserved(run);
+  assert.deepEqual(lines, [
+    '/ (Today), 390 px: stopped early, bounced to the login page (the saved session was not accepted): 2 of 4 navigations tried; the rest not measured, not a pass',
+    'Phone taps, 390 px: stopped early, bounced to the login page (the saved session was not accepted): 0 of 12 taps tried; the rest not measured, not a pass',
+  ]);
+  const observed = stats.observedViolations(run.pages, run.inputs);
+  assert.ok(observed.includes('/ (Today), 390 px: only 2 of 4 navigations were measured'));
+  assert.ok(observed.some((l) => l.startsWith('/ (Today), 390 px: 1 of 2 navigations never reached data-ready')), 'the bounced navigation is not measured, never fast');
+  assert.ok(observed.includes('Phone taps, 390 px: only 0 of 12 taps were tried'));
+  assert.deepEqual(stats.budgetViolations(run.pages), [], 'observe-only results never decide the enforced budget');
+  const md = report.render([run]);
+  assert.match(md, /### Observe-only results not recorded or cut short/);
+  assert.match(md, /- Phone taps, 390 px: stopped early, bounced to the login page/);
+  assert.ok(!/NaN|undefined/.test(md));
+  // A `stopped` reason on an enforced page is not an observe-only line: an enforced page is judged by the budget alone.
+  const enforced = writeRun({ 'today.json': { meta: v2meta('today', '/ (Today)', { stopped: 'anything' }), samples: desktop.slice(0, 2) } });
+  const e = report.loadRun(enforced);
+  assert.ok(!report.missingObserved(e).some((l) => l.includes('stopped early')));
+  assert.ok(stats.budgetViolations(e.pages).includes('/ (Today): only 2 of 4 navigations were measured'));
+  for (const d of [dir, enforced]) fs.rmSync(d, { recursive: true, force: true });
+});
+
 test('report: pooled table keeps revisions and harness versions apart and never pools an unbound result', () => {
   const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
   const legacy = [sample(0, 600, 2), sample(1, 300, 2), sample(2, 310, 2), sample(3, 320, 2)];

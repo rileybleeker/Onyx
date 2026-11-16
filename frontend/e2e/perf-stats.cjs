@@ -134,6 +134,32 @@ const LOW_N = 10;
  */
 const PHONE_MAX_RUN_NAVIGATIONS = 4;
 
+/**
+ * An error as one short line for a result file: its first line, any address replaced by "<url>" (a result file never
+ * holds a URL), at most `max` characters. "unknown error" when there is no message.
+ */
+function errorLine(err, max = 200) {
+  const raw = err && typeof err === "object" && "message" in err ? err.message : err;
+  const line = String(raw == null ? "" : raw).split("\n")[0].replace(/https?:\/\/\S+/g, "<url>").trim();
+  return (line || "unknown error").slice(0, max);
+}
+
+/** True when the error (or reason string) is the harness's bounce to the login page (the saved session was refused). */
+const isLoginBounce = (err) => /^bounced-to-login\b/.test(errorLine(err));
+
+/**
+ * Why an observe-only loop (the phone scenario) ended early on a failure, for its result file's `stopped`: a bounce to
+ * the login page, or the error's first line. `tried` of `planned` navigations / taps were tried before it ended; the
+ * rest are not measured, never a pass. The observe-only test itself does not fail on it, so the run's exit code and
+ * the enforced speed-budget step depend on the enforced (desktop) pages only, which still fail on a bounce as before.
+ */
+function observeOnlyStop(err, tried, planned, unit) {
+  const what = isLoginBounce(err)
+    ? "bounced to the login page (the saved session was not accepted)"
+    : `stopped by an error (${errorLine(err, 120)})`;
+  return `${what}: ${tried} of ${planned} ${unit} tried`;
+}
+
 /** n plus robust spread (median, quartiles, MAD) of one population; never throws on empty input. */
 function robust(values) {
   const xs = (values || []).filter(finite).sort((a, b) => a - b);
@@ -972,6 +998,9 @@ module.exports = {
   HARNESS_VERSION,
   LOW_N,
   PHONE_MAX_RUN_NAVIGATIONS,
+  errorLine,
+  isLoginBounce,
+  observeOnlyStop,
   VIAS,
   PURPOSES,
   budgetViolations,

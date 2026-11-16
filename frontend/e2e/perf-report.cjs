@@ -65,6 +65,9 @@ function loadRun(dir) {
       // results measured with different windows apart.
       windowMs: Number.isFinite(raw.meta.fixedWindowMs) ? raw.meta.fixedWindowMs : null,
       windowRule: raw.meta.windowRule || null,
+      // Observe-only: why the loop ended before every planned navigation / tap was tried (its time budget, a bounce to
+      // the login page, an error); null when it ran to the end.
+      stopped: typeof raw.meta.stopped === "string" && raw.meta.stopped ? raw.meta.stopped : null,
     };
     if (raw.meta.kind === "input") {
       // Phone taps: observe-only, summarised per action, never part of the enforced budget.
@@ -87,9 +90,16 @@ function loadRun(dir) {
   return { dir, meta, pages, inputs, harness, missing, phoneSkipped, window: window_ };
 }
 
-/** Lines for the observe-only result files a version 2 run did not write (or, on a deep run, did not try). */
+/**
+ * Lines for the observe-only result files a version 2 run did not write (or, on a deep run, did not try), and for the
+ * ones that ended early (time budget, a bounce to the login page, an error): the rest of those is not measured, never a
+ * pass. Printed by the budget step and the report; never part of the exit code.
+ */
 function missingObserved(run) {
   const lines = (run.missing || []).map((x) => `${x.label}: no result file written (not measured, not a pass)`);
+  for (const p of [...(run.pages || []), ...(run.inputs || [])]) {
+    if (p.enforced === false && p.stopped) lines.push(`${p.label}: stopped early, ${p.stopped}; the rest not measured, not a pass`);
+  }
   if (run.phoneSkipped) {
     lines.push(`Phone scenario, 390 px: not run on a deep run (more than ${stats.PHONE_MAX_RUN_NAVIGATIONS} navigations per page); the hourly run measures it`);
   }
@@ -144,7 +154,7 @@ function render(runs) {
     }
     const missing = missingObserved(run);
     if (missing.length) {
-      out.push("### Observe-only results not recorded\n");
+      out.push("### Observe-only results not recorded or cut short\n");
       out.push(missing.map((l) => `- ${l}`).join("\n") + "\n");
     }
     const notes = stats.runNotes(run.pages);

@@ -53,7 +53,10 @@ const stats = require("./perf-stats.cjs");
  * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): reported on
  * every run that has it and never part of the budget's exit code until it has been repeated across scheduled runs.
  * Each phone test has a time budget (no navigation or tap starts after it; the rest are reported as not tried) and a
- * timeout covering the budget plus one worst-case step, so it cannot time out either. A manual deep run (more than
+ * timeout covering the budget plus one worst-case step, so it cannot time out either. Nor does a phone failure fail
+ * it (a bounce to the login page included, `observeOnly`): the workflow's speed-budget step runs only when this
+ * measuring step passed, so the result file records why the phone loop ended (`stopped`) and the report lists the rest
+ * as not measured, never as a pass; a bounce on a desktop page still fails the run. A manual deep run (more than
  * PHONE_MAX_RUN_NAVIGATIONS navigations per page) skips it, so the run stays inside the job timeout and its speed
  * budget is always evaluated. Its taps only navigate and open / close the menu; nothing is written.
  *
@@ -886,13 +889,28 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
         break;
       }
       const windowMs = i < FIXED_WINDOW_NAVS ? FIXED_WINDOW_MS : 0;
-      const s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs, beforeGoto });
+      let s: Sample;
+      try {
+        s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs, beforeGoto });
+      } catch (e) {
+        // measureOnce throws only on a bounce to the login page. On an observe-only page that navigation is kept as
+        // not measured (the catch below ends the series); an enforced page fails as before, its file unchanged.
+        if (!o.scenario.enforced) samples.push({ i, cold: i === 0, ok: false, error: stats.errorLine(e) });
+        throw e;
+      }
       samples.push(s);
       // Two navigations in a row that never reach data-ready mean the page (or this
       // script's selector for it) is broken: stop instead of burning 30 s per navigation.
       if (i >= 1 && samples.every((x) => !x.ok)) break;
       if (i < o.navigations - 1) await page.waitForTimeout(PAUSE_MS);
     }
+  } catch (e) {
+    // Observe-only (the phone): a failure, a bounce to the login page included, ends the series and is recorded as not
+    // measured (`stopped`, written below); the test does not fail, so the run's exit code and the enforced speed-budget
+    // step (which runs only when the measuring step passed) depend on the enforced pages alone. An enforced page still
+    // fails the test, exactly as before.
+    if (o.scenario.enforced) throw e;
+    stopped = stats.observeOnlyStop(e, samples.length, o.navigations, "navigations");
   } finally {
     deployed.end = await deployedSha(context, origin);
     await probe.detach();
@@ -981,14 +999,35 @@ test("timing in-app navigation from Today", async ({ browser }) => {
 // Phone, 390 px (observed only, `enforced: false`): full loads of Today and Log, then taps on the bottom bar.
 // ---------------------------------------------------------------------------
 
+/**
+ * Runs the body of an observe-only test (`scenario.enforced: false`) so that it never fails the run: the workflow's
+ * enforced speed-budget step runs only when the measuring step passed, so a phone failure (a bounce to the login page,
+ * a context that could not be set up) must not decide the run's exit code or keep the budget from being evaluated.
+ * Failures inside a series or the taps are recorded in the result file as not measured (`stopped`); one before a result
+ * file was written leaves that file absent, which the report lists as "no result file written (not measured, not a
+ * pass)". Logged as one line with no address. An enforced scenario runs the body as it is, so it fails as before; the
+ * desktop pages never go through this.
+ */
+async function observeOnly(scenario: ScenarioMeta, label: string, body: () => Promise<void>): Promise<void> {
+  if (scenario.enforced) return body();
+  try {
+    await body();
+  } catch (e) {
+    console.log(`${label}: not measured (${stats.errorLine(e, 160)}); observe-only, so it does not fail the run, and it is not a pass`);
+  }
+}
+
 for (const slug of PHONE_PAGES) {
   const spec = PAGES.find((p) => p.slug === slug)!;
   test(`timing phone ${spec.label}`, async ({ browser }) => {
     test.skip(!PHONE_THIS_RUN, PHONE_SKIP_REASON);
-    await timePageSeries(browser, spec, {
-      device: PHONE, scenario: SCENARIO.phoneLoad, navigations: PHONE_NAVIGATIONS, slug: `phone-${spec.slug}`, label: `${spec.label}, 390 px`,
-      budgetMs: PHONE_SERIES_BUDGET_MS,
-    });
+    const label = `${spec.label}, 390 px`;
+    await observeOnly(SCENARIO.phoneLoad, label, () =>
+      timePageSeries(browser, spec, {
+        device: PHONE, scenario: SCENARIO.phoneLoad, navigations: PHONE_NAVIGATIONS, slug: `phone-${spec.slug}`, label,
+        budgetMs: PHONE_SERIES_BUDGET_MS,
+      })
+    );
   });
 }
 
@@ -1017,15 +1056,29 @@ const PHONE_STEPS: TapStep[] = [
   { action: "tap Log tab", target: `${TAB_BAR} a[href="/log"]`, ready: logReady, paths: ["/log"], leaveAt: "/log", timeoutMs: READY_TIMEOUT_MS },
 ];
 
-async function openAndWait(page: Page, route: string, readyExpr: string): Promise<boolean> {
+type OpenResult = "ready" | "not-ready" | "bounced";
+/** The reason a phone loop ends on a bounce to the login page (perf-stats.cjs isLoginBounce recognises it). */
+const BOUNCED = "bounced-to-login: saved session is not valid";
+/**
+ * Load a phone screen and wait until it is ready: "ready", "not-ready" (it did not load or get ready in time) or
+ * "bounced" (it ended on the login page: the saved session was not accepted, also when the app sent it there after the
+ * load). Never throws: the phone scenario is observe-only, and the caller records a bounce as not measured.
+ */
+async function openAndWait(page: Page, route: string, readyExpr: string): Promise<OpenResult> {
+  const onLogin = () => {
+    try {
+      return /^\/login/.test(new URL(page.url()).pathname);
+    } catch {
+      return false;
+    }
+  };
   try {
     await page.goto(route, { waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
-    if (/^\/login/.test(new URL(page.url()).pathname)) throw new Error("bounced-to-login: saved session is not valid");
+    if (onLogin()) return "bounced";
     await page.waitForFunction(readyExpr, undefined, { timeout: READY_TIMEOUT_MS, polling: "raf" });
-    return true;
-  } catch (e) {
-    if ((e as Error).message.startsWith("bounced")) throw e;
-    return false;
+    return "ready";
+  } catch {
+    return onLogin() ? "bounced" : "not-ready";
   }
 }
 
@@ -1100,55 +1153,68 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
   // Observe-only, so bounded: no tap starts after PHONE_INPUT_BUDGET_MS, and the timeout covers the budget plus one
   // tap's worst case (its ready wait and the recovery load included) plus the finish, so the test cannot time out.
   test.setTimeout(PHONE_INPUT_BUDGET_MS + TAP_WORST_MS + FINISH_RESERVE_MS);
-  const context = await browser.newContext({ ...PHONE, storageState: AUTH_FILE });
-  await context.addInitScript(INIT_SCRIPT);
-  await context.addInitScript(INPUT_SCRIPT);
-  const page = await context.newPage();
-  const origin = new URL(test.info().project.use.baseURL as string).origin;
-  const cpu = await slowCpu(page, PHONE_CPU_SLOWDOWN);
-  const startedAt = new Date().toISOString();
-  const deployed = { start: await deployedSha(context, origin), end: null as string | null };
-  const samples: InputSample[] = [];
-  let stopped: string | null = null;
-  try {
-    // Log not loading leaves every tap untried: the report shows "0 of N taps were tried", never a pass.
-    const opened = await openAndWait(page, "/log", logReady);
-    rounds: for (let round = 0; opened && round < PHONE_ROUNDS; round++) {
-      let previousOk = true;
-      for (const step of PHONE_STEPS) {
-        if (Date.now() - began >= PHONE_INPUT_BUDGET_MS) {
-          stopped = `time budget of ${PHONE_INPUT_BUDGET_MS / 1000} s used up: ${samples.length} of ${planned} taps tried`;
-          break rounds;
+  await observeOnly(SCENARIO.phoneInput, "Phone taps, 390 px", async () => {
+    const context = await browser.newContext({ ...PHONE, storageState: AUTH_FILE });
+    await context.addInitScript(INIT_SCRIPT);
+    await context.addInitScript(INPUT_SCRIPT);
+    const page = await context.newPage();
+    const origin = new URL(test.info().project.use.baseURL as string).origin;
+    const cpu = await slowCpu(page, PHONE_CPU_SLOWDOWN);
+    const startedAt = new Date().toISOString();
+    const deployed = { start: await deployedSha(context, origin), end: null as string | null };
+    const samples: InputSample[] = [];
+    let stopped: string | null = null;
+    try {
+      // Log not loading leaves every tap untried: the report shows "0 of N taps were tried" and why, never a pass.
+      const opened = await openAndWait(page, "/log", logReady);
+      if (opened === "bounced") stopped = stats.observeOnlyStop(BOUNCED, 0, planned, "taps");
+      else if (opened === "not-ready") stopped = `Log did not load or get ready: 0 of ${planned} taps tried`;
+      rounds: for (let round = 0; opened === "ready" && round < PHONE_ROUNDS; round++) {
+        let previousOk = true;
+        for (const step of PHONE_STEPS) {
+          if (Date.now() - began >= PHONE_INPUT_BUDGET_MS) {
+            stopped = `time budget of ${PHONE_INPUT_BUDGET_MS / 1000} s used up: ${samples.length} of ${planned} taps tried`;
+            break rounds;
+          }
+          const s: InputSample = step.needsPrevious && !previousOk
+            ? { i: samples.length, round, action: step.action, ok: false, error: "skipped: the step before was not measured" }
+            : await measureTap(page, step, round, samples.length);
+          samples.push(s);
+          previousOk = s.ok;
+          if (!s.ok) {
+            const back = step.leaveAt === "/log" ? logReady : todayReady;
+            // Sent to the login page: no later tap can be measured, so stop and say why (not measured, not a pass).
+            if ((await openAndWait(page, step.leaveAt, back)) === "bounced") {
+              stopped = stats.observeOnlyStop(BOUNCED, samples.length, planned, "taps");
+              break rounds;
+            }
+          }
+          await page.waitForTimeout(TAP_PAUSE_MS);
         }
-        const s: InputSample = step.needsPrevious && !previousOk
-          ? { i: samples.length, round, action: step.action, ok: false, error: "skipped: the step before was not measured" }
-          : await measureTap(page, step, round, samples.length);
-        samples.push(s);
-        previousOk = s.ok;
-        if (!s.ok) {
-          const back = step.leaveAt === "/log" ? logReady : todayReady;
-          await openAndWait(page, step.leaveAt, back);
-        }
-        await page.waitForTimeout(TAP_PAUSE_MS);
+        // A first round with no tap measured means the taps themselves are broken: stop (the report shows the
+        // untried taps as missing, never as fast).
+        if (round === 0 && !samples.some((x) => x.ok)) break;
       }
-      // A first round with no tap measured means the taps themselves are broken: stop (the report shows the
-      // untried taps as missing, never as fast).
-      if (round === 0 && !samples.some((x) => x.ok)) break;
+    } catch (e) {
+      // Observe-only: any other failure ends the taps and is recorded as not measured; the test does not fail on it (see
+      // timePageSeries), so the run's exit code and the enforced speed-budget step depend on the desktop pages alone.
+      if (SCENARIO.phoneInput.enforced) throw e;
+      stopped = stats.observeOnlyStop(e, samples.length, planned, "taps");
+    } finally {
+      deployed.end = await deployedSha(context, origin);
+      await context.close();
+      writeResult(
+        {
+          slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
+          note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
+          scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null, stopped,
+        },
+        browser.version(),
+        samples
+      );
     }
-  } finally {
-    deployed.end = await deployedSha(context, origin);
-    await context.close();
-    writeResult(
-      {
-        slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
-        note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
-        scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null, stopped,
-      },
-      browser.version(),
-      samples
-    );
-  }
-  // Observed only: never fails the run. A tap that could not be measured is listed as missing in the report and in
-  // the budget step's "observed only" lines, never counted as fast.
-  console.log(`phone taps: ${samples.filter((s) => s.ok).length}/${planned} measured${stopped ? ` (${stopped})` : ""}`);
+    // Observed only: never fails the run. A tap that could not be measured is listed as missing in the report and in
+    // the budget step's "observed only" lines, never counted as fast.
+    console.log(`phone taps: ${samples.filter((s) => s.ok).length}/${planned} measured${stopped ? ` (${stopped})` : ""}`);
+  });
 });
