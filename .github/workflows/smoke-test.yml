@@ -26,7 +26,7 @@ name: Production Smoke Test
 # than production moving on to a newer master commit (an annotation names the cause),
 # so a Vercel rollback or a broken provenance read cannot keep the tripwire green.
 # The receipt is the job summary; post-merge also records it as the commit status
-# post-merge/smoke.
+# post-merge/smoke while the repository variable SMOKE_RECEIPT_STATUS is "on".
 
 on:
   schedule:

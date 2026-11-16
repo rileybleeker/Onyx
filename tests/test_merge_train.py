@@ -304,6 +304,26 @@ class SmokeProvenance(unittest.TestCase):
         self.assertEqual(mt.served_other(self.E, self.rec(), self.rec(self.N)), self.N)
         self.assertIsNone(mt.served_other(self.E, self.rec(), None))
 
+    def test_moving_on_needs_the_final_record_and_never_goes_backwards(self):
+        # Codex round 4: a newer commit at the start must not make a run benign when production ends on an older
+        # commit (a Vercel rollback) or the end record could not be read. Synthetic master history P < E < N < M.
+        P, M = "d" * 40, "a" * 40
+        order = [P, self.E, self.N, M]
+
+        def contains(older, newer):
+            return order.index(newer) > order.index(older)
+        moved = mt.moved_on_to
+        self.assertEqual(moved(self.E, self.rec(), self.rec(self.N), contains), self.N)
+        self.assertEqual(moved(self.E, self.rec(self.N), self.rec(self.N), contains), self.N)
+        self.assertEqual(moved(self.E, self.rec(self.N), self.rec(M), contains), M)  # moved on twice, forwards
+        self.assertEqual(moved(self.E, None, self.rec(self.N), contains), self.N)  # no start record: the end decides
+        self.assertIsNone(moved(self.E, self.rec(self.N), None, contains))  # end unreadable
+        self.assertIsNone(moved(self.E, self.rec(self.N), self.rec(P), contains))  # newer, then older: rollback
+        self.assertIsNone(moved(self.E, self.rec(self.N), self.rec(), contains))  # newer, then back to the target
+        self.assertIsNone(moved(self.E, self.rec(M), self.rec(self.N), contains))  # newer, then less new
+        self.assertIsNone(moved(self.E, self.rec(), self.rec(P), contains))
+        self.assertIsNone(moved(self.E, None, None, contains))
+
     def test_other_deployment_of_the_same_commit_is_deferred_after_a_merge(self):
         # a redeploy (or a Vercel rollback) of the same commit is not the deployment this run was started for
         self.assertEqual(self.verdict(True, self.rec(), self.rec(deployment=self.OTHER)), "deferred")
@@ -819,6 +839,18 @@ class SmokeCommands(unittest.TestCase):
             got, out, calls = self.verdict_cmd(tests, before, after, mode="scheduled", url="", gh=compare)
             self.assertEqual((out["verdict"], got), ("deferred", 1), (before, after, tests))
             self.assertIn(("annotate", "error"), [c[:2] for c in calls])
+        # Codex round 4: a newer commit at the START no longer makes the run green when the end shows an older
+        # commit, the target again (a rollback) or nothing readable; the final record must show the newer commit
+        for after in (older, same, None):
+            for tests in ("success", "failure"):
+                got, out, calls = self.verdict_cmd(tests, newer, after, mode="scheduled", url="", gh=compare)
+                self.assertEqual((out["verdict"], got), ("deferred", 1), (after, tests))
+                self.assertIn(("annotate", "error"), [c[:2] for c in calls])
+                self.assertNotIn("moved on", out["detail"], (after, tests))
+        # still benign when production ends the run on the newer commit
+        got, out, _ = self.verdict_cmd("failure", newer, newer, mode="scheduled", url="", gh=compare)
+        self.assertEqual((out["verdict"], got), ("deferred", 0))
+        self.assertIn("moved on", out["detail"])
         # a target that could not be resolved is red on a schedule, pending after a merge
         code, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, "", False, "no deployment", "skipped", "", "scheduled")
         self.assertEqual((out["verdict"], code), ("deferred", 1))
@@ -877,7 +909,7 @@ class SmokeCommands(unittest.TestCase):
         self.assertEqual(out["ready"], "false")
 
     def receipt(self, attempts, parent_state="pass", verify="ok", parent_age=600, existing="unknown",
-                compare="ahead", post_error=False):
+                compare="ahead", post_error=False, record=True, clock=None):
         from datetime import datetime, timezone
         stamp = datetime.fromtimestamp(self.NOW - parent_age, timezone.utc).isoformat().replace("+00:00", "Z")
         receipts = {self.P: (parent_state, stamp if parent_state != "unknown" else ""), self.E: (existing, "")}
@@ -892,7 +924,7 @@ class SmokeCommands(unittest.TestCase):
             return self.P + "\n" if a[1].startswith(f"repos/{mt.REPO}/commits/") else ""
         with patch.object(mt, "smoke_receipt_of", side_effect=receipts.get):
             code, out, calls = self.run_cmd(mt.smoke_receipt, self.E, self.URL, verify, "detail", attempts,
-                                            self.NOW, gh=fake)
+                                            self.NOW, gh=fake, record=record, clock=clock or (lambda: self.NOW))
         status = next((c for c in calls if c[:3] == ("api", "-X", "POST")), None)
         return code, out, status
 
@@ -939,6 +971,49 @@ class SmokeCommands(unittest.TestCase):
         self.assertNotIn("action", out)  # the workflow then halts without a revert
         self.assertNotIn("culprit", out)
         self.assertNotIn("observed_at", out)  # and with no failure time, no smoke pass can cancel that halt
+
+    def test_observed_at_is_read_after_the_status_is_written(self):
+        # Claude round 4: a time taken before the write would let a pass recorded in between count as after it
+        fail = ("fail", "failure", "failed on host")
+        posted = []
+
+        def fake(a):
+            if a[:3] == ("api", "-X", "POST"):
+                posted.append(a)
+                return ""
+            return "ahead\n" if "/compare/" in a[1] else self.P + "\n"
+        receipts = {self.P: ("pass", mt.iso_utc(self.NOW - 600)), self.E: ("unknown", "")}
+        with patch.object(mt, "smoke_receipt_of", side_effect=receipts.get):
+            code, out, _ = self.run_cmd(mt.smoke_receipt, self.E, self.URL, "ok", "", [fail, fail], self.NOW,
+                                        gh=fake, clock=lambda: self.NOW + 3 if posted else self.NOW)
+        self.assertEqual((code, out["action"], len(posted)), (0, "revert", 1))
+        self.assertEqual(out["observed_at"], mt.iso_utc(self.NOW + 3))
+
+    def test_with_recording_off_nothing_is_written_and_nothing_is_reverted(self):
+        # Codex round 4: no post-merge/smoke status until every reader of master's combined status reads the
+        # Vercel context (SMOKE_RECEIPT_STATUS); a revert needs a recorded receipt, so an exact double failure halts
+        fail = ("fail", "failure", "failed on host")
+        code, out, status = self.receipt([fail, fail], record=False)
+        self.assertEqual((code, out["action"], out["culprit"]), (0, "halt", ""))
+        self.assertIsNone(status)
+        self.assertIn("SMOKE_RECEIPT_STATUS", out["reason"])
+        self.assertEqual(out["observed_at"], mt.iso_utc(self.NOW))  # the halt still reconciles after this time
+        cases = [([("pass", "success", "ok"), ("", "skipped", "")], "none"),
+                 ([("deferred", "success", "moved"), ("", "skipped", "")], "none"),
+                 ([("unverified", "failure", "x"), ("unverified", "failure", "y")], "halt"),
+                 ([("fail", "failure", "x"), ("", "skipped", "")], "halt")]
+        for attempts, action in cases:
+            code, out, status = self.receipt(attempts, record=False)
+            self.assertEqual((code, out["action"], out["culprit"]), (0, action, ""), attempts)
+            self.assertIsNone(status, attempts)
+
+    def test_receipt_command_records_only_when_the_variable_is_on(self):
+        seen = []
+        with patch.object(mt, "smoke_receipt", side_effect=lambda *a, **k: seen.append(k.get("record")) or 0):
+            for value in ("on", " On ", "", "off", "true"):
+                mt.main(["smoke-receipt", "--sha", self.E, "--record-status", value])
+            mt.main(["smoke-receipt", "--sha", self.E])
+        self.assertEqual(seen, [True, True, False, False, False, False])
 
     def test_receipt_only_on_a_master_commit(self):
         # a dispatch with a PR head must not put a pending status on that PR (the train would wait on it)
@@ -1024,6 +1099,10 @@ class SmokeWorkflowContract(unittest.TestCase):
         self.assertIn("observed_at: ${{ steps.r.outputs.observed_at }}", wf)
         self.assertIn("FAILED_AT: ${{ needs.receipt.outputs.observed_at }}", wf)
         self.assertIn('--failed-at "$FAILED_AT"', wf)
+        # Codex round 4: the status is written only while the repository variable is on
+        receipt_job = wf.split("\n  receipt:\n", 1)[1].split("\n  rollback:\n", 1)[0]
+        self.assertIn("RECORD_STATUS: ${{ vars.SMOKE_RECEIPT_STATUS }}", receipt_job)
+        self.assertIn('--record-status "$RECORD_STATUS"', receipt_job)
         # rollback() reads deployments and commit statuses; job permissions replace the workflow's
         rollback_job = wf.split("\n  rollback:\n", 1)[1]
         self.assertIn("statuses: read", rollback_job)

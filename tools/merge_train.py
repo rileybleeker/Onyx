@@ -14,8 +14,9 @@ enforced for admins) stays the final gate: this script only does the clicking a 
     smoke-verdict --sha SHA      (smoke-test.yml) pass | fail | deferred | unverified from the test outcome and the
              [--mode MODE]       revision production served before and after the run; writes the receipt. A
                                  scheduled run also fails when it could not test what production serves
-    smoke-receipt --sha SHA      (post-merge.yml) record the attempts as the commit status post-merge/smoke and
-                                 decide none | revert | halt, with the culprit read from the smoke receipts
+    smoke-receipt --sha SHA      (post-merge.yml) decide none | revert | halt, with the culprit read from the smoke
+             [--record-status V] receipts; V=on also records the attempts as the commit status post-merge/smoke,
+                                 otherwise nothing is written and a smoke failure always halts (no revert)
     rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting);
              [--halt-only]       with --halt-only (failure provenance unknown) halt and file the issue, no revert;
              [--failed-at T]     only a smoke pass recorded after T (the receipt's observed_at) cancels either
@@ -701,6 +702,25 @@ def served_other(sha: str, before: dict | None, after: dict | None) -> str | Non
     return next((r["version"] for r in (before, after) if r and r["version"] != sha), None)
 
 
+def moved_on_to(sha: str, before: dict | None, after: dict | None, contains) -> str | None:
+    """Pure (contains(older, newer) = newer is a master commit that contains older: newer_master_commit, or a fake in
+    tests): the newer master commit production moved on to during the run, or None. Only this makes a deferral
+    benign (a green scheduled run), so it needs the FINAL record: production must end the run on a commit other than
+    sha that contains sha, and the run must never have gone backwards, so a different commit served at the start
+    must be contained in the final one. A newer commit at the start followed by sha again, an older commit or no
+    readable record at the end is a Vercel rollback or a broken provenance read, never production moving on (Codex
+    review round 4). A start record that could not be read shows no transition, so the final record decides."""
+    if after is None or after["version"] == sha:
+        return None
+    final = after["version"]
+    if not contains(sha, final):
+        return None
+    start = before["version"] if before else None
+    if start not in (None, sha, final) and not contains(start, final):
+        return None
+    return final
+
+
 def smoke_exit(verdict: str, scheduled: bool, benign: bool) -> int:
     """Pure: the smoke job's exit code. fail and unverified always fail it. A scheduled run has no commit to attribute
     a deferral to, so a deferral fails it too unless it is benign (production moved on to a newer master commit, whose
@@ -971,8 +991,8 @@ def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests
                       f"host, so no post-merge run can be attributed until that is fixed")
             annotate("error", "Smoke provenance broken", detail)
     if verdict == "deferred" and not benign and ready:
-        other = served_other(sha, before, after)
-        if other and newer_master_commit(sha, other):
+        other = moved_on_to(sha, before, after, newer_master_commit)
+        if other:
             benign = True
             detail += f"; production moved on to the newer {BASE} commit {other[:7]}, whose own verification covers it"
     code = smoke_exit(verdict, scheduled, benign)
@@ -1004,13 +1024,20 @@ def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests
 
 
 def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts: list[tuple[str, str, str]],
-                  now: float | None = None) -> int:
+                  now: float | None = None, record: bool = True, clock=time.time) -> int:
     """post-merge.yml: record the smoke attempts on the commit and decide the action. attempts = [(verdict, job
     result, detail)] for the first run and the retry. Outputs action = none | revert | halt, culprit, reason, and
     only once the receipt is recorded: when it cannot be written (or sha cannot be checked against master) the job
-    fails with no action, and post-merge.yml halts without a revert if the smoke test failed."""
+    fails with no action, and post-merge.yml halts without a revert if the smoke test failed.
+
+    record = write the receipt as the commit status post-merge/smoke (post-merge.yml: the repository variable
+    SMOKE_RECEIPT_STATUS is "on"). Off: nothing is written and nothing is reverted (a revert needs its failure
+    recorded as a receipt, which a queued rollback PR is later reconciled against), so every smoke failure halts for
+    a person; the job summary still carries the receipt. It stays off until every reader of master's combined commit
+    status reads the `Vercel` context instead, because a pending or failed receipt changes that combined state
+    (docs/ci-cd.md). clock = the time source of observed_at, read after the status is written (tests pass a fake)."""
     host = deployment_host(url) or "production"
-    now = time.time() if now is None else now
+    now = clock() if now is None else now
     if not HEX40.fullmatch(sha or ""):
         set_outputs(action="none", culprit="", reason="", outcome="pending")
         note(f"smoke receipt: no commit to record ({sha!r})")
@@ -1035,7 +1062,12 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
             set_outputs(action="none", culprit="", reason="", outcome=outcome)
             note(f"smoke receipt {sha[:7]}: not a commit on {BASE} ({compare or 'unknown'}): nothing recorded")
             return 0
-        if outcome == "fail":
+        if outcome == "fail" and not record:
+            action = "halt"
+            reason = (f"production smoke test failed twice on {host} serving {sha[:7]}, but smoke receipts are not "
+                      f"recorded yet (repository variable SMOKE_RECEIPT_STATUS is not on), so no parent pass can be "
+                      f"shown and nothing is reverted")
+        elif outcome == "fail":
             parent = gh("api", f"repos/{REPO}/commits/{sha}", "--jq", ".parents[0].sha", check=False).strip()
             known = bool(HEX40.fullmatch(parent))
             try:
@@ -1059,10 +1091,13 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
             action = "halt"
             reason = f"production smoke test failed but the failure is not attributed to {sha[:7]}: {detail}"
         try:
-            existing = smoke_state(sha) if state == "pending" else "unknown"
+            existing = smoke_state(sha) if state == "pending" and record else "unknown"
         except GhError:
             existing = "unknown"
-        if existing in ("pass", "fail"):
+        if not record:
+            note(f"smoke receipt {sha[:7]}: not written as the {SMOKE_CONTEXT} commit status (SMOKE_RECEIPT_STATUS is "
+                 f"not on); this job summary is the receipt")
+        elif existing in ("pass", "fail"):
             note(f"smoke receipt {sha[:7]}: this run is {label}; the earlier exact receipt ({existing}) stands")
         else:
             run = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{REPO}/actions/runs/"
@@ -1074,11 +1109,17 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
         note(f"smoke receipt {sha[:7]}: could not record the receipt ({e}); no action published, so a failed smoke "
              f"test halts the train without a revert")
         return 1
-    # observed_at = when these attempts were judged (all of them had ended): rollback only lets a smoke pass recorded
-    # after it resolve this failure. It is published with the decision, so a receipt that could not be written leaves
-    # no time and the halt goes ahead.
-    set_outputs(action=action, culprit=culprit, reason=reason, outcome=outcome, observed_at=iso_utc(now))
-    note(f"smoke receipt {sha[:7]}: {state} ({label}): {detail}; action {action}" + (f" {culprit[:7]}" if culprit else ""))
+    # observed_at = when this receipt was settled, read AFTER the status was written (Claude round 4: a time taken
+    # before the write would let a pass recorded in between, such as a newer commit's run, count as after the
+    # failure). rollback only lets a smoke pass recorded after it resolve this failure. GitHub's created_at and
+    # iso_utc both drop fractions of a second and the comparison is strict, so a pass in the same second never
+    # counts. It is published with the decision, so a receipt that could not be written leaves no time and the halt
+    # goes ahead.
+    observed = max(now, clock())
+    set_outputs(action=action, culprit=culprit, reason=reason, outcome=outcome, observed_at=iso_utc(observed))
+    recorded = state if record else f"{state}, not written"
+    note(f"smoke receipt {sha[:7]}: {recorded} ({label}): {detail}; action {action}"
+         + (f" {culprit[:7]}" if culprit else ""))
     return 0
 
 
@@ -1107,7 +1148,8 @@ def rollback(sha: str, reason: str, halt_only: bool = False, failed_at: float | 
            f"without a finished build, a canceled or errored deployment, or a deploy that never finished. For the "
            f"smoke test: a failure on a deployment whose served revision was not confirmed, or whose parent was never "
            f"smoke-tested on its own deployment or passed too long ago to rule out changed live data (see its "
-           f"`{SMOKE_CONTEXT}` commit status). Open the failed run or "
+           f"`{SMOKE_CONTEXT}` commit status, or the post-merge run's job summary while those statuses are off). "
+           f"Open the failed run or "
            f"deployment log, then either revert the commit that broke it or, for a transient error, redeploy or "
            f"re-run. Close this issue to resume the merge train.", check=False)
         note(f"HALTED train without a revert for {short}: failure provenance unknown")
@@ -1198,6 +1240,9 @@ def main(argv: list[str] | None = None) -> int:
         sr.add_argument(f"--{n}", default="")
         sr.add_argument(f"--{n}-result", default="")
         sr.add_argument(f"--{n}-detail", default="")
+    sr.add_argument("--record-status", default="", help='"on" = write the post-merge/smoke commit status (the '
+                    'repository variable SMOKE_RECEIPT_STATUS); anything else = job summary only, and a smoke '
+                    'failure halts')
     r = sub.add_parser("rollback")
     r.add_argument("--sha", required=True)
     r.add_argument("--reason", required=True)
@@ -1216,7 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
                                  a.mode)
     if a.cmd == "smoke-receipt":
         return smoke_receipt(a.sha, a.deployment_url, a.verify, a.verify_detail,
-                             [(a.first, a.first_result, a.first_detail), (a.retry, a.retry_result, a.retry_detail)])
+                             [(a.first, a.first_result, a.first_detail), (a.retry, a.retry_result, a.retry_detail)],
+                             record=a.record_status.strip().lower() == "on")
     if a.cmd == "rollback":
         return rollback(a.sha, a.reason, a.halt_only, receipt_time(a.failed_at) if a.failed_at else None)
     ensure_labels()

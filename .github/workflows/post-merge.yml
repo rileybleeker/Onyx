@@ -12,8 +12,10 @@ name: Post-merge verify
 # revert, and so does a failed smoke test whose receipt could not be written. A halt is dropped, and a revert never
 # opened, once a newer master commit containing the change (or a later run of the commit itself) passed on its own
 # deployment AFTER this failure was observed (the receipt's observed_at; no time = the halt goes ahead).
-# post-merge/smoke is a smoke receipt, not the deploy signal: master's combined commit status now carries it too, so
-# read the `Vercel` context (or the deployment) to know whether a deploy succeeded.
+# post-merge/smoke is a smoke receipt, not the deploy signal, and a pending or failed receipt changes master's
+# combined commit status. So it is written only while the repository variable SMOKE_RECEIPT_STATUS is "on", which is
+# set once every reader of that combined status reads the `Vercel` context instead (docs/ci-cd.md). Until then the
+# job summary is the receipt and every smoke failure halts without a revert (a revert needs a recorded receipt).
 # `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
 on:
   push:
@@ -89,9 +91,10 @@ jobs:
       SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
       SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
       SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
-  # The durable smoke receipt + the decision. No smoke secrets here; the token can only post a commit status. The
-  # decision is published only after the status is written (or an earlier exact receipt stands); otherwise this job
-  # fails with no decision and the rollback job below halts without a revert when the smoke test failed.
+  # The durable smoke receipt + the decision. No smoke secrets here; the token can only post a commit status, and
+  # only does while vars.SMOKE_RECEIPT_STATUS is "on". The decision is published only after the status is written
+  # (or an earlier exact receipt stands, or recording is off); otherwise this job fails with no decision and the
+  # rollback job below halts without a revert when the smoke test failed.
   receipt:
     needs: [verify, smoke, smoke-retry]
     if: always() && (needs.verify.outputs.result == 'ok' || needs.verify.outputs.result == 'skipped')
@@ -123,11 +126,13 @@ jobs:
           RETRY: ${{ needs.smoke-retry.outputs.verdict }}
           RETRY_RESULT: ${{ needs.smoke-retry.result }}
           RETRY_DETAIL: ${{ needs.smoke-retry.outputs.detail }}
+          RECORD_STATUS: ${{ vars.SMOKE_RECEIPT_STATUS }}
         run: >-
           python3 tools/merge_train.py smoke-receipt --sha "$SHA" --deployment-url "$DEPLOYMENT_URL"
           --verify "$VERIFY" --verify-detail "$VERIFY_DETAIL"
           --first "$FIRST" --first-result "$FIRST_RESULT" --first-detail "$FIRST_DETAIL"
           --retry "$RETRY" --retry-result "$RETRY_RESULT" --retry-detail "$RETRY_DETAIL"
+          --record-status "$RECORD_STATUS"
   # A build failure (verify fail / halt) or a smoke decision. A smoke test that failed (and whose retry failed too or
   # never ran) while the receipt could not be written halts without a revert. A cancelled retry (superseded by a
   # newer run for the same commit) does nothing: that run decides.
