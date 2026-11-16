@@ -3,9 +3,10 @@
 //
 // Extracted verbatim from HrvAnalysisClient.tsx so the SAME functions can run
 // (a) server-side in page.tsx for the ISR prefetch and (b) client-side for the
-// silent mount revalidation + range changes. Uses the module-level anon
-// supabase-js client (lib/supabase), which works in both runtimes — RLS grants
-// anon read-only.
+// silent mount revalidation + range changes. Uses the module-level
+// supabase-js client (lib/supabase): the service role on the server, the owner
+// session in the browser. Materialized views have no row security, so in the
+// browser their reads go through the owner-only facade (lib/derived-reads.ts).
 //
 // All forecast queries read from pds.hrv_predictions_latest — a DISTINCT ON
 // view that returns one row per (prediction_date, model, horizon_days), always
@@ -23,6 +24,7 @@
 
 import { supabase } from "@/lib/supabase";
 import { getWorkoutSleepGap, type WorkoutSleepGap } from "@/lib/queries";
+import { assertServerRead, derivedRead } from "@/lib/derived-reads";
 import {
   SWEET_SPOT_COLUMNS, parseSweetSpotBaked, shapeSweetSpotRows, sweetSpotBakedIsComplete,
   type SweetSpotBaked, type SweetSpotRow,
@@ -196,6 +198,14 @@ export function parseJsonb(v: unknown): any {
 export async function getHistoricalHrv(days = 180) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  const sinceStr = since.toISOString().split("T")[0];
+  // Owner-only facade in the browser (lib/derived-reads.ts).
+  return derivedRead("historical-hrv", sinceStr, () => readHistoricalHrv(sinceStr));
+}
+
+/** Server only (service role), behind GET /api/derived/historical-hrv. Throws on a PostgREST error. */
+export async function readHistoricalHrv(sinceStr: string) {
+  assertServerRead("historical-hrv");
   // ADR-0001 Phase 3: HRV is the morning-after measurement that "belongs to"
   // the prior night's behaviors, so the trend line should sit on the
   // bedtime-day (onyx_behavioral_date), not the watch-local clock-day. The
@@ -209,7 +219,7 @@ export async function getHistoricalHrv(days = 180) {
   const { data, error } = await supabase
     .from("daily_health_matrix_behavioral_mat")
     .select("onyx_behavioral_date,whoop_hrv_rmssd")
-    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .gte("onyx_behavioral_date", sinceStr)
     .not("whoop_hrv_rmssd", "is", null)
     .order("onyx_behavioral_date", { ascending: true });
   if (error) throw error;
@@ -222,6 +232,14 @@ export async function getHistoricalHrv(days = 180) {
 // mean of the selected outcome; which rows count for an axis pair is decided client-side, so
 // this takes NO arguments and the server prefetch and the client revalidation cannot diverge.
 export async function getEnvDoseResponseData(): Promise<SweetSpotRow[]> {
+  // Owner-only facade in the browser (lib/derived-reads.ts): the server pages and shapes, the browser gets
+  // the same compact rows.
+  return derivedRead("sweet-spot", null, readEnvDoseResponseData);
+}
+
+/** Server only (service role), behind GET /api/derived/sweet-spot. Throws on a PostgREST error. */
+export async function readEnvDoseResponseData(): Promise<SweetSpotRow[]> {
+  assertServerRead("sweet-spot");
   // Row D of the matrix holds the HRV / recovery / sleep of the sleep that CLOSES behavioral
   // day D, and day-D inputs (meals, calories, caffeine) are on the same row, so those pair
   // as-is. Eight Sleep rows are dated by the wake-up day, so the temperature on row D belongs
@@ -234,18 +252,39 @@ export async function getEnvDoseResponseData(): Promise<SweetSpotRow[]> {
   // this historical chart) through an explicit all-scalar column list (SWEET_SPOT_COLUMNS).
   // Paged: every HRV night is needed (not just temperature nights), which passes PostgREST's
   // 1000-row cap as history grows. onyx_behavioral_date is unique in the matview, so the order
-  // is total (the client's sameJson bailout needs that).
-  const rows: Record<string, unknown>[] = [];
-  for (let from = 0; ; from += 1000) {
-    const { data, error } = await supabase
+  // is total (the client's sameJson bailout needs that). The first page carries count:"exact"
+  // and the other pages run in parallel, so this one /api/derived call stays one round trip
+  // deep; a page that still comes back full (no count, or rows added by a refresh in between)
+  // is followed serially.
+  const PAGE = 1000;
+  const page = (from: number, withCount: boolean) =>
+    supabase
       .from("daily_health_matrix_behavioral_mat")
-      .select(SWEET_SPOT_COLUMNS)
+      .select(SWEET_SPOT_COLUMNS, withCount ? { count: "exact" } : undefined)
       .or("eight_sleep_room_temp.not.is.null,eight_sleep_bed_temp.not.is.null,whoop_hrv_rmssd.not.is.null")
       .order("onyx_behavioral_date", { ascending: true })
-      .range(from, from + 999);
-    if (error) throw error;
+      .range(from, from + PAGE - 1);
+  const { data: first, error, count } = await page(0, true);
+  if (error) throw error;
+  const rows: Record<string, unknown>[] = [...((first ?? []) as unknown as Record<string, unknown>[])];
+  let lastLength = first?.length ?? 0;
+  let nextFrom = PAGE;
+  if (typeof count === "number" && count > PAGE) {
+    const starts = Array.from({ length: Math.ceil(count / PAGE) - 1 }, (_, i) => (i + 1) * PAGE);
+    const rest = await Promise.all(starts.map((from) => page(from, false)));
+    for (const { data, error: pageErr } of rest) {
+      if (pageErr) throw pageErr;
+      rows.push(...((data ?? []) as unknown as Record<string, unknown>[]));
+      lastLength = data?.length ?? 0;
+    }
+    nextFrom = (starts.length + 1) * PAGE;
+  }
+  while (lastLength === PAGE) {
+    const { data, error: pageErr } = await page(nextFrom, false);
+    if (pageErr) throw pageErr;
     rows.push(...((data ?? []) as unknown as Record<string, unknown>[]));
-    if (!data || data.length < 1000) break;
+    lastLength = data?.length ?? 0;
+    nextFrom += PAGE;
   }
   // Compact rows (short keys, nulls dropped): about 420 nights ride in the ISR payload.
   return shapeSweetSpotRows(rows);
