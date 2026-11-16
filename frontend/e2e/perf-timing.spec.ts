@@ -1,4 +1,4 @@
-import { test, expect, devices, type Page, type Request } from "@playwright/test";
+import { test, expect, devices, type Browser, type BrowserContext, type CDPSession, type Page, type Request } from "@playwright/test";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -8,24 +8,39 @@ const stats = require("./perf-stats.cjs");
 
 /**
  * Production timing run (.github/workflows/perf-timing.yml: hourly at :23 and on workflow_dispatch). It samples
- * whatever production serves at that moment; it is not tied to one deployment.
+ * whatever production serves at that moment; it is not tied to one deployment, so every result file records the
+ * build production served (/api/version, read at the start and the end of the page) and is bound to that SHA.
  *
  * For each key page: N full-document navigations in ONE browser context created
  * from the saved smoke-test login (auth.setup.ts). Navigation 1 starts with an
  * empty HTTP cache and is recorded as "cold" (browser cache; the Vercel function
- * and CDN state are not controllable). Navigations 2..N reuse the context's cache
- * and are the "warm" population the percentiles are computed from.
+ * and CDN state are not controllable and are recorded as observed, or "unknown").
+ * Navigations 2..N reuse the context's cache and are the "warm" population the
+ * percentiles are computed from.
  *
  * Per navigation it records: TTFB, FCP, LCP, time to the page's data-ready
  * element, time to the first drawn chart mark, and every network request the page
- * made (class, path only, duration, transferred bytes) until the page has been
- * network-quiet for QUIET_MS. Query strings, headers, cookies and response bodies
- * are never recorded, so the JSON holds no credentials and no health data.
+ * made (class, path only, duration, transferred bytes). Two observation windows:
+ *   - the network-quiet window (harness version 1, unchanged): requests that started before the page had been
+ *     network-quiet for QUIET_MS after data-ready (at most WINDOW_CAP_MS); `req`, `total` and `endpoints`, and the
+ *     speed budget, use it;
+ *   - a FIXED window from navigation start (harness version 2, `window`): every request that started in it, split by
+ *     purpose (routed = before data-ready, background = after it, prefetch = router prefetch) and by origin (network,
+ *     memory / disk / prefetch cache, service worker, or unknown, from the browser's own network log). A fixed window
+ *     makes request totals comparable between pages and runs; the quiet window closes at a different moment on each.
+ * Plus long tasks (main-thread blocking) in the fixed window and when the continuous scroll's first neighbour page
+ * appeared. Query strings, headers, cookies and response bodies are never recorded, so the JSON holds no
+ * credentials and no health data (full URLs are held in memory only, to match the network log, and never written).
  *
  * A second test opens the app at / (Today), lets it settle (the idle warm-up included) and then CLICKS each page's
  * sidebar link in turn, timing click to data-ready: the in-app navigation Riley actually does, served from the client
- * cache. Its first round is the first visit of the session ("cold"), later rounds are warm. Written as
- * nav-<slug>.json, labelled "<route> (in-app)".
+ * cache. Its first round is the first visit of a session Today already PREWARMED (client cache, router prefetch,
+ * HTTP cache), never a cold visit, and is labelled that way. Written as nav-<slug>.json, labelled "<route> (in-app)".
+ *
+ * A phone scenario (390 px, Chromium iPhone emulation, CPU slowed 4x) loads Today and Log and times taps on the
+ * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): it is
+ * reported on every run and never turns the run red until it has been repeated across scheduled runs. Its taps only
+ * navigate and open / close the menu; nothing is written.
  *
  * This is NOT part of the smoke suite: playwright.config.ts only matches
  * smoke.spec.ts, and this file is run through e2e/perf.config.ts.
@@ -36,8 +51,22 @@ const PAUSE_MS = 1_000; // between navigations, so the run does not hammer produ
 const QUIET_MS = 1_500; // network must be idle this long after data-ready to close the window
 const WINDOW_CAP_MS = 15_000; // never wait longer than this after data-ready
 const READY_TIMEOUT_MS = 30_000;
+// Fixed observation windows from navigation start (harness 2). A full load covers the continuous scroll's start
+// (2 s after the page opened) and the warm-up's start (2.5 s after load, then idle slots); a click has no document.
+const FIXED_WINDOW_MS = 6_000;
+const IN_APP_WINDOW_MS = 4_000;
 // Mirror of AGENTS_API in src/lib/agents-api.ts (the sms-reminders Worker).
 const AGENTS_HOST = "sms-reminders.rileybleeklm.workers.dev";
+
+const DESKTOP = devices["Desktop Chrome"];
+// The 390 px phone: iPhone 13 metrics and user agent on Chromium (the run's only browser), CPU slowed like a phone.
+const PHONE = devices["iPhone 13"];
+const PHONE_CPU_SLOWDOWN = 4;
+const PHONE_NAVIGATIONS = Math.min(4, NAVIGATIONS); // bounded: a manual 15-navigation run does not grow it
+const PHONE_ROUNDS = Math.min(3, NAVIGATIONS);
+const PHONE_PAGES = ["today", "log"];
+const INPUT_SETTLE_MS = 1_000; // after a tap's ready, long tasks are still collected this long
+const TAP_PAUSE_MS = 500;
 
 const AUTH_FILE = path.join(__dirname, ".auth/state.json");
 const OUT_DIR = path.join(__dirname, "..", "perf-results");
@@ -57,11 +86,14 @@ const ROUTED_TEXT = `((document.querySelector("[data-feed-root] > div[data-feed-
 // Installed in every page before its scripts run: records the first frame in
 // which a chart mark exists, on the page's own performance.now() clock. An in-app
 // navigation restarts it with window.__pfWatchChart(); marks left over from the
-// previous page (inside [data-pf-old]) never count.
+// previous page (inside [data-pf-old]) never count. Also kept per document: long tasks ([start, duration]) and the
+// first moment a neighbour page of the continuous scroll is in the DOM (polled every 100 ms, reset with the chart).
 const INIT_SCRIPT = `(() => {
   const SEL = ${JSON.stringify(CHART)};
+  const FEED = ${JSON.stringify(FEED_PAGE + ":not([data-pf-old])")};
   window.__pfWatchChart = () => {
     window.__pfChart = null;
+    window.__pfFeedAt = null;
     const tick = () => {
       if (window.__pfChart == null && [...document.querySelectorAll(SEL)].some((e) => !e.closest("[data-pf-old]") && !e.closest(${JSON.stringify(FEED_PAGE)}))) window.__pfChart = performance.now();
       if (window.__pfChart == null) requestAnimationFrame(tick);
@@ -69,6 +101,34 @@ const INIT_SCRIPT = `(() => {
     requestAnimationFrame(tick);
   };
   window.__pfWatchChart();
+  window.__pfLong = [];
+  try {
+    new PerformanceObserver((list) => { for (const e of list.getEntries()) window.__pfLong.push([e.startTime, e.duration]); })
+      .observe({ type: "longtask", buffered: true });
+  } catch (e) {}
+  setInterval(() => {
+    if (window.__pfFeedAt == null && document.querySelector(FEED)) window.__pfFeedAt = performance.now();
+  }, 100);
+})();`;
+
+// Phone scenario only: per tap, the finger-down time, the click time and the first frame painted after the click
+// handlers ran (requestAnimationFrame, then a task), plus Event Timing entries of interactions (16 ms and longer).
+const INPUT_SCRIPT = `(() => {
+  window.__pfInputs = [];
+  let cur = null;
+  const add = (rec) => { window.__pfInputs.push(rec); if (window.__pfInputs.length > 50) window.__pfInputs.shift(); return rec; };
+  addEventListener("pointerdown", (e) => { cur = add({ down: e.timeStamp, click: null, paint: null }); }, { capture: true, passive: true });
+  addEventListener("click", (e) => {
+    const rec = cur && cur.click == null ? cur : (cur = add({ down: null, click: null, paint: null }));
+    rec.click = e.timeStamp;
+    requestAnimationFrame(() => setTimeout(() => { rec.paint = performance.now(); }, 0));
+  }, { capture: true });
+  window.__pfEvents = [];
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) if (e.interactionId) window.__pfEvents.push([e.interactionId, e.startTime, e.duration]);
+    }).observe({ type: "event", durationThreshold: 16, buffered: true });
+  } catch (e) {}
 })();`;
 
 // The route content sits in AppShell's <main><div>, inside the continuous scroll's routed wrapper
@@ -196,6 +256,57 @@ const PAGES: PageSpec[] = [
 // Pages timed as in-app navigations (sidebar links). Routes with a query string have no sidebar link.
 const IN_APP = ["/log", "/check-in", "/sleep", "/nutrition", "/supplements", "/analytics/hrv", "/caffeine", "/status", "/financials", "/financials/budgets", "/financials/forecast"];
 
+/** What a result file says about how it was measured (harness 2). `enforced: false` = observed only. */
+interface ScenarioMeta {
+  name: "full-load" | "in-app-prewarmed" | "phone-full-load" | "phone-input";
+  device: string;
+  viewport: string;
+  cpuSlowdown: number;
+  firstNavigation: string;
+  laterNavigations: string;
+  enforced: boolean;
+  /** In-app only: how long Today had been open (its load and warm-up) before the first click. */
+  prewarmedForMs?: number | null;
+}
+
+const viewportOf = (d: { viewport?: { width: number; height: number } | null }) => (d.viewport ? `${d.viewport.width}x${d.viewport.height}` : "unknown");
+const SCENARIO: Record<"fullLoad" | "inApp" | "phoneLoad" | "phoneInput", ScenarioMeta> = {
+  fullLoad: {
+    name: "full-load", device: "Desktop Chrome", viewport: viewportOf(DESKTOP), cpuSlowdown: 1, enforced: true,
+    firstNavigation: "empty browser cache (new context); CDN and function state not controlled, recorded as observed",
+    laterNavigations: "warm browser cache, same context",
+  },
+  inApp: {
+    name: "in-app-prewarmed", device: "Desktop Chrome", viewport: viewportOf(DESKTOP), cpuSlowdown: 1, enforced: true,
+    firstNavigation: "first click of the session, after Today loaded and its warm-up ran (prewarmed: client cache, router prefetch, HTTP cache); not a cold visit",
+    laterNavigations: "later rounds of the same session",
+  },
+  phoneLoad: {
+    name: "phone-full-load", device: "iPhone 13 metrics on Chromium", viewport: viewportOf(PHONE), cpuSlowdown: PHONE_CPU_SLOWDOWN, enforced: false,
+    firstNavigation: "empty browser cache (new context); CDN and function state not controlled, recorded as observed",
+    laterNavigations: "warm browser cache, same context",
+  },
+  phoneInput: {
+    name: "phone-input", device: "iPhone 13 metrics on Chromium", viewport: viewportOf(PHONE), cpuSlowdown: PHONE_CPU_SLOWDOWN, enforced: false,
+    firstNavigation: "taps on the bottom bar after Log loaded at 390 px (the session is prewarmed by then)",
+    laterNavigations: "later rounds of the same session",
+  },
+};
+
+interface Rec {
+  cls: string;
+  key: string;
+  /** Full URL, held in memory only to match the browser's network log; never written to a result file. */
+  url: string;
+  startMs: number;
+  endMs?: number;
+  durMs?: number;
+  bytes: number;
+  failed: boolean;
+  prefetch: boolean;
+  via?: string;
+}
+
 interface Sample {
   i: number;
   cold: boolean;
@@ -219,22 +330,162 @@ interface Sample {
   req?: Record<string, unknown>;
   total?: { n: number; bytes: number };
   endpoints?: Record<string, unknown>;
+  // Harness 2.
+  cacheState?: Record<string, string>;
+  firstVisit?: boolean;
+  /** Request clock (ms since this navigation started): data-ready, the click, the network-quiet close. */
+  readyAtMs?: number | null;
+  clickAtMs?: number | null;
+  quietAtMs?: number | null;
+  window?: Record<string, unknown>;
+  longTasks?: Record<string, unknown>;
+  feedAtMs?: number | null;
+  firstPrefetchAtMs?: number | null;
 }
 
-async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number, mode: "load" | "click" = "load"): Promise<Sample> {
-  const sample: Sample = { i, cold: i === 0, ok: false };
-  if (mode === "load") await page.goto("about:blank");
+interface InputSample {
+  i: number;
+  round: number;
+  action: string;
+  ok: boolean;
+  error?: string;
+  inputMs?: number | null;
+  eventMs?: number | null;
+  readyMs?: number | null;
+  longTasks?: Record<string, unknown>;
+}
 
-  const records: Array<{
-    cls: string;
-    key: string;
-    startMs: number;
-    endMs?: number;
-    durMs?: number;
-    bytes: number;
-    failed: boolean;
-  }> = [];
-  const open = new Map<Request, (typeof records)[number]>();
+// ---------------------------------------------------------------------------
+// Browser network log: where each response came from (network, memory / disk / prefetch cache, service worker).
+// Chromium only (the run's only browser). Requests are matched to Playwright's by URL in order; anything the log
+// did not report (probe unavailable, request still open, a hop it never saw) is "unknown", never "network".
+// ---------------------------------------------------------------------------
+
+interface NetInfo {
+  servedFromCache?: boolean;
+  fromDiskCache?: boolean;
+  fromPrefetchCache?: boolean;
+  fromServiceWorker?: boolean;
+  responded?: boolean;
+  lowPriority?: boolean;
+}
+interface CacheProbe {
+  reset(): void;
+  take(url: string): NetInfo | undefined;
+  detach(): Promise<void>;
+}
+
+async function attachCacheProbe(page: Page): Promise<CacheProbe> {
+  let byUrl = new Map<string, NetInfo[]>();
+  let byId = new Map<string, NetInfo>();
+  let session: CDPSession | null = null;
+  try {
+    session = await page.context().newCDPSession(page);
+    await session.send("Network.enable");
+    session.on("Network.requestWillBeSent", (e) => {
+      if (String(e.type) === "Preflight") return; // CORS preflights are not page requests in Playwright's events
+      if (e.redirectResponse) {
+        const prev = byId.get(e.requestId);
+        if (prev) Object.assign(prev, { responded: true, fromDiskCache: !!e.redirectResponse.fromDiskCache, fromServiceWorker: !!e.redirectResponse.fromServiceWorker });
+      }
+      const pr = String(e.request.initialPriority || "");
+      const info: NetInfo = { lowPriority: pr === "Low" || pr === "VeryLow" };
+      byId.set(e.requestId, info);
+      const q = byUrl.get(e.request.url);
+      if (q) q.push(info);
+      else byUrl.set(e.request.url, [info]);
+    });
+    session.on("Network.requestServedFromCache", (e) => {
+      const info = byId.get(e.requestId);
+      if (info) info.servedFromCache = true;
+    });
+    session.on("Network.responseReceived", (e) => {
+      const info = byId.get(e.requestId);
+      if (!info) return;
+      info.responded = true;
+      info.fromDiskCache = !!e.response.fromDiskCache;
+      info.fromPrefetchCache = !!e.response.fromPrefetchCache;
+      info.fromServiceWorker = !!e.response.fromServiceWorker;
+    });
+  } catch {
+    session = null;
+  }
+  return {
+    reset() {
+      byUrl = new Map();
+      byId = new Map();
+    },
+    take(url) {
+      if (!session) return undefined;
+      return byUrl.get(url)?.shift();
+    },
+    async detach() {
+      try {
+        await session?.detach();
+      } catch {
+        /* the context may already be closed */
+      }
+    },
+  };
+}
+
+/**
+ * Slow the page's CPU like a phone (Chrome DevTools protocol), on one session kept for the page. `applied` is the
+ * slowdown actually in force (1 when the browser refused it, which the result file then says); `reapply` sets it
+ * again before each measured navigation, in case a new renderer process did not inherit it.
+ */
+async function slowCpu(page: Page, rate: number): Promise<{ applied: number; reapply: () => Promise<void> }> {
+  if (rate <= 1) return { applied: 1, reapply: async () => {} };
+  try {
+    const session = await page.context().newCDPSession(page);
+    await session.send("Emulation.setCPUThrottlingRate", { rate });
+    return {
+      applied: rate,
+      reapply: async () => {
+        try {
+          await session.send("Emulation.setCPUThrottlingRate", { rate });
+        } catch {
+          /* the first setting stays in force */
+        }
+      },
+    };
+  } catch {
+    return { applied: 1, reapply: async () => {} };
+  }
+}
+
+/** The commit SHA production serves (/api/version, the signed-in context's cookies); null when it cannot be read. */
+async function deployedSha(context: BrowserContext, origin: string): Promise<string | null> {
+  try {
+    const res = await context.request.get(`${origin}/api/version`, { timeout: 10_000, failOnStatusCode: false });
+    if (!res.ok()) return null;
+    const body = (await res.json()) as { version?: unknown };
+    return typeof body.version === "string" && /^[0-9a-f]{7,40}$/i.test(body.version) ? body.version : null;
+  } catch {
+    return null;
+  }
+}
+
+interface MeasureOptions {
+  probe?: CacheProbe;
+  /** Observe a fixed window of this many ms from navigation start (0 = network-quiet window only, harness 1). */
+  windowMs?: number;
+  /** Runs after about:blank, before the measured navigation (re-applies the phone CPU slowdown). */
+  beforeGoto?: () => Promise<unknown>;
+}
+
+async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number, mode: "load" | "click" = "load", opts: MeasureOptions = {}): Promise<Sample> {
+  const sample: Sample = { i, cold: i === 0, ok: false };
+  if (mode === "click") sample.firstVisit = i === 0;
+  const windowMs = opts.windowMs ?? 0;
+  if (mode === "load") {
+    await page.goto("about:blank");
+    if (opts.beforeGoto) await opts.beforeGoto();
+  }
+  opts.probe?.reset();
+
+  const records: Rec[] = [];
+  const open = new Map<Request, Rec>();
   const sizeJobs: Promise<void>[] = [];
   const t0 = Date.now();
   let lastActivity = t0;
@@ -243,7 +494,10 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     const url = req.url();
     if (url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("about:")) return;
     const { cls, key } = stats.classifyRequest(url, req.resourceType(), origin, AGENTS_HOST);
-    const rec = { cls, key, startMs: Date.now() - t0, bytes: 0, failed: false };
+    const hd = req.headers();
+    // Next's router prefetch header (auto prefetch, segment prefetch) or a browser prefetch purpose header.
+    const prefetch = "next-router-prefetch" in hd || "next-router-segment-prefetch" in hd || /prefetch/i.test(hd["purpose"] || hd["sec-purpose"] || "");
+    const rec: Rec = { cls, key, url, startMs: Date.now() - t0, bytes: 0, failed: false, prefetch };
     open.set(req, rec);
     records.push(rec);
     lastActivity = Date.now();
@@ -274,15 +528,18 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
   page.on("requestfailed", onFailed);
 
   let clickedAt = 0; // page clock at the click (in-app mode); its timings are measured from it
+  let vercelCache: string | undefined;
+  let vercelId: string | undefined;
   try {
     if (mode === "load") {
       const resp = await page.goto(spec.route, { waitUntil: "domcontentloaded", timeout: 45_000 });
       sample.status = resp ? resp.status() : null;
       const headers = resp ? resp.headers() : {};
-      sample.cache = headers["x-vercel-cache"] ?? null;
-      const vid = headers["x-vercel-id"];
+      vercelCache = headers["x-vercel-cache"];
+      vercelId = headers["x-vercel-id"];
+      sample.cache = vercelCache ?? null;
       // "iad1::<request-id>" (CDN) or "iad1::iad1::<request-id>" (function ran): keep the regions only.
-      sample.region = vid ? vid.split("::").slice(0, -1).join(">") : null;
+      sample.region = vercelId ? vercelId.split("::").slice(0, -1).join(">") : null;
     } else {
       // Shown copy only: every page also has an off (display:none) copy in Quick access or its section.
       const link = page.locator(`aside a[href="${spec.route}"]:not([data-off])`).first();
@@ -292,40 +549,55 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
         (window as unknown as { __pfWatchChart: () => void }).__pfWatchChart();
         return performance.now();
       }, ROUTE_CONTENT);
+      sample.clickAtMs = Date.now() - t0;
       await link.click({ timeout: 10_000 });
     }
+    sample.cacheState = stats.cacheStateOf({ mode, first: i === 0, vercelCache, vercelId });
 
     const finalPath = new URL(page.url()).pathname;
     if (/^\/login/.test(finalPath)) throw new Error("bounced-to-login: saved session is not valid");
 
-    const readyExpr = mode === "load" ? spec.ready
+    const routeReady = mode === "load" ? spec.ready
       : `(location.pathname === ${JSON.stringify(spec.route)} && !document.querySelector(${JSON.stringify(OLD_CONTENT)})) ? ${spec.ready} : false`;
+    // [page clock at ready, that document's time origin]: the time origin puts data-ready on the request clock.
+    const readyExpr = `(() => { const v = ${routeReady}; return v ? [v, performance.timeOrigin] : false; })()`;
     try {
       const handle = await page.waitForFunction(readyExpr, undefined, {
         timeout: READY_TIMEOUT_MS,
         polling: "raf",
       });
-      sample.ready = ((await handle.jsonValue()) as number) - clickedAt;
+      const [at, timeOrigin] = (await handle.jsonValue()) as [number, number];
+      sample.ready = at - clickedAt;
+      const onRequestClock = timeOrigin + at - t0;
+      sample.readyAtMs = Number.isFinite(onRequestClock) && onRequestClock >= 0 ? onRequestClock : Date.now() - t0;
     } catch (e) {
       if ((e as Error).message.includes("bounced")) throw e;
       sample.error = "ready-timeout";
     }
 
-    // Keep the window open until the page has been network-quiet (silent
-    // revalidations and late chart fetches are part of the cost of a page view).
+    // Keep observing until the page has been network-quiet (silent revalidations and late chart fetches are part of
+    // the cost of a page view; harness 1, unchanged) AND, in harness 2, the fixed window from navigation start is
+    // over. The quiet moment is kept: the version 1 totals count only requests that started before it.
     const winStart = Date.now();
+    let quietAt: number | null = null;
     for (;;) {
-      if (open.size === 0 && Date.now() - lastActivity >= QUIET_MS) break;
-      if (Date.now() - winStart >= WINDOW_CAP_MS) {
-        sample.quietTimedOut = true;
-        break;
+      const now = Date.now();
+      if (quietAt == null) {
+        if (open.size === 0 && now - lastActivity >= QUIET_MS) quietAt = now - t0;
+        else if (now - winStart >= WINDOW_CAP_MS) {
+          sample.quietTimedOut = true;
+          quietAt = now - t0;
+        }
       }
+      if (quietAt != null && now - t0 >= windowMs) break;
       await page.waitForTimeout(100);
     }
+    const observedMs = Date.now() - t0;
+    sample.quietAtMs = quietAt;
     await Promise.allSettled(sizeJobs);
 
     const m = await page.evaluate(
-      async ({ emptyText, routedSel }) => {
+      async ({ emptyText, routedSel, since }) => {
         const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming;
         const fcpEntry = performance.getEntriesByName("first-contentful-paint")[0];
         const lcp = await new Promise<number | null>((resolve) => {
@@ -347,6 +619,7 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
         const text = document.body.innerText;
         // The empty state is the routed page's own, not a neighbour's in the continuous scroll.
         const routedText = (document.querySelector(routedSel) as HTMLElement | null)?.innerText ?? text;
+        const w = window as unknown as { __pfChart?: number; __pfFeedAt?: number | null; __pfLong?: Array<[number, number]> };
         return {
           ttfb: nav.responseStart,
           serverWait: nav.responseStart - nav.requestStart,
@@ -355,24 +628,44 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
           docBytes: nav.transferSize,
           fcp: fcpEntry ? fcpEntry.startTime : null,
           lcp,
-          firstChart: (window as unknown as { __pfChart?: number }).__pfChart ?? null,
+          firstChart: w.__pfChart ?? null,
           degraded: /Application error|client-side exception/i.test(text),
           emptyState: emptyText ? routedText.toLowerCase().includes(emptyText.toLowerCase()) : false,
+          timeOrigin: performance.timeOrigin,
+          feedAt: w.__pfFeedAt ?? null,
+          long: (w.__pfLong || []).filter((x) => x[0] >= since),
         };
       },
-      { emptyText: spec.emptyText ?? "", routedSel: "[data-feed-root] > div[data-feed-route]" }
+      { emptyText: spec.emptyText ?? "", routedSel: "[data-feed-root] > div[data-feed-route]", since: clickedAt }
     );
+    const { timeOrigin, feedAt, long, ...timings } = m;
     if (mode === "click") {
       // The document was loaded before the click: its TTFB / FCP / LCP belong to Today, not to this page.
-      Object.assign(sample, { degraded: m.degraded, emptyState: m.emptyState, firstChart: m.firstChart == null ? null : m.firstChart - clickedAt });
+      Object.assign(sample, { degraded: timings.degraded, emptyState: timings.emptyState, firstChart: timings.firstChart == null ? null : timings.firstChart - clickedAt });
     } else {
-      Object.assign(sample, m);
+      Object.assign(sample, timings);
     }
+    const toRequestClock = (pageMs: number) => timeOrigin + pageMs - t0;
 
-    const folded = stats.foldRequests(records);
+    // Origin and purpose of every request, in the order they started (the network log is matched by URL in order).
+    for (const rec of records) {
+      const info = opts.probe?.take(rec.url);
+      rec.via = stats.viaOf(info);
+      if (!rec.prefetch && rec.cls === "rsc" && info?.lowPriority) rec.prefetch = true; // full prefetches go at low priority
+    }
+    const prefetchStarts = records.filter((r) => r.prefetch).map((r) => r.startMs);
+
+    // Harness 1 totals: the requests that started before the network-quiet moment.
+    const folded = stats.foldRequests(quietAt == null ? records : records.filter((r) => r.startMs <= quietAt!));
     sample.req = folded.req;
     sample.total = folded.total;
     sample.endpoints = folded.endpoints;
+    if (windowMs > 0) {
+      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs });
+      sample.longTasks = stats.foldLongTasks(long.map((x) => [toRequestClock(x[0]), x[1]]), 0, windowMs, sample.readyAtMs);
+      sample.feedAtMs = feedAt == null ? null : toRequestClock(feedAt);
+      sample.firstPrefetchAtMs = prefetchStarts.length ? Math.min(...prefetchStarts) : null;
+    }
     sample.ok = !sample.error && sample.ready != null;
   } catch (e) {
     sample.ok = false;
@@ -386,78 +679,30 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
   return sample;
 }
 
-for (const spec of PAGES) {
-  test(`timing ${spec.label}`, async ({ browser }) => {
-    test.setTimeout(NAVIGATIONS * (READY_TIMEOUT_MS + WINDOW_CAP_MS + PAUSE_MS + 5_000) + 60_000);
-
-    // Fresh context per page => navigation 1 really has an empty HTTP cache.
-    const context = await browser.newContext({
-      ...devices["Desktop Chrome"],
-      storageState: AUTH_FILE,
-    });
-    await context.addInitScript(INIT_SCRIPT);
-    const page = await context.newPage();
-    const origin = new URL(test.info().project.use.baseURL as string).origin;
-
-    const samples: Sample[] = [];
-    const startedAt = new Date().toISOString();
-    try {
-      for (let i = 0; i < NAVIGATIONS; i++) {
-        const s = await measureOnce(page, spec, origin, i);
-        samples.push(s);
-        // Two navigations in a row that never reach data-ready mean the page (or this
-        // script's selector for it) is broken: stop instead of burning 30 s per navigation.
-        if (i >= 1 && samples.every((x) => !x.ok)) break;
-        if (i < NAVIGATIONS - 1) await page.waitForTimeout(PAUSE_MS);
-      }
-    } finally {
-      await context.close();
-      fs.mkdirSync(OUT_DIR, { recursive: true });
-      const payload = {
-        meta: {
-          slug: spec.slug,
-          label: spec.label,
-          route: spec.route,
-          note: spec.note ?? null,
-          navigations: NAVIGATIONS,
-          startedAt,
-          finishedAt: new Date().toISOString(),
-          quietMs: QUIET_MS,
-          windowCapMs: WINDOW_CAP_MS,
-          github: {
-            runId: process.env.GITHUB_RUN_ID ?? null,
-            runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
-            sha: process.env.GITHUB_SHA ?? null,
-            ref: process.env.GITHUB_REF_NAME ?? null,
-          },
-          runner: {
-            platform: process.platform,
-            cpus: os.cpus().length,
-            memGB: Math.round(os.totalmem() / 2 ** 30),
-            chromium: browser.version(),
-          },
-        },
-        samples,
-      };
-      fs.writeFileSync(path.join(OUT_DIR, `${spec.slug}.json`), JSON.stringify(payload, null, 1));
-    }
-
-    const okCount = samples.filter((s) => s.ok).length;
-    console.log(`${spec.label}: ${okCount}/${samples.length} navigations reached data-ready`);
-    // A page that never reached data-ready in ANY navigation is a failed measurement, not a slow one.
-    // (A page that reached it only sometimes is caught by the speed budget: every missing navigation is a breach.)
-    expect(okCount, `${spec.label} never reached its data-ready state`).toBeGreaterThan(0);
-  });
+interface ResultMeta {
+  slug: string;
+  label: string;
+  route: string;
+  note: string | null;
+  navigations: number;
+  startedAt: string;
+  scenario: ScenarioMeta;
+  deployed: { start: string | null; end: string | null };
+  windowMs: number;
+  kind?: "input";
+  planned?: number;
 }
 
-function writeResult(slug: string, label: string, route: string, note: string | null, navigations: number, startedAt: string, browserVersion: string, samples: Sample[]) {
+function writeResult(meta: ResultMeta, browserVersion: string, samples: unknown[]) {
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const payload = {
     meta: {
-      slug, label, route, note, navigations, startedAt,
+      ...meta,
+      harness: stats.HARNESS_VERSION,
       finishedAt: new Date().toISOString(),
       quietMs: QUIET_MS,
       windowCapMs: WINDOW_CAP_MS,
+      fixedWindowMs: meta.windowMs,
       github: {
         runId: process.env.GITHUB_RUN_ID ?? null,
         runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
@@ -468,26 +713,95 @@ function writeResult(slug: string, label: string, route: string, note: string | 
     },
     samples,
   };
-  fs.writeFileSync(path.join(OUT_DIR, `${slug}.json`), JSON.stringify(payload, null, 1));
+  fs.writeFileSync(path.join(OUT_DIR, `${meta.slug}.json`), JSON.stringify(payload, null, 1));
+}
+
+interface SeriesOptions {
+  device: typeof DESKTOP;
+  scenario: ScenarioMeta;
+  navigations: number;
+  slug: string;
+  label: string;
+}
+
+/** N full loads of one page in a fresh context (navigation 1 = empty browser cache), written as <slug>.json. */
+async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions) {
+  test.setTimeout(o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + PAUSE_MS + 5_000) + 90_000);
+
+  // Fresh context per page => navigation 1 really has an empty HTTP cache.
+  const context = await browser.newContext({ ...o.device, storageState: AUTH_FILE });
+  await context.addInitScript(INIT_SCRIPT);
+  const page = await context.newPage();
+  const origin = new URL(test.info().project.use.baseURL as string).origin;
+  const probe = await attachCacheProbe(page);
+  const cpu = await slowCpu(page, o.scenario.cpuSlowdown);
+  const beforeGoto = cpu.applied > 1 ? cpu.reapply : undefined;
+
+  const samples: Sample[] = [];
+  const startedAt = new Date().toISOString();
+  const deployed = { start: await deployedSha(context, origin), end: null as string | null };
+  try {
+    for (let i = 0; i < o.navigations; i++) {
+      const s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs: FIXED_WINDOW_MS, beforeGoto });
+      samples.push(s);
+      // Two navigations in a row that never reach data-ready mean the page (or this
+      // script's selector for it) is broken: stop instead of burning 30 s per navigation.
+      if (i >= 1 && samples.every((x) => !x.ok)) break;
+      if (i < o.navigations - 1) await page.waitForTimeout(PAUSE_MS);
+    }
+  } finally {
+    deployed.end = await deployedSha(context, origin);
+    await probe.detach();
+    await context.close();
+    writeResult(
+      {
+        slug: o.slug, label: o.label, route: spec.route, note: spec.note ?? null, navigations: o.navigations, startedAt,
+        scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS,
+      },
+      browser.version(),
+      samples
+    );
+  }
+
+  const okCount = samples.filter((s) => s.ok).length;
+  console.log(`${o.label}: ${okCount}/${samples.length} navigations reached data-ready`);
+  // A page that never reached data-ready in ANY navigation is a failed measurement, not a slow one.
+  // (A page that reached it only sometimes is caught by the speed budget: every missing navigation is a breach.)
+  // An observe-only scenario (the phone) is reported, never fails the run: the report lists its missing
+  // navigations as not measured, never as fast.
+  if (o.scenario.enforced) expect(okCount, `${o.label} never reached its data-ready state`).toBeGreaterThan(0);
+}
+
+for (const spec of PAGES) {
+  test(`timing ${spec.label}`, async ({ browser }) => {
+    await timePageSeries(browser, spec, { device: DESKTOP, scenario: SCENARIO.fullLoad, navigations: NAVIGATIONS, slug: spec.slug, label: spec.label });
+  });
 }
 
 // In-app navigation: open the app, let Today and the idle warm-up settle, then click through the sidebar.
 const ROUNDS = Math.min(4, NAVIGATIONS);
 test("timing in-app navigation from Today", async ({ browser }) => {
-  test.setTimeout((ROUNDS * IN_APP.length + 1) * (READY_TIMEOUT_MS + WINDOW_CAP_MS + PAUSE_MS + 15_000) + 60_000);
-  const context = await browser.newContext({ ...devices["Desktop Chrome"], storageState: AUTH_FILE });
+  test.setTimeout((ROUNDS * IN_APP.length + 1) * (READY_TIMEOUT_MS + WINDOW_CAP_MS + PAUSE_MS + 15_000) + 90_000);
+  const context = await browser.newContext({ ...DESKTOP, storageState: AUTH_FILE });
   await context.addInitScript(INIT_SCRIPT);
   const page = await context.newPage();
   const origin = new URL(test.info().project.use.baseURL as string).origin;
+  const probe = await attachCacheProbe(page);
   const startedAt = new Date().toISOString();
   const specs = IN_APP.map((route) => PAGES.find((p) => p.route === route)).filter((p): p is PageSpec => !!p);
   const byRoute = new Map<string, Sample[]>(specs.map((p) => [p.route, []]));
+  const deployed = { start: await deployedSha(context, origin), end: null as string | null };
+  let prewarmedForMs: number | null = null;
   try {
+    // Today is opened exactly as in harness 1 (network-quiet window only), so the prewarmed state the first click
+    // starts from is unchanged; how long Today had been open by the first click is recorded.
+    const openedAt = Date.now();
     const opened = await measureOnce(page, PAGES.find((p) => p.slug === "today")!, origin, 0, "load");
     expect(opened.ok, "Today did not load, so no in-app navigation could be timed").toBe(true);
+    prewarmedForMs = Date.now() - openedAt;
     for (let round = 0; round < ROUNDS; round++) {
       for (const spec of specs) {
-        byRoute.get(spec.route)!.push(await measureOnce(page, spec, origin, round, "click"));
+        byRoute.get(spec.route)!.push(await measureOnce(page, spec, origin, round, "click", { probe, windowMs: IN_APP_WINDOW_MS }));
         await page.waitForTimeout(PAUSE_MS);
       }
       // A first round with no page reaching data-ready means the clicking itself is broken: stop (the missing rounds
@@ -495,14 +809,187 @@ test("timing in-app navigation from Today", async ({ browser }) => {
       if (round === 0 && ![...byRoute.values()].some((xs) => xs[0]?.ok)) break;
     }
   } finally {
+    deployed.end = await deployedSha(context, origin);
+    await probe.detach();
     await context.close();
     for (const spec of specs) {
-      writeResult(`nav-${spec.slug}`, `${spec.route} (in-app)`, spec.route,
-        "clicked from the sidebar after Today settled; the first round is the first visit of the session",
-        ROUNDS, startedAt, browser.version(), byRoute.get(spec.route)!);
+      writeResult(
+        {
+          slug: `nav-${spec.slug}`, label: `${spec.route} (in-app)`, route: spec.route,
+          note: "clicked from the sidebar after Today settled; the first round is the first visit of a prewarmed session",
+          navigations: ROUNDS, startedAt, scenario: { ...SCENARIO.inApp, prewarmedForMs }, deployed, windowMs: IN_APP_WINDOW_MS,
+        },
+        browser.version(),
+        byRoute.get(spec.route)!
+      );
     }
   }
   const ok = [...byRoute.values()].flat().filter((s) => s.ok).length;
   console.log(`in-app: ${ok}/${ROUNDS * specs.length} navigations reached data-ready`);
   expect(ok, "no in-app navigation reached its data-ready state").toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Phone, 390 px (observed only, `enforced: false`): full loads of Today and Log, then taps on the bottom bar.
+// ---------------------------------------------------------------------------
+
+for (const slug of PHONE_PAGES) {
+  const spec = PAGES.find((p) => p.slug === slug)!;
+  test(`timing phone ${spec.label}`, async ({ browser }) => {
+    await timePageSeries(browser, spec, {
+      device: PHONE, scenario: SCENARIO.phoneLoad, navigations: PHONE_NAVIGATIONS, slug: `phone-${spec.slug}`, label: `${spec.label}, 390 px`,
+    });
+  });
+}
+
+interface TapStep {
+  action: string;
+  /** The control to tap (the shown copy is used). */
+  target: string;
+  /** Truthy (performance.now()) once what the tap opens is ready. */
+  ready: string;
+  /** For a tap that navigates: the paths it may land on (the old page's content must be gone too). */
+  paths?: string[];
+  /** Where the screen should be after the step: a failed step is recovered by loading it (not measured). */
+  leaveAt: string;
+  timeoutMs: number;
+  /** Skipped (and counted as not measured) when the step before it was not measured. */
+  needsPrevious?: boolean;
+}
+
+const TAB_BAR = '[data-testid="mobile-tab-bar"]';
+const DRAWER_OPEN = `!!document.querySelector('#mobile-navigation[role="dialog"]')`;
+// Read-only taps: two bottom-bar pages and the menu. Nothing on these screens is tapped that could write.
+const PHONE_STEPS: TapStep[] = [
+  { action: "tap Today tab", target: `${TAB_BAR} a[href="/today"], ${TAB_BAR} a[href="/"]`, ready: todayReady, paths: ["/today", "/"], leaveAt: "/today", timeoutMs: READY_TIMEOUT_MS },
+  { action: "open More menu", target: `${TAB_BAR} button[aria-haspopup="dialog"], header button[aria-label="More"]`, ready: ready(DRAWER_OPEN), leaveAt: "/today", timeoutMs: 5_000 },
+  { action: "close More menu", target: '#mobile-navigation button[aria-label="Close navigation"]', ready: ready(`!(${DRAWER_OPEN})`), leaveAt: "/today", timeoutMs: 5_000, needsPrevious: true },
+  { action: "tap Log tab", target: `${TAB_BAR} a[href="/log"]`, ready: logReady, paths: ["/log"], leaveAt: "/log", timeoutMs: READY_TIMEOUT_MS },
+];
+
+async function openAndWait(page: Page, route: string, readyExpr: string): Promise<boolean> {
+  try {
+    await page.goto(route, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    if (/^\/login/.test(new URL(page.url()).pathname)) throw new Error("bounced-to-login: saved session is not valid");
+    await page.waitForFunction(readyExpr, undefined, { timeout: READY_TIMEOUT_MS, polling: "raf" });
+    return true;
+  } catch (e) {
+    if ((e as Error).message.startsWith("bounced")) throw e;
+    return false;
+  }
+}
+
+async function measureTap(page: Page, step: TapStep, round: number, i: number): Promise<InputSample> {
+  const s: InputSample = { i, round, action: step.action, ok: false };
+  try {
+    const target = page.locator(step.target).filter({ visible: true }).first();
+    if ((await target.count()) === 0) {
+      s.error = "control not on screen";
+      return s;
+    }
+    const before = await page.evaluate(({ sel, nav }) => {
+      if (nav) {
+        document.querySelectorAll(sel).forEach((e) => e.setAttribute("data-pf-old", ""));
+        (window as unknown as { __pfWatchChart?: () => void }).__pfWatchChart?.();
+      }
+      return { since: performance.now(), origin: performance.timeOrigin };
+    }, { sel: ROUTE_CONTENT, nav: !!step.paths });
+    await target.tap({ timeout: 10_000 });
+    const readyExpr = step.paths
+      ? `(${JSON.stringify(step.paths)}.includes(location.pathname) && !document.querySelector(${JSON.stringify(OLD_CONTENT)})) ? ${step.ready} : false`
+      : step.ready;
+    let readyAt: number | null = null;
+    try {
+      const handle = await page.waitForFunction(readyExpr, undefined, { timeout: step.timeoutMs, polling: "raf" });
+      readyAt = (await handle.jsonValue()) as number;
+    } catch {
+      s.error = "ready-timeout";
+    }
+    await page.waitForTimeout(INPUT_SETTLE_MS);
+    const m = await page.evaluate((since) => {
+      const w = window as unknown as {
+        __pfInputs?: Array<{ down: number | null; click: number | null; paint: number | null }>;
+        __pfEvents?: Array<[number, number, number]>;
+        __pfLong?: Array<[number, number]>;
+      };
+      const rec = (w.__pfInputs || []).find((x) => (x.down ?? x.click ?? -1) >= since);
+      const events = (w.__pfEvents || []).filter((x) => x[1] >= since).map((x) => x[2]);
+      return {
+        origin: performance.timeOrigin,
+        down: rec ? rec.down : null,
+        click: rec ? rec.click : null,
+        paint: rec ? rec.paint : null,
+        eventMax: events.length ? Math.max(...events) : null,
+        long: (w.__pfLong || []).filter((x) => x[0] >= since),
+      };
+    }, before.since);
+    if (m.origin !== before.origin) {
+      s.error = s.error || "document reloaded";
+      return s;
+    }
+    const start = m.down ?? m.click;
+    if (start == null || m.click == null || m.paint == null) {
+      s.error = s.error || "no input recorded";
+      return s;
+    }
+    s.inputMs = m.paint - start;
+    s.eventMs = m.eventMax;
+    s.readyMs = readyAt != null ? readyAt - start : null;
+    s.longTasks = stats.foldLongTasks(m.long, start, (readyAt ?? start) + INPUT_SETTLE_MS, readyAt);
+    s.ok = !s.error && s.readyMs != null;
+  } catch (e) {
+    s.error = s.error || (e as Error).message.split("\n")[0].slice(0, 120);
+  }
+  return s;
+}
+
+test("timing phone input responsiveness, 390 px", async ({ browser }) => {
+  const planned = PHONE_ROUNDS * PHONE_STEPS.length;
+  test.setTimeout(planned * (READY_TIMEOUT_MS * 2 + INPUT_SETTLE_MS + TAP_PAUSE_MS + 10_000) + 120_000);
+  const context = await browser.newContext({ ...PHONE, storageState: AUTH_FILE });
+  await context.addInitScript(INIT_SCRIPT);
+  await context.addInitScript(INPUT_SCRIPT);
+  const page = await context.newPage();
+  const origin = new URL(test.info().project.use.baseURL as string).origin;
+  const cpu = await slowCpu(page, PHONE_CPU_SLOWDOWN);
+  const startedAt = new Date().toISOString();
+  const deployed = { start: await deployedSha(context, origin), end: null as string | null };
+  const samples: InputSample[] = [];
+  try {
+    // Log not loading leaves every tap untried: the report shows "0 of N taps were tried", never a pass.
+    const opened = await openAndWait(page, "/log", logReady);
+    for (let round = 0; opened && round < PHONE_ROUNDS; round++) {
+      let previousOk = true;
+      for (const step of PHONE_STEPS) {
+        const s: InputSample = step.needsPrevious && !previousOk
+          ? { i: samples.length, round, action: step.action, ok: false, error: "skipped: the step before was not measured" }
+          : await measureTap(page, step, round, samples.length);
+        samples.push(s);
+        previousOk = s.ok;
+        if (!s.ok) {
+          const back = step.leaveAt === "/log" ? logReady : todayReady;
+          await openAndWait(page, step.leaveAt, back);
+        }
+        await page.waitForTimeout(TAP_PAUSE_MS);
+      }
+      // A first round with no tap measured means the taps themselves are broken: stop (the report shows the
+      // untried taps as missing, never as fast).
+      if (round === 0 && !samples.some((x) => x.ok)) break;
+    }
+  } finally {
+    deployed.end = await deployedSha(context, origin);
+    await context.close();
+    writeResult(
+      {
+        slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
+        note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
+        scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0,
+      },
+      browser.version(),
+      samples
+    );
+  }
+  // Observed only: never fails the run. A tap that could not be measured is listed as missing in the report and in
+  // the budget step's "observed only" lines, never counted as fast.
+  console.log(`phone taps: ${samples.filter((s) => s.ok).length}/${planned} measured`);
 });

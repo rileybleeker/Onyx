@@ -117,6 +117,173 @@ function normRegion(raw) {
   return `${parts[0]} (cdn)`;
 }
 
+// ---------------------------------------------------------------------------
+// Harness version 2 (2026-11-16): scenario and cache state, a fixed observation window split by purpose, request
+// origin (network / browser cache / service worker / unknown), sample sizes with robust percentiles, the measured
+// production revision and an observe-only phone scenario. Result files without `meta.harness` are version 1; every
+// field version 1 recorded keeps its definition, so an older artifact stays a valid baseline.
+// ---------------------------------------------------------------------------
+
+const HARNESS_VERSION = 2;
+/** Below this many samples a p95 is the worst sample or close to it: the report says so. */
+const LOW_N = 10;
+
+/** n plus robust spread (median, quartiles, MAD) of one population; never throws on empty input. */
+function robust(values) {
+  const xs = (values || []).filter(finite).sort((a, b) => a - b);
+  const n = xs.length;
+  if (n === 0) return { n: 0, p50: null, p75: null, p90: null, p95: null, min: null, max: null, iqr: null, mad: null, lowN: true };
+  const p50 = percentile(xs, 50);
+  return {
+    n,
+    p50,
+    p75: percentile(xs, 75),
+    p90: percentile(xs, 90),
+    p95: percentile(xs, 95),
+    min: xs[0],
+    max: xs[n - 1],
+    iqr: percentile(xs, 75) - percentile(xs, 25),
+    mad: percentile(xs.map((v) => Math.abs(v - p50)), 50),
+    lowN: n < LOW_N,
+  };
+}
+
+/** Where a response came from. "unknown" whenever the browser did not say (probe missing, request still open). */
+const VIAS = ["network", "memory-cache", "disk-cache", "prefetch-cache", "service-worker", "unknown"];
+const CACHED_VIAS = new Set(["memory-cache", "disk-cache", "prefetch-cache"]);
+
+/**
+ * @param {{servedFromCache?: boolean, fromDiskCache?: boolean, fromPrefetchCache?: boolean, fromServiceWorker?: boolean, responded?: boolean}|undefined} info
+ *   what the browser's network log (Chrome DevTools protocol) reported for one request
+ */
+function viaOf(info) {
+  if (!info) return "unknown";
+  if (info.fromServiceWorker) return "service-worker";
+  if (info.servedFromCache) return "memory-cache";
+  if (info.fromDiskCache) return "disk-cache";
+  if (info.fromPrefetchCache) return "prefetch-cache";
+  if (info.responded) return "network";
+  return "unknown";
+}
+
+/**
+ * Why a request ran, as far as the outside of the browser can tell:
+ *   prefetch   = a router prefetch (Next's prefetch header, or an RSC request sent at low priority): warm-up or hover;
+ *   routed     = started before the routed page reached data-ready (what the page waited for, or competed with);
+ *   background = started after data-ready (neighbour pages of the continuous scroll, the warm-up's data reads,
+ *                silent revalidation);
+ *   unknown    = the page never reached data-ready, so there is nothing to split on.
+ */
+const PURPOSES = ["routed", "background", "prefetch", "unknown"];
+function purposeOf(rec, readyAtMs) {
+  if (rec && rec.prefetch) return "prefetch";
+  if (!finite(readyAtMs)) return "unknown";
+  return rec.startMs < readyAtMs ? "routed" : "background";
+}
+
+const DATA_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
+
+/**
+ * The requests that STARTED inside a fixed window from navigation start ([0, windowMs) on the request clock), split
+ * by purpose and by origin. A fixed window makes request totals comparable between pages and runs (the network-quiet
+ * window closes at a different moment on every page). `observedMs` = how long the navigation was actually observed;
+ * a window that was not observed to its end is `complete: false` and is never counted as a measurement.
+ */
+function foldWindow(records, { windowMs, readyAtMs, observedMs }) {
+  const bucket = () => ({ n: 0, data: 0, ms: 0, bytes: 0, network: 0, cached: 0, serviceWorker: 0, unknownVia: 0, cls: {} });
+  const purpose = {};
+  for (const p of PURPOSES) purpose[p] = bucket();
+  const via = {};
+  for (const v of VIAS) via[v] = 0;
+  let n = 0;
+  let bytes = 0;
+  for (const r of records || []) {
+    if (!r || !finite(r.startMs) || r.startMs >= windowMs) continue;
+    const b = purpose[purposeOf(r, readyAtMs)];
+    const v = VIAS.includes(r.via) ? r.via : "unknown";
+    const dur = finite(r.durMs) ? r.durMs : finite(r.endMs) ? r.endMs - r.startMs : 0;
+    b.n += 1;
+    if (DATA_CLASSES.has(r.cls)) b.data += 1;
+    b.ms += dur;
+    b.bytes += r.bytes || 0;
+    if (v === "network") b.network += 1;
+    else if (CACHED_VIAS.has(v)) b.cached += 1;
+    else if (v === "service-worker") b.serviceWorker += 1;
+    else b.unknownVia += 1;
+    b.cls[r.cls] = (b.cls[r.cls] || 0) + 1;
+    via[v] += 1;
+    n += 1;
+    bytes += r.bytes || 0;
+  }
+  return {
+    windowMs,
+    readyAtMs: finite(readyAtMs) ? readyAtMs : null,
+    observedMs: finite(observedMs) ? observedMs : null,
+    complete: finite(observedMs) && finite(windowMs) && observedMs >= windowMs,
+    total: { n, bytes },
+    purpose,
+    via,
+  };
+}
+
+/**
+ * Main-thread long tasks (over 50 ms) that started in [fromMs, toMs): count, total, blocking time (the part of each
+ * task over 50 ms, as in Total Blocking Time) and the longest. `entries` are [startMs, durationMs] on one clock.
+ */
+function foldLongTasks(entries, fromMs, toMs, readyAtMs) {
+  let n = 0;
+  let totalMs = 0;
+  let blockingMs = 0;
+  let maxMs = 0;
+  let beforeReady = 0;
+  for (const e of entries || []) {
+    const start = e && e[0];
+    const dur = e && e[1];
+    if (!finite(start) || !finite(dur) || start < fromMs || start >= toMs) continue;
+    const b = Math.max(0, dur - 50);
+    n += 1;
+    totalMs += dur;
+    blockingMs += b;
+    if (dur > maxMs) maxMs = dur;
+    if (finite(readyAtMs) && start < readyAtMs) beforeReady += b;
+  }
+  return { n, totalMs, blockingMs, maxMs, blockingBeforeReadyMs: finite(readyAtMs) ? beforeReady : null };
+}
+
+/**
+ * The cache state of one navigation, with what cannot be known said as such.
+ *   browser: "empty" (first navigation in a fresh context), "warm" (later navigations in it), or "prewarmed" (an
+ *            in-app click after Today loaded and its warm-up ran: client cache, router prefetch, HTTP cache);
+ *   cdn:     the document's x-vercel-cache header (HIT, MISS, STALE, PRERENDER, ...), "unknown" without one, "n/a"
+ *            for an in-app click (no document request);
+ *   fn:      "ran" when x-vercel-id shows a function region, "not-run" when only the edge answered, else "unknown";
+ *   fnWarmth: whether a function that ran was cold is never visible from the browser: always "unknown" then.
+ */
+function cacheStateOf({ mode, first, vercelCache, vercelId }) {
+  if (mode === "click") return { browser: "prewarmed", cdn: "n/a", fn: "n/a", fnWarmth: "n/a" };
+  const browser = first ? "empty" : "warm";
+  const cdn = vercelCache ? String(vercelCache).toUpperCase() : "unknown";
+  const region = normRegion(vercelId);
+  const fn = !region ? "unknown" : region.endsWith("(function)") ? "ran" : "not-run";
+  return { browser, cdn, fn, fnWarmth: fn === "ran" ? "unknown" : "n/a" };
+}
+
+/** The production build a result file measured: its SHA, "mixed" when a deploy landed mid-page, null if not recorded. */
+function revisionOf(meta) {
+  const d = meta && meta.deployed;
+  if (!d) return null;
+  if (d.start && d.end && d.start !== d.end) return "mixed";
+  return d.start || d.end || "unknown";
+}
+
+/** Scenario name, enforcement and harness version of a result file (version 1 files carry none of them). */
+function scenarioOf(meta, slug) {
+  const m = meta || {};
+  const s = m.scenario || {};
+  const name = s.name || (String(slug || m.slug || "").startsWith("nav-") ? "in-app-prewarmed" : "full-load");
+  return { name, enforced: s.enforced !== false, harness: finite(m.harness) ? m.harness : 1, detail: m.scenario || null };
+}
+
 const TIMING_KEYS = ["ttfb", "fcp", "lcp", "ready", "firstChart"];
 
 /** Aggregate the samples of one page (cold = first navigation, warm = the rest). */
@@ -128,7 +295,8 @@ function summarizePage(samples) {
   const timing = {};
   for (const k of TIMING_KEYS) {
     const xs = warm.map((s) => s[k]);
-    timing[k] = { p50: percentile(xs, 50), p95: percentile(xs, 95), min: percentile(xs, 0), max: percentile(xs, 100), n: xs.filter(finite).length, values: xs.filter(finite) };
+    const n = xs.filter(finite).length;
+    timing[k] = { p50: percentile(xs, 50), p90: percentile(xs, 90), p95: percentile(xs, 95), min: percentile(xs, 0), max: percentile(xs, 100), n, lowN: n < LOW_N, values: xs.filter(finite) };
   }
 
   const requests = {};
@@ -187,7 +355,37 @@ function summarizePage(samples) {
     return t;
   };
 
+  // Harness 2 fields. A version 1 sample has none of them, so each is then null / empty (never zero).
+  const windowOf = (xs) => {
+    const ws = xs.map((s) => s.window).filter((w) => w && w.complete);
+    if (ws.length === 0) return null;
+    const purpose = {};
+    for (const p of PURPOSES) {
+      purpose[p] = {};
+      for (const f of ["n", "data", "network", "cached", "serviceWorker", "unknownVia", "bytes", "ms"]) purpose[p][f] = median(ws.map((w) => w.purpose?.[p]?.[f]));
+    }
+    const via = {};
+    for (const v of VIAS) via[v] = median(ws.map((w) => w.via?.[v]));
+    return { windowMs: ws[0].windowMs, n: ws.length, total: median(ws.map((w) => w.total?.n)), bytes: median(ws.map((w) => w.total?.bytes)), purpose, via };
+  };
+  const stateKey = (c) => (c ? `${c.browser} cdn:${c.cdn} fn:${c.fn}` : null);
+  const restStates = {};
+  for (const s of samples.slice(1)) {
+    const k = stateKey(s.cacheState);
+    if (k) restStates[k] = (restStates[k] || 0) + 1;
+  }
+
   return {
+    harness2: samples.some((s) => s.window || s.cacheState),
+    windows: { recorded: samples.filter((s) => s.window).length, complete: samples.filter((s) => s.window && s.window.complete).length },
+    window: windowOf(warm),
+    coldWindow: cold && cold.ok ? windowOf([cold]) : null,
+    cacheStates: { first: samples[0] && samples[0].cacheState ? samples[0].cacheState : null, rest: restStates },
+    readyRobust: robust(warm.map((s) => s.ready)),
+    blocking: robust(warm.map((s) => s.longTasks?.blockingMs)),
+    blockingBeforeReady: robust(warm.map((s) => s.longTasks?.blockingBeforeReadyMs)),
+    feedAt: robust(warm.map((s) => s.feedAtMs)),
+    firstPrefetchAt: robust(warm.map((s) => s.firstPrefetchAtMs)),
     total: samples.length,
     ok: ok.length,
     failed: samples.length - ok.length,
@@ -226,6 +424,39 @@ function pickCold(s) {
   };
 }
 
+/**
+ * Phone input responsiveness (harness 2, `meta.kind: "input"`): one sample per tap. Per action, in the order the
+ * actions were first tried: how many were measured, why the others were not, and robust stats of
+ *   inputMs    = finger down to the next frame painted after the click handlers (the INP-style latency),
+ *   eventMs    = the longest Event Timing entry of the interaction (null below the API's 16 ms threshold),
+ *   readyMs    = finger down to the screen the tap opens being ready,
+ *   blockingMs = long-task blocking time from the tap to ready + the settle time.
+ * A sample that is not ok never contributes a number: a missing measurement is shown as missing, never as fast.
+ */
+function summarizeInput(samples) {
+  const order = [];
+  for (const s of samples || []) if (s && !order.includes(s.action)) order.push(s.action);
+  const actions = order.map((action) => {
+    const xs = samples.filter((s) => s && s.action === action);
+    const ok = xs.filter((s) => s.ok);
+    const errors = {};
+    for (const s of xs) if (!s.ok) errors[s.error || "not measured"] = (errors[s.error || "not measured"] || 0) + 1;
+    return {
+      action,
+      total: xs.length,
+      ok: ok.length,
+      failed: xs.length - ok.length,
+      errors,
+      inputMs: robust(ok.map((s) => s.inputMs)),
+      eventMs: robust(ok.map((s) => s.eventMs)),
+      readyMs: robust(ok.map((s) => s.readyMs)),
+      blockingMs: robust(ok.map((s) => s.longTasks?.blockingMs)),
+    };
+  });
+  const all = samples || [];
+  return { total: all.length, ok: all.filter((s) => s && s.ok).length, actions };
+}
+
 // ---------------------------------------------------------------------------
 // Markdown rendering
 // ---------------------------------------------------------------------------
@@ -235,13 +466,18 @@ const kb = (v) => (finite(v) ? (v / 1024).toFixed(0) : "-");
 const num = (v) => (finite(v) ? (Number.isInteger(v) ? String(v) : v.toFixed(1)) : "-");
 const pair = (t) => (t && t.n > 0 ? `${ms(t.p50)} / ${ms(t.p95)}` : "-");
 
+const isPrewarmed = (p) => p.scenario === "in-app-prewarmed" || (!p.scenario && String(p.slug || "").startsWith("nav-"));
+const short = (sha) => (sha === "mixed" ? "mixed (deploy during the page)" : sha === "unknown" ? "unknown" : sha ? String(sha).slice(0, 7) : "not recorded");
+
 function timingTable(pages) {
   const out = [];
-  out.push("| Page | ok/total | TTFB p50 / p95 | FCP p50 / p95 | LCP p50 / p95 | Data ready p50 / p95 | First chart p50 / p95 | Cold: ready (TTFB) |");
+  out.push("| Page | ok/total | TTFB p50 / p95 | FCP p50 / p95 | LCP p50 / p95 | Data ready p50 / p95 | First chart p50 / p95 | First navigation: ready (TTFB) |");
   out.push("|---|---|---|---|---|---|---|---|");
   for (const p of pages) {
     const s = p.summary;
-    const cold = s.cold ? `${ms(s.cold.ready)} (${ms(s.cold.ttfb)})` : "-";
+    // An in-app click has no document of its own: its first round is the first visit of a session Today already
+    // warmed (client cache, router prefetch, HTTP cache), so it is labelled that way and never called cold.
+    const cold = !s.cold ? "-" : isPrewarmed(p) ? `${ms(s.cold.ready)} (first visit, prewarmed)` : `${ms(s.cold.ready)} (${ms(s.cold.ttfb)})`;
     out.push(
       `| ${p.label} | ${s.ok}/${s.total} | ${pair(s.timing.ttfb)} | ${pair(s.timing.fcp)} | ${pair(s.timing.lcp)} | ${pair(s.timing.ready)} | ${pair(s.timing.firstChart)} | ${cold} |`
     );
@@ -251,7 +487,7 @@ function timingTable(pages) {
 
 function requestsTable(pages) {
   const out = [];
-  out.push("| Page | Requests (all) | /rest/v1 n | /rest/v1 summed ms | /rest/v1 last finish (ms) | /api n | /api summed ms | worker n | RSC prefetch n / summed ms | static chunk n | KB transferred (all) | KB /rest/v1 |");
+  out.push("| Page | Requests (all, until network-quiet) | /rest/v1 n | /rest/v1 summed ms | /rest/v1 last finish (ms) | /api n | /api summed ms | worker n | RSC prefetch n / summed ms | static chunk n | KB transferred (all) | KB /rest/v1 |");
   out.push("|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const p of pages) {
     const r = p.summary.requests;
@@ -295,11 +531,133 @@ function runNotes(pages) {
   return lines.join("\n");
 }
 
+/**
+ * Scenario, cache state and revision per page (harness 2). The browser cache of the first navigation is stated
+ * separately from the CDN and the function, which the run cannot control; a function's cold or warm start is never
+ * visible from the browser and is always "unknown".
+ */
+function scenarioTable(pages) {
+  const out = [];
+  out.push("| Page | Scenario | Viewport / CPU | Budget | First navigation: browser / CDN / function | Later navigations | Function warmth | Production revision |");
+  out.push("|---|---|---|---|---|---|---|---|");
+  for (const p of pages) {
+    const s = p.summary;
+    const d = p.detail || {};
+    const view = d.viewport ? `${d.viewport}${d.cpuSlowdown > 1 ? `, CPU ${d.cpuSlowdown}x slower` : ""}` : "not recorded";
+    const first = s.cacheStates && s.cacheStates.first;
+    const rest = s.cacheStates ? Object.entries(s.cacheStates.rest).map(([k, v]) => `${k} x${v}`).join(", ") : "";
+    const ran = !!first && (first.fn === "ran" || Object.keys(s.cacheStates.rest).some((k) => k.endsWith("fn:ran")));
+    const firstCell = first ? `${first.browser} / ${first.cdn} / ${first.fn}` : "not recorded (harness 1)";
+    const warmth = !first ? "not recorded" : ran ? "unknown" : "n/a";
+    out.push(`| ${p.label} | ${p.scenario || "full-load"} | ${view} | ${p.enforced === false ? "observed only" : "enforced"} | ${firstCell} | ${rest || "-"} | ${warmth} | ${short(p.revision)} |`);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Routed readiness against background work, in the fixed window from navigation start (warm median). Routed =
+ * started before data-ready, background = after it (continuous-scroll neighbours, warm-up data, revalidation),
+ * prefetch = router prefetches. Each count is split into network / browser cache; requests whose origin the
+ * browser did not report are counted as unknown, never as either.
+ */
+function windowTable(pages) {
+  const out = [];
+  out.push("| Page | Fixed window (ms) | Complete windows | Data ready p50 / p90 (n) | Routed: requests network / cached / unknown | Routed data calls | Background: requests network / cached / unknown | Background data calls | Prefetch n | KB routed / background | Neighbour page shown at p50 (ms) | First prefetch at p50 (ms) | Blocking time p50 before ready / window (ms) |");
+  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+  for (const p of pages) {
+    const s = p.summary;
+    const w = s.window;
+    const rr = s.readyRobust || { n: 0 };
+    const readyCell = rr.n ? `${ms(rr.p50)} / ${ms(rr.p90)} (${rr.n})` : "-";
+    const counts = s.harness2 && s.windows ? `${s.windows.complete}/${s.total}` : "not recorded (harness 1)";
+    if (!w) {
+      out.push(`| ${p.label} | - | ${counts} | ${readyCell} | - | - | - | - | - | - | - | - | - |`);
+      continue;
+    }
+    const r = w.purpose.routed;
+    const b = w.purpose.background;
+    const split = (x) => `${num(x.network)} / ${num(x.cached)} / ${num(x.unknownVia)}`;
+    const blocking = `${ms(s.blockingBeforeReady.p50)} / ${ms(s.blocking.p50)}`;
+    out.push(
+      `| ${p.label} | ${ms(w.windowMs)} | ${counts} | ${readyCell} | ${split(r)} | ${num(r.data)} | ${split(b)} | ${num(b.data)} | ${num(w.purpose.prefetch.n)} | ${kb(r.bytes)} / ${kb(b.bytes)} | ${ms(s.feedAt.p50)} | ${ms(s.firstPrefetchAt.p50)} | ${blocking} |`
+    );
+  }
+  return out.join("\n");
+}
+
+const lowNote = (r) => (r.n === 0 ? "no sample" : r.lowN ? `low n (${r.n} < ${LOW_N}): p95 is about the worst view; pool scheduled runs before acting on it` : "");
+
+/** Warm data-ready percentiles with their sample size and a low-n warning. */
+function robustTable(pages) {
+  const out = [];
+  out.push("| Page | n | p50 | p90 | p95 | max | IQR | MAD | Note |");
+  out.push("|---|---|---|---|---|---|---|---|---|");
+  for (const p of pages) {
+    const r = p.summary.readyRobust || robust((p.summary.timing && p.summary.timing.ready && p.summary.timing.ready.values) || []);
+    out.push(`| ${p.label} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${ms(r.iqr)} | ${ms(r.mad)} | ${lowNote(r)} |`);
+  }
+  return out.join("\n");
+}
+
+/** Phone taps (observed only): input to next paint, Event Timing, tap to ready, blocking time, with n. */
+function inputTable(inputs) {
+  const out = [];
+  out.push("| Scenario | Action | ok/total | Input to next paint p50 / p90 / max (n) | Event Timing longest p50 (n) | Tap to ready p50 / max (n) | Blocking time p50 (ms) | Not measured | Note |");
+  out.push("|---|---|---|---|---|---|---|---|---|");
+  for (const run of inputs || []) {
+    for (const a of run.summary.actions) {
+      const i = a.inputMs;
+      const e = a.eventMs;
+      const r = a.readyMs;
+      const missing = Object.entries(a.errors).map(([k, v]) => `${k} x${v}`).join(", ");
+      out.push(
+        `| ${run.label} | ${a.action} | ${a.ok}/${a.total} | ${i.n ? `${ms(i.p50)} / ${ms(i.p90)} / ${ms(i.max)} (${i.n})` : "-"} | ${e.n ? `${ms(e.p50)} (${e.n})` : "under 16 ms or not reported"} | ${r.n ? `${ms(r.p50)} / ${ms(r.max)} (${r.n})` : "-"} | ${ms(a.blockingMs.p50)} | ${missing || "-"} | ${lowNote(i)} |`
+      );
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * Data ready pooled over several runs (directories), one row per page, harness version and production revision, so
+ * samples of different builds or methods are never mixed. Only pooled numbers with a real n are a basis for enforcing
+ * a new metric.
+ */
+function pooledTable(runs) {
+  if (!runs || runs.length < 2) return "";
+  const groups = new Map();
+  for (const run of runs) {
+    for (const p of run.pages) {
+      const key = `${p.label}|${p.harness || 1}|${p.revision || ""}`;
+      const g = groups.get(key) || { label: p.label, harness: p.harness || 1, revision: p.revision || null, runs: 0, values: [], failed: 0 };
+      g.runs += 1;
+      g.values.push(...(((p.summary.timing || {}).ready || {}).values || []));
+      g.failed += p.summary.failed || 0;
+      groups.set(key, g);
+    }
+  }
+  const out = [];
+  out.push("| Page | Harness | Production revision | Runs | Warm n | p50 | p90 | p95 | max | Not reached | Note |");
+  out.push("|---|---|---|---|---|---|---|---|---|---|---|");
+  for (const g of groups.values()) {
+    const r = robust(g.values);
+    const note = g.revision === "mixed" ? "a deploy landed during measurement: not bound to one build" : lowNote(r);
+    out.push(`| ${g.label} | ${g.harness} | ${short(g.revision)} | ${g.runs} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${g.failed} | ${note} |`);
+  }
+  return out.join("\n");
+}
+
 /** Side-by-side p50 stability across repeated runs of the same suite. */
 function stabilityTable(runs) {
   if (runs.length < 2) return "";
   const labels = runs[0].pages.map((p) => p.label);
   const out = [];
+  const versions = [...new Set(runs.map((r) => r.harness || 1))];
+  if (versions.length > 1) {
+    out.push(
+      `Runs were measured with different harness versions (${versions.join(", ")}). TTFB, data ready and the network-quiet request totals keep their definition; version 2 adds a browser network listener and in-page observers, so a difference between versions is not evidence of a speed-up.\n`
+    );
+  }
   const head = ["Page", "Metric"];
   runs.forEach((_, i) => head.push(`run ${i + 1} p50`));
   head.push("max spread");
@@ -329,37 +687,70 @@ function stabilityTable(runs) {
  */
 const SPEED_BUDGET_MS = 1000;
 const BUDGET_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
-function budgetViolations(pages, ms = SPEED_BUDGET_MS) {
+/** The budget lines of ONE page, whether or not the page is enforced. */
+function pageBreaches(p, ms = SPEED_BUDGET_MS) {
   const out = [];
   const r = (v) => Math.round(v);
   // Repeatable = slow in two or more warm views; with the hourly 3 warm views a p95 is close to the max, so the count
   // tells a persistent regression from one slow request, and the p95 is reported beside it.
   const kind = (p95, slowViews, views) =>
     `${slowViews >= 2 ? "repeatable" : "isolated"}: ${slowViews} of ${views} warm views${finite(p95) ? `, warm p95 ${r(p95)} ms` : ""}`;
-  for (const p of pages) {
-    const s = p.summary || {};
-    const name = p.label || p.slug;
-    const total = s.total ?? 0;
-    const expected = finite(p.expected) ? p.expected : total;
-    if (total < expected) out.push(`${name}: only ${total} of ${expected} navigations were measured`);
-    if (s.failed > 0) out.push(`${name}: ${s.failed} of ${total} navigations never reached data-ready (counts as over ${ms} ms)`);
-    const ready = s.timing?.ready || {};
-    if (expected >= 2 && !(ready.n > 0)) out.push(`${name}: no warm navigation reached data-ready`);
-    if (s.cold && finite(s.cold.ready) && s.cold.ready >= ms) out.push(`${name}: data ready ${r(s.cold.ready)} ms on the cold first visit`);
-    if (finite(ready.max) && ready.max >= ms) {
-      const slow = (ready.values || []).filter((v) => v >= ms).length || 1;
-      out.push(`${name}: data ready ${r(ready.max)} ms in the slowest warm view (${kind(ready.p95, slow, ready.n || 1)})`);
-    }
-    for (const e of s.endpoints || []) {
-      if (!BUDGET_CLASSES.has(e.cls)) continue;
-      const max = finite(e.callMsMax) ? e.callMsMax : e.callMsP50;
-      if (!(finite(max) && max >= ms)) continue;
-      const per = Array.isArray(e.maxPerView) ? e.maxPerView : [];
-      const slow = per.filter((v) => v >= ms).length || 1;
-      out.push(`${name}: ${e.key} took ${r(max)} ms (${kind(e.callMaxP95, slow, per.length || 1)})`);
-    }
-    for (const e of s.coldEndpoints || []) {
-      if (BUDGET_CLASSES.has(e.cls) && finite(e.maxMs) && e.maxMs >= ms) out.push(`${name}: ${e.key} took ${r(e.maxMs)} ms on the cold first visit`);
+  // An in-app click's first round is the first visit of a session Today already warmed, not a cold one.
+  const first = isPrewarmed(p) ? "on the first in-app visit (session prewarmed by Today)" : "on the cold first visit";
+  const s = p.summary || {};
+  const name = p.label || p.slug;
+  const total = s.total ?? 0;
+  const expected = finite(p.expected) ? p.expected : total;
+  if (total < expected) out.push(`${name}: only ${total} of ${expected} navigations were measured`);
+  if (s.failed > 0) out.push(`${name}: ${s.failed} of ${total} navigations never reached data-ready (counts as over ${ms} ms)`);
+  const ready = s.timing?.ready || {};
+  if (expected >= 2 && !(ready.n > 0)) out.push(`${name}: no warm navigation reached data-ready`);
+  if (s.cold && finite(s.cold.ready) && s.cold.ready >= ms) out.push(`${name}: data ready ${r(s.cold.ready)} ms ${first}`);
+  if (finite(ready.max) && ready.max >= ms) {
+    const slow = (ready.values || []).filter((v) => v >= ms).length || 1;
+    out.push(`${name}: data ready ${r(ready.max)} ms in the slowest warm view (${kind(ready.p95, slow, ready.n || 1)})`);
+  }
+  for (const e of s.endpoints || []) {
+    if (!BUDGET_CLASSES.has(e.cls)) continue;
+    const max = finite(e.callMsMax) ? e.callMsMax : e.callMsP50;
+    if (!(finite(max) && max >= ms)) continue;
+    const per = Array.isArray(e.maxPerView) ? e.maxPerView : [];
+    const slow = per.filter((v) => v >= ms).length || 1;
+    out.push(`${name}: ${e.key} took ${r(max)} ms (${kind(e.callMaxP95, slow, per.length || 1)})`);
+  }
+  for (const e of s.coldEndpoints || []) {
+    if (BUDGET_CLASSES.has(e.cls) && finite(e.maxMs) && e.maxMs >= ms) out.push(`${name}: ${e.key} took ${r(e.maxMs)} ms ${first}`);
+  }
+  return out;
+}
+
+/**
+ * The enforced budget: every page except a scenario added as observe-only (`meta.scenario.enforced: false`, the
+ * phone scenarios of harness 2). Version 1 result files and every desktop page are enforced exactly as before.
+ */
+function budgetViolations(pages, ms = SPEED_BUDGET_MS) {
+  return (pages || []).filter((p) => p.enforced !== false).flatMap((p) => pageBreaches(p, ms));
+}
+
+/** Web Vitals' upper bound for a "good" interaction (INP): a phone tap whose next paint takes longer is reported. */
+const INPUT_PAINT_MS = 200;
+
+/**
+ * What the observe-only scenarios would break if they were enforced: the same page rules as the budget, plus for
+ * phone taps any tap that was not measured, any tap to ready of `ms` or more and any input to next paint of
+ * INPUT_PAINT_MS or more. Reported on every run and never turns the run red: a new metric is enforced only after it
+ * has been stable across repeated scheduled runs (promote it by setting `enforced: true` on its scenario).
+ */
+function observedViolations(pages, inputs, ms = SPEED_BUDGET_MS) {
+  const out = (pages || []).filter((p) => p.enforced === false).flatMap((p) => pageBreaches(p, ms));
+  const r = (v) => Math.round(v);
+  for (const run of inputs || []) {
+    const expected = finite(run.expected) ? run.expected : null;
+    if (expected != null && run.summary.total < expected) out.push(`${run.label}: only ${run.summary.total} of ${expected} taps were tried`);
+    for (const a of run.summary.actions) {
+      if (a.failed > 0) out.push(`${run.label}: ${a.action}: ${a.failed} of ${a.total} taps not measured (${Object.keys(a.errors).join(", ")}), not a pass`);
+      if (finite(a.readyMs.max) && a.readyMs.max >= ms) out.push(`${run.label}: ${a.action}: tap to ready ${r(a.readyMs.max)} ms (slowest of ${a.readyMs.n})`);
+      if (finite(a.inputMs.max) && a.inputMs.max >= INPUT_PAINT_MS) out.push(`${run.label}: ${a.action}: input to next paint ${r(a.inputMs.max)} ms (slowest of ${a.inputMs.n}, over ${INPUT_PAINT_MS} ms)`);
     }
   }
   return out;
@@ -367,7 +758,28 @@ function budgetViolations(pages, ms = SPEED_BUDGET_MS) {
 
 module.exports = {
   SPEED_BUDGET_MS,
+  INPUT_PAINT_MS,
+  HARNESS_VERSION,
+  LOW_N,
+  VIAS,
+  PURPOSES,
   budgetViolations,
+  observedViolations,
+  pageBreaches,
+  robust,
+  viaOf,
+  purposeOf,
+  foldWindow,
+  foldLongTasks,
+  cacheStateOf,
+  revisionOf,
+  scenarioOf,
+  summarizeInput,
+  scenarioTable,
+  windowTable,
+  robustTable,
+  inputTable,
+  pooledTable,
   REQUEST_CLASSES,
   percentile,
   median,
