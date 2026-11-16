@@ -3,8 +3,10 @@
 // itself"). The forms are mounted with the REAL scheduler and hook on a manual clock (tests/helpers/
 // autosave-harness.cjs) and judged by what reaches the network and what the status line says: a complete entry is
 // created once and then updated, a refusal is shown and not retried, an outage is retried, leaving a field or the
-// form sends what is waiting, a failed save keeps the form open. Pages too large to mount offline keep a few
-// structural checks read from the syntax tree (tests/helpers/source-facts.cjs), so formatting never matters.
+// form sends what is waiting, a failed save keeps the form open. The stacks and weight routes behind the forms run
+// against an in-memory database (a repeated or concurrent stack create leaves one stack). Pages too large to mount
+// offline keep a few structural checks read from the syntax tree (tests/helpers/source-facts.cjs), so formatting
+// never matters.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -168,6 +170,9 @@ test("stack editor: a new stack is created once it has a name and a product; lat
 });
 
 test("stack editor: a create whose answer is lost is shown, retried with the same key, and then edited in place", async (t) => {
+  // The editor's half: the failure is shown and the create is resent with the same key. The server's reply is
+  // faked here; that the stacks route really answers a repeated key with the stack it made (and makes no second
+  // one, also under a race) is tested against the route in "stacks route: repeated and concurrent creates" below.
   let posts = 0;
   const h = await mountStack(t, {
     answer: (call) => {
@@ -691,9 +696,15 @@ test("weight rules: what can be saved and how long to wait", () => {
 
 const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
 
-/** A supabase-js stand-in over in-memory tables (the weight route's reads and writes). */
-function fakeSupabase(tables = {}) {
+/**
+ * A supabase-js stand-in over in-memory tables (the weight and stacks routes' reads and writes). A new
+ * supplement_stack row gets the next stack_id. `unique` names a column per table that is kept unique while set: an
+ * insert of a value already there answers 23505, as Postgres does for sql/supplement_stack_client_key.sql's index.
+ * `onInsert` / `onSelect` may answer an error instead of running the query.
+ */
+function fakeSupabase(tables = {}, { onInsert, onSelect, unique = {} } = {}) {
   const db = { tables, ops: [] };
+  let nextId = 100;
   db.from = (table) => {
     const q = { op: "select", filters: [], value: null };
     const rows = () => (db.tables[table] ??= []);
@@ -701,7 +712,14 @@ function fakeSupabase(tables = {}) {
     const exec = (mode) => {
       db.ops.push({ table, op: q.op, filters: [...q.filters], value: q.value });
       if (q.op === "insert") {
-        const list = (Array.isArray(q.value) ? q.value : [q.value]).map((r) => ({ ...r }));
+        const err = onInsert?.(table, q.value, db);
+        if (err) return { data: null, error: err };
+        const list = (Array.isArray(q.value) ? q.value : [q.value]).map((r) => ({ ...(table === "supplement_stack" ? { stack_id: nextId++ } : {}), ...r }));
+        const col = unique[table];
+        const taken = (r) => r[col] != null && (rows().some((o) => o[col] === r[col]) || list.filter((o) => o[col] === r[col]).length > 1);
+        if (col && list.some(taken)) {
+          return { data: null, error: { code: "23505", message: `duplicate key value violates unique constraint "${table}_${col}_uniq"` } };
+        }
         rows().push(...list);
         return { data: mode === "many" ? list : list[0], error: null };
       }
@@ -715,6 +733,8 @@ function fakeSupabase(tables = {}) {
         db.tables[table] = rows().filter((r) => !gone.has(r));
         return { data: null, error: null };
       }
+      const err = onSelect?.(table, q.filters, db);
+      if (err) return { data: null, error: err };
       const hit = matches();
       return { data: mode === "many" ? hit : hit[0] ?? null, error: null };
     };
@@ -754,6 +774,119 @@ test("the stack key migration is additive (no DROP; the Supabase connector decli
   assert.doesNotMatch(sql, /drop/i);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS\s+client_key\s+uuid/i);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS[\s\S]*WHERE\s+client_key\s+IS NOT NULL/i);
+});
+
+// ─── stacks route: repeated and concurrent creates (executed) ────────────────
+// The editor tests above check what the editor sends (one key per new stack, the same key on a retry); these run
+// the stacks route itself, so a server that stops recognising a repeated key fails here and not only in a fake.
+// They cover the route as it is on master today (look the key up, adopt on 23505, create without a key before the
+// column exists). PROD-T12 (#365) moves that into one database function (pds.save_supplement_stack) and tests the
+// same cases in tests/supplement-stack-save.test.cjs: when #365 is merged first, the rebase replaces this block with
+// #365's assertions for this file and leaves the editor tests above as they are.
+
+const STACKS_ROUTE = "app/api/supplements/stacks/route.ts";
+const KEY = "0f0f0f0f-1111-4222-8333-444444444444";
+const OTHER_KEY = "0f0f0f0f-1111-4222-8333-555555555555";
+const stackBody = (over = {}) => ({ name: "Synthetic stack", description: "", remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }], client_key: KEY, ...over });
+const itemsOf = (db, id) => (db.tables.supplement_stack_item ?? []).filter((r) => r.stack_id === id).map((r) => [r.product_id, r.doses]);
+const keyedDb = () => fakeSupabase({}, { unique: { supplement_stack: "client_key" } });
+
+test("stacks route: a create repeated with the same key answers the stack it made and brings it up to date; another key makes another stack", async () => {
+  const db = keyedDb();
+  const { POST } = loadRoute(STACKS_ROUTE, db);
+  const first = await POST(jsonRequest(stackBody()));
+  assert.equal(first.status, 200);
+  assert.equal(first.body.existing, undefined, "a first create is not a replay");
+  const again = await POST(jsonRequest(stackBody({ name: "Synthetic stack, renamed", items: [{ product_id: "synthetic-product-2", doses: 2 }] })));
+  assert.deepEqual([again.status, again.body.stack_id, again.body.existing], [200, first.body.stack_id, true]);
+  assert.equal(db.tables.supplement_stack.length, 1, "one stack, not two");
+  assert.equal(db.tables.supplement_stack[0].name, "Synthetic stack, renamed", "the repeat's newer body is kept");
+  assert.deepEqual(itemsOf(db, first.body.stack_id), [["synthetic-product-2", 2]], "items replaced, not doubled");
+  const third = await POST(jsonRequest(stackBody({ name: "Synthetic stack B", client_key: OTHER_KEY })));
+  assert.equal(third.status, 200);
+  assert.notEqual(third.body.stack_id, first.body.stack_id, "a new key is a new stack: the first is never adopted and renamed");
+  assert.deepEqual(db.tables.supplement_stack.map((r) => r.name), ["Synthetic stack, renamed", "Synthetic stack B"]);
+});
+
+test("stacks route: a create that loses the insert race to the same key adopts the other request's stack", async () => {
+  // Deterministic: the key is not there when this request looks it up, and another request's insert lands just
+  // before this one's (Postgres answers 23505 from the unique index).
+  let raced = false;
+  const db = fakeSupabase({}, {
+    unique: { supplement_stack: "client_key" },
+    onInsert: (table, row, d) => {
+      if (table !== "supplement_stack" || raced) return null;
+      raced = true;
+      d.tables.supplement_stack = [{ stack_id: 200, name: row.name, description: null, remind_time: null, client_key: row.client_key }];
+      return { code: "23505", message: 'duplicate key value violates unique constraint "supplement_stack_client_key_uniq"' };
+    },
+  });
+  const { POST } = loadRoute(STACKS_ROUTE, db);
+  const res = await POST(jsonRequest(stackBody()));
+  assert.deepEqual([res.status, res.body.stack_id, res.body.existing], [200, 200, true]);
+  assert.equal(db.tables.supplement_stack.length, 1, "no second, keyless stack");
+  assert.deepEqual(itemsOf(db, 200), [["synthetic-product-1", 1]], "the adopted stack carries this request's items");
+});
+
+test("stacks route: two creates with one key in flight at once leave one stack, and both answer it", async () => {
+  // Both requests start before either is answered, so they interleave at every database call. Whichever inserts
+  // first makes the stack; the other finds it (or hits the unique index) and answers it as a replay.
+  const db = keyedDb();
+  const { POST } = loadRoute(STACKS_ROUTE, db);
+  const [a, b] = await Promise.all([POST(jsonRequest(stackBody())), POST(jsonRequest(stackBody()))]);
+  assert.deepEqual([a.status, b.status], [200, 200]);
+  assert.equal(db.tables.supplement_stack.length, 1, "one stack");
+  assert.equal(a.body.stack_id, b.body.stack_id, "both answer the same stack");
+  assert.equal([a.body.existing, b.body.existing].filter(Boolean).length, 1, "exactly one of them made it");
+});
+
+test("stacks route: works before the client_key column exists, and refuses a key that is not a UUID", async () => {
+  const missing = { code: "42703", message: "column supplement_stack.client_key does not exist" };
+  const db = fakeSupabase({}, {
+    onSelect: (table, filters) => (table === "supplement_stack" && filters.some(([c]) => c === "client_key") ? missing : null),
+    onInsert: (table, row) => (table === "supplement_stack" && !Array.isArray(row) && "client_key" in row ? missing : null),
+  });
+  const { POST } = loadRoute(STACKS_ROUTE, db);
+  const res = await POST(jsonRequest(stackBody()));
+  assert.equal(res.status, 200);
+  assert.equal(db.tables.supplement_stack.length, 1);
+  assert.equal("client_key" in db.tables.supplement_stack[0], false, "created without the key, as before");
+
+  const db2 = keyedDb();
+  const bad = await loadRoute(STACKS_ROUTE, db2).POST(jsonRequest(stackBody({ client_key: "not-a-uuid" })));
+  assert.equal(bad.status, 400);
+  assert.deepEqual(db2.ops, [], "nothing read or written");
+});
+
+test("stack editor + stacks route: a create whose answer was lost is sent again, the route answers the stack it made, and the next edit updates it", async (t) => {
+  // The route runs; only its first answer is dropped on the way back, as when the connection breaks after the
+  // database wrote the stack. Nothing here decides the replay: the route finds the key.
+  const db = keyedDb();
+  const route = loadRoute(STACKS_ROUTE, db);
+  let posts = 0;
+  const h = await mountStack(t, {
+    answer: async (call) => {
+      const res = await route[call.method](jsonRequest(call.body));
+      if (call.method === "POST" && ++posts === 1) throw new TypeError("Synthetic lost answer");
+      return response(res.body, res.status);
+    },
+  });
+  await nameAndProduct(h);
+  await h.tick(400);
+  assert.equal(db.tables.supplement_stack.length, 1, "the first create reached the database");
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\. Trying again…/, "the editor does not know that, and says so");
+  await h.tick(2000);
+  assert.deepEqual(methods(h), ["POST /api/supplements/stacks", "POST /api/supplements/stacks"]);
+  assert.equal(db.tables.supplement_stack.length, 1, "the repeat made no second stack");
+  assert.match(h.text(), /Stack created/);
+  change(one(h, STACK_DESCRIPTION, "the description field"), "Synthetic description");
+  await h.flush();
+  await h.tick(1200);
+  assert.deepEqual(methods(h).slice(2), ["PATCH /api/supplements/stacks"], "edited in place");
+  const [stack] = db.tables.supplement_stack;
+  assert.equal(h.net.writes()[2].body.stack_id, stack.stack_id, "the edit names the stack the route answered");
+  assert.deepEqual([db.tables.supplement_stack.length, stack.name, stack.description], [1, "Synthetic stack", "Synthetic description"]);
+  assert.deepEqual(itemsOf(db, stack.stack_id), [["synthetic-product-1", 1]]);
 });
 
 test("weight route: a restore may set the source back to the scale's, and nothing else", async () => {

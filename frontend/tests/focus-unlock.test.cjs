@@ -418,7 +418,7 @@ test("middleware(): without the owner's session the CI token opens /api/focus/un
   }
 });
 
-const nextServer ={ NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
+const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
 const loadRoute = (rel, db) => loadTs(rel, { "@supabase/supabase-js": { createClient: () => db }, "next/server": nextServer });
 // Next.js answers a method only when the route exports a function of that name.
 const methodsOf = (route) => Object.keys(route).filter((k) => typeof route[k] === "function").sort();
