@@ -8,9 +8,12 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
 
-const S = loadTs("lib/drink-session.ts");
+// One copy of lib/autosave.ts, passed to drink-session as "./autosave": loadTs has no module cache, and a second copy
+// would give the session its own AutosaveRefused class, which `instanceof` here would not recognise.
+const autosaveLib = loadTs("lib/autosave.ts");
+const { AutosaveRefused } = autosaveLib;
+const S = loadTs("lib/drink-session.ts", { "./autosave": autosaveLib });
 const C = loadTs("lib/drink-capture.ts");
-const { AutosaveRefused } = loadTs("lib/autosave.ts");
 const WG = "gorilla-mind-energy-wild-grape-16oz";
 const NY = "America/New_York";
 const KEY = "0b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b";
