@@ -62,6 +62,12 @@ Usage:
     python urgent_email_etl.py --days 60
     python urgent_email_etl.py --dry-run     # read Gmail, print counts, no database access
                                              # (would-clear counts are reported as unknown)
+    python urgent_email_etl.py --preview-db --refresh-limit 1
+        # retention preview: read Gmail AND stored pds.inbox_emails metadata through a guarded
+        # GET-only client (email_preview_readonly.py), print counts only (would_refresh,
+        # would_clear, retained, ...), write nothing: no upsert, no update, no heartbeat.
+        # --refresh-limit (1..300, preview only) shrinks the refresh slice; the all-age
+        # membership read is unchanged. See docs/email-retention-preview.md.
 
 Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, IMAP_HOST and the IMAP_EMAIL* /
      IMAP_APP_PASSWORD* pairs shared with flights_email_etl.py.
@@ -480,8 +486,28 @@ def new_stats() -> dict:
             "membership": None, "membership_size": 0}
 
 
-def process_account(account: str, password: str, since: date, seen_at: str) -> tuple[list[dict], dict, Optional[set[str]]]:
-    """Read one mailbox. Returns (rows to upsert, counts-only stats, all-age label membership or None)."""
+def check_refresh_limit(limit: Any) -> int:
+    """The refresh slice size: an int in 1..MAX_MESSAGES (bool refused). Only the refresh slice uses it."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_MESSAGES:
+        raise ValueError("refresh limit out of range")
+    return limit
+
+
+def bounded_refresh_limit(text: str) -> int:
+    """argparse type for --refresh-limit: an integer in 1..MAX_MESSAGES (rejected before any work)."""
+    try:
+        return check_refresh_limit(int(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"refresh limit must be an integer between 1 and {MAX_MESSAGES}") from None
+
+
+def process_account(account: str, password: str, since: date, seen_at: str,
+                    refresh_limit: int = MAX_MESSAGES) -> tuple[list[dict], dict, Optional[set[str]]]:
+    """Read one mailbox. Returns (rows to upsert, counts-only stats, all-age label membership or None).
+
+    refresh_limit bounds only the refresh slice (newest N window UIDs). label_membership, its
+    no-date searches, completeness checks and MAX_MEMBERSHIP cap do not depend on it."""
+    refresh_limit = check_refresh_limit(refresh_limit)
     stats = new_stats()
     imap = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
@@ -491,8 +517,8 @@ def process_account(account: str, password: str, since: date, seen_at: str) -> t
         found, how = search_labeled(imap, since)
         stats["search"] = how
         stats["window_candidates"] = len(found)
-        stats["dropped_by_cap"] = max(0, len(found) - MAX_MESSAGES)
-        uids = found[-MAX_MESSAGES:]
+        stats["dropped_by_cap"] = max(0, len(found) - refresh_limit)
+        uids = found[-refresh_limit:]
         stats["messages"] = len(uids)
         rows_by_mid: dict[str, dict] = {}
         if uids:
@@ -659,14 +685,14 @@ def store_account(supa: Any, account: str, rows: list[dict], seen_at: str,
 # Run
 # ---------------------------------------------------------------------------
 
-def _account_notes(fp: str, stats: dict, rec: dict, dry_run: bool) -> list[str]:
+def _account_notes(fp: str, stats: dict, rec: dict, dry_run: bool, refresh_limit: int = MAX_MESSAGES) -> list[str]:
     """Counts-only heartbeat notes for one account. Any note makes the run 'partial'."""
     notes: list[str] = []
     if stats["mailbox"] != "all_mail":
         notes.append(f"account {fp}: mailbox={stats['mailbox']}")
     if stats["dropped_by_cap"]:
         notes.append(f"account {fp}: {stats['dropped_by_cap']} labeled message(s) beyond the refresh cap "
-                     f"{MAX_MESSAGES} not refreshed (kept)")
+                     f"{refresh_limit} not refreshed (kept)")
     unreadable = stats["skipped"]
     chunks = stats["attr_failed_chunks"] + stats["header_failed_chunks"]
     if unreadable or chunks:
@@ -691,24 +717,32 @@ def _account_notes(fp: str, stats: dict, rec: dict, dry_run: bool) -> list[str]:
     return notes
 
 
-def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = False) -> dict:
-    """One run. Returns counts-only diagnostics: status, records, error note, window and per-account counts."""
+def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = False,
+                 refresh_limit: int = MAX_MESSAGES, preview: bool = False) -> dict:
+    """One run. Returns counts-only diagnostics: status, records, error note, window and per-account counts.
+
+    preview: the --preview-db retention preview. Requires dry_run and a (guarded, read-only) database
+    client; accounts are labelled by position ('acct1', ...) instead of a fingerprint in its output.
+    In a dry run 'records' / reconcile 'refreshed' are refresh CANDIDATES, never database writes."""
+    refresh_limit = check_refresh_limit(refresh_limit)
+    if preview and (not dry_run or supa is None):
+        raise ValueError("preview requires dry_run and a read client")
     seen_at = datetime.now(timezone.utc).isoformat()
     since = et_today() - timedelta(days=days)
     report: dict[str, Any] = {"status": "failed", "records": 0, "error": None, "window_days": days,
-                              "refresh_cap": MAX_MESSAGES, "dry_run": dry_run, "accounts": []}
+                              "refresh_cap": refresh_limit, "dry_run": dry_run, "preview": preview, "accounts": []}
     if not accounts:
         report["error"] = "no IMAP accounts configured"
         return report
     failures: list[str] = []
     notes: list[str] = []
     total = 0
-    for account, password in accounts:
-        fp = account_fingerprint(account)
+    for index, (account, password) in enumerate(accounts, 1):
+        fp = f"acct{index}" if preview else account_fingerprint(account)
         entry: dict[str, Any] = {"fp": fp}
         report["accounts"].append(entry)
         try:
-            rows, stats, membership = process_account(account, password, since, seen_at)
+            rows, stats, membership = process_account(account, password, since, seen_at, refresh_limit)
         except Exception as e:
             code = log_failure(log, "account_read_failed", e, fp=fp, level=logging.ERROR,
                                extra={SearchMalformed: "search_malformed"})
@@ -732,14 +766,15 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
         entry["reconcile"] = rec
         total += rec["refreshed"]
         cleared_label = "would_clear" if dry_run else "cleared"
+        rows_label = "would_refresh" if dry_run else "rows"
         log.info(f"[fp={fp}] mailbox={stats['mailbox']} search={stats['search']} window={days}d "
-                 f"candidates={stats['window_candidates']} cap={MAX_MESSAGES} over_cap={stats['dropped_by_cap']} "
-                 f"rows={rec['refreshed']} action={stats['action']} deadline={stats['deadline']} "
+                 f"candidates={stats['window_candidates']} cap={refresh_limit} over_cap={stats['dropped_by_cap']} "
+                 f"{rows_label}={rec['refreshed']} action={stats['action']} deadline={stats['deadline']} "
                  f"unreadable={stats['skipped']} snippet_gaps={stats['bodies_missing'] + stats['snippet_errors']} "
                  f"reconcile={stats['membership']} labeled_rows={rec['labeled_rows']} "
                  f"{cleared_label}={rec[cleared_label]} retained={rec['retained']} unknown={rec['unknown']} "
                  f"unidentified={rec['unidentified']}")
-        notes.extend(_account_notes(fp, stats, rec, dry_run))
+        notes.extend(_account_notes(fp, stats, rec, dry_run, refresh_limit))
     report["records"] = total
     if len(failures) == len(accounts):
         report["error"] = "; ".join(failures)
@@ -753,17 +788,104 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
     return report
 
 
-def run(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = False) -> tuple[str, int, Optional[str]]:
+def run(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = False,
+        refresh_limit: int = MAX_MESSAGES) -> tuple[str, int, Optional[str]]:
     """Returns (heartbeat status, records, error note)."""
-    r = run_detailed(supa, accounts, days, dry_run=dry_run)
+    r = run_detailed(supa, accounts, days, dry_run=dry_run, refresh_limit=refresh_limit)
     return r["status"], r["records"], r["error"]
+
+
+# ---------------------------------------------------------------------------
+# Retention preview (--preview-db): real database reads, zero writes
+# ---------------------------------------------------------------------------
+
+# The integer counters a preview prints per account (allowlist; nothing else from the report is emitted).
+PREVIEW_STATS = ("window_candidates", "dropped_by_cap", "messages", "membership_size", "skipped")
+PREVIEW_RECONCILE = ("labeled_rows", "seen", "retained", "would_clear", "unknown", "unidentified",
+                     "identity_ambiguous", "upserted", "cleared")
+
+
+def _open_preview_client() -> Any:
+    """The guarded GET-only client (email_preview_readonly.py). The only database client a preview uses."""
+    import os
+    from email_preview_readonly import open_preview_client
+    return open_preview_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+
+
+def _emit_preview(report: dict, counters: dict) -> None:
+    """Counts and fixed codes only: no address, fingerprint, subject, Gmail id, URL or exception text."""
+    log.info(f"preview: window={report['window_days']}d refresh_limit={report['refresh_cap']} "
+             f"status={report['status']} accounts={len(report['accounts'])} "
+             f"db_reads={int(counters.get('allowed_reads', 0))} "
+             f"blocked_requests={int(counters.get('blocked_requests', 0))} "
+             f"blocked_redirects={int(counters.get('blocked_redirects', 0))} "
+             f"sent_writes={int(counters.get('sent_writes', 0))} heartbeat_gate={'open' if HEARTBEAT.allowed else 'closed'}")
+    for entry in report["accounts"]:
+        stats, rec = entry.get("stats") or {}, entry.get("reconcile") or {}
+        parts = [f"preview [{entry['fp']}]"]
+        if entry.get("failed"):
+            parts.append(f"failed={entry['failed']}")
+        if stats:
+            parts.append(f"mailbox={stats.get('mailbox')} reconcile={stats.get('membership')}")
+            parts += [f"{k}={int(stats.get(k) or 0)}" for k in PREVIEW_STATS]
+        if rec:
+            parts.append(f"would_refresh={int(rec.get('refreshed') or 0)}")
+            parts += [f"{k}={'unknown' if rec.get(k) is None else int(rec[k])}" for k in PREVIEW_RECONCILE]
+        log.info(" ".join(parts))
+
+
+def preview(days: int, refresh_limit: int) -> int:
+    """Retention preview: Gmail + stored metadata through the guarded client; never writes, never heartbeats.
+
+    Any failure returns 1 with a fixed code. There is no fallback to write mode or to another client."""
+    refresh_limit = check_refresh_limit(refresh_limit)
+    accounts = imap_accounts()
+    try:
+        client = _open_preview_client()
+    except Exception as e:
+        log_failure(log, "preview_client_failed", e, level=logging.ERROR)
+        return 1
+    try:
+        report = run_detailed(client, accounts, days, dry_run=True, refresh_limit=refresh_limit, preview=True)
+        counters = client.counters()
+    except Exception as e:
+        log_failure(log, "preview_failed", e, level=logging.ERROR)
+        return 1
+    finally:
+        client.close()
+    _emit_preview(report, counters)
+    incomplete = report["status"] == "failed" or any(
+        e.get("failed") or (e.get("stats") or {}).get("membership") != RECONCILE_COMPLETE
+        for e in report["accounts"]
+    )
+    breached = (counters.get("blocked_requests", 0) or counters.get("blocked_redirects", 0)
+                or counters.get("sent_writes", 0)
+                or any((e.get("reconcile") or {}).get(k) for e in report["accounts"] for k in ("upserted", "cleared")))
+    if breached:
+        log.error("preview_failed:boundary_refused_request")
+        return 1
+    if incomplete:
+        log.error("preview_failed:incomplete")
+        return 1
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=bounded_days, default=DEFAULT_DAYS, help="refresh window (default 30)")
-    ap.add_argument("--dry-run", action="store_true", help="read Gmail and print counts; no database access")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="read Gmail and print counts; no database access")
+    mode.add_argument("--preview-db", action="store_true",
+                      help="retention preview: read Gmail and stored metadata (guarded GET-only client); "
+                           "write nothing, no heartbeat")
+    ap.add_argument("--refresh-limit", type=bounded_refresh_limit, default=None,
+                    help=f"preview only: refresh at most N window messages per account (1..{MAX_MESSAGES}, "
+                         f"default {MAX_MESSAGES})")
     args = ap.parse_args()
+    if args.refresh_limit is not None and not args.preview_db:
+        ap.error("--refresh-limit is accepted only with --preview-db")
+    if args.preview_db:           # read-only: the heartbeat gate stays closed and no write client exists
+        return preview(args.days, MAX_MESSAGES if args.refresh_limit is None else args.refresh_limit)
     if not args.dry_run:
         HEARTBEAT.open()          # write mode, arguments valid: a crash from here on writes a heartbeat
     started = time.time()
@@ -785,7 +907,8 @@ def main() -> int:
 
 def fatal(e: BaseException) -> None:
     """Root crash handler: a code on the log; a 'failed' heartbeat ONLY when HEARTBEAT was opened by a
-    write-mode run. A --dry-run (or a crash before the mode is known) creates no client and writes nothing."""
+    write-mode run. A --dry-run or --preview-db (or a crash before the mode is known) creates no write
+    client and writes nothing."""
     code = log_failure(log, "fatal", e, level=logging.ERROR)
     if not HEARTBEAT.allowed:
         return

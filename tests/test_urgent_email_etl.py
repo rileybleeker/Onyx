@@ -269,14 +269,60 @@ def stored(account, mid, gm, **kw):
             "agent_labels": ["Agent/Action"], "labeled": True, "last_seen_at": OLD_SEEN, "synced_at": OLD_SEEN, **kw}
 
 
-def run_with(fakes, accounts, supa=None, days=30, dry_run=None):
+def run_with(fakes, accounts, supa=None, days=30, dry_run=None, **kw):
     queue = list(fakes)
     original = u.imaplib.IMAP4_SSL
     u.imaplib.IMAP4_SSL = lambda host: queue.pop(0)
     try:
-        return u.run_detailed(supa, accounts, days, dry_run=(supa is None) if dry_run is None else dry_run)
+        return u.run_detailed(supa, accounts, days, dry_run=(supa is None) if dry_run is None else dry_run, **kw)
     finally:
         u.imaplib.IMAP4_SSL = original
+
+
+class GuardedFakeQuery(FakeQuery):
+    """FakeQuery behind a stand-in of the preview transport guard: a select is 'sent', anything else is
+    refused before it reaches the table (the real guard is tested in tests/test_email_preview_readonly.py)."""
+
+    def __init__(self, guard, db, table):
+        super().__init__(db, table)
+        self.guard = guard
+
+    def execute(self):
+        if self.kind != "select":
+            self.guard.blocked += 1
+            raise RuntimeError("preview_request_blocked")
+        self.guard.allowed += 1
+        return super().execute()
+
+
+class FakePreviewClient:
+    """Stand-in for email_preview_readonly.PreviewReadClient over a FakeSupa table."""
+
+    def __init__(self, supa):
+        self.supa, self.allowed, self.blocked, self.closed = supa, 0, 0, False
+        self.gate_at_open = u.HEARTBEAT.allowed
+
+    def schema(self, name):
+        assert name == "pds"
+        return self
+
+    def table(self, name):
+        assert name == "inbox_emails"
+        return GuardedFakeQuery(self, self.supa, name)
+
+    def counters(self):
+        return {"allowed_reads": self.allowed, "blocked_requests": self.blocked,
+                "blocked_redirects": 0, "sent_writes": 0}
+
+    def close(self):
+        self.closed = True
+
+
+def preview_with(fakes, accounts, supa, refresh_limit=1, **kw):
+    """run_detailed exactly as --preview-db calls it, through the guarded stand-in."""
+    client = FakePreviewClient(supa)
+    r = run_with(fakes, accounts, client, dry_run=True, refresh_limit=refresh_limit, preview=True, **kw)
+    return r, client
 
 
 GM = lambda n: str(1000000000000000000 + n)  # noqa: E731
@@ -779,6 +825,129 @@ class MailboxProofTests(unittest.TestCase):
         self.assertFalse(supa.row(ACCT_A, "unlabeled-elsewhere@example.org")["labeled"])
 
 
+def membership_commands(fake):
+    """The all-age reconciliation reads: undated X-GM-LABELS searches and X-GM-MSGID fetches."""
+    return [c for c in fake.commands
+            if (c[0] == "SEARCH" and c[2] == "X-GM-LABELS" and "SINCE" not in c)
+            or (c[0] == "FETCH" and c[2] == "(X-GM-MSGID)")]
+
+
+class PreviewTests(unittest.TestCase):
+    """--preview-db: production classification over real-shaped stored rows; reads only."""
+
+    def three_labeled(self):
+        messages = {b"901": msg(901, ["Agent/Action"]), b"902": msg(902, ["Agent/Deadline"]),
+                    b"903": msg(903, ["\\Inbox", "Agent/Action"])}
+        rows = [stored(ACCT_A, f"synthetic-{n}@example.org", GM(n)) for n in (901, 902, 903)]
+        return messages, rows
+
+    def test_refresh_limit_one_retains_unrefreshed_rows_with_complete_membership(self):
+        messages, rows = self.three_labeled()
+        supa = FakeSupa(rows)
+        before = {k: dict(v) for k, v in supa.rows.items()}
+        fake = FakeIMAP(messages=messages)
+        r, client = preview_with([fake], [(ACCT_A, "pw")], supa, refresh_limit=1)
+        stats, rec = r["accounts"][0]["stats"], r["accounts"][0]["reconcile"]
+        self.assertEqual((stats["window_candidates"], stats["messages"], stats["dropped_by_cap"]), (3, 1, 2))
+        self.assertEqual(stats["membership"], u.RECONCILE_COMPLETE)
+        self.assertEqual(stats["membership_size"], 3, "membership is all-age and unaffected by the limit")
+        self.assertEqual((rec["refreshed"], rec["seen"], rec["retained"], rec["would_clear"]), (1, 1, 2, 0))
+        self.assertEqual((rec["upserted"], rec["cleared"]), (0, 0), "actual mutation counters")
+        self.assertEqual({op[0] for op in supa.log}, {"select"})
+        self.assertEqual(supa.rows, before, "stored rows unchanged")
+        self.assertEqual((client.blocked, r["refresh_cap"], r["preview"]), (0, 1, True))
+        self.assertGreater(client.allowed, 0)
+        self.assertIn("beyond the refresh cap 1 not refreshed", r["error"])
+        self.assertEqual(r["accounts"][0]["fp"], "acct1", "preview output carries no fingerprint")
+        # The same account at the normal 300 cap issues identical membership reads.
+        normal = FakeIMAP(messages=messages)
+        preview_with([normal], [(ACCT_A, "pw")], FakeSupa(rows), refresh_limit=300)
+        self.assertEqual(membership_commands(fake), membership_commands(normal))
+        self.assertTrue(membership_commands(fake))
+
+    def test_removed_membership_reports_would_clear_without_changing_rows(self):
+        messages, rows = self.three_labeled()
+        messages[b"902"] = msg(902, ["\\Inbox"])           # label removed in Gmail
+        supa = FakeSupa(rows)
+        before = {k: dict(v) for k, v in supa.rows.items()}
+        r, client = preview_with([FakeIMAP(messages=messages)], [(ACCT_A, "pw")], supa, refresh_limit=1)
+        rec = r["accounts"][0]["reconcile"]
+        self.assertEqual((rec["would_clear"], rec["cleared"], rec["upserted"]), (1, 0, 0))
+        self.assertEqual(supa.rows, before)
+        self.assertTrue(supa.row(ACCT_A, "synthetic-902@example.org")["labeled"])
+        self.assertEqual((supa.ops("update"), supa.ops("upsert"), client.blocked), ([], [], 0))
+
+    def test_unknown_or_malformed_membership_keeps_rows_unknown(self):
+        cases = [dict(membership_status="NO"), dict(membership_malformed=True), dict(membership_payload=[None]),
+                 dict(drop_msgid={b"901"}), dict(all_mail=False)]
+        for kw in cases:
+            with self.subTest(kw=repr(kw)):
+                messages, rows = self.three_labeled()
+                supa = FakeSupa(rows + [stored(ACCT_A, "unlabeled-elsewhere@example.org", GM(999))])
+                before = {k: dict(v) for k, v in supa.rows.items()}
+                r, _ = preview_with([FakeIMAP(messages=messages, **kw)], [(ACCT_A, "pw")], supa, refresh_limit=1)
+                rec = r["accounts"][0]["reconcile"]
+                self.assertEqual((rec["would_clear"], rec["retained"]), (0, 0))
+                self.assertEqual(rec["unknown"], 4 - rec["seen"])
+                self.assertEqual(supa.rows, before)
+                self.assertIn("reconcile=unknown(", r["error"])
+
+    def test_missing_identity_and_ambiguity_stay_safe(self):
+        m = msg(904, ["Agent/Action"], mid=None)
+        m["no_gm"] = True
+        supa = FakeSupa([stored(ACCT_A, "synthetic-904@example.org", GM(904)),
+                         stored(ACCT_A, "first@example.org", GM(905)), stored(ACCT_A, "second@example.org", GM(905))])
+        before = {k: dict(v) for k, v in supa.rows.items()}
+        r, _ = preview_with([FakeIMAP(messages={b"904": m, b"905": msg(905, ["Agent/Action"])})],
+                            [(ACCT_A, "pw")], supa, refresh_limit=300)
+        stats, rec = r["accounts"][0]["stats"], r["accounts"][0]["reconcile"]
+        self.assertEqual(stats["identity_missing"], 1, "no identity is manufactured")
+        self.assertEqual(rec["identity_ambiguous"], 1)
+        self.assertEqual(rec["refreshed"], 0)
+        self.assertEqual(supa.rows, before)
+
+    def test_more_than_a_page_of_stored_rows_is_read_in_order(self):
+        rows = [stored(ACCT_A, f"page-{n:04d}@example.org", GM(5000 + n)) for n in range(1001)]
+        rows.append(stored(ACCT_B, "other-account@example.org", GM(9999)))
+        supa = FakeSupa(rows)
+        r, _ = preview_with([FakeIMAP(messages={})], [(ACCT_A, "pw")], supa, refresh_limit=1)
+        rec = r["accounts"][0]["reconcile"]
+        self.assertEqual(rec["labeled_rows"], 1001, "second page read; other account not included")
+        self.assertEqual(rec["would_clear"], 1001)
+        self.assertTrue(all(row["labeled"] for row in supa.rows.values()))
+        ranges = [f for op in supa.log for f in op[3] if f[0] == "eq" and f[1] == "account"]
+        self.assertTrue(all(f[2] == ACCT_A for f in ranges), "every read is account-scoped")
+
+    def test_identity_paging_over_a_thousand_rows_is_kept(self):
+        gm = GM(906)
+        supa = FakeSupa([stored(ACCT_A, f"copy-{n:04d}@example.org", gm) for n in range(1001)])
+        r, _ = preview_with([FakeIMAP(messages={b"906": msg(906, ["Agent/Action"])})], [(ACCT_A, "pw")], supa)
+        self.assertEqual(r["accounts"][0]["reconcile"]["identity_ambiguous"], 1)
+
+    def test_accidental_write_through_the_preview_client_is_refused(self):
+        messages, rows = self.three_labeled()
+        supa = FakeSupa(rows)
+        client = FakePreviewClient(supa)
+        with self.assertRaises(RuntimeError):
+            u.upsert_rows(client, [dict(rows[0])])
+        with self.assertRaises(RuntimeError):
+            u.store_account(client, ACCT_A, [], "2026-11-15T00:00:00+00:00", membership=set(), dry_run=False)
+        self.assertEqual((supa.ops("upsert"), supa.ops("update")), ([], []))
+        self.assertEqual(client.blocked, 2)
+
+    def test_normal_default_is_unchanged_and_limits_are_bounded(self):
+        self.assertEqual(u.MAX_MESSAGES, 300)
+        r = run_with([FakeIMAP()], [(ACCT_A, "pw")], FakeSupa())
+        self.assertEqual((r["refresh_cap"], r["preview"]), (300, False))
+        for bad in (0, 301, -1, True, "1", 1.0, None):
+            with self.subTest(bad=repr(bad)), self.assertRaises(ValueError):
+                u.run_detailed(FakeSupa(), [(ACCT_A, "pw")], 30, refresh_limit=bad)
+        with self.assertRaises(ValueError):
+            u.run_detailed(FakePreviewClient(FakeSupa()), [(ACCT_A, "pw")], 30, dry_run=False, preview=True)
+        with self.assertRaises(ValueError):
+            u.run_detailed(None, [(ACCT_A, "pw")], 30, dry_run=True, preview=True)
+
+
 class CliTests(unittest.TestCase):
     """--dry-run is zero-write on every path, crashes included; write mode still heartbeats on a crash."""
 
@@ -834,6 +1003,136 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(heartbeats, ["fatal:runtime_error"])
         self.assertFalse(u.HEARTBEAT.allowed, "the gate closes after every invocation")
+
+    # --- --preview-db -------------------------------------------------------------------------
+
+    PREVIEW = ["urgent_email_etl.py", "--preview-db", "--refresh-limit", "1"]
+
+    def _preview(self, argv=None, fakes=None, supa=None, factory=None, **patches):
+        supa = supa if supa is not None else FakeSupa(
+            [stored(ACCT_A, f"synthetic-{n}@example.org", GM(n)) for n in (901, 902, 903)])
+        messages = {b"901": msg(901, ["Agent/Action"]), b"902": msg(902, ["Agent/Deadline"]),
+                    b"903": msg(903, ["Agent/Action"])}
+        opened = []
+
+        def default_factory():
+            client = FakePreviewClient(supa)
+            opened.append(client)
+            return client
+        patches.setdefault("_open_preview_client", factory or default_factory)
+        patches.setdefault("imap_accounts", lambda: [(ACCT_A, "pw")])
+        queue = list(fakes) if fakes is not None else [FakeIMAP(messages=messages)]
+        original = u.imaplib.IMAP4_SSL
+        u.imaplib.IMAP4_SSL = lambda host: queue.pop(0)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        old_level = u.log.level
+        u.log.addHandler(handler)
+        u.log.setLevel(logging.INFO)
+        try:
+            rc, created, heartbeats = self._cli(argv or self.PREVIEW, **patches)
+        finally:
+            u.imaplib.IMAP4_SSL = original
+            u.log.removeHandler(handler)
+            u.log.setLevel(old_level)
+        return SimpleNamespace(rc=rc, created=created, heartbeats=heartbeats, opened=opened, supa=supa,
+                               text=stream.getvalue())
+
+    def assertNoWriteSideEffects(self, res):
+        self.assertEqual(res.created, [], "no normal (write) database client is ever created")
+        self.assertEqual(res.heartbeats, [], "no heartbeat")
+        self.assertEqual([op for op in res.supa.log if op[0] != "select"], [])
+        self.assertFalse(u.HEARTBEAT.allowed)
+        for client in res.opened:
+            self.assertFalse(client.gate_at_open, "the heartbeat gate is closed while the preview runs")
+            self.assertTrue(client.closed, "the preview client is closed")
+
+    def test_preview_success_reads_and_writes_nothing(self):
+        res = self._preview()
+        self.assertEqual(res.rc, 0)
+        self.assertNoWriteSideEffects(res)
+        for row in res.supa.rows.values():
+            self.assertEqual((row["labeled"], row["last_seen_at"], row["synced_at"]), (True, OLD_SEEN, OLD_SEEN))
+        self.assertEqual(len(res.opened), 1)
+        self.assertGreater(res.opened[0].allowed, 0)
+        for counter in ("refresh_limit=1", "db_reads=", "blocked_requests=0", "sent_writes=0",
+                        "heartbeat_gate=closed", "would_refresh=1", "retained=2", "would_clear=0",
+                        "upserted=0", "cleared=0", "reconcile=complete"):
+            self.assertIn(counter, res.text)
+        for private in (ACCT_A, u.account_fingerprint(ACCT_A), "synthetic-90", GM(901), "example.org",
+                        "Synthetic notice", "http"):
+            self.assertNotIn(private, res.text, "counts and codes only")
+
+    def test_preview_default_limit_is_the_normal_cap(self):
+        res = self._preview(["urgent_email_etl.py", "--preview-db"])
+        self.assertEqual(res.rc, 0)
+        self.assertIn("refresh_limit=300", res.text)
+        self.assertNoWriteSideEffects(res)
+
+    def test_invalid_or_mixed_mode_is_rejected_before_any_client(self):
+        for argv in (["--refresh-limit", "1"], ["--dry-run", "--refresh-limit", "1"],
+                     ["--preview-db", "--dry-run"], ["--preview-db", "--refresh-limit", "0"],
+                     ["--preview-db", "--refresh-limit", "301"], ["--preview-db", "--refresh-limit", "x"],
+                     ["--preview-db", "--days", "0"]):
+            with self.subTest(argv=argv), mock_stderr():
+                res = self._preview(["urgent_email_etl.py", *argv], imap_accounts=self._boom)
+                self.assertEqual(res.rc, ("exit", 2))
+                self.assertEqual(res.opened, [])
+                self.assertNoWriteSideEffects(res)
+
+    def test_preview_failures_are_nonzero_and_never_heartbeat(self):
+        failing_db = FakeSupa([stored(ACCT_A, "synthetic-901@example.org", GM(901))])
+        failing_db.fail = RuntimeError("synthetic db failure owner@example.com")
+        cases = {
+            "accounts": dict(imap_accounts=self._boom),
+            "client_creation": dict(factory=self._boom),
+            "account_read": dict(fakes=[FakeIMAP(fail_login=True)]),
+            "db_read": dict(supa=failing_db),
+            "classification": dict(classify_rows=self._boom),
+            "run": dict(run_detailed=self._boom),
+            "report": dict(_emit_preview=self._boom),
+        }
+        for stage, kw in cases.items():
+            with self.subTest(stage=stage):
+                res = self._preview(**kw)
+                self.assertEqual(res.rc, 1)
+                self.assertNoWriteSideEffects(res)
+                self.assertNotIn(ACCT_A, res.text)
+                self.assertNotIn("synthetic db failure", res.text)
+
+    def test_incomplete_membership_fails_preview_without_writes(self):
+        for options in ({"all_mail": False}, {"membership_payload": [None]},
+                        {"membership_status": "NO"}, {"drop_msgid": (b"101",)}):
+            with self.subTest(options=options):
+                res = self._preview(fakes=[FakeIMAP(**options)])
+                self.assertEqual(res.rc, 1)
+                self.assertNoWriteSideEffects(res)
+                self.assertIn("preview_failed:incomplete", res.text)
+
+    def test_blocked_request_fails_the_preview(self):
+        original = u.store_account
+
+        def accidental_write(supa, account, rows, seen_at, membership=None, dry_run=False):
+            return original(supa, account, rows, seen_at, membership, dry_run=False)
+        res = self._preview(store_account=accidental_write)
+        self.assertEqual(res.rc, 1)
+        self.assertNoWriteSideEffects(res)
+        self.assertGreater(res.opened[0].blocked, 0)
+        self.assertIn("preview_failed:boundary_refused_request", res.text)
+
+    def test_prior_write_mode_cannot_leave_the_gate_open_for_a_preview(self):
+        rc, _, heartbeats = self._cli(["urgent_email_etl.py"], imap_accounts=lambda: [], run=self._boom)
+        self.assertEqual((rc, heartbeats), (1, ["fatal:runtime_error"]))
+        u.HEARTBEAT.open()                     # even a gate left open by something else is closed by cli()
+        res = self._preview(_emit_preview=self._boom)
+        self.assertEqual(res.rc, 1)
+        self.assertNoWriteSideEffects(res)
+
+    def test_dry_run_still_creates_no_database_client(self):
+        res = self._preview(["urgent_email_etl.py", "--dry-run"], fakes=[FakeIMAP()])
+        self.assertEqual(res.rc, 0)
+        self.assertEqual(res.opened, [], "the Gmail-only dry run never opens the preview client")
+        self.assertEqual((res.created, res.heartbeats, res.supa.log), ([], [], []))
 
 
 class mock_stderr:
