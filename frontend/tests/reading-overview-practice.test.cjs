@@ -162,7 +162,12 @@ test("practiceReady: due plus new ideas, at most a round, 0 while the bank is of
   assert.equal(R.practiceReady(R.parsePracticeSummary(summaryRaw({ enabled: false }))), 0);
   assert.equal(R.practiceReady(null), 0);
   assert.equal(R.practiceReady(undefined), 0);
-  assert.equal(R.practiceReady, P.practiceReady, "the overview re-exports the one helper Today imports");
+  // The overview re-exports the one helper Today imports (each loadTs call has its own module copy: compare behaviour).
+  for (const [due, newReady] of [[2, 3], [20, 30], [0, 0], [8, 0]]) {
+    const summary = { enabled: true, due, newReady };
+    assert.equal(R.practiceReady(summary), P.practiceReady(summary));
+  }
+  assert.match(read("frontend/src/lib/reading.ts"), /export \{ practiceReady, PRACTICE_ROUND_SIZE \} from "@\/lib\/reading-practice-ready";/);
   assert.equal(P.PRACTICE_ROUND_SIZE, 8);
   assert.equal(P.practiceReady({ enabled: true, due: 3, newReady: 2 }), 5);
   assert.equal(P.practiceReady({ enabled: true, due: Number.NaN, newReady: -4 }), 0, "a bad number is no questions");
