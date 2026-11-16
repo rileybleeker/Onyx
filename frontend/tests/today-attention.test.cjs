@@ -3,6 +3,9 @@
 // Today reads, deduplicated by source identity only, ranked deterministically, budgeted for the quiet view, with
 // device-only snooze / "hide here" marks that lapse when the snooze ends or the circumstance changes, and sources
 // that could not confirm their answer reported as unknown, never as a clear day. SYNTHETIC DATA ONLY.
+// A zone with daylight saving time, so the snooze test can check the two days a year the clock changes (every other
+// test builds and compares local times, so it holds in any zone). Set before any Date is made.
+process.env.TZ = "America/New_York";
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -132,6 +135,18 @@ test("unknown: a source that is checking, failed, stale or partial never yields 
   assert.equal(withItems.unknown.length, 1);
 });
 
+test("not connected is trusted only from a current answer: a cached one being refreshed, or whose refresh failed, is unknown", () => {
+  const failed = A.sourceStatus("packages", { load: "ready", connected: false, refreshFailed: true, asOf: iso(-2 * H) }, NOW);
+  assert.equal(failed.state, "stale");
+  const checking = A.sourceStatus("packages", { load: "ready", connected: false, checking: true }, NOW);
+  assert.equal(checking.state, "checking");
+  const partial = A.sourceStatus("urgent-email", { load: "ready", connected: false, partial: true }, NOW);
+  assert.equal(partial.state, "partial");
+  const healthy = [A.sourceStatus("agents", ok, NOW)];
+  for (const st of [failed, checking, partial]) assert.equal(quiet([], [...healthy, st]).verdict, "unknown", `${st.state} is never "every source answered"`);
+  assert.equal(A.sourceStatus("packages", { load: "ready", connected: false }, NOW).state, "not_connected", "a current answer is");
+});
+
 test("retry: a failed check that later succeeds turns unknown into an answer", () => {
   const failed = A.sourceStatus("urgent-email", { load: "error" }, NOW);
   assert.equal(failed.state, "failed");
@@ -179,6 +194,17 @@ test("snooze: lasts until 06:00 on the next behavioral day, then the item return
   const full = A.fullList([item], marks, MS);
   assert.deepEqual([full[0].state, full[0].until], ["snoozed", until]);
   assert.deepEqual(quiet([item], [], { marks, nowMs: until + 1 }).shown.map((s) => s.item.id), ["money:budget:x"]);
+});
+
+test("snooze: the next 06:00 on the local clock, also on the days the clock changes", () => {
+  // Clocks go forward 2030-03-10 and back 2030-11-03 in America/New_York (set at the top of this file).
+  assert.notEqual(new Date(2030, 2, 9, 12).getTimezoneOffset(), new Date(2030, 2, 11, 12).getTimezoneOffset(), "this zone has daylight saving time");
+  const spring = new Date(2030, 2, 10, 6, 30);
+  assert.equal(A.snoozeUntil(spring), new Date(2030, 2, 11, 6, 0).getTime(), "spring forward, 06:30: tomorrow 06:00, not 06:00 today (already past)");
+  assert.ok(A.snoozeUntil(spring) > spring.getTime(), "a snooze never ends before it starts");
+  assert.equal(A.snoozeUntil(new Date(2030, 2, 10, 1, 30)), new Date(2030, 2, 10, 6, 0).getTime());
+  assert.equal(A.snoozeUntil(new Date(2030, 10, 3, 5, 30)), new Date(2030, 10, 3, 6, 0).getTime(), "fall back, 05:30: 06:00 the same morning, not a day later");
+  assert.equal(A.snoozeUntil(new Date(2030, 10, 3, 6, 30)), new Date(2030, 10, 4, 6, 0).getTime());
 });
 
 test("marks: stored copies are validated and pruned (age, count)", () => {
@@ -235,6 +261,46 @@ test("adapter: urgent email keeps Today's merged key; deadlines and inbox-triage
   assert.equal(out[1].reason, "Deadline tomorrow (Thu, Mar 6)");
   const later = A.urgentEmailObligations([item("email:t1", { at: iso(-10 * 60_000) })], [], NOW)[0];
   assert.notEqual(later.version, out[0].version, "a newer message in the thread is a new circumstance");
+});
+
+test("adapter: an agent request's version follows its message and everything the card says", () => {
+  const req = (over = {}, card = {}) => ({ thread: "fixture-agent", messageId: 7, created_at: "2030-03-05 12:00:00", ...over, card: { code: "a1", agent: "Planning assistant", name: "Synthetic choice", details: "Pick one", link: "", expires: null, updated: true, ...card } });
+  const v = (r) => A.requestObligations([r], NOW)[0].version;
+  assert.equal(v(req()), v(req()));
+  assert.notEqual(v(req()), v(req({}, { details: "Pick another one" })), "new instructions under the same title");
+  assert.notEqual(v(req()), v(req({}, { link: "https://example.com/synthetic" })), "a new link");
+  assert.notEqual(v(req()), v(req({ messageId: 8, created_at: "2030-03-05 13:00:00" })), "the card posted again");
+});
+
+test("adapter: urgent email: the deadline countdown keeps a mark, a higher tier or a new date lifts it; unreturned threads are one aggregate", () => {
+  const item = (key) => ({ key, sources: ["Gmail"], sourceDetail: "Gmail, owner@: Agent/Deadline", title: "Synthetic subject", from: null, reasons: [], nextStep: "Reply in Gmail", at: iso(-H), atVerb: "Received", gmailHref: null, requestHref: null, clear: { cards: [], emails: [] } });
+  const email = (deadline) => ({ key: "t1", threadId: "1", messageId: "m", account: "owner@example.com", from: "x", subject: "s", receivedAt: iso(-H), labels: ["Agent/Deadline"], deadline, reasons: [], nextStep: "x", href: null });
+  const at = (daysLeft, label = "Sat, Mar 8") => A.urgentEmailObligations([item("email:t1")], [email({ daysLeft, label })], NOW)[0];
+  assert.equal(at(3).version, at(2).version, "the next morning alone is not a new circumstance");
+  assert.notEqual(at(2).version, at(1).version, "crossing into urgent is");
+  assert.notEqual(at(3, "Sun, Mar 9").version, at(3).version, "a new deadline date is");
+  const withRest = A.urgentEmailObligations([item("email:t1")], [], NOW, 7);
+  assert.deepEqual(withRest.map((o) => [o.id, o.aggregate ?? false]), [["urgent-email:email:t1", false], ["urgent-email:more", true]]);
+  assert.equal(withRest[1].title, "7 more labelled emails not listed here");
+  assert.equal(A.urgentEmailObligations([item("email:t1")], [], NOW, 0).length, 1);
+});
+
+test("adapter: packages are versioned by which orders are in each group; a count Today cannot name is never set aside", () => {
+  const ready = (over = {}) => ({ status: "ready", attention: 1, arrivingToday: 1, onTheWay: 2, top: [{ merchant: "Synthetic store", label: "Item", reason: "Late" }], attentionVersion: "aaaa", arrivingVersion: "bbbb", ...over });
+  const [att, arr] = A.packageObligations(ready());
+  const [att2, arr2] = A.packageObligations(ready({ attentionVersion: "cccc", arrivingVersion: "dddd" }));
+  assert.notEqual(att.version, att2.version, "a different package with the same count is a new circumstance");
+  assert.notEqual(arr.version, arr2.version);
+  assert.ok(!att.aggregate && !arr.aggregate);
+  // An older answer without the fingerprints: the listed orders identify the group only when they are all of it.
+  const old = A.packageObligations(ready({ attentionVersion: undefined, arrivingVersion: undefined }));
+  assert.deepEqual(old.map((o) => o.aggregate ?? false), [false, true]);
+  const big = A.packageObligations(ready({ attention: 5, attentionVersion: undefined, arrivingVersion: undefined }))[0];
+  assert.equal(big.aggregate, true);
+  const marks = { [A.markKey(big)]: A.markFor(big, "hide", MS) };
+  assert.deepEqual(quiet([big], [], { marks }).shown.map((x) => x.item.id), ["packages:attention"], "a mark never applies to an aggregate");
+  assert.equal(A.fullList([big], marks, MS)[0].state, "open");
+  assert.equal(A.renewalObligations({ status: "ready", count: 3, withinDays: 3, soon: [] })[0].aggregate, true);
 });
 
 test("adapter: money alerts get an identity from kind + subject, numbered on a repeat; amount drift is not a change", () => {

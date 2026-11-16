@@ -13,7 +13,9 @@
  * - Urgent items bypass the ordinary budget and say so (`selectQuiet`: `overBudget`, `urgentOver`).
  * - Snooze and "hide here" are display marks on this device, keyed by a hash of the id and of the obligation's
  *   `version`; a mark stops applying when its snooze ends or the circumstance changes (new message, nearer
- *   deadline, higher urgency ...). A marked item stays open: the full Today view lists it as before.
+ *   deadline, higher urgency ...). A marked item stays open: the full Today view lists it as before. An
+ *   `aggregate` (a count of items Today cannot name one by one) is never set aside: hiding a count would also hide
+ *   a different item that later takes the same count.
  * - A source that is checking, failed, stale or partial is "unknown": the quiet view never calls such a day clear.
  *
  * IMPORT-FREE at run time (tests/today-regression.cjs bundles it by name; type imports only).
@@ -61,6 +63,8 @@ export interface Obligation {
   version: string;
   /** An optional learning action (reading): at most one in the quiet view, never in the ordinary budget. */
   learning: boolean;
+  /** A count of items Today cannot name one by one ("3 more ..."): listed, never snoozed or hidden. */
+  aggregate?: true;
 }
 
 export type SourceState = "ok" | "checking" | "stale" | "partial" | "failed" | "not_connected";
@@ -104,15 +108,21 @@ function ago(iso: string | null | undefined, now: Date): string | null {
   return `${Math.floor(min / 1440)} d ago`;
 }
 
-/** One source's state, most serious first: an unread answer, then not connected, then a failed refresh, ... */
+/**
+ * One source's state, most serious first: an unread answer, a failed refresh, a partial answer, then not connected,
+ * a late sync, a check still running. "Not connected" is trusted only from a current answer: a cached "not
+ * connected" whose refresh failed (or is still running) is stale (or checking), never a confirmed answer.
+ */
 export function sourceStatus(source: AttentionSource, p: SourceProbe, now: Date): SourceStatus {
   const label = SOURCE_LABEL[source];
   const at = ago(p.asOf, now);
   if (p.load === "loading") return { source, label, state: "checking", note: "checking..." };
   if (p.load === "error") return { source, label, state: "failed", note: "couldn't check" };
-  if (p.connected === false) return { source, label, state: "not_connected", note: "not connected yet" };
   if (p.refreshFailed) return { source, label, state: "stale", note: `couldn't refresh; showing ${at ? `the check from ${at}` : "an earlier check"}` };
   if (p.partial) return { source, label, state: "partial", note: "part of it couldn't be read, so an item may be missing" };
+  if (p.connected === false) {
+    return p.checking ? { source, label, state: "checking", note: "checking; showing an earlier check" } : { source, label, state: "not_connected", note: "not connected yet" };
+  }
   if (p.syncLate) return { source, label, state: "stale", note: `its sync is late${at ? ` (last ${at})` : ""}; newer items may be missing` };
   if (p.checking) return { source, label, state: "checking", note: "checking; showing an earlier check" };
   return { source, label, state: "ok", note: at ? `checked ${at}` : "checked" };
@@ -152,7 +162,7 @@ export interface RequestLike {
   thread: string;
   messageId: number;
   created_at: string;
-  card: { code: string; agent: string; name: string; expires?: string | null; updated?: boolean };
+  card: { code: string; agent: string; name: string; details?: string; link?: string; expires?: string | null; updated?: boolean };
 }
 
 /** Agent requests waiting for an answer (email questions are handled with urgent email). */
@@ -180,7 +190,9 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
       urgency,
       dueAt: due,
       reason,
-      version: [urgency, r.card.expires ?? "", r.card.updated ? "updated" : "", r.card.name].join("|"),
+      // The message and everything the card says: a re-posted or edited card (same code and title, new details,
+      // link or message) is a new circumstance.
+      version: [urgency, r.card.expires ?? "", r.card.updated ? "updated" : "", r.messageId, r.created_at, r.card.name, r.card.details ?? "", r.card.link ?? ""].join("|"),
       learning: false,
     };
   });
@@ -188,12 +200,14 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
 
 /**
  * Urgent email as Today merged it (lib/urgent-email.ts mergeUrgent: labelled threads + inbox-triage's questions,
- * each once). `emails` are the label answer's items, read for their deadline.
+ * each once). `emails` are the label answer's items, read for their deadline. `unreturned`: labelled threads the
+ * answer counted but did not return (GET /api/urgent-email returns only the most pressing ITEMS_RETURNED), listed
+ * as one aggregate so "All open items" never leaves them out without saying so.
  */
-export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails: readonly EmailItemLike[], now: Date): Obligation[] {
+export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails: readonly EmailItemLike[], now: Date, unreturned = 0): Obligation[] {
   const byKey = new Map<string, EmailItemLike>();
   for (const e of emails) byKey.set(`email:${e.key}`, e);
-  return items.map((item) => {
+  const out: Obligation[] = items.map((item) => {
     const deadline = byKey.get(item.key)?.deadline ?? null;
     const asked = item.sources.includes("Agent Inbox");
     let urgency: Urgency = "normal";
@@ -214,10 +228,30 @@ export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails
       urgency,
       dueAt: deadline ? endOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
       reason,
-      version: [urgency, deadline ? deadline.daysLeft : "", item.at, item.sources.join("+")].join("|"),
+      // The deadline's date, not its countdown: the next morning is not a new circumstance; crossing into a higher
+      // tier (urgency), a new message (at) or a new deadline date is.
+      version: [urgency, deadline ? deadline.label : "", item.at, item.sources.join("+")].join("|"),
       learning: false,
     };
   });
+  const rest = Number.isFinite(unreturned) ? Math.max(0, Math.floor(unreturned)) : 0;
+  if (rest > 0) {
+    out.push({
+      id: "urgent-email:more",
+      source: "urgent-email",
+      title: `${rest} more labelled email${rest === 1 ? "" : "s"} not listed here`,
+      detail: "Today loads the most pressing ones; the rest are in Gmail under Agent/Action and Agent/Deadline.",
+      href: null,
+      external: false,
+      urgency: "normal",
+      dueAt: null,
+      reason: "Labelled for a reply or decision, ranked below the ones listed",
+      version: String(rest),
+      learning: false,
+      aggregate: true,
+    });
+  }
+  return out;
 }
 
 /** Today's arm of a running N-of-1 trial: the instruction for the day (nothing to open). */
@@ -334,19 +368,30 @@ export function renewalObligations(summary: RenewalSummary | null): Obligation[]
       reason: `Renew within ${summary.withinDays} days`,
       version: String(rest),
       learning: false,
+      aggregate: true,
     });
   }
   return out;
 }
 
-/** GET /api/orders/summary (what Today reads). */
-export type PackagesLike = { status: "not_connected" } | { status: "ready"; attention: number; arrivingToday: number; onTheWay: number; top: { merchant: string; label: string; reason: string }[] };
+/**
+ * GET /api/orders/summary (what Today reads). `attentionVersion` / `arrivingVersion`: opaque fingerprints of WHICH
+ * orders are in each group and their status / due date / reason (app/api/orders/summary/route.ts), so a different
+ * package with the same count is a new circumstance. An older answer without them falls back to what it lists.
+ */
+export type PackagesLike = { status: "not_connected" } | {
+  status: "ready"; attention: number; arrivingToday: number; onTheWay: number; top: { merchant: string; label: string; reason: string }[];
+  attentionVersion?: string; arrivingVersion?: string;
+};
 /** Packages as two counts the orders page keeps (needs attention, arriving today): the orders themselves live there. */
 export function packageObligations(summary: PackagesLike | null): Obligation[] {
   if (!summary || summary.status !== "ready") return [];
   const out: Obligation[] = [];
   if (summary.attention > 0) {
     const top = summary.top[0];
+    // Without the server's fingerprint the listed orders still identify the group when they are all of it.
+    const named = summary.attention <= summary.top.length;
+    const listed = summary.top.map((t) => `${t.merchant}|${t.label}|${t.reason}`).join("\n");
     out.push({
       id: "packages:attention",
       source: "packages",
@@ -357,8 +402,9 @@ export function packageObligations(summary: PackagesLike | null): Obligation[] {
       urgency: "normal",
       dueAt: null,
       reason: "Late, stuck or not shipped",
-      version: String(summary.attention),
+      version: summary.attentionVersion ? `v|${summary.attentionVersion}` : `${summary.attention}|${listed}`,
       learning: false,
+      ...(summary.attentionVersion || named ? {} : { aggregate: true as const }),
     });
   }
   if (summary.arrivingToday > 0) {
@@ -372,8 +418,9 @@ export function packageObligations(summary: PackagesLike | null): Obligation[] {
       urgency: "low",
       dueAt: null,
       reason: "Expected today",
-      version: String(summary.arrivingToday),
+      version: summary.arrivingVersion ? `v|${summary.arrivingVersion}` : String(summary.arrivingToday),
       learning: false,
+      ...(summary.arrivingVersion ? {} : { aggregate: true as const }),
     });
   }
   return out;
@@ -522,11 +569,13 @@ export function pruneMarks(marks: AttentionMarks, nowMs: number): Record<string,
 
 /**
  * "Snooze until tomorrow": 06:00 local on the next behavioral day (the app's day runs to 06:00; ADR-0001's −6 h
- * rule). At 22:00 Monday or 01:00 Tuesday that is 06:00 Tuesday; at 07:00 Tuesday it is 06:00 Wednesday.
+ * rule). At 22:00 Monday or 01:00 Tuesday that is 06:00 Tuesday; at 07:00 Tuesday it is 06:00 Wednesday. Worked
+ * out on the local clock (before 06:00 = still the previous behavioral day), never by subtracting 6 elapsed hours,
+ * which is an hour off on the two days a year the clock changes.
  */
 export function snoozeUntil(now: Date): number {
-  const behavioral = new Date(now.getTime() - 6 * HOUR);
-  return new Date(behavioral.getFullYear(), behavioral.getMonth(), behavioral.getDate() + 1, 6, 0, 0, 0).getTime();
+  const day = now.getHours() < 6 ? now.getDate() : now.getDate() + 1;
+  return new Date(now.getFullYear(), now.getMonth(), day, 6, 0, 0, 0).getTime();
 }
 
 // ─── The quiet selection ────────────────────────────────────────────────────────────────────────────────────
@@ -584,7 +633,7 @@ export function selectQuiet(obligations: readonly Obligation[], sources: readonl
   const open: Obligation[] = [];
   const setAside: SetAside[] = [];
   for (const o of ranked) {
-    const mark = opts.marks[markKey(o)];
+    const mark = o.aggregate ? undefined : opts.marks[markKey(o)];
     const state = markApplies(mark, o, opts.nowMs);
     if (state) setAside.push({ item: o, state, until: state === "snoozed" ? mark?.until ?? null : null });
     else open.push(o);
@@ -617,7 +666,7 @@ export interface ListedItem {
 /** The full list: every open obligation and learning action, ranked, each with its display state. Nothing is left out. */
 export function fullList(obligations: readonly Obligation[], marks: AttentionMarks, nowMs: number): ListedItem[] {
   return rankObligations(obligations).map((item) => {
-    const mark = marks[markKey(item)];
+    const mark = item.aggregate ? undefined : marks[markKey(item)];
     const state = markApplies(mark, item, nowMs);
     return { item, state: state ?? "open", until: state === "snoozed" ? mark?.until ?? null : null };
   });
@@ -628,7 +677,8 @@ export function fullList(obligations: readonly Obligation[], marks: AttentionMar
 export interface TodayAttentionInput {
   now: Date;
   requests: { probe: SourceProbe; items: readonly RequestLike[] };
-  urgentEmail: { probe: SourceProbe; items: readonly TodayUrgentItem[]; emails: readonly EmailItemLike[] };
+  /** `unreturned`: labelled threads the answer counted but did not return (its `total` minus its items). */
+  urgentEmail: { probe: SourceProbe; items: readonly TodayUrgentItem[]; emails: readonly EmailItemLike[]; unreturned?: number };
   /** Omitted when no trial is registered or the check is not made here (the scroll's copy of Today). */
   experiment?: { probe: SourceProbe; trial: TrialLike | null };
   calendar: { probe: SourceProbe; events: readonly CalendarEvent[] };
@@ -651,7 +701,7 @@ export function todayAttention(input: TodayAttentionInput): { obligations: Oblig
     sourceStatus("reading", input.reading.probe, now),
   ];
   const obligations = collectObligations([
-    urgentEmailObligations(input.urgentEmail.items, input.urgentEmail.emails, now),
+    urgentEmailObligations(input.urgentEmail.items, input.urgentEmail.emails, now, input.urgentEmail.unreturned ?? 0),
     requestObligations(input.requests.items, now),
     experimentObligations(input.experiment?.trial ?? null),
     calendarObligations(input.calendar.events, now),

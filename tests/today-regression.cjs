@@ -31,6 +31,10 @@ const attentionLib = ids.size; ids.set('frontend/src/lib/today-attention.ts', at
 component = component.replace(/require\("@\/lib\/today-attention"\)/g, `require(${attentionLib})`);
 const viewLib = ids.size; ids.set('frontend/src/lib/today-view.ts', viewLib); modules[viewLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/today-view.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/today-view"\)/g, `require(${viewLib})`);
+// The pre-paint script as the page's HTML runs it (today-view.ts has type imports only, so it runs on its own here).
+const viewModule = { exports: {} };
+new Function('module', 'exports', 'require', modules[viewLib])(viewModule, viewModule.exports, () => ({}));
+const quietBootJs = viewModule.exports.quietBootScript();
 // Takes the reads Today's HTML started before the JavaScript (import-free). Here no script started any, so the first
 // load fetches as usual and the requests checked below are unchanged.
 const earlyLib = ids.size; ids.set('frontend/src/lib/early-fetch.ts', earlyLib); modules[earlyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/early-fetch.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
@@ -518,6 +522,15 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert.equal(await page.getByRole('button', { name: 'Quiet view' }).getAttribute('aria-pressed'), 'true');
         assert.deepEqual(await page.evaluate(() => window.quietPuts), [{ key: 'today.quiet', value: { v: 1, on: true, budget: 3, learning: true } }], 'the change is stored under its own UI preference');
         assert(await page.locator('#today-full').isHidden(), 'the full page is hidden, not removed');
+        const quietLog = quietPanel.getByRole('link', { name: 'Start your check-in' });
+        assert(await quietLog.isVisible(), 'the primary Log action stays in the quiet view');
+        assert.equal(await quietLog.getAttribute('href'), '/log');
+        // Personalize while the quiet view is on: the full page (every part) shows again, and hides when editing ends.
+        await page.evaluate(() => document.querySelector('#today-full .pz-grid').setAttribute('data-pz-editing', ''));
+        assert(await page.locator('#today-full').isVisible(), 'personalizing shows the full page under the quiet view');
+        assert(await page.locator('section[aria-labelledby="requests-heading"]').isVisible());
+        await page.evaluate(() => document.querySelector('#today-full .pz-grid').removeAttribute('data-pz-editing'));
+        assert(await page.locator('#today-full').isHidden());
         const priorities = quietPanel.getByRole('list', { name: 'Priorities' });
         assert.deepEqual(await texts(priorities.locator('li > div:first-child > p:nth-child(2)')), ['Synthetic labelled email 1', 'A synthetic sign-in check', 'Arm A: Synthetic instruction for arm A.'], 'urgent first (nearest deadline first), then the arm, ranked the same every time');
         assert(await priorities.locator('li').first().getByText(/^Urgent · Urgent email · checked/).isVisible(), 'each item names its urgency, source and how current it is');
@@ -570,6 +583,18 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         // Nothing open and every source answered: a clear day. A source that failed: not an all-clear.
         page = await setup('empty', 390, false, 'none');
         await settled(page);
+        // A full load with the quiet view on: the pre-paint style (run before React, here on a device copy that says
+        // on) hides the full page and shows the quiet slot, against the compiled CSS (Tailwind's [hidden] rule
+        // included). Checked in one step, before any render can remove the style.
+        const boot = await page.evaluate((js) => {
+            const slot = () => getComputedStyle(document.querySelector('[data-today-quiet]')).display;
+            const before = slot();
+            new Function('localStorage', js)({ getItem: () => JSON.stringify({ settings: { v: 1, on: true, budget: 3, learning: true } }) });
+            const result = { before, shown: slot(), full: getComputedStyle(document.getElementById('today-full')).display };
+            document.getElementById('today-quiet-boot').remove();
+            return result;
+        }, quietBootJs);
+        assert.deepEqual(boot, { before: 'none', shown: 'block', full: 'none' }, 'the quiet slot is painted before React, the full page is not');
         await page.getByRole('button', { name: 'Quiet view' }).click();
         await quietPanel.waitFor();
         assert(await quietPanel.getByText('Nothing needs you right now. Every source answered.').isVisible());

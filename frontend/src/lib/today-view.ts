@@ -89,7 +89,11 @@ function storage(): Storage | null {
 // The last record written in this page load: used when this device's storage is off or full, so a change still
 // applies and is still sent.
 let memRecord: QuietRecord | null = null;
+// The last write did not reach storage (full, or off): storage holds an older record (or none), so this page
+// load's copy is the current one until a write succeeds again.
+let storageBehind = false;
 function readRecord(): QuietRecord | null {
+  if (storageBehind && memRecord) return memRecord;
   try {
     const s = storage();
     if (s) {
@@ -99,11 +103,19 @@ function readRecord(): QuietRecord | null {
   } catch { /* storage off: fall back to this page load's copy */ }
   return memRecord;
 }
-function writeRecord(rec: QuietRecord) {
+/** Keep the record; false when this device's storage could not take it (the change still applies on this screen). */
+function writeRecord(rec: QuietRecord): boolean {
   memRecord = rec;
   try {
-    storage()?.setItem(QUIET_DEVICE_KEY, JSON.stringify({ settings: quietValue(rec.settings), savedAt: rec.savedAt, updatedAt: rec.updatedAt, dirty: rec.dirty, checkedAt: rec.checkedAt }));
-  } catch { /* storage full or off: the change still applies on this screen */ }
+    const s = storage();
+    if (!s) { storageBehind = true; return false; }
+    s.setItem(QUIET_DEVICE_KEY, JSON.stringify({ settings: quietValue(rec.settings), savedAt: rec.savedAt, updatedAt: rec.updatedAt, dirty: rec.dirty, checkedAt: rec.checkedAt }));
+    storageBehind = false;
+    return true;
+  } catch {
+    storageBehind = true;
+    return false;
+  }
 }
 
 // The settings shown now. Read once per page load; changed here only by Riley's own change, or (on the next
@@ -204,11 +216,14 @@ function time(iso: string | null): number {
 /**
  * Read the server copy (a GET, nothing is written there) at most every QUIET_SYNC_EVERY_MS. A newer copy than
  * this device's is stored here and applies on the next mount; a newer change made here that has not been sent
- * yet wins and waits for Riley's Retry or next change.
+ * yet wins and waits for Riley's Retry or next change. An answer older than what this device already holds (a GET
+ * that was out while Riley changed a setting, or older than the copy his last save stored) never replaces it.
  */
 export async function syncQuiet(fetchImpl: Fetch | null = defaultFetch(), nowMs: number = Date.now()): Promise<"skipped" | "same" | "adopted" | "kept" | "failed"> {
   const rec = readRecord();
   if (!fetchImpl || (rec?.checkedAt != null && nowMs - rec.checkedAt < QUIET_SYNC_EVERY_MS)) return "skipped";
+  const savedBefore = rec?.savedAt ?? null;
+  const storedBefore = rec?.updatedAt ?? null;
   let body: { key?: unknown; value?: unknown; updatedAt?: unknown } | null;
   try {
     const res = await fetchImpl(QUIET_PREF_URL, { cache: "no-store" });
@@ -227,8 +242,12 @@ export async function syncQuiet(fetchImpl: Fetch | null = defaultFetch(), nowMs:
     stamp(local ?? { settings: DEFAULT_QUIET, savedAt: null, updatedAt: null, dirty: false, checkedAt: null });
     return "same";
   }
+  // Riley changed a setting (or a save landed) while the GET was out: this answer predates it.
+  if (local && ((local.savedAt ?? null) !== savedBefore || (local.updatedAt ?? null) !== storedBefore)) { stamp(local); return "kept"; }
   if (local?.dirty && (local.savedAt ?? 0) >= time(updatedAt)) { stamp(local); return "kept"; }
   if (local && !local.dirty && local.updatedAt === updatedAt && sameQuiet(local.settings, server)) { stamp(local); return "same"; }
+  // This device holds a copy the server stored after the one in this answer (a delayed or cached read).
+  if (local && !local.dirty && local.updatedAt !== null && time(local.updatedAt) > time(updatedAt)) { stamp(local); return "kept"; }
   writeRecord({ settings: server, savedAt: null, updatedAt, dirty: false, checkedAt: nowMs });
   if (!live || !sameQuiet(live, server)) pending = server;
   return "adopted";

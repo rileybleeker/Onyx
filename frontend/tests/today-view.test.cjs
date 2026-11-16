@@ -173,6 +173,43 @@ test("storage off: the change still applies on screen and is still sent", async 
   assert.deepEqual(V.readMarks(() => ({ never: true }), (m) => m), {});
 });
 
+test("storage readable but full: the newer change in this page load wins over the older stored copy and is sent", async (t) => {
+  const store = memoryStorage({ "onyx.today.quiet": JSON.stringify({ settings: { v: 1, on: false, budget: 3, learning: true }, savedAt: 1, updatedAt: "2030-03-05T10:00:00.000Z", dirty: false, checkedAt: 1 }) });
+  store.setItem = () => { throw new Error("QuotaExceededError"); };
+  withWindow(t, store);
+  const V = fresh();
+  assert.equal(V.readQuiet().on, false, "the stored copy is read");
+  assert.equal(await V.setQuiet({ on: true, budget: 2, learning: true }, recorder(() => answer(500, {}))), false);
+  assert.equal(V.readQuiet().on, true);
+  assert.equal(V.quietUnsent(), true, "the failed send is still waiting, not lost behind the older stored copy");
+  const ok = recorder((url, init) => answer(200, { key: "today.quiet", value: JSON.parse(init.body).value, updatedAt: "2030-03-05T12:00:00.000Z" }));
+  assert.equal(await V.pushQuiet(ok), true);
+  assert.deepEqual(ok.calls.map((c) => c.body.value), [{ v: 1, on: true, budget: 2, learning: true }], "Retry sends the new value");
+  assert.equal(V.quietUnsent(), false);
+});
+
+test("sync: a GET that was out while Riley changed a setting never replaces it (nor does an older answer)", async (t) => {
+  const store = memoryStorage();
+  withWindow(t, store);
+  const V = fresh();
+  let release;
+  const slow = recorder(() => new Promise((resolve) => { release = () => resolve(answer(200, { key: "today.quiet", value: { v: 1, on: false, budget: 3, learning: true }, updatedAt: "2030-03-05T11:00:00.000Z" })); }));
+  const reading = V.syncQuiet(slow, Date.parse("2030-03-05T12:00:00Z"));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(slow.calls.length, 1);
+  const put = recorder((url, init) => answer(200, { key: "today.quiet", value: JSON.parse(init.body).value, updatedAt: "2030-03-05T12:00:01.000Z" }));
+  assert.equal(await V.setQuiet({ on: true, budget: 4, learning: true }, put), true, "saved while the GET is out");
+  release();
+  assert.equal(await reading, "kept", "the older answer is not adopted");
+  V.adoptQuiet();
+  assert.deepEqual(V.readQuiet(), { on: true, budget: 4, learning: true });
+  assert.equal(JSON.parse(store.getItem(V.QUIET_DEVICE_KEY)).settings.on, true, "the next visit keeps the saved choice");
+  // A clean copy stored by a save is newer than a cached or delayed answer: kept as well.
+  const older = recorder(() => answer(200, { key: "today.quiet", value: { v: 1, on: false, budget: 3, learning: true }, updatedAt: "2030-03-05T11:30:00.000Z" }));
+  assert.equal(await V.syncQuiet(older, Date.parse("2030-03-05T13:00:00Z")), "kept");
+  assert.equal(JSON.parse(store.getItem(V.QUIET_DEVICE_KEY)).settings.on, true);
+});
+
 test("pre-paint script: hides the full page only when this device says on; never throws", () => {
   const V = fresh();
   const run = (stored) => {
@@ -238,11 +275,17 @@ test("Today: opening reads the setting, never writes it; the quiet view hides (n
   // The only calls that send the setting are behind Riley's taps (changeQuiet / retryQuiet).
   const effects = today.split("useEffect(").slice(1).map((s) => s.slice(0, s.search(/\n {2}\}(, \[[^\]]*\])?\);/)));
   for (const body of effects) assert.ok(!/setQuiet\(|pushQuiet\(|writeMarks\(/.test(body), `no write from an effect: ${body.slice(0, 80)}`);
-  assert.match(today, /if \(feed\) return undefined;\s*const timer = setTimeout\(\(\) => \{ void syncQuiet\(\); \}, 3000\);/, "only the routed page reads the server copy, after the page settles");
-  assert.match(today, /data-today-full="" hidden=\{!!selection && !showFull\}/);
+  assert.match(today, /if \(feed\) return undefined;\s*const timer = setTimeout\(\(\) => \{\s*void syncQuiet\(\)/, "only the routed page reads the server copy, after the page settles");
+  // A data attribute, never the HTML hidden attribute: Tailwind's base layer makes [hidden] display:none !important.
+  assert.match(today, /data-today-full="" data-quiet-off=\{selection && !showFull \? "" : undefined\}/);
+  assert.ok(!/data-today-(?:full|quiet)="" hidden/.test(today), "the quiet markup never uses the hidden attribute");
+  assert.match(today, /<div data-today-quiet="" className=\{`\$\{panelStyle\} \$\{styles\.quiet\} \$\{styles\.quietBoot\}`\}>/, "the pre-paint slot is hidden by its class");
   assert.match(today, /\{!feed && <script dangerouslySetInnerHTML=\{\{ __html: quietBootScript\(\) \}\} \/>\}/);
   const css = fs.readFileSync(path.join(SRC, "app", "today", "Today.module.css"), "utf8");
-  assert.match(css, /\.full\[hidden\]:has\(\[data-pz-editing\]\) \{ display: flex; \}/, "Personalize still edits the full page while the quiet view is on");
+  assert.match(css, /\.full\[data-quiet-off\] \{ display: none; \}/);
+  assert.match(css, /\.full\[data-quiet-off\]:has\(\[data-pz-editing\]\) \{ display: flex; \}/, "Personalize still edits the full page while the quiet view is on");
+  assert.match(css, /\.quietBoot \{ display: none; \}/);
+  assert.ok(!/!important/.test(css.replace(/\/\*[\s\S]*?\*\//g, "")), "no !important here: the pre-paint style's must win");
   const regression = fs.readFileSync(path.join(SRC, "..", "..", "tests", "today-regression.cjs"), "utf8");
   assert.match(regression, /lib\/today-attention\.ts/);
   assert.match(regression, /lib\/today-view\.ts/);

@@ -38,7 +38,7 @@ type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; val
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
 // GET /api/orders/summary (online orders read from shipping emails; see /orders).
 type OrdersSummary = { status: "not_connected" } | { status: "ready"; attention: number; arrivingToday: number; onTheWay: number;
-  top: { merchant: string; label: string; reason: string }[] };
+  top: { merchant: string; label: string; reason: string }[]; attentionVersion?: string; arrivingVersion?: string };
 // Roles (PROD-T05): the page title, then section headings (Today.module.css .sectionLabel), then card titles
 // (titleStyle), then metadata (text-xs, secondary). Secondary links are plain underlined text; the one filled
 // accent control is the primary Log action. Every card has the same padding (20 px on a phone, 24 px wider).
@@ -350,7 +350,12 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // every 15 minutes (lib/today-view.ts syncQuiet). A newer copy applies the next time Today opens.
   useEffect(() => {
     if (feed) return undefined;
-    const timer = setTimeout(() => { void syncQuiet(); }, 3000);
+    const timer = setTimeout(() => {
+      void syncQuiet().then((result) => {
+        // A newer copy from another device replaced a change made here that was not sent: nothing waits for Retry.
+        if (result === "adopted" && !quietUnsent()) setQuietSave((s) => (s === "failed" ? "idle" : s));
+      });
+    }, 3000);
     return () => clearTimeout(timer);
   }, [feed]);
   // A setting changed here earlier whose send failed: say so (after hydration; the server render cannot know).
@@ -506,9 +511,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       probe: probe(urgent, "urgent-email", { connected: !(urgent.state === "ready" && urgent.value.status === "not_connected"), syncLate: syncStale, partial: inbox.state === "error" }),
       items: allUrgent,
       emails: emailItems,
+      unreturned: email ? Math.max(0, email.total - email.items.length) : 0,
     },
     experiment: experimentSource ? { probe: probe(experiment, "experiment"), trial } : undefined,
-    calendar: { probe: probe(calendar, "calendar", { connected: !calendarOff, syncLate: !!agenda && calendarSync !== "ok" }), events: agenda?.events ?? [] },
+    calendar: { probe: probe(calendar, "calendar", { connected: !calendarOff, syncLate: !!agenda && calendarSync !== "ok", partial: !!agenda?.truncated }), events: agenda?.events ?? [] },
     money: {
       probe: money
         ? { load: "ready", refreshFailed: money.refreshFailed, checking: (money.updating && !money.refreshFailed) || lifeChecks.money.state === "checking", partial: money.partial !== null, asOf: money.asOf ?? iso(lifeChecks.money.at) }
@@ -570,13 +576,14 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         <p className="mt-1 break-words text-xs text-text-secondary">Why: {o.reason}{overBudget ? ". Urgent, so it is shown past your number" : ""}</p>
         {o.detail && <p className="mt-0.5 break-words text-xs text-text-secondary">{o.detail}</p>}
       </div>
-      <div className="flex shrink-0 flex-col items-end sm:flex-row sm:items-center">
+      {!o.aggregate && <div className="flex shrink-0 flex-col items-end sm:flex-row sm:items-center">
         <button type="button" onClick={() => setAside(o, "snooze")} aria-label={`Snooze until tomorrow: ${o.title}`} className={quietAction}>Snooze</button>
         <button type="button" onClick={() => setAside(o, "hide")} aria-label={`Hide here: ${o.title}`} className={quietAction}>Hide</button>
-      </div>
+      </div>}
     </li>;
   }
   const setAsideCount = selection ? selection.setAside.filter((x) => !x.item.learning).length + selection.more : 0;
+  const stillChecking = !!selection && selection.unknown.length > 0 && selection.unknown.every((st) => st.state === "checking");
   const budgetChoices = Array.from({ length: MAX_BUDGET - MIN_BUDGET + 1 }, (_, i) => MIN_BUDGET + i);
   return (
     <div className={styles.today}>
@@ -607,7 +614,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         <p aria-live="polite" className="mt-1 text-xs text-text-secondary">{quietNote}</p>
         {selection.verdict === "clear" && <p className="mt-2 text-sm text-text-primary">Nothing needs you right now. Every source answered.</p>}
         {selection.verdict === "set_aside" && <p className="mt-2 text-sm text-text-primary">Nothing new needs you. {setAsideCount === 1 ? "1 open item is" : `${setAsideCount} open items are`} snoozed, hidden here or past your number; see All open items.</p>}
-        {selection.verdict === "unknown" && <p className="mt-2 text-sm text-mid">Nothing to show yet, but not every source could be checked, so this is not an all-clear.</p>}
+        {selection.verdict === "unknown" && <p className="mt-2 text-sm text-mid">{stillChecking ? "Still checking your sources..." : "Nothing to show yet, but not every source could be checked, so this is not an all-clear."}</p>}
         {selection.shown.length > 0 && <ol className="mt-2 divide-y divide-border-subtle" aria-label="Priorities">
           {selection.shown.map(({ item, overBudget }) => quietRow(item, overBudget))}
         </ol>}
@@ -617,6 +624,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
           <p className={styles.eyebrow}>OPTIONAL</p>
           <ul aria-label="Optional learning action">{quietRow(selection.learning, false)}</ul>
         </div>}
+        <Link href="/log" className={`${styles.primaryAction} mt-4`}>Start your check-in <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>
         {selection.unknown.length > 0 && <p className="mt-3 break-words text-sm text-mid">Not confirmed: {sourceList(selection.unknown)}. Something from {selection.unknown.length === 1 ? "it" : "them"} may be missing.</p>}
         {selection.notConnected.length > 0 && <p className="mt-1 break-words text-xs text-text-secondary">Not connected yet: {selection.notConnected.map((st) => st.label).join(", ")}.</p>}
         <details className="mt-4">
@@ -660,12 +668,13 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         <button type="button" onClick={() => setShowFull((v) => !v)} aria-expanded={showFull} aria-controls="today-full" className={`${linkStyle} mt-3 min-h-11`}>
           {showFull ? "Hide the full Today page" : "Show the full Today page"}
         </button>
-      </section> : <div data-today-quiet="" hidden className={`${panelStyle} ${styles.quiet}`}>
+      </section> : <div data-today-quiet="" className={`${panelStyle} ${styles.quiet} ${styles.quietBoot}`}>
         <h2 className={styles.quietTitle}>Your priorities</h2>
         <p className="mt-2 text-sm text-text-secondary">Checking your sources...</p>
       </div>}
-      {/* The full page: every panel, unchanged. Hidden (not removed) while the quiet view is on, unless asked for. */}
-      <div id="today-full" data-today-full="" hidden={!!selection && !showFull} className={styles.full}>
+      {/* The full page: every panel, unchanged. Hidden (not removed) while the quiet view is on, unless asked for or
+          while personalizing (Today.module.css .full[data-quiet-off]). */}
+      <div id="today-full" data-today-full="" data-quiet-off={selection && !showFull ? "" : undefined} className={styles.full}>
       {/* Default layout: section order, each heading full width; the panels of a section side by side. */}
       <PartGrid page="/today" title="Today" mode="css" gap={20}>
       <Part id="start-here" title="Start here: check-in" width="half">
@@ -699,7 +708,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       </div>}
       {trial && <div role="region" aria-labelledby="experiment-heading" className={panelStyle}>
         <div className="flex items-center gap-2"><FlaskConical aria-hidden="true" className={iconStyle} />
-          <h3 id="experiment-heading" className={titleStyle}>{trial.status === "active" ? "Today's experiment arm" : "Experiment"}</h3></div>
+          <h2 id="experiment-heading" className={titleStyle}>{trial.status === "active" ? "Today's experiment arm" : "Experiment"}</h2></div>
         {trial.status === "active" && <>
           <p className="mt-1 break-words text-xs text-text-secondary">{trial.experimentId}: {trial.title}. Day {trial.dayNumber} of {trial.nDays} ({dayLabel(trial.behavioralDate)}).</p>
           <p className="mt-3 text-base font-medium text-text-primary">Arm {trial.arm}</p>
