@@ -384,11 +384,15 @@ test("/status has a SimpleFIN card: automated, every 6h, worst-of-two heartbeats
   assert.deepEqual(dedicated, ["balances", "transactions"], "each heartbeat has its own limit-1 read");
   assert.equal(ok.reads.some((q) => q.table.startsWith("finance_")), false, "the cacheable status endpoint never reads ledger rows");
 
-  const revoked = await statusBody({ transactions: fresh(1, { status: "failed", error_message: "SimpleFIN refused the Access URL" }), balances: fresh(1) });
+  // Heartbeat text reaches the card only as re-rendered from its allowlisted codes (SEC-07).
+  const refused = S.formatSimplefinNotes({ sf_access_refused: 1 });
+  const revoked = await statusBody({ transactions: fresh(1, { status: "failed", error_message: refused }), balances: fresh(1) });
   assert.equal(revoked.body.sources.simplefin.status, "failed");
-  assert.equal(revoked.body.sources.simplefin.errorMessage, "SimpleFIN refused the Access URL");
+  assert.equal(revoked.body.sources.simplefin.errorMessage, refused);
+  assert.match(refused, /^SimpleFIN refused the Access URL .* \[sf_access_refused\]$/);
   const reconnect = await statusBody({ transactions: fresh(1, { status: "partial", error_message: "SimpleFIN: Reconnect Demo Bank" }), balances: fresh(1) });
   assert.equal(reconnect.body.sources.simplefin.status, "partial");
+  assert.equal(reconnect.body.sources.simplefin.errorMessage, S.SIMPLEFIN_UNREADABLE_NOTE, "an older free-text row is never shown");
 
   assert.equal((await statusBody({ transactions: fresh(13), balances: fresh(13) })).body.sources.simplefin.status, "success");
   assert.equal((await statusBody({ transactions: fresh(15), balances: fresh(1) })).body.sources.simplefin.status, "partial");

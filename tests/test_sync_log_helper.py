@@ -88,6 +88,17 @@ class LogSyncTests(unittest.TestCase):
         supa = FakeSupa(fail=RuntimeError(SENTINEL))
         capture(lambda: self.assertIsNone(h.log_sync(supa, "delivery", "email", "failed")))
 
+    def test_write_sync_says_whether_the_row_landed(self):
+        """write_sync is log_sync's write with a result: True when inserted, False (logged, never raised) when not."""
+        supa = FakeSupa()
+        self.assertIs(h.write_sync(supa, "simplefin", "transactions", "partial", records=2, error="[cutover_review]"), True)
+        [row] = supa.rows
+        self.assertEqual((row["source"], row["status"], row["error_message"]), ("simplefin", "partial", "[cutover_review]"))
+        failing = FakeSupa(fail=RuntimeError(SENTINEL))
+        text, _ = capture(lambda: self.assertIs(h.write_sync(failing, "simplefin", "balances", "partial"), False))
+        self.assertIn("sync_log insert (simplefin|balances) failed", text)
+        self.assertNotIn(SENTINEL, text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -124,7 +124,8 @@ test("an empty ledger is its own state, with the heartbeat if one exists", async
   const ran = await load(makeDb({ beats: [{ source: "simplefin", data_type: "transactions", status: "failed", sync_start: hoursAgo(1), records_synced: 0, duration_seconds: 1, error_message: "Login required" }] })).loadLedger(q(), NOW);
   assert.equal(ran.kind, "empty");
   assert.equal(ran.freshness.status, "failed");
-  assert.equal(ran.freshness.errorMessage, "Login required");
+  // SimpleFIN heartbeat text is shown only as re-rendered from its allowlisted codes (SEC-07): free text never.
+  assert.match(ran.freshness.errorMessage, /^SimpleFIN reported a problem; its details are not shown here/);
 });
 
 test("default month is the newest with data; flows, trend and month list match an independent sum", async () => {
