@@ -103,7 +103,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
     { key: CACHE_KEYS.habitsJournal, fetch: () => import("@/lib/queries").then((q) => q.getHabitJournal(365)), freshMs: 5 * 60_000 },
     { key: CACHE_KEYS.habitsHistory, fetch: () => import("@/lib/queries").then((q) => q.getHabitMetadataHistory()), freshMs: 5 * 60_000 },
   ],
-  "/reading": () => [json("/api/reading")],
+  // The Want to read list (app/reading/ReadingList.tsx): GET only, same key as the list.
+  "/reading": () => [json("/api/reading"), json("/api/reading/list")],
   "/status": () => [json("/api/status")],
 };
 

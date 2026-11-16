@@ -15,6 +15,7 @@ import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
+import ReadingList from "./ReadingList";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -94,6 +95,19 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Want to read (ReadingList.tsx): after a change, re-read the quest and the book list; a book Riley just started
+  // is shown (his explicit choice). A queued book is never picked as the quest on its own.
+  const onListChanged = useCallback(
+    (e: { started?: string }) => {
+      if (e.started) {
+        setSlug(e.started);
+        void load(e.started, true);
+      } else void load(slug, true);
+    },
+    [load, slug],
+  );
+  const wantList = <ReadingList books={books} onChanged={onListChanged} />;
+
   if (loading && !overview) {
     return (
       <div className="max-w-3xl space-y-3">
@@ -110,20 +124,24 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-red-400">{error}</p>
         <p className="mt-1 text-[12px] text-text-tertiary">If this is a fresh deploy, apply sql/reading_schema.sql in Supabase first.</p>
+        <div className="mt-5">{wantList}</div>
       </div>
     );
   }
 
   if (!overview) {
     return (
-      <div className="max-w-3xl">
+      <div className="max-w-3xl pb-24">
         <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
-        <p className="mt-3 text-sm text-text-secondary">No book in progress. Add one with POST /api/reading/books or the chat.</p>
+        <p className="mt-3 text-sm text-text-secondary">No book in progress.</p>
+        <div className="mt-5">{wantList}</div>
       </div>
     );
   }
 
   const o = overview;
+  // The switcher lists books with a quest; queued ones live on Want to read (the one on screen always stays).
+  const questBooks = books.filter((b) => b.status !== "queued" || b.slug === o.book.slug);
 
   return (
     <div className="max-w-3xl pb-24">
@@ -136,7 +154,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             {o.book.author && <span className="text-text-tertiary"> · {o.book.author}</span>}
           </p>
         </div>
-        {books.length > 1 && (
+        {questBooks.length > 1 && (
           <select
             value={o.book.slug}
             onChange={(e) => {
@@ -145,7 +163,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             }}
             className="bg-surface-card border border-border-subtle rounded-control text-[12px] px-2 py-1.5 text-text-secondary"
           >
-            {books.map((b) => (
+            {questBooks.map((b) => (
               <option key={b.slug} value={b.slug}>
                 {b.title}
               </option>
@@ -203,6 +221,12 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
 
         <Part id="add-highlight" title="Highlight + comment">
           <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+        </Part>
+      </PartGroup>
+
+      <PartGroup id="section-want-list" title="Want to read">
+        <Part id="want-to-read" title="Want to read">
+          {wantList}
         </Part>
       </PartGroup>
 

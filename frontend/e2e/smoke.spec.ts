@@ -841,3 +841,80 @@ test("/financials keeps the CSV preview tool behind its disclosure", async ({ pa
   await expect(page.locator("details").getByRole("alert"), "unexpected import error on a fresh load").toHaveCount(0);
   await expectNoClientCrash(page);
 });
+
+// Read-only acceptance of the two capture carryovers. A fresh authenticated context contains no intake drafts.
+// No screenshots/traces/content logs, and no interaction that could enter or change user data.
+test.describe("Capture carryovers — read-only opening", () => {
+  test.use({ serviceWorkers: "block", trace: "off", screenshot: "off", video: "off" });
+
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+    for (const target of ["log", "reading"] as const) {
+      test(`${target} opens without saving at ${viewport.width}x${viewport.height}`, async ({ page, context }) => {
+        test.setTimeout(90_000);
+        await page.setViewportSize(viewport);
+        const guardedPaths = new Set(["/api/nutrition/drinks", "/api/reading/list"]);
+        let attempts = 0;
+        // Keep this guard installed until the test context closes, including after all assertions.
+        await context.route((url) => guardedPaths.has(url.pathname), async (route) => {
+          if (["POST", "PATCH", "DELETE"].includes(route.request().method())) {
+            attempts += 1;
+            await route.abort("blockedbyclient");
+          } else await route.continue();
+        });
+        const version = async (): Promise<string | null> => {
+          try {
+            const response = await page.request.get("/api/version", { timeout: 10_000, headers: { "Cache-Control": "no-cache" } });
+            if (!response.ok()) return null;
+            const value: unknown = (await response.json()).version;
+            return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value) ? value : null;
+          } catch { return null; }
+        };
+        const before = await version();
+        let after: string | null = null;
+        let authenticated = false;
+        let ready = false;
+        let noLoadError = false;
+        let listMatchesApi = target === "log";
+        try {
+          expect(before !== null, "production revision is available").toBe(true);
+          const apiPath = target === "log" ? "/api/nutrition/drinks" : "/api/reading/list";
+          const apiReady = page.waitForResponse((r) => new URL(r.url()).pathname === apiPath && r.request().method() === "GET", { timeout: LOAD_TIMEOUT })
+            .then((r) => r.ok()).catch(() => false);
+          const response = await page.goto(`/${target}`, { waitUntil: "domcontentloaded" });
+          authenticated = !!response?.ok() && !/\/login(?:[/?#]|$)/.test(page.url());
+          expect(authenticated, "authenticated page opened").toBe(true);
+          expect(await apiReady, "capture read succeeded without a migration/load failure").toBe(true);
+          const panel = target === "log" ? page.locator("#log-section-drinks") : page.getByTestId("reading-want-list");
+          await expect.poll(() => panel.isVisible(), { timeout: LOAD_TIMEOUT, message: "capture panel is visible" }).toBe(true);
+          if (target === "reading") {
+            await expect.poll(() => panel.locator("#add-title").isVisible(), { timeout: LOAD_TIMEOUT, message: "planned-book title input is visible" }).toBe(true);
+          }
+          await settle(page); // allows delayed mount/autosave mistakes to reach the aborting guard
+          ready = await panel.isVisible();
+          noLoadError = !(await panel.getByText(/Drinks are not set up yet|Couldn't load drinks|Your list isn't available yet|Couldn't load your list/).isVisible());
+          if (target === "reading") {
+            // Compare private data inside the browser; only the boolean leaves this evaluation.
+            listMatchesApi = await page.evaluate(async () => {
+              const response = await fetch("/api/reading/list", { cache: "no-store" });
+              if (!response.ok()) return false;
+              const value = await response.json();
+              if (!Array.isArray(value.items)) return false;
+              const rows = Array.from(document.querySelectorAll('[data-testid="reading-want-list"] [data-testid="want-to-read-item"]'));
+              return rows.length === value.items.length && value.items.every((item: { title?: unknown }, i: number) =>
+                typeof item.title === "string" && rows[i].querySelector("p")?.textContent === item.title);
+            }).catch(() => false);
+          }
+          expect(ready && noLoadError, "capture panel loaded without a failure state").toBe(true);
+          expect(listMatchesApi, "all planned-book titles match the authenticated list").toBe(true);
+        } finally {
+          after = await version();
+          const sameSha = before !== null && before === after;
+          const zeroWriteAttempts = attempts === 0;
+          console.log(JSON.stringify({ sha_before: before, sha_after: after, viewport: `${viewport.width}x${viewport.height}`, authenticated, ready, no_load_error: noLoadError, list_matches_api: listMatchesApi, zero_write_attempts: zeroWriteAttempts, same_sha: sameSha }));
+          expect(zeroWriteAttempts, "opening attempted no capture mutation").toBe(true);
+          expect(sameSha, "the production revision stayed unchanged throughout this case").toBe(true);
+        }
+      });
+    }
+  }
+});
