@@ -8,8 +8,9 @@
 -- Per docs/adr/0001-timezone-and-behavioral-day-handling.md (D4).
 --
 -- Sources covered:
---   pds.eight_sleep_trends — date-only; bed is stationary in NY ET
---   pds.spotify_plays      — TIMESTAMPTZ instant (played_at)
+--   pds.eight_sleep_trends — date-only (the provider's wake-up day); the bed is
+--                            stationary in America/New_York (Eastern time)
+--   pds.spotify_plays     — TIMESTAMPTZ instant (played_at)
 --   pds.supplement_intake  — Onyx-owned: behavioral_date already canonical
 --                            (intake_date), enrich with instant-derived et/local
 --   pds.meal_events        — same pattern as supplement_intake
@@ -21,8 +22,19 @@
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
--- 1. eight_sleep_trends — stationary bed, calendar_date is already correct
+-- 1. eight_sleep_trends — stationary bed, calendar_date is the provider's day
 -- ---------------------------------------------------------------------------
+-- Date contract (docs/eight-sleep-date-contract.md, live check 2026-11-16):
+-- calendar_date is the trends API `day`, which is the WAKE-UP date (local date
+-- in the requested zone of the night's end). The trigger copies it into all
+-- three onyx_* dates, so on this table onyx_behavioral_date is the wake-up date
+-- too, NOT the -6 h behavioral day the sleep closes (that is calendar_date - 1
+-- for a night-time onset). Consumers re-key instead: hrv_alignment.py moves
+-- eight_sleep_* one day earlier, the check-in and the sweet spot read the row
+-- dated D+1 for the sleep that closes day D. Never re-date these rows here
+-- (it would double-shift every consumer). Live, this function was replaced by
+-- the identical pds.set_onyx_dates_calendar_passthrough
+-- (audit_re_2026_06_07_consolidate_identical_onyx_triggers.sql).
 ALTER TABLE pds.eight_sleep_trends
     ADD COLUMN IF NOT EXISTS onyx_et_date         DATE,
     ADD COLUMN IF NOT EXISTS onyx_behavioral_date DATE,
@@ -35,9 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_eight_sleep_trends_behavioral_date
 CREATE OR REPLACE FUNCTION pds.set_onyx_dates_eight_sleep_trends()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Bed is stationary in NY ET. Trends are pre-attributed by Eight Sleep
-    -- backend (request hard-codes ?tz=America/New_York). All three onyx_*
-    -- dates collapse to calendar_date.
+    -- Bed is stationary in Eastern time. Trends are pre-attributed by the
+    -- Eight Sleep backend (the ETL requests ?tz=EIGHTSLEEP_TIMEZONE, default
+    -- America/New_York) to the wake-up date. All three onyx_* dates collapse
+    -- to calendar_date (see the section note above).
     NEW.onyx_et_date         := NEW.calendar_date;
     NEW.onyx_behavioral_date := NEW.calendar_date;
     NEW.onyx_local_date      := NEW.calendar_date;

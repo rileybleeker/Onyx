@@ -350,7 +350,11 @@ def test_missing_session_unknown_side_and_empty_timeseries() -> None:
 
 def test_session_id_parsing_handles_json_string_and_sessionids_fallback() -> None:
     assert es._session_id_from_raw('{"mainSessionId": "A"}') == "A"
-    assert es._session_id_from_raw({"sessionIds": ["B", "C"]}) == "B"
+    # A sole session is the main one; with several and no mainSessionId the
+    # main session is unknown (the first may be a nap), so nothing is paired.
+    assert es._session_id_from_raw({"sessionIds": ["B"]}) == "B"
+    assert es._session_id_from_raw({"sessionIds": ["B", "C"]}) is None
+    assert es._session_id_from_raw({"mainSessionId": "", "sessionIds": ["B", "C"]}) is None
     assert es._session_id_from_raw({"mainSessionId": None, "sessionIds": []}) is None
     assert es._session_id_from_raw("not json") is None
     assert es._session_id_from_raw(None) is None
@@ -439,7 +443,13 @@ class MainDB(FakeSupabase):
         return _Result(None)
 
 
-def _run_main(sb, client, argv, sync_user=lambda *a, **k: 5, users=None, heal=None):
+def _sync_stats(records=0, **extra):
+    """A sync_user result: the counters main() sums, with `records` rows upserted."""
+    return {**es._new_sync_stats(), "records": records, **extra}
+
+
+def _run_main(sb, client, argv, sync_user=lambda *a, **k: _sync_stats(5), users=None,
+              heal=None):
     """Run es.main() with every outside dependency faked. Returns sync_log rows by type."""
     client.close = lambda: None
     client.authenticate = lambda: None
@@ -479,7 +489,7 @@ def test_main_runs_heal_after_sync_and_logs_healed_count() -> None:
     assert len(client.calls) == 1, "--selfheal-max 1 must cap per-ID calls"
     # --selfheal-max 0 -> no heal, no extra sync_log row.
     sb2 = MainDB([_trend_row("2026-11-01", sid="S1")])
-    _run_main(sb2, client, ["--selfheal-max", "0"], sync_user=lambda *a, **k: 0)
+    _run_main(sb2, client, ["--selfheal-max", "0"], sync_user=lambda *a, **k: _sync_stats(0))
     assert [r["data_type"] for r in sb2.sync_logs] == ["trends"], sb2.sync_logs
     assert len(client.calls) == 1
 
@@ -537,6 +547,29 @@ def test_main_reports_sync_errors_and_heal_problems_together() -> None:
     assert msg.startswith("1 error(s); temp self-heal:"), msg
 
 
+def test_main_bed_zone_mismatch_leads_the_trends_heartbeat_with_the_guard() -> None:
+    """A session reporting another UTC offset turns the /status row partial, GUARD first."""
+    sb = MainDB([])
+    by_type = _run_main(sb, FakeClient({}), ["--selfheal-max", "0"],
+                        sync_user=lambda *a, **k: _sync_stats(3, bed_tz_mismatch=1))
+    trends = by_type["trends"]
+    assert trends["status"] == "partial" and trends["records_synced"] == 3, trends
+    assert trends["error_message"].startswith("GUARD eight_sleep_bed_tz:"), trends
+    # Sides are summed: one clean side and one mismatching side still report it.
+    sides = iter([_sync_stats(2), _sync_stats(1, bed_tz_mismatch=2)])
+    sb2 = MainDB([])
+    by_type2 = _run_main(sb2, FakeClient({}), ["--selfheal-max", "0"],
+                         users={"left": "u-left", "right": "u-right"},
+                         sync_user=lambda *a, **k: next(sides))
+    assert by_type2["trends"]["records_synced"] == 3
+    assert by_type2["trends"]["error_message"].startswith(
+        "GUARD eight_sleep_bed_tz: 2 session(s)"), by_type2["trends"]
+    # A clean sync stays success.
+    sb3 = MainDB([])
+    by_type3 = _run_main(sb3, FakeClient({}), ["--selfheal-max", "0"])
+    assert by_type3["trends"]["status"] == "success", by_type3["trends"]
+
+
 def test_main_passes_selfheal_days_to_the_heal() -> None:
     sb = MainDB([_trend_row("2026-08-01", sid="OLD")])
     client = FakeClient({"OLD": _interval()})
@@ -565,14 +598,17 @@ def test_rows_without_an_interval_do_not_overwrite_stored_temps() -> None:
     assert es._split_rows_by_temp([with_t]) == [[with_t]]
     assert es._split_rows_by_temp([]) == []
 
-    # End to end through sync_user with a fake API: 2 trend days, 1 interval.
+    # End to end through sync_user with a fake API: 2 trend days, 1 interval,
+    # paired with the 2026-11-10 day by its session id.
     class API:
         def get_intervals(self, _uid):
-            return [{"ts": "2026-11-10T08:00:00.000Z",
+            return [{"id": "S10", "ts": "2026-11-10T08:00:00.000Z",
                      "timeseries": {"tempBedC": [["t", 24.0]], "tempRoomC": [["t", 20.0]]}}]
 
         def get_trends(self, _uid, _start, _end):
-            return [{"day": "2026-11-10", "score": 80}, {"day": "2026-10-20", "score": 70}]
+            return [{"day": "2026-11-10", "score": 80, "mainSessionId": "S10",
+                     "sessionIds": ["S10"]},
+                    {"day": "2026-10-20", "score": 70}]
 
     sent: list[list[dict]] = []
 
@@ -589,7 +625,7 @@ def test_rows_without_an_interval_do_not_overwrite_stored_temps() -> None:
         n = es.sync_user(API(), SB(), "u", "left", date(2026, 10, 15), date(2026, 11, 10))
     finally:
         es.time.sleep = saved_sleep
-    assert n == 2 and len(sent) == 2, sent
+    assert n["records"] == 2 and len(sent) == 2, (n, sent)
     flat = {r["calendar_date"]: r for batch in sent for r in batch}
     assert flat["2026-11-10"]["median_bed_temp"] == 24.0
     assert "median_bed_temp" not in flat["2026-10-20"], "NULL temp would erase a stored value"

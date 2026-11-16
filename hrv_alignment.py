@@ -48,6 +48,9 @@ derived; verified on live data 2026-11-10)
   dated by the wake-up day, so row D shows the night that closes day D-1 (Eight Sleep HRV
   on row D+1 vs WHOOP HRV on row D: r = 0.84; Garmin HRV on row D vs WHOOP row D-1:
   r = 0.82). Moved one day earlier, so they describe the same sleep as row D's WHOOP HRV.
+  Eight Sleep's date contract (wake-up date in the bed's zone, never re-dated in SQL) is in
+  docs/eight-sleep-date-contract.md; its known limit: a main sleep that starts between
+  06:00 and 18:00 local closes its own wake-up day, so the one-day move pairs it one row early.
 * Source frames hrv_analysis.load_all_data merges by their own calendar_date, which is the
   wake-up day: garmin_sleep (onyx_behavioral_date = calendar_date - 1 in 233/236 rows),
   garmin_hrv and eight_sleep_trends. wake_date_to_closing_day() re-keys them.

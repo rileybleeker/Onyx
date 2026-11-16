@@ -15,13 +15,26 @@ stored trends payload carries mainSessionId + sessionIds.
 Usage:
     python eight_sleep_temp_backfill.py            # dry-run, no DB writes
     python eight_sleep_temp_backfill.py --apply    # actually write to Supabase
+    python eight_sleep_temp_backfill.py --compare  # read-only: stored vs main session
 
 Only NULL columns are written; existing values are never overwritten. Reads
 at most 1000 rows per run, so re-run until it reports 0 candidate rows.
+
+--compare is step 1 of the affected-history plan in
+docs/eight-sleep-date-contract.md: until 2026-11-16 the daily sync paired an
+interval with a trend day by the date the session STARTED, so a night that
+began before local midnight (or a nap) could put another session's temps on a
+row. It pages through EVERY stored row, looks up each row's main session and
+prints COUNTS only (same, differ, partial, ...) plus `complete`; it never
+writes and never prints a date or a value. Provider and HTTP logging is
+turned down while it runs, but treat the whole transcript as private anyway
+(a crash traceback can still carry a provider id).
 """
 
 import sys
+import time
 import logging
+from contextlib import contextmanager
 
 import eight_sleep_etl as es
 
@@ -31,8 +44,167 @@ BACKFILL_MAX_LOOKUPS = 1000   # per-ID API calls per run
 BACKFILL_SCAN_LIMIT = 1000    # PostgREST returns at most 1000 rows per request
 
 
+COMPARE_TOLERANCE = 0.005    # stored temps are NUMERIC(5,2)
+COMPARE_PAGE_SIZE = 1000     # PostgREST's per-request maximum
+COMPARE_MAX_ROWS = 50000     # stop paging here and report truncated=True
+
+# Counts that leave a row unchecked: the row is neither clean nor a difference.
+NOT_VERIFIABLE = ("unmapped_side", "no_session", "not_found", "no_temp")
+
+
+def _stored_rows(sb, page_size: int, max_rows: int) -> tuple[list[dict], bool]:
+    """Every eight_sleep_trends row, paged (newest first, stable order).
+
+    Returns (rows, truncated). truncated=True when paging stopped at max_rows
+    with a full last page, i.e. more rows may exist. A row read twice (a sync
+    inserting a newer row between two pages shifts the offsets) counts once.
+    """
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    offset = 0
+    while True:
+        page = (
+            sb.schema("pds").from_("eight_sleep_trends")
+            .select("calendar_date,bed_side,raw_json,median_bed_temp,median_room_temp")
+            .order("calendar_date", desc=True)
+            .order("bed_side")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        ).data or []
+        for row in page:
+            key = (row.get("calendar_date"), row.get("bed_side"))
+            if key not in seen:
+                seen.add(key)
+                out.append(row)
+        offset += page_size
+        if len(page) < page_size:
+            return out, False
+        if offset >= max_rows:
+            return out, True
+
+
+def compare_temps(client, sb, users: dict[str, str],
+                  max_lookups: int = BACKFILL_MAX_LOOKUPS,
+                  page_size: int = COMPARE_PAGE_SIZE,
+                  max_rows: int = COMPARE_MAX_ROWS,
+                  delay_s: float = es.SELFHEAL_DELAY_S) -> dict:
+    """Read-only: does each stored temp equal its trend day's main session?
+
+    Pages through every row of the table. For each row with a stored bed or
+    room temp, fetch /intervals/{id} of the row's main session (one call per
+    distinct user + session, capped) and compare the medians the ETL would
+    compute. Returns counts only:
+      scanned              rows read (all rows, with or without temps)
+      rows                 rows with at least one stored temp
+      same                 every stored temp matches the main session
+      differ               at least one stored temp does not match
+      partial              no stored temp differs, but one could not be checked
+                           (the session has no readings for that column)
+      unmapped_side        bed side not on the device now (e.g. 'away')
+      no_session           no known main session (see _session_id_from_raw)
+      not_found / no_temp  session gone, or no readings for any stored column
+      failed / over_cap    lookup error, or beyond the lookup cap
+      not_verifiable       unmapped_side + no_session + not_found + no_temp
+    `complete` is True only when the whole table was read and every row with
+    a stored temp was checked in full or is counted as not verifiable:
+    truncated is False and failed, over_cap and partial are all 0. Rows that
+    are not verifiable are never clean; `differ = 0` with complete=False
+    proves nothing about the rows left out. Writes nothing.
+    """
+    stats = {"scanned": 0, "truncated": False, "rows": 0, "same": 0, "differ": 0,
+             "partial": 0, "unmapped_side": 0, "no_session": 0, "not_found": 0,
+             "no_temp": 0, "failed": 0, "over_cap": 0, "lookups": 0}
+    rows, stats["truncated"] = _stored_rows(sb, page_size, max_rows)
+    stats["scanned"] = len(rows)
+    fetched: dict[tuple[str, str], object] = {}
+    for row in rows:
+        stored = {c: row.get(c) for c in es.TEMP_COLUMNS if row.get(c) is not None}
+        if not stored:
+            continue
+        stats["rows"] += 1
+        user_id = users.get(row.get("bed_side"))
+        if not user_id:
+            stats["unmapped_side"] += 1
+            continue
+        session_id = es._session_id_from_raw(row.get("raw_json"))
+        if not session_id:
+            stats["no_session"] += 1
+            continue
+        key = (user_id, session_id)
+        if key not in fetched:
+            if stats["lookups"] >= max_lookups:
+                stats["over_cap"] += 1
+                continue
+            stats["lookups"] += 1
+            try:
+                fetched[key] = client.get_interval(*key)
+            except Exception as e:  # noqa: BLE001 — counted, never raised
+                fetched[key] = e
+            time.sleep(delay_s)
+        interval = fetched[key]
+        if isinstance(interval, Exception):
+            stats["failed"] += 1
+            continue
+        if interval is None:
+            stats["not_found"] += 1
+            continue
+        ts = interval.get("timeseries") or {}
+        found = {"median_bed_temp": es.median_timeseries(ts.get("tempBedC")),
+                 "median_room_temp": es.median_timeseries(ts.get("tempRoomC"))}
+        pairs = [(float(v), found[c]) for c, v in stored.items() if found[c] is not None]
+        if not pairs:
+            stats["no_temp"] += 1
+        elif any(abs(a - b) > COMPARE_TOLERANCE for a, b in pairs):
+            stats["differ"] += 1
+        elif len(pairs) < len(stored):
+            stats["partial"] += 1
+        else:
+            stats["same"] += 1
+    stats["not_verifiable"] = sum(stats[k] for k in NOT_VERIFIABLE)
+    stats["complete"] = (not stats["truncated"] and stats["failed"] == 0
+                         and stats["over_cap"] == 0 and stats["partial"] == 0)
+    return stats
+
+
+@contextmanager
+def _quiet_provider_logs():
+    """Turn down the loggers that print provider ids (the ETL's authenticate
+    line, retry warnings, httpx request URLs) while --compare runs."""
+    names = ("eight_sleep_etl", "retry_helper", "httpx", "httpcore")
+    saved = {n: logging.getLogger(n).level for n in names}
+    for n in names:
+        logging.getLogger(n).setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        for n, level in saved.items():
+            logging.getLogger(n).setLevel(level)
+
+
 def main(argv: list[str] | None = None) -> dict:
-    apply = "--apply" in (sys.argv[1:] if argv is None else argv)
+    args = sys.argv[1:] if argv is None else argv
+    apply = "--apply" in args
+    compare = "--compare" in args
+    if apply and compare:
+        raise SystemExit("--compare is read-only; it cannot be combined with --apply")
+
+    if compare:
+        with _quiet_provider_logs():
+            client = es.EightSleepClient(es.EIGHTSLEEP_EMAIL, es.EIGHTSLEEP_PASSWORD,
+                                         es.EIGHTSLEEP_TIMEZONE)
+            try:
+                client.authenticate()
+                sb = es.get_supabase_client()
+                stats = compare_temps(client, sb, es.discover_users(client))
+            finally:
+                client.close()
+        log.info("=" * 60)
+        log.info("COMPARE (read-only, nothing written): "
+                 + ", ".join(f"{k}={v}" for k, v in stats.items()))
+        if not stats["complete"]:
+            log.info("Incomplete: differ=0 here does not clear the rows left out "
+                     "(truncated, failed, over_cap or partial is not 0).")
+        return stats
 
     client = es.EightSleepClient(es.EIGHTSLEEP_EMAIL, es.EIGHTSLEEP_PASSWORD,
                                  es.EIGHTSLEEP_TIMEZONE)

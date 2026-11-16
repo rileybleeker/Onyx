@@ -20,7 +20,7 @@ import json
 import time
 import argparse
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -39,15 +39,22 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 EIGHTSLEEP_EMAIL = os.environ["EIGHTSLEEP_EMAIL"]
 EIGHTSLEEP_PASSWORD = os.environ["EIGHTSLEEP_PASSWORD"]
-# Eight Sleep API requires a TZ to slice "today's trend" — passed as ?tz=...
-# This is also used to attribute interval timestamps to a calendar_date. On
-# travel days the env var doesn't update, so non-ET sleeps may attribute to
-# the wrong calendar day until manually re-exported. The DB trigger on
-# pds.eight_sleep_trends.start_time corrects this downstream via
-# pds.derive_onyx_dates -> tz_for_instant (ADR-0001), so the audit-flagged
-# concern is bounded to the raw `calendar_date` join key only. Future option:
-# call pds.tz_for_instant for each fetch's date as a per-fetch override.
-# Audit re-2026-05-26 P3 (deepseek etl F-007).
+# The zone the trends API slices its days in (passed as ?tz=...). Date
+# contract (docs/eight-sleep-date-contract.md, checked on live data
+# 2026-11-16): a trend `day` is the WAKE-UP date, i.e. the local date in this
+# zone of the night's end (presenceEnd / sleepEnd), and it is stored as
+# calendar_date unchanged. Nothing corrects it downstream: the table has no
+# start_time column, and its trigger (pds.set_onyx_dates_calendar_passthrough)
+# copies calendar_date into all three onyx_* dates. That is right because the
+# Pod is stationary, so this is the BED's zone, not the wearer's: a night spent
+# away leaves no session here, and a night in the bed stays home-dated even
+# while user_tz_log still shows a trip. Interval values attach to a trend day
+# by session id (never by their own timestamp; a day with several sessions and
+# no mainSessionId gets none), and no row is written without a trend day. If
+# the Pod moves to a zone with another UTC offset, change this variable; until
+# then a session reporting such a zone turns the run `partial`
+# (GUARD eight_sleep_bed_tz). Supersedes audit re-2026-05-26 P3 (deepseek etl
+# F-007) and re-2026-06-07 etl gpt-5/F-002 + deepseek/F-006.
 EIGHTSLEEP_TIMEZONE = os.environ.get("EIGHTSLEEP_TIMEZONE", "America/New_York")
 
 AUTH_URL = "https://auth-api.8slp.net/v1/tokens"
@@ -383,29 +390,63 @@ def parse_trend_day(day: dict, bed_side: str) -> dict | None:
     }
 
 
-def parse_interval(interval: dict, bed_side: str) -> dict | None:
-    """Parse an interval dict for biometric data (fallback for older data)."""
-    ts_str = interval.get("ts")
-    if not ts_str:
+def _parse_instant(value) -> datetime | None:
+    """An Eight Sleep ISO instant ('...Z' or with an offset) as an aware datetime."""
+    if not isinstance(value, str) or not value:
         return None
-
     try:
-        dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-    except (ValueError, TypeError):
-        try:
-            dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")
-        except (ValueError, TypeError):
-            return None
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else None
 
-    # interval.ts is UTC ("...Z"); converting to the user's local TZ before
-    # taking .date() ensures the interval lands on the same calendar day the
-    # rest of the trend payload uses (`parse_trend_day` calls the API with
-    # ?tz=EIGHTSLEEP_TIMEZONE). Without this, a 2 AM ET in-bed event has its
-    # ts at ~06:00 UTC and would get attributed to the UTC date, differing
-    # from the trend-day attribution. Once Phase 1 of ADR-0001 ships, this
-    # becomes onyx_behavioral_date from the WHOOP cycle anchor.
-    dt_utc = dt.replace(tzinfo=timezone.utc)
-    calendar_date = dt_utc.astimezone(ZoneInfo(EIGHTSLEEP_TIMEZONE)).date().isoformat()
+
+def bed_tz_check(day: dict, tz: str) -> dict:
+    """Compare the zone each session of a trend day reports with `tz`.
+
+    Counts {"mismatch", "unknown"}: a mismatch is a session whose `timezone`
+    has a different UTC offset than `tz` at the session's end (so the provider
+    may be slicing days in the wrong zone: the Pod moved); a session without a
+    readable zone or instant is unknown and is never treated as a match or a
+    mismatch. Same-offset zones are not a mismatch (no date can differ).
+    Whether the field is the Pod's own setting or an echo of ?tz= is not
+    known; with every request in one zone the data cannot tell them apart.
+    """
+    out = {"mismatch": 0, "unknown": 0}
+    try:
+        ours = ZoneInfo(tz)
+    except Exception:  # noqa: BLE001 — an unusable configured zone cannot be compared
+        out["unknown"] = len(day.get("sessions") or [])
+        return out
+    for s in day.get("sessions") or []:
+        if not isinstance(s, dict):
+            out["unknown"] += 1
+            continue
+        instant = _parse_instant(s.get("presenceEnd")) or _parse_instant(s.get("ts"))
+        name = s.get("timezone")
+        try:
+            theirs = ZoneInfo(name) if isinstance(name, str) and name else None
+        except Exception:  # noqa: BLE001 — unknown zone name
+            theirs = None
+        if theirs is None or instant is None:
+            out["unknown"] += 1
+        elif instant.astimezone(theirs).utcoffset() != instant.astimezone(ours).utcoffset():
+            out["mismatch"] += 1
+    return out
+
+
+def parse_interval(interval: dict, bed_side: str) -> dict | None:
+    """Parse one /intervals session (bed / room temps, fallback biometrics).
+
+    Returns its `session_id` instead of a date: the caller attaches it to the
+    trend day whose mainSessionId names it. Dating an interval by its own
+    `ts` (the session START) put every session that began before local
+    midnight on the previous trend day, because a trend `day` is the wake-up
+    date (docs/eight-sleep-date-contract.md). None without an id.
+    """
+    session_id = interval.get("id")
+    if not session_id:
+        return None
     ts = interval.get("timeseries", {}) or {}
 
     stages = interval.get("stages", [])
@@ -417,7 +458,10 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
             stage_totals[stage_name] = stage_totals.get(stage_name, 0) + dur
 
     return {
-        "calendar_date": calendar_date,
+        "session_id": str(session_id),
+        # Only used to tell whether the session falls inside a sync window
+        # (the pairing check in sync_user), never to date a row.
+        "session_start": _parse_instant(interval.get("ts")),
         "bed_side": bed_side,
         "avg_heart_rate": avg_timeseries(ts.get("heartRate")),
         "avg_breath_rate": avg_timeseries(ts.get("respiratoryRate")),
@@ -487,11 +531,28 @@ def _strip_timeseries(data: dict) -> dict:
 # Sync logic
 # ---------------------------------------------------------------------------
 
-def sync_user(client: EightSleepClient, sb: Client, user_id: str,
-              bed_side: str, start_date: date, end_date: date) -> int:
-    """Sync trend + interval data for one user/bed side."""
+def _new_sync_stats() -> dict:
+    return {"records": 0, "trend_chunks": 0, "trend_chunks_failed": 0,
+            "intervals_matched": 0, "intervals_unmatched": 0,
+            "interval_pairing_failed": 0,
+            "bed_tz_mismatch": 0, "bed_tz_unknown": 0}
 
-    # 1. Fetch intervals (all available)
+
+def sync_user(client: EightSleepClient, sb: Client, user_id: str,
+              bed_side: str, start_date: date, end_date: date) -> dict:
+    """Sync trend + interval data for one user/bed side.
+
+    Every row is a trend `day` from the provider (calendar_date = that day,
+    the wake-up date); interval values join it by the day's mainSessionId.
+    An interval with no trend day this run (a night still processing, a
+    failed trends chunk) writes nothing: a row built from an interval alone
+    would carry NULL scores and raw_json and erase the stored ones. The next
+    run (7-day window) or the temp self-heal picks it up by session id.
+    Returns counters; `records` is the number of rows upserted.
+    """
+    stats = _new_sync_stats()
+
+    # 1. Fetch intervals (the 10 most recent sessions)
     log.info(f"  [{bed_side}] Fetching intervals...")
     try:
         intervals = client.get_intervals(user_id)
@@ -500,11 +561,11 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         log.warning(f"  [{bed_side}] Intervals fetch failed: {e}")
         intervals = []
 
-    interval_by_date: dict[str, dict] = {}
+    interval_by_id: dict[str, dict] = {}
     for interval in intervals:
         parsed = parse_interval(interval, bed_side)
         if parsed:
-            interval_by_date[parsed["calendar_date"]] = parsed
+            interval_by_id[parsed["session_id"]] = parsed
 
     # 2. Fetch trends in 30-day chunks (v2 API includes biometrics)
     log.info(f"  [{bed_side}] Fetching trends...")
@@ -517,6 +578,7 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         chunk_end = min(current + timedelta(days=chunk_size - 1), end_date)
         start_str = current.isoformat()
         end_str = chunk_end.isoformat()
+        stats["trend_chunks"] += 1
 
         try:
             days = client.get_trends(user_id, start_str, end_str)
@@ -526,22 +588,25 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
                     trend_by_date[parsed["calendar_date"]] = parsed
                     raw_by_date[parsed["calendar_date"]] = day
         except Exception as e:
+            stats["trend_chunks_failed"] += 1
             log.error(f"  [{bed_side}] Trends {start_str} → {end_str}: {e}")
 
         current = chunk_end + timedelta(days=1)
         time.sleep(0.5)
 
-    # 3. Merge: trend data is primary, interval fills gaps
-    all_dates = set(trend_by_date.keys()) | set(
-        d for d in interval_by_date.keys()
-        if start_date.isoformat() <= d <= end_date.isoformat()
-    )
-
+    # 3. Merge: one row per trend day; the interval is the day's main session
+    used_sessions: set[str] = set()
     rows = []
-    for d in sorted(all_dates):
-        trend = trend_by_date.get(d, {})
-        interval = interval_by_date.get(d, {})
+    for d in sorted(trend_by_date):
+        trend = trend_by_date[d]
         raw = raw_by_date.get(d)
+        tz_check = bed_tz_check(raw or {}, EIGHTSLEEP_TIMEZONE)
+        stats["bed_tz_mismatch"] += tz_check["mismatch"]
+        stats["bed_tz_unknown"] += tz_check["unknown"]
+        session_id = _session_id_from_raw(raw)
+        interval = interval_by_id.get(session_id, {}) if session_id else {}
+        if interval:
+            used_sessions.add(session_id)
 
         row = {
             "calendar_date": d,
@@ -588,6 +653,32 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         }
         rows.append(row)
 
+    stats["intervals_matched"] = len(used_sessions)
+    stats["intervals_unmatched"] = len(set(interval_by_id) - used_sessions)
+    if stats["intervals_unmatched"]:
+        # Most are the main sessions of nights outside the window and naps;
+        # nothing is lost, they are only not written by date.
+        log.info(f"  [{bed_side}] {stats['intervals_unmatched']} interval(s) are not "
+                 "the main session of a trend day in this window (not written)")
+    # Pairing by id assumes /intervals items carry the same id as the trend
+    # day's mainSessionId. If that ever stops holding, nothing pairs and the
+    # sync silently stops writing temps; flag it when it can be told apart
+    # from a quiet window: sessions started inside the window (or the evening
+    # before it), trend days with a known main session, and not one match.
+    lo = start_date - timedelta(days=1)
+    try:
+        zone = ZoneInfo(EIGHTSLEEP_TIMEZONE)
+        in_window = sum(1 for p in interval_by_id.values()
+                        if p.get("session_start") is not None
+                        and lo <= p["session_start"].astimezone(zone).date() <= end_date)
+    except Exception:  # noqa: BLE001 — an unusable zone: cannot tell, do not flag
+        in_window = 0
+    days_with_main = sum(1 for d in trend_by_date if _session_id_from_raw(raw_by_date.get(d)))
+    if not used_sessions and in_window and days_with_main:
+        stats["interval_pairing_failed"] = 1
+        log.warning(f"  [{bed_side}] none of {in_window} interval(s) in the window "
+                    f"paired with {days_with_main} trend day(s) by session id")
+
     if rows:
         count = 0
         for batch in _split_rows_by_temp(rows):
@@ -596,10 +687,11 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
             )
         log.info(f"  [{bed_side}] Upserted {count} records "
                  f"({start_date} → {end_date})")
-        return count
+        stats["records"] = count
+        return stats
 
     log.info(f"  [{bed_side}] No data found")
-    return 0
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -635,9 +727,14 @@ def _new_heal_stats() -> dict:
 
 
 def _session_id_from_raw(raw) -> str | None:
-    """mainSessionId (else the first sessionId) from a stored trends payload.
+    """The main session id of a trends payload (or of a stored raw_json).
 
-    raw_json is a dict on current rows and a JSON string on older ones.
+    mainSessionId when present; else the sole sessionIds entry when the day
+    has exactly one session. A day with several sessions and no
+    mainSessionId has no known main session (the list order is not
+    documented, so the first one may be a nap): None, so nothing is paired
+    with it and stored temps stay as they are. raw_json is a dict on current
+    rows and a JSON string on older ones.
     """
     if isinstance(raw, str):
         try:
@@ -649,8 +746,8 @@ def _session_id_from_raw(raw) -> str | None:
     main_id = raw.get("mainSessionId")
     if main_id:
         return str(main_id)
-    session_ids = raw.get("sessionIds") or []
-    return str(session_ids[0]) if session_ids else None
+    session_ids = [i for i in (raw.get("sessionIds") or []) if i]
+    return str(session_ids[0]) if len(session_ids) == 1 else None
 
 
 def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
@@ -773,6 +870,41 @@ def _selfheal_summary(stats: dict, max_rows: int) -> str:
             + (f"; {stats['scan_error']}" if stats["scan_error"] else ""))
 
 
+def trends_problems(errors: int, sync_totals: dict,
+                    heal_problem: str | None) -> list[str]:
+    """What turns the `eight_sleep|trends` heartbeat partial, GUARD first.
+
+    A bed-zone mismatch breaks the date contract (the provider may be slicing
+    days in the wrong zone), so it leads the message with the GUARD prefix the
+    devops agent reports to Riley instead of re-running. Counts only: never a
+    zone name or a value (the Actions log is public).
+    """
+    problems: list[str] = []
+    if sync_totals.get("bed_tz_mismatch"):
+        problems.append(
+            f"GUARD eight_sleep_bed_tz: {sync_totals['bed_tz_mismatch']} session(s) "
+            "report a time zone whose UTC offset differs from EIGHTSLEEP_TIMEZONE, so "
+            "their trend days may be dated in the wrong zone; if the Pod moved, set "
+            "EIGHTSLEEP_TIMEZONE (docs/eight-sleep-date-contract.md)")
+    if errors:
+        problems.append(f"{errors} error(s)")
+    if sync_totals.get("trend_chunks_failed"):
+        problems.append(
+            f"trends fetch failed for {sync_totals['trend_chunks_failed']} of "
+            f"{sync_totals.get('trend_chunks', 0)} chunk(s); those days were not "
+            "written and are retried next run")
+    if sync_totals.get("interval_pairing_failed"):
+        problems.append(
+            f"no interval paired with a trend day by session id on "
+            f"{sync_totals['interval_pairing_failed']} bed side(s) although sessions "
+            "fall in the window, so the sync wrote no temps; check that /intervals "
+            "ids still equal the trend mainSessionId (the self-heal still fills "
+            "NULL temps of past days by per-ID lookup)")
+    if heal_problem:
+        problems.append(heal_problem)
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # Discover bed sides
 # ---------------------------------------------------------------------------
@@ -878,14 +1010,20 @@ def main():
     t0 = time.time()
     total_records = 0
     errors = 0
+    sync_totals = _new_sync_stats()
 
     for side, user_id in users.items():
         try:
-            count = sync_user(client, sb, user_id, side, start, end)
-            total_records += count
+            side_stats = sync_user(client, sb, user_id, side, start, end)
+            for k in sync_totals:
+                sync_totals[k] += side_stats.get(k, 0)
+            total_records += side_stats["records"]
         except Exception as e:
             errors += 1
             log.error(f"[{side}] Sync failed: {e}", exc_info=True)
+    if sync_totals["bed_tz_unknown"]:
+        log.info(f"{sync_totals['bed_tz_unknown']} session(s) report no readable "
+                 "zone or end time (bed zone unknown, not counted as a move)")
 
     # Self-heal NULL temps the normal sync could not fill (before the matview
     # refresh so healed values reach daily_health_matrix this run). It never
@@ -928,8 +1066,7 @@ def main():
 
     # The /status Eight Sleep card reads this row only, so a heal problem is
     # reported here too (the sync itself still counts its records).
-    problems = [p for p in (f"{errors} error(s)" if errors else None,
-                            heal_problem) if p]
+    problems = trends_problems(errors, sync_totals, heal_problem)
     log_sync(sb, "eight_sleep", "trends", "partial" if problems else "success",
              records=total_records, started_at=t0,
              date_range_start=start, date_range_end=end,
