@@ -152,7 +152,9 @@ class _PreviewSchema:
     def table(self, name: str) -> Any:
         if name != TABLE:
             raise PreviewClientError("preview_table_refused")
-        builder = self._owner._sdk.schema(PROFILE).table(name)
+        # ClientOptions already selected pds. Calling SDK.schema() clones PostgREST in
+        # current SDK versions and can drop its custom HTTP client; retain the configured client.
+        builder = self._owner._sdk.table(name)
         # Every query must run on the guarded httpx client. A builder carrying any other session
         # (an SDK version that ignores httpx_client, or rebuilds the client per schema) is refused.
         if getattr(builder, "session", None) is not self._owner._http:

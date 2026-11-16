@@ -207,8 +207,7 @@ if HAVE_HTTPX:
             self.session, self.schemas = session, []
 
         def schema(self, name):
-            self.schemas.append(name)
-            return self
+            raise AssertionError("schema cloning drops the guarded transport; use the configured pds client")
 
         def table(self, name):
             return FakeBuilder(self.session)
