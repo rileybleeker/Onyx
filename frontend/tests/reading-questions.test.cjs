@@ -31,6 +31,8 @@ function fakeClient({ answer = { ok: true, replayed: false }, rpcError = null, b
     from: (table) => {
       const q = {
         select: () => q, eq: () => q, order: () => q, limit: () => q,
+        // The answer key's earlier attempt (none here; tests/reading-key-binding.test.cjs covers a stored one).
+        maybeSingle: async () => ({ data: null, error: null }),
         then: (yes, no) => Promise.resolve({ data: book ? [book] : [], error: null }).then(yes, no),
       };
       for (const verb of ["insert", "update", "upsert", "delete"]) q[verb] = () => (calls.writes.push({ table, verb }), q);

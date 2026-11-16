@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
+  isMissingSchema,
   isOpKey,
   newOpKey,
   PRACTICE_GRADES,
@@ -678,18 +679,16 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
 }
 
 export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
-  const book = input.book_id
-    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
-    : await getBook(supabase, input.slug ?? null);
-  if (!book) return { ok: false, error: "No active book found" };
-
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
-  const replay = async (prior: ReadingSession): Promise<LogSessionResult> => {
+  /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
+  const replay = async (prior: ReadingSession, fallback: Book | null): Promise<LogSessionResult | null> => {
     const { data: b } = await supabase.from("books").select(BOOK_COLS).eq("book_id", prior.book_id).maybeSingle();
+    const ofSession = (b as Book | null) ?? fallback;
+    if (!ofSession) return null;
     const prevMax = await furthestChapter(supabase, prior.book_id, prior.session_id);
     return {
       ok: true,
-      book: (b as Book | null) ?? book,
+      book: ofSession,
       session: prior,
       xpGained: sessionXp(prior.chapter_through ?? 0, prevMax, prior.recall),
       finished: false,
@@ -698,10 +697,19 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
       replayed: true,
     };
   };
+  // A retried create answers its stored session BEFORE the book is resolved: the session it made may have finished
+  // the book (no active book any more) or another book may be active now, and the retry of a create whose answer was
+  // lost must still get that session back, not "No active book found".
   if (key) {
     const prior = await sessionByClientKey(supabase, key);
-    if (prior) return replay(prior);
+    const replayed = prior ? await replay(prior, null) : null;
+    if (replayed) return replayed;
   }
+
+  const book = input.book_id
+    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+    : await getBook(supabase, input.slug ?? null);
+  if (!book) return { ok: false, error: "No active book found" };
 
   const through = Math.floor(Number(input.chapter_through));
   if (!Number.isFinite(through) || through < 0) return { ok: false, error: "chapter_through must be a non-negative integer" };
@@ -732,7 +740,8 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
   if (error && key && error.code === "23505") {
     // The same create arrived twice at once: the other one made the session.
     const prior = await sessionByClientKey(supabase, key);
-    if (prior) return replay(prior);
+    const replayed = prior ? await replay(prior, book) : null;
+    if (replayed) return replayed;
   }
   if (error && key && missingColumn(error)) ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
   if (error) return { ok: false, error: error.message };
@@ -1204,6 +1213,19 @@ export interface QuizInput {
 export type QuizResult = { ok: true; quiz: Quiz; passed: boolean; replayed: boolean; op_key: string } | PracticeFailure;
 
 /**
+ * The book a quiz operation key's stored receipt was recorded for (pds.reading_practice_ops; book_id null = nothing is
+ * stored under this key, or a review is). A failed read is a failure, never "no receipt": guessing the active book
+ * instead could turn the retry of a stored result into 409 key_reused. Codes only.
+ */
+async function quizReceiptBook(supabase: Supa, opKey: string): Promise<{ ok: true; book_id: number | null } | PracticeFailure> {
+  const { data, error } = await supabase.from("reading_practice_ops").select("kind, result").eq("op_key", opKey.toLowerCase()).maybeSingle();
+  if (error) return isMissingSchema(error) ? { ok: false, status: 503, error: "practice_unavailable" } : { ok: false, status: 500, error: "failed" };
+  const row = data as { kind?: unknown; result?: { book_id?: unknown } | null } | null;
+  const id = row?.kind === "quiz" ? Number(row.result?.book_id) : NaN;
+  return { ok: true, book_id: Number.isInteger(id) && id > 0 ? id : null };
+}
+
+/**
  * Record a checkpoint quiz result: ONE call of pds.reading_record_quiz (quiz row + receipt, one transaction). Each
  * stored row is one durable attempt and counts toward XP; a retry under the same op_key stores nothing new.
  * Without a key (an older page, and the chat tool until it passes its operation id) one is made here, so that call is
@@ -1212,10 +1234,22 @@ export type QuizResult = { ok: true; quiz: Quiz; passed: boolean; replayed: bool
  */
 export async function recordQuiz(supabase: Supa, input: QuizInput): Promise<QuizResult> {
   if (input.op_key != null && !isOpKey(input.op_key)) return { ok: false, status: 400, error: "bad_op_key" };
-  const book = input.book_id
-    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
-    : await getBook(supabase, input.slug ?? null);
-  if (!book) return { ok: false, status: 404, error: "No active book found" };
+  // A key that already stored a result is bound to the book it was stored for. With no book named, the retry of a
+  // result whose answer was lost uses THAT book, not the one active now (the active book may have changed in
+  // between), so it answers its receipt instead of 409 key_reused or 404. A named book is part of the request.
+  let bookId: number | null = null;
+  if (!input.book_id && !input.slug && input.op_key != null) {
+    const bound = await quizReceiptBook(supabase, input.op_key);
+    if (!bound.ok) return bound;
+    bookId = bound.book_id;
+  }
+  if (bookId == null) {
+    const book = input.book_id
+      ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+      : await getBook(supabase, input.slug ?? null);
+    if (!book) return { ok: false, status: 404, error: "No active book found" };
+    bookId = book.book_id;
+  }
   const score = Math.round(Number(input.score));
   const total = Math.round(Number(input.total));
   if (!(total > 0) || !(score >= 0) || score > total) return { ok: false, status: 400, error: "score must be between 0 and total" };
@@ -1225,7 +1259,7 @@ export async function recordQuiz(supabase: Supa, input: QuizInput): Promise<Quiz
   const notes = input.notes?.trim() || null;
   const opKey = input.op_key ?? newOpKey();
   const { data, error } = await supabase.rpc("reading_record_quiz", {
-    p: { op_key: opKey, book_id: book.book_id, checkpoint, score, total, notes, quiz_date: input.date ?? null },
+    p: { op_key: opKey, book_id: bookId, checkpoint, score, total, notes, quiz_date: input.date ?? null },
   });
   const failed = rpcFailure(data as RpcAnswer | null, error);
   if (failed) return failed;

@@ -30,6 +30,14 @@ written, the review card keeps the card with Retry) until the SQL is applied.
   quiz: book, checkpoint, score, total, notes, explicit date). The same key and request answers the stored receipt
   (`replayed: true`, no second row, no second XP); the same key with another request is `409 key_reused`.
   Refusals are not recorded, so a refused key is not spent.
+- **A key is bound to its book.** A quiz request that names no book is the active book's, but the active book can
+  change between a try whose answer was lost and its retry (the result's session finished the book, or another book
+  was started). So `recordQuiz` first reads the key's receipt and, when one is stored, uses the book it was stored
+  for; only a key with nothing stored under it uses the active book. A named book is part of the request and is never
+  replaced. A failed receipt read is a `500` (may have written: retry with the same key), never a guessed book. The
+  same rule holds for a question answer (the stored attempt's question gives the book) and for a reading session
+  (`logSession` answers a stored `client_key` before it resolves any book, so the retry of the session that finished
+  the book gets that session back instead of "No active book found").
 - The schedule is computed by `scheduleAfterGrade` in `frontend/src/lib/reading-practice.ts` (the same helper the
   review card's previews use) from the row the server read. The function refuses `raced` when the locked row is no
   longer that state (the server re-reads and recomputes, at most three tries) and `409 changed` when the card on
@@ -165,6 +173,9 @@ recovery); never delete reviews, quizzes or receipts to roll back.
 
 `frontend/tests/reading-practice.test.cjs` (synthetic data): request parsing, the single RPC per operation with no
 direct table writes, replay, the `raced` re-read, failure mapping without fallback, and SQL ordering / grant guards.
+`frontend/tests/reading-key-binding.test.cjs`: a keyed retry with no book named, after the active book changed or
+none is active, answers its stored receipt for a reading session, a quiz result and a question answer; a fresh key
+uses the active book, a named book is never looked up by key, and a failed lookup never guesses a book.
 The guards complement SQL review. The real functions are exercised by `tests/sql/reading_practice_fixture.sql`
 (replay after a lost answer, `key_reused`, `changed` / `raced`, a failing schedule write rolling the review back,
 quiz refusals for ungraded answers, a wrong score and another book's answers, a correction invalidating and
