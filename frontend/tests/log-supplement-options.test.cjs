@@ -2,8 +2,10 @@
 // /log Supplements, "Log a product" (2026-11-16, Riley: "I should be able to click the existing options, instead of
 // having to search"): every /supplements product is a tappable option without typing, most used first (single
 // doses in the last 30 days, then the most recent, then the name); the search box filters the same options; tapping
-// one fills the form like choosing a search result did and writes nothing (Log stays the write); the order is fixed
-// once settled while the section is mounted; Say it suggestions moved in with Edit keep their amount, unit and times.
+// one fills the form like choosing a search result did and writes nothing (Log stays the write); the options never
+// wait for a network read of the history, and their order is fixed on first display while the section is mounted;
+// a Log answering late never clears a newer pick; Say it suggestions moved in with Edit keep their amount, unit and
+// times.
 // SYNTHETIC DATA ONLY: invented product names, ids and dates; no network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -129,12 +131,16 @@ const HISTORY_ROWS = [
 const todayIntake = (intake_id, product_id, stack_id) => ({ intake_id, intake_date: TODAY, intake_time: null, product_id, doses: 1, notes: null, stack_id, brand_name: null, full_name: "Synthetic" });
 const TODAY_RESP = { date: TODAY, intakes: [todayIntake(21, "p-eps", null), todayIntake(22, "p-delta", 3)], reminders: [] };
 
-/** The section's client cache, as a plain map: peek / read for the first paint, cachedJson for the server read. */
-function fakeCache(store, registered = new Map()) {
+/**
+ * The section's client cache, as a plain map: peek / read for the first paint, cachedJson for the server read.
+ * `disk`: copies only the persisted store has (read finds them, peek does not). `hang`: keys whose persisted read
+ * never answers (a store slow to open).
+ */
+function fakeCache(store, registered = new Map(), hang = new Set(), disk = new Map()) {
   const GONE = Symbol("gone");
   const clientCache = {
     peek: (k) => store.get(k),
-    read: async (k) => store.get(k),
+    read: (k) => (hang.has(k) ? new Promise(() => {}) : Promise.resolve(store.get(k) ?? disk.get(k))),
     put: (k, v) => { store.set(k, v); return true; },
     register: (k, fetcher) => { registered.set(k, fetcher); },
   };
@@ -152,7 +158,7 @@ function fakeCache(store, registered = new Map()) {
   return { clientCache, cachedJson, fetchJsonValue, GONE };
 }
 
-function mountSection(t, { cache = new Map(), registered = new Map(), answers = {}, post, draft = null } = {}) {
+function mountSection(t, { cache = new Map(), registered = new Map(), hang = new Set(), disk = new Map(), answers = {}, post, draft = null } = {}) {
   const calls = { writes: [], gets: [] };
   const defaults = {
     [URL.products]: () => response({ products: FIVE }),
@@ -181,11 +187,12 @@ function mountSection(t, { cache = new Map(), registered = new Map(), answers = 
     stubs: {
       "@/components/FeedContext": { useInFeed: () => false },
       "lucide-react": { Check: () => null, Plus: () => null, X: () => null },
-      "@/lib/client-cache": fakeCache(cache, registered),
+      "@/lib/client-cache": fakeCache(cache, registered, hang, disk),
       "@/lib/log-early": {
         LOG_SUPPLEMENTS_TODAY_URL: URL.today,
         LOG_SUPPLEMENTS_STACKS_URL: URL.stacks,
         LOG_SUPPLEMENTS_PRODUCTS_URL: URL.products,
+        LOG_SUPPLEMENTS_HISTORY_URL: URL.history,
         logEarlyGet: () => undefined,
       },
       "@/lib/log-drafts": { useLogDrafts: () => drafts.current },
@@ -278,22 +285,28 @@ test("section: a long list is capped with Show all, and the search box filters t
   assert.equal(h.calls.writes.length, 0);
 });
 
-test("section: on a cold cache the options wait for the history and today's intakes, then keep their order through a Log, a later answer and Cancel", async (t) => {
+// Without the history: today's single dose first (Epsilon; Delta's dose today came from a stack), then by name.
+const WITHOUT_HISTORY = ["Synthetic Epsilon", "Synthetic Alpha", "Synthetic Beta", "Synthetic Delta", "Synthetic Gamma"];
+const skeletonPills = (h) => h.find((n) => typeof n.props?.className === "string" && n.props.className.includes("skeleton h-11 w-28"));
+
+test("section: cached products show on the first flush while the history read is still out (no network wait); its answer moves nothing, nor do a Log and Cancel", async (t) => {
   const held = deferred();
   let todayReads = 0;
   // After the Log, today's answer carries four new single doses of Alpha: sorted again, Alpha would jump to the top.
   const later = { ...TODAY_RESP, intakes: [...TODAY_RESP.intakes, ...[31, 32, 33, 34].map((id) => todayIntake(id, "p-alpha", null))] };
+  const cache = new Map([[URL.products, { products: FIVE }], [URL.today, TODAY_RESP], [URL.stacks, { stacks: [STACK] }]]);
   const h = mountSection(t, {
+    cache,
     answers: { [URL.history]: () => held.promise, [URL.today]: () => response(todayReads++ === 0 ? TODAY_RESP : later) },
     post: () => response({ ok: true, product: "Synthetic Alpha", logged: [{ intake_id: 35, time: null }], doses_each: 1, intake_date: TODAY }),
   });
   await h.flush();
-  assert.equal(h.options().length, 0, "no option before the order is known (skeleton pills), so nothing reshuffles on screen");
-  assert.ok(h.find((n) => typeof n.props?.className === "string" && n.props.className.includes("skeleton h-11 w-28")).length > 0);
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "shown in the order known, without waiting for the history's answer");
+  assert.equal(skeletonPills(h).length, 0, "no skeleton pills left");
+  assert.ok(h.calls.gets.includes(URL.history), "the history is still read (it orders the next mount)");
   held.resolve(response({ rows: HISTORY_ROWS }));
   await h.flush();
-  const order = ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"];
-  assert.deepEqual(h.optionNames(), order, "shown once settled, most used first");
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "a later history answer never moves an option under the finger");
 
   h.option("Synthetic Alpha").props.onClick();
   await h.flush();
@@ -301,27 +314,46 @@ test("section: on a cold cache the options wait for the history and today's inta
   await h.flush();
   assert.equal(h.calls.writes.length, 1);
   assert.ok(todayReads >= 2, "today was read again after the Log");
-  assert.deepEqual(h.optionNames(), order, "a dose just logged does not move the options");
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "a dose just logged does not move the options");
   h.option("Synthetic Gamma").props.onClick();
   await h.flush();
   await h.click("Cancel");
   await h.flush();
-  assert.deepEqual(h.optionNames(), order, "nor does Cancel: the order is fixed while the section is mounted");
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "nor does Cancel: the order is fixed while the section is mounted");
 });
 
-test("section: a history answer slower than the wait shows the options in the order known, and landing later moves nothing", async (t) => {
+test("section: a history copy on this device (the persisted cache) orders the options before they show", async (t) => {
+  // In memory: the products and today. Only on disk (read after mount): the history. The network answers never come.
+  const held = deferred();
+  const cache = new Map([[URL.products, { products: FIVE }], [URL.today, TODAY_RESP]]);
+  const disk = new Map([[URL.history, { rows: HISTORY_ROWS }]]);
+  const pending = () => held.promise;
+  const h = mountSection(t, { cache, disk, answers: { [URL.products]: pending, [URL.today]: pending, [URL.stacks]: pending, [URL.history]: pending } });
+  await h.flush();
+  assert.deepEqual(h.optionNames(), ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"], "most used first");
+  assert.equal(h.calls.writes.length, 0);
+});
+
+test("section: on a first visit (nothing on this device) the options show with the products' answer, not after the history's", async (t) => {
   const held = deferred();
   const h = mountSection(t, { answers: { [URL.history]: () => held.promise } });
   await h.flush();
-  assert.equal(h.options().length, 0);
-  await new Promise((resolve) => setTimeout(resolve, 900));
-  await h.flush();
-  // Without the history: today's single dose first (Epsilon), then by name.
-  const before = ["Synthetic Epsilon", "Synthetic Alpha", "Synthetic Beta", "Synthetic Delta", "Synthetic Gamma"];
-  assert.deepEqual(h.optionNames(), before);
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY);
   held.resolve(response({ rows: HISTORY_ROWS }));
   await h.flush();
-  assert.deepEqual(h.optionNames(), before, "nothing moved under the finger");
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "nothing moved under the finger");
+  assert.equal(h.calls.writes.length, 0);
+});
+
+test("section: a persisted store that never answers holds the options at most a moment (LOCAL_WAIT_MS), then they show", async (t) => {
+  const held = deferred();
+  const h = mountSection(t, { hang: new Set([URL.history]), answers: { [URL.history]: () => held.promise } });
+  await h.flush();
+  assert.equal(h.options().length, 0, "the device's copy is still being looked at");
+  assert.ok(skeletonPills(h).length > 0);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  await h.flush();
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY);
   assert.equal(h.calls.writes.length, 0);
 });
 
@@ -360,6 +392,76 @@ test("section: the options are one radio group; the arrow keys move to and choos
   assert.equal(h.option("Synthetic Delta").props["aria-checked"], true, "wraps to the last");
   assert.deepEqual(focused, [1, 4]);
   assert.equal(h.calls.writes.length, 0, "choosing with the keyboard writes nothing");
+});
+
+test("section: arrowing past a product that cannot take the typed unit does not lose the amount for the next one that can", async (t) => {
+  const scoop = (id, name) => ({ ...prod(id, name), serving_unit: "Scoop" });
+  const three = [scoop("p-aa", "Synthetic Aa"), prod("p-bb", "Synthetic Bb"), scoop("p-cc", "Synthetic Cc")];
+  const h = mountSection(t, {
+    answers: {
+      [URL.products]: () => response({ products: three }),
+      [URL.history]: () => response({ rows: [] }),
+      [URL.today]: () => response({ date: TODAY, intakes: [], reminders: [] }),
+    },
+  });
+  await h.flush();
+  assert.deepEqual(h.optionNames(), ["Synthetic Aa", "Synthetic Bb", "Synthetic Cc"]);
+  h.option("Synthetic Aa").props.onClick();
+  await h.flush();
+  h.field("Amount").props.onChange({ target: { value: "2" } });
+  h.field("Unit").props.onChange({ target: { value: "Scoop" } });
+  await h.flush();
+  // The group as last rendered (its handler sees that render's state), like a real key press.
+  const key = (k, i) => h.find((n) => n.props?.role === "radiogroup")[0].props.onKeyDown({
+    key: k,
+    target: { dataset: { optionIndex: String(i) } },
+    currentTarget: { children: Array.from({ length: 3 }, () => ({ focus() {} })) },
+    preventDefault() {},
+  });
+  key("ArrowRight", 0);
+  await h.flush();
+  assert.equal(h.option("Synthetic Bb").props["aria-checked"], true);
+  assert.equal(h.field("Amount").props.value, "", "a capsule product cannot take 2 scoops: one serving");
+  key("ArrowRight", 1);
+  await h.flush();
+  assert.equal(h.option("Synthetic Cc").props["aria-checked"], true);
+  assert.equal(h.field("Amount").props.value, "2", "the typed amount comes back for a product that takes scoops");
+  assert.equal(h.field("Unit").props.value, "Scoop");
+  assert.equal(h.calls.writes.length, 0);
+});
+
+test("section: a Log answering after Riley picked another product keeps the new pick and what he typed; only the first dose is sent", async (t) => {
+  const first = deferred();
+  const second = deferred();
+  const h = mountSection(t, { post: (url, n) => (n === 1 ? first.promise : second.promise) });
+  await h.flush();
+  h.option("Synthetic Alpha").props.onClick();
+  await h.flush();
+  await h.click("Log");
+  await h.flush();
+  h.option("Synthetic Beta").props.onClick();
+  await h.flush();
+  h.field("Amount").props.onChange({ target: { value: "3" } });
+  await h.flush();
+  first.resolve(response({ ok: true, product: "Synthetic Alpha", logged: [{ intake_id: 50, time: null }], doses_each: 1, intake_date: TODAY }));
+  await h.flush();
+  assert.equal(h.calls.writes.length, 1);
+  assert.equal(h.calls.writes[0].body.product_id, "p-alpha", "the dose sent is the one picked when Log was tapped");
+  assert.equal(h.option("Synthetic Beta").props["aria-checked"], true, "the new pick survives the first answer");
+  assert.equal(h.field("Amount").props.value, "3", "and so does what was typed");
+  assert.match(h.text(), /Saved Synthetic Alpha/);
+
+  // The same when the earlier Log is refused: the error names that dose, the new pick stays.
+  await h.click("Log");
+  await h.flush();
+  h.option("Synthetic Gamma").props.onClick();
+  await h.flush();
+  second.resolve(response({ ok: false, error: "Synthetic refusal" }, 422));
+  await h.flush();
+  assert.equal(h.calls.writes.length, 2);
+  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
+  assert.equal(h.option("Synthetic Gamma").props["aria-checked"], true);
+  assert.match(h.text(), /Synthetic Beta not saved: Synthetic refusal/);
 });
 
 test("section: a Say it product moved into the form with Edit keeps its amount, unit and time when another option is tapped", async (t) => {
@@ -402,5 +504,9 @@ test("source: the options are radio buttons with 44 px targets, accent when sele
   assert.match(src, /role="radio"\s+aria-checked=\{on\}/);
   const pick = src.slice(src.indexOf("function pickProduct("), src.indexOf("/** One product write"));
   assert.ok(pick.length > 0 && !/fetch\(|postJson|logProduct\(/.test(pick), "pickProduct writes nothing");
-  assert.match(src, /const HISTORY_URL = "\/api\/supplements\/history\?days=30&perPage=200";/);
+  // The history is one of the HTML's early reads (the options never wait for it, it only orders them).
+  assert.match(src, /const HISTORY_URL = LOG_SUPPLEMENTS_HISTORY_URL;/);
+  const early = loadTs("lib/log-early.ts");
+  assert.equal(early.LOG_SUPPLEMENTS_HISTORY_URL, URL.history);
+  assert.ok(early.LOG_EARLY_GETS.includes(URL.history));
 });

@@ -6,7 +6,8 @@
  * "Most used" = single-product doses (not doses a stack logged) among the newest 200 intakes of the last 30 days
  * (`GET /api/supplements/history`, which caps a page at 200 rows; stack doses use up part of that, so with daily
  * stacks it reaches back fewer days) plus behavioral today's `GET /api/supplements/today`, then the most recent, then
- * the name. The section fixes the order once it is settled and keeps it while it is mounted.
+ * the name. The section shows the options as soon as the products are in (never waiting for a network read of the
+ * history), fixes their order on that first display and keeps it while it is mounted.
  */
 
 export interface OptionProduct {
@@ -15,7 +16,7 @@ export interface OptionProduct {
   full_name: string | null;
 }
 
-/** One intake row as the section reads it: today's (carries `stack_id`) or the 30-day history (carries `notes`). */
+/** One intake row as the section reads it: today's or the 30-day history (both carry `stack_id` and `notes`). */
 export interface UsageRow {
   intake_id: number;
   product_id: string;
@@ -34,7 +35,10 @@ export interface Usage {
 /** Options shown before "Show all". */
 export const OPTIONS_CAP = 12;
 
-/** The note lib/supplement-stacks.ts writes on every dose a stack logged (history rows carry no stack id). */
+/**
+ * The note lib/supplement-stacks.ts writes on every dose a stack logged. A fallback only: a dose with a `stack_id`
+ * is a stack's whatever its note says; the note covers a history copy cached before the route returned `stack_id`.
+ */
 const STACK_NOTE = "Logged from stack";
 
 export const normName = (s: string | null | undefined) => (s ?? "").toLowerCase().replace(/[^a-z0-9µ.]+/g, " ").trim();

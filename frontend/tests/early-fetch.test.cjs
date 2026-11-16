@@ -215,6 +215,8 @@ test("/log: the sections read the URLs the script starts", () => {
   assert.match(read("app/log/sections/Weight.tsx"), /const WEIGHT_URL = LOG_WEIGHT_URL;/);
   assert.match(read("app/log/sections/Reading.tsx"), /const READING_URL = LOG_READING_URL;/);
   assert.match(read("app/log/sections/Supplements.tsx"), /const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;/);
+  assert.match(read("app/log/sections/Supplements.tsx"), /const HISTORY_URL = LOG_SUPPLEMENTS_HISTORY_URL;/);
+  assert.match(read("app/log/sections/Supplements.tsx"), /cachedJson<\{ rows: UsageRow\[\] \}>\(HISTORY_URL, \{ check: checkHistory, get: logEarlyGet\(HISTORY_URL, routed\) \}\)/);
   assert.match(read("app/log/page.tsx"), /<EarlyReads \/>/);
 });
 

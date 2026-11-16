@@ -27,7 +27,8 @@ export async function GET(req: NextRequest) {
   // Product names ride along in the same query (FK supplement_intake.product_id): one round trip, not two.
   const { data, error, count } = await supabase
     .from("supplement_intake")
-    .select("intake_id,intake_date,intake_time,product_id,doses,notes,supplement_products(brand_name,full_name)", { count: "exact" })
+    // stack_id: which stack logged a dose (the /log product options leave those out of "most used").
+    .select("intake_id,intake_date,intake_time,product_id,doses,notes,stack_id,supplement_products(brand_name,full_name)", { count: "exact" })
     .gte("intake_date", sinceStr)
     .order("intake_date", { ascending: false })
     .order("intake_time", { ascending: false, nullsFirst: false })
