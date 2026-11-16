@@ -40,7 +40,13 @@ fingerprint of this file and the revision (--revision, else $GITHUB_SHA). A METH
 covers exactly that configuration and that inference code, and a trial's decision is firm only
 when its alpha, re-draw count and block design are among them and the running code has the same
 inference fingerprint (experiment_analysis.method_review_problem). A report without a revision or
-whose inference code cannot be fingerprinted is never review-ready.
+whose inference code cannot be fingerprinted is never review-ready. The fingerprints are those of
+the code the process loaded, taken when this module is imported, before any simulation
+(LOADED_FINGERPRINTS); the files are read again, with no cache, before and after the run and before
+a merge (loaded_code), and a source that changed refuses the report rather than label results of the
+code that ran with the edited code's fingerprint. So run it as a fresh process from an unchanged
+checkout of the revision (in Actions, the job's checkout of $GITHUB_SHA; on the PC, a worktree at
+that commit that nothing edits during the run).
 
 Supported scenarios satisfy the working model of experiment_analysis (one-night carryover,
 constant additive effects, missing nights and excluded blocks independent of the arm) and must
@@ -115,6 +121,37 @@ CALIBRATION_AS_OF = date(2026, 11, 16)   # the synthetic report date given to th
 # `covers` names it with the range of scheduled blocks its supported scenarios ran, and a trial with
 # another design is not covered (experiment_analysis.method_review_problem).
 BLOCK_LEN, N_A = 4, 2
+
+# The fingerprints of the code this process loaded (review of round 6): taken from the files when this
+# module is imported, right after experiment_analysis and experiment_design (the imports above), so
+# before any simulation. A report records these, never a value first read after a run: a run takes
+# hours, and a source edited meanwhile would otherwise label the results of the code that ran with the
+# fingerprint of the edited files. loaded_code() reads the files again (no cache) before and after every
+# run and before every merge, and refuses when they no longer give these values.
+LOADED_FINGERPRINTS: dict[str, str | None] = {
+    "inference_fingerprint": fingerprint.read_inference_fingerprint(),
+    "harness_fingerprint": fingerprint.read_harness_fingerprint(),
+}
+_CODE_NAMES = {"inference_fingerprint": "inference code (experiment_analysis.py, experiment_design.py)",
+               "harness_fingerprint": "calibration harness (experiment_calibration.py)"}
+
+
+def loaded_code(when: str) -> dict[str, str | None]:
+    """The fingerprints this process loaded (LOADED_FINGERPRINTS), once the files, read again now with
+    no cache, still give them. Raises ValueError when a fingerprinted source changed since the import
+    (`when` names the step): the process runs the code it imported, which the files no longer hold, so
+    no report is written; run again from an unchanged checkout of the revision. A source that was
+    unreadable at the import and still is is not a change: its fingerprint stays None, the report is
+    not review-ready and the merge refuses it."""
+    now = {"inference_fingerprint": fingerprint.read_inference_fingerprint(),
+           "harness_fingerprint": fingerprint.read_harness_fingerprint()}
+    changed = [key for key in LOADED_FINGERPRINTS if now[key] != LOADED_FINGERPRINTS[key]]
+    if changed:
+        raise ValueError(f"the source of the {' and the '.join(_CODE_NAMES[key] for key in changed)} changed since "
+                         f"this process loaded it ({when}): the results are of the code it loaded, which the files "
+                         "no longer hold, so no report is written; run again from an unchanged checkout of the "
+                         "revision")
+    return dict(LOADED_FINGERPRINTS)
 
 
 @dataclass(frozen=True)
@@ -312,12 +349,16 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
     """The calibration report. Deterministic in (seed, n_sims, n_redraws, names): trial i of scenario
     j draws its synthetic trial from numpy's default_rng([seed, j, i]) and its re-draws from
     calibration_redraw_seed(seed, j, i). beta None = the registered level for n_redraws. revision
-    names the commit the run used (recorded, never read: a report without one is not review-ready)."""
+    names the commit the run used (recorded, never read: a report without one is not review-ready).
+    The report records the fingerprints this process loaded, checked against the files before the
+    first simulation and again after the last (loaded_code): a source that changed in between refuses
+    the report instead of labelling it."""
     beta = ea.nuisance_beta_for(n_redraws) if beta is None else beta
     chosen = [(j, s) for j, s in enumerate(SCENARIOS) if names is None or s.name in names]
     unknown = set(names or ()) - {s.name for s in SCENARIOS}
     if unknown:
         raise ValueError("unknown scenario(s): " + ", ".join(sorted(unknown)))
+    code = loaded_code("before the run")
     scenarios = []
     for j, s in chosen:
         rows, skipped = [], 0
@@ -329,8 +370,9 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
             else:
                 rows.append(row)
         scenarios.append(summarize(s, rows, skipped, alpha))
+    loaded_code("during the run")
     return _assemble(_config(alpha=alpha, beta=beta, n_sims=n_sims, n_redraws=n_redraws, seed=seed,
-                             revision=revision), scenarios)
+                             revision=revision, code=code), scenarios)
 
 
 # The fields that must agree for shards to be merged into one report.
@@ -339,14 +381,16 @@ CONFIG_KEYS = ("method", "interval_method", "alpha", "nuisance_beta", "z_mc", "n
 
 
 def _config(*, alpha: float, beta: float, n_sims: int, n_redraws: int, seed: int,
-            revision: str | None = None) -> dict[str, Any]:
+            revision: str | None = None, code: dict[str, str | None] | None = None) -> dict[str, Any]:
+    code = LOADED_FINGERPRINTS if code is None else code
     return {"method": ea.INFERENCE_METHOD, "interval_method": ea.INTERVAL_METHOD,
             "alpha": alpha, "nuisance_beta": beta, "z_mc": Z_MC,
             "n_sims": n_sims, "n_redraws": n_redraws, "seed": seed, "generator": design.GENERATOR,
-            # The code this report calibrated (METHOD_REVIEW's calibration_report copies these).
+            # The code this report calibrated (METHOD_REVIEW's calibration_report copies these): the
+            # fingerprints taken when this process loaded it (LOADED_FINGERPRINTS), never read after a run.
             "fingerprint_version": fingerprint.FINGERPRINT_VERSION,
-            "inference_fingerprint": fingerprint.inference_fingerprint(),
-            "harness_fingerprint": fingerprint.harness_fingerprint(),
+            "inference_fingerprint": code["inference_fingerprint"],
+            "harness_fingerprint": code["harness_fingerprint"],
             "revision": revision.strip() if isinstance(revision, str) and revision.strip() else None}
 
 
@@ -405,7 +449,8 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
     merged after a harness change would claim designs and limits they never ran. Their harness
     fingerprint must therefore be the running one (a missing or unreadable one refuses too), and each
     scenario's stored inputs must equal its entry in SCENARIOS. Their inference fingerprint must be
-    the running code's as well, since only such a report can back METHOD_REVIEW."""
+    the running code's as well, since only such a report can back METHOD_REVIEW. "Running" means the
+    fingerprints this process loaded, checked against the files first (loaded_code)."""
     if not reports:
         raise ValueError("nothing to merge")
     config = {key: reports[0].get(key) for key in CONFIG_KEYS}
@@ -419,7 +464,8 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
             differs = sorted(key for key in CONFIG_KEYS if other[key] != config[key])
             raise ValueError(f"shard {index + 1} has another configuration ({', '.join(differs)})")
         scenarios += report.get("scenarios") or []
-    running = fingerprint.harness_fingerprint()
+    code = loaded_code("before the merge")
+    running = code["harness_fingerprint"]
     recorded = config["harness_fingerprint"]
     if not running:
         raise ValueError("the running calibration harness's source cannot be read, so the shards' harness "
@@ -433,7 +479,7 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
                          "them or run them again")
     # Refused here too (method review, round 6): METHOD_REVIEW would refuse such a report anyway, since its
     # inference fingerprint must be the running code's, so a merge under other inference code is never useful.
-    live = fingerprint.inference_fingerprint()
+    live = code["inference_fingerprint"]
     calibrated = config["inference_fingerprint"]
     if not live:
         raise ValueError("the running inference code's source cannot be read, so the shards' inference fingerprint "

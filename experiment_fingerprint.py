@@ -35,6 +35,11 @@ below, not ast.dump, so the value is the same on the Python versions in use here
 harness_fingerprint() is the same over experiment_calibration.py as a whole: the calibration report
 records it, so the record says which harness produced it.
 
+inference_fingerprint() and harness_fingerprint() read the files once per process (cached), which
+suits the short report and register runs. read_inference_fingerprint() and read_harness_fingerprint()
+read them again on every call; the calibration harness uses those, taking the values when it is
+imported and checking them before and after a run, since a run takes hours.
+
 Standard library only (no numpy), so it can be computed anywhere. Print both values:
     python experiment_fingerprint.py
 """
@@ -173,21 +178,45 @@ def _read(name: str) -> str | None:
         return None
 
 
-@lru_cache(maxsize=1)
-def inference_fingerprint() -> str | None:
-    """Fingerprint of the inference code that is running, or None when its source cannot be read
-    (then no review can be checked against it and every decision is withheld)."""
+def read_inference_fingerprint() -> str | None:
+    """The inference fingerprint of the files as they are now, read again on every call (no cache),
+    or None when a source cannot be read or parsed (a file caught half-written). The calibration
+    harness takes it when it is imported and again before and after a run
+    (experiment_calibration.loaded_code), so a source edited while a long run is under way can never
+    label that run's results."""
     analysis, design = _read("experiment_analysis.py"), _read("experiment_design.py")
     if analysis is None or design is None:
         return None
-    return fingerprint_sources(analysis, design)
+    try:
+        return fingerprint_sources(analysis, design)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def read_harness_fingerprint() -> str | None:
+    """The harness fingerprint of experiment_calibration.py as it is now (no cache), or None when it
+    cannot be read or parsed."""
+    source = _read("experiment_calibration.py")
+    if source is None:
+        return None
+    try:
+        return module_fingerprint(source)
+    except (SyntaxError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=1)
+def inference_fingerprint() -> str | None:
+    """Fingerprint of the inference code that is running, or None when its source cannot be read
+    (then no review can be checked against it and every decision is withheld). Read once per process."""
+    return read_inference_fingerprint()
 
 
 @lru_cache(maxsize=1)
 def harness_fingerprint() -> str | None:
-    """Fingerprint of the calibration harness (experiment_calibration.py), or None when unreadable."""
-    source = _read("experiment_calibration.py")
-    return None if source is None else module_fingerprint(source)
+    """Fingerprint of the calibration harness (experiment_calibration.py), or None when unreadable.
+    Read once per process."""
+    return read_harness_fingerprint()
 
 
 def main() -> int:

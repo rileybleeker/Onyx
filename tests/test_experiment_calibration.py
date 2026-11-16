@@ -56,7 +56,10 @@ Covers
     PIPE06-FOLLOWUP-R2): the merge refuses shards whose harness fingerprint is missing or not the
     running harness's (or when the running one cannot be read), and scenarios whose stored inputs
     differ from SCENARIOS, and shards of other inference code; a report without a harness
-    fingerprint is not review-ready.
+    fingerprint is not review-ready;
+  * a report names the code that ran (review of round 6): it records the fingerprints taken when
+    the harness was imported, and a fingerprinted source that changes (or becomes unreadable)
+    before the run, during it or before a merge refuses the report instead of labelling it.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -1016,10 +1019,14 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
             assert words in str(exc), (words, str(exc))
         else:
             raise AssertionError(f"merge must refuse: {words}")
-    for name in ("harness_fingerprint", "inference_fingerprint"):
-        original = getattr(ef, name)
+    # The running code is what this process loaded (cal.LOADED_FINGERPRINTS): unreadable when it was loaded
+    # and still unreadable now is no change, but leaves nothing to check the shards against.
+    for name, reader in (("harness_fingerprint", "read_harness_fingerprint"),
+                         ("inference_fingerprint", "read_inference_fingerprint")):
+        loaded, original = cal.LOADED_FINGERPRINTS[name], getattr(ef, reader)
         try:
-            setattr(ef, name, lambda: None)
+            cal.LOADED_FINGERPRINTS[name] = None
+            setattr(ef, reader, lambda: None)
             try:
                 cal.merge_reports(shards)
             except ValueError as exc:
@@ -1027,8 +1034,68 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
             else:
                 raise AssertionError(f"merge must refuse when the running code cannot be fingerprinted ({name})")
         finally:
-            setattr(ef, name, original)
+            cal.LOADED_FINGERPRINTS[name] = loaded
+            setattr(ef, reader, original)
     assert cal.merge_reports(shards) == whole, "the refusals leave the valid merge unchanged"
+
+
+def test_a_source_edited_during_a_run_never_labels_its_results():
+    """Review of round 6: the fingerprints were first read after the simulations, so a source edited
+    during an hours-long run labelled the results of the code that ran with the fingerprint of the
+    edited files. A report now records the fingerprints taken when the harness was imported, and a
+    source that changes before the run, during it or before a merge refuses the report."""
+    loaded = dict(cal.LOADED_FINGERPRINTS)
+    assert loaded == {"inference_fingerprint": ef.read_inference_fingerprint(),
+                      "harness_fingerprint": ef.read_harness_fingerprint()}
+    assert loaded["inference_fingerprint"] == ef.inference_fingerprint()
+    assert loaded["harness_fingerprint"] == ef.harness_fingerprint()
+    assert cal.loaded_code("synthetic step") == loaded
+
+    def run():
+        # The configuration of the shard test above, whose JSON round trip is known to compare equal.
+        return cal.run_calibration(n_sims=3, n_redraws=199, seed=8, names=["no_effect"])
+
+    report = run()
+    assert {key: report[key] for key in loaded} == loaded
+    assert report["covers"]["inference_fingerprint"] == loaded["inference_fingerprint"]
+    shard = json.loads(json.dumps(report))
+    assert cal.merge_reports([shard]) == shard
+
+    def refuses(call, *words):
+        try:
+            call()
+        except ValueError as exc:
+            for word in ("changed since this process loaded it", "no report is written") + words:
+                assert word in str(exc), (word, str(exc))
+        else:
+            raise AssertionError(f"a changed source must refuse the report ({', '.join(words)})")
+
+    real_one_trial = cal.one_trial
+    for reader, what in (("read_inference_fingerprint", "inference code"),
+                         ("read_harness_fingerprint", "calibration harness")):
+        original = getattr(ef, reader)
+        # Edited (or caught half-written: unreadable) after the import: refused before the run, before
+        # any simulation, and before a merge.
+        for now in ("0" * 64, None):
+            try:
+                setattr(ef, reader, lambda now=now: now)
+                refuses(run, "before the run", what)
+                refuses(lambda: cal.merge_reports([shard]), "before the merge", what)
+            finally:
+                setattr(ef, reader, original)
+
+        # Edited while the simulations run: the files change after the first check, and the report is
+        # refused after the last simulation rather than labelled with either fingerprint.
+        def editing_one_trial(*args, **kwargs):
+            setattr(ef, reader, lambda: "0" * 64)
+            return real_one_trial(*args, **kwargs)
+        try:
+            cal.one_trial = editing_one_trial
+            refuses(run, "during the run", what)
+        finally:
+            cal.one_trial = real_one_trial
+            setattr(ef, reader, original)
+    assert cal.LOADED_FINGERPRINTS == loaded and run() == report, "the refusals change nothing"
 
 
 def test_unsupported_scenarios_are_reported_without_a_verdict():
