@@ -413,7 +413,8 @@ export default function StatusPage() {
 function StatusView({ early }: { early: boolean }) {
   // "feed-page-heading" when this page is shown inside the continuous scroll (components/ContinuousScroll.tsx).
   const headingTestId = usePageHeadingTestId();
-  // Start from the cached copy (instant revisit / reopen), then revalidate.
+  // Start from the in-memory copy (instant revisit this session), then revalidate. Never from the device: /api/status
+  // carries heartbeat error text, so it is a memory-only key (lib/client-cache.ts isSensitiveKey).
   const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
   const [loading, setLoading] = useState(() => data === null);
   const refreshedAtRef = useRef<Date | null>(null);
@@ -446,17 +447,6 @@ function StatusView({ early }: { early: boolean }) {
     } finally {
       setLoading(false);
     }
-  }, []);
-
-  // Reopening the app: the copy kept on this device until the live answer arrives.
-  useEffect(() => {
-    let alive = true;
-    void clientCache.read<StatusResponse>(STATUS_URL).then((cached) => {
-      if (!alive || !cached) return;
-      setData((prev) => prev ?? cached);
-      setLoading(false);
-    });
-    return () => { alive = false; };
   }, []);
 
   useEffect(() => {

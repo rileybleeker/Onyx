@@ -81,7 +81,9 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
   const info = agentInfo(thread);
   const cacheKey = CACHE_KEYS.agentsThread(thread);
   // Start from the cached conversation (shown until the first live answer replaces it). Nothing is marked
-  // read from the cached copy: markRead waits for a live answer (lastIdRef stays 0 until then).
+  // read from the cached copy: markRead waits for a live answer (lastIdRef stays 0 until then). The copy is in
+  // memory only (agents:* is a memory-only key, lib/client-cache.ts isSensitiveKey): message bodies and cards can
+  // quote finance, medical or email content, so they never reach the device's disk.
   const [messages, setMessages] = useState<AgentMessage[]>(() => cachedThread(clientCache.peek(cacheKey))?.messages ?? []);
   const [cardStates, setCardStates] = useState<Record<string, CardState>>(() => cachedThread(clientCache.peek(cacheKey))?.cardStates ?? {});
   const [pending, setPending] = useState<Pending[]>([]);
@@ -182,19 +184,7 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
     }
   }, [merge, handleError, thread]);
 
-  // Reopening the app: the conversation kept on this device, until the live answer arrives.
-  useEffect(() => {
-    let alive = true;
-    void clientCache.read(cacheKey).then((raw) => {
-      const cached = cachedThread(raw);
-      if (!alive || !cached || lastIdRef.current) return;
-      setMessages((prev) => (prev.length ? prev : cached.messages));
-      setCardStates((prev) => (Object.keys(prev).length ? prev : cached.cardStates ?? {}));
-    });
-    return () => { alive = false; };
-  }, [cacheKey]);
-
-  // Keep the cached copy in step with what the server last said (the newest 60 messages).
+  // Keep the in-memory copy in step with what the server last said (the newest 60 messages).
   useEffect(() => {
     if (!loaded || !lastIdRef.current) return;
     clientCache.put(cacheKey, { messages: messages.slice(-60), cardStates, lastRead: 0, typing: false } satisfies MessagesResponse);

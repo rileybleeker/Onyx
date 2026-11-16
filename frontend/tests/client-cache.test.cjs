@@ -14,7 +14,7 @@ const mod = { exports: {} };
 new Function('require', 'module', 'exports', outputText)((name) => { throw new Error(`client-cache.ts must stay import-free (imported ${name})`); }, mod, mod.exports);
 const {
   ClientCache, CACHE_SCHEMA_VERSION, CACHE_DB_NAME, DEFAULT_MAX_AGE_MS, SWEEP_EVERY_MS, GONE, GoneError, isSensitiveKey, isAppStorageKey,
-  writeInvalidates, sessionEnded, isGoneStatus, wipeClientData, cachedJson, setSessionEndedHandler,
+  sensitiveRowKeys, writeInvalidates, sessionEnded, isGoneStatus, wipeClientData, cachedJson, setSessionEndedHandler,
 } = mod.exports;
 
 const USER_A = 'user-aaaa-synthetic';
@@ -63,12 +63,208 @@ test('finance, procurement, medical, screen time, experiments and token routes a
   for (const key of ['/api/finance/alerts', '/api/procurement/renewals/summary', '/api/medical/labs', '/api/screen-time/token',
     '/api/experiments/today', '/api/spotify/auth-url', '/api/focus/config', '/financials', '/financials/forecast?x=1',
     '/procurement', '/screen-time?days=30', '/health/records', 'finance:ledger', 'medical:docs', 'screen-time:daily',
-    '/api/care/google/callback', '/api/anything/token', '/api/x/session']) {
+    '/api/care/google/callback', '/api/anything/token', '/api/x/session', '/api/care/items', '/api/care/page-data', 'care:items']) {
     assert.equal(isSensitiveKey(key), true, key);
   }
-  for (const key of ['/api/reading', '/api/habits/checkin', '/api/status', 'agents:inbox', 'habits:journal:365', '/api/urgent-email', '/api/orders/summary']) {
+  for (const key of ['/api/reading', '/api/habits/checkin', 'habits:journal:365', '/api/orders/summary', '/api/statuses',
+    '/api/urgent-emails', 'agentsx:inbox', '/onyxfoo', '/api/calendar/events?from=2031-02-03&to=2031-02-04']) {
     assert.equal(isSensitiveKey(key), false, key);
   }
+});
+
+test('mixed payloads (agents inbox and threads, agents Worker routes, /api/status, /api/urgent-email) are memory-only', () => {
+  for (const key of ['agents:inbox', 'agents:thread:synthetic-agent', 'agents:thread:a.b-c', '/api/status', '/api/status?x=1',
+    '/api/urgent-email', '/api/urgent-email?view=all', '/onyx/inbox', '/onyx/messages?thread=synthetic',
+    'https://agents.example.invalid/onyx/messages?thread=synthetic']) {
+    assert.equal(isSensitiveKey(key), true, key);
+  }
+  assert.ok(CACHE_SCHEMA_VERSION >= 2, 'stores written before agents / status became memory-only are deleted whole');
+  assert.deepEqual(sensitiveRowKeys([{ key: '/api/reading' }, { key: 'agents:inbox' }, { key: '/api/status' }, { key: 'k:x' }]),
+    ['agents:inbox', '/api/status']);
+});
+
+// Synthetic markers standing in for finance / medical / email text an agent message or a heartbeat could quote.
+const MARKERS = ['SYNTHETIC-FIN-MARKER-7f3a', 'SYNTHETIC-MED-MARKER-91c2', 'SYNTHETIC-MAIL-MARKER-c40d', 'SYNTHETIC-BANK-MARKER-2b88'];
+const inboxValue = () => ({ items: [{ code: 'A1', text: `Synthetic card ${MARKERS[0]}` }], threads: [{ id: 'synthetic', last: { id: 3, preview: MARKERS[1] } }], badge: 1 });
+const threadValue = () => ({ messages: [{ id: 3, body: `Synthetic message ${MARKERS[1]} ${MARKERS[0]}` }], cardStates: {}, lastRead: 0, typing: false });
+const statusValue = () => ({ sources: { synthetic: { status: 'partial', error: MARKERS[3] } }, recentHistory: [{ source: 'synthetic', error_message: MARKERS[3] }] });
+const urgentValue = () => ({ status: 'ready', items: [{ subject: MARKERS[2], from: 'Synthetic Sender' }] });
+
+function storeText(backend) {
+  return JSON.stringify([Array.from(backend.rows.entries()), Array.from(backend.values.entries())]);
+}
+
+function assertNoMarkers(backend, label) {
+  const text = storeText(backend);
+  for (const m of MARKERS) assert.equal(text.includes(m), false, `${label}: ${m} reached the persisted store`);
+}
+
+test('agents, status and urgent-email values never enter the persisted store, whatever the caller asks', async () => {
+  const backend = fakeBackend();
+  const cache = makeCache();
+  // Queued before the store attaches, like a warm-up or an early read landing first.
+  cache.put('agents:inbox', inboxValue());
+  await cache.attach(backend, USER_A);
+  cache.put('agents:thread:synthetic', threadValue(), { persist: true });
+  cache.put('/api/status', statusValue());
+  cache.put('/api/urgent-email', urgentValue(), { persist: true });
+  cache.put('/api/reading', { overview: null });
+  await persisted(cache);
+  assert.deepEqual(backend.puts, ['/api/reading']);
+  assertNoMarkers(backend, 'after put');
+  // Rendered at once from memory this session (no await, no disk read).
+  assert.deepEqual(cache.peek('agents:inbox'), inboxValue());
+  assert.deepEqual(cache.peek('agents:thread:synthetic'), threadValue());
+  assert.deepEqual(cache.peek('/api/status'), statusValue());
+  // Live revalidation still replaces the in-memory copy and still stays off the disk.
+  const next = { ...threadValue(), messages: [{ id: 4, body: `Newer ${MARKERS[0]}` }] };
+  assert.deepEqual(await cache.revalidate('agents:thread:synthetic', async () => next), next);
+  assert.deepEqual(cache.peek('agents:thread:synthetic'), next);
+  await persisted(cache);
+  assertNoMarkers(backend, 'after revalidate');
+  // A write invalidates the agents entries in memory; the background refetch stays in memory too.
+  cache.register('agents:inbox', async () => inboxValue());
+  cache.invalidate(writeInvalidates('/onyx/dismiss'));
+  assert.equal(cache.peek('agents:thread:synthetic'), undefined);
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cache.peek('agents:inbox'), inboxValue());
+  await persisted(cache);
+  assertNoMarkers(backend, 'after invalidate + refetch');
+  // Restart: a new cache over the same store has no copy of any of them.
+  const reopened = makeCache();
+  await reopened.attach(backend, USER_A);
+  for (const key of ['agents:inbox', 'agents:thread:synthetic', '/api/status', '/api/urgent-email']) {
+    assert.equal(await reopened.read(key), undefined, key);
+  }
+  assert.deepEqual(await reopened.read('/api/reading'), { overview: null });
+});
+
+test('a quota retry never writes a memory-only key', async () => {
+  const backend = fakeBackend();
+  const cache = makeCache();
+  await cache.attach(backend, USER_A);
+  for (const k of ['k:1', 'k:2']) cache.put(k, { k });
+  await persisted(cache);
+  backend.failPut = 1;
+  cache.put('agents:inbox', inboxValue());
+  cache.put('/api/status', statusValue());
+  cache.put('k:3', { k: 'k:3' });
+  await persisted(cache);
+  assert.equal(backend.rows.has('k:3'), true, 'the persistable value was retried after evicting');
+  assert.equal(backend.puts.includes('agents:inbox') || backend.puts.includes('/api/status'), false);
+  assertNoMarkers(backend, 'after quota retry');
+});
+
+test('a memory-only read answers at once and never waits for the store to attach', async () => {
+  const cache = makeCache(clock(), { readyTimeoutMs: 60_000 });
+  const timeout = new Promise((r) => setTimeout(() => r('waited'), 200));
+  assert.equal(await Promise.race([cache.read('agents:inbox'), timeout]), undefined);
+  assert.equal(await Promise.race([cache.read('/api/status'), timeout]), undefined);
+  cache.put('agents:inbox', inboxValue());
+  assert.deepEqual(await Promise.race([cache.read('agents:inbox'), timeout]), inboxValue());
+});
+
+/** A store already scoped to this user and this schema, holding rows written under an older policy. */
+function storeWithOldRows(userId = USER_A) {
+  const backend = fakeBackend();
+  backend.scope = { userId, schema: CACHE_SCHEMA_VERSION, lastSweep: 0 };
+  const at = Date.parse('2031-02-03T11:00:00Z');
+  const rows = [['agents:inbox', inboxValue()], ['agents:thread:synthetic', threadValue()], ['/api/status', statusValue()],
+    ['/api/urgent-email', urgentValue()], ['/api/finance/alerts', { alerts: [{ text: MARKERS[0] }] }], ['/api/reading', { overview: null }]];
+  for (const [key, value] of rows) {
+    backend.rows.set(key, { key, at, maxAge: DEFAULT_MAX_AGE_MS, lastUsed: at, size: 100 });
+    backend.values.set(key, value);
+  }
+  return backend;
+}
+
+test('rows persisted under an older policy are purged at the next start, without a sign-out or a schema bump', async () => {
+  const backend = storeWithOldRows();
+  const base = backend.destroyed;
+  const cache = makeCache();
+  await cache.attach(backend, USER_A);
+  assert.equal(backend.destroyed, base, 'the store is kept: only the memory-only rows go');
+  assert.deepEqual(Array.from(backend.rows.keys()), ['/api/reading']);
+  assert.deepEqual(Array.from(backend.values.keys()), ['/api/reading']);
+  assertNoMarkers(backend, 'after the purge');
+  assert.equal(cache.persistent, true);
+  assert.deepEqual(await cache.read('/api/reading'), { overview: null });
+  assert.equal(await cache.read('agents:inbox'), undefined);
+  assert.equal(cache.totalBytes(), 100, 'purged rows no longer count towards the size cap');
+
+  // A tab still running an older version writes one after this tab attached: never served, purged at the next start.
+  const late = Date.parse('2031-02-03T11:30:00Z'); // inside the max age: purged, not just expired
+  await backend.put({ key: 'agents:inbox', at: late, maxAge: DEFAULT_MAX_AGE_MS, lastUsed: late, size: 100 }, inboxValue());
+  assert.equal(await cache.read('agents:inbox'), undefined);
+  const restarted = makeCache();
+  await restarted.attach(backend, USER_A);
+  assert.equal(backend.rows.has('agents:inbox'), false);
+  assertNoMarkers(backend, 'after the restart');
+});
+
+test('a store written before the schema bump is deleted whole before anything is read', async () => {
+  const backend = storeWithOldRows();
+  backend.scope = { ...backend.scope, schema: CACHE_SCHEMA_VERSION - 1 };
+  const base = backend.destroyed;
+  const cache = makeCache();
+  await cache.attach(backend, USER_A);
+  assert.equal(backend.destroyed, base + 1);
+  assert.equal(backend.rows.size, 0);
+  assertNoMarkers(backend, 'after the schema bump');
+  assert.equal(backend.scope.schema, CACHE_SCHEMA_VERSION);
+  assert.equal(await cache.read('/api/reading'), undefined);
+});
+
+test('purge failure: rows that cannot be removed take the whole store; if that fails too, memory only until the next start', async () => {
+  // 1. remove() fails: the whole store is deleted instead, and the cache keeps working on the empty store.
+  const first = storeWithOldRows();
+  const remove = first.remove;
+  first.remove = async () => { throw new Error('synthetic remove failure'); };
+  const base = first.destroyed;
+  const a = makeCache();
+  await a.attach(first, USER_A);
+  assert.equal(first.destroyed, base + 1);
+  assertNoMarkers(first, 'after the fallback');
+  assert.equal(a.persistent, true);
+  assert.equal(first.scope.userId, USER_A);
+  first.remove = remove;
+  a.put('/api/reading', { overview: { book: { title: 'A synthetic book' } } });
+  await persisted(a);
+  assert.deepEqual(first.puts.slice(-1), ['/api/reading']);
+
+  // 2. remove() and destroy() both fail: nothing is served from the store this session (memory only) ...
+  const second = storeWithOldRows();
+  const secondRemove = second.remove;
+  const secondDestroy = second.destroy;
+  second.remove = async () => { throw new Error('synthetic remove failure'); };
+  second.destroy = async () => { throw new Error('synthetic destroy failure'); };
+  const b = makeCache();
+  await b.attach(second, USER_A);
+  assert.equal(b.persistent, false);
+  assert.equal(await b.read('agents:inbox'), undefined);
+  assert.equal(await b.read('/api/reading'), undefined, 'a store that could not be cleaned is not used at all');
+  b.put('agents:inbox', inboxValue());
+  assert.deepEqual(b.peek('agents:inbox'), inboxValue(), 'still rendered from memory');
+  // ... and the next start retries the purge.
+  second.remove = secondRemove;
+  second.destroy = secondDestroy;
+  const c = makeCache();
+  await c.attach(second, USER_A);
+  assert.equal(c.persistent, true);
+  assert.deepEqual(Array.from(second.rows.keys()), ['/api/reading']);
+  assertNoMarkers(second, 'after the retry');
+  assert.deepEqual(await c.read('/api/reading'), { overview: null });
+});
+
+test('another user on the device never sees the previous user\'s agents or status copies', async () => {
+  const backend = storeWithOldRows(USER_A);
+  const cache = makeCache();
+  await cache.attach(backend, USER_B);
+  assert.equal(backend.rows.size, 0);
+  assertNoMarkers(backend, 'after the user switch');
+  assert.equal(await cache.read('agents:inbox'), undefined);
+  assert.equal(await cache.read('/api/reading'), undefined);
 });
 
 test('sensitive values never reach the persisted store and are gone when the app closes', async () => {
@@ -112,13 +308,14 @@ test('the store is scoped to the user and the schema version: a mismatch deletes
   backend.listRows = list;
 
   // Same user, older cache schema: destroyed too.
-  second.put('/api/status', { ok: 1 });
+  second.put('k:user-b', { ok: 1 });
   await persisted(second);
+  assert.equal(backend.rows.has('k:user-b'), true);
   backend.scope = { ...backend.scope, schema: CACHE_SCHEMA_VERSION - 1 };
   const third = makeCache();
   await third.attach(backend, USER_B);
   assert.equal(backend.destroyed, base + 2);
-  assert.equal(await third.read('/api/status'), undefined);
+  assert.equal(await third.read('k:user-b'), undefined);
 });
 
 test('signing out wipes memory, the IndexedDB store, Cache Storage and only this app\'s localStorage keys', async () => {
@@ -127,6 +324,8 @@ test('signing out wipes memory, the IndexedDB store, Cache Storage and only this
   await cache.attach(backend, USER_A);
   cache.put('/api/reading', { overview: null });
   cache.put('/api/finance/alerts', { status: 'ready', alerts: [] });
+  cache.put('agents:thread:synthetic', threadValue());
+  cache.put('/api/status', statusValue());
   await persisted(cache);
   const base = backend.destroyed;
   const store = new Map([['onyx:checkin:2031-02-03', '{}'], ['onyx.warmup.visits', '{}'], ['onyx-care-planner-v1', '[]'],
@@ -138,6 +337,8 @@ test('signing out wipes memory, the IndexedDB store, Cache Storage and only this
   await wipeClientData({ cache, storage, cacheStorage, deleteDatabase: async (n) => { deletedDbs.push(n); } });
   assert.equal(cache.peek('/api/reading'), undefined);
   assert.equal(cache.peek('/api/finance/alerts'), undefined);
+  assert.equal(cache.peek('agents:thread:synthetic'), undefined);
+  assert.equal(cache.peek('/api/status'), undefined);
   assert.equal(backend.destroyed, base + 1);
   assert.equal(backend.values.size, 0);
   assert.deepEqual(deletedDbs, [CACHE_DB_NAME]);

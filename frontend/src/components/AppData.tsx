@@ -56,6 +56,9 @@ function logUberEatsWarmers(): DataWarmer[] {
 
 // GET reads each page's client makes when it opens. Same keys and the same raw values the pages store.
 // /api/experiments/today is deliberately absent: reading it stamps the arm as revealed, so only Today asks.
+// Memory-only keys (lib/client-cache.ts isSensitiveKey: the agents inbox and threads, /api/status, /api/urgent-email,
+// finance and the rest) are still warmed, so a page opened later this session renders at once, but the cache
+// never writes them to the device.
 const DATA: Record<string, () => DataWarmer[]> = {
   "/today": () => {
     const today = new Date();

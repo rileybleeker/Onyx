@@ -144,7 +144,7 @@ function cachedInbox(raw: unknown): InboxResponse | null {
 
 export default function AgentsInbox({ initialView }: { initialView: InboxView | null }) {
   const router = useRouter();
-  // Start from the cached inbox (Today and the warm-up keep it fresh), then revalidate.
+  // Start from the in-memory inbox (Today and the warm-up keep it fresh this session), then revalidate.
   const [data, setData] = useState<InboxResponse | null>(() => cachedInbox(clientCache.peek(CACHE_KEYS.agentsInbox)));
   // With nothing waiting in the cached copy, open on the conversations (the first live answer decides).
   const autoAllRef = useRef(initialView === null && !!data && data.items.length === 0);
@@ -189,16 +189,8 @@ export default function AgentsInbox({ initialView }: { initialView: InboxView | 
     }
   }, []);
 
-  // Reopening the app: show the inbox kept on this device until the live one answers.
-  useEffect(() => {
-    let alive = true;
-    void clientCache.read(CACHE_KEYS.agentsInbox).then((raw) => {
-      const cached = cachedInbox(raw);
-      if (alive && cached) setData((prev) => prev ?? cached);
-    });
-    return () => { alive = false; };
-  }, []);
-
+  // No copy on the device to fill from: agents:inbox is memory-only (lib/client-cache.ts isSensitiveKey, cards and
+  // previews can quote finance, medical or email content). A reopened app starts from the GET the HTML started.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     let stopped = false;
