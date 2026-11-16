@@ -451,14 +451,61 @@ test("a goal change refuses an old tap, a kept tap is not offered under another 
   const store = read("lib/use-winddown.ts");
   assert.match(store, /ruleFor\(p\.rules, night\)/, "the tap carries the goal version the screen showed");
   // Undo goes back to the answer the screen showed when the tap was made, not the server's "previous": a retry
-  // after a lost answer comes back from the server as an unchanged night.
-  assert.match(store, /previous: intent\.expect === "none" \? null : intent\.expect/);
+  // after a lost answer comes back from the server as an unchanged night (behavior: the undo test below).
+  assert.match(store, /const previous = intent\.expect === "none" \? null : intent\.expect;/);
+  assert.match(store, /\{ night: intent\.night, answer, previous, ruleId: intent\.ruleId \}/, "undo remembers the goal version it answered");
   const kept = W.parsePending(W.pendingRecord(intent(), Date.parse("2031-03-20T22:00:00Z")));
   const now = Date.parse("2031-03-20T23:00:00Z");
   assert.ok(W.pendingToOffer(kept, payload(), now));
   const changed = payload({ rules: [rule(), rule({ id: 2, effectiveFrom: TODAY, habitPageId: ID_B, habitName: HABIT_2 })], habitNames: { [ID_A]: HABIT, [ID_B]: HABIT_2 } });
   assert.equal(W.pendingToOffer(kept, changed, now), null, "the goal changed since the tap: not offered");
   assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, opId: newOp(), at: 1 })), null, "a kept tap without its goal is dropped");
+});
+
+test("undo after a goal switch or a replay: never written to another habit, never over a later change", () => {
+  // Habit A answered No -> Yes under goal 1. Tonight's goal is then switched to habit B (goal 2), already Yes.
+  const last = { night: TODAY, answer: "Yes", previous: "No", ruleId: 1 };
+  assert.equal(W.undoApplies(last, payload({ answers: [yes(0)] })), true, "same goal, still the tap's answer");
+  const switched = payload({
+    rules: [rule(), rule({ id: 2, effectiveFrom: TODAY, habitPageId: ID_B, habitName: HABIT_2 })],
+    habitNames: { [ID_A]: HABIT, [ID_B]: HABIT_2 },
+    answers: [yes(0), yes(0, HABIT_2)],
+  });
+  assert.equal(W.answerOn(switched, TODAY), "Yes", "habit B shows the same answer the tap gave");
+  assert.equal(W.undoApplies(last, switched), false, "another goal version: Undo would write No to habit B");
+  // A replayed (or found-landed) tap whose night was cleared since: nothing to undo, and the re-read decides.
+  assert.equal(W.undoApplies(last, payload({ answers: [] })), false, "cleared since: nothing to undo");
+  assert.equal(W.undoApplies(last, payload({ answers: [no(0)] })), false, "changed back since");
+  assert.equal(W.undoApplies({ ...last, previous: "Yes" }, payload({ answers: [yes(0)] })), false, "a tap that changed nothing");
+  assert.equal(W.undoApplies(null, payload()), false);
+  assert.equal(W.undoApplies(last, payload({ status: "not_set_up" })), false);
+  const store = read("lib/use-winddown.ts");
+  const undo = store.slice(store.indexOf("export function undoLast("), store.indexOf("export function retryNow("));
+  assert.ok(undo.indexOf("undoApplies(last, snap.payload)") >= 0 && undo.indexOf("undoApplies(last, snap.payload)") < undo.indexOf("answerNight("), "checked before it writes");
+  assert.match(store, /!undoApplies\(snap\.last, next\)/, "a read that shows another goal or answer drops the undo");
+  assert.match(store, /kind === "rule" \? \{ busy: null, last: null \}/, "a goal change drops the undo");
+  // Cancel that found the tap landed is a replay: its historical answer is never installed as the current one.
+  assert.match(store, /onLanded: \(intent, answer\) => settled\(intent, answer \?\? intent\.answer, true, LANDED_NOTICE\)/);
+  assert.match(store, /if \(server && !replayed\) server = withAnswer\(server, intent\.night, answer\);/);
+  const panel = read("components/sleep/WindDownPanel.tsx");
+  assert.match(panel, /undoApplies\(last, s\.payload\)/);
+});
+
+test("a stale refusal keeps every answer button waiting until a read judged the kept tap, also when that read fails", () => {
+  const store = read("lib/use-winddown.ts");
+  const refused = store.slice(store.indexOf("onRefused: (intent, e, sentBefore) => {"), store.indexOf("async function fenceRefused("));
+  assert.match(refused, /if \(e\.code === WINDDOWN_STALE_CODE\) \{[\s\S]*?checking = true;/);
+  assert.match(refused, /emit\(\{ recovery: null, recoveryChecking: checking \}\);/);
+  const fence = store.slice(store.indexOf("async function fenceRefused("), store.indexOf("function resetAfterSessionEnd("));
+  assert.match(fence, /recoveryChecking: !d \}/, "an unanswered fence keeps the buttons waiting");
+  // A kept copy no send owns is never overwritten by a new tap, whatever the snapshot says.
+  assert.match(store, /if \(keptUnowned\(\)\) \{ emit\(\{ recoveryChecking: true \}\); void reloadWindDown\(\); return false; \}/);
+  const answer = store.slice(store.indexOf("export function answerNight("), store.indexOf("export function undoLast("));
+  assert.ok(answer.indexOf("keptUnowned()") < answer.indexOf("saver.submit("), "checked before the tap is sent");
+  // The kept copy is judged only on the server's read: hold (older copy) waits, a later day offers it again.
+  const kept = W.parsePending(W.pendingRecord(intent({ today: TODAY }), Date.parse("2031-03-21T09:00:00Z")));
+  assert.equal(W.keptTapDecision(kept, payload({ today: day(-1) }), Date.parse("2031-03-21T11:00:00Z")).kind, "hold");
+  assert.equal(W.keptTapDecision(kept, payload({ today: day(1) }), Date.parse("2031-03-21T11:00:00Z")).kind, "offer");
 });
 
 test("one unsaved tap at a time: the answer buttons wait; every mount, the day rollover and the Habits page follow", () => {

@@ -954,6 +954,20 @@ export function pendingToOffer(tap: PendingTap | null, p: WindDownPayload | null
   const d = keptTapDecision(tap, p, nowMs);
   return d.kind === "offer" ? d.intent : null;
 }
+/** The last confirmed tap, for its Undo: the night, the answer it gave, the answer before it, the goal version it answered. */
+export interface LastTap { night: string; answer: NightAnswer | null; previous: NightAnswer | null; ruleId: number }
+/**
+ * Undo of the last tap still means what it says on this payload (the server's own read, never the tap's result):
+ * the night is under the SAME goal version the tap answered (a goal switched since names another habit, whose answer
+ * the undo would overwrite) and still holds the tap's answer (a replayed or found-landed tap may have been changed
+ * since). Anything else: there is nothing left to undo.
+ */
+export function undoApplies(last: LastTap | null, p: WindDownPayload | null): boolean {
+  if (!last || !p || p.status !== "ready") return false;
+  if (last.answer === last.previous) return false;
+  if ((ruleFor(p.rules, last.night)?.id ?? 0) !== last.ruleId) return false;
+  return answerOn(p, last.night) === (last.answer ?? "none");
+}
 /** The offered tap's answer is already what the night shows: settling it changes nothing on the night. */
 export function offerMatchesShown(i: NightIntent): boolean {
   return i.expect === (i.answer ?? "none");

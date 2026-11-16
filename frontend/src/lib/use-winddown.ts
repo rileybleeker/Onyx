@@ -59,7 +59,9 @@ import {
   pendingRecord,
   readIsCurrent,
   ruleFor,
+  undoApplies,
   withAnswer,
+  type LastTap,
   type NightAnswer,
   type NightIntent,
   type SaverState,
@@ -84,8 +86,11 @@ export interface WindDownSnapshot {
    * settled by its id after a refusal: nothing is offered and every answer button waits.
    */
   recoveryChecking: boolean;
-  /** The last thing a tap did, for the screen reader and the undo line. */
-  last: { night: string; answer: NightAnswer | null; previous: NightAnswer | null } | null;
+  /**
+   * The last thing a tap did, for the screen reader and the undo line, with the goal version it answered (Undo is
+   * dropped once the night is under another goal or no longer holds that answer: undoApplies).
+   */
+  last: LastTap | null;
   /** A goal / pause / hide action (or discarding a kept tap) in flight, and the message of the last one that failed. */
   busy: "rule" | "pause" | "hidden" | "recovery" | null;
   actionError: string | null;
@@ -132,6 +137,11 @@ const LANDED_NOTICE = "That tap had already been saved.";
  */
 const resentKept = new Set<string>();
 
+/** A tap is kept on this device and no send of this visit owns it (offered, being checked, or waiting for a read). */
+function keptUnowned(): boolean {
+  if (saver.unsaved) return false;
+  try { return parsePending(window.localStorage.getItem(WINDDOWN_PENDING_KEY)) !== null; } catch { return false; }
+}
 /** What to do with the kept tap on the payload shown now (keptTapDecision; never decided by equal answers). */
 function readKept(): ReturnType<typeof keptTapDecision> {
   try {
@@ -168,10 +178,15 @@ function accept(raw: unknown, fresh = false): boolean {
   const kept = readKept();
   if (kept.kind === "drop" && !saver.unsaved && fencing === null) keep(null);
   const owned = saver.unsaved || fencing !== null;
+  // Undo is judged on the server's own read: a goal switched since (another habit) or an answer changed since (a
+  // replayed tap's later edits) leaves nothing to undo.
+  const last = snap.last && !saver.unsaved && !undoApplies(snap.last, next) ? null : snap.last;
   emit({
     load: "ready", refreshFailed: false, at: clientCache.fetchedAt(WINDDOWN_URL) ?? Date.now(), fresh: snap.fresh || fresh,
     recovery: !owned && kept.kind === "offer" ? kept.intent : null,
-    recoveryChecking: fencing !== null || (!saver.unsaved && kept.kind === "hold"),
+    // (A payload that is not ready has no answer buttons: nothing to say about a kept tap until the goal exists.)
+    recoveryChecking: fencing !== null || (!saver.unsaved && kept.kind === "hold" && next.status === "ready"),
+    last,
   });
   return true;
 }
@@ -257,8 +272,9 @@ function settled(intent: NightIntent, answer: NightAnswer | null, replayed: bool
   if (!saver.unsaved) overlay = null;
   afterWrite();
   const previous = intent.expect === "none" ? null : intent.expect;
-  // A kept tap confirmed on a night that already showed its answer changed nothing: there is nothing to undo.
-  emit({ last: previous === answer ? null : { night: intent.night, answer, previous }, recovery: null, recoveryChecking: false, notice });
+  // A kept tap confirmed on a night that already showed its answer changed nothing: there is nothing to undo. Undo
+  // remembers the goal version the tap answered, so a goal switched since never has the undo written to its habit.
+  emit({ last: previous === answer ? null : { night: intent.night, answer, previous, ruleId: intent.ruleId }, recovery: null, recoveryChecking: false, notice });
   try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ }
   void reloadWindDown();
 }
@@ -281,8 +297,9 @@ const saver = new WindDownSaver({
     const d = await send(WINDDOWN_CANCEL_URL, "POST", { op_id: intent.opId, night: intent.night }, confirmCancelReply(intent));
     return { landed: d.landed === true, answer: d.answer === "Yes" || d.answer === "No" ? d.answer : null };
   },
-  // Cancel found the tap HAD landed: the same as a save.
-  onLanded: (intent, answer) => settled(intent, answer ?? intent.answer, false, LANDED_NOTICE),
+  // Cancel found the tap HAD landed: a replay, not a fresh save. Its answer is what the tap wrote back then; the night
+  // may have changed since (cleared on another device), so it is never installed as current: the re-read decides.
+  onLanded: (intent, answer) => settled(intent, answer ?? intent.answer, true, LANDED_NOTICE),
   // Cancel settled a tap that never landed and now never will: the screen goes back to what the server holds.
   onCancelled: () => {
     keep(null);
@@ -304,15 +321,18 @@ const saver = new WindDownSaver({
     const earlierSend = sentBefore || resentKept.has(intent.opId);
     resentKept.delete(intent.opId);
     overlay = null;
+    let checking = false;
     if (e.code === WINDDOWN_STALE_CODE) {
-      // kept, offered again by the reload below
+      // kept, offered again by the reload below. Until a read judged it, every answer button waits ("Checking a tap
+      // from earlier"), also when that read fails: a new tap would overwrite the kept copy.
+      checking = true;
     } else if (earlierSend && !WINDDOWN_FINAL_REFUSALS.has(e.code) && e.code !== WINDDOWN_SESSION_ENDED_CODE) {
       void fenceRefused(intent);
       return;
     } else {
       keep(null);
     }
-    emit({ recovery: null });
+    emit({ recovery: null, recoveryChecking: checking });
     void reloadWindDown();
   },
 });
@@ -340,7 +360,8 @@ async function fenceRefused(intent: NightIntent) {
     return;
   }
   if (d) { keep(null); afterWrite(); }
-  emit({ recovery: null, recoveryChecking: false });
+  // Not settled (d null): the kept copy stays and the buttons keep waiting until a read offers it or drops it.
+  emit({ recovery: null, recoveryChecking: !d });
   void reloadWindDown();
 }
 
@@ -438,6 +459,8 @@ export function answerNight(night: string, answer: NightAnswer | null): boolean 
   const p = snap.payload;
   if (!p || p.status !== "ready") return false;
   if (snap.recovery || snap.recoveryChecking || fencing !== null || !saver.canAccept(night)) return false;
+  // A kept tap that no send of this visit owns is never overwritten by a new tap: check it again first.
+  if (keptUnowned()) { emit({ recoveryChecking: true }); void reloadWindDown(); return false; }
   const rule = ruleFor(p.rules, night);
   if (!rule) return false;
   const expect = answerOn(p, night);
@@ -446,10 +469,14 @@ export function answerNight(night: string, answer: NightAnswer | null): boolean 
   emit({ recovery: null, actionError: null, notice: null });
   return saver.submit({ night, answer, expect, today: p.today, ruleId: rule.id, opId: newOpId() });
 }
-/** Undo the last tap: put that night back to the answer it had. */
+/**
+ * Undo the last tap: put that night back to the answer it had, only while the night is still under the goal version
+ * the tap answered and still holds the tap's answer (undoApplies). Otherwise there is nothing to undo.
+ */
 export function undoLast() {
   const last = snap.last;
   if (!last) return;
+  if (!undoApplies(last, snap.payload)) { emit({ last: null }); return; }
   if (answerNight(last.night, last.previous)) emit({ last: null });
 }
 export function retryNow() { saver.retryNow(); }
@@ -505,7 +532,8 @@ async function action(kind: "rule" | "pause" | "hidden", run: () => Promise<unkn
   try {
     await run();
     afterWrite();
-    emit({ busy: null });
+    // A new goal version may name another habit for that night: the last tap's Undo would answer the wrong one.
+    emit(kind === "rule" ? { busy: null, last: null } : { busy: null });
     await reloadWindDown();
     return true;
   } catch (e) {

@@ -21,6 +21,7 @@ import {
   offerMatchesShown,
   shortDate,
   sleepFeedback,
+  undoApplies,
   windDownAttention,
   windDownProgress,
   windowSummary,
@@ -105,9 +106,9 @@ function SaveLine({ s, p }: { s: WindDownSnapshot; p: WindDownProgress }) {
     );
   }
   const last = s.last;
-  // Undo while that night can still be answered here and still holds the answer the tap gave it.
-  // (Tonight's own Clear covers a tap that only answered tonight.)
-  const undoable = !!last && last.answer !== last.previous && last.night <= p.today && last.night >= addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)
+  // Undo while that night can still be answered here, is still under the goal version the tap answered and still
+  // holds the answer the tap gave it (undoApplies). (Tonight's own Clear covers a tap that only answered tonight.)
+  const undoable = !!last && undoApplies(last, s.payload) && last.night <= p.today && last.night >= addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)
     && currentAnswer(p, last.night) === last.answer && !(last.night === p.today && last.previous === null);
   if (st.status === "saved" || undoable || s.notice) {
     return (
