@@ -19,6 +19,11 @@ export interface MoneyAlert {
   due?: string;
   /** Low cash only: the day cash is lowest (the day the title names), which can be later than `due`. */
   lowest?: string;
+  /**
+   * Low cash only: the first day the LIKELY path is below the line, when it is within the 30 days. It can come before
+   * the cautious path's lowest day, so Today treats a likely breach today or tomorrow as urgent from this date.
+   */
+  likelyDue?: string;
 }
 
 const usd = (cents: number) => `$${Math.round(Math.abs(cents) / 100).toLocaleString("en-US")}`;
@@ -33,16 +38,21 @@ export function moneyAlerts(forecast: ForecastResult | null, budgets: BudgetsRes
     const low = soon.reduce<{ date: string; cents: number } | null>((m, d) => (!m || d.low < m.cents ? { date: d.date, cents: d.low } : m), null);
     // The day it first crosses the line is when Riley has to act, even when the lowest point is later.
     const firstBelow = soon.find((d) => d.low < line);
+    // The likely path can drop below the line on a day other than the cautious low point (sooner, even): that day
+    // makes the alert likely (high) and is Today's deadline when it is today or tomorrow.
+    const firstLikely = soon.find((d) => d.likely < line);
     if (low && low.cents < line) {
       const likelyThen = soon.find((d) => d.date === low.date)?.likely ?? low.cents;
+      const likelyElsewhere = firstLikely && likelyThen >= line ? `; likely below it around ${day(firstLikely.date)}` : "";
       out.push({
         kind: "low-cash",
-        severity: likelyThen < line ? "high" : "medium",
+        severity: likelyThen < line || firstLikely ? "high" : "medium",
         title: `Cash may drop to ${low.cents < 0 ? "-" : ""}${usd(low.cents)} around ${day(low.date)}`,
-        detail: `${line > 0 ? `Below your ${usd(line)} line` : "Below $0"} on the cautious path (likely ${likelyThen < 0 ? "-" : ""}${usd(likelyThen)}). Move money or delay a payment.`,
+        detail: `${line > 0 ? `Below your ${usd(line)} line` : "Below $0"} on the cautious path (likely ${likelyThen < 0 ? "-" : ""}${usd(likelyThen)}${likelyElsewhere}). Move money or delay a payment.`,
         href: "/financials/forecast",
         due: firstBelow?.date ?? low.date,
         lowest: low.date,
+        ...(firstLikely ? { likelyDue: firstLikely.date } : {}),
       });
     }
     for (const m of forecast.milestones) {

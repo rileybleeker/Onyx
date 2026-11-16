@@ -120,10 +120,15 @@ function parseOrders(data: unknown): OrdersSummary {
   if (!v || (v.status !== "not_connected" && !(v.status === "ready" && Array.isArray(v.top)))) throw new Error("Invalid orders");
   return v;
 }
-function parseRenewals(data: unknown): RenewalSummary {
-  const v = data as RenewalSummary | null;
+// The renewals answer and how current it is, like the money alerts: `updating` = an older stored detection is being
+// recomputed (asOf = when it was computed), so "nothing renews" is not confirmed until the ?fresh=1 follow-up read
+// answers; `refreshFailed` = that follow-up failed.
+type RenewalsView = RenewalSummary & { asOf: string | null; updating: boolean; refreshFailed: boolean };
+function parseRenewals(data: unknown): RenewalsView {
+  const v = data as (RenewalSummary & { asOf?: unknown; updating?: unknown }) | null;
   if (!v || (v.status !== "empty" && !(v.status === "ready" && Array.isArray(v.soon) && typeof v.count === "number"))) throw new Error("Invalid renewals");
-  return v;
+  const asOf = typeof v.asOf === "string" && Number.isFinite(Date.parse(v.asOf)) ? v.asOf : null;
+  return { ...v, asOf, updating: v.updating === true, refreshFailed: false };
 }
 function parseExperiment(data: unknown): ExperimentToday {
   if (!isExperimentToday(data)) throw new Error("Invalid experiment arm");
@@ -134,6 +139,8 @@ const READING_URL = "/api/reading";
 const URGENT_URL = "/api/urgent-email";
 const ORDERS_URL = "/api/orders/summary";
 const RENEWALS_URL = "/api/procurement/renewals/summary";
+// The follow-up read after an `updating` renewals answer (computed before answering; never started early).
+const RENEWALS_FRESH_URL = "/api/procurement/renewals/summary?fresh=1";
 const EXPERIMENT_URL = "/api/experiments/today";
 // Today and tomorrow in this device's zone; the server pads the range by a day on each side.
 function calendarUrl(): string {
@@ -163,6 +170,16 @@ function cachedValue<T>(key: string, parse: (data: unknown) => T): T | null {
 function fresh<T>(value: T) {
   return (previous: Load<T>): Load<T> => previous.state === "ready" && !previous.stale && sameJson(previous.value, value) ? previous : { state: "ready", value };
 }
+// "the check 2 h ago": how old a stored server answer is (`iso`: when it was computed).
+function checkAge(iso: string | null, nowMs: number): string {
+  const t = iso ? Date.parse(iso) : NaN;
+  if (!Number.isFinite(t)) return "an earlier check";
+  const min = Math.max(0, Math.floor((nowMs - t) / 60_000));
+  if (min < 2) return "the check just now";
+  if (min < 60) return `the check ${min} min ago`;
+  if (min < 48 * 60) return `the check ${Math.floor(min / 60)} h ago`;
+  return `the check ${Math.floor(min / 1440)} d ago`;
+}
 // A copy read from the device fills a panel that has nothing yet (or only an error); it never replaces a
 // fresher answer.
 function fromDevice<T>(value: T) {
@@ -186,7 +203,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const [experiment, setExperiment] = useState<Load<ExperimentToday>>(() => cachedLoad(EXPERIMENT_URL, parseExperiment));
   // Subscription renewals (GET /api/procurement/renewals/summary) follow the same rule: shown only
   // when one is due within 3 days; a failed check hides the panel, /procurement has the details.
-  const [renewals, setRenewals] = useState<RenewalSummary | null>(() => cachedValue(RENEWALS_URL, parseRenewals));
+  // An `updating` answer is followed by one ?fresh=1 read (renewalsRecheck), like the money alerts.
+  const [renewals, setRenewals] = useState<RenewalsView | null>(() => cachedValue(RENEWALS_URL, parseRenewals));
+  const renewalsRecheck = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Money alerts (GET /api/finance/alerts): shown when there is something to act on, or when "nothing to act on"
   // is not verified (an older answer that could not be updated, or part of the check missing); every shown answer
   // says how current it is (lib/money-alerts-view.ts). A failed check keeps the last answer, marked.
@@ -285,6 +304,23 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       if (sequence.current !== current) return;
       setRenewals((previous) => sameJson(previous, value) ? previous : value);
       markCheck("renewals", true);
+      if (!value.updating) return;
+      // An older stored detection, recomputed on the server after it answered: not a confirmed answer. Ask once
+      // more for the current one (?fresh=1 computes it first); if that fails, it stays marked as not confirmed.
+      if (renewalsRecheck.current) clearTimeout(renewalsRecheck.current);
+      renewalsRecheck.current = setTimeout(() => {
+        renewalsRecheck.current = null;
+        if (sequence.current !== current) return;
+        void bounded(getJson(RENEWALS_FRESH_URL).then((data) => {
+          const next = parseRenewals(data);
+          clientCache.put(RENEWALS_URL, data);
+          return next;
+        })).then((next) => {
+          if (sequence.current === current) setRenewals((previous) => sameJson(previous, next) ? previous : next);
+        }).catch(() => {
+          if (sequence.current === current) setRenewals((previous) => previous && previous.updating && !previous.refreshFailed ? { ...previous, refreshFailed: true } : previous);
+        });
+      }, MONEY_RECHECK_MS);
     }).catch(() => { if (sequence.current === current) markCheck("renewals", false); /* keep the last summary, marked */ });
     const keepMarked = (previous: MoneyView | null): MoneyView | null => previous && !previous.refreshFailed ? { ...previous, refreshFailed: true } : previous;
     const moneyRequest = request(MONEY_URL, parseMoneyAnswer).then((value) => {
@@ -350,6 +386,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       sequence.current++;
       inFlight.current = false;
       if (moneyRecheck.current) { clearTimeout(moneyRecheck.current); moneyRecheck.current = null; }
+      if (renewalsRecheck.current) { clearTimeout(renewalsRecheck.current); renewalsRecheck.current = null; }
       document.removeEventListener("visibilitychange", visible);
       clearInterval(tick);
     };
@@ -438,7 +475,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const requests = cards.filter((item) => !isEmailCard(item.card));
   const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading" || calendar.state === "loading";
   const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale) || calendar.state === "error" || (calendar.state === "ready" && calendar.stale)
-    || lifeChecks.orders.state === "failed" || lifeChecks.renewals.state === "failed" || lifeChecks.money.state === "failed";
+    || lifeChecks.orders.state === "failed" || lifeChecks.renewals.state === "failed" || lifeChecks.money.state === "failed"
+    || !!renewals?.refreshFailed || !!money?.refreshFailed;
   // "none" (no trial registered, the usual case) and "not_connected" render nothing at all.
   const trial = experiment.state === "ready" && experiment.value.status !== "none" && experiment.value.status !== "not_connected" ? experiment.value : null;
   const email = urgent.state === "ready" && urgent.value.status === "ready" ? urgent.value : null;
@@ -486,10 +524,18 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       : `Nothing needs attention or arrives today${orders?.status === "ready" && orders.onTheWay > 0 ? `; ${orders.onTheWay} on the way` : ""}.`);
     checkLines.push(ordersLate && orders ? { ...line, text: `${line.text} ${ordersLateText}`, warn: true } : line);
   }
+  // An older stored renewals detection (`updating`) is never a confirmed "nothing renews": it says how old it is
+  // while the follow-up read runs, and that it is not confirmed when that read failed.
+  const renewalsNote = renewals?.updating && lifeChecks.renewals.state !== "failed"
+    ? renewals.refreshFailed
+      ? { text: `Not confirmed: this is from ${checkAge(renewals.asOf, now.getTime())} and couldn't be brought up to date.`, warn: true }
+      : { text: `From ${checkAge(renewals.asOf, now.getTime())}. Updating...`, warn: false }
+    : null;
   if (!renewing) {
-    checkLines.push(checkLine("renewals", "Renewals", "/procurement", !!renewals, renewals?.status === "ready"
+    const line = checkLine("renewals", "Renewals", "/procurement", !!renewals, renewals?.status === "ready"
       ? `Nothing renews in the next ${renewals.withinDays} days.`
-      : "No subscriptions found in your ledger."));
+      : "No subscriptions found in your ledger.");
+    checkLines.push(renewalsNote ? { ...line, text: `${line.text} ${renewalsNote.text}`, warn: renewalsNote.warn, when: "" } : line);
   }
   if (!moneyPanel) {
     checkLines.push(checkLine("money", "Money", "/financials/budgets", !!money, moneyStatus ? `No alerts to act on. ${moneyStatus.text}` : "No alerts to act on."));
@@ -542,7 +588,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       // Budgets are monthly: a budget alert hidden this month comes back next month.
       period: todayDate.slice(0, 7),
     },
-    renewals: { probe: lifeProbe("renewals", !!renewals), summary: renewals },
+    // An `updating` answer is checking until its follow-up read lands, and stale (not confirmed) when that failed.
+    renewals: { probe: lifeProbe("renewals", !!renewals, renewals?.updating ? { checking: !renewals.refreshFailed, refreshFailed: lifeChecks.renewals.state === "failed" || renewals.refreshFailed, asOf: renewals.asOf } : {}), summary: renewals },
     packages: { probe: lifeProbe("orders", !!orders, { connected: orders?.status !== "not_connected", syncLate: ordersLate, syncAt: orders?.status === "ready" ? orders.lastSync?.at ?? null : null }), summary: orders },
     reading: { probe: probe(reading, "reading"), overview: book },
   }) : null;
@@ -940,6 +987,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         </ul>
         {renewing.count > renewing.soon.length && <p className="mt-1 text-xs text-text-secondary">And {renewing.count - renewing.soon.length} more.</p>}
         <p className="mt-2 text-xs text-text-secondary">Estimated from past charges in your ledger. Onyx never pays or cancels anything.</p>
+        {renewalsNote && <p className={`mt-3 text-sm ${renewalsNote.warn ? "text-mid" : "text-text-secondary"}`}>{renewalsNote.text}</p>}
         {lifeFailed("renewals") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh renewals. Showing {clock(lifeChecks.renewals.at) ? `the check at ${clock(lifeChecks.renewals.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/procurement" className={`${linkStyle} mt-4 inline-block`}>Open procurement</Link>
       </section>

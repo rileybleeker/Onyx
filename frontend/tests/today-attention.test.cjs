@@ -235,6 +235,7 @@ test("adapter: agent requests keep the card code; expiry drives urgency; date-on
   ], NOW);
   assert.deepEqual(out.map((o) => [o.id, o.urgency]), [["agents:A1", "normal"], ["agents:A2", "urgent"], ["agents:A3", "high"], ["agents:A4", "normal"]]);
   assert.equal(out[1].reason, "Expires in 2 h");
+  assert.equal(out[3].reason, "Its expiry has passed; Planning assistant is still waiting for your answer", "an expired request says so");
   assert.equal(out[0].href, "/agents?t=fixture-agent#m7");
   assert.equal(A.expiryInstant("2030-03-05"), new Date(2030, 2, 5, 23, 59, 59).getTime());
   assert.equal(A.expiryInstant("2030-03-05T23:59:59"), new Date(2030, 2, 5, 23, 59, 59).getTime(), "the Worker's date-only form, local time");
@@ -502,6 +503,26 @@ test("money: a low-cash alert dated by its first day below the line cannot be hi
   // Urgent alerts reach the urgent list past the budget.
   const sel = quiet([base({ id: "agents:N1", urgency: "high" }), likely], [], { budget: 1 });
   assert.deepEqual(sel.shown.map((s) => [s.item.id, s.overBudget]), [[likely.id, false]]);
+});
+
+test("money: the likely path below the line tomorrow is urgent even when the cautious low point is later", () => {
+  // The cautious path is lowest late in the month, where the likely balance is back above the line, but the likely
+  // balance is negative tomorrow (finance-alerts.ts likelyDue). Severity alone would leave it in the ordinary tier.
+  const cash = { kind: "low-cash", severity: "medium", title: "Cash may drop to -$900 around Mar 25", detail: "Synthetic.", href: "/financials/forecast", due: "2030-03-06", lowest: "2030-03-25", likelyDue: "2030-03-06" };
+  const [o] = A.moneyObligations([cash], "2030-03", NOW);
+  assert.deepEqual([o.urgency, o.reason], ["urgent", "Cash may drop below your line tomorrow"]);
+  assert.equal(o.resurfaceAt, new Date(2030, 2, 6, 0, 0, 0).getTime());
+  const sel = quiet([base({ id: "agents:N1", urgency: "high" }), base({ id: "agents:N2", urgency: "high" }), o], [], { budget: 1 });
+  assert.ok(sel.shown.some((s) => s.item.id === o.id), "never budgeted out");
+  // The likely path's day comes first even when the alert's own date is later: it is the deadline.
+  const [early] = A.moneyObligations([{ ...cash, due: "2030-03-20", likelyDue: "2030-03-05" }], "", NOW);
+  assert.deepEqual([early.urgency, early.reason], ["urgent", "Cash may drop below your line today"]);
+  assert.equal(early.resurfaceAt, new Date(2030, 2, 5, 0, 0, 0).getTime());
+  assert.equal(A.canSetAside(early, MS), false);
+  // A likely breach weeks away keeps the alert's tier; its first day is still the deadline for a mark.
+  const [later] = A.moneyObligations([{ ...cash, severity: "high", due: "2030-03-20", likelyDue: "2030-03-22" }], "", NOW);
+  assert.equal(later.urgency, "high");
+  assert.equal(later.resurfaceAt, new Date(2030, 2, 20, 0, 0, 0).getTime());
 });
 
 test("urgent email: a request merged into a thread keeps its expiry; a snooze or hide lapses before it", () => {

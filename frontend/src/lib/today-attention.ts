@@ -228,6 +228,9 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
     } else if (left !== null && left > 0 && left <= 48 * HOUR) {
       urgency = "high";
       reason = `Expires in ${Math.round(left / HOUR)} h`;
+    } else if (left !== null && left <= 0) {
+      // Still listed by the inbox, so still open: say that its time has passed (it cannot be set aside either).
+      reason = `Its expiry has passed; ${r.card.agent || "the agent"} is still waiting for your answer`;
     }
     return {
       id: `agents:${code}`,
@@ -415,11 +418,15 @@ const MONEY_URGENT_REASON: Readonly<Record<Exclude<MoneyAlert["kind"], "budget">
  * The alert's own date (`due`: a tax payment's due date, the day a 0% promo ends, the first day cash drops below the
  * line on the cautious path) is its deadline: today, tomorrow or already past is URGENT (shown past the budget),
  * except a low-cash alert whose likely path stays above the line (severity medium), which keeps its ordinary tier.
- * A mark lapses at the start of that day. An alert without a readable `due` (an answer stored before the field
- * existed, recomputed on the next build or ET day) has no deadline.
+ * Low cash also carries the first day the LIKELY path is below the line (`likelyDue`): that day today or tomorrow is
+ * urgent whatever the severity says (the cautious low point that sets the severity and the title can be later), and
+ * the earlier of the two days is the deadline. A mark lapses at the start of the deadline day. An alert without a
+ * readable `due` (an answer stored before the field existed, recomputed on the next build or ET day) has no deadline.
  */
 export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now: Date = new Date()): Obligation[] {
   const seen = new Map<string, number>();
+  type Day = NonNullable<ReturnType<typeof localDay>>;
+  const soon = (d: Day | null): d is Day => !!d && d.daysLeft <= 1;
   return alerts.map((a) => {
     const colon = a.title.indexOf(": ");
     const subject = colon > 0 ? a.title.slice(0, colon) : "";
@@ -427,7 +434,12 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
     const due = localDay(a.due, now);
-    const imminent = !!due && due.daysLeft <= 1 && (a.kind !== "low-cash" || a.severity === "high");
+    const likelyDue = a.kind === "low-cash" ? localDay(a.likelyDue, now) : null;
+    // The days that make it urgent: its own date (for low cash only when the likely path breaches too), and for low
+    // cash the likely path's own first day below the line.
+    const pressing = [a.kind !== "low-cash" || a.severity === "high" ? due : null, likelyDue].filter(soon);
+    const imminent = pressing.length > 0;
+    const deadline = [due, likelyDue].filter((d): d is Day => !!d).sort((x, y) => x.start - y.start)[0] ?? null;
     const urgency: Urgency = imminent ? "urgent" : a.severity === "high" ? "high" : "normal";
     const urgentReason = a.kind === "budget" ? undefined : MONEY_URGENT_REASON[a.kind];
     return {
@@ -438,9 +450,9 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now
       href: a.href,
       external: false,
       urgency,
-      dueAt: due ? endOfLocalDay(now, Math.max(0, due.daysLeft)) : null,
-      resurfaceAt: due ? due.start : null,
-      reason: imminent && urgentReason ? urgentReason(due && due.daysLeft <= 0 ? "today" : "tomorrow") : MONEY_REASON[a.kind] ?? "Money alert",
+      dueAt: deadline ? endOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
+      resurfaceAt: deadline ? deadline.start : null,
+      reason: imminent && urgentReason ? urgentReason(pressing.some((d) => d.daysLeft <= 0) ? "today" : "tomorrow") : MONEY_REASON[a.kind] ?? "Money alert",
       version: `${urgency}|${a.severity}|${a.title.replace(/-?\$[\d,]+(?:\.\d+)?/g, "$")}|${due ? a.due : ""}${a.kind === "budget" ? `|${period}` : ""}`,
       learning: false,
     };
