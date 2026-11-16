@@ -6,7 +6,8 @@
  *   at the top of the screen; a host appended to <body> put Cancel and Done after every control of the page and of
  *   the continuous scroll).
  * - When the banner opens it takes focus (the Personalize button that started it turns disabled, which dropped
- *   focus on <body>: the next Tab then landed on Sign out).
+ *   focus on <body>: the next Tab then landed on Sign out). Except while a modal dialog it is not part of is open:
+ *   the side-panel session started from the phone drawer keeps the drawer open, and focus stays inside it.
  * - When it closes (Cancel, Done, Clear) focus goes back to the control that started it, or else to the control
  *   that had focus when the banner opened (on a phone: the More tab, as the drawer holding Personalize is closed).
  */
@@ -46,4 +47,41 @@ export function createBannerHost(doc: Document): HTMLElement {
   host.setAttribute(BANNER_HOST_ATTR, "");
   doc.body.prepend(host);
   return host;
+}
+
+/** An open modal dialog (the phone's navigation drawer while it is open, the command palette). */
+export const MODAL_DIALOG = '[role="dialog"][aria-modal="true"]';
+
+/** Attribute on the phone drawer's side-panel arranger (NavArranger's DrawerArranger). */
+export const ARRANGER_ATTR = "data-pz-arranger";
+
+/** The parts of `document` read here (a Document in the app, a stub in tests). */
+export interface FocusDoc {
+  querySelector: (selector: string) => unknown;
+  activeElement: unknown;
+  body: unknown;
+}
+
+interface Container {
+  contains: (node: unknown) => boolean;
+  querySelector: (selector: string) => unknown;
+}
+
+/**
+ * Where focus goes when the banner opens (null: leave it where it is). Normally the banner itself. While a modal
+ * dialog the banner is not part of is open, focus must not leave that dialog (the banner sits under its backdrop,
+ * and a screen reader would follow focus out of the modal): a control inside it that has focus keeps it, otherwise
+ * (the disabled Personalize button dropped focus) the arranger's first control, else the dialog's first control.
+ */
+export function openingFocusTarget(doc: FocusDoc, banner: unknown): Focusable | null {
+  const modal = doc.querySelector(MODAL_DIALOG) as Partial<Container> | null;
+  if (!modal || typeof modal.contains !== "function" || typeof modal.querySelector !== "function" || modal.contains(banner)) {
+    return canTakeFocus(banner) ? banner : null;
+  }
+  const active = doc.activeElement;
+  if (active && active !== doc.body && modal.contains(active) && canTakeFocus(active)) return null;
+  return returnFocusTarget([
+    modal.querySelector(`[${ARRANGER_ATTR}] button:not([disabled])`),
+    modal.querySelector("button:not([disabled]), a[href]"),
+  ]);
 }

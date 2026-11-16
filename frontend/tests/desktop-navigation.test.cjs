@@ -165,7 +165,20 @@ test('the skip link targets the opened page title, then the page, then <main>', 
   assert.equal(pageContentTarget(docWith({ [ROUTED]: bare })), bare, 'a page without a title: the page itself');
   const main = node('main');
   assert.equal(pageContentTarget(docWith({ main })), main, 'no scroll root: <main>');
+  // /agents is drawn without <main>: its title, else the screen after the side panel (review round 1).
+  const title = node('agents h1');
+  const screen = node('agents screen');
+  assert.equal(pageContentTarget(docWith({ h1: title, [sidebarModule.AFTER_SIDE_PANEL]: screen })), title, 'no <main>: the h1');
+  assert.equal(pageContentTarget(docWith({ [sidebarModule.AFTER_SIDE_PANEL]: screen })), screen, 'no title: what follows the side panel');
+  assert.equal(pageContentTarget(docWith({ h1: title, main })), main, '<main> first when there is one');
   assert.equal(pageContentTarget(docWith({})), null, 'nothing to skip to');
+});
+test('the skip link never falls through to the browser jump, and the side panel is marked for the fallback', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'Sidebar.tsx'), 'utf8');
+  const body = src.slice(src.indexOf('function skipToPage'), src.indexOf('export default function Sidebar'));
+  assert.ok(body.indexOf('event.preventDefault()') >= 0 && body.indexOf('event.preventDefault()') < body.indexOf('if (!target) return'), 'prevented before the target check');
+  assert.match(src, /<aside data-side-panel=""/);
+  assert.match(sidebarModule.AFTER_SIDE_PANEL, /^\[data-side-panel\] ~ /);
 });
 // CI's offline stage has no browser installed. Opt in after installing Playwright:
 // RUN_DESKTOP_LAYOUT=1 node --test tests/desktop-navigation.test.cjs

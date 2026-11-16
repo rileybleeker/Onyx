@@ -49,7 +49,7 @@ import { clearAndEnd, editingSession, endEdit, subscribe, updateDraftFor } from 
 import { AREAS_KEY } from "@/lib/nav-areas";
 import type { GridApi } from "./PartGrid";
 import { announce, setSpeaker } from "./editor-shared";
-import { createBannerHost, returnFocusTarget } from "./banner-focus";
+import { createBannerHost, openingFocusTarget, returnFocusTarget } from "./banner-focus";
 import { personalizeOpener } from "./start";
 
 export { SidebarArranger, DrawerArranger } from "./NavArranger";
@@ -892,14 +892,15 @@ export function Banner() {
   }, [host, isOpen]);
 
   // Keyboard: the banner takes focus when it opens and gives it back when it closes (banner-focus.ts). After the
-  // commit's own effects (the phone drawer that held Personalize puts focus on its More tab while it closes).
+  // commit's own effects (the phone drawer that held Personalize puts focus on its More tab while it closes). A
+  // drawer that stays open (the side-panel session on a phone) keeps focus inside it.
   useEffect(() => {
     const el = ref.current;
     if (!host || !el) return;
     let before: Element | null = null;
     const raf = requestAnimationFrame(() => {
       before = document.activeElement === document.body ? null : document.activeElement;
-      el.focus({ preventScroll: true });
+      openingFocusTarget(document, el)?.focus({ preventScroll: true });
     });
     return () => {
       cancelAnimationFrame(raf);
@@ -928,7 +929,7 @@ export function Banner() {
     }));
 
   return createPortal(
-    <div ref={ref} role="region" aria-label={`Personalizing ${pageTitle}`} tabIndex={-1} className="pz-banner outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent">
+    <div ref={ref} role="region" aria-label={`Personalizing ${pageTitle}`} tabIndex={-1} className="pz-banner outline-none focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-6">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <Settings2 className="h-4 w-4 shrink-0 text-accent" strokeWidth={1.75} aria-hidden />

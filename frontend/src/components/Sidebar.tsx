@@ -24,20 +24,25 @@ const NAV_BOOT = navBootScript(NAV_SECTIONS);
 const noPrefs = () => null;
 const none = () => null;
 
+/** What follows the side panel in a layout without <main> (the full-screen /agents screens). */
+export const AFTER_SIDE_PANEL = "[data-side-panel] ~ :not(script):not(style):not(template)";
+
 /**
  * Where "Skip to page content" puts focus: the opened (routed) page's title, else that page, else <main>. The
- * routed page is the continuous scroll's `div[data-feed-route]`; the pages around it are <section>s.
+ * routed page is the continuous scroll's `div[data-feed-route]`; the pages around it are <section>s. /agents has no
+ * <main> (AppShell draws it full screen): its title, else the screen that follows the side panel.
  */
 export function pageContentTarget(doc: Pick<Document, "querySelector">): HTMLElement | null {
   const page = doc.querySelector<HTMLElement>("[data-feed-root] > div[data-feed-route]") ?? doc.querySelector<HTMLElement>("main");
-  if (!page) return null;
-  return page.querySelector<HTMLElement>('[data-testid="page-heading"]') ?? page;
+  if (page) return page.querySelector<HTMLElement>('[data-testid="page-heading"]') ?? page;
+  return doc.querySelector<HTMLElement>("h1") ?? doc.querySelector<HTMLElement>(AFTER_SIDE_PANEL);
 }
 
 function skipToPage(event: React.MouseEvent<HTMLAnchorElement>) {
+  // Never the browser's own jump: no element has the id, so it would only add #page-content to the address.
+  event.preventDefault();
   const target = pageContentTarget(document);
   if (!target) return;
-  event.preventDefault();
   if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
   target.focus({ preventScroll: true });
   target.scrollIntoView({ block: "start" });
@@ -111,7 +116,7 @@ export default function Sidebar() {
   }
 
   return (
-    <aside className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-sunken border-r border-border-subtle flex flex-col max-md:hidden">
+    <aside data-side-panel="" className="fixed inset-y-0 left-0 z-50 w-[220px] bg-surface-sunken border-r border-border-subtle flex flex-col max-md:hidden">
       <script dangerouslySetInnerHTML={{ __html: NAV_BOOT }} />
       {/* First in the Tab order: past the side panel straight to the opened page (the continuous scroll puts the
           previous page above it, so plain Tab from here walked through that whole page first). */}

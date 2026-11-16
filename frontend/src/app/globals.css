@@ -145,6 +145,11 @@ html:has([data-pz-key="layout.check-in"]) {
   html:has([data-pz-key="layout.check-in"]) {
     scroll-padding-bottom: calc(env(safe-area-inset-bottom) + 9rem);
   }
+  /* Jump targets whose scroll-mt-24 was sized to clear the phone header on its own (ChartCard, SectionHeader, the
+     meal photo box): with the 3.5rem padding above, 2.5rem keeps them landing where they did (6rem below the top). */
+  .scroll-mt-24 {
+    scroll-margin-top: 2.5rem;
+  }
 }
 
 /* Scrollbar styling */

@@ -85,3 +85,15 @@ test('a Log part link still lands where it did (safe area + 4.25rem) now that th
   assert.equal(top + margin, 4.25);
   assert.match(anchor, /md:scroll-mt-6/, 'desktop unchanged');
 });
+
+// Review round 1 (2026-11-16): the padding adds to a target's own scroll margin, so the scroll-mt-24 jump targets
+// (sized to clear the phone header by themselves) would have landed 3.5rem lower on a phone.
+test('scroll-mt-24 jump targets still land 6rem below the top on a phone', () => {
+  const block = phoneBlock();
+  const top = remIn(decl(block, 'html', 'scroll-padding-top'));
+  const margin = Number(decl(block, '.scroll-mt-24', 'scroll-margin-top').match(/^([\d.]+)rem$/)[1]);
+  assert.equal(top + margin, 24 * TW);
+  for (const rel of ['components/ChartCard.tsx', 'components/SectionHeader.tsx', 'components/PhotoMealLogger.tsx']) {
+    assert.match(read(rel), /\bscroll-mt-24\b/, `${rel} still uses scroll-mt-24`);
+  }
+});

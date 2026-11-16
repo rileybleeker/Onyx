@@ -556,7 +556,8 @@ export function DrawerArranger() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-2 py-3">
+    // data-pz-arranger: where the banner puts focus when Personalize starts inside the open drawer (banner-focus.ts).
+    <div data-pz-arranger="" className="flex-1 overflow-y-auto px-2 py-3">
       <div className="mb-3 flex items-center gap-2 rounded-control border border-dashed border-border-emphasis bg-surface-raised/60 px-3 py-2">
         <p className="flex-1 text-[12px] leading-snug text-text-secondary">Reorder, pin and hide pages, and choose the bottom bar. The scroll follows this order.</p>
         <button type="button" onClick={() => endEdit(false)} className="min-h-11 rounded-control px-2 text-[12px] text-text-secondary hover:text-text-primary">
