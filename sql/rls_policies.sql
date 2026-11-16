@@ -6,7 +6,11 @@
 -- SUPERSEDED for reads by sql/pds_owner_only_read.sql (2026-11-10): anon has no
 -- access to pds at all, and the signed-in owner reads through owner_read
 -- policies. Re-running this file re-creates inert anon policies/grants (anon
--- has no schema USAGE); re-run pds_owner_only_read.sql afterwards.
+-- has no schema USAGE); re-run pds_owner_only_read.sql afterwards. Its
+-- section 4 also grants authenticated SELECT on EVERY pds relation, the
+-- service-role-only tables and materialized views included (matviews have no
+-- row security: sql/pds_matview_revoke_authenticated.sql), so never re-run
+-- that section as a whole.
 --
 -- Historical two-role model:
 --   anon (read-only)       - frontend public reads via NEXT_PUBLIC_SUPABASE_ANON_KEY
