@@ -106,15 +106,33 @@ test("parseSessionUpdate: strict body", () => {
 /**
  * `noDiscards`: sql/reading_session_discards.sql is not applied (no function, no trigger). `discardError`: the discard
  * call fails with this code. Otherwise pds.discard_reading_session_key records the key and answers the session it made,
- * and the insert trigger refuses a discarded key (OXR01), as the SQL does. `hooks.beforeInsert` runs right before an
- * insert reaches the table: what the database does while a create is still under way on the server.
+ * and the insert trigger refuses a discarded key (OXR01), as the SQL does. A keyed create is pds.create_reading_session:
+ * the session, the finish and the habit Yes in one transaction holding the key's lock, which the discard takes too
+ * (modelled as a per-key queue). `hooks.beforeInsert` runs right before an insert reaches the table (before the lock):
+ * what the database does while a create is still under way on the server. `hooks.inCreate` runs inside the keyed
+ * create's transaction, after its insert and before its finish and habit stamp; anything it starts that needs the
+ * key's lock waits for that transaction to commit. `booksReadError`: every read of pds.books fails.
  */
-function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null } = {}) {
+function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null, booksReadError = false } = {}) {
   let keyLookups = 0;
   const tables = JSON.parse(JSON.stringify(seed));
   for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards"]) tables[t] ??= [];
   const log = [];
-  const hooks = { beforeInsert: null };
+  const hooks = { beforeInsert: null, inCreate: null };
+  const locks = new Map();
+  /** The key's transaction-scoped advisory lock: whoever comes second waits until the first commits. */
+  const withLock = async (key, fn) => {
+    const prev = locks.get(key) ?? Promise.resolve();
+    let release;
+    const mine = new Promise((r) => (release = r));
+    locks.set(key, prev.then(() => mine));
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
   let nextId = 1000;
   function builder(table) {
     const st = { table, filters: [], op: "select", payload: null, order: null, limit: null, single: null };
@@ -128,6 +146,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       if (noClientKey && table === "reading_sessions" && (st.filters.some(([k]) => k === "client_key") || (st.op === "insert" && "client_key" in st.payload))) {
         return { data: null, error: { code: st.op === "insert" ? "PGRST204" : "42703", message: "column client_key does not exist" } };
       }
+      if (booksReadError && table === "books" && st.op === "select") return { data: null, error: { code: "57014", message: "statement timeout" } };
       let out;
       if (st.op === "select" && table === "reading_sessions" && st.filters.some(([k]) => k === "client_key") && missFirstKeyLookup && keyLookups++ === 0) out = [];
       else if (st.op === "select") out = rows().filter(match);
@@ -188,14 +207,74 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
     };
     return b;
   }
-  const discard = (key) => {
+  const discard = async (key) => {
     log.push({ table: "reading_session_discards", op: "rpc", payload: { client_key: key } });
     if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
     if (discardError) return { data: null, error: { code: discardError, message: "database failure" } };
     if (noClientKey) return { data: null, error: { code: "42703", message: "column client_key does not exist" } };
-    if (!tables.reading_session_discards.some((d) => d.client_key === key)) tables.reading_session_discards.push({ client_key: key });
-    const row = tables.reading_sessions.find((r) => r.client_key === key);
-    return { data: row ? row.session_id : null, error: null };
+    return withLock(key, () => {
+      if (!tables.reading_session_discards.some((d) => d.client_key === key)) tables.reading_session_discards.push({ client_key: key });
+      const row = tables.reading_sessions.find((r) => r.client_key === key);
+      return { data: row ? row.session_id : null, error: null };
+    });
+  };
+  /** pds.create_reading_session: one transaction under the key's lock (sql/reading_session_discards.sql). */
+  const createKeyed = async (a) => {
+    log.push({ table: "reading_sessions", op: "rpc", payload: { client_key: a.p_client_key } });
+    if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
+    if (noClientKey) return { data: null, error: { code: "42703", message: "column client_key does not exist" } };
+    const pre = hooks.beforeInsert;
+    if (pre) {
+      hooks.beforeInsert = null;
+      await pre();
+    }
+    return withLock(a.p_client_key, () => {
+      if (tables.reading_session_discards.some((d) => d.client_key === a.p_client_key)) {
+        return { data: null, error: { code: "OXR01", message: "this reading entry was discarded" } };
+      }
+      if (tables.reading_sessions.some((r) => r.client_key === a.p_client_key)) {
+        return { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint" } };
+      }
+      const row = {
+        session_id: nextId++,
+        book_id: a.p_book_id,
+        session_date: a.p_session_date,
+        chapter_from: a.p_chapter_from,
+        chapter_through: a.p_chapter_through,
+        minutes: a.p_minutes,
+        medium: a.p_medium,
+        recall: a.p_recall,
+        question: a.p_question,
+        source: a.p_source,
+        client_key: a.p_client_key,
+        notion_block_id: null,
+        in_chapter: null,
+        highlight_count: null,
+        created_at: "2026-11-15T20:00:00Z",
+      };
+      tables.reading_sessions.push(row);
+      const during = hooks.inCreate;
+      if (during) {
+        hooks.inCreate = null;
+        during(); // not awaited: what it starts waits for this transaction's lock
+      }
+      const b = tables.books.find((x) => x.book_id === a.p_book_id);
+      let finished = false;
+      if (b && b.total_chapters > 0 && a.p_chapter_through >= b.total_chapters && b.status !== "finished") {
+        Object.assign(b, { status: "finished", finished_on: a.p_session_date });
+        finished = true;
+      }
+      let marked = false;
+      let created = false;
+      if (b && b.habit_name) {
+        const hit = tables.habit_journal.find((h) => h.cycle_date === a.p_session_date && h.question === b.habit_name);
+        if (hit) Object.assign(hit, { category: "learning", answer: "Yes" });
+        else tables.habit_journal.push({ cycle_date: a.p_session_date, question: b.habit_name, category: "learning", answer: "Yes" });
+        marked = true;
+        created = !hit;
+      }
+      return { data: JSON.parse(JSON.stringify({ session: row, finished, habit_marked: marked, habit_created: created })), error: null };
+    });
   };
   return {
     tables,
@@ -207,7 +286,9 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
         ? { data: "2026-11-15", error: null }
         : name === "discard_reading_session_key"
           ? discard(args.p_key)
-          : { data: null, error: null },
+          : name === "create_reading_session"
+            ? createKeyed(args)
+            : { data: null, error: null },
   };
 }
 
@@ -469,10 +550,16 @@ test("deleteSession by id records the session's key as discarded: a create of it
   const late = await R.logSession(db, create());
   assert.equal(late.discarded, true);
   assert.equal(db.tables.reading_sessions.length, 0);
-  // Before sql/reading_session_discards.sql is applied the removal still goes ahead; another failure stops it.
+  // Before sql/reading_session_discards.sql is applied a keyed session is NOT removed (no discard record: a delayed
+  // create retry of its key could bring it back): 503, the form keeps the entry and retries (Codex T01-R6).
   const before = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { noDiscards: true });
-  assert.equal((await R.deleteSession(before, 41, null)).ok, true);
-  assert.equal(before.tables.reading_sessions.length, 0);
+  const refused = await R.deleteSession(before, 41, null);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.status, 503);
+  assert.match(refused.error, /reading_session_discards\.sql/);
+  assert.equal(before.tables.reading_sessions.length, 1, "nothing removed without the discard record");
+  const keylessBefore = fakeDb({ books: [BOOK], reading_sessions: [session({})] }, { noDiscards: true });
+  assert.equal((await R.deleteSession(keylessBefore, 41, null)).ok, true, "a session with no key needs no record");
   const failing = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { discardError: "XX000" });
   assert.equal((await R.deleteSession(failing, 41, null)).status, 500);
   assert.equal(failing.tables.reading_sessions.length, 1);
@@ -480,6 +567,68 @@ test("deleteSession by id records the session's key as discarded: a create of it
   const keyless = fakeDb({ books: [BOOK], reading_sessions: [session({})] });
   assert.equal((await R.deleteSession(keyless, 41, null)).ok, true);
   assert.equal(keyless.log.some((l) => l.op === "rpc"), false);
+});
+
+test("a Discard landing while a keyed create is still committing removes the session AND the finish it caused (Codex T01-R4)", async () => {
+  // The create reaches the last chapter. Its insert has run but its transaction has not committed when the Discard
+  // arrives (the browser's connection already failed). The discard waits for the key's lock, then finds the session
+  // with every effect of its create, and removes it; nothing of the create can follow afterwards.
+  const db = fakeDb({ books: [BOOK] });
+  let discarding = null;
+  db.hooks.inCreate = () => {
+    discarding = R.deleteSessionByClientKey(db, KEY);
+  };
+  const made = await R.logSession(db, create({ chapter_through: 12, date: "2026-11-15" }));
+  assert.equal(made.ok, true, "the create committed first");
+  assert.equal(made.finished, true);
+  const d = await discarding;
+  assert.equal(d.ok, true);
+  assert.equal(d.removed.session_id, made.session.session_id, "the discard found the committed session");
+  assert.equal(d.unfinished, true, "and took back the finish its create caused");
+  assert.equal(db.tables.reading_sessions.length, 0);
+  assert.equal(db.tables.books[0].status, "reading", "no finished book for a removed session");
+  assert.equal(db.tables.books[0].finished_on, null);
+  assert.equal(db.tables.habit_journal.length, 1, "the create made the habit Yes before the discard: kept by the documented rule (unknown to the form)");
+  // Nothing of the create ran after the removal: a repeat finds nothing and a late retry is refused.
+  assert.deepEqual(await R.deleteSessionByClientKey(db, KEY), { ok: true, removed: null });
+  const late = await R.logSession(db, create({ chapter_through: 12 }));
+  assert.equal(late.discarded, true);
+  assert.equal(db.tables.books[0].status, "reading");
+});
+
+test("deleteSessionByClientKey: a failed read is never 'nothing stored' (Codex T01-R5)", async () => {
+  // The book read fails while the session exists: the answer is an error and the session stays.
+  const db = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { booksReadError: true });
+  const r = await R.deleteSessionByClientKey(db, KEY);
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 500);
+  assert.equal(db.tables.reading_sessions.length, 1, "still stored: the form keeps the entry and retries");
+  const byId = await R.deleteSession(db, 41, null);
+  assert.equal(byId.status, 500, "the same read failure on a removal by id is not a 404 either");
+  assert.equal(db.tables.reading_sessions.length, 1);
+  // The session the discard found is gone by the time it is removed (another request removed it): confirmed absent.
+  const gone = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] });
+  const baseRpc = gone.rpc;
+  gone.rpc = async (name, args) => {
+    const out = await baseRpc(name, args);
+    if (name === "discard_reading_session_key") gone.tables.reading_sessions.length = 0;
+    return out;
+  };
+  assert.deepEqual(await R.deleteSessionByClientKey(gone, KEY), { ok: true, removed: null });
+});
+
+test("logSession: before sql/reading_session_discards.sql is applied a keyed create still works as before", async () => {
+  // No fence yet: a Discard by key answers 503 and a keyed session is not removed by id, so nothing can land
+  // between the separate steps of the earlier create path.
+  const db = fakeDb({ books: [BOOK] }, { noDiscards: true });
+  const r = await R.logSession(db, create({ chapter_through: 12, date: "2026-11-15" }));
+  assert.equal(r.ok, true);
+  assert.equal(r.finished, true);
+  assert.equal(r.habitCreated, true);
+  assert.equal(db.tables.reading_sessions[0].client_key, KEY);
+  assert.equal((await R.deleteSessionByClientKey(db, KEY)).status, 503);
+  assert.equal((await R.deleteSession(db, r.session.session_id, null)).status, 503);
+  assert.equal(db.tables.reading_sessions.length, 1);
 });
 
 test("Notion mirror race check: only a change that alters the entry counts", () => {
@@ -536,10 +685,15 @@ test("sql/reading_session_discards.sql: additive, service-role only, one lock pe
   assert.match(sql, /BEFORE INSERT OR UPDATE OF client_key ON pds\.reading_sessions/);
   assert.match(sql, /ERRCODE = 'OXR01'/);
   const locks = sql.match(/pg_advisory_xact_lock\(\s*pg_catalog\.hashtextextended\('pds\.reading_sessions\.client_key:' \|\|/g) ?? [];
-  assert.equal(locks.length, 2, "the trigger and the discard take the same lock");
+  assert.equal(locks.length, 3, "the trigger, the keyed create and the discard take the same lock");
+  const fn = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.create_reading_session("));
+  const body = fn.slice(0, fn.indexOf("$$;"));
+  assert.match(body, /INSERT INTO pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*INSERT INTO pds\.habit_journal/, "session, finish and habit in one function (T01-R4)");
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.create_reading_session\([^)]*\) TO service_role/);
   const lib = read("lib/reading.ts");
   assert.match(lib, /DISCARDED_KEY_CODE = "OXR01"/, "lib/reading.ts maps the trigger's code");
   assert.match(lib, /rpc\("discard_reading_session_key", \{ p_key: key \}\)/);
+  assert.match(lib, /rpc\("create_reading_session", \{/, "a keyed create is one database call");
 });
 
 test("sql/reading_sessions_client_key.sql: additive only (the Supabase connector refuses any DROP)", () => {
