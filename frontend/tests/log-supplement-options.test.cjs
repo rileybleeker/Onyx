@@ -2,8 +2,8 @@
 // /log Supplements, "Log a product" (2026-11-16, Riley: "I should be able to click the existing options, instead of
 // having to search"): every /supplements product is a tappable option without typing, most used first (single
 // doses in the last 30 days, then the most recent, then the name); the search box filters the same options; tapping
-// one fills the form like choosing a search result did and writes nothing (Log stays the write); Say it suggestions
-// moved in with Edit keep their amount, unit and times.
+// one fills the form like choosing a search result did and writes nothing (Log stays the write); the order is fixed
+// once settled while the section is mounted; Say it suggestions moved in with Edit keep their amount, unit and times.
 // SYNTHETIC DATA ONLY: invented product names, ids and dates; no network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -89,10 +89,19 @@ test("labels: the name; the brand only when two products share the name", () => 
   assert.equal(labels.get("4"), "Synthetic Solo");
 });
 
-test("unit after a tap: servings on a fresh form, the unit kept when an amount is already in", () => {
-  assert.equal(O.unitAfterPick("", "mg"), "serving");
-  assert.equal(O.unitAfterPick("  ", "capsule"), "serving");
-  assert.equal(O.unitAfterPick("15", "mg"), "mg", "a Say it amount moved in with Edit keeps its unit (15 mg never becomes 15 servings)");
+test("unit after a tap: one serving on a fresh form; an amount stays only with a unit that applies to the new product", () => {
+  assert.deepEqual(O.unitAfterPick("", "mg", "capsule"), { amount: "", unit: "serving" });
+  assert.deepEqual(O.unitAfterPick("  ", "Scoop", "capsule"), { amount: "  ", unit: "serving" });
+  assert.deepEqual(O.unitAfterPick("15", "mg", "capsule"), { amount: "15", unit: "mg" }, "15 mg never becomes 15 servings");
+  assert.deepEqual(O.unitAfterPick("400", "IU", "Softgel"), { amount: "400", unit: "IU" });
+  assert.deepEqual(O.unitAfterPick("2", "serving", "Scoop"), { amount: "2", unit: "serving" });
+  // The new product's own count unit: kept, shown as that product's unit (plural or not, pill words as one).
+  assert.deepEqual(O.unitAfterPick("2", "capsules", "Capsule(s)"), { amount: "2", unit: "Capsule(s)" });
+  assert.deepEqual(O.unitAfterPick("2", "Capsule", "Tablet"), { amount: "2", unit: "Tablet" });
+  // Another product's count unit: the form starts fresh, never read as servings and never refused on Log.
+  assert.deepEqual(O.unitAfterPick("2", "Scoop", "Capsule"), { amount: "", unit: "serving" });
+  assert.deepEqual(O.unitAfterPick("1", "Gummies", "g"), { amount: "", unit: "serving" });
+  assert.deepEqual(O.unitAfterPick("5", "ml", null), { amount: "", unit: "serving" });
 });
 
 // ---- the section: app/log/sections/Supplements.tsx ----
@@ -121,9 +130,14 @@ const todayIntake = (intake_id, product_id, stack_id) => ({ intake_id, intake_da
 const TODAY_RESP = { date: TODAY, intakes: [todayIntake(21, "p-eps", null), todayIntake(22, "p-delta", 3)], reminders: [] };
 
 /** The section's client cache, as a plain map: peek / read for the first paint, cachedJson for the server read. */
-function fakeCache(store) {
+function fakeCache(store, registered = new Map()) {
   const GONE = Symbol("gone");
-  const clientCache = { peek: (k) => store.get(k), read: async (k) => store.get(k), put: (k, v) => { store.set(k, v); return true; } };
+  const clientCache = {
+    peek: (k) => store.get(k),
+    read: async (k) => store.get(k),
+    put: (k, v) => { store.set(k, v); return true; },
+    register: (k, fetcher) => { registered.set(k, fetcher); },
+  };
   async function fetchJsonValue(url, get) {
     const r = await (get ? get() : fetch(url, { cache: "no-store" }));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -138,7 +152,7 @@ function fakeCache(store) {
   return { clientCache, cachedJson, fetchJsonValue, GONE };
 }
 
-function mountSection(t, { cache = new Map(), answers = {}, post, draft = null } = {}) {
+function mountSection(t, { cache = new Map(), registered = new Map(), answers = {}, post, draft = null } = {}) {
   const calls = { writes: [], gets: [] };
   const defaults = {
     [URL.products]: () => response({ products: FIVE }),
@@ -167,7 +181,7 @@ function mountSection(t, { cache = new Map(), answers = {}, post, draft = null }
     stubs: {
       "@/components/FeedContext": { useInFeed: () => false },
       "lucide-react": { Check: () => null, Plus: () => null, X: () => null },
-      "@/lib/client-cache": fakeCache(cache),
+      "@/lib/client-cache": fakeCache(cache, registered),
       "@/lib/log-early": {
         LOG_SUPPLEMENTS_TODAY_URL: URL.today,
         LOG_SUPPLEMENTS_STACKS_URL: URL.stacks,
@@ -178,7 +192,7 @@ function mountSection(t, { cache = new Map(), answers = {}, post, draft = null }
     },
   });
   t.after(() => h.unmount());
-  const options = () => h.find((n) => n.type === "button" && n.props["aria-pressed"] !== undefined);
+  const options = () => h.find((n) => n.type === "button" && n.props.role === "radio");
   const optionNames = () => options().map((n) => h.text(n));
   const option = (name) => {
     const found = options().find((n) => h.text(n) === name);
@@ -202,7 +216,7 @@ test("section: the options show from this device's cache before any read answers
   await h.flush();
   // Beta 3 single doses, Epsilon 1 + today's 1, Gamma 1; Delta's doses all came from a stack (= never), Alpha never.
   assert.deepEqual(h.optionNames(), ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"]);
-  assert.ok(h.options().every((n) => n.props["aria-pressed"] === false), "nothing selected yet");
+  assert.ok(h.options().every((n) => n.props["aria-checked"] === false), "nothing selected yet");
   assert.equal(h.field("Filter your supplements"), undefined, "a short list needs no search box");
   assert.equal(h.calls.writes.length, 0, "opening the section writes nothing");
 });
@@ -217,8 +231,8 @@ test("section: tapping an option fills the form like a search result and writes 
 
   h.option("Synthetic Gamma").props.onClick();
   await h.flush();
-  assert.equal(h.option("Synthetic Gamma").props["aria-pressed"], true, "the tapped option is marked");
-  assert.equal(h.options().filter((n) => n.props["aria-pressed"]).length, 1);
+  assert.equal(h.option("Synthetic Gamma").props["aria-checked"], true, "the tapped option is marked");
+  assert.equal(h.options().filter((n) => n.props["aria-checked"]).length, 1);
   assert.equal(h.field("Amount").props.value, "", "amount = one serving (the label's)");
   assert.equal(h.field("Unit").props.value, "serving");
   assert.equal(h.field("Day").props.value, "today", "behavioral today");
@@ -227,8 +241,8 @@ test("section: tapping an option fills the form like a search result and writes 
 
   h.option("Synthetic Beta").props.onClick();
   await h.flush();
-  assert.equal(h.option("Synthetic Beta").props["aria-pressed"], true, "another tap switches the product");
-  assert.equal(h.option("Synthetic Gamma").props["aria-pressed"], false);
+  assert.equal(h.option("Synthetic Beta").props["aria-checked"], true, "another tap switches the product");
+  assert.equal(h.option("Synthetic Gamma").props["aria-checked"], false);
   assert.equal(h.calls.writes.length, 0);
 
   await h.click("Log");
@@ -264,24 +278,88 @@ test("section: a long list is capped with Show all, and the search box filters t
   assert.equal(h.calls.writes.length, 0);
 });
 
-test("section: a history answer that lands while Riley is choosing does not move the options; they reorder after Cancel", async (t) => {
+test("section: on a cold cache the options wait for the history and today's intakes, then keep their order through a Log, a later answer and Cancel", async (t) => {
+  const held = deferred();
+  let todayReads = 0;
+  // After the Log, today's answer carries four new single doses of Alpha: sorted again, Alpha would jump to the top.
+  const later = { ...TODAY_RESP, intakes: [...TODAY_RESP.intakes, ...[31, 32, 33, 34].map((id) => todayIntake(id, "p-alpha", null))] };
+  const h = mountSection(t, {
+    answers: { [URL.history]: () => held.promise, [URL.today]: () => response(todayReads++ === 0 ? TODAY_RESP : later) },
+    post: () => response({ ok: true, product: "Synthetic Alpha", logged: [{ intake_id: 35, time: null }], doses_each: 1, intake_date: TODAY }),
+  });
+  await h.flush();
+  assert.equal(h.options().length, 0, "no option before the order is known (skeleton pills), so nothing reshuffles on screen");
+  assert.ok(h.find((n) => typeof n.props?.className === "string" && n.props.className.includes("skeleton h-11 w-28")).length > 0);
+  held.resolve(response({ rows: HISTORY_ROWS }));
+  await h.flush();
+  const order = ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"];
+  assert.deepEqual(h.optionNames(), order, "shown once settled, most used first");
+
+  h.option("Synthetic Alpha").props.onClick();
+  await h.flush();
+  await h.click("Log");
+  await h.flush();
+  assert.equal(h.calls.writes.length, 1);
+  assert.ok(todayReads >= 2, "today was read again after the Log");
+  assert.deepEqual(h.optionNames(), order, "a dose just logged does not move the options");
+  h.option("Synthetic Gamma").props.onClick();
+  await h.flush();
+  await h.click("Cancel");
+  await h.flush();
+  assert.deepEqual(h.optionNames(), order, "nor does Cancel: the order is fixed while the section is mounted");
+});
+
+test("section: a history answer slower than the wait shows the options in the order known, and landing later moves nothing", async (t) => {
   const held = deferred();
   const h = mountSection(t, { answers: { [URL.history]: () => held.promise } });
   await h.flush();
-  // Before the history: today's single dose first (Epsilon), then by name.
+  assert.equal(h.options().length, 0);
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  await h.flush();
+  // Without the history: today's single dose first (Epsilon), then by name.
   const before = ["Synthetic Epsilon", "Synthetic Alpha", "Synthetic Beta", "Synthetic Delta", "Synthetic Gamma"];
   assert.deepEqual(h.optionNames(), before);
-  const wrapper = h.find((n) => typeof n.props?.onPointerDownCapture === "function")[0];
-  wrapper.props.onPointerDownCapture();
-  h.option("Synthetic Alpha").props.onClick();
-  await h.flush();
   held.resolve(response({ rows: HISTORY_ROWS }));
   await h.flush();
   assert.deepEqual(h.optionNames(), before, "nothing moved under the finger");
-  await h.click("Cancel");
-  await h.flush();
-  assert.deepEqual(h.optionNames(), ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"]);
   assert.equal(h.calls.writes.length, 0);
+});
+
+test("section: the history read is registered, so a supplement write's cache invalidation refetches it (checked like the section's read)", async (t) => {
+  const registered = new Map();
+  let answer = () => response({ rows: HISTORY_ROWS });
+  const h = mountSection(t, { registered, answers: { [URL.history]: () => answer() } });
+  await h.flush();
+  const refetch = registered.get(URL.history);
+  assert.equal(typeof refetch, "function");
+  assert.deepEqual(await refetch(), { rows: HISTORY_ROWS });
+  answer = () => response({ nope: true });
+  await assert.rejects(() => refetch(), /bad supplements\/history answer/);
+  assert.equal(h.calls.writes.length, 0);
+});
+
+test("section: the options are one radio group; the arrow keys move to and choose the next option, Tab reaches the chosen one", async (t) => {
+  const h = mountSection(t);
+  await h.flush();
+  const group = h.find((n) => n.props?.role === "radiogroup")[0];
+  assert.equal(group.props["aria-label"], "Your supplements");
+  assert.deepEqual(h.options().map((n) => n.props.tabIndex), [0, -1, -1, -1, -1], "nothing chosen: Tab reaches the first");
+  const focused = [];
+  const key = (k, i) => group.props.onKeyDown({
+    key: k,
+    target: { dataset: { optionIndex: String(i) } },
+    currentTarget: { children: Array.from({ length: 5 }, (_, j) => ({ focus: () => focused.push(j) })) },
+    preventDefault() {},
+  });
+  key("ArrowRight", 0);
+  await h.flush();
+  assert.equal(h.option("Synthetic Epsilon").props["aria-checked"], true);
+  assert.deepEqual(h.options().map((n) => n.props.tabIndex), [-1, 0, -1, -1, -1]);
+  key("ArrowLeft", 0);
+  await h.flush();
+  assert.equal(h.option("Synthetic Delta").props["aria-checked"], true, "wraps to the last");
+  assert.deepEqual(focused, [1, 4]);
+  assert.equal(h.calls.writes.length, 0, "choosing with the keyboard writes nothing");
 });
 
 test("section: a Say it product moved into the form with Edit keeps its amount, unit and time when another option is tapped", async (t) => {
@@ -300,7 +378,7 @@ test("section: a Say it product moved into the form with Edit keeps its amount, 
   assert.match(h.text(), /Synthetic refusal/);
   await h.click("Edit");
   await h.flush();
-  assert.equal(h.option("Synthetic Beta").props["aria-pressed"], true, "Edit selects the suggested product");
+  assert.equal(h.option("Synthetic Beta").props["aria-checked"], true, "Edit selects the suggested product");
   assert.equal(h.field("Amount").props.value, "15");
   assert.equal(h.field("Unit").props.value, "mg");
   assert.equal(h.field("Time 1").props.value, "08:30");
@@ -315,12 +393,13 @@ test("section: a Say it product moved into the form with Edit keeps its amount, 
   assert.deepEqual(h.calls.writes[1].body, { product_id: "p-gamma", product: "Synthetic Gamma", amount: 15, unit: "mg", times: ["08:30"], date: null });
 });
 
-test("source: the options are buttons with 44 px targets, accent when selected, visible focus; a tap only sets state", () => {
+test("source: the options are radio buttons with 44 px targets, accent when selected, visible focus; a tap only sets state", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "src", "app/log/sections/Supplements.tsx"), "utf8");
   assert.match(src, /const pill =\s*"[^"]*min-h-11[^"]*max-w-full|const pill =\s*"[^"]*max-w-full[^"]*min-h-11/);
   assert.match(src, /const pill =\s*"[^"]*focus-visible:outline-accent/);
   assert.match(src, /const pillOn = "border-accent bg-accent\/15/);
-  assert.match(src, /role="group" aria-label="Your supplements" className="flex flex-wrap gap-2"/);
+  assert.match(src, /role="radiogroup" aria-label="Your supplements" className="flex flex-wrap gap-2"/);
+  assert.match(src, /role="radio"\s+aria-checked=\{on\}/);
   const pick = src.slice(src.indexOf("function pickProduct("), src.indexOf("/** One product write"));
   assert.ok(pick.length > 0 && !/fetch\(|postJson|logProduct\(/.test(pick), "pickProduct writes nothing");
   assert.match(src, /const HISTORY_URL = "\/api\/supplements\/history\?days=30&perPage=200";/);

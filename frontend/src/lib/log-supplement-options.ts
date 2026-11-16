@@ -3,8 +3,10 @@
  * from the /supplements list as a tappable option, shown without typing, most used first. The search box filters
  * the same options. Pure and import-free (tests/log-supplement-options.test.cjs); the section reads the data.
  *
- * "Most used" = single-product doses (not doses a stack logged) in the last 30 days of `GET
- * /api/supplements/history` plus behavioral today's `GET /api/supplements/today`, then the most recent, then the name.
+ * "Most used" = single-product doses (not doses a stack logged) among the newest 200 intakes of the last 30 days
+ * (`GET /api/supplements/history`, which caps a page at 200 rows; stack doses use up part of that, so with daily
+ * stacks it reaches back fewer days) plus behavioral today's `GET /api/supplements/today`, then the most recent, then
+ * the name. The section fixes the order once it is settled and keeps it while it is mounted.
  */
 
 export interface OptionProduct {
@@ -83,8 +85,9 @@ export function orderOptions<P extends OptionProduct>(products: readonly P[], us
 }
 
 /**
- * The order frozen while Riley is choosing (set on the first touch or focus in the options): a history answer that
- * lands late never moves an option under the finger. Products no longer listed drop out, new ones go last.
+ * The order fixed once it is settled (the section keeps it while mounted): a history or today answer that lands
+ * later, or a dose just logged, never moves an option under the finger. Products no longer listed drop out, new
+ * ones go last.
  */
 export function keepOrder<P extends OptionProduct>(ordered: readonly P[], frozen: readonly string[] | null): P[] {
   if (!frozen) return [...ordered];
@@ -147,11 +150,35 @@ export function optionLabels(products: readonly OptionProduct[]): Map<string, st
   return out;
 }
 
+const SERVING_WORDS = new Set(["serving", "servings", "dose", "doses"]);
+/** Weights and IU: lib/supplement-intake.ts dosesFor reads them for every product (from its ingredients). */
+const MASS_UNITS = new Set(["g", "mg", "mcg", "ug", "µg", "iu"]);
+/** Count words dosesFor treats as one another (lib/supplement-intake.ts PILL_WORDS). */
+const PILL_WORDS = new Set(["pill", "tablet", "tab", "capsule", "cap", "softgel", "gel", "caplet"]);
+
+/** "Capsule(s)" / "Vegetable Capsule" / "Gummies" -> "capsule" / "capsule" / "gummy" (as dosesFor's countUnit). */
+function countWord(u: string | null | undefined): string {
+  const w = (u ?? "").toLowerCase().replace(/\([^)]*\)/g, "").trim().split(/\s+/).pop() ?? "";
+  if (w.endsWith("ies")) return `${w.slice(0, -3)}y`;
+  return w.endsWith("s") ? w.slice(0, -1) : w;
+}
+
 /**
- * The unit after tapping an option, same as choosing a search result: servings (the label's serving) on a fresh
- * form. When an amount is already in (moved in from a Say it suggestion with Edit, or typed), its unit stays, so
- * "15 mg" never turns into 15 servings.
+ * The amount and unit after tapping an option. A fresh form: one serving (the label's). When an amount is already
+ * in (a Say it suggestion moved in with Edit, or typed), it stays while its unit still means something for the new
+ * product, the same units dosesFor reads: servings, a weight or IU (so "15 mg" never turns into 15 servings), or the
+ * product's own count unit (shown as that product's unit). A count unit of another product ("2 scoops" for a capsule
+ * product) starts the form fresh instead of being read as servings or refused on Log.
  */
-export function unitAfterPick(amount: string, unit: string): string {
-  return amount.trim() === "" ? "serving" : unit;
+export function unitAfterPick(amount: string, unit: string, servingUnit: string | null | undefined): { amount: string; unit: string } {
+  if (amount.trim() === "") return { amount, unit: "serving" };
+  const u = unit.toLowerCase().trim();
+  if (!u) return { amount, unit: "serving" };
+  if (SERVING_WORDS.has(u) || MASS_UNITS.has(u)) return { amount, unit };
+  const mine = countWord(u);
+  const theirs = countWord(servingUnit);
+  if (mine && theirs && !MASS_UNITS.has(theirs) && !SERVING_WORDS.has(theirs) && (mine === theirs || (PILL_WORDS.has(mine) && PILL_WORDS.has(theirs)))) {
+    return { amount, unit: servingUnit as string };
+  }
+  return { amount: "", unit: "serving" };
 }

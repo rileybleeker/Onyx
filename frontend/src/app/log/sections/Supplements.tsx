@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Check, Plus, X } from "lucide-react";
 import { useInFeed } from "@/components/FeedContext";
 import { cachedJson, clientCache, fetchJsonValue, GONE } from "@/lib/client-cache";
@@ -27,8 +27,9 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  *     /api/supplements/stacks/log with only the stack id (the server stamps behavioral today + now, like the
  *     /agents card); Skip only for a reminder card still open (status "prompted" in pds.supplement_stack_reminder),
  *     through POST /api/supplements/reminders/respond. Undo deletes that stack's rows for the day.
- *   - Log a product: tap one of the /supplements products (listed without typing, most used first, the search box
- *     filters them; lib/log-supplement-options.ts), amount + unit, clock times, day. POST
+ *   - Log a product: tap one of the /supplements products (listed without typing, most used first, the order fixed
+ *     while the section is mounted, the search box filters them; lib/log-supplement-options.ts), amount + unit,
+ *     clock times, day. POST
  *     /api/supplements/log-product, which runs the chat tool's logSupplementIntake (lib/supplement-intake.ts), so
  *     amounts, times, the awake tail and the no-time rule are the same as "log 15 mg of X at 8:30" in chat.
  *   - Logged today: single products logged on behavioral today, each with Undo (DELETE /api/supplements/log-intake).
@@ -47,8 +48,14 @@ const loggedItems = new Map<number, Set<number>>(); // draft id -> indexes of it
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
 const PRODUCTS_URL = LOG_SUPPLEMENTS_PRODUCTS_URL;
-/** The last 30 days of doses, only to order the product options (most used first). GET only, cached like the rest. */
+/**
+ * The newest 200 doses of the last 30 days (the route's page cap; daily stacks use up part of it), only to order the
+ * product options (most used first). GET only, cached like the rest, and registered so a supplement write's cache
+ * invalidation refetches it in the background (the next visit then paints the options in their order at once).
+ */
 const HISTORY_URL = "/api/supplements/history?days=30&perPage=200";
+/** How long the options wait for the history and today's intakes on a cold cache before showing in the order known. */
+const ORDER_WAIT_MS = 800;
 
 interface Intake {
   intake_id: number;
@@ -102,6 +109,12 @@ function checkProducts(d: unknown) {
 }
 function checkHistory(d: unknown) {
   if (!d || !Array.isArray((d as { rows?: unknown }).rows)) throw new Error("bad supplements/history answer");
+}
+/** The registered refetch of HISTORY_URL (client-cache invalidation after a write): same check as the section's read. */
+async function fetchHistory(): Promise<unknown> {
+  const v = await fetchJsonValue(HISTORY_URL);
+  if (v !== GONE) checkHistory(v);
+  return v;
 }
 
 /** This device's memory copy of a read, if it passes `check` (the persisted copy is read after mount). */
@@ -224,6 +237,7 @@ export default function SupplementsSection() {
   const [products, setProducts] = useState<Product[] | null>(() => peekChecked<{ products: Product[] }>(PRODUCTS_URL, checkProducts)?.products ?? null);
   // Only orders the product options; without it they are listed by today's doses, then by name.
   const [history, setHistory] = useState<UsageRow[] | null>(() => peekChecked<{ rows: UsageRow[] }>(HISTORY_URL, checkHistory)?.rows ?? null);
+  const [historyFailed, setHistoryFailed] = useState(false);
   const [todayState, setTodayState] = useState<LoadState>(() => (today ? "ready" : "loading"));
   const [stacksState, setStacksState] = useState<LoadState>(() => (stacks ? "ready" : "loading"));
   const [productsState, setProductsState] = useState<LoadState>(() => (products ? "ready" : "loading"));
@@ -300,12 +314,13 @@ export default function SupplementsSection() {
         answered.current.history = true;
         setHistory((prev) => (sameJson(prev, v.rows) ? prev : v.rows));
       })
-      .catch(() => {});
+      .catch(() => setHistoryFailed(true));
   }, [applyToday, routed]);
 
   // This device's copy at once (memory, else the persisted cache), then the server.
   useEffect(() => {
     let alive = true;
+    clientCache.register(HISTORY_URL, fetchHistory);
     const seedToday = (v: unknown) => {
       if (!alive || answered.current.today || v === undefined) return;
       try { checkToday(v); } catch { return; }
@@ -502,20 +517,33 @@ export default function SupplementsSection() {
     receiptTimer.current = setTimeout(() => setReceipt(null), 4000);
   };
 
-  // The options: every product, most used first (lib/log-supplement-options.ts), filtered by the search box. The
-  // order freezes on the first touch or focus in them (a late history answer never moves one under the finger) and
-  // thaws when the form is reset (logged or Cancel).
+  // The options: every product, most used first (lib/log-supplement-options.ts), filtered by the search box. The order
+  // is settled once the products, the history and today's intakes are in (this device's copy, the server's answer or
+  // a failed read), or after ORDER_WAIT_MS on a cold cache, and the options show from then on (skeleton pills before,
+  // so they never reshuffle on screen). It is then fixed while the section is mounted: a later answer, a dose just
+  // logged or an Undo never moves an option under the finger; only the next mount sorts again.
   const [frozenOrder, setFrozenOrder] = useState<string[] | null>(null);
+  const [orderWaitOver, setOrderWaitOver] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setOrderWaitOver(true), ORDER_WAIT_MS);
+    return () => clearTimeout(t);
+  }, []);
   const [showAllOptions, setShowAllOptions] = useState(false);
   // The search box: for a long list, or once it holds text (a Say it name moved in with Edit); it stays while edited.
   const [filterOpen, setFilterOpen] = useState(false);
   const usage = useMemo(() => usageByProduct([...(history ?? []), ...(today?.intakes ?? [])], hidden), [history, today, hidden]);
   const ordered = useMemo(() => orderOptions(products ?? [], usage), [products, usage]);
+  const orderSettled =
+    products !== null && (((history !== null || historyFailed) && (today !== null || todayState === "failed")) || orderWaitOver);
+  useEffect(() => {
+    if (orderSettled && !frozenOrder) setFrozenOrder(ordered.map((p) => p.product_id));
+  }, [orderSettled, frozenOrder, ordered]);
   const optionOrder = useMemo(() => keepOrder(ordered, frozenOrder), [ordered, frozenOrder]);
   const matches = useMemo(() => filterOptions(optionOrder, query), [optionOrder, query]);
   const labels = useMemo(() => optionLabels(products ?? []), [products]);
   const { shown: shownOptions, more: moreOptions } = visibleOptions(matches, showAllOptions, picked?.product_id ?? null);
-  const freezeOrder = () => { if (!frozenOrder) setFrozenOrder(optionOrder.map((p) => p.product_id)); };
+  // Roving focus: Tab reaches the chosen option (else the first); the arrow keys move within the group.
+  const focusOption = Math.max(0, shownOptions.findIndex((p) => p.product_id === picked?.product_id));
   const formDate = dayChoice === "today" ? null : dayChoice === "yesterday" ? (day ? addDays(day, -1) : null) : dayChoice;
 
   function resetForm() {
@@ -527,15 +555,39 @@ export default function SupplementsSection() {
     setDayChoice("today");
     setFormFromDraft(false);
     setFormError(null);
-    setFrozenOrder(null);
   }
 
-  /** Tap on an option: the product, same as choosing a search result (servings unless an amount is already in;
-   *  times and day stay). State only: Log is the write. */
-  function pickProduct(p: Product) {
+  // After a tap the form below the options is scrolled into view (on a phone a long list can push it off screen).
+  const formRef = useRef<HTMLDivElement | null>(null);
+  const scrollToForm = useRef(false);
+  useEffect(() => {
+    if (!picked || !scrollToForm.current) return;
+    scrollToForm.current = false;
+    formRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [picked]);
+
+  /** Choosing an option: the product, same as choosing a search result (one serving unless an amount is already in
+   *  that still applies; times and day stay). State only: Log is the write. `tap`: scroll the form into view. */
+  function pickProduct(p: Product, tap: boolean) {
+    const next = unitAfterPick(amount, unit, p.serving_unit);
     setPicked(p);
-    setUnit((u) => unitAfterPick(amount, u));
+    setAmount(next.amount);
+    setUnit(next.unit);
     setFormError(null);
+    if (tap && picked?.product_id !== p.product_id) scrollToForm.current = true;
+  }
+
+  /** The options are one radio group: the arrow keys (and Home / End) move to and choose another option. */
+  function onOptionsKey(e: KeyboardEvent<HTMLDivElement>) {
+    const n = shownOptions.length;
+    const i = Number((e.target as HTMLElement).dataset?.optionIndex);
+    if (n === 0 || !Number.isInteger(i)) return;
+    const step: Record<string, number> = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+    const j = e.key in step ? (i + step[e.key] + n) % n : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
+    if (j < 0) return;
+    e.preventDefault();
+    pickProduct(shownOptions[j], false);
+    (e.currentTarget.children[j] as HTMLElement | undefined)?.focus();
   }
 
   /** One product write through the chat tool's rules. Returns an error message, or null when saved. */
@@ -644,6 +696,7 @@ export default function SupplementsSection() {
     setDayChoice(!d.date || d.date === day ? "today" : day && d.date === addDays(day, -1) ? "yesterday" : d.date);
     setFormFromDraft(true);
     setFormError(null);
+    scrollToForm.current = true;
     dropSuggestion(s.key);
   }
 
@@ -837,31 +890,34 @@ export default function SupplementsSection() {
           <h3 className="text-[13px] font-medium text-text-secondary">Log a product</h3>
           {formFromDraft && <DraftMark />}
         </div>
-        {products ? (
-          products.length > 0 ? (
-            <div onPointerDownCapture={freezeOrder} onFocusCapture={freezeOrder}>
-              {(products.length > OPTIONS_CAP || query !== "" || filterOpen) && (
-                <input
-                  type="search"
-                  value={query}
-                  onChange={(e) => { setQuery(e.target.value); setFilterOpen(true); setFormError(null); }}
-                  placeholder="Filter your supplements"
-                  aria-label="Filter your supplements"
-                  className={`${input} mb-2 w-full`}
-                />
-              )}
-              {matches.length > 0 ? (
-                <div role="group" aria-label="Your supplements" className="flex flex-wrap gap-2">
-                  {shownOptions.map((p) => {
+        {products && products.length > 0 && orderSettled ? (
+          <div>
+            {(products.length > OPTIONS_CAP || query !== "" || filterOpen) && (
+              <input
+                type="search"
+                value={query}
+                onChange={(e) => { setQuery(e.target.value); setFilterOpen(true); setFormError(null); }}
+                placeholder="Filter your supplements"
+                aria-label="Filter your supplements"
+                className={`${input} mb-2 w-full`}
+              />
+            )}
+            {matches.length > 0 ? (
+              <>
+                <div role="radiogroup" aria-label="Your supplements" className="flex flex-wrap gap-2" onKeyDown={onOptionsKey}>
+                  {shownOptions.map((p, i) => {
                     const on = picked?.product_id === p.product_id;
                     const label = labels.get(p.product_id) ?? productLabel(p);
                     return (
                       <button
                         key={p.product_id}
                         type="button"
-                        aria-pressed={on}
+                        role="radio"
+                        aria-checked={on}
+                        tabIndex={i === focusOption ? 0 : -1}
+                        data-option-index={i}
                         title={label}
-                        onClick={() => pickProduct(p)}
+                        onClick={() => pickProduct(p, true)}
                         className={`${pill} ${on ? pillOn : pillOff}`}
                       >
                         {on && <Check className="w-4 h-4 shrink-0" aria-hidden />}
@@ -869,25 +925,29 @@ export default function SupplementsSection() {
                       </button>
                     );
                   })}
-                  {moreOptions > 0 && (
-                    <button type="button" className={`${pill} ${pillOff}`} onClick={() => setShowAllOptions(true)}>
-                      Show all ({matches.length})
-                    </button>
-                  )}
-                  {showAllOptions && matches.length > OPTIONS_CAP && (
-                    <button type="button" className={`${pill} ${pillOff}`} onClick={() => setShowAllOptions(false)}>
-                      Show fewer
-                    </button>
-                  )}
                 </div>
-              ) : (
-                <p className="text-[13px] text-text-tertiary">No match in your supplements</p>
-              )}
-            </div>
-          ) : (
-            <p className="text-[13px] text-text-tertiary">No products in your supplements list yet</p>
-          )
-        ) : productsState === "failed" ? (
+                {(moreOptions > 0 || (showAllOptions && matches.length > OPTIONS_CAP)) && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {moreOptions > 0 && (
+                      <button type="button" className={`${pill} ${pillOff}`} onClick={() => setShowAllOptions(true)}>
+                        Show all ({matches.length})
+                      </button>
+                    )}
+                    {showAllOptions && matches.length > OPTIONS_CAP && (
+                      <button type="button" className={`${pill} ${pillOff}`} onClick={() => setShowAllOptions(false)}>
+                        Show fewer
+                      </button>
+                    )}
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="text-[13px] text-text-tertiary">No match in your supplements</p>
+            )}
+          </div>
+        ) : products && products.length === 0 ? (
+          <p className="text-[13px] text-text-tertiary">No products in your supplements list yet</p>
+        ) : !products && productsState === "failed" ? (
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-[13px] text-text-secondary">Couldn&apos;t load your products.</p>
             <button type="button" className={btn} onClick={() => { setProductsState("loading"); loadAll(); }}>Retry</button>
@@ -896,7 +956,7 @@ export default function SupplementsSection() {
           <div className="flex flex-wrap gap-2" aria-hidden>{[0, 1, 2, 3].map((i) => <div key={i} className="skeleton h-11 w-28 rounded-control" />)}</div>
         )}
         {picked && (
-          <div className="mt-3 space-y-3">
+          <div ref={formRef} className="mt-3 space-y-3">
             <div className="text-[14px] text-text-primary truncate">{productLabel(picked)}</div>
             <div className="flex flex-wrap gap-2">
               <input
