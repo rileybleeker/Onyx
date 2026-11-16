@@ -66,6 +66,17 @@ test("Log Drinks: opening or scrolling never saves (drinks exist only after a Fi
   assert.match(read("components/AppData.tsx"), /json\("\/api\/nutrition\/drinks"\)/);
 });
 
+test("/reading Want to read: mounting (page or scroll) only reads the list; the warm-up reads it with GET", () => {
+  const list = read("app/reading/ReadingList.tsx");
+  // The only POST is inside `send`, which is called from taps and the autosave of typed words.
+  assert.equal((list.match(/method: "POST"/g) || []).length, 1);
+  const mount = /\/\/ Mount: read only\.[^\n]*\n\s*useEffect\(\(\) => \{([\s\S]*?)\n  \}, \[/.exec(list);
+  assert.ok(mount, "the list's mount effect is found");
+  assert.ok(!/send\(|method:|retryPending|act\(/.test(mount[1]), "the mount effect writes nothing");
+  assert.match(read("app/reading/ReadingClient.tsx"), /<ReadingList books=\{books\} onChanged=\{onListChanged\} \/>/);
+  assert.match(read("components/AppData.tsx"), /"\/reading": \(\) => \[json\("\/api\/reading"\), json\("\/api\/reading\/list"\)\]/);
+});
+
 test("Personalize: a grid in the scroll never syncs its layout with the server or saves an edit", () => {
   const grid = read("components/personalize/PartGrid.tsx");
   const calls = grid.split("\n").filter((l) => l.includes("scheduleSync(key)"));

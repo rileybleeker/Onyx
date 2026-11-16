@@ -230,6 +230,10 @@ test('deep-equal bailout: an identical answer is not a change and notifies nobod
 test('a successful write invalidates the entries it changed and refetches them in the background', async () => {
   assert.deepEqual(writeInvalidates('/api/habits/checkin'), ['/api/habits', 'habits:', '/api/delivery']);
   assert.deepEqual(writeInvalidates('/api/reading/sessions'), ['/api/reading', 'reading:']);
+  // A Want to read change refreshes the quest (/api/reading, the switcher's book list) and the list itself.
+  assert.deepEqual(writeInvalidates('/api/reading/list'), ['/api/reading', 'reading:']);
+  assert.ok('/api/reading/list'.startsWith('/api/reading') && !isSensitiveKey('/api/reading/list'));
+  assert.ok(isAppStorageKey('onyx.reading.list.v2'), 'the list\'s unconfirmed changes are wiped on sign-out');
   assert.deepEqual(writeInvalidates('/api/urgent-email/clear'), ['/api/urgent-email', 'urgent-email:']);
   assert.deepEqual(writeInvalidates('/onyx/dismiss'), ['agents:']);
   assert.deepEqual(writeInvalidates('/api/habits/sync'), [], 'the page itself re-reads what the sync changed');
