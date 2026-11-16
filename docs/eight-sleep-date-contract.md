@@ -41,11 +41,17 @@ Rules the ETL follows (since 2026-11-16):
    or time is counted as unknown, never as a match or a move. A failed trends chunk also
    turns the heartbeat `partial`.
 6. Pairing by id assumes `/intervals` items carry the same id as the trend day's
-   `mainSessionId` (the per-ID lookup the self-heal makes with that id is the proven part). If a
-   run fetched sessions that started inside its window (or the evening before), has trend days
-   with a known main session, and pairs none of them, the heartbeat turns `partial` ("no
-   interval paired with a trend day by session id"), so the sync cannot stop writing
-   temperatures without a word.
+   `mainSessionId` (the per-ID lookup the self-heal makes with that id is the proven part).
+   Two checks report it if that stops holding, so the sync cannot stop writing temperatures
+   without a word:
+   - every `/intervals` item without a usable `id` (missing, renamed, or not an object) turns
+     the heartbeat `partial` ("N /intervals item(s) carry no session id");
+   - if a run fetched sessions that started inside its window (or the evening before), counted
+     over every item whether it had an id or not, has trend days with a known main session, and
+     pairs none of them, the heartbeat turns `partial` ("no interval paired with a trend day by
+     session id").
+
+   A session's start only places it inside or outside the window; it never dates a row.
 
 ## Evidence
 
@@ -95,7 +101,9 @@ the ETL reads the log.
 **G. Relocated bed.** A move within Eastern time (for example to New York) changes nothing.
 If the Pod moves to another UTC offset, say Pacific, days sliced in Eastern can be wrong near
 local midnight: an evening nap ending 22:30 PDT on 2026-10-05 ends 01:30 EDT on 10-06. Set
-`EIGHTSLEEP_TIMEZONE` to the new zone from the move on. Until then, if the session `timezone`
+`EIGHTSLEEP_TIMEZONE` to the new zone from the move on. The scheduled run sets it in
+`.github/workflows/eight-sleep-etl.yml` (a protected path, so Riley changes it; it is neither a
+secret nor a repository variable), a local run reads it from `.env` or the shell. Until then, if the session `timezone`
 field reflects the Pod, each run is `partial` with the GUARD line (and for up to a week after
 the change, while nights from before the move are still in the 7-day window). Changing the
 variable is not free: the next routine runs ask the provider to re-slice the whole 7-day
@@ -107,6 +115,9 @@ check the week around it read-only); rows older than the window are not touched.
 **H. Daytime onset (known limit).** In bed 08:00, up 15:00 on 2026-03-20. Provider day
 2026-03-20, and the onset - 6 h is 2026-03-20 too, so this sleep closes behavioral day
 2026-03-20, yet the uniform one-day move in `hrv_alignment.py` pairs it with row 2026-03-19.
+The condition is an onset at or after 06:00 local on the same date the sleep ends (onset - 6 h
+= the wake-up date). A sleep that starts in the afternoon or evening and ends after midnight is
+not affected: its onset - 6 h falls on the day before its wake-up date, where the move puts it.
 Rare; left as a documented limit. Fixing it means re-keying Eight Sleep by the main session's
 onset in `hrv_alignment.py`, which needs an `ALIGNMENT_VERSION` bump and a retrain.
 
@@ -121,9 +132,12 @@ date the `/intervals` list returned last.
 - `eight_sleep_etl.py`: the false comment is replaced by this contract; `parse_interval` returns
   the session id instead of a date; `sync_user` pairs intervals with trend days by session id
   (`_session_id_from_raw`: main id, else a sole session, else none), writes no interval-only
-  rows, counts failed trends chunks, flags a run where no interval pairs (rule 6) and checks the
-  bed zone (`bed_tz_check`); `trends_problems` builds the heartbeat message, GUARD first.
-- `eight_sleep_temp_backfill.py --compare`: the read-only comparison in the plan below.
+  rows, counts failed trends chunks, flags `/intervals` items without an id and a run where no
+  interval pairs (rule 6) and checks the bed zone (`bed_tz_check`); `trends_problems` builds the
+  heartbeat message, GUARD first. The temp self-heal no longer logs a row's date, its
+  temperatures or a session id (the Actions log is public); its counters are unchanged.
+- `eight_sleep_temp_backfill.py --compare [--max-lookups N]`: the read-only comparison in the
+  plan below.
 - Comments in `sql/adr_0001_04_other_onyx_dates.sql`, `eight_sleep_schema.sql`, `hrv_alignment.py`
   and the ADR-0001 addendum. **No SQL to apply, no schema change, no date shifted, no backfill.**
 - Tests: `tests/test_eight_sleep_date_contract.py` (synthetic payloads and fakes) and
@@ -141,21 +155,27 @@ date the `/intervals` list returned last.
 
 1. Read-only comparison, from a PC with `.env`:
    `python eight_sleep_temp_backfill.py --compare`. It pages through every row of the table,
-   looks up each stored row's main session (one call per distinct session, capped at 1000) and
-   prints counts only: `scanned`, `truncated`, `rows`, `same`, `differ`, `partial` (no stored
-   temperature differs but one could not be checked), `unmapped_side` (a side not on the device
-   now, such as `away`), `no_session`, `not_found`, `no_temp`, `failed`, `over_cap`,
-   `not_verifiable` (the sum of the four "cannot be checked" counts) and `complete`. It writes
-   nothing. Provider and HTTP logging is turned down while it runs, but treat the whole
+   looks up each stored row's main session (one call per distinct session, at most 1000 unless
+   `--max-lookups N` raises it) and prints counts only: `scanned`, `truncated`, `rows`, `same`,
+   `differ`, `partial` (no stored temperature differs but one could not be checked),
+   `unmapped_side` (a side not on the device now, such as `away`), `no_session`, `not_found`,
+   `no_temp`, `failed`, `over_cap`, `lookups`, `not_verifiable` (the sum of the four "cannot be
+   checked" counts), `complete` (the scan finished) and `clean`. It writes nothing. Every run
+   starts again from the newest row, so an identical re-run repeats the same capped lookups:
+   when `over_cap` is not 0, re-run with `--max-lookups` at least `lookups + over_cap` (the
+   command prints that number). Provider and HTTP logging is turned down while it runs, but treat the whole
    transcript as private: it is about Riley's rows, and a crash traceback can still carry a
    provider id. **Timing:** the first runs after this change is deployed rewrite the temperatures
    of the nights in the 7-day window with correctly paired values and keep no copy of the old
    ones. If a pre-fix count for the most recent week is wanted, run the comparison before the
    deploy; after it, that week reads as `same` whatever it held before.
-2. Closing rule. The history is cleared only when `complete = True` (the whole table was read:
-   `truncated`, `failed`, `over_cap` and `partial` are all 0) **and** `differ = 0`. Rows counted
-   in `not_verifiable` are never clean: report their number as unresolved, not as "no harm".
-   `complete = False` means re-run (a later run reaches rows the cap left out) or report the
+2. Closing rule. Claim 4 closes as "no harm" only when `clean = True`: `complete = True` (the
+   whole table was read and `truncated`, `failed`, `over_cap` and `partial` are all 0),
+   `differ = 0` **and** `not_verifiable = 0`. `complete = True` with `differ = 0` but
+   `not_verifiable > 0` means only "no difference among the rows that could be checked": report
+   it that way, with the `not_verifiable` count as unresolved, and the claim stays open for those
+   rows (Riley decides whether that is enough). `complete = False` means re-run with a larger
+   `--max-lookups` when `over_cap` is the reason, re-run later when `failed` is, or report the
    result as incomplete. `differ > 0`: Riley decides. A correction is a separate, reviewed,
    reversible one-off: save each affected row's current `(calendar_date, bed_side,
    median_bed_temp, median_room_temp)` to a private file first, then write the main session's
@@ -177,4 +197,6 @@ These open items are also recorded in the Notes of the HIST-ETL-01 roadmap row.
 - That `/intervals` items use the same id as the trend `mainSessionId` is assumed, not observed
   on a collection payload; rule 6 reports it if it ever fails.
 - Temperature units: `tempBedC` / `tempRoomC` are Celsius by name; not re-checked here.
+- Other ETL log lines still name provider ids (the authenticate line, fetch error messages that
+  quote a request URL). Only the temp self-heal's per-row lines were made counts-only here.
 - The other items on the same roadmap row (not Eight Sleep) are untouched.

@@ -238,6 +238,49 @@ def test_ids_that_never_match_are_reported_not_silently_dropped() -> None:
     assert len(problems) == 1 and problems[0].startswith("no interval paired"), problems
 
 
+def _id_renamed(interval: dict) -> dict:
+    # The same item with its id under another key, as a provider rename would ship it.
+    item = dict(interval)
+    item["sessionId"] = item.pop("id")
+    return item
+
+
+def test_intervals_without_an_id_are_reported_not_mistaken_for_a_quiet_window() -> None:
+    # If /intervals renamed or dropped its id field, every item would be
+    # discarded before pairing; the window check must still count them.
+    a = _session("A", "2026-05-10T05:00:00Z", "2026-05-10T12:00:00Z")
+    b = _session("B", "2026-05-11T05:00:00Z", "2026-05-11T12:00:00Z")
+    client = FakeClient(days=[_day("2026-05-10", [a]), _day("2026-05-11", [b])],
+                        intervals=[_id_renamed(_interval("A", a["ts"], 30.0, 20.0)),
+                                   _id_renamed(_interval("B", b["ts"], 30.0, 20.0))])
+    sb, stats = _sync(client, "2026-05-05", "2026-05-11")
+    assert stats["records"] == 2 and stats["intervals_without_id"] == 2, stats
+    assert stats["interval_pairing_failed"] == 1, stats
+    assert all("median_bed_temp" not in r for r in sb.rows().values())
+    problems = es.trends_problems(0, stats, None)
+    assert len(problems) == 2, problems
+    assert "carry no session id" in problems[0], problems
+    assert problems[1].startswith("no interval paired"), problems
+    # Counts only: no id, date or value in the heartbeat text.
+    assert not any(t in " ".join(problems) for t in ("2026-05", "30.0", "A,", "B,")), problems
+
+
+def test_one_interval_without_an_id_next_to_paired_ones_is_still_reported() -> None:
+    a = _session("A", "2026-05-20T05:00:00Z", "2026-05-20T12:00:00Z")
+    b = _session("B", "2026-05-21T05:00:00Z", "2026-05-21T12:00:00Z")
+    client = FakeClient(days=[_day("2026-05-20", [a]), _day("2026-05-21", [b])],
+                        intervals=[_interval("A", a["ts"], 29.0, 20.0),
+                                   _id_renamed(_interval("B", b["ts"], 31.0, 21.0)),
+                                   "not an object"])
+    sb, stats = _sync(client, "2026-05-15", "2026-05-21")
+    rows = sb.rows()
+    assert rows["2026-05-20"]["median_bed_temp"] == 29.0, rows["2026-05-20"]
+    assert "median_bed_temp" not in rows["2026-05-21"], "unpaired day keeps its stored temps"
+    assert stats["intervals_without_id"] == 2 and stats["interval_pairing_failed"] == 0, stats
+    problems = es.trends_problems(0, stats, None)
+    assert len(problems) == 1 and "carry no session id" in problems[0], problems
+
+
 def test_a_window_older_than_the_recent_sessions_is_not_a_pairing_failure() -> None:
     # A --date / backfill run over an old window: the 10 recent intervals all
     # started after it, so no match is expected and nothing is reported.
@@ -387,6 +430,7 @@ def test_relocated_bed_is_stored_unshifted_and_reported_with_guard_first() -> No
     assert problems[0].startswith("GUARD eight_sleep_bed_tz:"), problems
     assert problems[1:] == ["1 error(s)", "temp self-heal: synthetic"], problems
     assert "Los_Angeles" not in problems[0] and "America" not in problems[0], problems[0]
+    assert ".github/workflows/eight-sleep-etl.yml" in problems[0], problems[0]
 
 
 def test_clean_run_has_no_problems() -> None:
@@ -513,7 +557,7 @@ def test_compare_counts_every_outcome_and_writes_nothing() -> None:
     assert stats == {"scanned": 8, "truncated": False, "rows": 7, "same": 2, "differ": 1,
                      "partial": 0, "unmapped_side": 0, "no_session": 1, "not_found": 1,
                      "no_temp": 1, "failed": 1, "over_cap": 0, "lookups": 5,
-                     "not_verifiable": 3, "complete": False}, stats
+                     "not_verifiable": 3, "complete": False, "clean": False}, stats
     assert client.calls.count(("u-left", "S")) == 1, client.calls
 
 
@@ -534,6 +578,7 @@ def test_compare_pages_through_the_whole_table() -> None:
     assert sb.ranges == [(0, 1), (2, 3), (4, 5)], sb.ranges
     assert stats["scanned"] == 5 and stats["same"] == 5 and stats["truncated"] is False, stats
     assert stats["complete"] is True and stats["not_verifiable"] == 0, stats
+    assert stats["clean"] is True, "whole table read, every row checked, none differ"
 
 
 def test_compare_that_stops_at_its_row_cap_is_incomplete() -> None:
@@ -564,9 +609,52 @@ def test_compare_reports_rows_it_cannot_verify_and_never_counts_them_clean() -> 
     assert stats["unmapped_side"] == 1 and stats["no_session"] == 1, stats
     assert stats["same"] == 0 and stats["not_verifiable"] == 2, stats
     assert client.calls == [], "nothing to look up"
-    # Every row was read and counted, so the scope is complete, but nothing in it
+    # Every row was read and counted, so the scan is complete, but nothing in it
     # is clean: the two rows are reported as not verifiable.
-    assert stats["complete"] is True, stats
+    assert stats["complete"] is True and stats["clean"] is False, stats
+
+
+def test_compare_with_a_difference_is_complete_but_not_clean() -> None:
+    rows = [_stored("2026-08-10", "S", 27.0, 19.0), _stored("2026-08-11", "D", 31.0, 19.0)]
+    client = FakeIntervalClient({"S": _interval("S", "t", 27.0, 19.0),
+                                 "D": _interval("D", "t", 28.0, 19.0)})
+    stats = backfill.compare_temps(client, FakeReadSB(rows), {"left": "u-left"}, delay_s=0)
+    assert stats["differ"] == 1 and stats["complete"] is True, stats
+    assert stats["clean"] is False, stats
+
+
+def test_compare_lookup_cap_can_be_raised_so_a_rerun_reaches_every_row() -> None:
+    # An identical re-run repeats the same capped lookups (the scan restarts at the
+    # newest row); a larger --max-lookups is what reaches the rest.
+    rows = [_stored(f"2026-09-0{i}", f"S{i}", 27.0, 19.0) for i in range(1, 6)]
+    client = FakeIntervalClient({f"S{i}": _interval(f"S{i}", "t", 27.0, 19.0) for i in range(1, 6)})
+    first = backfill.compare_temps(client, FakeReadSB(rows), {"left": "u-left"},
+                                   max_lookups=3, delay_s=0)
+    again = backfill.compare_temps(client, FakeReadSB(rows), {"left": "u-left"},
+                                   max_lookups=3, delay_s=0)
+    assert first == again and first["over_cap"] == 2 and first["complete"] is False, first
+    wider = backfill.compare_temps(client, FakeReadSB(rows), {"left": "u-left"},
+                                   max_lookups=first["lookups"] + first["over_cap"], delay_s=0)
+    assert wider["over_cap"] == 0 and wider["same"] == 5 and wider["clean"] is True, wider
+
+
+def test_max_lookups_flag_is_parsed_and_bounded() -> None:
+    assert backfill._max_lookups(["--compare"]) == backfill.BACKFILL_MAX_LOOKUPS
+    assert backfill._max_lookups(["--compare", "--max-lookups", "2500"]) == 2500
+    for bad in (["--max-lookups"], ["--max-lookups", "x"], ["--max-lookups", "0"],
+                ["--max-lookups", str(backfill.COMPARE_MAX_LOOKUPS + 1)]):
+        try:
+            backfill._max_lookups(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"{bad} must be refused")
+    try:
+        backfill.main(["--max-lookups", "5"])
+    except SystemExit as exc:
+        assert "--compare" in str(exc)
+    else:
+        raise AssertionError("--max-lookups without --compare must refuse before connecting")
 
 
 def test_compare_cannot_be_combined_with_apply() -> None:

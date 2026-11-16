@@ -51,8 +51,9 @@ EIGHTSLEEP_PASSWORD = os.environ["EIGHTSLEEP_PASSWORD"]
 # while user_tz_log still shows a trip. Interval values attach to a trend day
 # by session id (never by their own timestamp; a day with several sessions and
 # no mainSessionId gets none), and no row is written without a trend day. If
-# the Pod moves to a zone with another UTC offset, change this variable; until
-# then a session reporting such a zone turns the run `partial`
+# the Pod moves to a zone with another UTC offset, change this variable (the
+# scheduled run sets it in .github/workflows/eight-sleep-etl.yml); until then
+# a session reporting such a zone turns the run `partial`
 # (GUARD eight_sleep_bed_tz). Supersedes audit re-2026-05-26 P3 (deepseek etl
 # F-007) and re-2026-06-07 etl gpt-5/F-002 + deepseek/F-006.
 EIGHTSLEEP_TIMEZONE = os.environ.get("EIGHTSLEEP_TIMEZONE", "America/New_York")
@@ -459,9 +460,6 @@ def parse_interval(interval: dict, bed_side: str) -> dict | None:
 
     return {
         "session_id": str(session_id),
-        # Only used to tell whether the session falls inside a sync window
-        # (the pairing check in sync_user), never to date a row.
-        "session_start": _parse_instant(interval.get("ts")),
         "bed_side": bed_side,
         "avg_heart_rate": avg_timeseries(ts.get("heartRate")),
         "avg_breath_rate": avg_timeseries(ts.get("respiratoryRate")),
@@ -534,7 +532,7 @@ def _strip_timeseries(data: dict) -> dict:
 def _new_sync_stats() -> dict:
     return {"records": 0, "trend_chunks": 0, "trend_chunks_failed": 0,
             "intervals_matched": 0, "intervals_unmatched": 0,
-            "interval_pairing_failed": 0,
+            "intervals_without_id": 0, "interval_pairing_failed": 0,
             "bed_tz_mismatch": 0, "bed_tz_unknown": 0}
 
 
@@ -562,10 +560,22 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         intervals = []
 
     interval_by_id: dict[str, dict] = {}
+    # The start of EVERY item, with or without an id: the pairing check below
+    # must also see sessions whose id is missing or renamed, or a payload
+    # change that drops the id would look like a quiet window.
+    session_starts: list[datetime] = []
     for interval in intervals:
+        if not isinstance(interval, dict):
+            stats["intervals_without_id"] += 1
+            continue
+        start = _parse_instant(interval.get("ts"))
+        if start is not None:
+            session_starts.append(start)
         parsed = parse_interval(interval, bed_side)
         if parsed:
             interval_by_id[parsed["session_id"]] = parsed
+        else:
+            stats["intervals_without_id"] += 1
 
     # 2. Fetch trends in 30-day chunks (v2 API includes biometrics)
     log.info(f"  [{bed_side}] Fetching trends...")
@@ -660,17 +670,21 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         # nothing is lost, they are only not written by date.
         log.info(f"  [{bed_side}] {stats['intervals_unmatched']} interval(s) are not "
                  "the main session of a trend day in this window (not written)")
+    if stats["intervals_without_id"]:
+        log.warning(f"  [{bed_side}] {stats['intervals_without_id']} interval(s) carry "
+                    "no session id and cannot be paired with a trend day")
     # Pairing by id assumes /intervals items carry the same id as the trend
     # day's mainSessionId. If that ever stops holding, nothing pairs and the
     # sync silently stops writing temps; flag it when it can be told apart
     # from a quiet window: sessions started inside the window (or the evening
-    # before it), trend days with a known main session, and not one match.
+    # before it), counted over every item whether it had an id or not, trend
+    # days with a known main session, and not one match. The session start
+    # only places a session in or out of the window, it never dates a row.
     lo = start_date - timedelta(days=1)
     try:
         zone = ZoneInfo(EIGHTSLEEP_TIMEZONE)
-        in_window = sum(1 for p in interval_by_id.values()
-                        if p.get("session_start") is not None
-                        and lo <= p["session_start"].astimezone(zone).date() <= end_date)
+        in_window = sum(1 for t in session_starts
+                        if lo <= t.astimezone(zone).date() <= end_date)
     except Exception:  # noqa: BLE001 — an unusable zone: cannot tell, do not flag
         in_window = 0
     days_with_main = sum(1 for d in trend_by_date if _session_id_from_raw(raw_by_date.get(d)))
@@ -770,7 +784,9 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
     overwritten. `dry_run=True` does the lookups but writes nothing.
     Today is excluded (the session may still be processing). One failing row
     never stops the others; it stays NULL and is retried next run.
-    Returns counters; `scan_error` is set if the candidate query failed.
+    Nothing per row is logged (no date, value or provider id: the Actions log
+    is public); the caller logs the counters. Returns counters; `scan_error`
+    is set if the candidate query failed.
     """
     stats = _new_heal_stats()
     if max_rows <= 0:
@@ -817,7 +833,6 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
             stats["over_cap"] += 1
             continue
         cal, side = row.get("calendar_date"), row.get("bed_side")
-        session_id = key[1]
         stats["attempted"] += 1
         try:
             if key not in fetched:
@@ -832,7 +847,6 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
                 raise interval
             if interval is None:
                 stats["not_found"] += 1
-                log.info(f"  Self-heal [{cal}/{side}]: session {session_id} not found")
                 continue
             ts = interval.get("timeseries") or {}
             found = {
@@ -852,11 +866,11 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
                     q = q.is_(col, "null")
                 q.execute()
             stats["healed"] += 1
-            log.info(f"  Self-heal [{cal}/{side}]"
-                     f"{' (dry run, not written)' if dry_run else ''}: {payload}")
         except Exception as e:  # noqa: BLE001 — row stays NULL, retried next run
             stats["failed"] += 1
-            log.warning(f"  Self-heal [{cal}/{side}] session {session_id} failed: {e}")
+            # Type only: the Actions log is public, and the message of a
+            # provider error can carry the user and session ids in its URL.
+            log.warning(f"  Self-heal: a lookup failed ({type(e).__name__})")
     return stats
 
 
@@ -885,7 +899,8 @@ def trends_problems(errors: int, sync_totals: dict,
             f"GUARD eight_sleep_bed_tz: {sync_totals['bed_tz_mismatch']} session(s) "
             "report a time zone whose UTC offset differs from EIGHTSLEEP_TIMEZONE, so "
             "their trend days may be dated in the wrong zone; if the Pod moved, set "
-            "EIGHTSLEEP_TIMEZONE (docs/eight-sleep-date-contract.md)")
+            "EIGHTSLEEP_TIMEZONE in .github/workflows/eight-sleep-etl.yml (a protected "
+            "path, so Riley changes it; docs/eight-sleep-date-contract.md, case G)")
     if errors:
         problems.append(f"{errors} error(s)")
     if sync_totals.get("trend_chunks_failed"):
@@ -893,6 +908,12 @@ def trends_problems(errors: int, sync_totals: dict,
             f"trends fetch failed for {sync_totals['trend_chunks_failed']} of "
             f"{sync_totals.get('trend_chunks', 0)} chunk(s); those days were not "
             "written and are retried next run")
+    if sync_totals.get("intervals_without_id"):
+        problems.append(
+            f"{sync_totals['intervals_without_id']} /intervals item(s) carry no session "
+            "id, so their temps cannot be paired with a trend day; check the /intervals "
+            "payload shape (the self-heal still fills NULL temps of past days by per-ID "
+            "lookup)")
     if sync_totals.get("interval_pairing_failed"):
         problems.append(
             f"no interval paired with a trend day by session id on "

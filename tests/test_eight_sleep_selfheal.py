@@ -331,6 +331,39 @@ def test_api_error_leaves_row_null_and_is_counted() -> None:
     assert "failed=1" in es._selfheal_summary(stats, 20)
 
 
+def test_heal_logs_no_dates_values_or_session_ids() -> None:
+    """The Actions log is public: the heal logs counters only, never a row's
+    date, a temperature or a provider id (not even inside an error message)."""
+    import logging
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    handler = _Capture()
+    logger = logging.getLogger("eight_sleep_etl")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        sb = FakeSupabase([_trend_row("2026-11-03", sid="SID-OK"),
+                           _trend_row("2026-11-02", sid="SID-GONE"),
+                           _trend_row("2026-11-01", sid="SID-BAD")])
+        client = FakeClient({"SID-OK": _interval(), "SID-GONE": None,
+                             "SID-BAD": RuntimeError("GET /users/u-left/intervals/SID-BAD")})
+        stats = _heal(sb, client)
+        _heal(FakeSupabase([_trend_row("2026-11-04", sid="SID-DRY")]),
+              FakeClient({"SID-DRY": _interval()}), dry_run=True)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    assert stats["healed"] == 1 and stats["not_found"] == 1 and stats["failed"] == 1, stats
+    text = " | ".join(seen)
+    for token in ("SID-", "2026-11-0", "25.0", "20.0", "u-left"):
+        assert token not in text, (token, text)
+
+
 def test_missing_session_unknown_side_and_empty_timeseries() -> None:
     sb = FakeSupabase([
         _trend_row("2026-11-06", sid="NOTFOUND"),                       # 404 -> None

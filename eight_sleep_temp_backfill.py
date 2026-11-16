@@ -16,6 +16,7 @@ Usage:
     python eight_sleep_temp_backfill.py            # dry-run, no DB writes
     python eight_sleep_temp_backfill.py --apply    # actually write to Supabase
     python eight_sleep_temp_backfill.py --compare  # read-only: stored vs main session
+    python eight_sleep_temp_backfill.py --compare --max-lookups 3000  # raise the lookup cap
 
 Only NULL columns are written; existing values are never overwritten. Reads
 at most 1000 rows per run, so re-run until it reports 0 candidate rows.
@@ -25,8 +26,11 @@ docs/eight-sleep-date-contract.md: until 2026-11-16 the daily sync paired an
 interval with a trend day by the date the session STARTED, so a night that
 began before local midnight (or a nap) could put another session's temps on a
 row. It pages through EVERY stored row, looks up each row's main session and
-prints COUNTS only (same, differ, partial, ...) plus `complete`; it never
-writes and never prints a date or a value. Provider and HTTP logging is
+prints COUNTS only (same, differ, partial, ...) plus `complete` and `clean`;
+it never writes and never prints a date or a value. Each run starts again
+from the newest row, so an identical re-run repeats the same capped lookups:
+when it reports over_cap > 0, re-run with a larger --max-lookups (at least
+lookups + over_cap) instead. Provider and HTTP logging is
 turned down while it runs, but treat the whole transcript as private anyway
 (a crash traceback can still carry a provider id).
 """
@@ -47,6 +51,7 @@ BACKFILL_SCAN_LIMIT = 1000    # PostgREST returns at most 1000 rows per request
 COMPARE_TOLERANCE = 0.005    # stored temps are NUMERIC(5,2)
 COMPARE_PAGE_SIZE = 1000     # PostgREST's per-request maximum
 COMPARE_MAX_ROWS = 50000     # stop paging here and report truncated=True
+COMPARE_MAX_LOOKUPS = COMPARE_MAX_ROWS  # highest --max-lookups accepted
 
 # Counts that leave a row unchecked: the row is neither clean nor a difference.
 NOT_VERIFIABLE = ("unmapped_side", "no_session", "not_found", "no_temp")
@@ -105,10 +110,14 @@ def compare_temps(client, sb, users: dict[str, str],
       not_found / no_temp  session gone, or no readings for any stored column
       failed / over_cap    lookup error, or beyond the lookup cap
       not_verifiable       unmapped_side + no_session + not_found + no_temp
-    `complete` is True only when the whole table was read and every row with
-    a stored temp was checked in full or is counted as not verifiable:
-    truncated is False and failed, over_cap and partial are all 0. Rows that
-    are not verifiable are never clean; `differ = 0` with complete=False
+    `complete` (the scan finished) is True only when the whole table was read
+    and every row with a stored temp was checked in full or is counted as not
+    verifiable: truncated is False and failed, over_cap and partial are all 0.
+    `clean` (the history question is answered "no harm") is True only when
+    complete is True, differ is 0 AND not_verifiable is 0: a row that could
+    not be checked is never clean, so complete with differ = 0 but
+    not_verifiable > 0 means "no difference among the rows that could be
+    checked", with the rest unresolved. `differ = 0` with complete=False
     proves nothing about the rows left out. Writes nothing.
     """
     stats = {"scanned": 0, "truncated": False, "rows": 0, "same": 0, "differ": 0,
@@ -163,7 +172,23 @@ def compare_temps(client, sb, users: dict[str, str],
     stats["not_verifiable"] = sum(stats[k] for k in NOT_VERIFIABLE)
     stats["complete"] = (not stats["truncated"] and stats["failed"] == 0
                          and stats["over_cap"] == 0 and stats["partial"] == 0)
+    stats["clean"] = (stats["complete"] and stats["differ"] == 0
+                      and stats["not_verifiable"] == 0)
     return stats
+
+
+def _max_lookups(args: list[str]) -> int:
+    """The --max-lookups N value (per-ID calls for --compare), default 1000."""
+    if "--max-lookups" not in args:
+        return BACKFILL_MAX_LOOKUPS
+    i = args.index("--max-lookups")
+    try:
+        n = int(args[i + 1])
+    except (IndexError, ValueError):
+        raise SystemExit("--max-lookups needs a whole number") from None
+    if not 1 <= n <= COMPARE_MAX_LOOKUPS:
+        raise SystemExit(f"--max-lookups must be between 1 and {COMPARE_MAX_LOOKUPS}")
+    return n
 
 
 @contextmanager
@@ -187,15 +212,19 @@ def main(argv: list[str] | None = None) -> dict:
     compare = "--compare" in args
     if apply and compare:
         raise SystemExit("--compare is read-only; it cannot be combined with --apply")
+    if "--max-lookups" in args and not compare:
+        raise SystemExit("--max-lookups only applies to --compare")
 
     if compare:
+        max_lookups = _max_lookups(args)
         with _quiet_provider_logs():
             client = es.EightSleepClient(es.EIGHTSLEEP_EMAIL, es.EIGHTSLEEP_PASSWORD,
                                          es.EIGHTSLEEP_TIMEZONE)
             try:
                 client.authenticate()
                 sb = es.get_supabase_client()
-                stats = compare_temps(client, sb, es.discover_users(client))
+                stats = compare_temps(client, sb, es.discover_users(client),
+                                      max_lookups=max_lookups)
             finally:
                 client.close()
         log.info("=" * 60)
@@ -204,6 +233,17 @@ def main(argv: list[str] | None = None) -> dict:
         if not stats["complete"]:
             log.info("Incomplete: differ=0 here does not clear the rows left out "
                      "(truncated, failed, over_cap or partial is not 0).")
+            if stats["over_cap"]:
+                log.info("An identical re-run repeats the same lookups; re-run with "
+                         f"--max-lookups {stats['lookups'] + stats['over_cap']} or more.")
+        elif not stats["clean"]:
+            why = []
+            if stats["differ"]:
+                why.append(f"differ={stats['differ']} (Riley decides)")
+            if stats["not_verifiable"]:
+                why.append(f"{stats['not_verifiable']} row(s) could not be checked and "
+                           "stay unresolved")
+            log.info("Complete but not clean: " + "; ".join(why) + ".")
         return stats
 
     client = es.EightSleepClient(es.EIGHTSLEEP_EMAIL, es.EIGHTSLEEP_PASSWORD,
