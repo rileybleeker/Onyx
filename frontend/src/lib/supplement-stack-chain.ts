@@ -96,6 +96,15 @@ export class StackSaveUnconfirmed extends Error {
   }
 }
 
+/**
+ * For the editor's Autosaver (lib/autosave.ts unknownOutcome): after an unconfirmed save the stack may hold that value,
+ * so changing back to the values the editor loaded is sent too (as the newest save, after the unanswered one) instead
+ * of being dropped as "unchanged" while the unwanted change stays stored.
+ */
+export function stackSaveUnknownOutcome(e: unknown): boolean {
+  return e instanceof StackSaveUnconfirmed;
+}
+
 const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
 
 /**
@@ -103,8 +112,9 @@ const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Numb
  * plus a StackConflict for the 409 stale / reload answers. A 503 "not_set_up" (the database function is missing) is a
  * refusal too: nothing was written and retrying cannot help until the migration is applied, so the editor shows the
  * message with Retry instead of retrying on its own. A 503 "conflict" wrote nothing and is retried as it is. Every
- * other failure where the outcome is not known (no answer at all, a 5xx that is not one of those, a success whose
- * body is not a saved stack) is a StackSaveUnconfirmed: retried with the same save id, never "nothing was changed".
+ * other failure where the outcome is not known (no answer at all, a 5xx that is not one of those, a 408 / 429 from
+ * something between the browser and the route, a success whose body is not a saved stack) is a StackSaveUnconfirmed:
+ * retried with the same save id, never "nothing was changed".
  * Answers the parsed JSON of a successful save.
  */
 export async function stackSaveRequest(
@@ -136,6 +146,6 @@ export async function stackSaveRequest(
   if (res.status === 503 && json.code === "not_set_up") throw new AutosaveRefused(text);
   if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(text);
   if (res.status === 503 && json.code === "conflict") throw new Error(text); // two saves met; nothing was written
-  if (res.status === 408 || res.status === 429) throw new Error(text); // not processed: sent again later
+  // 408 / 429 never come from the route; whatever sent one may have done so after forwarding the save. Not known.
   throw new StackSaveUnconfirmed(json.code === "unconfirmed" && typeof json.error === "string" && json.error ? json.error : STACK_UNCONFIRMED_TEXT);
 }

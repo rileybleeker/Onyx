@@ -34,6 +34,7 @@ export function useAutosave<T>(name: string, opts: Omit<AutosaverOptions<T>, "on
           save: (v, ctx) => optsRef.current.save(v, ctx),
           ready: (v) => optsRef.current.ready?.(v),
           same: (a, b) => (optsRef.current.same ? optsRef.current.same(a, b) : JSON.stringify(a) === JSON.stringify(b)),
+          unknownOutcome: (e) => optsRef.current.unknownOutcome?.(e) ?? false,
           delayMs: opts.delayMs,
           retryDelaysMs: opts.retryDelaysMs,
           onState: (s) => {

@@ -154,6 +154,13 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
    * from before those saves, so reopening a stack then would start from an old version and get a false 409.
    */
   const [stacksReloading, setStacksReloading] = useState(false);
+  /**
+   * The newest read of the stack list failed: the list may hold versions older than a save made since, so Edit waits
+   * for a read that works (Retry) instead of opening a stack that would only get a false 409 on its next change.
+   */
+  const [stacksLoadFailed, setStacksLoadFailed] = useState(false);
+  /** Only the newest stack-list read updates the list (an older one answering late is ignored). */
+  const stacksReadSeq = useRef(0);
   // Single-row deletes the server refused: the row is back on the list, listed here with Retry.
   const [failedDeletes, setFailedDeletes] = useState<{ intake_id: number; label: string }[]>([]);
 
@@ -253,12 +260,24 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
     }
   }, [historyDays]);
 
-  const loadStacks = useCallback(async () => {
+  /**
+   * Reads the stack list. `blocking` (after the editor saved, and Retry) keeps Edit disabled until a read that started
+   * then has answered. A failure is kept (stacksLoadFailed: Edit stays disabled, the card offers Retry), never
+   * swallowed: the list on screen would otherwise hand the editor an old version.
+   */
+  const loadStacks = useCallback(async (opts?: { blocking?: boolean }) => {
+    const seq = ++stacksReadSeq.current;
+    if (opts?.blocking) setStacksReloading(true);
     try {
       const json = await getJson("/api/supplements/stacks");
+      if (seq !== stacksReadSeq.current) return; // a newer read answers for the list
       setStacks(json.stacks ?? []);
+      setStacksLoadFailed(false);
     } catch (e) {
       console.error("Stacks load:", e);
+      if (seq === stacksReadSeq.current) setStacksLoadFailed(true);
+    } finally {
+      if (seq === stacksReadSeq.current) setStacksReloading(false);
     }
   }, []);
 
@@ -505,10 +524,25 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
               </button>
             </div>
 
+            {stacksLoadFailed && (
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2 text-[11px] font-mono text-down">
+                <span>Could not load your saved stacks. Editing waits until they load.</span>
+                <button
+                  type="button"
+                  onClick={() => void loadStacks({ blocking: true })}
+                  disabled={stacksReloading}
+                  className="px-2 py-1 border border-border-subtle rounded-control text-text-primary hover:border-accent/50 disabled:opacity-40 transition-colors"
+                >
+                  {stacksReloading ? "Loading…" : "Retry"}
+                </button>
+              </div>
+            )}
             {stacks.length === 0 ? (
-              <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
-                No stacks yet. Create one to log your recurring supplements in a single tap on Log.
-              </p>
+              stacksLoadFailed ? null : (
+                <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
+                  No stacks yet. Create one to log your recurring supplements in a single tap on Log.
+                </p>
+              )
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {stacks.map((s) => (
@@ -543,9 +577,15 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                           })),
                         })
                       }
-                      disabled={stacksReloading}
+                      disabled={stacksReloading || stacksLoadFailed}
                       className="px-2 py-2 text-[10px] font-mono text-text-tertiary hover:text-text-primary disabled:opacity-40 transition-colors"
-                      title={stacksReloading ? "Loading the saved stack…" : "Edit stack"}
+                      title={
+                        stacksReloading
+                          ? "Loading the saved stack…"
+                          : stacksLoadFailed
+                            ? "Load your saved stacks first (Retry above)"
+                            : "Edit stack"
+                      }
                     >
                       edit
                     </button>
@@ -791,12 +831,8 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
         onClose={() => setEditingStack(null)}
         onSaved={async () => {
           setEditingStack(null);
-          setStacksReloading(true);
-          try {
-            await loadStacks();
-          } finally {
-            setStacksReloading(false);
-          }
+          // Edit stays disabled until a read started after these saves answers (a failure keeps it so, with Retry).
+          await loadStacks({ blocking: true });
         }}
       />
 

@@ -365,6 +365,68 @@ test("a create that committed but lost its answer is resent with the same key an
   assert.equal(current.db.stacks.length, 1, "no second stack");
 });
 
+// Codex review round 2 (PR 365): a save commits but its answer is lost, then the form is put back the way it loaded.
+// The real Autosaver, wired as the editor wires it, must SEND that change back (not treat the form as clean and cancel
+// the retry), so the unwanted change does not stay stored.
+test("real Autosaver: a committed save whose answer was lost, then a change back to the loaded values, stores the loaded values", async () => {
+  const db = reset();
+  const id = await seedStack(db);
+  const loaded = { name: "Test stack", description: null, remind_time: null, items: BODY.items };
+  const unwanted = { ...loaded, items: [{ product_id: "prod-c", doses: 3 }] };
+  const chain = new chainLib.StackSaveChain(1, idGen(700));
+  const sent = [];
+  const viaRoute = async (_url, init) => {
+    const b = JSON.parse(init.body);
+    sent.push(b);
+    const r = init.method === "POST" ? await post(b) : await patch(b);
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+  };
+  const timers = { set: () => ({}), clear: () => {} }; // retries are driven by hand below
+  const saver = new autosave.Autosaver(
+    {
+      timers,
+      unknownOutcome: chainLib.stackSaveUnknownOutcome, // what components/StackEditorModal.tsx passes
+      // The editor's save: chain fields, one request, a refusal forgets its id, a success is the version held now.
+      save: async (f, { keepalive }) => {
+        const fields = chain.next(f);
+        let json;
+        try {
+          json = await chainLib.stackSaveRequest("PATCH", { stack_id: id, ...f, ...fields }, keepalive, viaRoute);
+        } catch (e) {
+          if (e instanceof autosave.AutosaveRefused) chain.refused(fields);
+          throw e;
+        }
+        chain.accepted(json.version);
+      },
+    },
+    loaded,
+  );
+
+  current.db.loseAnswer = "throw";
+  saver.change(unwanted, { delayMs: null });
+  assert.equal(await saver.flush(), false, "no clear answer: still unsaved");
+  assert.equal(saver.state.status, "error");
+  assert.equal(saver.state.retrying, true);
+  assert.doesNotMatch(saver.state.error, /Nothing was changed/i);
+  assert.deepEqual(itemsOf(current.db, id), [["prod-c", 3]], "the unwanted change did commit");
+
+  saver.change(loaded, { delayMs: null }); // the form is put back the way it loaded
+  assert.equal(saver.dirty, true, "not treated as clean: the stack may hold the lost save");
+  assert.equal(await saver.flush(), true);
+  assert.equal(saver.state.status, "saved");
+  assert.equal(sent.length, 2, "the change back was sent");
+  assert.notEqual(sent[1].save_id, sent[0].save_id);
+  assert.deepEqual(sent[1].after_save_ids, [sent[0].save_id], "sent after the unanswered save, so it is accepted");
+  assert.deepEqual(itemsOf(current.db, id), [["prod-a", 1], ["prod-b", 2]], "the loaded values are stored again");
+  assert.equal(current.db.stacks[0].version, 3);
+  assert.deepEqual(chain.unanswered, []);
+
+  // Once a save has answered, the stored value is known again: the same value sends nothing.
+  saver.change(loaded, { delayMs: null });
+  assert.equal(await saver.flush(), true);
+  assert.equal(sent.length, 2);
+});
+
 test("after a lost answer, the next (changed) save is accepted: the stack's last write was this editor's own", async () => {
   const db = reset();
   const id = await seedStack(db);
@@ -613,6 +675,8 @@ test("stackSaveRequest: 409 stale is a StackConflict, other 4xx a refusal, 5xx a
     ["a gateway timeout page", async () => ({ ok: false, status: 504, json: async () => { throw new SyntaxError("not json"); } })],
     ["a success whose body is not JSON", async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("cut off"); } })],
     ["a success that names no stack", async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })],
+    ["a 429 from something between the browser and the route", async () => ({ ok: false, status: 429, json: async () => ({}) })],
+    ["a 408 from something between the browser and the route", async () => ({ ok: false, status: 408, json: async () => ({}) })],
   ];
   for (const [label, impl] of unconfirmedCases) {
     await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, impl), (e) => {
@@ -713,12 +777,22 @@ test("the route saves only through the function; the editor sends versions and h
   assert.match(modal, /setUnconfirmed\(e instanceof StackSaveUnconfirmed\)/);
   assert.match(modal, /errorLabel=\{unconfirmed \? "Not confirmed:" : undefined\}/);
   assert.doesNotMatch(modal, /StackSaveUnconfirmed\) chain\.current\.refused/);
+  // After an unconfirmed save the loaded values are not "unchanged": the Autosaver is told so (see the real-Autosaver
+  // test above), and the hook passes the option through.
+  assert.match(modal, /unknownOutcome: stackSaveUnknownOutcome,/);
+  assert.match(modal, /if \(e instanceof StackSaveUnconfirmed\) savedAny\.current = true;/, "closing re-reads the list after a maybe-saved change");
+  assert.match(read("lib/use-autosave.ts"), /unknownOutcome: \(e\) => optsRef\.current\.unknownOutcome\?\.\(e\) \?\? false,/);
   assert.match(modal, /chain\.current\.accepted\(json\.version\)/);
   assert.match(modal, /new StackSaveChain\(stack\.stack_id \? \(stack\.version \?\? null\) : null, newClientKey\)/);
   assert.match(modal, /Load the latest version/);
   const page = read("app/supplements/SupplementsClient.tsx");
   assert.match(page, /version: s\.version \?\? null/);
-  // After a save the list is read again; until then a stack cannot be reopened from its old version.
-  assert.match(page, /setStacksReloading\(true\);\s+try \{\s+await loadStacks\(\);\s+\} finally \{\s+setStacksReloading\(false\);/);
-  assert.match(page, /disabled=\{stacksReloading\}/);
+  // After a save the list is read again; until then, and after a failed read until Retry works, a stack cannot be
+  // reopened from its old version (behaviour: tests/supplements-page.test.cjs).
+  assert.match(page, /onSaved=\{async \(\) => \{\s+setEditingStack\(null\);[\s\S]{0,200}?await loadStacks\(\{ blocking: true \}\);/);
+  assert.match(page, /if \(opts\?\.blocking\) setStacksReloading\(true\);/);
+  assert.match(page, /if \(seq === stacksReadSeq\.current\) setStacksLoadFailed\(true\);/);
+  assert.match(page, /disabled=\{stacksReloading \|\| stacksLoadFailed\}/);
+  assert.match(page, /onClick=\{\(\) => void loadStacks\(\{ blocking: true \}\)\}/);
+  assert.doesNotMatch(page, /console\.error\("Stacks load:", e\);\s+\}/, "a failed read is never swallowed");
 });

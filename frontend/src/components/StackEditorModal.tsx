@@ -3,7 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused } from "@/lib/autosave";
-import { StackConflict, StackSaveChain, StackSaveUnconfirmed, stackSaveRequest } from "@/lib/supplement-stack-chain";
+import {
+  StackConflict,
+  StackSaveChain,
+  StackSaveUnconfirmed,
+  stackSaveRequest,
+  stackSaveUnknownOutcome,
+} from "@/lib/supplement-stack-chain";
 import { useAutosave } from "@/lib/use-autosave";
 
 /** A product from the /supplements library picker (subset of the page's Product). */
@@ -107,6 +113,9 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
   const autosave = useAutosave<StackForm>("stack-editor", {
     delayMs: 500,
     ready: notReady,
+    // After an unconfirmed save the stack may hold that value: changing back to the loaded values is then sent (as a
+    // newer save after the unanswered one), never dropped as "unchanged" with the unwanted change left stored.
+    unknownOutcome: stackSaveUnknownOutcome,
     save: async (f, { keepalive }) => {
       const body = {
         name: f.name.trim(),
@@ -131,6 +140,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         if (e instanceof AutosaveRefused) chain.current.refused(fields);
         if (e instanceof StackConflict) setConflict(true);
         setUnconfirmed(e instanceof StackSaveUnconfirmed);
+        // It may have gone through: closing then re-reads the list (onSaved) instead of keeping the old version.
+        if (e instanceof StackSaveUnconfirmed) savedAny.current = true;
         throw e;
       }
       setUnconfirmed(false);
