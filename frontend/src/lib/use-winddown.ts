@@ -64,6 +64,7 @@ import {
   type LastTap,
   type NightAnswer,
   type NightIntent,
+  type PendingTap,
   type SaverState,
   type WindDownPayload,
 } from "@/lib/sleep-winddown";
@@ -176,7 +177,11 @@ function accept(raw: unknown, fresh = false): boolean {
   // A night that already shows its answer proves nothing (another writer may have set it while the tap is still on
   // its way), so that tap is offered to be settled by its id instead (SLEEP01-R2).
   const kept = readKept();
-  if (kept.kind === "drop" && !saver.unsaved && fencing === null) keep(null);
+  // "drop" means the request as sent can no longer be accepted, but a request already inside the database when the day
+  // or the goal moved may still commit: the kept copy is forgotten only after the server settled that tap id under
+  // the write's own lock (pds.sleep_winddown_cancel_op; SLEEP01-R2). Until then every answer button waits.
+  const dropping = kept.kind === "drop" && !saver.unsaved;
+  if (dropping && fencing === null) settleDropped();
   const owned = saver.unsaved || fencing !== null;
   // Undo is judged on the server's own read: a goal switched since (another habit) or an answer changed since (a
   // replayed tap's later edits) leaves nothing to undo.
@@ -185,10 +190,23 @@ function accept(raw: unknown, fresh = false): boolean {
     load: "ready", refreshFailed: false, at: clientCache.fetchedAt(WINDDOWN_URL) ?? Date.now(), fresh: snap.fresh || fresh,
     recovery: !owned && kept.kind === "offer" ? kept.intent : null,
     // (A payload that is not ready has no answer buttons: nothing to say about a kept tap until the goal exists.)
-    recoveryChecking: fencing !== null || (!saver.unsaved && kept.kind === "hold" && next.status === "ready"),
+    recoveryChecking: fencing !== null || dropping || (!saver.unsaved && kept.kind === "hold" && next.status === "ready"),
     last,
   });
   return true;
+}
+
+/** Tap ids whose settlement was tried lately (a failed attempt is repeated on a later read, never in a tight loop). */
+const settleTried = new Map<string, number>();
+const SETTLE_RETRY_MS = 30_000;
+function settleDropped() {
+  let tap: PendingTap | null = null;
+  try { tap = parsePending(window.localStorage.getItem(WINDDOWN_PENDING_KEY)); } catch { /* none */ }
+  if (!tap) return;
+  const last = settleTried.get(tap.opId);
+  if (last !== undefined && Date.now() - last < SETTLE_RETRY_MS) return;
+  settleTried.set(tap.opId, Date.now());
+  void fenceRefused(tap);
 }
 
 /**
@@ -215,6 +233,17 @@ function readServer(): Promise<boolean> {
   reading = job;
   p.finally(() => { if (reading === job) reading = null; }).catch(() => {});
   return p;
+}
+
+/**
+ * The warm-up's read (components/AppData): tagged with the write count at its start like every other read, so a
+ * response that was answered before a confirmed write is never shown, however late it is stored.
+ */
+export async function warmWindDownRead(): Promise<unknown> {
+  const seq = writeSeq;
+  const data = await fetchJsonValue(WINDDOWN_URL);
+  if (data !== GONE && data && typeof data === "object") born.set(data, seq);
+  return data;
 }
 
 /** Read the payload (the cached copy is already showing, then the server). Never writes. */
@@ -378,6 +407,7 @@ function resetAfterSessionEnd() {
   settling = false;
   fencing = null;
   resentKept.clear();
+  settleTried.clear();
   keep(null);
   unsavedWork.setDirty("sleep-winddown", false);
   snap = INITIAL;

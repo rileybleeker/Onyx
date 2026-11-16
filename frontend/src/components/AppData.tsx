@@ -41,6 +41,10 @@ function localDay(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// Read through the wind-down store so the answer is tagged with the write count at its start (a late pre-save
+// response must never replace a confirmed answer).
+const windDownWarmer = (): DataWarmer => ({ key: "/api/sleep/winddown", fetch: () => import("@/lib/use-winddown").then((m) => m.warmWindDownRead()) });
+
 const inboxWarmer: DataWarmer = { key: CACHE_KEYS.agentsInbox, fetch: () => agentsApi.inbox() };
 
 function logUberEatsWarmers(): DataWarmer[] {
@@ -72,7 +76,7 @@ const DATA: Record<string, () => DataWarmer[]> = {
       json("/api/procurement/renewals/summary"),
       json("/api/finance/alerts"),
       // The wind-down panel (components/sleep/WindDownPanel, opt-in): GET only, same key as its store.
-      json("/api/sleep/winddown"),
+      windDownWarmer(),
       // The overview cards under Today's panels (shown cards only; memory-only and Today's own keys excluded).
       ...overviewWarmers(),
     ];
@@ -88,7 +92,7 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
     // Wind-down (app/log/sections/WindDown.tsx): GET only, same key as the store (lib/use-winddown.ts).
-    json("/api/sleep/winddown"),
+    windDownWarmer(),
     // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
     json("/api/nutrition/drinks"),
     // Uber Eats (app/log/sections/UberEats.tsx): behavioral today, today's dish window, the harvester heartbeat.

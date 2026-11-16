@@ -723,7 +723,18 @@ test("a refusal after an unanswered send is settled by the tap's id before its k
   assert.match(store, /earlierSend && !WINDDOWN_FINAL_REFUSALS\.has\(e\.code\)[^\n]*\) \{\s+void fenceRefused\(intent\);\s+return;/);
   assert.match(store, /resentKept\.add\(r\.opId\);/, "a kept tap sent again had an unanswered send in an earlier visit");
   // The store forgets a kept tap on a read only when the decision says its request can no longer land.
-  assert.match(store, /if \(kept\.kind === "drop" && !saver\.unsaved && fencing === null\) keep\(null\);/);
+  // ...and even then only after the server settled that tap id under the write's own lock (SLEEP01-R2): never a bare keep(null).
+  assert.match(store, /if \(dropping && fencing === null\) settleDropped\(\);/);
+  assert.ok(!/kind === "drop".*keep\(null\)/.test(store),"a dropped decision never forgets the tap without the server");
+  const settle = store.slice(store.indexOf("function settleDropped("), store.indexOf("async function fenceRefused(") > 0 ? store.indexOf("const settleTried") + 600 : undefined);
+  assert.match(settle, /void fenceRefused\(tap\)/);
+  assert.match(settle, /SETTLE_RETRY_MS/, "a failed settlement is repeated later, not in a tight loop");
+  assert.match(store, /recoveryChecking: fencing !== null \|\| dropping \|\|/, "answer buttons wait while a dropped tap is being settled");
+  // Warm-up reads go through the store's tagged read, never a plain fetch of the same key.
+  const appData = read("components/AppData.tsx");
+  assert.ok(!/json\("\/api\/sleep\/winddown"\)/.test(appData), "no untagged warm-up read of the wind-down payload");
+  assert.match(appData, /warmWindDownRead\(\)/);
+  assert.match(store, /export async function warmWindDownRead\(\)[\s\S]*?born\.set\(data, seq\)/, "warm-up read tagged with the write count at its start");
   assert.ok(!/answerOn\(server/.test(store), "the store never compares answers to decide a kept tap");
   const lib = read("lib/sleep-winddown.ts");
   const decision = lib.slice(lib.indexOf("export function keptTapDecision("), lib.indexOf("export function pendingToOffer("));
