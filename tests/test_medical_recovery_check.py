@@ -5,21 +5,27 @@ and files:
   * a healthy store passes, prints counts only (no id, storage path, key or record text), and asks
     PostgREST for id / path / size / type / state columns only, never a text column;
   * failure-recovery: a restore that lost a file (from the listing, or only its bytes in the storage
-    backend), changed a size or type, left a lab result pointing at a missing document, cleared or
-    reassigned a lab result's document link, brought back a removed document as live, or brought
-    back a corrupted / truncated / look-alike file is a FAIL;
+    backend: proven by a download on the drill, whether Storage answers not-found or 500; on
+    production that is unknown, never a pass, because HEAD and the listing read the row only),
+    changed a size or type, left a lab result pointing at a missing document, cleared or reassigned
+    a lab result's document link, brought back a removed document as live, or brought back a
+    corrupted / truncated / look-alike file is a FAIL; a content type with parameters or capitals
+    is compared the way the app's complete route compares it;
   * privacy / cross-user: a public bucket, a changed size cap or type list, the anon key or a
-    signed-in user's token reaching a table or listing a file, or the public URL serving a file are
-    each a FAIL; a stale / invalid key, a probe answered without a permission code and a malformed
-    listing are INCOMPLETE, never a pass;
+    signed-in user's token reaching a table, listing a file or reaching one file directly (with the
+    listing still empty), or the public URL serving a file are each a FAIL; every file probe on
+    production is a HEAD (no bytes); a stale / invalid key, a table probe answered without a
+    permission code, a listing answered with anything but a list or "bucket not found" (e.g.
+    "Invalid Compact JWS") and a malformed listing are INCOMPLETE, never a pass;
   * retry: network errors and 5xx are retried with backoff and then pass; a read that keeps failing
     is INCOMPLETE (exit 2), never a pass; a 401 / 403 is not retried and becomes the exact access ask;
   * backups: no access token = incomplete with the access ask; a backup older than 36 h = fail;
-    the backup summary keeps dates and counts only;
+    the backup summary keeps dates and counts only; a fresh point-in-time value does not hide
+    failed daily backups when PITR is off;
   * the drill: files are opened, backups skipped and a manifest written only on a local stack or a
     named throwaway project, never on production (refused before any request); the manifest is
     written only from a PASS; a wipe is detected against the manifest and a full restore passes,
-    including the signed-link fetch;
+    including the signed-link fetch; a drill target never reads the production key file;
   * paging past PostgREST's 1000-row cap; placeholder files and orphans warn instead of failing.
 
 Synthetic data only. No network, no credentials.
@@ -60,6 +66,10 @@ JPEG = (b"\xff\xd8"
         + b"\x00\x00\x00\x00\xff\xd9")
 TEXT_COLUMNS = ("title", "provider", "notes", "test_name", "value_num", "value_text", "unit", "ref_text", "lab")
 INVALID_KEY = b'{"message":"Invalid API key"}'
+NOT_FOUND = b'{"statusCode":"404","error":"not_found","message":"Object not found"}'
+BAD_JWS = b'{"statusCode":"403","error":"Unauthorized","message":"Invalid Compact JWS"}'
+INTERNAL = (500, b'{"statusCode":"500","error":"Internal","message":"Internal Server Error"}')
+BYTE_CHECKS = ("files_stored", "stored_sizes_match")
 
 
 def uid(n: int) -> str:
@@ -100,7 +110,7 @@ class FakeServer:
     def __init__(self, docs, labs, files, *, public=False, limit=rc.EXPECTED_LIMIT, types=rc.EXPECTED_TYPES,
                  anon_table=False, anon_list=False, user_table=False, user_list=False, anon_table_answer=None,
                  anon_list_answer=None, lost_bytes=(), fail=None, backups=None, extra_top=(), extra_docs=(),
-                 signed_bytes=None):
+                 signed_bytes=None, anon_file=False, user_file=False, lost_answer=None):
         self.tables = {"medical_documents": docs, "lab_results": labs}
         self.files = dict(files)
         self.public, self.limit, self.types = public, limit, sorted(types)
@@ -108,11 +118,13 @@ class FakeServer:
         self.user_table, self.user_list = user_table, user_list
         self.anon_table_answer, self.anon_list_answer = anon_table_answer, anon_list_answer
         self.lost_bytes = set(lost_bytes)  # listed (storage.objects row) but the bytes are gone
+        self.lost_answer = lost_answer or INTERNAL  # the local file backend answers 500 for a missing file
+        self.anon_file, self.user_file = anon_file, user_file  # a policy letting the role read one file
         self.fail = {k: list(v) for k, v in (fail or {}).items()}
         self.backups = backups if backups is not None else recent_backups()
         self.extra_top, self.extra_docs = list(extra_top), list(extra_docs)
         self.signed_bytes = signed_bytes
-        self.calls, self.selects = [], []
+        self.calls, self.selects, self.heads = [], [], []
 
     def __call__(self, method, url, headers, body, read_body=True):
         parts = urllib.parse.urlsplit(url)
@@ -165,7 +177,9 @@ class FakeServer:
                 return 400, b"{}"
             return 200, json.dumps(items[req["offset"]:req["offset"] + req["limit"]]).encode()
         if path.startswith(f"/storage/v1/object/public/{rc.BUCKET}/"):
-            return (200, b"") if self.public else (400, b"{}")
+            if method == "HEAD":
+                self.heads.append((path, "public"))
+            return (200, b"") if self.public else (400, b"" if method == "HEAD" else NOT_FOUND)
         if path.startswith(f"/storage/v1/object/sign/{rc.BUCKET}/"):
             obj = urllib.parse.unquote(path.split(f"/object/sign/{rc.BUCKET}/", 1)[1])
             if method == "POST":
@@ -177,11 +191,25 @@ class FakeServer:
             return 200, self.signed_bytes if self.signed_bytes is not None else self.files[obj][1]
         if path.startswith(f"/storage/v1/object/{rc.BUCKET}/"):
             obj = urllib.parse.unquote(path.split(f"/object/{rc.BUCKET}/", 1)[1])
-            if key != SERVICE or obj not in self.files or obj in self.lost_bytes:
-                return 400, b"", {}
+            who = "user" if user else "anon" if key == ANON else "service" if key == SERVICE else "other"
+            if method == "HEAD":
+                self.heads.append((obj, who))
+            if who in ("user", "anon"):
+                # row-level security on storage.objects: with no policy the row is invisible to the role
+                if (self.user_file if who == "user" else self.anon_file) and obj in self.files:
+                    return 200, b"" if method == "HEAD" else self.files[obj][1], {}
+                return 400, b"" if method == "HEAD" else NOT_FOUND, {}
+            if who != "service":
+                return 400, BAD_JWS, {}
+            if obj not in self.files:
+                return 400, b"" if method == "HEAD" else NOT_FOUND, {}
             mime, data = self.files[obj]
             if method == "HEAD":
+                # like Storage: HEAD is answered from the storage.objects row and never asks the backend, so a
+                # file whose bytes are gone still answers 200 (why HEAD is not byte evidence)
                 return 200, b"", {"content-length": str(len(data)), "content-type": mime}
+            if obj in self.lost_bytes:
+                return self.lost_answer[0], self.lost_answer[1], {}
             return 200, data, {"content-length": str(len(data)), "content-type": mime}
         return 404, b"{}"
 
@@ -239,6 +267,13 @@ def result(report, name):
     return next(c for c in report["checks"] if c["name"] == name)
 
 
+def only_bytes_unknown(report):
+    """Production's best result: everything read, only the bytes unknown (real records are never downloaded)."""
+    unknown = {c["name"] for c in report["checks"] if c["result"] == "unknown"}
+    return (report["status"] == "incomplete" and unknown == set(BYTE_CHECKS)
+            and [u["stage"] for u in report.get("incomplete", [])] == ["bytes"])
+
+
 def assert_private_output(text):
     for secret in (SERVICE, ANON, TOKEN, USER, "Synthetic title", "synthetic note", "Synthetic test", "documents/", uid(1)):
         assert secret not in text, secret
@@ -254,26 +289,38 @@ def seed_manifest(tmp, docs, labs, files):
 
 # ---------------------------------------------------------------- healthy store, counts only
 
-def test_healthy_store_passes_with_counts_only():
+def test_healthy_store_on_production_reads_everything_but_the_bytes():
     docs, labs, files = healthy()
     server = FakeServer(docs, labs, files, backups=recent_backups(hours_ago=5))
     code, text, report, _ = run(server)
-    assert code == 0, text
-    assert report["status"] == "pass"
+    assert code == 2 and only_bytes_unknown(report), text  # never PASS without byte evidence
     assert report["counts"]["documents"] == 4 and report["counts"]["documents_ready"] == 3
     assert report["counts"]["files"] == 3 and report["counts"]["lab_results_linked"] == 1
     assert report["backups"]["state"] == "read" and report["backups"]["completed_backups"] == 7
-    for name in ("public_url_refused", "files_stored", "stored_sizes_match", "anon_tables_refused",
-                 "authenticated_tables_refused", "authenticated_files_hidden"):
+    for name in ("public_url_refused", "anon_tables_refused", "anon_files_hidden", "anon_file_refused",
+                 "authenticated_tables_refused", "authenticated_files_hidden", "authenticated_file_refused",
+                 "ready_documents_have_file", "file_sizes_match", "lab_links_resolve", "database_backup_recent"):
         assert result(report, name)["result"] == "pass", name
     assert_private_output(text)
     # only ids, paths, sizes, types and states are ever requested
     assert server.selects and all(not any(c in sel.split(",") for c in TEXT_COLUMNS) for _, sel in server.selects)
     assert ("medical_documents", rc.DOC_SELECT) in server.selects and ("lab_results", rc.LAB_SELECT) in server.selects
-    # read-only, and no file is downloaded on production: GET, HEAD (headers only) and list calls
+    # read-only, and no file is downloaded or signed on production: GET, HEAD (headers only) and list calls
     assert all(m in ("GET", "HEAD") or p.endswith(f"/object/list/{rc.BUCKET}") for m, _, p in server.calls), server.calls
-    assert sum(1 for m, _, _ in server.calls if m == "HEAD") == 3  # one per ready document, removed ones included
-    assert not any(m == "GET" and p.startswith(f"/storage/v1/object/{rc.BUCKET}/") for m, _, p in server.calls)
+    assert not any(m == "GET" and p.startswith("/storage/v1/object/") for m, _, p in server.calls)
+    assert not any("/object/sign/" in p for _, _, p in server.calls)
+    # a HEAD only from the role and public-URL probes, never with the service key
+    assert sorted(w for _, w in server.heads) == ["anon", "public", "user"]
+
+
+def test_healthy_drill_target_passes_with_the_bytes_proven():
+    docs, labs, files = healthy()
+    code, text, report, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 0 and report["status"] == "pass", text
+    for name in BYTE_CHECKS + ("files_open", "signed_link_serves_file", "anon_file_refused",
+                               "authenticated_file_refused"):
+        assert result(report, name)["result"] == "pass", name
+    assert_private_output(text)
 
 
 def test_human_output_is_counts_only_too():
@@ -284,8 +331,9 @@ def test_human_output_is_counts_only_too():
         kf.write_text(SERVICE, encoding="utf-8")
         code = rc.main(["--url", PROD, "--key-file", str(kf)], transport=FakeServer(docs, labs, files),
                        sleep=lambda s: None, out=out)
-    assert code == 0
-    assert out.getvalue().startswith("medical records recovery check: PASS")
+    assert code == 2
+    assert out.getvalue().startswith("medical records recovery check: INCOMPLETE")
+    assert "incomplete: bytes:" in out.getvalue()
     assert_private_output(out.getvalue())
 
 
@@ -297,18 +345,35 @@ def test_restore_that_lost_a_file_fails():
     code, text, report, _ = run(FakeServer(docs, labs, files))
     assert code == 1 and report["status"] == "fail"
     assert result(report, "ready_documents_have_file") == {"name": "ready_documents_have_file", "result": "fail", "count": 1}
-    assert result(report, "files_stored")["result"] == "fail"
+    assert result(report, "files_stored")["result"] == "unknown"  # production never claims the bytes
     assert_private_output(text)
+    code, _, report, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 1 and result(report, "files_stored") == {"name": "files_stored", "result": "fail", "count": 1}
 
 
-def test_list_entry_whose_bytes_are_gone_fails():
-    # a database restore brings storage.objects rows back without the bytes: the listing alone looks fine
+def test_list_entry_whose_bytes_are_gone_fails_on_the_drill_and_never_passes_on_production():
+    # a database restore brings storage.objects rows back without the bytes: the listing AND a HEAD look fine
     docs, labs, files = healthy()
-    code, text, report, _ = run(FakeServer(docs, labs, files, lost_bytes={f"documents/{uid(1)}"}))
-    assert code == 1 and report["status"] == "fail"
-    assert result(report, "ready_documents_have_file")["result"] == "pass"
-    assert result(report, "files_stored") == {"name": "files_stored", "result": "fail", "count": 1}
-    assert_private_output(text)
+    lost = {f"documents/{uid(1)}"}
+    code, text, report, _ = run(FakeServer(docs, labs, files, lost_bytes=lost))
+    assert code == 2 and only_bytes_unknown(report), text
+    # the drill: the local file backend answers 500 for the missing file, the hosted backend a not-found
+    for answer in (None, (400, NOT_FOUND), (404, b"")):
+        server = FakeServer(docs, labs, files, lost_bytes=lost, lost_answer=answer)
+        code, text, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+        assert code == 1 and report["status"] == "fail", (answer, text)
+        assert result(report, "ready_documents_have_file")["result"] == "pass"
+        assert result(report, "files_stored") == {"name": "files_stored", "result": "fail", "count": 1}
+        assert result(report, "signed_link_serves_file")["result"] == "pass"  # from a file that was served
+        assert_private_output(text)
+
+
+def test_download_refused_for_another_reason_is_incomplete():
+    # a 400 that is not Storage's not-found answer (a credential error) proves nothing about the bytes
+    docs, labs, files = healthy()
+    server = FakeServer(docs, labs, files, lost_bytes={f"documents/{uid(1)}"}, lost_answer=(400, BAD_JWS))
+    code, _, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 2 and result(report, "files_stored")["result"] == "unknown"
 
 
 def test_removed_document_keeps_its_file_for_undo():
@@ -324,7 +389,16 @@ def test_size_and_type_mismatches_fail():
     _, _, report, _ = run(FakeServer(docs, labs, files))
     assert result(report, "file_sizes_match")["result"] == "fail"
     assert result(report, "file_types_match")["result"] == "fail"
-    assert result(report, "stored_sizes_match")["result"] == "fail"
+    _, _, report, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--open-files", url=LOCAL)
+    assert result(report, "stored_sizes_match")["result"] == "fail"  # the downloaded bytes, not the row
+
+
+def test_content_type_is_compared_like_the_complete_route():
+    # the app's complete route accepts "Application/PDF; charset=binary" as application/pdf: no false alarm
+    docs, labs, files = healthy()
+    files[f"documents/{uid(1)}"] = ("Application/PDF; charset=binary", PDF)
+    _, _, report, _ = run(FakeServer(docs, labs, files))
+    assert result(report, "file_types_match")["result"] == "pass"
 
 
 def test_lab_result_pointing_at_a_missing_document_fails():
@@ -338,7 +412,7 @@ def test_link_to_a_removed_document_only_warns():
     docs, labs, files = healthy()
     labs.append(lab(4, uid(4)))
     code, _, report, _ = run(FakeServer(docs, labs, files))
-    assert result(report, "lab_links_live")["result"] == "warn" and code == 0
+    assert result(report, "lab_links_live")["result"] == "warn" and code == 2 and only_bytes_unknown(report)
 
 
 def test_placeholders_and_orphans_warn_but_do_not_fail():
@@ -347,7 +421,7 @@ def test_placeholders_and_orphans_warn_but_do_not_fail():
     server = FakeServer(docs, labs, files, extra_top=[{"name": "stray.pdf", "id": "x", "metadata": {}}],
                         extra_docs=[{"name": ".emptyFolderPlaceholder", "id": "y", "metadata": {"size": 0}}])
     code, _, report, _ = run(server)
-    assert code == 0 and report["status"] == "pass"
+    assert code == 2 and only_bytes_unknown(report)  # warnings never fail the check
     assert result(report, "no_orphan_files") == {"name": "no_orphan_files", "result": "warn", "count": 1}
     assert result(report, "no_unexpected_paths") == {"name": "no_unexpected_paths", "result": "warn", "count": 2}
 
@@ -379,6 +453,21 @@ def test_signed_in_user_reaching_a_table_or_a_file_fails():
     assert_private_output(text)
 
 
+def test_file_reachable_directly_while_the_listing_is_empty_fails():
+    # listing and download are separate permissions in Storage: an empty listing alone proves nothing
+    docs, labs, files = healthy()
+    server = FakeServer(docs, labs, files, anon_file=True, user_file=True)
+    code, text, report, _ = run(server)
+    assert code == 1 and report["status"] == "fail"
+    assert result(report, "anon_files_hidden")["result"] == "pass"
+    assert result(report, "authenticated_files_hidden")["result"] == "pass"
+    assert result(report, "anon_file_refused")["result"] == "fail"
+    assert result(report, "authenticated_file_refused")["result"] == "fail"
+    assert_private_output(text)
+    # the probe is a HEAD: no bytes of a real record are sent even when the role may read them
+    assert not any(m == "GET" and p.startswith("/storage/v1/object/") for m, _, p in server.calls)
+
+
 def test_missing_anon_key_is_incomplete_not_pass():
     docs, labs, files = healthy()
     code, _, report, _ = run(FakeServer(docs, labs, files), anon=None)
@@ -393,8 +482,8 @@ def test_invalid_anon_key_is_incomplete_not_a_privacy_pass():
     docs, labs, files = healthy()
     code, text, report, _ = run(FakeServer(docs, labs, files), anon="anon-key-STALE")
     assert code == 2 and report["status"] == "incomplete", text
-    for name in ("anon_tables_refused", "anon_files_hidden", "public_url_refused",
-                 "authenticated_tables_refused", "authenticated_files_hidden"):
+    for name in ("anon_tables_refused", "anon_files_hidden", "anon_file_refused", "public_url_refused",
+                 "authenticated_tables_refused", "authenticated_files_hidden", "authenticated_file_refused"):
         assert result(report, name)["result"] == "unknown", name
     ask = next(u for u in report["incomplete"] if u["stage"] == "anon")
     assert "401" in ask["reason"] and ask["ask"] == rc.ACCESS_ASK["anon"]
@@ -407,10 +496,15 @@ def test_probe_without_a_permission_refusal_is_unknown():
     code, _, report, _ = run(FakeServer(docs, labs, files, anon_table_answer=(401, b'{"code":"PGRST301"}')))
     assert code == 2 and result(report, "anon_tables_refused")["result"] == "unknown"
     assert any(u["stage"] == "anon" and "without a permission refusal" in u["reason"] for u in report["incomplete"])
-    # a listing that is not a list, and a listing refused for a credential problem
-    for answer in ((200, b'{"not":"a list"}'), (200, b"<html>"), (400, b'{"error":"InvalidJWT","message":"invalid signature"}')):
+    # a listing that is not a list, and a listing refused for a credential problem (whatever its wording)
+    for answer in ((200, b'{"not":"a list"}'), (200, b"<html>"),
+                   (400, b'{"error":"InvalidJWT","message":"invalid signature"}'), (400, BAD_JWS), (403, b"{}")):
         code, _, report, _ = run(FakeServer(docs, labs, files, anon_list_answer=answer))
         assert code == 2 and result(report, "anon_files_hidden")["result"] == "unknown", answer
+    # the bucket itself hidden from the role is an answer given after the credential was accepted
+    hidden = (400, b'{"statusCode":"404","error":"Bucket not found","message":"Bucket not found"}')
+    code, _, report, _ = run(FakeServer(docs, labs, files, anon_list_answer=hidden))
+    assert result(report, "anon_files_hidden")["result"] == "pass" and only_bytes_unknown(report)
 
 
 def test_missing_or_invalid_user_token_is_an_access_ask():
@@ -433,7 +527,7 @@ def test_transient_errors_are_retried_then_pass():
     server = FakeServer(docs, labs, files, fail={"/rest/v1/medical_documents": [503, "network"],
                                                  f"/storage/v1/object/list/{rc.BUCKET}": [429]})
     code, _, report, sleeps = run(server)
-    assert code == 0 and report["status"] == "pass"
+    assert code == 2 and only_bytes_unknown(report)  # every retried read completed
     assert sleeps[:2] == [1.0, 2.0] and 1.0 in sleeps[2:]
 
 
@@ -509,10 +603,20 @@ def test_backup_summary_keeps_dates_and_counts_only():
     assert rc.summarize_backups(["not", "a", "dict"], NOW) == {"state": "unreadable"}
 
 
+def test_fresh_pitr_point_does_not_hide_failed_daily_backups():
+    # PITR off: only COMPLETED daily backups count, whatever physical_backup_data says
+    latest = int(datetime(2026, 1, 15, 11, 0, tzinfo=timezone.utc).timestamp())
+    s = rc.summarize_backups({"pitr_enabled": False,
+                              "backups": [{"status": "FAILED", "inserted_at": "2026-01-15T03:00:00Z"}],
+                              "physical_backup_data": {"latest_physical_backup_date_unix": latest}}, NOW)
+    assert s["completed_backups"] == 0 and s["newest"] is None and s["newest_age_hours"] is None
+    assert result(rc.evaluate(rc.Inventory(backups=s)), "database_backup_recent")["result"] == "fail"
+
+
 def test_skip_backups_is_explicit_in_the_report_on_a_drill_target():
     docs, labs, files = healthy()
     server = FakeServer(docs, labs, files)
-    code, _, report, _ = run(server, "--skip-backups", token=None, url=LOCAL)
+    code, _, report, _ = run(server, "--skip-backups", "--open-files", token=None, url=LOCAL)
     assert code == 0 and result(report, "database_backup_recent")["result"] == "skip"
     assert server.calls and not any(h == "api.supabase.com" for _, h, _ in server.calls)
 
@@ -550,6 +654,31 @@ def test_production_is_never_a_drill_target():
             pass
 
 
+def test_drill_target_never_reads_the_production_key_file():
+    # the default key file holds the production key: a drill stack (whose logs may keep headers) never gets it
+    server = FakeServer(*healthy())
+    saved = rc.DEFAULT_KEY_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        prod_file = Path(tmp) / "onyx_supabase_secret"
+        prod_file.write_text(SERVICE, encoding="utf-8")
+        rc.DEFAULT_KEY_FILE = prod_file
+        try:
+            for extra in ([], ["--key-file", str(prod_file)]):
+                out = io.StringIO()
+                with Env():
+                    code = rc.main(["--url", LOCAL, "--skip-backups", "--open-files", *extra], transport=server,
+                                   sleep=lambda s: None, out=out)
+                assert code == 2 and "drill stack's service key" in out.getvalue(), extra
+            assert server.calls == [], "nothing was sent to the drill target"
+            out = io.StringIO()
+            with Env():  # on production the same file is the key
+                code = rc.main(["--url", PROD], transport=server, sleep=lambda s: None, out=out)
+            assert code == 2 and out.getvalue().startswith("medical records recovery check: INCOMPLETE")
+            assert server.calls
+        finally:
+            rc.DEFAULT_KEY_FILE = saved
+
+
 def test_drill_wipe_is_detected_and_full_restore_passes():
     docs, labs, files = healthy()
     with tempfile.TemporaryDirectory() as tmp:
@@ -573,6 +702,7 @@ def test_drill_wipe_is_detected_and_full_restore_passes():
         assert code == 0, text
         for name in ("files_open", "manifest_hashes_match", "manifest_sizes_match", "signed_link_serves_file",
                      "bucket_private", "anon_tables_refused", "authenticated_tables_refused", "files_stored",
+                     "anon_file_refused", "authenticated_file_refused", "stored_sizes_match",
                      "lab_links_resolve", "manifest_document_state_match", "manifest_lab_links_match"):
             assert result(report, name)["result"] == "pass", name
         assert_private_output(text)

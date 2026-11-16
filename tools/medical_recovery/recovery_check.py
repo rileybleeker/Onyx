@@ -5,23 +5,28 @@ value, id or storage path, and never sends anything to a model. It answers three
 docs/medical-records-recovery.md:
 
   1. Do the metadata relationships hold?  Every confirmed document (status 'ready', removed or not:
-     removal is soft and keeps the file for Undo) has its file in the bucket listing AND in the
-     storage backend (a HEAD request: headers only, no bytes are sent) with the size and type its row
-     declares; every lab result's document_id resolves; no file sits outside documents/.
+     removal is soft and keeps the file for Undo) has its file in the bucket listing with the size and
+     type its row declares; every lab result's document_id resolves; no file sits outside documents/.
+     The listing (and a HEAD request) read the storage.objects ROW only, which comes back with a
+     database restore even when the bytes did not, so the bytes themselves are proven only by opening
+     the files on a drill target (below). On production that check is reported as unknown, never as
+     a pass: this tool does not download real records.
   2. Is it still private?  The bucket is private with the 25 MB cap and the type list; the anon key
-     and a signed-in user's token each reach neither table and list no file, and the public URL of a
-     file is refused. A refusal counts only when it is a real permission answer (PostgREST code 42501
-     or PGRST106) after the key itself was accepted: a stale or invalid key is "incomplete", never a
-     pass.
+     and a signed-in user's token each reach neither table, list no file and cannot reach one file
+     directly (a HEAD request: the same row-level check a download makes, no bytes sent), and the
+     public URL of a file is refused (HEAD as well). A refusal counts only after the key itself was
+     accepted: a table refusal must be PostgREST's permission answer (42501 or PGRST106), a listing
+     must answer a list (or "bucket not found"); a stale or invalid key is "incomplete", never a pass.
   3. Is there a recent database backup?  Supabase's Management API backup list (needs a personal
      access token in SUPABASE_ACCESS_TOKEN; the Supabase MCP has no backup tool). Storage files are
      NOT in those backups (Supabase docs), which is why the doc's off-site plan exists.
 
 On a DRILL target only (a local Supabase stack on localhost / 127.0.0.1, or a throwaway hosted
 project named with --drill-project, never the production project) it can also open every file
-(download into memory, SHA-256, "does it parse as its declared type", and one file fetched through a
-60-second signed link, the app's own viewing path) and write or compare a manifest of every file's
-size and hash, every document's path / size / type / state and every lab result's document link.
+(download into memory: are the bytes served at their declared size, SHA-256, "does it parse as its
+declared type", and one file fetched through a 60-second signed link, the app's own viewing path) and
+write or compare a manifest of every file's size and hash, every document's path / size / type /
+state and every lab result's document link.
 On production those options are refused: real records are never downloaded by this tool.
 A missing key, a refused read (401 / 403) or a read that keeps failing is reported as "incomplete"
 with the exact access to ask for, never as a pass.
@@ -31,9 +36,12 @@ Usage (from the repo root):
   python tools/medical_recovery/recovery_check.py --write-synthetic DIR   # made-up drill files
   python tools/medical_recovery/recovery_check.py --skip-backups --url http://127.0.0.1:54321 \
       --open-files --manifest drill-manifest.json                    # the recovery drill
-Keys: SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret; SUPABASE_ANON_KEY (or
-NEXT_PUBLIC_SUPABASE_ANON_KEY); SUPABASE_USER_ACCESS_TOKEN (a signed-in user's short-lived access
-token) for the signed-in-user probe; SUPABASE_ACCESS_TOKEN for the backup list. Keys are never printed.
+Keys: SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret (production only: a drill target reads
+the environment variable or an explicit --key-file, never the production key file); SUPABASE_ANON_KEY
+(or NEXT_PUBLIC_SUPABASE_ANON_KEY); SUPABASE_USER_ACCESS_TOKEN (a signed-in user's short-lived access
+token) for the signed-in-user probe; SUPABASE_ACCESS_TOKEN (a personal access token: account-wide
+admin, so set it for one shell only and revoke it after the run) for the backup list. Keys are never
+printed.
 Exit status: 0 pass, 1 a check failed, 2 incomplete (something could not be checked).
 Standard library only. Tests: tests/test_medical_recovery_check.py (synthetic, no network).
 """
@@ -87,12 +95,12 @@ ACCESS_ASK = {
     "labs": "service-role key able to read pds.lab_results",
     "bucket": "service-role key able to read the storage bucket settings of medical-records",
     "objects": "service-role key able to list the medical-records bucket",
-    "head": "service-role key able to read object headers in medical-records (HEAD: no bytes are sent)",
     "anon": "the project's current anon / publishable key in SUPABASE_ANON_KEY (public; it ships in the site's JS)",
     "authenticated": "a signed-in user's access token in SUPABASE_USER_ACCESS_TOKEN (it expires within an hour; "
                      "on production Riley's own sign-in, on the drill stack a made-up user's), with the anon key set",
-    "backups": "a Supabase personal access token in SUPABASE_ACCESS_TOKEN (dashboard > Account > Access Tokens), "
-               "or the dates on Dashboard > Database > Backups",
+    "backups": "the dates on Dashboard > Database > Backups, or a Supabase personal access token in "
+               "SUPABASE_ACCESS_TOKEN for this one shell (dashboard > Account > Access Tokens; it is account-wide "
+               "admin: shortest expiry, never a saved environment variable, revoke it after the run)",
     "download": "service-role key able to download from the drill bucket",
     "signed": "service-role key able to sign a download link in the drill bucket",
 }
@@ -136,10 +144,9 @@ def urllib_transport(method: str, url: str, headers: dict, body: Optional[bytes]
 
 def request(transport: Transport, stage: str, method: str, url: str, headers: dict,
             body: Optional[bytes] = None, *, read_body: bool = True, attempts: int = 3,
-            sleep: Callable[[float], None] = time.sleep, want_headers: bool = False) -> tuple:
+            sleep: Callable[[float], None] = time.sleep) -> tuple:
     """One HTTP call with retries for network errors, 429 and 5xx (1 s, 2 s backoff). Answers the last
-    (status, body) (plus the response headers with want_headers); raises Unreadable when every attempt
-    hit a network error or a 5xx / 429."""
+    (status, body); raises Unreadable when every attempt hit a network error or a 5xx / 429."""
     last = "network"
     for attempt in range(1, attempts + 1):
         try:
@@ -149,8 +156,6 @@ def request(transport: Transport, stage: str, method: str, url: str, headers: di
         else:
             status, data = answer[0], answer[1]
             if status != 429 and status < 500:
-                if want_headers:
-                    return status, data, (answer[2] if len(answer) > 2 else {}) or {}
                 return status, data
             last = f"HTTP {status}"
         if attempt < attempts:
@@ -171,6 +176,27 @@ def _error_body(data: bytes) -> dict:
     except (UnicodeDecodeError, ValueError):
         return {}
     return got if isinstance(got, dict) else {}
+
+
+def _said(data: bytes) -> str:
+    err = _error_body(data)
+    return " ".join(str(err.get(k) or "") for k in ("statusCode", "error", "message")).lower()
+
+
+def _not_found(status: int, data: bytes) -> bool:
+    """Storage's answer for an object (or bucket) it does not hold: HTTP 404, or HTTP 400 carrying
+    statusCode 404 / not_found. A credential error is also HTTP 400 (statusCode 403), so it never
+    matches."""
+    if status == 404:
+        return True
+    err = _error_body(data)
+    return status == 400 and (str(err.get("statusCode")) == "404" or "not found" in _said(data)
+                              or str(err.get("error") or "").lower() in ("not_found", "nosuchkey"))
+
+
+def norm_type(value) -> str:
+    """A content type the way the app's complete route compares it: no parameters, lower case."""
+    return str(value or "").split(";")[0].strip().lower()
 
 
 def _ok(stage: str, status: int) -> None:
@@ -258,22 +284,6 @@ class Target:
             if len(out) >= MAX_ROWS:
                 raise Unreadable("objects", f"more than {MAX_ROWS} files")
 
-    def stored(self, path: str) -> dict:
-        """Whether the storage backend holds the object's bytes, from a HEAD request (headers only: no
-        bytes are sent, so this runs on production too). A list entry can survive a database restore
-        while the bytes are gone; this is what tells the two apart. {"present", "size"}."""
-        quoted = urllib.parse.quote(path)
-        status, _, headers = request(self.transport, "head", "HEAD", f"{self.url}/storage/v1/object/{BUCKET}/{quoted}",
-                                     self._h(), read_body=False, sleep=self.sleep, want_headers=True)
-        if 200 <= status < 300:
-            length = headers.get("content-length")
-            return {"present": True, "size": int(length) if str(length or "").isdigit() else None}
-        if status in (400, 404):  # what Storage answers for an object it cannot find
-            return {"present": False, "size": None}
-        if status in (401, 403):
-            raise Unreadable("head", f"HTTP {status} (access refused)", denied=True)
-        raise Unreadable("head", f"HTTP {status}")
-
     # -- role probes: what the anon key, or a signed-in user's token, can reach
     def key_accepted(self, stage: str, apikey: str, bearer: str, check_path: str) -> None:
         """A positive control before any refusal is believed: the key (or the user's token) must be
@@ -306,15 +316,32 @@ class Target:
             if not isinstance(got, list):
                 raise Unreadable(stage, "file listing answer was not a list")
             return len([o for o in got if isinstance(o, dict) and o.get("id")])
-        err = _error_body(data)
-        said = " ".join(str(err.get(k) or "") for k in ("error", "message")).lower()
-        if status in (400, 403, 404) and not any(w in said for w in ("jwt", "signature", "token", "apikey", "api key")):
-            return 0  # refused (no policy on storage.objects), not a credential problem
-        raise Unreadable(stage, f"file listing answered HTTP {status}")
+        if status in (400, 404) and "bucket not found" in _said(data):
+            return 0  # the bucket itself is hidden from this role (answered after the credential was accepted)
+        # Without a storage policy a role's listing answers 200 []: any other answer (a credential error
+        # such as "Invalid Compact JWS", a gateway error) proves nothing about privacy.
+        raise Unreadable(stage, f"file listing answered HTTP {status} without a listing")
+
+    def role_file_served(self, stage: str, apikey: str, bearer: str, path: str) -> bool:
+        """Whether this role reaches one file directly: a HEAD request on the download route runs the
+        same row-level check a download makes, and sends no bytes. Asked only after the role's own
+        listing answered (proof that Storage accepted the credential), so a refusal here is the access
+        decision, not a credential problem. Listing and download are separate permissions in Storage, so
+        an empty listing alone does not prove a file is out of reach."""
+        quoted = urllib.parse.quote(path)
+        status, _ = request(self.transport, stage, "HEAD", f"{self.url}/storage/v1/object/{BUCKET}/{quoted}",
+                            {"apikey": apikey, "Authorization": f"Bearer {bearer}"}, read_body=False,
+                            sleep=self.sleep)
+        if 200 <= status < 300:
+            return True
+        if status in (400, 401, 403, 404):
+            return False
+        raise Unreadable(stage, f"file probe answered HTTP {status}")
 
     def public_url_served(self, path: str) -> bool:
+        # HEAD: even if the bucket were ever made public, no bytes of a real record are sent
         quoted = urllib.parse.quote(path)
-        status, _ = request(self.transport, "anon", "GET", f"{self.url}/storage/v1/object/public/{BUCKET}/{quoted}",
+        status, _ = request(self.transport, "anon", "HEAD", f"{self.url}/storage/v1/object/public/{BUCKET}/{quoted}",
                             {}, read_body=False, sleep=self.sleep)
         if 200 <= status < 300:
             return True
@@ -322,13 +349,24 @@ class Target:
             return False
         raise Unreadable("anon", f"public URL probe answered HTTP {status}")
 
-    def download(self, path: str) -> bytes:
+    def download(self, path: str) -> Optional[bytes]:
+        """The file's bytes (drill target only), or None when Storage does not serve them: a not-found
+        answer (the hosted S3 backend), or a 5xx that persisted through the retries (the local file
+        backend answers 500 for a row whose file is gone). A refused read, any other answer or a
+        network failure raises Unreadable."""
         if not self.drill:
             raise PermissionError("files are opened on a drill target only")
         quoted = urllib.parse.quote(path)
-        status, data = request(self.transport, "download", "GET", f"{self.url}/storage/v1/object/{BUCKET}/{quoted}",
-                               self._h(), sleep=self.sleep)
-        _ok("download", status)
+        try:
+            status, data = request(self.transport, "download", "GET",
+                                   f"{self.url}/storage/v1/object/{BUCKET}/{quoted}", self._h(), sleep=self.sleep)
+        except Unreadable as e:
+            if e.reason.startswith("HTTP 5"):
+                return None
+            raise
+        if _not_found(status, data):
+            return None
+        _ok("download", status)  # a refusal (401 / 403) or any other non-2xx answer raises
         return data
 
     def signed_fetch(self, path: str) -> bytes:
@@ -560,11 +598,13 @@ class Inventory:
     labs: list[dict] = field(default_factory=list)        # LAB_SELECT columns
     objects: dict[str, dict] = field(default_factory=dict)  # "documents/<id>" -> {"size", "type"}
     unexpected_paths: int = 0                              # files or folders outside documents/<id>
-    stored: Optional[dict] = None     # path -> {"present", "size"} from HEAD, for every ready document
     bucket: Optional[dict] = None
-    anon: Optional[dict] = None       # {"tables_reached": n, "files_listed": n, "public_url_served": bool|None}
-    authenticated: Optional[dict] = None  # {"tables_reached": n, "files_listed": n} for a signed-in user
-    opened: Optional[dict] = None     # path -> {"sha256": hex, "opens": bool} (drill target only)
+    # {"tables_reached": n, "files_listed": n, "file_served": bool|None, "public_url_served": bool|None}
+    anon: Optional[dict] = None
+    authenticated: Optional[dict] = None  # {"tables_reached", "files_listed", "file_served"} for a signed-in user
+    # drill target only: path -> {"served": False} or {"served": True, "size", "sha256", "opens"}, for every
+    # listed file and every ready document's path
+    opened: Optional[dict] = None
     signed_ok: Optional[bool] = None  # one file fetched through a signed link matched its download
     manifest: Optional[dict] = None
     backups: Optional[dict] = None    # summarize_backups() output
@@ -609,18 +649,25 @@ def evaluate(inv: Inventory) -> dict:
         checks.append(_check("bucket_size_limit", "pass" if b.get("file_size_limit") == EXPECTED_LIMIT else "fail"))
         types = b.get("allowed_mime_types")
         checks.append(_check("bucket_types", "pass" if isinstance(types, list) and set(types) == EXPECTED_TYPES else "fail"))
+
+    def refused(name: str, served) -> None:
+        checks.append(_check(name, "skip" if served is None else ("fail" if served else "pass")))
+
     if inv.anon is None:
-        checks += [_check(n, "unknown") for n in ("anon_tables_refused", "anon_files_hidden", "public_url_refused")]
+        checks += [_check(n, "unknown") for n in ("anon_tables_refused", "anon_files_hidden", "anon_file_refused",
+                                                   "public_url_refused")]
     else:
         add("anon_tables_refused", int(inv.anon.get("tables_reached", 0)))
         add("anon_files_hidden", int(inv.anon.get("files_listed", 0)))
-        served = inv.anon.get("public_url_served")
-        checks.append(_check("public_url_refused", "skip" if served is None else ("fail" if served else "pass")))
+        refused("anon_file_refused", inv.anon.get("file_served"))
+        refused("public_url_refused", inv.anon.get("public_url_served"))
     if inv.authenticated is None:
-        checks += [_check(n, "unknown") for n in ("authenticated_tables_refused", "authenticated_files_hidden")]
+        checks += [_check(n, "unknown") for n in ("authenticated_tables_refused", "authenticated_files_hidden",
+                                                   "authenticated_file_refused")]
     else:
         add("authenticated_tables_refused", int(inv.authenticated.get("tables_reached", 0)))
         add("authenticated_files_hidden", int(inv.authenticated.get("files_listed", 0)))
+        refused("authenticated_file_refused", inv.authenticated.get("file_served"))
 
     # metadata relationships
     docs_ok = "documents" not in unread
@@ -637,22 +684,22 @@ def evaluate(inv: Inventory) -> dict:
             continue
         if obj.get("size") != d.get("size_bytes"):
             size_bad += 1
-        if obj.get("type") != d.get("mime_type"):
+        if norm_type(obj.get("type")) != norm_type(d.get("mime_type")):
             type_bad += 1
     both = None if docs_ok and objs_ok else "documents" if not docs_ok else "objects"
     add("ready_documents_have_file", missing, stage=both)
     add("file_sizes_match", size_bad, stage=both)
     add("file_types_match", type_bad, stage=both)
-    # the storage backend itself: a list entry can come back with the database while the bytes did not
-    if inv.stored is None or not docs_ok or "head" in unread:
+    # the bytes themselves: the listing (and a HEAD request) read the storage.objects row, which comes back
+    # with a database restore while the bytes may not; only a download proves them (drill target only)
+    if inv.opened is None or not docs_ok or "download" in unread:
         checks += [_check(n, "unknown") for n in ("files_stored", "stored_sizes_match")]
     else:
-        declared = {d.get("storage_path"): d.get("size_bytes") for d in ready}
-        present = {p: v for p, v in inv.stored.items() if v.get("present")}
-        add("files_stored", len(inv.stored) - len(present))
-        add("stored_sizes_match", sum(1 for p, v in present.items()
-                                      if v.get("size") is not None and v.get("size") != declared.get(p)),
-            stage="head_size" if any(v.get("size") is None for v in present.values()) else None)
+        declared = {d.get("storage_path"): d.get("size_bytes") for d in ready
+                    if PATH_RE.match(str(d.get("storage_path") or ""))}
+        served = {p: inv.opened[p] for p in declared if (inv.opened.get(p) or {}).get("served")}
+        add("files_stored", len(declared) - len(served))
+        add("stored_sizes_match", sum(1 for p, v in served.items() if v.get("size") != declared[p]))
     add("storage_paths_valid", sum(1 for d in inv.documents if not PATH_RE.match(str(d.get("storage_path") or ""))),
         stage="documents" if not docs_ok else None)
     link_stage = None if labs_ok and docs_ok else ("labs" if not labs_ok else "documents")
@@ -669,7 +716,7 @@ def evaluate(inv: Inventory) -> dict:
 
     # opened files (drill target only)
     if inv.opened is not None:
-        add("files_open", sum(1 for v in inv.opened.values() if not v.get("opens")),
+        add("files_open", sum(1 for v in inv.opened.values() if v.get("served") and not v.get("opens")),
             stage="download" if "download" in unread else None)
         if "signed" in unread:
             checks.append(_check("signed_link_serves_file", "unknown"))
@@ -749,16 +796,19 @@ def summarize_backups(answer, now: datetime) -> dict:
         return {"state": "unreadable"}
     completed = [b for b in answer.get("backups") or [] if isinstance(b, dict) and b.get("status") == "COMPLETED"]
     times = [t for t in (_parse_time(b.get("inserted_at")) for b in completed) if t]
+    pitr = answer.get("pitr_enabled") if isinstance(answer.get("pitr_enabled"), bool) else None
+    # The point-in-time range counts only when PITR is on (it then replaces the daily backups); otherwise
+    # freshness comes from COMPLETED daily backups alone, so a fresh WAL point cannot hide failed backups.
     phys = answer.get("physical_backup_data") or {}
     for key in ("earliest_physical_backup_date_unix", "latest_physical_backup_date_unix"):
-        t = _parse_time(phys.get(key)) if isinstance(phys, dict) else None
+        t = _parse_time(phys.get(key)) if pitr is True and isinstance(phys, dict) else None
         if t:
             times.append(t)
     newest = max(times) if times else None
     oldest = min(times) if times else None
     return {
         "state": "read",
-        "pitr_enabled": answer.get("pitr_enabled") if isinstance(answer.get("pitr_enabled"), bool) else None,
+        "pitr_enabled": pitr,
         "completed_backups": len(completed),
         "oldest": oldest.date().isoformat() if oldest else None,
         "newest": newest.isoformat(timespec="minutes") if newest else None,
@@ -767,10 +817,14 @@ def summarize_backups(answer, now: datetime) -> dict:
 
 
 # ---------------------------------------------------------------- collection
-def _probe_role(target: Target, stage: str, apikey: str, bearer: str, check_path: str) -> dict:
+def _probe_role(target: Target, stage: str, apikey: str, bearer: str, check_path: str,
+                sample: Optional[str]) -> dict:
     target.key_accepted(stage, apikey, bearer, check_path)
-    return {"tables_reached": sum(1 for t in TABLES if target.role_reaches_table(stage, apikey, bearer, t)),
-            "files_listed": target.role_list_count(stage, apikey, bearer)}
+    out = {"tables_reached": sum(1 for t in TABLES if target.role_reaches_table(stage, apikey, bearer, t)),
+           "files_listed": target.role_list_count(stage, apikey, bearer)}
+    # after the listing answered (the credential is accepted): can the role reach one file directly?
+    out["file_served"] = target.role_file_served(stage, apikey, bearer, sample) if sample else None
+    return out
 
 
 def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[str], skip_backups: bool,
@@ -785,11 +839,9 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
             item["ask"] = ACCESS_ASK.get(err.stage, "access to " + err.stage)
         inv.unreadable.append(item)
 
-    docs_read = True
     try:
         inv.documents = target.rows("documents", "medical_documents", DOC_SELECT)
     except Unreadable as e:
-        docs_read = False
         note(e)
     try:
         inv.labs = target.rows("labs", "lab_results", LAB_SELECT)
@@ -818,23 +870,10 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
         note(e)
         inv.objects = {}
 
-    if docs_read:
-        stored: dict = {}
-        try:
-            for d in inv.documents:
-                path = d.get("storage_path")
-                if d.get("status") == "ready" and isinstance(path, str) and PATH_RE.match(path):
-                    stored[path] = target.stored(path)
-            inv.stored = stored
-            if any(v["present"] and v["size"] is None for v in stored.values()):
-                inv.unreadable.append({"stage": "head_size", "reason": "a HEAD answer had no content length"})
-        except Unreadable as e:
-            note(e)
-
     sample = next(iter(sorted(inv.objects)), None)
     if anon_key:
         try:
-            anon = _probe_role(target, "anon", anon_key, anon_key, "/auth/v1/settings")
+            anon = _probe_role(target, "anon", anon_key, anon_key, "/auth/v1/settings", sample)
             anon["public_url_served"] = target.public_url_served(sample) if sample else None
             inv.anon = anon
         except Unreadable as e:
@@ -849,26 +888,37 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
                                "ask": ACCESS_ASK["anon"]})
     else:
         try:
-            inv.authenticated = _probe_role(target, "authenticated", anon_key, user_token, "/auth/v1/user")
+            inv.authenticated = _probe_role(target, "authenticated", anon_key, user_token, "/auth/v1/user", sample)
         except Unreadable as e:
             note(e)
 
     if open_files:
         inv.opened = {}
         types = {d.get("storage_path"): d.get("mime_type") for d in inv.documents}
+        # every listed file, and every ready document's path even when the listing lost it
+        ready_paths = {d.get("storage_path") for d in inv.documents if d.get("status") == "ready"
+                       and PATH_RE.match(str(d.get("storage_path") or ""))}
         try:
-            for path in sorted(inv.objects):
+            for path in sorted(set(inv.objects) | ready_paths):
                 data = target.download(path)
-                inv.opened[path] = {"sha256": hashlib.sha256(data).hexdigest(),
-                                    "opens": opens_as(str(types.get(path) or inv.objects[path].get("type")), data)}
+                if data is None:
+                    inv.opened[path] = {"served": False}
+                    continue
+                mime = norm_type(types.get(path) or (inv.objects.get(path) or {}).get("type"))
+                inv.opened[path] = {"served": True, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                                    "opens": opens_as(mime, data)}
         except Unreadable as e:
             note(e)
-        if inv.opened:
-            first = sorted(inv.opened)[0]
+        first = next((p for p in sorted(inv.opened) if inv.opened[p].get("served")), None)
+        if first:
             try:
                 inv.signed_ok = hashlib.sha256(target.signed_fetch(first)).hexdigest() == inv.opened[first]["sha256"]
             except Unreadable as e:
                 note(e)
+    else:
+        inv.unreadable.append({"stage": "bytes", "reason": "file bytes are not checked without opening the files: "
+                               "the listing and HEAD read the database row only, and files are opened on a "
+                               "drill target only (--open-files), never on production"})
 
     if skip_backups:
         inv.backups = {"state": "skipped"}
@@ -908,7 +958,7 @@ def build_manifest(inv: Inventory, now: datetime) -> dict:
         "labs": len(inv.labs),
         "lab_results_linked": sum(1 for r in inv.labs if r.get("document_id")),
         "objects": {p: {"size": inv.objects[p].get("size"), "sha256": inv.opened[p]["sha256"]}
-                    for p in sorted(inv.opened)},
+                    for p in sorted(inv.opened) if p in inv.objects and inv.opened[p].get("served")},
         "document_rows": {d.get("id"): doc_state(d) for d in inv.documents},
         "lab_rows": {r.get("id"): lab_state(r) for r in inv.labs},
     }
@@ -945,12 +995,20 @@ def _read_key(env_names: tuple[str, ...], key_file: Optional[Path]) -> Optional[
     return None
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.expanduser().resolve() == b.expanduser().resolve()
+    except OSError:
+        return True  # cannot tell: treat it as the production key file
+
+
 def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transport,
          sleep: Callable[[float], None] = time.sleep, out=None) -> int:
     out = out or sys.stdout
     ap = argparse.ArgumentParser(description="Counts-only, read-only recovery check of /health/records.")
     ap.add_argument("--url", default=os.environ.get("SUPABASE_URL") or DEFAULT_URL)
-    ap.add_argument("--key-file", type=Path, default=DEFAULT_KEY_FILE, help="service-role key file")
+    ap.add_argument("--key-file", type=Path,
+                    help="service-role key file (default ~/.onyx_supabase_secret, on production only)")
     ap.add_argument("--skip-backups", action="store_true", help="do not read the backup list (drill target only)")
     ap.add_argument("--open-files", action="store_true", help="download and open every file (drill target only)")
     ap.add_argument("--manifest", type=Path, help="compare with this manifest (files, row states, lab links)")
@@ -979,9 +1037,20 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
               f"check (without SUPABASE_ACCESS_TOKEN it is reported as incomplete; ask for: {ACCESS_ASK['backups']})",
               file=out)
         return 2
-    key = _read_key(("SUPABASE_SERVICE_ROLE_KEY",), args.key_file)
+    on_drill = drill_allowed(args.url, args.drill_project)
+    if on_drill:
+        # The default key file holds the PRODUCTION key; a drill target (whose logs may record headers) only
+        # ever gets SUPABASE_SERVICE_ROLE_KEY or a key file named explicitly that is not that file.
+        key_file = args.key_file if args.key_file and not _same_file(args.key_file, DEFAULT_KEY_FILE) else None
+    else:
+        key_file = args.key_file or DEFAULT_KEY_FILE
+    key = _read_key(("SUPABASE_SERVICE_ROLE_KEY",), key_file)
     if not key:
-        print(f"incomplete: no service-role key; ask for: {ACCESS_ASK['documents']}", file=out)
+        if on_drill:
+            print("incomplete: set the drill stack's service key in SUPABASE_SERVICE_ROLE_KEY (the production key "
+                  "file is never read for a drill target)", file=out)
+        else:
+            print(f"incomplete: no service-role key; ask for: {ACCESS_ASK['documents']}", file=out)
         return 2
     manifest = None
     if args.manifest:
