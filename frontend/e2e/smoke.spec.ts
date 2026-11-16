@@ -878,6 +878,7 @@ test.describe("Capture carryovers — read-only opening", () => {
         let ready = false;
         let noLoadError = false;
         let listMatchesApi = target === "log";
+        let readingEvaluationFailed = false;
         try {
           expect(before !== null, "production revision is available").toBe(true);
           const apiPath = target === "log" ? "/api/nutrition/drinks" : "/api/reading/list";
@@ -899,13 +900,13 @@ test.describe("Capture carryovers — read-only opening", () => {
             // Compare private data inside the browser; only the boolean leaves this evaluation.
             listMatchesApi = await page.evaluate(async () => {
               const response = await fetch("/api/reading/list", { cache: "no-store" });
-              if (!response.ok()) return false;
+              if (!response.ok) return false; // native fetch Response; APIRequestContext above uses ok()
               const value = await response.json();
               if (!Array.isArray(value.items)) return false;
               const rows = Array.from(document.querySelectorAll('[data-testid="reading-want-list"] [data-testid="want-to-read-item"]'));
               return rows.length === value.items.length && value.items.every((item: { title?: unknown }, i: number) =>
                 typeof item.title === "string" && rows[i].querySelector("p")?.textContent === item.title);
-            }).catch(() => false);
+            }).catch(() => { readingEvaluationFailed = true; return false; });
           }
           expect(ready && noLoadError, "capture panel loaded without a failure state").toBe(true);
           expect(listMatchesApi, "all planned-book titles match the authenticated list").toBe(true);
@@ -913,7 +914,7 @@ test.describe("Capture carryovers — read-only opening", () => {
           after = await version();
           const sameSha = before !== null && before === after;
           const zeroWriteAttempts = attempts === 0;
-          console.log(JSON.stringify({ sha_before: before, sha_after: after, viewport: `${viewport.width}x${viewport.height}`, authenticated, ready, no_load_error: noLoadError, list_matches_api: listMatchesApi, zero_write_attempts: zeroWriteAttempts, same_sha: sameSha }));
+          console.log(JSON.stringify({ sha_before: before, sha_after: after, viewport: `${viewport.width}x${viewport.height}`, authenticated, ready, no_load_error: noLoadError, list_matches_api: listMatchesApi, reading_evaluation_failed: readingEvaluationFailed, zero_write_attempts: zeroWriteAttempts, same_sha: sameSha }));
           expect(zeroWriteAttempts, "opening attempted no capture mutation").toBe(true);
           expect(sameSha, "the production revision stayed unchanged throughout this case").toBe(true);
         }
