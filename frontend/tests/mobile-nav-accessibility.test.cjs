@@ -119,3 +119,12 @@ test('bottom bar keeps 44px-plus targets and the safe-area padding', () => {
   assert.match(html, /data-testid="mobile-tab-bar"[^>]*pb-\[env\(safe-area-inset-bottom\)\]/);
   assert.match(html, /grid grid-cols-5 h-14/);
 });
+// PROD-T11 (2026-11-16): the drawer's wordmark is not a heading; the page's own title stays the one h1.
+test('the drawer names itself by aria-label and has no heading of its own', () => {
+  for (const open of [false, true]) {
+    const html = render(open);
+    assert.doesNotMatch(html, /<h[1-6]\b/, open ? 'open drawer' : 'closed drawer');
+    assert.match(html, /id="mobile-navigation"[^>]*aria-label="Navigation"|aria-label="Navigation"[^>]*id="mobile-navigation"/);
+  }
+  assert.ok(render(true).includes('Onyx</p>'), 'wordmark still shown');
+});

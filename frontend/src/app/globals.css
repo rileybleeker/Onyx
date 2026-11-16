@@ -125,6 +125,35 @@
   }
 }
 
+/* Keep a focused control, an anchor jump or scrollIntoView clear of what is fixed over the page. Without it the
+   browser counts a control under the phone's header (h-12) or tab bar (h-14) as "on screen" and does not scroll, so
+   Tab could land on a Yes / No button hidden behind the tab bar. The check-in's save bar (sticky 4.75rem above the
+   bottom on a phone, 1rem on desktop, at least 3.75rem tall) adds its own band wherever the check-in is drawn (/log,
+   /check-in, Log in the continuous scroll). --pz-banner-h is the Personalize banner, set on <html> while it is open
+   (components/personalize/PersonalizeEditor.tsx). A scroll-margin on a jump target (scroll-mt-*) comes on top of this. */
+html {
+  scroll-padding-top: var(--pz-banner-h, 0px);
+}
+html:has([data-pz-key="layout.check-in"]) {
+  scroll-padding-bottom: 5.25rem;
+}
+@media (max-width: 767.98px) {
+  html {
+    scroll-padding-top: calc(env(safe-area-inset-top) + 3.5rem + var(--pz-banner-h, 0px));
+    scroll-padding-bottom: calc(env(safe-area-inset-bottom) + 4rem);
+  }
+  html:has([data-pz-key="layout.check-in"]) {
+    scroll-padding-bottom: calc(env(safe-area-inset-bottom) + 9rem);
+  }
+  /* Jump targets whose scroll-mt-24 was sized to clear the phone header on its own (ChartCard, SectionHeader, the
+     meal photo box): with the 3.5rem padding above, 2.5rem keeps them landing where they did (6rem below the top).
+     This rule is unlayered, so below 768 px it beats every Tailwind utility: do not give an element with scroll-mt-24
+     another scroll-margin utility that applies on a phone (it would be ignored there; an md: one is fine). */
+  .scroll-mt-24 {
+    scroll-margin-top: 2.5rem;
+  }
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;
