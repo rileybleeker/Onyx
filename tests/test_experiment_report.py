@@ -538,6 +538,11 @@ def test_stopped_early_and_too_few_nights_still_get_a_final_report():
     report = store.final()
     assert report["stopped_early"] is True and report["last_day_analysed"] == stop.isoformat()
     assert report["days_elapsed"] == 48 and report["n_nights"] == 48 and report["stop_reason"] == "synthetic reason"
+    # Review PIPE06-FOLLOWUP-R1: the stop withholds the decision whatever else holds, named in the report.
+    check = {c["id"]: c for c in report["inference"]["checks"]}["stopping_not_outcome_dependent"]
+    assert check["status"] == "failed" and check["reason"] in report["decision_withheld"]
+    assert report["decision"] == "inconclusive" and report["decision_firm"] is False
+    assert "p_value_no_effect" in report["inference"]["unsupported_outputs"]
     assert store.exp["status"] == "stopped_early", "a stopped trial keeps its status"
 
     # Stopped on day 6: the model cannot be fitted. The final report says so and carries no estimate.

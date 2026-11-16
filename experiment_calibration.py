@@ -70,7 +70,10 @@ registered re-draw count (10,000 in the template). A full run is many hours in o
 than one Actions job allows, so it runs on the PC or as one job per scenario, merged afterwards.
 Scenario j's trial i always draws from default_rng([seed, j, i]) and calibration_redraw_seed(seed, j, i),
 so a shard holds exactly the rows a full run would; --merge refuses shards of different
-configurations or a scenario twice:
+configurations or a scenario twice, and shards that another calibration harness ran: the merged
+report's `covers` and review readiness come from this file's SCENARIOS, BLOCK_LEN / N_A and review
+limits, so the shards' harness fingerprint must be the running one and each scenario's stored inputs
+must equal its entry in SCENARIOS (merge at the revision the shards ran, or run them again):
     python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --revision <commit> --out calibration.json
     python experiment_calibration.py --sims 1000 --redraws 10000 --seed 20261116 --revision <commit> --scenario no_effect --out s1.json
     python experiment_calibration.py --merge s1.json s2.json ... --out calibration.json
@@ -384,16 +387,23 @@ def _assemble(config: dict[str, Any], scenarios: list[dict[str, Any]]) -> dict[s
         # Only a full run may back a METHOD_REVIEW entry: every supported scenario, at least
         # REVIEW_MIN_SIMS trials ANALYSED in each (REVIEW_MIN_STRESS in a stress scenario; skipped,
         # unfittable trials do not count; the tolerances widen as the count falls) and at most
-        # REVIEW_MAX_SKIP of them skipped (REVIEW_MAX_SKIP_STRESS), a recorded revision and an inference
-        # fingerprint, so the record can name the code it covers.
+        # REVIEW_MAX_SKIP of them skipped (REVIEW_MAX_SKIP_STRESS), a recorded revision, an inference
+        # fingerprint and a harness fingerprint, so the record can name the code it covers and the harness
+        # whose scenarios and limits it was judged by.
         "review_ready": (passed and all(_review_counts_ok(x) for x in supported)
-                         and bool(config.get("revision")) and bool(config.get("inference_fingerprint"))),
+                         and bool(config.get("revision")) and bool(config.get("inference_fingerprint"))
+                         and bool(config.get("harness_fingerprint"))),
     }
 
 
 def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
     """One report from shards run with the same configuration (each with its own scenarios).
-    Refuses shards that disagree on any CONFIG_KEYS field or that both hold a scenario."""
+    Refuses shards that disagree on any CONFIG_KEYS field or that both hold a scenario, and shards
+    that another calibration harness ran (review PIPE06-FOLLOWUP-R2): _assemble builds `covers` and
+    review readiness from this file's SCENARIOS, BLOCK_LEN / N_A and review limits, so archived shards
+    merged after a harness change would claim designs and limits they never ran. Their harness
+    fingerprint must therefore be the running one (a missing or unreadable one refuses too), and each
+    scenario's stored inputs must equal its entry in SCENARIOS."""
     if not reports:
         raise ValueError("nothing to merge")
     config = {key: reports[0].get(key) for key in CONFIG_KEYS}
@@ -407,6 +417,18 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
             differs = sorted(key for key in CONFIG_KEYS if other[key] != config[key])
             raise ValueError(f"shard {index + 1} has another configuration ({', '.join(differs)})")
         scenarios += report.get("scenarios") or []
+    running = fingerprint.harness_fingerprint()
+    recorded = config["harness_fingerprint"]
+    if not running:
+        raise ValueError("the running calibration harness's source cannot be read, so the shards' harness "
+                         "fingerprint cannot be checked against it")
+    if not (isinstance(recorded, str) and recorded.strip()):
+        raise ValueError("the shards record no harness fingerprint, so the harness that ran them cannot be checked")
+    if recorded != running:
+        raise ValueError(f"the shards ran another calibration harness (fingerprint {recorded[:12]}; the running harness "
+                         f"is {running[:12]}): the merged report would take its coverage and review readiness from "
+                         "this harness's scenarios, block design and limits, so merge them at the revision that ran "
+                         "them or run them again")
     names = [x["name"] for x in scenarios]
     repeated = sorted({name for name in names if names.count(name) > 1})
     if repeated:
@@ -414,6 +436,12 @@ def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
     unknown = sorted(set(names) - {s.name for s in SCENARIOS})
     if unknown:
         raise ValueError("unknown scenario(s): " + ", ".join(unknown))
+    by_name = {s.name: s for s in SCENARIOS}
+    for x in scenarios:
+        expected = by_name[x["name"]]
+        if x.get("inputs") != asdict(expected) or x.get("supported") is not expected.supported:
+            raise ValueError(f"scenario {x['name']} in the shards was run with other inputs than the running harness's "
+                             "SCENARIOS entry, so it cannot be merged as that scenario")
     return _assemble(config, scenarios)
 
 

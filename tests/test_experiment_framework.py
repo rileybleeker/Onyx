@@ -294,6 +294,11 @@ def test_stopped_early_trial_is_reported_as_such():
     report = ea.analyze_trial(spec, data, stop + timedelta(days=1))
     assert report["stopped_early"] is True and report["last_day_analysed"] == stop.isoformat()
     assert report["days_in_scope"] <= 122 and report["n_nights"] < 122
+    # The stop withholds a firm decision and is named (review PIPE06-FOLLOWUP-R1).
+    check = {c["id"]: c for c in report["inference"]["checks"]}["stopping_not_outcome_dependent"]
+    assert check["status"] == "failed" and check["blocks_decision"] is True and stop.isoformat() in check["reason"]
+    assert report["decision_firm"] is False and report["decision"] == "inconclusive"
+    assert check["reason"] in report["decision_withheld"]
 
 
 # ---------------------------------------------------------------------------

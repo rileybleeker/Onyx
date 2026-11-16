@@ -47,7 +47,15 @@ Covers
     scheduled blocks the calibration did not run (or whose design is not given) stays withheld, and
     the report's `covers` names the block shape and the block range of its supported scenarios;
   * missing-night checks fail closed: an A/A check without a readable Fisher p, and a treatment
-    trial without a readable 10-point flag, count as failed.
+    trial without a readable 10-point flag, count as failed;
+  * an early stop withholds the decision (review PIPE06-FOLLOWUP-R1): a stopped trial that passes
+    every other check stays inconclusive with the stop named, its numbers unsupported (Fisher's
+    test too), the rule's verdict visible; a stop on or after the planned end changes nothing, and a
+    stop that cannot be checked fails closed;
+  * archived calibration shards never take coverage from another harness (review
+    PIPE06-FOLLOWUP-R2): the merge refuses shards whose harness fingerprint is missing or not the
+    running harness's (or when the running one cannot be read), and scenarios whose stored inputs
+    differ from SCENARIOS; a report without a harness fingerprint is not review-ready.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -279,8 +287,10 @@ def test_randomization_analysis_reports_the_assumption_visible_outputs():
     semantics = ea.output_semantics(fit["nuisance_beta"])
     assert "tau = 0" in semantics["p_value"]["null"] and "one_night_carryover" in semantics["p_value"]["needs"]
     assert "one_night_carryover" not in semantics["p_value_no_effect"]["needs"]
-    assert set(semantics["p_value_no_effect"]["needs"]) == {"randomized_schedule", "missing_not_caused_by_arm"}, \
-        "Fisher's test still needs the schedule and missing nights not caused by the arm"
+    assert set(semantics["p_value_no_effect"]["needs"]) == {"randomized_schedule", "missing_not_caused_by_arm",
+                                                              "stopping_not_outcome_dependent"}, \
+        "Fisher's test still needs the schedule, missing nights not caused by the arm and a fixed analysed period"
+    assert "stopping_not_outcome_dependent" in semantics["p_value"]["needs"]
     assert set(semantics["p_value"]["needs"]) <= set(ea.ASSUMPTIONS)
     assert ea.INTERVAL_METHOD in semantics["ci_low / ci_high"]["validity"]
     assert "approximately unbiased" in semantics["estimate"]["validity"]
@@ -733,9 +743,59 @@ def test_a_trial_without_a_declared_model_never_gets_a_firm_decision():
                 assert judged["missing_not_caused_by_arm"]["status"] == "ok", ("a readable result passes", readable, kind)
         tied32 = {c["id"]: c for c in ea.assumption_checks(bounded, {"threat": False, "fisher_p": np.float32(0.01)}, spec)}
         assert tied32["missing_not_caused_by_arm"]["status"] == "failed"
-        # Without a spec nothing is declared, so the protocol checks fail closed.
+        # Without a spec nothing is declared, so the protocol checks fail closed, and so does the stop check.
         closed = {c["id"]: c["status"] for c in ea.assumption_checks({"carryover_set_bounded": True}, {"threat": False})}
         assert closed["model_justified"] == "failed" and closed["registered_method"] == "failed"
+        assert closed["stopping_not_outcome_dependent"] == "failed"
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
+def test_an_early_stop_withholds_an_otherwise_firm_decision():
+    # Review PIPE06-FOLLOWUP-R1: a trial stopped early was analysed as a fixed-length one, so with the method
+    # recorded it could get a firm decision although the stop may have followed the data. Here every other check
+    # passes (reviewed method, declared model, no missing nights, enough blocks left), and the stop alone withholds.
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        ea.METHOD_REVIEW.update(REVIEWED)
+        spec, data = _spec_and_data()
+        plain = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
+        assert plain["decision_firm"] is True and plain["decision"] == "adopt_A"
+        assert {c["id"]: c for c in plain["inference"]["checks"]}["stopping_not_outcome_dependent"]["status"] == "ok"
+
+        stop = spec.start + timedelta(days=120)         # day 121 of 160: 31 of 40 blocks analysed, above the 7 covered
+        stopped = ea.analyze_trial(replace(spec, stopped_on=stop), data, stop + timedelta(days=1))
+        checks = {c["id"]: c for c in stopped["inference"]["checks"]}
+        assert stopped["stopped_early"] is True and stopped["last_day_analysed"] == stop.isoformat()
+        assert all(checks[i]["status"] == "ok" for i in ("missing_not_caused_by_arm", "model_justified",
+                                                         "registered_method", "method_reviewed")), checks
+        check = checks["stopping_not_outcome_dependent"]
+        assert check["status"] == "failed" and check["blocks_decision"] is True
+        assert check["covers"] == ["stopping_not_outcome_dependent"]
+        assert stop.isoformat() in check["reason"] and spec.planned_end.isoformat() in check["reason"]
+        assert stopped["decision"] == "inconclusive" and stopped["decision_firm"] is False
+        assert stopped["decision_withheld"] == [check["reason"]], "the stop is the only reason, and it is named"
+        assert stopped["decision_if_supported"] == "adopt_A", "the rule's own verdict stays visible"
+        # Every number that needs a fixed analysed period is marked unsupported, Fisher's test included.
+        outputs = stopped["inference"]["outputs"]
+        for name in ("estimate", "p_value", "ci_low / ci_high", "p_carryover", "p_value_no_effect",
+                     "p_carryover_no_effect", "sensitivity.ln_outcome"):
+            assert outputs[name]["supported"] is False, name
+            assert name in stopped["inference"]["unsupported_outputs"], name
+        assert "stopping_not_outcome_dependent" in stopped["inference"]["assumptions"]
+
+        # A stop on or after the planned end cuts no night: it changes nothing but the label.
+        for late in (spec.planned_end, spec.planned_end + timedelta(days=3)):
+            at_end = ea.analyze_trial(replace(spec, stopped_on=late), data, late + timedelta(days=1))
+            assert at_end["stopped_early"] is True and at_end["decision_firm"] is True, late
+            assert at_end["last_day_analysed"] == spec.planned_end.isoformat(), late
+            redo = ea.analyze_trial(spec, data, late + timedelta(days=1))
+            assert _without(at_end, "stopped_early") == _without(redo, "stopped_early"), late
+        # A stop date that cannot be compared with the planned end fails closed.
+        odd = {c["id"]: c for c in ea.assumption_checks({"carryover_set_bounded": True}, {"threat": False},
+                                                         replace(spec, stopped_on="2030-03-01"))}
+        assert odd["stopping_not_outcome_dependent"]["status"] == "failed"
     finally:
         ea.METHOD_REVIEW.clear()
         ea.METHOD_REVIEW.update(saved)
@@ -772,8 +832,8 @@ def test_sensitivity_and_secondary_outputs_state_their_assumptions():
         # The covariate fit: its p-value and interval are labelled approximate; its Fisher p is the exact one.
         covariate = outputs["sensitivity.covariate_lag"]
         assert covariate["approximate"] is True and "not certified" in covariate["validity"]
-        assert outputs["sensitivity.covariate_lag.p_value_no_effect"]["needs"] == ["randomized_schedule",
-                                                                                     "missing_not_caused_by_arm"]
+        assert outputs["sensitivity.covariate_lag.p_value_no_effect"]["needs"] == [
+            "randomized_schedule", "missing_not_caused_by_arm", "stopping_not_outcome_dependent"]
         assert 0 < report["sensitivity"]["covariate_lag"]["p_value_no_effect"] <= 1
         assert "approximate" not in outputs["p_value"], "the primary numbers are not approximate"
 
@@ -908,6 +968,8 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
     # Without a revision, or without a fingerprint of the code it ran, a report cannot back the record.
     assert cal._assemble({**config, "revision": None}, fake)["review_ready"] is False
     assert cal._assemble({**config, "inference_fingerprint": None}, fake)["review_ready"] is False
+    assert cal._assemble({**config, "harness_fingerprint": None}, fake)["review_ready"] is False
+    assert config["harness_fingerprint"] == ef.harness_fingerprint()
     assert config["inference_fingerprint"] == ef.inference_fingerprint() and config["revision"] == "synthetic-revision"
     fake[0] = {**fake[0], "n_analysed": 990}            # ten of the 1,000 trials could not be fitted
     short = cal._assemble(config, fake)
@@ -932,6 +994,36 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
             assert words in str(exc), (words, str(exc))
         else:
             raise AssertionError(f"merge must refuse: {words}")
+
+    # Review PIPE06-FOLLOWUP-R2: `covers` and review readiness come from the running harness's SCENARIOS,
+    # block shape and limits, so archived shards that another harness ran, even all agreeing with each
+    # other, are refused, and so is a scenario whose stored inputs are not the running ones.
+    edited = json.loads(json.dumps(shards))
+    edited[0]["scenarios"][0]["inputs"]["n_blocks"] = 99
+    flipped = json.loads(json.dumps(shards))
+    flipped[1]["scenarios"][0]["supported"] = False
+    for bad, words in (([{**x, "harness_fingerprint": "0" * 64} for x in shards], "another calibration harness"),
+                       ([{**x, "harness_fingerprint": None} for x in shards], "no harness fingerprint"),
+                       ([{**x, "harness_fingerprint": " "} for x in shards], "no harness fingerprint"),
+                       (edited, "other inputs"), (flipped, "other inputs")):
+        try:
+            cal.merge_reports(bad)
+        except ValueError as exc:
+            assert words in str(exc), (words, str(exc))
+        else:
+            raise AssertionError(f"merge must refuse: {words}")
+    original = ef.harness_fingerprint
+    try:
+        ef.harness_fingerprint = lambda: None
+        try:
+            cal.merge_reports(shards)
+        except ValueError as exc:
+            assert "cannot be read" in str(exc), str(exc)
+        else:
+            raise AssertionError("merge must refuse when the running harness cannot be fingerprinted")
+    finally:
+        ef.harness_fingerprint = original
+    assert cal.merge_reports(shards) == whole, "the refusals leave the valid merge unchanged"
 
 
 def test_unsupported_scenarios_are_reported_without_a_verdict():

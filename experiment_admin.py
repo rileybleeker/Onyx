@@ -284,7 +284,9 @@ def cmd_stop(store: Store, experiment_id: str, reason: str, confirm: str) -> lis
         raise AdminError(f"{experiment_id} is not an active trial")
     stopped_on = store.behavioral_today()
     store.stop(experiment_id, stopped_on, reason.strip())
-    return [f"{experiment_id} stopped early on {stopped_on}. It stays on record and can be analysed as stopped_early."]
+    return [f"{experiment_id} stopped early on {stopped_on}. It stays on record and can be analysed as stopped_early; "
+            "a stop before the planned end means its final report covers the nights before the stop and gives no firm "
+            "decision (docs/experiment-framework.md 8.1, stopping_not_outcome_dependent)."]
 
 
 def cmd_power(store: Store, window_days: int, effect_ms: float, *, n_trials: int = 500) -> list[str]:

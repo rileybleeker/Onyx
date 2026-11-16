@@ -54,11 +54,14 @@ seeds its re-draws with the same deterministic rule, so it is the empirical evid
 and coverage that rule gives.
 
 analyze_trial() REFUSES to run before the pre-registered end (Riley's decision 1, doc section 13:
-analyse only at the pre-registered end). A trial stopped early is reported as such. It reports the
-decision rule's verdict as a firm decision only when every blocking check in assumption_checks()
-passes: missing nights not tied to the arm, the registered protocol's declaration and
-justification of the untestable parts of M (one-night carryover, constant effects, pre-trial day
-as control), the registered inference method, and a METHOD_REVIEW (calibration report plus
+analyse only at the pre-registered end). A trial stopped early is reported as such, over the nights
+before the stop. It reports the decision rule's verdict as a firm decision only when every blocking
+check in assumption_checks() passes: missing nights not tied to the arm, the registered protocol's
+declaration and justification of the untestable parts of M (one-night carryover, constant effects,
+pre-trial day as control), a trial that ran to its pre-registered end (the re-draws and the
+calibration assume the analysed nights were fixed in advance, and a stop can follow what was seen,
+so an early stop withholds the decision whatever its reason), the registered inference method, and
+a METHOD_REVIEW (calibration report plus
 independent review) covering the trial's alpha, re-draw count and block design (block length,
 arm-A days per block, scheduled blocks) and recorded for the inference code that is running (its
 experiment_fingerprint fingerprint). Otherwise the decision is
@@ -1039,6 +1042,13 @@ ASSUMPTIONS: dict[str, str] = {
     "pre_trial_day_is_control": (
         "The day before the trial counts as the control arm for the first night's carryover. Covered by the "
         "protocol's analysis.model_justification."),
+    "stopping_not_outcome_dependent": (
+        "The nights analysed were fixed before the trial: it ran to its pre-registered end, so when it ended did not "
+        "depend on the arms or the outcomes seen so far. The re-draws hold the analysed period fixed and the "
+        "calibration runs fixed-length trials only, so neither allows for a stop chosen after looking (each day's "
+        "arm is shown on Today and the HRV in its app, so a stop can follow a run of good or bad nights on one "
+        "arm). Checked: a stop before the planned end fails it, whatever the stop's reason, because no registered "
+        "stopping rule exists that the calibration covers. A stop on or after the planned end changes nothing."),
     "constant_multiplicative_effects": (
         "For the ln(HRV) sensitivity fit only: the model holds for ln(outcome), i.e. each arm multiplies the "
         "outcome by a constant factor on its own night and the next one. It cannot hold together with "
@@ -1048,10 +1058,10 @@ ASSUMPTIONS: dict[str, str] = {
 }
 
 _MODEL = ["randomized_schedule", "one_night_carryover", "constant_additive_effects", "missing_not_caused_by_arm",
-          "pre_trial_day_is_control"]
-_FISHER = ["randomized_schedule", "missing_not_caused_by_arm"]
+          "pre_trial_day_is_control", "stopping_not_outcome_dependent"]
+_FISHER = ["randomized_schedule", "missing_not_caused_by_arm", "stopping_not_outcome_dependent"]
 _LOG_MODEL = ["randomized_schedule", "one_night_carryover", "constant_multiplicative_effects",
-              "missing_not_caused_by_arm", "pre_trial_day_is_control"]
+              "missing_not_caused_by_arm", "pre_trial_day_is_control", "stopping_not_outcome_dependent"]
 
 
 def secondary_missing_assumption(name: str) -> str:
@@ -1110,13 +1120,14 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
         "p_value_no_effect": {
             "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
             "validity": ("exact without the effect model (one-night carryover, constant effects), but still only "
-                         "with the randomized schedule and missing nights not caused by the arm; rejecting it says "
+                         "with the randomized schedule, missing nights not caused by the arm and a trial that ran "
+                         "to its pre-registered end; rejecting it says "
                          f"the arm acts on some night, not that the same-night effect is non-zero{mc}. Not read by "
                          "the decision rule")},
         "p_carryover_no_effect": {
             "null": "Fisher's sharp null, tested with the carryover coefficient", "needs": _FISHER,
-            "validity": ("exact without the effect model, with the randomized schedule and missing nights not caused "
-                         f"by the arm{mc}. Not read by the decision rule")},
+            "validity": ("exact without the effect model, with the randomized schedule, missing nights not caused "
+                         f"by the arm and a trial that ran to its pre-registered end{mc}. Not read by the decision rule")},
         "hac_se / hac_se_carryover": {
             "validity": "approximate Newey-West cross-check (lags count observed nights). Not read by the decision rule"},
     }
@@ -1177,6 +1188,13 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
     n_blocks_analysed (analyze_trial passes it) is the number of scheduled blocks the analysis keeps,
     for the method-review check; None = all of them.
 
+    An early stop: a trial stopped before its planned end (spec.stopped_on) fails
+    stopping_not_outcome_dependent, which withholds the decision and marks every output that needs
+    a fixed analysed period (all of them but the HAC cross-check). The stop may have followed the
+    arms and the HRV seen so far, the re-draws hold the analysed period fixed, and the calibration
+    runs fixed-length trials only; no registered stopping rule exists that could cover a stop, so
+    its reason does not matter. Without a spec the stop cannot be checked, so it fails closed too.
+
     Missing nights: a treatment trial fails the check on the 10-point rule (fail closed; the arm can
     change behaviour). In an A/A check both arms are the same instruction, so only a pipeline fault
     can tie missing nights to the arm; it fails on Fisher's exact test of the arm x missing table at
@@ -1218,6 +1236,27 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
                         "day as control")
     else:
         model_status, model_reason = "ok", "declared and justified in the registered protocol"
+    stopped_on = spec.stopped_on if spec is not None else None
+
+    def ran_to_end() -> bool:
+        # A stop on or after the planned end cuts no night; a stop date that cannot be compared fails closed.
+        try:
+            return spec is not None and (stopped_on is None or bool(stopped_on >= spec.planned_end))
+        except TypeError:
+            return False
+
+    if spec is None:
+        stop_status = "failed"
+        stop_reason = "no trial specification was given, so whether the trial ran to its pre-registered end cannot be checked"
+    elif not ran_to_end():
+        stop_status = "failed"
+        stop_reason = (f"the trial was stopped on {stopped_on}, before its pre-registered end on {spec.planned_end}: "
+                       "the stop may have followed the arms and the HRV seen so far, while the randomization tests, "
+                       "the intervals and the calibration assume the nights analysed were fixed in advance (no "
+                       "registered stopping rule covers a stop), so the numbers are reported but not supported")
+    else:
+        stop_status = "ok"
+        stop_reason = "the trial ran to its pre-registered end, so the nights analysed were fixed in advance"
     registered = spec.inference_method if spec is not None else None
     review = method_review_problem(
         alpha, spec.n_redraws if spec is not None else 10000,
@@ -1230,6 +1269,8 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
         {"id": "model_justified", "status": model_status, "blocks_decision": True,
          "covers": ["one_night_carryover", "constant_additive_effects", "pre_trial_day_is_control"],
          "reason": model_reason},
+        {"id": "stopping_not_outcome_dependent", "status": stop_status, "blocks_decision": True,
+         "covers": ["stopping_not_outcome_dependent"], "reason": stop_reason},
         {"id": "carryover_set_bounded", "status": "ok" if primary.get("carryover_set_bounded") else "failed",
          "blocks_decision": False, "covers": [],
          "reason": ("the nights cannot bound the carryover, so the same-night test cannot reject (valid, "
