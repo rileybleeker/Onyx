@@ -376,3 +376,95 @@ test('a session end also stops a copy on screen that was never kept (beyond the 
   assert.equal(retainer.size, 0);
   assert.equal(retainer.find('one'), null);
 });
+
+test('a background retry that gets through after a copy rendered (found the form) and before it attached: the form is taken back live', async () => {
+  const { timers, work, retainer, api, show } = setup();
+  api.mode = 'offline';
+  const a = show();
+  a.form.saver.change({ through: '4' });
+  await timers.advance(800);
+  await a.unmount();
+  assert.equal(retainer.size, 1, 'kept, retrying');
+
+  // The next copy renders: it finds the kept form; its effect (attach) has not run yet.
+  const found = retainer.find('log-reading');
+  assert.equal(found, a.form);
+  api.mode = 'up';
+  await timers.advance(60_000); // the kept saver's retry gets through in between
+  assert.equal(api.rows.size, 1);
+  assert.equal(found.released, true, 'clean with nobody attached: let go, its saver disposed');
+  assert.equal(retainer.size, 0);
+
+  // The effect attaches the form the render holds: it is live again, not a dead saver.
+  const states = [];
+  retainer.attach(found, (s) => states.push(s.status));
+  assert.equal(found.released, false, 'taken back');
+  assert.equal(retainer.find('log-reading'), found, 'kept under its name again while shown');
+  assert.equal(work.has(), false, 'nothing unsaved');
+  assert.equal(found.data.row.through, '4', 'with its data (the row it made)');
+  const sent = api.calls.length;
+  found.saver.change({ through: '4' });
+  await timers.advance(800);
+  assert.equal(api.calls.length, sent, 'its last saved value is its baseline: nothing to send');
+  found.saver.change({ through: '5' });
+  await timers.advance(800);
+  assert.equal(api.calls.length, sent + 1, 'a later edit is sent, not dropped');
+  assert.deepEqual(states.slice(-3), ['waiting', 'saving', 'saved']);
+  await retainer.detach(found, () => {});
+  assert.equal(retainer.size, 0, 'clean at unmount: forgotten as usual');
+});
+
+test('an edit before the attach takes a form let go as clean back too; a form let go by a session end is never taken back', async () => {
+  const { timers, retainer, api, show } = setup();
+  api.mode = 'offline';
+  const a = show();
+  a.form.saver.change({ through: '2' });
+  await timers.advance(800);
+  await a.unmount();
+  const found = retainer.find('log-reading');
+  api.mode = 'up';
+  await timers.advance(60_000);
+  assert.equal(found.released, true);
+  // Riley types before the effect attached (what useRetainedAutosave's change() does first).
+  assert.equal(retainer.revive(found), true);
+  const sent = api.calls.length;
+  found.saver.change({ through: '3' });
+  await timers.advance(800);
+  assert.equal(api.calls.length, sent + 1, 'the edit is sent');
+  retainer.attach(found, () => {});
+  assert.equal(retainer.find('log-reading'), found);
+
+  // Session end: the copy on screen keeps its fields but sends nothing more, also after a later attach.
+  retainer.clear();
+  assert.equal(found.wiped, true);
+  assert.equal(retainer.revive(found), false, 'a session end is final');
+  retainer.attach(found, () => {});
+  assert.equal(retainer.size, 0, 'not kept again');
+  const after = api.calls.length;
+  found.saver.change({ through: '6' });
+  await timers.advance(60_000);
+  assert.equal(api.calls.length, after, 'nothing is sent after the session ended');
+});
+
+test('a form let go as clean and then a session end, both before the attach: never taken back (its data is the ended session\'s)', async () => {
+  const { timers, work, retainer, api, show } = setup();
+  api.mode = 'offline';
+  const a = show();
+  a.form.saver.change({ through: '7' });
+  await timers.advance(800);
+  await a.unmount();
+  const found = retainer.find('log-reading'); // the next copy rendered with it
+  api.mode = 'up';
+  await timers.advance(60_000); // let go as clean
+  assert.equal(found.released, true);
+  assert.equal(found.wiped, false, 'not kept or shown at the session end below, so clear() never saw it');
+  retainer.clear(); // the session ends before that copy's effect ran
+  assert.equal(retainer.revive(found), false);
+  retainer.attach(found, () => {});
+  assert.equal(retainer.size, 0, 'not kept');
+  assert.equal(work.has(), false);
+  const sent = api.calls.length;
+  found.saver.change({ through: '8' });
+  await timers.advance(60_000);
+  assert.equal(api.calls.length, sent, 'nothing typed into it is sent');
+});

@@ -97,6 +97,8 @@ export type UseRetainedAutosave<T, D> = UseAutosave<T> & {
  * keeps the saver (retrying on its own) and `data` for the next mount, still counted as unsaved work. One form per
  * `name`: use a name only one form on the screen has. Taking a kept form over sends nothing. Its `save` also gets
  * `cancelled()` (lib/autosave-retain.ts RetainedSaveContext): check it after every await, a session end stops the save.
+ * A kept form found at render and let go as clean before the effect (a background retry got through) is taken back
+ * live, never left with a disposed saver that would drop later edits (FormRetainer.revive).
  */
 export function useRetainedAutosave<T, D extends object>(
   name: string,
@@ -114,13 +116,17 @@ export function useRetainedAutosave<T, D extends object>(
   const form = taken.form;
   const saver = form.saver;
   const [state, setState] = useState<AutosaveState>(() => saver.state);
+  // Unmounted (cleanup ran, no setup since): a late call is not a reason to take a let-go form back.
+  const left = useRef(false);
 
   useEffect(() => {
     let alive = true;
+    left.current = false;
     const listener = (s: AutosaveState) => {
       if (alive) setState(s);
     };
     form.source = () => optsRef.current;
+    // attach() takes back a form let go as clean between this render and now (FormRetainer.revive).
     formRetainer.attach(form, listener);
     setState(saver.state); // anything that happened between the render and now (a background retry)
     const hidden = () => {
@@ -131,6 +137,7 @@ export function useRetainedAutosave<T, D extends object>(
     window.addEventListener("pagehide", leave);
     return () => {
       alive = false;
+      left.current = true;
       document.removeEventListener("visibilitychange", hidden);
       window.removeEventListener("pagehide", leave);
       void formRetainer.detach(form, listener);
@@ -140,9 +147,15 @@ export function useRetainedAutosave<T, D extends object>(
   const dirty = state.status === "waiting" || state.status === "saving" || state.status === "error" || state.status === "incomplete";
   useUnsavedWork(dirty, `autosave:${name}`);
 
-  const change = useCallback((value: T, o?: { delayMs?: number | null }) => saver.change(value, o), [saver]);
-  const flush = useCallback(() => saver.flush(), [saver]);
-  const retry = useCallback(() => saver.retry(), [saver]);
+  // An edit (or a save) after the render but before the effect attached: the form may have been let go as clean in
+  // between (a background retry got through), so it is taken back first instead of dropping the edit.
+  const live = useCallback(() => {
+    if (!left.current) formRetainer.revive(form);
+    return saver;
+  }, [form, saver]);
+  const change = useCallback((value: T, o?: { delayMs?: number | null }) => live().change(value, o), [live]);
+  const flush = useCallback(() => live().flush(), [live]);
+  const retry = useCallback(() => live().retry(), [live]);
   const setBaseline = useCallback((value: T) => saver.setBaseline(value), [saver]);
   const reset = useCallback((b?: T) => saver.reset(b), [saver]);
 

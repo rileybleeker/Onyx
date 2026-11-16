@@ -28,7 +28,8 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * An entry not saved yet (incomplete, failed or waiting) survives the section being unmounted: its fields, the session
  * it made and its client_key stay with its autosaver until it is saved (useRetainedAutosave, PROD-T01). It keeps the
  * day it was started on (also when finished after 06:00 with no new answer from the server), and it stays on screen
- * with its reason and Retry when its book is no longer in progress (or the overview cannot be read), with Discard.
+ * with its reason and Retry when its book is no longer in progress (or the overview cannot be read), with Discard
+ * (which drops the Say it words the entry was made from too).
  */
 
 const READING_URL = LOG_READING_URL;
@@ -161,9 +162,9 @@ type ReadingFormData = {
  * gone before the click landed (PROD-T01). A mouse press keeps focus where it is (mousedown prevented: no blur at all);
  * focus moving to one of them (Tab) skips the blur save. A touch press can still blur the field, often with no
  * relatedTarget (iOS Safari does not focus a tapped button), so the press itself is remembered (pointerdown and
- * touchstart both come before that blur) and the next blur within PRESS_MS skips the save; the click, or that blur,
- * clears it. Skipping only drops the immediate save: what is waiting still goes on its pause timer unless the button
- * drops it. Leaving the form from anywhere else still saves at once.
+ * touchstart both come before that blur) and the next blur within PRESS_MS skips the save; the click, that blur, or
+ * the touch being cancelled (it became a scroll) clears it. Skipping only drops the immediate save: what is waiting
+ * still goes on its pause timer unless the button drops it. Leaving the form from anywhere else still saves at once.
  */
 const BLUR_SKIP_ATTR = "data-autosave-blur-skip";
 const PRESS_MS = 1000;
@@ -344,10 +345,16 @@ export default function ReadingSection() {
   const notePress = () => {
     pressAt.current = Date.now();
   };
+  // A touch that turned into a scroll (or was taken over by the browser) is no press: a later blur saves at once.
+  const dropPress = () => {
+    pressAt.current = null;
+  };
   const keepsFocus = {
     [BLUR_SKIP_ATTR]: "",
     onPointerDown: notePress,
     onTouchStart: notePress,
+    onPointerCancel: dropPress,
+    onTouchCancel: dropPress,
     onMouseDown: (e: { preventDefault(): void }) => e.preventDefault(),
   };
   const onFormBlur = (next: EventTarget | null) => {
@@ -464,6 +471,7 @@ export default function ReadingSection() {
     kept.entryStarted = false;
     kept.entrySent = false;
     kept.entryDay = null;
+    kept.pendingDraft = null;
     setFromDraft(null);
     setSaved(null);
     setRemoveError(null);
@@ -471,6 +479,19 @@ export default function ReadingSection() {
     setForm(blankForm(overviewRef.current?.today ?? ""));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autosave.reset, kept]);
+
+  /**
+   * Discard the entry not saved yet (offered when its book is no longer in progress). The Say it words it was made
+   * from go with it: left in the shared draft store, the next mount (a fresh form, since nothing is kept) would apply
+   * them again and save them. Words this entry was not made from (a newer draft, or one waiting for the session
+   * above to be saved) stay offered.
+   */
+  const discardEntry = () => {
+    const d = draft;
+    const fromThisEntry = !!d && (d.id === kept.pendingDraft || d.id === kept.fromDraft?.id);
+    startNew(); // first: the marks and pendingDraft go, so dropping the draft below reverts nothing
+    if (d && fromThisEntry) clear(d.id);
+  };
 
   const applyDraft = async (force: boolean) => {
     if (!draft) return;
@@ -797,7 +818,7 @@ export default function ReadingSection() {
             <button
               type="button"
               {...keepsFocus}
-              onClick={startNew}
+              onClick={discardEntry}
               disabled={busy}
               className="min-h-11 px-2 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
             >

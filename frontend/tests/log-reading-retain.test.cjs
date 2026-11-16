@@ -4,8 +4,10 @@
 // failed offline keeps its client_key, so Retry creates the session once; opening the section never sends anything;
 // an entry made before the behavioral day rolls keeps its own day; Discard / Remove / New session pressed while a
 // field has focus are never pre-empted by the form's blur save (the press keeps focus, Tab to them skips the save, a
-// touch press that still blurs the field is remembered); a session end stops a save under way (no replay PATCH, no
-// refetch); a copy mounted while the previous copy's create was out shows the day the server stored.
+// touch press that still blurs the field is remembered, a touch that became a scroll is not); a session end stops a
+// save under way (no replay PATCH, no refetch); a copy mounted while the previous copy's create was out shows the day
+// the server stored; a background retry landing between a render and its effects leaves the form live; Discard drops
+// the Say it words the entry was made from.
 // Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
 // tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
 // "server" is the in-memory fetch below.
@@ -123,6 +125,16 @@ function setup(t) {
   // D1 until rollDay(), then D2 for every instant from then on.
   let serverToday = D1;
   let rollAt = Infinity;
+  // The shared Say it draft store (lib/log-drafts.ts), reading section only: one draft or none.
+  let draft = null;
+  let draftSeq = 0;
+  const clearDraft = (id) => {
+    if (!draft || (id !== undefined && draft.id !== id)) return;
+    draft = null;
+    R.dirty = true;
+  };
+  // Run once between the next render and its effects (a background save landing before React's passive effects).
+  let beforeEffects = null;
   const reply = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
   const replacements = {
     document: { visibilityState: "visible", activeElement: null, body: {}, addEventListener() {}, removeEventListener() {} },
@@ -171,7 +183,7 @@ function setup(t) {
       },
     },
     "@/lib/format": { sameJson: (a, b) => JSON.stringify(a) === JSON.stringify(b) },
-    "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }) },
+    "@/lib/log-drafts": { useLogDrafts: () => ({ draft, clear: clearDraft }) },
     "@/lib/log-early": { LOG_READING_URL: "/api/reading", logEarlyGet: () => undefined },
   };
   const Section = loadTs("app/log/sections/Reading.tsx", stubs).default;
@@ -196,6 +208,11 @@ function setup(t) {
         R.dirty = false;
         effects = [];
         tree = expand({ type: Section, props: {} });
+        if (beforeEffects) {
+          const between = beforeEffects;
+          beforeEffects = null;
+          await between();
+        }
         for (const effect of effects) effect();
       }
       await new Promise((resolve) => setImmediate(resolve));
@@ -258,6 +275,7 @@ function setup(t) {
     text: () => text(),
     value: (label) => field(label).props.value,
     hasButton: (label) => nodes().some((n) => n.type === "button" && text(n) === label),
+    button,
     type: async (label, value) => { field(label).props.onChange({ target: { value } }); await flush(); },
     click: async (label) => { await button(label).props.onClick(); await flush(); },
     blurTo,
@@ -294,6 +312,31 @@ function setup(t) {
       return async () => { const h0 = hold; hold = null; release(); await h0.promise; await flush(); };
     },
     async mount() { R.gen += 1; R.frames = new Map(); R.mounted = true; R.dirty = true; await flush(); },
+    /** Mount, running `between` after the first render and before its effects (attach) run. */
+    async mountThen(between) { beforeEffects = between; await h.mount(); },
+    /**
+     * Run every autosave timer due within `ms` WITHOUT rendering (as when a kept saver's own retry fires while a
+     * render is waiting for its effects).
+     */
+    async runTimers(ms) {
+      for (let left = ms; ;) {
+        const hit = timers.due(left);
+        if (!hit) break;
+        left = hit.left;
+        hit.fn();
+        for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+      }
+    },
+    /** Riley's Say it words for this section (a ReadingLogDraft): written to the shared store. */
+    async say(value) {
+      draft = {
+        section: "reading", id: ++draftSeq, at: 0, said: "synthetic words",
+        value: { book: null, minutes: null, chapter_from: null, chapter_through: null, medium: null, recall: null, date: null, ...value },
+      };
+      R.dirty = true;
+      await flush();
+    },
+    get draft() { return draft; },
     async unmount() {
       const cells = [...R.frames.values()].flatMap((f) => f.slots.filter((s) => s && typeof s === "object" && "cleanup" in s));
       R.mounted = false;
@@ -772,4 +815,75 @@ test("remounted while the previous copy's create is out: the day the server stor
   assert.equal(h.value("Day"), D2, "and the day it was stored on");
   assert.match(h.text(), /For Apr 11/);
   assert.equal(h.posts().length, 1, "created once");
+});
+
+test("a background retry that gets through after the section rendered and before its effects ran: later edits are still saved", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "2");
+  await h.tick(1500);
+  await h.unmount(); // kept, with its retry timer set
+  assert.equal(h.retainer.size, 1);
+  h.mode = "up";
+  // The next copy renders (it finds the kept entry); the retry lands before its effects attach it.
+  await h.mountThen(() => h.runTimers(60_000));
+  assert.equal(h.rows.size, 1, "created once, by the background retry");
+  assert.equal(new Set(h.posts().map((p) => p.body.client_key)).size, 1, "every attempt carried the same client_key");
+  assert.match(h.text(), /This session/, "the new copy shows the session the retry made");
+  assert.match(h.text(), /Saved · \+10 XP/);
+  assert.equal(h.work.has(), false, "nothing unsaved");
+
+  const before = h.calls.length;
+  await h.type("Minutes", "40");
+  await h.tick(1500);
+  const after = h.calls.slice(before);
+  assert.deepEqual(after.map((c) => c.method), ["PATCH"], "the edit updates that session: not dropped by a disposed saver");
+  assert.match(after[0].url, /^\/api\/reading\/sessions\/\d+$/);
+  assert.equal(after[0].body.minutes, 40);
+  assert.match(h.text(), /Saved/);
+  await h.unmount();
+  assert.equal(h.retainer.size, 0, "all saved: nothing kept");
+});
+
+test("Discard drops the Say it words the entry was made from: the next mount neither applies them again nor saves them", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.say({ chapter_through: 5, minutes: 20 });
+  assert.equal(h.value("Through ch."), "5", "the words filled the form");
+  await h.tick(1500); // the create fails offline
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./);
+  await h.unmount();
+  await h.serve(noBookAnswer()); // the book was finished elsewhere meanwhile
+  await h.mount();
+  assert.equal(h.value("Through ch."), "5", "the kept entry is still reachable");
+  await h.click("Discard this entry");
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.draft, null, "its words left the draft store with it");
+  assert.equal(h.work.has(), false);
+
+  h.mode = "up";
+  await h.serve(answer()); // a book in progress again
+  await h.unmount();
+  await h.mount();
+  assert.equal(h.value("Through ch."), "", "a blank form: the discarded words are not applied again");
+  assert.equal(h.value("Minutes"), "");
+  const posts = h.posts().length;
+  await h.tick(60_000);
+  assert.equal(h.posts().length, posts, "and nothing is saved");
+  assert.equal(h.rows.size, 0);
+});
+
+test("a touch on Discard that turns into a scroll is no press: the next blur out of the form saves at once", async (t) => {
+  const h = setup(t);
+  await keptCompleteEntryWithoutBook(h);
+  const b = h.button("Discard this entry");
+  b.props.onPointerDown?.({});
+  b.props.onTouchStart?.({});
+  b.props.onTouchCancel?.({}); // the browser took the touch over for scrolling: no click follows
+  b.props.onPointerCancel?.({});
+  await h.blurTo(null); // later, focus leaves the form
+  assert.equal(h.posts().length, 1, "saved at once, not skipped as if Discard had been pressed");
+  assert.equal(h.posts()[0].body.chapter_through, 5);
 });
