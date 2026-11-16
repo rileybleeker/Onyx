@@ -364,6 +364,94 @@ def test_heal_logs_no_dates_values_or_session_ids() -> None:
         assert token not in text, (token, text)
 
 
+def test_heal_through_the_real_http_clients_logs_no_ids_or_dates_on_any_logger() -> None:
+    """Root-log capture with the real HTTP clients behind mock transports.
+
+    httpx logs every request at INFO with its URL, and the heal's URLs carry
+    the user and session ids (GET /users/{id}/intervals/{session id}) and the
+    healed row's date (PATCH .../eight_sleep_trends?calendar_date=eq.<date>).
+    The HTTP loggers are reset to inherit DEBUG from the root first, so only
+    the heal's own quieting can keep those lines out; their levels must be put
+    back afterwards."""
+    import logging
+
+    import httpx
+    from postgrest import SyncPostgrestClient
+
+    rows = [_trend_row("2026-11-03", sid="SID-OK"),
+            _trend_row("2026-11-02", sid="SID-GONE"),
+            _trend_row("2026-11-01", sid="SID-BAD")]
+    provider_urls: list[str] = []
+    database_urls: list[str] = []
+
+    def provider(request):
+        provider_urls.append(str(request.url))
+        sid = request.url.path.rsplit("/", 1)[-1]
+        if sid == "SID-OK":
+            return httpx.Response(200, json=_interval(), request=request)
+        if sid == "SID-GONE":
+            return httpx.Response(404, json={"error": f"no session {sid}"}, request=request)
+        return httpx.Response(500, json={"error": f"session {sid} failed"}, request=request)
+
+    def database(request):
+        database_urls.append(f"{request.method} {request.url}")
+        if request.method == "GET":
+            return httpx.Response(200, json=rows, request=request)
+        return httpx.Response(200, json=[], request=request)
+
+    client = es.EightSleepClient("e", "p", "America/New_York")
+    client.token = "t"
+    client.http.close()
+    client.http = httpx.Client(transport=httpx.MockTransport(provider))
+    pds = SyncPostgrestClient("https://db.example/rest/v1", schema="pds",
+                              http_client=httpx.Client(transport=httpx.MockTransport(database)))
+
+    class _Supabase:
+        # postgrest's own .schema() builds a new client without the mock
+        # transport, so sb.schema("pds") hands back the pds client directly.
+        def schema(self, _name):
+            return pds
+
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(f"{record.name}: {self.format(record)}")
+
+    handler = _Capture(level=logging.DEBUG)
+    root = logging.getLogger()
+    names = (*es.HTTP_LOGGERS, "eight_sleep_etl", "retry_helper", "postgrest")
+    saved_levels = {n: logging.getLogger(n).level for n in names}
+    saved_root, saved_sleep = root.level, es.time.sleep
+    for n in names:
+        logging.getLogger(n).setLevel(logging.NOTSET)
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    es.time.sleep = lambda *_: None       # retry_http's backoff between the 500s
+    try:
+        stats = es.self_heal_temps(client, _Supabase(), USERS, TODAY, delay_s=0)
+        after = {n: logging.getLogger(n).level for n in es.HTTP_LOGGERS}
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(saved_root)
+        es.time.sleep = saved_sleep
+        for n, level in saved_levels.items():
+            logging.getLogger(n).setLevel(level)
+        client.close()
+        pds.session.close()
+
+    assert stats["healed"] == 1 and stats["not_found"] == 1 and stats["failed"] == 1, stats
+    # The requests really carried the ids and the date, so a request line would show them.
+    assert any("/users/u-left/intervals/SID-OK" in u for u in provider_urls), provider_urls
+    assert any(u.startswith("PATCH ") and "2026-11-03" in u for u in database_urls), database_urls
+    assert after == {n: logging.NOTSET for n in es.HTTP_LOGGERS}, "levels must be restored"
+    text = " | ".join(seen)
+    assert seen, "the heal's own warnings reach the root handler"
+    for token in ("SID-", "u-left", "2026-11-0", "25.0", "20.0", "HTTP Request",
+                  "8slp.net", "db.example"):
+        assert token not in text, (token, text)
+
+
 def test_missing_session_unknown_side_and_empty_timeseries() -> None:
     sb = FakeSupabase([
         _trend_row("2026-11-06", sid="NOTFOUND"),                       # 404 -> None

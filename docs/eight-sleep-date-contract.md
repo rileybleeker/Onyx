@@ -104,13 +104,14 @@ If the Pod moves to another UTC offset, say Pacific, days sliced in Eastern can 
 local midnight: an evening nap ending 22:30 PDT on 2026-10-05 ends 01:30 EDT on 10-06. Set
 `EIGHTSLEEP_TIMEZONE` to the new zone from the move on. The scheduled run sets it in
 `.github/workflows/eight-sleep-etl.yml` (a protected path, so Riley changes it; it is neither a
-secret nor a repository variable), a local run reads it from `.env` or the shell. Until then, if the session `timezone`
-field reflects the Pod, each run is `partial` with the GUARD line (and for up to a week after
-the change, while nights from before the move are still in the 7-day window). Changing the
-variable is not free: the next routine runs ask the provider to re-slice the whole 7-day
-window, including the nights just before the move, in the new zone, so those rows can be
-rewritten or a night can land on a neighbouring date. How the provider re-slices them is not
-known. Treat a relocation as its own scoped plan (change the variable on the move date, then
+secret nor a repository variable); a local run takes it from the shell for that session (the PC
+has no `.env`; see the credentials note in the Affected-history plan). Until then, if the
+session `timezone` field reflects the Pod, each run is `partial` with the GUARD line (and for
+up to a week after the change, while nights from before the move are still in the 7-day
+window). Changing the variable is not free: the next routine runs ask the provider to re-slice
+the whole 7-day window, including the nights just before the move, in the new zone, so those
+rows can be rewritten or a night can land on a neighbouring date. How the provider re-slices
+them is not known. Treat a relocation as its own scoped plan (change the variable on the move date, then
 check the week around it read-only); rows older than the window are not touched.
 
 **H. Daytime onset (known limit).** In bed 08:00, up 15:00 on 2026-03-20. Provider day
@@ -137,7 +138,10 @@ date the `/intervals` list returned last.
   rows, counts failed trends chunks, flags `/intervals` items without an id and a run where no
   interval pairs (rule 6) and checks the bed zone (`bed_tz_check`); `trends_problems` builds the
   heartbeat message, GUARD first. The temp self-heal no longer logs a row's date, its
-  temperatures or a session id (the Actions log is public); its counters are unchanged.
+  temperatures or a session id (the Actions log is public), and it turns the HTTP client
+  loggers down while it runs (`quiet_http_logs`): httpx logs every request URL at INFO, and the
+  heal's URLs carry the user and session ids (`/intervals/{id}`) and the healed row's date (the
+  `calendar_date=eq.<date>` filter of its UPDATE). Its counters are unchanged.
 - `eight_sleep_temp_backfill.py --compare [--max-lookups N]`: the read-only comparison in the
   plan below.
 - Comments in `sql/adr_0001_04_other_onyx_dates.sql`, `eight_sleep_schema.sql`, `hrv_alignment.py`
@@ -216,9 +220,12 @@ These open items are also recorded in the Notes of the HIST-ETL-01 roadmap row.
   GUARD may never fire even after a move (if the field only echoes the request).
 - Whether stored temperatures were actually harmed by the old start-date pairing (claim 4):
   pending the comparison above, which needs credentials and runs privately.
-- That `/intervals` items use the same id as the trend `mainSessionId` is assumed, not observed
-  on a collection payload; rule 6 reports it if it ever fails.
+- That `/intervals` items use the same id as the trend `mainSessionId` (and as `sessions[].id`,
+  read when a day has no `mainSessionId`) is assumed, not observed on a collection payload; rule
+  6 reports it if it ever fails, and a day that cannot pair gets no temperature, never a wrong
+  one.
 - Temperature units: `tempBedC` / `tempRoomC` are Celsius by name; not re-checked here.
 - Other ETL log lines still name provider ids (the authenticate line, fetch error messages that
-  quote a request URL). Only the temp self-heal's per-row lines were made counts-only here.
+  quote a request URL, and httpx's request lines during the normal sync). Only the temp
+  self-heal was made counts-only here: its own lines, and the HTTP request lines while it runs.
 - The other items on the same roadmap row (not Eight Sleep) are untouched.

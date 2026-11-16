@@ -20,6 +20,7 @@ import json
 import time
 import argparse
 import logging
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -70,6 +71,31 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("eight_sleep_etl")
+
+# HTTP client loggers. httpx logs every request at INFO with its full URL, and
+# the temp self-heal's URLs carry the provider's user and session ids
+# (/users/{id}/intervals/{session id}) and the healed row's date (the
+# PostgREST filter calendar_date=eq.<date>). The Actions log is public.
+HTTP_LOGGERS = ("httpx", "httpcore", "hpack", "h2")
+
+
+@contextmanager
+def quiet_http_logs(level: int = logging.ERROR):
+    """Raise the HTTP client loggers to `level` while the block (or a function
+    decorated with @quiet_http_logs()) runs, then put their levels back.
+
+    A failed request still reaches the caller as an exception, which it counts
+    or logs by type, so nothing is lost but the request lines.
+    """
+    loggers = [logging.getLogger(n) for n in HTTP_LOGGERS]
+    saved = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.setLevel(max(lg.level, level))
+    try:
+        yield
+    finally:
+        for lg, lvl in zip(loggers, saved):
+            lg.setLevel(lvl)
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +795,9 @@ def _session_id_from_raw(raw) -> str | None:
     return ids.pop() if len(ids) == 1 else None
 
 
+# Decorated, so every caller (the ETL, the backfill script) gets the quiet
+# HTTP loggers for the whole heal, lookups and UPDATEs alike.
+@quiet_http_logs()
 def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
                     max_rows: int = SELFHEAL_MAX_ROWS,
                     lookback_days: int | None = SELFHEAL_LOOKBACK_DAYS,
@@ -790,8 +819,11 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
     Today is excluded (the session may still be processing). One failing row
     never stops the others; it stays NULL and is retried next run.
     Nothing per row is logged (no date, value or provider id: the Actions log
-    is public); the caller logs the counters. Returns counters; `scan_error`
-    is set if the candidate query failed.
+    is public); the caller logs the counters. That covers the HTTP clients
+    too: httpx's per-request INFO lines, whose URLs carry the user and session
+    ids and the healed row's date, are turned down while it runs
+    (quiet_http_logs). Returns counters; `scan_error` is set if the candidate
+    query failed.
     """
     stats = _new_heal_stats()
     if max_rows <= 0:

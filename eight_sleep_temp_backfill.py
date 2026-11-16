@@ -205,8 +205,10 @@ def _max_lookups(args: list[str]) -> int:
 @contextmanager
 def _quiet_provider_logs():
     """Turn down the loggers that print provider ids (the ETL's authenticate
-    line, retry warnings, httpx request URLs) while --compare runs."""
-    names = ("eight_sleep_etl", "retry_helper", "httpx", "httpcore")
+    line, retry warnings, httpx request URLs) while --compare runs. The
+    dry-run / --apply heal needs no wrapper for the HTTP lines: the ETL's
+    self_heal_temps quiets them itself (es.quiet_http_logs)."""
+    names = ("eight_sleep_etl", "retry_helper", *es.HTTP_LOGGERS)
     saved = {n: logging.getLogger(n).level for n in names}
     for n in names:
         logging.getLogger(n).setLevel(logging.ERROR)
