@@ -20,8 +20,9 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * must be current), graded in code when it can be (a short answer, a choice after "Show choices", an order, "I don't
  * know"; the same gradeLocal the browser ran, and the server's verdict wins) and stored with the replayed schedule in
  * ONE call of pds.reading_bank_attempt; anything else is stored pending and its grade job runs in after(), never
- * awaited. The same attempt_key with the same request answers the first receipt (`replayed: true`); another request
- * under that key is 409 key_reused. Answers: 200 {success, attempt_key, grading_status, verdict, score,
+ * awaited. The same attempt_key with the same request answers the first receipt (`replayed: true`), also after the
+ * question was re-versioned or retired since (the function looks the key up before it refuses a changed question);
+ * another request under that key is 409 key_reused. Answers: 200 {success, attempt_key, grading_status, verdict, score,
  * attempt_date, next_review, hinted, overridden, replayed}.
  *
  * Auth: owner session only (middleware; NEVER add this to isCiRoute). Same-origin, JSON only, 16 KB cap, unknown

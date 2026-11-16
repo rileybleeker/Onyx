@@ -92,8 +92,13 @@ export const RACE_RETRIES = 3;
 /** The grade prompt's version (stored as the grade job's prompt_version). */
 export const GRADE_PROMPT_VERSION = "grade-2026-11-16.1";
 export const GRADE_MAX_TOKENS = 4000;
-/** Minutes before a failed grade call is tried again, by attempt (the third retry fails the job). */
-export const GRADE_RETRY_MINUTES = [5, 30, 180] as const;
+/**
+ * Minutes before a failed grade call is tried again, by attempt: after the first failed try 5, after the second 30.
+ * The third failed try fails the job (pds.reading_bank_finish turns a retry into failed at attempts >= 3, as the
+ * claim does for an expired lease), so the answer stays pending with its grade_error and "Grade it yourself" is
+ * offered. Spec §7.5's further 3 h retry would need a fourth attempt, which S1's SQL does not allow.
+ */
+export const GRADE_RETRY_MINUTES = [5, 30] as const;
 /** At most this many questions per chat read (get_reading_questions). */
 export const CHAT_QUESTIONS_MAX = 10;
 /** The far-future answered_at of a new answer in a replay: it sorts after every stored answer of its day. */
@@ -209,15 +214,21 @@ function answerOf(err: unknown): BankAnswer {
   return { status: 500, body: { error: "failed" } };
 }
 
-type DbError = { code?: string } | null | undefined;
+type DbError = { code?: string; message?: string } | null | undefined;
+
+/** The two PROD-T07 column checks sql/reading_question_bank_checks.sql widens (source_kind 'idea', grader 'local'). */
+export const T07_WIDENED_CHECKS = ["reading_question_attempts_grader_check", "reading_questions_source_kind_check"] as const;
 
 /** An RPC or read answer as a failure (status + short code), or null when it succeeded. */
 export function bankFailure(data: unknown, error: DbError): { status: number; error: string } | null {
   if (error) {
     const code = String(error.code ?? "");
     if (isMissingSchema(error)) return { status: 503, error: "bank_unavailable" };
-    // T07's two CHECKs not widened yet (sql/reading_question_bank_checks.sql): a local grade cannot be stored.
-    if (code === "23514") return { status: 503, error: "schema_checks" };
+    // T07's two CHECKs not widened yet (sql/reading_question_bank_checks.sql): a local grade cannot be stored. Only
+    // those two constraint names (read from the message, which is never logged or answered); any other check
+    // violation is a plain failure.
+    const msg = typeof error.message === "string" ? error.message : "";
+    if (code === "23514" && T07_WIDENED_CHECKS.some((c) => msg.includes(c))) return { status: 503, error: "schema_checks" };
     if (/^OXB/.test(code)) return { status: 409, error: "refused" };
     return { status: 500, error: "failed" };
   }
@@ -236,6 +247,7 @@ const readFailed = (error: DbError) => {
   return refuse(f.status, f.error);
 };
 const isRaced = (data: unknown, error: DbError) => !error && plainObject(data) && data.ok === false && data.code === "raced";
+const isStatesMissing = (data: unknown, error: DbError) => !error && plainObject(data) && data.ok === false && data.code === "states_missing";
 
 /** The round's day as the SQL stores it: kept across the 06:00 rollover, never more than one day back. */
 export function clampRoundDate(roundDate: string | null, today: string): string {
@@ -562,7 +574,10 @@ export interface PracticeCard {
   sources: PracticeSource[];
   /** Distinct sites among the web sources, plus 1 when a highlight supports the idea (the "Sources N" chip). */
   source_count: number;
-  /** What each verdict would schedule (counts = false: the idea had an answer today, this one changes nothing). */
+  /**
+   * What each verdict would schedule (counts = false: the idea had an answer today, this one changes nothing).
+   * null for a dirty state (a flag's repair is pending), where the stored state is not what the commit replays.
+   */
   preview: { counts: boolean; next: Record<Verdict, VerdictPreview> } | null;
   /** A highlight review card: what Again / Good / Easy would schedule (T02's reviewPreview). */
   review_preview: Record<PracticeGrade, Schedule> | null;
@@ -616,6 +631,8 @@ function deckState(i: DeckIdea): IdeaState {
  * The preview under a card: scheduleAfterGrade on the stored state with this answer appended, which is what the
  * commit's full replay computes while the state is clean (the stored state IS the replay of every earlier answer).
  * An idea that already had an answer today (in any round, or covered by a chapter recall) changes nothing.
+ * The caller shows no preview for a dirty state (a flag's repair is pending): the stored state is not the replay
+ * then, and the T03 rule is that the preview equals the commit.
  */
 export function ideaPreview(idea: DeckIdea, q: DeckQuestion, today: string, answeredToday: boolean): { counts: boolean; next: Record<Verdict, VerdictPreview> } {
   const state = deckState(idea);
@@ -665,7 +682,8 @@ function cardOut(c: RoundCard, deck: Deck, answeredIdeas: Set<number>): Practice
     base.again_question = questionOut(again?.question);
     base.sources = src.list;
     base.source_count = src.count;
-    base.preview = ideaPreview(i, c.question, deck.today, answeredIdeas.has(i.idea_id));
+    // A dirty state (a flag's repair pending) is not the replay of its answers: no preview rather than a wrong one.
+    base.preview = i.dirty === true ? null : ideaPreview(i, c.question, deck.today, answeredIdeas.has(i.idea_id));
   } else if (c.kind === "chapter_recall" && c.recall) {
     const r = c.recall;
     const doneN = num(r.done_n, 0);
@@ -785,13 +803,17 @@ export type AttemptAnswer = BankAnswer & { /** Set when the answer was stored pe
  * with the replayed schedule in the same transaction, so the receipt carries the verdict at once; everything else is
  * stored pending with a grade job (pendingKey). The same attempt_key with the same request answers the first
  * receipt (`replayed`), another request under it is 409 key_reused (pds.reading_bank_attempt).
+ *
+ * Whether the question may still be answered (superseded, retired, locked, another edition) is decided by
+ * pds.reading_bank_attempt alone, AFTER it looked the attempt key up: a retry of an answer that was stored before its
+ * question changed (a sync re-versioned the chapter recall, a flag retired it) gets its original receipt, never 409.
+ * Only the version is checked here: a question_id is one immutable version, so another version is a malformed request.
  */
 export async function recordAttempt(supabase: Supa, input: AttemptInput): Promise<AttemptAnswer> {
   try {
     const [q, today] = await Promise.all([readQuestion(supabase, input.question_id, true), dbToday(supabase)]);
     if (!q || !q.format) return { status: 404, body: { error: "not_found" }, pendingKey: null };
-    if (q.superseded_at || q.version !== input.version) return { status: 409, body: { error: "question_changed" }, pendingKey: null };
-    if (q.retired_at) return { status: 409, body: { error: "retired" }, pendingKey: null };
+    if (q.version !== input.version) return { status: 409, body: { error: "question_changed" }, pendingKey: null };
     if (input.hinted && q.format !== "cued") return { status: 400, body: { error: "bad_request" }, pendingKey: null };
     const format = q.format;
     const grade = gradeLocal(format, q.rubric, input.answer, input.hinted);
@@ -988,7 +1010,11 @@ function gradeInputs(q: AttemptQuestion, ideas: Map<number, IdeaRow>, covers: nu
     return { points: [{ id: CUED_POINT_ID, text }], reference, score: (hits: PointHit[]) => modelScore("cued", rubric, hits) };
   }
   if (q.format === "chapter_recall" && rubric?.format === "chapter_recall") {
-    // Only the ideas still active (an idea flagged Wrong after the answer no longer counts for it).
+    // Only the ideas still active (an idea flagged Wrong after the answer no longer counts for it). An idea moved to
+    // the end of the book ("Not in this chapter") after the answer stays: the answer counts for it (spec §8.7) and
+    // pds.reading_bank_grade wants a replayed state for every active covered idea, where one with no mark would
+    // take the answer's overall verdict. Its feedback stays on the server: GET .../round/[roundKey] leaves out any
+    // attempt whose question version lists an idea above the gate (pds.reading_bank_question_open).
     const listed: ChapterRecallIdea[] = rubric.ideas.filter((i) => covers.includes(i.idea_id) && ideas.get(i.idea_id)?.status === "active");
     return {
       points: listed.map((i) => {
@@ -1002,29 +1028,43 @@ function gradeInputs(q: AttemptQuestion, ideas: Map<number, IdeaRow>, covers: nu
   return null;
 }
 
-/** The idea ids a grade of this answer moves: its idea, or the chapter recall's covered ideas (active ones). */
-function gradeIdeaIds(a: Pick<AttemptRow, "idea_id" | "covers">, activeIdeas?: Map<number, IdeaRow>): number[] {
+/**
+ * The idea ids a grade of this answer moves, as pds.reading_bank_grade asks for them: its idea, or the covered ideas
+ * of a chapter recall answer that are still active (one flagged Wrong is retired and moves no more). With `ideas`
+ * (already read) nothing is read; otherwise the covered ideas' statuses are read.
+ */
+async function gradeIdeaIds(supabase: Supa, a: Pick<AttemptRow, "idea_id" | "covers">, ideas?: Map<number, Pick<IdeaRow, "status">>): Promise<number[]> {
   if (a.idea_id) return [Number(a.idea_id)];
   const covers = uniqueIds(a.covers ?? []);
-  return activeIdeas ? covers.filter((id) => activeIdeas.get(id)?.status === "active") : covers;
+  if (!covers.length) return [];
+  let status = ideas;
+  if (!status) {
+    const { data, error } = await supabase.from("reading_ideas").select("idea_id,status").in("idea_id", covers);
+    if (error) throw readFailed(error);
+    status = new Map(((data ?? []) as { idea_id: unknown; status: string }[]).map((r) => [Number(r.idea_id), { status: r.status }] as [number, Pick<IdeaRow, "status">]));
+  }
+  return covers.filter((id) => status!.get(id)?.status === "active");
 }
 
 /**
- * Write a grade (model or self) with the replayed schedule of every idea it moves; `raced` re-reads (at most
- * RACE_RETRIES more times). The answer's own event gets the verdict (for a chapter recall answer, each covered idea
- * the verdict its mark gives: recallEventVerdict, which mirrors pds.reading_bank_events).
+ * Write a grade (model or self) with the replayed schedule of every idea it moves. `raced` (a write moved a version
+ * in between) and `states_missing` (a Restore made a covered idea active again in between) re-read the ideas and
+ * the schedule and send again, at most RACE_RETRIES more times. The answer's own event gets the verdict (for a
+ * chapter recall answer, each covered idea the verdict its mark gives: recallEventVerdict, which mirrors
+ * pds.reading_bank_events). `first` = the ids already resolved for the first try.
  */
 async function writeGrade(
   supabase: Supa,
-  a: Pick<AttemptRow, "attempt_key">,
+  a: Pick<AttemptRow, "attempt_key" | "idea_id" | "covers">,
   q: Pick<AttemptQuestion, "format" | "book_id">,
-  ids: number[],
   grade: { verdict: ModelVerdict; score: number; hits: PointHit[] | null; feedback: string | null; grader: "model" | "self" },
+  first?: number[],
 ): Promise<{ data: unknown; error: DbError }> {
   const recall = q.format === "chapter_recall";
   let data: unknown = null;
   let error: DbError = null;
   for (let tries = 0; tries <= RACE_RETRIES; tries++) {
+    const ids = tries === 0 && first ? first : await gradeIdeaIds(supabase, a);
     const [versions, today] = await Promise.all([readVersions(supabase, ids), dbToday(supabase)]);
     const events = await readEvents(supabase, q.book_id, ids);
     const states = computeStates(ids, versions, events, today, a.attempt_key, (id) => ({
@@ -1033,34 +1073,51 @@ async function writeGrade(
     ({ data, error } = await supabase.rpc("reading_bank_grade", {
       p: { attempt_key: a.attempt_key, verdict: grade.verdict, score: grade.score, hits: grade.hits, feedback: grade.feedback, grader: grade.grader, states },
     }));
-    if (!isRaced(data, error)) break;
+    if (!isRaced(data, error) && !(recall && isStatesMissing(data, error))) break;
   }
   return { data, error };
 }
 
+/** A claimed grade job as runGradeJob takes it: pds.reading_bank_claim's answer, or the job row it carries. */
+export type GradeJobClaim =
+  | { job: ClaimedGradeJob; headroom_cents?: number | string | null }
+  | (ClaimedGradeJob & { headroom_cents?: number | string | null });
+
+/** The claim's headroom in cents, or null when none was given (a bare job row). */
+export function claimHeadroom(claimed: GradeJobClaim): number | null {
+  const raw = (claimed as { headroom_cents?: unknown }).headroom_cents;
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 /**
- * Run one claimed grade job and finish it (pds.reading_bank_finish). Takes the claim's answer ({job, headroom_cents})
- * or the job row itself. S2's worker dispatches step 'grade' here and does not finish the job again.
+ * Run one claimed grade job and finish it (pds.reading_bank_finish). Takes pds.reading_bank_claim's answer
+ * ({job, headroom_cents}) or the job row it carries (`claim.job`). S2's worker dispatches step 'grade' here and does
+ * not finish the job again.
  *
  * The model is asked only when the answer is still pending; its marks are checked in code, the score and verdict
- * are computed here (lib/reading-recall.ts), and the grade is written with the replayed schedule. Money: the call
- * is bounded by the claim's headroom and every request is reserved first (pds.reading_bank_reserve); a call that
- * may have been billed without a usage report is charged its reservation. Failures retry after 5, 30 and 180
- * minutes (a malformed answer once), then fail: the answer stays pending with its grade_error, and "Grade it
- * yourself" is offered. Nothing here logs text.
+ * are computed here (lib/reading-recall.ts), and the grade is written with the replayed schedule. Money: every
+ * request is reserved first (pds.reading_bank_reserve, which checks the monthly cap atomically against every
+ * running reservation), and with the claim's answer the call is also bounded by its headroom_cents. A bare job row
+ * carries no headroom (its reserved_cents is only the claim's estimate, well below one grade request's bound), so
+ * then the reservation alone bounds the call. A call that may have been billed without a usage report is charged
+ * its reservation. Failures retry after 5 and 30 minutes (a malformed answer once), then fail (GRADE_RETRY_MINUTES):
+ * the answer stays pending with its grade_error, and "Grade it yourself" is offered. Nothing here logs text.
  */
-export async function runGradeJob(
-  supabase: Supa,
-  claimed: { job: ClaimedGradeJob; headroom_cents?: number | string | null } | (ClaimedGradeJob & { headroom_cents?: number | string | null }),
-  opts: GradeJobOptions = {},
-): Promise<GradeJobResult> {
+export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: GradeJobOptions = {}): Promise<GradeJobResult> {
   const job: ClaimedGradeJob = "job" in claimed && plainObject(claimed.job) ? (claimed.job as ClaimedGradeJob) : (claimed as ClaimedGradeJob);
-  const headroom = num((claimed as { headroom_cents?: unknown }).headroom_cents, num(job.reserved_cents, STEP_ESTIMATE_CENTS.grade));
+  const headroom = claimHeadroom(claimed);
   let reserved = num(job.reserved_cents, STEP_ESTIMATE_CENTS.grade);
   let usage: unknown = null;
   let cost = 0;
 
-  const finish = async (outcome: GradeJobResult["outcome"], code: string | null, graded = false): Promise<GradeJobResult> => {
+  /**
+   * `sqlOutcome` is what pds.reading_bank_finish records when it differs from what the caller is told: a job whose
+   * answer is no longer pending is finished 'done' there, because any other outcome counts a grade try and writes
+   * the code into the (already graded or voided) answer's grade_error.
+   */
+  const finish = async (outcome: GradeJobResult["outcome"], code: string | null, graded = false, sqlOutcome: GradeJobResult["outcome"] = outcome): Promise<GradeJobResult> => {
     const attempts = num(job.attempts, 1);
     const retryMinutes = GRADE_RETRY_MINUTES[Math.min(Math.max(attempts, 1), GRADE_RETRY_MINUTES.length) - 1];
     const safeCode = code ? bankCode(code) : null;
@@ -1069,11 +1126,11 @@ export async function runGradeJob(
         p: {
           job_id: job.job_id,
           attempts,
-          outcome,
+          outcome: sqlOutcome,
           cost_cents: Math.round(cost * 100) / 100,
           usage,
           error_code: safeCode,
-          retry_minutes: outcome === "retry" ? retryMinutes : null,
+          retry_minutes: sqlOutcome === "retry" ? retryMinutes : null,
         },
       });
     } catch {
@@ -1087,7 +1144,7 @@ export async function runGradeJob(
     const read = await readAttempt(supabase, job.attempt_key, true);
     if (!read || !read.a.ext_hash) return await finish("failed", "other");
     const { a, q } = read;
-    if (a.grading_status !== "pending") return await finish("skipped", "not_pending");
+    if (a.grading_status !== "pending") return await finish("skipped", "not_pending", false, "done");
     if (typeof a.answer !== "string" || !a.answer.trim()) return await finish("failed", "other");
 
     const covers = uniqueIds(a.covers ?? []);
@@ -1110,7 +1167,8 @@ export async function runGradeJob(
       maxTokens: GRADE_MAX_TOKENS,
       schema: GRADE_SCHEMA,
       step: "grade",
-      maxCostCents: headroom,
+      // With no headroom (a bare job row) the reservation below is the only bound: cap null in bankModelCall.
+      ...(headroom === null ? {} : { maxCostCents: headroom }),
       reserve: async (total) => {
         const { data, error } = await supabase.rpc("reading_bank_reserve", {
           p: { job_id: job.job_id, attempts: job.attempts, total_cents: total, month_cap_cents: monthCap(opts) },
@@ -1133,8 +1191,8 @@ export async function runGradeJob(
     const score = inputs.score(parsed.hits);
     const verdict = verdictFromScore(score);
 
-    const ids = gradeIdeaIds(a, ideas);
-    const { data, error } = await writeGrade(supabase, a, q, ids, { verdict, score, hits: parsed.hits, feedback: parsed.feedback, grader: "model" });
+    const ids = await gradeIdeaIds(supabase, a, ideas);
+    const { data, error } = await writeGrade(supabase, a, q, { verdict, score, hits: parsed.hits, feedback: parsed.feedback, grader: "model" }, ids);
     const failed = bankFailure(data, error);
     if (!failed) return await finish("done", null, true);
     // Graded or voided meanwhile (self grade, a flag): the call is paid, nothing is written.
@@ -1193,7 +1251,7 @@ export async function selfGrade(supabase: Supa, attemptKey: string, verdict: Mod
     if (!read || !read.a.ext_hash) return { status: 404, body: { error: "not_found" } };
     const { a, q } = read;
     if (a.grading_status === "pending" && !selfGradable(a, nowMs)) return { status: 409, body: { error: "still_grading" } };
-    const { data, error } = await writeGrade(supabase, a, q, gradeIdeaIds(a), { verdict, score: VERDICT_SCORE[verdict], hits: null, feedback: null, grader: "self" });
+    const { data, error } = await writeGrade(supabase, a, q, { verdict, score: VERDICT_SCORE[verdict], hits: null, feedback: null, grader: "self" });
     const failed = bankFailure(data, error);
     if (failed) return { status: failed.status, body: { error: failed.error } };
     return { status: 200, body: receiptBody(data as Record<string, unknown>) };
@@ -1208,8 +1266,12 @@ export async function selfGrade(supabase: Supa, attemptKey: string, verdict: Mod
 
 /**
  * The attempts of one round: verdict, score, grading status, feedback, the rubric marks (ids only), override state
- * and whether Disagree / Grade it yourself apply. Never the answer text. An attempt whose question is above the
- * spoiler gate now (a "Not read yet" hold since) is left out. The client keeps this key in memory only.
+ * and whether Disagree / Grade it yourself apply. Never the answer text. The client keeps this key in memory only.
+ *
+ * Spoiler gate: an attempt is listed only while pds.reading_bank_question_open says its question version is open,
+ * the same rule as T07's export: unlocked, of the current edition, and (for a chapter recall answer) every idea its
+ * rubric lists unlocked. So a "Not read yet" hold, a table of contents change, or a covered idea moved to the end of
+ * the book after the answer ("Not in this chapter") hides the attempt and its feedback, which may restate that idea.
  */
 export async function getRoundAttempts(supabase: Supa, roundKey: string, nowMs = Date.now()): Promise<BankAnswer> {
   try {
@@ -1230,8 +1292,18 @@ export async function getRoundAttempts(supabase: Supa, roundKey: string, nowMs =
         through.set(b, num(t, 0));
       }),
     );
-    const attempts = rows
-      .filter((r) => r.q && num(r.q.unlock_chapter, Number.MAX_SAFE_INTEGER) <= (through.get(Number(r.q.book_id)) ?? 0))
+    // A question above the gate by its own unlock chapter is left out without asking; the rest are asked once each.
+    const candidates = rows.filter((r) => r.q && num(r.q.unlock_chapter, Number.MAX_SAFE_INTEGER) <= (through.get(Number(r.q.book_id)) ?? 0));
+    const open = new Map<number, boolean>();
+    await Promise.all(
+      [...new Map(candidates.map((r) => [Number(r.a.question_id), through.get(Number(r.q!.book_id)) ?? 0] as [number, number]))].map(async ([qid, t]) => {
+        const { data: o, error: oe } = await supabase.rpc("reading_bank_question_open", { p_question: qid, p_through: t });
+        if (oe) throw readFailed(oe);
+        open.set(qid, o === true);
+      }),
+    );
+    const attempts = candidates
+      .filter((r) => open.get(Number(r.a.question_id)) === true)
       .map(({ a, q }) => {
         const hits = Array.isArray(a.rubric_hits)
           ? (a.rubric_hits as unknown[]).filter((h): h is PointHit => plainObject(h) && typeof h.id === "string" && ["yes", "partial", "no"].includes(String(h.hit))).map((h) => ({ id: h.id, hit: h.hit }))
@@ -1467,7 +1539,9 @@ export async function recordChatAnswer(
     if (typeof input.tool_use_id !== "string" || !input.tool_use_id) return { ok: false, status: 400, error: "bad_request" };
     const q = await readQuestion(supabase, input.question_id, false);
     if (!q || !q.format) return { ok: false, status: 404, error: "not_found" };
-    if (q.superseded_at || q.version !== input.version) return { ok: false, status: 409, error: "question_changed" };
+    // Only the version here (a question_id is one immutable version); superseded, retired and locked are refused by
+    // pds.reading_bank_attempt after it looked the key up, so a replayed tool call still gets its stored answer.
+    if (q.version !== input.version) return { ok: false, status: 409, error: "question_changed" };
     const attemptKey = chatAttemptKey(input.tool_use_id);
     const { data, error } = await supabase.rpc("reading_bank_attempt", {
       p: {
@@ -1491,10 +1565,11 @@ export async function recordChatAnswer(
     if (r.grading_status !== "pending") {
       return { ok: true, attempt_key: attemptKey, chapter, verdict: (r.verdict as string | null) ?? null, grading_status: String(r.grading_status), replayed: r.replayed === true };
     }
-    // The attempt row covers what its question version lists: the idea, or the chapter recall rubric's ideas.
+    // The attempt row covers what its question version lists: the idea, or the chapter recall rubric's ideas (the
+    // grade moves the active ones: writeGrade reads their statuses).
     const stored = { attempt_key: attemptKey, idea_id: q.idea_id, covers: q.format === "chapter_recall" ? rubricIdeaIds(q.rubric) : null };
     const feedback = input.feedback ? cutAtWord(input.feedback, FEEDBACK_MAX) || null : null;
-    const g = await writeGrade(supabase, stored, q, gradeIdeaIds(stored), {
+    const g = await writeGrade(supabase, stored, q, {
       verdict: input.verdict,
       score: VERDICT_SCORE[input.verdict],
       hits: null,

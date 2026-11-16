@@ -35,6 +35,7 @@ function makeDb() {
     hold: null,
     missing: false,
     raceNext: 0,
+    claimCode: null,
     clock: Date.parse("2031-03-10T15:00:00Z"),
     ideas: new Map(),
     questions: new Map(),
@@ -276,7 +277,18 @@ function fakeSupabase(db) {
       return { ok: true, kind: p.kind, invalidated: hit.length, affected_ideas: ideas, replayed: false };
     },
     reading_bank_write_states: ({ p }) => (statesOk(p.states) ? { ok: true, written: statesWrite(p.states) } : refuse(409, "raced")),
+    // pds.reading_bank_question_open: unlocked, current edition (staleEdition marks another one), and every idea the
+    // version names (its idea, or a chapter recall rubric's ideas) unlocked.
+    reading_bank_question_open: ({ p_question, p_through }) => {
+      const q = db.questions.get(Number(p_question));
+      if (!q) return false;
+      if (q.unlock_chapter > p_through || q.staleEdition) return false;
+      if (q.idea_id && db.ideas.get(q.idea_id)?.unlock_chapter > p_through) return false;
+      if (q.format === "chapter_recall" && JSON.parse(q.rubric).ideas.some((i) => (db.ideas.get(i.idea_id)?.unlock_chapter ?? 0) > p_through)) return false;
+      return true;
+    },
     reading_bank_claim: ({ p }) => {
+      if (db.claimCode) return { ok: true, job: null, code: db.claimCode }; // monthly cap reached: nothing claimed
       const job = db.jobs.get(p.job_id);
       if (!job || job.status !== "queued") return { ok: true, job: null };
       Object.assign(job, { status: "running", attempts: job.attempts + 1, reserved_cents: p.estimates.grade });
@@ -479,6 +491,15 @@ test("routes: cross-origin, non-JSON, oversize and unknown-field requests are re
   assert.equal(db.attempts.size, 0);
 });
 
+test("bankFailure: only T07's two widened checks read as schema_checks; any other check violation is a plain failure", () => {
+  const { S } = load(makeDb());
+  const check = (name) => ({ code: "23514", message: `new row for relation "reading_question_attempts" violates check constraint "${name}"` });
+  assert.deepEqual(S.bankFailure(null, check("reading_question_attempts_grader_check")), { status: 503, error: "schema_checks" });
+  assert.deepEqual(S.bankFailure(null, check("reading_questions_source_kind_check")), { status: 503, error: "schema_checks" });
+  assert.deepEqual(S.bankFailure(null, check("reading_question_attempts_score_check")), { status: 500, error: "failed" });
+  assert.deepEqual(S.bankFailure(null, { code: "23514" }), { status: 500, error: "failed" });
+});
+
 /* ------------------------------------------------------------------ */
 /* The round                                                            */
 /* ------------------------------------------------------------------ */
@@ -522,6 +543,16 @@ test("a missing book is 404 and missing SQL is 503 bank_unavailable, with nothin
   const a = await r.attempt.POST(post(answer()));
   assert.deepEqual([a.status, a.body.error], [503, "bank_unavailable"]);
   assert.equal(db.attempts.size, 0);
+});
+
+test("no preview for a dirty state (a flag's repair is pending): the stored state is not what the commit replays", async () => {
+  const db = makeDb();
+  db.states.set(103, { book_id: BOOK, stage: 0, ease: 2.5, interval_days: 0, review_count: 0, next_review: null, last_reviewed: null, lapses: 0,
+    last_verdict: null, stage_success_on: null, last_question_ids: [], state_version: 1, dirty: true });
+  const r = load(db);
+  const cards = (await r.today.GET(get())).body.cards;
+  assert.equal(cards.find((c) => c.idea?.idea_id === 103).preview, null);
+  assert.notEqual(cards.find((c) => c.idea?.idea_id === 101).preview, null, "a clean state keeps its preview");
 });
 
 /* ------------------------------------------------------------------ */
@@ -595,6 +626,40 @@ test("locked, retired and changed questions are refused with 409 and store nothi
   assert.deepEqual((await r.attempt.POST(post(answer()))).body, { error: "question_changed" });
   assert.equal((await r.attempt.POST(post(answer({ question_id: 999999 })))).status, 404);
   assert.equal(db.attempts.size, 0);
+});
+
+test("a retry with the same attempt_key after its question was re-versioned or retired returns the stored receipt", async () => {
+  const db = makeDb();
+  const r = load(db);
+  // A code-graded answer; a sync gives its question a new version before the lost response is retried.
+  const body = answer();
+  const first = await r.attempt.POST(post(body));
+  assert.equal(first.body.grading_status, "graded");
+  db.questions.get(1001).superseded_at = "2031-03-10T15:30:00Z";
+  const again = await r.attempt.POST(post(body));
+  assert.deepEqual([again.status, again.body.replayed], [200, true]);
+  for (const k of ["attempt_key", "grading_status", "verdict", "score", "attempt_date"]) assert.deepEqual(again.body[k], first.body[k], k);
+  // A pending answer; a flag retires its question before the retry. Still its receipt, still pending.
+  const pend = answer({ question_id: 1002, answer: "The keeper writes each change before dawn" });
+  const p1 = await r.attempt.POST(post(pend));
+  assert.equal(p1.body.grading_status, "pending");
+  db.questions.get(1002).retired_at = "2031-03-10T15:31:00Z";
+  const p2 = await r.attempt.POST(post(pend));
+  assert.deepEqual([p2.status, p2.body.replayed, p2.body.grading_status, p2.body.attempt_key], [200, true, "pending", p1.body.attempt_key]);
+  assert.equal(db.attempts.size, 2, "no second attempt");
+  // A NEW answer to either question is still refused, and another payload under a stored key is still 409.
+  assert.deepEqual((await r.attempt.POST(post(answer()))).body, { error: "question_changed" });
+  assert.deepEqual((await r.attempt.POST(post(answer({ question_id: 1002, answer: "Another synthetic answer" })))).body, { error: "retired" });
+  assert.deepEqual((await r.attempt.POST(post({ ...pend, answer: "A different synthetic answer" }))).body, { error: "key_reused" });
+  assert.equal(db.attempts.size, 2);
+  // The chat tool: a tool call replayed after its question got a new version is the same write.
+  const chat = { question_id: 1006, version: 1, answer: "The fog bell rings in fog", verdict: "correct", tool_use_id: "toolu_synthetic_replay" };
+  const c1 = await r.S.recordChatAnswer(r.supabase, chat);
+  assert.equal(c1.ok, true);
+  db.questions.get(1006).superseded_at = "2031-03-10T15:32:00Z";
+  const c2 = await r.S.recordChatAnswer(r.supabase, chat);
+  assert.deepEqual([c2.ok, c2.attempt_key, c2.replayed, c2.grading_status], [true, c1.attempt_key, true, "graded"]);
+  assert.equal(db.attempts.size, 3);
 });
 
 test("a chapter recall 'I don't know' is graded at once and moves every covered idea", async () => {
@@ -705,7 +770,7 @@ test("a refused or failed model grade leaves the answer pending; Grade it yourse
   assert.equal(late.self_gradable, true);
 });
 
-test("a grade job for an answer that is no longer pending is skipped without a model call", async () => {
+test("a grade job for an answer that is no longer pending is skipped without a model call, and the answer is left alone", async () => {
   const db = makeDb();
   const model = fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }], wrong_claims: [], feedback: "ok" }));
   const r = load(db, model);
@@ -713,9 +778,114 @@ test("a grade job for an answer that is no longer pending is skipped without a m
   const k = res.body.attempt_key;
   db.attempts.get(k).grading_status = "graded"; // graded another way meanwhile
   db.attempts.get(k).verdict = "correct";
+  const out = await r.S.claimAndRunGrade(r.supabase, k);
+  assert.deepEqual([out.outcome, out.code, out.graded], ["skipped", "not_pending", false]);
+  assert.equal(model.calls.length, 0);
+  assert.equal(db.finished[0].outcome, "done", "finished 'done' in SQL: any other outcome counts a grade try on the answer");
+  assert.equal([...db.jobs.values()][0].status, "done");
+  assert.deepEqual([db.attempts.get(k).grade_error, db.attempts.get(k).grade_tries], [null, 0], "no grade_error on a graded answer");
+});
+
+test("runGradeJob with a bare job row (no claim headroom) still grades: the reservation alone bounds the call", async () => {
+  const db = makeDb();
+  const model = fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "yes" }], wrong_claims: [], feedback: "Right." }));
+  const r = load(db, model);
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const k = res.body.attempt_key;
+  const job = [...db.jobs.values()][0];
+  Object.assign(job, { status: "running", attempts: 1, reserved_cents: 1 }); // as the claim left it: the 1-cent grade estimate
+  const bare = { job_id: job.job_id, book_id: BOOK, step: "grade", attempt_key: k, attempts: 1, reserved_cents: 1 };
+  assert.equal(r.S.claimHeadroom(bare), null);
+  assert.equal(r.S.claimHeadroom({ job: bare, headroom_cents: "250" }), 250);
+  const out = await r.S.runGradeJob(r.supabase, bare, { client: model.client });
+  assert.deepEqual([out.outcome, out.graded], ["done", true]);
+  assert.equal(model.calls.length, 1, "the model was asked");
+  assert.ok(db.reserves[0].total_cents > 1, "the request's bound is above the estimate: it was reserved, not refused as cost_limit");
+  assert.deepEqual([db.attempts.get(k).grading_status, db.attempts.get(k).verdict], ["graded", "correct"]);
+  assert.deepEqual([...r.S.GRADE_RETRY_MINUTES], [5, 30], "two retries; the third failed try fails the job (pds.reading_bank_finish)");
+});
+
+test("a chapter recall answer is graded per idea: a covered core idea counts, a missed one comes back as due tomorrow", async () => {
+  const db = makeDb();
+  db.ideas.set(105, { ...db.ideas.get(101), idea_id: 105, title: "Synthetic idea 105", statement: "Synthetic statement 105." });
+  addRecall(db, 1100, 1, [101, 105]);
+  const model = fakeModel(modelReply({ points: [{ id: "i101", hit: "yes" }, { id: "i105", hit: "no" }], wrong_claims: [], feedback: "Missed the second point." }));
+  const r = load(db, model);
+  const res = await r.attempt.POST(post(answer({ question_id: 1100, answer: "The keeper keeps a careful ledger of the tides" })));
+  assert.equal(res.body.grading_status, "pending");
+  await r.queue[0]();
+  const a = db.attempts.get(res.body.attempt_key);
+  assert.deepEqual([a.grading_status, a.grader, a.score, a.verdict], ["graded", "model", 0.5, "partial"]);
+  assert.deepEqual(a.rubric_hits, [{ id: "i101", hit: "yes" }, { id: "i105", hit: "no" }]);
+  assert.ok(model.calls[0].messages[0].content.includes("Synthetic statement 105."), "every covered idea is a point to mark");
+  const s101 = db.states.get(101);
+  const s105 = db.states.get(105);
+  assert.deepEqual([s101.stage, s101.last_verdict], [3, "correct"], "covered: Explained");
+  assert.deepEqual([s105.stage, s105.last_verdict, s105.next_review], [1, "incorrect", addDays(TODAY, 1)], "missed: due tomorrow");
+  assert.deepEqual((await r.override.POST(post({ verdict: "correct" }), ctx({ attemptKey: res.body.attempt_key }))).body, { error: "not_overridable" });
+});
+
+test("raced: a model grade, a Disagree and a self grade re-read the schedule and send again", async () => {
+  const db = makeDb();
+  const r = load(db, fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "yes" }], wrong_claims: [], feedback: "Right." })));
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const k = res.body.attempt_key;
+  db.raceNext = 1;
+  await r.queue[0]();
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_grade").length, 2, "raced once, then written");
+  assert.equal(db.attempts.get(k).grading_status, "graded");
+  assert.equal([...db.jobs.values()][0].status, "done");
+  db.raceNext = 2;
+  const o = await r.override.POST(post({ verdict: "partial" }), ctx({ attemptKey: k }));
+  assert.deepEqual([o.status, o.body.verdict, o.body.overridden], [200, "partial", true]);
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_override").length, 3);
+  // Grade it yourself after a failed model grade, racing once.
+  const p2 = await r.attempt.POST(post(answer({ question_id: 1006, answer: "The fog bell rings when the lamp fails" })));
+  const k2 = p2.body.attempt_key;
+  db.attempts.get(k2).grade_error = "refusal";
+  db.raceNext = 1;
+  const before = db.rpc.filter((n) => n === "reading_bank_grade").length;
+  const s = await r.S.selfGrade(r.supabase, k2, "correct");
+  assert.deepEqual([s.status, s.body.verdict], [200, "correct"]);
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_grade").length - before, 2);
+});
+
+test("a claim refused by the monthly cap leaves the answer pending, with no model call; it can be graded by hand after a minute", async () => {
+  const db = makeDb();
+  const model = fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }], wrong_claims: [], feedback: "ok" }));
+  const r = load(db, model);
+  db.claimCode = "monthly_cap";
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const k = res.body.attempt_key;
   await r.queue[0]();
   assert.equal(model.calls.length, 0);
-  assert.equal([...db.jobs.values()][0].status, "skipped");
+  assert.equal(db.attempts.get(k).grading_status, "pending");
+  assert.equal([...db.jobs.values()][0].status, "queued", "the job waits; nothing was spent");
+  const at = Date.parse(db.attempts.get(k).answered_at);
+  assert.deepEqual((await r.S.selfGrade(r.supabase, k, "partial", at + 1000)).body, { error: "still_grading" });
+  const s = await r.S.selfGrade(r.supabase, k, "partial", at + r.S.SELF_GRADE_AFTER_MS);
+  assert.deepEqual([s.status, s.body.verdict, s.body.grading_status], [200, "partial", "graded"]);
+});
+
+test("the round's attempts follow the spoiler gate: a recall answer listing an idea moved above it, or another edition, is left out with its feedback", async () => {
+  const db = makeDb();
+  db.ideas.set(105, { ...db.ideas.get(101), idea_id: 105, title: "Synthetic idea 105", statement: "Synthetic statement 105." });
+  addRecall(db, 1100, 1, [101, 105]);
+  const FEEDBACK = "SYNTHETIC-FEEDBACK-MARKER-9c2d restates the second point";
+  const r = load(db, fakeModel(modelReply({ points: [{ id: "i101", hit: "yes" }, { id: "i105", hit: "no" }], wrong_claims: [], feedback: FEEDBACK })));
+  const rec = await r.attempt.POST(post(answer({ question_id: 1100, answer: "The keeper keeps a careful ledger of the tides" })));
+  await r.queue[0]();
+  const cuedAnswer = await r.attempt.POST(post(answer({ question_id: 1005, answer: "fog bell" })));
+  const listed = async () => (await r.round.GET(get(), ctx({ roundKey: ROUND }))).body;
+  assert.deepEqual((await listed()).attempts.map((x) => x.attempt_key).sort(), [rec.body.attempt_key, cuedAnswer.body.attempt_key].sort());
+  // "Not in this chapter" moved idea 105 to the end of the book after the answer was graded.
+  db.ideas.get(105).unlock_chapter = 9;
+  const later = await listed();
+  assert.deepEqual(later.attempts.map((x) => x.attempt_key), [cuedAnswer.body.attempt_key]);
+  assert.ok(!JSON.stringify(later).includes("SYNTHETIC-FEEDBACK-MARKER"), "the feedback stays on the server");
+  // A table of contents change (another edition) hides that chapter's attempts too.
+  db.questions.get(1005).staleEdition = true;
+  assert.deepEqual((await listed()).attempts, []);
 });
 
 /* ------------------------------------------------------------------ */
