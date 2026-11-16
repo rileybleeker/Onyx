@@ -85,7 +85,8 @@ test("network failure keeps the card and the note; Retry sends the SAME key; suc
   assert.match(h.text(), /Synthetic passage 1/);
   assert.match(h.text(), /Synthetic note 1/, "the revealed note stays on screen");
   assert.equal(alerts().length, 1);
-  assert.match(alerts()[0], /Not saved: No answer from Onyx/);
+  assert.match(alerts()[0], /Save not confirmed: No answer from Onyx/);
+  assert.doesNotMatch(alerts()[0], /Not saved/, "no answer is not proof that nothing was stored");
   assert.equal(events.graded.length, 0);
   h.click("Retry Good");
   await h.flush();
@@ -99,6 +100,54 @@ test("network failure keeps the card and the note; Retry sends the SAME key; suc
   assert.equal(alerts().length, 0);
   assert.ok(h.buttons(REVEAL).length === 1, "the next card starts hidden (focus target: its reveal button)");
 });
+
+// READING-R2: a grade that DID commit, whose answer never reached the card. A synthetic in-memory server stands in
+// for pds.reading_grade_review: it stores the grade and its receipt under the op_key, then the answer is lost (no
+// answer at all, or a gateway error written after the commit). The card must not claim the grade is absent, and
+// Retry must be answered from the stored receipt, so one review is stored and the card advances once.
+for (const [mode, lose] of [
+  ["the answer never arrives", () => { throw new TypeError("connection reset"); }],
+  ["a gateway error after the commit", () => response({ error: "gateway" }, 504)],
+]) {
+  test(`committed but unacknowledged (${mode}): "Save not confirmed", Retry replays the stored receipt`, async (t) => {
+    const receipts = new Map();
+    const stored = [];
+    const { h, sent, events, alerts, header } = mount(t, {
+      answer: (body, n) => {
+        const prior = receipts.get(body.op_key);
+        if (prior) return response({ ...prior, replayed: true });
+        const receipt = { success: true, xp_gained: 15, next_review: "2026-03-11", interval_days: 1, op_key: body.op_key };
+        receipts.set(body.op_key, receipt);
+        stored.push({ highlight_id: body.highlight_id, grade: body.grade });
+        if (n === 1) return lose();
+        return response({ ...receipt, replayed: false });
+      },
+    });
+    await h.flush();
+    h.click(REVEAL);
+    await h.flush();
+    h.click("Good, next review in 1 day");
+    await h.flush();
+    assert.equal(stored.length, 1, "the fixture committed the grade");
+    assert.equal(alerts().length, 1);
+    assert.match(alerts()[0], /^Save not confirmed: /);
+    assert.match(alerts()[0], /Retry can't store it twice\./);
+    assert.doesNotMatch(alerts()[0], /Not saved|Nothing was saved/, "the card never claims a committed grade is absent");
+    assert.equal(header(), "2 due", "the queue waits for a definite answer");
+    assert.match(h.text(), /Synthetic note 1/, "the card and the note stay on screen");
+    assert.equal(events.graded.length, 0);
+    h.click("Retry Good");
+    await h.flush();
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].op_key, sent[0].op_key, "Retry sends the same operation key");
+    assert.deepEqual(sent[1], sent[0]);
+    assert.equal(stored.length, 1, "the retry stored nothing new");
+    assert.deepEqual(events.graded, [15], "advanced exactly once, with the receipt's original award");
+    assert.equal(header(), "1 due");
+    assert.match(h.text(), /Synthetic passage 2/);
+    assert.equal(alerts().length, 0);
+  });
+}
 
 test("a pending grade blocks every grade button and says why; a second tap sends nothing", async (t) => {
   const gate = deferred();
@@ -130,7 +179,7 @@ test("a different grade after an unconfirmed try reuses the key; key_reused mean
   await h.flush();
   h.click("Good, next review in 1 day");
   await h.flush();
-  assert.match(alerts()[0], /couldn't confirm/);
+  assert.match(alerts()[0], /Save not confirmed: Onyx answered with an error before confirming the grade\./);
   h.click("Easy, next review in 3 days");
   await h.flush();
   assert.equal(sent[1].op_key, sent[0].op_key);
@@ -146,7 +195,7 @@ test("a refusal writes nothing: no Retry, any grade can be picked, and the next 
   await h.flush();
   h.click("Again, next review in 1 day");
   await h.flush();
-  assert.match(alerts()[0], /Not saved: Onyx refused this grade\. Nothing was saved\. Pick a grade again\./);
+  assert.match(alerts()[0], /^Not saved: Onyx refused this grade\. Pick a grade again\.$/, "only a proven refusal says Not saved");
   assert.equal(h.buttons("Retry Again").length, 0);
   h.click("Good, next review in 1 day");
   await h.flush();
@@ -160,7 +209,7 @@ test("graded on another screen: the card stays, grades are blocked, Refresh re-r
   await h.flush();
   h.click("Good, next review in 1 day");
   await h.flush();
-  assert.match(alerts()[0], /graded on another screen/);
+  assert.match(alerts()[0], /^Card out of date: This highlight was graded on another screen\./);
   assert.equal(h.button("Good, next review in 1 day").props["aria-disabled"], true);
   h.button("Good, next review in 1 day").props.onClick();
   await h.flush();
@@ -314,6 +363,7 @@ test("pure helpers: answer classification, key reuse, and a graded card never re
   assert.equal(P.classifyReviewAnswer(null, null).kind, "unknown");
   assert.equal(P.classifyReviewAnswer(500, { error: "failed" }).kind, "unknown");
   assert.equal(P.classifyReviewAnswer(503, { error: "practice_unavailable" }).kind, "unknown");
+  assert.deepEqual(P.REVIEW_ALERT_HEADING, { unknown: "Save not confirmed", refused: "Not saved", stale: "Card out of date" });
   assert.equal(P.classifyReviewAnswer(400, { error: "bad_grade" }).kind, "refused");
   assert.equal(P.classifyReviewAnswer(404, { error: "not_found" }).kind, "stale");
   assert.equal(P.classifyReviewAnswer(409, { error: "archived" }).message, "This highlight was removed.");
@@ -337,4 +387,6 @@ test("source pins: the page uses the card file; no empty catch that swallows a f
   assert.doesNotMatch(src, /catch\s*\{\s*\/\*/, "no silent catch");
   assert.doesNotMatch(src, /\sdisabled=\{/,"grade buttons use aria-disabled so a pressed button keeps focus");
   assert.match(src, /role="alert"/);
+  assert.match(src, /REVIEW_ALERT_HEADING\[status\.kind\]/, "the heading follows the outcome");
+  assert.doesNotMatch(src, />Not saved:</, "no shared Not saved heading for an unconfirmed or stale grade");
 });

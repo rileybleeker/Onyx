@@ -231,12 +231,22 @@ export interface ReviewAttempt {
 export type ReviewOutcome =
   /** Stored (or stored earlier under this key): advance once. */
   | { kind: "saved"; xp: number; replayed: boolean; earlier: boolean }
-  /** No answer, or the server failed: the grade may or may not be stored. Retry sends the same key. */
+  /**
+   * No answer, or the server failed: the grade may or may not be stored (a grade that committed and lost its answer
+   * lands here too), so the card says "Save not confirmed", never "Not saved". Retry sends the same key.
+   */
   | { kind: "unknown"; message: string }
-  /** The server refused it: nothing was written; any grade can be picked again (a new key). */
+  /** The server refused it: nothing was written ("Not saved"); any grade can be picked again (a new key). */
   | { kind: "refused"; message: string }
-  /** The card changed elsewhere (graded on another screen, archived, gone): refresh before grading. */
+  /** The card changed elsewhere (graded on another screen, archived, gone): "Card out of date", refresh first. */
   | { kind: "stale"; message: string };
+
+/** The alert heading for each failed outcome: only a proven refusal says "Not saved". */
+export const REVIEW_ALERT_HEADING: Record<"unknown" | "refused" | "stale", string> = {
+  unknown: "Save not confirmed",
+  refused: "Not saved",
+  stale: "Card out of date",
+};
 
 /**
  * Classify the review route's answer. `status` null = no answer at all (offline, timeout, reload). 409 key_reused
@@ -245,7 +255,7 @@ export type ReviewOutcome =
  */
 export function classifyReviewAnswer(status: number | null, body: unknown): ReviewOutcome {
   const b = (plainObject(body) ? body : {}) as Record<string, unknown>;
-  if (status === null) return { kind: "unknown", message: "No answer from Onyx, so this grade may not be saved." };
+  if (status === null) return { kind: "unknown", message: "No answer from Onyx, so this grade may or may not be stored." };
   if (status >= 200 && status < 300 && b.success === true) {
     return { kind: "saved", xp: Number(b.xp_gained) || 0, replayed: b.replayed === true, earlier: false };
   }
@@ -254,9 +264,9 @@ export function classifyReviewAnswer(status: number | null, body: unknown): Revi
   if (status === 409 || status === 404) {
     return { kind: "stale", message: code === "archived" ? "This highlight was removed." : status === 404 ? "This highlight no longer exists." : "This highlight was graded on another screen." };
   }
-  if (status === 503) return { kind: "unknown", message: "Reviews can't be saved right now." };
-  if (status >= 400 && status < 500) return { kind: "refused", message: "Onyx refused this grade. Nothing was saved." };
-  return { kind: "unknown", message: "Onyx couldn't confirm the save." };
+  if (status === 503) return { kind: "unknown", message: "Reviews are unavailable right now." };
+  if (status >= 400 && status < 500) return { kind: "refused", message: "Onyx refused this grade." };
+  return { kind: "unknown", message: "Onyx answered with an error before confirming the grade." };
 }
 
 /**

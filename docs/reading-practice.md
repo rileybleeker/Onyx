@@ -61,13 +61,15 @@ Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 K
   same `scheduleAfterGrade` the commit uses). The first Good is 1 day, the second 3 days.
 - One request at a time. While a grade is saving, the buttons are `aria-disabled` (a pressed button keeps focus) and
   a status line says the buttons wait for Onyx's answer. The card and the revealed note stay on screen.
-- No answer or a server error: an inline "Not saved" alert (a word and an icon, not color alone) with Retry. The
-  card keeps ONE operation key until it hears a definite answer, so Retry, or a different grade, reuses it: a
-  grade that did land is answered from its receipt, and `key_reused` (another grade was stored first under that
-  key) counts as graded. A reload loses the key, which stays safe: every grade carries the card's review count, and
+- No answer or a server error: an inline "Save not confirmed" alert (a word and an icon, not color alone) with
+  Retry. It never says "Not saved": a grade that committed and only lost its answer ends up here too. The card
+  keeps ONE operation key until it hears a definite answer, so Retry, or a different grade, reuses it: a grade that
+  did land is answered from its receipt, and `key_reused` (another grade was stored first under that key) counts as
+  graded. A reload loses the key, which stays safe: every grade carries the card's review count, and
   a grade on an older state of the row is `409 changed`, so a card is still graded once.
-- A refusal (4xx) wrote nothing: no Retry, any grade can be picked, the next try gets a new key. Graded on another
-  screen, archived or gone (409 / 404): grades are blocked and Refresh re-reads the overview. While it re-reads, a
+- A refusal (4xx) wrote nothing: "Not saved", no Retry, any grade can be picked, the next try gets a new key.
+  Graded on another screen, archived or gone (409 / 404): "Card out of date", grades are blocked and Refresh
+  re-reads the overview. While it re-reads, a
   status line says "Refreshing" and the grades stay blocked; a re-read that leaves the same card on top unblocks
   it, one that fails keeps the card stale with its own message and Refresh.
 - Success advances exactly once: the card's graded highlight ids are kept for the day, so a reload that raced the
@@ -127,10 +129,11 @@ Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under t
 - **Source deletion.** Removing a source (archiving a highlight, deleting a session) never removes a question or an
   attempt: the version keeps its hash, inspection shows `removed`, and the question cannot be answered again until
   it is corrected to a permitted source.
-- **Raw-exchange retention (defined, not yet scheduled).** `pds.reading_clear_question_answers(days)` clears the
-  answer and feedback text of attempts graded or invalidated more than `days` ago (at least 30), keeping the
-  answer's hash, the grade and every timestamp. Proposed: 180 days, run daily. Scheduling it is a rollout decision
-  for Riley; nothing runs it yet. Pending (ungraded) answers are never cleared.
+- **Raw-exchange retention (defined; scheduled with READ-QUIZ-01).** `pds.reading_clear_question_answers(days)`
+  clears the answer and feedback text of attempts graded or invalidated more than `days` ago (at least 30), keeping
+  the answer's hash, the grade and every timestamp. Decided 2026-11-16: 180 days, run daily by the READ-QUIZ-01
+  worker, the first writer of answers; nothing runs it before that ships. Pending (ungraded) answers are never
+  cleared.
 - Access: tables and functions are service_role only (row level security on, no policies, nothing granted to anon
   or authenticated). Errors are codes; no prompt, answer or feedback text is logged.
 - **Not wired yet (PROD-T07 stays In Progress):** this is the storage layer only. No screen or chat tool writes

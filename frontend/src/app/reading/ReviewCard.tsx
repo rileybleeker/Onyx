@@ -10,6 +10,7 @@ import {
   intervalLabel,
   PRACTICE_GRADES,
   remainingQueue,
+  REVIEW_ALERT_HEADING,
   reviewPreview,
   type PracticeGrade,
   type ReviewAttempt,
@@ -22,12 +23,13 @@ import {
  *   commit uses; the first Good is 1 day).
  * - One grade request at a time: while it is saving the buttons are aria-disabled (they keep focus) and a line says
  *   why. The card and the note stay on screen until the server confirms.
- * - A failure keeps the card. No answer / a server error: "Not saved" with Retry, which sends the SAME operation
- *   key (lib/reading-practice.ts attemptFor), so a grade that did land is answered from its receipt instead of
- *   being stored twice. A refusal: nothing was written, any grade can be picked again. Graded on another screen
- *   (409): Refresh, which keeps the grades blocked ("Refreshing") until the re-read lands; a re-read that fails
- *   keeps the card stale with its own message and Refresh. The message is a role=alert line with a word and an icon,
- *   not color alone.
+ * - A failure keeps the card. No answer / a server error: "Save not confirmed" (the grade may have been stored and
+ *   only its answer lost, so never "Not saved") with Retry, which sends the SAME operation key
+ *   (lib/reading-practice.ts attemptFor), so a grade that did land is answered from its receipt instead of being
+ *   stored twice. A refusal: "Not saved", nothing was written, any grade can be picked again. Graded on another
+ *   screen (409): "Card out of date" with Refresh, which keeps the grades blocked ("Refreshing") until the re-read
+ *   lands; a re-read that fails keeps the card stale with its own message and Refresh. The message is a role=alert
+ *   line with a word and an icon, not color alone.
  * - Success advances exactly once (this card's graded ids are kept, so a reload that raced the grade cannot bring
  *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line.
  * - Retry and Refresh leave the screen while they work, so focus never drops to the page: both put it on the note
@@ -275,10 +277,14 @@ export default function ReviewCard({
               {(status.kind === "unknown" || status.kind === "refused" || status.kind === "stale") && (
                 <div role="alert" className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-[12px] text-text-primary">
                   <span className="inline-flex items-center gap-1.5">
-                    <AlertTriangle aria-hidden="true" className="h-4 w-4 text-[var(--color-down)]" />
+                    <AlertTriangle
+                      aria-hidden="true"
+                      className={`h-4 w-4 ${status.kind === "unknown" ? "text-[var(--color-mid)]" : "text-[var(--color-down)]"}`}
+                    />
                     <span>
-                      <strong className="font-medium">Not saved:</strong> {status.message}
+                      <strong className="font-medium">{REVIEW_ALERT_HEADING[status.kind]}:</strong> {status.message}
                       {status.kind === "refused" ? " Pick a grade again." : ""}
+                      {status.kind === "unknown" ? " Retry can't store it twice." : ""}
                     </span>
                   </span>
                   {status.kind === "unknown" && (
