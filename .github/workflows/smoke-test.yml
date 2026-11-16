@@ -9,15 +9,24 @@ name: Production Smoke Test
 #
 # Provenance (DEL-02). The browser loads the production ALIAS (generated deployment
 # URLs sit behind Vercel's sign-in), and the alias moves to every newer deployment.
-# So each run is bound to ONE commit + immutable deployment: the expected commit must
-# be on master and have a live successful Production deployment (else nothing runs),
-# the tests of that exact commit are checked out, and production must serve that
-# commit and deployment (signed-in /api/version) before AND after the tests. Verdict:
-# pass / fail = exact target; deferred = it served something else or could not be
-# confirmed with tests passing (pending verification, never a pass); unverified =
-# tests failed and the target was not confirmed (never attributed to the commit).
-# The job fails only on fail and unverified. The receipt is the job summary; post-merge
-# also records it as the commit status post-merge/smoke.
+# So each run is bound to ONE commit: it must be on master and have a successful
+# Production deployment (else nothing is checked out and no login is used), the tests
+# of that exact commit are checked out, and production must serve that commit
+# (signed-in /api/version) before AND after the tests.
+#   post-merge (post_merge: true): the commit + the deployment verify found; refused
+#     up front when a newer master head already deployed; both records must name that
+#     exact deployment.
+#   scheduled (schedule / workflow_dispatch): the newest master commit with a
+#     successful Production deployment (from expected_sha, default master head),
+#     matched on the commit alone; nothing is attributed.
+# Verdict: pass / fail = that target at both ends; deferred = it served something else
+# or could not be confirmed with tests passing (pending verification, never a pass);
+# unverified = tests failed and the target was not confirmed (never attributed).
+# The job fails on fail and unverified, and a scheduled run also on any deferral other
+# than production moving on to a newer master commit (an annotation names the cause),
+# so a Vercel rollback or a broken provenance read cannot keep the tripwire green.
+# The receipt is the job summary; post-merge also records it as the commit status
+# post-merge/smoke.
 
 on:
   schedule:
@@ -37,6 +46,10 @@ on:
         type: string
         required: false
         default: ""
+      post_merge: # true = bind the run to expected_sha + deployment_url (the result is attributed to that commit)
+        type: boolean
+        required: false
+        default: false
     secrets:
       SMOKE_BASE_URL:
         required: false
@@ -75,6 +88,8 @@ jobs:
     # Move back to ubuntu-latest once Playwright supports 26.04.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      SMOKE_MODE: ${{ inputs.post_merge && 'post-merge' || 'scheduled' }}
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
       detail: ${{ steps.verdict.outputs.detail }}
@@ -93,14 +108,17 @@ jobs:
           sparse-checkout: tools
           persist-credentials: false
 
+      # Scheduled: an empty SHA means master head when the job runs, not when it was queued.
       - name: Resolve the exact target
         id: target
         working-directory: ${{ github.workspace }}
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ inputs.expected_sha || github.sha }}
+          SHA: ${{ inputs.expected_sha }}
           DEPLOYMENT_URL: ${{ inputs.deployment_url }}
-        run: python3 .tooling/tools/merge_train.py smoke-target --sha "$SHA" --deployment-url "$DEPLOYMENT_URL"
+        run: >-
+          python3 .tooling/tools/merge_train.py smoke-target --mode "$SMOKE_MODE" --sha "$SHA"
+          --deployment-url "$DEPLOYMENT_URL"
 
       - name: Check out the tests of that commit
         if: steps.target.outputs.ready == 'true'
@@ -145,6 +163,7 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: ${{ github.workspace }}
         env:
+          GH_TOKEN: ${{ github.token }} # read-only: whether production moved on to a newer master commit
           SHA: ${{ steps.target.outputs.sha || inputs.expected_sha || github.sha }}
           DEPLOYMENT_URL: ${{ steps.target.outputs.deployment_url }}
           READY: ${{ steps.target.outputs.ready }}
@@ -152,5 +171,6 @@ jobs:
           TESTS: ${{ steps.tests.outcome }}
           PROVENANCE_DIR: ${{ runner.temp }}/smoke-provenance
         run: >-
-          python3 .tooling/tools/merge_train.py smoke-verdict --sha "$SHA" --deployment-url "$DEPLOYMENT_URL"
-          --ready "$READY" --target-detail "$TARGET_DETAIL" --tests "$TESTS" --provenance-dir "$PROVENANCE_DIR"
+          python3 .tooling/tools/merge_train.py smoke-verdict --mode "$SMOKE_MODE" --sha "$SHA"
+          --deployment-url "$DEPLOYMENT_URL" --ready "$READY" --target-detail "$TARGET_DETAIL" --tests "$TESTS"
+          --provenance-dir "$PROVENANCE_DIR"

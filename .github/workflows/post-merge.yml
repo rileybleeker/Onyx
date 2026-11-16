@@ -8,7 +8,8 @@ name: Post-merge verify
 # Smoke provenance (DEL-02): verify hands the smoke test the commit AND its immutable deployment URL; the smoke run
 # counts only when production served exactly that before and after the tests. `receipt` records the result as the
 # commit status post-merge/smoke (pass / fail / pending verification) and reverts only a commit that failed twice on
-# its own deployment while its parent passed on its own; anything less certain halts without a revert.
+# its own deployment while its parent passed on its own within the last 3 h; anything less certain halts without a
+# revert, and so does a failed smoke test whose receipt could not be written.
 # `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
 on:
   push:
@@ -56,7 +57,8 @@ jobs:
     uses: ./.github/workflows/scheduled-tests.yml
     with:
       sha: ${{ needs.verify.outputs.sha }}
-  # Only the three smoke secrets reach the smoke test (never `secrets: inherit`: that hands it every repo secret).
+  # Only the three smoke secrets reach the smoke test, never every repo secret. post_merge: true binds each attempt
+  # to this commit + deployment (a scheduled run instead tests whatever master commit production serves).
   smoke:
     needs: verify
     if: needs.verify.outputs.result == 'ok'
@@ -64,22 +66,28 @@ jobs:
     with:
       expected_sha: ${{ needs.verify.outputs.sha }}
       deployment_url: ${{ needs.verify.outputs.deployment_url }}
+      post_merge: true
     secrets:
       SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
       SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
       SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
+  # failure() is required: without a status function GitHub adds success(), which is false once smoke failed, so the
+  # retry would never run and the receipt would see a skipped retry (read as unverified: a halt, never a pass).
   smoke-retry:
     needs: [verify, smoke]
-    if: needs.smoke.result == 'failure'
+    if: failure() && needs.smoke.result == 'failure'
     uses: ./.github/workflows/smoke-test.yml
     with:
       expected_sha: ${{ needs.verify.outputs.sha }}
       deployment_url: ${{ needs.verify.outputs.deployment_url }}
+      post_merge: true
     secrets:
       SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
       SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
       SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
-  # The durable smoke receipt + the decision. No smoke secrets here; the token can only post a commit status.
+  # The durable smoke receipt + the decision. No smoke secrets here; the token can only post a commit status. The
+  # decision is published only after the status is written (or an earlier exact receipt stands); otherwise this job
+  # fails with no decision and the rollback job below halts without a revert when the smoke test failed.
   receipt:
     needs: [verify, smoke, smoke-retry]
     if: always() && (needs.verify.outputs.result == 'ok' || needs.verify.outputs.result == 'skipped')
@@ -122,11 +130,15 @@ jobs:
     if: always() && (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt' || needs.receipt.outputs.action == 'revert' || needs.receipt.outputs.action == 'halt' || (needs.receipt.result == 'failure' && needs.smoke-retry.result == 'failure'))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Job permissions replace the workflow's, so the reads rollback() makes (deployments for a fixed build, commit
+    # statuses for the smoke receipts) are listed here too.
     permissions:
       contents: write
       pull-requests: write
       issues: write
       actions: write
+      statuses: read
+      deployments: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

@@ -281,8 +281,8 @@ class SmokeProvenance(unittest.TestCase):
     def rec(self, version=None, deployment=HOST):
         return mt.provenance_record({"version": version or self.E, "deployment": deployment})
 
-    def verdict(self, tests_ok, before, after, host=HOST):
-        return mt.smoke_verdict(self.E, host, tests_ok, before, after)[0]
+    def verdict(self, tests_ok, before, after, host=HOST, exact=True):
+        return mt.smoke_verdict(self.E, host, tests_ok, before, after, exact_deployment=exact)[0]
 
     def test_exact_target_both_ends_passes_or_fails(self):
         self.assertEqual(self.verdict(True, self.rec(), self.rec()), "pass")
@@ -291,30 +291,48 @@ class SmokeProvenance(unittest.TestCase):
     def test_alias_moved_during_the_run_is_deferred_never_a_pass_or_a_fail(self):
         # a newer merge deployed while the run was going: its UI must not count for the older commit
         moved = self.rec(self.N, self.OTHER)
-        for tests_ok in (True, False):
-            self.assertEqual(self.verdict(tests_ok, self.rec(), moved), "deferred", tests_ok)
-            self.assertEqual(self.verdict(tests_ok, moved, moved), "deferred", tests_ok)
-            self.assertEqual(self.verdict(tests_ok, moved, None), "deferred", tests_ok)
+        for exact in (True, False):
+            for tests_ok in (True, False):
+                self.assertEqual(self.verdict(tests_ok, self.rec(), moved, exact=exact), "deferred", (exact, tests_ok))
+                self.assertEqual(self.verdict(tests_ok, moved, moved, exact=exact), "deferred", (exact, tests_ok))
+                self.assertEqual(self.verdict(tests_ok, moved, None, exact=exact), "deferred", (exact, tests_ok))
 
     def test_newer_commit_served_from_the_start_names_it(self):
         verdict, detail = mt.smoke_verdict(self.E, self.HOST, True, self.rec(self.N), self.rec(self.N))
         self.assertEqual(verdict, "deferred")
         self.assertIn(self.N[:7], detail)
+        self.assertEqual(mt.served_other(self.E, self.rec(), self.rec(self.N)), self.N)
+        self.assertIsNone(mt.served_other(self.E, self.rec(), None))
 
-    def test_other_deployment_of_the_same_commit_is_deferred(self):
+    def test_other_deployment_of_the_same_commit_is_deferred_after_a_merge(self):
         # a redeploy (or a Vercel rollback) of the same commit is not the deployment this run was started for
         self.assertEqual(self.verdict(True, self.rec(), self.rec(deployment=self.OTHER)), "deferred")
         self.assertEqual(self.verdict(False, self.rec(deployment=self.OTHER), self.rec()), "deferred")
 
-    def test_build_that_names_no_deployment_matches_on_the_commit(self):
-        old = self.rec(deployment=None)
-        self.assertEqual(self.verdict(True, old, old), "pass")
-        self.assertIn("matched on commit", mt.smoke_verdict(self.E, self.HOST, True, old, old)[1])
+    def test_scheduled_run_matches_the_commit_alone(self):
+        # nothing is attributed on a schedule: a redeploy of the same commit is the same code
+        other = self.rec(deployment=self.OTHER)
+        self.assertEqual(self.verdict(True, self.rec(), other, host=None, exact=False), "pass")
+        self.assertEqual(self.verdict(False, other, other, host=None, exact=False), "fail")
+        self.assertIn("matched on the commit", mt.smoke_verdict(self.E, None, True, other, other, False)[1])
 
-    def test_unconfirmed_target_never_passes_and_a_failure_is_not_attributed(self):
-        for before, after in ((None, None), (self.rec(), None), (None, self.rec())):
+    def test_record_without_a_deployment_is_not_confirmed_after_a_merge(self):
+        # two deployments of one commit could not be told apart, so it never passes or fails post-merge
+        unnamed = self.rec(deployment=None)
+        for before, after in ((unnamed, unnamed), (self.rec(), unnamed), (unnamed, self.rec())):
             self.assertEqual(self.verdict(True, before, after), "deferred")
             self.assertEqual(self.verdict(False, before, after), "unverified")
+        # no usable expected host at all: nothing can be confirmed either
+        self.assertEqual(self.verdict(True, self.rec(), self.rec(), host=None), "deferred")
+        self.assertEqual(self.verdict(False, self.rec(), self.rec(), host=None), "unverified")
+        # on a schedule the commit is enough
+        self.assertEqual(self.verdict(True, unnamed, unnamed, host=None, exact=False), "pass")
+
+    def test_unconfirmed_target_never_passes_and_a_failure_is_not_attributed(self):
+        for exact in (True, False):
+            for before, after in ((None, None), (self.rec(), None), (None, self.rec())):
+                self.assertEqual(self.verdict(True, before, after, exact=exact), "deferred")
+                self.assertEqual(self.verdict(False, before, after, exact=exact), "unverified")
 
     def test_malformed_records_prove_nothing(self):
         for raw in (None, [], "x", {}, {"version": "E" * 40}, {"version": "abc"}, {"version": self.E[:39]},
@@ -332,25 +350,38 @@ class SmokeProvenance(unittest.TestCase):
                     f"https://{self.HOST}:8443", "https://", "https://-bad-.example"):
             self.assertIsNone(mt.deployment_host(bad), bad)
 
+    def test_exit_code(self):
+        for scheduled in (False, True):
+            self.assertEqual(mt.smoke_exit("fail", scheduled, False), 1)
+            self.assertEqual(mt.smoke_exit("unverified", scheduled, True), 1)
+            self.assertEqual(mt.smoke_exit("pass", scheduled, False), 0)
+            self.assertEqual(mt.smoke_exit("deferred", scheduled, True), 0)
+        # post-merge: a deferral is pending verification and the receipt records it
+        self.assertEqual(mt.smoke_exit("deferred", False, False), 0)
+        # schedule: nothing else would notice, so any deferral but a newer master commit fails the run
+        self.assertEqual(mt.smoke_exit("deferred", True, False), 1)
+
 
 class SmokeTarget(unittest.TestCase):
     E = "e" * 40
     A = "https://frontend-aaa111-example.vercel.app"
     B = "https://frontend-bbb222-example.vercel.app"
 
-    def test_requested_url_must_be_a_live_deployment_of_the_commit(self):
+    def test_requested_url_must_be_a_successful_deployment_of_the_commit(self):
         self.assertEqual(mt.pick_deployment([("success", self.A)], self.A, self.E)[0], self.A)
         self.assertEqual(mt.pick_deployment([("success", self.A + "/")], self.A, self.E)[0], self.A)
         self.assertIsNone(mt.pick_deployment([("success", self.A)], self.B, self.E)[0])  # another commit's URL
         self.assertIsNone(mt.pick_deployment([("success", self.A)], "http://x", self.E)[0])
 
-    def test_superseded_deployment_is_not_a_target(self):
-        url, why = mt.pick_deployment([("inactive", self.A)], self.A, self.E)
-        self.assertIsNone(url)
-        self.assertIn("inactive", why)
-        self.assertIsNone(mt.pick_deployment([("pending", self.A)], self.A, self.E)[0])
+    def test_unsuccessful_deployment_is_not_a_target(self):
+        # a failed build, one still building, or one canceled from Vercel's dashboard. (A deployment a newer one
+        # replaced still reads success on GitHub; smoke_target and the provenance check refuse that one.)
+        for state in ("failure", "pending", "inactive"):
+            url, why = mt.pick_deployment([(state, self.A)], self.A, self.E)
+            self.assertIsNone(url, state)
+            self.assertIn(state, why)
 
-    def test_without_a_request_the_newest_live_deployment_is_taken(self):
+    def test_without_a_request_the_newest_successful_deployment_is_taken(self):
         deps = [("failure", self.B), ("success", self.A)]
         self.assertEqual(mt.pick_deployment(deps, "", self.E)[0], self.A)
         self.assertIsNone(mt.pick_deployment([], "", self.E)[0])
@@ -374,6 +405,15 @@ class SmokeOutcome(unittest.TestCase):
         self.assertEqual(mt.attempt_verdict("", "failure"), "unverified")
         self.assertEqual(mt.attempt_verdict("bogus", "failure"), "unverified")
 
+    def test_a_retry_that_never_ran_is_unverified(self):
+        # the retry must run after a failed first attempt; skipped means the workflow did not schedule it
+        for result in ("skipped", ""):
+            self.assertEqual(mt.retry_verdict("", result), "unverified", result)
+        self.assertEqual(mt.retry_verdict("", "cancelled"), "deferred")  # superseded by a newer run, same commit
+        self.assertEqual(mt.retry_verdict("fail", "failure"), "fail")
+        self.assertEqual(mt.retry_verdict("pass", "success"), "pass")
+        self.assertEqual(mt.smoke_outcome("fail", mt.retry_verdict("", "skipped")), "halt")
+
     def test_outcomes(self):
         self.assertEqual(mt.smoke_outcome("pass", ""), "pass")
         self.assertEqual(mt.smoke_outcome("fail", "pass"), "pass")  # a flaky first attempt
@@ -392,11 +432,12 @@ class SmokeOutcome(unittest.TestCase):
 
 class SmokeCulpritAndStaleRollback(unittest.TestCase):
     E, P, N = "e" * 40, "d" * 40, "f" * 40
+    NOW = 1_800_000_000.0
 
-    def status(self, state, creator="github-actions[bot]", context=mt.SMOKE_CONTEXT):
-        return dict(context=context, state=state, creator=creator)
+    def status(self, state, creator="github-actions[bot]", context=mt.SMOKE_CONTEXT, created_at=""):
+        return dict(context=context, state=state, creator=creator, created_at=created_at)
 
-    def test_receipt_reads_only_the_workflows_own_newest_smoke_status(self):
+    def test_receipt_reads_only_the_workflows_own_newest_exact_smoke_status(self):
         self.assertEqual(mt.smoke_state_of([self.status("success")]), "pass")
         self.assertEqual(mt.smoke_state_of([self.status("failure"), self.status("success")]), "fail")
         self.assertEqual(mt.smoke_state_of([self.status("pending")]), "unknown")
@@ -404,12 +445,30 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         self.assertEqual(mt.smoke_state_of([self.status("success", creator="someone")]), "unknown")
         self.assertEqual(mt.smoke_state_of([self.status("success", context="ci/other")]), "unknown")
 
-    def test_revert_only_when_the_parent_passed_on_its_own_deployment(self):
-        self.assertEqual(mt.smoke_culprit(self.E, "pass"), self.E)
+    def test_a_later_pending_receipt_does_not_erase_an_exact_one(self):
+        # a re-dispatch after master moved only reaches "pending verification"; the exact pass or fail still counts
+        self.assertEqual(mt.smoke_state_of([self.status("pending"), self.status("success")]), "pass")
+        self.assertEqual(mt.smoke_state_of([self.status("pending"), self.status("failure")]), "fail")
+        row = mt.smoke_receipt_row([self.status("pending"), self.status("success", created_at="2026-01-01T00:00:00Z")])
+        self.assertEqual(row["created_at"], "2026-01-01T00:00:00Z")
+
+    def test_receipt_age(self):
+        from datetime import datetime, timezone
+        at = datetime(2027, 1, 15, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(mt.receipt_age_s("2027-01-15T08:00:00Z", at + 90), 90)
+        self.assertIsNone(mt.receipt_age_s("not a time", self.NOW))
+        self.assertIsNone(mt.receipt_age_s(None, self.NOW))
+
+    def test_revert_only_when_the_parent_passed_recently_on_its_own_deployment(self):
+        self.assertEqual(mt.smoke_culprit(self.E, "pass", 600), self.E)
+        self.assertEqual(mt.smoke_culprit(self.E, "pass", mt.SMOKE_PARENT_MAX_AGE_S), self.E)
+        # an older pass does not rule out live data that changed since: a person decides
+        self.assertIsNone(mt.smoke_culprit(self.E, "pass", mt.SMOKE_PARENT_MAX_AGE_S + 1))
+        self.assertIsNone(mt.smoke_culprit(self.E, "pass", None))  # no readable time
         # the parent was superseded / deferred: it may hold the breaking change, so no unrelated revert
-        self.assertIsNone(mt.smoke_culprit(self.E, "unknown"))
+        self.assertIsNone(mt.smoke_culprit(self.E, "unknown", 600))
         # the parent already failed: its own verification acted; a person decides
-        self.assertIsNone(mt.smoke_culprit(self.E, "fail"))
+        self.assertIsNone(mt.smoke_culprit(self.E, "fail", 600))
 
     def test_failed_smoke_fixed_by_a_newer_exact_pass_is_a_stale_rollback(self):
         self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "pass"), (self.P, "unknown")]), self.N)
@@ -433,13 +492,26 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
                 patch.object(mt, "smoke_state", side_effect=states.get):
             self.assertIsNone(mt.already_fixed(self.E))
 
+    def test_already_fixed_never_reads_receipts_for_a_failed_build_and_survives_an_unreadable_one(self):
+        later = [(self.N, ["failure"])]
+        with patch.object(mt, "later_chain", return_value=later), \
+                patch.object(mt, "production_states", return_value=["failure"]), \
+                patch.object(mt, "smoke_state", side_effect=AssertionError("not read for a failed build")):
+            self.assertIsNone(mt.already_fixed(self.E))
+        with patch.object(mt, "later_chain", return_value=[(self.N, ["success"])]), \
+                patch.object(mt, "production_states", return_value=["success"]), \
+                patch.object(mt, "smoke_state", side_effect=mt.GhError("HTTP 502")):
+            self.assertIsNone(mt.already_fixed(self.E))  # unknown, never a crash before the revert or halt
+
 
 class SmokeCommands(unittest.TestCase):
     """The smoke-test.yml / post-merge.yml steps with GitHub faked: outputs and the commit status they write."""
-    E, P = "e" * 40, "d" * 40
+    E, P, N = "e" * 40, "d" * 40, "f" * 40
     URL = "https://frontend-abc123-example.vercel.app"
+    NEW_URL = "https://frontend-new999-example.vercel.app"
+    NOW = 1_800_000_000.0
 
-    def run_cmd(self, fn, *args, gh=None):
+    def run_cmd(self, fn, *args, gh=None, **kwargs):
         import os
         import tempfile
         calls = []
@@ -450,8 +522,9 @@ class SmokeCommands(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "out")
             with patch.dict(os.environ, {"GITHUB_OUTPUT": out, "GITHUB_STEP_SUMMARY": os.path.join(d, "sum")}), \
-                    patch.object(mt, "gh", side_effect=fake_gh):
-                code = fn(*args)
+                    patch.object(mt, "gh", side_effect=fake_gh), \
+                    patch.object(mt, "annotate", side_effect=lambda *a: calls.append(("annotate", *a))):
+                code = fn(*args, **kwargs)
             outputs = {}
             if os.path.exists(out):
                 for line in open(out, encoding="utf-8"):
@@ -467,25 +540,70 @@ class SmokeCommands(unittest.TestCase):
                 with open(os.path.join(d, f"{phase}.json"), "w", encoding="utf-8") as fh:
                     json.dump(rec, fh)
 
-    def test_verdict_command_fails_the_job_only_on_fail_or_unverified(self):
+    def verdict_cmd(self, tests, before, after, mode="post-merge", url=URL, gh=None):
         import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.write_provenance(d, before, after)
+            return self.run_cmd(mt.smoke_verdict_cmd, self.E, url, True, "", tests, d, mode, gh=gh)
+
+    def test_verdict_command_fails_a_post_merge_job_only_on_fail_or_unverified(self):
         host = mt.deployment_host(self.URL)
         same = {"version": self.E, "deployment": host}
-        moved = {"version": "f" * 40, "deployment": "frontend-new-example.vercel.app"}
+        moved = {"version": self.N, "deployment": "frontend-new-example.vercel.app"}
+        unnamed = {"version": self.E, "deployment": None}
         cases = [("success", same, same, "pass", 0), ("failure", same, same, "fail", 1),
                  ("success", same, moved, "deferred", 0), ("failure", same, moved, "deferred", 0),
-                 ("failure", None, None, "unverified", 1), ("cancelled", same, None, "deferred", 0)]
+                 ("failure", None, None, "unverified", 1), ("cancelled", same, None, "deferred", 0),
+                 ("success", unnamed, unnamed, "deferred", 0), ("failure", unnamed, same, "unverified", 1)]
         for tests, before, after, verdict, code in cases:
-            with tempfile.TemporaryDirectory() as d:
-                self.write_provenance(d, before, after)
-                got, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, self.URL, True, "", tests, d)
+            got, out, calls = self.verdict_cmd(tests, before, after)
             self.assertEqual((out["verdict"], got), (verdict, code), (tests, before, after))
             self.assertEqual(out["tested_sha"], self.E if verdict in ("pass", "fail") else "")
+            self.assertEqual(out["tested_deployment"], self.URL if verdict in ("pass", "fail") else "")
+            # every deferral leaves an annotation on the run
+            self.assertEqual(any(c[0] == "annotate" for c in calls), verdict == "deferred", (tests, before, after))
+
+    def test_scheduled_run_fails_unless_production_moved_on_to_a_newer_master_commit(self):
+        same = {"version": self.E, "deployment": "frontend-abc123-example.vercel.app"}
+        redeploy = {"version": self.E, "deployment": "frontend-again-example.vercel.app"}
+        older = {"version": self.P, "deployment": "frontend-old-example.vercel.app"}
+        newer = {"version": self.N, "deployment": "frontend-new-example.vercel.app"}
+
+        def compare(a):
+            path = a[1] if len(a) > 1 else ""
+            if path.endswith(f"/compare/{self.E}...{self.N}"):
+                return "ahead\n"  # N contains E
+            if path.endswith(f"/compare/{self.E}...{self.P}"):
+                return "behind\n"  # P is older: a Vercel rollback
+            if path.endswith(f"/compare/{self.N}...{mt.BASE}"):
+                return "identical\n"
+            return "diverged\n"
+        # the commit alone decides on a schedule: a redeploy of it is still a real test
+        got, out, _ = self.verdict_cmd("success", same, redeploy, mode="scheduled", url="", gh=compare)
+        self.assertEqual((out["verdict"], got), ("pass", 0))
+        got, out, _ = self.verdict_cmd("failure", same, same, mode="scheduled", url="", gh=compare)
+        self.assertEqual((out["verdict"], got, out["tested_deployment"]),
+                         ("fail", 1, "https://frontend-abc123-example.vercel.app"))
+        # moved on to a newer master merge mid-run: benign, that merge's post-merge smoke covers it
+        got, out, calls = self.verdict_cmd("success", same, newer, mode="scheduled", url="", gh=compare)
+        self.assertEqual((out["verdict"], got), ("deferred", 0))
+        self.assertIn(("annotate", "warning"), [c[:2] for c in calls])
+        # production pinned to an older deployment (Vercel rollback), or provenance never confirmed: red, annotated
+        for before, after, tests in ((older, older, "failure"), (None, None, "success"), (same, None, "success")):
+            got, out, calls = self.verdict_cmd(tests, before, after, mode="scheduled", url="", gh=compare)
+            self.assertEqual((out["verdict"], got), ("deferred", 1), (before, after, tests))
+            self.assertIn(("annotate", "error"), [c[:2] for c in calls])
+        # a target that could not be resolved is red on a schedule, pending after a merge
+        code, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, "", False, "no deployment", "skipped", "", "scheduled")
+        self.assertEqual((out["verdict"], code), ("deferred", 1))
+        code, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, "", False, "no deployment", "skipped", "", "post-merge")
+        self.assertEqual((out["verdict"], code), ("deferred", 0))
 
     def test_verdict_command_not_ready_is_deferred_without_reading_anything(self):
-        code, out, _ = self.run_cmd(mt.smoke_verdict_cmd, self.E, "", False, "no live deployment", "skipped", "")
+        code, out, calls = self.run_cmd(mt.smoke_verdict_cmd, self.E, "", False, "no live deployment", "skipped", "")
         self.assertEqual((out["verdict"], code), ("deferred", 0))
         self.assertIn("no live deployment", out["detail"])
+        self.assertFalse([c for c in calls if c[0] != "annotate"])  # no GitHub call
 
     def test_target_refuses_an_unmerged_commit_before_any_checkout(self):
         code, out, calls = self.run_cmd(mt.smoke_target, self.E, self.URL, gh=lambda a: "behind\n")
@@ -495,86 +613,190 @@ class SmokeCommands(unittest.TestCase):
         self.assertEqual(out["ready"], "false")
 
     def test_target_forwards_the_exact_commit_and_deployment(self):
-        with patch.object(mt, "production_deployments", return_value=[("success", self.URL)]):
+        with patch.object(mt, "master_sha", return_value=self.E), \
+                patch.object(mt, "production_deployments", return_value=[("success", self.URL)]):
             code, out, _ = self.run_cmd(mt.smoke_target, self.E, self.URL, gh=lambda a: "ahead\n")
         self.assertEqual((out["ready"], out["sha"], out["deployment_url"]), ("true", self.E, self.URL))
 
-    def receipt(self, attempts, parent_state="pass", verify="ok"):
-        def fake(a):
-            return self.P + "\n" if a[1].startswith(f"repos/{mt.REPO}/commits/") else ""
-        with patch.object(mt, "smoke_state", return_value=parent_state):
-            code, out, calls = self.run_cmd(mt.smoke_receipt, self.E, self.URL, verify, "detail", attempts, gh=fake)
-        status = next((c for c in calls if c[:3] == ("api", "-X", "POST")), None)
-        return out, status
+    def test_target_superseded_by_a_deployed_newer_head_stops_before_any_checkout(self):
+        # GitHub keeps "success" on a replaced deployment, so the newer head's own deployment is the evidence
+        deps = {self.N: [("success", self.NEW_URL)], self.E: [("success", self.URL)]}
+        with patch.object(mt, "master_sha", return_value=self.N), \
+                patch.object(mt, "production_deployments", side_effect=deps.get):
+            code, out, _ = self.run_cmd(mt.smoke_target, self.E, self.URL, gh=lambda a: "ahead\n")
+        self.assertEqual((code, out["ready"], out["sha"]), (0, "false", ""))
+        self.assertIn("superseded", out["detail"])
+        # the newer head is still deploying: production still serves this commit, so it runs
+        deps = {self.N: [], self.E: [("success", self.URL)]}
+        with patch.object(mt, "master_sha", return_value=self.N), \
+                patch.object(mt, "production_deployments", side_effect=deps.get):
+            code, out, _ = self.run_cmd(mt.smoke_target, self.E, self.URL, gh=lambda a: "ahead\n")
+        self.assertEqual((out["ready"], out["sha"]), ("true", self.E))
 
-    def test_receipt_reverts_only_a_double_exact_failure_with_a_passing_parent(self):
+    def test_scheduled_target_is_the_newest_deployed_master_commit(self):
+        def fake(a):
+            if a[1].endswith(f"/commits/{self.N}"):
+                return self.E + "\n"  # N's parent
+            return "identical\n"
+        deps = {self.N: [("pending", "")], self.E: [("success", self.URL)]}
+        with patch.object(mt, "master_sha", return_value=self.N), \
+                patch.object(mt, "production_deployments", side_effect=deps.get):
+            code, out, _ = self.run_cmd(mt.smoke_target, "", "", "scheduled", gh=fake)
+        # head still deploying: its parent is what production serves; no deployment pin on a schedule
+        self.assertEqual((code, out["ready"], out["sha"], out["deployment_url"]), (0, "true", self.E, ""))
+        self.assertIn(self.N[:7], out["detail"])
+        with patch.object(mt, "master_sha", return_value=self.N), \
+                patch.object(mt, "production_deployments", return_value=[]):
+            code, out, _ = self.run_cmd(mt.smoke_target, "", "", "scheduled", gh=lambda a: "")
+        self.assertEqual(out["ready"], "false")
+
+    def receipt(self, attempts, parent_state="pass", verify="ok", parent_age=600, existing="unknown",
+                compare="ahead", post_error=False):
+        from datetime import datetime, timezone
+        stamp = datetime.fromtimestamp(self.NOW - parent_age, timezone.utc).isoformat().replace("+00:00", "Z")
+        receipts = {self.P: (parent_state, stamp if parent_state != "unknown" else ""), self.E: (existing, "")}
+
+        def fake(a):
+            if a[:3] == ("api", "-X", "POST"):
+                if post_error:
+                    raise mt.GhError("HTTP 403")
+                return ""
+            if "/compare/" in a[1]:
+                return compare + "\n"
+            return self.P + "\n" if a[1].startswith(f"repos/{mt.REPO}/commits/") else ""
+        with patch.object(mt, "smoke_receipt_of", side_effect=receipts.get):
+            code, out, calls = self.run_cmd(mt.smoke_receipt, self.E, self.URL, verify, "detail", attempts,
+                                            self.NOW, gh=fake)
+        status = next((c for c in calls if c[:3] == ("api", "-X", "POST")), None)
+        return code, out, status
+
+    def test_receipt_reverts_only_a_double_exact_failure_with_a_recently_passing_parent(self):
         fail = ("fail", "failure", "failed on host")
-        out, status = self.receipt([fail, fail])
-        self.assertEqual((out["action"], out["culprit"]), ("revert", self.E))
+        code, out, status = self.receipt([fail, fail])
+        self.assertEqual((code, out["action"], out["culprit"]), (0, "revert", self.E))
         self.assertIn("state=failure", status)
         self.assertIn(f"context={mt.SMOKE_CONTEXT}", status)
         self.assertTrue(status[3].endswith(f"/statuses/{self.E}"))
-        out, status = self.receipt([fail, fail], parent_state="unknown")
-        self.assertEqual((out["action"], out["culprit"]), ("halt", ""))
-        self.assertIn("state=failure", status)  # the deployment did fail; only the culprit is unknown
+        for kwargs in (dict(parent_state="unknown"), dict(parent_state="fail"),
+                       dict(parent_age=mt.SMOKE_PARENT_MAX_AGE_S + 60)):
+            code, out, status = self.receipt([fail, fail], **kwargs)
+            self.assertEqual((out["action"], out["culprit"]), ("halt", ""), kwargs)
+            self.assertIn("state=failure", status)  # the deployment did fail; only the culprit is unknown
 
     def test_receipt_records_pending_verification_and_never_reverts_otherwise(self):
         cases = [([("pass", "success", "ok"), ("", "skipped", "")], "none", "state=success"),
                  ([("deferred", "success", "moved"), ("", "skipped", "")], "none", "state=pending"),
                  ([("fail", "failure", "x"), ("deferred", "success", "moved")], "none", "state=pending"),
                  ([("fail", "cancelled", "x"), ("", "skipped", "")], "none", "state=pending"),
-                 ([("unverified", "failure", "x"), ("unverified", "failure", "y")], "halt", "state=pending")]
+                 ([("unverified", "failure", "x"), ("unverified", "failure", "y")], "halt", "state=pending"),
+                 # the retry never ran after a failed first attempt: halt, never "pending"
+                 ([("fail", "failure", "x"), ("", "skipped", "")], "halt", "state=pending")]
         for attempts, action, state in cases:
-            out, status = self.receipt(attempts)
-            self.assertEqual((out["action"], out["culprit"]), (action, ""), attempts)
+            code, out, status = self.receipt(attempts)
+            self.assertEqual((code, out["action"], out["culprit"]), (0, action, ""), attempts)
             self.assertIn(state, status, attempts)
+
+    def test_pending_never_overwrites_an_earlier_exact_receipt(self):
+        attempts = [("deferred", "success", "moved"), ("", "skipped", "")]
+        for existing in ("pass", "fail"):
+            code, out, status = self.receipt(attempts, existing=existing)
+            self.assertEqual((code, out["action"]), (0, "none"))
+            self.assertIsNone(status, existing)
+        code, out, status = self.receipt([("pass", "success", "ok"), ("", "skipped", "")], existing="fail")
+        self.assertIn("state=success", status)  # an exact result is always recorded
+
+    def test_receipt_that_cannot_be_written_publishes_no_decision(self):
+        fail = ("fail", "failure", "failed on host")
+        code, out, status = self.receipt([fail, fail], post_error=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn("action", out)  # the workflow then halts without a revert
+        self.assertNotIn("culprit", out)
+
+    def test_receipt_only_on_a_master_commit(self):
+        # a dispatch with a PR head must not put a pending status on that PR (the train would wait on it)
+        code, out, status = self.receipt([("", "skipped", ""), ("", "skipped", "")], verify="skipped",
+                                         compare="diverged")
+        self.assertEqual((code, out["action"]), (0, "none"))
+        self.assertIsNone(status)
 
     def test_receipt_with_an_unreadable_parent_receipt_halts(self):
         fail = ("fail", "failure", "failed on host")
-        with patch.object(mt, "smoke_state", side_effect=mt.GhError("HTTP 502")):
-            code, out, _ = self.run_cmd(mt.smoke_receipt, self.E, self.URL, "ok", "", [fail, fail],
-                                        gh=lambda a: self.P + "\n")
+
+        def receipts(sha):
+            if sha == self.P:
+                raise mt.GhError("HTTP 502")
+            return "unknown", ""
+
+        def fake(a):
+            return "ahead\n" if "/compare/" in a[1] else self.P + "\n"
+        with patch.object(mt, "smoke_receipt_of", side_effect=receipts):
+            code, out, _ = self.run_cmd(mt.smoke_receipt, self.E, self.URL, "ok", "", [fail, fail], self.NOW, gh=fake)
         self.assertEqual((code, out["action"], out["culprit"]), (0, "halt", ""))
 
     def test_receipt_of_a_superseded_merge_is_pending(self):
-        out, status = self.receipt([("", "skipped", ""), ("", "skipped", "")], verify="skipped")
+        code, out, status = self.receipt([("", "skipped", ""), ("", "skipped", "")], verify="skipped")
         self.assertEqual(out["action"], "none")
         self.assertIn("state=pending", status)
 
 
 class SmokeWorkflowContract(unittest.TestCase):
-    """Workflow text contracts: SHA + URL forwarding, credential confinement, no artifacts."""
+    """Workflow text contracts: SHA + URL forwarding, credential confinement, no artifacts. Comments are stripped
+    first, so a comment that names a forbidden setting never satisfies or breaks a check."""
     ROOT = Path(__file__).resolve().parents[1]
 
     def read(self, rel):
         return (self.ROOT / rel).read_text(encoding="utf-8")
 
+    def code(self, rel):
+        import re
+        lines = []
+        for line in self.read(rel).splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            lines.append(re.sub(r"\s+#\s.*$", "", line))
+        return "\n".join(lines)
+
     def test_post_merge_forwards_the_verified_commit_and_deployment_to_both_attempts(self):
-        wf = self.read(".github/workflows/post-merge.yml")
+        wf = self.code(".github/workflows/post-merge.yml")
         self.assertIn("deployment_url: ${{ steps.v.outputs.deployment_url }}", wf)
         self.assertEqual(wf.count("expected_sha: ${{ needs.verify.outputs.sha }}"), 2)
         self.assertEqual(wf.count("deployment_url: ${{ needs.verify.outputs.deployment_url }}"), 2)
+        self.assertEqual(wf.count("post_merge: true"), 2)
 
     def test_post_merge_hands_the_smoke_test_only_the_smoke_secrets(self):
-        wf = self.read(".github/workflows/post-merge.yml")
+        wf = self.code(".github/workflows/post-merge.yml")
         self.assertNotIn("secrets: inherit", wf)
         for name in ("SMOKE_BASE_URL", "SMOKE_TEST_EMAIL", "SMOKE_TEST_PASSWORD"):
             self.assertEqual(wf.count(f"{name}: ${{{{ secrets.{name} }}}}"), 2, name)
 
+    def test_failure_conditions_carry_a_status_function(self):
+        # without one GitHub prepends success(), which is false once the dependency failed: the job never runs
+        import re
+        for rel in (".github/workflows/post-merge.yml", ".github/workflows/smoke-test.yml"):
+            for cond in re.findall(r"^\s*if:\s*(.+)$", self.code(rel), re.M):
+                if ".result == 'failure'" in cond:
+                    self.assertRegex(cond, r"(always|failure|cancelled)\(\)", (rel, cond))
+        self.assertIn("if: failure() && needs.smoke.result == 'failure'", self.code(".github/workflows/post-merge.yml"))
+
     def test_rollback_follows_the_receipt_decision(self):
-        wf = self.read(".github/workflows/post-merge.yml")
+        wf = self.code(".github/workflows/post-merge.yml")
         self.assertIn("needs.receipt.outputs.action == 'revert'", wf)
         self.assertIn("needs.receipt.outputs.culprit ||", wf)
         self.assertIn("needs.receipt.outputs.action != 'revert'", wf)  # anything but a proven culprit halts
         self.assertIn("statuses: write", wf)
         # a second smoke failure alone no longer reverts: only the receipt's proven culprit does
         self.assertNotIn("|| needs.smoke-retry.result == 'failure'", wf)
+        # rollback() reads deployments and commit statuses; job permissions replace the workflow's
+        rollback_job = wf.split("\n  rollback:\n", 1)[1]
+        self.assertIn("statuses: read", rollback_job)
+        self.assertIn("deployments: read", rollback_job)
 
     def test_smoke_workflow_is_bound_read_only_and_keeps_no_artifact(self):
-        wf = self.read(".github/workflows/smoke-test.yml")
+        wf = self.code(".github/workflows/smoke-test.yml")
         self.assertIn("ref: ${{ steps.target.outputs.sha }}", wf)
-        self.assertIn("smoke-target --sha", wf)
-        self.assertIn("smoke-verdict --sha", wf)
+        self.assertIn('smoke-target --mode "$SMOKE_MODE" --sha', wf)
+        self.assertIn('smoke-verdict --mode "$SMOKE_MODE" --sha', wf)
+        self.assertIn("SMOKE_MODE: ${{ inputs.post_merge && 'post-merge' || 'scheduled' }}", wf)
         self.assertIn("SMOKE_EXPECTED_SHA: ${{ steps.target.outputs.sha }}", wf)
         self.assertIn("SMOKE_EXPECTED_DEPLOYMENT: ${{ steps.target.outputs.deployment_url }}", wf)
         self.assertEqual(wf.count("persist-credentials: false"), 2)

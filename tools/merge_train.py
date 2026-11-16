@@ -8,10 +8,12 @@ enforced for admins) stays the final gate: this script only does the clicking a 
     train [--dry-run]            merge what is green, bring the next PR up to date, one in flight at a time
     post-merge --sha SHA         wait for the Production deploy of SHA, print result=ok|fail|halt|skipped and the
                                  immutable deployment URL it found
-    smoke-target --sha SHA       (smoke-test.yml) resolve the exact target: SHA must be on master and have a live
-                                 successful Production deployment; print ready, sha, deployment_url
+    smoke-target --sha SHA       (smoke-test.yml) resolve the exact target: SHA must be on master, have a
+             [--mode MODE]       successful Production deployment and (post-merge) not be superseded by a deployed
+                                 newer head; scheduled: the newest deployed master commit; print ready, sha, URL
     smoke-verdict --sha SHA      (smoke-test.yml) pass | fail | deferred | unverified from the test outcome and the
-                                 revision production served before and after the run; writes the receipt
+             [--mode MODE]       revision production served before and after the run; writes the receipt. A
+                                 scheduled run also fails when it could not test what production serves
     smoke-receipt --sha SHA      (post-merge.yml) record the attempts as the commit status post-merge/smoke and
                                  decide none | revert | halt, with the culprit read from the smoke receipts
     rollback --sha SHA --reason  halt the train, open a revert PR for SHA (needs the Actions PR-creation setting);
@@ -27,6 +29,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "rileybleeker/Onyx")
 BASE = "master"
@@ -453,13 +456,17 @@ def already_fixed(sha: str) -> str | None:
     """I/O wrapper of fixed_later and smoke_fixed_later: the newer master commit whose good build shows sha's failed
     build is fixed, or whose exact smoke pass shows sha's failed smoke test is fixed (DEL-02)."""
     later = later_chain(sha)
-    fixer = fixed_later(production_states(sha), later)
-    if fixer:
+    own_states = production_states(sha)
+    fixer = fixed_later(own_states, later)
+    if fixer or build_state(own_states) == "failed":  # a failed build never reached the smoke test
         return fixer
-    own = smoke_state(sha)
-    if own != "fail":  # only then are the later receipts worth reading
+    try:  # an unreadable receipt proves nothing: never let it stop a revert or a halt issue
+        own = smoke_state(sha)
+        if own != "fail":  # only then are the later receipts worth reading
+            return None
+        return smoke_fixed_later(own, [(c, smoke_state(c)) for c, _ in later])
+    except GhError:
         return None
-    return smoke_fixed_later(own, [(c, smoke_state(c)) for c, _ in later])
 
 
 def describe_chain(chain: list[tuple[str, list[str]]]) -> str:
@@ -538,6 +545,11 @@ HEX40 = re.compile(r"[0-9a-f]{40}")
 HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 VERDICTS = ("pass", "fail", "deferred", "unverified")
 FAILED = {"fail", "unverified"}  # verdicts that fail the smoke job (and so get the one retry)
+MODES = ("post-merge", "scheduled")  # post-merge: bound to one commit + deployment; scheduled: what production serves
+SCHEDULED_DEPTH = 8  # a scheduled run tests the newest deployed commit among this many master commits
+# A smoke failure reverts a commit only when its parent passed this recently: the suite reads live data, so an older
+# pass says less about whether the parent would still pass now (an ETL outage can empty a panel in between).
+SMOKE_PARENT_MAX_AGE_S = 3 * 3600
 
 
 def deployment_host(url: str | None) -> str | None:
@@ -552,9 +564,11 @@ def on_master(compare_status: str) -> bool:
 
 
 def pick_deployment(deps: list[tuple[str, str]], requested: str, sha: str) -> tuple[str | None, str]:
-    """Pure: deps = [(latest state, environment_url)] newest first. -> (https URL of the live successful Production
-    deployment to smoke-test, why). A requested URL must be one of sha's own deployments and still live: a deployment
-    a newer one replaced reads `inactive`, and the alias no longer serves it."""
+    """Pure: deps = [(latest state, environment_url)] newest first. -> (https URL of the successful Production
+    deployment to smoke-test, why). A requested URL must be one of sha's own deployments and its latest status must be
+    success. That does NOT prove the alias still serves it: Vercel's GitHub records keep a single `success` status
+    even after a newer deployment replaced it (checked 2026-11-16), so superseded targets are refused by smoke_target
+    (a deployed newer head) and by the provenance check, never by this state alone."""
     short = sha[:7]
     if requested:
         host = deployment_host(requested)
@@ -564,14 +578,14 @@ def pick_deployment(deps: list[tuple[str, str]], requested: str, sha: str) -> tu
         if not same:
             return None, f"{host} is not a Production deployment of {short}"
         if same[0] != "success":
-            return None, (f"the Production deployment {host} of {short} is {same[0]}, not live: a newer deployment "
-                          f"replaced it or it never finished")
-        return f"https://{host}", f"live Production deployment {host} of {short}"
+            return None, (f"the Production deployment {host} of {short} is {same[0]}, not success: it failed, was "
+                          f"replaced or never finished")
+        return f"https://{host}", f"successful Production deployment {host} of {short}"
     for state, url in deps:
         host = deployment_host(url)
         if state == "success" and host:
-            return f"https://{host}", f"live Production deployment {host} of {short}"
-    return None, f"no live successful Production deployment of {short}"
+            return f"https://{host}", f"successful Production deployment {host} of {short}"
+    return None, f"no successful Production deployment of {short}"
 
 
 def provenance_record(raw) -> dict | None:
@@ -597,34 +611,63 @@ def served_label(rec: dict | None) -> str:
     return rec["version"][:7] + " on " + (rec["deployment"] or "a deployment it does not name")
 
 
-def smoke_verdict(sha: str, host: str | None, tests_ok: bool, before: dict | None, after: dict | None) -> tuple[str, str]:
-    """Pure: (verdict, detail) of one smoke run against expected commit sha + deployment host.
+def smoke_verdict(sha: str, host: str | None, tests_ok: bool, before: dict | None, after: dict | None,
+                  exact_deployment: bool = True) -> tuple[str, str]:
+    """Pure: (verdict, detail) of one smoke run against expected commit sha (+ deployment host).
 
-    pass / fail   = production served exactly sha (and host, when the build names its deployment) before and after.
+    exact_deployment (post-merge runs, which attribute the result to sha): both records must name exactly `host`; a
+    record that names no deployment counts as not confirmed, since two deployments of one commit (a redeploy, a
+    Vercel rollback) could not be told apart. False (scheduled runs, which attribute nothing): the commit alone.
+
+    pass / fail   = production served exactly that target before and after the run.
     deferred      = it served something else at either end (alias moved, a redeploy, a rollback in Vercel), or the
-                    tests passed but the served revision was not confirmed: pending verification, never a pass.
-    unverified    = the tests failed and the served revision was not confirmed: the failure is not attributed."""
+                    tests passed but the target was not confirmed: pending verification, never a pass.
+    unverified    = the tests failed and the target was not confirmed: the failure is not attributed."""
     short = sha[:7]
+    unconfirmed = []
     for phase, rec in (("before", before), ("after", after)):
         if rec is None:
+            unconfirmed.append(phase)
             continue
         if rec["version"] != sha:
-            return "deferred", (f"production served {rec['version'][:7]} {phase} the run, not {short}: alias moved; "
-                                f"that deployment's own verification covers it")
-        if host and rec["deployment"] and rec["deployment"] != host:
+            return "deferred", f"production served {rec['version'][:7]} {phase} the run, not {short}"
+        if not exact_deployment:
+            continue
+        if not host or not rec["deployment"]:
+            unconfirmed.append(phase)
+        elif rec["deployment"] != host:
             return "deferred", (f"production served another deployment of {short} ({rec['deployment']}) {phase} the "
                                 f"run, not {host}")
-    missing = " and ".join(p for p, r in (("before", before), ("after", after)) if r is None)
-    if missing:
+    if unconfirmed:
+        what = "served deployment" if exact_deployment else "served commit"
+        missing = " and ".join(unconfirmed)
         if tests_ok:
-            return "deferred", f"tests passed but the served revision was not confirmed {missing} the run: not a pass"
-        return "unverified", (f"tests failed and the served revision was not confirmed {missing} the run: "
-                              f"not attributed to {short}")
-    where = host or "production"
-    named = "" if before["deployment"] and after["deployment"] else " (build names no deployment; matched on commit)"
+            return "deferred", f"tests passed but the {what} was not confirmed {missing} the run: not a pass"
+        return "unverified", f"tests failed and the {what} was not confirmed {missing} the run: not attributed to {short}"
+    if exact_deployment:
+        where = f"{host} serving {short}"
+    else:
+        where = f"production serving {short} (scheduled run: matched on the commit)"
     if tests_ok:
-        return "pass", f"passed on {where} serving {short} before and after the run{named}"
-    return "fail", f"failed on {where} serving {short} before and after the run{named}"
+        return "pass", f"passed on {where} before and after the run"
+    return "fail", f"failed on {where} before and after the run"
+
+
+def served_other(sha: str, before: dict | None, after: dict | None) -> str | None:
+    """Pure: the first other commit production served at either end of the run, or None."""
+    return next((r["version"] for r in (before, after) if r and r["version"] != sha), None)
+
+
+def smoke_exit(verdict: str, scheduled: bool, benign: bool) -> int:
+    """Pure: the smoke job's exit code. fail and unverified always fail it. A scheduled run has no commit to attribute
+    a deferral to, so a deferral fails it too unless it is benign (production moved on to a newer master commit, whose
+    own post-merge verification covers it, or a newer run superseded this one): otherwise a Vercel rollback, a
+    broken provenance read or a target that cannot be resolved would leave the 6-hourly tripwire green forever."""
+    if verdict in FAILED:
+        return 1
+    if scheduled and verdict == "deferred" and not benign:
+        return 1
+    return 0
 
 
 def attempt_verdict(verdict: str, result: str) -> str:
@@ -636,6 +679,16 @@ def attempt_verdict(verdict: str, result: str) -> str:
     if verdict in VERDICTS:
         return verdict
     return "unverified"
+
+
+def retry_verdict(verdict: str, result: str) -> str:
+    """Pure: the retry, read only after a failed first attempt, so it must have run. A retry the workflow skipped or
+    never started is unverified: a failure must never become "pending verification" just because the retry was not
+    scheduled (a job `if` without a status function is skipped after a failed dependency). A cancelled retry was
+    superseded by a newer run for the same commit: deferred, as for any attempt."""
+    if result in ("skipped", ""):
+        return "unverified"
+    return attempt_verdict(verdict, result)
 
 
 def smoke_outcome(first: str, retry: str) -> str:
@@ -652,21 +705,40 @@ def smoke_outcome(first: str, retry: str) -> str:
     return "halt"
 
 
-def smoke_state_of(rows: list[dict]) -> str:
-    """Pure: rows = sha's commit statuses newest first. -> pass | fail | unknown from the newest smoke receipt the
-    workflow's own token wrote (anything else, including a status another account posted, is ignored)."""
+def smoke_receipt_row(rows: list[dict]) -> dict | None:
+    """Pure: rows = sha's commit statuses newest first. -> the newest exact smoke receipt (success / failure) the
+    workflow's own token wrote. Pending rows are skipped: a later re-run that only reached "pending verification" does
+    not erase an exact pass or fail recorded earlier. A status another account posted is ignored."""
     for r in rows:
-        if r.get("context") == SMOKE_CONTEXT and r.get("creator") in BOT_LOGINS:
-            return {"success": "pass", "failure": "fail"}.get(r.get("state"), "unknown")
-    return "unknown"
+        if (r.get("context") == SMOKE_CONTEXT and r.get("creator") in BOT_LOGINS
+                and r.get("state") in ("success", "failure")):
+            return r
+    return None
 
 
-def smoke_culprit(sha: str, parent_state: str) -> str | None:
+def smoke_state_of(rows: list[dict]) -> str:
+    """Pure: pass | fail | unknown from the newest exact smoke receipt (smoke_receipt_row)."""
+    r = smoke_receipt_row(rows)
+    return {"success": "pass", "failure": "fail"}[r["state"]] if r else "unknown"
+
+
+def receipt_age_s(created_at: str | None, now: float) -> float | None:
+    """Pure: seconds from a status's created_at (ISO 8601) to now, or None when it cannot be read."""
+    try:
+        return now - datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def smoke_culprit(sha: str, parent_state: str, parent_age_s: float | None) -> str | None:
     """Pure: the commit to revert after BOTH smoke attempts failed on sha's own deployment. Only sha itself, and only
-    when its parent passed the smoke test on its own deployment: then the change that broke it is sha. A parent that
-    was never verified on its own deployment (superseded, deferred, unverified) may hold the breaking change, and a
-    parent that already failed was handled by its own verification; both halt for a person instead."""
-    return sha if parent_state == "pass" else None
+    when its parent passed the smoke test on its own deployment within SMOKE_PARENT_MAX_AGE_S: then the change that
+    broke it is sha. A parent that was never verified on its own deployment (superseded, deferred, unverified) may
+    hold the breaking change, a parent that already failed was handled by its own verification, and an old pass does
+    not rule out live data that changed since (the suite reads production data); all of these halt for a person."""
+    if parent_state != "pass" or parent_age_s is None or parent_age_s > SMOKE_PARENT_MAX_AGE_S:
+        return None
+    return sha
 
 
 def smoke_fixed_later(own_state: str, later: list[tuple[str, str]]) -> str | None:
@@ -682,25 +754,71 @@ def smoke_status(outcome: str) -> str:
     return {"pass": "success", "fail": "failure"}.get(outcome, "pending")
 
 
-def smoke_state(sha: str) -> str:
+def smoke_receipt_of(sha: str) -> tuple[str, str]:
+    """-> (pass | fail | unknown, created_at of that receipt or "")."""
     rows = api_items(f"repos/{REPO}/commits/{sha}/statuses?per_page=100",
-                     ".[]|{context,state,creator:(.creator.login // \"\")}")
-    return smoke_state_of(rows)
+                     ".[]|{context,state,created_at,creator:(.creator.login // \"\")}")
+    r = smoke_receipt_row(rows)
+    return smoke_state_of(rows), (r or {}).get("created_at") or ""
 
 
-def smoke_target(sha: str, requested: str) -> int:
-    """smoke-test.yml: resolve the exact target before any checkout or credential use. Never fails the job."""
+def smoke_state(sha: str) -> str:
+    return smoke_receipt_of(sha)[0]
+
+
+def annotate(level: str, title: str, msg: str) -> None:
+    """A GitHub annotation on the run (warning / error), one line."""
+    text = " ".join(str(msg).split()).replace("%", "%25")
+    print(f"::{level} title={title}::{text}", flush=True)
+
+
+def scheduled_target(start: str, depth: int = SCHEDULED_DEPTH) -> tuple[str | None, str, str]:
+    """-> (URL, why, commit): the newest commit from start back through first parents that has a successful Production
+    deployment, which is what production serves unless someone rolled it back in Vercel. A head that is still
+    deploying, or whose build failed, falls back to its parent instead of leaving the run without a target."""
+    cur, newer = start, []
+    for _ in range(depth):
+        url, why = pick_deployment(production_deployments(cur), "", cur)
+        if url:
+            if newer:
+                why += f" (newer {', '.join(newer)} has no successful Production deployment yet)"
+            return url, why, cur
+        newer.append(cur[:7])
+        cur = gh("api", f"repos/{REPO}/commits/{cur}", "--jq", ".parents[0].sha", check=False).strip()
+        if not HEX40.fullmatch(cur):
+            break
+    return None, f"no successful Production deployment among the {len(newer)} newest {BASE} commits", start
+
+
+def smoke_target(sha: str, requested: str, mode: str = "post-merge") -> int:
+    """smoke-test.yml: resolve the target before any checkout or credential use. Never fails the job (the verdict
+    step does). post-merge: exactly sha + its deployment, refused when a newer head already deployed (production no
+    longer serves sha, so checking out and signing in would only produce a deferral). scheduled: the newest deployed
+    master commit from sha (default: master head now), matched on the commit alone (no deployment pin)."""
+    scheduled = mode == "scheduled"
+
     def done(ready: bool, detail: str, url: str = "") -> int:
-        note(f"smoke target {sha[:7] if HEX40.fullmatch(sha) else sha!r}: {'ready' if ready else 'deferred'}: {detail}")
-        set_outputs(ready="true" if ready else "false", sha=sha if ready else "", deployment_url=url, detail=detail)
+        note(f"smoke target ({mode}) {sha[:7] if HEX40.fullmatch(sha or '') else sha!r}: "
+             f"{'ready' if ready else 'deferred'}: {detail}")
+        set_outputs(ready="true" if ready else "false", sha=sha if ready else "",
+                    deployment_url="" if scheduled else url, detail=detail)
         return 0
-    if not HEX40.fullmatch(sha or ""):
-        return done(False, "the expected commit is not a 40-hex SHA")
     try:
+        if scheduled and not sha:
+            sha = master_sha()
+        if not HEX40.fullmatch(sha or ""):
+            return done(False, "the expected commit is not a 40-hex SHA")
         status = gh("api", f"repos/{REPO}/compare/{sha}...{BASE}", "--jq", ".status").strip()
         if not on_master(status):
             return done(False, f"{sha[:7]} is not a commit on {BASE} ({status or 'unknown'}): unmerged code never runs "
                                f"with the smoke credentials")
+        if scheduled:
+            url, why, sha = scheduled_target(sha)
+            return done(bool(url), why, url or "")
+        head = master_sha()
+        if head != sha and pick_deployment(production_deployments(head), "", head)[0]:
+            return done(False, f"superseded: {BASE} head {head[:7]} already has a successful Production deployment, "
+                               f"so production no longer serves {sha[:7]}; that merge's own verification covers it")
         url, why = pick_deployment(production_deployments(sha), requested, sha)
     except GhError:
         return done(False, "could not read the commit or its deployment history")
@@ -715,36 +833,71 @@ def load_provenance(directory: str, phase: str) -> dict | None:
         return None
 
 
-def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests: str, directory: str) -> int:
-    """smoke-test.yml: the verdict and the receipt (job summary). Exit 1 = the smoke job fails (fail, unverified)."""
+def newer_master_commit(sha: str, other: str) -> bool:
+    """Whether `other` is a master commit that contains sha (production moved on to a newer merge)."""
+    try:
+        ahead = gh("api", f"repos/{REPO}/compare/{sha}...{other}", "--jq", ".status").strip()
+        merged = gh("api", f"repos/{REPO}/compare/{other}...{BASE}", "--jq", ".status").strip()
+    except GhError:
+        return False
+    return ahead == "ahead" and on_master(merged)
+
+
+def smoke_verdict_cmd(sha: str, url: str, ready: bool, target_detail: str, tests: str, directory: str,
+                      mode: str = "post-merge") -> int:
+    """smoke-test.yml: the verdict and the receipt (job summary). Exit 1 = the smoke job fails (smoke_exit)."""
+    scheduled = mode == "scheduled"
     host = deployment_host(url)
     before = load_provenance(directory, "before") if ready and directory else None
     after = load_provenance(directory, "after") if ready and directory else None
+    benign = False
     if not ready:
         verdict, detail = "deferred", f"not run: {target_detail or 'no exact target'}"
     elif tests == "cancelled":
-        verdict, detail = "deferred", "cancelled: superseded by a newer smoke run"
+        verdict, detail, benign = "deferred", "cancelled: superseded by a newer smoke run", True
     else:
-        verdict, detail = smoke_verdict(sha, host, tests == "success", before, after)
+        verdict, detail = smoke_verdict(sha, host, tests == "success", before, after, exact_deployment=not scheduled)
+    if verdict == "deferred" and not benign and ready:
+        other = served_other(sha, before, after)
+        if other and newer_master_commit(sha, other):
+            benign = True
+            detail += f"; production moved on to the newer {BASE} commit {other[:7]}, whose own verification covers it"
+    code = smoke_exit(verdict, scheduled, benign)
+    if verdict == "deferred":
+        if code:
+            detail += ("; a scheduled run must test what production serves: check for a Vercel rollback, a broken "
+                       "/api/version or a deploy that failed")
+            annotate("error", "Smoke target not confirmed", detail)
+        else:
+            annotate("warning", "Smoke deferred", detail)
     exact = verdict in ("pass", "fail")
-    set_outputs(verdict=verdict, detail=detail, tested_sha=sha if exact else "",
-                tested_deployment=f"https://{host}" if exact and host else "")
+    if exact and not scheduled and host:
+        tested_deployment = f"https://{host}"
+    elif exact and scheduled and before and after and before["deployment"] and before["deployment"] == after["deployment"]:
+        tested_deployment = f"https://{before['deployment']}"
+    else:
+        tested_deployment = ""
+    set_outputs(verdict=verdict, detail=detail, tested_sha=sha if exact else "", tested_deployment=tested_deployment)
     note("\n".join([
-        "### Smoke receipt",
+        f"### Smoke receipt ({mode})",
         f"- expected commit: `{sha or 'none'}`",
-        f"- expected deployment: `{host or 'none'}`",
+        f"- expected deployment: `{host or ('any deployment of the commit' if scheduled else 'none')}`",
         f"- production served before the run: {served_label(before)}",
         f"- production served after the run: {served_label(after)}",
         f"- tests: {tests or 'not run'}",
-        f"- verdict: **{verdict}**: {detail}",
+        f"- verdict: **{verdict}**{' (fails this scheduled run)' if verdict == 'deferred' and code else ''}: {detail}",
     ]))
-    return 1 if verdict in FAILED else 0
+    return code
 
 
-def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts: list[tuple[str, str, str]]) -> int:
+def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts: list[tuple[str, str, str]],
+                  now: float | None = None) -> int:
     """post-merge.yml: record the smoke attempts on the commit and decide the action. attempts = [(verdict, job
-    result, detail)] for the first run and the retry. Outputs action = none | revert | halt, culprit, reason."""
+    result, detail)] for the first run and the retry. Outputs action = none | revert | halt, culprit, reason, and
+    only once the receipt is recorded: when it cannot be written (or sha cannot be checked against master) the job
+    fails with no action, and post-merge.yml halts without a revert if the smoke test failed."""
     host = deployment_host(url) or "production"
+    now = time.time() if now is None else now
     if not HEX40.fullmatch(sha or ""):
         set_outputs(action="none", culprit="", reason="", outcome="pending")
         note(f"smoke receipt: no commit to record ({sha!r})")
@@ -754,36 +907,61 @@ def smoke_receipt(sha: str, url: str, verify: str, verify_detail: str, attempts:
     else:
         (v1, r1, d1), (v2, r2, d2) = attempts
         first = attempt_verdict(v1, r1)
-        retry = attempt_verdict(v2, r2) if first in FAILED else ""
+        retry = retry_verdict(v2, r2) if first in FAILED else ""
         outcome = smoke_outcome(first, retry)
         detail = (d2 if first in FAILED else d1) or f"smoke job {r2 if first in FAILED else r1}"
     action, culprit, reason = "none", "", ""
-    if outcome == "fail":
-        parent = gh("api", f"repos/{REPO}/commits/{sha}", "--jq", ".parents[0].sha", check=False).strip()
-        known = bool(HEX40.fullmatch(parent))
-        try:
-            parent_state = smoke_state(parent) if known else "unknown"
-        except GhError:  # an unreadable receipt proves nothing about the parent
-            parent_state = "unknown"
-        culprit = smoke_culprit(sha, parent_state) or ""
-        if culprit:
-            action = "revert"
-            reason = f"production smoke test failed twice on {host} serving {sha[:7]} (its parent passed)"
-        else:
-            action = "halt"
-            reason = (f"production smoke test failed twice on {host} serving {sha[:7]}, but its parent "
-                      f"{parent[:7] if known else '(unreadable)'} has smoke receipt '{parent_state}', so the breaking "
-                      f"commit is not known: nothing is reverted")
-    elif outcome == "halt":
-        action = "halt"
-        reason = f"production smoke test failed but the failure is not attributed to {sha[:7]}: {detail}"
-    set_outputs(action=action, culprit=culprit, reason=reason, outcome=outcome)
     state = smoke_status(outcome)
     label = {"pass": "pass", "fail": "fail", "pending": "pending verification",
              "halt": "pending verification (failure not attributed)"}[outcome]
-    run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{REPO}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
-    gh("api", "-X", "POST", f"repos/{REPO}/statuses/{sha}", "-f", f"state={state}", "-f", f"context={SMOKE_CONTEXT}",
-       "-f", f"description={(label + ': ' + detail)[:140]}", "-f", f"target_url={run}", check=False)
+    try:
+        # a receipt belongs on a master commit only: a dispatch with a PR head would put a pending status on that PR
+        # and stall the merge train on it
+        compare = gh("api", f"repos/{REPO}/compare/{sha}...{BASE}", "--jq", ".status").strip()
+        if not on_master(compare):
+            set_outputs(action="none", culprit="", reason="", outcome=outcome)
+            note(f"smoke receipt {sha[:7]}: not a commit on {BASE} ({compare or 'unknown'}): nothing recorded")
+            return 0
+        if outcome == "fail":
+            parent = gh("api", f"repos/{REPO}/commits/{sha}", "--jq", ".parents[0].sha", check=False).strip()
+            known = bool(HEX40.fullmatch(parent))
+            try:
+                parent_state, parent_at = smoke_receipt_of(parent) if known else ("unknown", "")
+            except GhError:  # an unreadable receipt proves nothing about the parent
+                parent_state, parent_at = "unknown", ""
+            age = receipt_age_s(parent_at, now) if parent_at else None
+            culprit = smoke_culprit(sha, parent_state, age) or ""
+            if culprit:
+                action = "revert"
+                reason = (f"production smoke test failed twice on {host} serving {sha[:7]} (its parent passed "
+                          f"{int(age // 60)} min earlier)")
+            else:
+                action = "halt"
+                when = f" from {parent_at}" if parent_at else ""
+                reason = (f"production smoke test failed twice on {host} serving {sha[:7]}, but its parent "
+                          f"{parent[:7] if known else '(unreadable)'} has smoke receipt '{parent_state}'{when} (a "
+                          f"revert needs a pass within {SMOKE_PARENT_MAX_AGE_S // 3600} h), so the breaking commit "
+                          f"is not known: nothing is reverted")
+        elif outcome == "halt":
+            action = "halt"
+            reason = f"production smoke test failed but the failure is not attributed to {sha[:7]}: {detail}"
+        try:
+            existing = smoke_state(sha) if state == "pending" else "unknown"
+        except GhError:
+            existing = "unknown"
+        if existing in ("pass", "fail"):
+            note(f"smoke receipt {sha[:7]}: this run is {label}; the earlier exact receipt ({existing}) stands")
+        else:
+            run = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{REPO}/actions/runs/"
+                   f"{os.environ.get('GITHUB_RUN_ID', '')}")
+            gh("api", "-X", "POST", f"repos/{REPO}/statuses/{sha}", "-f", f"state={state}",
+               "-f", f"context={SMOKE_CONTEXT}", "-f", f"description={(label + ': ' + detail)[:140]}",
+               "-f", f"target_url={run}")
+    except GhError as e:
+        note(f"smoke receipt {sha[:7]}: could not record the receipt ({e}); no action published, so a failed smoke "
+             f"test halts the train without a revert")
+        return 1
+    set_outputs(action=action, culprit=culprit, reason=reason, outcome=outcome)
     note(f"smoke receipt {sha[:7]}: {state} ({label}): {detail}; action {action}" + (f" {culprit[:7]}" if culprit else ""))
     return 0
 
@@ -800,7 +978,8 @@ def rollback(sha: str, reason: str, halt_only: bool = False) -> int:
            f"No automatic revert: the evidence does not show which commit broke the release. For a build: a merge "
            f"without a finished build, a canceled or errored deployment, or a deploy that never finished. For the "
            f"smoke test: a failure on a deployment whose served revision was not confirmed, or whose parent was never "
-           f"smoke-tested on its own deployment (see its `{SMOKE_CONTEXT}` commit status). Open the failed run or "
+           f"smoke-tested on its own deployment or passed too long ago to rule out changed live data (see its "
+           f"`{SMOKE_CONTEXT}` commit status). Open the failed run or "
            f"deployment log, then either revert the commit that broke it or, for a transient error, redeploy or "
            f"re-run. Close this issue to resume the merge train.", check=False)
         note(f"HALTED train without a revert for {short}: failure provenance unknown")
@@ -872,8 +1051,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sha", required=True)
     p.add_argument("--drill", action="store_true")
     st = sub.add_parser("smoke-target")
-    st.add_argument("--sha", required=True)
+    st.add_argument("--sha", required=True, help="the commit; empty in scheduled mode = master head now")
     st.add_argument("--deployment-url", default="")
+    st.add_argument("--mode", choices=MODES, default="post-merge")
     sv = sub.add_parser("smoke-verdict")
     sv.add_argument("--sha", default="")
     sv.add_argument("--deployment-url", default="")
@@ -881,6 +1061,7 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("--target-detail", default="")
     sv.add_argument("--tests", default="")
     sv.add_argument("--provenance-dir", default="")
+    sv.add_argument("--mode", choices=MODES, default="post-merge")
     sr = sub.add_parser("smoke-receipt")
     sr.add_argument("--sha", required=True)
     sr.add_argument("--deployment-url", default="")
@@ -901,9 +1082,10 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "post-merge":
         return post_merge(a.sha, a.drill)
     if a.cmd == "smoke-target":
-        return smoke_target(a.sha, a.deployment_url)
+        return smoke_target(a.sha, a.deployment_url, a.mode)
     if a.cmd == "smoke-verdict":
-        return smoke_verdict_cmd(a.sha, a.deployment_url, a.ready == "true", a.target_detail, a.tests, a.provenance_dir)
+        return smoke_verdict_cmd(a.sha, a.deployment_url, a.ready == "true", a.target_detail, a.tests, a.provenance_dir,
+                                 a.mode)
     if a.cmd == "smoke-receipt":
         return smoke_receipt(a.sha, a.deployment_url, a.verify, a.verify_detail,
                              [(a.first, a.first_result, a.first_detail), (a.retry, a.retry_result, a.retry_detail)])
