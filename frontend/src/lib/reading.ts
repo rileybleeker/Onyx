@@ -1039,6 +1039,33 @@ export async function deleteSession(
   return { ok: true, book, session, unfinished, habitRemoved };
 }
 
+/**
+ * Discard of an autosaving /log entry whose create may have been stored although its answer never arrived (PROD-T01):
+ * the session a POST with this `client_key` made, if any, is removed exactly like DELETE /api/reading/sessions/[id]
+ * (a finish it caused goes back to reading, its Notion entry is trashed by the route). Whether that create made the
+ * day's habit row is unknown (its answer was lost), so the habit Yes stays, the same rule as an edit of a replayed
+ * create. `removed: null` = no session has this key: nothing of the entry is stored. Until
+ * sql/reading_sessions_client_key.sql is applied keys are not stored, so nothing can be found by one (null too).
+ * A read failure is an error (500), never "nothing stored": the form retries instead of dropping the entry.
+ */
+export async function deleteSessionByClientKey(
+  supabase: Supa,
+  clientKey: string,
+): Promise<
+  | { ok: true; removed: null }
+  | { ok: true; removed: ReadingSession; book: Book; unfinished: boolean }
+  | { ok: false; status: number; error: string }
+> {
+  if (!UUID_RE.test(clientKey)) return { ok: false, status: 400, error: "client_key must be a UUID" };
+  const { data, error } = await supabase.from("reading_sessions").select("session_id").eq("client_key", clientKey.toLowerCase()).maybeSingle();
+  if (error) return missingColumn(error) ? { ok: true, removed: null } : { ok: false, status: 500, error: error.message };
+  const id = (data as { session_id?: number } | null)?.session_id;
+  if (!id) return { ok: true, removed: null };
+  const r = await deleteSession(supabase, id, null);
+  if (!r.ok) return r.status === 404 ? { ok: true, removed: null } : r;
+  return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished };
+}
+
 export interface AddHighlightInput {
   slug?: string | null;
   book_id?: number | null;

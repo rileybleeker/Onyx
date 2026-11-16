@@ -1,6 +1,6 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { BOOK_COLS, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
+import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -74,4 +74,47 @@ export async function POST(req: NextRequest) {
     replayed: result.replayed,
     overview,
   });
+}
+
+/** Same-origin check for a request without a body (DELETE): the Origin header must be this site. */
+function originRefused(req: NextRequest): { status: number; error: string } | null {
+  const origin = req.headers.get("origin");
+  if (!origin) return { status: 403, error: "missing Origin" };
+  let o: URL;
+  try {
+    o = new URL(origin);
+  } catch {
+    return { status: 403, error: "bad Origin" };
+  }
+  const hosts = [req.headers.get("x-forwarded-host"), req.headers.get("host"), req.nextUrl.host].filter(Boolean);
+  return hosts.includes(o.host) ? null : { status: 403, error: "cross-origin request refused" };
+}
+
+/**
+ * DELETE /api/reading/sessions?client_key=<uuid>
+ *
+ * Discard of an autosaving /log Reading entry whose create may have been stored although its answer never arrived
+ * (PROD-T01): the form knows no session id, only the create's client_key, so the session that key made (if any) is
+ * removed here like DELETE /api/reading/sessions/[id] (lib/reading.ts deleteSessionByClientKey: finish undone, habit
+ * Yes left because whether the create made it is unknown). Nothing is created: a key no session has answers
+ * `removed: null`, which tells the form nothing of the entry is stored. Repeating it is safe.
+ * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check.
+ * Answers: 200 { success, removed: id | null, unfinished, overview }, 400 for a key that is not a UUID.
+ */
+export async function DELETE(req: NextRequest) {
+  const refused = originRefused(req);
+  if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
+  const r = await deleteSessionByClientKey(supabase, req.nextUrl.searchParams.get("client_key") ?? "");
+  if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
+  if (!r.removed) return NextResponse.json({ success: true, removed: null, unfinished: false, overview: null });
+  const { removed, book, unfinished } = r;
+  const overview = await getOverview(supabase, book.slug).catch(() => null);
+
+  // A create's own after() that was still writing the Notion entry trashes it once it sees the row gone.
+  after(async () => {
+    await removeMirroredBlock(removed.notion_block_id);
+    await mirrorProgress(book, overview?.chaptersDone ?? 0, overview?.sessions?.[0]?.session_date ?? null);
+  });
+
+  return NextResponse.json({ success: true, removed: removed.session_id, unfinished, overview });
 }

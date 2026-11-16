@@ -342,6 +342,32 @@ test("deleteSession removes a manual session, undoes the finish it caused and th
   assert.equal(k.tables.reading_sessions.length, 1);
 });
 
+test("deleteSessionByClientKey (Discard after a lost create answer): removes the session that key made and creates nothing", async () => {
+  const finished = { ...BOOK, status: "finished", finished_on: "2026-11-15" };
+  const db = fakeDb({
+    books: [finished],
+    reading_sessions: [session({ chapter_from: 10, chapter_through: 12, client_key: KEY }), session({ session_id: 42, client_key: null })],
+    habit_journal: [yes("2026-11-15")],
+  });
+  const r = await R.deleteSessionByClientKey(db, KEY.toUpperCase());
+  assert.equal(r.ok, true);
+  assert.equal(r.removed.session_id, 41, "found by the create's own key");
+  assert.equal(r.unfinished, true, "the finish it caused is undone");
+  assert.deepEqual(db.tables.reading_sessions.map((s) => s.session_id), [42], "only that session goes");
+  assert.equal(db.tables.habit_journal.length, 1, "whether that create made the habit row is unknown: the Yes stays");
+  assert.equal(db.log.some((l) => l.op === "insert" || l.op === "upsert"), false, "nothing is created to find out");
+
+  const again = await R.deleteSessionByClientKey(db, KEY);
+  assert.deepEqual(again, { ok: true, removed: null }, "repeating it is safe: nothing of the entry is stored");
+  const empty = fakeDb({ books: [BOOK] });
+  assert.deepEqual(await R.deleteSessionByClientKey(empty, KEY), { ok: true, removed: null }, "a create that never arrived");
+  assert.equal(empty.log.some((l) => l.op !== "select"), false, "and nothing is written");
+  const noColumn = fakeDb({ books: [BOOK], reading_sessions: [session({})] }, { noClientKey: true });
+  assert.deepEqual(await R.deleteSessionByClientKey(noColumn, KEY), { ok: true, removed: null }, "keys not stored yet: none can be found");
+  assert.equal(noColumn.tables.reading_sessions.length, 1);
+  assert.equal((await R.deleteSessionByClientKey(db, "not-a-key")).status, 400);
+});
+
 test("Notion mirror race check: only a change that alters the entry counts", () => {
   const a = session({});
   assert.equal(N.sessionMirrorDiffers(a, { ...a, notion_block_id: "b1", created_at: "later" }), false);
@@ -372,6 +398,11 @@ test("source pins: no Save button on the reading forms; keys and habit days trav
   const post = read("app/api/reading/sessions/route.ts");
   assert.match(post, /client_key:/);
   assert.match(post, /if \(!result\.replayed\) after\(/, "a replayed create writes no second Notion entry");
+  const del = post.slice(post.indexOf("export async function DELETE"));
+  assert.ok(del.length > 30, "DELETE /api/reading/sessions?client_key= exists (Discard after a lost create answer)");
+  assert.match(del, /originRefused\(req\)/, "same-origin only");
+  assert.match(del, /deleteSessionByClientKey\(/);
+  assert.doesNotMatch(del, /logSession\(/, "it never creates a session to find one");
   const mw = read("middleware.ts");
   const ci = mw.slice(mw.indexOf("function isCiRoute"), mw.indexOf("}", mw.indexOf("function isCiRoute")));
   assert.doesNotMatch(ci, /\/api\/reading\/sessions/);

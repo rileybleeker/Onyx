@@ -10,7 +10,8 @@ import type { AutosaveState } from "@/lib/autosave";
  * the server answered; in text-up, the success colour, with a check mark) and "Not saved: <why>" with a Retry button
  * (a failure). `incomplete` shows the form's own reason only when `showIncomplete` (a blank field is not worth a
  * message). Nothing at all while idle. `errorLabel` replaces the "Not saved:" in front of an error, for a form that
- * knows the save may have gone through (no clear answer came back); it is announced the same way.
+ * knows the save may have gone through (no clear answer came back); it is announced the same way. `savingText`
+ * replaces "Saving…" for a request that is not a save of the fields (the /log Reading form discarding its entry).
  *
  * Screen readers (PROD-T01): each result is announced once, from its own polite live region that holds only "Saved"
  * or "Not saved: <why>" (every save the server confirms is read, also a second "Saved" in a row; a background retry
@@ -64,6 +65,7 @@ export function AutosaveStatus({
   savedText = "Saved",
   showIncomplete = false,
   errorLabel = "Not saved:",
+  savingText = "Saving…",
   className = "",
   id,
 }: {
@@ -72,6 +74,7 @@ export function AutosaveStatus({
   savedText?: string;
   showIncomplete?: boolean;
   errorLabel?: string;
+  savingText?: string;
   className?: string;
   id?: string;
 }) {
@@ -110,7 +113,7 @@ export function AutosaveStatus({
   if (status === "waiting") {
     body = <span className="text-text-tertiary">Not saved yet</span>;
   } else if (status === "saving") {
-    body = <span className="text-text-tertiary">Saving…</span>;
+    body = <span className="text-text-tertiary">{savingText}</span>;
   } else if (status === "saved") {
     body = (
       <span className="inline-flex items-center gap-1 text-up">

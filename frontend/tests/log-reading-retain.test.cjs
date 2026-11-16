@@ -10,7 +10,9 @@
 // the server stored; a background retry landing between a render and its effects leaves the form live; Discard drops
 // the Say it words the entry was made from; an edit the server stored but whose answer was lost reads "Not confirmed",
 // and changing it back to the last confirmed values is sent to the same session (before the retry and after a
-// remount), never shown as "Saved" while the server holds the lost edit (Codex T01-R3).
+// remount), never shown as "Saved" while the server holds the lost edit (Codex T01-R3); a create whose answer was
+// lost is never dropped by Discard or by emptying the form: its kept key finds the stored session and removes it
+// (DELETE /api/reading/sessions?client_key=, nothing created), and the entry goes only once the server confirms.
 // Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
 // tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
 // "server" is the in-memory fetch below.
@@ -124,6 +126,9 @@ function setup(t) {
   /** "up", "lost" (the server stores an edit of a session, but its answer never arrives) or "gone" (404: removed). */
   let patchMode = "up";
   let readMode = "up";
+  /** "up", or "lost": the server removes what a DELETE names, but its answer never arrives. */
+  let deleteMode = "up";
+  let nextSessionId = 500;
   /** Reads of the reading overview through cachedJson (the mount's load, and the refetch after every save). */
   let reads = 0;
   /** While set, every save request waits for it (the request is in flight, as between a press and its click). */
@@ -152,11 +157,11 @@ function setup(t) {
     fetch: async (url, init = {}) => {
       const body = init.body ? JSON.parse(init.body) : null;
       calls.push({ url, method: init.method, body });
-      if (hold && (init.method === "POST" || init.method === "PATCH")) await hold.promise;
+      if (hold && (init.method === "POST" || init.method === "PATCH" || init.method === "DELETE")) await hold.promise;
       if (mode === "offline") throw new TypeError("Failed to fetch");
       if (init.method === "POST" && url === "/api/reading/sessions") {
         const replayed = rows.has(body.client_key);
-        if (!replayed) rows.set(body.client_key, { session_id: 500 + rows.size + 1, session_date: body.date ?? serverToday, ...body });
+        if (!replayed) rows.set(body.client_key, { session_id: ++nextSessionId, session_date: body.date ?? serverToday, ...body });
         if (mode === "lost") throw new TypeError("Failed to fetch");
         const row = rows.get(body.client_key);
         return reply({ session: row, replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: row.session_date, overview: null });
@@ -170,7 +175,20 @@ function setup(t) {
         if (patchMode === "lost") throw new TypeError("Failed to fetch");
         return reply({ session: { session_id: sid }, xp_gained: 0, finished: false, overview: null });
       }
-      if (init.method === "DELETE" && url.startsWith("/api/reading/sessions/")) return reply({ overview: null });
+      if (init.method === "DELETE" && url.startsWith("/api/reading/sessions?client_key=")) {
+        // Discard after a lost create answer: the session that key made, if any, is removed; nothing is created.
+        const key = decodeURIComponent(url.slice(url.indexOf("=") + 1));
+        const row = rows.get(key);
+        rows.delete(key);
+        if (deleteMode === "lost") throw new TypeError("Failed to fetch");
+        return reply({ success: true, removed: row ? row.session_id : null, overview: null });
+      }
+      if (init.method === "DELETE" && url.startsWith("/api/reading/sessions/")) {
+        const sid = Number(url.split("/").pop().split("?")[0]);
+        for (const [k, r] of rows) if (r.session_id === sid) rows.delete(k);
+        if (deleteMode === "lost") throw new TypeError("Failed to fetch");
+        return reply({ overview: null });
+      }
       throw new Error(`unexpected request ${init.method} ${url}`);
     },
   };
@@ -286,6 +304,9 @@ function setup(t) {
     /** "lost": the next edits are stored on the server, but their answers never arrive. */
     set patchMode(m) { patchMode = m; },
     patches: () => calls.filter((c) => c.method === "PATCH"),
+    deletes: () => calls.filter((c) => c.method === "DELETE"),
+    /** "lost": the next removals happen on the server, but their answers never arrive. */
+    set deleteMode(m) { deleteMode = m; },
     /** The overview read fails (offline): the section keeps what the cache showed it. */
     set readMode(m) { readMode = m; },
     set serverToday(d) { serverToday = d; },
@@ -524,11 +545,20 @@ test("day boundary: emptying an entry that kept its day lets the form follow tod
   await h.tick(1500);
   await h.serve(answer(D2)); // the day rolls while the failed entry is on screen
   assert.match(h.text(), /For Apr 10/);
-  const sent = h.calls.length;
   await h.type("Through ch.", "");
+  // Its create went out with no answer: what it may have stored is removed first (by its key), then the day follows.
+  assert.match(h.text(), /Not saved yet/);
+  await h.tick(1500); // still offline
+  assert.match(h.text(), /Discard not confirmed: Couldn't reach Onyx\./);
+  assert.match(h.text(), /For Apr 10/, "until Onyx answers, the entry keeps its day");
+  assert.equal(h.work.has(), true);
+  h.mode = "up";
+  await h.tick(60_000);
   assert.match(h.text(), /For today/, "nothing left of the entry: the day follows again");
-  assert.doesNotMatch(h.text(), /Not saved/);
+  assert.doesNotMatch(h.text(), /Not saved|Not confirmed/);
   assert.equal(h.work.has(), false, "an emptied form is not unsaved work");
+  assert.equal(h.rows.size, 0);
+  const sent = h.calls.length;
   await h.tick(60_000);
   assert.equal(h.calls.length, sent, "and nothing more is sent");
 });
@@ -714,7 +744,7 @@ test("no book in progress any more: a kept incomplete entry stays on screen with
   assert.equal(h.hasButton("New session"), false, "nothing left: the empty form is not drawn without a book");
 });
 
-test("no book in progress any more: a failed create keeps its Retry, and Discard drops the entry", async (t) => {
+test("no book in progress any more: a failed create keeps its Retry; Discard drops the entry only once Onyx says nothing was stored", async (t) => {
   const h = setup(t);
   h.mode = "offline";
   await h.mount();
@@ -726,15 +756,138 @@ test("no book in progress any more: a failed create keeps its Retry, and Discard
   assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
   assert.ok(h.hasButton("Retry"), "Retry is still offered");
   assert.equal(h.value("Through ch."), "5");
+  const key = h.posts()[0].body.client_key;
+  const posts = h.posts().length;
+
+  // Still offline: the create may have reached the server, so the entry is not dropped on the spot.
   await h.click("Discard this entry");
+  assert.deepEqual(h.deletes().map((c) => c.url), [`/api/reading/sessions?client_key=${key}`], "asked by the create's own key, kept");
+  assert.match(h.text(), /Discard not confirmed: Couldn't reach Onyx\./);
+  assert.equal(h.value("Through ch."), "5", "the entry stays on screen");
+  assert.equal(h.work.has(), true, "and stays unsaved work");
+  await h.unmount();
+  assert.equal(h.retainer.size, 1, "kept across an unmount, still discarding");
+
+  h.mode = "up";
+  await h.tick(60_000); // the discard's own retry, with no copy mounted
+  assert.equal(h.retainer.size, 0, "let go once the server said nothing of it is stored");
+  assert.equal(h.work.has(), false, "a discarded entry is not unsaved work");
+  assert.equal(h.rows.size, 0);
+  assert.equal(h.posts().length, posts, "nothing was created to find out");
+  assert.ok(h.deletes().every((c) => c.url === `/api/reading/sessions?client_key=${key}`), "every attempt carried the same key");
+  await h.mount();
   assert.match(h.text(), /No book in progress\./);
   assert.equal(h.hasButton("Retry"), false);
-  assert.equal(h.work.has(), false, "a discarded entry is not unsaved work");
+  assert.equal(h.hasButton("Audio"), false, "nothing kept: no form without a book");
   const sent = h.calls.length;
   await h.tick(60_000);
   assert.equal(h.calls.length, sent, "and nothing more is sent");
+});
+
+test("a create the server stored but whose answer was lost, then Discard: the kept key finds that session and removes it (PR 376 review)", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "lost"; // the server stores the session; the answer never arrives
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1, "stored on the server");
+  const key = h.posts()[0].body.client_key;
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
+  await h.serve(noBookAnswer()); // the book is no longer in progress (that session finished it): Discard is offered
+  assert.ok(h.hasButton("Discard this entry"));
+
+  h.mode = "up";
+  const posts = h.posts().length;
+  const release = h.holdSaves();
+  await h.click("Discard this entry");
+  assert.match(h.text(), /Discarding…/, "the request is out");
+  assert.doesNotMatch(h.text(), /Saving…/);
+  assert.equal(h.value("Through ch."), "5", "the entry stays until the server answers");
+  assert.equal(h.work.has(), true);
+  await release();
+  assert.deepEqual(h.deletes().map((c) => c.url), [`/api/reading/sessions?client_key=${key}`], "found by the create's own key");
+  assert.equal(h.rows.size, 0, "the stored session is gone, with what it did");
+  assert.equal(h.posts().length, posts, "nothing was created: the lost create's retry went with the entry");
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.hasButton("Audio"), false, "nothing kept: no form without a book");
+  assert.equal(h.work.has(), false);
+  const sent = h.calls.length;
+  await h.tick(120_000);
+  assert.equal(h.calls.length, sent, "and nothing more is sent");
+  assert.equal(h.rows.size, 0);
   await h.unmount();
   assert.equal(h.retainer.size, 0);
+});
+
+test("lost create answer, kept across an unmount, then a Discard whose own answer is lost: retried with the same key until confirmed", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "lost";
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  await h.unmount(); // sends once more on the way out (replayed: still one row); that answer is lost too
+  assert.equal(h.rows.size, 1);
+  const kept = h.retainer.find("log-reading");
+  assert.ok(kept, "kept: the server may hold the session");
+  const key = kept.data.clientKey;
+  const posts = h.posts().length;
+  await h.serve(noBookAnswer());
+  h.mode = "up";
+  await h.mount();
+  assert.strictEqual(h.retainer.find("log-reading"), kept, "the same kept entry");
+  assert.equal(h.value("Through ch."), "5");
+
+  h.deleteMode = "lost"; // the server removes the session; the answer never arrives
+  await h.click("Discard this entry");
+  assert.equal(h.rows.size, 0, "removed on the server");
+  assert.match(h.text(), /Discard not confirmed: Couldn't reach Onyx\./, "but not confirmed: the entry stays");
+  assert.equal(h.value("Through ch."), "5");
+  assert.equal(h.work.has(), true);
+
+  h.deleteMode = "up";
+  await h.tick(60_000); // its retry asks again: nothing left under that key
+  assert.ok(h.deletes().length >= 2);
+  assert.ok(h.deletes().every((c) => c.url === `/api/reading/sessions?client_key=${key}`), "the same key every time");
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.work.has(), false);
+  assert.equal(h.posts().length, posts, "nothing was created to find out");
+  assert.equal(h.rows.size, 0);
+  await h.unmount();
+  assert.equal(h.retainer.size, 0);
+});
+
+test("lost create answer, then the form emptied: the stored session is removed by its key, never left behind under a clean form", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "lost";
+  await h.type("Through ch.", "4");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1, "stored on the server");
+  const key = h.posts()[0].body.client_key;
+  const posts = h.posts().length;
+
+  h.mode = "up";
+  await h.type("Through ch.", ""); // back to nothing typed, before the lost create's retry (2 s) fires
+  assert.match(h.text(), /Not saved yet/, "emptying it is a change to save: the server may hold the session");
+  assert.doesNotMatch(h.text(), /Saved|Discarded/);
+  assert.equal(h.work.has(), true, "still unsaved work");
+  await h.tick(1500);
+  assert.deepEqual(h.deletes().map((c) => c.url), [`/api/reading/sessions?client_key=${key}`]);
+  assert.equal(h.rows.size, 0, "the stored session is gone");
+  assert.equal(h.posts().length, posts, "and the lost create was not sent again");
+  assert.match(h.text(), /Discarded/, "confirmed by the server");
+  assert.equal(h.value("Through ch."), "");
+  assert.equal(h.work.has(), false, "an emptied, confirmed form is not unsaved work");
+  const sent = h.calls.length;
+  await h.tick(120_000);
+  assert.equal(h.calls.length, sent, "nothing more is sent");
+
+  await h.type("Through ch.", "6"); // a new entry
+  await h.tick(1500);
+  const last = h.posts()[h.posts().length - 1];
+  assert.notEqual(last.body.client_key, key, "a new entry gets its own key");
+  assert.equal(h.rows.size, 1);
+  assert.match(h.text(), /Saved · \+10 XP/);
 });
 
 test("no book in progress and nothing kept: only the line, no form", async (t) => {
@@ -948,7 +1101,9 @@ test("Discard drops the Say it words the entry was made from: the next mount nei
   await h.serve(noBookAnswer()); // the book was finished elsewhere meanwhile
   await h.mount();
   assert.equal(h.value("Through ch."), "5", "the kept entry is still reachable");
+  h.mode = "up"; // the discard asks Onyx whether the failed create stored anything (it did not)
   await h.click("Discard this entry");
+  assert.equal(h.deletes().length, 1);
   assert.match(h.text(), /No book in progress\./);
   assert.equal(h.draft, null, "its words left the draft store with it");
   assert.equal(h.work.has(), false);

@@ -32,7 +32,10 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * with its reason and Retry when its book is no longer in progress (or the overview cannot be read), with Discard
  * (which drops the Say it words the entry was made from too). A failed save that may have been stored anyway (every
  * failure but a refusal: mayHaveStored) reads "Not confirmed", and until a save is answered changing the form back to
- * the last confirmed values is sent, never shown as "Saved" while the server may hold the lost edit.
+ * the last confirmed values is sent, never shown as "Saved" while the server may hold the lost edit. Likewise an entry
+ * whose create went out without a confirmed answer is never dropped locally: Discard, or emptying the form, removes the
+ * session that create may have made (by its client_key; nothing is created) and the entry goes only once the server
+ * says nothing of it is stored ("Discarded"); until then it is kept and retried like a save.
  */
 
 const READING_URL = LOG_READING_URL;
@@ -111,6 +114,14 @@ function SessionLine({ s }: { s: ReadingSession }) {
 }
 
 type SavedInfo = { xp: number; finished: boolean } | null;
+
+/**
+ * What the autosaver holds: the session the fields describe, or DISCARD, the request that removes the session this
+ * entry's create may have made (Discard, or the form emptied, after a create got no confirmed answer).
+ */
+type FormValue = SessionValue & { discard?: true };
+const DISCARD: FormValue = { body: null, reason: null, discard: true };
+const sameValue = (a: FormValue, b: FormValue) => !!a.discard === !!b.discard && sameReadingValue(a, b);
 type DraftMarks = { id: number; fields: Record<Field, boolean> };
 
 /**
@@ -139,6 +150,15 @@ type ReadingFormData = {
   keptDay: boolean;
   /** The last failed save may have been stored anyway (mayHaveStored): its status line says "Not confirmed". */
   unconfirmed: boolean;
+  /**
+   * DISCARD is the value being saved (Discard, or the form emptied, after a create of this entry got no confirmed
+   * answer): once the server says nothing of the entry is stored, the entry goes. An edit before then continues it.
+   */
+  discarding: boolean;
+  /** The Say it draft the discarded entry was made from: dropped from the store with it. */
+  discardDraft: number | null;
+  /** The last save was a discard the server confirmed: the status line says "Discarded". */
+  discarded: boolean;
   /**
    * The book on screen when this entry was started (when the form has no book of its own). A restored entry, or a
    * later edit of the session it made, stays with that book even if the current book changes meanwhile.
@@ -217,6 +237,9 @@ const newReadingData = (): ReadingFormData => ({
   pendingDraft: null,
   keptDay: false,
   unconfirmed: false,
+  discarding: false,
+  discardDraft: null,
+  discarded: false,
   entryBook: null,
   entryStarted: false,
   entrySent: false,
@@ -245,10 +268,11 @@ export default function ReadingSection() {
   // after an unmount (a retry): it reads and writes `kept` only, and touches React state only while mounted.
   // saveSession is one save of the session form (the create, or an edit of the session it made); the autosaver's save
   // below wraps it to remember whether a failure may have been stored anyway.
-  const saveSession = async (v: SessionValue, { keepalive, cancelled }: RetainedSaveContext): Promise<void> => {
+  const saveSession = async (v: FormValue, { keepalive, cancelled }: RetainedSaveContext): Promise<void> => {
     // ready() keeps an incomplete value from getting here; never report "Saved" without a request.
     // cancelled(): the session ended while this save was under way (sign-out, a 401): it stops after the request
     // that is out, before any further request (a replay's PATCH), any write to `kept` and any refetch.
+    if (v.discard) return discardStored({ keepalive, cancelled });
     if (!v.body) throw new AutosaveRefused(v.reason ?? "Enter the chapter you read through to save.");
     const id = kept.sessionId;
     const target = readingSaveTarget("sessions", id);
@@ -311,12 +335,55 @@ export default function ReadingSection() {
       clear(savedDraft);
     }
   };
+  /**
+   * The discard of an entry whose create may have been stored (DISCARD): the session that create made, if any, is
+   * removed by its id when an answer arrived after all, else by its client_key (DELETE /api/reading/sessions?client_key=,
+   * which never creates anything). Only once the server answered does the entry go: until then it is kept and retried
+   * like any save, so a create whose answer was lost never stays stored with its habit stamp, XP and Notion entry after
+   * Discard (Codex review r1 of PR 376: dropping the entry and its key on the spot left exactly that behind).
+   */
+  const discardStored = async ({ keepalive, cancelled }: RetainedSaveContext): Promise<void> => {
+    const id = kept.sessionId;
+    const day = kept.habitCreatedOn;
+    const url =
+      id !== null
+        ? `/api/reading/sessions/${id}${day ? `?habit_created_on=${encodeURIComponent(day)}` : ""}`
+        : kept.clientKey
+          ? `/api/reading/sessions?client_key=${encodeURIComponent(kept.clientKey)}`
+          : null;
+    let overview: ReadingOverview | null | undefined;
+    if (url) {
+      const res = await fetch(url, { method: "DELETE", keepalive });
+      const json = (await res.json().catch(() => ({}))) as { error?: string; overview?: ReadingOverview | null };
+      if (cancelled()) return;
+      if (!res.ok && res.status !== 404) {
+        // 404: that session is gone already. A refusal is shown and not retried; anything else is retried.
+        const text = json.error || `Discard failed (${res.status}).`;
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(text);
+        throw new Error(text);
+      }
+      overview = json.overview;
+    }
+    if (cancelled()) return;
+    // Nothing of the entry is stored now. An edit made while this was out continues the entry (created again with
+    // the same key next); otherwise the entry goes, with the Say it words it was made from.
+    setSessionId(null);
+    kept.habitCreatedOn = null;
+    setSaved(null);
+    if (kept.discarding) {
+      const words = kept.discardDraft;
+      forgetEntry();
+      kept.discarded = true;
+      if (words !== null) clear(words);
+    }
+    showOverview(overview);
+  };
   const autosave = useRetainedAutosave<SessionValue, ReadingFormData>(
     "log-reading",
     {
       delayMs: 1500,
       ready: (v) => v.reason,
-      same: sameReadingValue,
+      same: sameValue,
       // A failure that may have been stored anyway leaves no value counted as saved until a save is answered.
       unknownOutcome: mayHaveStored,
       save: async (v, ctx) => {
@@ -377,6 +444,7 @@ export default function ReadingSection() {
     setSavedState((prev) => (prev === kept.saved ? prev : kept.saved));
     setFormState((prev) => (prev === kept.form ? prev : kept.form));
     setFromDraftState((prev) => (prev === kept.fromDraft ? prev : kept.fromDraft));
+    setHeldDraftState((prev) => (prev === kept.heldDraft ? prev : kept.heldDraft));
   }, [autosave.state, kept]);
 
   const show = useCallback((raw: unknown) => {
@@ -455,9 +523,21 @@ export default function ReadingSection() {
   const commit = (next: Form) => {
     setForm(next);
     setRemoveError(null);
+    // Any change continues the entry: a discard still waiting or out no longer drops it (DISCARD is replaced).
+    kept.discarding = false;
+    kept.discardDraft = null;
+    kept.discarded = false;
     const cur = overviewRef.current;
     const anyBook = !!next.book && next.book !== cur?.book.slug;
     if (kept.sessionId === null && !anyBook && !kept.touched.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
+      if (kept.entrySent) {
+        // Back to nothing typed after a create of this entry went out with no confirmed answer: the server may hold
+        // that session, so emptying the form is saved like any edit (DISCARD removes it by its client_key) instead of
+        // being dropped as nothing to save (the create's version of Codex T01-R3). The form is clean once it is gone.
+        kept.discarding = true;
+        autosave.change(DISCARD);
+        return;
+      }
       autosave.reset(); // back to nothing typed: nothing to save, nothing unsaved
       kept.entryBook = null;
       kept.entryStarted = false;
@@ -487,7 +567,7 @@ export default function ReadingSection() {
   // remount) keeps that day instead, sent explicitly from now on, so a retry after the rollover never moves it to
   // the new day. The form shows "For <that day>" and Riley can still change it.
   useEffect(() => {
-    if (!today || kept.touched.date || kept.keptDay || kept.fromDraft?.fields.date) return;
+    if (!today || kept.touched.date || kept.keptDay || kept.fromDraft?.fields.date || kept.discarding) return;
     const f = kept.form;
     if (f.date === today) return;
     if (kept.sessionId !== null && f.date) return; // a session already made stays on its own day, also on screen
@@ -508,8 +588,8 @@ export default function ReadingSection() {
     commit({ ...kept.form, ...patch });
   };
 
-  /** Start the next session: the one on screen is kept as saved. */
-  const startNew = useCallback(() => {
+  /** Forget the entry on screen (its fields, the session it made, its key and marks) for a fresh, empty one. */
+  const forgetEntry = () => {
     setSessionId(null);
     kept.clientKey = newClientKey();
     kept.habitCreatedOn = null;
@@ -517,6 +597,9 @@ export default function ReadingSection() {
     kept.touched = { ...EMPTY_FIELDS };
     kept.keptDay = false;
     kept.unconfirmed = false;
+    kept.discarding = false;
+    kept.discardDraft = null;
+    kept.discarded = false;
     kept.entryBook = null;
     kept.entryStarted = false;
     kept.entrySent = false;
@@ -524,9 +607,14 @@ export default function ReadingSection() {
     kept.pendingDraft = null;
     setFromDraft(null);
     setSaved(null);
+    setForm(blankForm(overviewRef.current?.today ?? ""));
+  };
+
+  /** Start the next session: the one on screen is kept as saved. */
+  const startNew = useCallback(() => {
+    forgetEntry();
     setRemoveError(null);
     autosave.reset();
-    setForm(blankForm(overviewRef.current?.today ?? ""));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autosave.reset, kept]);
 
@@ -534,13 +622,25 @@ export default function ReadingSection() {
    * Discard the entry not saved yet (offered when its book is no longer in progress). The Say it words it was made
    * from go with it: left in the shared draft store, the next mount (a fresh form, since nothing is kept) would apply
    * them again and save them. Words this entry was not made from (a newer draft, or one waiting for the session
-   * above to be saved) stay offered.
+   * above to be saved) stay offered. An entry none of whose creates went out is dropped at once. Once a create went
+   * out with no confirmed answer the server may hold that session, so its key is kept and DISCARD is saved like any
+   * edit (one request in flight with the create's retry, retried, kept across an unmount): the entry goes once the
+   * server says nothing of it is stored (discardStored). Pressed again after a failure it tries again.
    */
   const discardEntry = () => {
     const d = draft;
-    const fromThisEntry = !!d && (d.id === kept.pendingDraft || d.id === kept.fromDraft?.id);
-    startNew(); // first: the marks and pendingDraft go, so dropping the draft below reverts nothing
-    if (d && fromThisEntry) clear(d.id);
+    const words = d && (d.id === kept.pendingDraft || d.id === kept.fromDraft?.id) ? d.id : null;
+    if (kept.sessionId === null && !kept.entrySent) {
+      startNew(); // first: the marks and pendingDraft go, so dropping the draft below reverts nothing
+      if (words !== null) clear(words);
+      return;
+    }
+    setRemoveError(null);
+    kept.discarding = true;
+    kept.discardDraft = words;
+    kept.discarded = false;
+    autosave.change(DISCARD);
+    void autosave.retry(); // at once; also after a refused discard, which change() alone would leave as it was
   };
 
   const applyDraft = async (force: boolean) => {
@@ -549,14 +649,15 @@ export default function ReadingSection() {
     // Words about another session: the session already made from this form keeps its values (anything still
     // waiting is sent first), and the words fill a new one. If that send fails the form stays as it is and the
     // words wait (Use, once it is saved).
-    if (kept.sessionId !== null) {
+    // Words that arrive while the entry is being discarded wait for that too, then fill the fresh form.
+    if (kept.sessionId !== null || kept.discarding) {
       const ok = await autosave.flush();
       if (!alive.current) return;
       if (!ok) {
         setHeldDraft(true);
         return;
       }
-      startNew();
+      if (kept.sessionId !== null) startNew();
     }
     const vals = draftFields(d.value);
     const applied: Record<Field, boolean> = { ...EMPTY_FIELDS };
@@ -597,7 +698,7 @@ export default function ReadingSection() {
     // The draft left the store before its values were saved (dismissed elsewhere): they go too, so nothing Riley
     // did not keep is saved. A newer draft is handled by applyDraft above. A saved draft keeps its marks.
     const f = kept.fromDraft;
-    if (f && !draft && kept.pendingDraft === f.id && kept.sessionId === null) revertDraftFields();
+    if (f && !draft && kept.pendingDraft === f.id && kept.sessionId === null && !kept.discarding) revertDraftFields();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
@@ -678,7 +779,11 @@ export default function ReadingSection() {
   const day = form.date || today;
   const anyTouched = Object.values(kept.touched).some(Boolean) || anyMarked;
   const describedBy = (st === "incomplete" && anyTouched) || st === "error" ? statusId : undefined;
-  const savedText = `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
+  const savedText = kept.discarded ? "Discarded" : `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
+  // A failure of the save on screen: a refusal reads "Not saved:" (the server answered), anything else may have gone
+  // through ("Not confirmed:"); a failed discard says so instead.
+  const errorLabel =
+    st !== "error" ? undefined : kept.discarding ? (kept.unconfirmed ? "Discard not confirmed:" : "Not discarded:") : kept.unconfirmed ? "Not confirmed:" : undefined;
 
   const inputCls =
     "mt-1 w-full min-h-11 px-3 text-[16px] font-mono tabular-nums bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none";
@@ -868,7 +973,8 @@ export default function ReadingSection() {
               onRetry={() => void autosave.retry()}
               savedText={savedText}
               showIncomplete={anyTouched}
-              errorLabel={st === "error" && kept.unconfirmed ? "Not confirmed:" : undefined}
+              errorLabel={errorLabel}
+              savingText={kept.discarding ? "Discarding…" : undefined}
             />
           </span>
           {sessionId === null && !o && (
