@@ -4065,6 +4065,81 @@ def run_dose_response_continuous(df: pd.DataFrame) -> dict:
 # PHASE 3 – PREDICTION MODELS
 # ===========================================================================
 
+# Forward-fill policy for HIGH_VALUE_SPARSE_FEATURES (audit PIPE-07, 2026-11-16). Garmin
+# training-state metrics (ATL/CTL, hrv_factor, baselines, ...) are stable over short windows,
+# so a value may stand in for up to SPARSE_FILL_MAX_AGE_DAYS CALENDAR days after the day it
+# was observed. The fill runs on every row of the frame BEFORE rows without an outcome are
+# dropped, and training (prepare_ml_data) and serving (serve_features) call the same
+# function. Until 2026-11-16 training filled after that drop (7 kept rows could span more than
+# 7 days, and a value observed on a night with no HRV was never carried) while serving filled
+# the full frame, so training rows after an HRV gap carried other values than the live row.
+SPARSE_FILL_MAX_AGE_DAYS = 7
+# Stored in the model pickle as "preprocessing". hrv_predict.py serves a model stamped with this
+# version with this same fill (training and serving match) and refuses a value it does not know.
+SPARSE_FILL_VERSION = "calendar_ffill_7d_v1"
+# Pickles written before the field existed keep the OLD serving behaviour (7 rows forward on the
+# full frame) until the next retrain. That is not how they were trained (old training filled
+# after the outcome drop), so it keeps the old mismatch; only a retrain on SPARSE_FILL_VERSION fixes it.
+LEGACY_SPARSE_FILL_VERSION = "row_ffill_7_v0"
+SPARSE_FILL_VERSIONS = (SPARSE_FILL_VERSION, LEGACY_SPARSE_FILL_VERSION)
+
+
+def fill_sparse_features(df: pd.DataFrame, cols=HIGH_VALUE_SPARSE_FEATURES,
+                         max_age_days: int = SPARSE_FILL_MAX_AGE_DAYS) -> pd.DataFrame:
+    """Copy of df in which each missing value of `cols` is replaced by the latest observation
+    of that column dated at most `max_age_days` calendar days EARLIER (a duplicate row of the
+    same day counts as age 0).
+
+    Pure. Observed values never change, row order and index are kept, and nothing moves
+    backwards in time, so row D's result depends only on rows dated D or earlier: it is the
+    same whether the frame ends at D (the evening of the forecast) or runs on past D
+    (training). Ages are counted on an explicit sorted, unique daily spine from the first to
+    the last date, so dates missing from the frame still count as days. Rows whose date cannot
+    be parsed are neither filled nor used as a source.
+    """
+    if max_age_days < 0:
+        raise ValueError("max_age_days must be >= 0")
+    out = df.copy()
+    present = [c for c in sorted(cols) if c in out.columns]
+    if not present or out.empty:
+        return out
+    days = pd.to_datetime(out[al.DATE_COL], errors="coerce").dt.normalize()
+    dated = days.notna()
+    if not dated.any():
+        return out
+    spine = pd.date_range(days[dated].min(), days[dated].max(), freq="D")
+    for col in present:
+        values = out[col]
+        observed = dated & values.notna()
+        missing = dated & values.isna()
+        if not observed.any() or not missing.any():
+            continue
+        # One value per calendar day (the day's last observed row), on every day of the spine.
+        per_day = values[observed].groupby(days[observed]).last().reindex(spine)
+        carried = per_day.ffill(limit=max_age_days) if max_age_days else per_day
+        out.loc[missing, col] = carried.reindex(days[missing]).to_numpy()
+    return out
+
+
+def _legacy_row_fill(df: pd.DataFrame) -> pd.DataFrame:
+    """Old serving fill, for models pickled before SPARSE_FILL_VERSION: 7 ROWS forward on the
+    sorted full frame, whatever their dates. Kept only so such a pickle keeps forecasting as it
+    did before until the next retrain; it does not match how that model was trained (old
+    training filled after the outcome drop). Never used for training."""
+    d = df.copy()
+    for col in HIGH_VALUE_SPARSE_FEATURES:
+        if col in d.columns:
+            d[col] = d[col].ffill(limit=7)
+    return d
+
+
+def model_preprocessing(bundle: dict) -> str:
+    """The sparse-feature fill version recorded in a model pickle (LEGACY_SPARSE_FILL_VERSION
+    for a pickle from before the field, meaning: serve it the old way)."""
+    value = bundle.get("preprocessing")
+    return LEGACY_SPARSE_FILL_VERSION if value is None else str(value)
+
+
 def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, list[str], pd.Series]:
     """Build X, feature_cols, y for ML. Target = HRV of the sleep that closes day D+h-1.
 
@@ -4078,6 +4153,13 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     df = df.copy()
     target_col = al.outcome_col(horizon)
     df[target_col] = al.outcome_series(df, horizon)
+
+    # Forward-fill HIGH_VALUE_SPARSE_FEATURES up to SPARSE_FILL_MAX_AGE_DAYS calendar days, on
+    # the full frame BEFORE rows without a target are dropped, with the same function
+    # serve_features uses (audit finding 6.A; PIPE-07). After the fill the standard 5% threshold
+    # applies below; the earlier "lower threshold to 2% (= 10 obs)" rescue produced too-noisy
+    # SHAP attributions on those columns.
+    df = fill_sparse_features(df)
 
     # Filter to rows with a valid target
     model_df = df.dropna(subset=[target_col, "hrv_lag1"])
@@ -4099,16 +4181,6 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     feat_cols = [c for c in model_df.columns
                  if c not in exclude and pd.api.types.is_numeric_dtype(model_df[c])]
 
-    # Forward-fill HIGH_VALUE_SPARSE_FEATURES within a 7-day window (audit
-    # finding 6.A + self-review fix). Garmin training-state metrics (ATL/CTL,
-    # hrv_factor, etc.) are stable over short windows, so a 7-day ffill is
-    # physiologically defensible. After ffill we apply the standard 5%
-    # threshold — the previous "lower threshold to 2% (= 10 obs)" rescue
-    # produced too-noisy SHAP attributions on those columns.
-    for col in HIGH_VALUE_SPARSE_FEATURES:
-        if col in model_df.columns:
-            model_df[col] = model_df[col].ffill(limit=7)
-
     feat_cols = [c for c in feat_cols if model_df[c].notna().mean() >= 0.05]
 
     X = model_df[feat_cols].copy()
@@ -4117,15 +4189,21 @@ def prepare_ml_data(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, l
     return model_df, feat_cols, X, y
 
 
-def serve_features(df: pd.DataFrame, feat_cols: list[str]) -> tuple[pd.DataFrame, str] | tuple[None, None]:
+def serve_features(df: pd.DataFrame, feat_cols: list[str],
+                   preprocessing: str = SPARSE_FILL_VERSION,
+                   now: datetime | None = None) -> tuple[pd.DataFrame, str] | tuple[None, None]:
     """Feature row for the live forecast: behavioral today's row (the sleep Riley goes to
-    tonight). Same 7-day forward-fill of the sparse Garmin columns as prepare_ml_data.
+    tonight). `preprocessing` is the fill version recorded in the model's pickle
+    (model_preprocessing): SPARSE_FILL_VERSION is fill_sparse_features, the same call
+    prepare_ml_data makes; LEGACY_SPARSE_FILL_VERSION is the old serving fill (7 rows) kept for
+    older pickles until the next retrain. Any other value raises ValueError. `now` is for tests (default: the clock).
     Returns (X_row, behavioral_date) or (None, None) if the row is missing."""
+    if preprocessing not in SPARSE_FILL_VERSIONS:
+        raise ValueError(f"unknown sparse-feature fill {preprocessing!r}; "
+                         f"this code knows {SPARSE_FILL_VERSIONS}")
     d = df.sort_values("calendar_date").reset_index(drop=True)
-    for col in HIGH_VALUE_SPARSE_FEATURES:
-        if col in d.columns:
-            d[col] = d[col].ffill(limit=7)
-    idx = al.serve_index(d)
+    d = fill_sparse_features(d) if preprocessing == SPARSE_FILL_VERSION else _legacy_row_fill(d)
+    idx = al.serve_index(d, now)
     if idx is None:
         return None, None
     X = d.loc[[idx]].reindex(columns=feat_cols)
@@ -4432,7 +4510,8 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     with open(model_path, "wb") as f:
         pickle.dump({"model": production_model, "feat_cols": feat_cols,
                      "pred_std": pred_std, "model_version": MODEL_VERSION,
-                     "alignment": al.ALIGNMENT_VERSION}, f)
+                     "alignment": al.ALIGNMENT_VERSION,
+                     "preprocessing": SPARSE_FILL_VERSION}, f)
     log.info(f"  Model saved: {model_path}")
 
     results = {

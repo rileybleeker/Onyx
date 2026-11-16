@@ -86,6 +86,50 @@ LIVE_METRICS_SUFFIX = "_live_rolling"
 ALIGNMENT_CUTOVER_AT = pd.Timestamp("2026-11-11T01:00:00", tz=ET_TZ)
 
 
+# Heartbeat for a model pickle served with, or refused for, another sparse-feature fill than
+# the current one (hrv_analysis.SPARSE_FILL_VERSION). That state repeats on every hourly run
+# until the next retrain, so the same status + message is written at most once per
+# PREPROCESSING_REPORT_EVERY_HOURS (the /status sync history reads the newest 100 sync_log
+# rows; an hourly row would push other sources out of it). A model on the current fill writes
+# one "success" row only when the newest row of this heartbeat is not already "success".
+PREPROCESSING_HEARTBEAT = ("hrv_predict", "preprocessing")
+PREPROCESSING_REPORT_EVERY_HOURS = 12
+
+
+def report_preprocessing(status: str, message: str | None) -> bool:
+    """Write the preprocessing heartbeat unless it would repeat (see above). Never raises.
+    Returns True when a row was written."""
+    source, data_type = PREPROCESSING_HEARTBEAT
+    last = None
+    try:
+        resp = (
+            supa.schema("pds").from_("sync_log")
+            .select("status,error_message,sync_start")
+            .eq("source", source).eq("data_type", data_type)
+            .order("sync_start", desc=True).limit(1).execute()
+        )
+        last = (resp.data or [None])[0]
+    except Exception as e:  # noqa: BLE001 - the heartbeat must never stop a forecast
+        log.warning(f"  preprocessing heartbeat lookup failed ({type(e).__name__}); writing it anyway")
+    if status == "success":
+        if last is None or last.get("status") == "success":
+            return False
+    elif last and last.get("status") == status and last.get("error_message") == message:
+        try:
+            age = pd.Timestamp.now(tz="UTC") - pd.to_datetime(last.get("sync_start"), utc=True)
+            if age < timedelta(hours=PREPROCESSING_REPORT_EVERY_HOURS):
+                return False
+        except Exception:  # noqa: BLE001 - an unreadable time just means: write it
+            pass
+    try:
+        _shared_log_sync(supa, source=source, data_type=data_type, status=status,
+                         records=0, error=message)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  preprocessing heartbeat write failed ({type(e).__name__})")
+        return False
+    return True
+
+
 def live_metrics_model(model: str) -> str:
     return f"{model}{LIVE_METRICS_SUFFIX}"
 
@@ -256,7 +300,8 @@ def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
 
 def predict_tomorrow(model_bundle: dict) -> dict | None:
     """Predict tonight's sleep (wake-up tomorrow) using the loaded model."""
-    from hrv_analysis import FEATURE_LABELS, compute_input_data_hash, TARGET, serve_features
+    from hrv_analysis import (FEATURE_LABELS, compute_input_data_hash, TARGET, serve_features,
+                              model_preprocessing, SPARSE_FILL_VERSION, SPARSE_FILL_VERSIONS)
     import hrv_alignment as al
 
     # A model trained under another alignment rule predicts a different night; never
@@ -265,6 +310,28 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         log.error(f"Model pickle alignment={model_bundle.get('alignment')!r}, expected "
                   f"{al.ALIGNMENT_VERSION!r} — retrain (hrv-retrain-on-backfill.yml) before predicting.")
         return None
+
+    # A model stamped with the current fill is served with that same fill, so training and
+    # serving match. A pickle from before the field keeps the old serving behaviour (7-row fill
+    # on the full frame, which never matched how it was trained) until the next retrain writes
+    # one on the current fill; a fill this code does not know (a newer pickle after a code
+    # rollback) is refused.
+    fill_version = model_preprocessing(model_bundle)
+    if fill_version not in SPARSE_FILL_VERSIONS:
+        msg = (f"GUARD model_preprocessing: model pickle preprocessing={fill_version!r}, this code "
+               f"knows {', '.join(SPARSE_FILL_VERSIONS)}. Forecast skipped; retrain "
+               "(gh workflow run hrv-retrain-on-backfill.yml) so the model and its feature fill match.")
+        log.error(msg)
+        report_preprocessing("failed", msg)
+        return None
+    if fill_version != SPARSE_FILL_VERSION:
+        msg = (f"Model pickle predates the calendar-day sparse-feature fill ({SPARSE_FILL_VERSION}); "
+               f"forecasting with the old serving fill ({fill_version}), which does not match how this "
+               "model was trained, until the next retrain (hrv-retrain-on-backfill.yml, daily at 12:00 UTC).")
+        log.warning(msg)
+        report_preprocessing("partial", msg)
+    else:
+        report_preprocessing("success", None)
 
     model = model_bundle["model"]
     feat_cols = model_bundle["feat_cols"]
@@ -285,7 +352,7 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         input_data_hash = None
 
     # Predict from behavioral today's row: tonight's sleep.
-    latest_X, serve_date = serve_features(df, feat_cols)
+    latest_X, serve_date = serve_features(df, feat_cols, fill_version)
     if latest_X is None:
         log.error("No matrix row for behavioral today — cannot predict tonight's sleep.")
         return None
