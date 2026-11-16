@@ -8,6 +8,17 @@ import { fallbackBehavioralToday } from "@/lib/checkin";
 import { sameJson } from "@/lib/format";
 import { useLogDrafts, type SupplementLogDraft } from "@/lib/log-drafts";
 import { LOG_SUPPLEMENTS_PRODUCTS_URL, LOG_SUPPLEMENTS_STACKS_URL, LOG_SUPPLEMENTS_TODAY_URL, logEarlyGet } from "@/lib/log-early";
+import {
+  filterOptions,
+  keepOrder,
+  OPTIONS_CAP,
+  optionLabels,
+  orderOptions,
+  unitAfterPick,
+  usageByProduct,
+  visibleOptions,
+  type UsageRow,
+} from "@/lib/log-supplement-options";
 import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
 
 /**
@@ -16,7 +27,8 @@ import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
  *     /api/supplements/stacks/log with only the stack id (the server stamps behavioral today + now, like the
  *     /agents card); Skip only for a reminder card still open (status "prompted" in pds.supplement_stack_reminder),
  *     through POST /api/supplements/reminders/respond. Undo deletes that stack's rows for the day.
- *   - Log a product: pick from the /supplements list, amount + unit, clock times, day. POST
+ *   - Log a product: tap one of the /supplements products (listed without typing, most used first, the search box
+ *     filters them; lib/log-supplement-options.ts), amount + unit, clock times, day. POST
  *     /api/supplements/log-product, which runs the chat tool's logSupplementIntake (lib/supplement-intake.ts), so
  *     amounts, times, the awake tail and the no-time rule are the same as "log 15 mg of X at 8:30" in chat.
  *   - Logged today: single products logged on behavioral today, each with Undo (DELETE /api/supplements/log-intake).
@@ -35,6 +47,8 @@ const loggedItems = new Map<number, Set<number>>(); // draft id -> indexes of it
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
 const PRODUCTS_URL = LOG_SUPPLEMENTS_PRODUCTS_URL;
+/** The last 30 days of doses, only to order the product options (most used first). GET only, cached like the rest. */
+const HISTORY_URL = "/api/supplements/history?days=30&perPage=200";
 
 interface Intake {
   intake_id: number;
@@ -85,6 +99,9 @@ function checkStacks(d: unknown) {
 }
 function checkProducts(d: unknown) {
   if (!d || !Array.isArray((d as { products?: unknown }).products)) throw new Error("bad supplements/products answer");
+}
+function checkHistory(d: unknown) {
+  if (!d || !Array.isArray((d as { rows?: unknown }).rows)) throw new Error("bad supplements/history answer");
 }
 
 /** This device's memory copy of a read, if it passes `check` (the persisted copy is read after mount). */
@@ -188,6 +205,12 @@ const btn =
   "min-h-11 px-3 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50 transition-colors";
 const btnAccent =
   "min-h-11 px-4 rounded-full bg-accent text-on-accent text-[13px] font-semibold disabled:opacity-40 transition-opacity";
+// An option of "Log a product": 44 px, wraps on a phone (long names are cut with the full name in the title),
+// selected = accent border and fill plus a check (Instrument theme), visible keyboard focus.
+const pill =
+  "inline-flex max-w-full min-h-11 items-center gap-1.5 rounded-control border px-3 text-left text-[13px] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent";
+const pillOn = "border-accent bg-accent/15 text-text-primary";
+const pillOff = "border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-hover";
 const input =
   "min-h-11 rounded-control border border-border-subtle bg-transparent px-3 text-[14px] text-text-primary placeholder:text-text-disabled focus:outline-none focus:border-border-emphasis";
 
@@ -199,6 +222,8 @@ export default function SupplementsSection() {
   );
   const [stacks, setStacks] = useState<Stack[] | null>(() => peekChecked<{ stacks: Stack[] }>(STACKS_URL, checkStacks)?.stacks ?? null);
   const [products, setProducts] = useState<Product[] | null>(() => peekChecked<{ products: Product[] }>(PRODUCTS_URL, checkProducts)?.products ?? null);
+  // Only orders the product options; without it they are listed by today's doses, then by name.
+  const [history, setHistory] = useState<UsageRow[] | null>(() => peekChecked<{ rows: UsageRow[] }>(HISTORY_URL, checkHistory)?.rows ?? null);
   const [todayState, setTodayState] = useState<LoadState>(() => (today ? "ready" : "loading"));
   const [stacksState, setStacksState] = useState<LoadState>(() => (stacks ? "ready" : "loading"));
   const [productsState, setProductsState] = useState<LoadState>(() => (products ? "ready" : "loading"));
@@ -214,7 +239,7 @@ export default function SupplementsSection() {
   // A read started before a write is dropped (the write's own re-read follows it).
   const writeSeq = useRef(0);
   const loadSeq = useRef(0);
-  const answered = useRef({ today: false, stacks: false, products: false });
+  const answered = useRef({ today: false, stacks: false, products: false, history: false });
 
   const applyToday = useCallback((t: TodayResp, fromServer: boolean) => {
     setToday((prev) => (sameJson(prev, t) ? prev : t));
@@ -269,6 +294,13 @@ export default function SupplementsSection() {
         setProductsState("ready");
       })
       .catch(() => setProductsState((s) => (s === "ready" ? s : "failed")));
+    // Not one of the HTML's early reads: the options show from the product list, this only orders them.
+    cachedJson<{ rows: UsageRow[] }>(HISTORY_URL, { check: checkHistory })
+      .then((v) => {
+        answered.current.history = true;
+        setHistory((prev) => (sameJson(prev, v.rows) ? prev : v.rows));
+      })
+      .catch(() => {});
   }, [applyToday, routed]);
 
   // This device's copy at once (memory, else the persisted cache), then the server.
@@ -292,6 +324,11 @@ export default function SupplementsSection() {
       setProducts((v as { products: Product[] }).products);
       setProductsState("ready");
     };
+    const seedHistory = (v: unknown) => {
+      if (!alive || answered.current.history || v === undefined) return;
+      try { checkHistory(v); } catch { return; }
+      setHistory((v as { rows: UsageRow[] }).rows);
+    };
     const seed = (url: string, fn: (v: unknown) => void) => {
       const hit = clientCache.peek(url);
       if (hit !== undefined) fn(hit);
@@ -300,6 +337,7 @@ export default function SupplementsSection() {
     seed(TODAY_URL, seedToday);
     seed(STACKS_URL, seedStacks);
     seed(PRODUCTS_URL, seedProducts);
+    seed(HISTORY_URL, seedHistory);
     loadAll();
     return () => { alive = false; };
   }, [applyToday, loadAll]);
@@ -464,7 +502,20 @@ export default function SupplementsSection() {
     receiptTimer.current = setTimeout(() => setReceipt(null), 4000);
   };
 
-  const hits = useMemo(() => (picked || !products ? [] : searchProducts(products, query).slice(0, 6)), [products, query, picked]);
+  // The options: every product, most used first (lib/log-supplement-options.ts), filtered by the search box. The
+  // order freezes on the first touch or focus in them (a late history answer never moves one under the finger) and
+  // thaws when the form is reset (logged or Cancel).
+  const [frozenOrder, setFrozenOrder] = useState<string[] | null>(null);
+  const [showAllOptions, setShowAllOptions] = useState(false);
+  // The search box: for a long list, or once it holds text (a Say it name moved in with Edit); it stays while edited.
+  const [filterOpen, setFilterOpen] = useState(false);
+  const usage = useMemo(() => usageByProduct([...(history ?? []), ...(today?.intakes ?? [])], hidden), [history, today, hidden]);
+  const ordered = useMemo(() => orderOptions(products ?? [], usage), [products, usage]);
+  const optionOrder = useMemo(() => keepOrder(ordered, frozenOrder), [ordered, frozenOrder]);
+  const matches = useMemo(() => filterOptions(optionOrder, query), [optionOrder, query]);
+  const labels = useMemo(() => optionLabels(products ?? []), [products]);
+  const { shown: shownOptions, more: moreOptions } = visibleOptions(matches, showAllOptions, picked?.product_id ?? null);
+  const freezeOrder = () => { if (!frozenOrder) setFrozenOrder(optionOrder.map((p) => p.product_id)); };
   const formDate = dayChoice === "today" ? null : dayChoice === "yesterday" ? (day ? addDays(day, -1) : null) : dayChoice;
 
   function resetForm() {
@@ -475,6 +526,15 @@ export default function SupplementsSection() {
     setTimes([]);
     setDayChoice("today");
     setFormFromDraft(false);
+    setFormError(null);
+    setFrozenOrder(null);
+  }
+
+  /** Tap on an option: the product, same as choosing a search result (servings unless an amount is already in;
+   *  times and day stay). State only: Log is the write. */
+  function pickProduct(p: Product) {
+    setPicked(p);
+    setUnit((u) => unitAfterPick(amount, u));
     setFormError(null);
   }
 
@@ -777,44 +837,67 @@ export default function SupplementsSection() {
           <h3 className="text-[13px] font-medium text-text-secondary">Log a product</h3>
           {formFromDraft && <DraftMark />}
         </div>
-        {!picked ? (
-          <div>
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => { setQuery(e.target.value); setFormError(null); }}
-              placeholder={productsState === "failed" ? "Couldn't load products" : "Search your supplements"}
-              aria-label="Search your supplements"
-              disabled={productsState === "failed" && !products}
-              className={`${input} w-full`}
-            />
-            {query.trim() && products && (
-              hits.length > 0 ? (
-                <ul className="mt-2 rounded-control border border-border-subtle divide-y divide-border-subtle">
-                  {hits.map((p) => (
-                    <li key={p.product_id}>
+        {products ? (
+          products.length > 0 ? (
+            <div onPointerDownCapture={freezeOrder} onFocusCapture={freezeOrder}>
+              {(products.length > OPTIONS_CAP || query !== "" || filterOpen) && (
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => { setQuery(e.target.value); setFilterOpen(true); setFormError(null); }}
+                  placeholder="Filter your supplements"
+                  aria-label="Filter your supplements"
+                  className={`${input} mb-2 w-full`}
+                />
+              )}
+              {matches.length > 0 ? (
+                <div role="group" aria-label="Your supplements" className="flex flex-wrap gap-2">
+                  {shownOptions.map((p) => {
+                    const on = picked?.product_id === p.product_id;
+                    const label = labels.get(p.product_id) ?? productLabel(p);
+                    return (
                       <button
+                        key={p.product_id}
                         type="button"
-                        className="w-full min-h-11 px-3 py-2 text-left hover:bg-white/[0.04]"
-                        onClick={() => { setPicked(p); setUnit("serving"); setFormError(null); }}
+                        aria-pressed={on}
+                        title={label}
+                        onClick={() => pickProduct(p)}
+                        className={`${pill} ${on ? pillOn : pillOff}`}
                       >
-                        <div className="text-[14px] text-text-primary truncate">{productLabel(p)}</div>
-                        {p.brand_name && p.full_name && <div className="text-[12px] text-text-tertiary truncate">{p.brand_name}</div>}
+                        {on && <Check className="w-4 h-4 shrink-0" aria-hidden />}
+                        <span className="min-w-0 truncate">{label}</span>
                       </button>
-                    </li>
-                  ))}
-                </ul>
+                    );
+                  })}
+                  {moreOptions > 0 && (
+                    <button type="button" className={`${pill} ${pillOff}`} onClick={() => setShowAllOptions(true)}>
+                      Show all ({matches.length})
+                    </button>
+                  )}
+                  {showAllOptions && matches.length > OPTIONS_CAP && (
+                    <button type="button" className={`${pill} ${pillOff}`} onClick={() => setShowAllOptions(false)}>
+                      Show fewer
+                    </button>
+                  )}
+                </div>
               ) : (
-                <p className="mt-2 text-[13px] text-text-tertiary">No match in your supplements</p>
-              )
-            )}
+                <p className="text-[13px] text-text-tertiary">No match in your supplements</p>
+              )}
+            </div>
+          ) : (
+            <p className="text-[13px] text-text-tertiary">No products in your supplements list yet</p>
+          )
+        ) : productsState === "failed" ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-[13px] text-text-secondary">Couldn&apos;t load your products.</p>
+            <button type="button" className={btn} onClick={() => { setProductsState("loading"); loadAll(); }}>Retry</button>
           </div>
         ) : (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <div className="min-w-0 flex-1 text-[14px] text-text-primary truncate">{productLabel(picked)}</div>
-              <button type="button" className={btn} onClick={() => { setPicked(null); setFormError(null); }}>Change</button>
-            </div>
+          <div className="flex flex-wrap gap-2" aria-hidden>{[0, 1, 2, 3].map((i) => <div key={i} className="skeleton h-11 w-28 rounded-control" />)}</div>
+        )}
+        {picked && (
+          <div className="mt-3 space-y-3">
+            <div className="text-[14px] text-text-primary truncate">{productLabel(picked)}</div>
             <div className="flex flex-wrap gap-2">
               <input
                 type="number"
