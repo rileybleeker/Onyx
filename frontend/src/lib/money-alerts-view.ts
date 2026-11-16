@@ -61,6 +61,18 @@ export function showMoneyPanel(v: MoneyView | null): boolean {
   return v.alerts.length > 0 || v.partial !== null || (v.updating && v.refreshFailed) || (!!v.cash && !v.cash.eligible);
 }
 
+/**
+ * Why this answer cannot confirm "nothing to act on" though it was read: a part that could not be read, or a cash
+ * forecast whose input check failed (the gate behind safe to move). The quiet view's Money source is then partial
+ * with this note, so it never says "Nothing needs you right now". null = the answer is complete.
+ */
+export function moneyIncomplete(v: MoneyView): string | null {
+  const why: string[] = [];
+  if (v.partial) why.push(`your ${v.partial} couldn't be read`);
+  if (v.cash && !v.cash.eligible) why.push("the cash forecast's inputs are incomplete");
+  return why.length ? `${why.join(" and ")}, so an alert may be missing` : null;
+}
+
 function age(iso: string | null, now: Date): string {
   const t = iso ? Date.parse(iso) : NaN;
   if (!Number.isFinite(t)) return "an earlier check";

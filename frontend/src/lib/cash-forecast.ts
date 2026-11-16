@@ -1114,7 +1114,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
       // Leave it out could clear those but not this one.
       const debt = unvaluedDebt(input.balances, k, Number.isFinite(usdAt) ? usdAt : null);
       if (debt === "debt") reason("invalid-balance", `The newest balance for ${label} is a debt in another currency, so it cannot be counted.`);
-      else if (debt === "unknown") reason("invalid-balance", `The balance for ${label} has no usable amount and could be a debt.`);
+      else if (debt === "unknown") reason("invalid-balance", `A balance record for ${label} could not be read (no usable amount or date), so it could be a debt.`);
       if (!b || !usable) {
         warnings.push(`No balance for ${label}: counted as $0.`);
         if (chosen) leftOut.push({ account: k, label, asOf: null, why: "chosen" });

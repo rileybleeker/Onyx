@@ -95,6 +95,8 @@ export interface SourceProbe {
   syncAt?: string | null;
   /** Part of the answer could not be read (or was cut off): an item may be missing. */
   partial?: boolean;
+  /** What is missing when `partial`, in plain words (replaces the generic note). */
+  partialNote?: string;
   /** When the source's data was last confirmed (ISO), when known. */
   asOf?: string | null;
 }
@@ -133,7 +135,7 @@ export function sourceStatus(source: AttentionSource, p: SourceProbe, now: Date)
   if (p.load === "loading") return { source, label, state: "checking", note: "checking..." };
   if (p.load === "error") return { source, label, state: "failed", note: "couldn't check" };
   if (p.refreshFailed) return { source, label, state: "stale", note: `couldn't refresh; showing ${at ? `the check from ${at}` : "an earlier check"}` };
-  if (p.partial) return { source, label, state: "partial", note: "part of it couldn't be read, so an item may be missing" };
+  if (p.partial) return { source, label, state: "partial", note: p.partialNote || "part of it couldn't be read, so an item may be missing" };
   if (p.connected === false) {
     return p.checking ? { source, label, state: "checking", note: "checking; showing an earlier check" } : { source, label, state: "not_connected", note: "not connected yet" };
   }

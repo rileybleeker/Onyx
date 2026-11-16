@@ -126,8 +126,10 @@ export default function ForecastView({
   // otherwise withhold it for good. Leaving one out takes its balance out of the amount; the projection keeps it.
   // One account per request, merged with the saved list on the server (never this page's copy of the drivers).
   const setLeftOut = (account: string, out: boolean) => run(() => send("/api/finance/forecast/drivers", "PUT", { key: "safe-to-move", account, leaveOut: out }));
-  const reasonItem = (r: { text: string; account?: string }) => (
-    <li key={r.text}>
+  // Keyed by account AND text (index for an exact repeat): two accounts can share a label, so the same sentence can
+  // name two accounts, and each Leave it out button must stay bound to its own account.
+  const reasonItem = (r: { text: string; account?: string }, i: number) => (
+    <li key={`${i}|${r.account ?? ""}|${r.text}`}>
       {r.text}
       {r.account && (
         <button type="button" className="ml-1 underline disabled:opacity-50" disabled={busy} onClick={() => void setLeftOut(r.account as string, true)}>

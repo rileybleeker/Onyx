@@ -78,7 +78,7 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 | Reason code | When |
 |---|---|
 | `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small or negative older one (counted as $0 in the estimate) |
-| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future. When that newest row is a DEBT (negative, or a card balance owed) in another currency, or has no usable amount (so it could be one), the reason offers no Leave it out and leaving the account out does not clear it: the amount cannot value that debt in US dollars, and leaving it out would count it as $0. A row the ledger parser rejects (no whole-cent amount, no date) is never dropped: the loader keeps it as an unusable balance of its account (`forecastBalanceRows`, in the 60-day read and the older-balance read alike), so a newest unusable row withholds the amount (an older row never looks current, and the account never looks merely missing), and the estimate starts from the newest usable balance. A row with no account key withholds the amount too (it could be any account's newest) |
+| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future. When that newest row is a DEBT (negative, or a card balance owed) in another currency, or has no usable amount (so it could be one), the reason offers no Leave it out and leaving the account out does not clear it: the amount cannot value that debt in US dollars, and leaving it out would count it as $0. A row the ledger parser rejects (no whole-cent amount, no date) is never dropped: the loader keeps it as an unusable balance of its account (`forecastBalanceRows`, in the 60-day read and the older-balance read alike), so a newest unusable row withholds the amount (an older row never looks current, and the account never looks merely missing), and the estimate starts from the newest usable balance. The reason then reads "A balance record for <account> could not be read (no usable amount or date), so it could be a debt"; it clears once a newer usable balance of that account lands (an unusable row older than the US-dollar balance in use is skipped). A row with no account key withholds the amount too (it could be any account's newest), for as long as it is inside the 60-day read: "A balance could not be matched to an account", with no Leave it out (there is no account to leave out) |
 | `stale-balance` | a pool balance of ANY size older than 48 h (`staleBalanceHours`; an old small or zero balance is no proof the account is not overdrawn now), or a stored result read after its `validUntil` |
 | `balance-unreadable` | the read of a pool account's older balance failed (not "no row": the read itself errored), so its balance is unknown. Leaving the account out does not clear it, and the reason offers no Leave it out |
 | `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
@@ -103,7 +103,7 @@ again; at most 5 tries, then 409 and nothing saved). So two tabs changing differ
 keep their change, and two changes to the same account are applied in turn, the last one to commit deciding. A
 left-out account's positive balance is taken out of the opening and the lowest point, so the amount never rests on
 it; an overdraft keeps lowering the amount, also once it is older than the 60-day read. Leaving an account out never
-clears `balance-unreadable`, nor an `invalid-balance` debt in another currency. The low-cash alert (Today, the
+clears `balance-unreadable`, an `invalid-balance` debt in another currency, a balance record that could not be read, or a balance that could not be matched to an account. The low-cash alert (Today, the
 finance pages) uses the same cash: the left-out accounts' positive balance (`eligibility.leftOutCents`) is taken out
 of the cautious and likely paths before the alert is checked, so a left-out savings balance cannot keep a low-cash
 alert from firing on the accounts that are counted; the alert then says so ("not counting the accounts you left out").
@@ -121,7 +121,8 @@ expired amount.
 The tile shows the first three reasons inside the same Personalize part as the amount (the rest folded below
 them), the accounts left out, and the time of the oldest cash balance the amount counts. The what-if comparison
 and Today read the same result: `/api/finance/alerts` answers `cash: {eligible, reasons}` and Today shows the
-Money panel with the reason and a link to the forecast instead of "No alerts to act on". The amount itself is unchanged when the inputs are
+Money panel with the reason and a link to the forecast instead of "No alerts to act on"; its quiet view counts Money
+as not confirmed ("the cash forecast's inputs are incomplete"), never "Nothing needs you right now". The amount itself is unchanged when the inputs are
 complete and nothing is left out.
 
 ### 4.2 Sign convention

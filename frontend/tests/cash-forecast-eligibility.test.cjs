@@ -185,7 +185,7 @@ test("a debt in another currency, or a balance with no usable amount, withholds 
   // No usable amount: it could be a debt, so the same.
   const nan = run({ balances: [bal("chk", 400_000), bal("sav", Number.NaN)], settings: leave });
   assert.deepEqual(why(nan), [["invalid-balance", undefined]]);
-  assert.match(nan.eligibility.reasons[0].text, /Demo Savings has no usable amount and could be a debt/);
+  assert.match(nan.eligibility.reasons[0].text, /balance record for Demo Savings could not be read \(no usable amount or date\), so it could be a debt/);
   // A debt OLDER than the US-dollar balance changes nothing; a positive balance in another currency can be left out.
   const older = run({ balances: [bal("chk", 400_000), bal("sav", 900_000, ago(3)), bal("sav", -80_000, ago(30), { currency: "EUR" }), bal("card", 50_000)] });
   assert.deepEqual(gate(older.eligibility), { eligible: true, reasons: [] });
@@ -206,7 +206,7 @@ test("a NEWER balance row with no usable amount withholds the amount, left out o
     assert.equal(out.state, "ok");
     assert.equal(out.eligibility.eligible, false, `left out: ${!!settings}`);
     assert.deepEqual(why(out), [["invalid-balance", undefined]], "no Leave it out: it could be a debt");
-    assert.match(out.eligibility.reasons[0].text, /Demo Savings has no usable amount and could be a debt/);
+    assert.match(out.eligibility.reasons[0].text, /balance record for Demo Savings could not be read \(no usable amount or date\), so it could be a debt/);
     assert.equal(out.headlines.safeToMoveCents, null);
     assert.equal(E.safeToMoveOf(JSON.parse(JSON.stringify(out))), null, "also when stored");
     assert.equal(out.opening.cents, 1_300_000, "the estimate starts from the last usable balance, never NaN or $0");
@@ -547,6 +547,11 @@ test("source: the tile shows the reason inside the same part as the amount; ever
   assert.match(view, /visibilitychange/, "and when the page comes back into view");
   assert.match(view, /<CompareTable [^>]*now=\{checkNow\}/, "the what-if uses the same clock");
   assert.match(view, /\{ key: "safe-to-move", account, leaveOut: out \}/, "one account per change, applied on the server with a compare-and-swap");
+  // Two accounts can share a label: each reason row (and its Leave it out button) is keyed by its account too.
+  const reasonKey = view.match(/const reasonItem = [\s\S]*?<li key=\{(.*)\}>/);
+  assert.ok(reasonKey, "reasonItem renders a keyed <li>");
+  assert.match(reasonKey[1], /r\.account/, "the React key includes the account key");
+  assert.doesNotMatch(view, /<li key=\{r\.text\}>/, "never the label text alone");
   const compare = fs.readFileSync(path.join(SRC, "app/financials/forecast/TaxAndWhatIf.tsx"), "utf8");
   assert.match(compare, /safeToMoveOf\(base, now\), safeToMoveOf\(scen, now\)/);
   assert.match(compare, /eligibilityOf\(base, now\)/);

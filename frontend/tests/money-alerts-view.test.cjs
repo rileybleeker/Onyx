@@ -71,6 +71,20 @@ test("cash forecast check: parsed strictly; an incomplete forecast shows the pan
   assert.match(both.text, /budgets couldn't be read.*Cash forecast incomplete/);
 });
 
+test("quiet view: an incomplete cash forecast or a part that couldn't be read is never complete", () => {
+  const v = (over) => ({ alerts: [], asOf: hoursAgo(1), updating: false, partial: null, refreshFailed: false, cash: null, ...over });
+  assert.equal(V.moneyIncomplete(v({})), null, "no cash check in the answer (no ledger, or an older answer)");
+  assert.equal(V.moneyIncomplete(v({ cash: { eligible: true, reasons: [] } })), null, "complete");
+  assert.equal(V.moneyIncomplete(v({ cash: { eligible: false, reasons: ["Synthetic reason."] } })), "the cash forecast's inputs are incomplete, so an alert may be missing");
+  assert.equal(V.moneyIncomplete(v({ partial: "budgets" })), "your budgets couldn't be read, so an alert may be missing");
+  assert.equal(V.moneyIncomplete(v({ partial: "forecast", cash: { eligible: false, reasons: [] } })), "your forecast couldn't be read and the cash forecast's inputs are incomplete, so an alert may be missing");
+  // Today's quiet view probes the Money source with it: partial + this note, so the day is never called clear.
+  const today = fs.readFileSync(path.join(SRC, "app", "today", "TodayClient.tsx"), "utf8");
+  assert.match(today, /const moneyGap = money \? moneyIncomplete\(money\) : null;/);
+  assert.match(today, /partial: moneyGap !== null, \.\.\.\(moneyGap \? \{ partialNote: moneyGap \} : \{\}\)/);
+  assert.doesNotMatch(today, /partial: money\.partial !== null/, "the cash check is not left out of the quiet view");
+});
+
 test("source: import-free (bundled by name in tests/today-regression.cjs) and used by Today", () => {
   const lib = fs.readFileSync(path.join(SRC, "lib", "money-alerts-view.ts"), "utf8");
   for (const line of lib.split(/\r?\n/)) if (/^\s*import\s/.test(line)) assert.match(line, /^\s*import type\s/, line);
