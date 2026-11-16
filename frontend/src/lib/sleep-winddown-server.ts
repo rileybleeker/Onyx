@@ -205,6 +205,8 @@ export interface SetNightResult {
   habitPageId: string;
   startedAt: string | null;
   localTime: string | null;
+  /** The server answered a repeat of a tap that had already landed: nothing was written this time. */
+  replayed: boolean;
 }
 export function setNightResult(raw: unknown): SetNightResult | null {
   const r = raw && typeof raw === "object" ? (raw as Row) : null;
@@ -213,7 +215,16 @@ export function setNightResult(raw: unknown): SetNightResult | null {
   return {
     night: r.night, answer: ans(r.answer), previous: ans(r.previous), changed: r.changed, question: r.question,
     channel: s(r.channel), habitPageId: s(r.habit_page_id) ?? "", startedAt: s(r.started_at), localTime: s(r.local_time),
+    replayed: r.replayed === true,
   };
+}
+
+/** The answer of pds.sleep_winddown_cancel_op: did the tap land (and with what answer), or can it now never land. */
+export interface CancelResult { night: string; landed: boolean; answer: "Yes" | "No" | null }
+export function cancelResult(raw: unknown): CancelResult | null {
+  const r = raw && typeof raw === "object" ? (raw as Row) : null;
+  if (!r || !isDate(r.night) || typeof r.landed !== "boolean") return null;
+  return { night: r.night, landed: r.landed, answer: r.landed && (r.answer === "Yes" || r.answer === "No") ? r.answer : null };
 }
 
 /** WHOOP-derived questions have frozen rows through this date (same rule as /api/habits/complete). */

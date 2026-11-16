@@ -27,6 +27,15 @@
 --                                Riley was, the rule in force): shown against
 --                                the target time. Never written by a report
 --                                made after the night.
+--   pds.sleep_winddown_ops       one row per tap (the id the screen made for
+--                                it): 'applied' with the answer given back, or
+--                                'cancelled' when Riley stopped a tap whose
+--                                outcome was unknown. Append-only. It is what
+--                                makes a repeated request a true replay (the
+--                                same result, no new write, even after the
+--                                answer was changed elsewhere) and what keeps a
+--                                cancelled request that is still on its way
+--                                from landing later.
 -- "Hide from Today" is a layout choice: the UI preference sleep.winddown
 -- (pds.ui_preferences), not a table here.
 --
@@ -39,6 +48,7 @@
 --   OXW12 older than the answer window        OXW13 not set up for that night
 --   OXW14 the chosen habit is gone            OXW15 the answer changed elsewhere
 --   OXW16 the goal changed since the tap was made
+--   OXW17 that tap was cancelled before it landed
 --   OXW20 pause starting on a past night      OXW21 pause ends before it starts
 --   OXW22 overlaps another pause              OXW23 no such pause
 --   OXW24 a past night's pause cannot change
@@ -89,12 +99,28 @@ CREATE TABLE IF NOT EXISTS pds.sleep_winddown_starts (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One row per tap, keyed by the id the screen made for it. A tap is retried with
+-- the SAME id until the server answers, so a lost answer never writes twice and a
+-- replay returns what the first request returned. Riley's Cancel on a tap whose
+-- outcome is unknown writes a 'cancelled' row (or finds the 'applied' one): a
+-- request with that id that reaches the server later is refused (OXW17).
+CREATE TABLE IF NOT EXISTS pds.sleep_winddown_ops (
+    op_id       UUID PRIMARY KEY,
+    night       DATE NOT NULL,
+    state       TEXT NOT NULL CHECK (state IN ('applied', 'cancelled')),
+    result      JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((state = 'applied') = (result IS NOT NULL))
+);
+
 COMMENT ON TABLE pds.sleep_winddown_rules IS
     'Wind-down goal versions (PROD-SLEEP-01), append-only. A version applies from effective_from on; the night record itself is the habit''s pds.habit_journal row.';
 COMMENT ON TABLE pds.sleep_winddown_pauses IS
     'Planned wind-down pauses: paused nights are left out of every count. Start tonight or later; past nights keep their pause state.';
 COMMENT ON TABLE pds.sleep_winddown_starts IS
     'When Started wind-down was tapped for a night (server clock; wall clock where Riley was). Shown against the target time, never counted.';
+COMMENT ON TABLE pds.sleep_winddown_ops IS
+    'One row per wind-down tap, by the id the screen made for it: applied (a repeat replays its result) or cancelled (a late arrival is refused). Append-only; a few rows a day.';
 
 -- ---------------------------------------------------------------------------
 -- 2. Guards: goal history is append-only; past nights keep their pause state
@@ -197,11 +223,17 @@ END $$;
 --           check). When another version applies to the night now (the goal was
 --           changed from another device or tab), the tap refuses (OXW16): an
 --           old tap can never complete a different habit than the one it showed.
+-- p_op_id   the id the screen made for this tap (NULL = none). A request whose id
+--           is already 'applied' is a replay: it returns that first result with
+--           replayed = true and writes nothing, even when the answer was changed
+--           elsewhere since (a lost answer must never restore a cleared one). An
+--           id that was cancelled refuses (OXW17). Checked before any other rule,
+--           under the same lock as the cancel function.
 -- Writes the habit_journal row and, for a Yes this call wrote on tonight when
 -- there was no answer before, the start time (the first tap wins: a replay or a
 -- later correction keeps it, and records none). A clear or a No removes the
 -- start time.
-CREATE OR REPLACE FUNCTION pds.sleep_winddown_set_night(p_night date, p_answer text, p_expect text, p_today date, p_rule_id bigint DEFAULT NULL)
+CREATE OR REPLACE FUNCTION pds.sleep_winddown_set_night(p_night date, p_answer text, p_expect text, p_today date, p_rule_id bigint DEFAULT NULL, p_op_id uuid DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql SET search_path = pds, pg_temp AS $$
 DECLARE
@@ -216,6 +248,8 @@ DECLARE
     v_rows     integer;
     v_tz       text;
     s          pds.sleep_winddown_starts%ROWTYPE;
+    o          pds.sleep_winddown_ops%ROWTYPE;
+    v_result   jsonb;
 BEGIN
     IF p_answer IS NOT NULL AND p_answer NOT IN ('Yes', 'No') THEN
         RAISE EXCEPTION 'the answer must be Yes, No or empty' USING ERRCODE = '22023';
@@ -223,6 +257,26 @@ BEGIN
     IF p_expect IS NOT NULL AND p_expect NOT IN ('Yes', 'No', 'none') THEN
         RAISE EXCEPTION 'expect must be Yes, No or none' USING ERRCODE = '22023';
     END IF;
+
+    -- One answer at a time: two taps (or a tap and its retry, or a tap and its
+    -- cancel) never interleave. Taken first, so every check below sees the
+    -- state this call will write on.
+    PERFORM pg_advisory_xact_lock(hashtext('pds.sleep_winddown_set_night'));
+
+    -- A repeat of a tap that already landed, or a tap Riley cancelled.
+    IF p_op_id IS NOT NULL THEN
+        SELECT * INTO o FROM pds.sleep_winddown_ops WHERE op_id = p_op_id;
+        IF FOUND THEN
+            IF o.state = 'cancelled' THEN
+                RAISE EXCEPTION 'that tap was cancelled before it landed' USING ERRCODE = 'OXW17';
+            END IF;
+            IF o.night IS DISTINCT FROM p_night OR (o.result ->> 'answer') IS DISTINCT FROM p_answer THEN
+                RAISE EXCEPTION 'that tap id belongs to a different tap' USING ERRCODE = '22023';
+            END IF;
+            RETURN o.result || jsonb_build_object('replayed', true, 'changed', false);
+        END IF;
+    END IF;
+
     IF p_today IS NOT NULL AND p_today <> v_today THEN
         RAISE EXCEPTION 'a new day started' USING ERRCODE = 'OXW10';
     END IF;
@@ -232,9 +286,6 @@ BEGIN
     IF p_night < v_today - 2 THEN
         RAISE EXCEPTION 'older nights are corrected on the Habits page' USING ERRCODE = 'OXW12';
     END IF;
-
-    -- One answer at a time: two taps (or a tap and its retry) never interleave.
-    PERFORM pg_advisory_xact_lock(hashtext('pds.sleep_winddown_set_night'));
 
     SELECT * INTO r FROM pds.sleep_winddown_rules
      WHERE effective_from <= p_night
@@ -305,10 +356,50 @@ BEGIN
     END IF;
     SELECT * INTO s FROM pds.sleep_winddown_starts WHERE night = p_night;
 
-    RETURN jsonb_build_object(
+    v_result := jsonb_build_object(
         'night', p_night, 'answer', p_answer, 'previous', v_current, 'changed', v_changed,
         'question', v_question, 'channel', v_channel, 'habit_page_id', r.habit_page_id, 'rule_id', r.rule_id,
         'started_at', s.started_at, 'local_time', s.local_time, 'tz', s.tz);
+    -- Written in the same transaction as the answer: both are there or neither.
+    IF p_op_id IS NOT NULL THEN
+        INSERT INTO pds.sleep_winddown_ops (op_id, night, state, result)
+        VALUES (p_op_id, p_night, 'applied', v_result);
+    END IF;
+    RETURN v_result;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 4b. Stop a tap whose outcome is unknown (Cancel on "Not saved yet")
+-- ---------------------------------------------------------------------------
+-- The screen sent a tap and never heard back, so it cannot know whether it
+-- landed. This settles it under the same lock as the write:
+--   landed = true   the tap had been applied: the answer stands (the screen
+--                   shows it saved, with Undo)
+--   landed = false  it had not, and now never will: a request with this id that
+--                   is still on its way is refused (OXW17)
+-- Nothing is written to habit_journal here.
+CREATE OR REPLACE FUNCTION pds.sleep_winddown_cancel_op(p_op_id uuid, p_night date)
+RETURNS jsonb
+LANGUAGE plpgsql SET search_path = pds, pg_temp AS $$
+DECLARE
+    o pds.sleep_winddown_ops%ROWTYPE;
+BEGIN
+    IF p_op_id IS NULL OR p_night IS NULL THEN
+        RAISE EXCEPTION 'a tap id and its night are needed' USING ERRCODE = '22023';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('pds.sleep_winddown_set_night'));
+    SELECT * INTO o FROM pds.sleep_winddown_ops WHERE op_id = p_op_id;
+    IF FOUND THEN
+        IF o.night IS DISTINCT FROM p_night THEN
+            RAISE EXCEPTION 'that tap id belongs to a different tap' USING ERRCODE = '22023';
+        END IF;
+        IF o.state = 'applied' THEN
+            RETURN jsonb_build_object('landed', true, 'night', o.night, 'answer', o.result -> 'answer');
+        END IF;
+        RETURN jsonb_build_object('landed', false, 'night', o.night);
+    END IF;
+    INSERT INTO pds.sleep_winddown_ops (op_id, night, state) VALUES (p_op_id, p_night, 'cancelled');
+    RETURN jsonb_build_object('landed', false, 'night', p_night);
 END $$;
 
 -- ---------------------------------------------------------------------------
@@ -371,23 +462,28 @@ END $$;
 ALTER TABLE pds.sleep_winddown_rules  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.sleep_winddown_pauses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pds.sleep_winddown_starts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pds.sleep_winddown_ops    ENABLE ROW LEVEL SECURITY;
 
 REVOKE ALL ON pds.sleep_winddown_rules  FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON pds.sleep_winddown_pauses FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON pds.sleep_winddown_starts FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON pds.sleep_winddown_ops    FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT                 ON pds.sleep_winddown_rules  TO service_role;
 GRANT SELECT, INSERT, UPDATE         ON pds.sleep_winddown_pauses TO service_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON pds.sleep_winddown_starts TO service_role;
+GRANT SELECT, INSERT                 ON pds.sleep_winddown_ops    TO service_role;
 REVOKE ALL ON SEQUENCE pds.sleep_winddown_rules_rule_id_seq   FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON SEQUENCE pds.sleep_winddown_pauses_pause_id_seq FROM PUBLIC, anon, authenticated;
 GRANT USAGE, SELECT ON SEQUENCE pds.sleep_winddown_rules_rule_id_seq   TO service_role;
 GRANT USAGE, SELECT ON SEQUENCE pds.sleep_winddown_pauses_pause_id_seq TO service_role;
 
 REVOKE ALL ON FUNCTION pds.sleep_winddown_add_rule(text, text, text, integer, integer, date) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date, bigint)       FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date, bigint, uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION pds.sleep_winddown_cancel_op(uuid, date)                            FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION pds.sleep_winddown_add_pause(date, date, date)                       FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION pds.sleep_winddown_end_pause(bigint)                                 FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION pds.sleep_winddown_add_rule(text, text, text, integer, integer, date) TO service_role;
-GRANT EXECUTE ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date, bigint)       TO service_role;
+GRANT EXECUTE ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date, bigint, uuid) TO service_role;
+GRANT EXECUTE ON FUNCTION pds.sleep_winddown_cancel_op(uuid, date)                            TO service_role;
 GRANT EXECUTE ON FUNCTION pds.sleep_winddown_add_pause(date, date, date)                       TO service_role;
 GRANT EXECUTE ON FUNCTION pds.sleep_winddown_end_pause(bigint)                                 TO service_role;

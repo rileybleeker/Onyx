@@ -186,7 +186,9 @@ function manualTimers() {
   return { timers: { set: (fn, ms) => { const h = { fn, ms }; queue.push(h); return h; }, clear: (h) => { const i = queue.indexOf(h); if (i >= 0) queue.splice(i, 1); } }, queue };
 }
 const flush = () => new Promise((r) => setImmediate(r));
-const intent = (over = {}) => ({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, ruleId: 1, ...over });
+let opCounter = 0;
+const newOp = () => `00000000-0000-4000-8000-${String(++opCounter).padStart(12, "0")}`;
+const intent = (over = {}) => ({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, ruleId: 1, opId: newOp(), ...over });
 
 test("saver: a network failure is retried with backoff and saved once", async () => {
   const { timers, queue } = manualTimers();
@@ -252,27 +254,191 @@ test("saver: a tap for another night never replaces an unsaved one; the same nig
   assert.equal(saver.submit(intent({ night: TODAY })), false, "refused: nothing is cancelled or overwritten");
   assert.equal(queue.length, 1, "the retry of the first tap is still scheduled");
   assert.deepEqual(saver.unsavedNights, [day(-1)]);
-  // The same night again while it waits: one tap from what the server last held (none) to the newest answer.
+  // The same night again while it waits: the first tap may have landed, so it is sent AGAIN first (same id) and the new
+  // tap goes right after it; the two are never merged into one.
   fail = false;
   assert.equal(saver.submit(intent({ night: day(-1), answer: null, expect: "Yes" })), true);
   await flush();
-  assert.equal(sent.length, 2);
-  assert.deepEqual({ answer: sent[1].answer, expect: sent[1].expect }, { answer: null, expect: "none" });
+  await flush();
+  assert.equal(sent.length, 3);
+  assert.equal(sent[1].opId, sent[0].opId, "the retry carries the first tap's id");
+  assert.deepEqual({ answer: sent[2].answer, expect: sent[2].expect }, { answer: null, expect: "Yes" });
+  assert.notEqual(sent[2].opId, sent[0].opId);
   assert.equal(saver.unsaved, false);
   assert.equal(saver.submit(intent({ night: TODAY })), true, "free again once the first is saved");
 });
 
-test("saver: a failed tap with a same-night tap behind it goes out as one tap from the server's answer", async () => {
+test("saver: a failed tap with a same-night tap behind it is retried first (same id); the waiting tap follows, never merged", async () => {
+  const { timers, queue } = manualTimers();
   let release;
   const sent = [];
-  const saver = new W.WindDownSaver({ send: (i) => { sent.push(i); return sent.length === 1 ? new Promise((_, rej) => { release = rej; }) : Promise.resolve({}); } });
-  saver.submit(intent({ answer: "Yes", expect: "none" }));
+  const saver = new W.WindDownSaver({ timers, send: (i) => { sent.push(i); return sent.length === 1 ? new Promise((_, rej) => { release = rej; }) : Promise.resolve({}); } });
+  const first = intent({ answer: "Yes", expect: "none" });
+  saver.submit(first);
   saver.submit(intent({ answer: "No", expect: "Yes" }));
   release(new TypeError("offline"));
   await flush();
+  assert.equal(saver.current.status, "retrying", "its outcome is unknown: it is not folded into the next tap");
+  assert.equal(sent.length, 1);
+  assert.equal(queue.length, 1);
+  assert.equal(saver.unsaved, true);
+  queue.shift().fn();
   await flush();
-  assert.equal(sent.length, 2);
-  assert.deepEqual({ answer: sent[1].answer, expect: sent[1].expect }, { answer: "No", expect: "none" });
+  await flush();
+  assert.equal(sent.length, 3);
+  assert.deepEqual({ answer: sent[1].answer, opId: sent[1].opId }, { answer: "Yes", opId: first.opId });
+  assert.deepEqual({ answer: sent[2].answer, expect: sent[2].expect }, { answer: "No", expect: "Yes" });
+});
+
+test("cancel on a tap whose answer was lost: the server is asked; a tap that landed shows as saved, one that never did is stopped for good", async () => {
+  const run = async (landed) => {
+    const { timers, queue } = manualTimers();
+    const calls = [];
+    const events = [];
+    let sends = 0;
+    const saver = new W.WindDownSaver({
+      timers,
+      send: async () => { sends++; throw new TypeError("offline"); },
+      cancel: async (i) => { calls.push(i.opId); return { landed, answer: landed ? "Yes" : null }; },
+      onLanded: (i, a) => events.push(["landed", i.night, a]),
+      onCancelled: (i) => events.push(["cancelled", i.night]),
+      onState: (s) => events.push(s.status),
+    });
+    const i = intent();
+    saver.submit(i);
+    await flush();
+    assert.equal(saver.current.status, "retrying");
+    const outcome = await saver.cancel();
+    assert.equal(queue.length, 0, "no retry is left running after a Cancel that was answered");
+    assert.deepEqual(calls, [i.opId], "the server is asked about THIS tap's id");
+    assert.equal(sends, 1, "nothing is sent again");
+    return { outcome, saver, events };
+  };
+  const landed = await run(true);
+  assert.equal(landed.outcome, "landed");
+  assert.equal(landed.saver.current.status, "saved");
+  assert.deepEqual(landed.events.filter(Array.isArray), [["landed", TODAY, "Yes"]]);
+  assert.equal(landed.saver.unsaved, false);
+  const never = await run(false);
+  assert.equal(never.outcome, "cancelled");
+  assert.equal(never.saver.current.status, "idle");
+  assert.deepEqual(never.events.filter(Array.isArray), [["cancelled", TODAY]]);
+  assert.equal(never.saver.unsaved, false);
+  assert.ok(never.events.includes("cancelling"), "the screen says it is checking");
+});
+
+test("cancel when the server cannot be reached: the tap is NOT dropped, it stays unsaved and keeps retrying with its id", async () => {
+  const { timers, queue } = manualTimers();
+  const sent = [];
+  const saver = new W.WindDownSaver({
+    timers,
+    send: async (i) => { sent.push(i.opId); throw new TypeError("offline"); },
+    cancel: async () => { throw new TypeError("offline"); },
+    onCancelled: () => assert.fail("not cancelled"),
+  });
+  const i = intent();
+  saver.submit(i);
+  await flush();
+  assert.equal(await saver.cancel(), "unreachable");
+  assert.equal(saver.current.status, "retrying");
+  assert.match(saver.current.error, /Couldn't stop it/);
+  assert.equal(saver.unsaved, true, "still unsaved work: nothing contradictory is allowed for another night");
+  assert.equal(saver.canAccept(day(-1)), false);
+  assert.equal(queue.length, 1, "retrying resumes");
+  queue.shift().fn();
+  await flush();
+  assert.deepEqual(sent, [i.opId, i.opId]);
+  // dismiss() (the OK of a refusal) never drops a tap that is waiting to retry or being checked.
+  saver.dismiss();
+  assert.equal(saver.current.status, "retrying");
+});
+
+test("a cancelled tap that is still on its way: the same id refused on arrival, a replay of a landed one writes nothing (SQL contract)", () => {
+  const sql = fs.readFileSync(path.join(ROOT, "sql", "sleep_winddown.sql"), "utf8");
+  // The ledger: one row per tap id, append-only, written with the answer in ONE transaction.
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.sleep_winddown_ops \(\s+op_id\s+UUID PRIMARY KEY/);
+  assert.match(sql, /CHECK \(state IN \('applied', 'cancelled'\)\)/);
+  assert.match(sql, /GRANT SELECT, INSERT\s+ON pds\.sleep_winddown_ops\s+TO service_role;/, "no update or delete: append-only");
+  assert.match(sql, /ALTER TABLE pds\.sleep_winddown_ops\s+ENABLE ROW LEVEL SECURITY/);
+  assert.match(sql, /REVOKE ALL ON pds\.sleep_winddown_ops\s+FROM PUBLIC, anon, authenticated/);
+  // set_night and cancel_op take the SAME lock, so a write and its cancel are strictly ordered.
+  const setFn = sql.slice(sql.indexOf("FUNCTION pds.sleep_winddown_set_night"), sql.indexOf("FUNCTION pds.sleep_winddown_cancel_op"));
+  const cancelFn = sql.slice(sql.indexOf("FUNCTION pds.sleep_winddown_cancel_op"), sql.indexOf("FUNCTION pds.sleep_winddown_add_pause"));
+  for (const fn of [setFn, cancelFn]) assert.match(fn, /pg_advisory_xact_lock\(hashtext\('pds\.sleep_winddown_set_night'\)\)/);
+  // A replay is answered from the ledger BEFORE any other rule (the habit may have been changed since: never restored).
+  assert.ok(setFn.indexOf("SELECT * INTO o FROM pds.sleep_winddown_ops") < setFn.indexOf("p_today <> v_today"), "the ledger is read before the day and answer checks");
+  assert.ok(setFn.indexOf("SELECT * INTO o FROM pds.sleep_winddown_ops") < setFn.indexOf("INSERT INTO pds.habit_journal"), "and before any write");
+  assert.match(setFn, /RETURN o\.result \|\| jsonb_build_object\('replayed', true, 'changed', false\)/);
+  assert.match(setFn, /IF o\.state = 'cancelled' THEN\s+RAISE EXCEPTION [^;]*ERRCODE = 'OXW17'/);
+  assert.match(setFn, /INSERT INTO pds\.sleep_winddown_ops \(op_id, night, state, result\)\s+VALUES \(p_op_id, p_night, 'applied', v_result\)/);
+  assert.ok(setFn.indexOf("INSERT INTO pds.sleep_winddown_ops") > setFn.indexOf("INSERT INTO pds.habit_journal"), "recorded after the answer, in the same transaction");
+  // Cancel: finds the landed tap, or writes the tombstone; never touches habit_journal.
+  assert.match(cancelFn, /IF o\.state = 'applied' THEN\s+RETURN jsonb_build_object\('landed', true/);
+  assert.match(cancelFn, /INSERT INTO pds\.sleep_winddown_ops \(op_id, night, state\) VALUES \(p_op_id, p_night, 'cancelled'\)/);
+  assert.ok(!/habit_journal/.test(cancelFn.replace(/--[^\n]*/g, "")), "cancel writes nothing to the habit rows");
+  assert.match(sql, /REVOKE ALL ON FUNCTION pds\.sleep_winddown_cancel_op\(uuid, date\)\s+FROM PUBLIC, anon, authenticated/);
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.sleep_winddown_cancel_op\(uuid, date\)\s+TO service_role/);
+  assert.equal(W.WINDDOWN_DB_ERRORS.OXW17.status, 409);
+  assert.equal(W.WINDDOWN_DB_ERRORS.OXW17.code, "cancelled");
+  // The routes: the night route passes the id, the cancel route asks the settling function and writes nothing else.
+  assert.match(read("app/api/sleep/winddown/night/route.ts"), /p_op_id: b\.opId/);
+  const cancelRoute = read("app/api/sleep/winddown/cancel/route.ts");
+  assert.match(cancelRoute, /rpc\("sleep_winddown_cancel_op", \{ p_op_id: parsed\.value\.opId, p_night: parsed\.value\.night \}\)/);
+  assert.ok(!/from\("habit_journal"\)|mirrorLastCompleted/.test(cancelRoute));
+  // The bodies: a tap id is required on a night write; the cancel body is exactly {op_id, night}.
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 1 }).ok, false, "a night write without its tap id is refused");
+  assert.equal(W.parseCancelBody({ op_id: newOp(), night: TODAY }).ok, true);
+  assert.equal(W.parseCancelBody({ op_id: "not-an-id", night: TODAY }).ok, false);
+  assert.equal(W.parseCancelBody({ op_id: newOp(), night: TODAY, extra: 1 }).ok, false);
+  assert.ok(W.OP_ID.test(W.newOpId()) && W.newOpId() !== W.newOpId(), "a new tap id is a fresh UUID");
+});
+
+test("a read that started before a confirmed write is never shown; the re-read after a write is always a new request", () => {
+  // The rule (pure): tagged reads must have started at the current write count; untagged copies wait while a write is settling.
+  assert.equal(W.readIsCurrent(0, 0, false), true);
+  assert.equal(W.readIsCurrent(0, 1, true), false, "started before the write");
+  assert.equal(W.readIsCurrent(1, 1, true), true, "started after it");
+  assert.equal(W.readIsCurrent(undefined, 1, true), false, "an untagged copy waits for the re-read");
+  assert.equal(W.readIsCurrent(undefined, 1, false), true);
+  const store = read("lib/use-winddown.ts");
+  // Every read tags its payload with the count at ITS start and is a fresh request (no shared cache request).
+  assert.match(store, /born\.set\(data, seq\)/);
+  assert.match(store, /const data = await fetchJsonValue\(WINDDOWN_URL\);/);
+  assert.ok(!/cachedJson\(WINDDOWN_URL/.test(store), "the shared cache request (which can predate a write) is not used");
+  assert.match(store, /if \(reading && reading\.seq === seq && reading\.epoch === mine\) return reading\.p;/, "shared only at the same write count");
+  assert.match(store, /if \(!readIsCurrent\(tag, writeSeq, settling\)\) return false;/);
+  // A confirmed save, a found-landed cancel, a goal / pause / hide write each bump the count before the re-read.
+  for (const fn of ["function settled(", "onCancelled: () => {", "async function discardRecovery(", "async function action("]) {
+    const at = store.indexOf(fn);
+    assert.ok(at > 0, fn);
+    assert.match(store.slice(at, at + 1400), /afterWrite\(\)/, fn);
+  }
+  assert.match(store, /function afterWrite\(\) \{ writeSeq\+\+; settling = true; \}/);
+  // The cache's own registered fetcher tags its reads too, and a stale one stored late sends a fresh read.
+  assert.match(store, /const seq = writeSeq;\s+const data = await fetchJsonValue\(WINDDOWN_URL\);/);
+  assert.match(store, /born\.has\(raw\)\) void reloadWindDown\(\)/);
+  assert.match(store, /reading = null;\s+lastRaw = null;\s+settling = false;/, "a session end resets the read bookkeeping");
+});
+
+test("Cancel and Discard never just forget a tap: the buttons ask the server, and a failed ask keeps the tap", () => {
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /if \(st\.status === "retrying"\) \{ void saver\.cancel\(\); return; \}/);
+  assert.match(store, /cancel: async \(intent\) => \{\s+const d = await send\(WINDDOWN_CANCEL_URL, "POST", \{ op_id: intent\.opId, night: intent\.night \}/);
+  // Discard of a kept tap: the tap is forgotten only after the server settled it.
+  const discard = store.slice(store.indexOf("async function discardRecovery("), store.indexOf("async function action("));
+  assert.ok(discard.indexOf("await send(WINDDOWN_CANCEL_URL") < discard.indexOf("keep(null)"), "forgotten only after the answer");
+  assert.match(discard, /catch \{[\s\S]*Couldn't discard it[\s\S]*still offered/, "a failed ask leaves it offered");
+  // Each new tap has its own id; a kept tap keeps its id across visits.
+  assert.match(store, /saver\.submit\(\{ night, answer, expect, today: p\.today, ruleId: rule\.id, opId: newOpId\(\) \}\)/);
+  const kept = W.parsePending(W.pendingRecord(intent(), 5));
+  assert.ok(W.OP_ID.test(kept.opId));
+  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, ruleId: 1, at: 1 })), null, "a kept tap without its id is dropped");
+  const panel = read("components/sleep/WindDownPanel.tsx");
+  assert.match(panel, /Cancel and check/);
+  assert.match(panel, /It may already be saved\./, "the screen says so while the outcome is unknown");
+  assert.match(panel, /s\.saver\.status === "cancelling"/);
+  const cache = read("lib/client-cache.ts");
+  assert.match(cache, /path === "\/api\/sleep\/winddown\/night" \|\| path === "\/api\/sleep\/winddown\/cancel"/, "a cancel that found the tap landed refreshes the habits too");
 });
 
 test("a goal change refuses an old tap, a kept tap is not offered under another goal, undo uses the screen's answer", () => {
@@ -292,12 +458,12 @@ test("a goal change refuses an old tap, a kept tap is not offered under another 
   assert.ok(W.pendingToOffer(kept, payload(), now));
   const changed = payload({ rules: [rule(), rule({ id: 2, effectiveFrom: TODAY, habitPageId: ID_B, habitName: HABIT_2 })], habitNames: { [ID_A]: HABIT, [ID_B]: HABIT_2 } });
   assert.equal(W.pendingToOffer(kept, changed, now), null, "the goal changed since the tap: not offered");
-  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, at: 1 })), null, "a kept tap without its goal is dropped");
+  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, opId: newOp(), at: 1 })), null, "a kept tap without its goal is dropped");
 });
 
 test("one unsaved tap at a time: the answer buttons wait; every mount, the day rollover and the Habits page follow", () => {
   const panel = read("components/sleep/WindDownPanel.tsx");
-  assert.match(panel, /const saving = s\.saver\.status === "saving" \|\| s\.saver\.status === "retrying" \|\| !!s\.recovery;/);
+  assert.match(panel, /const saving = s\.saver\.status === "saving" \|\| s\.saver\.status === "retrying" \|\| s\.saver\.status === "cancelling" \|\| !!s\.recovery;/);
   const store = read("lib/use-winddown.ts");
   assert.match(store, /if \(snap\.recovery \|\| !saver\.canAccept\(night\)\) return false;/);
   assert.match(store, /if \(!saver\.unsaved\) overlay = null;/, "a tap still waiting keeps its optimistic answer");
@@ -328,13 +494,13 @@ test("offline recovery: a kept tap is offered (never sent) only while it still a
   const kept = W.parsePending(W.pendingRecord(intent({ night: TODAY }), now - 3600_000));
   assert.equal(kept.night, TODAY);
   const tomorrow = payload({ today: day(1) });
-  assert.deepEqual(W.pendingToOffer(kept, tomorrow, now), { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1 }, "resent for the same night with the new day");
+  assert.deepEqual(W.pendingToOffer(kept, tomorrow, now), { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1, opId: kept.opId }, "resent for the same night with the new day, with its own tap id");
   assert.equal(W.pendingToOffer(kept, payload({ today: day(1), answers: [yes(0)] }), now), null, "it landed: nothing to offer");
   assert.equal(W.pendingToOffer(kept, payload({ today: day(3) }), now), null, "the night is outside the answer window");
   assert.equal(W.pendingToOffer(kept, tomorrow, now + W.PENDING_MAX_AGE_MS + 1), null, "too old");
   assert.equal(W.pendingToOffer(kept, payload({ status: "not_set_up", rules: [] }), now), null);
   assert.equal(W.parsePending("{bad json"), null);
-  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Maybe", expect: "none", today: TODAY, ruleId: 1, at: 1 })), null);
+  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Maybe", expect: "none", today: TODAY, ruleId: 1, opId: newOp(), at: 1 })), null);
   assert.ok(W.WINDDOWN_PENDING_KEY.startsWith("onyx"), "wiped on sign-out with every onyx* key");
 });
 
@@ -342,7 +508,7 @@ test("client to handler: the tap's request body is what the night route reads (r
   for (const i of [intent(), intent({ answer: null, expect: "Yes" }), intent({ night: day(-1), answer: "No", expect: "none" })]) {
     const parsed = W.parseNightBody(W.nightRequestBody(i));
     assert.equal(parsed.ok, true, parsed.error);
-    assert.deepEqual({ ...parsed.value }, { night: i.night, answer: i.answer, expect: i.expect, today: i.today, ruleId: i.ruleId });
+    assert.deepEqual({ ...parsed.value }, { night: i.night, answer: i.answer, expect: i.expect, today: i.today, ruleId: i.ruleId, opId: i.opId });
   }
   // The saver's own intent (camelCase ruleId) is not a valid body: the route refuses unknown fields and needs rule_id.
   const asIs = W.parseNightBody(intent());
@@ -390,7 +556,7 @@ test("a tap that reaches the server after 06:00 is refused as stale and its kept
   // The kept record of that tap (written while it was saving / retrying) is offered again on the new day.
   const kept = W.parsePending(W.pendingRecord(intent({ today: TODAY }), Date.parse("2031-03-21T09:00:00Z")));
   const offer = W.pendingToOffer(kept, payload({ today: day(1) }), Date.parse("2031-03-21T11:00:00Z"));
-  assert.deepEqual(offer, { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1 }, "the night Riley tapped, sent with the new day");
+  assert.deepEqual(offer, { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1, opId: kept.opId }, "the night Riley tapped, sent with the new day");
   const store = read("lib/use-winddown.ts");
   assert.match(store, /if \(e\.code !== WINDDOWN_STALE_CODE\) keep\(null\);/, "only a stale refusal keeps the tap");
   assert.match(store, /if \(!snap\.recovery && !stale\) keep\(null\);/, "OK on the message does not drop the offered tap");
@@ -431,7 +597,7 @@ test("the session ending empties the store: no data, no retry, no write to the d
   assert.match(store, /clientCache\.onWipe\(resetAfterSessionEnd\)/);
   const reset = store.slice(store.indexOf("function resetAfterSessionEnd()"), store.indexOf("function scheduleRollover"));
   for (const part of [/epoch\+\+/, /saver\.reset\(\)/, /server = null/, /overlay = null/, /keep\(null\)/, /started = false/, /snap = INITIAL/]) assert.match(reset, part);
-  assert.match(store, /if \(mine === epoch\) accept\(raw, true\)/);
+  assert.match(store, /if \(mine !== epoch\) return false;/, "a read that started before the session end never fills the emptied store");
   const cache = read("lib/client-cache.ts");
   assert.match(cache, /onWipe\(listener: \(\) => void\)/);
   assert.match(cache.slice(cache.indexOf("async wipe()")), /this\.generation\+\+;\s+for \(const fn of Array\.from\(this\.wipeListeners\)\)/);
@@ -489,13 +655,15 @@ test("Today: the wind-down is a source only once it is known to be set up", () =
 // ─── bodies, errors, SQL, boundary ──────────────────────────────────────────────────────────────────────────
 
 test("request bodies: exact fields, Riley's own values, no assumed bedtime", () => {
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, rule_id: 1 }).ok, true);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 1, extra: 1 }).ok, false);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Maybe", today: TODAY, rule_id: 1 }).ok, false);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: null, today: TODAY, rule_id: 1 }).value.expect, null);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY }).ok, false, "the goal the screen showed is required");
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 0 }).ok, false);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 7 }).value.ruleId, 7);
+  const OP = newOp();
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, rule_id: 1, op_id: OP }).ok, true);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 1, op_id: OP, extra: 1 }).ok, false);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Maybe", today: TODAY, rule_id: 1, op_id: OP }).ok, false);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: null, today: TODAY, rule_id: 1, op_id: OP }).value.expect, null);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, op_id: OP }).ok, false, "the goal the screen showed is required");
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 0, op_id: OP }).ok, false);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 7, op_id: OP }).value.ruleId, 7);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 7, op_id: OP }).value.opId, OP);
   const goal = { habit_page_id: ID_A, target_time: "22:30", wins_needed: 5, window_nights: 7, tz: "America/New_York", today: TODAY };
   assert.equal(W.parseRuleBody(goal).ok, true);
   assert.equal(W.parseRuleBody({ ...goal, target_time: "" }).ok, false, "a target time must be chosen");
@@ -540,7 +708,7 @@ test("auth boundary: the wind-down routes are owner-session only and check origi
   const mw = read("middleware.ts");
   const ci = mw.slice(mw.indexOf("function isCiRoute"), mw.indexOf("}", mw.indexOf("function isCiRoute")));
   assert.ok(!ci.includes("/api/sleep"), "never a CI-token route");
-  for (const f of ["app/api/sleep/winddown/night/route.ts", "app/api/sleep/winddown/rule/route.ts", "app/api/sleep/winddown/pause/route.ts"]) {
+  for (const f of ["app/api/sleep/winddown/night/route.ts", "app/api/sleep/winddown/cancel/route.ts", "app/api/sleep/winddown/rule/route.ts", "app/api/sleep/winddown/pause/route.ts"]) {
     const src = read(f);
     assert.match(src, /checkPortionRequest\(req\.headers, req\.nextUrl\.origin, MAX_WINDDOWN_BODY_BYTES\)/, f);
     assert.match(src, /readJsonBody\(req, MAX_WINDDOWN_BODY_BYTES\)/, f);

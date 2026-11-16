@@ -84,12 +84,14 @@ function Strip({ p }: { p: WindDownProgress }) {
 function SaveLine({ s, p }: { s: WindDownSnapshot; p: WindDownProgress }) {
   const st = s.saver;
   if (st.status === "saving") return <p role="status" className="mt-2 text-[12px] text-text-tertiary">Saving…</p>;
+  if (st.status === "cancelling") return <p role="status" className="mt-2 text-[12px] text-text-tertiary">Checking whether it was saved…</p>;
   if (st.status === "retrying") {
+    // The tap was sent and never answered: it may already be saved. Cancel asks the server and shows what it holds.
     return (
       <div role="status" className="mt-2 flex flex-wrap items-center gap-x-2 text-[12px] text-mid">
-        <span>Not saved yet: {st.error} Trying again.</span>
+        <span>Not confirmed yet: {st.error} It may already be saved. Trying again.</span>
         <button type="button" onClick={retryNow} className={textButton}>Retry now</button>
-        <button type="button" onClick={dismissTap} className={textButton}>Cancel</button>
+        <button type="button" onClick={dismissTap} className={textButton}>Cancel and check</button>
       </div>
     );
   }
@@ -106,10 +108,11 @@ function SaveLine({ s, p }: { s: WindDownSnapshot; p: WindDownProgress }) {
   // (Tonight's own Clear covers a tap that only answered tonight.)
   const undoable = !!last && last.answer !== last.previous && last.night <= p.today && last.night >= addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)
     && currentAnswer(p, last.night) === last.answer && !(last.night === p.today && last.previous === null);
-  if (st.status === "saved" || undoable) {
+  if (st.status === "saved" || undoable || s.notice) {
     return (
       <div role="status" className="mt-2 flex flex-wrap items-center gap-x-2 text-[12px]">
         {st.status === "saved" && <span className="inline-flex items-center gap-1 text-up"><Check size={13} aria-hidden="true" />Saved</span>}
+        {s.notice && <span className="text-text-secondary">{s.notice}</span>}
         {undoable && <button type="button" onClick={undoLast} className={textButton}>Undo</button>}
       </div>
     );
@@ -203,9 +206,10 @@ function Recovery({ s }: { s: WindDownSnapshot }) {
   const what = r.answer === "Yes" ? "wound down" : r.answer === "No" ? "not done" : "cleared";
   return (
     <div role="status" className="mt-3 flex flex-wrap items-center gap-2 rounded-control border border-border-subtle px-3 py-2 text-[13px] text-text-primary">
-      <span>A tap for {nightName(r.night, p.today).toLowerCase()} ({what}) wasn&apos;t saved.</span>
-      <button type="button" onClick={() => resolveRecovery(true)} className={textButton}>Save it</button>
-      <button type="button" onClick={() => resolveRecovery(false)} className={textButton}>Discard</button>
+      <span>A tap for {nightName(r.night, p.today).toLowerCase()} ({what}) wasn&apos;t confirmed as saved.</span>
+      <button type="button" onClick={() => resolveRecovery(true)} disabled={s.busy === "recovery"} className={textButton}>Save it</button>
+      <button type="button" onClick={() => resolveRecovery(false)} disabled={s.busy === "recovery"} className={textButton}>{s.busy === "recovery" ? "Checking…" : "Discard"}</button>
+      {s.actionError && <span role="alert" className="basis-full text-[12px] text-mid">{s.actionError}</span>}
     </div>
   );
 }
@@ -230,9 +234,9 @@ export default function WindDownPanel({ surface, className = "" }: { surface: "t
   const now = Date.now();
   // Log's sections are h2 under its h1; Today's panels are h3 under its section headings.
   const Heading = surface === "log" ? "h2" : "h3";
-  // One unsaved tap at a time: while one is saving, waiting to retry or kept from an earlier visit, the answer
-  // buttons wait (the line below them says why; Retry now / Cancel / Save it / Discard resolve it).
-  const saving = s.saver.status === "saving" || s.saver.status === "retrying" || !!s.recovery;
+  // One unsaved tap at a time: while one is saving, waiting to retry, being checked or kept from an earlier visit, the
+  // answer buttons wait (the line below them says why; Retry now / Cancel and check / Save it / Discard resolve it).
+  const saving = s.saver.status === "saving" || s.saver.status === "retrying" || s.saver.status === "cancelling" || !!s.recovery;
   const checked = ago(s.at, now);
   const stopped = p.streak.current === 0 && p.streak.stoppedAt
     ? `Streak ended ${shortDate(p.streak.stoppedAt.date)}: ${p.streak.stoppedAt.status === "missed" ? "not done" : "not answered"}.`

@@ -10,20 +10,26 @@
  *   writes.
  * - Writes only after a tap: one night at a time through WindDownSaver (retry with backoff, Retry now when the
  *   device comes back online, a refusal shown and the answer reloaded). A tap for another night waits for the
- *   unsaved one to be saved or cancelled (the buttons say so); nothing unsaved is replaced. The tap is shown at once
+ *   unsaved one to be saved or settled (the buttons say so); nothing unsaved is replaced. The tap is shown at once
  *   and kept on this device until the server confirmed it; a kept tap from a closed tab is OFFERED again (Save it /
  *   Discard), never sent on its own, and blocks new taps until it is resolved. A tap that reaches the server after the
  *   behavioral day turned over (offline across 06:00) is refused as stale, and its kept copy stays: the reloaded day
  *   offers it again for the night Riley tapped.
+ * - Every tap carries its own id (the same on every retry). A tap that was sent and not answered may have landed, so
+ *   "Cancel" (and "Discard" on a kept tap) asks the server to settle it: it had landed (shown as saved, with Undo) or
+ *   it had not and now never will (a late arrival is refused). When the server cannot be asked, nothing is dropped.
+ * - A read that started before a confirmed write is never shown (it may predate the write): each read is tagged with
+ *   the write count at its start, the re-read after a write is always a NEW request, and untagged copies wait for it.
  * - The session ending (sign-out, 401, redirect to sign-in) empties this store: the private data, any retry waiting
  *   and the kept tap (clientCache.onWipe). A 200 that is a sign-in page is never taken for a saved answer.
  */
 
 import { useSyncExternalStore } from "react";
-import { GONE, cachedJson, clientCache, fetchJsonValue, reportSessionEnded, sessionEnded } from "@/lib/client-cache";
+import { GONE, clientCache, fetchJsonValue, reportSessionEnded, sessionEnded } from "@/lib/client-cache";
 import { unsavedWork } from "@/lib/unsaved-work";
 import { UI_PREFS_PATH } from "@/lib/ui-preferences";
 import {
+  WINDDOWN_CANCEL_URL,
   WINDDOWN_NIGHT_URL,
   WINDDOWN_PAUSE_URL,
   WINDDOWN_PENDING_KEY,
@@ -39,11 +45,13 @@ import {
   answerOn,
   confirmNightReply,
   msUntilRollover,
+  newOpId,
   nightRequestBody,
   parsePending,
   parseWindDownPayload,
   pendingRecord,
   pendingToOffer,
+  readIsCurrent,
   ruleFor,
   withAnswer,
   type NightAnswer,
@@ -67,9 +75,11 @@ export interface WindDownSnapshot {
   recovery: NightIntent | null;
   /** The last thing a tap did, for the screen reader and the undo line. */
   last: { night: string; answer: NightAnswer | null; previous: NightAnswer | null } | null;
-  /** A goal / pause / hide action in flight, and the message of the last one that failed. */
-  busy: "rule" | "pause" | "hidden" | null;
+  /** A goal / pause / hide action (or discarding a kept tap) in flight, and the message of the last one that failed. */
+  busy: "rule" | "pause" | "hidden" | "recovery" | null;
   actionError: string | null;
+  /** What the last Cancel / Discard settled, in words (cleared by the next tap). */
+  notice: string | null;
 }
 
 const RELOAD_AFTER_MS = 60_000;
@@ -78,7 +88,7 @@ const REMOUNT_RELOAD_MS = 5_000;
 let server: WindDownPayload | null = null;
 let overlay: { night: string; answer: NightAnswer | null } | null = null;
 const INITIAL: WindDownSnapshot = {
-  load: "loading", payload: null, refreshFailed: false, at: null, fresh: false, saver: { status: "idle" }, recovery: null, last: null, busy: null, actionError: null,
+  load: "loading", payload: null, refreshFailed: false, at: null, fresh: false, saver: { status: "idle" }, recovery: null, last: null, busy: null, actionError: null, notice: null,
 };
 let snap: WindDownSnapshot = INITIAL;
 const listeners = new Set<() => void>();
@@ -89,6 +99,20 @@ let started = false;
 let lastLoad = 0;
 /** Bumped when the session ends: a read that started before it never fills the emptied store. */
 let epoch = 0;
+/** Writes confirmed in this visit. A read tagged with an older count started before the latest write (readIsCurrent). */
+let writeSeq = 0;
+/** A write was confirmed and its own re-read has not been accepted yet: untagged payloads (a cached copy) wait. */
+let settling = false;
+/** The write count at the START of the read that produced a payload. */
+const born = new WeakMap<object, number>();
+/** The read in flight, shared only by callers at the same write count. */
+let reading: { seq: number; epoch: number; p: Promise<boolean> } | null = null;
+/** The last payload object that was accepted (the cache notifies the same object again after our own put). */
+let lastRaw: unknown = null;
+function afterWrite() { writeSeq++; settling = true; }
+const CANCELLED_NOTICE = "Stopped. That tap was not saved and will not be.";
+const DISCARDED_NOTICE = "Discarded. That tap was not saved and will not be.";
+const LANDED_NOTICE = "That tap had already been saved.";
 
 function readKept(): NightIntent | null {
   try {
@@ -112,6 +136,12 @@ function emit(patch: Partial<WindDownSnapshot> = {}) {
 function accept(raw: unknown, fresh = false): boolean {
   let next: WindDownPayload;
   try { next = parseWindDownPayload(raw); } catch { return false; }
+  const tag = raw && typeof raw === "object" ? born.get(raw) : undefined;
+  // A read that started before the latest confirmed write may have been answered before it landed: never shown.
+  if (!readIsCurrent(tag, writeSeq, settling)) return false;
+  if (raw === lastRaw) return true;
+  lastRaw = raw;
+  if (tag !== undefined) settling = false;
   server = next;
   // A kept tap that did land (the server now holds its answer) is dropped without asking.
   const offer = readKept();
@@ -120,12 +150,38 @@ function accept(raw: unknown, fresh = false): boolean {
   return true;
 }
 
-/** Read the payload (cached copy first, then the server). Never writes. */
+/**
+ * One NEW read of the payload (never the answer to a request that started earlier: the cache's shared request could
+ * have been sent before a write), tagged with the write count at its start. Callers at the same write count share it.
+ */
+function readServer(): Promise<boolean> {
+  const seq = writeSeq;
+  const mine = epoch;
+  if (reading && reading.seq === seq && reading.epoch === mine) return reading.p;
+  const p = (async () => {
+    const data = await fetchJsonValue(WINDDOWN_URL);
+    if (data === GONE || !data || typeof data !== "object") throw new Error("Couldn't read the wind-down.");
+    parseWindDownPayload(data);
+    if (mine !== epoch) return false;
+    born.set(data, seq);
+    if (!readIsCurrent(seq, writeSeq, settling)) return false;
+    // Stored first so the shown "checked" time is this read's; the cache's own notice of the same object is a no-op.
+    clientCache.put(WINDDOWN_URL, data);
+    accept(data, true);
+    return true;
+  })();
+  const job = { seq, epoch: mine, p };
+  reading = job;
+  p.finally(() => { if (reading === job) reading = null; }).catch(() => {});
+  return p;
+}
+
+/** Read the payload (the cached copy is already showing, then the server). Never writes. */
 export function reloadWindDown(): Promise<void> {
   lastLoad = Date.now();
   const mine = epoch;
-  return cachedJson(WINDDOWN_URL, { check: parseWindDownPayload }).then(
-    (raw) => { if (mine === epoch) accept(raw, true); },
+  return readServer().then(
+    () => {},
     () => { if (mine === epoch) emit(server ? { refreshFailed: true } : { load: "error" }); },
   );
 }
@@ -159,6 +215,26 @@ const hasKey = (key: string) => (d: Record<string, unknown>) => {
   if (!d[key] || typeof d[key] !== "object") throw new Error("Couldn't confirm it was saved.");
 };
 
+/** The cancel answer is the server's own for this tap: its night and whether it landed. */
+const confirmCancelReply = (intent: NightIntent) => (d: Record<string, unknown>) => {
+  if (d.night !== intent.night || typeof d.landed !== "boolean") throw new Error("Couldn't confirm it was stopped.");
+};
+
+/** A tap is confirmed (saved, or found to have landed): show it, offer undo, re-read the server. */
+function settled(intent: NightIntent, answer: NightAnswer | null, replayed: boolean, notice: string | null) {
+  keep(null);
+  // A replay answers with the first request's result; the habit may have been changed since, so it is read, not assumed.
+  if (server && !replayed) server = withAnswer(server, intent.night, answer);
+  // The answer the night had BEFORE this tap is the one the screen showed when it was made: a retry after a lost
+  // answer comes back from the server as an unchanged night, so the server's own "previous" cannot be used to undo.
+  // (A same-night tap still waiting behind this one keeps the overlay until it is saved too.)
+  if (!saver.unsaved) overlay = null;
+  afterWrite();
+  emit({ last: { night: intent.night, answer, previous: intent.expect === "none" ? null : intent.expect }, recovery: null, notice });
+  try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ }
+  void reloadWindDown();
+}
+
 const saver = new WindDownSaver({
   send: async (intent) => {
     try {
@@ -170,20 +246,26 @@ const saver = new WindDownSaver({
     }
   },
   onState: (s) => {
-    if (s.status === "saving" || s.status === "retrying") keep(s.intent);
+    if (s.status === "saving" || s.status === "retrying" || s.status === "cancelling") keep(s.intent);
     emit({ saver: s });
   },
-  onSaved: (intent, answer) => {
-    const a = answer as { answer?: NightAnswer | null };
+  cancel: async (intent) => {
+    const d = await send(WINDDOWN_CANCEL_URL, "POST", { op_id: intent.opId, night: intent.night }, confirmCancelReply(intent));
+    return { landed: d.landed === true, answer: d.answer === "Yes" || d.answer === "No" ? d.answer : null };
+  },
+  // Cancel found the tap HAD landed: the same as a save.
+  onLanded: (intent, answer) => settled(intent, answer ?? intent.answer, false, LANDED_NOTICE),
+  // Cancel settled a tap that never landed and now never will: the screen goes back to what the server holds.
+  onCancelled: () => {
     keep(null);
-    if (server) server = withAnswer(server, intent.night, a.answer ?? intent.answer);
-    // The answer the night had BEFORE this tap is the one the screen showed when it was made: a retry after a lost
-    // answer comes back from the server as an unchanged night, so the server's own "previous" cannot be used to undo.
-    // (A same-night tap still waiting behind this one keeps the overlay until it is saved too.)
-    if (!saver.unsaved) overlay = null;
-    emit({ last: { night: intent.night, answer: a.answer ?? intent.answer, previous: intent.expect === "none" ? null : intent.expect }, recovery: null });
-    try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ }
+    overlay = null;
+    afterWrite();
+    emit({ recovery: null, notice: CANCELLED_NOTICE, saver: saver.current });
     void reloadWindDown();
+  },
+  onSaved: (intent, answer) => {
+    const a = answer as { answer?: NightAnswer | null; replayed?: boolean };
+    settled(intent, a.answer ?? intent.answer, a.replayed === true, null);
   },
   onRefused: (_intent, e) => {
     // A stale refusal is the only one that keeps the tap: its night is still the one Riley tapped and may still be
@@ -203,6 +285,9 @@ function resetAfterSessionEnd() {
   overlay = null;
   lastLoad = 0;
   started = false;
+  reading = null;
+  lastRaw = null;
+  settling = false;
   keep(null);
   unsavedWork.setDirty("sleep-winddown", false);
   snap = INITIAL;
@@ -222,11 +307,19 @@ function hook() {
   // A write elsewhere (the check-in, /habits, chat) drops the cached copy and refetches it: show that answer.
   // (A plain fetch, not cachedJson: invalidate() already runs the fetcher inside the cache's own revalidate.)
   clientCache.register(WINDDOWN_URL, async () => {
+    const seq = writeSeq;
     const data = await fetchJsonValue(WINDDOWN_URL);
-    if (data !== GONE) parseWindDownPayload(data);
+    if (data !== GONE) {
+      parseWindDownPayload(data);
+      if (data && typeof data === "object") born.set(data, seq);
+    }
     return data;
   });
-  clientCache.subscribe(WINDDOWN_URL, (raw) => { if (raw !== undefined) accept(raw, true); });
+  clientCache.subscribe(WINDDOWN_URL, (raw) => {
+    if (raw === undefined) return;
+    // A read from before a write that the cache stored late: ignored here, and the current state is read again.
+    if (!accept(raw, true) && raw && typeof raw === "object" && born.has(raw)) void reloadWindDown();
+  });
   clientCache.onWipe(resetAfterSessionEnd);
   document.addEventListener("visibilitychange", () => {
     if (started && document.visibilityState === "visible" && Date.now() - lastLoad > RELOAD_AFTER_MS && !saver.unsaved) void reloadWindDown();
@@ -281,8 +374,8 @@ export function answerNight(night: string, answer: NightAnswer | null): boolean 
   const expect = answerOn(p, night);
   if (expect === (answer ?? "none")) return false;
   overlay = { night, answer };
-  emit({ recovery: null, actionError: null });
-  return saver.submit({ night, answer, expect, today: p.today, ruleId: rule.id });
+  emit({ recovery: null, actionError: null, notice: null });
+  return saver.submit({ night, answer, expect, today: p.today, ruleId: rule.id, opId: newOpId() });
 }
 /** Undo the last tap: put that night back to the answer it had. */
 export function undoLast() {
@@ -291,9 +384,15 @@ export function undoLast() {
   if (answerNight(last.night, last.previous)) emit({ last: null });
 }
 export function retryNow() { saver.retryNow(); }
-/** Give up on a tap that is waiting to retry or was refused: the screen goes back to what the server holds. */
+/**
+ * "Cancel" on a tap that is waiting to retry: the server is asked whether it landed (it shows as saved) or is told it
+ * never will (the screen goes back to what the server holds); when it cannot be asked the tap stays and retries.
+ * "OK" on a refusal: clear the message (the screen already went back to what the server holds).
+ */
 export function dismissTap() {
   const st = saver.current;
+  if (st.status === "retrying") { void saver.cancel(); return; }
+  if (st.status === "cancelling") return;
   const stale = st.status === "refused" && st.code === WINDDOWN_STALE_CODE;
   saver.dismiss();
   // A tap that is being offered again (after a stale refusal) keeps its copy until Riley picks Save it or Discard;
@@ -302,21 +401,42 @@ export function dismissTap() {
   overlay = null;
   emit({ saver: saver.current });
 }
-/** The kept tap from an earlier visit: send it now (Riley tapped Save it), or drop it. */
+/**
+ * The kept tap from an earlier visit: send it now (Riley tapped Save it: the same tap id, so the server replays it if
+ * it had landed), or discard it. Discard asks the server to settle the tap first, because it may still be on its way
+ * or may have landed: only then is it forgotten, and when the server cannot be asked it stays offered.
+ */
 export function resolveRecovery(save: boolean) {
   const r = snap.recovery;
-  emit({ recovery: null });
-  if (!r) return;
-  if (!save) { keep(null); return; }
+  if (!r || snap.busy === "recovery") return;
+  if (!save) { void discardRecovery(r); return; }
+  emit({ recovery: null, notice: null });
   overlay = { night: r.night, answer: r.answer };
   emit({});
   saver.submit(r);
+}
+async function discardRecovery(r: NightIntent) {
+  const mine = epoch;
+  emit({ busy: "recovery", actionError: null });
+  try {
+    const d = await send(WINDDOWN_CANCEL_URL, "POST", { op_id: r.opId, night: r.night }, confirmCancelReply(r));
+    if (mine !== epoch) return;
+    keep(null);
+    afterWrite();
+    emit({ busy: null, recovery: null, notice: d.landed === true ? LANDED_NOTICE : DISCARDED_NOTICE });
+    if (d.landed === true) { try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ } }
+    void reloadWindDown();
+  } catch {
+    if (mine !== epoch) return;
+    emit({ busy: null, actionError: "Couldn't discard it: Onyx could not be reached. It is still offered." });
+  }
 }
 
 async function action(kind: "rule" | "pause" | "hidden", run: () => Promise<unknown>): Promise<boolean> {
   emit({ busy: kind, actionError: null });
   try {
     await run();
+    afterWrite();
     emit({ busy: null });
     await reloadWindDown();
     return true;

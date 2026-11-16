@@ -52,16 +52,31 @@ tool and not an experiment: it never claims that winding down improved sleep.
 
 - Opening, scrolling, inspecting progress or new wearable data never writes. Only a tap does.
 - One night at a time (`lib/use-winddown.ts`, `WindDownSaver` in `lib/sleep-winddown.ts`): shown at once; a network
-  failure is retried with backoff and at once when the device comes back online (Retry now / Cancel on screen); a
+  failure is retried with backoff and at once when the device comes back online (Retry now on screen); a
   refusal is shown and the screen reloads. **Nothing unsaved is replaced:** while a tap is saving, waiting to retry
   or kept from an earlier visit, the answer buttons for the other nights wait (the line under them says why;
-  Retry now / Cancel / Save it / Discard resolve it). A second tap for the same night merges into one tap from the
-  answer the server last held.
+  Retry now / Cancel and check / Save it / Discard resolve it). A second tap for the same night waits behind the
+  first and is sent once the first is settled; taps that were never sent merge into one, but a tap that was sent and
+  not answered is never merged with another, because it may have landed.
+- **A tap is an operation with an id.** Each tap gets a UUID when it is made (`op_id`), the same on every retry and
+  on a kept copy offered again. `pds.sleep_winddown_set_night` records it in `pds.sleep_winddown_ops` in the same
+  transaction as the answer, so a repeat of a tap that landed (a lost answer, a retry, an offered copy) returns the
+  first result (`replayed`) and writes nothing, **even when the habit was changed elsewhere in between** (a lost
+  answer can no longer restore an answer that was cleared since).
+- **Cancel is not a local delete.** While the outcome is unknown ("Not confirmed yet ... It may already be saved"),
+  **Cancel and check** (and **Discard** on a kept tap) asks `POST /api/sleep/winddown/cancel {op_id, night}`, which
+  takes the same lock as the write: if the tap had landed it shows as saved (with Undo); if it had not, it is
+  recorded as cancelled and a request with that id that is still on its way is refused (409 cancelled), so a late
+  arrival cannot write after Riley stopped it. When the server cannot be asked, nothing is dropped: the tap stays
+  unsaved and keeps retrying (a kept tap stays offered). The ledger is append-only (one small row per tap).
 - The tap is kept on the device until the server confirmed it; a tap from a closed tab is offered on the next visit
   (**Save it** / **Discard**), never sent on its own, and not offered at all when the goal changed since.
 - A tap that reaches the server after the behavioral day turned over (offline across 06:00, or a screen left open)
   is refused as stale, and **its kept copy stays**: the screen reloads the new day and offers the tap again for the
   night Riley tapped (Save it / Discard) while that night can still be answered here. Every other refusal drops it.
+- **A read that started before a write is never shown.** Each read is tagged with the number of confirmed writes at the
+  moment it started, a read tagged older is ignored, the re-read after a write is always a new request (never the
+  cache's shared request, which can have been sent before the write), and untagged copies wait for that re-read.
 - A success answer must be the server's own answer to that tap (the night and the answer it holds). A 200 sign-in
   page after a redirect, or any unreadable 200, is never taken for a saved answer: the session ending empties the
   store, anything else is retried and kept.
@@ -87,10 +102,10 @@ tool and not an experiment: it never claims that winding down improved sleep.
 
 ## Storage and access
 
-`sql/sleep_winddown.sql`: `pds.sleep_winddown_rules`, `pds.sleep_winddown_pauses`, `pds.sleep_winddown_starts` and
-four functions. Service role only (RLS on, no policies, nothing granted to anon or authenticated). Hidden is the UI
+`sql/sleep_winddown.sql`: `pds.sleep_winddown_rules`, `pds.sleep_winddown_pauses`, `pds.sleep_winddown_starts`,
+`pds.sleep_winddown_ops` (the tap ledger) and five functions. Service role only (RLS on, no policies, nothing granted to anon or authenticated). Hidden is the UI
 preference `sleep.winddown` (`pds.ui_preferences`). Routes: `GET /api/sleep/winddown`, `POST
-/api/sleep/winddown/night`, `POST /api/sleep/winddown/rule`, `POST|PATCH /api/sleep/winddown/pause`, all owner
+/api/sleep/winddown/night`, `POST /api/sleep/winddown/cancel`, `POST /api/sleep/winddown/rule`, `POST|PATCH /api/sleep/winddown/pause`, all owner
 session only (never in `isCiRoute()`), same-origin JSON, at most 1 KB; logs carry a step or a database code, never
 a habit, an answer or a sleep value. Until the SQL is applied the GET answers `not_connected` and Log says so.
 

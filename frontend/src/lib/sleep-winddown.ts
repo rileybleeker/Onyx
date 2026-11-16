@@ -25,6 +25,8 @@
 
 export const WINDDOWN_URL = "/api/sleep/winddown";
 export const WINDDOWN_NIGHT_URL = "/api/sleep/winddown/night";
+/** Stops a tap whose outcome is unknown (it landed, or it never will): POST {op_id, night}. */
+export const WINDDOWN_CANCEL_URL = "/api/sleep/winddown/cancel";
 export const WINDDOWN_RULE_URL = "/api/sleep/winddown/rule";
 export const WINDDOWN_PAUSE_URL = "/api/sleep/winddown/pause";
 /** "Hide from Today": a layout choice, so a UI preference (pds.ui_preferences), not a table of its own. */
@@ -541,22 +543,48 @@ function exactKeys(body: unknown, required: readonly string[], optional: readonl
   return b;
 }
 
-export interface NightBody { night: string; answer: NightAnswer | null; expect: NightAnswer | "none" | null; today: string; ruleId: number }
+/** The id the screen makes for one tap (a UUID): every retry of that tap carries it, so the server can tell a repeat from a new tap. */
+export const OP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A new tap id: crypto.randomUUID() where there is one, else a random v4 built from random bytes. */
+export function newOpId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string; getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID().toLowerCase();
+  const b = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === "function") c.getRandomValues(b);
+  else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+export interface NightBody { night: string; answer: NightAnswer | null; expect: NightAnswer | "none" | null; today: string; ruleId: number; opId: string }
 /**
- * POST /api/sleep/winddown/night: {night, answer: "Yes" | "No" | null, expect?: "Yes" | "No" | "none", today, rule_id}.
+ * POST /api/sleep/winddown/night: {night, answer: "Yes" | "No" | null, expect?: "Yes" | "No" | "none", today, rule_id, op_id}.
  * `rule_id` is the goal version the screen showed for that night: a tap made under an older goal refuses (OXW16)
  * instead of completing whatever habit the goal names now.
  */
 export function parseNightBody(body: unknown): Parsed<NightBody> {
-  const b = exactKeys(body, ["night", "answer", "today", "rule_id"], ["expect"]);
+  const b = exactKeys(body, ["night", "answer", "today", "rule_id", "op_id"], ["expect"]);
   if (typeof b === "string") return { ok: false, error: b };
   if (!isDate(b.night)) return { ok: false, error: "night must be YYYY-MM-DD" };
   if (!isDate(b.today)) return { ok: false, error: "today must be YYYY-MM-DD" };
   if (typeof b.rule_id !== "number" || !Number.isInteger(b.rule_id) || b.rule_id < 1) return { ok: false, error: "rule_id must be the goal's id" };
+  if (typeof b.op_id !== "string" || !OP_ID.test(b.op_id)) return { ok: false, error: "op_id must be the tap's id" };
   if (b.answer !== null && b.answer !== "Yes" && b.answer !== "No") return { ok: false, error: "answer must be Yes, No or null" };
   const expect = b.expect === undefined ? null : b.expect;
   if (expect !== null && expect !== "Yes" && expect !== "No" && expect !== "none") return { ok: false, error: "expect must be Yes, No or none" };
-  return { ok: true, value: { night: b.night, answer: b.answer as NightAnswer | null, expect: expect as NightBody["expect"], today: b.today, ruleId: b.rule_id } };
+  return { ok: true, value: { night: b.night, answer: b.answer as NightAnswer | null, expect: expect as NightBody["expect"], today: b.today, ruleId: b.rule_id, opId: b.op_id } };
+}
+
+export interface CancelBody { opId: string; night: string }
+/** POST /api/sleep/winddown/cancel {op_id, night}: settle a tap whose outcome is unknown (see pds.sleep_winddown_cancel_op). */
+export function parseCancelBody(body: unknown): Parsed<CancelBody> {
+  const b = exactKeys(body, ["op_id", "night"]);
+  if (typeof b === "string") return { ok: false, error: b };
+  if (typeof b.op_id !== "string" || !OP_ID.test(b.op_id)) return { ok: false, error: "op_id must be the tap's id" };
+  if (!isDate(b.night)) return { ok: false, error: "night must be YYYY-MM-DD" };
+  return { ok: true, value: { opId: b.op_id, night: b.night } };
 }
 
 export interface RuleBody { habitPageId: string; targetTime: string; winsNeeded: number; windowNights: number; tz: string; today: string }
@@ -604,6 +632,7 @@ export const WINDDOWN_DB_ERRORS: Readonly<Record<string, { status: number; code:
   OXW14: { status: 409, code: "habit_gone", error: "The chosen habit is no longer in Onyx. Choose another one." },
   OXW15: { status: 409, code: "changed", error: "That night's answer changed somewhere else (check-in or Habits). It has been refreshed." },
   OXW16: { status: 409, code: "goal_changed", error: "The wind-down goal changed since this screen loaded. It has been refreshed; tap again if you still mean it." },
+  OXW17: { status: 409, code: "cancelled", error: "That tap was cancelled before it was saved, so it was not applied." },
   OXW20: { status: 409, code: "pause_past", error: "A pause can start tonight or later, not on a night that already passed." },
   OXW21: { status: 400, code: "pause_range", error: "The pause ends before it starts." },
   OXW22: { status: 409, code: "pause_overlap", error: "That overlaps a pause you already planned." },
@@ -623,14 +652,18 @@ export function isMissingStorage(e: { code?: unknown } | null | undefined): bool
 
 // ─── Saving one tap: retry, refusal, replay, recovery ──────────────────────────────────────────────────────
 
-/** `ruleId` = the goal version the screen showed for that night; `expect` = the answer it showed. */
-export interface NightIntent { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; ruleId: number }
+/**
+ * `ruleId` = the goal version the screen showed for that night; `expect` = the answer it showed; `opId` = this tap's
+ * id, the same on every retry (and on a kept copy offered again), so the server answers a repeat with the first
+ * result instead of writing again, and can be told to refuse the tap if it is cancelled.
+ */
+export interface NightIntent { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; ruleId: number; opId: string }
 /**
  * The request body of one tap, in the field names parseNightBody reads (`rule_id`, not the intent's camelCase
  * `ruleId`: the route refuses unknown fields, so sending the intent as it is would refuse every tap).
  */
-export function nightRequestBody(i: NightIntent): { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; rule_id: number } {
-  return { night: i.night, answer: i.answer, expect: i.expect, today: i.today, rule_id: i.ruleId };
+export function nightRequestBody(i: NightIntent): { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; rule_id: number; op_id: string } {
+  return { night: i.night, answer: i.answer, expect: i.expect, today: i.today, rule_id: i.ruleId, op_id: i.opId };
 }
 /**
  * A 200 only counts as saved when it is the server's answer to THIS tap: an object naming the night and the answer
@@ -648,7 +681,10 @@ export const WINDDOWN_STALE_CODE = "stale";
 export const WINDDOWN_SESSION_ENDED_CODE = "session_ended";
 /** A tap that reached the server after the behavioral day turned over (offline across 06:00): kept, offered again. */
 export const WINDDOWN_STALE_MESSAGE = "A new day started before this was saved. The tap is offered again below while that night can still be answered here.";
-/** Two taps for one night that were never both sent: one tap going from the OLDER one's `expect` to the newer answer. */
+/**
+ * Two taps for one night that were NEVER SENT: one tap going from the OLDER one's `expect` to the newer answer (the
+ * newer tap's id). A tap that was sent and not answered is never merged with another: its outcome is unknown.
+ */
 export function coalesceIntents(older: NightIntent | null, newer: NightIntent): NightIntent {
   return older && older.night === newer.night ? { ...newer, expect: older.expect, ruleId: older.ruleId } : newer;
 }
@@ -663,6 +699,8 @@ export type SaverState =
   | { status: "idle" }
   | { status: "saving"; intent: NightIntent }
   | { status: "retrying"; intent: NightIntent; error: string; attempt: number }
+  /** Cancel was pressed on a tap whose outcome is unknown: the server is being asked whether it landed. */
+  | { status: "cancelling"; intent: NightIntent }
   | { status: "refused"; intent: NightIntent; error: string; code: string }
   | { status: "saved"; intent: NightIntent };
 export interface SaverTimers { set: (fn: () => void, ms: number) => unknown; clear: (h: unknown) => void }
@@ -672,19 +710,31 @@ export interface SaverOptions {
   onState?: (s: SaverState) => void;
   onSaved?: (intent: NightIntent, answer: unknown) => void;
   onRefused?: (intent: NightIntent, error: WindDownRefused) => void;
+  /** Settles a tap whose outcome is unknown: landed (it was applied) or not (and now never will be). */
+  cancel?: (intent: NightIntent) => Promise<{ landed: boolean; answer: NightAnswer | null }>;
+  /** Cancel found that the tap HAD landed: the same as a save (Undo, reload). */
+  onLanded?: (intent: NightIntent, answer: NightAnswer | null) => void;
+  /** Cancel settled a tap that never landed and now never will. */
+  onCancelled?: (intent: NightIntent) => void;
   retryDelaysMs?: readonly number[];
   timers?: SaverTimers;
 }
 
 /**
  * One wind-down tap at a time. A failure that is not a refusal is retried with backoff (and at once by retryNow(),
- * e.g. when the device comes back online); the server treats a repeated tap as a no-op, so a retry after a lost
- * answer cannot count twice.
+ * e.g. when the device comes back online) with the SAME tap id; the server answers a repeat with the first result and
+ * writes nothing, so a retry after a lost answer cannot count twice, and cannot restore an answer someone cleared
+ * since.
  *
  * Nothing unsaved is ever replaced by a tap for ANOTHER night: submit() refuses it (returns false, canAccept() says
- * so beforehand) until the first one is saved, refused or dismissed, so a night's retry is never cancelled and its
- * kept copy is never overwritten. A second tap for the SAME night merges with the first (one tap from the answer the
- * server last held to the newest answer): a tap made while one is in flight waits and is sent next.
+ * so beforehand) until the first one is saved, refused or settled, so a night's retry is never lost and its kept copy
+ * is never overwritten. A second tap for the SAME night waits behind the first (taps that were never sent merge into
+ * one, from the answer the server last held to the newest answer) and is sent once the first is settled: a tap that was
+ * sent and not answered is never merged with another, because it may have landed.
+ *
+ * "Cancel" on such a tap is not a local delete: cancel() asks the server whether it landed. It then either shows as
+ * saved (it had landed) or is stopped for good (the server refuses that tap id if it still arrives). When the server
+ * cannot be reached the tap stays unsaved and keeps retrying.
  */
 export class WindDownSaver {
   private state: SaverState = { status: "idle" };
@@ -701,13 +751,13 @@ export class WindDownSaver {
   }
   get current(): SaverState { return this.state; }
   /** Something tapped is not saved yet (saving, waiting to retry, or waiting behind another tap). */
-  get unsaved(): boolean { return this.inflight || this.queued !== null || this.state.status === "retrying"; }
+  get unsaved(): boolean { return this.inflight || this.queued !== null || this.state.status === "retrying" || this.state.status === "cancelling"; }
   /** The nights with a tap that is not saved yet. */
   get unsavedNights(): string[] {
     const s = this.state;
     const nights = new Set<string>();
     if (this.queued) nights.add(this.queued.night);
-    if (s.status === "saving" || s.status === "retrying") nights.add(s.intent.night);
+    if (s.status === "saving" || s.status === "retrying" || s.status === "cancelling") nights.add(s.intent.night);
     return Array.from(nights);
   }
   /** A tap for this night can be taken now: nothing is unsaved, or what is unsaved is for this same night. */
@@ -717,9 +767,14 @@ export class WindDownSaver {
   submit(intent: NightIntent): boolean {
     if (!this.canAccept(intent.night)) return false;
     if (this.inflight) { this.queued = coalesceIntents(this.queued, intent); return true; }
-    const waiting = this.state.status === "retrying" ? this.state.intent : null;
+    if (this.state.status === "retrying") {
+      // The earlier tap may have landed: it is sent again first (same id), this one right after it.
+      this.queued = coalesceIntents(this.queued, intent);
+      this.retryNow();
+      return true;
+    }
     this.clearTimer();
-    void this.run(coalesceIntents(waiting, intent), 0);
+    void this.run(intent, 0);
     return true;
   }
   /** Retry a tap that is waiting to retry, now (Retry, or the device came back online). A refusal is not retried. */
@@ -730,12 +785,54 @@ export class WindDownSaver {
     this.clearTimer();
     void this.run(s.intent, s.attempt);
   }
-  /** Drop a tap that is waiting to retry or was refused (Riley gave up on it). */
+  /** Clear a refusal that was shown (OK). A tap that is waiting to retry is never dropped here: see cancel(). */
   dismiss() {
-    if (this.inflight) return;
+    if (this.inflight || this.state.status === "retrying" || this.state.status === "cancelling") return;
     this.clearTimer();
     this.queued = null;
     this.set({ status: "idle" });
+  }
+  /**
+   * Stop retrying a tap whose outcome is unknown, by asking the server to settle it. "landed": it had been applied
+   * (shown as saved, undo available); "cancelled": it had not and now never will (the screen goes back to what the
+   * server holds); "unreachable": the server could not be asked, so the tap stays unsaved and retrying resumes;
+   * "none": nothing to cancel.
+   */
+  async cancel(): Promise<"landed" | "cancelled" | "unreachable" | "none"> {
+    const s = this.state;
+    if (s.status !== "retrying" || this.inflight || !this.opts.cancel) return "none";
+    const intent = s.intent;
+    const gen = this.gen;
+    this.clearTimer();
+    this.inflight = true;
+    this.set({ status: "cancelling", intent });
+    let r: { landed: boolean; answer: NightAnswer | null };
+    try {
+      r = await this.opts.cancel(intent);
+    } catch {
+      if (gen !== this.gen) return "none";
+      this.inflight = false;
+      // Not settled: it is still unsaved. Keep retrying it (same id) and say why Cancel did nothing.
+      this.set({ status: "retrying", intent, error: "Couldn't stop it: Onyx could not be reached.", attempt: s.attempt });
+      this.timer = this.timers.set(() => { this.timer = null; void this.run(intent, s.attempt); }, this.delays[Math.min(s.attempt, this.delays.length - 1)]);
+      return "unreachable";
+    }
+    if (gen !== this.gen) return "none";
+    this.inflight = false;
+    if (r.landed) {
+      // A tap made meanwhile for the same night was made on top of this answer: it goes out once this is shown.
+      this.set({ status: "saved", intent });
+      this.opts.onLanded?.(intent, r.answer);
+      const next = this.queued;
+      this.queued = null;
+      if (next) void this.run(next, 0);
+      return "landed";
+    }
+    // Never applied and never will be: a tap made on top of it was made on an answer that does not exist.
+    this.queued = null;
+    this.set({ status: "idle" });
+    this.opts.onCancelled?.(intent);
+    return "cancelled";
   }
   /**
    * The session ended (sign-out, 401, redirect to sign-in): forget everything, silently. A pending retry is cancelled
@@ -762,19 +859,19 @@ export class WindDownSaver {
     } catch (e) {
       if (gen !== this.gen) return;
       this.inflight = false;
-      if (e instanceof WindDownRefused) {
-        this.set({ status: "refused", intent, error: e.message, code: e.code });
-        this.opts.onRefused?.(intent, e);
-      } else if (this.queued) {
-        // The tap behind it is for the same night and starts from where the failed one would have left it: it
-        // goes out as one tap from the answer the server last held.
-        this.queued = coalesceIntents(intent, this.queued);
-      } else {
+      if (!(e instanceof WindDownRefused)) {
+        // Not answered: it may or may not have landed. It is sent again with the same id (the server replays a repeat);
+        // a tap waiting behind it stays queued and goes out once this one is settled, never merged into it.
         const error = e instanceof TypeError ? "Couldn't reach Onyx." : e instanceof Error && e.message ? e.message : "Not saved.";
         const n = attempt + 1;
         this.set({ status: "retrying", intent, error, attempt: n });
         this.timer = this.timers.set(() => { this.timer = null; void this.run(intent, n); }, this.delays[Math.min(attempt, this.delays.length - 1)]);
+        return;
       }
+      // Refused: the screen's picture of the night was wrong, so a tap made on top of it is not sent either.
+      this.queued = null;
+      this.set({ status: "refused", intent, error: e.message, code: e.code });
+      this.opts.onRefused?.(intent, e);
     }
     const next = this.queued;
     this.queued = null;
@@ -784,6 +881,7 @@ export class WindDownSaver {
 
 /** A tap kept on this device until the server confirmed it (a closed tab or a lost connection must not lose it). */
 export interface PendingTap extends NightIntent { at: number }
+/** (kept with its tap id: offering it again sends the same tap, which the server replays if it had landed) */
 export function pendingRecord(intent: NightIntent, nowMs: number): string {
   return JSON.stringify({ ...intent, at: nowMs });
 }
@@ -796,7 +894,8 @@ export function parsePending(raw: string | null | undefined): PendingTap | null 
   if (r.answer !== null && r.answer !== "Yes" && r.answer !== "No") return null;
   if (r.expect !== "Yes" && r.expect !== "No" && r.expect !== "none") return null;
   if (typeof r.ruleId !== "number" || !Number.isInteger(r.ruleId) || r.ruleId < 1) return null;
-  return { night: r.night, answer: r.answer as NightAnswer | null, expect: r.expect, today: r.today, ruleId: r.ruleId, at: r.at };
+  if (typeof r.opId !== "string" || !OP_ID.test(r.opId)) return null;
+  return { night: r.night, answer: r.answer as NightAnswer | null, expect: r.expect, today: r.today, ruleId: r.ruleId, opId: r.opId, at: r.at };
 }
 /**
  * The kept tap worth offering again on this payload, or null: it must be under PENDING_MAX_AGE_MS old, for a night
@@ -811,5 +910,15 @@ export function pendingToOffer(tap: PendingTap | null, p: WindDownPayload | null
   if (tap.night > p.today || tap.night < addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)) return null;
   if (ruleFor(p.rules, tap.night)?.id !== tap.ruleId) return null;
   if (answerOn(p, tap.night) === (tap.answer ?? "none")) return null;
-  return { night: tap.night, answer: tap.answer, expect: tap.expect, today: p.today, ruleId: tap.ruleId };
+  return { night: tap.night, answer: tap.answer, expect: tap.expect, today: p.today, ruleId: tap.ruleId, opId: tap.opId };
+}
+
+/**
+ * May a payload replace what the screen holds? Every read is tagged with the number of confirmed writes at the moment
+ * it STARTED (`tag`). A read that started before the latest write may have been answered before it landed: it is
+ * stale and never shown, even though its answer arrives after the write was confirmed. A payload with no tag (a cached
+ * copy, another loader's read) is only trusted while no write is waiting for its own re-read (`settling`).
+ */
+export function readIsCurrent(tag: number | undefined, writes: number, settling: boolean): boolean {
+  return tag === undefined ? !settling : tag === writes;
 }
