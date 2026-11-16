@@ -1,19 +1,25 @@
 """Medical records recovery check (tools/medical_recovery/recovery_check.py).
 
-Covers, against a fake Supabase (PostgREST + Storage + Management API) with SYNTHETIC rows and files:
+Covers, against a fake Supabase (PostgREST + Storage + Auth + Management API) with SYNTHETIC rows
+and files:
   * a healthy store passes, prints counts only (no id, storage path, key or record text), and asks
     PostgREST for id / path / size / type / state columns only, never a text column;
-  * failure-recovery: a restore that lost a file, changed a size or type, left a lab result pointing
-    at a missing document, or brought back a corrupted / truncated file is a FAIL;
-  * privacy / cross-user: a public bucket, a changed size cap or type list, the anon key reaching a
-    table, listing a file or the public URL serving a file are each a FAIL;
+  * failure-recovery: a restore that lost a file (from the listing, or only its bytes in the storage
+    backend), changed a size or type, left a lab result pointing at a missing document, cleared or
+    reassigned a lab result's document link, brought back a removed document as live, or brought
+    back a corrupted / truncated / look-alike file is a FAIL;
+  * privacy / cross-user: a public bucket, a changed size cap or type list, the anon key or a
+    signed-in user's token reaching a table or listing a file, or the public URL serving a file are
+    each a FAIL; a stale / invalid key, a probe answered without a permission code and a malformed
+    listing are INCOMPLETE, never a pass;
   * retry: network errors and 5xx are retried with backoff and then pass; a read that keeps failing
     is INCOMPLETE (exit 2), never a pass; a 401 / 403 is not retried and becomes the exact access ask;
   * backups: no access token = incomplete with the access ask; a backup older than 36 h = fail;
     the backup summary keeps dates and counts only;
-  * the drill: files are opened and a manifest written only on a local stack or a named throwaway
-    project, never on production (refused before any request); a wipe is detected against the
-    manifest and a full restore passes, including the signed-link fetch;
+  * the drill: files are opened, backups skipped and a manifest written only on a local stack or a
+    named throwaway project, never on production (refused before any request); the manifest is
+    written only from a PASS; a wipe is detected against the manifest and a full restore passes,
+    including the signed-link fetch;
   * paging past PostgREST's 1000-row cap; placeholder files and orphans warn instead of failing.
 
 Synthetic data only. No network, no credentials.
@@ -41,11 +47,19 @@ DRILL = f"https://{DRILL_REF}.supabase.co"
 SERVICE = "service-key-SYNTHETIC-0001"
 ANON = "anon-key-SYNTHETIC-0002"
 TOKEN = "access-token-SYNTHETIC-0003"
+USER = "user-token-SYNTHETIC-0004"
 NOW = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
 FILES = rc.synthetic_files()
 PDF = FILES["synthetic-drill-document.pdf"][1]
 PNG = FILES["synthetic-drill-image.png"][1]
+# a structurally valid, made-up baseline JPEG: SOI, JFIF APP0, SOF0 (1x1, one component), SOS, EOI
+JPEG = (b"\xff\xd8"
+        + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        + b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+        + b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+        + b"\x00\x00\x00\x00\xff\xd9")
 TEXT_COLUMNS = ("title", "provider", "notes", "test_name", "value_num", "value_text", "unit", "ref_text", "lab")
+INVALID_KEY = b'{"message":"Invalid API key"}'
 
 
 def uid(n: int) -> str:
@@ -79,16 +93,21 @@ def recent_backups(hours_ago=5):
 
 
 class FakeServer:
-    """PostgREST, Storage and the Management API as one transport. `fail` scripts answers per path
-    prefix (a status, or "network") before the normal answer."""
+    """PostgREST, Storage, Auth and the Management API as one transport. `fail` scripts answers per path
+    prefix (a status, or "network") before the normal answer. Roles: the service key; the anon key;
+    a signed-in user = the anon key as apikey with the user's token as the bearer."""
 
     def __init__(self, docs, labs, files, *, public=False, limit=rc.EXPECTED_LIMIT, types=rc.EXPECTED_TYPES,
-                 anon_table=False, anon_list=False, fail=None, backups=None, extra_top=(), extra_docs=(),
+                 anon_table=False, anon_list=False, user_table=False, user_list=False, anon_table_answer=None,
+                 anon_list_answer=None, lost_bytes=(), fail=None, backups=None, extra_top=(), extra_docs=(),
                  signed_bytes=None):
         self.tables = {"medical_documents": docs, "lab_results": labs}
         self.files = dict(files)
         self.public, self.limit, self.types = public, limit, sorted(types)
         self.anon_table, self.anon_list = anon_table, anon_list
+        self.user_table, self.user_list = user_table, user_list
+        self.anon_table_answer, self.anon_list_answer = anon_table_answer, anon_list_answer
+        self.lost_bytes = set(lost_bytes)  # listed (storage.objects row) but the bytes are gone
         self.fail = {k: list(v) for k, v in (fail or {}).items()}
         self.backups = backups if backups is not None else recent_backups()
         self.extra_top, self.extra_docs = list(extra_top), list(extra_docs)
@@ -106,14 +125,23 @@ class FakeServer:
                     raise rc.TransportError("ConnectError")
                 return v, b'{"code":"SYNTHETIC"}'
         key = headers.get("apikey")
+        user = key == ANON and headers.get("Authorization") == f"Bearer {USER}"
         if parts.hostname == "api.supabase.com":
             return (200, json.dumps(self.backups).encode()) if headers.get("Authorization") == f"Bearer {TOKEN}" else (401, b"{}")
+        if path == "/auth/v1/settings":
+            return (200, b"{}") if key == ANON else (401, INVALID_KEY)
+        if path == "/auth/v1/user":
+            return (200, b"{}") if user else (401, INVALID_KEY if key != ANON else b'{"code":"bad_jwt"}')
         if path.startswith("/rest/v1/"):
             table = path.rsplit("/", 1)[1]
+            if user:
+                return (200, b"[]") if self.user_table else (403, b'{"code":"42501"}')
             if key == ANON:
+                if self.anon_table_answer:
+                    return self.anon_table_answer
                 return (200, b"[]") if self.anon_table else (401, b'{"code":"42501"}')
             if key != SERVICE or headers.get("Accept-Profile") != "pds":
-                return 401, b"{}"
+                return 401, INVALID_KEY
             cols = q["select"][0].split(",")
             self.selects.append((table, q["select"][0]))
             off, lim = int(q.get("offset", ["0"])[0]), int(q["limit"][0])
@@ -127,7 +155,11 @@ class FakeServer:
         if path == f"/storage/v1/object/list/{rc.BUCKET}":
             req = json.loads(body.decode())
             items = self._listing(req["prefix"])
+            if user:
+                return 200, json.dumps(items[:1] if self.user_list and req["prefix"] == "documents" else []).encode()
             if key == ANON:
+                if self.anon_list_answer:
+                    return self.anon_list_answer
                 return 200, json.dumps(items[:1] if self.anon_list and req["prefix"] == "documents" else []).encode()
             if key != SERVICE:
                 return 400, b"{}"
@@ -145,9 +177,12 @@ class FakeServer:
             return 200, self.signed_bytes if self.signed_bytes is not None else self.files[obj][1]
         if path.startswith(f"/storage/v1/object/{rc.BUCKET}/"):
             obj = urllib.parse.unquote(path.split(f"/object/{rc.BUCKET}/", 1)[1])
-            if key != SERVICE or obj not in self.files:
-                return 400, b"{}"
-            return 200, self.files[obj][1]
+            if key != SERVICE or obj not in self.files or obj in self.lost_bytes:
+                return 400, b"", {}
+            mime, data = self.files[obj]
+            if method == "HEAD":
+                return 200, b"", {"content-length": str(len(data)), "content-type": mime}
+            return 200, data, {"content-length": str(len(data)), "content-type": mime}
         return 404, b"{}"
 
     def _listing(self, prefix):
@@ -159,11 +194,11 @@ class FakeServer:
 
 
 class Env:
-    """Set the anon key / access token for one main() call (offline runs strip SUPABASE_* vars)."""
+    """Set the anon key / user token / access token for one main() call (offline runs strip SUPABASE_* vars)."""
 
-    def __init__(self, anon=ANON, token=TOKEN):
-        self.values = {"SUPABASE_ANON_KEY": anon, "SUPABASE_ACCESS_TOKEN": token, "SUPABASE_SERVICE_ROLE_KEY": None,
-                       "NEXT_PUBLIC_SUPABASE_ANON_KEY": None, "SUPABASE_URL": None}
+    def __init__(self, anon=ANON, token=TOKEN, user=USER):
+        self.values = {"SUPABASE_ANON_KEY": anon, "SUPABASE_ACCESS_TOKEN": token, "SUPABASE_USER_ACCESS_TOKEN": user,
+                       "SUPABASE_SERVICE_ROLE_KEY": None, "NEXT_PUBLIC_SUPABASE_ANON_KEY": None, "SUPABASE_URL": None}
 
     def __enter__(self):
         self.saved = {k: os.environ.get(k) for k in self.values}
@@ -182,14 +217,14 @@ class Env:
                 os.environ[k] = v
 
 
-def run(server, *args, url=PROD, anon=ANON, token=TOKEN, key=SERVICE):
+def run(server, *args, url=PROD, anon=ANON, token=TOKEN, key=SERVICE, user=USER):
     """main() with the fake server; answers (exit code, printed text, JSON report or None, sleeps)."""
     sleeps = []
     with tempfile.TemporaryDirectory() as tmp:
         key_file = Path(tmp) / "key"
         key_file.write_text(key or "", encoding="utf-8")
         out = io.StringIO()
-        with Env(anon=anon, token=token):
+        with Env(anon=anon, token=token, user=user):
             code = rc.main(["--url", url, "--key-file", str(key_file), "--json", *args],
                            transport=server, sleep=sleeps.append, out=out)
     text = out.getvalue()
@@ -205,8 +240,16 @@ def result(report, name):
 
 
 def assert_private_output(text):
-    for secret in (SERVICE, ANON, TOKEN, "Synthetic title", "synthetic note", "Synthetic test", "documents/", uid(1)):
+    for secret in (SERVICE, ANON, TOKEN, USER, "Synthetic title", "synthetic note", "Synthetic test", "documents/", uid(1)):
         assert secret not in text, secret
+
+
+def seed_manifest(tmp, docs, labs, files):
+    """The drill baseline: the manifest of the healthy synthetic store (written only from a PASS)."""
+    manifest = Path(tmp) / "drill-manifest.json"
+    code, text, _, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--write-manifest", str(manifest), url=LOCAL)
+    assert code == 0 and manifest.exists(), text
+    return manifest
 
 
 # ---------------------------------------------------------------- healthy store, counts only
@@ -220,13 +263,17 @@ def test_healthy_store_passes_with_counts_only():
     assert report["counts"]["documents"] == 4 and report["counts"]["documents_ready"] == 3
     assert report["counts"]["files"] == 3 and report["counts"]["lab_results_linked"] == 1
     assert report["backups"]["state"] == "read" and report["backups"]["completed_backups"] == 7
-    assert result(report, "public_url_refused")["result"] == "pass"
+    for name in ("public_url_refused", "files_stored", "stored_sizes_match", "anon_tables_refused",
+                 "authenticated_tables_refused", "authenticated_files_hidden"):
+        assert result(report, name)["result"] == "pass", name
     assert_private_output(text)
     # only ids, paths, sizes, types and states are ever requested
     assert server.selects and all(not any(c in sel.split(",") for c in TEXT_COLUMNS) for _, sel in server.selects)
     assert ("medical_documents", rc.DOC_SELECT) in server.selects and ("lab_results", rc.LAB_SELECT) in server.selects
-    # read-only: nothing but GET / list / sign-free reads on production
-    assert all(m == "GET" or p.endswith(f"/object/list/{rc.BUCKET}") for m, _, p in server.calls), server.calls
+    # read-only, and no file is downloaded on production: GET, HEAD (headers only) and list calls
+    assert all(m in ("GET", "HEAD") or p.endswith(f"/object/list/{rc.BUCKET}") for m, _, p in server.calls), server.calls
+    assert sum(1 for m, _, _ in server.calls if m == "HEAD") == 3  # one per ready document, removed ones included
+    assert not any(m == "GET" and p.startswith(f"/storage/v1/object/{rc.BUCKET}/") for m, _, p in server.calls)
 
 
 def test_human_output_is_counts_only_too():
@@ -250,6 +297,17 @@ def test_restore_that_lost_a_file_fails():
     code, text, report, _ = run(FakeServer(docs, labs, files))
     assert code == 1 and report["status"] == "fail"
     assert result(report, "ready_documents_have_file") == {"name": "ready_documents_have_file", "result": "fail", "count": 1}
+    assert result(report, "files_stored")["result"] == "fail"
+    assert_private_output(text)
+
+
+def test_list_entry_whose_bytes_are_gone_fails():
+    # a database restore brings storage.objects rows back without the bytes: the listing alone looks fine
+    docs, labs, files = healthy()
+    code, text, report, _ = run(FakeServer(docs, labs, files, lost_bytes={f"documents/{uid(1)}"}))
+    assert code == 1 and report["status"] == "fail"
+    assert result(report, "ready_documents_have_file")["result"] == "pass"
+    assert result(report, "files_stored") == {"name": "files_stored", "result": "fail", "count": 1}
     assert_private_output(text)
 
 
@@ -266,6 +324,7 @@ def test_size_and_type_mismatches_fail():
     _, _, report, _ = run(FakeServer(docs, labs, files))
     assert result(report, "file_sizes_match")["result"] == "fail"
     assert result(report, "file_types_match")["result"] == "fail"
+    assert result(report, "stored_sizes_match")["result"] == "fail"
 
 
 def test_lab_result_pointing_at_a_missing_document_fails():
@@ -308,12 +367,63 @@ def test_public_bucket_and_anon_access_fail():
     assert_private_output(text)
 
 
+def test_signed_in_user_reaching_a_table_or_a_file_fails():
+    # another account (the authenticated role) must not read medical rows or files either
+    docs, labs, files = healthy()
+    code, text, report, _ = run(FakeServer(docs, labs, files, user_table=True, user_list=True))
+    assert code == 1
+    assert result(report, "authenticated_tables_refused") == {"name": "authenticated_tables_refused", "result": "fail",
+                                                              "count": 2}
+    assert result(report, "authenticated_files_hidden")["result"] == "fail"
+    assert result(report, "anon_tables_refused")["result"] == "pass"
+    assert_private_output(text)
+
+
 def test_missing_anon_key_is_incomplete_not_pass():
     docs, labs, files = healthy()
     code, _, report, _ = run(FakeServer(docs, labs, files), anon=None)
     assert code == 2 and report["status"] == "incomplete"
     assert result(report, "anon_tables_refused")["result"] == "unknown"
+    assert result(report, "authenticated_tables_refused")["result"] == "unknown"
     assert any(u["stage"] == "anon" and "anon" in u["ask"] for u in report["incomplete"])
+
+
+def test_invalid_anon_key_is_incomplete_not_a_privacy_pass():
+    # a stale, rotated or disabled key is refused by the gateway: that refusal proves nothing about grants
+    docs, labs, files = healthy()
+    code, text, report, _ = run(FakeServer(docs, labs, files), anon="anon-key-STALE")
+    assert code == 2 and report["status"] == "incomplete", text
+    for name in ("anon_tables_refused", "anon_files_hidden", "public_url_refused",
+                 "authenticated_tables_refused", "authenticated_files_hidden"):
+        assert result(report, name)["result"] == "unknown", name
+    ask = next(u for u in report["incomplete"] if u["stage"] == "anon")
+    assert "401" in ask["reason"] and ask["ask"] == rc.ACCESS_ASK["anon"]
+    assert "anon-key-STALE" not in text
+
+
+def test_probe_without_a_permission_refusal_is_unknown():
+    docs, labs, files = healthy()
+    # PostgREST refused for another reason (an invalid JWT), not for missing grants
+    code, _, report, _ = run(FakeServer(docs, labs, files, anon_table_answer=(401, b'{"code":"PGRST301"}')))
+    assert code == 2 and result(report, "anon_tables_refused")["result"] == "unknown"
+    assert any(u["stage"] == "anon" and "without a permission refusal" in u["reason"] for u in report["incomplete"])
+    # a listing that is not a list, and a listing refused for a credential problem
+    for answer in ((200, b'{"not":"a list"}'), (200, b"<html>"), (400, b'{"error":"InvalidJWT","message":"invalid signature"}')):
+        code, _, report, _ = run(FakeServer(docs, labs, files, anon_list_answer=answer))
+        assert code == 2 and result(report, "anon_files_hidden")["result"] == "unknown", answer
+
+
+def test_missing_or_invalid_user_token_is_an_access_ask():
+    docs, labs, files = healthy()
+    code, _, report, _ = run(FakeServer(docs, labs, files), user=None)
+    assert code == 2 and report["status"] == "incomplete"
+    assert result(report, "authenticated_tables_refused")["result"] == "unknown"
+    ask = next(u for u in report["incomplete"] if u["stage"] == "authenticated")
+    assert "SUPABASE_USER_ACCESS_TOKEN" in ask["ask"]
+    code, text, report, _ = run(FakeServer(docs, labs, files), user="user-token-EXPIRED")
+    assert code == 2 and result(report, "authenticated_files_hidden")["result"] == "unknown"
+    assert next(u for u in report["incomplete"] if u["stage"] == "authenticated")["ask"] == rc.ACCESS_ASK["authenticated"]
+    assert "user-token-EXPIRED" not in text
 
 
 # ---------------------------------------------------------------- retry and access
@@ -335,6 +445,7 @@ def test_read_that_keeps_failing_is_incomplete_never_pass():
     assert sleeps == [1.0, 2.0]
     assert any(u["stage"] == "documents" and "HTTP 503" in u["reason"] for u in report["incomplete"])
     assert result(report, "ready_documents_have_file")["result"] == "unknown"
+    assert result(report, "files_stored")["result"] == "unknown"
     assert_private_output(text)
 
 
@@ -398,19 +509,27 @@ def test_backup_summary_keeps_dates_and_counts_only():
     assert rc.summarize_backups(["not", "a", "dict"], NOW) == {"state": "unreadable"}
 
 
-def test_skip_backups_is_explicit_in_the_report():
+def test_skip_backups_is_explicit_in_the_report_on_a_drill_target():
     docs, labs, files = healthy()
     server = FakeServer(docs, labs, files)
-    code, _, report, _ = run(server, "--skip-backups", token=None)
+    code, _, report, _ = run(server, "--skip-backups", token=None, url=LOCAL)
     assert code == 0 and result(report, "database_backup_recent")["result"] == "skip"
     assert server.calls and not any(h == "api.supabase.com" for _, h, _ in server.calls)
+
+
+def test_skip_backups_is_refused_on_production():
+    # a production report must never read PASS without backup evidence
+    server = FakeServer(*healthy())
+    code, text, _, _ = run(server, "--skip-backups", token=None)
+    assert code == 2 and text.startswith("refused:") and "SUPABASE_ACCESS_TOKEN" in text
+    assert server.calls == [], "refused before any request"
 
 
 # ---------------------------------------------------------------- the drill: never on production
 
 def test_production_is_never_a_drill_target():
     server = FakeServer(*healthy())
-    for args in (["--open-files"], ["--write-manifest", "m.json"],
+    for args in (["--open-files"], ["--write-manifest", "m.json"], ["--skip-backups"],
                  ["--open-files", "--drill-project", rc.PRODUCTION_REF]):
         code, text, _, _ = run(server, *args)
         assert code == 2 and text.startswith("refused:"), args
@@ -434,12 +553,15 @@ def test_production_is_never_a_drill_target():
 def test_drill_wipe_is_detected_and_full_restore_passes():
     docs, labs, files = healthy()
     with tempfile.TemporaryDirectory() as tmp:
-        manifest = Path(tmp) / "drill-manifest.json"
         # 1. seed: the manifest of the synthetic store
-        code, _, report, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--write-manifest", str(manifest), url=LOCAL)
-        assert code == 0, report
-        m = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest = seed_manifest(tmp, docs, labs, files)
+        raw = manifest.read_text(encoding="utf-8")
+        m = json.loads(raw)
         assert m["version"] == 1 and m["documents"] == 4 and m["labs"] == 2 and len(m["objects"]) == 3
+        assert len(m["document_rows"]) == 4 and len(m["lab_rows"]) == 2 and m["lab_results_linked"] == 1
+        assert all(set(v) == {"storage_path", "size_bytes", "mime_type", "status", "removed"}
+                   for v in m["document_rows"].values())
+        assert "Synthetic title" not in raw and "Synthetic test" not in raw  # never a text column
         # 2. after the wipe, only the schema is back: everything is missing
         code, _, report, _ = run(FakeServer([], [], {}), "--skip-backups", "--manifest", str(manifest), "--open-files", url=LOCAL)
         assert code == 1
@@ -450,16 +572,44 @@ def test_drill_wipe_is_detected_and_full_restore_passes():
                                     "--open-files", url=LOCAL)
         assert code == 0, text
         for name in ("files_open", "manifest_hashes_match", "manifest_sizes_match", "signed_link_serves_file",
-                     "bucket_private", "anon_tables_refused", "lab_links_resolve"):
+                     "bucket_private", "anon_tables_refused", "authenticated_tables_refused", "files_stored",
+                     "lab_links_resolve", "manifest_document_state_match", "manifest_lab_links_match"):
             assert result(report, name)["result"] == "pass", name
         assert_private_output(text)
+
+
+def test_restore_that_cleared_or_moved_a_lab_link_fails():
+    docs, labs, files = healthy()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = seed_manifest(tmp, docs, labs, files)
+        # the link nulled, then the link pointing at another (existing) document: both still "resolve"
+        for restored in ([lab(1, None), lab(2)], [lab(1, uid(2)), lab(2)]):
+            code, text, report, _ = run(FakeServer(docs, restored, files), "--skip-backups", "--manifest",
+                                        str(manifest), url=LOCAL)
+            assert code == 1, text
+            assert result(report, "manifest_lab_links_match") == {"name": "manifest_lab_links_match", "result": "fail",
+                                                                  "count": 1}
+            assert result(report, "lab_links_resolve")["result"] == "pass"
+            assert result(report, "manifest_lab_rows")["result"] == "pass"
+
+
+def test_restore_that_revived_a_removed_document_fails():
+    docs, labs, files = healthy()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = seed_manifest(tmp, docs, labs, files)
+        revived = [doc(1), doc(2, "image/png", PNG), doc(3, status="pending"), doc(4)]  # removed_at lost
+        code, text, report, _ = run(FakeServer(revived, labs, files), "--skip-backups", "--manifest", str(manifest),
+                                    url=LOCAL)
+        assert code == 1, text
+        assert result(report, "manifest_document_state_match") == {"name": "manifest_document_state_match",
+                                                                   "result": "fail", "count": 1}
+        assert result(report, "manifest_document_rows")["result"] == "pass"
 
 
 def test_drill_catches_corrupted_and_truncated_restores():
     docs, labs, files = healthy()
     with tempfile.TemporaryDirectory() as tmp:
-        manifest = Path(tmp) / "m.json"
-        run(FakeServer(docs, labs, files), "--skip-backups", "--write-manifest", str(manifest), url=LOCAL)
+        manifest = seed_manifest(tmp, docs, labs, files)
         flipped = bytearray(PDF)
         flipped[20] ^= 0x01  # same size, different bytes: only the hash can tell
         bad = dict(files)
@@ -494,18 +644,42 @@ def test_manifest_is_not_written_from_an_incomplete_read():
         assert code == 2 and "refused" in text and not manifest.exists()
 
 
+def test_manifest_is_not_written_from_a_failing_baseline():
+    # a broken state must never become the reference a restore is judged against
+    docs, labs, files = healthy()
+    files[f"documents/{uid(1)}"] = ("application/pdf", PDF + b"x")  # the file's size no longer matches its row
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = Path(tmp) / "m.json"
+        code, text, _, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--write-manifest", str(manifest), url=LOCAL)
+        assert code == 1 and "refused" in text and not manifest.exists()
+
+
 # ---------------------------------------------------------------- files and paging
 
-def test_opens_as_checks_header_and_end():
-    assert rc.opens_as("application/pdf", PDF) and rc.opens_as("image/png", PNG)
+def test_opens_as_checks_the_structure_not_just_the_ends():
+    assert rc.opens_as("application/pdf", PDF) and rc.opens_as("image/png", PNG) and rc.opens_as("image/jpeg", JPEG)
+    # truncated, swapped, or only the start and end markers of the format
     assert not rc.opens_as("application/pdf", PDF[: len(PDF) // 2])
     assert not rc.opens_as("application/pdf", PNG) and not rc.opens_as("image/png", PDF)
-    assert rc.opens_as("image/jpeg", b"\xff\xd8\xff\xe0" + b"\x00" * 40 + b"\xff\xd9")
-    assert not rc.opens_as("image/jpeg", b"\xff\xd8\xff\xe0" + b"\x00" * 200)
-    webp = b"RIFF" + (12).to_bytes(4, "little") + b"WEBP" + b"VP8 "
+    assert not rc.opens_as("application/pdf", b"%PDF-junk%%EOF")
+    assert not rc.opens_as("application/pdf", b"%PDF-1.4\nstartxref\n9\n%%EOF\n")
+    assert not rc.opens_as("application/pdf", PDF[:9] + b" " + PDF[9:])  # every offset now points one byte early
+    assert not rc.opens_as("image/png", PNG[:-12])  # no IEND chunk
+    bad_crc = bytearray(PNG)
+    bad_crc[-20] ^= 0x01  # inside the pixel data: its chunk CRC no longer matches
+    assert not rc.opens_as("image/png", bytes(bad_crc))
+    assert not rc.opens_as("image/png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 20 + b"IEND\xaeB`\x82")
+    assert not rc.opens_as("image/jpeg", JPEG[:-2])  # no end-of-image marker
+    assert not rc.opens_as("image/jpeg", b"\xff\xd8\xff\xe0" + b"\x00" * 40 + b"\xff\xd9")
+    chunk = b"VP8L" + (5).to_bytes(4, "little") + b"\x2f\x00\x00\x00\x00" + b"\x00"  # odd size: one pad byte
+    payload = b"WEBP" + chunk
+    webp = b"RIFF" + len(payload).to_bytes(4, "little") + payload
     assert rc.opens_as("image/webp", webp) and not rc.opens_as("image/webp", webp + b"extra")
-    assert rc.opens_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12)
-    assert not rc.opens_as("image/heif", b"\x00\x00\x00\x18ftypisom" + b"\x00" * 12)
+    assert not rc.opens_as("image/webp", b"RIFF" + (8).to_bytes(4, "little") + b"WEBPVP8 ")  # a chunk with no size
+    meta = b"\x00\x00\x00\x0cmeta" + b"\x00" * 4
+    assert rc.opens_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12 + meta)
+    assert not rc.opens_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12)  # no meta box
+    assert not rc.opens_as("image/heif", b"\x00\x00\x00\x18ftypisom" + b"\x00" * 12 + meta)
     assert not rc.opens_as("application/pdf", b"") and not rc.opens_as("text/html", b"<html>")
 
 
@@ -515,7 +689,7 @@ def test_every_row_is_read_past_the_1000_row_cap():
     server = FakeServer(docs, labs, files)
     _, _, report, _ = run(server)
     assert report["counts"]["lab_results"] == rc.PAGE + 1
-    assert sum(1 for t, _ in server.selects if t == "lab_results") == 2  # service reads (the anon probe is separate)
+    assert sum(1 for t, _ in server.selects if t == "lab_results") == 2  # service reads (the role probes are separate)
 
 
 def test_write_synthetic_files_are_valid_and_made_up():

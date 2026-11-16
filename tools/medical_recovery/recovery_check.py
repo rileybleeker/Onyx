@@ -5,10 +5,14 @@ value, id or storage path, and never sends anything to a model. It answers three
 docs/medical-records-recovery.md:
 
   1. Do the metadata relationships hold?  Every confirmed document (status 'ready', removed or not:
-     removal is soft and keeps the file for Undo) has its file in the bucket with the size and type
-     its row declares; every lab result's document_id resolves; no file sits outside documents/.
+     removal is soft and keeps the file for Undo) has its file in the bucket listing AND in the
+     storage backend (a HEAD request: headers only, no bytes are sent) with the size and type its row
+     declares; every lab result's document_id resolves; no file sits outside documents/.
   2. Is it still private?  The bucket is private with the 25 MB cap and the type list; the anon key
-     reaches neither table, lists no file and the public URL of a file is refused.
+     and a signed-in user's token each reach neither table and list no file, and the public URL of a
+     file is refused. A refusal counts only when it is a real permission answer (PostgREST code 42501
+     or PGRST106) after the key itself was accepted: a stale or invalid key is "incomplete", never a
+     pass.
   3. Is there a recent database backup?  Supabase's Management API backup list (needs a personal
      access token in SUPABASE_ACCESS_TOKEN; the Supabase MCP has no backup tool). Storage files are
      NOT in those backups (Supabase docs), which is why the doc's off-site plan exists.
@@ -16,8 +20,9 @@ docs/medical-records-recovery.md:
 On a DRILL target only (a local Supabase stack on localhost / 127.0.0.1, or a throwaway hosted
 project named with --drill-project, never the production project) it can also open every file
 (download into memory, SHA-256, "does it parse as its declared type", and one file fetched through a
-60-second signed link, the app's own viewing path) and write or compare a manifest of sizes and
-hashes. On production those options are refused: real records are never downloaded by this tool.
+60-second signed link, the app's own viewing path) and write or compare a manifest of every file's
+size and hash, every document's path / size / type / state and every lab result's document link.
+On production those options are refused: real records are never downloaded by this tool.
 A missing key, a refused read (401 / 403) or a read that keeps failing is reported as "incomplete"
 with the exact access to ask for, never as a pass.
 
@@ -27,7 +32,8 @@ Usage (from the repo root):
   python tools/medical_recovery/recovery_check.py --skip-backups --url http://127.0.0.1:54321 \
       --open-files --manifest drill-manifest.json                    # the recovery drill
 Keys: SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret; SUPABASE_ANON_KEY (or
-NEXT_PUBLIC_SUPABASE_ANON_KEY); SUPABASE_ACCESS_TOKEN for the backup list. Keys are never printed.
+NEXT_PUBLIC_SUPABASE_ANON_KEY); SUPABASE_USER_ACCESS_TOKEN (a signed-in user's short-lived access
+token) for the signed-in-user probe; SUPABASE_ACCESS_TOKEN for the backup list. Keys are never printed.
 Exit status: 0 pass, 1 a check failed, 2 incomplete (something could not be checked).
 Standard library only. Tests: tests/test_medical_recovery_check.py (synthetic, no network).
 """
@@ -35,14 +41,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
+import struct
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +77,9 @@ PRODUCTION_REF = "fewweioupmsnbccqtxdl"
 DEFAULT_KEY_FILE = Path.home() / ".onyx_supabase_secret"
 MANAGEMENT_API = "https://api.supabase.com"
 MANIFEST_VERSION = 1
+# PostgREST's answers that mean "this role may not read it" (permission denied; schema not exposed
+# to the request). Anything else (an invalid JWT, a missing table, a gateway error) proves nothing.
+REFUSAL_CODES = frozenset({"42501", "PGRST106"})
 
 # What to ask for when a read is refused or a key is missing, per stage.
 ACCESS_ASK = {
@@ -75,7 +87,10 @@ ACCESS_ASK = {
     "labs": "service-role key able to read pds.lab_results",
     "bucket": "service-role key able to read the storage bucket settings of medical-records",
     "objects": "service-role key able to list the medical-records bucket",
-    "anon": "the project's anon / publishable key in SUPABASE_ANON_KEY (public; it ships in the site's JS)",
+    "head": "service-role key able to read object headers in medical-records (HEAD: no bytes are sent)",
+    "anon": "the project's current anon / publishable key in SUPABASE_ANON_KEY (public; it ships in the site's JS)",
+    "authenticated": "a signed-in user's access token in SUPABASE_USER_ACCESS_TOKEN (it expires within an hour; "
+                     "on production Riley's own sign-in, on the drill stack a made-up user's), with the anon key set",
     "backups": "a Supabase personal access token in SUPABASE_ACCESS_TOKEN (dashboard > Account > Access Tokens), "
                "or the dates on Dashboard > Database > Backups",
     "download": "service-role key able to download from the drill bucket",
@@ -95,40 +110,47 @@ class TransportError(Exception):
     pass
 
 
-# (method, url, headers, body, read_body) -> (status, body bytes)
-Transport = Callable[[str, str, dict, Optional[bytes], bool], "tuple[int, bytes]"]
+# (method, url, headers, body, read_body) -> (status, body bytes[, response headers lower-cased])
+Transport = Callable[[str, str, dict, Optional[bytes], bool], tuple]
 
 
-def urllib_transport(method: str, url: str, headers: dict, body: Optional[bytes], read_body: bool = True) -> tuple[int, bytes]:
+def urllib_transport(method: str, url: str, headers: dict, body: Optional[bytes],
+                     read_body: bool = True) -> tuple[int, bytes, dict]:
     # A generic client name: some API front ends refuse urllib's default User-Agent.
-    req = urllib.request.Request(url, data=body, method=method,
-                                 headers={"User-Agent": "onyx-recovery-check/1", **headers})
     try:
+        req = urllib.request.Request(url, data=body, method=method,
+                                     headers={"User-Agent": "onyx-recovery-check/1", **headers})
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.status, (resp.read() if read_body else b"")
+            data = resp.read() if read_body and method != "HEAD" else b""
+            return resp.status, data, {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as e:
         try:
-            data = e.read() if read_body else b""
-        except OSError:
+            data = e.read() if read_body and method != "HEAD" else b""
+        except (OSError, http.client.HTTPException):
             data = b""
-        return e.code, data
-    except (urllib.error.URLError, OSError) as e:
+        return e.code, data, {k.lower(): v for k, v in (e.headers or {}).items()}
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+        # a refused connection, a truncated or dropped answer, a malformed URL: never a traceback
         raise TransportError(type(getattr(e, "reason", e)).__name__) from None
 
 
 def request(transport: Transport, stage: str, method: str, url: str, headers: dict,
             body: Optional[bytes] = None, *, read_body: bool = True, attempts: int = 3,
-            sleep: Callable[[float], None] = time.sleep) -> tuple[int, bytes]:
+            sleep: Callable[[float], None] = time.sleep, want_headers: bool = False) -> tuple:
     """One HTTP call with retries for network errors, 429 and 5xx (1 s, 2 s backoff). Answers the last
-    status; raises Unreadable when every attempt hit a network error or a 5xx / 429."""
+    (status, body) (plus the response headers with want_headers); raises Unreadable when every attempt
+    hit a network error or a 5xx / 429."""
     last = "network"
     for attempt in range(1, attempts + 1):
         try:
-            status, data = transport(method, url, headers, body, read_body)
+            answer = transport(method, url, headers, body, read_body)
         except TransportError:
             last = "network"
         else:
+            status, data = answer[0], answer[1]
             if status != 429 and status < 500:
+                if want_headers:
+                    return status, data, (answer[2] if len(answer) > 2 else {}) or {}
                 return status, data
             last = f"HTTP {status}"
         if attempt < attempts:
@@ -141,6 +163,14 @@ def _json(stage: str, data: bytes):
         return json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise Unreadable(stage, "answer was not JSON") from None
+
+
+def _error_body(data: bytes) -> dict:
+    try:
+        got = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def _ok(stage: str, status: int) -> None:
@@ -211,45 +241,86 @@ class Target:
             raise Unreadable("bucket", "answer was not an object")
         return got
 
-    def list_objects(self, prefix: str, key: Optional[str] = None, stage: str = "objects") -> list[dict]:
+    def list_objects(self, prefix: str) -> list[dict]:
         out: list[dict] = []
         while True:
             body = json.dumps({"prefix": prefix, "limit": PAGE, "offset": len(out),
                                "sortBy": {"column": "name", "order": "asc"}}).encode("utf-8")
-            status, data = request(self.transport, stage, "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
-                                   self._h(key, **{"Content-Type": "application/json"}), body, sleep=self.sleep)
-            _ok(stage, status)
-            page = _json(stage, data)
+            status, data = request(self.transport, "objects", "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
+                                   self._h(**{"Content-Type": "application/json"}), body, sleep=self.sleep)
+            _ok("objects", status)
+            page = _json("objects", data)
             if not isinstance(page, list):
-                raise Unreadable(stage, "answer was not a list")
+                raise Unreadable("objects", "answer was not a list")
             out.extend(page)
             if len(page) < PAGE:
                 return out
             if len(out) >= MAX_ROWS:
-                raise Unreadable(stage, f"more than {MAX_ROWS} files")
+                raise Unreadable("objects", f"more than {MAX_ROWS} files")
 
-    def anon_reaches_table(self, anon_key: str, table: str) -> bool:
-        status, _ = request(self.transport, "anon", "GET", f"{self.url}/rest/v1/{table}?select=id&limit=1",
-                            self._h(anon_key, **{"Accept-Profile": "pds"}), read_body=False, sleep=self.sleep)
-        return 200 <= status < 300
+    def stored(self, path: str) -> dict:
+        """Whether the storage backend holds the object's bytes, from a HEAD request (headers only: no
+        bytes are sent, so this runs on production too). A list entry can survive a database restore
+        while the bytes are gone; this is what tells the two apart. {"present", "size"}."""
+        quoted = urllib.parse.quote(path)
+        status, _, headers = request(self.transport, "head", "HEAD", f"{self.url}/storage/v1/object/{BUCKET}/{quoted}",
+                                     self._h(), read_body=False, sleep=self.sleep, want_headers=True)
+        if 200 <= status < 300:
+            length = headers.get("content-length")
+            return {"present": True, "size": int(length) if str(length or "").isdigit() else None}
+        if status in (400, 404):  # what Storage answers for an object it cannot find
+            return {"present": False, "size": None}
+        if status in (401, 403):
+            raise Unreadable("head", f"HTTP {status} (access refused)", denied=True)
+        raise Unreadable("head", f"HTTP {status}")
 
-    def anon_list_count(self, anon_key: str) -> int:
-        body = json.dumps({"prefix": "documents", "limit": 1, "offset": 0}).encode("utf-8")
-        status, data = request(self.transport, "anon", "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
-                               self._h(anon_key, **{"Content-Type": "application/json"}), body, sleep=self.sleep)
+    # -- role probes: what the anon key, or a signed-in user's token, can reach
+    def key_accepted(self, stage: str, apikey: str, bearer: str, check_path: str) -> None:
+        """A positive control before any refusal is believed: the key (or the user's token) must be
+        accepted by a read that every valid key may make. A stale, rotated or disabled key is refused
+        here, so its later refusals are never counted as privacy."""
+        status, _ = request(self.transport, stage, "GET", f"{self.url}{check_path}",
+                            {"apikey": apikey, "Authorization": f"Bearer {bearer}"}, read_body=False,
+                            sleep=self.sleep)
         if not 200 <= status < 300:
-            return 0
-        try:
-            got = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            return 0
-        return len([o for o in got if isinstance(o, dict) and o.get("id")]) if isinstance(got, list) else 0
+            raise Unreadable(stage, f"HTTP {status} from the key check (the key was not accepted)",
+                             denied=status in (401, 403))
+
+    def role_reaches_table(self, stage: str, apikey: str, bearer: str, table: str) -> bool:
+        status, data = request(self.transport, stage, "GET", f"{self.url}/rest/v1/{table}?select=id&limit=1",
+                               {"apikey": apikey, "Authorization": f"Bearer {bearer}", "Accept-Profile": "pds"},
+                               sleep=self.sleep)
+        if 200 <= status < 300:
+            return True
+        if status in (401, 403, 404, 406) and str(_error_body(data).get("code")) in REFUSAL_CODES:
+            return False
+        raise Unreadable(stage, f"table probe answered HTTP {status} without a permission refusal")
+
+    def role_list_count(self, stage: str, apikey: str, bearer: str) -> int:
+        body = json.dumps({"prefix": "documents", "limit": 1, "offset": 0}).encode("utf-8")
+        status, data = request(self.transport, stage, "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
+                               {"apikey": apikey, "Authorization": f"Bearer {bearer}",
+                                "Content-Type": "application/json"}, body, sleep=self.sleep)
+        if 200 <= status < 300:
+            got = _json(stage, data)
+            if not isinstance(got, list):
+                raise Unreadable(stage, "file listing answer was not a list")
+            return len([o for o in got if isinstance(o, dict) and o.get("id")])
+        err = _error_body(data)
+        said = " ".join(str(err.get(k) or "") for k in ("error", "message")).lower()
+        if status in (400, 403, 404) and not any(w in said for w in ("jwt", "signature", "token", "apikey", "api key")):
+            return 0  # refused (no policy on storage.objects), not a credential problem
+        raise Unreadable(stage, f"file listing answered HTTP {status}")
 
     def public_url_served(self, path: str) -> bool:
         quoted = urllib.parse.quote(path)
         status, _ = request(self.transport, "anon", "GET", f"{self.url}/storage/v1/object/public/{BUCKET}/{quoted}",
                             {}, read_body=False, sleep=self.sleep)
-        return 200 <= status < 300
+        if 200 <= status < 300:
+            return True
+        if status in (400, 401, 403, 404):
+            return False
+        raise Unreadable("anon", f"public URL probe answered HTTP {status}")
 
     def download(self, path: str) -> bytes:
         if not self.drill:
@@ -282,9 +353,6 @@ class Target:
 # ---------------------------------------------------------------- file checks (pure)
 def synthetic_files() -> dict[str, tuple[str, bytes]]:
     """Two made-up, valid files for the drill: a one-page PDF and a 1x1 PNG. No real content."""
-    import struct
-    import zlib
-
     objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>"]
     pdf = bytearray(b"%PDF-1.4\n% SYNTHETIC RECOVERY DRILL DOCUMENT\n")
@@ -307,25 +375,182 @@ def synthetic_files() -> dict[str, tuple[str, bytes]]:
 
 
 _HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1", b"heif"}
+_PDF_OBJ = re.compile(rb"(\d+)\s+(\d+)\s+obj")
+_PDF_SUB = re.compile(rb"\s*(\d+)\s+(\d+)[ \t]*\r?\n?")
+_PDF_ENTRY = re.compile(rb"(\d{10}) (\d{5}) ([nf])[ \r\n]{1,2}")
+_PDF_TRAILER = re.compile(rb"\s*trailer\s*<<(.*?)>>", re.S)
+_PDF_TAIL = re.compile(rb"startxref\s+(\d+)\s+%%EOF\s*$")
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
+def _pdf_ok(data: bytes) -> bool:
+    """Header, a startxref that points at a cross-reference table (or stream), every in-use table entry
+    pointing at its own "N 0 obj", and a trailer with /Root. A structural parse, not a rendering."""
+    if not data.startswith(b"%PDF-"):
+        return False
+    at = data.rfind(b"startxref", max(0, len(data) - 1024))
+    tail = _PDF_TAIL.match(data, at) if at >= 0 else None
+    if not tail or int(tail.group(1)) >= at:
+        return False
+    off = int(tail.group(1))
+    if not data.startswith(b"xref", off):  # PDF 1.5+: a cross-reference stream object
+        return bool(_PDF_OBJ.match(data, off)) and b"/XRef" in data[off:off + 2048]
+    pos, entries = off + 4, 0
+    while True:
+        sub = _PDF_SUB.match(data, pos)
+        if not sub:
+            break
+        first, count = int(sub.group(1)), int(sub.group(2))
+        pos = sub.end()
+        for k in range(count):
+            e = _PDF_ENTRY.match(data, pos)
+            entries += 1
+            if not e or entries > 1_000_000:
+                return False
+            pos = e.end()
+            if e.group(3) == b"n":
+                obj = _PDF_OBJ.match(data, int(e.group(1)))
+                if not obj or int(obj.group(1)) != first + k:
+                    return False
+    trailer = _PDF_TRAILER.match(data, pos)
+    return bool(entries and trailer and trailer.end() <= at and b"/Root" in trailer.group(1))
+
+
+def _png_ok(data: bytes) -> bool:
+    """Every chunk's length and CRC, IHDR first and IEND last, and the pixel data inflating to exactly
+    the size the header declares."""
+    if not data.startswith(_PNG_SIG):
+        return False
+    pos, ihdr, idat, ended = 8, None, bytearray(), False
+    while pos + 12 <= len(data):
+        n = int.from_bytes(data[pos:pos + 4], "big")
+        kind, end = data[pos + 4:pos + 8], pos + 12 + n
+        if end > len(data):
+            return False
+        body = data[pos + 8:pos + 8 + n]
+        if zlib.crc32(kind + body) & 0xFFFFFFFF != int.from_bytes(data[end - 4:end], "big"):
+            return False
+        if ihdr is None and kind != b"IHDR":
+            return False
+        if kind == b"IHDR":
+            if n != 13:
+                return False
+            ihdr = body
+        elif kind == b"IDAT":
+            idat += body
+        pos = end
+        if kind == b"IEND":
+            ended = True
+            break
+    if not ended or pos != len(data) or ihdr is None or not idat:
+        return False
+    width, height = int.from_bytes(ihdr[0:4], "big"), int.from_bytes(ihdr[4:8], "big")
+    depth, channels, interlace = ihdr[8], {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ihdr[9]), ihdr[12]
+    if not channels or not width or not height or depth not in (1, 2, 4, 8, 16):
+        return False
+    expected = height * (1 + (width * channels * depth + 7) // 8)
+    cap = expected + 1 if interlace == 0 else 2 * expected + 64
+    if cap > 512 * 1024 * 1024:
+        return False
+    inflate = zlib.decompressobj()
+    try:
+        raw = inflate.decompress(bytes(idat), cap)
+    except zlib.error:
+        return False
+    return inflate.eof and (len(raw) == expected if interlace == 0 else len(raw) > 0)
+
+
+def _jpeg_ok(data: bytes) -> bool:
+    """The marker segments from start-of-image to start-of-scan (each with a sane length, a frame
+    header before the scan), then an end-of-image marker at the end."""
+    if not data.startswith(b"\xff\xd8"):
+        return False
+    pos, frame = 2, False
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            return False
+        marker = data[pos + 1]
+        if marker == 0xFF:  # fill byte
+            pos += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # markers without a length
+            pos += 2
+            continue
+        if marker in (0xD8, 0xD9):  # a second start, or the end before any scan
+            return False
+        size = int.from_bytes(data[pos + 2:pos + 4], "big")
+        if size < 2 or pos + 2 + size > len(data):
+            return False
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            frame = True
+        if marker == 0xDA:  # start of scan: entropy-coded data runs to the end-of-image marker
+            rest = data[pos + 2 + size:]
+            return frame and b"\xff\xd9" in rest[-64:]
+        pos += 2 + size
+    return False
+
+
+def _webp_ok(data: bytes) -> bool:
+    """The RIFF size, then every chunk inside it (padded to even), the first being an image chunk."""
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return False
+    if int.from_bytes(data[4:8], "little") + 8 != len(data):
+        return False
+    pos, first = 12, True
+    while pos < len(data):
+        if pos + 8 > len(data):
+            return False
+        kind, size = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+        if pos + 8 + size > len(data):
+            return False
+        if first:
+            if kind not in (b"VP8 ", b"VP8L", b"VP8X"):
+                return False
+            if kind == b"VP8 " and data[pos + 11:pos + 14] != b"\x9d\x01\x2a":
+                return False
+            if kind == b"VP8L" and (size < 1 or data[pos + 8] != 0x2F):
+                return False
+            first = False
+        pos += 8 + size + (size & 1)
+    return not first and pos == len(data)
+
+
+def _heif_ok(data: bytes) -> bool:
+    """Top-level boxes that add up to the file exactly: ftyp first with a HEIF brand, and a meta box."""
+    pos, brands, meta = 0, set(), False
+    while pos < len(data):
+        if pos + 8 > len(data):
+            return False
+        size, kind, head = int.from_bytes(data[pos:pos + 4], "big"), data[pos + 4:pos + 8], 8
+        if size == 1:
+            if pos + 16 > len(data):
+                return False
+            size, head = int.from_bytes(data[pos + 8:pos + 16], "big"), 16
+        elif size == 0:
+            size = len(data) - pos
+        if size < head or pos + size > len(data):
+            return False
+        if pos == 0:
+            body = data[pos + head:pos + size]
+            if kind != b"ftyp" or len(body) < 8:
+                return False
+            brands = {body[0:4]} | {body[i:i + 4] for i in range(8, len(body) - 3, 4)}
+        elif kind == b"meta":
+            meta = True
+        pos += size
+    return bool(brands & _HEIF_BRANDS) and meta
 
 
 def opens_as(mime: str, data: bytes) -> bool:
-    """Whether the bytes are a whole file of the declared type (header AND end marker where the format
-    has one), so a truncated or swapped file is caught."""
+    """Whether the bytes parse as a whole file of the declared type: the format's structure from start
+    to end (PDF cross-reference table, PNG chunks and pixel data, JPEG segments, WebP chunks, HEIF
+    boxes), so a truncated, swapped or merely look-alike file is caught. Not a rendering: the drill
+    adds a human opening one restored file (docs/medical-records-recovery.md, section 6)."""
     if not data:
         return False
-    if mime == "application/pdf":
-        return data.startswith(b"%PDF-") and b"%%EOF" in data[-1024:]
-    if mime == "image/png":
-        return data.startswith(b"\x89PNG\r\n\x1a\n") and b"IEND" in data[-16:]
-    if mime == "image/jpeg":
-        return data.startswith(b"\xff\xd8\xff") and b"\xff\xd9" in data[-64:]
-    if mime == "image/webp":
-        return (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
-                and int.from_bytes(data[4:8], "little") + 8 == len(data))
-    if mime in ("image/heic", "image/heif"):
-        return len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in _HEIF_BRANDS
-    return False
+    checker = {"application/pdf": _pdf_ok, "image/png": _png_ok, "image/jpeg": _jpeg_ok,
+               "image/webp": _webp_ok, "image/heic": _heif_ok, "image/heif": _heif_ok}.get(mime)
+    return bool(checker and checker(data))
 
 
 # ---------------------------------------------------------------- evaluation (pure)
@@ -335,8 +560,10 @@ class Inventory:
     labs: list[dict] = field(default_factory=list)        # LAB_SELECT columns
     objects: dict[str, dict] = field(default_factory=dict)  # "documents/<id>" -> {"size", "type"}
     unexpected_paths: int = 0                              # files or folders outside documents/<id>
+    stored: Optional[dict] = None     # path -> {"present", "size"} from HEAD, for every ready document
     bucket: Optional[dict] = None
     anon: Optional[dict] = None       # {"tables_reached": n, "files_listed": n, "public_url_served": bool|None}
+    authenticated: Optional[dict] = None  # {"tables_reached": n, "files_listed": n} for a signed-in user
     opened: Optional[dict] = None     # path -> {"sha256": hex, "opens": bool} (drill target only)
     signed_ok: Optional[bool] = None  # one file fetched through a signed link matched its download
     manifest: Optional[dict] = None
@@ -349,6 +576,17 @@ def _check(name: str, result: str, count: Optional[int] = None) -> dict:
     if count is not None:
         out["count"] = count
     return out
+
+
+def doc_state(d: dict) -> dict:
+    """What a restore must bring back for one document row (no text column)."""
+    return {"storage_path": d.get("storage_path"), "size_bytes": d.get("size_bytes"), "mime_type": d.get("mime_type"),
+            "status": d.get("status"), "removed": bool(d.get("removed_at"))}
+
+
+def lab_state(r: dict) -> dict:
+    """What a restore must bring back for one lab result row: its document link and removal."""
+    return {"document_id": r.get("document_id") or None, "removed": bool(r.get("removed_at"))}
 
 
 def evaluate(inv: Inventory) -> dict:
@@ -378,10 +616,16 @@ def evaluate(inv: Inventory) -> dict:
         add("anon_files_hidden", int(inv.anon.get("files_listed", 0)))
         served = inv.anon.get("public_url_served")
         checks.append(_check("public_url_refused", "skip" if served is None else ("fail" if served else "pass")))
+    if inv.authenticated is None:
+        checks += [_check(n, "unknown") for n in ("authenticated_tables_refused", "authenticated_files_hidden")]
+    else:
+        add("authenticated_tables_refused", int(inv.authenticated.get("tables_reached", 0)))
+        add("authenticated_files_hidden", int(inv.authenticated.get("files_listed", 0)))
 
     # metadata relationships
     docs_ok = "documents" not in unread
     objs_ok = "objects" not in unread
+    labs_ok = "labs" not in unread
     doc_ids = {d.get("id") for d in inv.documents}
     paths = {d.get("storage_path") for d in inv.documents}
     ready = [d for d in inv.documents if d.get("status") == "ready"]
@@ -399,15 +643,25 @@ def evaluate(inv: Inventory) -> dict:
     add("ready_documents_have_file", missing, stage=both)
     add("file_sizes_match", size_bad, stage=both)
     add("file_types_match", type_bad, stage=both)
+    # the storage backend itself: a list entry can come back with the database while the bytes did not
+    if inv.stored is None or not docs_ok or "head" in unread:
+        checks += [_check(n, "unknown") for n in ("files_stored", "stored_sizes_match")]
+    else:
+        declared = {d.get("storage_path"): d.get("size_bytes") for d in ready}
+        present = {p: v for p, v in inv.stored.items() if v.get("present")}
+        add("files_stored", len(inv.stored) - len(present))
+        add("stored_sizes_match", sum(1 for p, v in present.items()
+                                      if v.get("size") is not None and v.get("size") != declared.get(p)),
+            stage="head_size" if any(v.get("size") is None for v in present.values()) else None)
     add("storage_paths_valid", sum(1 for d in inv.documents if not PATH_RE.match(str(d.get("storage_path") or ""))),
         stage="documents" if not docs_ok else None)
-    labs_ok = "labs" not in unread
+    link_stage = None if labs_ok and docs_ok else ("labs" if not labs_ok else "documents")
     dangling = sum(1 for r in inv.labs if r.get("document_id") and r.get("document_id") not in doc_ids)
-    add("lab_links_resolve", dangling, stage=None if labs_ok and docs_ok else ("labs" if not labs_ok else "documents"))
+    add("lab_links_resolve", dangling, stage=link_stage)
     by_id = {d.get("id"): d for d in inv.documents}
     unready_links = sum(1 for r in inv.labs if r.get("removed_at") is None and r.get("document_id") in by_id
                         and (by_id[r["document_id"]].get("status") != "ready" or by_id[r["document_id"]].get("removed_at")))
-    add("lab_links_live", unready_links, warn=True, stage=None if labs_ok and docs_ok else ("labs" if not labs_ok else "documents"))
+    add("lab_links_live", unready_links, warn=True, stage=link_stage)
     add("no_orphan_files", sum(1 for p in inv.objects if p not in paths), warn=True, stage=both)
     pending_with_file = sum(1 for d in inv.documents if d.get("status") == "pending" and d.get("storage_path") in inv.objects)
     add("uploads_confirmed", pending_with_file, warn=True, stage=both)
@@ -422,7 +676,7 @@ def evaluate(inv: Inventory) -> dict:
         elif inv.signed_ok is not None:
             checks.append(_check("signed_link_serves_file", "pass" if inv.signed_ok else "fail"))
 
-    # manifest (a backup's, or the drill's seed)
+    # manifest (a backup's, or the drill's seed): files, and every row's identity, state and link
     if inv.manifest is not None:
         m_objects = inv.manifest.get("objects") or {}
         add("manifest_files_present", sum(1 for p in m_objects if p not in inv.objects), stage=both)
@@ -433,10 +687,16 @@ def evaluate(inv: Inventory) -> dict:
         else:
             add("manifest_hashes_match", sum(1 for p, v in m_objects.items()
                                              if p in inv.opened and inv.opened[p].get("sha256") != v.get("sha256")))
-        add("manifest_document_rows", max(0, int(inv.manifest.get("documents", 0)) - len(inv.documents)),
-            stage="documents" if not docs_ok else None)
-        add("manifest_lab_rows", max(0, int(inv.manifest.get("labs", 0)) - len(inv.labs)),
-            stage="labs" if not labs_ok else None)
+        m_docs = inv.manifest.get("document_rows") or {}
+        m_labs = inv.manifest.get("lab_rows") or {}
+        labs_by_id = {r.get("id"): r for r in inv.labs}
+        doc_stage = "documents" if not docs_ok else None
+        add("manifest_document_rows", sum(1 for i in m_docs if i not in by_id), stage=doc_stage)
+        add("manifest_document_state_match", sum(1 for i, s in m_docs.items()
+                                                 if i in by_id and doc_state(by_id[i]) != s), stage=doc_stage)
+        add("manifest_lab_rows", sum(1 for i in m_labs if i not in labs_by_id), stage="labs" if not labs_ok else None)
+        add("manifest_lab_links_match", sum(1 for i, s in m_labs.items()
+                                            if i in labs_by_id and lab_state(labs_by_id[i]) != s), stage=link_stage)
         add("files_newer_than_manifest", sum(1 for p in inv.objects if p not in m_objects), warn=True, stage=both)
 
     # database backups
@@ -507,8 +767,15 @@ def summarize_backups(answer, now: datetime) -> dict:
 
 
 # ---------------------------------------------------------------- collection
+def _probe_role(target: Target, stage: str, apikey: str, bearer: str, check_path: str) -> dict:
+    target.key_accepted(stage, apikey, bearer, check_path)
+    return {"tables_reached": sum(1 for t in TABLES if target.role_reaches_table(stage, apikey, bearer, t)),
+            "files_listed": target.role_list_count(stage, apikey, bearer)}
+
+
 def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[str], skip_backups: bool,
-            open_files: bool, manifest: Optional[dict], now: Optional[datetime] = None) -> Inventory:
+            open_files: bool, manifest: Optional[dict], now: Optional[datetime] = None,
+            user_token: Optional[str] = None) -> Inventory:
     inv = Inventory(manifest=manifest)
     now = now or datetime.now(timezone.utc)
 
@@ -518,9 +785,11 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
             item["ask"] = ACCESS_ASK.get(err.stage, "access to " + err.stage)
         inv.unreadable.append(item)
 
+    docs_read = True
     try:
         inv.documents = target.rows("documents", "medical_documents", DOC_SELECT)
     except Unreadable as e:
+        docs_read = False
         note(e)
     try:
         inv.labs = target.rows("labs", "lab_results", LAB_SELECT)
@@ -549,18 +818,40 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
         note(e)
         inv.objects = {}
 
+    if docs_read:
+        stored: dict = {}
+        try:
+            for d in inv.documents:
+                path = d.get("storage_path")
+                if d.get("status") == "ready" and isinstance(path, str) and PATH_RE.match(path):
+                    stored[path] = target.stored(path)
+            inv.stored = stored
+            if any(v["present"] and v["size"] is None for v in stored.values()):
+                inv.unreadable.append({"stage": "head_size", "reason": "a HEAD answer had no content length"})
+        except Unreadable as e:
+            note(e)
+
+    sample = next(iter(sorted(inv.objects)), None)
     if anon_key:
         try:
-            sample = next(iter(sorted(inv.objects)), None)
-            inv.anon = {
-                "tables_reached": sum(1 for t in TABLES if target.anon_reaches_table(anon_key, t)),
-                "files_listed": target.anon_list_count(anon_key),
-                "public_url_served": target.public_url_served(sample) if sample else None,
-            }
+            anon = _probe_role(target, "anon", anon_key, anon_key, "/auth/v1/settings")
+            anon["public_url_served"] = target.public_url_served(sample) if sample else None
+            inv.anon = anon
         except Unreadable as e:
             note(e)
     else:
         inv.unreadable.append({"stage": "anon", "reason": "no anon key", "ask": ACCESS_ASK["anon"]})
+    if not user_token:
+        inv.unreadable.append({"stage": "authenticated", "reason": "no signed-in user token",
+                               "ask": ACCESS_ASK["authenticated"]})
+    elif not anon_key:
+        inv.unreadable.append({"stage": "authenticated", "reason": "the anon key is needed as the apikey",
+                               "ask": ACCESS_ASK["anon"]})
+    else:
+        try:
+            inv.authenticated = _probe_role(target, "authenticated", anon_key, user_token, "/auth/v1/user")
+        except Unreadable as e:
+            note(e)
 
     if open_files:
         inv.opened = {}
@@ -605,7 +896,9 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
 
 
 def build_manifest(inv: Inventory, now: datetime) -> dict:
-    """Sizes and hashes of every file plus the row counts: what a backup (or the drill's seed) holds."""
+    """What a backup (or the drill's seed) holds: every file's size and hash, every document's path /
+    size / type / state, every lab result's document link and removal, and the row counts. It holds
+    ids, so it is kept privately (drill folder, or encrypted with the off-site copy), never in the repo."""
     if inv.opened is None:
         raise ValueError("a manifest needs the files opened (local drill target only)")
     return {
@@ -613,14 +906,18 @@ def build_manifest(inv: Inventory, now: datetime) -> dict:
         "created_at": now.isoformat(timespec="seconds"),
         "documents": len(inv.documents),
         "labs": len(inv.labs),
+        "lab_results_linked": sum(1 for r in inv.labs if r.get("document_id")),
         "objects": {p: {"size": inv.objects[p].get("size"), "sha256": inv.opened[p]["sha256"]}
                     for p in sorted(inv.opened)},
+        "document_rows": {d.get("id"): doc_state(d) for d in inv.documents},
+        "lab_rows": {r.get("id"): lab_state(r) for r in inv.labs},
     }
 
 
 def load_manifest(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != MANIFEST_VERSION or not isinstance(data.get("objects"), dict):
+    if (not isinstance(data, dict) or data.get("version") != MANIFEST_VERSION
+            or not all(isinstance(data.get(k), dict) for k in ("objects", "document_rows", "lab_rows"))):
         raise ValueError("not a version-1 recovery manifest")
     return data
 
@@ -654,10 +951,11 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
     ap = argparse.ArgumentParser(description="Counts-only, read-only recovery check of /health/records.")
     ap.add_argument("--url", default=os.environ.get("SUPABASE_URL") or DEFAULT_URL)
     ap.add_argument("--key-file", type=Path, default=DEFAULT_KEY_FILE, help="service-role key file")
-    ap.add_argument("--skip-backups", action="store_true", help="do not read the backup list (drill target)")
+    ap.add_argument("--skip-backups", action="store_true", help="do not read the backup list (drill target only)")
     ap.add_argument("--open-files", action="store_true", help="download and open every file (drill target only)")
-    ap.add_argument("--manifest", type=Path, help="compare with this manifest (sizes, hashes, row counts)")
-    ap.add_argument("--write-manifest", type=Path, help="write the manifest of this target (drill target only)")
+    ap.add_argument("--manifest", type=Path, help="compare with this manifest (files, row states, lab links)")
+    ap.add_argument("--write-manifest", type=Path,
+                    help="write the manifest of this target (drill target only, and only after a PASS)")
     ap.add_argument("--drill-project", help="ref of a throwaway hosted project used as the drill target")
     ap.add_argument("--write-synthetic", type=Path, help="write the two made-up drill files to this folder and stop")
     ap.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -676,6 +974,11 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
               "throwaway project named with --drill-project); real records are never downloaded by this check",
               file=out)
         return 2
+    if args.skip_backups and not drill_allowed(args.url, args.drill_project):
+        print("refused: --skip-backups is for a drill target only; on production the backup list is part of the "
+              f"check (without SUPABASE_ACCESS_TOKEN it is reported as incomplete; ask for: {ACCESS_ASK['backups']})",
+              file=out)
+        return 2
     key = _read_key(("SUPABASE_SERVICE_ROLE_KEY",), args.key_file)
     if not key:
         print(f"incomplete: no service-role key; ask for: {ACCESS_ASK['documents']}", file=out)
@@ -691,15 +994,18 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
     target = Target(args.url, key, transport=transport, sleep=sleep, drill=drill)
     inv = collect(target, anon_key=_read_key(("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"), None),
                   access_token=os.environ.get("SUPABASE_ACCESS_TOKEN") or None, skip_backups=args.skip_backups,
-                  open_files=bool(args.open_files or args.write_manifest), manifest=manifest, now=now)
+                  open_files=drill, manifest=manifest, now=now,
+                  user_token=os.environ.get("SUPABASE_USER_ACCESS_TOKEN") or None)
     report = evaluate(inv)
-    if args.write_manifest:
-        if any(u["stage"] in ("documents", "labs", "objects", "download") for u in inv.unreadable):
-            print("refused: the manifest would be incomplete", file=out)
-            return 2
-        args.write_manifest.write_text(json.dumps(build_manifest(inv, now), indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2) if args.json else format_report(report), file=out)
-    return {"pass": 0, "fail": 1}.get(report["status"], 2)
+    code = {"pass": 0, "fail": 1}.get(report["status"], 2)
+    if args.write_manifest:
+        if report["status"] != "pass":
+            # a broken or partly read state must never become the reference a restore is judged against
+            print(f"refused: the baseline is {report['status']}, not PASS; no manifest written", file=out)
+            return code
+        args.write_manifest.write_text(json.dumps(build_manifest(inv, now), indent=2), encoding="utf-8")
+    return code
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ different recovery points.
 | Document details (`pds.medical_documents`) | Postgres | Yes | Database backup, or the off-site table snapshot (section 4) |
 | Lab results (`pds.lab_results`, `document_id` links to a document) | Postgres | Yes | Same, restored after the documents (the link is a foreign key) |
 | Original files (`medical-records` bucket) | Supabase Storage | **No** | Only from an off-site copy (section 4) |
-| The bucket's list of files (`storage.objects` rows) | Postgres | Yes, but only the list: the bytes are not in it | Comes back with the database, so a restore can list files whose bytes are gone |
+| The bucket's list of files (`storage.objects` rows) | Postgres | Yes, but only the list: the bytes are not in it | Comes back with the database, so a restore can list files whose bytes are gone (the check's HEAD request, section 7, tells the two apart) |
 | Bucket settings (private, 25 MB cap, six file types), RLS, grants | `sql/medical_records_schema.sql` in git | Not needed | Re-apply the SQL file |
 | Service-role key | Supabase project settings | Not needed | Re-issued in the dashboard after a project is rebuilt; update Vercel and the PC's key file |
 | Backup encryption key (section 4) | Offline, with Riley | Never stored online | Riley's password manager entry or the printed copy |
@@ -85,14 +85,18 @@ redone; a lost original usually cannot, which is why the files are the priority.
 
 - **Encryption before anything leaves the machine** with [`age`](https://age-encryption.org)
   (X25519 public-key encryption, open source, no service). Riley creates one key pair once. The
-  backup job is given only the public key, so it can encrypt but can never decrypt: a leaked job
-  credential cannot read the copies. The private key lives in Riley's password manager and on one
-  printed copy; never in the repo, never under OneDrive, never on a CI runner.
+  backup job is given only the public key, so it can encrypt but can never decrypt: a leaked
+  off-site storage credential (OneDrive, R2 or B2) cannot read the copies. The job's Supabase
+  service-role key stays exactly as sensitive as it is today, since it reads every original in
+  production directly. The private key lives in Riley's password manager and on one printed copy;
+  never in the repo, never under OneDrive, never on a CI runner.
 - **What each run copies**, in this order: (1) a snapshot of every column of both tables, as one
   encrypted JSON file; (2) every file whose `documents/<id>` is not in the copy yet, encrypted one
-  file per object and named only by the id (`<id>.age`); (3) an encrypted manifest of path, size,
-  SHA-256 and row counts (the format `recovery_check.py --manifest` reads). Taking the snapshot first
-  means every confirmed row in a snapshot has its file in the copy.
+  file per object and named only by the id (`<id>.age`); (3) an encrypted manifest (the format
+  `recovery_check.py --manifest` reads): each file's path, size and SHA-256, each document's path,
+  size, type, status and removed flag, each lab result's document link and removed flag, and the row
+  counts. It holds ids but no text column. Taking the snapshot first means every confirmed row in a
+  snapshot has its file in the copy.
 - **Retention**: files are kept indefinitely (the app never deletes a file, and Undo needs it; a
   permanent purge of a record would be a separate, manual decision). Table snapshots: one per day
   for 30 days, plus the first of each month for 12 months.
@@ -169,30 +173,63 @@ The commands below follow the Supabase CLI and Storage API docs; they have not b
    $lab = @{ id = [guid]::NewGuid().ToString(); test_name = "Synthetic drill test"; value_num = 1.5; collected_on = "2026-01-01"; document_id = $rows[0].id }
    Invoke-RestMethod -Method Post "$api/rest/v1/lab_results" -Headers $pdb -ContentType "application/json" -Body (ConvertTo-Json @($lab))
    ```
-5. **Baseline.** With `$env:SUPABASE_SERVICE_ROLE_KEY` and `$env:SUPABASE_ANON_KEY` set to the local
-   keys: `python tools\medical_recovery\recovery_check.py --url http://127.0.0.1:54321 --skip-backups --write-manifest "$d\manifest.json"`
-   must print PASS.
-6. **Back up** with the off-site job chosen in section 4, pointed at the local stack and a drill-only
+5. **A made-up signed-in user, then the baseline.** Set `$env:SUPABASE_SERVICE_ROLE_KEY` and
+   `$env:SUPABASE_ANON_KEY` to the local keys, and give the check a made-up user's token for the
+   signed-in-user probe (the local stack confirms sign-ups by itself; the token lasts an hour):
+   ```powershell
+   $anon = $env:SUPABASE_ANON_KEY
+   $s = Invoke-RestMethod -Method Post "$api/auth/v1/signup" -Headers @{ apikey = $anon } -ContentType "application/json" `
+        -Body (ConvertTo-Json @{ email = "drill-user@example.com"; password = [guid]::NewGuid().ToString() })
+   $env:SUPABASE_USER_ACCESS_TOKEN = $s.access_token
+   ```
+   Then `python tools\medical_recovery\recovery_check.py --url http://127.0.0.1:54321 --skip-backups --write-manifest "$d\manifest.json"`
+   must print PASS (the manifest is written only from a PASS, so a broken seed can never become the
+   reference).
+6. **Bytes-only loss.** This is what a database-only restore leaves: the file's row and list entry
+   are there, its bytes are not. It also confirms on a real Storage server that the check's HEAD
+   request notices it. Delete one file's bytes inside the local storage container:
+   ```powershell
+   $c = docker ps --format "{{.Names}}" | Where-Object { $_ -like "supabase_storage_*" }
+   docker exec $c sh -c "find /mnt /var/lib/storage -path '*$($rows[0].id)*' -type f -delete 2>/dev/null"
+   ```
+   The check (step 5's command without `--write-manifest`, plus `--manifest "$d\manifest.json"`) must
+   FAIL on `files_stored` while `ready_documents_have_file` still passes. Put the file back
+   (`Invoke-RestMethod -Method Post "$api/storage/v1/object/medical-records/documents/$($rows[0].id)" -Headers ($h + @{ "x-upsert" = "true" }) -ContentType "application/pdf" -InFile "$d\files\synthetic-drill-document.pdf"`)
+   and the check must PASS again.
+7. **Back up** with the off-site job chosen in section 4, pointed at the local stack and a drill-only
    destination and a drill-only key pair (`age-keygen -o "$d\drill-key.txt"`, never the real key).
    Until that job exists, the same by hand: download both files and both tables
    (`GET $api/rest/v1/medical_documents?select=*` with `Accept-Profile: pds`) and encrypt each with
    `age -r <drill public key>` into `$d\offsite`.
-7. **Disaster.** `npx supabase stop --no-backup` (this removes the local stack's data, and only the
+8. **Disaster.** `npx supabase stop --no-backup` (this removes the local stack's data, and only the
    local stack), `npx supabase start`, repeat step 2. The check with `--manifest "$d\manifest.json"`
    must now FAIL (files and rows missing): this proves the check notices a loss.
-8. **Restore and time it.** Decrypt with `age -d -i "$d\drill-key.txt"`, upsert the documents and
+9. **Restore and time it.** Decrypt with `age -d -i "$d\drill-key.txt"`, upsert the documents and
    then the lab results as in step 4, upload each file to its same path. Note the minutes taken: that
    is the measured RTO.
-9. **Verify.** `python tools\medical_recovery\recovery_check.py --url http://127.0.0.1:54321 --skip-backups --open-files --manifest "$d\manifest.json"`
-   must print PASS, which covers: every file opens as its declared type, every hash and size matches
-   the manifest, a 60-second signed link (the app's own viewing path) serves the same bytes, the
-   bucket is private with the right cap and types, the anon key reaches neither table and lists no
-   file, the public URL is refused, and every lab result's document link resolves. Also run in the
-   local SQL editor: `SELECT r.rolname, has_table_privilege(r.rolname, 'pds.medical_documents', 'SELECT') FROM pg_roles r WHERE r.rolname IN ('anon', 'authenticated', 'service_role');`
-   (only `service_role` may say true).
-10. **Evidence and clean-up.** Save, privately (the audit folder, never the repo): date, the git SHA
-    of the check, both JSON reports (`--json`), the measured restore time and the production backup
-    dates from section 2. Then `npx supabase stop --no-backup` and move `$d` to the Recycle Bin.
+10. **Verify.** The wipe removed the made-up user as well, so repeat step 5's sign-up for a fresh
+    token. Then `python tools\medical_recovery\recovery_check.py --url http://127.0.0.1:54321 --skip-backups --open-files --manifest "$d\manifest.json"`
+    must print PASS, which covers: every confirmed document's file is in the listing and in the
+    storage backend with its declared size; every file parses as its declared type (the PDF's
+    cross-reference table, the PNG's chunks and pixel data: structure, not a rendering); every hash
+    and size matches the manifest; every document's path, size, type, status and removed flag and
+    every lab result's document link and removed flag match the manifest (a link that was cleared or
+    now points at another document fails); a 60-second signed link (the app's own viewing path)
+    serves the same bytes; the bucket is private with the right cap and types; the anon key and the
+    made-up user's token each reach neither table and list no file (a refusal counts only after the
+    key itself was accepted); and the public URL is refused. Then **open one restored file by hand**:
+    ```powershell
+    $l = Invoke-RestMethod -Method Post "$api/storage/v1/object/sign/medical-records/documents/$($rows[0].id)" -Headers $h -ContentType "application/json" -Body '{"expiresIn":60}'
+    Start-Process "$api/storage/v1$($l.signedURL)"
+    ```
+    and note that Edge shows the blank synthetic page: this is the opening evidence for the receipt.
+    Also run in the local SQL editor:
+    `SELECT r.rolname, has_table_privilege(r.rolname, 'pds.medical_documents', 'SELECT') FROM pg_roles r WHERE r.rolname IN ('anon', 'authenticated', 'service_role');`
+    (only `service_role` may say true).
+11. **Evidence and clean-up.** Save, privately (the audit folder, never the repo): date, the git SHA
+    of the check, every JSON report (`--json`), the measured restore time, the note that the restored
+    file opened, and the production backup dates from section 2. Then `npx supabase stop --no-backup`
+    and move `$d` to the Recycle Bin.
 
 **SEC-06 closes only when** the production backup dates have been read (section 2), an off-site
 option is chosen and running, a drill has passed against its copy, and the receipt is saved. A merge
@@ -209,12 +246,24 @@ python tools\medical_recovery\recovery_check.py --json       # the same as JSON 
 ```
 
 - Keys: `SUPABASE_SERVICE_ROLE_KEY` or `~/.onyx_supabase_secret`; `SUPABASE_ANON_KEY` (the public
-  key the site ships); `SUPABASE_ACCESS_TOKEN` for the backup list. Keys are never printed.
+  key the site ships); `SUPABASE_USER_ACCESS_TOKEN` (a signed-in user's access token, which expires
+  within an hour, for the signed-in-user probe); `SUPABASE_ACCESS_TOKEN` for the backup list. Keys
+  are never printed.
 - It reads only id, path, size, type and state columns, never a title, note, test name or value, and
   prints counts and pass / fail / warn per check, never an id or path.
-- On production it never downloads a file: `--open-files` and `--write-manifest` run only on a local
-  stack or a project named with `--drill-project` that is not production, and are refused before any
-  request otherwise.
+- Files: each confirmed document must be in the bucket listing AND answer a HEAD request with its
+  declared size. A HEAD sends headers only, no bytes, so it runs on production too, and it is what
+  catches a list entry that came back with the database while the bytes did not.
+- Privacy: the anon key and a signed-in user's token must each be accepted by a harmless read first
+  (`/auth/v1/settings`, `/auth/v1/user`). After that, a table counts as refused only on PostgREST's
+  permission answer (`42501` or `PGRST106`). A stale or rotated key, any other refusal and a
+  malformed listing are incomplete, never a privacy pass. Without a user token the signed-in-user
+  checks are incomplete: on production that token is Riley's own sign-in (decision 7 below); the
+  catalog query in section 6 step 10 is the manual alternative.
+- On production it never downloads a file: `--open-files`, `--write-manifest` and `--skip-backups`
+  run only on a local stack or a project named with `--drill-project` that is not production, and
+  are refused before any request otherwise (so a production report never reads PASS without backup
+  evidence). A manifest is written only from a PASS.
 - Network errors, 429 and 5xx are retried twice (1 s, 2 s). A read that keeps failing, a refused
   read (401 / 403, with the exact access to ask for), a missing key or token is **incomplete**
   (exit 2), never a pass. A failed check exits 1; a pass exits 0.
@@ -233,3 +282,7 @@ python tools\medical_recovery\recovery_check.py --json       # the same as JSON 
 5. **Monitoring**: whether the backup job may write a count-free heartbeat and get a `/status` card
    (today's rule: no heartbeat for medical records).
 6. **PITR**: not recommended (about $100 per month plus compute) for hand-typed, infrequent entries.
+7. **Signed-in-user probe on production**: whether a production run should include it, which needs
+   a short-lived access token from Riley's own sign-in set in `SUPABASE_USER_ACCESS_TOKEN` for that
+   run (never saved). Without it, those two checks stay incomplete and the catalog query is the
+   evidence instead.
