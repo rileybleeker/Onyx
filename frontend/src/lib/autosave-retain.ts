@@ -39,7 +39,7 @@ export type RetainedSaveContext = { keepalive: boolean; cancelled: () => boolean
 export type RetainedSave<T> = (value: T, ctx: RetainedSaveContext) => Promise<void>;
 
 /** What the component showing the form supplies on every render (the latest closures are always used). */
-export type FormSource<T> = Pick<AutosaverOptions<T>, "ready" | "same"> & { save: RetainedSave<T> };
+export type FormSource<T> = Pick<AutosaverOptions<T>, "ready" | "same" | "unknownOutcome"> & { save: RetainedSave<T> };
 
 export type RetainOptions<T> = Omit<AutosaverOptions<T>, "onState" | "save"> & { save: RetainedSave<T> };
 
@@ -72,6 +72,7 @@ export class RetainedForm<T, D> {
         save: (v, ctx) => this.source().save(v, { keepalive: ctx.keepalive, cancelled: () => this.released }),
         ready: (v) => this.source().ready?.(v),
         same: (a, b) => (this.source().same ?? jsonSame)(a, b),
+        unknownOutcome: (e) => this.source().unknownOutcome?.(e) ?? false,
         delayMs: opts.delayMs,
         retryDelaysMs: opts.retryDelaysMs,
         timers: opts.timers ?? defaults.timers,

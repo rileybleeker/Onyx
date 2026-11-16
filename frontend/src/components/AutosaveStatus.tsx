@@ -9,7 +9,8 @@ import type { AutosaveState } from "@/lib/autosave";
  * "Not saved yet" (an entry waiting for the pause after typing), "Saving…" (the request is out), "Saved" (only once
  * the server answered; in text-up, the success colour, with a check mark) and "Not saved: <why>" with a Retry button
  * (a failure). `incomplete` shows the form's own reason only when `showIncomplete` (a blank field is not worth a
- * message). Nothing at all while idle.
+ * message). Nothing at all while idle. `errorLabel` replaces the "Not saved:" in front of an error, for a form that
+ * knows the save may have gone through (no clear answer came back); it is announced the same way.
  *
  * Screen readers (PROD-T01): each result is announced once, from its own polite live region that holds only "Saved"
  * or "Not saved: <why>" (every save the server confirms is read, also a second "Saved" in a row; a background retry
@@ -19,9 +20,9 @@ import type { AutosaveState } from "@/lib/autosave";
  * the next stop if it fails again. `id` names the visible text only (never the live region), so a field pointing at
  * it with aria-describedby reads the current reason, never an old "Saved".
  */
-/** "Not saved: <why>": the failure text, shown and announced. */
-export function failureText(state: Pick<AutosaveState, "error">): string {
-  return `Not saved: ${state.error ?? "save failed."}`;
+/** "Not saved: <why>" (or `errorLabel` <why>): the failure text, shown and announced. */
+export function failureText(state: Pick<AutosaveState, "error">, errorLabel = "Not saved:"): string {
+  return `${errorLabel} ${state.error ?? "save failed."}`;
 }
 
 /**
@@ -38,13 +39,18 @@ export const NO_ANNOUNCEMENT: Announcement = { text: "", kind: "", savedAt: null
  * else that is not a result (a new edit waiting, a save of a new edit, an incomplete entry, a reset to idle, also
  * when Autosaver.reset kept savedAt) empties the region.
  */
-export function nextAnnouncement(prev: Announcement, state: Pick<AutosaveState, "status" | "error" | "savedAt">, savedText: string): Announcement {
+export function nextAnnouncement(
+  prev: Announcement,
+  state: Pick<AutosaveState, "status" | "error" | "savedAt">,
+  savedText: string,
+  errorLabel = "Not saved:",
+): Announcement {
   if (state.status === "saved") {
     if (prev.kind === "saved" && prev.text === savedText && prev.savedAt === state.savedAt) return prev;
     return { text: savedText, kind: "saved", savedAt: state.savedAt, seq: prev.seq + 1 };
   }
   if (state.status === "error") {
-    const text = failureText(state);
+    const text = failureText(state, errorLabel);
     if (prev.kind === "error" && prev.text === text) return prev;
     return { text, kind: "error", savedAt: prev.savedAt, seq: prev.seq + 1 };
   }
@@ -72,13 +78,13 @@ export function AutosaveStatus({
   const { status, error, retrying, savedAt } = state;
   const wrap = useRef<HTMLSpanElement | null>(null);
   const focusAfterRetry = useRef(false);
-  const failure = failureText(state);
+  const failure = failureText(state, errorLabel);
 
   // The live region: changes only when the result does (see nextAnnouncement()).
   const [announced, setAnnounced] = useState<Announcement>(NO_ANNOUNCEMENT);
   useEffect(() => {
-    setAnnounced((prev) => nextAnnouncement(prev, { status, error, savedAt }, savedText));
-  }, [status, error, savedAt, savedText]);
+    setAnnounced((prev) => nextAnnouncement(prev, { status, error, savedAt }, savedText, errorLabel));
+  }, [status, error, savedAt, savedText, errorLabel]);
 
   // Retry pressed: its button leaves while the save runs; keep keyboard focus on this line, not on the page.
   useEffect(() => {
