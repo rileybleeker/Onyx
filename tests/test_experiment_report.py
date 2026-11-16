@@ -55,7 +55,11 @@ END = START + timedelta(days=N_DAYS - 1)
 ALIGNMENT = "same_night_v1"
 EFFECT = 25.0
 EFFECT_KEYS = {"estimate", "ci_low", "ci_high", "p_value", "carryover", "two_night_total", "decision",
-               "sensitivity", "secondary_outcomes", "allocation", "aa_check"}
+               "sensitivity", "secondary_outcomes", "allocation", "aa_check",
+               # since the inference under carryover (doc 8.1): every other number or verdict about the effect
+               "p_carryover", "p_value_no_effect", "p_carryover_no_effect", "carryover_ci_low", "carryover_ci_high",
+               "carryover_exceeds_half_mid", "hac_se", "hac_se_carryover", "decision_if_supported",
+               "decision_firm", "decision_withheld", "inference"}
 RULE = {"source": ad.SCREEN_SOURCE, "max": 5, "arm": "A"}
 SQL_FILE = ROOT / admin.REPORTS_SQL
 
@@ -107,7 +111,10 @@ class FakeStore:
             "n_days": self.n_days, "start_date": START.isoformat(), "planned_end": self.end.isoformat(), "alpha": 0.05,
             "n_redraws": 999, "adherence": {} if aa else {"objective": dict(RULE)},
             "protocol": {"analysis": {"sensitivity": ["ln HRV", "per-protocol", "plus hrv_lag1 covariate",
-                                                       "excluding travel blocks", "a synthetic unbuilt analysis"]}},
+                                                       "excluding travel blocks", "a synthetic unbuilt analysis"],
+                                      # The registered declarations the final report passes to the analysis (doc 8.1).
+                                      "inference_method": er.analysis.INFERENCE_METHOD, "carryover_nights": 1,
+                                      "model_justification": "synthetic: acts on its own night only"}},
             "protocol_path": "docs/experiments/EXP-901.md", "protocol_sha256": "a" * 64, "git_commit": "c0ffee",
             "seed_sha256": ed.seed_commitment(SEED), "stopped_on": None, "stop_reason": None, "notion_page_id": None,
         }
@@ -462,8 +469,19 @@ def test_final_report_at_the_end_is_written_once():
     assert "FINAL report written" in text and "not in this log" in text
     assert store.exp["status"] == "complete" and store.calls.count("matrix") == 1
 
-    # The registered analysis found the planted effect.
-    assert abs(report["estimate"] - EFFECT) < 4 and report["p_value"] < 0.01 and report["decision"] == "adopt_A"
+    # The registered analysis found the planted effect. Until the inference method's calibration and
+    # independent review are recorded (experiment_analysis.METHOD_REVIEW) the verdict is withheld:
+    # the decision reads inconclusive and the rule's verdict and the reason travel with the report.
+    assert abs(report["estimate"] - EFFECT) < 4 and report["p_value"] < 0.01
+    assert report["decision_if_supported"] == "adopt_A" and report["decision_firm"] is False
+    assert report["decision"] == "inconclusive" and any("independent statistical review" in reason
+                                                        for reason in report["decision_withheld"])
+    # The job passed the registered declarations through: only the method review is outstanding.
+    checks = {c["id"]: c["status"] for c in report["inference"]["checks"]}
+    assert checks["model_justified"] == "ok" and checks["registered_method"] == "ok" and len(report["decision_withheld"]) == 1
+    assert report["inference"]["method"] and "p_value" in report["inference"]["outputs"]
+    carry_low, carry_high = (float(report[k]) for k in ("carryover_ci_low", "carryover_ci_high"))  # "inf" text parses
+    assert carry_low < report["carryover"] < carry_high
     assert report["ci_low"] < EFFECT < report["ci_high"] and report["n_redraws"] == 999
     assert report["report_kind"] == "final" and report["as_of"] == today.isoformat() and report["stopped_early"] is False
     assert report["excluded_blocks"] == [3, 5, 8]
@@ -753,7 +771,9 @@ def test_aa_check_verdict_rules():
     revealed = {_day(i).isoformat() for i in range(28)}
     ok = er.aa_check(exp, {"p_value": 0.41}, 28, revealed, 28)
     assert ok["passed"] is True and ok["false_effect"] is False and ok["answer_pct"] == 100.0
-    assert ok["phase2_done"] == {"no_false_effect": True, "every_day_revealed": True, "answers_on_90pct_of_days": True}
+    assert ok["phase2_done"] == {"no_false_effect": True, "inference_supported": True, "every_day_revealed": True,
+                                 "answers_on_90pct_of_days": True}
+    assert ok["p_supported"] is None and ok["unsupported_reasons"] == [], "an older report carries no support mark"
     bad = er.aa_check(exp, {"p_value": 0.01}, 28, revealed, 28)
     assert bad["passed"] is False and bad["false_effect"] is True
     assert er.aa_check(exp, {"p_value": 0.41}, 28, revealed - {_day(3).isoformat()}, 28)["phase2_done"]["every_day_revealed"] is False
@@ -764,6 +784,38 @@ def test_aa_check_verdict_rules():
     assert none["false_effect"] is None and none["passed"] is False, "no result is not a pass"
     treatment = FakeStore(AA_END).exp
     assert er.aa_check(treatment, {"p_value": 0.01}, 28, revealed, 28) is None, "only an A/A protocol gets the check"
+    # With identical arms Fisher's no-effect null holds exactly, so the check reads that p, not the
+    # carryover-robust same-night p (conservative, near 1 on four weeks); an older payload falls back.
+    caught = er.aa_check(exp, {"p_value": 0.93, "p_value_no_effect": 0.012}, 28, revealed, 28)
+    assert caught["p_source"] == "p_value_no_effect" and caught["p_value"] == 0.012
+    assert caught["false_effect"] is True and caught["passed"] is False
+    clear = er.aa_check(exp, {"p_value": 0.01, "p_value_no_effect": 0.41}, 28, revealed, 28)
+    assert clear["false_effect"] is False and clear["passed"] is True
+    assert ok["p_source"] == "p_value" and ok["p_value"] == 0.41, "a report from before the no-effect p falls back"
+
+    # A non-significant p from a test the report marks unsupported is not a pass: missing nights
+    # caused by the arm invalidate Fisher's test too (synthetic payload, no analysis run).
+    reason = "missing nights differ between the arms by more than 10 points"
+    inference = {
+        "checks": [{"id": "missing_not_caused_by_arm", "status": "failed", "blocks_decision": True,
+                    "covers": ["missing_not_caused_by_arm"], "reason": reason},
+                   {"id": "carryover_set_bounded", "status": "failed", "blocks_decision": False, "covers": [],
+                    "reason": "synthetic unrelated limit"}],
+        "outputs": {"p_value_no_effect": {"needs": ["randomized_schedule", "missing_not_caused_by_arm"],
+                                          "supported": False},
+                    "p_value": {"needs": ["randomized_schedule", "missing_not_caused_by_arm"], "supported": False}},
+        "unsupported_outputs": ["p_value_no_effect", "p_value"]}
+    hidden = er.aa_check(exp, {"p_value": 0.9, "p_value_no_effect": 0.41, "inference": inference}, 28, revealed, 28)
+    assert hidden["false_effect"] is False and hidden["p_supported"] is False
+    assert hidden["phase2_done"]["inference_supported"] is False and hidden["passed"] is False
+    assert hidden["unsupported_reasons"] == [reason], "only the checks the test needs are named"
+    # Only the unsupported-outputs list (an older shape of the mark) is enough to refuse the pass too.
+    listed = {**inference, "outputs": {}}
+    assert er.aa_check(exp, {"p_value_no_effect": 0.41, "inference": listed}, 28, revealed, 28)["passed"] is False
+    supported = {**inference, "checks": [], "unsupported_outputs": [],
+                 "outputs": {"p_value_no_effect": {"needs": ["randomized_schedule"], "supported": True}}}
+    fine = er.aa_check(exp, {"p_value_no_effect": 0.41, "inference": supported}, 28, revealed, 28)
+    assert fine["passed"] is True and fine["p_supported"] is True
 
 
 def test_aa_trial_end_to_end_reports_its_verdict():
@@ -773,7 +825,8 @@ def test_aa_trial_end_to_end_reports_its_verdict():
     assert code == 0 and report is not None and report["days_scheduled"] == 28
     check = report["aa_check"]
     assert check["days"] == 28 and check["days_revealed"] == 28 and check["days_answered"] == 28
-    assert check["false_effect"] == (report["p_value"] < 0.05) and check["passed"] == (not check["false_effect"])
+    assert check["p_source"] == "p_value_no_effect" and check["p_value"] == report["p_value_no_effect"]
+    assert check["false_effect"] == (report["p_value_no_effect"] < 0.05) and check["passed"] == (not check["false_effect"])
     assert store.supa.heartbeats[-1]["status"] == ("success" if check["passed"] else "partial")
     assert pages.writes[-1][3]["aa_check"] == check, "the verdict goes to the Notion page with the report"
     _no_leak(text, store, report)
@@ -802,9 +855,12 @@ def test_aa_trials_rarely_report_a_false_effect():
     from experiment_analysis import TrialData, TrialSpec, analyze_trial
 
     rng = np.random.default_rng(20261114)
-    spec = TrialSpec(experiment_id="EXP-900", start=START, planned_end=AA_END, mid_ms=8.0, n_redraws=199)
+    spec = TrialSpec(experiment_id="EXP-900", start=START, planned_end=AA_END, mid_ms=8.0, n_redraws=999,
+                     kind=ed.KIND_AA)
+    aa_exp = FakeStore(AA_END, n_blocks=AA_BLOCKS, kind=ed.KIND_AA).exp
+    every_day = {_day(i).isoformat() for i in range(28)}
     sigma, rho, n = 21.4, 0.476, 28
-    significant = adopted = analysed = 0
+    significant = exact = adopted = analysed = flagged = unsupported = 0
     for _ in range(300):
         e = np.empty(n)
         e[0] = rng.normal(0, sigma)
@@ -819,10 +875,23 @@ def test_aa_trials_rarely_report_a_false_effect():
             continue
         analysed += 1
         significant += report["p_value"] < 0.05
-        adopted += report["decision"] == "adopt_A"
+        exact += report["p_value_no_effect"] < 0.05
+        adopted += report["decision_if_supported"] == "adopt_A"
+        verdict = er.aa_check(aa_exp, report, 28, every_day, 28)
+        flagged += verdict["false_effect"] is True
+        unsupported += verdict["phase2_done"]["inference_supported"] is False
     assert analysed >= 290
+    # Identical arms satisfy Fisher's no-effect null exactly: about 5%. The registered same-night
+    # test also allows for any carryover, so on 28 days it is conservative: at most about 5%.
+    assert 0.01 <= exact / analysed <= 0.09, f"no-effect test rejects {exact / analysed:.3f} on identical arms"
+    # The A/A verdict reads the exact test, so it can fail (about 1 run in 20), unlike the near-1
+    # same-night p on four weeks; a check that could never fail would not check the pipeline.
+    assert flagged == exact, "aa_check flags exactly the runs Fisher's no-effect test rejects"
+    # Random missing nights rarely void the check: with identical arms it reads Fisher's exact test
+    # of the missing nights at alpha, not the 10-point rule, which would fire on about half of these.
+    assert unsupported / analysed <= 0.09, f"missing nights voided {unsupported / analysed:.3f} of the checks"
     rate = significant / analysed
-    assert 0.01 <= rate <= 0.09, f"false-positive rate {rate:.3f} on identical arms"
+    assert rate <= 0.09, f"false-positive rate {rate:.3f} on identical arms"
     assert adopted <= significant, "adopt_A needs a significant result"
 
 

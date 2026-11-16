@@ -295,6 +295,10 @@ def test_aa_verdict_leads_the_report_and_an_unanalysable_trial_prints_no_none():
     assert line.startswith("A/A check NOT PASSED") and "difference between identical arms" in line
     assert "about 1 time in 20" in line and "only 20 of 28 days have a check-in answer" in line
     assert en.aa_lines(_final()) == [], "a treatment trial has no A/A line"
+    # Since 2026-11-16 the check reads Fisher's no-effect p and the page names that p, not the same-night one.
+    fisher = {**passed, "p_source": "p_value_no_effect", "p_value": 0.37}
+    first = en.aa_lines(_final(p_value=0.98, aa_check=fisher))[0]
+    assert "no-effect randomization p = 0.3700" in first and "0.9800" not in first
 
     tiny = {"report_kind": "final", "as_of": "2030-01-14", "stopped_early": True, "decision": None,
             "not_analysable": "only 4 nights with an outcome; too few to fit the model",
@@ -304,6 +308,108 @@ def test_aa_verdict_leads_the_report_and_an_unanalysable_trial_prints_no_none():
     assert "No estimate: only 4 nights" in text and "stopped early" in text and "None" not in text
     props = en.final_properties(tiny)
     assert props["Estimate (ms)"] == {"number": None} and props["Decision"] == {"select": None}
+
+
+def test_a_withheld_decision_and_the_inference_assumptions_are_on_the_page():
+    def body(report):
+        return " ".join(b[b["type"]]["rich_text"][0]["text"]["content"] for b in en.report_blocks(report))
+
+    inference = {"method": "joint_sharp_null_berger_boos_v1", "checks": [], "outputs": {}}
+    withheld = _final(decision="inconclusive", decision_if_supported="adopt_A", decision_firm=False,
+                      decision_withheld=["the synthetic review is not recorded yet"], inference=inference,
+                      p_value_no_effect=0.0004, carryover_ci_low=-3.25, carryover_ci_high="inf")
+    text = body(withheld)
+    assert "Decision: Inconclusive" in text
+    assert "No firm decision yet, so it reads Inconclusive: the synthetic review is not recorded yet." in text
+    assert "The rule on its own gives: Adopt A." in text
+    assert "allow for carryover (joint_sharp_null_berger_boos_v1)" in text and "p = 0.0004" in text
+    assert "Carryover interval: -3.25 to unbounded ms." in text and "None" not in text
+
+    # Fisher's fallback is not presented as assumption-free: it still needs the schedule and the missing nights.
+    assert "but still with the randomized schedule and missing nights not caused by the arm" in text
+    assert "Without any of that" not in text
+
+    firm = body(_final(decision_if_supported="adopt_A", decision_firm=True, decision_withheld=[], inference=inference))
+    assert "No firm decision" not in firm and "allow for carryover" in firm
+    # A report stored before the inference block existed renders exactly as it did.
+    assert "allow for carryover" not in body(_final()) and en.inference_lines(_final()) == []
+
+    # Missing nights caused by the arm: every p-value is marked unsupported, Fisher's included.
+    skewed = {**inference, "unsupported_outputs": ["p_value", "ci_low / ci_high", "p_value_no_effect"],
+              "outputs": {"p_value_no_effect": {"supported": False}, "p_value": {"supported": False}}}
+    text = body(_final(decision="inconclusive", decision_if_supported="adopt_A", decision_firm=False,
+                       decision_withheld=["missing nights differ between the arms"], inference=skewed,
+                       p_value_no_effect=0.003))
+    assert "these numbers are not supported either" in text
+    assert "(randomization p = 0.0030)" in text and "so it is not supported either" in text
+    assert "but still with the randomized schedule" not in text, "an unsupported test is never offered as the fallback"
+
+    # A check that limits the result without withholding it is named on the page.
+    limited = {**inference, "checks": [
+        {"id": "carryover_set_bounded", "status": "failed", "blocks_decision": False,
+         "reason": "the nights cannot bound the carryover, so the same-night test cannot reject"},
+        {"id": "method_reviewed", "status": "pending", "blocks_decision": True, "reason": "synthetic pending review"}]}
+    text = body(_final(decision_firm=False, decision_if_supported="inconclusive",
+                       decision_withheld=["synthetic pending review"], inference=limited))
+    assert "Limit: the nights cannot bound the carryover, so the same-night test cannot reject." in text
+    assert "Limit: synthetic pending review" not in text, "a blocking check is listed with the withheld reasons only"
+
+    # The interval encloses every accepted value, so it can contain 0 while the test rejects 0: said on the page.
+    split = body(_final(p_value=0.01, ci_low=-2.0, ci_high="inf", inference=inference))
+    assert "rejects no same-night effect, but the interval still contains 0" in split
+    assert "interval still contains 0" not in body(_final(inference=inference)), "20.1 to unbounded leaves out 0"
+    assert "interval still contains 0" not in body(_final(p_value=0.2, ci_low=-2.0, inference=inference))
+
+
+def test_sensitivity_and_secondary_numbers_carry_what_they_rest_on():
+    def body(report):
+        return " ".join(b[b["type"]]["rich_text"][0]["text"]["content"] for b in en.report_blocks(report))
+
+    sensitivity = {"ln_outcome": {"estimate_pct": 35.0, "p_value": 0.001},
+                   "covariate_hrv_lag1": {"estimate": 24.0, "ci_low": 19.0, "ci_high": 29.0, "p_value": 0.001,
+                                          "p_value_no_effect": 0.0007, "n_nights": 60}}
+    secondary = {"whoop_rhr": {"estimate": 0.2, "ci_low": -1.0, "ci_high": 1.4, "p_value": 0.8, "n_nights": 67,
+                               "missingness": {"missing_share_a": 0.05, "missing_share_b": 0.25, "threat": True}}}
+    outputs = {"sensitivity.ln_outcome": {"supported": True},
+               "sensitivity.covariate_hrv_lag1": {"supported": True, "approximate": True},
+               "sensitivity.covariate_hrv_lag1.p_value_no_effect": {"supported": True},
+               "secondary_outcomes.whoop_rhr": {"supported": False}}
+    inference = {"method": "joint_sharp_null_berger_boos_v1", "checks": [], "outputs": outputs,
+                 "unsupported_outputs": ["secondary_outcomes.whoop_rhr"]}
+    text = body(_final(sensitivity=sensitivity, secondary_outcomes=secondary, inference=inference))
+    assert "Sensitivity, ln(HRV): 35.0% (p = 0.0010). Assumes the arms multiply HRV by a constant factor" in text
+    assert "60 nights). Approximate: the covariate is built from earlier trial nights" in text
+    assert "Fisher's no-effect p for this fit: 0.0007 (exact)." in text
+    assert "Secondary outcome whoop_rhr" in text and "Not supported for this trial" in text
+    assert "Missing nights: 5.0% on arm A, 25.0% on arm B." in text and "None" not in text
+
+    outputs_failed = {**outputs, "sensitivity.ln_outcome": {"supported": False},
+                      "sensitivity.covariate_hrv_lag1": {"supported": False, "approximate": True},
+                      "sensitivity.covariate_hrv_lag1.p_value_no_effect": {"supported": False}}
+    text = body(_final(sensitivity=sensitivity, secondary_outcomes=secondary,
+                       inference={**inference, "outputs": outputs_failed}))
+    assert "Sensitivity, ln(HRV): 35.0% (p = 0.0010). Not supported for this trial" in text
+    assert "60 nights). Not supported for this trial" in text and "0.0007 (not supported for this trial either)" in text
+    # A report stored before these entries existed renders its sensitivity lines exactly as before.
+    plain = body(_final())
+    assert "Sensitivity, ln(HRV): 35.0% (p = 0.0010)." in plain and "Assumes the arms multiply" not in plain
+    assert "Approximate" not in plain and "Not supported" not in plain
+
+
+def test_an_aa_check_on_an_unsupported_test_names_why():
+    check = {"passed": False, "false_effect": False, "days": 28, "days_revealed": 28, "days_answered": 28,
+             "p_source": "p_value_no_effect", "p_value": 0.41, "p_supported": False,
+             "unsupported_reasons": ["missing nights differ between the arms by more than 10 points"],
+             "phase2_done": {"no_false_effect": True, "inference_supported": False, "every_day_revealed": True,
+                             "answers_on_90pct_of_days": True}}
+    line = en.aa_lines(_final(p_value=0.9, aa_check=check))[0]
+    assert line.startswith("A/A check NOT PASSED") and "is not supported for this check" in line
+    assert "missing nights differ between the arms" in line and "difference between identical arms" not in line
+    # A significant p from an unsupported test is not presented as a found difference either.
+    loud = {**check, "false_effect": True, "p_value": 0.01,
+            "phase2_done": {**check["phase2_done"], "no_false_effect": False}}
+    line = en.aa_lines(_final(aa_check=loud))[0]
+    assert "is not supported for this check" in line and "difference between identical arms" not in line
 
 
 # ---------------------------------------------------------------------------

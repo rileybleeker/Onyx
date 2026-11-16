@@ -50,6 +50,23 @@ OBJECTIVE_SOURCES = ("pds.phone_usage_daily.minutes_last_hour_before_sleep_est",
 # can only be a false one. docs/experiments/EXP-900.md is the first.
 KIND_TREATMENT, KIND_AA = "treatment", "aa"
 TRIAL_KINDS = (KIND_TREATMENT, KIND_AA)
+# The daily block design models one night of carryover (docs/experiment-framework.md 8.1): the arm
+# acts on its own night and the next one only. A protocol states it (analysis.carryover_nights: 1)
+# and says why (analysis.model_justification); a treatment that can act longer uses the period design.
+CARRYOVER_NIGHTS = 1
+# Berger & Boos (1994) nuisance level of the end-of-trial analysis (experiment_analysis): 0.001,
+# raised to 5 / (R + 1) below 4,999 re-draws so the nuisance set rests on at least 5 re-draws.
+# It lives here so the protocol rules can check that alpha leaves room above it.
+NUISANCE_BETA = 0.001
+MIN_NUISANCE_TAIL = 5
+# alpha must leave at least this many re-draws between beta and alpha, or the same-night test
+# could (almost) never reject.
+MIN_REJECTION_ROOM = 10
+
+
+def nuisance_beta_for(n_redraws: int) -> float:
+    """The registered nuisance level for a trial with n_redraws re-draws (fixed by the protocol's count)."""
+    return max(NUISANCE_BETA, MIN_NUISANCE_TAIL / (n_redraws + 1))
 
 
 def trial_kind(protocol: Any) -> str:
@@ -208,13 +225,15 @@ def _jsonable(value: Any) -> Any:
 
 
 def validate_protocol(p: dict[str, Any], *, today: date, alignment_version: str,
-                      seed_sha256: str | None = None) -> dict[str, Any]:
+                      seed_sha256: str | None = None, inference_method: str | None = None) -> dict[str, Any]:
     """Check a parsed protocol against the design rules and return the normalized fields the
     registration writes. Raises ProtocolError listing every problem.
 
     today              ET today; the first behavioral day must be later (register before the start).
     alignment_version  hrv_alignment.ALIGNMENT_VERSION at registration time.
     seed_sha256        commitment of the seed stored for this experiment; must equal the file's.
+    inference_method   experiment_analysis.INFERENCE_METHOD at registration time (the register
+                       step passes it); the protocol's analysis.inference_method must equal it.
     """
     problems: list[str] = []
 
@@ -321,13 +340,43 @@ def validate_protocol(p: dict[str, Any], *, today: date, alignment_version: str,
         problems.append("stopping.interim must be 'none': interim looks are not built yet, and the effect is "
                         "analysed only at the pre-registered end (docs/experiment-framework.md 12.1 and 13)")
 
-    analysis = p.get("analysis") or {}
+    analysis = p.get("analysis") if isinstance(p.get("analysis"), dict) else {}
     alpha = analysis.get("alpha", 0.05)
     n_redraws = analysis.get("n_redraws", 10000)
-    if not isinstance(alpha, (int, float)) or not (0 < alpha < 1):
+    alpha_ok = isinstance(alpha, (int, float)) and not isinstance(alpha, bool) and 0 < alpha < 1
+    redraws_ok = isinstance(n_redraws, int) and not isinstance(n_redraws, bool) and n_redraws >= 999
+    if not alpha_ok:
         problems.append("analysis.alpha must be between 0 and 1")
-    if not isinstance(n_redraws, int) or n_redraws < 999:
+    if not redraws_ok:
         problems.append("analysis.n_redraws must be an integer of 999 or more")
+    if alpha_ok and redraws_ok:
+        # The same-night p-value is beta + (1 + count) / (R + 1) (doc 8.1), so it can only fall
+        # below alpha when alpha leaves room above beta.
+        beta = nuisance_beta_for(n_redraws)
+        if alpha < 2 * beta or (alpha - beta) * (n_redraws + 1) < MIN_REJECTION_ROOM:
+            problems.append(
+                f"analysis.alpha {alpha:g} leaves too little room above the nuisance level {beta:g} for "
+                f"{n_redraws} re-draws (the same-night test could almost never reject): use a larger alpha "
+                "or more re-draws")
+
+    # Per-trial support for the parts of the model the analysis cannot test (doc 8.1).
+    carryover = analysis.get("carryover_nights", CARRYOVER_NIGHTS if kind == KIND_AA else None)
+    # An integer only: the report job reads the field as an int, so 1.0 would register but leave
+    # the final report's decision withheld for good (it is written once).
+    if not isinstance(carryover, int) or isinstance(carryover, bool) or carryover != CARRYOVER_NIGHTS:
+        problems.append(
+            f"analysis.carryover_nights must be {CARRYOVER_NIGHTS}: the daily block design models one night of "
+            "carryover; a treatment that can act longer needs the period design (doc 4.2), which is not built yet")
+    justification = analysis.get("model_justification")
+    if kind == KIND_TREATMENT and not (isinstance(justification, str) and justification.strip()):
+        problems.append(
+            "analysis.model_justification is missing: say why the arm acts on its own night and the next one only, "
+            "by about the same amount every night, and why the day before the trial is like the control arm "
+            "(doc 8.1)")
+    if inference_method is not None and analysis.get("inference_method") != inference_method:
+        problems.append(
+            f"analysis.inference_method is {analysis.get('inference_method')!r} but the analysis that would run is "
+            f"{inference_method!r}")
 
     if problems:
         raise ProtocolError(problems)

@@ -46,6 +46,14 @@ analysis:
   n_redraws: 10000
   ci: inversion of the randomization test (HAC Newey-West maxlags=7 as a quick check)
   sensitivity: [ln HRV, per-protocol, plus hrv_lag1 covariate, excluding travel blocks]
+  inference_method: joint_sharp_null_berger_boos_v1   # must equal experiment_analysis.INFERENCE_METHOD (section 8.1)
+  carryover_nights: 1           # the arm acts on its own night and the next one only (section 8.1)
+  # Why the parts of the model the analysis cannot test hold for this treatment (section 8.1).
+  # Without it the register step refuses the protocol and no final decision can be firm.
+  model_justification: >-
+    Phone use in the last hour acts on that night's sleep; nothing in it is expected to last past
+    the next night, and the effect should be about the same size every night. The day before the
+    trial is a usual evening, like arm B.
 exclusions:                     # decided without looking at HRV, applied to whole blocks
   - block contains a flight day (pds.flight_day_unified.flew = 1) or onyx_is_transition_day
   - illness or travel pause declared before the block starts
