@@ -745,9 +745,18 @@ def test_the_real_writer_end_to_end_against_an_in_memory_notion():
     assert page["properties"]["Status"]["status"]["name"] == "Complete"
     assert page["properties"]["Estimate (ms)"]["number"] == round(store.final()["estimate"], 2)
     # Until METHOD_REVIEW is recorded the decision is withheld (PIPE-06): the page reads Inconclusive.
+    # The production record is left as it is (no calibration report yet), so this is the withheld path.
+    final = store.final()
+    assert final["decision"] == "inconclusive" and final["decision_firm"] is False
+    assert final["decision_if_supported"] == "adopt_A" and final["decision_withheld"]
     assert page["properties"]["Decision"]["select"]["name"] == "Inconclusive"
     heading = [b for b in api.children[page["id"]] if b["type"] == "heading_2"]
     assert len(heading) == 1 and api.children[heading[0]["id"]], "the report body sits under one heading"
+    # The real writer carries the reason and the rule's own verdict onto the page body, word for word.
+    body = " ".join(api.text_of(heading[0]["id"]))
+    assert "No firm decision yet, so it reads Inconclusive: " in body
+    assert all(reason in body for reason in final["decision_withheld"]), "every withheld reason is on the page"
+    assert "The rule on its own gives: Adopt A." in body
     assert store.exp["notion_page_id"] == page["id"]
 
 
