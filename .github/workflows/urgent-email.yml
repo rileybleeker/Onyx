@@ -6,6 +6,10 @@ name: Urgent Email Labels
 # writes one urgent_email|labels heartbeat per run for the /status card.
 # Needs sql/inbox_emails_schema.sql applied first; until then every run writes a
 # 'failed' heartbeat that names the missing table.
+# Manual dispatch with preview=true runs the zero-write retention preview
+# (urgent_email_etl.py --preview-db; docs/email-retention-preview.md): no upsert,
+# no update, no heartbeat. The shared concurrency group keeps it from
+# overlapping a scheduled run.
 
 on:
   schedule:
@@ -20,6 +24,17 @@ on:
         description: 'Look-back window in days (default 30)'
         required: false
         type: string
+      preview:
+        description: 'Retention preview: read Gmail + stored metadata, write nothing (no upsert/update/heartbeat)'
+        required: false
+        type: boolean
+        default: false
+      preview_refresh_limit:
+        description: 'Preview only: refresh at most N window messages per account'
+        required: false
+        type: choice
+        options: ['300', '1']
+        default: '300'
 
 concurrency:
   group: urgent-email
@@ -45,10 +60,36 @@ jobs:
         run: pip install supabase python-dotenv
 
       - name: Read Agent/Action + Agent/Deadline labels (read-only IMAP)
-        run: >
-          python urgent_email_etl.py
-          ${{ inputs.days && format('--days {0}', inputs.days) || '' }}
+        shell: bash
+        # Inputs reach the script only as environment variables (never pasted into the script text).
+        # days is validated by bounded_days in Python; mode / limit are checked here before anything
+        # runs. A schedule has no inputs: normal write mode with the 300 refresh cap.
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "${INPUT_DAYS}" ]; then
+            args+=(--days "${INPUT_DAYS}")
+          fi
+          case "${INPUT_PREVIEW}" in
+            true)
+              case "${INPUT_PREVIEW_REFRESH_LIMIT}" in
+                1|300) args+=(--preview-db --refresh-limit "${INPUT_PREVIEW_REFRESH_LIMIT}") ;;
+                *) echo "::error::preview_refresh_limit must be 1 or 300"; exit 2 ;;
+              esac
+              ;;
+            ''|false)
+              case "${INPUT_PREVIEW_REFRESH_LIMIT}" in
+                ''|300) ;;
+                *) echo "::error::preview_refresh_limit applies only to a preview run"; exit 2 ;;
+              esac
+              ;;
+            *) echo "::error::preview must be true or false"; exit 2 ;;
+          esac
+          python urgent_email_etl.py "${args[@]}"
         env:
+          INPUT_DAYS: ${{ inputs.days }}
+          INPUT_PREVIEW: ${{ inputs.preview }}
+          INPUT_PREVIEW_REFRESH_LIMIT: ${{ inputs.preview_refresh_limit }}
           IMAP_HOST: ${{ secrets.IMAP_HOST }}
           # Same mailbox slots as flights-email.yml / delivery-email.yml. An unset pair is skipped.
           IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}

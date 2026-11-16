@@ -350,7 +350,8 @@ const req = (body, h = headers) => ({ headers: H(h), nextUrl: { origin: ORIGIN }
 
 function fakeWriteDb({ existing = [], failWith = null } = {}) {
   const calls = [];
-  const rows = [...existing];
+  // capture_kind defaults to 'photo' in the table (sql/direct_drink_capture.sql); the route pins reads/deletes to it.
+  const rows = existing.map((r) => ({ capture_kind: "photo", ...r }));
   let seq = 100;
   const client = {
     from(table) {
@@ -367,7 +368,7 @@ function fakeWriteDb({ existing = [], failWith = null } = {}) {
           let data = [];
           if (st.op === "upsert") {
             if (!rows.some((r) => r.client_key === st.payload.client_key)) {
-              const row = { meal_id: ++seq, ...st.payload, eaten_at: "2030-01-06T00:30:00Z" };
+              const row = { meal_id: ++seq, capture_kind: "photo", ...st.payload, eaten_at: "2030-01-06T00:30:00Z" };
               rows.push(row);
               data = [row];
             }
@@ -438,12 +439,13 @@ test("POST refusals never reach the database; database errors map to clear answe
 });
 
 test("DELETE removes one meal by id; unknown id is 404", async () => {
-  const db = fakeWriteDb({ existing: [{ meal_id: 5, client_key: KEY }] });
+  const db = fakeWriteDb({ existing: [{ meal_id: 5, client_key: KEY }, { meal_id: 7, client_key: "drink-key", capture_kind: "drink" }] });
   const route = loadSave(db);
   assert.equal((await route.DELETE(req({ meal_id: 9 }))).status, 404);
+  assert.equal((await route.DELETE(req({ meal_id: 7 }))).status, 404, "a drink capture is never deleted here");
   const ok = await route.DELETE(req({ meal_id: 5 }));
   assert.equal(ok.status, 200);
-  assert.equal(db.rows.length, 0);
+  assert.deepEqual(db.rows.map((r) => r.meal_id), [7]);
   assert.equal((await route.DELETE(req({ meal_id: "5" }))).status, 400);
 });
 
