@@ -14,7 +14,7 @@ import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightVa
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { getJson } from "@/lib/reading-practice-client";
-import { checkpointUrl, hasUnrecordedAnswers, parseCheckpoint } from "@/lib/reading-map";
+import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, parseCheckpoint } from "@/lib/reading-map";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
@@ -22,6 +22,13 @@ import ReviewCard from "./ReviewCard";
 import PracticePart from "./PracticePart";
 import ChapterMap from "./ChapterMap";
 import CheckpointQuiz from "./CheckpointQuiz";
+
+/**
+ * Which checkpoints held answers without a result, as last read, kept for the session (memory only, one entry per book
+ * and checkpoint) so the page coming back into view (the continuous scroll mounts and unmounts it) does not read again.
+ */
+const UNRECORDED_TTL_MS = 120_000;
+const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -72,6 +79,13 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
   // (keyed by book and checkpoint, so another book's "ch12" is not this one's).
   const [quiz, setQuiz] = useState<Checkpoint | null>(null);
   const [unrecorded, setUnrecorded] = useState<Record<string, boolean>>({});
+  // Checkpoints whose quiz read answered "not available" (the checkpoint SQL is not applied yet): no Start button for
+  // them, so the tile never leads to a dead end.
+  const [offerOff, setOfferOff] = useState<Record<string, boolean>>({});
+  const markUnrecorded = useCallback((book: string, key: string, pending: boolean) => {
+    unrecordedMemo.set(`${book}:${key}`, { at: Date.now(), pending });
+    setUnrecorded((prev) => (prev[`${book}:${key}`] === pending ? prev : { ...prev, [`${book}:${key}`]: pending }));
+  }, []);
 
   const showToast = useCallback((t: Toast) => {
     setToast(t);
@@ -110,28 +124,40 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
 
   // Which offered checkpoints already hold answers without a recorded result ("Answered · record result"), read from
   // the stored answers rather than from this page's memory, so it survives a reload and shows on another device. One
-  // light GET per offered checkpoint (no cards read, nothing written), after the page's own reads have settled.
+  // light GET per offered checkpoint (no cards read, nothing written), all at once and after the page's own reads have
+  // settled; the answer is kept for the session. The copy in the continuous scroll reads nothing: the routed page does.
   const offerBook = overview?.book.slug ?? null;
   const offered = overview ? overview.checkpoints.filter((c) => checkpointOffer(overview, c)).map((c) => `${c.key}:${c.chapter}`).join(",") : "";
   useEffect(() => {
-    if (!offerBook || !offered) return;
+    if (feed || !offerBook || !offered) return;
     let live = true;
     const run = async () => {
-      for (const part of offered.split(",")) {
-        const [key, chapter] = part.split(":");
-        const r = await getJson(checkpointUrl(offerBook, Number(chapter), true));
-        const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
-        if (!live || !parsed) continue;
-        const pending = hasUnrecordedAnswers(parsed);
-        setUnrecorded((prev) => (prev[`${offerBook}:${key}`] === pending ? prev : { ...prev, [`${offerBook}:${key}`]: pending }));
-      }
+      await Promise.all(
+        offered.split(",").map(async (part) => {
+          const [key, chapter] = part.split(":");
+          const seen = unrecordedMemo.get(`${offerBook}:${key}`);
+          if (seen && Date.now() - seen.at < UNRECORDED_TTL_MS) {
+            if (live) markUnrecorded(offerBook, key, seen.pending);
+            return;
+          }
+          const r = await getJson(checkpointUrl(offerBook, Number(chapter), true));
+          if (!live) return;
+          // The quiz round is not available (the checkpoint SQL is missing): do not offer a quiz that cannot open.
+          if (r.status !== 200 && checkpointRefusal(r.status, r.body).kind === "off") {
+            setOfferOff((prev) => (prev[`${offerBook}:${key}`] === true ? prev : { ...prev, [`${offerBook}:${key}`]: true }));
+            return;
+          }
+          const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
+          if (parsed) markUnrecorded(offerBook, key, hasUnrecordedAnswers(parsed));
+        }),
+      );
     };
     const timer = setTimeout(() => void run(), 1200);
     return () => {
       live = false;
       clearTimeout(timer);
     };
-  }, [offerBook, offered]);
+  }, [feed, offerBook, offered, markUnrecorded]);
 
   // Want to read (ReadingList.tsx): after a change, re-read the quest and the book list; a book Riley just started
   // is shown (his explicit choice). A queued book is never picked as the quest on its own.
@@ -218,15 +244,16 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
           checkpoint={quiz.key}
           chapter={quiz.chapter}
           onRecorded={(r) => {
-            setUnrecorded((prev) => ({ ...prev, [`${o.book.slug}:${quiz.key}`]: false }));
+            markUnrecorded(o.book.slug, quiz.key, false);
             showToast({ text: `Checkpoint ${r.score}/${r.total}${r.xp ? ` · +${r.xp} XP` : ""}`, kind: r.passed ? "xp" : "ok" });
             void load(slug, true);
           }}
           onClose={(r) => {
-            const key = `${o.book.slug}:${quiz.key}`;
+            const book = o.book.slug;
+            const key = quiz.key;
             setQuiz(null);
-            if (r.unrecorded) void r.unrecorded.then((v) => setUnrecorded((prev) => ({ ...prev, [key]: v })));
-            else setUnrecorded((prev) => ({ ...prev, [key]: false }));
+            if (r.unrecorded) void r.unrecorded.then((v) => markUnrecorded(book, key, v));
+            else markUnrecorded(book, key, false);
             if (r.changed) void Promise.resolve(r.settled).then(() => load(slug, true));
           }}
         />
@@ -262,7 +289,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       >
         {o.checkpoints.map((c, i) => (
           <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
-            <CheckpointTile c={c} offer={quiz === null && checkpointOffer(o, c)} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
+            <CheckpointTile c={c} offer={quiz === null && checkpointOffer(o, c) && offerOff[`${o.book.slug}:${c.key}`] !== true} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
           </Part>
         ))}
       </PartGroup>

@@ -38,6 +38,10 @@ the UI (S4), the chapter map / checkpoint / XP (S5) and the chat tools (S6) buil
    `sql/reading_learning_questions.sql` is applied again: it re-defines two T07 functions,
    `pds.reading_source_text` (an added `idea` branch) and `pds.reading_questions_export` (bank rows above the
    spoiler gate left out), and T07's own definitions lack both.
+4. `sql/reading_bank_checkpoint.sql` (S5, through the Supabase MCP or the dashboard): two read-only functions the in-app
+   checkpoint quiz needs. It uses step 3's functions, so it goes after it. `pds.reading_bank_schema_ok()` does not check it
+   on purpose (a missing read-only function must not stop generation): until it is applied the checkpoint route answers
+   503 `bank_unavailable`, the checkpoint tile's light read learns that and shows no Start button, and nothing else changes.
 
 Until step 3, every bank route answers 503 `bank_unavailable` and nothing is written; `/reading` behaves as before
 (the review card).
@@ -306,10 +310,17 @@ highlights step links the new passage again or the idea has other evidence, and 
   one tile per chapter (5 per row on a phone, 10 on desktop), each an icon plus a word: Locked, Building / Failed
   (dashed), Few sources, In progress (recalled share in four steps), Covered (every core idea Explained), Needs review
   (two lapses in 7 days). The header reads "Recalled N of M ideas · Kept K" and the 7- and 21-day recall with their n and
-  the definition. A narrative book's locked chapters show no title; a locked chapter is not a button. A tap opens the
+  the definition. A narrative book's locked chapters show no title (and neither does a book the map step has not looked at
+  yet: `narrative` null is treated as narrative until it is known to be false; the bank GET still carries those titles
+  until `pds.reading_bank_overview` stops coalescing a null `narrative` to false, a change in S1's SQL); a locked chapter
+  is not a button. A tap opens the
   chapter sheet (bottom sheet on a phone, side panel on desktop): recalled bar, Practice 5, the ideas with stage dots
   (no statement before an idea was asked), flagged questions with Restore, "Built <date> · prompt <version>", Rebuild
-  chapter (confirm with its cost). A "Not read yet" hold is named under the header with Restore.
+  chapter (confirm with its cost: a rebuild replaces the chapter's ideas and questions, which start again at New, and
+  earlier chapter-recall answers for it stop counting). A "Not read yet" hold is named under the header with Restore.
+  The sheet's x and backdrop close through the runner's own guard while Practice 5 runs (a typed answer not checked yet
+  asks "Leave without checking?" first), and the sheet closes behind the runner. The map's read at mount joins the
+  Practice part's read of the same bank URL (`getJsonShared`: one request, not two).
 - **Checkpoint quiz** (replaces the "quiz me" chat link on a checkpoint tile once the chapter is quizzable and the
   chapters up to it hold 10 ideas): 10 questions, one per idea, from chapters 1..N, core ideas first, detail never, at
   least half from the latest act (the chapters since the previous checkpoint), at least 3 explain questions, no idea
@@ -319,7 +330,11 @@ highlights step links the new passage again or the idea has other evidence, and 
   `pds.reading_bank_idea_cards` (the picked ideas). **The quotas are enforced while choosing**: a quiz that cannot have
   half from the latest act and three explain questions (or enough ideas) is withheld, and the answer's `shortfall`
   (`ideas` / `latest` / `explain`) says which part is short; the page shows it in words and offers no quiz. Same day,
-  same quiz, and a reopened quiz keeps the cards answered in it.
+  same quiz, and a reopened quiz keeps the cards answered in it. **A resumed quiz holds to the quotas too**, counting what
+  its answers already supply: when a flag took out a question and the replacements cannot keep half from the latest act
+  or the third explain question (no other explain-capable idea left), the quiz is withheld with that shortfall instead of
+  being finished without it; its answers stay valid and no result is recorded for it,
+  which the page says in one line ("It cannot be finished right now ...").
 - **The quiz's size is the database's count, not the screen's.** The answer carries `tally` ({total, right, pending}):
   every valid answer under the quiz key, counted from the pool's answers (so an answer whose idea left the quiz since,
   flagged "Not in this chapter", still counts and takes a slot: the quiz asks only for `remaining` more, and no card is
@@ -332,9 +347,19 @@ highlights step links the new passage again or the idea has other evidence, and 
   (a flag took a question out: "Close, then open the checkpoint again for replacements"), more, or any still pending
   records nothing, so one right answer with nine questions flagged away is never a passing 1 of 1. The pass mark is 80%.
   The quiz table's refusals have their own words (`attempts_pending`, `score_mismatch`, `quiz_other_book`).
+  **An answer whose idea was flagged "Not in this chapter" while its model grade was on its way** is no longer listed by
+  the round's attempts read (the idea unlocks at the end of the book), so its grade can never reach the screen: such an
+  answer no longer holds Done back ("N still grading · Done checks it"), and Done's own tally read, which lists every valid
+  answer under the quiz key with its grading status, decides ("still being graded, tap Done again", then the result). A model
+  grade that fails for such an answer has no Grade-it-yourself on screen; the quiz then waits for the tally (known limit).
+  **A quiz left open across the 06:00 rollover** has its answers under yesterday's quiz key; the tally read carries the
+  quiz key it was computed for, and a mismatch says "This quiz belongs to the previous day" instead of reading today's
+  empty quiz.
 - **"Answered · record result"** on a checkpoint tile comes from the stored answers (a light `brief=1` read per offered
   checkpoint after the page settled, a GET with no side effect), so it survives a reload and shows on another device;
-  closing a quiz without touching it keeps it. Leaving without Done records nothing; a quiz recorded today closes that
+  closing a quiz without touching it keeps it. The light reads run all at once, are kept for the session (two minutes),
+  are skipped for the copy of the page in the continuous scroll (the routed page reads them), and a read that answers
+  "not available" (the checkpoint SQL is missing) withdraws the Start button. Leaving without Done records nothing; a quiz recorded today closes that
   day's quiz. Known limit: a quiz left open across the 06:00 behavioral rollover leaves its answers under the old day's
   quiz key (the next day is a new quiz).
 - **XP**: `XP.perPracticeCorrect = 2` / `perPracticePartial = 1` over the day's first counted answer of each idea

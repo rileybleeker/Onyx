@@ -16,7 +16,11 @@
  * database's own list of valid answers under its quiz key (`quizAnswers`), not from the cards that can be drawn: an
  * idea answered here and moved out of the quiz since (flagged "Not in this chapter") still has a valid answer that the
  * result is checked against, so it takes a slot (`remaining` = size minus every valid answer) and the quiz asks only
- * for the rest. The result is recorded from this count (`tally`), never from what is on screen.
+ * for the rest. The quotas hold on a resumed quiz too, counting what its answers already supply: a quiz whose flagged
+ * questions cannot be replaced without breaking them (the third explain question flagged away, no other explain-capable
+ * idea left) is withheld with the shortfall, never completed short of a quota (its answers stay valid and count
+ * toward practice; no result is recorded for it today). The result is recorded from this count (`tally`), never from
+ * what is on screen.
  */
 import {
   pickQuestion,
@@ -168,12 +172,10 @@ export interface CheckpointSelection {
   remaining: number;
   /** Ideas that could be asked (answered ones included). */
   eligible: number;
-  /** The quiz can be taken now (or finished). */
+  /** The quiz can be taken now (or finished), with its quotas met. */
   ready: boolean;
   /** What is short when it cannot. */
   shortfall: Shortfall | null;
-  /** A resumed quiz filled without meeting the quotas (what it already holds changed under it). */
-  relaxed: boolean;
 }
 
 /**
@@ -181,8 +183,8 @@ export interface CheckpointSelection {
  * elsewhere today, not already answered here, ranked by importance, then ideas with an explain variant, then a hash
  * fixed by the idea and the day. Taken, in this order: the best of the latest act until half the quiz is from it,
  * then explain-capable ideas until the quiz holds CHECKPOINT_MIN_EXPLAIN, then the best of the rest until it is full.
- * What the quiz already holds counts toward each quota. A fresh quiz that cannot meet them is not ready; a resumed
- * one that cannot is still filled (it was balanced when it began) as long as there are enough ideas.
+ * What the quiz already holds counts toward each quota. A quiz that cannot meet them is not ready, fresh or resumed
+ * (a complete quiz, with nothing left to ask, is always ready).
  */
 export function selectCheckpointIdeas(pool: CheckpointPool, opts: { actFrom: number; size?: number }): CheckpointSelection {
   const size = opts.size ?? CHECKPOINT_SIZE;
@@ -261,9 +263,10 @@ export function selectCheckpointIdeas(pool: CheckpointPool, opts: { actFrom: num
   const donePool = [...done.keys()].map((id) => inPool.get(id)).filter((i): i is PoolIdea => !!i);
   const picked = [...best.out, ...donePool].sort(rank);
   const orphanExplain = answers.filter((a) => a.format === "explain" && !(a.idea_id !== null && a.idea_id !== undefined && inPool.has(a.idea_id))).length;
-  const started = answers.length > 0;
   const fillable = candidates.length >= remaining;
-  const ready = remaining === 0 ? true : started ? fillable : best.met;
+  // The quotas hold whether the quiz is new or resumed: what it already holds counts toward them (needLatest and
+  // needExplain above), and whatever is still to ask must make up the rest.
+  const ready = remaining === 0 ? true : best.met;
   let shortfall: Shortfall | null = null;
   if (!ready) {
     if (!fillable) shortfall = "ideas";
@@ -281,15 +284,17 @@ export function selectCheckpointIdeas(pool: CheckpointPool, opts: { actFrom: num
     eligible: candidates.length + answers.length,
     ready,
     shortfall,
-    relaxed: ready && started && remaining > 0 && !best.met,
   };
 }
 
 const explainOf = (idea: DeckIdea): DeckQuestion | null => (idea.questions ?? []).find((q) => q.format === "explain") ?? null;
 
-/** How many explain questions a set of cards holds, plus the explain answers whose idea has no card. */
-export const explainCount = (cards: Pick<RoundCard, "format">[], sel: Pick<CheckpointSelection, "orphanExplain">): number =>
-  cards.filter((c) => c.format === "explain").length + sel.orphanExplain;
+/**
+ * How many explain questions the quiz holds: every valid explain answer (an answered card, or one whose idea has no card
+ * here any more) plus the explain questions still to ask among the cards.
+ */
+export const explainCount = (cards: Pick<RoundCard, "format" | "done">[], sel: Pick<CheckpointSelection, "answers">): number =>
+  sel.answers.filter((a) => a.format === "explain").length + cards.filter((c) => !c.done && c.format === "explain").length;
 
 /**
  * The cards of a selection. An idea answered in this quiz keeps the question it was answered with (marked done);

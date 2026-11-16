@@ -116,11 +116,15 @@ export default function CheckpointQuiz({
     onClose({ changed, recorded: done, settled, unrecorded });
   };
 
-  // The database's count of this quiz's valid answers, read when Done is tapped (the result is built from it).
+  // The database's count of this quiz's valid answers, read when Done is tapped (the result is built from it). The
+  // count belongs to the quiz key the server computes now: a quiz left open across the 06:00 rollover has answers
+  // under yesterday's key, and today's count (another quiz, 0 answers) must never stand in for it.
   const readTally = async () => {
     const r = await getJson(checkpointUrl(slug, chapter, true));
     const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
-    return parsed ? parsed.tally : null;
+    if (!parsed) return null;
+    if (data && parsed.quizKey !== data.quizKey) return "stale" as const;
+    return parsed.tally;
   };
 
   const heading = `Checkpoint · ch ${chapter}`;
@@ -173,9 +177,14 @@ export default function CheckpointQuiz({
             )}
           </p>
           {data.tally.total > 0 && (
-            <p className="text-[14px] text-text-secondary">
-              Answered so far · <span className="font-mono">{data.tally.total} of {data.size}</span>
-            </p>
+            <>
+              <p className="text-[14px] text-text-secondary">
+                Answered so far · <span className="font-mono">{data.tally.total} of {data.size}</span>
+              </p>
+              <p data-testid="quiz-stuck" className="text-[13px] text-text-secondary">
+                It cannot be finished right now, so no result is recorded. The answers stay.
+              </p>
+            </>
           )}
           <p className="text-[12px] text-text-tertiary">Ideas answered in the last 7 days wait.</p>
           <button type="button" onClick={() => leave(false)} className="inline-flex min-h-11 items-center rounded-control border border-border-default px-3 text-[14px] text-text-primary">

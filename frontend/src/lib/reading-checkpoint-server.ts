@@ -31,7 +31,8 @@ import { CHECKPOINT_SIZE, checkpointActStart, checkpointChapters, checkpointKey,
  * result is recorded from it, because the database checks the result against exactly those answers.
  *
  * A quiz is `ready` only when it can be built with the quotas met (half from the latest act, at least three explain
- * questions); otherwise `shortfall` names what is short ("ideas" | "latest" | "explain") and there are no cards.
+ * questions), a resumed one included (what it already holds counts toward them); otherwise `shortfall` names what is
+ * short ("ideas" | "latest" | "explain") and there are no cards (the answers already given stay valid).
  * `brief=1` answers the same without the cards (no cards read): the page asks it to learn, after a reload, whether a
  * quiz holds answers without a recorded result. Errors leave as short codes only.
  */
@@ -92,8 +93,9 @@ export async function getCheckpointRound(supabase: Supa, q: CheckpointQuery): Pr
     const rec = !quizRes.error && isObj(quizRes.data) ? { score: Number(quizRes.data.score), total: Number(quizRes.data.total) } : null;
     const ideas = (Array.isArray(cardsRes.data) ? cardsRes.data : []).filter((i): i is DeckIdea => isObj(i) && typeof i.idea_id === "number");
     const cards = rec || q.brief ? [] : buildCheckpointCards(sel, ideas, pool.today);
-    // A quiz that cannot be drawn whole is withheld, never trimmed: every idea still to ask needs a card, and a fresh
-    // quiz needs its explain questions (the choice made sure ideas with an explain variant were picked).
+    // A quiz that cannot be drawn whole is withheld, never trimmed: every idea still to ask needs a card, and the quiz
+    // (new or resumed: what it already holds counts) needs its explain questions (the choice made sure ideas with an
+    // explain variant were picked).
     const drawn = cards.filter((c) => !c.done).length;
     let ready = !rec && sel.ready;
     let shortfall = sel.shortfall;
@@ -101,7 +103,7 @@ export async function getCheckpointRound(supabase: Supa, q: CheckpointQuery): Pr
       if (drawn < sel.fresh.length) {
         ready = false;
         shortfall = "ideas";
-      } else if (sel.remaining > 0 && !sel.relaxed && explainCount(cards, sel) < CHECKPOINT_MIN_EXPLAIN) {
+      } else if (sel.remaining > 0 && explainCount(cards, sel) < CHECKPOINT_MIN_EXPLAIN) {
         ready = false;
         shortfall = "explain";
       }

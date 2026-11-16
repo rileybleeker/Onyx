@@ -107,6 +107,9 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
   const [phone, setPhone] = useState(() => phoneQuery()?.matches === true);
   const alive = useRef(true);
   const changed = useRef(false);
+  // Practice 5's own close guard (the runner fills it), and whether the sheet is closing behind it.
+  const runnerClose = useRef<((after?: () => void) => void) | null>(null);
+  const leaving = useRef(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
 
@@ -157,7 +160,17 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
     };
   }, []);
 
-  const close = () => onClose(changed.current);
+  // The x and the backdrop. While Practice 5 runs they go through the runner's own guard first: with a typed answer not
+  // checked yet it asks "Leave without checking?", and the sheet closes behind the runner once it really closes.
+  const close = () => {
+    if (practice && runnerClose.current) {
+      runnerClose.current(() => {
+        leaving.current = true;
+      });
+      return;
+    }
+    onClose(changed.current);
+  };
 
   // Esc closes the sheet (the runner takes its own Esc while Practice 5 is running); Tab stays inside.
   const keyHandler = useRef<(e: KeyboardEvent) => void>(() => undefined);
@@ -357,7 +370,7 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
               {confirm ? (
                 <div role="group" aria-label="Rebuild chapter" className="space-y-2 rounded-control border border-border-subtle p-3 text-[13px] text-text-primary">
                   <p>
-                    Rebuild chapter {chapter}? {perChapterCents !== null ? <span className="font-mono">About {dollars(perChapterCents)}</span> : "It uses part of this book's spending cap"}. Your answers stay; the questions are replaced.
+                    Rebuild chapter {chapter}? {perChapterCents !== null ? <span className="font-mono">About {dollars(perChapterCents)}</span> : "It uses part of this book's spending cap"}. The chapter's ideas and questions are replaced and start again at New; earlier chapter-recall answers for it stop counting.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <button
@@ -397,11 +410,21 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
             key={practice.round_key}
             round={practice}
             mode="chapter"
+            closeRef={runnerClose}
             onClose={(didChange, _finished, settled) => {
               setPractice(null);
               if (didChange) changed.current = true;
+              // The sheet's own x or backdrop asked: the sheet closes too, once the answers on their way have landed.
+              const leaveSheet = leaving.current;
+              leaving.current = false;
               void Promise.resolve(settled).then(() => {
                 if (!alive.current) return;
+                if (leaveSheet) {
+                  // onChanged re-reads the map and the overview itself; a plain close re-reads the map only when something changed.
+                  if (didChange) onChanged();
+                  onClose(changed.current && !didChange);
+                  return;
+                }
                 if (didChange) onChanged();
                 void read();
               });

@@ -80,7 +80,7 @@ export interface MapState {
   pausedReason: "owner" | "budget" | null;
   quizThrough: number;
   totalChapters: number;
-  /** A book the map step marked as narrative: the titles of locked chapters stay hidden. */
+  /** A book the map step marked as narrative, or has not looked at yet: the titles of locked chapters stay hidden. */
   narrative: boolean;
   mapping: "unknown" | "ok" | "uncertain";
   /** A "Not read yet" hold: the chapter, and the flag Restore undoes. */
@@ -94,7 +94,9 @@ export interface MapState {
 /** The bank GET (pds.reading_bank_overview plus the route's estimate), or null when it is not one. */
 export function parseMap(raw: unknown): MapState | null {
   if (!isObj(raw) || typeof raw.book_id !== "number") return null;
-  const narrative = raw.narrative === true;
+  // Hidden until the map step says the book is NOT narrative: an unknown (null: the step has not run yet) hides locked
+  // titles like a narrative book does, the safe default (a fiction title can give the plot away).
+  const narrative = raw.narrative !== false;
   const chapters: MapChapter[] = [];
   for (const c of Array.isArray(raw.chapters) ? raw.chapters : []) {
     if (!isObj(c) || typeof c.chapter !== "number" || c.chapter < 1) continue;

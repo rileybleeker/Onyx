@@ -334,6 +334,13 @@ test("the spoiler rule on screen: a narrative book hides locked titles, a nonfic
   const plain = M.parseMap(bankRaw(rows, { narrative: false, quiz_through: 1 }));
   assert.equal(plain.chapters[1].title, "A secret harbour", "a nonfiction book's titles are its own Kindle contents");
   assert.equal(M.chapterLabel(plain.chapters[1], false), "Ch 2 · A secret harbour");
+  // The map step has not said yet (narrative null or missing): the safe default hides the locked title, whatever the server sent.
+  for (const unknown of [null, undefined]) {
+    const pending = M.parseMap(bankRaw(rows, { narrative: unknown, quiz_through: 1 }));
+    assert.equal(pending.narrative, true, "unknown is treated as narrative until the book is known not to be");
+    assert.equal(pending.chapters[1].title, null);
+    assert.equal(pending.chapters[0].title, "Harbour 1", "an unlocked chapter shows its title");
+  }
 });
 
 test("parseMap: not a map is null; chapters sorted; the hold, the estimate and the signature", () => {
@@ -566,7 +573,7 @@ test("selection resumes: the ideas answered in this quiz stay, the rest fills th
   assert.ok(!resumed.fresh.some((i) => answered.includes(i.idea_id)), "and is not asked again");
   assert.ok(resumed.fresh.filter((i) => i.chapter >= 7).length + rows.filter((r) => r.chapter >= 7).length >= 5, "half from the latest act counts what was already answered");
   assert.ok(resumed.fresh.filter((i) => i.has_explain).length >= 3, "none of the four was answered as an explain question, so three of the rest must be");
-  assert.equal(resumed.relaxed, false);
+  assert.equal(resumed.ready, true, "its quotas were met, so it is ready");
   // An idea answered in this quiz that the choice would not have made takes the place of an unanswered one.
   const outside = baseIdeas().find((i) => !first.picked.some((p) => p.idea_id === i.idea_id) && i.importance === "core").idea_id;
   const moved = K.selectCheckpointIdeas(
@@ -584,6 +591,31 @@ test("selection resumes: the ideas answered in this quiz stay, the rest fills th
   assert.ok(!elsewhere.picked.some((i) => i.idea_id === 11), "answered today elsewhere: it rests");
   // A voided answer is no answer.
   assert.equal(K.selectCheckpointIdeas(K.parsePool(poolRaw({ answered_today: [answerRow(11, { grading_status: "invalidated" })] })), { actFrom: 7 }).done.size, 0);
+});
+
+test("selection resumes strictly: a quiz that can no longer have its explain questions or half from the latest act is withheld, its answers still counted", () => {
+  // Two explain answers are in, the third explain question was flagged away and no other idea has an explain variant.
+  const rows = [answerRow(11, { format: "explain", chapter: 1 }), answerRow(12, { format: "explain", chapter: 1 })];
+  const noExplain = baseIdeas().map((i) => ({ ...i, has_explain: false, last_reviewed: [11, 12].includes(i.idea_id) ? TODAY : null }));
+  const stuck = K.selectCheckpointIdeas(K.parsePool(poolRaw({ ideas: noExplain, answered_today: rows })), { actFrom: 7 });
+  assert.deepEqual([stuck.ready, stuck.shortfall, stuck.remaining, stuck.tally.total], [false, "explain", 8, 2], "completing it with 2 explain questions would break the quota");
+  assert.equal(stuck.done.size, 2, "the answers it holds still count");
+  // One more explain-capable idea of the pool makes it whole again: the quota is met by what is still to ask.
+  const third = noExplain.map((i) => (i.idea_id === 131 ? { ...i, has_explain: true } : i));
+  const whole = K.selectCheckpointIdeas(K.parsePool(poolRaw({ ideas: third, answered_today: rows })), { actFrom: 7 });
+  assert.deepEqual([whole.ready, whole.shortfall], [true, null]);
+  assert.ok(whole.fresh.some((i) => i.idea_id === 131), "the one explain-capable idea left is asked");
+  assert.equal(K.explainCount([], whole) + whole.fresh.filter((i) => i.has_explain).length, 3, "two answered plus one to ask");
+  // Half from the latest act: five answers from earlier chapters, three ideas of the latest act left, five questions to ask.
+  const early = [];
+  for (let ch = 1; ch <= 6; ch++) early.push(pIdea(ch * 10 + 1, ch, "core"), pIdea(ch * 10 + 2, ch, "core"), pIdea(ch * 10 + 3, ch, "supporting"));
+  const answeredEarly = [11, 12, 13, 21, 22].map((id) => answerRow(id, { format: "cued", chapter: Math.floor(id / 10) }));
+  const ideas = [...early, pIdea(131, 13, "core"), pIdea(132, 13, "core"), pIdea(133, 13, "core")].map((i) => (answeredEarly.some((a) => a.idea_id === i.idea_id) ? { ...i, last_reviewed: TODAY } : i));
+  const thin = K.selectCheckpointIdeas(K.parsePool(poolRaw({ ideas, answered_today: answeredEarly })), { actFrom: 7 });
+  assert.deepEqual([thin.ready, thin.shortfall, thin.remaining], [false, "latest", 5], "five more are needed from the latest act and only three exist");
+  // A complete quiz has nothing left to choose: it is ready.
+  const full = K.selectCheckpointIdeas(K.parsePool(poolRaw({ ideas: noExplain, answered_today: Array.from({ length: 10 }, (_, n) => answerRow(800 + n, { format: "cued", chapter: 1 })) })), { actFrom: 7 });
+  assert.deepEqual([full.ready, full.remaining], [true, 0]);
 });
 
 test("selection: half from the latest act is enforced, not hoped for: a quiz that cannot have it is withheld", () => {
@@ -905,6 +937,22 @@ test("the checkpoint round resumes: answered cards are marked done and come back
   assert.equal(r.body.remaining, 7);
 });
 
+test("the checkpoint round resumed without its quotas is withheld with the shortfall; the answers it holds stay counted", async () => {
+  const rows = [answerRow(11, { format: "explain", chapter: 1 }), answerRow(12, { format: "explain", chapter: 1 })];
+  const pool = poolRaw({ ideas: baseIdeas().map((i) => ({ ...i, has_explain: false, last_reviewed: [11, 12].includes(i.idea_id) ? TODAY : null })), answered_today: rows });
+  const { S, supabase, calls } = serverWith({ pool });
+  const r = await S.getCheckpointRound(supabase, { slug: SLUG, chapter: 13 });
+  assert.equal(r.status, 200);
+  assert.deepEqual([r.body.ready, r.body.shortfall, r.body.cards.length], [false, "explain", 0], "never completed with fewer than three explain questions");
+  assert.deepEqual(r.body.tally, { total: 2, right: 2, pending: 0 }, "the answers given stay valid");
+  assert.ok(!rpcCalls(calls).includes("reading_bank_idea_cards"), "no cards are read for a quiz that is withheld");
+  // The cards come back without the explain variants the pool promised: a resumed quiz is withheld too.
+  const answeredCued = [answerRow(11, { format: "cued", chapter: 1 })];
+  const resumed = serverWith({ pool: poolRaw({ ideas: baseIdeas().map((i) => (i.idea_id === 11 ? { ...i, last_reviewed: TODAY } : i)), answered_today: answeredCued }), cards: cardsFor(null, false) });
+  const rr = await resumed.S.getCheckpointRound(resumed.supabase, { slug: SLUG, chapter: 13 });
+  assert.deepEqual([rr.body.ready, rr.body.shortfall, rr.body.cards.length], [false, "explain", 0]);
+});
+
 test("the checkpoint round counts an answer whose idea left the quiz: it takes a slot, no card is drawn for it, and the tally has it", async () => {
   const pool = poolRaw({ answered_today: [answerRow(999, { format: "cued", chapter: 13 }), answerRow(998, { format: "explain", chapter: 5, grading_status: "pending", verdict: null })] });
   const { S, supabase, calls } = serverWith({ pool });
@@ -1218,6 +1266,8 @@ test("the sheet: Restore sends the flag's own key and reads the chapter again; R
   s.h.click("Rebuild chapter");
   await s.h.flush();
   assert.match(s.h.text(), /Rebuild chapter 6\? About \$0\.40/);
+  assert.match(s.h.text(), /ideas and questions are replaced and start again at New; earlier chapter-recall answers for it stop counting\./, "the confirm names what a rebuild does to the answers");
+  assert.doesNotMatch(s.h.text(), /Your answers stay/);
   assert.equal(s.calls.filter((c) => c.url === "/api/reading/bank/run").length, 0, "nothing starts before the confirm");
   s.h.click("Rebuild");
   await s.h.flush();
@@ -1251,6 +1301,40 @@ test("the sheet: Practice 5 opens the runner in chapter mode; a locked chapter s
   const locked = mountSheet(t, { sheet: { error: "locked" }, status: 404 });
   await locked.h.flush();
   assert.match(locked.h.text(), /This chapter is locked\. Keep reading to open it\./);
+});
+
+test("the sheet: the x and the backdrop go through the runner's close guard while Practice 5 runs, and the sheet closes behind it", async (t) => {
+  const card = { key: "idea:1", kind: "idea", chapter: 6, format: "cued", slot: "practice", done: false, attempt_key: null, question: { question_id: 11, version: 1, format: "cued", prompt: "Synthetic prompt?", rubric: rubric(1) }, again_question: null, idea: null, recall: null, highlight: null, sources: [], source_count: 0, preview: null, review_preview: null };
+  const chapterRound = () => response({ today: TODAY, quiz_through: 6, enabled: true, round_key: "0f0e0d0c-0b0a-4908-8706-050403020100", kind: "chapter", n: 6, cards: [card], done: 0, minutes: 1, extra_available: 0, chapter_recall: null });
+  // Before the runner is there, the x simply closes the sheet.
+  const early = mountSheet(t, { round: chapterRound });
+  await early.h.flush();
+  early.h.click("Close chapter");
+  assert.deepEqual(early.closed, [false]);
+
+  const s = mountSheet(t, { round: chapterRound });
+  await s.h.flush();
+  s.h.click("Practice 5");
+  await s.h.flush();
+  const props = s.runnerProps[s.runnerProps.length - 1];
+  assert.equal(typeof props.closeRef, "object", "the sheet gives the runner a place for its close guard");
+  // The runner (a stub here) takes the request, as it does when a typed answer makes it ask first.
+  const asked = [];
+  props.closeRef.current = (after) => asked.push(after);
+  s.h.click("Close chapter");
+  await s.h.flush();
+  assert.equal(asked.length, 1);
+  assert.deepEqual(s.closed, [], "the x did not unmount the runner under a typed answer");
+  s.h.find((n) => n.props["data-testid"] === "sheet-backdrop")[0].props.onClick();
+  assert.equal(asked.length, 2, "the backdrop goes through the guard too");
+  // Riley chose Leave: the runner runs the sheet's callback, then its own onClose.
+  asked[1]();
+  props.onClose(false, true, undefined);
+  await s.h.flush();
+  await tick();
+  await s.h.flush();
+  assert.deepEqual(s.closed, [false], "the sheet closed behind the runner");
+  assert.equal(s.h.find((n) => n.props["data-testid"] === "runner-stub").length, 0);
 });
 
 /* ---------------------------- the quiz host ---------------------------- */
@@ -1319,6 +1403,25 @@ test("the quiz host: a GET with no side effect, then the runner in checkpoint mo
   // A close with nothing stored is not "answered"; one with answers and no result reads the quiz again to say so.
   last.onClose(false, false, undefined);
   assert.deepEqual([closes[0].changed, closes[0].recorded, closes[0].unrecorded], [false, false, undefined]);
+});
+
+test("the quiz host: the count Done reads must be this quiz's: a count under another day's quiz key is 'stale', never the answer", async (t) => {
+  const other = K.checkpointQuizKey(7, addDays(TODAY, 1), 6);
+  const stale = mountQuizHost(t, { get: (n, brief) => response(brief ? quizBody({ quiz_key: other, tally: { total: 0, right: 0, pending: 0 } }) : quizBody()) });
+  await stale.h.flush();
+  const last = stale.runnerProps[stale.runnerProps.length - 1];
+  assert.equal(await last.onTally(), "stale", "the page was left open across the rollover: today's empty quiz is not this one");
+  const same = mountQuizHost(t, { get: (n, brief) => response(brief ? quizBody({ tally: { total: 3, right: 2, pending: 1 } }) : quizBody()) });
+  await same.h.flush();
+  assert.deepEqual({ ...(await same.runnerProps[same.runnerProps.length - 1].onTally()) }, { total: 3, right: 2, pending: 1 });
+  const lost = mountQuizHost(t, { get: (n, brief) => (brief ? response({ error: "failed" }, 500) : response(quizBody())) });
+  await lost.h.flush();
+  assert.equal(await lost.runnerProps[lost.runnerProps.length - 1].onTally(), null, "no count is no count");
+  // A quiz that was started and cannot be finished says so, and that its answers stay.
+  const stuck = mountQuizHost(t, { get: () => response(quizBody({ cards: [], ready: false, eligible: 30, shortfall: "explain", tally: { total: 5, right: 4, pending: 0 } })) });
+  await stuck.h.flush();
+  assert.match(stuck.h.text(), /Answered so far · 5 of 10/);
+  assert.match(stuck.h.text(), /It cannot be finished right now, so no result is recorded\. The answers stay\./);
 });
 
 test("the quiz host: stored answers without a result are reported once the quiz is read again; a recorded result is not", async (t) => {
@@ -1438,7 +1541,7 @@ const receiptFor = (cards, body, o = {}) => {
   return { success: true, attempt_key: body.attempt_key, grading_status: g.kind === "graded" ? "graded" : "pending", verdict: g.kind === "graded" ? g.verdict : null, score: g.kind === "graded" ? g.score : null, attempt_date: TODAY, next_review: g.kind === "graded" ? "2026-03-11" : null, hinted: body.hinted, overridden: false, replayed: false, ...o };
 };
 
-function mountQuiz(t, { cards, answer, poll, quiz, size, onTally } = {}) {
+function mountQuiz(t, { cards, answer, poll, quiz, size, onTally, closeRef } = {}) {
   const calls = [];
   const timers = fakeTimers();
   const recorded = [];
@@ -1463,6 +1566,7 @@ function mountQuiz(t, { cards, answer, poll, quiz, size, onTally } = {}) {
       onClose: (changed, finished) => closed.push({ changed, finished }),
       onRecorded: (r) => recorded.push(r),
       onTally,
+      closeRef,
       timers,
     },
     stubs: { "lucide-react": ICONS },
@@ -1696,6 +1800,94 @@ test("checkpoint mode: a refusal of the quiz table gets its own words, and the n
   assert.equal(r.recorded.length, 1);
 });
 
+test("checkpoint mode: an answer whose idea was flagged 'Not in this chapter' while its grade was on its way does not hold Done back; Done's own count decides", async (t) => {
+  // The round's attempts read leaves out an answer whose idea moved to the end of the book, so the model grade of the
+  // explain answer below can never be read on this screen (the poll answers no attempts at all).
+  const reads = [];
+  const counts = [
+    { total: 2, right: 1, pending: 1 },
+    { total: 2, right: 2, pending: 0 },
+  ];
+  const r = mountQuiz(t, { cards: [explainCard(1), cuedCard(2)], onTally: async () => (reads.push(1), counts.shift()) });
+  await r.h.flush();
+  await answerCard(r.h, "A synthetic explanation of several words.");
+  await answerCard(r.h, "alpha 2");
+  assert.match(r.h.text(), /1 still grading/);
+  assert.equal(r.h.buttons("Done")[0].props["aria-disabled"], true, "a grade on its way and readable holds Done back");
+  // Open the answered explain card from the summary and flag it.
+  const row = r.h.find((n) => n.type === "button" && r.h.text(n).includes("Explain synthetic idea 1."))[0];
+  row.props.onClick();
+  await r.h.flush();
+  await menu(r.h, "Not in this chapter");
+  await r.timers.advance(C.FLAG_HOLD_MS + 100, r.h);
+  assert.equal(r.calls.filter((c) => c.url === C.FLAG_URL).length, 1, "the flag was sent");
+  assert.equal(r.h.find((n) => n.props["data-testid"] === "quiz-blind").length, 1, "its grade can no longer be read here, and the screen says so");
+  assert.match(r.h.text(r.h.find((n) => n.props["data-testid"] === "quiz-blind")[0]), /1 still grading · Done checks it/);
+  assert.doesNotMatch(r.h.text(r.h.find((n) => n.props["data-testid"] === "quiz-score")[0]), /%/, "no score while a grade is unknown");
+  assert.equal(r.h.buttons("Done")[0].props["aria-disabled"], undefined, "Done is not disabled forever by a grade the screen cannot see");
+  r.h.click("Done");
+  await r.h.flush();
+  assert.equal(reads.length, 1, "Done reads the database's count");
+  assert.equal(r.quizzes().length, 0, "the count says one answer is still being graded: nothing is sent");
+  assert.match(r.h.text(), /1 answer is still being graded\. Tap Done again in a moment\./);
+  r.h.click("Done");
+  await r.h.flush();
+  assert.deepEqual(r.quizzes()[0].body, { book: SLUG, checkpoint: "ch6", score: 2, total: 2, op_key: QUIZ_KEY }, "the grade that landed in the database is counted");
+  assert.match(r.h.text(r.h.find((n) => n.props["data-testid"] === "quiz-score")[0]), /2 of 2 · 100%/);
+});
+
+test("checkpoint mode: a count that belongs to another day's quiz is never recorded from", async (t) => {
+  const r = mountQuiz(t, { cards: [cuedCard(1)], onTally: async () => "stale" });
+  await r.h.flush();
+  await answerCard(r.h, "alpha 1");
+  r.h.click("Done");
+  await r.h.flush();
+  assert.equal(r.quizzes().length, 0);
+  assert.match(r.alerts()[0], /Not recorded: This quiz belongs to the previous day\. Close it, then open the checkpoint again\./);
+  assert.equal(r.h.buttons("Done").length, 0, "Done gives way to Close: it cannot succeed");
+  assert.equal(r.h.buttons("Retry").length, 0);
+  r.h.click("Close");
+  assert.equal(r.closed.length, 1);
+});
+
+test("the runner's close guard: a parent's close asks first when a typed answer is not checked, and runs after the runner closes", async (t) => {
+  const closeRef = { current: null };
+  const r = mountQuiz(t, { cards: [cuedCard(1), cuedCard(2)], closeRef });
+  await r.h.flush();
+  assert.equal(typeof closeRef.current, "function", "the runner hands the parent its guard");
+  const order = [];
+  typeAnswer(r.h, "half-written answer");
+  await r.h.flush();
+  closeRef.current(() => order.push("after"));
+  await r.h.flush();
+  assert.match(r.h.text(), /Leave without checking\? What you typed is not saved\./);
+  assert.deepEqual([order, r.closed.length], [[], 0], "nothing closes under a typed answer");
+  r.h.click("Keep writing");
+  await r.h.flush();
+  assert.deepEqual([order, r.closed.length], [[], 0], "Keep writing drops the request");
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Next");
+  await r.h.flush();
+  // Asked again with a typed answer, then Leave: the runner closes and the parent hears of it.
+  typeAnswer(r.h, "another half-written answer");
+  await r.h.flush();
+  closeRef.current(() => order.push("after"));
+  await r.h.flush();
+  r.h.click("Leave");
+  await r.h.flush();
+  assert.deepEqual([order, r.closed.length], [["after"], 1], "the parent's callback runs once, as the runner closes");
+  // Nothing typed: it closes at once.
+  const plain = { current: null };
+  const q = mountQuiz(t, { cards: [cuedCard(1)], closeRef: plain });
+  await q.h.flush();
+  const seen = [];
+  plain.current(() => seen.push("after"));
+  await q.h.flush();
+  assert.deepEqual([seen, q.closed.length], [["after"], 1]);
+  assert.equal(order.length, 1, "the earlier callback is not called again");
+});
+
 test("the runner still offers Skip and Again outside a quiz (the daily round is unchanged)", async (t) => {
   const calls = [];
   withGlobals(t, { fetch: async (url, init = {}) => { calls.push({ url, body: init.body ? JSON.parse(init.body) : null }); return response({ round_key: ROUND_KEY, attempts: [] }); } });
@@ -1729,6 +1921,13 @@ test("ReadingClient: the Chapters group sits after the checkpoints, only while t
   assert.match(src, /hasUnrecordedAnswers\(parsed\)/);
   assert.match(src, /unrecorded\[`\$\{o\.book\.slug\}:\$\{c\.key\}`\]/, "another book's ch12 is not this one's");
   assert.match(src, /checkpointOffer\(overview, c\)/);
+  // The light reads: all at once, kept for the session, none for the copy in the continuous scroll, and a quiz that cannot
+  // open (the checkpoint SQL is not applied yet) is not offered.
+  assert.match(src, /if \(feed \|\| !offerBook \|\| !offered\) return;/, "the neighbour in the scroll reads nothing");
+  assert.match(src, /await Promise\.all\(\s*offered\.split\(","\)\.map/, "one read per offered checkpoint, in parallel");
+  assert.match(src, /unrecordedMemo\.get\(`\$\{offerBook\}:\$\{key\}`\)/, "kept in memory for the session");
+  assert.match(src, /checkpointRefusal\(r\.status, r\.body\)\.kind === "off"/);
+  assert.match(src, /offerOff\[`\$\{o\.book\.slug\}:\$\{c\.key\}`\] !== true/, "a quiz that cannot open has no Start button");
   assert.match(src, /<Part id="review" title="Practice">/, "the practice part keeps its id");
   const feed = read("frontend/src/app/reading/FeedSection.tsx");
   assert.match(feed, /<ReadingClient feed \/>/);
@@ -1738,4 +1937,6 @@ test("ReadingClient: the Chapters group sits after the checkpoints, only while t
   }
   const map = read("frontend/src/app/reading/ChapterMap.tsx");
   assert.doesNotMatch(map, /useEffect\([^)]*postJson/, "mounting the map never writes");
+  assert.match(map, /getJsonShared\(bUrl\)/, "the map's mount read joins the Practice part's read of the same URL");
+  assert.match(map, /void load\(true\);/);
 });

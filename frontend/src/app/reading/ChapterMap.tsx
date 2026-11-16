@@ -5,7 +5,7 @@ import { AlertTriangle, Check, CircleDashed, Lock } from "lucide-react";
 import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import type { ReadingOverview } from "@/lib/reading";
-import { bankUrl, classifyFlagAnswer, FLAG_URL, getJson, postJson } from "@/lib/reading-practice-client";
+import { bankUrl, classifyFlagAnswer, FLAG_URL, getJson, getJsonShared, postJson } from "@/lib/reading-practice-client";
 import { chapterLabel, mapHeader, mapSignature, parseMap, recallLine, tileState, TILE_WORD, type MapChapter, type MapState, type TileState } from "@/lib/reading-map";
 import { AlertLine } from "./PracticeCards";
 import ChapterSheet from "./ChapterSheet";
@@ -47,8 +47,10 @@ export default function ChapterMap({ o, onChanged }: { o: ReadingOverview; onCha
     };
   }, []);
 
-  const load = useCallback(async () => {
-    const r = await getJson(bUrl);
+  // `shared`: the read at mount joins the Practice part's own read of the same URL (one request, not two); a read after
+  // a Restore or a rebuild is a plain GET, so it never joins an answer from before the write.
+  const load = useCallback(async (shared = false) => {
+    const r = await (shared ? getJsonShared(bUrl) : getJson(bUrl));
     if (!alive.current) return;
     if (r.status === 200) {
       const parsed = parseMap(r.body);
@@ -72,7 +74,7 @@ export default function ChapterMap({ o, onChanged }: { o: ReadingOverview; onCha
   // Mount, and whenever the overview's bank numbers move (an answer, a new chapter unlocked, a build finished).
   const signature = mapSignature(o.practice);
   useEffect(() => {
-    void load();
+    void load(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bUrl, signature]);
 
