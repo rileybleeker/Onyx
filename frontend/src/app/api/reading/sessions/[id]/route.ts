@@ -4,6 +4,7 @@ import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
 import { removalAnswer, runRemovalCleanup } from "@/lib/reading-removal";
+import { SESSION_GONE_CODE } from "@/lib/reading-removal-receipt";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -23,8 +24,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * The Notion quote block follows best-effort after the response (updated in place, moved to the other book's page,
  * or trashed), and the progress callout is rewritten.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check, JSON only and a size cap.
- * Answers: 200 { success, session, xp_gained, finished, overview } / { success, removed, unfinished, overview },
- * 400 with the reason, 404 for a session that no longer exists (and no removal of it on record), 409 for a Kindle
+ * Answers: 200 { success, session, xp_gained, finished, overview } / { success, removed: id, unfinished, overview },
+ * 400 with the reason, 404 { error, code: "session_gone" } for a session that no longer exists (and no removal of it
+ * on record; the form takes a removal as done only on that 200 for its id or this 404, Codex T01-R8), 409 for a Kindle
  * session, 503 while sql/reading_session_discards.sql is not applied (nothing removed; the form retries).
  */
 
@@ -117,7 +119,9 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   // cleanup still owed. A retry of a removal whose answer was lost finds the session gone and gets that cleanup back,
   // so the entry is still trashed (Codex review of PR 376); the database part is never repeated.
   const r = await deleteSession(supabase, id, habitCreatedOn);
-  if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
+  // 404 carries a code so the form can tell this answer (the session is gone, nothing on record) from any other 404
+  // page, which never counts as a removal (Codex T01-R8).
+  if (!r.ok) return NextResponse.json(r.status === 404 ? { error: r.error, code: SESSION_GONE_CODE } : { error: r.error }, { status: r.status });
   const { book, overview, removedId, owed } = await removalAnswer(supabase, r);
   if (owed) after(() => runRemovalCleanup(supabase, r, book, overview));
 

@@ -694,11 +694,35 @@ async function removeSessionTx(
     if (discardsMissing(error)) return { kind: "failed", status: 503, error: DISCARD_UNAVAILABLE };
     return { kind: "failed", status: 500, error: error.message };
   }
-  const out = (data ?? {}) as { removed?: boolean; session?: Record<string, unknown>; book?: Record<string, unknown>; unfinished?: boolean; habit_removed?: boolean; removal?: unknown };
-  if (out.removed !== true) return { kind: "absent", cleanup: cleanupOf(out.removal) };
-  if (!out.session || !out.book) return { kind: "failed", status: 500, error: "The removal was not confirmed. Try again." };
-  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, out.session?.[k] ?? null])) as unknown as ReadingSession;
-  const book = Object.fromEntries(BOOK_KEYS.map((k) => [k, out.book?.[k] ?? null])) as unknown as Book;
+  return removalOutcomeOf(data);
+}
+
+const REMOVAL_UNCONFIRMED = "The removal was not confirmed. Try again.";
+
+/**
+ * Reads pds.remove_reading_session's answer (Codex T01-R8). Only an explicit outcome counts: `removed` must be a
+ * boolean; `removed: false` must carry its `removal` (null = nothing on record, else a well-formed cleanup row);
+ * `removed: true` must carry the session and its book with their ids. Anything else (null, {}, a missing or
+ * non-boolean `removed`, a malformed row) is "not confirmed" (500, retried): it is never read as "nothing stored",
+ * so a Discard never clears an entry whose removal was not confirmed. Exported for the tests.
+ */
+export function removalOutcomeOf(data: unknown): RemovalOutcome {
+  const unconfirmed: RemovalOutcome = { kind: "failed", status: 500, error: REMOVAL_UNCONFIRMED };
+  if (!data || typeof data !== "object" || Array.isArray(data)) return unconfirmed;
+  const out = data as { removed?: unknown; session?: unknown; book?: unknown; unfinished?: unknown; habit_removed?: unknown; removal?: unknown };
+  if (typeof out.removed !== "boolean" || !("removal" in out)) return unconfirmed;
+  if (out.removed === false) {
+    if (out.removal === null) return { kind: "absent", cleanup: null };
+    const cleanup = cleanupOf(out.removal);
+    return cleanup ? { kind: "absent", cleanup } : unconfirmed;
+  }
+  const isRow = (v: unknown, idKey: string): v is Record<string, unknown> =>
+    !!v && typeof v === "object" && !Array.isArray(v) && Number.isFinite(Number((v as Record<string, unknown>)[idKey])) && (v as Record<string, unknown>)[idKey] !== null;
+  const rawSession = out.session;
+  const rawBook = out.book;
+  if (!isRow(rawSession, "session_id") || !isRow(rawBook, "book_id")) return unconfirmed;
+  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, rawSession[k] ?? null])) as unknown as ReadingSession;
+  const book = Object.fromEntries(BOOK_KEYS.map((k) => [k, rawBook[k] ?? null])) as unknown as Book;
   return { kind: "removed", session, book, unfinished: out.unfinished === true, habitRemoved: out.habit_removed === true, cleanup: cleanupOf(out.removal) };
 }
 
@@ -1178,6 +1202,11 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
       await unstampHabitIfUnused(supabase, previousBook, previous.session_date, sessionId);
     }
     habitCreatedOn = sameRow ? input.habit_created_on : stamp.created ? date : null;
+    // The keyed create's record of the habit row (sql/reading_session_discards.sql) describes the day the session
+    // left: from here on its removal goes by habit_created_on as before (Codex T01-R7). Best-effort: a record left
+    // in place only keeps a Yes its row version no longer matches, the safe direction.
+    const { error: recordError } = await supabase.from("reading_session_habit_stamps").delete().eq("session_id", sessionId);
+    if (recordError && !discardsMissing(recordError) && recordError.code !== "PGRST205") console.error("reading: habit record cleanup failed:", recordError.code ?? "unknown");
   }
 
   return {
@@ -1207,8 +1236,8 @@ export type SessionRemoval =
 /**
  * Remove a manual or chat session (the autosaving form's "Remove this session"). A book this session finished
  * (finished on its day, and no other session reaches the last chapter) goes back to reading. The day's habit Yes
- * is taken back only when this session made it (`habitCreatedOn`) and no other session with the same habit is on
- * that day. All of it, and the session's client_key recorded as discarded (a create of that key still under way is
+ * is taken back only when this session made it and no other session with the same habit is on that day: a keyed
+ * create's own record in the database decides (Codex T01-R7), else `habitCreatedOn`. All of it, and the session's client_key recorded as discarded (a create of that key still under way is
  * then refused instead of bringing the session back, Codex T01-R6), is ONE transaction (pds.remove_reading_session):
  * a removal whose answer is lost has removed everything or nothing, and its retry finds the cleanup row and gets
  * `removed: null` with it, so the route still trashes the Notion entry (Codex review of PR 376).
@@ -1229,8 +1258,10 @@ export async function deleteSession(supabase: Supa, sessionId: number, habitCrea
  * one transaction (pds.remove_reading_session) records the key as discarded under the key's lock, so a create of it
  * still running on the server either committed before (its session is found and removed here) or is refused after,
  * and removes that session exactly like DELETE /api/reading/sessions/[id] (a finish it caused goes back to reading;
- * the route trashes its Notion entry). Whether that create made the day's habit row is unknown (its answer was lost),
- * so the habit Yes stays, the same rule as an edit of a replayed create.
+ * the route trashes its Notion entry). Whether that create made the day's habit row is not taken from the browser
+ * (its answer was lost): the create wrote it down with the session (pds.reading_session_habit_stamps), and the
+ * removal takes back the Yes it made (or gives back the answer it replaced) unless the row was answered again since
+ * (Codex T01-R7).
  * The create side is one transaction too (pds.create_reading_session: session, finish and habit Yes together), so the
  * session found here comes with every effect its create had, and none can follow after its removal (Codex T01-R4).
  * `removed: null` = no session has this key (the database said so inside that transaction, never assumed from a

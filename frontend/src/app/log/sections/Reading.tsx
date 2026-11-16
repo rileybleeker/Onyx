@@ -11,6 +11,7 @@ import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
 import { deviceBehavioralDay, fallbackBehavioralToday } from "@/lib/checkin";
 import { isBlankSession, newClientKey, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
+import { readRemovalReply } from "@/lib/reading-removal-receipt";
 import type { RetainedSaveContext } from "@/lib/autosave-retain";
 import { useRetainedAutosave } from "@/lib/use-autosave";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
@@ -374,15 +375,14 @@ export default function ReadingSection() {
     let overview: ReadingOverview | null | undefined;
     if (url) {
       const res = await fetch(url, { method: "DELETE", keepalive });
-      const json = (await res.json().catch(() => ({}))) as { error?: string; overview?: ReadingOverview | null };
+      // Only the removal's own receipt lets the entry go (Codex T01-R8): 200 naming this session id or this key (or
+      // 404 "session_gone" for an id). An empty, malformed or redirected answer is retried and the entry, its draft
+      // and its key stay. A refusal is shown and not retried.
+      const reply = await readRemovalReply(res, id !== null ? { sessionId: id } : { clientKey: kept.clientKey });
       if (cancelled()) return;
-      if (!res.ok && res.status !== 404) {
-        // 404: that session is gone already. A refusal is shown and not retried; anything else is retried.
-        const text = json.error || `Discard failed (${res.status}).`;
-        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(text);
-        throw new Error(text);
-      }
-      overview = json.overview;
+      if (reply.kind === "refused") throw new AutosaveRefused(reply.error);
+      if (reply.kind === "unconfirmed") throw new Error(reply.error);
+      overview = reply.overview;
     }
     if (cancelled()) return;
     // Nothing of the entry is stored now, and the server will create nothing more under its key (recorded as
@@ -741,11 +741,12 @@ export default function ReadingSection() {
     try {
       const day = kept.habitCreatedOn;
       const res = await fetch(`/api/reading/sessions/${id}${day ? `?habit_created_on=${encodeURIComponent(day)}` : ""}`, { method: "DELETE" });
-      const json = (await res.json().catch(() => ({}))) as { error?: string; overview?: ReadingOverview | null };
-      if (!res.ok && res.status !== 404) throw new Error(json.error || `HTTP ${res.status}`);
+      // Only the removal's own receipt (200 naming this id, or 404 "session_gone") clears the form (Codex T01-R8).
+      const reply = await readRemovalReply(res, { sessionId: id }, "Removing the session");
+      if (reply.kind !== "confirmed") throw new Error(reply.error);
       if (!alive.current) return;
       startNew();
-      showOverview(json.overview);
+      showOverview(reply.overview);
     } catch (e) {
       if (alive.current) setRemoveError(`Couldn't remove the session: ${e instanceof Error ? e.message : String(e)}`);
     } finally {

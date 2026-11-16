@@ -110,25 +110,30 @@ function originRefused(req: NextRequest): { status: number; error: string } | nu
  * (PROD-T01): the form knows no session id, only the create's client_key. The key is recorded as discarded first
  * (sql/reading_session_discards.sql), so a create of it still running on the server is either found or refused, then
  * the session that key made (if any) is removed here like DELETE /api/reading/sessions/[id] (lib/reading.ts
- * deleteSessionByClientKey: finish undone, habit Yes left because whether the create made it is unknown). Nothing is
+ * deleteSessionByClientKey: finish undone, and the habit change the create made taken back from the create's own
+ * record in the database unless the habit was answered again since, Codex T01-R7). Nothing is
  * created: `removed: null` tells the form nothing of the entry is stored, and nothing can be stored under that key
  * any more. Repeating it is safe.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check.
- * Answers: 200 { success, removed: id | null, unfinished, overview } (a retry of a removal whose answer was lost
+ * Answers: 200 { success, discarded: true, client_key, removed: id | null, unfinished, overview } (the form clears
+ * the entry only on exactly this receipt for its own key, Codex T01-R8; a retry of a removal whose answer was lost
  * answers its id and replays its Notion cleanup), 400 for a key that is not a UUID, 503 while the
  * discard cannot be recorded (SQL not applied), 500 on a database failure (the form retries both).
  */
 export async function DELETE(req: NextRequest) {
   const refused = originRefused(req);
   if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
-  const r = await deleteSessionByClientKey(supabase, req.nextUrl.searchParams.get("client_key") ?? "");
+  const clientKey = (req.nextUrl.searchParams.get("client_key") ?? "").toLowerCase();
+  const r = await deleteSessionByClientKey(supabase, clientKey);
   if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
-  if (!r.removed && !r.cleanup) return NextResponse.json({ success: true, removed: null, unfinished: false, overview: null });
+  // The receipt names the key whose discard is recorded (Codex T01-R8).
+  const receipt = { success: true, discarded: true, client_key: clientKey };
+  if (!r.removed && !r.cleanup) return NextResponse.json({ ...receipt, removed: null, unfinished: false, overview: null });
   // A fresh removal, or a retry of one whose answer was lost: the Notion cleanup it still owes runs after the
   // response (lib/reading-removal.ts). A create's own after() that was still writing the Notion entry trashes it
   // once it sees the row gone.
   const { book, overview, removedId, owed } = await removalAnswer(supabase, r);
   if (owed) after(() => runRemovalCleanup(supabase, r, book, overview));
 
-  return NextResponse.json({ success: true, removed: removedId, unfinished: r.unfinished, overview });
+  return NextResponse.json({ ...receipt, removed: removedId, unfinished: r.unfinished, overview });
 }

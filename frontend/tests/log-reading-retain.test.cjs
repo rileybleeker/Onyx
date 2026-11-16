@@ -128,7 +128,12 @@ function setup(t) {
   /** "up", "lost" (the server stores an edit of a session, but its answer never arrives) or "gone" (404: removed). */
   let patchMode = "up";
   let readMode = "up";
-  /** "up", or "lost": the server removes what a DELETE names, but its answer never arrives. */
+  /**
+   * "up", or "lost": the server removes what a DELETE names, but its answer never arrives. "empty" / "null" /
+   * "malformed" / "redirected" / "foreign404": it removes it, but the 200 (or 404) that arrives carries no valid
+   * receipt (Codex T01-R8): {}, the JSON null, a body that is not JSON, a sign-in page after a redirect, or a 404 page
+   * that is not the route's own "session_gone".
+   */
   let deleteMode = "up";
   // Keys whose entry was discarded (sql/reading_session_discards.sql): a create under one is refused with 409, so a
   // create that reaches the server after its Discard stores nothing.
@@ -155,7 +160,16 @@ function setup(t) {
   };
   // Run once between the next render and its effects (a background save landing before React's passive effects).
   let beforeEffects = null;
-  const reply = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
+  const raw = (text, status = 200, redirected = false) => ({ ok: status >= 200 && status < 300, status, redirected, text: async () => text, json: async () => JSON.parse(text) });
+  const reply = (body, status = 200) => raw(JSON.stringify(body), status);
+  /** The answer of a DELETE the server carried out: its receipt, or a broken one (deleteMode). */
+  const deleteReply = (receipt) =>
+    deleteMode === "empty" ? reply({})
+      : deleteMode === "null" ? raw("null")
+        : deleteMode === "malformed" ? raw("<html>oops")
+          : deleteMode === "redirected" ? raw("<html>Sign in</html>", 200, true)
+            : deleteMode === "foreign404" ? raw("<html>Not found</html>", 404)
+              : receipt();
   const replacements = {
     document: { visibilityState: "visible", activeElement: null, body: {}, addEventListener() {}, removeEventListener() {} },
     window: { addEventListener() {}, removeEventListener() {} },
@@ -191,17 +205,21 @@ function setup(t) {
         const row = rows.get(key);
         rows.delete(key);
         if (deleteMode === "lost") throw new TypeError("Failed to fetch");
-        return reply({ success: true, removed: row ? row.session_id : null, overview: null });
+        return deleteReply(() => reply({ success: true, discarded: true, client_key: key.toLowerCase(), removed: row ? row.session_id : null, overview: null }));
       }
       if (init.method === "DELETE" && url.startsWith("/api/reading/sessions/")) {
         const sid = Number(url.split("/").pop().split("?")[0]);
+        let found = false;
         for (const [k, r] of rows) {
           if (r.session_id !== sid) continue;
           discardedKeys.add(k); // a removal by id records the session's key as discarded too
           rows.delete(k);
+          found = true;
         }
         if (deleteMode === "lost") throw new TypeError("Failed to fetch");
-        return reply({ overview: null });
+        return deleteReply(() =>
+          found ? reply({ success: true, removed: sid, unfinished: false, overview: null }) : reply({ error: "That session no longer exists.", code: "session_gone" }, 404),
+        );
       }
       throw new Error(`unexpected request ${init.method} ${url}`);
     },
@@ -868,6 +886,52 @@ test("lost create answer, kept across an unmount, then a Discard whose own answe
   assert.equal(h.rows.size, 0);
   await h.unmount();
   assert.equal(h.retainer.size, 0);
+});
+
+for (const broken of ["empty", "null", "malformed", "redirected"]) {
+  test(`lost create answer, then a Discard answered 200 with no valid receipt (${broken}): the entry, its draft and its key stay until a real receipt (Codex T01-R8)`, async (t) => {
+    const h = setup(t);
+    await h.mount();
+    h.mode = "lost"; // the server stores the session; the answer never arrives
+    await h.type("Through ch.", "5");
+    await h.tick(1500);
+    assert.equal(h.rows.size, 1, "stored on the server");
+    const key = h.posts()[0].body.client_key;
+    await h.serve(noBookAnswer());
+    h.mode = "up";
+    const posts = h.posts().length;
+
+    h.deleteMode = broken; // the removal happens, but the 200 that arrives proves nothing
+    await h.click("Discard this entry");
+    assert.equal(h.deletes().length, 1);
+    assert.match(h.text(), /Discard not confirmed/, "a 200 without its receipt is not a discard");
+    assert.doesNotMatch(h.text(), /Discarded/);
+    assert.equal(h.value("Through ch."), "5", "the entry stays on screen");
+    assert.equal(h.work.has(), true, "still unsaved work");
+    assert.equal(h.retainer.find("log-reading").data.clientKey, key, "and keeps the same key");
+
+    h.deleteMode = "up";
+    await h.tick(60_000); // the retry gets the route's own receipt for that key
+    assert.ok(h.deletes().every((c) => c.url === `/api/reading/sessions?client_key=${key}`), "the same key every time");
+    assert.match(h.text(), /No book in progress\./, "gone only once confirmed");
+    assert.equal(h.work.has(), false);
+    assert.equal(h.posts().length, posts, "nothing created to find out");
+  });
+}
+
+test("Remove this session answered by a 404 page that is not the route's own: the session stays on screen (Codex T01-R8)", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1);
+  h.deleteMode = "foreign404";
+  await h.click("Remove this session");
+  assert.match(h.text(), /Couldn't remove the session: /);
+  assert.equal(h.value("Through ch."), "5", "not cleared on an answer that proves nothing");
+  h.deleteMode = "up";
+  await h.click("Remove this session"); // the session is gone already: the route's own 404 confirms it
+  assert.equal(h.value("Through ch."), "", "cleared once the route says the session is gone");
 });
 
 test("lost create answer, then the form emptied: the stored session is removed by its key, never left behind under a clean form", async (t) => {

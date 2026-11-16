@@ -117,7 +117,12 @@ test("parseSessionUpdate: strict body", () => {
 function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null, booksReadError = false } = {}) {
   let keyLookups = 0;
   const tables = JSON.parse(JSON.stringify(seed));
-  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals"]) tables[t] ??= [];
+  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals", "reading_session_habit_stamps"]) tables[t] ??= [];
+  // The habit rows' versions (xmin in the database): every write to a row gives it a new one.
+  const versions = new Map();
+  let nextVersion = 1;
+  const habitKey = (date, question) => `${date}|${question}`;
+  const bump = (date, question) => versions.set(habitKey(date, question), nextVersion++);
   const log = [];
   const hooks = { beforeInsert: null, inCreate: null };
   const locks = new Map();
@@ -144,6 +149,10 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       );
     const run = () => {
       log.push({ table, op: st.op, payload: st.payload, filters: st.filters });
+      if (table === "habit_journal" && st.op !== "select") {
+        const touched = st.op === "upsert" || st.op === "insert" ? [st.payload] : rows().filter(match);
+        for (const r of touched) bump(r.cycle_date, r.question);
+      }
       if (noClientKey && table === "reading_sessions" && (st.filters.some(([k]) => k === "client_key") || (st.op === "insert" && "client_key" in st.payload))) {
         return { data: null, error: { code: st.op === "insert" ? "PGRST204" : "42703", message: "column client_key does not exist" } };
       }
@@ -246,18 +255,35 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
         unfinished = true;
       }
       let habitRemoved = false;
+      let habitRestored = false;
       const sameHabit = tables.books.filter((x) => x.habit_name === b.habit_name).map((x) => x.book_id);
-      if (
-        a.p_habit_created_on && a.p_habit_created_on === row.session_date && b.habit_name &&
-        !tables.reading_sessions.some((s) => s.session_date === row.session_date && sameHabit.includes(s.book_id))
-      ) {
-        const before = tables.habit_journal.length;
-        tables.habit_journal = tables.habit_journal.filter((h) => !(h.cycle_date === row.session_date && h.question === b.habit_name && h.answer === "Yes"));
-        habitRemoved = tables.habit_journal.length < before;
+      const stamp = tables.reading_session_habit_stamps.find((t) => t.session_id === row.session_id);
+      if (b.habit_name && !tables.reading_sessions.some((s) => s.session_date === row.session_date && sameHabit.includes(s.book_id))) {
+        if (stamp && stamp.cycle_date === row.session_date && stamp.question === b.habit_name) {
+          // The create's own record decides, while the habit row is still the version that create left (T01-R7).
+          const h = tables.habit_journal.find((x) => x.cycle_date === row.session_date && x.question === b.habit_name);
+          if (h && versions.get(habitKey(h.cycle_date, h.question)) === stamp.row_version) {
+            if (!stamp.had_row) {
+              tables.habit_journal = tables.habit_journal.filter((x) => x !== h);
+              versions.delete(habitKey(h.cycle_date, h.question));
+              habitRemoved = true;
+            } else if (h.answer !== stamp.prev_answer || h.category !== stamp.prev_category) {
+              Object.assign(h, { answer: stamp.prev_answer, category: stamp.prev_category });
+              bump(h.cycle_date, h.question);
+              habitRestored = true;
+              habitRemoved = stamp.prev_answer !== "Yes";
+            }
+          }
+        } else if (a.p_habit_created_on && a.p_habit_created_on === row.session_date) {
+          const before = tables.habit_journal.length;
+          tables.habit_journal = tables.habit_journal.filter((h) => !(h.cycle_date === row.session_date && h.question === b.habit_name && h.answer === "Yes"));
+          habitRemoved = tables.habit_journal.length < before;
+        }
       }
+      tables.reading_session_habit_stamps = tables.reading_session_habit_stamps.filter((t) => t.session_id !== row.session_id);
       const removal = { session_id: row.session_id, client_key: row.client_key ?? null, book_id: row.book_id, session_date: row.session_date, notion_block_id: row.notion_block_id ?? null, unfinished, removed_at: "2026-11-15T21:00:00Z", mirror_done_at: null };
       tables.reading_session_removals = tables.reading_session_removals.filter((r) => r.session_id !== row.session_id).concat([removal]);
-      return { data: JSON.parse(JSON.stringify({ removed: true, session: row, book: b, unfinished, habit_removed: habitRemoved, removal })), error: null };
+      return { data: JSON.parse(JSON.stringify({ removed: true, session: row, book: b, unfinished, habit_removed: habitRemoved, habit_restored: habitRestored, removal })), error: null };
     };
     return key ? withLock(key, tx) : tx();
   };
@@ -311,8 +337,21 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       let created = false;
       if (b && b.habit_name) {
         const hit = tables.habit_journal.find((h) => h.cycle_date === a.p_session_date && h.question === b.habit_name);
+        const prev = hit ? { answer: hit.answer, category: hit.category } : null;
         if (hit) Object.assign(hit, { category: "learning", answer: "Yes" });
         else tables.habit_journal.push({ cycle_date: a.p_session_date, question: b.habit_name, category: "learning", answer: "Yes" });
+        bump(a.p_session_date, b.habit_name);
+        // What this create did to the habit row, written with the session (pds.reading_session_habit_stamps).
+        tables.reading_session_habit_stamps.push({
+          session_id: row.session_id,
+          client_key: a.p_client_key,
+          cycle_date: a.p_session_date,
+          question: b.habit_name,
+          had_row: !!hit,
+          prev_answer: prev ? prev.answer : null,
+          prev_category: prev ? prev.category : null,
+          row_version: versions.get(habitKey(a.p_session_date, b.habit_name)),
+        });
         marked = true;
         created = !hit;
       }
@@ -520,7 +559,7 @@ test("deleteSessionByClientKey (Discard after a lost create answer): removes the
   assert.equal(r.removed.session_id, 41, "found by the create's own key");
   assert.equal(r.unfinished, true, "the finish it caused is undone");
   assert.deepEqual(db.tables.reading_sessions.map((s) => s.session_id), [42], "only that session goes");
-  assert.equal(db.tables.habit_journal.length, 1, "whether that create made the habit row is unknown: the Yes stays");
+  assert.equal(db.tables.habit_journal.length, 1, "no create record for this session (stored before it existed) and no day from the form: the Yes stays");
   assert.equal(db.log.some((l) => l.op === "insert" || l.op === "upsert"), false, "nothing is created to find out");
   assert.deepEqual(db.tables.reading_session_discards.map((d) => d.client_key), [KEY], "the key is recorded as discarded (lower case)");
 
@@ -640,7 +679,7 @@ test("a Discard landing while a keyed create is still committing removes the ses
   assert.equal(db.tables.reading_sessions.length, 0);
   assert.equal(db.tables.books[0].status, "reading", "no finished book for a removed session");
   assert.equal(db.tables.books[0].finished_on, null);
-  assert.equal(db.tables.habit_journal.length, 1, "the create made the habit Yes before the discard: kept by the documented rule (unknown to the form)");
+  assert.equal(db.tables.habit_journal.length, 0, "the create made the habit Yes, and its own record takes it back (Codex T01-R7)");
   // Nothing of the create ran after the removal: a repeat finds nothing to remove and a late retry is refused.
   const repeat = await R.deleteSessionByClientKey(db, KEY);
   assert.equal(repeat.removed, null);
@@ -662,6 +701,69 @@ test("removal: a failed database call is never 'nothing stored' (Codex T01-R5)",
   assert.equal(db.tables.reading_sessions.length, 1);
   // A session that is gone with no removal of it on record is a 404, as before.
   assert.equal((await R.deleteSession(fakeDb({ books: [BOOK] }), 99, null)).status, 404);
+});
+
+test("lost create answer, then Discard: the Yes the create made goes, from its own record, not from the browser (Codex T01-R7)", async () => {
+  const db = fakeDb({ books: [BOOK] });
+  const made = await R.logSession(db, create({ date: "2026-11-15" }));
+  assert.equal(made.habitCreated, true, "the create made the day's habit row");
+  // Its answer is lost: the form never learns habit_created_on, and the Discard goes by key with no day.
+  const r = await R.deleteSessionByClientKey(db, KEY);
+  assert.equal(r.ok, true);
+  assert.equal(r.removed.session_id, made.session.session_id);
+  assert.equal(r.habitRemoved, true);
+  assert.equal(db.tables.habit_journal.length, 0, "no habit Yes left for a removed session");
+  assert.equal(db.tables.reading_session_habit_stamps.length, 0, "the record goes with the session");
+});
+
+test("lost create answer, then an independent answer to the habit, then Discard: that answer is kept (Codex T01-R7)", async () => {
+  const db = fakeDb({ books: [BOOK] });
+  await R.logSession(db, create({ date: "2026-11-15" }));
+  // Riley answers the habit elsewhere (/check-in): a new write to the row, even with the same value.
+  await db.from("habit_journal").upsert({ cycle_date: "2026-11-15", question: HABIT, category: "learning", answer: "Yes" });
+  const r = await R.deleteSessionByClientKey(db, KEY);
+  assert.equal(r.ok, true);
+  assert.equal(r.habitRemoved, false);
+  assert.deepEqual(db.tables.habit_journal, [yes("2026-11-15")], "the independent answer stays");
+});
+
+test("lost create answer over an explicit No, then Discard: the No comes back (Codex T01-R7)", async () => {
+  const no = { cycle_date: "2026-11-15", question: HABIT, category: "other", answer: "No" };
+  const db = fakeDb({ books: [BOOK], habit_journal: [no] });
+  const made = await R.logSession(db, create({ date: "2026-11-15" }));
+  assert.equal(made.habitCreated, false, "the row existed");
+  assert.equal(db.tables.habit_journal[0].answer, "Yes");
+  const r = await R.deleteSessionByClientKey(db, KEY);
+  assert.equal(r.habitRemoved, true, "the Yes the create wrote is taken back");
+  assert.deepEqual(db.tables.habit_journal, [no], "the earlier answer and category again");
+});
+
+test("removal RPC adapter: only an explicit outcome counts; null, {} and malformed answers are 'not confirmed', never 'nothing stored' (Codex T01-R8)", async () => {
+  const rowsOk = { session: session({ client_key: KEY }), book: BOOK };
+  for (const data of [
+    null,
+    {},
+    [],
+    "removed",
+    { removed: null, removal: null },
+    { removed: "false", removal: null },
+    { removed: false }, // no removal key at all
+    { removed: false, removal: { session_id: "x" } }, // a malformed cleanup row
+    { removed: true, removal: null }, // removed with no session or book
+    { removed: true, session: { session_id: null }, book: BOOK, removal: null },
+    { removed: true, session: rowsOk.session, book: {}, removal: null },
+  ]) {
+    assert.deepEqual(R.removalOutcomeOf(data), { kind: "failed", status: 500, error: "The removal was not confirmed. Try again." }, JSON.stringify(data));
+    const db = { rpc: async () => ({ data, error: null }), from: () => { throw new Error("no table read"); } };
+    const byKey = await R.deleteSessionByClientKey(db, KEY);
+    assert.equal(byKey.ok, false, `by key: ${JSON.stringify(data)}`);
+    assert.equal(byKey.status, 500);
+    const byId = await R.deleteSession(db, 41, null);
+    assert.equal(byId.ok, false, `by id: ${JSON.stringify(data)}`);
+    assert.equal(byId.status, 500);
+  }
+  assert.deepEqual(R.removalOutcomeOf({ removed: false, removal: null }), { kind: "absent", cleanup: null }, "an explicit 'nothing here'");
+  assert.equal(R.removalOutcomeOf({ removed: true, ...rowsOk, unfinished: false, habit_removed: false, removal: null }).kind, "removed");
 });
 
 test("removal whose answer was lost: the database part committed whole, the retry replays only the Notion cleanup (PR 376 review)", async () => {
@@ -778,6 +880,11 @@ test("sql/reading_session_discards.sql: additive, service-role only, one lock pe
   assert.match(sql, /REVOKE ALL ON pds\.reading_session_removals FROM anon, authenticated/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.remove_reading_session\(bigint, uuid, date\) TO service_role/);
   assert.match(lib, /rpc\("create_reading_session", \{/, "a keyed create is one database call");
+  // Codex T01-R7: what the create did to the habit row is written in the create and read by the removal.
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.reading_session_habit_stamps/);
+  assert.match(sql, /REVOKE ALL ON pds\.reading_session_habit_stamps FROM anon, authenticated/);
+  assert.match(body, /INSERT INTO pds\.habit_journal[\s\S]*INSERT INTO pds\.reading_session_habit_stamps/, "the record is written in the same step as the stamp");
+  assert.match(rmBody, /FROM pds\.reading_session_habit_stamps[\s\S]*h\.xmin::text[\s\S]*v_version = v_stamp\.row_version/, "the removal reads the record and checks the row version");
 });
 
 test("sql/reading_sessions_client_key.sql: additive only (the Supabase connector refuses any DROP)", () => {

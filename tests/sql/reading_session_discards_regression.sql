@@ -19,6 +19,7 @@ DECLARE
     v_book bigint;
     r jsonb;
     v_status text;
+    v_cat text;
     v_count integer;
 BEGIN
     INSERT INTO pds.books (slug, title, total_chapters, status)
@@ -94,6 +95,53 @@ BEGIN
     END;
     SELECT count(*) INTO v_count FROM pds.reading_sessions WHERE client_key = '00000000-0000-4000-8000-000000000004';
     ASSERT v_count = 0, 'nothing stored by a failed create';
+
+    -- Habit cases (Codex T01-R7): a synthetic habit on a synthetic book, on future days (no frozen era, no retrain
+    -- signal). Every removal below passes p_habit_created_on = NULL, as a Discard after a lost create answer does.
+    INSERT INTO pds.habit_name_map (notion_page_id, habit_name) VALUES ('sql-regression-page', 'SQL regression habit?');
+    INSERT INTO pds.books (slug, title, total_chapters, status, habit_name)
+    VALUES ('sql-regression-habit-book', 'Synthetic', 30, 'reading', 'SQL regression habit?') RETURNING book_id INTO v_book;
+
+    -- 9. Lost create answer, no habit row before: the create's record decides and the Yes it made goes.
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000009', v_book, DATE '2030-01-10', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    ASSERT (r->>'habit_created')::boolean, 'the create made the habit row';
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000009', NULL);
+    ASSERT (r->>'removed')::boolean AND (r->>'habit_removed')::boolean, 'the Yes the create made is taken back';
+    SELECT count(*) INTO v_count FROM pds.habit_journal WHERE cycle_date = DATE '2030-01-10' AND question = 'SQL regression habit?';
+    ASSERT v_count = 0, 'no habit row left';
+    SELECT count(*) INTO v_count FROM pds.reading_session_habit_stamps WHERE client_key = '00000000-0000-4000-8000-000000000009';
+    ASSERT v_count = 0, 'the create record goes with the session';
+
+    -- 10. Lost create answer, then an independent answer to the habit (a later write gives the row a new version):
+    --     the removal keeps that answer.
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000010', v_book, DATE '2030-01-11', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    UPDATE pds.habit_journal SET answer = 'Yes', notes = 'answered elsewhere'
+     WHERE cycle_date = DATE '2030-01-11' AND question = 'SQL regression habit?';
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000010', NULL);
+    ASSERT (r->>'removed')::boolean AND NOT (r->>'habit_removed')::boolean, 'an independent answer is kept';
+    SELECT count(*) INTO v_count FROM pds.habit_journal
+     WHERE cycle_date = DATE '2030-01-11' AND question = 'SQL regression habit?' AND answer = 'Yes';
+    ASSERT v_count = 1, 'the independent Yes stays';
+
+    -- 11. Lost create answer over an explicit No: the removal gives the No (and its category) back.
+    INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
+    VALUES (DATE '2030-01-12', 'SQL regression habit?', 'other', 'No');
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000011', v_book, DATE '2030-01-12', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    ASSERT NOT (r->>'habit_created')::boolean, 'the row existed';
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000011', NULL);
+    ASSERT (r->>'habit_restored')::boolean AND (r->>'habit_removed')::boolean, 'the earlier answer is restored';
+    SELECT answer, category INTO v_status, v_cat FROM pds.habit_journal
+     WHERE cycle_date = DATE '2030-01-12' AND question = 'SQL regression habit?';
+    ASSERT v_status = 'No' AND v_cat = 'other', 'answer No and category other again';
+
+    -- 12. Another session with the same habit on that day keeps the Yes.
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000012', v_book, DATE '2030-01-13', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000013', v_book, DATE '2030-01-13', 2, 2, NULL, NULL, NULL, NULL, 'manual');
+    r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000012', NULL);
+    ASSERT NOT (r->>'habit_removed')::boolean, 'the other session still holds the Yes';
+    SELECT count(*) INTO v_count FROM pds.habit_journal
+     WHERE cycle_date = DATE '2030-01-13' AND question = 'SQL regression habit?' AND answer = 'Yes';
+    ASSERT v_count = 1, 'Yes stays while another session is on the day';
 END $$;
 
 ROLLBACK;
