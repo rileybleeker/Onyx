@@ -6,6 +6,7 @@ import { MoreHorizontal, X } from "lucide-react";
 import { DONT_KNOW_ANSWER, gradeLocal, orderAnswerText, parseRubric, QUICK_SIZE, type ModelVerdict, type Verdict } from "@/lib/reading-recall";
 import { attemptFor, classifyReviewAnswer, GRADE_LABEL, intervalLabel, newOpKey, PRACTICE_GRADES, type PracticeGrade, type ReviewAttempt } from "@/lib/reading-practice";
 import {
+  ANSWER_MAX_CHARS,
   ATTEMPT_URL,
   choiceOrder,
   classifyAttemptAnswer,
@@ -71,7 +72,12 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  *   feedback, Disagree, Grade it yourself and the flags. A resumed round reads its earlier answers' grades once on
  *   open and polls for one still pending.
  * - Closing (Done, ×, Esc, One more round) sends what is pending and tells the part when it has settled, so the part
- *   re-reads the round only after the answers and flags landed.
+ *   re-reads the round only after the answers and flags landed. × and Esc with a typed answer not yet checked ask
+ *   first ("Leave without checking?"): the answer lives in memory only, so closing would lose it (an Esc that cancels
+ *   an input method's composition never closes anything).
+ * - "Not read yet" hides the held chapter and every later one at once, stored answers included: they leave the
+ *   summary's list, the opened results and the chapter recall's Covered / Missed, because their prompts, answers
+ *   and sources now state what Riley said he has not read (the counts stay; the answers are still valid).
  * - Keys only act from inside the runner (or with nothing focused) and never on an event another widget handled;
  *   Esc only with focus inside.
  * - The verdict is announced once (aria-live polite) as a word; every verdict on screen is an icon plus a word.
@@ -154,6 +160,12 @@ const attemptKeyOf = (it: Item): string | null => (it.req?.attempt_key ?? it.car
 const isDone = (it: Item) => it.phase === "past" || it.phase === "out";
 const answerable = (it: Item) => it.phase === "open" || it.phase === "refused";
 const canNext = (it: Item) => it.phase === "saved" || it.phase === "stale";
+/** The card shows a text box (not steps to order, not the four choices) ... */
+const showsTextBox = (it: Item) => !it.earlier && it.question?.format !== "order" && !(it.question?.format === "cued" && it.hinted);
+/** ... and Riley typed something in it that was not checked yet: it lives in memory only, so closing would lose it. */
+const typedUnsent = (it: Item) => answerable(it) && it.card.kind !== "highlight" && showsTextBox(it) && it.answer.trim() !== "";
+/** More characters than the attempt route takes (400 bad_answer): Check waits until it is shortened. */
+const tooLong = (it: Item) => showsTextBox(it) && it.answer.length > ANSWER_MAX_CHARS;
 
 type Results = Record<string, AttemptResult>;
 
@@ -236,6 +248,10 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const [voidedKeys, setVoidedKeys] = useState<ReadonlySet<string>>(() => new Set());
   // "Again" repeats whose model grade arrived after the round was over: offered on the summary, never pushed on it.
   const [againOffer, setAgainOffer] = useState<Item[]>([]);
+  // Card keys a sent "Not read yet" put behind the gate: shown nowhere any more (the server stopped serving them).
+  const [gated, setGated] = useState<ReadonlySet<string>>(() => new Set());
+  // × / Esc with a typed answer not yet checked: asking before it is dropped.
+  const [confirmLeave, setConfirmLeave] = useState(false);
   // An answered card opened again from the summary (its result, feedback, Disagree, Grade it yourself, flags).
   const [viewKey, setViewKey] = useState<string | null>(null);
   const [announce, setAnnounce] = useState("");
@@ -254,6 +270,8 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   resultsRef.current = results;
   const voidedRef = useRef(voidedKeys);
   voidedRef.current = voidedKeys;
+  const gatedRef = useRef(gated);
+  gatedRef.current = gated;
   const alive = useRef(true);
   const busy = useRef(false);
   const changed = useRef(false);
@@ -312,7 +330,10 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         if (!alive.current) return;
         if (r.invalidated) setVoided((v) => v + r.invalidated);
         if (f.kind === "wrong" || f.kind === "unclear") voidAnswers(f);
-        if (f.kind === "not_read_yet") void reconcile();
+        if (f.kind === "not_read_yet") {
+          holdGate(f);
+          void reconcile();
+        }
       },
     });
   }
@@ -328,6 +349,39 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       for (const [k, it] of Object.entries(prev)) if (!isDone(it) && !it.stored && !keep.has(it.card.key)) next[k] = { ...it, phase: "out" };
       return next;
     });
+  }
+
+  /**
+   * A "Not read yet" hold the server confirmed: that chapter and every later one (and the whole-book ideas, which
+   * unlock at the end of the book) are locked now, so no card of them may stay on screen. The unanswered ones leave
+   * the round; the answered ones leave the summary's list and the opened results (render-time: `gated`), because
+   * their prompts, reference answers, sources and Covered / Missed lists would show what the server no longer serves.
+   * A card whose answer is on its way (or not confirmed) leaves the screen too ("past"): the request goes on (the
+   * outbox re-sends it) and `send` keeps the card off screen whatever the answer is.
+   */
+  function holdGate(f: HeldFlag) {
+    const all = Object.values(itemsRef.current);
+    const flagged = all.find((x) => x.question?.question_id === f.question_id);
+    // The server holds from the flagged chapter (at least 1: a whole-book card holds everything), and the whole-book
+    // ideas (chapter 0) unlock only at the end of the book, so every hold covers them.
+    const from = flagged?.card.chapter != null ? Math.max(1, flagged.card.chapter) : null;
+    const keys = all
+      .filter((x) => x.card.kind !== "highlight" && (x.card.key === flagged?.card.key || (from !== null && x.card.chapter !== null && (x.card.chapter >= from || x.card.chapter === 0))))
+      .map((x) => x.card.key);
+    if (!keys.length) return;
+    const set = new Set(keys);
+    gatedRef.current = new Set([...gatedRef.current, ...set]);
+    setGated(gatedRef.current);
+    setItems((prev) => {
+      const next = { ...prev };
+      for (const [k, it] of Object.entries(prev)) {
+        if (!set.has(it.card.key)) continue;
+        if (!it.stored && answerable(it)) next[k] = { ...it, phase: "out" };
+        else if (it.phase === "saved" || it.phase === "stale" || it.phase === "saving" || it.phase === "unknown") next[k] = { ...it, phase: "past" };
+      }
+      return next;
+    });
+    setViewKey((v) => (v && itemsRef.current[v] && set.has(itemsRef.current[v].card.key) ? null : v));
   }
 
   /**
@@ -375,7 +429,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const cur = curKey ? items[curKey] : null;
   const showSummary = cur === null;
   // An answered card opened again from the summary.
-  const viewed = showSummary && viewKey && items[viewKey]?.stored ? items[viewKey] : null;
+  const viewed = showSummary && viewKey && items[viewKey]?.stored && !gated.has(items[viewKey].card.key) ? items[viewKey] : null;
   const active = cur ?? viewed;
   const vOf = (it: Item) => verdictOf(it, results, voidedKeys);
   const gOf = (it: Item) => isGrading(it, results, voidedKeys);
@@ -385,6 +439,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     if (curKey !== currentKey) setCurrentKey(curKey);
     setMenuOpen(false);
     setSourcesOpen(false);
+    setConfirmLeave(false);
     if (curKey && items[curKey]?.shownAt === null) patch(curKey, { shownAt: timers.now() });
     if (!curKey) finished.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -436,7 +491,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         announced.current.add(it.key);
         if (it.key === curKey || it.key === viewKey) setAnnounce(`${VERDICT_VIEW[v].word}.`);
       }
-      if (it.stored && !it.earlier && !it.again && (v === "incorrect" || v === "dont_know") && it.card.kind === "idea" && it.card.again_question && !againDone.current.has(it.key)) {
+      if (it.stored && !it.earlier && !it.again && (v === "incorrect" || v === "dont_know") && it.card.kind === "idea" && it.card.again_question && !againDone.current.has(it.key) && !gatedRef.current.has(it.card.key)) {
         againDone.current.add(it.key);
         if (it.card.again_question.question_id !== it.question?.question_id) add.push(newItem(it.card, it.card.again_question, true));
       }
@@ -524,12 +579,12 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   /**
    * Send what is not settled: held flags (and unconfirmed ones) go out now, and unconfirmed answers are re-sent (the
    * same request, so a stored one answers its receipt). With `keepalive` (the page is going away) every answer not
-   * confirmed is re-sent, including one on its way, whose fetch may die with the page; otherwise only those no
-   * request is carrying. Returns the work started plus the requests already on their way.
+   * confirmed is re-sent, including one on its way, whose fetch may die with the page (a flag on its way too);
+   * otherwise only those no request is carrying. Returns the work started plus the requests already on their way.
    */
   function sendPending(keepalive: boolean): Promise<unknown>[] {
     const work: Promise<unknown>[] = [...inflight.current];
-    if (queue.list().some((f) => f.status === "held" || f.status === "unknown")) work.push(queue.flush(keepalive));
+    if (queue.list().some((f) => f.status === "held" || f.status === "unknown" || (keepalive && f.status === "sending"))) work.push(queue.flush(keepalive));
     for (const [key, req] of outbox.current) if (keepalive || !inflightKeys.current.has(key)) work.push(postJson(ATTEMPT_URL, req, { keepalive }));
     return work;
   }
@@ -585,6 +640,11 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   /* ---------------------------- actions ---------------------------- */
 
   const close = () => onClose(changed.current, finished.current, leave());
+  // × and Esc: with a typed answer not checked yet, ask first (the answer is in memory only).
+  const requestClose = () => {
+    if (cur && typedUnsent(cur)) setConfirmLeave(true);
+    else close();
+  };
   const more = () => onMore?.(leave());
 
   function answerOf(it: Item): string | null {
@@ -616,7 +676,8 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       changed.current = true;
       const receipt = out.receipt;
       patch(key, (it) => ({
-        phase: "saved",
+        // An answer that lands after a "Not read yet" hold on its chapter is stored but never shown again.
+        phase: gatedRef.current.has(it.card.key) ? "past" : "saved",
         stored: true,
         receipt,
         savedAt: timers.now(),
@@ -624,14 +685,22 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         // The server's verdict wins; a pending receipt means the model grades it.
         local: receipt ? (receipt.grading_status === "graded" ? receipt.verdict : null) : it.local,
       }));
+      // A chapter recall answer graded on the spot (an "I don't know") has no pending grade to poll for, yet its
+      // Covered / Missed lists (what the missed ideas say, and where they come from) come from the round's attempts.
+      if (itemsRef.current[key]?.card.kind === "chapter_recall" && (!receipt || receipt.grading_status === "graded")) void refreshResults();
       return;
     }
+    // A card a "Not read yet" put behind the gate while its answer was on its way stays off screen: the request
+    // goes on (the outbox re-sends an unconfirmed one when the runner closes), and nothing of the card comes back.
+    const gatedNow = gatedRef.current.has(itemsRef.current[key]?.card.key ?? "");
     if (out.kind === "unknown") {
+      if (gatedNow) return;
       patch(key, { phase: "unknown", message: out.message });
       setFocus("retry");
       return;
     }
     outbox.current.delete(req.attempt_key);
+    if (gatedNow) return;
     if (out.kind === "refused") {
       patch(key, { phase: "refused", message: out.message, req: null, local: null });
       setFocus("input");
@@ -646,7 +715,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     if (!it || !answerable(it) || busy.current || !it.question || it.card.kind === "highlight") return;
     const q = it.question;
     const answer = dontKnow ? DONT_KNOW_ANSWER : answerOf(it);
-    if (!answer) return;
+    if (!answer || answer.length > ANSWER_MAX_CHARS) return;
     const hinted = !dontKnow && it.hinted;
     const g = gradeLocal(q.format, q.rubric, answer, hinted);
     const shown = it.shownAt ?? timers.now();
@@ -820,6 +889,9 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       changed.current = true;
       // The committed grade and schedule: "Next: ..." and the summary's next due read this receipt from now on.
       patch(key, { change: { mode, verdict, status: "saved" }, receipt: out.value });
+      // The poll stops once the grade is saved, so read the round's attempts once more: a chapter recall answer's
+      // covered ideas take the new grade, and the Covered / Missed lists can show.
+      void refreshResults();
       return;
     }
     patch(key, { change: { mode, verdict, status: out.kind, message: out.message } });
@@ -843,12 +915,15 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     const mods = e.ctrlKey || e.metaKey || e.altKey;
     if (e.key === "Escape") {
       if (!inside) return;
+      // An Esc that cancels an input method's composition (a dictation or an IME) is the keyboard's, not ours.
+      if (e.isComposing === true || e.keyCode === 229) return;
       e.preventDefault?.();
       if (menuOpen) {
         setMenuOpen(false);
         setFocus("menu");
       } else if (viewed) backToSummary();
-      else close();
+      else if (confirmLeave) setConfirmLeave(false);
+      else requestClose();
       return;
     }
     if (!cur) return;
@@ -894,7 +969,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
 
   const summaryItems: SummaryItem[] = order
     .map((k) => items[k])
-    .filter((it): it is Item => !!it && (it.stored || (!hidden.has(it.key) && !it.again)))
+    .filter((it): it is Item => !!it && (it.stored || (!hidden.has(it.key) && !it.again && !gated.has(it.card.key))))
     .map((it) => {
       const v = vOf(it);
       // A voided answer earns no XP and moves no idea up (acceptance 9); it still counts as answered.
@@ -912,14 +987,15 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       };
     });
   const summary = summarize(summaryItems, round.today);
-  const recallItem = order.map((k) => items[k]).find((it) => it?.card.kind === "chapter_recall" && it.stored && !isVoided(it, results, voidedKeys));
+  const recallItem = order.map((k) => items[k]).find((it) => it?.card.kind === "chapter_recall" && it.stored && !gated.has(it.card.key) && !isVoided(it, results, voidedKeys));
   const recallResult = recallItem ? results[attemptKeyOf(recallItem) ?? ""] : undefined;
   const recallSplit = coveredSplit(recallResult?.covered_ideas);
   const pos = curKey ? visible.indexOf(curKey) + 1 : visible.length;
   // The answered cards of this sitting and of earlier today, each openable from the summary.
-  const answeredList = order.map((k) => items[k]).filter((it): it is Item => !!it && it.stored && it.card.kind !== "highlight" && !!it.question);
-  // An "Again" offer whose idea was flagged since is dropped.
-  const againShown = againOffer.filter((a) => !voidedKeys.has(a.card.key) && !hidden.has(a.card.key));
+  // (A card a "Not read yet" put behind the gate is left out: its prompt and sources are locked now.)
+  const answeredList = order.map((k) => items[k]).filter((it): it is Item => !!it && it.stored && it.card.kind !== "highlight" && !!it.question && !gated.has(it.card.key));
+  // An "Again" offer whose idea was flagged or gated since is dropped.
+  const againShown = againOffer.filter((a) => !voidedKeys.has(a.card.key) && !hidden.has(a.card.key) && !gated.has(a.card.key));
 
   const cardProps = (it: Item): CardViewProps => ({
     it,
@@ -963,7 +1039,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         <button
           type="button"
           aria-label="Close practice"
-          onClick={close}
+          onClick={requestClose}
           className="ml-auto inline-flex min-h-11 min-w-11 items-center justify-center rounded-control text-text-secondary hover:text-text-primary"
         >
           <X aria-hidden="true" className="h-5 w-5" />
@@ -995,7 +1071,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
                 </p>
                 {order
                   .map((k) => items[k])
-                  .filter((it): it is Item => !!it && gOf(it) && results[attemptKeyOf(it) ?? ""]?.self_gradable === true)
+                  .filter((it): it is Item => !!it && !gated.has(it.card.key) && gOf(it) && results[attemptKeyOf(it) ?? ""]?.self_gradable === true)
                   .map((it) => (
                     <SelfGrade key={it.key} it={it} onPick={(v) => void changeGrade(it.key, "self", v)} />
                   ))}
@@ -1037,6 +1113,24 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         <p aria-live="polite" role="status" className="sr-only">
           {announce}
         </p>
+        {confirmLeave && cur && typedUnsent(cur) && (
+          <div role="alert" data-testid="practice-leave" className="mt-3 flex flex-wrap items-center gap-2 rounded-control border border-border-subtle bg-surface-raised p-3 text-[13px] text-text-primary">
+            <span className="flex-1">Leave without checking? What you typed is not saved.</span>
+            <button type="button" onClick={() => setConfirmLeave(false)} className={SECONDARY}>
+              Keep writing
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmLeave(false);
+                close();
+              }}
+              className={SECONDARY}
+            >
+              Leave
+            </button>
+          </div>
+        )}
         <FlagBars flags={flags} onUndo={undoFlag} onRetry={(k) => void queue.retry(k)} />
       </div>
 
@@ -1052,7 +1146,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
                 <span className="flex-1" />
               ) : (
                 <>
-                  <button type="button" disabled={!answerOf(cur) || busy.current} onClick={() => check(cur.key)} className={`${PRIMARY} disabled:opacity-40`}>
+                  <button type="button" disabled={!answerOf(cur) || busy.current || tooLong(cur)} onClick={() => check(cur.key)} className={`${PRIMARY} disabled:opacity-40`}>
                     Check
                   </button>
                   <button type="button" onClick={() => check(cur.key, true)} className={SECONDARY}>
@@ -1339,6 +1433,7 @@ function CardView({ it, today, pollOver, results, voided, sourcesOpen, setSource
   const steps = rub?.format === "order" ? rub.steps : [];
   const offered = format === "order" ? offeredOrder(steps, `${q.question_id}|${today}`) : [];
   const choicesShown = format === "cued" && it.hinted ? choiceOrder(options.length, `${q.question_id}|${today}`) : [];
+  const typedLength = open && showsTextBox(it) ? it.answer.length : 0;
 
   return (
     <article data-testid="practice-card" className="space-y-3">
@@ -1372,6 +1467,15 @@ function CardView({ it, today, pollOver, results, voided, sourcesOpen, setSource
           label={format === "chapter_recall" ? "What you remember" : "Your answer"}
         />
       )}
+
+      {typedLength > ANSWER_MAX_CHARS - 400 &&
+        (typedLength > ANSWER_MAX_CHARS ? (
+          <AlertLine heading="Too long:" message={`${typedLength.toLocaleString("en-US")} characters; ${ANSWER_MAX_CHARS.toLocaleString("en-US")} is the most Onyx takes. Shorten it to check.`} />
+        ) : (
+          <p className="font-mono text-[12px] text-text-tertiary">
+            {typedLength.toLocaleString("en-US")} / {ANSWER_MAX_CHARS.toLocaleString("en-US")}
+          </p>
+        ))}
 
       {it.phase === "refused" && it.message && <AlertLine heading="Not saved:" message={it.message} />}
 

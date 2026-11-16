@@ -48,7 +48,9 @@ const prefetchRunner = () => {
  * Nothing is written and nothing is generated until a tap (inside the continuous scroll too). When the runner closes
  * after a change it re-reads the overview (`onChanged`) and the round once; when answers or flags were still on
  * their way, it waits for them first (the runner's `settled`, at most 10 s) and keeps Start waiting meanwhile, so a
- * reopened round never asks a question whose answer is still being stored.
+ * reopened round never asks a question whose answer is still being stored. Start keeps waiting until the round has been
+ * read again and replaced the one the runner was opened from; when that read fails the old round is dropped (and its
+ * cached copy), never offered again: its answered cards would be asked, and sent, a second time.
  */
 export default function PracticePart({ o, review, onChanged }: { o: ReadingOverview; review: ReactNode; onChanged: () => void }) {
   const slug = o.book.slug;
@@ -65,7 +67,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
   const [extraState, setExtraState] = useState<"idle" | "loading" | "none" | "failed">("idle");
   const [allowMore, setAllowMore] = useState(false);
   const [menu, setMenu] = useState<"closed" | "open" | "confirm">("closed");
-  const [offState, setOffState] = useState<{ saving: boolean; message: string | null }>({ saving: false, message: null });
+  const [offState, setOffState] = useState<{ saving: boolean; message: string | null; unsure: boolean }>({ saving: false, message: null, unsure: false });
   // Answers or flags from a closed runner still on their way: Start waits, and the round is re-read once they land.
   const [settling, setSettling] = useState(false);
   const alive = useRef(true);
@@ -117,8 +119,10 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
     }
   }, [bUrl]);
 
-  const load = useCallback(async () => {
-    await Promise.all([loadRound(), loadBank()]);
+  /** Both reads in parallel; the round (null when it could not be read). */
+  const load = useCallback(async (): Promise<PracticeRound | null> => {
+    const [fresh] = await Promise.all([loadRound(), loadBank()]);
+    return fresh;
   }, [loadRound, loadBank]);
 
   // Mount (and a new behavioral day): read both, silently over what the cache showed.
@@ -132,25 +136,42 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
   const p = roundProgress(shown);
   const notice = bankNotice(bank);
 
-  /** After the runner: re-read the overview and the round (once what it left on its way has settled), then `then`. */
+  /**
+   * After the runner: re-read the overview and the round (once what it left on its way has settled), then `then`.
+   * Start and One more round wait (`settling`) through all of it, up to the new round replacing the old one: a
+   * reopened round built from the old snapshot would ask the answered cards again and send them under new keys. A
+   * round that could not be read again is dropped (state and cache) and the part says so, with Try again.
+   */
   const afterRunner = useCallback(
     (changed: boolean, settled: Promise<void> | undefined, then?: () => void) => {
-      const refresh = () => {
-        onChanged();
-        void load();
+      if (!settled && !changed) {
         then?.();
-      };
-      if (settled) {
-        setSettling(true);
-        void settled.then(() => {
+        return;
+      }
+      setSettling(true);
+      void (async () => {
+        let fresh: PracticeRound | null = null;
+        try {
+          if (settled) await settled;
           if (!alive.current) return;
+          onChanged();
+          fresh = await load();
+        } catch {
+          fresh = null;
+        }
+        if (!alive.current) return;
+        if (!fresh) {
+          clientCache.remove(roundUrl);
+          setRound(null);
+        }
+        try {
+          then?.();
+        } finally {
           setSettling(false);
-          refresh();
-        });
-      } else if (changed) refresh();
-      else then?.();
+        }
+      })();
     },
-    [onChanged, load],
+    [onChanged, load, roundUrl],
   );
 
   const closeRunner = useCallback(
@@ -188,17 +209,19 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
 
   const turnOff = async () => {
     if (offState.saving) return;
-    setOffState({ saving: true, message: null });
+    setOffState({ saving: true, message: null, unsure: false });
     const r = await postJson(APPROVAL_URL, { book: slug, on: false, cap_cents: bank?.cap_cents ?? null }, { method: "PUT" });
     if (!alive.current) return;
     const out = classifyApprovalAnswer(r.status, r.body);
     if (out.kind === "saved") {
-      setOffState({ saving: false, message: null });
+      setOffState({ saving: false, message: null, unsure: false });
       setMenu("closed");
       void load();
       return;
     }
-    setOffState({ saving: false, message: out.message });
+    // An unknown outcome may have been stored: say so, and read the real state (the part follows it).
+    setOffState({ saving: false, message: out.message, unsure: out.kind === "unknown" });
+    if (out.kind === "unknown") void load();
   };
 
   // Off, unknown or not there: the Review card as before; the approval card above it when the bank can be turned on.
@@ -206,7 +229,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
     const canApprove = avail !== "off" && !!bank && !bank.enabled && bank.estimate_cents !== null && bank.cap_cents !== null;
     return (
       <div className="space-y-3">
-        {canApprove && bank && <BankApproval slug={slug} bank={bank} onDone={() => void load()} onRecheck={loadBank} />}
+        {canApprove && bank && <BankApproval slug={slug} bank={bank} onDone={() => void load()} onRecheck={load} />}
         {review}
       </div>
     );
@@ -275,7 +298,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
           </button>
           {offState.message && (
             <p role="alert" className="w-full text-[12px] text-text-primary">
-              <strong className="font-medium">Not turned off:</strong> {offState.message}
+              <strong className="font-medium">{offState.unsure ? "Not sure it turned off:" : "Not turned off:"}</strong> {offState.message}
             </p>
           )}
         </div>
@@ -387,7 +410,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
               setAllowMore(false);
               void load();
             }}
-            onRecheck={loadBank}
+            onRecheck={load}
             onCancel={() => setAllowMore(false)}
           />
         </div>

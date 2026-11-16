@@ -29,6 +29,11 @@ export const FLAG_URL = "/api/reading/practice/flag";
 export const APPROVAL_URL = "/api/reading/bank/approval";
 export const REVIEW_URL = "/api/reading/review";
 export const READING_URL = "/api/reading";
+/**
+ * The longest answer the attempt route takes (400 bad_answer above it): ANSWER_MAX in lib/reading-recall-server.ts,
+ * copied here because that file is server code (tests/reading-practice-ui.test.cjs checks the two stay equal).
+ */
+export const ANSWER_MAX_CHARS = 4000;
 
 export const roundAttemptsUrl = (roundKey: string) => `/api/reading/practice/round/${encodeURIComponent(roundKey)}`;
 export const overrideUrl = (attemptKey: string) => `/api/reading/practice/attempt/${encodeURIComponent(attemptKey)}/override`;
@@ -293,7 +298,7 @@ export interface AttemptReceipt {
 }
 
 export type AttemptOutcome =
-  /** Stored (receipt), or stored earlier under this key (receipt null: the round's attempts say how it was graded). */
+  /** Stored: the receipt (the first one again when this request was stored by an earlier try whose answer was lost). */
   | { kind: "saved"; receipt: AttemptReceipt | null }
   /** No answer or a server failure: it may or may not be stored. Retry sends the same request. */
   | { kind: "unknown"; message: string }
@@ -318,7 +323,7 @@ export function parseReceipt(body: unknown): AttemptReceipt | null {
   };
 }
 
-const STALE_CODES = new Set(["question_changed", "retired", "superseded", "chapter_changed", "source_not_permitted", "states_missing"]);
+const STALE_CODES = new Set(["question_changed", "retired", "superseded", "chapter_changed", "source_not_permitted"]);
 
 /** What the attempt route's answer means. `status` null = no answer at all (offline, timeout, the page went away). */
 export function classifyAttemptAnswer(status: number | null, body: unknown): AttemptOutcome {
@@ -328,8 +333,13 @@ export function classifyAttemptAnswer(status: number | null, body: unknown): Att
     const receipt = parseReceipt(body);
     return receipt ? { kind: "saved", receipt } : { kind: "unknown", message: "Onyx couldn't confirm the save." };
   }
-  // The key already stored an answer (an earlier try whose answer was lost): it counts; its grade is read back.
-  if (status === 409 && code === "key_reused") return { kind: "saved", receipt: null };
+  // The same request under its key answers the first receipt (a 2xx above), so key_reused means ANOTHER request holds
+  // this key: what is stored is not what is on screen. Nothing new was stored; checking again takes a new key.
+  if (status === 409 && code === "key_reused") return { kind: "refused", message: "Onyx already holds a different answer under this save. Nothing new was saved. Check it again." };
+  if (status === 400 && code === "bad_answer") {
+    return { kind: "refused", message: `Onyx takes answers of up to ${ANSWER_MAX_CHARS.toLocaleString("en-US")} characters. Shorten it and check again. Nothing was saved.` };
+  }
+  if (status === 400 && code === "states_missing") return { kind: "refused", message: "A flagged idea of this chapter changed while you answered. Nothing was saved. Check it again." };
   if (status === 409 && code === "raced") return { kind: "unknown", message: "Onyx was busy saving another answer." };
   if (status === 409 && code === "locked") return { kind: "stale", message: "This chapter is locked now, so the question is left out." };
   if ((status === 409 || status === 400) && STALE_CODES.has(code)) return { kind: "stale", message: "This question changed, so it is left out of today's round." };
@@ -592,9 +602,14 @@ export function createFlagQueue(opts: {
     const f = flags.get(key);
     if (f) flags.set(key, { ...f, ...p });
   };
-  async function sendOne(key: string, keepalive: boolean) {
+  /**
+   * `again`: send a flag whose first request is still on its way once more (the page is going away, so that fetch may
+   * die with it; this one carries keepalive). The same flag_key makes both replay-safe, and whichever answer arrives
+   * first settles the flag: a later one never reports it twice (onSent runs once) or turns a sent flag back.
+   */
+  async function sendOne(key: string, keepalive: boolean, again = false) {
     const f = flags.get(key);
-    if (!f || f.status === "sending" || f.status === "sent" || f.status === "refused") return;
+    if (!f || f.status === "sent" || f.status === "refused" || (f.status === "sending" && !again)) return;
     const h = handles.get(key);
     if (h !== undefined) {
       timers.clear(h);
@@ -603,10 +618,11 @@ export function createFlagQueue(opts: {
     patch(key, { status: "sending", message: undefined });
     changed();
     const out = await opts.send(flags.get(key)!, keepalive);
+    if (flags.get(key)?.status === "sent") return;
     if (out.kind === "saved") {
       patch(key, { status: "sent" });
       opts.onSent?.(flags.get(key)!, out.value);
-    } else patch(key, { status: out.kind, message: out.message });
+    } else if (flags.get(key)?.status !== "sending" || !again) patch(key, { status: out.kind, message: out.message });
     changed();
   }
   return {
@@ -626,7 +642,12 @@ export function createFlagQueue(opts: {
       return true;
     },
     async flush(keepalive) {
-      await Promise.all([...flags.values()].filter((f) => f.status === "held" || f.status === "unknown").map((f) => sendOne(f.flag_key, keepalive)));
+      // With keepalive (the page is hiding) a flag already on its way is sent again too: its fetch may die with the page.
+      await Promise.all(
+        [...flags.values()]
+          .filter((f) => f.status === "held" || f.status === "unknown" || (keepalive && f.status === "sending"))
+          .map((f) => sendOne(f.flag_key, keepalive, f.status === "sending")),
+      );
     },
     retry: (key) => sendOne(key, false),
     list: () => [...flags.values()],

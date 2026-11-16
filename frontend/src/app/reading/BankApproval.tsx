@@ -14,8 +14,14 @@ import { APPROVAL_URL, capDollars, classifyApprovalAnswer, estimateDollars, post
  * ("Allow $N more"), with the remaining estimate.
  *
  * One request at a time; the button keeps focus (aria-disabled) while it saves; a failure is a role=alert line with
- * an icon and a word.
+ * an icon and a word. A refusal stored nothing ("Not turned on:"); no answer, a server failure or an answer that cannot
+ * be read may have stored it ("Not sure it turned on:"), so the part re-reads the bank and the round and follows what
+ * the server says now.
  */
+/** The line's heading: a refusal stored nothing; an unknown outcome may have stored it. */
+const heading = (mode: "on" | "more", unsure: boolean) =>
+  mode === "more" ? (unsure ? "Not sure it was allowed:" : "Not allowed:") : unsure ? "Not sure it turned on:" : "Not turned on:";
+
 export default function BankApproval({
   slug,
   bank,
@@ -29,12 +35,12 @@ export default function BankApproval({
   mode?: "on" | "more";
   /** Turned on: the part re-reads the bank and the round. */
   onDone: () => void;
-  /** Re-read the bank (the estimate changed). */
+  /** Re-read the bank and the round (the estimate changed, or the outcome of the tap is not known). */
   onRecheck: () => Promise<unknown> | void;
   onCancel?: () => void;
 }) {
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ unsure: boolean; text: string } | null>(null);
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
@@ -60,16 +66,17 @@ export default function BankApproval({
       onDone();
       return;
     }
-    if (out.kind === "changed") {
+    if (out.kind === "changed" || out.kind === "unknown") {
       try {
         await onRecheck();
       } catch {
-        /* the message below says to check the amount */
+        /* the message below says what to check */
       }
     }
+    // The re-read may show it was stored after all: the part then replaces this card and there is nothing to update.
     if (!alive.current) return;
     setSaving(false);
-    setMessage(out.message);
+    setMessage({ unsure: out.kind === "unknown", text: out.message });
   };
 
   return (
@@ -108,7 +115,7 @@ export default function BankApproval({
         <p role="alert" className="mt-2 inline-flex items-center gap-1.5 text-[13px] text-text-primary">
           <AlertTriangle aria-hidden="true" className="h-4 w-4 text-down" />
           <span>
-            <strong className="font-medium">Not turned on:</strong> {message}
+            <strong className="font-medium">{heading(mode, message.unsure)}</strong> {message.text}
           </span>
         </p>
       )}

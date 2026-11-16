@@ -5,10 +5,16 @@
 // nothing; held flags and unconfirmed answers go out with keepalive when the page hides; the 390 px classes (and a
 // phone turned to landscape); the keys (only from inside the runner); Quick 3 goes on from the first open card; a
 // resumed round reads its earlier grades; a sent Wrong voids the answer in the summary; closing with an answer on its
-// way says when it settled; a late "Again" is offered on the summary; the bank GET in S2's real shape.
+// way says when it settled; a late "Again" is offered on the summary; the bank GET in S2's real shape. Review round 2:
+// an approval or Turn off whose outcome is unknown says "Not sure" and re-reads; × and Esc ask before a typed answer
+// is dropped; an over-long answer waits; a flag on its way is re-sent with keepalive; "Not read yet" takes the held
+// chapter's answered cards off the summary; a chapter recall graded on the spot still reads its Covered / Missed; Start
+// waits until the round was read again.
 // Synthetic data only (invented prompts and answers); no network, no storage.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const React = require("react");
 const { loadTs } = require("./helpers/load-ts.cjs");
 const { mountClient, response, deferred, withGlobals } = require("./helpers/hook-harness.cjs");
@@ -355,7 +361,7 @@ test("a lost answer keeps the card; Retry sends the SAME request; a later succes
 
 test("a refusal stored nothing: no Retry, the answer can be changed and checked again under a new key", async (t) => {
   const cards = [cued(1), cued(2)];
-  const r = mountRunner(t, { cards, answer: (b, n) => (n === 1 ? response({ error: "bad_answer" }, 400) : response(serverReceipt(cards, b))) });
+  const r = mountRunner(t, { cards, answer: (b, n) => (n === 1 ? response({ error: "refused" }, 409) : response(serverReceipt(cards, b))) });
   await r.h.flush();
   typeAnswer(r.h, "alpha 1");
   await r.h.flush();
@@ -991,6 +997,236 @@ test("a model grade that comes after the round ended offers Again on the summary
 });
 
 /* ------------------------------------------------------------------ */
+/* Review round 2: closing, limits, flags on their way, the gate        */
+/* ------------------------------------------------------------------ */
+
+test("× and Esc with a typed answer not checked yet ask first; nothing is lost until Leave; an input method's Esc is left alone", async (t) => {
+  const win = fakeTarget();
+  const r = mountRunner(t, { cards: [cued(1), cued(2)], win });
+  await r.h.flush();
+  const box = { tagName: "TEXTAREA" };
+  r.root().props.ref.current = { contains: (x) => x === box };
+  typeAnswer(r.h, "a half typed answer");
+  await r.h.flush();
+  r.h.click("Close practice");
+  await r.h.flush();
+  assert.deepEqual(r.closed, [], "× asks before it drops what was typed");
+  assert.match(r.h.text(), /Leave without checking\? What you typed is not saved\./);
+  r.h.click("Keep writing");
+  await r.h.flush();
+  assert.doesNotMatch(r.h.text(), /Leave without checking/);
+  // Esc from the text box asks too (it never closes the round with an answer in it) ...
+  win.fire("keydown", keyEvent("Escape", { target: box }));
+  await r.h.flush();
+  assert.deepEqual(r.closed, []);
+  assert.match(r.h.text(), /Leave without checking/);
+  // ... and a second Esc takes the question back: the typed answer is still there.
+  win.fire("keydown", keyEvent("Escape", { target: box }));
+  await r.h.flush();
+  assert.doesNotMatch(r.h.text(), /Leave without checking/);
+  assert.equal(r.h.find((n) => n.type === "textarea")[0].props.value, "a half typed answer");
+  // An Esc that cancels an input method's composition (a dictation, an IME) is the keyboard's.
+  win.fire("keydown", keyEvent("Escape", { target: box, isComposing: true }));
+  win.fire("keydown", keyEvent("Escape", { target: box, keyCode: 229 }));
+  await r.h.flush();
+  assert.deepEqual(r.closed, []);
+  assert.doesNotMatch(r.h.text(), /Leave without checking/);
+  r.h.click("Close practice");
+  await r.h.flush();
+  r.h.click("Leave");
+  assert.deepEqual(r.closed, [{ changed: false, finished: false }], "Leave closes");
+});
+
+test("an answer over the route's limit cannot be checked: a count shows near it, Check waits, nothing is sent", async (t) => {
+  const r = mountRunner(t, { cards: [cued(1), cued(2)] });
+  await r.h.flush();
+  typeAnswer(r.h, "x".repeat(C.ANSWER_MAX_CHARS - 100));
+  await r.h.flush();
+  assert.match(r.h.text(), /3,900 \/ 4,000/);
+  assert.equal(r.h.button("Check").props.disabled, false);
+  typeAnswer(r.h, "x".repeat(C.ANSWER_MAX_CHARS + 1));
+  await r.h.flush();
+  assert.match(r.alerts()[0], /Too long: 4,001 characters; 4,000 is the most Onyx takes\. Shorten it to check\./);
+  assert.equal(r.h.button("Check").props.disabled, true);
+  r.h.button("Check").props.onClick();
+  await r.h.flush();
+  assert.equal(r.attempts().length, 0, "even a forced check sends nothing");
+  typeAnswer(r.h, "x".repeat(C.ANSWER_MAX_CHARS));
+  await r.h.flush();
+  assert.equal(r.h.button("Check").props.disabled, false, "exactly the limit is fine");
+});
+
+test("a flag still on its way when the page hides is sent again with keepalive (the same flag_key)", async (t) => {
+  const gate = deferred();
+  const win = fakeTarget();
+  const doc = fakeTarget({ visibilityState: "visible", documentElement: { style: {} }, body: { style: {} } });
+  const r = mountRunner(t, { cards: [cued(1), cued(2), cued(3)], win, doc, flagAnswer: () => gate.promise });
+  await r.h.flush();
+  await menu(r.h, "Unclear");
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent().length, 1);
+  assert.equal(r.flagsSent()[0].keepalive, false);
+  doc.visibilityState = "hidden";
+  doc.fire("visibilitychange");
+  await r.h.flush();
+  assert.equal(r.flagsSent().length, 2, "the flag on its way may die with the page: sent again");
+  assert.equal(r.flagsSent()[1].keepalive, true);
+  assert.equal(r.flagsSent()[1].body.flag_key, r.flagsSent()[0].body.flag_key, "replay safe by its key");
+  gate.resolve(response({ success: true, kind: "unclear", invalidated: 0, replayed: false }));
+  await r.h.flush();
+  assert.equal(r.flagsSent().length, 2, "nothing more once it is confirmed");
+});
+
+test("Not read yet takes the held chapter's and every later chapter's answered cards off the summary; the counts stay", async (t) => {
+  const cards = [
+    cued(1, { chapter: 5, again: false }),
+    cued(2, { chapter: 2, again: false }),
+    cued(3, { chapter: 3, again: false }),
+    cued(4, { chapter: 0, again: false }),
+  ];
+  const r = mountRunner(t, { cards, onReread: async () => round([cards[1]]) });
+  await r.h.flush();
+  for (const n of [1, 2]) {
+    typeAnswer(r.h, `alpha ${n}`);
+    await r.h.flush();
+    r.h.click("Check");
+    await r.h.flush();
+    r.h.click("Next");
+    await r.h.flush();
+  }
+  assert.match(r.h.text(), /Synthetic prompt 3\?/, "chapter 3 is the card on screen");
+  await menu(r.h, "Not read yet");
+  assert.match(r.h.text(), /Synthetic prompt 4\?/, "the whole-book card is not held until the server says so");
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent()[0].body.kind, "not_read_yet");
+  const text = r.h.text();
+  assert.match(text, /Round done/, "the whole-book card left the round with the hold");
+  assert.match(text, /Synthetic prompt 2\?/, "chapter 2 is below the hold: still listed");
+  for (const locked of [/Synthetic prompt 1\?/, /Synthetic prompt 3\?/, /Synthetic prompt 4\?/]) assert.doesNotMatch(text, locked);
+  assert.equal(r.h.find((n) => n.type === "button" && /Synthetic prompt 1\?/.test(r.h.text(n))).length, 0, "no row to open the chapter 5 answer again");
+  assert.match(text, /2 of 2 · \+4 XP/, "both answers are still valid, so their counts stay");
+});
+
+test("a Not read yet that lands while an answer of the held range is on its way never shows that answer's result", async (t) => {
+  const gate = deferred();
+  const cards = [cued(1, { chapter: 4, again: false }), cued(2, { chapter: 0, again: false })];
+  const r = mountRunner(t, { cards, answer: (b) => gate.promise.then(() => response(serverReceipt(cards, b))), onReread: async () => round([cards[1]]) });
+  await r.h.flush();
+  // The first card is held (chapter 4); the whole-book card is not held until the server says so, so it is answered.
+  await menu(r.h, "Not read yet");
+  assert.match(r.h.text(), /Synthetic prompt 2\?/);
+  typeAnswer(r.h, "alpha 2");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  assert.match(r.h.text(), /Answer: alpha 2/, "its result shows while it is being stored");
+  // The hold goes out while that answer is still on its way, then the answer lands.
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent()[0].body.kind, "not_read_yet");
+  gate.resolve();
+  await r.h.flush();
+  const text = r.h.text();
+  assert.match(text, /Round done/);
+  assert.match(text, /1 of 1/, "the answer is stored and counted");
+  assert.doesNotMatch(text, /Answer: alpha 2|Synthetic prompt 2\?|Synthetic snippet/);
+  assert.equal(r.h.find((n) => n.type === "button" && /Synthetic prompt/.test(r.h.text(n))).length, 0, "nothing of the held range can be opened");
+});
+
+/** A chapter recall card (its rubric lists the chapter's ideas), as GET /api/reading/practice/today sends it. */
+function recallCard(chapter) {
+  return {
+    ...cued(chapter, { again: false }),
+    key: `recall:${chapter}`,
+    kind: "chapter_recall",
+    chapter,
+    format: "chapter_recall",
+    slot: "recall",
+    idea: null,
+    recall: { chapter, done_n: 0, due_on: TODAY, next_due_on: "2026-03-17" },
+    question: {
+      question_id: 900 + chapter,
+      version: 1,
+      format: "chapter_recall",
+      prompt: `What do you remember of chapter ${chapter}?`,
+      rubric: { v: 1, format: "chapter_recall", ideas: [{ idea_id: 51, title: "Synthetic core idea", importance: "core" }, { idea_id: 52, title: "Synthetic supporting idea", importance: "supporting" }] },
+    },
+    preview: null,
+  };
+}
+const recallIdeas = (verdict) =>
+  [51, 52].map((id) => ({
+    idea_id: id,
+    title: id === 51 ? "Synthetic core idea" : "Synthetic supporting idea",
+    importance: id === 51 ? "core" : "supporting",
+    statement: `Synthetic statement ${id}.`,
+    key_points: [],
+    stage: 1,
+    source_count: 1,
+    sources: [webSource],
+    verdict,
+    hit: null,
+  }));
+
+test("a chapter recall answered \"I don't know\" is graded on the spot, yet its Covered / Missed lists are read from the round's attempts once", async (t) => {
+  const card = recallCard(5);
+  const r = mountRunner(t, {
+    cards: [card],
+    poll: () =>
+      response({
+        round_key: ROUND_KEY,
+        attempts: r.attempts()[0]
+          ? [{ attempt_key: r.attempts()[0].body.attempt_key, question_id: 905, grading_status: "graded", verdict: "dont_know", score: 0, hinted: false, feedback: null, rubric_hits: null, grader: "local", overridden: false, grade_error: null, overridable: false, self_gradable: false, covered_ideas: recallIdeas("dont_know") }]
+          : [],
+      }),
+  });
+  await r.h.flush();
+  assert.equal(r.polls().length, 0, "nothing to read before an answer");
+  r.h.click("I don't know");
+  await r.h.flush();
+  assert.equal(r.attempts()[0].body.answer, R.DONT_KNOW_ANSWER);
+  assert.equal(r.polls().length, 1, "read once after the save: a graded answer has no pending grade to poll for");
+  const text = r.h.text();
+  assert.match(text, /Missed\s*2/);
+  assert.match(text, /Synthetic statement 51\./, "each missed idea says what it is");
+  assert.match(text, /Synthetic statement 52\./);
+  await r.timers.advance(C.POLL_EVERY_MS * 3, r.h);
+  assert.equal(r.polls().length, 1, "and no polling after");
+});
+
+test("grading a chapter recall answer yourself reads its Covered / Missed lists once the grade is saved", async (t) => {
+  const card = recallCard(5);
+  const r = mountRunner(t, {
+    cards: [card],
+    poll: () => {
+      const key = r.attempts()[0]?.body.attempt_key;
+      const selfGraded = r.calls.some((c) => c.url.endsWith("/override"));
+      return response({
+        round_key: ROUND_KEY,
+        attempts: key
+          ? [
+              selfGraded
+                ? { attempt_key: key, question_id: 905, grading_status: "graded", verdict: "correct", score: 1, hinted: false, feedback: null, rubric_hits: null, grader: "self", overridden: false, grade_error: null, overridable: false, self_gradable: false, covered_ideas: recallIdeas("correct") }
+                : { attempt_key: key, question_id: 905, grading_status: "pending", verdict: null, score: null, hinted: false, feedback: null, rubric_hits: null, grader: null, overridden: false, grade_error: "failed", overridable: false, self_gradable: true, covered_ideas: recallIdeas(null) },
+            ]
+          : [],
+      });
+    },
+  });
+  await r.h.flush();
+  typeAnswer(r.h, "Several synthetic words about what happened in the chapter.");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  await r.timers.advance(C.POLL_EVERY_MS, r.h);
+  assert.match(r.h.text(), /Grade it yourself/);
+  assert.doesNotMatch(r.h.text(), /Covered/, "no verdict on any idea yet");
+  r.h.click("Correct");
+  await r.h.flush();
+  assert.match(r.h.text(), /Covered\s*2/, "the lists are read once the grade is saved (the poll had stopped)");
+  assert.doesNotMatch(r.h.text(), /Missed/);
+});
+
+/* ------------------------------------------------------------------ */
 /* Practice part + approval                                             */
 /* ------------------------------------------------------------------ */
 
@@ -1146,6 +1382,168 @@ test("practice part: a runner closed with answers on their way keeps Start waiti
   assert.equal(p.h.button("Start").props["aria-disabled"], undefined);
 });
 
+test("practice part: Start stays disabled until the round was read again; reopening never offers the answered cards again", async (t) => {
+  runnerProps.length = 0;
+  const gate = deferred();
+  let reads = 0;
+  const p = mountPart(t, {
+    roundAnswer: () => {
+      reads += 1;
+      return reads === 1 ? response(round([cued(1), cued(2)])) : gate.promise;
+    },
+    bankAnswer: () => response(bankBody({ enabled: true, approved_cents: 1900 })),
+  });
+  await p.h.flush();
+  p.h.click("Start");
+  await p.h.flush();
+  const props = runnerProps[runnerProps.length - 1];
+  runnerProps.length = 0;
+  // Answers were stored and nothing is left on its way (no settled promise): the part still waits for the new round.
+  props.onClose(true, false);
+  await p.h.flush();
+  assert.equal(reads, 2, "the round is read again");
+  assert.equal(p.h.button("Start").props["aria-disabled"], true, "Start waits for the round that includes those answers");
+  assert.match(p.h.text(), /Saving/);
+  p.h.button("Start").props.onClick();
+  await p.h.flush();
+  assert.equal(p.h.find((n) => n.props["data-testid"] === "runner-stub").length, 0, "a tap on a waiting Start opens nothing");
+  gate.resolve(response(round([{ ...cued(1), done: true, attempt_key: "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a" }, cued(2)])));
+  await p.h.flush();
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined, "Start is back with the new round");
+  p.h.click("Start");
+  await p.h.flush();
+  const reopened = runnerProps[runnerProps.length - 1];
+  assert.equal(reopened.round.cards[0].done, true, "the answered card comes from the new round, as answered");
+});
+
+test("practice part: a round that cannot be read again after a change is dropped, never offered again", async (t) => {
+  runnerProps.length = 0;
+  let reads = 0;
+  const p = mountPart(t, {
+    roundAnswer: () => {
+      reads += 1;
+      return reads === 1 ? response(round([cued(1), cued(2)])) : response({ error: "failed" }, 500);
+    },
+    bankAnswer: () => response(bankBody({ enabled: true, approved_cents: 1900 })),
+  });
+  await p.h.flush();
+  assert.ok(p.store[C.practiceUrl("synthetic-book")], "the round was cached");
+  p.h.click("Start");
+  await p.h.flush();
+  runnerProps[runnerProps.length - 1].onClose(true, false);
+  await p.h.flush();
+  assert.equal(p.h.buttons("Start").length, 0, "the old round is not offered");
+  assert.match(p.h.text(), /Couldn't load/);
+  assert.equal(p.store[C.practiceUrl("synthetic-book")], undefined, "its cached copy is dropped too");
+  assert.equal(p.h.buttons("Try again").length, 1);
+});
+
+test("practice part: Turn on whose outcome is not known says 'Not sure it turned on' and reads the bank and the round again", async (t) => {
+  let stored = false;
+  let bankReads = 0;
+  let roundReads = 0;
+  const p = mountPart(t, {
+    roundAnswer: () => {
+      roundReads += 1;
+      return response({ ...round([]), enabled: stored });
+    },
+    bankAnswer: () => {
+      bankReads += 1;
+      return response(bankBody({ enabled: stored, approved_cents: stored ? 1900 : null }));
+    },
+    approval: () => {
+      throw new TypeError("offline");
+    },
+  });
+  await p.h.flush();
+  p.h.click("Turn on");
+  await p.h.flush();
+  assert.match(p.h.text(), /Not sure it turned on: No answer from Onyx/);
+  assert.doesNotMatch(p.h.text(), /Not turned on/);
+  assert.equal(bankReads, 2, "the bank is read again");
+  assert.equal(roundReads, 2, "and the round");
+
+  // The tap did go through: the re-read shows it, and the part follows it (no stale approval card, no message).
+  stored = false;
+  const p2 = mountPart(t, {
+    roundAnswer: () => response({ ...round([]), enabled: stored }),
+    bankAnswer: () => response(bankBody({ enabled: stored, approved_cents: stored ? 1900 : null })),
+    approval: () => {
+      stored = true;
+      throw new TypeError("offline");
+    },
+  });
+  await p2.h.flush();
+  p2.h.click("Turn on");
+  await p2.h.flush();
+  assert.doesNotMatch(p2.h.text(), /Not sure it turned on|Questions on every chapter/);
+  assert.match(p2.h.text(), /Nothing due/, "the part shows the book as on");
+});
+
+test("practice part: a refused Turn on says 'Not turned on' and reads nothing again", async (t) => {
+  let bankReads = 0;
+  const p = mountPart(t, {
+    roundAnswer: () => response({ ...round([]), enabled: false }),
+    bankAnswer: () => {
+      bankReads += 1;
+      return response(bankBody());
+    },
+    approval: () => response({ error: "forbidden" }, 403),
+  });
+  await p.h.flush();
+  p.h.click("Turn on");
+  await p.h.flush();
+  assert.match(p.h.text(), /Not turned on: Onyx refused this\. Nothing changed\./);
+  assert.doesNotMatch(p.h.text(), /Not sure/);
+  assert.equal(bankReads, 1, "a refusal stored nothing: no re-read");
+});
+
+test("practice part: Turn off whose outcome is not known says 'Not sure it turned off' and re-reads; a refusal says 'Not turned off'", async (t) => {
+  let reads = 0;
+  const p = mountPart(t, {
+    roundAnswer: () => response(round([cued(1)])),
+    bankAnswer: () => {
+      reads += 1;
+      return response(bankBody({ enabled: true, approved_cents: 1900 }));
+    },
+    approval: () => {
+      throw new TypeError("offline");
+    },
+  });
+  await p.h.flush();
+  p.h.click("Practice options");
+  await p.h.flush();
+  p.h.click("Turn off questions for this book");
+  await p.h.flush();
+  const before = reads;
+  p.h.click("Turn off");
+  await p.h.flush();
+  assert.match(p.h.text(), /Not sure it turned off: No answer from Onyx/);
+  assert.doesNotMatch(p.h.text(), /Not turned off/);
+  assert.equal(reads, before + 1, "the bank is read again to follow the real state");
+
+  let reads2 = 0;
+  const p2 = mountPart(t, {
+    roundAnswer: () => response(round([cued(1)])),
+    bankAnswer: () => {
+      reads2 += 1;
+      return response(bankBody({ enabled: true, approved_cents: 1900 }));
+    },
+    approval: () => response({ error: "forbidden" }, 403),
+  });
+  await p2.h.flush();
+  p2.h.click("Practice options");
+  await p2.h.flush();
+  p2.h.click("Turn off questions for this book");
+  await p2.h.flush();
+  const before2 = reads2;
+  p2.h.click("Turn off");
+  await p2.h.flush();
+  assert.match(p2.h.text(), /Not turned off: Onyx refused this\. Nothing changed\./);
+  assert.doesNotMatch(p2.h.text(), /Not sure/);
+  assert.equal(reads2, before2, "a refusal stored nothing: no re-read");
+});
+
 /* ------------------------------------------------------------------ */
 /* lib/reading-practice-client.ts                                       */
 /* ------------------------------------------------------------------ */
@@ -1154,7 +1552,9 @@ test("attempt answers: saved, not sure (Retry the same request), refused (nothin
   const ok = { success: true, attempt_key: "1A1A1A1A-1A1A-4A1A-8A1A-1A1A1A1A1A1A", grading_status: "graded", verdict: "correct", score: 1, attempt_date: TODAY, next_review: "2026-03-11" };
   assert.equal(C.classifyAttemptAnswer(200, ok).kind, "saved");
   assert.equal(C.classifyAttemptAnswer(200, ok).receipt.attempt_key, ok.attempt_key.toLowerCase());
-  assert.deepEqual(C.classifyAttemptAnswer(409, { error: "key_reused" }), { kind: "saved", receipt: null });
+  // The same request under its key answers the first receipt (a 2xx); key_reused is ANOTHER request under it, so what
+  // is stored is not what is on screen: nothing new was stored and checking again takes a new key.
+  assert.equal(C.classifyAttemptAnswer(409, { error: "key_reused" }).kind, "refused");
   for (const [status, body] of [[null, null], [503, { error: "bank_unavailable" }], [500, {}], [409, { error: "raced" }], [200, { nope: true }]]) {
     assert.equal(C.classifyAttemptAnswer(status, body).kind, "unknown", `${status} ${JSON.stringify(body)}`);
   }
@@ -1298,4 +1698,53 @@ test("the bank GET in S2's shape: the estimate and the cap come from `estimate`;
   assert.equal(old.estimate_cents, null, "top-level fields are not S2's contract");
   assert.equal(old.cap_cents, null);
   assert.equal(C.parseBank({ error: "bank_unavailable" }), null);
+});
+
+test("a refused answer says why where Riley can act: too long, another request under the key, a flagged idea that moved; the limit equals the route's", () => {
+  const long = C.classifyAttemptAnswer(400, { error: "bad_answer" });
+  assert.equal(long.kind, "refused");
+  assert.match(long.message, /up to 4,000 characters/);
+  assert.doesNotMatch(long.message, /refused this answer/);
+  const reused = C.classifyAttemptAnswer(409, { error: "key_reused" });
+  assert.equal(reused.kind, "refused", "the same request answers its first receipt, so this is another one: not 'saved'");
+  assert.match(reused.message, /different answer/);
+  const missing = C.classifyAttemptAnswer(400, { error: "states_missing" });
+  assert.equal(missing.kind, "refused", "nothing was stored: the answer can be checked again");
+  assert.match(missing.message, /flagged idea/);
+  assert.doesNotMatch(missing.message, /question changed|left out of today/i);
+  const src = fs.readFileSync(path.join(__dirname, "..", "src", "lib", "reading-recall-server.ts"), "utf8");
+  assert.equal(C.ANSWER_MAX_CHARS, Number(/export const ANSWER_MAX = (\d+);/.exec(src)[1]), "the client's limit is the route's");
+});
+
+test("the flag queue: a flag on its way is sent again with keepalive when the page hides, and is reported once", async () => {
+  const timers = fakeTimers();
+  const gates = [deferred(), deferred()];
+  const sent = [];
+  const reported = [];
+  const q = C.createFlagQueue({
+    timers,
+    send: (f, keepalive) => {
+      sent.push({ key: f.flag_key, keepalive });
+      return gates[sent.length - 1].promise;
+    },
+    onSent: (f) => reported.push(f.flag_key),
+  });
+  q.add({ flag_key: "a", question_id: 1, kind: "wrong", cardKeys: [] });
+  await timers.advance(C.FLAG_HOLD_MS);
+  assert.deepEqual(sent, [{ key: "a", keepalive: false }]);
+  assert.equal(q.list()[0].status, "sending");
+  void q.flush(false);
+  await tick();
+  assert.equal(sent.length, 1, "a plain flush leaves a flag on its way alone");
+  const again = q.flush(true);
+  await tick();
+  assert.deepEqual(sent, [{ key: "a", keepalive: false }, { key: "a", keepalive: true }], "keepalive: sent again, the same key");
+  gates[1].resolve({ kind: "saved", value: { invalidated: 1, kind: "wrong" } });
+  await again;
+  assert.equal(q.list()[0].status, "sent");
+  gates[0].resolve({ kind: "unknown", message: "x" });
+  await tick();
+  await tick();
+  assert.equal(q.list()[0].status, "sent", "the first request's late answer does not turn a sent flag back");
+  assert.deepEqual(reported, ["a"], "reported once");
 });
