@@ -196,6 +196,56 @@ test("a debt in another currency, or a balance with no usable amount, withholds 
   assert.equal(typeof next.headlines.safeToMoveCents, "number");
 });
 
+test("a NEWER balance row with no usable amount withholds the amount, left out or not; the estimate keeps the last usable one", () => {
+  const leave = { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] };
+  const why = (r) => r.eligibility.reasons.map((x) => [x.code, x.account]);
+  // Savings: a fresh usable balance 3 h old, then a newer row 1 h old the loader could not read an amount from.
+  const rows = [bal("chk", 400_000), bal("sav", 900_000, ago(3)), bal("sav", Number.NaN, ago(1)), bal("card", 50_000)];
+  for (const settings of [undefined, leave]) {
+    const out = run({ balances: rows, ...(settings ? { settings } : {}) });
+    assert.equal(out.state, "ok");
+    assert.equal(out.eligibility.eligible, false, `left out: ${!!settings}`);
+    assert.deepEqual(why(out), [["invalid-balance", undefined]], "no Leave it out: it could be a debt");
+    assert.match(out.eligibility.reasons[0].text, /Demo Savings has no usable amount and could be a debt/);
+    assert.equal(out.headlines.safeToMoveCents, null);
+    assert.equal(E.safeToMoveOf(JSON.parse(JSON.stringify(out))), null, "also when stored");
+    assert.equal(out.opening.cents, 1_300_000, "the estimate starts from the last usable balance, never NaN or $0");
+  }
+  assert.ok(run({ balances: rows }).warnings.some((w) => /Demo Savings has no usable amount: the estimate uses its last usable balance/.test(w)));
+  // A row with no usable amount AND no date may be the current one: withheld too.
+  assert.deepEqual(why(run({ balances: [bal("chk", 400_000), bal("sav", 900_000), bal("sav", Number.NaN, "")], settings: leave })), [["invalid-balance", undefined]]);
+  // An OLDER unusable row changes nothing: the newest snapshot is the usable one.
+  const older = run({ balances: [bal("chk", 400_000), bal("sav", Number.NaN, ago(30)), bal("sav", 900_000), bal("card", 50_000)] });
+  assert.deepEqual(gate(older.eligibility), { eligible: true, reasons: [] });
+  assert.equal(older.headlines.safeToMoveCents, run().headlines.safeToMoveCents);
+  // A card whose only row is unusable: never NaN in the card or net worth projection.
+  const card = run({ balances: [bal("chk", 400_000), bal("sav", 900_000), bal("card", Number.NaN)] });
+  assert.ok(card.netWorth.every((p) => Object.values(p).every((v) => typeof v !== "number" || Number.isFinite(v))), "no NaN in net worth");
+});
+
+test("reads the loader reports as incomplete: a capped plan or category read and an unmatched balance row each withhold the amount", () => {
+  const fresh = run();
+  const plan = run({ quality: { planTruncated: true } });
+  assert.deepEqual(codes(plan), ["plan-unavailable"]);
+  assert.match(plan.eligibility.reasons[0].text, /Not all planned items or plan settings were read/);
+  assert.equal(plan.headlines.safeToMoveCents, null);
+  assert.deepEqual(plan.days, fresh.days, "the estimate stays");
+  const cats = run({ quality: { categoriesTruncated: true } });
+  assert.deepEqual(codes(cats), ["categories-unavailable"]);
+  assert.match(cats.eligibility.reasons[0].text, /Not all of your category fixes were read/);
+  assert.equal(cats.headlines.safeToMoveCents, null);
+  // A balance row matched to no account could be any pool account's newest: withheld, even with every pool account left out.
+  const everyLeft = { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["chk", "sav"] };
+  for (const settings of [undefined, everyLeft]) {
+    const out = run({ quality: { balanceRowsUnmatched: 1 }, ...(settings ? { settings } : {}) });
+    assert.deepEqual(out.eligibility.reasons.map((r) => [r.code, r.account]), [["invalid-balance", undefined]]);
+    assert.equal(out.headlines.safeToMoveCents, null);
+  }
+  assert.deepEqual(gate(run({ quality: { planTruncated: false, categoriesTruncated: false, balanceRowsUnmatched: 0 } }).eligibility), { eligible: true, reasons: [] }, "nothing missing, nothing withheld");
+  // Known codes: a stored copy is read back with the same reasons.
+  assert.deepEqual(E.eligibilityOf(JSON.parse(JSON.stringify(plan))).reasons, plan.eligibility.reasons);
+});
+
 test("two pool accounts with the same label each keep their own reason and Leave it out", () => {
   const twins = [...ACCOUNTS, { account_key: "sav2", account_type: "Cash", label: "Demo Savings" }];
   const out = run({ accounts: twins, balances: [bal("chk", 400_000), bal("sav", 900_000, ago(60)), bal("sav2", 10_000, ago(60))] });
@@ -510,8 +560,12 @@ test("source: the tile shows the reason inside the same part as the amount; ever
   const server = fs.readFileSync(path.join(SRC, "lib/finance-result-cache-server.ts"), "utf8");
   assert.match(server, /cashForecastCheck\(/, "Today's alerts answer carries the same check");
   const loader = fs.readFileSync(path.join(SRC, "lib/cash-forecast-server.ts"), "utf8");
-  assert.match(loader, /planUnavailable: setupPending,\s+planInvalid/);
-  assert.match(loader, /historyTruncated: bal\.truncated \|\| txn\.truncated/);
+  assert.match(loader, /planUnavailable: setupPending,\s+planTruncated,\s+planInvalid/);
+  assert.match(loader, /historyTruncated: acc\.truncated \|\| bal\.truncated \|\| txn\.truncated/);
+  assert.match(loader, /categoriesTruncated: fixes\.truncated === true/, "a capped category-fix read reaches the gate");
+  assert.match(loader, /forecastBalanceRows\(bal\.rows\)/, "rejected balance rows are kept, not filtered out");
+  assert.match(loader, /balanceRowsUnmatched: unmatched/);
+  assert.doesNotMatch(loader, /\.map\(parseBalance\)\.filter/, "no balance row is dropped before the gate");
   assert.match(loader, /balanceUnreadable: unreadable/, "a failed older-balance read reaches the gate");
   assert.match(loader, /applyLeaveOut\(leaveOutStore\(/, "Leave it out goes through the compare-and-swap");
 });

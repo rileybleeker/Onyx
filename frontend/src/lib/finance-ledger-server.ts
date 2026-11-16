@@ -144,31 +144,41 @@ async function heartbeat(db: Db, dataType: string): Promise<Record<string, unkno
   return error ? null : ((data?.[0] as Record<string, unknown> | undefined) ?? null);
 }
 
+const FIX_MAX_PAGES = 20; // 20k merchant rules or one-off fixes; a read that still stops there is reported
+
 /**
  * Category fixes Riley made (merchant rules, one-off overrides). Fail-open: a missing table or a failed read
  * shows the source categories, never an error page. `failed` (optional, so other callers are unaffected) says a
- * read failed for another reason than a missing table: the cash forecast withholds its safe-to-move amount then.
+ * read failed for another reason than a missing table; `truncated` says a read answered but stopped at its page
+ * limit, so some fixes were not read. The cash forecast withholds its safe-to-move amount on either.
+ *
+ * Both tables are read in pages ordered by their primary key (fetchPaged): a single select would stop at the
+ * server's row cap without an error and the missing fixes would go unnoticed.
  */
-export async function loadCategoryFixes(db: Db): Promise<CategoryFixes & { failed?: boolean }> {
-  let rules: { data: unknown[] | null; error: unknown };
-  let overrides: { data: unknown[] | null; error: unknown };
-  try {
-    [rules, overrides] = await Promise.all([
-      db.from("finance_category_rules").select("merchant_key,category"),
-      db.from("finance_txn_categories").select("txn_key,category"),
-    ]);
-  } catch {
-    return { ...NO_FIXES, failed: true };
-  }
+export async function loadCategoryFixes(db: Db): Promise<CategoryFixes & { failed?: boolean; truncated?: boolean }> {
   // A missing table (migration not applied) means no fixes were ever saved: the source categories are right.
-  const realError = (e: unknown) => !!e && !["42P01", "PGRST205"].includes(String((e as { code?: unknown }).code ?? ""));
-  const failed = realError(rules.error) || realError(overrides.error);
-  if (rules.error && overrides.error) return failed ? { ...NO_FIXES, failed } : NO_FIXES;
-  const fixes: CategoryFixes = {
-    rules: new Map(((rules.data ?? []) as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
-    overrides: new Map(((overrides.data ?? []) as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
+  const MISSING = ["42P01", "PGRST205"];
+  type FixRead = { rows: unknown[]; truncated: boolean; error: "missing" | "failed" | null };
+  const read = async (build: Parameters<typeof fetchPaged>[0]): Promise<FixRead> => {
+    try {
+      const r = await fetchPaged(build, FIX_MAX_PAGES);
+      return { rows: r.rows, truncated: r.truncated, error: null };
+    } catch (e) {
+      const code = e instanceof LedgerQueryError ? e.code : null;
+      return { rows: [], truncated: false, error: code && MISSING.includes(code) ? "missing" : "failed" };
+    }
   };
-  return failed ? { ...fixes, failed } : fixes;
+  const [rules, overrides] = await Promise.all([
+    read((f, t, c) => db.from("finance_category_rules").select("merchant_key,category", c ? { count: "exact" } : undefined).order("merchant_key", { ascending: true }).range(f, t)),
+    read((f, t, c) => db.from("finance_txn_categories").select("txn_key,category", c ? { count: "exact" } : undefined).order("txn_key", { ascending: true }).range(f, t)),
+  ]);
+  const failed = rules.error === "failed" || overrides.error === "failed";
+  const truncated = rules.truncated || overrides.truncated;
+  const fixes: CategoryFixes = {
+    rules: new Map((rules.rows as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
+    overrides: new Map((overrides.rows as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
+  };
+  return { ...fixes, ...(failed ? { failed } : {}), ...(truncated ? { truncated } : {}) };
 }
 
 export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Promise<LedgerLoad> {

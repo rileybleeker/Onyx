@@ -78,14 +78,14 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 | Reason code | When |
 |---|---|
 | `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small or negative older one (counted as $0 in the estimate) |
-| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future. When that newest row is a DEBT (negative, or a card balance owed) in another currency, or has no usable amount (so it could be one), the reason offers no Leave it out and leaving the account out does not clear it: the amount cannot value that debt in US dollars, and leaving it out would count it as $0 |
+| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future. When that newest row is a DEBT (negative, or a card balance owed) in another currency, or has no usable amount (so it could be one), the reason offers no Leave it out and leaving the account out does not clear it: the amount cannot value that debt in US dollars, and leaving it out would count it as $0. A row the ledger parser rejects (no whole-cent amount, no date) is never dropped: the loader keeps it as an unusable balance of its account (`forecastBalanceRows`, in the 60-day read and the older-balance read alike), so a newest unusable row withholds the amount (an older row never looks current, and the account never looks merely missing), and the estimate starts from the newest usable balance. A row with no account key withholds the amount too (it could be any account's newest) |
 | `stale-balance` | a pool balance of ANY size older than 48 h (`staleBalanceHours`; an old small or zero balance is no proof the account is not overdrawn now), or a stored result read after its `validUntil` |
 | `balance-unreadable` | the read of a pool account's older balance failed (not "no row": the read itself errored), so its balance is unknown. Leaving the account out does not clear it, and the reason offers no Leave it out |
 | `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
-| `history-truncated` | a paged read of the balances or the history stopped at its page limit |
-| `plan-unavailable` | the planned items or the plan drivers could not be read (`setupPending`) |
+| `history-truncated` | a paged read of the accounts, the balances or the history stopped at its page limit |
+| `plan-unavailable` | the planned items or the plan drivers could not be read (`setupPending`), or their read stopped at its page limit (`planTruncated`: both are read in pages ordered by a unique key, so a server row cap is paged through, never taken as the whole plan) |
 | `plan-invalid` | a saved tax profile or move plan was read but no longer parses, so its taxes or move costs are missing |
-| `categories-unavailable` | Riley's category fixes could not be read (a missing table is not a failure), so transfers and card payments may be misclassified |
+| `categories-unavailable` | Riley's category fixes could not be read (a missing table is not a failure), or their paged read stopped at its page limit (`loadCategoryFixes` `truncated`), so transfers and card payments may be misclassified |
 | `short-history` | fewer than `minBaselineWeeks` of history, so everyday spending is not projected |
 | `invalid-input` | an input that is not a number reached the projection |
 | `unverified` | a stored result from before the gate (no `eligibility`), or a malformed one: never eligible |

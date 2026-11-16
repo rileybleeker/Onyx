@@ -25,12 +25,14 @@ const PROFILE = {
 // balance snapshots: gte / eq / order / limit, so the 60-day read and the newest-snapshot read differ). A table in
 // `failing` answers a database error instead. `olderRead` = how the per-account newest-snapshot read (the one with
 // eq on account_key) answers: "error" (a database error) or "reject" (the request itself fails); default: rows.
-function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = [], balances = [], drivers = [], olderRead = "rows" } = {}) {
+// Ranged reads (the paged ones) answer like PostgREST: the exact count of every row, and at most `caps[table]` rows
+// per request (a server row cap: a success with fewer rows than asked for, never an error).
+function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = [], balances = [], drivers = [], items = [], olderRead = "rows", caps = {} } = {}) {
   const tables = {
     finance_accounts: [{ account_key: "demo-checking", institution: "Demo Bank", account_name: "Checking", account_type: "Cash", mask: "0001" }, ...accounts],
     finance_balance_snapshots: [{ account_key: "demo-checking", captured_at: new Date(now.getTime() - 3_600_000).toISOString(), balance_cents: 5_000_000, currency: "USD", kind: "asset" }, ...balances],
     finance_transactions: txns,
-    finance_plan_items: [],
+    finance_plan_items: items,
     finance_plan_drivers: [...(profile ? [{ key: "tax", value: profile }] : []), ...drivers],
     finance_forecast_snapshots: [],
     finance_goals: [],
@@ -56,18 +58,36 @@ function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = []
       const answer = () => {
         if (failing.includes(table)) return { data: null, error: { code: "57014", message: "synthetic failure" }, count: null };
         if (olderOne() && olderRead === "error") return { data: null, error: { code: "57014", message: "synthetic failure" }, count: null };
-        const rows = rowsNow();
-        return { data: rows, error: null, count: rows.length };
+        const all = rowsNow();
+        const range = calls.find(([k]) => k === "range")?.[1];
+        const rows = range ? all.slice(range[0], Math.min(range[1] + 1, range[0] + (caps[table] ?? 1000))) : all;
+        return { data: rows, error: null, count: all.length };
       };
       const b = new Proxy({}, {
         get: (_, k) =>
           k === "then"
             ? (res, rej) => (olderOne() && olderRead === "reject" ? Promise.reject(new Error("synthetic network failure")) : Promise.resolve(answer())).then(res, rej)
-            : (...a) => (calls.push([k, a]), b),
+            : k === "__table"
+              ? table
+              : (...a) => (calls.push([k, a]), b),
       });
       return b;
     },
   };
+}
+// The REAL pager (lib/finance-ledger-server.ts fetchPaged): count-driven paging, server row caps, page limits and
+// errors behave exactly as in production. `truncated: true` additionally marks the history reads (transactions,
+// balances) as cut off at their page limit.
+const LS = loadTs("lib/finance-ledger-server.ts", { "server-only": {}, "@supabase/supabase-js": { createClient: () => { throw new Error("no network in tests"); } } });
+const HISTORY_TABLES = ["finance_transactions", "finance_balance_snapshots"];
+async function pagedLikeProduction(build, maxPages, opts) {
+  let table = null;
+  const r = await LS.fetchPaged((f, t, c) => {
+    const q = build(f, t, c);
+    table = q.__table;
+    return q;
+  }, maxPages);
+  return opts?.truncated && HISTORY_TABLES.includes(table) ? { ...r, truncated: true } : r;
 }
 function loader(opts) {
   const box = { now: null };
@@ -75,11 +95,8 @@ function loader(opts) {
     "server-only": {},
     "@/lib/finance-ledger-server": {
       serviceClient: () => fakeDb(box.now, opts),
-      fetchPaged: async (build) => {
-        const r = await build(0, 999, true);
-        return { rows: r.data ?? [], truncated: !!opts?.truncated };
-      },
-      loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map(), ...(opts?.fixesFailed ? { failed: true } : {}) }),
+      fetchPaged: (build, maxPages) => pagedLikeProduction(build, maxPages, opts),
+      loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map(), ...(opts?.fixesFailed ? { failed: true } : {}), ...(opts?.fixesTruncated ? { truncated: true } : {}) }),
     },
   });
   return async (iso, levers) => {
@@ -218,7 +235,7 @@ test("a balance older than 48 hours at load time: no amount until the next sync"
     "server-only": {},
     "@/lib/finance-ledger-server": {
       serviceClient: () => fakeDb(new Date(AT), { txns: everyday(AT) }),
-      fetchPaged: async (build) => ({ rows: (await build(0, 999, true)).data ?? [], truncated: false }),
+      fetchPaged: (build, maxPages) => pagedLikeProduction(build, maxPages),
       loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map() }),
     },
   });
@@ -326,6 +343,114 @@ test("a failed older-balance read is unknown, not $0: no amount even when Riley 
   // No older read is made (and none can fail) when every cash account has a balance in the 60-day read.
   const inWindow = await loader({ txns: everyday(AT), olderRead: "error" })(AT);
   assert.equal(inWindow.result.eligibility.eligible, true);
+});
+
+test("balance rows the ledger parser rejects are kept as unusable, never dropped (forecastBalanceRows)", () => {
+  const S = loadTs("lib/cash-forecast-server.ts", { "server-only": {}, "@/lib/finance-ledger-server": { serviceClient: () => null, fetchPaged: async () => ({ rows: [], truncated: false }), loadCategoryFixes: async () => ({}) } });
+  const at = "2030-06-15T14:00:00Z";
+  const good = { account_key: "a1", captured_at: at, balance_cents: 1_000, currency: "usd", kind: "Asset" };
+  const out = S.forecastBalanceRows([
+    good,
+    { account_key: "a1", captured_at: at, balance_cents: "12.5", currency: "USD", kind: "asset" }, // not whole cents
+    { account_key: "a2", captured_at: at, balance_cents: 2 ** 60, currency: "EUR", kind: "liability" }, // not a safe integer
+    { account_key: "a3", captured_at: null, balance_cents: 500, currency: null, kind: null }, // no date
+    { account_key: "a4", captured_at: "not a time", balance_cents: 700, currency: "USD", kind: "asset" }, // a date that does not parse
+    { account_key: null, captured_at: at, balance_cents: 500 }, // no account
+    null,
+  ]);
+  assert.deepEqual(out.usable, [{ account_key: "a1", captured_at: at, balance_cents: 1_000, currency: "USD", kind: "asset" }]);
+  assert.deepEqual(out.rejected.map((b) => [b.account_key, b.captured_at, Number.isNaN(b.balance_cents), b.currency, b.kind]), [
+    ["a1", at, true, "USD", "asset"],
+    ["a2", at, true, "EUR", "liability"],
+    ["a3", "", true, "USD", null],
+    ["a4", "not a time", true, "USD", "asset"],
+  ]);
+  assert.equal(out.unmatched, 2, "rows with no account key cannot belong to any account");
+});
+
+test("a newest balance row with no usable amount is never dropped: no amount, left out or not, and an older row never looks current", async () => {
+  const leave = [{ key: "safe-to-move", value: { leaveOut: ["demo-savings"] } }];
+  const savings = { account_key: "demo-savings", institution: "Demo Bank", account_name: "Savings", account_type: "Cash", mask: "0003" };
+  const row = (hours, cents) => ({ account_key: "demo-savings", captured_at: new Date(Date.parse(AT) - hours * 3_600_000).toISOString(), balance_cents: cents, currency: "USD", kind: "asset" });
+  const why = (r) => r.eligibility.reasons.map((x) => [x.code, x.account]);
+  // Newer unusable row (1 h) over an older valid one (3 h), both inside the 60-day read.
+  for (const drivers of [[], leave]) {
+    const load = await loader({ txns: everyday(AT), accounts: [savings], balances: [row(3, 200_000), row(1, "not a number")], drivers })(AT, { otherIncome: 6_000 });
+    assert.deepEqual(why(load.result), [["invalid-balance", undefined]], `left out: ${drivers.length > 0}`);
+    assert.equal(load.result.headlines.safeToMoveCents, null);
+    assert.deepEqual(why(load.scenario.result), why(load.result), "the what-if reads the same inputs");
+    assert.equal(load.scenario.result.headlines.safeToMoveCents, null);
+    assert.equal(load.result.opening.cents, 5_200_000, "the estimate keeps the last usable balance");
+  }
+  // The account's ONLY row in the read has no usable amount: not "missing" (which Leave it out would clear as $0).
+  for (const drivers of [[], leave]) {
+    const only = await loader({ txns: everyday(AT), accounts: [savings], balances: [row(2, 2 ** 60)], drivers })(AT);
+    assert.deepEqual(why(only.result), [["invalid-balance", undefined]], `left out: ${drivers.length > 0}`);
+    assert.equal(only.result.headlines.safeToMoveCents, null);
+  }
+  // Older unusable row, newer valid one: the newest snapshot is usable, the amount stands.
+  const fine = await loader({ txns: everyday(AT), accounts: [savings], balances: [row(30, "not a number"), row(2, 200_000)] })(AT);
+  assert.equal(fine.result.eligibility.eligible, true);
+});
+
+test("the older-balance read: a newest snapshot with no usable amount withholds the amount, left out or not", async () => {
+  const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
+  const old = (cents) => ({ account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - 90 * 86_400_000).toISOString(), balance_cents: cents, currency: "USD", kind: "asset" });
+  const leave = [{ key: "safe-to-move", value: { leaveOut: ["demo-wallet"] } }];
+  for (const drivers of [[], leave]) {
+    const load = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old("12.5")], drivers })(AT);
+    assert.deepEqual(load.result.eligibility.reasons.map((r) => [r.code, r.account]), [["invalid-balance", undefined]], `left out: ${drivers.length > 0}`);
+    assert.equal(load.result.headlines.safeToMoveCents, null);
+    assert.equal(load.result.opening.cents, 5_000_000, "never NaN in the estimate");
+  }
+  // The same account with a usable newest snapshot (large, positive): missing as before, which Leave it out clears.
+  const usable = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(400_000)], drivers: leave })(AT);
+  assert.equal(usable.result.eligibility.eligible, true);
+});
+
+test("a balance row with no account key withholds the amount", async () => {
+  const load = await loader({ txns: everyday(AT), balances: [{ account_key: null, captured_at: new Date(Date.parse(AT) - 3_600_000).toISOString(), balance_cents: 100, currency: "USD", kind: "asset" }] })(AT);
+  assert.deepEqual(load.result.eligibility.reasons.map((r) => [r.code, r.account]), [["invalid-balance", undefined]]);
+  assert.equal(load.result.headlines.safeToMoveCents, null);
+});
+
+test("plan reads are paged: a server row cap still reads every planned item and driver; a read cut off at its page limit withholds the amount", async () => {
+  const item = (i) => ({ id: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, label: `Demo plan ${i}`, item_date: "2026-12-10", amount_cents: -10_000, certainty: "likely", repeat_unit: null, repeat_every: null, repeat_count: null, note: null, account_key: null, removed_at: null });
+  const three = [1, 2, 3].map(item);
+  // One row per request (a cap far below the 1000 asked for): every item and driver is still read, and the amount stands.
+  const capped = await loader({ txns: everyday(AT), items: three, drivers: [{ key: "settings", value: { bufferCents: 10_000 } }], caps: { finance_plan_items: 1, finance_plan_drivers: 1 } })(AT, { otherIncome: 6_000 });
+  assert.equal(capped.items.length, 3, "all three planned items");
+  assert.deepEqual(capped.drivers.map((d) => d.key).sort(), ["settings", "tax"], "both drivers");
+  assert.equal(capped.result.eligibility.eligible, true);
+  assert.equal(capped.setupPending, false);
+  const uncapped = await loader({ txns: everyday(AT), items: three, drivers: [{ key: "settings", value: { bufferCents: 10_000 } }] })(AT, { otherIncome: 6_000 });
+  assert.equal(capped.result.headlines.safeToMoveCents, uncapped.result.headlines.safeToMoveCents, "the same amount as one full page");
+  // More pages than the plan read's limit (10): a success with part of the plan, reported, never complete.
+  const many = Array.from({ length: 11 }, (_, i) => item(i + 1));
+  const cut = await loader({ txns: everyday(AT), items: many, caps: { finance_plan_items: 1 } })(AT, { otherIncome: 6_000 });
+  assert.equal(cut.setupPending, false, "it answered: not a failed read");
+  assert.deepEqual(cut.result.eligibility.reasons.map((r) => r.code), ["plan-unavailable"]);
+  assert.match(cut.result.eligibility.reasons[0].text, /Not all planned items or plan settings were read/);
+  assert.equal(cut.result.headlines.safeToMoveCents, null);
+  assert.deepEqual(cut.scenario.result.eligibility.reasons.map((r) => r.code), ["plan-unavailable"], "the what-if too");
+  assert.equal(cut.scenario.result.headlines.safeToMoveCents, null);
+  // The drivers read cut off the same way.
+  const drivers = Array.from({ length: 11 }, (_, i) => ({ key: `scenario:demo-${String(i).padStart(2, "0")}`, value: { name: `Demo ${i}`, params: {} } }));
+  const cutDrivers = await loader({ txns: everyday(AT), drivers, caps: { finance_plan_drivers: 1 } })(AT);
+  assert.deepEqual(cutDrivers.result.eligibility.reasons.map((r) => r.code), ["plan-unavailable"]);
+  // The accounts read is paged the same way: a cap still reads every account; one cut off withholds the amount.
+  const cards = Array.from({ length: 11 }, (_, i) => ({ account_key: `demo-card-${String(i).padStart(2, "0")}`, institution: "Demo Card Co", account_name: `Card ${i}`, account_type: "Credit Card", mask: null }));
+  const fewAccounts = await loader({ txns: everyday(AT), accounts: cards.slice(0, 2), caps: { finance_accounts: 1 } })(AT);
+  assert.equal(fewAccounts.accounts.length, 3, "every account behind a one-row cap");
+  assert.equal(fewAccounts.result.eligibility.eligible, true);
+  const manyAccounts = await loader({ txns: everyday(AT), accounts: cards, caps: { finance_accounts: 1 } })(AT);
+  assert.deepEqual(manyAccounts.result.eligibility.reasons.map((r) => r.code), ["history-truncated"]);
+  assert.equal(manyAccounts.result.headlines.safeToMoveCents, null);
+  // Category fixes cut off at their page limit (lib/finance-ledger-server.ts loadCategoryFixes reports it): withheld too.
+  const cats = await loader({ txns: everyday(AT), fixesTruncated: true })(AT, { otherIncome: 6_000 });
+  assert.deepEqual(cats.result.eligibility.reasons.map((r) => r.code), ["categories-unavailable"]);
+  assert.match(cats.result.eligibility.reasons[0].text, /Not all of your category fixes were read/);
+  assert.equal(cats.scenario.result.headlines.safeToMoveCents, null);
 });
 
 test("Leave it out on the server: every write is conditional on the version read, and a lost race is reported as a conflict", async () => {

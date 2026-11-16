@@ -137,10 +137,22 @@ export interface InputQuality {
   historyTruncated?: boolean;
   /** The planned items or the plan drivers (settings, tax profile, move, stream changes) could not be read. */
   planUnavailable?: boolean;
+  /**
+   * The planned items or plan drivers read stopped at its page limit: it answered, but not with every row, so some
+   * planned payments or settings may be missing (a row cap is a success with fewer rows, never an error).
+   */
+  planTruncated?: boolean;
   /** A saved tax profile or move plan was read but no longer parses, so its tax payments or move costs are missing. */
   planInvalid?: boolean;
   /** Riley's category fixes could not be read, so transfers and card payments are classified from raw categories. */
   categoriesUnavailable?: boolean;
+  /** The category-fix read stopped at its page limit, so some of Riley's fixes were not applied. */
+  categoriesTruncated?: boolean;
+  /**
+   * Balance rows the loader read but could not match to any account (no account key). Any pool account's newest
+   * balance could be among them, so they withhold the amount and leaving an account out cannot clear that.
+   */
+  balanceRowsUnmatched?: number;
   /**
    * Pool accounts whose balance read FAILED (not "no row": the read itself errored), so their balance is unknown and
    * could be an overdraft. Each withholds the amount even when Riley left the account out: leaving an account out
@@ -570,10 +582,16 @@ export function poolAccountKeys(accounts: readonly ForecastAccount[], settings?:
   return accounts.filter((a) => isCashType(a.account_type)).map((a) => a.account_key);
 }
 
+/**
+ * The newest USABLE US-dollar balance per account (a finite amount), the one the estimate starts from. Rows in another
+ * currency, or with no usable amount (a row the loader kept as rejected: amount NaN), are skipped here; the gate reads
+ * them through unvaluedDebt / supersededByOtherCurrency, so a newer unusable row still withholds the amount.
+ */
 function latestBalances(balances: readonly ForecastBalance[]): Map<string, ForecastBalance> {
   const out = new Map<string, ForecastBalance>();
   for (const b of balances) {
     if ((b.currency ?? "USD").toUpperCase() !== "USD") continue;
+    if (!Number.isFinite(b.balance_cents)) continue;
     const cur = out.get(b.account_key);
     if (!cur || b.captured_at > cur.captured_at) out.set(b.account_key, b);
   }
@@ -1032,8 +1050,12 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     reason("history-truncated", "Part of the balance or transaction history was not read.");
   }
   if (quality.planUnavailable) reason("plan-unavailable", "Planned items or plan settings could not be read, so planned payments and taxes may be missing.");
+  if (quality.planTruncated) reason("plan-unavailable", "Not all planned items or plan settings were read (page limit), so planned payments and taxes may be missing.");
   if (quality.planInvalid) reason("plan-invalid", "Your saved tax profile or move plan could not be read, so planned taxes or move costs may be missing.");
   if (quality.categoriesUnavailable) reason("categories-unavailable", "Your category fixes could not be read, so some transfers or card payments may be counted as spending.");
+  if (quality.categoriesTruncated) reason("categories-unavailable", "Not all of your category fixes were read (page limit), so some transfers or card payments may be counted as spending.");
+  // A balance row matched to no account could be any pool account's newest one: withheld, with no Leave it out.
+  if (typeof quality.balanceRowsUnmatched === "number" && quality.balanceRowsUnmatched !== 0) reason("invalid-balance", "A balance could not be matched to an account.");
 
   const base: ForecastResult = {
     state: "ok",
@@ -1121,9 +1143,14 @@ export function forecastCash(input: ForecastInput): ForecastResult {
         leftOutCents += Math.max(0, signedCents);
         continue;
       }
-      // A newer debt in another currency (named above) decides: this US-dollar balance is not the current one.
+      // A newer debt in another currency, or a newer row with no usable amount (named above), decides: this US-dollar
+      // balance is not the current one.
       if (debt) {
-        warnings.push(`The newest balance for ${label} is not in US dollars: the estimate uses its last US-dollar balance.`);
+        warnings.push(
+          debt === "unknown"
+            ? `The newest balance for ${label} has no usable amount: the estimate uses its last usable balance.`
+            : `The newest balance for ${label} is not in US dollars: the estimate uses its last US-dollar balance.`,
+        );
         continue;
       }
       if (!Number.isFinite(at)) {
