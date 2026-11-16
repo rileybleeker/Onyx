@@ -43,7 +43,7 @@ Every message ends with its code in brackets (`[sf_reauth]`, `[account_unmatched
 | Other `[sf_...]` codes (amber) | SimpleFIN reported a connection, account or general problem; check its site. Most clear on the next run. |
 | `an account was not imported [account_unmatched]` (amber) | A new or renamed account could not be matched; see step 4. |
 | `a new account is balances-only ... [account_type_unset]` | Set `finance_accounts.account_type` (Cash or Credit Card) if its transactions should count. |
-| `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. |
+| `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. Reported by the run that records them: if that run's ledger write then fails, the count is on its red `db_write_failed` heartbeat, and the next run (which writes those rows) does not report them again. |
 | `the cutover match record table is missing ... [cutover_provenance_unsaved]` (red) | Apply `sql/finance_cutover_matches.sql`. Nothing was written that run: a run with cutover decisions to record stops before the ledger, so no row is left out on a match that is not on record. |
 | `the SimpleFIN ETL could not write to Supabase [db_write_failed]` (red) | The cutover record (written first) or the ledger could not be written; the next run retries (every write is an upsert). |
 | `the SimpleFIN ETL could not read its cutover record ... [db_read_failed]` (red) | Nothing was written that run; the next run retries. If it repeats, check that Supabase is up and the table is readable. |
@@ -89,15 +89,23 @@ share a word and are still two payees. A payee of generic words only says nothin
 
 In both steps a group of candidate pairs is a match only when it is one to one, or when its rows cannot be told
 apart on either side (same dates and text) and every SimpleFIN row has a twin of its own: two identical coffees on
-both sides both match, and one coffee with two identical Rocket Money twins matches one of them. More SimpleFIN
-rows than twins (two identical new rows and one Rocket Money row) is never guessed: all of them are kept as
-ambiguous, and that Rocket Money row is held, so no other row is matched to it.
+both sides both match, and one coffee with two identical Rocket Money twins matches one of them (the only unequal
+group that is paired: whichever twin it takes, the same SimpleFIN row is dropped and the other twin stays free).
+More SimpleFIN rows than twins (two identical new rows and one Rocket Money row) is never guessed: all of them are
+kept as ambiguous, and that Rocket Money row is held, so no other row is matched to it.
 
 Every SimpleFIN row of the response takes part, also the rows before the window, so a Rocket Money row whose twin is
 before the window is taken by that twin and a later purchase of the same amount is not matched to it. That match is
 recorded too. A Rocket Money row a recorded decision matched stays taken on later runs, also when SimpleFIN's answer
 no longer has that row (a narrower or incomplete answer), and a settled match is not reopened by a new row of the
-same merchant.
+same merchant. In the same way the candidates of a row recorded as **ambiguous** stay held while that row is missing
+from a later answer (also a row before the window, which is dropped all the same but recorded for this): two
+identical purchases competing for one Rocket Money row, then an answer with only a new purchase of that amount two
+days later, keep the new purchase for review instead of matching it to the held row. A held row is never freed by
+the run itself; that is a decision by hand. A recorded match or ambiguity that a row still in the answer no longer
+carries (SimpleFIN corrected its amount or text) is replaced, before the ledger is written, by the new decision or
+by **unconfirmed** with the Rocket Money keys the old record named: the row is kept and listed for review, and the
+Rocket Money row is free again for its real twin, also when a later answer lacks the corrected row.
 
 An equal amount alone never drops a row. A row with competing candidates (**ambiguous**: a tie on dates, rows that
 can be told apart competing for one twin, or more SimpleFIN rows than twins) or with a same-amount Rocket Money row
@@ -115,9 +123,12 @@ order by m.account_key;
 ```
 
 lists the kept rows still counted next to the Rocket Money rows they might duplicate (join `finance_transactions`
-on `txn_key` again for the details). A kept row that is a real purchase needs no change; a duplicate is resolved by
-hand, e.g. by setting its `ignored_from`. Nothing is ever removed automatically. `python simplefin_etl.py --dry-run`
-prints the decisions per account and the rows recorded for review so far (counts only).
+on `txn_key` again for the details). The record also holds decisions on rows dropped before the window (kept there
+only so their Rocket Money rows stay taken or held); the join leaves them out, and they are never reported as
+`cutover_review`. A kept row that is a real purchase needs no change; a duplicate is resolved by hand, e.g. by
+setting its `ignored_from`. Nothing is ever removed automatically. `python simplefin_etl.py --dry-run` prints the
+decisions per account (`... before the window` for the dropped ones) and the rows recorded for review so far that
+are in the ledger (counts only).
 
 The matches and the kept rows are recorded in `pds.finance_cutover_matches` (`sql/finance_cutover_matches.sql`,
 service-role only): the SimpleFIN row's key, the decision, its evidence and the Rocket Money key(s), no amounts or

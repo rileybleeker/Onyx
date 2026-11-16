@@ -594,6 +594,88 @@ def test_cutover_recorded_matches_hold_across_runs():
     assert sf.recorded_claims({"x": {"decision": "ambiguous", "history_txn_keys": ["h1"]}}) == {}
 
 
+def test_cutover_ambiguous_rows_hold_their_twin_across_runs():
+    """Codex review: rows competing for one Rocket Money row are recorded as ambiguous (also before the window,
+    where they are dropped all the same), and that row stays held while they are missing from a later answer: a new
+    purchase of the same amount at that merchant is kept and listed for review, never matched to it."""
+    hist = [hrow("h1", "2026-11-07", 525, None, name="Demo Cafe")]
+    s1 = row("s1", "2026-11-07", 525, desc="SQ *DEMO CAFE")   # two identical purchases before the window ...
+    s2 = row("s2", "2026-11-07", 525, desc="SQ *DEMO CAFE")   # ... and one Rocket Money row: never guessed
+    s3 = row("s3", "2026-11-09", 525, desc="SQ *DEMO CAFE")   # a new purchase two days later, in the window
+    kept, dropped, first = sf.apply_cutover([s1, s2], hist, CUT, set())
+    assert not kept and dropped == {"before the Rocket Money cutover": 2}
+    assert decided(first) == {"s1": ("ambiguous", None, ("h1",)), "s2": ("ambiguous", None, ("h1",))}
+    assert not any(d.kept for d in first) and sf.new_review_count(first, {}) == 0, "dropped rows are not for review"
+    assert sf.cutover_counts(first) == {"ambiguous before the window": 2}
+    saved = {r["sf_txn_key"]: r for r in sf.decision_rows(first, NOW)}
+    assert sf.recorded_holds(saved) == {"s1": ("h1",), "s2": ("h1",)} and sf.recorded_claims(saved) == {}
+    assert "kept" not in sf.decision_rows(first, NOW)[0], "the record has no such column"
+    # The later answer has only s3: h1 is held, so s3 is kept and reported once.
+    kept, dropped, decisions = sf.apply_cutover([s3], hist, CUT, set(), records=saved)
+    assert kept == [s3] and not dropped
+    assert decided(decisions) == {"s3": ("ambiguous", None, ("h1",))} and sf.new_review_count(decisions, saved) == 1
+    assert sf.apply_cutover([s3], hist, CUT, set())[0] == [], "without the record s3 would be matched to h1"
+    # One of the two back in the answer, the other still missing: h1 stays held, nothing is guessed.
+    kept, dropped, decisions = sf.apply_cutover([s3, s1], hist, CUT, set(), records=saved)
+    assert kept == [s3]
+    assert decided(decisions) == {"s1": ("ambiguous", None, ("h1",)), "s3": ("ambiguous", None, ("h1",))}
+    # A claim recorded for the held row takes it: a taken row is not a candidate, so nothing is left to hold.
+    taken = dict(saved, s9={"decision": "matched", "history_txn_keys": ["h1"]})
+    kept, dropped, decisions = sf.apply_cutover([s3], hist, CUT, set(), records=taken)
+    assert kept == [s3] and decided(decisions) == {}
+    # The same in the window: two kept rows competing for one twin, then an answer without them.
+    deli = [hrow("k1", "2026-11-11", 820, "DEMO DELI ATLANTA")]
+    d = row("d", "2026-11-11", 820, desc="DEMO DELI ATLANTA")
+    e = row("e", "2026-11-11", 820, desc="DEMO DELI ATLANTA")
+    f = row("f", "2026-11-12", 820, desc="DEMO DELI ATLANTA GA")
+    kept, dropped, first = sf.apply_cutover([d, e], deli, CUT, set())
+    assert len(kept) == 2 and sf.new_review_count(first, {}) == 2
+    saved = {r["sf_txn_key"]: r for r in sf.decision_rows(first, NOW)}
+    kept, dropped, decisions = sf.apply_cutover([f], deli, CUT, {"d", "e"}, records=saved)
+    assert kept == [f] and decided(decisions) == {"f": ("ambiguous", None, ("k1",))}
+    assert sf.apply_cutover([f], deli, CUT, {"d", "e"})[0] == []
+
+
+def test_cutover_claim_that_no_longer_holds_is_replaced():
+    """Codex review: a matched row whose amount changed no longer holds its Rocket Money row. It is kept and recorded
+    as 'unconfirmed' (listed for review) in place of the claim, so when a later answer lacks it the Rocket Money row
+    is free for its real twin instead of being held by a stale claim. The same for an ambiguity this run no longer
+    makes: replaced, never left as a hold."""
+    hist = [hrow("h1", "2026-11-10", 800, "DEMO BAKERY ATLANTA", name="Demo Bakery")]
+    s1 = row("s1", "2026-11-11", 800, desc="DEMO BAKERY 0042 ATLANTA GA")
+    kept, dropped, first = sf.apply_cutover([s1], hist, CUT, set())
+    assert not kept and decided(first) == {"s1": ("matched", "merchant", ("h1",))}
+    saved = {r["sf_txn_key"]: r for r in sf.decision_rows(first, NOW)}
+    corrected = dict(s1, amount_cents=850)   # SimpleFIN corrected the amount
+    kept, dropped, second = sf.apply_cutover([corrected], hist, CUT, set(), records=saved)
+    assert kept == [corrected] and not dropped
+    assert decided(second) == {"s1": ("unconfirmed", None, ("h1",))} and sf.new_review_count(second, saved) == 1
+    saved.update({r["sf_txn_key"]: r for r in sf.decision_rows(second, NOW)})
+    assert sf.recorded_claims(saved) == {} and sf.recorded_holds(saved) == {}
+    # The later answer lacks s1 and has h1's real twin: matched to it.
+    twin = row("s2", "2026-11-10", 800, desc="DEMO BAKERY 0042 ATLANTA GA")
+    kept, dropped, third = sf.apply_cutover([twin], hist, CUT, set(), records=saved)
+    assert not kept and decided(third) == {"s2": ("matched", "merchant", ("h1",))}
+    stale = {"s1": {"decision": "matched", "history_txn_keys": ["h1"]}}
+    assert sf.apply_cutover([twin], hist, CUT, set(), records=stale)[0] == [twin], "a stale claim keeps a duplicate"
+    # A stored claimant (stored_duplicate) that changed is replaced the same way, and stays in the ledger.
+    dup = {"s1": {"decision": "stored_duplicate", "history_txn_keys": ["h1"]}}
+    kept, dropped, decisions = sf.apply_cutover([corrected], hist, CUT, {"s1"}, records=dup)
+    assert kept == [corrected] and decided(decisions) == {"s1": ("unconfirmed", None, ("h1",))}
+    # Still evidenced: the claim is kept as it was (not replaced).
+    assert decided(sf.apply_cutover([s1], hist, CUT, set(), records=stale)[2]) == {"s1": ("matched", "merchant", ("h1",))}
+    # A row recorded as ambiguous that is here again but has no candidate left (it changed): replaced, not kept as a
+    # hold the run no longer makes.
+    amb = {"s1": {"decision": "ambiguous", "history_txn_keys": ["h1"]}}
+    kept, dropped, decisions = sf.apply_cutover([corrected], hist, CUT, set(), records=amb)
+    assert kept == [corrected] and decided(decisions) == {"s1": ("unconfirmed", None, ("h1",))}
+    # Before the window the replacement is recorded too (the row is dropped all the same, not for review).
+    early = row("s4", "2026-11-06", 850, desc="DEMO BAKERY 0042 ATLANTA GA")
+    kept, dropped, decisions = sf.apply_cutover([early], hist, CUT, set(), records={"s4": stale["s1"]})
+    assert not kept and decided(decisions) == {"s4": ("unconfirmed", None, ("h1",))}
+    assert sf.new_review_count(decisions, {}) == 0 and sf.cutover_counts(decisions) == {"unconfirmed before the window": 1}
+
+
 # --- categories -------------------------------------------------------------------------------------------------
 def test_categories():
     types = {"wf1": "Cash", "wf2": "Cash", "amex": "Credit Card"}
@@ -682,6 +764,9 @@ class FakeStore:
         if self.read_error is not None:
             raise self.read_error
         return dict(self.saved)
+
+    def ledger_keys(self, keys):
+        return set(keys) & {t["txn_key"] for t in self.window_rows(None)}
 
     def save_cutover_decisions(self, rows):
         self.saved_rows.extend(rows)
@@ -879,6 +964,13 @@ def cutover_body():
     return b
 
 
+def wf_answer(*txns):
+    """body() with these transactions on the Wells Fargo checking account."""
+    b = body()
+    next(a for a in b["accounts"] if a["id"] == "S-WF")["transactions"] = list(txns)
+    return b
+
+
 def cutover_store(cls=None):
     window = [hrow("rm-1", "2026-11-11", 1500, "DEMO GROCER 0101 ATLANTA"), hrow("rm-2", "2026-11-10", 700, "DEMO DELI ATLANTA")]
     return (cls or FakeStore)(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
@@ -1014,6 +1106,76 @@ def test_run_recorded_match_survives_a_response_without_its_row():
     assert sf.run(store, Http(get=Res(200, second)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
     assert any(t["source_txn_id"] == "sf:S-WF:b2" for t in store.txns), "the new purchase is kept"
     assert store.beats[2][1] == "success"
+
+
+def test_run_ambiguous_rows_hold_their_twin_across_responses():
+    """Codex review, end to end (two-response replay): run 1 has two identical purchases before the window competing
+    for one Rocket Money row (dropped, recorded as ambiguous, not reported, not listed by the dry run); run 2's
+    answer has only a new purchase two days later, which is written and reported for review instead of being
+    matched to the held row."""
+    window = [hrow("rm-7", "2026-11-07", 525, None, name="Demo Cafe")]
+    store = FakeStore(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+    first = wf_answer(txn("x1", "2026-11-07", "-5.25", "SQ *DEMO CAFE"), txn("x2", "2026-11-07", "-5.25", "SQ *DEMO CAFE"))
+    assert sf.run(store, Http(get=Res(200, first)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert {store.saved[sf.txn_key("S-WF", k)]["decision"] for k in ("x1", "x2")} == {"ambiguous"}
+    assert not any(t["source_txn_id"].startswith("sf:S-WF:x") for t in store.txns)
+    assert store.beats[-2][:2] == ("transactions", "success"), "dropped before the window: nothing for review"
+    dry = []
+    assert sf.run(store, Http(get=Res(200, first)), ACCESS, 60, True, now=NOW, out=dry.append) == 0
+    assert not any("recorded for review" in line for line in dry), "not in the ledger: not listed for review"
+    assert any("ambiguous before the window" in line for line in dry)
+    second = wf_answer(txn("x3", "2026-11-09", "-5.25", "SQ *DEMO CAFE"))
+    assert sf.run(store, Http(get=Res(200, second)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert any(t["source_txn_id"] == "sf:S-WF:x3" for t in store.txns), "the new purchase is written"
+    assert store.saved[sf.txn_key("S-WF", "x3")] == {"decision": "ambiguous", "history_txn_keys": ["rm-7"]}
+    assert store.beats[-2][3] == sf.format_notes({"cutover_review": 1})
+
+
+def test_run_replaced_claim_is_saved_before_the_ledger():
+    """Codex review, end to end: run 1 matches a row; in run 2 SimpleFIN has corrected its amount, so the row is
+    written and its claim replaced by an 'unconfirmed' decision, recorded BEFORE the ledger write; run 3's answer
+    lacks it (incomplete) and has the Rocket Money row's real twin, which is matched and not written. A failed save
+    of the replacement writes nothing."""
+    class Ordered(FakeStore):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.events = []
+
+        def save_cutover_decisions(self, rows):
+            self.events.append("record")
+            super().save_cutover_decisions(rows)
+
+        def upsert_transactions(self, rows):
+            self.events.append("ledger")
+            super().upsert_transactions(rows)
+
+    window = [hrow("rm-6", "2026-11-10", 800, "DEMO BAKERY ATLANTA", name="Demo Bakery")]
+    store = Ordered(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+    b1, b2 = sf.txn_key("S-WF", "b1"), sf.txn_key("S-WF", "b2")
+    run1 = wf_answer(txn("b1", "2026-11-11", "-8.00", "DEMO BAKERY 0042 ATLANTA GA"))
+    assert sf.run(store, Http(get=Res(200, run1)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert store.saved[b1]["decision"] == "matched" and not any(t["txn_key"] == b1 for t in store.txns)
+    store.events.clear()
+    run2 = wf_answer(txn("b1", "2026-11-11", "-8.50", "DEMO BAKERY 0042 ATLANTA GA"))
+    assert sf.run(store, Http(get=Res(200, run2)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert store.saved[b1] == {"decision": "unconfirmed", "history_txn_keys": ["rm-6"]}
+    assert any(t["txn_key"] == b1 for t in store.txns), "no longer evidenced: written"
+    assert store.events == ["record", "ledger"], "the replaced claim is on record before the ledger is written"
+    assert store.beats[-2][3] == sf.format_notes({"cutover_review": 1})
+    run3 = wf_answer(txn("b2", "2026-11-10", "-8.00", "DEMO BAKERY 0042 ATLANTA GA"))
+    assert sf.run(store, Http(get=Res(200, run3)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert store.saved[b2] == {"decision": "matched", "history_txn_keys": ["rm-6"]}
+    assert not any(t["txn_key"] == b2 for t in store.txns), "the real twin is not written twice"
+
+    class SaveFails(Ordered):
+        def save_cutover_decisions(self, rows):
+            raise FakeApiError("57014", pii_msg())
+
+    failing = SaveFails(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+    failing.saved = {b1: {"decision": "matched", "history_txn_keys": ["rm-6"]}}
+    assert sf.run(failing, Http(get=Res(200, run2)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 1
+    assert not failing.txns and failing.saved[b1]["decision"] == "matched" and failing.events == []
+    assert failing.beats[0][3] == sf.format_notes({"db_write_failed": 1})
 
 
 def test_run_cutover_record_read_error_fails_before_writing():

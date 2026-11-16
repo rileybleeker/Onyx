@@ -26,9 +26,12 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      only when it is one to one, or when its rows cannot be told apart on either side and every SimpleFIN row gets
      a twin of its own; more SimpleFIN rows than twins is never guessed. Every SimpleFIN row of the response takes
      part, so a Rocket Money row whose twin is before the window is taken by that twin, and a Rocket Money row an
-     earlier run matched stays taken (pds.finance_cutover_matches). An equal amount alone never drops a row: a row
-     with competing candidates ('ambiguous') or with a same-amount Rocket Money row nearby but no merchant evidence
-     ('unconfirmed') is KEPT and counted for review. Every match and every row kept for review is recorded in
+     earlier run matched stays taken (pds.finance_cutover_matches); the candidates of a row recorded as ambiguous
+     stay held while that row is missing from a later answer, and a recorded claim or hold the run no longer makes
+     is recorded again as 'unconfirmed' (kept for review), never left behind. An equal amount alone never drops a
+     row: a row with competing candidates ('ambiguous') or with a same-amount Rocket Money row nearby but no
+     merchant evidence ('unconfirmed') is KEPT and counted for review. Every match and every row kept for review is
+     recorded (also the decisions on rows dropped before the window, which hold or take a Rocket Money row) in
      pds.finance_cutover_matches (keys only) BEFORE the ledger is written: when that record cannot be read (other
      than not applied yet), cannot be written, or is missing while there are decisions to record, the run fails
      before writing anything, so a row is never left out on a match that is not on record. Rows already stored by
@@ -704,6 +707,14 @@ def recorded_claims(saved: Optional[dict]) -> dict[str, set[str]]:
     return dict(claims)
 
 
+def recorded_holds(saved: Optional[dict]) -> dict[str, tuple]:
+    """Recorded 'ambiguous' decisions -> {SimpleFIN txn_key: the Rocket Money candidates it competed for}. While that
+    SimpleFIN row is missing from a response its candidates are held (apply_cutover, step 0): the record cannot
+    say which of them, if any, is its twin, so none may be matched to another row."""
+    return {sf_key: tuple(rec.get("history_txn_keys") or ()) for sf_key, rec in (saved or {}).items()
+            if rec.get("decision") == "ambiguous" and rec.get("history_txn_keys")}
+
+
 def in_cutover_window(row: dict, cutover: date) -> bool:
     """Whether the cutover rule judges the row on evidence. A row transacted more than OVERLAP_DAYS before the
     account's last Rocket Money date and posted by that date is in the Rocket Money history already (it was posted
@@ -764,63 +775,87 @@ class CutoverDecision:
     evidence: Optional[str]    # exact | merchant (matched / stored_duplicate), else None
     history_txn_keys: tuple    # the Rocket Money twin, or the candidates
     cutover_date: str = ""     # the account's last Rocket Money date the decision was made against
+    kept: bool = True          # the row is in the ledger (not stored in the record: only kept rows are for review)
 
 
 def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[date], stored_keys: set[str],
-                  claims: Optional[dict] = None) -> tuple[list[dict], Counter, list[CutoverDecision]]:
+                  claims: Optional[dict] = None,
+                  records: Optional[dict] = None) -> tuple[list[dict], Counter, list[CutoverDecision]]:
     """SimpleFIN rows -> (kept, dropped counts, decisions) against one account's Rocket Money history (module
     docstring, step 3). Deterministic and order-independent. A row is dropped only when it is matched on identity
     evidence or when it is before the cutover window (in_cutover_window); a row stored by an earlier run is always
     kept (a match then marks it 'stored_duplicate').
 
     Every SimpleFIN row takes part in the matching, also the rows before the window: their Rocket Money twins are
-    taken by them, so a later purchase of the same amount cannot claim one, and their matches are recorded too.
-    `claims` (recorded_claims of earlier runs) keeps those decisions: a Rocket Money row claimed by a row missing
-    from this response stays taken, and a claim whose row is still here and still carries the evidence is kept as
-    it was."""
+    taken by them, so a later purchase of the same amount cannot claim one, and their decisions are recorded too.
+    `records` (the saved decisions of earlier runs, {sf_txn_key: {'decision', 'history_txn_keys'}}; `claims` alone
+    is recorded_claims of them) keeps those decisions: a Rocket Money row claimed by a row missing from this
+    response stays taken, a claim whose row is still here and still carries the evidence is kept as it was, and
+    the candidates of a row recorded as ambiguous are held while that row is missing (Codex review: two rows
+    competing for one twin, then a later answer without them, must not let a third purchase take it). A recorded
+    claim or ambiguity whose row is here but that this run no longer makes is replaced by a decision: the new one,
+    or 'unconfirmed' with the keys the record named (kept for review), so a stale claim or hold is never left in
+    the record (Codex review: a matched row whose amount changed, then a later answer without it)."""
     kept: list[dict] = []
     dropped: Counter = Counter()
     if cutover is None:
         return list(sf_rows), dropped, []
+    if claims is None:
+        claims = recorded_claims(records)
     rows = sorted(sf_rows, key=lambda r: (r["txn_date"], r["txn_key"]))
     in_zone = {r["txn_key"]: in_cutover_window(r, cutover) for r in rows}
     present = {r["txn_key"]: r for r in rows}
     pool = sorted(history, key=lambda h: (h["txn_date"], h["txn_key"]))
+    hist = {h["txn_key"]: h for h in pool}
 
-    used: set[str] = set()
+    used: set[str] = set()     # Rocket Money rows taken: never matched again, not a candidate either
+    held: set[str] = set()     # Rocket Money rows held: never matched, still a candidate (others become ambiguous)
     found: dict[str, tuple] = {}   # sf txn_key -> (decision, evidence, history keys)
+    carried: dict[str, set] = defaultdict(set)   # present sf txn_key -> Rocket Money keys its record named
 
-    # 0. Earlier decisions. A Rocket Money row claimed by a SimpleFIN row absent from this response stays taken (a
-    #    narrower or incomplete answer must not free it for another purchase); a claim still present and still
-    #    evidenced is kept, so a new same-merchant row cannot turn a settled match into a new ambiguity.
+    # 0. Earlier decisions.
+    #    Claims: a Rocket Money row claimed by a SimpleFIN row absent from this response stays taken (a narrower or
+    #    incomplete answer must not free it for another purchase); a claim still present and still evidenced is
+    #    kept, so a new same-merchant row cannot turn a settled match into a new ambiguity. A present claimant whose
+    #    evidence is gone (its amount or text changed) no longer holds the row: it is decided again (step 4).
     for h in pool:
-        claimants = (claims or {}).get(h["txn_key"])
+        hk = h["txn_key"]
+        claimants = claims.get(hk)
         if not claimants:
             continue
         here = sorted(claimants & present.keys())
-        if not here:
-            used.add(h["txn_key"])
-        elif len(here) == 1 and here[0] not in found:
-            evidence = same_purchase(present[here[0]], h)
-            if evidence:
-                used.add(h["txn_key"])
-                found[here[0]] = ("matched", evidence, (h["txn_key"],))
+        evidenced = [(sk, same_purchase(present[sk], h)) for sk in here]
+        evidenced = [(sk, how) for sk, how in evidenced if how and sk not in found]
+        for sk in here:
+            carried[sk].add(hk)
+        if len(evidenced) == 1:
+            used.add(hk)
+            found[evidenced[0][0]] = ("matched", evidenced[0][1], (hk,))
+        elif claimants - present.keys():
+            used.add(hk)
+        elif evidenced:
+            held.add(hk)   # two present claimants still evidenced (a partly saved record): never guessed
+    #    Ambiguities: the candidates of a row recorded as ambiguous and missing from this response are held. A row
+    #    recorded as ambiguous that is here competes again on its own.
+    for sk, keys in recorded_holds(records).items():
+        if sk in present:
+            carried[sk].update(keys)
+        else:
+            held.update(k for k in keys if k in hist and k not in used)
 
     # 1. Exact: same date, amount, currency and description text, payees not contradicting. Each connected group of
     #    such pairs is decided by _resolve: one to one, or indistinguishable rows with a twin for every SimpleFIN row,
-    #    is a match; anything else (two identical new rows and one twin) is ambiguous, and the group's Rocket Money
-    #    rows are held for it, so no other row can take them in step 2.
-    hist = {h["txn_key"]: h for h in pool}
+    #    is a match; anything else (two identical new rows and one twin, or a twin held by step 0) is ambiguous, and
+    #    the group's Rocket Money rows are held for it, so no other row can take them in step 2.
     by_key: dict[tuple, list] = defaultdict(list)
     for h in pool:
         k = exact_key(h)
         if k and h["txn_key"] not in used:
             by_key[k].append(h)
-    held: set[str] = set()   # Rocket Money rows of an unresolved exact group: never matched, still candidates
     exact_edges = [(r["txn_key"], h["txn_key"]) for r in rows if r["txn_key"] not in found
                    for h in by_key.get(exact_key(r), ()) if not names_conflict(r, h)]
     for ss, hs in _components(exact_edges):
-        pairs = _resolve(ss, hs, present, hist)
+        pairs = None if held.intersection(hs) else _resolve(ss, hs, present, hist)
         if pairs is None:
             held.update(hs)
             for sk in ss:
@@ -877,6 +912,14 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
         if cands:
             found[r["txn_key"]] = ("unconfirmed", None, cands[:MAX_CANDIDATES])
 
+    # 4. A row here whose recorded claim or ambiguity this run no longer makes, and that got no other decision:
+    #    recorded as 'unconfirmed' with the keys its record named. That replaces the record before the ledger is
+    #    written, so the stale claim or hold is gone when the row is missing from a later answer (and the Rocket
+    #    Money row is free for its real twin), while the row is still listed for review. 'unconfirmed' holds nothing.
+    for sk, keys in carried.items():
+        if sk not in found:
+            found[sk] = ("unconfirmed", None, tuple(sorted(keys))[:MAX_CANDIDATES])
+
     decisions: list[CutoverDecision] = []
     for r in rows:
         sk = r["txn_key"]
@@ -885,26 +928,36 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
         if decision == "matched" and stored:
             decision = "stored_duplicate"
         if not in_zone[sk]:
-            # Before the window: the Rocket Money history already has it. Only a match is recorded, so the Rocket
-            # Money row it took stays taken on later runs (an ambiguous row here is dropped all the same).
+            # Before the window: the Rocket Money history already has it, so it is dropped (unless stored) whatever
+            # was decided. Its decision is recorded all the same: a match keeps the Rocket Money row it took taken on
+            # later runs, an ambiguity keeps its candidates held while the row is missing from a later answer, and a
+            # replaced claim clears the old one. Not for review unless the row is in the ledger (kept=False).
+            keep = stored
             if stored:
                 kept.append(r)
             else:
                 dropped["before the Rocket Money cutover"] += 1
-            if decision not in CLAIM_DECISIONS:
-                continue
         elif decision == "matched":
+            keep = False
             dropped["already in the Rocket Money history"] += 1
         else:
+            keep = True
             kept.append(r)
         if decision:
-            decisions.append(CutoverDecision(sk, r["account_key"], decision, how, hkeys, cutover.isoformat()))
+            decisions.append(CutoverDecision(sk, r["account_key"], decision, how, hkeys, cutover.isoformat(), keep))
     return kept, dropped, sorted(decisions, key=lambda d: d.sf_txn_key)
 
 
 def cutover_counts(decisions: Iterable[CutoverDecision]) -> Counter:
-    """Decisions -> counts for the log: matched exact / matched merchant / stored_duplicate / ambiguous / unconfirmed."""
-    return Counter(f"{d.decision} {d.evidence}" if d.decision == "matched" else d.decision for d in decisions)
+    """Decisions -> counts for the log: matched exact / matched merchant / stored_duplicate / ambiguous / unconfirmed;
+    a decision on a row dropped before the window (not in the ledger, so not for review) is '<decision> before the
+    window'."""
+    def label(d: CutoverDecision) -> str:
+        if d.decision == "matched":
+            return f"matched {d.evidence}"
+        return d.decision if d.kept else f"{d.decision} before the window"
+
+    return Counter(label(d) for d in decisions)
 
 
 def decision_rows(decisions: Iterable[CutoverDecision], now: datetime) -> list[dict]:
@@ -917,9 +970,10 @@ def decision_rows(decisions: Iterable[CutoverDecision], now: datetime) -> list[d
 
 def new_review_count(decisions: Iterable[CutoverDecision], saved: Optional[dict]) -> int:
     """Rows kept for review whose decision is not recorded yet (each one is reported once, the run that records it).
-    `saved` = {sf_txn_key: {'decision': ..., 'history_txn_keys': [...]}} or None when the record could not be read."""
+    Only rows in the ledger count: a decision on a row dropped before the window is recorded for its hold only.
+    `saved` ={sf_txn_key: {'decision': ..., 'history_txn_keys': [...]}} or None when the record could not be read."""
     return sum(1 for d in decisions
-               if d.decision in REVIEW_DECISIONS
+               if d.kept and d.decision in REVIEW_DECISIONS
                and (saved is None or (saved.get(d.sf_txn_key) or {}).get("decision") != d.decision))
 
 
@@ -1141,6 +1195,15 @@ class Store:
         return {r["sf_txn_key"]: {"decision": r.get("decision"), "history_txn_keys": list(r.get("history_txn_keys") or [])}
                 for r in rows}
 
+    def ledger_keys(self, keys: Iterable[str]) -> set[str]:
+        """Which of these txn_keys are in the ledger (--dry-run only: the recorded rows still to review)."""
+        keys, out = sorted(set(keys)), set()
+        for i in range(0, len(keys), 100):
+            data = (_t(self.supa, "finance_transactions").select("txn_key").in_("txn_key", keys[i:i + 100])
+                    .execute().data or [])
+            out.update(r["txn_key"] for r in data)
+        return out
+
     def save_cutover_decisions(self, rows: list[dict]) -> None:
         for i in range(0, len(rows), CHUNK):
             _t(self.supa, "finance_cutover_matches").upsert(rows[i:i + CHUNK], on_conflict="sf_txn_key").execute()
@@ -1199,7 +1262,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     for p in pool:
         if p.get("source") != SOURCE:
             history_by_account[p["account_key"]].append(p)
-    # Earlier cutover decisions keep their Rocket Money rows taken (apply_cutover, step 0). Before
+    # Earlier cutover decisions keep their Rocket Money rows taken or held (apply_cutover, step 0). Before
     # sql/finance_cutover_matches.sql is applied the table is missing (saved = None): the plan matches on its own
     # response, and run() stops before writing if any decision would need recording. Any OTHER read error fails
     # the run here, before anything is written:
@@ -1211,7 +1274,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
         if not is_missing_relation(e):
             raise SimpleFinError("db_read_failed") from None
         saved = None
-    claims = recorded_claims(saved)
+    claims = recorded_claims(saved)   # computed once; holds and replaced claims come from `saved` itself
 
     for a in sf_accounts:
         m = matches[a.id]
@@ -1253,7 +1316,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
         rows, skip = normalize_transactions(a, key)
         skipped.update(skip)
         cutover = store.cutover(key) if m.action != "new" else None
-        kept, drop, decided = apply_cutover(rows, history_by_account.get(key, []), cutover, stored_sf, claims)
+        kept, drop, decided = apply_cutover(rows, history_by_account.get(key, []), cutover, stored_sf, claims, saved)
         dropped.update(drop)
         decisions.extend(decided)
         line["kept"], line["dropped"] = len(kept), sum(drop.values())
@@ -1302,10 +1365,18 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
             # Reconciliation preview of the cutover window, counts only (pds.finance_cutover_matches has the keys).
             out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}; new for review: "
                 f"{new_review_count(plan.cutover, plan.saved)}" + ("" if plan.saved is not None else " (no decision record yet)"))
-        recorded = Counter(rec.get("decision") for rec in (plan.saved or {}).values() if rec.get("decision") in REVIEW_DECISIONS)
-        if recorded:
-            # Every row kept for review so far (all runs), still to check by hand (docs/financials-simplefin.md).
-            out(f"  recorded for review (all runs): {dict(sorted(recorded.items()))}")
+        review_keys = {k for k, rec in (plan.saved or {}).items() if rec.get("decision") in REVIEW_DECISIONS}
+        if review_keys:
+            # Every row kept for review so far (all runs), still to check by hand (docs/financials-simplefin.md). Only
+            # rows in the ledger: the record also keeps decisions on rows dropped before the window (their holds).
+            try:
+                in_ledger = store.ledger_keys(review_keys)
+            except Exception as e:
+                out(f"  recorded for review (all runs): could not be counted ({safe_type_name(e)})")
+            else:
+                recorded = Counter(plan.saved[k]["decision"] for k in review_keys if k in in_ledger)
+                if recorded:
+                    out(f"  recorded for review (all runs): {dict(sorted(recorded.items()))}")
         if plan.cutover and plan.saved is None:
             out("  a real run would stop before writing: the cutover record table is missing (apply sql/finance_cutover_matches.sql)")
         if plan.notes:
