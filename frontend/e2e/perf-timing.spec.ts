@@ -83,6 +83,10 @@ const FIXED_WINDOW_NAVS = 4;
 // then is unfinished (cost unknown), whatever happens later.
 const DRAIN_MS = 2_000;
 const FULL_LOAD_WINDOW_RULE = `navigations 1-${FIXED_WINDOW_NAVS} of each page`;
+// The window a full-load navigation gets (0 = version 1 spacing, the network-quiet wait alone): its first
+// FIXED_WINDOW_NAVS navigations only. The hourly run (4 navigations) is all windowed; a deeper manual run's later
+// navigations are spaced differently, which is why each sample records its cadence and pooling keeps the two apart.
+const fullLoadWindowMs = (i: number) => (i < FIXED_WINDOW_NAVS ? FIXED_WINDOW_MS : 0);
 const IN_APP_WINDOW_RULE = "from the press on the link (pointerdown), rounds 2 and later (round 1 keeps version 1 spacing)";
 // Worst case of one measured full load: about:blank and the CPU setting, the page load, data-ready, the network-quiet
 // wait (or the fixed window, whichever is longer), the drain, the in-page reads and the pause.
@@ -365,6 +369,12 @@ interface Sample {
   i: number;
   cold: boolean;
   ok: boolean;
+  /**
+   * How this navigation was observed: "fixed-window" (observed to the window's end plus the drain) or "network-quiet"
+   * (version 1 spacing: the network-quiet wait alone). Samples of the two cadences are different methods and are never
+   * pooled together (perf-stats.cjs CADENCES). Set before anything can fail, so a failed navigation carries it too.
+   */
+  cadence?: string;
   error?: string;
   status?: number | null;
   ttfb?: number | null;
@@ -544,9 +554,9 @@ interface MeasureOptions {
 }
 
 async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number, mode: "load" | "click" = "load", opts: MeasureOptions = {}): Promise<Sample> {
-  const sample: Sample = { i, cold: i === 0, ok: false };
-  if (mode === "click") sample.firstVisit = i === 0;
   const windowMs = opts.windowMs ?? 0;
+  const sample: Sample = { i, cold: i === 0, ok: false, cadence: stats.cadenceFor(windowMs) };
+  if (mode === "click") sample.firstVisit = i === 0;
   if (mode === "load") {
     await page.goto("about:blank");
     if (opts.beforeGoto) await opts.beforeGoto();
@@ -922,7 +932,7 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
   // The navigation in progress (observe-only deadline: it is recorded as interrupted, not measured, never a pass).
   let inFlight: number | null = null;
   o.run?.onInterrupt((deadlineMs) => {
-    const rows: Sample[] = inFlight == null ? [...samples] : [...samples, { i: inFlight, cold: inFlight === 0, ok: false, error: stats.INTERRUPTED_ERROR }];
+    const rows: Sample[] = inFlight == null ? [...samples] : [...samples, { i: inFlight, cold: inFlight === 0, ok: false, cadence: stats.cadenceFor(fullLoadWindowMs(inFlight)), error: stats.INTERRUPTED_ERROR }];
     writeResult(meta(stats.interruptedStop(deadlineMs, rows.length, o.navigations, "navigations")), browser.version(), rows);
   });
   try {
@@ -932,7 +942,7 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
         stopped = `time budget of ${o.budgetMs / 1000} s used up: ${i} of ${o.navigations} navigations tried`;
         break;
       }
-      const windowMs = i < FIXED_WINDOW_NAVS ? FIXED_WINDOW_MS : 0;
+      const windowMs = fullLoadWindowMs(i);
       let s: Sample;
       inFlight = i;
       try {
@@ -940,7 +950,7 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
       } catch (e) {
         // measureOnce throws only on a bounce to the login page. On an observe-only page that navigation is kept as
         // not measured (the catch below ends the series); an enforced page fails as before, its file unchanged.
-        if (!o.scenario.enforced) samples.push({ i, cold: i === 0, ok: false, error: stats.errorLine(e) });
+        if (!o.scenario.enforced) samples.push({ i, cold: i === 0, ok: false, cadence: stats.cadenceFor(windowMs), error: stats.errorLine(e) });
         inFlight = null;
         throw e;
       }

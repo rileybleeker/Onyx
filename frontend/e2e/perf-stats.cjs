@@ -135,6 +135,22 @@ const LOW_N = 10;
 const PHONE_MAX_RUN_NAVIGATIONS = 4;
 
 /**
+ * Observation cadence of one navigation: how long the harness stayed on the page before the next one. A navigation
+ * taken with a fixed window is observed to its end plus the drain (`fixed-window`); one taken without it (a manual
+ * deep run's navigations after the first FIXED_WINDOW_NAVS of a page, in-app round 1) waits only for the network to be
+ * quiet (`network-quiet`), which closes sooner. The next view therefore starts from a different warm-up, cache and
+ * function state, so samples of the two cadences are different methods: they are summarised apart and never pooled
+ * together (a 15-navigation run's first four views match an hourly run's; its later views do not).
+ */
+const CADENCES = ["fixed-window", "network-quiet"];
+const cadenceFor = (windowMs) => (finite(windowMs) && windowMs > 0 ? "fixed-window" : "network-quiet");
+/** A sample's cadence: the recorded one, else (older or hand-built samples) a recorded window means fixed-window. */
+function cadenceOf(s) {
+  if (s && CADENCES.includes(s.cadence)) return s.cadence;
+  return s && s.window ? "fixed-window" : "network-quiet";
+}
+
+/**
  * An error as one short line for a result file: its first line, any address replaced by "<url>" (a result file never
  * holds a URL), at most `max` characters. "unknown error" when there is no message.
  */
@@ -631,6 +647,10 @@ function summarizePage(samples) {
     coldWindow: cold && cold.ok ? windowOf([cold]) : null,
     cacheStates: { first: samples[0] && samples[0].cacheState ? samples[0].cacheState : null, rest: restStates },
     readyRobust: robust(warm.map((s) => s.ready)),
+    // Warm data ready and not-reached counts per observation cadence (see CADENCES): what pooledTable pools by.
+    byCadence: Object.fromEntries(
+      CADENCES.map((c) => [c, { ready: warm.filter((s) => cadenceOf(s) === c).map((s) => s.ready).filter(finite), failed: samples.filter((s) => !s.ok && cadenceOf(s) === c).length, total: samples.filter((s) => cadenceOf(s) === c).length }])
+    ),
     blocking: robust(windowed.map((s) => s.longTasks?.blockingMs)),
     blockingBeforeReady: robust(windowed.map((s) => s.longTasks?.blockingBeforeReadyMs)),
     feedAt: robust(windowed.map((s) => s.feedAtMs)),
@@ -861,7 +881,12 @@ function robustTable(pages) {
   out.push("|---|---|---|---|---|---|---|---|---|");
   for (const p of pages) {
     const r = p.summary.readyRobust || robust((p.summary.timing && p.summary.timing.ready && p.summary.timing.ready.values) || []);
-    out.push(`| ${p.label} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${ms(r.iqr)} | ${ms(r.mad)} | ${lowNote(r)} |`);
+    // One run's views of two cadences (a manual deep run) share these percentiles; say so, and that pooling keeps them apart.
+    const by = p.summary.byCadence;
+    const mixed = by && CADENCES.every((c) => by[c] && by[c].ready.length > 0)
+      ? `mixes ${by["fixed-window"].ready.length} fixed-window and ${by["network-quiet"].ready.length} network-quiet-spaced views (the later navigations of a deep run); pooling across runs keeps them apart`
+      : "";
+    out.push(`| ${p.label} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${ms(r.iqr)} | ${ms(r.mad)} | ${[lowNote(r), mixed].filter(Boolean).join("; ")} |`);
   }
   return out.join("\n");
 }
@@ -887,10 +912,12 @@ function inputTable(inputs) {
 
 /**
  * Data ready pooled over several runs (directories), one row per page and METHOD: harness version, scenario, viewport,
- * the CPU slowdown actually in force, the fixed window and its rule, and the production revision. Samples of different
- * builds or methods are never mixed (a phone run whose CPU throttle failed, measured at 1x, never pools with a 4x one).
- * Only results bound to one exact build pool across runs; a mixed, unbound, unknown or unrecorded revision keeps one
- * row per run ("not pooled"). Only pooled numbers with a real n are a basis for enforcing a new metric.
+ * the CPU slowdown actually in force, the fixed window and its rule, the observation cadence of the views (CADENCES:
+ * a manual deep run's views after the first four of a page are spaced by the network-quiet wait alone, so they never
+ * pool with the fixed-window views of the same page, hourly or deep), and the production revision. Samples of
+ * different builds or methods are never mixed (a phone run whose CPU throttle failed, measured at 1x, never pools with
+ * a 4x one). Only results bound to one exact build pool across runs; a mixed, unbound, unknown or unrecorded revision
+ * keeps one row per run ("not pooled"). Only pooled numbers with a real n are a basis for enforcing a new metric.
  */
 function methodOf(p) {
   const d = p.detail || {};
@@ -910,12 +937,18 @@ function pooledTable(runs) {
     for (const p of run.pages) {
       const m = methodOf(p);
       const exact = isExactRevision(p.revision);
-      const key = [p.label, p.harness || 1, m.scenario, m.viewport, m.cpu, m.windowMs, m.windowRule, p.revision || "", exact ? "" : `run${runIdx}`].join("|");
-      const g = groups.get(key) || { label: p.label, harness: p.harness || 1, method: m, revision: p.revision || null, exact, runs: 0, values: [], failed: 0 };
-      g.runs += 1;
-      g.values.push(...(((p.summary.timing || {}).ready || {}).values || []));
-      g.failed += p.summary.failed || 0;
-      groups.set(key, g);
+      // A summary without per-cadence values (not produced by summarizePage) is one group of unknown cadence, which
+      // pools with nothing else.
+      const by = p.summary.byCadence || { "not recorded": { ready: (((p.summary.timing || {}).ready || {}).values) || [], failed: p.summary.failed || 0, total: p.summary.total || 0 } };
+      for (const [cadence, part] of Object.entries(by)) {
+        if (!part || (part.ready.length === 0 && part.failed === 0)) continue; // e.g. the cold first visit alone
+        const key = [p.label, p.harness || 1, m.scenario, m.viewport, m.cpu, m.windowMs, m.windowRule, cadence, p.revision || "", exact ? "" : `run${runIdx}`].join("|");
+        const g = groups.get(key) || { label: p.label, harness: p.harness || 1, method: m, cadence, revision: p.revision || null, exact, runs: 0, values: [], failed: 0 };
+        g.runs += 1;
+        g.values.push(...part.ready);
+        g.failed += part.failed;
+        groups.set(key, g);
+      }
     }
   });
   const unbound = {
@@ -930,8 +963,11 @@ function pooledTable(runs) {
     const r = robust(g.values);
     const m = g.method;
     const view = `${m.viewport} / ${m.cpu == null ? "CPU not recorded" : `CPU ${m.cpu}x`}`;
-    const win = m.windowMs == null ? "not recorded" : `${ms(m.windowMs)}${m.windowRule ? ` (${m.windowRule})` : ""}`;
-    const note = g.exact ? lowNote(r) : unbound[g.revision] || "no build recorded (harness 1): not pooled";
+    const fixed = m.windowMs == null ? "not recorded" : `${ms(m.windowMs)}${m.windowRule ? ` (${m.windowRule})` : ""}`;
+    // Views taken without the fixed window are a different method: say so in the cell, never show the window they lacked.
+    const win = g.cadence === "network-quiet" ? "none: network-quiet spacing only" : g.cadence === "not recorded" ? "not recorded" : fixed;
+    const cadenceNote = g.cadence === "network-quiet" && g.harness >= 2 ? "views spaced by the network-quiet wait alone (a manual deep run's later navigations, or in-app round 1): not pooled with the fixed-window views" : "";
+    const note = [g.exact ? lowNote(r) : unbound[g.revision] || "no build recorded (harness 1): not pooled", cadenceNote].filter(Boolean).join("; ");
     out.push(`| ${g.label} | ${g.harness} | ${m.scenario} | ${view} | ${win} | ${short(g.revision)} | ${g.runs} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${g.failed} | ${note} |`);
   }
   return out.join("\n");
@@ -1090,6 +1126,9 @@ module.exports = {
   viaOf,
   purposeOf,
   ANCHOR_KINDS,
+  CADENCES,
+  cadenceFor,
+  cadenceOf,
   foldWindow,
   foldLongTasks,
   inputAnchorOf,

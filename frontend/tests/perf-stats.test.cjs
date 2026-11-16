@@ -434,9 +434,9 @@ test('foldLongTasks: blocking time is the part over 50 ms, bounded by the window
 });
 
 test('cacheStateOf: the empty browser cache is told apart from CDN and function, which stay unknown without headers', () => {
-  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: true, vercelCache: 'HIT', vercelId: 'iad1::abcd1-1794452282628-11b03cce4640' }),
+  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: true, vercelCache: 'HIT', vercelId: 'iad1::abcd1-1700000000000-0123456789ab' }),
     { browser: 'empty', cdn: 'HIT', fn: 'not-run', fnWarmth: 'n/a' });
-  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: false, vercelCache: 'miss', vercelId: 'iad1::iad1::abcd1-1794452282628-11b03cce4640' }),
+  assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: false, vercelCache: 'miss', vercelId: 'iad1::iad1::abcd1-1700000000000-0123456789ab' }),
     { browser: 'warm', cdn: 'MISS', fn: 'ran', fnWarmth: 'unknown' }, 'whether the function was cold is never visible');
   assert.deepEqual(stats.cacheStateOf({ mode: 'load', first: true }), { browser: 'empty', cdn: 'unknown', fn: 'unknown', fnWarmth: 'n/a' });
   assert.equal(stats.cacheStateOf({ mode: 'click', first: true }).browser, 'prewarmed', 'an in-app first visit is never cold');
@@ -906,4 +906,100 @@ test('report: pooled table keeps the CPU slowdown actually in force apart (a fai
   assert.match(md2, /\| 8000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/);
   assert.match(md2, /\| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/);
   for (const d of [...dirs, other, same]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+// A manual deep run (15 navigations per page) gives only the first four a fixed window; the later ones are spaced by
+// the network-quiet wait alone, so the next view starts from a different warm-up state. They are a different method.
+const quietSample = (i, ready, over = {}) => ({ ...sample(i, ready, 2), cadence: 'network-quiet', ...over });
+// The first four navigations of a deep run are exactly an hourly run's; the rest are quiet-spaced and much slower here
+// so that any mixing would show in the percentiles.
+const deepSamples = () => [v2sample(0, 900), v2sample(1, 430), v2sample(2, 440), v2sample(3, 450),
+  ...Array.from({ length: 11 }, (_, k) => quietSample(4 + k, 1500 + k * 10))];
+const cellsOf = (line) => line.split('|').slice(1, -1).map((c) => c.trim());
+// | Page | Harness | Scenario | Viewport / CPU | Window | Revision | Runs | Warm n | p50 | p90 | p95 | max | Not reached | Note |
+const poolRow = (md, label, quiet) => md.split('\n').filter((l) => l.startsWith(`| ${label} | 2 | full-load |`) && l.includes('none: network-quiet spacing only') === quiet).map(cellsOf);
+
+test('cadenceFor / cadenceOf: a recorded cadence wins, else a recorded window means fixed-window', () => {
+  assert.deepEqual(stats.CADENCES, ['fixed-window', 'network-quiet']);
+  assert.equal(stats.cadenceFor(6000), 'fixed-window');
+  assert.equal(stats.cadenceFor(0), 'network-quiet');
+  assert.equal(stats.cadenceFor(undefined), 'network-quiet');
+  assert.equal(stats.cadenceOf({ cadence: 'network-quiet', window: {} }), 'network-quiet', 'the recorded cadence wins');
+  assert.equal(stats.cadenceOf({ cadence: 'fixed-window' }), 'fixed-window');
+  assert.equal(stats.cadenceOf(v2sample(1, 400)), 'fixed-window', 'older or hand-built sample: a window was recorded');
+  assert.equal(stats.cadenceOf(sample(1, 400, 2)), 'network-quiet', 'a version 1 sample never had a fixed window');
+  assert.equal(stats.cadenceOf({ cadence: 'whatever' }), 'network-quiet', 'an unknown value is not trusted');
+});
+
+test('summarizePage: data ready and not-reached counts are split by observation cadence; the budget inputs still see every warm view', () => {
+  const samples = deepSamples();
+  samples[2] = { i: 2, cold: false, ok: false, error: 'ready-timeout', cadence: 'fixed-window' };
+  samples[9] = { i: 9, cold: false, ok: false, error: 'ready-timeout', cadence: 'network-quiet' };
+  const s = stats.summarizePage(samples);
+  assert.deepEqual(s.byCadence['fixed-window'].ready, [430, 450], 'warm views of navigations 1-4 (the cold one and the failed one are not in it)');
+  assert.equal(s.byCadence['fixed-window'].failed, 1);
+  assert.equal(s.byCadence['fixed-window'].total, 4);
+  assert.equal(s.byCadence['network-quiet'].ready.length, 10, 'eleven later views, one of them failed');
+  assert.equal(s.byCadence['network-quiet'].failed, 1);
+  assert.equal(s.byCadence['network-quiet'].total, 11);
+  assert.equal(s.failed, 2, 'the page total is the sum of both');
+  // Budget and per-run percentiles are unchanged: they read every warm view, whatever its cadence.
+  assert.equal(s.timing.ready.n, 12);
+  assert.equal(s.readyRobust.n, 12);
+  assert.equal(s.timing.ready.max, 1600);
+  // A failed navigation with no recorded cadence and no window cannot be placed: it counts as network-quiet.
+  const bare = stats.summarizePage([v2sample(0, 900), { i: 1, cold: false, ok: false, error: 'ready-timeout' }]);
+  assert.equal(bare.byCadence['network-quiet'].failed, 1);
+});
+
+test('report: pooling never mixes a 15-navigation run\'s later views into the 4-navigation (hourly) views of the same page', () => {
+  const hourly = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const deep = (extra = {}) => writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { navigations: 15, ...extra }), samples: deepSamples() } });
+  const dirs = [writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples: hourly } }), deep(), deep()];
+  const md = report.render(dirs.map(report.loadRun));
+
+  // Fixed-window views: the hourly run's three warm views and the two deep runs' first four navigations pool (3 + 3 + 3).
+  const fixed = poolRow(md, '/sleep', false);
+  assert.equal(fixed.length, 1, 'one row for the fixed-window cadence');
+  const [, , , , window1, rev, runs, n, p50, , p95, max, failed, note] = fixed[0];
+  assert.equal(window1, '6000 (navigations 1-4 of each page)');
+  assert.equal(rev, 'aaaaaaa');
+  assert.equal(runs, '3');
+  assert.equal(n, '9');
+  assert.ok(Number(p50) >= 400 && Number(p50) <= 450, `p50 ${p50} comes from the fixed-window views only`);
+  assert.ok(Number(p95) <= 450 && Number(max) <= 450, `no later (network-quiet) view in p95 ${p95} / max ${max}`);
+  assert.equal(failed, '0');
+  assert.match(note, /low n \(9 < 10\)/);
+  assert.ok(!/network-quiet/.test(note), 'the fixed-window row carries no quiet-spacing note');
+
+  // Network-quiet views: only the two deep runs have them (11 each), on their own row, labelled, never given the window.
+  const quiet = poolRow(md, '/sleep', true);
+  assert.equal(quiet.length, 1, 'one row for the network-quiet cadence');
+  const [, , , , window2, rev2, runs2, n2, p50q, , , maxq, , note2] = quiet[0];
+  assert.equal(window2, 'none: network-quiet spacing only');
+  assert.equal(rev2, 'aaaaaaa');
+  assert.equal(runs2, '2');
+  assert.equal(n2, '22');
+  assert.ok(Number(p50q) >= 1500 && Number(maxq) <= 1600);
+  assert.match(note2, /not pooled with the fixed-window views/);
+
+  // A 4-navigation hourly run alone has no quiet row at all; two hourly runs pool exactly as before.
+  const two = [writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples: hourly } }), writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples: hourly } })];
+  const md2 = report.render(two.map(report.loadRun));
+  assert.equal(poolRow(md2, '/sleep', true).length, 0);
+  assert.match(md2, /\| \/sleep \| 2 \| full-load \| 1280x720 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/);
+  assert.ok(!/NaN|undefined/.test(md));
+  for (const d of [...dirs, ...two]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('report: a deep run\'s mixed percentiles say so, and its failed views are counted in the cadence they were taken in', () => {
+  const samples = deepSamples();
+  samples[9] = { i: 9, cold: false, ok: false, error: 'ready-timeout', cadence: 'network-quiet' };
+  const dirs = [writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { navigations: 15 }), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { navigations: 15 }), samples: deepSamples() } })];
+  const md = report.render(dirs.map(report.loadRun));
+  assert.match(md, /mixes 3 fixed-window and 11 network-quiet-spaced views.*pooling across runs keeps them apart/);
+  assert.equal(poolRow(md, '/sleep', false)[0][12], '0', 'a failure in a later navigation is not charged to the fixed-window row');
+  assert.equal(poolRow(md, '/sleep', true)[0][12], '1');
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
 });

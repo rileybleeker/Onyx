@@ -165,7 +165,7 @@ function render(runs) {
   if (runs.length > 1) {
     out.push("## Stability across runs\n");
     out.push(stats.stabilityTable(runs) + "\n");
-    out.push("## Pooled across runs (per page, harness version and production revision)\n");
+    out.push("## Pooled across runs (per page, harness version, method, observation cadence and production revision)\n");
     out.push(stats.pooledTable(runs) + "\n");
   }
   return out.join("\n");
