@@ -10,14 +10,16 @@
 -- decision:
 --   matched           identity evidence matched one Rocket Money row; the SimpleFIN row was not stored
 --   stored_duplicate  a row an earlier run stored matches a Rocket Money row; kept (never removed automatically)
---   ambiguous         more than one candidate on either side; kept
+--   ambiguous         competing candidates (a tie, rows that can be told apart, more SimpleFIN rows than twins); kept
 --   unconfirmed       a same-amount Rocket Money row is near but no merchant evidence; kept
 -- evidence: 'exact' (same date, amount, currency, description) or 'merchant' (shared merchant words, one to one).
 -- The ETL reads the table back each run: a Rocket Money row a recorded decision matched stays taken, also when a
--- later SimpleFIN answer no longer has the row that matched it. While the table does not exist the ETL matches each
--- response on its own, saves nothing and the SimpleFIN card reads partial with cutover_provenance_unsaved; any
+-- later SimpleFIN answer no longer has the row that matched it. The ETL writes its decisions here BEFORE the ledger,
+-- and a run that cannot (a failed write, or this table missing while there are decisions to record:
+-- cutover_provenance_unsaved) writes nothing, so a row is never left out on a match that is not recorded. Any
 -- other error reading it fails the run before anything is written (db_read_failed), so the record is never
--- rewritten from decisions made without it.
+-- rewritten from decisions made without it. (These comments were revised after the table was applied; the
+-- statements below are unchanged.)
 -- Applied 2026-11-16 (Supabase MCP, before the merge of the change that added it).
 
 create table if not exists pds.finance_cutover_matches (

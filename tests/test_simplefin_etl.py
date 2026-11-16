@@ -399,15 +399,20 @@ def test_cutover_repeat_purchases_pair_by_nearest_date():
 
 
 def test_cutover_stored_rows_are_never_dropped():
-    hist = [hrow("h1", "2026-11-10", 500, "DEMO CAFE ATLANTA"), hrow("h2", "2026-11-11", 800, "DEMO BAKERY ATLANTA")]
+    hist = [hrow("h1", "2026-11-10", 500, "DEMO CAFE ATLANTA"), hrow("h2", "2026-11-11", 800, "DEMO BAKERY ATLANTA"),
+            hrow("h3", "2026-11-11", 900, "DEMO PRINTS ATLANTA")]
     sf_rows = [row("s1", "2026-11-11", 500, desc="DEMO CAFE ATLANTA GA"),    # stored earlier, but a history twin exists
-               row("n1", "2026-11-11", 800, desc="DEMO BAKERY ATLANTA"),     # exact twin, not stored: dropped
-               row("s2", "2026-11-11", 800, desc="DEMO BAKERY ATLANTA")]     # stored copy of the same: kept, not paired
+               row("n1", "2026-11-11", 800, desc="DEMO BAKERY ATLANTA"),     # exact twin of h2, not stored ...
+               row("s2", "2026-11-11", 800, desc="DEMO BAKERY ATLANTA"),     # ... and a stored copy of the same
+               row("n2", "2026-11-11", 900, desc="DEMO PRINTS ATLANTA")]     # exact twin, alone: dropped
     kept, dropped, decisions = sf.apply_cutover(sf_rows, hist, CUT, {"s1", "s2"})
-    assert sorted(r["txn_key"] for r in kept) == ["s1", "s2"]
+    assert sorted(r["txn_key"] for r in kept) == ["n1", "s1", "s2"]
+    assert dropped == {"already in the Rocket Money history": 1}
     got = decided(decisions)
-    assert got["s1"] == ("stored_duplicate", "merchant", ("h1",)) and got["n1"] == ("matched", "exact", ("h2",))
-    assert "s2" not in got, "unstored rows pair first in an exact group; the stored copy stays as it was"
+    assert got["s1"] == ("stored_duplicate", "merchant", ("h1",)) and got["n2"] == ("matched", "exact", ("h3",))
+    # Two SimpleFIN rows that cannot be told apart and one Rocket Money twin (Codex review): which one is the twin is
+    # not known, so neither is matched, also when one of them was stored by an earlier run. Both are kept for review.
+    assert got["n1"] == got["s2"] == ("ambiguous", None, ("h2",))
 
 
 def test_cutover_late_posted_row_is_judged_on_evidence():
@@ -495,6 +500,70 @@ def test_cutover_distinct_merchants_are_not_identity():
     donkey = hrow("h5", "2026-11-11", 475, "DEMO DONKEY COFFEE ATLANTA", name="Demo Donkey Coffee")
     kept, dropped, decisions = sf.apply_cutover([bottle], [donkey], CUT, set())
     assert [r["txn_key"] for r in kept] == ["d"] and decided(decisions) == {"d": ("unconfirmed", None, ("h5",))}
+
+
+def test_cutover_generic_payee_words_are_not_identity():
+    """Codex review (R1): identical bank descriptions with different payees that share only a generic word (STORE,
+    COFFEE) are two purchases: never matched, kept and counted for review. A payee of generic words only is no
+    evidence either way, and a processor payee still agrees with the merchant name."""
+    desc = "PLAZA KIOSK 0042"
+    hist = [hrow("h1", "2026-11-11", 640, desc, name="Other Store")]
+    a = row("a", "2026-11-11", 640, desc=desc, name="Demo Store")
+    assert sf.names_conflict(a, hist[0]) and not sf.merchant_evidence(a, hist[0])
+    kept, dropped, decisions = sf.apply_cutover([a], hist, CUT, set())
+    assert [r["txn_key"] for r in kept] == ["a"] and not dropped
+    assert decided(decisions) == {"a": ("unconfirmed", None, ("h1",))}
+    assert sf.cutover_counts(decisions) == {"unconfirmed": 1}
+    # The same with kinds of business on both sides, and with a shared city ('Demo Atlanta' vs 'Other Atlanta').
+    for mine, theirs in (("Demo Coffee Store", "Other Coffee Store"), ("Demo Atlanta", "Other Atlanta")):
+        b = row("b", "2026-11-11", 640, desc=desc, name=mine)
+        h = hrow("h2", "2026-11-11", 640, desc, name=theirs)
+        assert sf.names_conflict(b, h), (mine, theirs)
+        assert sf.apply_cutover([b], [h], CUT, set())[0] == [b], (mine, theirs)
+    # A generic-only payee says nothing: the description (store number included) decides.
+    store = row("c", "2026-11-11", 640, desc=desc, name="Store")
+    assert not sf.names_conflict(store, hist[0])
+    assert decided(sf.apply_cutover([store], hist, CUT, set())[2]) == {"c": ("matched", "exact", ("h1",))}
+    # A processor as payee ('Square') agrees with the merchant name on the description.
+    sq = row("d", "2026-11-11", 640, desc="SQ *DEMO CAFE", name="Square")
+    assert not sf.names_conflict(sq, hrow("h3", "2026-11-11", 640, "SQ *DEMO CAFE", name="Demo Cafe"))
+    # Store numbers are part of the exact text: two shops of one chain on one day pair by their numbers, not by
+    # key order.
+    shops = [row("s1", "2026-11-11", 300, desc="DEMO DELI 0099 ATLANTA"), row("s2", "2026-11-11", 300, desc="DEMO DELI 0042 ATLANTA")]
+    twins = [hrow("k1", "2026-11-11", 300, "DEMO DELI 0042 ATLANTA"), hrow("k2", "2026-11-11", 300, "DEMO DELI 0099 ATLANTA")]
+    assert sf.exact_key(shops[0]) != sf.exact_key(shops[1])
+    kept, dropped, decisions = sf.apply_cutover(shops, twins, CUT, set())
+    assert not kept and decided(decisions) == {"s1": ("matched", "exact", ("k2",)), "s2": ("matched", "exact", ("k1",))}
+
+
+def test_cutover_unequal_groups_are_never_guessed():
+    """Codex review (R3): more SimpleFIN rows than Rocket Money twins is never paired by key order, in the exact step
+    and the merchant step: all of them are kept and recorded as ambiguous, and the twin is held so no other row
+    takes it. Fewer SimpleFIN rows than identical twins pair (each has a twin of its own; the rest stay free), and
+    twins that can be told apart competing for one row are never guessed either."""
+    hist = [hrow("h1", "2026-11-11", 820, "DEMO DELI ATLANTA")]
+    d = row("d", "2026-11-11", 820, desc="DEMO DELI ATLANTA")
+    e = row("e", "2026-11-11", 820, desc="DEMO DELI ATLANTA")
+    f = row("f", "2026-11-12", 820, desc="DEMO DELI ATLANTA GA")    # the next day, same merchant: h1 is held
+    assert sf.merchant_evidence(f, hist[0]), "without the hold f would be matched to h1"
+    kept, dropped, decisions = sf.apply_cutover([e, f, d], hist, CUT, set())
+    assert sorted(r["txn_key"] for r in kept) == ["d", "e", "f"] and not dropped
+    assert decided(decisions) == {k: ("ambiguous", None, ("h1",)) for k in ("d", "e", "f")}
+    assert sf.new_review_count(decisions, {}) == 3
+    assert sf.apply_cutover([d, e, f], list(hist), CUT, set())[2] == decisions, "order-independent"
+    # Merchant step (descriptions differ between the feeds): two identical rows, one twin -> both ambiguous.
+    m = [row("m1", "2026-11-10", 410, desc="SQ *DEMO CAFE ATLANTA GA"), row("m2", "2026-11-10", 410, desc="SQ *DEMO CAFE ATLANTA GA")]
+    kept, dropped, decisions = sf.apply_cutover(m, [hrow("g1", "2026-11-10", 410, None, name="Demo Cafe")], CUT, set())
+    assert len(kept) == 2 and decided(decisions) == {"m1": ("ambiguous", None, ("g1",)), "m2": ("ambiguous", None, ("g1",))}
+    # Two identical twins for one row: it has a twin whichever it takes; the other twin stays free.
+    two = [hrow("h1", "2026-11-11", 820, "DEMO DELI ATLANTA"), hrow("h2", "2026-11-11", 820, "DEMO DELI ATLANTA")]
+    kept, dropped, decisions = sf.apply_cutover([d], two, CUT, set())
+    assert not kept and decided(decisions) == {"d": ("matched", "exact", ("h1",))}
+    # Two twins that can be told apart (different merchant names) for one row: never guessed.
+    told = [hrow("t1", "2026-11-11", 820, "DEMO DELI ATLANTA", name="Demo Deli"),
+            hrow("t2", "2026-11-11", 820, "DEMO DELI ATLANTA", name="Demo Deli Midtown")]
+    kept, dropped, decisions = sf.apply_cutover([dict(d, name="Demo Deli")], told, CUT, set())
+    assert len(kept) == 1 and decided(decisions) == {"d": ("ambiguous", None, ("t1", "t2"))}
 
 
 def test_cutover_recorded_matches_hold_across_runs():
@@ -849,7 +918,11 @@ def test_run_cutover_review_reported_once_and_recorded():
     assert "PHARMACY" not in preview and "GROCER" not in preview
 
 
-def test_run_cutover_record_unavailable_is_partial_and_keeps_rows():
+def test_run_cutover_record_is_saved_before_the_ledger():
+    """Codex review (R2): a row is left out of the ledger only on a match already on record. The decisions are saved
+    BEFORE the ledger; a run that cannot save them (the table missing, or a failed write) writes nothing and fails,
+    so a later answer without the claimant can never let another purchase take the same Rocket Money row on a
+    match that was not recorded. The retry records the claim first, and the claim then holds."""
     for missing in ("PGRST205", "42P01"):   # PostgREST / Postgres: the table is not applied yet
         class NoTable(FakeStore):
             def cutover_decisions(self):
@@ -857,28 +930,72 @@ def test_run_cutover_record_unavailable_is_partial_and_keeps_rows():
 
         store = cutover_store(NoTable)
         lines = []
-        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
-        assert "sf:S-WF:w1" in {t["source_txn_id"] for t in store.txns}
-        assert store.beats[0][1] == "partial"
-        # Only the missing record is reported while it cannot be read (every run says so; the review rows wait) ...
-        assert store.beats[0][3] == sf.format_notes({"cutover_provenance_unsaved": 1})
+        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+        assert not (store.txns or store.balances or store.created or store.links or store.saved_rows), "nothing written"
+        assert [b[:2] for b in store.beats] == [("transactions", "failed"), ("balances", "failed")]
+        assert store.beats[0][3] == store.beats[1][3] == sf.format_notes({"cutover_provenance_unsaved": 1})
         assert "does not exist" not in "\n".join(lines)
-        assert store.saved_rows == [], "decisions made without the record are never saved over it"
-    # A save that fails after a good read is reported the same way.
-    class SaveFails(FakeStore):
-        def save_cutover_decisions(self, rows):
-            raise FakeApiError("57014", pii_msg())
+        # The dry run says a real run would stop (counts only) and writes nothing.
+        dry, preview = cutover_store(NoTable), []
+        assert sf.run(dry, Http(get=Res(200, cutover_body())), ACCESS, 60, True, now=NOW, out=preview.append) == 0
+        assert any("a real run would stop before writing" in line for line in preview) and not (dry.beats or dry.txns)
+    # With the table missing and nothing to decide (no Rocket Money row near), the run is not stopped.
+    quiet = FakeStore(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT})
+    quiet.cutover_decisions = lambda: (_ for _ in ()).throw(FakeApiError("PGRST205"))
+    assert sf.run(quiet, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert quiet.beats[0][1] == "success" and quiet.saved_rows == []
 
-    failing = cutover_store(SaveFails)
-    assert sf.run(failing, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
-    assert failing.beats[0][3] == sf.format_notes({"cutover_provenance_unsaved": 1})
-    # ... and the first run that records the decisions (after the table is applied) reports the review rows, once.
-    applied = cutover_store()
-    applied.txns = list(store.txns)
-    assert sf.run(applied, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
-    assert applied.beats[0][3] == sf.format_notes({"cutover_review": 1})
-    assert sf.run(applied, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
-    assert applied.beats[2][1] == "success"
+    # A failed save after a good read: nothing written, the record keeps what it had.
+    class SaveFails(FakeStore):
+        failing = True
+
+        def save_cutover_decisions(self, rows):
+            if self.failing:
+                raise FakeApiError("57014", pii_msg())
+            super().save_cutover_decisions(rows)
+
+    store = cutover_store(SaveFails)
+    lines = []
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+    assert not (store.txns or store.balances or store.saved_rows) and store.saved == {}
+    assert store.beats[0][3] == sf.format_notes({"db_write_failed": 1})
+    assert_no_pii("\n".join(lines) + store.beats[0][3])
+    # Retry: the record is saved, then the ledger; the matched row stays out and the kept one is reported once.
+    store.failing = False
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert {r["sf_txn_key"]: r["decision"] for r in store.saved_rows} == {
+        sf.txn_key("S-WF", "w1"): "unconfirmed", sf.txn_key("S-WF", "w2"): "matched"}
+    written = {t["source_txn_id"] for t in store.txns}
+    assert "sf:S-WF:w1" in written and "sf:S-WF:w2" not in written
+    assert store.beats[-1][3] == sf.format_notes({"cutover_review": 1})
+    # A later answer without the claimant w2 and with a new purchase of the same amount at that merchant: the taken
+    # Rocket Money row stays taken, so the new purchase is written.
+    later = cutover_body()
+    next(a for a in later["accounts"] if a["id"] == "S-WF")["transactions"] = [
+        txn("w1", "2026-11-11", "-15.00", "OTHER PHARMACY 0202 ATLANTA"), txn("w3", "2026-11-11", "-7.00", "DEMO DELI ATLANTA GA")]
+    assert sf.run(store, Http(get=Res(200, later)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert "sf:S-WF:w3" in {t["source_txn_id"] for t in store.txns}
+    assert store.beats[-1][1] == "success"
+
+    # The record saved but the ledger write failing: the failed heartbeat reports the rows kept for review (they
+    # are recorded now, so a later run does not report them again); the next run writes the ledger.
+    class LedgerFails(FakeStore):
+        failing = True
+
+        def upsert_transactions(self, rows):
+            if self.failing:
+                raise RuntimeError(pii_msg())
+            super().upsert_transactions(rows)
+
+    lf = cutover_store(LedgerFails)
+    assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 1
+    assert lf.beats[0][1] == "failed" and lf.beats[0][3] == sf.format_notes({"db_write_failed": 1, "cutover_review": 1})
+    assert sorted(r["decision"] for r in lf.saved_rows) == ["matched", "unconfirmed"] and not lf.txns
+    assert_no_pii(lf.beats[0][3])
+    lf.failing = False
+    assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert [(b[1], b[3]) for b in lf.beats[2:]] == [("success", None), ("success", None)]
+    assert {t["source_txn_id"] for t in lf.txns} == {"sf:S-WF:w1", "sf:S-AMEX:1"}
 
 
 def test_run_recorded_match_survives_a_response_without_its_row():
