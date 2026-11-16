@@ -17,6 +17,7 @@ import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
 import ReviewCard from "./ReviewCard";
+import PracticePart from "./PracticePart";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -212,8 +213,15 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       </PartGroup>
 
       <PartGroup id="section-practice" title="Review & capture">
-        <Part id="review" title="Review">
-          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />
+        {/* Practice (READ-QUIZ-01): the chapter question round when the book's questions are on; otherwise the Review
+            card as before (with the approval card above it). The part keeps its id so saved layouts keep their place. */}
+        <Part id="review" title="Practice">
+          <PracticePart
+            key={o.book.slug}
+            o={o}
+            onChanged={() => load(slug, true)}
+            review={<ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
+          />
         </Part>
 
         {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
