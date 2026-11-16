@@ -1,12 +1,16 @@
-// Run: node --test tests/focus-unlock.test.cjs
+// Run with the rest of the suite (after deployment): node --test tests/focus-unlock.test.cjs
 // Focus habit unlock (lib/focus-unlock.ts, lib/focus-unlock-server.ts): the unlock decision under both
-// rules, the settings body, what the phone's status answer contains, and the auth boundary.
+// rules, the settings body, what the phone's status answer contains, the auth boundary, the two routes (run
+// against a fake database) and the /install settings card (mounted with the real autosave on a manual clock).
 // SYNTHETIC DATA ONLY: invented habit names, ids and dates; a fake database; no network.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { loadTs, SRC } = require("./helpers/load-ts.cjs");
+const { response } = require("./helpers/hook-harness.cjs");
+const { mountAutosaving } = require("./helpers/autosave-harness.cjs");
+const SF = require("./helpers/source-facts.cjs");
 
 const F = loadTs("lib/focus-unlock.ts");
 const S = loadTs("lib/focus-unlock-server.ts");
@@ -281,57 +285,200 @@ test("saveFocusConfig: writes the one row; refuses an id that is not a known hab
   assert.deepEqual(db3.calls.map((c) => c.table), ["focus_unlock_config"]);
 });
 
-// ─── auth boundary and wiring ────────────────────────────────────────────────
+// ─── auth boundary and routes (executed) ─────────────────────────────────────
 
 test("middleware: the token opens /api/focus/unlock-status only, as an exact path", () => {
-  const src = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
-  const m = /function isCiRoute\(pathname: string\): boolean \{([\s\S]*?)\n\}/.exec(src);
-  assert.ok(m, "isCiRoute not found");
-  const isCiRoute = new Function("pathname", m[1]);
+  const isCiRoute = SF.loadFunction("middleware.ts", "isCiRoute");
   assert.equal(isCiRoute("/api/focus/unlock-status"), true);
   for (const p of ["/api/focus", "/api/focus/", "/api/focus/config", "/api/focus/unlock-status/", "/api/focus/unlock-status/x", "/api/focus/unlock-statusx", "/api/focusx/unlock-status"]) {
     assert.equal(isCiRoute(p), false, p);
   }
-  assert.ok(!/startsWith\("\/api\/focus/.test(src), "never a /api/focus prefix");
 });
 
-test("routes: the status route is read-only; the settings route checks the request before reading it", () => {
-  const status = fs.readFileSync(path.join(SRC, "app/api/focus/unlock-status/route.ts"), "utf8");
-  assert.deepEqual([...status.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["GET"]);
-  assert.match(status, /loadUnlockStatus\(supabase\)/);
-  assert.match(status, /"Cache-Control": "no-store"/);
-  assert.ok(!/\.(insert|upsert|update|delete)\(/.test(status));
+const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
+const loadRoute = (rel, db) => loadTs(rel, { "@supabase/supabase-js": { createClient: () => db }, "next/server": nextServer });
+// Next.js answers a method only when the route exports a function of that name.
+const methodsOf = (route) => Object.keys(route).filter((k) => typeof route[k] === "function").sort();
 
-  const config = fs.readFileSync(path.join(SRC, "app/api/focus/config/route.ts"), "utf8");
-  assert.deepEqual([...config.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["GET", "PUT"]);
-  assert.ok(config.indexOf("checkConfigWrite(req.headers") < config.indexOf("req.text()"));
-  assert.match(config, /text\.length > MAX_FOCUS_CONFIG_BODY_BYTES/);
-  assert.match(config, /parseConfigBody\(body\)/);
+test("status route: GET only, read-only, never cached; a failed read answers and logs a step name only", async (t) => {
+  const logged = t.mock.method(console, "error", () => {});
+  const config = { rule: "or", habit_page_ids: [ID_A] };
+  const journal = [{ cycle_date: DAY, question: "Synthetic habit A", answer: "Yes" }];
+  const db = fakeDb({ config, map: MAP, journal });
+  const route = loadRoute("app/api/focus/unlock-status/route.ts", db);
+  assert.deepEqual(methodsOf(route), ["GET"]);
+  const res = await route.GET();
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["Cache-Control"], "no-store");
+  assert.deepEqual(res.body.habits, [{ name: "Synthetic habit A", done: true }]);
+  assert.equal(db.calls.some((c) => c.upsert), false, "nothing is written");
+
+  const failing = loadRoute("app/api/focus/unlock-status/route.ts", fakeDb({ config, map: MAP, journal, fail: { habit_journal: true } }));
+  const err = await failing.GET();
+  assert.equal(err.status, 500);
+  assert.deepEqual(Object.keys(err.body).sort(), ["error", "step"], "no habit data in a failure");
+  assert.deepEqual(logged.mock.calls.map((c) => c.arguments), [["focus unlock-status failed:", "habit_answers"]]);
 });
 
-test("the Swift decision table matches this one", () => {
+const ORIGIN = "https://onyx.example";
+function putRequest(text, over = {}) {
+  let reads = 0;
+  const all = { origin: ORIGIN, host: "onyx.example", "content-type": "application/json", "content-length": String(text.length), ...over };
+  return {
+    headers: headers(all),
+    nextUrl: { origin: ORIGIN },
+    text: async () => {
+      reads += 1;
+      return text;
+    },
+    reads: () => reads,
+  };
+}
+
+test("settings route: a cross-site, non-JSON or oversized request is refused before the body is read", async () => {
+  const cases = [[{ origin: "https://evil.example" }, 403], [{ origin: undefined }, 403], [{ "content-type": "text/plain" }, 415], [{ "content-length": "999999" }, 413]];
+  for (const [over, status] of cases) {
+    const db = fakeDb({ config: null, map: MAP });
+    const route = loadRoute("app/api/focus/config/route.ts", db);
+    const req = putRequest(JSON.stringify({ rule: "or", habit_page_ids: [ID_A] }), over);
+    const res = await route.PUT(req);
+    assert.equal(res.status, status, JSON.stringify(over));
+    assert.equal(req.reads(), 0, "the body is never read");
+    assert.equal(db.calls.length, 0, "nothing is read or written");
+  }
+});
+
+test("settings route: a valid change is written once; a body larger than it claims, an unknown habit or bad JSON writes nothing", async () => {
+  const db = fakeDb({ config: null, map: MAP });
+  const route = loadRoute("app/api/focus/config/route.ts", db);
+  assert.deepEqual(methodsOf(route), ["GET", "PUT"]);
+  const ok = await route.PUT(putRequest(JSON.stringify({ rule: "and", habit_page_ids: [ID_A] })));
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body, { rule: "and", habit_page_ids: [ID_A], chosen: [{ id: ID_A, name: "Synthetic habit A" }] });
+  assert.equal(db.calls.filter((c) => c.upsert).length, 1);
+  const big = await route.PUT(putRequest(JSON.stringify({ rule: "or", habit_page_ids: [ID_A], pad: "x".repeat(2000) }), { "content-length": "10" }));
+  assert.equal(big.status, 413);
+  assert.equal((await route.PUT(putRequest(JSON.stringify({ rule: "or", habit_page_ids: [ID_GONE] })))).status, 400);
+  assert.equal((await route.PUT(putRequest("{not json"))).status, 400);
+  assert.equal(db.calls.filter((c) => c.upsert).length, 1, "only the valid change was written");
+});
+
+test("the Swift decision table matches this one (the phone app cannot run here)", () => {
   const swift = fs.readFileSync(path.join(SRC, "..", "..", "tools", "screentime_ios", "FocusCore", "Sources", "FocusCore", "OnyxHabits.swift"), "utf8");
-  assert.match(swift, /guard configPresent, let habitsDone else \{ return timeReady \}/);
-  assert.match(swift, /case \.and: return habitsDone && timeReady/);
-  assert.match(swift, /case \.or: return habitsDone \|\| timeReady/);
+  assert.match(swift, /guard\s+configPresent\s*,\s*let\s+habitsDone\s+else\s*\{\s*return\s+timeReady\s*\}/);
+  assert.match(swift, /case\s+\.and\s*:\s*return\s+habitsDone\s*&&\s*timeReady/);
+  assert.match(swift, /case\s+\.or\s*:\s*return\s+habitsDone\s*\|\|\s*timeReady/);
   // The phone asks the one path the token opens.
   const sync = fs.readFileSync(path.join(SRC, "..", "..", "tools", "screentime_ios", "FocusUI", "FocusHabitSync.swift"), "utf8");
   assert.match(sync, /"\/api\/focus\/unlock-status"/);
 });
 
-test("the settings card is on /install and writes with PUT", () => {
-  const page = fs.readFileSync(path.join(SRC, "app/install/page.tsx"), "utf8");
-  assert.match(page, /<FocusUnlockSettings \/>/);
-  const card = fs.readFileSync(path.join(SRC, "components/FocusUnlockSettings.tsx"), "utf8");
-  assert.match(card, /fetch\("\/api\/focus\/config", \{\s*method: "PUT"/);
-  assert.match(card, /JSON\.stringify\(\{ rule, habit_page_ids: selected \}\)/);
+// ─── the settings card on /install (mounted, real autosave on a manual clock) ─
+
+test("the settings card is on /install", () => {
+  assert.ok(SF.jsxElements(SF.parseFile("app/install/page.tsx")).some((e) => e.tag === "FocusUnlockSettings"));
 });
 
-test("the settings card autosaves: no Save button, every change goes through useAutosave", () => {
-  const card = fs.readFileSync(path.join(SRC, "components/FocusUnlockSettings.tsx"), "utf8");
-  assert.match(card, /useAutosave<FocusValue>\(\s*"focus-unlock"/);
-  assert.match(card, /<AutosaveStatus /);
-  assert.doesNotMatch(card, />\s*\{saving \? "Saving…"/);
-  assert.match(card, /changeAutosave\(\{ rule, selected: next \}\)/, "a tick is sent");
-  assert.match(card, /changeAutosave\(\{ rule: r, selected \}\)/, "a rule change is sent");
+const HABITS = [{ id: ID_A, name: "Synthetic habit A" }, { id: ID_B, name: "Synthetic habit B" }];
+const STATUS = { behavioral_date: DAY, rule: "or", config_present: false, habits: [], habits_done: false };
+const savedConfig = (ids) => response({ rule: "or", habit_page_ids: ids, chosen: [] });
+
+async function mountCard(t, { config = savedConfig([]), put = () => savedConfig([]) } = {}) {
+  return mountAutosaving(t, "components/FocusUnlockSettings.tsx", {
+    stubs: { "./InfoHint": { __esModule: true, default: () => null } },
+    answer: (call, n) => {
+      if (call.method === "PUT") return put(call, n);
+      if (call.url === "/api/focus/config") return config;
+      if (call.url === "/api/habits/list") return response({ habits: HABITS });
+      if (call.url === "/api/focus/unlock-status") return response(STATUS);
+      throw new Error(`unexpected request ${call.method} ${call.url}`);
+    },
+  });
+}
+function pick(h, text, type) {
+  const label = h.find((n) => n.type === "label" && h.text(n).includes(text))[0];
+  assert.ok(label, `${text} is listed`);
+  const input = h.nodes(label).find((n) => n.type === "input" && n.props.type === type);
+  assert.ok(input, `${text} has a ${type}`);
+  input.props.onChange();
+}
+const puts = (h) => h.net.writes().filter((c) => c.method === "PUT");
+
+test("settings card: opening writes nothing; a burst of ticks is one PUT with the chosen habits and the rule", async (t) => {
+  const h = await mountCard(t);
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0, "nothing is written on open");
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  pick(h, "Synthetic habit B", "checkbox");
+  await h.flush();
+  await h.tick(699);
+  assert.equal(puts(h).length, 0, "nothing until the pause after the last tick");
+  await h.tick(1);
+  assert.deepEqual(puts(h).map((c) => [c.url, c.body]), [["/api/focus/config", { rule: "or", habit_page_ids: [ID_A, ID_B] }]]);
+  assert.match(h.text(), /Saved/);
+  pick(h, F.FOCUS_RULE_TEXT.and.label, "radio");
+  await h.flush();
+  await h.tick(700);
+  assert.deepEqual(puts(h).map((c) => c.body), [{ rule: "or", habit_page_ids: [ID_A, ID_B] }, { rule: "and", habit_page_ids: [ID_A, ID_B] }], "a rule change is sent with the chosen habits");
+});
+
+test("settings card: ticking a habit and unticking it again sends nothing", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  await h.tick(60_000);
+  assert.equal(puts(h).length, 0, "back to what is saved");
+});
+
+test("settings card: a refusal is shown with Retry and not retried on its own", async (t) => {
+  let refuse = true;
+  const h = await mountCard(t, { put: () => (refuse ? response({ error: "Synthetic refusal" }, 400) : savedConfig([ID_A])) });
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  await h.tick(700);
+  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.doesNotMatch(h.text(), /Trying again/);
+  await h.tick(120_000);
+  assert.equal(puts(h).length, 1, "a refusal waits for Riley");
+  refuse = false;
+  h.click("Retry");
+  await h.flush();
+  assert.equal(puts(h).length, 2);
+  assert.match(h.text(), /Saved/);
+});
+
+test("settings card: an outage is shown and retried with backoff until it is saved", async (t) => {
+  let down = true;
+  const h = await mountCard(t, { put: () => (down ? response({ error: "Synthetic outage" }, 503) : savedConfig([ID_A])) });
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  await h.tick(700);
+  assert.match(h.text(), /Not saved: Synthetic outage Trying again…/);
+  down = false;
+  await h.tick(1999);
+  assert.equal(puts(h).length, 1, "retried after the backoff, not at once");
+  await h.tick(1);
+  assert.equal(puts(h).length, 2);
+  assert.match(h.text(), /Saved/);
+});
+
+test("settings card: hiding the page sends a waiting change at once, with keepalive", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  h.page.hide();
+  await h.flush();
+  assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
+});
+
+test("settings card: settings that could not load show the error and offer nothing to send", async (t) => {
+  const h = await mountCard(t, { config: response({ error: "Synthetic load failure" }, 500) });
+  assert.match(h.text(), /Couldn.t load the Focus settings\./);
+  assert.match(h.text(), /Synthetic load failure/);
+  assert.equal(h.find((n) => n.type === "input" && n.props.type === "checkbox").length, 0);
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0);
 });

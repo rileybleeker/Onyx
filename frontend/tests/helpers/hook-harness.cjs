@@ -3,10 +3,14 @@
 // useEffect are shimmed, function components are expanded into a plain element tree, and `flush()` re-renders
 // and runs effects until the tree settles, draining pending microtasks in between. Callers stub every module
 // the component imports that needs a browser (next/navigation, lucide-react, heavy children).
+// The first argument is a src path (its default export is mounted) or a factory `(load, hooks) => Component`, for a
+// small probe component around a real hook: `load(rel)` loads src modules with the same stubs and one module cache
+// as the rest of the mount, so the probe and the code it drives share every class and singleton.
 const assert = require("node:assert/strict");
 const { loadTs } = require("./load-ts.cjs");
 
 function mountClient(relPath, { props = {}, stubs = {} } = {}) {
+  let ids = 0;
   let dirty = true;
   let frame;
   let effects = [];
@@ -15,6 +19,7 @@ function mountClient(relPath, { props = {}, stubs = {} } = {}) {
   const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
   const slot = () => [frame.slots, frame.index++];
   const hooks = {
+    useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${ids++}:`; },
     useState(initialValue) {
       const [slots, i] = slot();
       if (!(i in slots)) slots[i] = typeof initialValue === "function" ? initialValue() : initialValue;
@@ -36,7 +41,9 @@ function mountClient(relPath, { props = {}, stubs = {} } = {}) {
       }
     },
   };
-  const Component = loadTs(relPath, { react: hooks, ...stubs }).default;
+  const cache = new Map();
+  const load = (rel) => loadTs(rel, { react: hooks, ...stubs }, { cache });
+  const Component = typeof relPath === "function" ? relPath(load, hooks) : load(relPath).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;
     if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
