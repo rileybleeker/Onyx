@@ -27,10 +27,11 @@
 -- Every write goes through pds.reading_question_apply(p), under the same advisory lock as review grades and quiz
 -- results (pds.reading_practice, sql/reading_practice_receipts.sql): kinds 'answer', 'grade', 'correct'. Each is
 -- replay safe: an answer or correction with the same key and request answers what was stored (replayed); the same
--- key with another request is 409 key_reused; grading an attempt again with the same grade replays, another grade
--- is 409 already_graded. A quiz result recorded under quiz key K (pds.reading_quizzes.op_key) links the attempts
--- answered with quiz_key K: the trigger below refuses the quiz while any of them is ungraded (OXQ01) or when its
--- score / total differ from the graded answers (OXQ02), and stores question_count.
+-- key with another request is 409 key_reused; a second answer to the same question in one quiz under a NEW key is
+-- 409 already_answered; grading an attempt again with the same grade replays, another grade is 409 already_graded.
+-- A quiz result recorded under quiz key K (pds.reading_quizzes.op_key) links the attempts answered with
+-- quiz_key K: the trigger below refuses the quiz while any of them is ungraded (OXQ01) or when its score / total
+-- differ from the graded answers (OXQ02), and stores question_count.
 --
 -- Inspection and export: pds.reading_questions_export(book_id) returns every version (with whether its source is
 -- the same, changed or removed now) and every attempt of the book. Retention: pds.reading_clear_question_answers
@@ -229,6 +230,13 @@ BEGIN
     IF v_quiz IS NOT NULL AND EXISTS (SELECT 1 FROM pds.reading_quizzes WHERE op_key = v_quiz) THEN
       RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'quiz_closed');
     END IF;
+    -- One counted answer per question per quiz: a second answer under a new key would raise the quiz's total.
+    IF v_quiz IS NOT NULL AND EXISTS (
+         SELECT 1 FROM pds.reading_question_attempts a
+           JOIN pds.reading_questions q ON q.question_id = a.question_id
+          WHERE a.quiz_key = v_quiz AND q.question_key = v_qkey AND a.grading_status <> 'invalidated') THEN
+      RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'already_answered');
+    END IF;
 
     v_src := pds.reading_source_text(v_book, v_skind, v_sref);
     IF v_src IS NULL THEN
@@ -339,7 +347,9 @@ $fn$;
 
 -- -----------------------------------------------------------
 -- A quiz result recorded under op_key K is checked against the answers given with quiz_key K (if any).
--- Without such answers it stays as before: question_count NULL (unverifiable).
+-- Without such answers it stays as before: question_count NULL (unverifiable). Answers already invalidated by a
+-- correction do not count; when every answer was invalidated there is nothing left to check the score against, so
+-- the result is refused (OXQ02) rather than stored as unverifiable.
 -- -----------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts()
 RETURNS TRIGGER
@@ -347,18 +357,20 @@ LANGUAGE plpgsql
 SET search_path = pds, pg_temp
 AS $fn$
 DECLARE
+  v_all     INTEGER;
   v_total   INTEGER;
   v_pending INTEGER;
   v_right   INTEGER;
 BEGIN
   IF NEW.op_key IS NULL THEN RETURN NEW; END IF;
-  SELECT count(*) FILTER (WHERE grading_status <> 'invalidated'),
+  SELECT count(*),
+         count(*) FILTER (WHERE grading_status <> 'invalidated'),
          count(*) FILTER (WHERE grading_status = 'pending'),
          count(*) FILTER (WHERE grading_status = 'graded' AND correct)
-    INTO v_total, v_pending, v_right
+    INTO v_all, v_total, v_pending, v_right
     FROM pds.reading_question_attempts
    WHERE quiz_key = NEW.op_key;
-  IF v_total = 0 THEN RETURN NEW; END IF;
+  IF v_all = 0 THEN RETURN NEW; END IF;
   IF v_pending > 0 THEN
     RAISE EXCEPTION USING ERRCODE = 'OXQ01', MESSAGE = 'quiz result has ungraded answers';
   END IF;

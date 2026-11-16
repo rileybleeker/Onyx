@@ -177,13 +177,16 @@ test("SQL: permitted sources only, hashes made by the database, lock before writ
   assert.ok(at("v_src := pds.reading_source_text(v_book, v_skind, v_sref)") < at("INSERT INTO pds.reading_questions"));
   assert.match(apply, /v_shash := pds\.reading_sha256\(v_src\)/);
   assert.match(apply, /'code', 'question_changed'/, "an edited question or source is never answered silently under the old version");
+  assert.ok(at("'code', 'already_answered'") < at("INSERT INTO pds.reading_question_attempts"), "one counted answer per question per quiz");
+  assert.ok(at("FROM pds.reading_question_attempts WHERE attempt_key = v_key;") < at("'code', 'already_answered'"), "a replay of the same answer is answered before that check");
   assert.match(apply, /SET grading_status = 'invalidated'/);
   assert.match(apply, /SET invalidated_count = COALESCE\(qz\.invalidated_count, 0\) \+ x\.n/);
   assert.doesNotMatch(sql, /\bDELETE\b/i, "corrections and retention never delete rows");
   const trig = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_quiz_link_attempts"), sql.indexOf("CREATE OR REPLACE TRIGGER"));
   assert.match(trig, /ERRCODE = 'OXQ01'/);
   assert.match(trig, /ERRCODE = 'OXQ02'/);
-  assert.match(trig, /IF v_total = 0 THEN RETURN NEW; END IF;/, "a result without answers stays as before (unverifiable)");
+  assert.match(trig, /IF v_all = 0 THEN RETURN NEW; END IF;/, "a result without answers stays as before (unverifiable)");
+  assert.ok(trig.indexOf("IF v_all = 0") < trig.indexOf("NEW.total <> v_total"), "answers that were all invalidated leave nothing to match: refused, not unverifiable");
   const ret = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.reading_clear_question_answers"));
   assert.match(ret, /p_days < 30/);
   assert.doesNotMatch(sql, /cron\.schedule/, "retention is defined, not scheduled, by this file");

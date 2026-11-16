@@ -70,12 +70,14 @@ Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under t
   client, is never read) and `chapter` (a chapter of the same book). Journals, email, health, finance and client
   material cannot be a source: the column's check allows nothing else.
 - **Attempts.** `pds.reading_question_attempts` keys each answer by the client's UUID. The same key and answer
-  replays; another answer under that key is `409 key_reused`. The answer is stored as `pending`; grading
-  (`correct`, `grader` model | self, feedback, `graded_at`) is a separate call, so an answer whose grading never
-  finished stays visible. Grading again with the same grade replays, another grade is `409 already_graded`.
+  replays; another answer under that key is `409 key_reused`, and a second answer to the same question in one quiz
+  under a new key is `409 already_answered` (it would raise the quiz's total). The answer is stored as `pending`;
+  grading (`correct`, `grader` model | self, feedback, `graded_at`) is a separate call, so an answer whose grading
+  never finished stays visible. Grading again with the same grade replays, another grade is `409 already_graded`.
 - **Quiz results.** A quiz result recorded under op_key K (`/api/reading/quiz`, `recordQuiz`) is checked against
   the answers given with `quiz_key` K: refused while any is ungraded (`409 attempts_pending`) or when its score /
-  total differ from the graded answers (`409 score_mismatch`); `question_count` is then set. A result without such
+  total differ from the graded answers (`409 score_mismatch`, also when every answer was invalidated by a
+  correction, leaving nothing to check against); `question_count` is then set. A result without such
   answers (every result stored before this change, and the chat's results until its tool sends questions) has
   `question_count` NULL and is shown as `unverified` in the overview and the chat summary; it still counts for XP.
 - **Corrections.** `op: "correct"` with the version on screen (`expected_version`) makes the next version and
