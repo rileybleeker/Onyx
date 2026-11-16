@@ -332,6 +332,12 @@ export function gmailThreadHref(account: string | null | undefined, threadId: st
   return `https://mail.google.com/mail/?authuser=${authuser}#all/thread-f:${id}`;
 }
 
+/** "2026-11-12": the Eastern calendar day `days` after the Eastern day of `now`, as a date. */
+export function etDateIso(now: Date, days: number): string {
+  const today = etDay(now);
+  return new Date(Date.UTC(today.year, today.month, today.day + days, 12)).toISOString().slice(0, 10);
+}
+
 /** "Thu, Nov 12": the Eastern calendar day `days` after the Eastern day of `now`. */
 export function etDayLabel(now: Date, days: number): string {
   const today = etDay(now);
@@ -356,7 +362,7 @@ export interface InboxCardLike {
   thread: string;
   messageId: number;
   created_at: string;
-  card: { code: string; agent: string; name: string; link?: string | null };
+  card: { code: string; agent: string; name: string; link?: string | null; expires?: string | null };
 }
 
 /** The part of a GET /api/urgent-email item (lib/urgent-email-query.ts) this file reads. */
@@ -369,7 +375,11 @@ export interface EmailItemLike {
   subject: string;
   receivedAt: string;
   labels: readonly string[];
-  deadline: { daysLeft: number; label: string } | null;
+  /**
+   * `daysLeft` is counted when the answer was made; `date` ("YYYY-MM-DD", Eastern) is the deadline's own day, so a
+   * copy kept past midnight still names the same day (absent in an answer from before it was added).
+   */
+  deadline: { daysLeft: number; label: string; date?: string } | null;
   reasons: string[];
   nextStep: string;
   href: string | null;
@@ -396,6 +406,11 @@ export interface TodayUrgentItem {
    * newer message arrives), including the same message's copy in the other mailbox.
    */
   clear: { cards: string[]; emails: { key: string; receivedAt: string }[] };
+  /**
+   * The expiry of every Agent Inbox card merged into this item, as the Worker sent it (cards without one are left
+   * out), so Today's attention model (lib/today-attention.ts) never lets a snooze outlast a request's expiry.
+   */
+  cardExpires?: string[];
 }
 
 const URGENT_PREFIX = /^\s*urgent\s*:\s*/i;
@@ -615,6 +630,7 @@ export function mergeUrgent(
         gmailHref: href,
         requestHref: null,
         clear: { cards: [], emails: [{ key: e.key, receivedAt: e.receivedAt }] },
+        cardExpires: [],
       },
     };
     entries.push(entry);
@@ -650,8 +666,10 @@ export function mergeUrgent(
         if (hits.length === 1) match = hits[0];
       }
     }
+    const expires = c.card.expires ? [c.card.expires] : [];
     if (match) {
       match.item.clear.cards.push(code);
+      match.item.cardExpires = [...(match.item.cardExpires ?? []), ...expires];
       if (!match.item.sources.includes("Agent Inbox")) {
         match.item.sources.push("Agent Inbox");
         match.item.sourceDetail += ` + Agent Inbox (${c.card.agent})`;
@@ -679,6 +697,7 @@ export function mergeUrgent(
         gmailHref: c.card.link && ref ? c.card.link : null,
         requestHref,
         clear: { cards: [code], emails: [] },
+        cardExpires: expires,
       },
     });
   }

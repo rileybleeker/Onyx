@@ -91,6 +91,22 @@ test("money alerts: low cash, promo, tax due, budget", () => {
   assert.equal(A.moneyAlerts(null, null, 0, TODAY).length, 0);
 });
 
+test("money alerts: low cash is dated by the first day below the line; the lowest day is kept for the title", () => {
+  // Below the line on day 1 already, lowest on day 21: Today must treat day 1 as the deadline.
+  const days = Array.from({ length: 30 }, (_, i) => ({
+    date: `2030-06-${String(1 + i).padStart(2, "0")}`,
+    likely: i >= 20 ? -5_000 : 20_000,
+    low: i === 0 ? -1_000 : i === 20 ? -50_000 : i < 20 ? 5_000 : -10_000,
+    high: 90_000,
+  }));
+  const [cash] = A.moneyAlerts({ state: "ok", days, milestones: [], lines: [] }, null, 0, TODAY);
+  assert.equal(cash.kind, "low-cash");
+  assert.equal(cash.due, "2030-06-01", "the first day the cautious path is below the line");
+  assert.equal(cash.lowest, "2030-06-21", "the lowest day, which the title names");
+  assert.match(cash.title, /around Jun 21$/);
+  assert.equal(cash.severity, "high");
+});
+
 test("savings goals: progress, monthly need and the forecast check", () => {
   const G = loadTs("lib/finance-goals.ts");
   const days = [{ date: "2031-03-01", likely: 900_000, low: 0, high: 0 }];

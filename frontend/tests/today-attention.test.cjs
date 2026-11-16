@@ -469,7 +469,7 @@ test("money: an alert dated today or tomorrow is urgent and bypasses the budget"
     alert("tax", null, "high", "Synthetic undated tax: stored before the field"),
   ], "2030-03", NOW);
   assert.deepEqual(out.map((o) => o.urgency), ["urgent", "urgent", "high", "urgent", "normal", "urgent", "high"]);
-  assert.deepEqual([out[0].reason, out[1].reason, out[3].reason, out[5].reason], ["A tax payment is due tomorrow", "A tax payment is due today", "A 0% promo ends tomorrow", "Cash is likely to drop below your line tomorrow"]);
+  assert.deepEqual([out[0].reason, out[1].reason, out[3].reason, out[5].reason], ["A tax payment is due tomorrow", "A tax payment is due today", "A 0% promo ends tomorrow", "Cash may drop below your line tomorrow"]);
   assert.equal(out[0].dueAt, new Date(2030, 2, 6, 23, 59, 59, 999).getTime(), "ranked by the end of its day, like an email deadline");
   assert.equal(out[0].resurfaceAt, new Date(2030, 2, 6, 0, 0, 0).getTime());
   assert.equal(A.canSetAside(out[1], MS), false, "due today: cannot be set aside");
@@ -485,6 +485,71 @@ test("money: an alert dated today or tomorrow is urgent and bypasses the budget"
   const sel = quiet(list, [], { budget: 1 });
   assert.deepEqual(sel.shown.map((s) => s.item.id), [out[0].id]);
   assert.equal(sel.more, 2);
+});
+
+test("money: a low-cash alert dated by its first day below the line cannot be hidden past that day", () => {
+  // The cautious path crosses the line today; the lowest point is later in the month (finance-alerts.ts dates the
+  // alert by the crossing, keeps the lowest day for its title).
+  const cash = (severity) => ({ kind: "low-cash", severity, title: "Cash may drop to -$500 around Mar 25", detail: "Synthetic.", href: "/financials/forecast", due: "2030-03-05", lowest: "2030-03-25" });
+  const [likely, cautious] = A.moneyObligations([cash("high"), { ...cash("medium"), title: "Synthetic second: cautious only" }], "2030-03", NOW);
+  assert.deepEqual([likely.urgency, likely.reason], ["urgent", "Cash may drop below your line today"]);
+  assert.equal(cautious.urgency, "normal", "the likely path stays above the line: its ordinary tier");
+  for (const o of [likely, cautious]) {
+    assert.equal(o.resurfaceAt, new Date(2030, 2, 5, 0, 0, 0).getTime());
+    assert.equal(A.canSetAside(o, MS), false, "below the line today: cannot be snoozed or hidden");
+    assert.equal(A.markApplies(A.markFor(o, "hide", MS - 24 * H), o, MS), null, "nor stay hidden from yesterday");
+  }
+  // Urgent alerts reach the urgent list past the budget.
+  const sel = quiet([base({ id: "agents:N1", urgency: "high" }), likely], [], { budget: 1 });
+  assert.deepEqual(sel.shown.map((s) => [s.item.id, s.overBudget]), [[likely.id, false]]);
+});
+
+test("urgent email: a request merged into a thread keeps its expiry; a snooze or hide lapses before it", () => {
+  const item = (key, over = {}) => ({ key, sources: ["Gmail", "Agent Inbox"], sourceDetail: "Gmail + Agent Inbox", title: "Synthetic " + key, from: null, reasons: [], nextStep: "Reply", at: iso(-H), atVerb: "Received", gmailHref: null, requestHref: "/agents?t=inbox-triage#m1", clear: { cards: ["E1"], emails: [] }, ...over });
+  const [merged, alone, none] = A.urgentEmailObligations([
+    item("email:t1", { cardExpires: [iso(5 * H), iso(2 * H)] }),
+    item("card:E2", { sources: ["Agent Inbox"], clear: { cards: ["E2"], emails: [] }, cardExpires: [iso(3 * H)] }),
+    item("email:t3", { cardExpires: [] }),
+  ], [], NOW);
+  assert.equal(merged.urgency, "urgent");
+  assert.equal(merged.reason, "inbox-triage flagged it as urgent; the request expires in 2 h", "the earliest expiry counts");
+  assert.equal(merged.dueAt, MS + 2 * H);
+  assert.equal(merged.resurfaceAt, MS + 2 * H - A.DUE_LEAD_MS);
+  assert.equal(A.snoozeEnd(merged, NOW), MS + H, "a snooze ends an hour before the request expires, not at 06:00");
+  const hide = { [A.markKey(merged)]: A.markFor(merged, "hide", MS) };
+  assert.equal(A.markApplies(hide[A.markKey(merged)], merged, MS + H - 1), "hidden");
+  assert.equal(A.markApplies(hide[A.markKey(merged)], merged, MS + H), null, "back before it expires");
+  assert.equal(quiet([merged], [], { marks: hide }).nextChange, MS + H);
+  assert.equal(alone.resurfaceAt, MS + 3 * H - A.DUE_LEAD_MS, "a request with no labelled thread too");
+  assert.equal(none.resurfaceAt, null, "no expiry and no deadline: no due time");
+  // An email deadline tomorrow and a request expiring sooner: the request comes first.
+  const email = { key: "t4", threadId: "4", messageId: "m4", account: "owner@example.com", from: "x", subject: "s", receivedAt: iso(-H), labels: ["Agent/Deadline"], deadline: { daysLeft: 1, label: "Thu, Mar 6", date: "2030-03-06" }, reasons: [], nextStep: "x", href: null };
+  const both = A.urgentEmailObligations([item("email:t4", { cardExpires: [iso(4 * H)] })], [email], NOW)[0];
+  assert.equal(both.resurfaceAt, MS + 3 * H);
+  assert.equal(both.reason, "Deadline tomorrow (Thu, Mar 6)");
+  assert.notEqual(A.urgentEmailObligations([item("email:t1", { cardExpires: [iso(6 * H)] })], [], NOW)[0].version, merged.version, "a new expiry is a new circumstance");
+});
+
+test("urgent email: a deadline keeps its own day past midnight when the refresh failed", () => {
+  const item = { key: "email:t1", sources: ["Gmail"], sourceDetail: "Gmail", title: "Synthetic subject", from: null, reasons: [], nextStep: "Reply", at: iso(-H), atVerb: "Received", gmailHref: null, requestHref: null, clear: { cards: [], emails: [] } };
+  // The answer read on Mar 5 (deadline tomorrow), kept on screen after its refresh failed.
+  const cached = { key: "t1", threadId: "1", messageId: "m", account: "owner@example.com", from: "x", subject: "s", receivedAt: iso(-H), labels: ["Agent/Deadline"], deadline: { daysLeft: 1, label: "Thu, Mar 6", date: "2030-03-06" }, reasons: [], nextStep: "x", href: null };
+  const before = A.urgentEmailObligations([item], [cached], NOW)[0];
+  assert.equal(before.reason, "Deadline tomorrow (Thu, Mar 6)");
+  assert.equal(before.resurfaceAt, new Date(2030, 2, 6, 0, 0, 0).getTime());
+  const hide = { [A.markKey(before)]: A.markFor(before, "hide", MS) };
+  // After midnight, same cached answer: the deadline is today, not moved to Mar 7.
+  const after = new Date(2030, 2, 6, 0, 30, 0);
+  const o = A.urgentEmailObligations([item], [cached], after)[0];
+  assert.equal(o.reason, "Deadline today (Thu, Mar 6)");
+  assert.equal(o.dueAt, new Date(2030, 2, 6, 23, 59, 59, 999).getTime());
+  assert.equal(o.resurfaceAt, before.resurfaceAt, "the same day, whatever the countdown said");
+  assert.equal(A.canSetAside(o, after.getTime()), false);
+  assert.equal(A.markApplies(hide[A.markKey(o)], o, after.getTime()), null, "the hide from yesterday no longer applies");
+  assert.deepEqual(A.fullList([o], hide, after.getTime()).map((l) => l.state), ["open"]);
+  // A day later still: the deadline has passed, and it says so.
+  const passed = A.urgentEmailObligations([item], [cached], new Date(2030, 2, 7, 9, 0, 0))[0];
+  assert.deepEqual([passed.urgency, passed.reason], ["urgent", "Deadline passed (Thu, Mar 6)"]);
 });
 
 test("urgent email: a request posted on a merged thread is a new circumstance; codes in any order are the same one", () => {

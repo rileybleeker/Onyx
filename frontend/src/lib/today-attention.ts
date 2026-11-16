@@ -187,14 +187,23 @@ function endOfLocalDay(now: Date, days: number): number {
 function startOfLocalDay(now: Date, days: number): number {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, 0, 0, 0, 0).getTime();
 }
-/** A "YYYY-MM-DD" date as the local day it names: whole days from `now`'s day (0 = today) and its start; null otherwise. */
-function localDay(date: string | null | undefined, now: Date): { daysLeft: number; start: number } | null {
+/**
+ * A "YYYY-MM-DD" date as the local day it names: whole days from `now`'s day (0 = today, negative = passed), its
+ * start and its end; null otherwise. The day is fixed by the date, so a copy kept past midnight still names it.
+ */
+function localDay(date: string | null | undefined, now: Date): { daysLeft: number; start: number; end: number } | null {
   const m = date ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(date) : null;
   if (!m) return null;
   const start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();
-  if (!Number.isFinite(start)) return null;
+  const end = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
   // Rounded: a day with a clock change is 23 or 25 hours long.
-  return { daysLeft: Math.round((start - startOfLocalDay(now, 0)) / (24 * HOUR)), start };
+  return { daysLeft: Math.round((start - startOfLocalDay(now, 0)) / (24 * HOUR)), start, end };
+}
+
+/** "2 h", "45 min": how long until an instant `left` ms away. */
+function inWords(left: number): string {
+  return left < HOUR ? `${Math.max(1, Math.round(left / MIN))} min` : `${Math.round(left / HOUR)} h`;
 }
 
 /** The part of an Agent Inbox card (lib/agents-api.ts) a request obligation reads. */
@@ -215,7 +224,7 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
     let reason = `${r.card.agent || "An agent"} is waiting for your answer`;
     if (left !== null && left > 0 && left <= 12 * HOUR) {
       urgency = "urgent";
-      reason = `Expires in ${left < HOUR ? `${Math.max(1, Math.round(left / MIN))} min` : `${Math.round(left / HOUR)} h`}`;
+      reason = `Expires in ${inWords(left)}`;
     } else if (left !== null && left > 0 && left <= 48 * HOUR) {
       urgency = "high";
       reason = `Expires in ${Math.round(left / HOUR)} h`;
@@ -240,26 +249,61 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
 }
 
 /**
+ * An email deadline as a fixed day: from its own date (`deadline.date`, the server's Eastern day) when the answer
+ * carries one, so a copy kept past midnight (a refresh that failed) counts down instead of moving the deadline a day
+ * later; else (an answer from before the field existed) its countdown, counted from now.
+ */
+function emailDeadline(d: EmailItemLike["deadline"], now: Date): { daysLeft: number; label: string; start: number; end: number } | null {
+  if (!d) return null;
+  const day = localDay(d.date, now);
+  if (day) return { label: d.label, ...day };
+  const days = Number.isFinite(d.daysLeft) ? Math.max(0, Math.round(d.daysLeft)) : 0;
+  return { daysLeft: days, label: d.label, start: startOfLocalDay(now, days), end: endOfLocalDay(now, days) };
+}
+
+/**
  * Urgent email as Today merged it BY IDENTITY ONLY (lib/urgent-email.ts mergeUrgent with `bySearch: false`:
  * labelled threads + inbox-triage's questions, a question folded into a thread only when its link names that thread
  * or message, never because a Gmail search's words match). `emails` are the label answer's items, read for their
  * deadline. `unreturned`: labelled threads the answer counted but did not return (GET /api/urgent-email returns only
  * the most pressing ITEMS_RETURNED), listed as one aggregate so "All open items" never leaves them out without saying so.
+ * The item is due at the earlier of its email deadline and the expiry of any request merged into it
+ * (`cardExpires`): a snooze or hide never outlasts either.
  */
 export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails: readonly EmailItemLike[], now: Date, unreturned = 0): Obligation[] {
   const byKey = new Map<string, EmailItemLike>();
   for (const e of emails) byKey.set(`email:${e.key}`, e);
+  const nowMs = now.getTime();
   const out: Obligation[] = items.map((item) => {
-    const deadline = byKey.get(item.key)?.deadline ?? null;
+    const deadline = emailDeadline(byKey.get(item.key)?.deadline ?? null, now);
+    const expiries = (item.cardExpires ?? []).slice().sort();
+    let expiresAt: number | null = null;
+    for (const x of expiries) {
+      const t = expiryInstant(x);
+      if (t !== null && (expiresAt === null || t < expiresAt)) expiresAt = t;
+    }
+    const expiresLeft = expiresAt === null ? null : expiresAt - nowMs;
     const asked = item.sources.includes("Agent Inbox");
     let urgency: Urgency = "normal";
     let reason = "Labelled for a reply or decision";
-    if (deadline && deadline.daysLeft <= 0) { urgency = "urgent"; reason = `Deadline today (${deadline.label})`; }
+    if (deadline && deadline.daysLeft < 0) { urgency = "urgent"; reason = `Deadline passed (${deadline.label})`; }
+    else if (deadline && deadline.daysLeft === 0) { urgency = "urgent"; reason = `Deadline today (${deadline.label})`; }
     else if (deadline && deadline.daysLeft === 1) { urgency = "urgent"; reason = `Deadline tomorrow (${deadline.label})`; }
-    else if (asked) { urgency = "urgent"; reason = "inbox-triage flagged it as urgent"; }
+    else if (asked) {
+      urgency = "urgent";
+      reason = expiresLeft !== null && expiresLeft > 0 && expiresLeft <= 48 * HOUR
+        ? `inbox-triage flagged it as urgent; the request expires in ${inWords(expiresLeft)}`
+        : "inbox-triage flagged it as urgent";
+    }
     else if (deadline && deadline.daysLeft <= 3) { urgency = "high"; reason = `Deadline ${deadline.label}`; }
     else if (deadline) reason = `Deadline ${deadline.label}`;
     const href = item.requestHref ?? item.gmailHref;
+    // A date-only deadline is due from the start of its day (a deadline today cannot be set aside); a request's
+    // expiry DUE_LEAD_MS before it. Whichever comes first.
+    const dueAt = deadline && expiresAt !== null ? Math.min(deadline.end, expiresAt) : deadline ? deadline.end : expiresAt;
+    const fromDeadline = deadline ? deadline.start : null;
+    const fromExpiry = expiresAt === null ? null : expiresAt - DUE_LEAD_MS;
+    const resurfaceAt = fromDeadline !== null && fromExpiry !== null ? Math.min(fromDeadline, fromExpiry) : fromDeadline ?? fromExpiry;
     return {
       id: `urgent-email:${item.key}`,
       source: "urgent-email",
@@ -268,14 +312,13 @@ export function urgentEmailObligations(items: readonly TodayUrgentItem[], emails
       href,
       external: !item.requestHref && !!item.gmailHref,
       urgency,
-      dueAt: deadline ? endOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
-      // A date-only deadline is due from the start of its day: a deadline today cannot be set aside.
-      resurfaceAt: deadline ? startOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
+      dueAt,
+      resurfaceAt,
       reason,
       // The deadline's date, not its countdown: the next morning is not a new circumstance; crossing into a higher
-      // tier (urgency), a new message (at), a new deadline date, or a request posted on the thread (a new card
-      // code, or the first request posted again) is.
-      version: [urgency, deadline ? deadline.label : "", item.at, item.sources.join("+"), item.clear.cards.slice().sort().join(","), item.requestHref ?? ""].join("|"),
+      // tier (urgency), a new message (at), a new deadline date, a request posted on the thread (a new card code, or
+      // the first request posted again) or a new expiry on one is.
+      version: [urgency, deadline ? deadline.label : "", item.at, item.sources.join("+"), item.clear.cards.slice().sort().join(","), item.requestHref ?? "", expiries.join(",")].join("|"),
       learning: false,
     };
   });
@@ -357,10 +400,9 @@ const MONEY_REASON: Readonly<Record<MoneyAlert["kind"], string>> = {
   promo: "A 0% promo is ending",
   tax: "A tax payment is due",
 };
-/** The urgent reason of a money alert whose date is today or tomorrow (`when`). */
-const MONEY_URGENT_REASON: Readonly<Record<MoneyAlert["kind"], (when: string) => string>> = {
-  "low-cash": (when) => `Cash is likely to drop below your line ${when}`,
-  budget: () => "A budget is over",
+/** The urgent reason of a dated money alert whose date is today or tomorrow (`when`); budgets carry no date. */
+const MONEY_URGENT_REASON: Readonly<Record<Exclude<MoneyAlert["kind"], "budget">, (when: string) => string>> = {
+  "low-cash": (when) => `Cash may drop below your line ${when}`,
   promo: (when) => `A 0% promo ends ${when}`,
   tax: (when) => `A tax payment is due ${when}`,
 };
@@ -370,10 +412,11 @@ const MONEY_URGENT_REASON: Readonly<Record<MoneyAlert["kind"], (when: string) =>
  * they are never folded together. Amounts are left out of the version: a dollar of drift is not a new
  * circumstance, a change of severity, status, date or tier is. `period` ("YYYY-MM"): the month a budget alert is
  * for, in its version, so a budget hidden this month comes back when it is over again next month.
- * The alert's own date (`due`: a tax payment's due date, the day a 0% promo ends, the day cash is lowest) is its
- * deadline: today, tomorrow or already past is URGENT (shown past the budget), except a low-cash alert whose likely
- * path stays above the line (severity medium), which keeps its ordinary tier. A mark lapses at the start of that
- * day. An alert without a readable `due` (an answer stored before the field existed) has no deadline.
+ * The alert's own date (`due`: a tax payment's due date, the day a 0% promo ends, the first day cash drops below the
+ * line on the cautious path) is its deadline: today, tomorrow or already past is URGENT (shown past the budget),
+ * except a low-cash alert whose likely path stays above the line (severity medium), which keeps its ordinary tier.
+ * A mark lapses at the start of that day. An alert without a readable `due` (an answer stored before the field
+ * existed, recomputed on the next build or ET day) has no deadline.
  */
 export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now: Date = new Date()): Obligation[] {
   const seen = new Map<string, number>();
@@ -386,7 +429,7 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now
     const due = localDay(a.due, now);
     const imminent = !!due && due.daysLeft <= 1 && (a.kind !== "low-cash" || a.severity === "high");
     const urgency: Urgency = imminent ? "urgent" : a.severity === "high" ? "high" : "normal";
-    const urgentReason = MONEY_URGENT_REASON[a.kind];
+    const urgentReason = a.kind === "budget" ? undefined : MONEY_URGENT_REASON[a.kind];
     return {
       id: n === 1 ? base : `${base}#${n}`,
       source: "money",

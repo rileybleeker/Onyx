@@ -431,6 +431,7 @@ await test("one item per thread even when both labels sit on different messages 
   assert.deepEqual(out.items[0].labels, ["Agent/Action", "Agent/Deadline"]);
   assert.equal(out.items[0].subject, "Re: Lease question, reply by Nov 12", "newest message names the thread");
   assert.equal(out.items[0].deadline.daysLeft, 1);
+  assert.equal(out.items[0].deadline.date, "2026-11-12", "the deadline's own Eastern day, so a copy kept past midnight still names it");
   assert.equal(out.items[0].href, `https://mail.google.com/mail/?authuser=owner%40example.com#all/thread-f:${thread}`);
 });
 
@@ -556,6 +557,18 @@ await test("each merged item says what a Clear removes: its cards and its thread
     "the copy in the other mailbox is cleared too, so it does not take the item's place");
   const solo = out.items.find((i) => i.key === "card:Z9");
   assert.deepEqual(solo.clear, { cards: ["Z9"], emails: [] });
+});
+
+await test("each merged item keeps the expiry of every request merged into it (Today never lets a snooze outlast it)", () => {
+  const e = emailItem();
+  const link = `https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:${e.threadId}`;
+  const c = card({}, { name: "Urgent: reply today", link, expires: "2026-11-11T18:00:00Z" });
+  const again = card({ messageId: 998 }, { code: "Q78", name: "Urgent: reply today (again)", link, expires: null });
+  const alone = card({ messageId: 997 }, { code: "Z8", name: "Urgent: other thing", link: "", expires: "2026-11-12" });
+  const out = mergeUrgent([e], [c, again, alone], Infinity, { bySearch: false });
+  assert.deepEqual(out.items.find((i) => i.key === `email:${e.key}`).cardExpires, ["2026-11-11T18:00:00Z"], "a card without an expiry adds none");
+  assert.deepEqual(out.items.find((i) => i.key === "card:Z8").cardExpires, ["2026-11-12"]);
+  assert.deepEqual(mergeUrgent([emailItem()], []).items[0].cardExpires, [], "an email with no request has none");
 });
 
 await test("same thread id in another mailbox does not merge; same Message-ID in both mailboxes does", () => {
