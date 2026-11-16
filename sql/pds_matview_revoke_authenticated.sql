@@ -37,6 +37,14 @@
 -- grant. A check that fails means the database is not what was reviewed: stop
 -- and review, never add a grant or skip the check to make it pass.
 --
+-- Boundary of the reachability check (step 3): the graph follows what the
+-- catalog records and what function source text names. A function that builds
+-- its SQL at run time (EXECUTE, query_to_xml and the like) or is written in
+-- another language can read a matview without either. Step 3d therefore fails
+-- closed on every SECURITY DEFINER function that browser roles can reach and
+-- whose own or callees' SQL the graph cannot read, unless that function and
+-- everything it calls is on the reviewed_opaque list with an unchanged hash.
+--
 -- Recreating one of these matviews later: the pds default privileges
 -- (sql/rls_policies.sql) give authenticated SELECT on every new relation, so a
 -- recreate recipe must end with
@@ -60,6 +68,16 @@ DECLARE
         'tz_log_gaps_mat'
     ];
     browser_roles constant oid[] := ARRAY[0::oid, 'anon'::regrole::oid, 'authenticated'::regrole::oid];  -- 0 = PUBLIC
+    -- Step 3d: SECURITY DEFINER functions with SQL the graph cannot read that were
+    -- reviewed by hand, as '<schema>.<name>(<args>)=<md5 of the function and
+    -- everything it calls>' (the hash is the closure_md5 of step 3d, so any
+    -- change to the body, language, definer flag or a callee fails the check
+    -- again). Reviewed 2026-11-16 (SEC01B-R3): Supabase's event-trigger function
+    -- that enables row security on tables created in schema public; it reads no
+    -- table and never runs for a Data API caller.
+    reviewed_opaque constant text[] := ARRAY[
+        'public.rls_auto_enable()=979445ae8414446737e577d80ba23b8c'
+    ];
     mat_name text;
     rel oid;
     six oid[] := '{}'::oid[];
@@ -192,6 +210,67 @@ BEGIN
                         AND d.classid NOT IN ('pg_proc'::regclass, 'pg_rewrite'::regclass, 'pg_policy'::regclass)));
     IF blocker IS NOT NULL THEN
         RAISE EXCEPTION 'A function browser roles can reach reads a matview, directly or through other objects (%); move it first', blocker;
+    END IF;
+
+    -- 3d. What the graph cannot see. A function that builds its SQL at run time
+    --     (EXECUTE, or query_to_xml / table_to_xml / ts_stat / dblink and the
+    --     like) or is written in a language other than sql / plpgsql can read a
+    --     matview without naming it ('pds.' || 'hrv_' || 'residuals_mat' is in no
+    --     catalog entry and in no source text). Only a SECURITY DEFINER function
+    --     whose owner can read a relation of the graph turns that into a leak:
+    --     anything else runs as its caller, which the revoke refuses. So for each
+    --     such definer function the check takes it plus everything it calls
+    --     (functions its source names or its SQL body depends on, transitively:
+    --     they run as its owner too). If any of them is opaque, it aborts unless
+    --     the function is unreachable by browser roles (no anon / authenticated
+    --     EXECUTE, no trigger or event trigger, no object that uses it, no
+    --     function source that names it) or the whole closure matches an entry of
+    --     reviewed_opaque. Fail closed: it may stop on a harmless function; then
+    --     review that function and add its entry, never loosen the rule.
+    WITH RECURSIVE fn AS (
+        SELECT p.oid, p.proname, p.prosecdef, p.proowner, l.lanname,
+               pn.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS sig,
+               p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src
+        FROM pg_proc p
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+    ), priv AS (
+        SELECT f.oid FROM fn f
+        WHERE f.prosecdef
+          AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_table_privilege(f.proowner, g, 'SELECT'))
+    ), calls(root, fn) AS (
+        SELECT oid, oid FROM priv
+      UNION
+        SELECT c.root, q.oid
+        FROM calls c JOIN fn cur ON cur.oid = c.fn JOIN fn q ON q.oid <> cur.oid
+        WHERE cur.src ~ ('\m' || q.proname || '\M')
+           OR EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_proc'::regclass AND d.objid = cur.oid
+                        AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid)
+    ), roots AS (
+        SELECT c.root,
+               bool_or(q.lanname NOT IN ('sql', 'plpgsql')
+                       OR q.src ~* '\mexecute\M'
+                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)') AS opaque,
+               md5(string_agg(q.sig || '|' || q.lanname || '|' || q.prosecdef::text || '|' || q.src,
+                              E'\n' ORDER BY q.sig)) AS closure_md5
+        FROM calls c JOIN fn q ON q.oid = c.fn
+        GROUP BY c.root
+    )
+    SELECT string_agg(f.sig, '; ' ORDER BY f.sig)
+    INTO blocker
+    FROM roots r JOIN fn f ON f.oid = r.root
+    WHERE r.opaque
+      AND NOT (f.sig || '=' || r.closure_md5) = ANY (reviewed_opaque)
+      AND (has_function_privilege('anon', r.root, 'EXECUTE')
+           OR has_function_privilege('authenticated', r.root, 'EXECUTE')
+           OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = r.root)
+           OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = r.root)
+           OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = r.root)
+           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~ ('\m' || f.proname || '\M')));
+    IF blocker IS NOT NULL THEN
+        RAISE EXCEPTION 'A SECURITY DEFINER function browser roles can reach runs SQL the graph cannot read (%); review it, then make it unreachable or add it to reviewed_opaque', blocker;
     END IF;
 
     -- 4. Revoke. Table-level REVOKE also takes away any column privileges.

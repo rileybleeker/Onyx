@@ -189,6 +189,67 @@ def test_verify_check_walks_the_same_graph_as_the_migration() -> None:
     assert _graph(_code(VERIFY)) == _graph(_code(FORWARD))
 
 
+def _dynamic_check(code: str) -> str:
+    """Step 3d: the query over SECURITY DEFINER functions whose SQL the graph cannot read."""
+    m = re.search(r"WITH RECURSIVE fn AS \(.*?INTO (?:blocker|leaked)\n.*?\);", code, re.S)
+    assert m, "dynamic-SQL definer check (step 3d) not found"
+    return m.group(0).replace("INTO leaked", "INTO blocker")
+
+
+def _reviewed(code: str) -> list[str]:
+    m = re.search(r"reviewed_opaque\s+constant\s+text\[\]\s*:=\s*ARRAY\[(.*?)\];", code, re.S)
+    assert m, "reviewed_opaque list not found"
+    return re.findall(r"'([^']*)'", m.group(1))
+
+
+def test_dynamic_sql_definers_fail_closed_before_the_revoke() -> None:
+    # SEC01B-R3: 'pds.' || 'hrv_' || 'residuals_mat' built at run time names no object, so the graph
+    # cannot find it. Step 3d fails closed on every reachable SECURITY DEFINER function whose own or
+    # callees' SQL is opaque, unless the whole closure is on the reviewed list with the same hash.
+    body = re.findall(r"DO \$migration\$(.*?)\$migration\$;", _code(FORWARD), re.S)[0]
+    check = _dynamic_check(body)
+    assert body.index(check) < body.index("EXECUTE format('REVOKE")
+    for needle in (
+        "f.prosecdef",                                                # definer functions only ...
+        "unnest(reach_rels)",                                         # ... whose owner reads the graph
+        "has_table_privilege(f.proowner, g, 'SELECT')",
+        "calls(root, fn)", "FROM calls c",                            # ... plus everything they call
+        r"cur.src ~ ('\m' || q.proname || '\M')",
+        "d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid",
+        "pg_get_function_sqlbody",                                    # SQL-standard bodies are read too
+        "q.lanname NOT IN ('sql', 'plpgsql')",                        # other languages are opaque
+        r"q.src ~* '\mexecute\M'",                                    # dynamic EXECUTE is opaque
+        "_to_xml|ts_stat|ts_rewrite|dblink",                          # query-string builtins are opaque
+        "md5(string_agg(", "= ANY (reviewed_opaque)",                 # reviewed closures, by hash
+        "has_function_privilege('anon', r.root, 'EXECUTE')",          # reachable: callable,
+        "has_function_privilege('authenticated', r.root, 'EXECUTE')",
+        "pg_trigger t WHERE t.tgfoid = r.root",                       # a trigger,
+        "pg_event_trigger e WHERE e.evtfoid = r.root",                # an event trigger,
+        "d.refobjid = r.root",                                        # used by any object,
+        r"o.src ~ ('\m' || f.proname || '\M')",                       # or named by another function
+    ):
+        assert needle in check, needle
+    after = body[body.index(check):]
+    assert after.index("IF blocker IS NOT NULL") < after.index("RAISE EXCEPTION 'A SECURITY DEFINER function")
+    assert "targets" not in check
+
+
+def test_verify_check_runs_the_same_dynamic_sql_check_and_list() -> None:
+    assert _dynamic_check(_code(VERIFY)) == _dynamic_check(_code(FORWARD))
+    assert _reviewed(_code(VERIFY)) == _reviewed(_code(FORWARD))
+    assert "dynamic_sql_definers_reviewed" in _code(VERIFY)
+
+
+def test_reviewed_list_entries_are_exact_signature_hash_pairs() -> None:
+    entries = _reviewed(_code(FORWARD))
+    assert entries, "the reviewed list must name what it exempts"
+    for entry in entries:
+        assert re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\([^)]*\)=[0-9a-f]{32}", entry), entry
+    # Nothing under pds is exempted by hand: a pds definer with dynamic SQL is made unreachable or
+    # rewritten, not waved through.
+    assert not [e for e in entries if e.startswith("pds.")], entries
+
+
 def test_forward_rerun_after_success_is_a_harmless_no_op() -> None:
     code = _code(FORWARD)
     # FOREACH over a NULL array raises, so an empty target list must be an empty array, not NULL.

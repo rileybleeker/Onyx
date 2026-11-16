@@ -11,13 +11,24 @@
 --     REFRESH ... CONCURRENTLY) is still there;
 -- that nothing anon or authenticated can read or call reaches one of the six another way (the same
 -- dependency graph as step 3 of the migration: views over views, functions naming them, views and
--- functions over those functions, policies), and that no other pds matview is readable by anon or
--- authenticated.
+-- functions over those functions, policies), that no SECURITY DEFINER function a browser role can
+-- reach runs SQL that graph cannot read (dynamic SQL, another language) unless it is on the reviewed
+-- list (the migration's step 3d), and that no other pds matview is readable by anon or authenticated.
 BEGIN READ ONLY;
 SET LOCAL statement_timeout = '45s';
 DO $check$
 DECLARE
     mat_names constant text[] := ARRAY['pds.daily_health_matrix_behavioral_mat','pds.hrv_prediction_gaps_mat','pds.hrv_residuals_mat','pds.recovery_vs_pace_mat','pds.spotify_daily_signature_mat','pds.tz_log_gaps_mat'];
+    -- The same list as reviewed_opaque in the migration (keep the two equal):
+    -- SECURITY DEFINER functions with SQL the graph cannot read that were
+    -- reviewed by hand, as '<schema>.<name>(<args>)=<md5 of the function and
+    -- everything it calls>' (closure_md5 of step 3d, so any change to the body,
+    -- language, definer flag or a callee fails the check again). Reviewed 2026-11-16 (SEC01B-R3): Supabase's event-trigger function
+    -- that enables row security on tables created in schema public; it reads no
+    -- table and never runs for a Data API caller.
+    reviewed_opaque constant text[] := ARRAY[
+        'public.rls_auto_enable()=979445ae8414446737e577d80ba23b8c'
+    ];
     owner_id uuid;
     initial_role text := current_user;
     relation_name text;
@@ -138,6 +149,54 @@ BEGIN
         RAISE EXCEPTION 'Function a browser role can reach reads a matview: %', leaked;
     END IF;
 
+    -- Step 3d of the migration, word for word: no reachable SECURITY DEFINER function
+    -- runs SQL the graph cannot read unless it was reviewed.
+    WITH RECURSIVE fn AS (
+        SELECT p.oid, p.proname, p.prosecdef, p.proowner, l.lanname,
+               pn.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS sig,
+               p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src
+        FROM pg_proc p
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+    ), priv AS (
+        SELECT f.oid FROM fn f
+        WHERE f.prosecdef
+          AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_table_privilege(f.proowner, g, 'SELECT'))
+    ), calls(root, fn) AS (
+        SELECT oid, oid FROM priv
+      UNION
+        SELECT c.root, q.oid
+        FROM calls c JOIN fn cur ON cur.oid = c.fn JOIN fn q ON q.oid <> cur.oid
+        WHERE cur.src ~ ('\m' || q.proname || '\M')
+           OR EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_proc'::regclass AND d.objid = cur.oid
+                        AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid)
+    ), roots AS (
+        SELECT c.root,
+               bool_or(q.lanname NOT IN ('sql', 'plpgsql')
+                       OR q.src ~* '\mexecute\M'
+                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)') AS opaque,
+               md5(string_agg(q.sig || '|' || q.lanname || '|' || q.prosecdef::text || '|' || q.src,
+                              E'\n' ORDER BY q.sig)) AS closure_md5
+        FROM calls c JOIN fn q ON q.oid = c.fn
+        GROUP BY c.root
+    )
+    SELECT string_agg(f.sig, '; ' ORDER BY f.sig)
+    INTO leaked
+    FROM roots r JOIN fn f ON f.oid = r.root
+    WHERE r.opaque
+      AND NOT (f.sig || '=' || r.closure_md5) = ANY (reviewed_opaque)
+      AND (has_function_privilege('anon', r.root, 'EXECUTE')
+           OR has_function_privilege('authenticated', r.root, 'EXECUTE')
+           OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = r.root)
+           OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = r.root)
+           OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = r.root)
+           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~ ('\m' || f.proname || '\M')));
+    IF leaked IS NOT NULL THEN
+        RAISE EXCEPTION 'Unreviewed SECURITY DEFINER function a browser role can reach runs SQL the graph cannot read: %', leaked;
+    END IF;
+
     -- The owner and a synthetic other account, each as a Data API caller (role authenticated).
     EXECUTE 'SET LOCAL ROLE authenticated';
     FOREACH subject IN ARRAY ARRAY[owner_id::text, '00000000-0000-0000-0000-000000000001'] LOOP
@@ -171,6 +230,7 @@ BEGIN
         'graph_relations', cardinality(reach_rels),
         'graph_functions', cardinality(reach_fns),
         'graph_closed_to_browser_roles', true,
+        'dynamic_sql_definers_reviewed', true,
         'other_pds_matviews_closed', true)::text, true);
 END
 $check$;

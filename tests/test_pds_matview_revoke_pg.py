@@ -18,6 +18,13 @@ what it does:
   - a trigger function that reads a matview: aborts;
   - a void SECURITY DEFINER refresh function no browser role may call: passes; the same function left
     callable by PUBLIC: aborts (fail closed, nothing changed).
+  - SQL the graph cannot read (SEC01B-R3): a callable definer function that builds the matview name at
+    run time ('pds.' || 'hrv_' || 'residuals_mat'): aborts, also when it is added after a successful
+    revoke and the migration is re-run; a callable definer calling an invoker function with dynamic
+    SQL: aborts; a SQL-standard body calling query_to_xml on an assembled name: aborts; a definer
+    trigger function with dynamic SQL that nobody may call directly: aborts; a definer with dynamic
+    SQL that no browser role may call and nothing uses (like the perf refresh function): passes, and a
+    re-run passes.
 Every aborted run must leave the grants exactly as they were (the migration is one atomic statement).
 
 Safety: each case is ONE transaction that ends in ROLLBACK, and its first statement refuses to run
@@ -57,6 +64,7 @@ SIX = (
 RELATION_ABORT = "A browser-readable relation reads a matview"
 POLICY_ABORT = "A row-security policy reads a matview"
 FUNCTION_ABORT = "A function browser roles can reach reads a matview"
+DYNAMIC_ABORT = "A SECURITY DEFINER function browser roles can reach runs SQL the graph cannot read"
 
 GUARD = """DO $guard$
 BEGIN
@@ -243,6 +251,52 @@ def test_refresh_function_no_browser_role_may_call_passes() -> None:
 
 def test_refresh_function_callable_by_public_aborts_without_changing_anything() -> None:
     _expect_abort(REFRESH_FN, FUNCTION_ABORT, "fixture_refresh")
+
+
+# SEC01B-R3: SQL assembled at run time names no object, so the graph cannot see it; step 3d fails closed.
+ASSEMBLED = """CREATE FUNCTION pds.fixture_assembled() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY EXECUTE 'SELECT k FROM ' || 'pds.' || 'hrv_' || 'residuals_mat'; END $f$;"""
+
+
+def test_definer_function_with_an_assembled_matview_name_aborts() -> None:
+    _expect_abort(ASSEMBLED, DYNAMIC_ABORT, "fixture_assembled")
+
+
+def test_assembled_name_function_added_after_the_revoke_aborts_the_rerun() -> None:
+    _expect_abort(ASSEMBLED, DYNAMIC_ABORT, "fixture_assembled", revoke_first=True)
+
+
+def test_callable_definer_calling_an_invoker_function_with_dynamic_sql_aborts() -> None:
+    # The invoker function runs as the definer's owner when the definer calls it.
+    _expect_abort("""CREATE FUNCTION pds.fixture_dyn_inner() RETURNS SETOF integer LANGUAGE plpgsql
+AS $f$ BEGIN RETURN QUERY EXECUTE format('SELECT k FROM pds.%I', 'recovery_' || 'vs_pace_mat'); END $f$;
+REVOKE EXECUTE ON FUNCTION pds.fixture_dyn_inner() FROM PUBLIC;
+CREATE FUNCTION pds.fixture_dyn_outer() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY SELECT * FROM pds.fixture_dyn_inner(); END $f$;""", DYNAMIC_ABORT, "fixture_dyn_outer")
+
+
+def test_sql_standard_body_with_a_query_string_builtin_aborts() -> None:
+    _expect_abort("""CREATE FUNCTION pds.fixture_xml() RETURNS xml LANGUAGE sql SECURITY DEFINER
+BEGIN ATOMIC
+    SELECT query_to_xml('SELECT k FROM pds.' || 'tz_log_' || 'gaps_mat', true, false, '');
+END;""", DYNAMIC_ABORT, "fixture_xml")
+
+
+def test_trigger_definer_with_dynamic_sql_aborts_even_when_not_callable() -> None:
+    _expect_abort("""CREATE TABLE pds.fixture_t3 (k integer);
+CREATE FUNCTION pds.fixture_dyn_trg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN EXECUTE 'SELECT 1 FROM pds.' || 'spotify_daily_' || 'signature_mat'; RETURN NEW; END $f$;
+REVOKE EXECUTE ON FUNCTION pds.fixture_dyn_trg() FROM PUBLIC;
+CREATE TRIGGER fixture_dyn_trg BEFORE INSERT ON pds.fixture_t3 FOR EACH ROW EXECUTE FUNCTION pds.fixture_dyn_trg();""",
+                  DYNAMIC_ABORT, "fixture_dyn_trg")
+
+
+def test_unreachable_definer_with_dynamic_sql_passes_and_reruns() -> None:
+    # Like the perf refresh function: dynamic SQL, but no browser role may call it and nothing uses it.
+    _expect_success("""CREATE FUNCTION pds.fixture_dyn_refresh() RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY pds.%I', 'hrv_' || 'residuals_mat'); END $f$;""",
+                    "REVOKE EXECUTE ON FUNCTION pds.fixture_dyn_refresh() FROM PUBLIC, anon, authenticated;",
+                    MIGRATE, _assert_grants(False), MIGRATE, _assert_grants(False))
 
 
 if __name__ == "__main__":
