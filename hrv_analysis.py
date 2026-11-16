@@ -901,6 +901,9 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["supplements"]["category"] = data["supplements"]["categories"].apply(
             lambda c: ", ".join(c) if isinstance(c, list) and c else None
         )
+    # Intakes whose label gives no readable amount are not in the rollup (its own filter); the
+    # dose-response leaves those days out instead of reading them as 0 (HIST-UNIT-01).
+    data["supplements_unquantified"] = load_supplement_unquantified()
 
     # Melatonin journal<->supplement bridge (pds.melatonin_unified, 2026-06-14):
     # one row per behavioral day unifying the frozen WHOOP journal Yes/No history
@@ -2867,12 +2870,89 @@ def print_completeness(df: pd.DataFrame) -> None:
 #   - no estimate when its only literal units are 'unitless' (amounts that cannot be compared) or
 #     it has two or more literal units and no mass;
 #   - a day with an intake in another class, or an intake whose amount is missing, has an unknown
-#     total: it is left out, never read as 0 (the value of a day without an intake).
+#     total: it is left out, never read as 0 (the value of a day without an intake). The view
+#     filters out ingredients with no readable quantity, so those days come from a separate read of
+#     the intakes and their products (load_supplement_unquantified).
 # What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
-# no estimate, in the coverage payload (supplement_impact / dose_response_coverage).
+# no estimate, in the coverage payload (supplement_impact / dose_response_coverage), which
+# /analytics/hrv shows under the dose-response chart.
 SUPPLEMENT_MASS_CLASS = "mass"
 SUPPLEMENT_UNKNOWN_UNIT_CLASS = "unitless"
-SUPPLEMENT_DOSE_COVERAGE_VERSION = 1
+SUPPLEMENT_DOSE_COVERAGE_VERSION = 2
+
+
+def _supplement_quantity_readable(q) -> bool:
+    """The rollup's own filter (sql/supplement_iu_conversion.sql: quantity text ~ '^[0-9.]+$'),
+    same as isQuantified in frontend/src/lib/supplement-units.ts. A JSON number is readable when
+    finite and not negative (jsonb prints it as plain digits)."""
+    if isinstance(q, bool):
+        return False  # jsonb true / false prints as a word
+    if isinstance(q, (int, float, np.integer, np.floating)):
+        return bool(np.isfinite(q)) and q >= 0
+    return isinstance(q, str) and q != "" and all(ch in "0123456789." for ch in q)
+
+
+_UNQUANTIFIED_COLS = ["calendar_date", "ingredient_group"]
+
+
+def _supplement_unquantified_products(products: pd.DataFrame | None) -> pd.DataFrame:
+    """(product_id, ingredient_group) of every product ingredient with no readable quantity."""
+    pairs: list[tuple[str, str]] = []
+    if products is not None and not products.empty:
+        for pid, ings in zip(products["product_id"], products["ingredients"]):
+            if isinstance(ings, str):  # a double-encoded JSONB row (pre-2026-05-26 bug pattern)
+                try:
+                    ings = json.loads(ings)
+                except ValueError:
+                    continue
+            if not isinstance(ings, list):
+                continue
+            for ing in ings:
+                if not isinstance(ing, dict):
+                    continue
+                group = ing.get("ingredient_group")
+                if isinstance(group, str) and not _supplement_quantity_readable(ing.get("quantity")):
+                    pairs.append((str(pid), group))
+    return pd.DataFrame(pairs, columns=["product_id", "ingredient_group"]).drop_duplicates()
+
+
+def supplement_unquantified_days(products: pd.DataFrame | None,
+                                 intakes: pd.DataFrame | None) -> pd.DataFrame:
+    """(calendar_date, ingredient_group) of every intake whose product lists that compound without a
+    readable amount: exactly the ingredient rows pds.supplement_intake_by_compound filters out, so
+    the rollup alone cannot tell such a day from a day without an intake.
+
+    `products`: product_id + ingredients (the JSONB array). `intakes`: intake_date + product_id.
+    The day is the intake's own intake_date, like the view's calendar_date.
+    """
+    affected = _supplement_unquantified_products(products)
+    if affected.empty or intakes is None or intakes.empty:
+        return pd.DataFrame(columns=_UNQUANTIFIED_COLS)
+    days = intakes[["intake_date", "product_id"]].dropna().copy()
+    days["product_id"] = days["product_id"].astype(str)
+    days["calendar_date"] = days["intake_date"].astype(str)
+    out = days.merge(affected, on="product_id", how="inner")[_UNQUANTIFIED_COLS].drop_duplicates()
+    return out.sort_values(_UNQUANTIFIED_COLS).reset_index(drop=True)
+
+
+def load_supplement_unquantified(fetch=None) -> pd.DataFrame | None:
+    """Days a compound was taken from a product that gives no readable amount for it.
+
+    Returns None when a read fails: the dose-response then runs without this check and says so in
+    its coverage (`unquantified_check`). Logs an error code or type only. `fetch` defaults to
+    fetch_all (injectable for tests). Intakes are read only when some product has such an
+    ingredient.
+    """
+    fetch = fetch or fetch_all
+    try:
+        products = fetch("supplement_products", select="product_id,ingredients", order="product_id")
+        if _supplement_unquantified_products(products).empty:
+            return pd.DataFrame(columns=_UNQUANTIFIED_COLS)
+        intakes = fetch("supplement_intake", select="intake_date,product_id", order="intake_id")
+        return supplement_unquantified_days(products, intakes)
+    except Exception as e:  # postgrest APIError, network error, ...
+        log.warning(f"  Supplement amount check unavailable ({getattr(e, 'code', None) or type(e).__name__})")
+        return None
 
 
 def supplement_unit_classes(frame: pd.DataFrame) -> pd.Series:
@@ -2908,41 +2988,53 @@ def _is_iu(unit: str) -> bool:
 
 
 def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.DataFrame,
-                                  target: str) -> tuple[list[dict], dict]:
+                                  target: str,
+                                  unquantified: pd.DataFrame | None = None) -> tuple[list[dict], dict]:
     """Per-compound Spearman between the day's amount and that night's HRV, one unit class each.
 
     `supplements`: the long rollup (calendar_date, ingredient_group, unit_class, unit,
     source_units, total_amount, category). `tracked`: HRV-valid rows (calendar_date + `target`)
-    inside the supplement tracking window. Returns (rows, coverage); rows carry no FDR fields.
+    inside the supplement tracking window. `unquantified`: (calendar_date, ingredient_group) of
+    intakes the rollup filters out for having no readable amount (supplement_unquantified_days);
+    None = that check could not be made. Returns (rows, coverage); rows carry no FDR fields.
     """
     rows: list[dict] = []
     excluded: list[dict] = []
-    coverage = {"version": SUPPLEMENT_DOSE_COVERAGE_VERSION, "analyzed": 0, "excluded": excluded}
+    coverage = {"version": SUPPLEMENT_DOSE_COVERAGE_VERSION, "analyzed": 0, "excluded": excluded,
+                "unquantified_check": "unavailable" if unquantified is None else "checked"}
+    unquantified_by_group: dict[str, set] = {}
+    if unquantified is not None and not unquantified.empty:
+        for group, day in zip(unquantified["ingredient_group"], unquantified["calendar_date"].astype(str)):
+            unquantified_by_group.setdefault(group, set()).add(day)
     if supplements is None or supplements.empty:
-        return rows, coverage
-    supp = supplements.dropna(subset=["ingredient_group", "calendar_date"]).copy()
+        supp = pd.DataFrame(columns=["calendar_date", "ingredient_group", "total_amount", "unit"])
+    else:
+        supp = supplements.dropna(subset=["ingredient_group", "calendar_date"]).copy()
     supp["total_amount"] = (pd.to_numeric(supp["total_amount"], errors="coerce")
                             if "total_amount" in supp.columns else np.nan)
     supp["_unit_class"] = supplement_unit_classes(supp)
+    by_group = {g: r for g, r in supp.groupby("ingredient_group")} if not supp.empty else {}
 
-    for compound, comp_rows in supp.groupby("ingredient_group"):
+    for compound in sorted(set(by_group) | set(unquantified_by_group)):
+        comp_rows = by_group.get(compound, supp.iloc[0:0])
         quantified = comp_rows[comp_rows["total_amount"].notna()]
-        unquantified_days = set(comp_rows.loc[comp_rows["total_amount"].isna(), "calendar_date"])
+        unquantified_days = (set(comp_rows.loc[comp_rows["total_amount"].isna(), "calendar_date"])
+                             | unquantified_by_group.get(compound, set()))
         classes = sorted(set(quantified["_unit_class"]))
         eligible = [c for c in classes if c != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+        n_days = len(set(comp_rows["calendar_date"]) | unquantified_days)
+
+        def leave_out(reason: str) -> None:
+            excluded.append({"compound": str(compound), "reason": reason,
+                             "unit_classes": classes, "n_days": n_days})
+
         if SUPPLEMENT_MASS_CLASS in eligible:
             primary = SUPPLEMENT_MASS_CLASS
         elif len(eligible) == 1:
             primary = eligible[0]
         else:
-            reason = ("unquantified" if not classes
+            leave_out("unquantified" if not classes
                       else "unknown_unit" if not eligible else "mixed_unconverted_units")
-            excluded.append({
-                "compound": str(compound),
-                "reason": reason,
-                "unit_classes": classes,
-                "n_days": int(comp_rows["calendar_date"].nunique()),
-            })
             continue
 
         other = quantified[quantified["_unit_class"] != primary]
@@ -2952,6 +3044,10 @@ def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.
                           & ~quantified["calendar_date"].isin(unknown_days)]
         distinct_doses = prim["total_amount"].unique()
         if len(distinct_doses) < 3:
+            # Too few doses is the usual "constant dose" case (the Yes/No chart covers it); it is
+            # recorded only when days were left out, so a compound never vanishes unexplained.
+            if unknown_days:
+                leave_out("too_few_comparable_days")
             continue
         # Amount per date; a day with no intake = 0, a day with an unknown total is not a row.
         amt_by_date = prim.groupby("calendar_date")["total_amount"].sum()
@@ -2959,6 +3055,8 @@ def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.
         merged = base.merge(amt_by_date.rename("amount").reset_index(), on="calendar_date", how="left")
         merged["amount"] = merged["amount"].fillna(0.0)
         if merged["amount"].nunique() < 3 or len(merged) < 20:
+            if unknown_days:
+                leave_out("too_few_comparable_days")
             continue
         try:
             res = stats.spearmanr(merged[target], merged["amount"])
@@ -2995,16 +3093,45 @@ def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.
     return rows, coverage
 
 
+def supplement_dose_response_results(supplements: pd.DataFrame, hrv_valid: pd.DataFrame, target: str,
+                                     unquantified: pd.DataFrame | None = None) -> dict:
+    """The dose-response block of run_statistical_analysis: rows (BH-FDR, sorted by |rho|) and coverage.
+
+    Both keys are returned after every successful run, the list possibly empty, so the stored
+    result is replaced when the unit rule leaves no estimate: a previous run's rows never stay on
+    the dashboard. Raises on failure; the caller then keeps the previous stored result.
+    The tracking window starts at the first day with a quantified amount, as before.
+    """
+    quantified = supplements.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
+    if quantified.empty:
+        tracked = hrv_valid.iloc[0:0][["calendar_date", target]]
+    else:
+        tracked = hrv_valid[hrv_valid["calendar_date"] >= quantified["calendar_date"].min()]
+        tracked = tracked[["calendar_date", target]].dropna()
+    rows, coverage = supplement_dose_response_rows(supplements, tracked, target, unquantified)
+    if rows and HAS_FDR and len(rows) > 1:
+        p_values = np.array([r["p_value"] for r in rows])
+        passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+        for row, q, p_pass in zip(rows, q_values, passes):
+            row["q_value"] = float(q)
+            row["passes_fdr"] = bool(p_pass)
+    rows.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
+    return {"supplement_dose_response": rows, "supplement_dose_response_coverage": coverage}
+
+
 def run_statistical_analysis(
     df: pd.DataFrame,
     skip: bool = False,
     supplements: pd.DataFrame | None = None,
+    supplements_unquantified: pd.DataFrame | None = None,
 ) -> dict:
     """Correlation analysis, journal impact, Granger tests. Returns result dict.
 
     `supplements` is the long-format supplement_intake_by_compound DataFrame
     (one row per (calendar_date, ingredient_group)). When provided, runs
     per-compound Yes/No t-tests and dose-response Spearman correlations.
+    `supplements_unquantified` (load_supplement_unquantified) lists the days an
+    intake gave no readable amount; None = not checked.
     """
     results: dict = {}
 
@@ -3492,34 +3619,21 @@ def run_statistical_analysis(
     # Captures monotonic dose-response effects that Yes/No collapses on.
     # Rank-based to handle outliers and non-linear monotonic responses.
     # One unit class per compound (supplement_dose_response_rows): mg and mL never add up.
-    supplement_dose_response: list[dict] = []
     if supplements is not None and not supplements.empty:
         try:
-            supp = supplements.copy()
-            supp = supp.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
-            tracking_start = supp["calendar_date"].min()
-            tracked = hrv_valid[hrv_valid["calendar_date"] >= tracking_start].copy()
-            tracked = tracked[["calendar_date", STAT_TARGET]].dropna()
-
-            supplement_dose_response, dose_coverage = supplement_dose_response_rows(
-                supplements, tracked, STAT_TARGET)
-            results["supplement_dose_response_coverage"] = dose_coverage
+            dose = supplement_dose_response_results(supplements, hrv_valid, STAT_TARGET,
+                                                    supplements_unquantified)
+            results.update(dose)
+            supplement_dose_response = dose["supplement_dose_response"]
+            dose_coverage = dose["supplement_dose_response_coverage"]
             if dose_coverage["excluded"] or dose_coverage.get("with_excluded_days"):
                 # Counts only: the Actions log is public.
                 log.info(f"  Supplement dose-response units: {len(dose_coverage['excluded'])} compounds "
-                         f"without a comparable unit, {dose_coverage.get('with_excluded_days', 0)} with "
-                         f"days left out (another unit or no amount)")
-
-            if supplement_dose_response and HAS_FDR and len(supplement_dose_response) > 1:
-                p_values = np.array([r["p_value"] for r in supplement_dose_response])
-                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
-                for row, q, p_pass in zip(supplement_dose_response, q_values, passes):
-                    row["q_value"] = float(q)
-                    row["passes_fdr"] = bool(p_pass)
-
+                         f"left out, {dose_coverage.get('with_excluded_days', 0)} with days left out "
+                         f"(another unit or no amount)")
+            if dose_coverage["unquantified_check"] != "checked":
+                log.info("  Supplement dose-response: days without a readable amount were not checked")
             if supplement_dose_response:
-                supplement_dose_response.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
-                results["supplement_dose_response"] = supplement_dose_response
                 log.info(f"  Supplement dose-response: {len(supplement_dose_response)} compounds (≥3 distinct doses)")
             else:
                 log.info("  Supplement dose-response: 0 compounds with ≥3 distinct doses + n≥20 rows")
@@ -6111,6 +6225,7 @@ def main() -> str | None:
         df,
         skip=args.skip_analysis,
         supplements=data.get("supplements"),
+        supplements_unquantified=data.get("supplements_unquantified"),
     )
 
     # ---------- Phase 2.5: Causal Inference ----------

@@ -117,3 +117,112 @@ export function unquantifiedIngredients(intakes: readonly { product_id: string; 
     .map(([name, e]) => ({ name, label: e.label, product_count: e.products.size }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
+
+// ── /analytics/hrv Supplement Dose-Response (hrv_analysis.supplement_dose_response_rows) ──────────────────────────
+// One unit class per compound: a row's amounts are mg (IU converted with the vitamin's own factor) or one literal
+// unit, never both. The coverage payload (supplement_impact / dose_response_coverage) says which compounds have no
+// estimate and why, so a compound never disappears from the chart without a reason on screen.
+
+export interface DoseLeftOut {
+  compound: string;
+  reason: string;
+  unit_classes: string[];
+  n_days: number;
+}
+
+export interface DoseCoverage {
+  analyzed: number;
+  /** Estimates that left out some days (an intake in another unit, or one without a readable amount). */
+  withExcludedDays: number;
+  /** False when the run could not check intakes without a readable amount (or the payload predates that check). */
+  unquantifiedChecked: boolean;
+  excluded: DoseLeftOut[];
+}
+
+function count(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+}
+
+/** The stored coverage payload, or null when there is none or it is not an object. */
+export function parseDoseCoverage(v: unknown): DoseCoverage | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  const excluded: DoseLeftOut[] = [];
+  if (Array.isArray(o.excluded)) {
+    for (const e of o.excluded) {
+      if (!e || typeof e !== "object") continue;
+      const r = e as Record<string, unknown>;
+      if (typeof r.compound !== "string" || !r.compound) continue;
+      excluded.push({
+        compound: r.compound,
+        reason: typeof r.reason === "string" ? r.reason : "",
+        unit_classes: Array.isArray(r.unit_classes) ? r.unit_classes.filter((u): u is string => typeof u === "string") : [],
+        n_days: count(r.n_days),
+      });
+    }
+  }
+  return {
+    analyzed: count(o.analyzed),
+    withExcludedDays: count(o.with_excluded_days),
+    unquantifiedChecked: o.unquantified_check === "checked",
+    excluded,
+  };
+}
+
+const LEFT_OUT_REASON: Record<string, string> = {
+  unquantified: "no amount on the label",
+  unknown_unit: "amounts without a unit",
+  mixed_unconverted_units: "units that cannot be compared",
+  too_few_comparable_days: "too few comparable days",
+};
+
+/** "Compound (why)" for a compound with no estimate; the units are named when they are the reason. */
+export function doseLeftOutLabel(e: DoseLeftOut): string {
+  const reason = LEFT_OUT_REASON[e.reason] ?? "left out";
+  const shown = e.unit_classes.map((u) => (u === MASS_UNIT_CLASS ? "mg" : u === UNKNOWN_UNIT_CLASS ? "no unit" : u));
+  const units = e.reason === "mixed_unconverted_units" && shown.length ? `: ${shown.join(", ")}` : "";
+  return `${e.compound} (${reason}${units})`;
+}
+
+/** Unit shown next to a dose-response compound ("mg", "mg, from IU", "mL, not in mg"); null for a row without one. */
+export function doseRowUnit(r: { unit?: unknown; converted?: unknown; converted_from_iu?: unknown }): string | null {
+  const unit = typeof r.unit === "string" && r.unit.trim() ? r.unit : null;
+  if (!unit) return null;
+  if (r.converted_from_iu === true) return `${unit}, from IU`;
+  if (r.converted === false) return `${unit}, not in mg`;
+  return unit;
+}
+
+/** "3 days in another unit and 2 days without an amount left out", or null when the estimate left out no day. */
+export function doseRowLeftOutDays(r: { excluded_days?: unknown }): string | null {
+  const d = r.excluded_days && typeof r.excluded_days === "object" ? (r.excluded_days as Record<string, unknown>) : {};
+  const other = count(d.other_unit);
+  const none = count(d.unquantified);
+  const parts: string[] = [];
+  if (other) parts.push(`${other} ${other === 1 ? "day" : "days"} in another unit`);
+  if (none) parts.push(`${none} ${none === 1 ? "day" : "days"} without an amount`);
+  return parts.length ? `${parts.join(" and ")} left out` : null;
+}
+
+/** Lines shown under the dose-response chart; empty when there is nothing to say. */
+export function doseCoverageLines(c: DoseCoverage | null, max = 6): string[] {
+  if (!c) return [];
+  const lines: string[] = [];
+  if (c.excluded.length) {
+    const shown = c.excluded.slice(0, max).map(doseLeftOutLabel);
+    const more = c.excluded.length - shown.length;
+    lines.push(`No estimate: ${shown.join(" · ")}${more > 0 ? ` · ${more} more` : ""}`);
+  }
+  if (c.withExcludedDays) {
+    lines.push(`${c.withExcludedDays === 1 ? "1 estimate leaves" : `${c.withExcludedDays} estimates leave`} out days logged in another unit or without an amount.`);
+  }
+  if ((c.excluded.length || c.withExcludedDays || c.analyzed) && !c.unquantifiedChecked) {
+    lines.push("Intakes without a readable amount were not checked on this run.");
+  }
+  return lines;
+}
+
+/** Whether the dose-response card has something to show: estimates, or compounds left out with a reason. */
+export function showDoseResponseCard(rows: readonly unknown[], c: DoseCoverage | null): boolean {
+  return rows.length > 0 || (c?.excluded.length ?? 0) > 0;
+}

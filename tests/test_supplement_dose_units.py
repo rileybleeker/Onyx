@@ -7,6 +7,11 @@ classes, must leave out (not zero-fill) a day whose total is unknown, must keep 
 an unconverted series, must keep unquantified intakes apart from unknown-unit ones, and must record
 IU provenance. A compound in one class gives exactly the numbers of the pre-change code.
 
+The rollup view filters out ingredients without a readable quantity, so those intakes are read from
+the intakes + products (load_supplement_unquantified); the loader tests below build the rollup the
+way the view does and run the whole path. A run that leaves no estimate stores an empty list, so a
+previous run's rows never stay on the dashboard.
+
 Synthetic data only: invented compound names, dates and amounts. No network, no credentials.
 
 Run: python tests/test_supplement_dose_units.py
@@ -202,11 +207,15 @@ def test_single_class_compound_matches_the_previous_code():
 
 def test_run_statistical_analysis_calls_the_unit_rule():
     """run_statistical_analysis(skip=False) also draws plots, so the call site is checked in the source:
-    the dose-response comes from supplement_dose_response_rows and its coverage is kept for storage."""
+    the dose-response comes from supplement_dose_response_results (rows + coverage, both kept for storage),
+    and main() passes the loader's amountless-intake days in."""
     src = Path(h.__file__).read_text(encoding="utf-8")
     body = src[src.index("def run_statistical_analysis("):src.index("# --- Nutrition Spearman correlation ---")]
-    assert re.search(r"supplement_dose_response_rows\(\s*supplements, tracked, STAT_TARGET\)", body)
-    assert 'results["supplement_dose_response_coverage"] = dose_coverage' in body
+    assert re.search(r"supplement_dose_response_results\(\s*supplements, hrv_valid, STAT_TARGET,\s*"
+                     r"supplements_unquantified\)", body)
+    assert "results.update(dose)" in body
+    main = src[src.index("stat_results = run_statistical_analysis("):]
+    assert 'supplements_unquantified=data.get("supplements_unquantified")' in main[:400]
     assert 'supp.groupby("ingredient_group")' in body  # the Yes/No block only (taken / not taken)
     assert body.count('supp.groupby("ingredient_group")') == 1, "the dose-response no longer groups by name alone"
 
@@ -254,6 +263,168 @@ def test_coverage_is_stored_next_to_the_dose_response():
 def test_loader_reads_unit_class_and_source_units():
     src = Path(h.__file__).read_text(encoding="utf-8")
     assert 'select="calendar_date,ingredient_group,categories,unit,unit_class,source_units,total_amount"' in src
+    loader = src[src.index("def load_all_data("):src.index("def load_all_data(") + 20000]
+    assert 'data["supplements_unquantified"] = load_supplement_unquantified()' in loader
+
+
+# --- Intakes without a readable amount, from the loader through the analysis -----------------------
+
+PRODUCTS = pd.DataFrame([
+    {"product_id": "synthetic_a", "ingredients": [
+        {"name": "Synthetic Mineral Salt", "ingredient_group": "Synthetic Mineral", "quantity": "100",
+         "unit": "mg", "category": "mineral"},
+        {"name": "Synthetic Filler", "ingredient_group": None, "quantity": None, "unit": None}]},
+    # A blend that names the mineral without an amount: the view drops this ingredient row.
+    {"product_id": "synthetic_b", "ingredients": [
+        {"name": "Synthetic Mineral Blend", "ingredient_group": "Synthetic Mineral", "quantity": None,
+         "unit": "mg", "category": "mineral"},
+        {"name": "Synthetic Herb", "ingredient_group": "Synthetic Herb", "quantity": "proprietary",
+         "unit": None, "category": "botanical"}]},
+])
+B_DAYS = (10, 11, 35)            # 10 and 11 with a quantified sibling the same day, 35 alone
+A_DAYS = [d for d in range(N_DAYS) if d not in (35, 36, 37)]
+
+
+def intakes_frame():
+    rows = [{"intake_id": i, "intake_date": DATES[d], "product_id": "synthetic_a", "doses": d % 3 + 1}
+            for i, d in enumerate(A_DAYS)]
+    rows += [{"intake_id": 1000 + d, "intake_date": DATES[d], "product_id": "synthetic_b", "doses": 1}
+             for d in B_DAYS]
+    return pd.DataFrame(rows)
+
+
+def view_rollup(products: pd.DataFrame, intakes: pd.DataFrame) -> pd.DataFrame:
+    """pds.supplement_intake_by_compound for mg ingredients only: quantity must read as digits and
+    dots, anything else is filtered out (sql/supplement_iu_conversion.sql)."""
+    by_pid = dict(zip(products["product_id"], products["ingredients"]))
+    acc: dict = {}
+    for _, i in intakes.iterrows():
+        for ing in by_pid[i["product_id"]]:
+            q = ing.get("quantity")
+            if not (isinstance(q, str) and q and all(ch in "0123456789." for ch in q)):
+                continue
+            key = (i["intake_date"], ing["ingredient_group"])
+            acc[key] = acc.get(key, 0.0) + float(q) * i["doses"]
+    return pd.DataFrame([{"calendar_date": d, "ingredient_group": g, "unit_class": "mass", "unit": "mg",
+                          "source_units": ["mg"], "total_amount": a, "category": "mineral"}
+                         for (d, g), a in sorted(acc.items())])
+
+
+class _FakeFetch:
+    def __init__(self, tables, fail=None):
+        self.tables, self.fail, self.calls = tables, fail, []
+
+    def __call__(self, table, select="*", order=None, **_):
+        self.calls.append((table, select, order))
+        if table == self.fail:
+            raise RuntimeError("synthetic failure")
+        frame_ = self.tables[table]
+        return frame_[select.split(",")].copy() if not frame_.empty else pd.DataFrame()
+
+
+def test_quantity_rule_matches_the_view_filter():
+    for q in ("100", "0.5", "0", 100, 0.5, 0):
+        assert h._supplement_quantity_readable(q), q
+    for q in (None, "", "blend", "1,000", "-1", True, -1, float("nan"), float("inf"), ["100"]):
+        assert not h._supplement_quantity_readable(q), q
+
+
+def test_loader_finds_intakes_the_view_filters_out():
+    fetch = _FakeFetch({"supplement_products": PRODUCTS, "supplement_intake": intakes_frame()})
+    days = h.load_supplement_unquantified(fetch)
+    assert [c[0] for c in fetch.calls] == ["supplement_products", "supplement_intake"]
+    assert fetch.calls[1][2] == "intake_id"  # paged in a fixed order
+    got = set(zip(days["calendar_date"], days["ingredient_group"]))
+    assert got == {(DATES[d], g) for d in B_DAYS for g in ("Synthetic Mineral", "Synthetic Herb")}
+    # A null ingredient_group is not a dose-response compound (the analysis drops it too).
+    assert days["ingredient_group"].notna().all()
+
+
+def test_loader_skips_the_intake_read_when_every_amount_is_readable():
+    products = pd.DataFrame([{"product_id": "synthetic_a", "ingredients": [PRODUCTS["ingredients"].iloc[0][0]]}])
+    fetch = _FakeFetch({"supplement_products": products, "supplement_intake": intakes_frame()})
+    days = h.load_supplement_unquantified(fetch)
+    assert days.empty and list(days.columns) == ["calendar_date", "ingredient_group"]
+    assert [c[0] for c in fetch.calls] == ["supplement_products"]
+
+
+def test_loader_failure_is_reported_not_treated_as_none_found():
+    for failing in ("supplement_products", "supplement_intake"):
+        fetch = _FakeFetch({"supplement_products": PRODUCTS, "supplement_intake": intakes_frame()}, fail=failing)
+        assert h.load_supplement_unquantified(fetch) is None
+    supp = view_rollup(PRODUCTS, intakes_frame())
+    _, coverage = h.supplement_dose_response_rows(supp, TRACKED, "y", None)
+    assert coverage["unquantified_check"] == "unavailable"
+
+
+def test_amountless_intake_days_are_left_out_end_to_end():
+    intakes = intakes_frame()
+    supp = view_rollup(PRODUCTS, intakes)
+    # The view keeps day 10's quantified sibling and has no row at all for day 35.
+    assert DATES[10] in set(supp["calendar_date"]) and DATES[35] not in set(supp["calendar_date"])
+    fetch = _FakeFetch({"supplement_products": PRODUCTS, "supplement_intake": intakes})
+    unquantified = h.load_supplement_unquantified(fetch)
+    rows, coverage = h.supplement_dose_response_rows(supp, TRACKED, "y", unquantified)
+    r = only(rows, "Synthetic Mineral")
+    assert r["excluded_days"] == {"other_unit": 0, "unquantified": 3}
+    # Days 10 / 11 (partial total) and 35 (amount unknown, not 0) are left out; 36 / 37 are real zeros.
+    by_day = {DATES[d]: 100.0 * (d % 3 + 1) for d in A_DAYS}
+    rho, n = expected_spearman(by_day, [d for d in range(N_DAYS) if d not in B_DAYS])
+    assert r["n"] == n == N_DAYS - 3
+    assert abs(r["spearman_r"] - rho) < 1e-12
+    assert coverage["unquantified_check"] == "checked" and coverage["with_excluded_days"] == 1
+    # Without the blend in the catalogue the same rollup reads day 35 as 0 and keeps the partial days.
+    blind, _ = h.supplement_dose_response_rows(supp, TRACKED, "y", h.load_supplement_unquantified(
+        _FakeFetch({"supplement_products": PRODUCTS.iloc[[0]], "supplement_intake": intakes})))
+    assert only(blind, "Synthetic Mineral")["n"] == N_DAYS
+    # The herb only ever appears without an amount: no estimate, listed with its own reason.
+    herb = [e for e in coverage["excluded"] if e["compound"] == "Synthetic Herb"]
+    assert herb == [{"compound": "Synthetic Herb", "reason": "unquantified", "unit_classes": [],
+                     "n_days": len(B_DAYS)}]
+
+
+def test_too_few_comparable_days_is_recorded_not_dropped_silently():
+    mass = mass_series(days=range(0, 24))
+    unq = pd.DataFrame({"calendar_date": [DATES[d] for d in range(0, 24)],
+                        "ingredient_group": "Synthetic Mineral"})
+    rows, coverage = h.supplement_dose_response_rows(frame(mass), TRACKED, "y", unq)
+    assert rows == []
+    (entry,) = coverage["excluded"]
+    assert entry["reason"] == "too_few_comparable_days" and entry["unit_classes"] == ["mass"]
+    # A constant-dose compound with nothing left out is the Yes/No chart's case: not listed.
+    flat = [row(d, "Synthetic Flat", 50.0) for d in range(N_DAYS)]
+    rows, coverage = h.supplement_dose_response_rows(frame(flat), TRACKED, "y", unq.iloc[0:0])
+    assert rows == [] and coverage["excluded"] == []
+
+
+def test_a_run_with_no_estimate_replaces_the_stored_rows():
+    hrv_valid = TRACKED.copy()
+    first = h.supplement_dose_response_results(frame(mass_series()), hrv_valid, "y",
+                                               pd.DataFrame(columns=["calendar_date", "ingredient_group"]))
+    assert len(first["supplement_dose_response"]) == 1
+    # Next run: the compound is logged in mL and in capsules, no mass: the unit rule leaves no estimate.
+    mixed = frame([row(d, "Synthetic Mineral", 5.0, unit_class="mL") for d in range(N_DAYS)]
+                  + [row(d, "Synthetic Mineral", 1.0 + d % 3, unit_class="capsule") for d in range(N_DAYS)])
+    second = h.supplement_dose_response_results(mixed, hrv_valid, "y", None)
+    assert second["supplement_dose_response"] == []
+    assert second["supplement_dose_response_coverage"]["excluded"][0]["reason"] == "mixed_unconverted_units"
+    fake = _FakeSupa()
+    real = h.supa
+    h.supa = fake
+    try:
+        h.store_analysis_results(second, {})
+    finally:
+        h.supa = real
+    stored = {(r["result_type"], r["result_key"]): r for r, _ in fake.upserts}
+    assert stored[("supplement_impact", "dose_response")]["result_json"] == []
+    assert stored[("supplement_impact", "dose_response_coverage")]["result_json"]["analyzed"] == 0
+
+
+def test_results_without_any_quantified_amount_do_not_raise():
+    supp = frame([row(d, "Synthetic Herb", None) for d in range(6)])
+    out = h.supplement_dose_response_results(supp, TRACKED, "y", None)
+    assert out["supplement_dose_response"] == []
+    assert out["supplement_dose_response_coverage"]["excluded"][0]["reason"] == "unquantified"
 
 
 if __name__ == "__main__":

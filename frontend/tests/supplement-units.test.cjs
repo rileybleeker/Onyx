@@ -3,7 +3,8 @@
 // unit as on the label). The /supplements table must key rows on that identity, so an mg and an mL row of one compound
 // stay two rows through a refresh that reorders them; an unconverted row keeps its literal unit and says so; IU
 // converted to mg says where it came from; ingredients with no readable amount are listed apart, never as a 0 or as
-// an unknown unit; PersonalTable never hands React the same key twice.
+// an unknown unit; PersonalTable never hands React the same key twice. /analytics/hrv shows which compounds the
+// dose-response left out and why, and each estimate's unit, IU provenance and left-out days.
 // SYNTHETIC DATA ONLY: invented compound names, ids and amounts; no network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -69,6 +70,69 @@ test("lib: unquantified ingredients follow the view's own filter and are listed 
     { name: "Synthetic Herb", label: "blend", product_count: 2 },
   ]);
   assert.deepEqual(units.unquantifiedIngredients([]), []);
+});
+
+test("lib: dose-response coverage says which compounds have no estimate and why", () => {
+  const cov = units.parseDoseCoverage({
+    version: 2, analyzed: 1, with_excluded_days: 1, unquantified_check: "checked",
+    excluded: [
+      { compound: "Synthetic Extract", reason: "mixed_unconverted_units", unit_classes: ["capsule", "mL"], n_days: 9 },
+      { compound: "Synthetic Herb", reason: "unquantified", unit_classes: [], n_days: 3 },
+      { compound: "Synthetic Blend", reason: "unknown_unit", unit_classes: ["unitless"], n_days: 4 },
+      { compound: "Synthetic Mineral", reason: "too_few_comparable_days", unit_classes: ["mass"], n_days: 2 },
+      { reason: "unquantified" },
+    ],
+  });
+  assert.equal(cov.excluded.length, 4, "an entry without a compound name is dropped");
+  assert.equal(units.doseLeftOutLabel(cov.excluded[0]), "Synthetic Extract (units that cannot be compared: capsule, mL)");
+  assert.equal(units.doseLeftOutLabel(cov.excluded[1]), "Synthetic Herb (no amount on the label)");
+  assert.equal(units.doseLeftOutLabel(cov.excluded[2]), "Synthetic Blend (amounts without a unit)");
+  assert.equal(units.doseLeftOutLabel(cov.excluded[3]), "Synthetic Mineral (too few comparable days)");
+  const lines = units.doseCoverageLines(cov);
+  assert.match(lines[0], /^No estimate: Synthetic Extract \(units that cannot be compared: capsule, mL\) · Synthetic Herb/);
+  assert.equal(lines[1], "1 estimate leaves out days logged in another unit or without an amount.");
+  assert.equal(lines.length, 2, "the amount check ran: no extra line");
+  const capped = units.doseCoverageLines({ ...cov, excluded: [...cov.excluded, ...cov.excluded] }, 3);
+  assert.match(capped[0], / · 5 more$/);
+  // A run that could not check intakes without an amount says so.
+  const unchecked = units.parseDoseCoverage({ analyzed: 2, excluded: [], unquantified_check: "unavailable" });
+  assert.deepEqual(units.doseCoverageLines(unchecked), ["Intakes without a readable amount were not checked on this run."]);
+  assert.deepEqual(units.doseCoverageLines(null), []);
+  assert.equal(units.parseDoseCoverage([]), null);
+  assert.equal(units.parseDoseCoverage("x"), null);
+  // The card shows when estimates remain OR compounds were left out; never for nothing at all.
+  assert.equal(units.showDoseResponseCard([], cov), true, "no estimate left, but the reason is shown");
+  assert.equal(units.showDoseResponseCard([{}], null), true);
+  assert.equal(units.showDoseResponseCard([], null), false);
+  assert.equal(units.showDoseResponseCard([], unchecked), false);
+});
+
+test("lib: a dose-response row names its unit, its IU provenance and the days it left out", () => {
+  assert.equal(units.doseRowUnit({ unit: "mg", converted: true, converted_from_iu: false }), "mg");
+  assert.equal(units.doseRowUnit({ unit: "mg", converted: true, converted_from_iu: true }), "mg, from IU");
+  assert.equal(units.doseRowUnit({ unit: "mL", converted: false, converted_from_iu: false }), "mL, not in mg");
+  assert.equal(units.doseRowUnit({ unit: "mg" }), "mg", "an older row without the new fields keeps its unit");
+  assert.equal(units.doseRowUnit({ unit: null }), null);
+  assert.equal(units.doseRowLeftOutDays({ excluded_days: { other_unit: 3, unquantified: 1 } }),
+    "3 days in another unit and 1 day without an amount left out");
+  assert.equal(units.doseRowLeftOutDays({ excluded_days: { other_unit: 0, unquantified: 2 } }), "2 days without an amount left out");
+  assert.equal(units.doseRowLeftOutDays({ excluded_days: { other_unit: 0, unquantified: 0 } }), null);
+  assert.equal(units.doseRowLeftOutDays({}), null);
+});
+
+test("dashboard: the coverage row is fetched in the bounded batch and rendered with the dose-response", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const q = fs.readFileSync(path.join(__dirname, "..", "src", "lib", "queries-hrv.ts"), "utf8");
+  assert.match(q, /\["supplement_impact", "dose_response"\], \["supplement_impact", "dose_response_coverage"\]/);
+  assert.match(q, /panel\("supplement_impact", "dose_response"\),\s*panel\("supplement_impact", "dose_response_coverage"\),/);
+  assert.match(q, /supplementDoseCoverage: parsedObject\(suppDoseCov\),/);
+  const c = fs.readFileSync(path.join(__dirname, "..", "src", "app", "analytics", "hrv", "HrvAnalysisClient.tsx"), "utf8");
+  assert.match(c, /useState<any \| null>\(initial\?\.supplementDoseCoverage \?\? null\)/);
+  assert.match(c, /setSupplementDoseCoverage\(\(prev: any\) => sameJson\(prev, d\.supplementDoseCoverage\) \? prev : d\.supplementDoseCoverage\)/);
+  assert.match(c, /showDoseResponseCard\(supplementDoseResponse, parseDoseCoverage\(supplementDoseCoverage\)\)/);
+  assert.match(c, /data-testid="dose-response-coverage"/);
+  assert.match(c, /displayLabel: `.*\$\{unit \? ` \(\$\{unit\}\)` : ""\}`/);
 });
 
 test("PersonalTable: unique keys pass through unchanged; a repeat never reaches React twice", () => {
