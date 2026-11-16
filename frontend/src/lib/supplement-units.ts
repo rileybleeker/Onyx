@@ -1,0 +1,119 @@
+// Unit identity of the supplement compound rollup (HIST-UNIT-01). Import-free (bundled by name in offline tests).
+//
+// pds.supplement_intake_by_compound has one row per (day, compound_key, ingredient_group, unii_code, unit_class):
+// unit_class 'mass' = every mass unit converted to mg (pds.unit_to_mg_factor_for, which also maps Vitamin A / D / E
+// IU with that vitamin's own factor); any other class is the literal label unit, never converted ('unitless' = a
+// number with no unit). One compound in two classes is two rows: never added together and never one table row.
+// Ingredients whose label gives no readable amount are not in the view at all; they are listed separately
+// (unquantifiedIngredients), never as a 0 and never as an unknown unit.
+
+export const MASS_UNIT_CLASS = "mass";
+export const UNKNOWN_UNIT_CLASS = "unitless";
+
+export interface CompoundIdentity {
+  compound_key: string;
+  ingredient_group?: string | null;
+  unii_code?: string | null;
+  unit_class?: string | null;
+  unit?: string | null;
+}
+
+/** The row's unit class; a payload without one (older cached copy) takes it from `unit` ('mg' = mass, as the view). */
+export function unitClassOf(c: { unit_class?: string | null; unit?: string | null }): string {
+  if (typeof c.unit_class === "string" && c.unit_class.trim()) return c.unit_class;
+  if (c.unit === "mg") return MASS_UNIT_CLASS;
+  return typeof c.unit === "string" && c.unit.trim() ? c.unit : UNKNOWN_UNIT_CLASS;
+}
+
+/**
+ * React key of a compound row: the rollup's own group key without the day. Distinct for mg / mL siblings of one
+ * compound and the same for the same row across refreshes and reorders (never the list position).
+ */
+export function compoundRowKey(c: CompoundIdentity): string {
+  return JSON.stringify([c.compound_key, c.ingredient_group ?? null, c.unii_code ?? null, unitClassOf(c)]);
+}
+
+/** Distinct compounds (a compound shown in two units counts once). */
+export function distinctCompoundCount(rows: readonly CompoundIdentity[]): number {
+  return new Set(rows.map((c) => c.compound_key)).size;
+}
+
+/** Same normalisation as pds.unit_to_mg_factor_for: letters only, lower case. */
+export function isIuUnit(u: string): boolean {
+  return u.toLowerCase().replace(/[^a-z]/g, "") === "iu";
+}
+
+function literalUnits(sourceUnits: unknown): string[] {
+  if (!Array.isArray(sourceUnits)) return [];
+  const out = new Set<string>();
+  for (const u of sourceUnits) if (typeof u === "string" && u.trim()) out.add(u);
+  return Array.from(out).sort();
+}
+
+export interface UnitLabel {
+  /** Text after the amount ("" when the label gives no unit). */
+  unit: string;
+  /** True when the amount is mg after conversion. */
+  converted: boolean;
+  /** Short tag next to the unit, or null. */
+  note: string | null;
+  /** Tooltip of the tag, or null. */
+  title: string | null;
+}
+
+/** How a row's amount is labelled: mg (with "from IU" provenance), or the literal unit marked as not converted. */
+export function compoundUnitLabel(c: CompoundIdentity & { source_units?: unknown }): UnitLabel {
+  const cls = unitClassOf(c);
+  const sources = literalUnits(c.source_units);
+  if (cls === MASS_UNIT_CLASS) {
+    return sources.some(isIuUnit)
+      ? { unit: "mg", converted: true, note: "from IU", title: `Converted to mg from ${sources.join(", ")} with this vitamin's own IU factor` }
+      : { unit: "mg", converted: true, note: null, title: null };
+  }
+  if (cls === UNKNOWN_UNIT_CLASS) {
+    return { unit: "", converted: false, note: "no unit", title: "The label gives a number with no unit: not converted and not added to any other row" };
+  }
+  return { unit: cls, converted: false, note: "not in mg", title: `Amount in ${cls} as on the label: not converted to mg and not added to an mg row` };
+}
+
+/** The view's own filter: an ingredient counts only when its quantity reads as digits and dots. */
+export function isQuantified(q: unknown): boolean {
+  if (typeof q === "number") return Number.isFinite(q) && q >= 0;
+  return typeof q === "string" && /^[0-9.]+$/.test(q);
+}
+
+export interface UnquantifiedIngredient {
+  /** ingredient_group, else the ingredient name. */
+  name: string;
+  /** The label's amount text when it is not a number (e.g. "blend"), else null. */
+  label: string | null;
+  /** Distinct products of the day that list it. */
+  product_count: number;
+}
+
+/**
+ * Ingredients of the day's intakes that the rollup leaves out because the label gives no readable amount.
+ * `intakes` = one entry per intake with its product's ingredients JSON (the products table's array).
+ */
+export function unquantifiedIngredients(intakes: readonly { product_id: string; ingredients: unknown }[]): UnquantifiedIngredient[] {
+  const byName = new Map<string, { label: string | null; products: Set<string> }>();
+  for (const intake of intakes) {
+    if (!Array.isArray(intake.ingredients)) continue;
+    for (const ing of intake.ingredients) {
+      if (!ing || typeof ing !== "object") continue;
+      const rec = ing as Record<string, unknown>;
+      if (isQuantified(rec.quantity)) continue;
+      const group = typeof rec.ingredient_group === "string" && rec.ingredient_group.trim() ? rec.ingredient_group : null;
+      const named = typeof rec.name === "string" && rec.name.trim() ? rec.name : null;
+      const name = group ?? named ?? "Unnamed ingredient";
+      const text = typeof rec.quantity === "string" && rec.quantity.trim() ? rec.quantity.trim().slice(0, 40) : null;
+      const entry = byName.get(name) ?? { label: null, products: new Set<string>() };
+      entry.label ??= text;
+      entry.products.add(intake.product_id);
+      byName.set(name, entry);
+    }
+  }
+  return Array.from(byName.entries())
+    .map(([name, e]) => ({ name, label: e.label, product_count: e.products.size }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}

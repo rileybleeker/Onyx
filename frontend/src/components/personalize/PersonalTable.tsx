@@ -39,6 +39,34 @@ function sticky(left: number | undefined): CSSProperties {
   return { position: "sticky", left: left ?? 0, zIndex: 1 };
 }
 
+const warnedDuplicateKeys = new Set<string>();
+
+/**
+ * React keys for the rows. A key given twice would let React mix the two rows up when the list refreshes or
+ * reorders (one row's cells kept under the other's, or a row dropped), so a repeat gets an occurrence suffix that
+ * no given key uses, and the table warns once in development. Callers pass unique keys (HIST-UNIT-01: the
+ * supplement compound table keys on compound + unit class); unique keys are returned unchanged.
+ */
+export function uniqueRowKeys(rows: readonly { key: string }[]): string[] {
+  const given = new Set(rows.map((r) => r.key));
+  if (given.size === rows.length) return rows.map((r) => r.key);
+  const used = new Set<string>();
+  const seen = new Map<string, number>();
+  return rows.map((r) => {
+    const n = (seen.get(r.key) ?? 0) + 1;
+    seen.set(r.key, n);
+    if (n === 1 && !used.has(r.key)) {
+      used.add(r.key);
+      return r.key;
+    }
+    let k = n;
+    let candidate = `${r.key}#${k}`;
+    while (given.has(candidate) || used.has(candidate)) candidate = `${r.key}#${++k}`;
+    used.add(candidate);
+    return candidate;
+  });
+}
+
 export default function PersonalTable({
   id,
   columns,
@@ -75,6 +103,11 @@ export default function PersonalTable({
   for (const c of columns) if (!byId.has(c.id)) byId.set(c.id, c);
   const frozen = visible.filter((c) => c.frozen).length;
   const signature = visible.map((c) => c.id).join(",");
+  const rowKeys = uniqueRowKeys(rows);
+  if (process.env.NODE_ENV !== "production" && !warnedDuplicateKeys.has(id) && rowKeys.some((k, i) => k !== rows[i].key)) {
+    warnedDuplicateKeys.add(id);
+    console.warn(`PersonalTable "${id}": duplicate row keys; give each row a unique key`);
+  }
 
   // Frozen columns stick at the left edge of the scroll area: their offsets are measured only when a freeze pane
   // is set (a table without one does no work here).
@@ -129,8 +162,8 @@ export default function PersonalTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.key} className={r.className ?? rowClassName}>
+          {rows.map((r, ri) => (
+            <tr key={rowKeys[ri]} className={r.className ?? rowClassName}>
               {visible.map((c, i) => (
                 <td
                   key={c.id}

@@ -18,6 +18,7 @@ import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { Check, X } from "lucide-react";
 import { clientCache } from "@/lib/client-cache";
 import { fallbackBehavioralToday } from "@/lib/checkin";
+import { compoundRowKey, compoundUnitLabel, distinctCompoundCount, type UnquantifiedIngredient } from "@/lib/supplement-units";
 
 // The page's two data-ready reads, under the client cache's keys (lib/client-cache.ts: one key per GET, the URL).
 const PRODUCTS_URL = "/api/supplements/products";
@@ -53,7 +54,11 @@ interface CompoundRow {
   ingredient_name: string | null;
   unii_code: string | null;
   category: string | null;
+  /** 'mass' (mg after conversion) or the literal label unit; one compound in two classes is two rows. */
+  unit_class?: string | null;
   unit: string | null;
+  /** Literal label units behind the row (conversion provenance, e.g. IU). */
+  source_units?: (string | null)[] | null;
   total_amount: number;
   total_doses: number;
   source_product_count: number;
@@ -142,6 +147,8 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   const [products, setProducts] = useState<Product[]>([]);
   const [intakes, setIntakes] = useState<Intake[]>([]);
   const [compounds, setCompounds] = useState<CompoundRow[]>([]);
+  // Ingredients of today's intakes whose label gives no readable amount (not in the rollup, never a 0).
+  const [unquantified, setUnquantified] = useState<UnquantifiedIngredient[]>([]);
   const [loading, setLoading] = useState(true);
   const [busyProductId, setBusyProductId] = useState<string | null>(null);
 
@@ -238,6 +245,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
       // Only server-confirmed rows live in `intakes`; rows still saving are drawn from `writes`.
       setIntakes(tRes.intakes ?? []);
       setCompounds(tRes.compounds ?? []);
+      setUnquantified(tRes.unquantified ?? []);
     } catch (e) {
       // A failed read keeps what is on screen (never an empty "nothing logged").
       console.error("Supplements load:", e);
@@ -287,7 +295,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   // 1.0-1.4 s in perf-timing run 43668835523).
   useEffect(() => {
     let alive = true;
-    type TodayCopy = { date?: unknown; intakes?: Intake[]; compounds?: CompoundRow[] };
+    type TodayCopy = { date?: unknown; intakes?: Intake[]; compounds?: CompoundRow[]; unquantified?: UnquantifiedIngredient[] };
     const seed = (p: { products?: Product[] } | undefined, t: TodayCopy | undefined) => {
       if (!alive || answeredRef.current || !p || !t || !Array.isArray(p.products) || !Array.isArray(t.intakes)) return;
       if (t.date !== fallbackBehavioralToday(new Date())) return;
@@ -295,6 +303,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
       setProducts(p.products);
       setIntakes(t.intakes);
       setCompounds(t.compounds ?? []);
+      setUnquantified(t.unquantified ?? []);
       setLoading(false);
     };
     const p = clientCache.peek<{ products?: Product[] }>(PRODUCTS_URL);
@@ -332,6 +341,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
         const tRes = await getJson("/api/supplements/today");
         setIntakes(tRes.intakes ?? []);
         setCompounds(tRes.compounds ?? []);
+        setUnquantified(tRes.unquantified ?? []);
       } catch (e) {
         console.error("Silent today refresh:", e);
       }
@@ -452,7 +462,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   );
 
   const intakeCount = intakes.length;
-  const distinctCompounds = compounds.length;
+  const distinctCompounds = distinctCompoundCount(compounds);
 
   return (
     <div className="space-y-6">
@@ -704,13 +714,13 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
             title="Today's compound totals"
             subtitle="Cross-product rollup by UNII code — Vitamin C from a multivitamin and a standalone Vitamin C tablet sum here."
             source="DSLD"
-            info="Each row is one compound. total_amount sums every intake event today × that product's dose. source_product_count tells you how many different products in your library contribute to that compound."
+            info="Each row is one compound. total_amount sums every intake event today × that product's dose. source_product_count tells you how many different products in your library contribute to that compound. Mass units are converted to mg (IU only for vitamins A, D and E, with each vitamin's own factor); any other unit stays as on the label on its own row and is never added to the mg row."
           >
-            {compounds.length === 0 ? (
+            {compounds.length === 0 && unquantified.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
                 No intakes logged today yet.
               </p>
-            ) : (
+            ) : compounds.length === 0 ? null : (
               <div className="overflow-x-auto">
                 <PersonalTable
                   id="compounds"
@@ -718,26 +728,45 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                   headRowClassName="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle"
                   rowClassName="border-b border-border-subtle/50 hover:bg-white/[0.02]"
                   columns={COMPOUND_COLUMNS}
-                  rows={compounds.map((c) => ({
-                    key: c.compound_key,
-                    cells: {
-                      category: (
-                        <span className={`${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
-                          {c.category ?? "—"}
-                        </span>
-                      ),
-                      compound: c.ingredient_group ?? c.ingredient_name ?? c.compound_key,
-                      amount: (
-                        <>
-                          {Number(c.total_amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
-                          <span className="text-text-tertiary">{c.unit}</span>
-                        </>
-                      ),
-                      sources: c.source_product_count,
-                    },
-                  }))}
+                  // One row per compound AND unit class (HIST-UNIT-01): an mg and an mL row of one compound are
+                  // two rows with their own keys, never one key for both.
+                  rows={compounds.map((c) => {
+                    const label = compoundUnitLabel(c);
+                    return {
+                      key: compoundRowKey(c),
+                      cells: {
+                        category: (
+                          <span className={`${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
+                            {c.category ?? "—"}
+                          </span>
+                        ),
+                        compound: c.ingredient_group ?? c.ingredient_name ?? c.compound_key,
+                        amount: (
+                          <>
+                            {Number(c.total_amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            {label.unit ? <>{" "}<span className="text-text-tertiary">{label.unit}</span></> : null}
+                            {label.note ? (
+                              <>
+                                {" "}
+                                <span className="text-[10px] text-text-tertiary" title={label.title ?? undefined}>
+                                  · {label.note}
+                                </span>
+                              </>
+                            ) : null}
+                          </>
+                        ),
+                        sources: c.source_product_count,
+                      },
+                    };
+                  })}
                 />
               </div>
+            )}
+            {unquantified.length > 0 && (
+              <p className="text-[11px] text-text-tertiary font-mono pt-2" data-testid="compounds-unquantified">
+                No amount on the label (not counted):{" "}
+                {unquantified.map((u) => (u.label ? `${u.name} (${u.label})` : u.name)).join(", ")}
+              </p>
             )}
           </ChartCard>
           </Part>

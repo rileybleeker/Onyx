@@ -889,7 +889,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
 
     log.info("  Loading supplement_intake_by_compound…")
     data["supplements"] = fetch_supplement_rollup(
-        select="calendar_date,ingredient_group,categories,unit,total_amount",
+        select="calendar_date,ingredient_group,categories,unit,unit_class,source_units,total_amount",
     )
     if not data["supplements"].empty:
         data["supplements"]["calendar_date"] = data["supplements"]["calendar_date"].astype(str)
@@ -2857,6 +2857,144 @@ def print_completeness(df: pd.DataFrame) -> None:
 # PHASE 2 – STATISTICAL ANALYSIS
 # ===========================================================================
 
+# Supplement dose-response unit identity (HIST-UNIT-01). pds.supplement_intake_by_compound has
+# one row per (day, compound_key, ingredient_group, unii_code, unit_class): 'mass' = every mass
+# unit converted to mg (pds.unit_to_mg_factor_for, which also maps Vitamin A / D / E IU with that
+# vitamin's own factor), any other class = the literal unit as on the label, never converted
+# ('unitless' = a number with no unit). A compound's dose series uses ONE class, so amounts in
+# different classes never add up:
+#   - mass when the compound has mass rows, else its one literal unit;
+#   - no estimate when its only literal units are 'unitless' (amounts that cannot be compared) or
+#     it has two or more literal units and no mass;
+#   - a day with an intake in another class, or an intake whose amount is missing, has an unknown
+#     total: it is left out, never read as 0 (the value of a day without an intake).
+# What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
+# no estimate, in the coverage payload (supplement_impact / dose_response_coverage).
+SUPPLEMENT_MASS_CLASS = "mass"
+SUPPLEMENT_UNKNOWN_UNIT_CLASS = "unitless"
+SUPPLEMENT_DOSE_COVERAGE_VERSION = 1
+
+
+def supplement_unit_classes(frame: pd.DataFrame) -> pd.Series:
+    """The rollup's unit_class per row. Rows without one (an older select, a test frame) take it
+    from `unit`: the view reports unit 'mg' exactly for the mass class and the class otherwise."""
+    def from_unit(u):
+        if not isinstance(u, str) or not u.strip():
+            return SUPPLEMENT_UNKNOWN_UNIT_CLASS
+        return SUPPLEMENT_MASS_CLASS if u == "mg" else u
+    units = frame["unit"] if "unit" in frame.columns else pd.Series(None, index=frame.index, dtype=object)
+    derived = units.map(from_unit)
+    if "unit_class" not in frame.columns:
+        return derived
+    given = frame["unit_class"].map(lambda c: c if isinstance(c, str) and c.strip() else None)
+    return given.where(given.notna(), derived)
+
+
+def _supplement_source_units(rows: pd.DataFrame) -> list[str]:
+    """Literal label units behind rows (the view's source_units array): the conversion provenance."""
+    out: set[str] = set()
+    if "source_units" in rows.columns:
+        for v in rows["source_units"]:
+            if isinstance(v, (list, tuple, np.ndarray)):
+                out.update(u for u in v if isinstance(u, str) and u.strip())
+            elif isinstance(v, str) and v.strip():
+                out.add(v)
+    return sorted(out)
+
+
+def _is_iu(unit: str) -> bool:
+    """Same normalisation as pds.unit_to_mg_factor_for: letters only, lower case."""
+    return "".join(ch for ch in unit.lower() if "a" <= ch <= "z") == "iu"
+
+
+def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.DataFrame,
+                                  target: str) -> tuple[list[dict], dict]:
+    """Per-compound Spearman between the day's amount and that night's HRV, one unit class each.
+
+    `supplements`: the long rollup (calendar_date, ingredient_group, unit_class, unit,
+    source_units, total_amount, category). `tracked`: HRV-valid rows (calendar_date + `target`)
+    inside the supplement tracking window. Returns (rows, coverage); rows carry no FDR fields.
+    """
+    rows: list[dict] = []
+    excluded: list[dict] = []
+    coverage = {"version": SUPPLEMENT_DOSE_COVERAGE_VERSION, "analyzed": 0, "excluded": excluded}
+    if supplements is None or supplements.empty:
+        return rows, coverage
+    supp = supplements.dropna(subset=["ingredient_group", "calendar_date"]).copy()
+    supp["total_amount"] = (pd.to_numeric(supp["total_amount"], errors="coerce")
+                            if "total_amount" in supp.columns else np.nan)
+    supp["_unit_class"] = supplement_unit_classes(supp)
+
+    for compound, comp_rows in supp.groupby("ingredient_group"):
+        quantified = comp_rows[comp_rows["total_amount"].notna()]
+        unquantified_days = set(comp_rows.loc[comp_rows["total_amount"].isna(), "calendar_date"])
+        classes = sorted(set(quantified["_unit_class"]))
+        eligible = [c for c in classes if c != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+        if SUPPLEMENT_MASS_CLASS in eligible:
+            primary = SUPPLEMENT_MASS_CLASS
+        elif len(eligible) == 1:
+            primary = eligible[0]
+        else:
+            reason = ("unquantified" if not classes
+                      else "unknown_unit" if not eligible else "mixed_unconverted_units")
+            excluded.append({
+                "compound": str(compound),
+                "reason": reason,
+                "unit_classes": classes,
+                "n_days": int(comp_rows["calendar_date"].nunique()),
+            })
+            continue
+
+        other = quantified[quantified["_unit_class"] != primary]
+        other_days = set(other["calendar_date"])
+        unknown_days = other_days | unquantified_days
+        prim = quantified[(quantified["_unit_class"] == primary)
+                          & ~quantified["calendar_date"].isin(unknown_days)]
+        distinct_doses = prim["total_amount"].unique()
+        if len(distinct_doses) < 3:
+            continue
+        # Amount per date; a day with no intake = 0, a day with an unknown total is not a row.
+        amt_by_date = prim.groupby("calendar_date")["total_amount"].sum()
+        base = tracked[~tracked["calendar_date"].isin(unknown_days)]
+        merged = base.merge(amt_by_date.rename("amount").reset_index(), on="calendar_date", how="left")
+        merged["amount"] = merged["amount"].fillna(0.0)
+        if merged["amount"].nunique() < 3 or len(merged) < 20:
+            continue
+        try:
+            res = stats.spearmanr(merged[target], merged["amount"])
+            r = float(res.statistic if hasattr(res, "statistic") else res[0])
+            p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
+        except Exception:
+            continue
+        category = None
+        if "category" in prim.columns and not prim["category"].dropna().empty:
+            category = prim["category"].dropna().iloc[0]
+        source_units = _supplement_source_units(prim)
+        if not source_units and primary != SUPPLEMENT_MASS_CLASS:
+            source_units = [primary]
+        rows.append({
+            "compound": str(compound),
+            "category": str(category) if category else None,
+            "unit": "mg" if primary == SUPPLEMENT_MASS_CLASS else str(primary),
+            "unit_class": str(primary),
+            "converted": primary == SUPPLEMENT_MASS_CLASS,
+            "source_units": source_units,
+            "converted_from_iu": primary == SUPPLEMENT_MASS_CLASS and any(_is_iu(u) for u in source_units),
+            "excluded_units": sorted(set(other["_unit_class"])),
+            "excluded_days": {"other_unit": len(other_days), "unquantified": len(unquantified_days)},
+            "spearman_r": r,
+            "p_value": p,
+            "n": int(len(merged)),
+            "n_distinct_doses": int(len(distinct_doses)),
+            "low_n": bool(len(merged) < 20),
+        })
+
+    coverage["analyzed"] = len(rows)
+    coverage["with_excluded_days"] = sum(
+        1 for r in rows if r["excluded_days"]["other_unit"] or r["excluded_days"]["unquantified"])
+    return rows, coverage
+
+
 def run_statistical_analysis(
     df: pd.DataFrame,
     skip: bool = False,
@@ -3353,6 +3491,7 @@ def run_statistical_analysis(
     # for compounds where the dose actually varies (≥3 distinct non-zero amounts).
     # Captures monotonic dose-response effects that Yes/No collapses on.
     # Rank-based to handle outliers and non-linear monotonic responses.
+    # One unit class per compound (supplement_dose_response_rows): mg and mL never add up.
     supplement_dose_response: list[dict] = []
     if supplements is not None and not supplements.empty:
         try:
@@ -3362,39 +3501,14 @@ def run_statistical_analysis(
             tracked = hrv_valid[hrv_valid["calendar_date"] >= tracking_start].copy()
             tracked = tracked[["calendar_date", STAT_TARGET]].dropna()
 
-            for compound, comp_rows in supp.groupby("ingredient_group"):
-                distinct_doses = comp_rows["total_amount"].dropna().unique()
-                if len(distinct_doses) < 3:
-                    continue
-                # Build amount-per-date series; days with no intake = 0.
-                amt_by_date = comp_rows.groupby("calendar_date")["total_amount"].sum()
-                merged = tracked.merge(
-                    amt_by_date.rename("amount").reset_index(),
-                    on="calendar_date", how="left",
-                )
-                merged["amount"] = merged["amount"].fillna(0.0)
-                if merged["amount"].nunique() < 3 or len(merged) < 20:
-                    continue
-                try:
-                    res = stats.spearmanr(merged[STAT_TARGET], merged["amount"])
-                    r = float(res.statistic if hasattr(res, "statistic") else res[0])
-                    p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
-                    unit = (comp_rows["unit"].dropna().iloc[0]
-                            if not comp_rows["unit"].dropna().empty else None)
-                    category = (comp_rows["category"].dropna().iloc[0]
-                                if not comp_rows["category"].dropna().empty else None)
-                    supplement_dose_response.append({
-                        "compound": str(compound),
-                        "category": str(category) if category else None,
-                        "unit": str(unit) if unit else None,
-                        "spearman_r": r,
-                        "p_value": p,
-                        "n": int(len(merged)),
-                        "n_distinct_doses": int(len(distinct_doses)),
-                        "low_n": bool(len(merged) < 20),
-                    })
-                except Exception:
-                    continue
+            supplement_dose_response, dose_coverage = supplement_dose_response_rows(
+                supplements, tracked, STAT_TARGET)
+            results["supplement_dose_response_coverage"] = dose_coverage
+            if dose_coverage["excluded"] or dose_coverage.get("with_excluded_days"):
+                # Counts only: the Actions log is public.
+                log.info(f"  Supplement dose-response units: {len(dose_coverage['excluded'])} compounds "
+                         f"without a comparable unit, {dose_coverage.get('with_excluded_days', 0)} with "
+                         f"days left out (another unit or no amount)")
 
             if supplement_dose_response and HAS_FDR and len(supplement_dose_response) > 1:
                 p_values = np.array([r["p_value"] for r in supplement_dose_response])
@@ -5615,6 +5729,13 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             "result_type": "supplement_impact",
             "result_key": "dose_response",
             "result_json": stat_results["supplement_dose_response"],
+        })
+    # Which compounds or days the dose-response left out for their unit (HIST-UNIT-01).
+    if "supplement_dose_response_coverage" in stat_results:
+        rows.append({
+            "result_type": "supplement_impact",
+            "result_key": "dose_response_coverage",
+            "result_json": stat_results["supplement_dose_response_coverage"],
         })
 
     # Nutrition Spearman
