@@ -209,7 +209,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
     const rows = () => tables[table];
     const match = (r) =>
       st.filters.every(([k, op, v]) =>
-        op === "eq" ? r[k] === v : op === "neq" ? r[k] !== v : op === "gte" ? r[k] >= v : op === "in" ? v.includes(r[k]) : true,
+        op === "eq" ? r[k] === v : op === "neq" ? r[k] !== v : op === "gte" ? r[k] >= v : op === "in" ? v.includes(r[k]) : op === "is" ? (r[k] ?? null) === v : true,
       );
     const run = () => {
       log.push({ table, op: st.op, payload: st.payload, filters: st.filters });
@@ -267,6 +267,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       select() { return b; },
       eq(k, v) { st.filters.push([k, "eq", v]); return b; },
       neq(k, v) { st.filters.push([k, "neq", v]); return b; },
+      is(k, v) { st.filters.push([k, "is", v]); return b; },
       gte(k, v) { st.filters.push([k, "gte", v]); return b; },
       in(k, v) { st.filters.push([k, "in", v]); return b; },
       order(k, o) { st.order = { k, asc: o?.ascending !== false }; return b; },
@@ -953,8 +954,103 @@ test("removal whose answer was lost: the database part committed whole, the retr
   assert.deepEqual([retry.cleanup.sessionId, retry.cleanup.notionBlockId, retry.cleanup.done], [41, "blk-1", false]);
   assert.equal(db.log.filter((l) => l.op === "rpc").length, 2, "the retry is one read-and-answer call: no second delete, finish or habit write");
   // Once the route has trashed the entry it marks the row done; a later retry replays nothing.
-  await R.markRemovalMirrored(db, 41);
+  await R.markRemovalMirrored(db, 41, "blk-1");
   assert.equal((await R.deleteSession(db, 41, null)).cleanup.done, true);
+});
+
+/* ---------- Notion cleanup completion races (Codex T01-R9) ---------- */
+
+/** reading-removal.ts with a controllable Notion: `trash(id)` and `progress()` answer what the test says. */
+function removalWithNotion() {
+  const notion = { trashed: [], trash: async () => true, progress: async () => true };
+  const RR = loadTs("lib/reading-removal.ts", {
+    "./reading-notion": {
+      removeMirroredBlock: async (id) => {
+        notion.trashed.push(id);
+        return notion.trash(id);
+      },
+      mirrorProgress: async () => notion.progress(),
+    },
+  });
+  return { RR, notion };
+}
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((r) => (resolve = r));
+  return { promise, resolve };
+};
+const removalRow = (over = {}) => ({ session_id: 41, client_key: KEY, book_id: 7, session_date: "2026-11-15", notion_block_id: null, unfinished: false, removed_at: "2026-11-15T21:00:00Z", mirror_done_at: null, ...over });
+const cleanupOf = (row) => ({ sessionId: row.session_id, bookId: row.book_id, sessionDate: row.session_date, notionBlockId: row.notion_block_id, unfinished: false, done: false });
+const PAGED_BOOK = { ...BOOK, notion_page_id: "page-1" };
+const answerFor = () => ({ book: PAGED_BOOK, bookUnread: false, overview: { chaptersDone: 3, sessions: [] }, removedId: null, owed: true });
+
+test("T01-R9: a removal cleanup that saw no entry does not close a late entry recorded while it ran, whose trash failed", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK], reading_session_removals: [removalRow()] });
+  // The removal's cleanup read its row with no Notion entry and is now waiting on the progress rewrite.
+  const gate = deferred();
+  notion.progress = () => gate.promise;
+  const stale = RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow()) }, answerFor());
+  await new Promise((r) => setImmediate(r));
+  // Meanwhile the create's callback records its late entry (reopening the row), but Notion refuses the trash.
+  notion.trash = async (id) => id !== "blk-late";
+  const late = await RR.trashLateBlock(db, 41, "blk-late", async () => true);
+  assert.deepEqual(late, { recorded: true, trashed: false, progressDone: true, complete: false });
+  // The stale cleanup's progress rewrite now succeeds: it closes only the work it did (no entry), not the late one.
+  gate.resolve(true);
+  await stale;
+  const row = db.tables.reading_session_removals[0];
+  assert.equal(row.notion_block_id, "blk-late", "the late entry stays recorded");
+  assert.equal(row.mirror_done_at, null, "still owed: the sweep finds it");
+  // The sweep's run reads the row with the late entry, trashes it and closes it.
+  notion.trash = async () => true;
+  notion.progress = async () => true;
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(row) }, answerFor());
+  assert.ok(notion.trashed.filter((id) => id === "blk-late").length >= 2, "the sweep trashed the late entry again");
+  assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null, "closed once its own work is done");
+});
+
+test("T01-R9: a stale cleanup that finishes BEFORE the late entry is recorded is reopened by it", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK], reading_session_removals: [removalRow()] });
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow()) }, answerFor());
+  assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null, "no entry and the progress rewritten: done");
+  notion.trash = async () => false;
+  await RR.trashLateBlock(db, 41, "blk-late", async () => true);
+  assert.equal(db.tables.reading_session_removals[0].mirror_done_at, null, "the late entry reopens the row");
+  assert.equal(db.tables.reading_session_removals[0].notion_block_id, "blk-late");
+});
+
+test("T01-R9: a late entry trashed but whose progress rewrite failed stays owed; it closes once both succeed", async () => {
+  const { RR, notion } = removalWithNotion();
+  // The removal's own cleanup had already closed the row (it saw no entry).
+  const db = fakeDb({ books: [PAGED_BOOK], reading_session_removals: [removalRow({ mirror_done_at: "2026-11-15T21:00:05Z" })] });
+  const failedProgress = await RR.trashLateBlock(db, 41, "blk-late", async () => false);
+  assert.deepEqual(failedProgress, { recorded: true, trashed: true, progressDone: false, complete: false });
+  assert.equal(db.tables.reading_session_removals[0].mirror_done_at, null, "not closed after the trash alone");
+  // A progress rewrite that throws counts as failed too.
+  const thrown = await RR.trashLateBlock(db, 41, "blk-late", async () => { throw new Error("notion down"); });
+  assert.equal(thrown.complete, false);
+  assert.equal(db.tables.reading_session_removals[0].mirror_done_at, null);
+  // The sweep later completes both steps and closes it.
+  notion.progress = async () => true;
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(db.tables.reading_session_removals[0]) }, answerFor());
+  assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null);
+  // And a late entry whose trash and progress both succeed closes at once.
+  const db2 = fakeDb({ books: [PAGED_BOOK], reading_session_removals: [removalRow()] });
+  const ok = await RR.trashLateBlock(db2, 41, "blk-late", async () => true);
+  assert.equal(ok.complete, true);
+  assert.notEqual(db2.tables.reading_session_removals[0].mirror_done_at, null);
+});
+
+test("T01-R9: markRemovalMirrored closes only the entry the caller handled", async () => {
+  const db = fakeDb({ reading_session_removals: [removalRow({ notion_block_id: "blk-new" })] });
+  await R.markRemovalMirrored(db, 41, null);
+  assert.equal(db.tables.reading_session_removals[0].mirror_done_at, null, "a run that saw no entry leaves a recorded one open");
+  await R.markRemovalMirrored(db, 41, "blk-old");
+  assert.equal(db.tables.reading_session_removals[0].mirror_done_at, null, "nor does a run that handled another entry");
+  await R.markRemovalMirrored(db, 41, "blk-new");
+  assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null);
 });
 
 test("logSession: without pds.create_reading_session a keyed create is refused (503), never done in steps (PR 376 review)", async () => {

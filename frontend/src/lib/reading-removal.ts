@@ -60,25 +60,52 @@ export async function runRemovalCleanup(supabase: Supa, r: Extract<SessionRemova
   else if (!overview) progressDone = false;
   else progressDone = await mirrorProgress(book, overview.chaptersDone ?? 0, overview.sessions?.[0]?.session_date ?? null);
   const sessionId = r.cleanup?.sessionId ?? null;
-  if (trashed && progressDone && sessionId !== null) await markRemovalMirrored(supabase, sessionId);
+  // Closed only while the row still records the entry this run handled (Codex T01-R9): a late entry a create
+  // callback recorded meanwhile stays owed.
+  if (trashed && progressDone && sessionId !== null) await markRemovalMirrored(supabase, sessionId, blockId);
+}
+
+/**
+ * The book page's progress line, rewritten from the database as it is NOW (review of PR 376, round 3). True when it
+ * was rewritten or is not owed (the book no longer exists, or has no Notion page); false when the book could not be
+ * read, its overview could not be computed, or the rewrite failed.
+ */
+export async function rewriteProgressNow(supabase: Supa, bookId: number): Promise<boolean> {
+  const { data, error } = await supabase.from("books").select(BOOK_COLS).eq("book_id", bookId).maybeSingle();
+  if (error) return false;
+  const book = (data as Book | null) ?? null;
+  if (!book || !book.notion_page_id) return true;
+  const current = await getOverview(supabase, book.slug).catch(() => null);
+  if (!current) return false;
+  return mirrorProgress(book, current.chaptersDone ?? 0, current.sessions?.[0]?.session_date ?? null);
 }
 
 /**
  * A create's own Notion callback wrote an entry for a session that a removal had already taken out (review of PR 376,
  * round 3). The block id goes into the removal's cleanup row FIRST, with the cleanup reopened, so it is owed and
- * found by the sweep below even if the trash call or this process fails; then it is trashed and the row closed.
- * Returns true when the entry is gone.
+ * found by the sweep below even if the trash call or this process fails; then it is trashed and the book's progress
+ * line rewritten (`rewriteProgress`, the callback's last step). The row is closed only when ALL of that succeeded
+ * (Codex T01-R9): a failed record, trash or progress rewrite leaves it open for the sweep, and the close is
+ * conditional on the row still recording this entry. A removal cleanup that started earlier with no entry closes
+ * nothing of this work (markRemovalMirrored). Returns what happened (`complete` = every step succeeded and the close was sent), for the caller and the tests.
  */
-export async function trashLateBlock(supabase: Supa, sessionId: number, blockId: string): Promise<boolean> {
+export async function trashLateBlock(
+  supabase: Supa,
+  sessionId: number,
+  blockId: string,
+  rewriteProgress: () => Promise<boolean>,
+): Promise<{ recorded: boolean; trashed: boolean; progressDone: boolean; complete: boolean }> {
   const { error } = await supabase
     .from("reading_session_removals")
     .update({ notion_block_id: blockId, mirror_done_at: null })
     .eq("session_id", sessionId);
   if (error) console.error("reading: late block record failed:", error.code ?? "unknown");
+  const recorded = !error;
   const trashed = await removeMirroredBlock(blockId);
-  // The book's progress line is rewritten by the create callback's last step from the database as it is then.
-  if (trashed && !error) await markRemovalMirrored(supabase, sessionId);
-  return trashed;
+  const progressDone = await rewriteProgress().catch(() => false);
+  const complete = recorded && trashed && progressDone;
+  if (complete) await markRemovalMirrored(supabase, sessionId, blockId);
+  return { recorded, trashed, progressDone, complete };
 }
 
 let lastSweep = 0;

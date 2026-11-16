@@ -726,9 +726,16 @@ export function removalOutcomeOf(data: unknown): RemovalOutcome {
   return { kind: "removed", session, book, unfinished: out.unfinished === true, habitRemoved: out.habit_removed === true, cleanup: cleanupOf(out.removal) };
 }
 
-/** The removal's Notion cleanup is done (its entry trashed, or it had none): a later retry replays nothing. */
-export async function markRemovalMirrored(supabase: Supa, sessionId: number): Promise<void> {
-  const { error } = await supabase.from("reading_session_removals").update({ mirror_done_at: new Date().toISOString() }).eq("session_id", sessionId);
+/**
+ * The removal's Notion cleanup is done (its entry trashed, or it had none): a later retry replays nothing. Closed
+ * only for the work the caller actually did (Codex T01-R9): `blockId` is the Notion entry it trashed (null = it saw
+ * none), and the row is closed only while it still records that same entry. A create callback that recorded a late
+ * entry meanwhile (lib/reading-removal.ts trashLateBlock) changed the row's block id and reopened it, so a cleanup
+ * that started before that, with no entry or another one, leaves the new work open for its owner or the sweep.
+ */
+export async function markRemovalMirrored(supabase: Supa, sessionId: number, blockId: string | null): Promise<void> {
+  const base = supabase.from("reading_session_removals").update({ mirror_done_at: new Date().toISOString() }).eq("session_id", sessionId);
+  const { error } = await (blockId === null ? base.is("notion_block_id", null) : base.eq("notion_block_id", blockId));
   if (error) console.error("reading: removal cleanup mark failed:", error.code ?? "unknown");
 }
 
