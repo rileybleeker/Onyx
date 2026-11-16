@@ -33,22 +33,33 @@ statement; apply only after the facade is deployed and the browser reads are
 confirmed gone), checked afterwards with `sql/checks/verify_matview_revoke.sql`
 (read-only: no browser-role privilege, role `authenticated` refused with the
 owner's and a synthetic other account's claims, `service_role` still reads, the
-unique indexes remain). In the repo no view reads any of the six (the one view
-over a matview, `pds.daily_micronutrient_totals`, reads
-`supplement_intake_by_compound_mat`, already service-role only); the revoke
-migration re-checks views, row-security policies and function bodies on the live
-database and aborts, changing nothing, if a browser role could reach a matview
-another way or if any other pds matview is still readable. The grants must not
-come back: the recreate recipes in `sql/perf_matrix_matview.sql` and
+matviews are populated, the unique indexes remain, and the dependency graph
+below is still closed to browser roles). In the repo no view reads any of the
+six (the one view over a matview, `pds.daily_micronutrient_totals`, reads
+`supplement_intake_by_compound_mat`, already service-role only). The revoke
+migration walks the whole dependency graph from all six on the live database on
+every run, a re-run included: views and matviews over them and over those
+(private definer views count as hops), functions whose body names or depends on
+any node, and views, policies and functions over those functions. It aborts,
+changing nothing, if anon or authenticated can read a relation in that graph
+(table or column), call a function in it, or if a policy, trigger or any other
+object uses one, or if any other pds matview is still readable. The grants must
+not come back: the recreate recipes in `sql/perf_matrix_matview.sql` and
 `sql/perf_tier2_matviews.sql` grant only `service_role` and revoke `anon` /
 `authenticated` (the pds default privileges in `sql/rls_policies.sql` grant
 `authenticated` SELECT on every new relation, matviews included), and PART 1 of
-`sql/pds_owner_only_read.sql` skips matviews. If a caller that cannot use the
-facade breaks, move it to a facade read or a service-role server read;
-`sql/pds_matview_revoke_authenticated_rollback.sql` restores the old
-`authenticated` SELECT (never anon) and reopens the direct read, so it is a
-last resort until the caller is moved. Future view migrations must preserve
-`security_invoker` and review their entire source graph.
+`sql/pds_owner_only_read.sql` skips matviews. There is no rollback that grants a
+browser role again. If a caller that cannot use the facade breaks (it gets
+42501), keep the grants revoked: move it to a facade read in
+`lib/derived-reads.ts` or a service-role server read, or turn that panel off
+until it is moved. If `service_role` lost SELECT on one (a recreate that skipped
+the recipe), `GRANT SELECT ON pds.<name>_mat TO service_role` restores the facade
+without opening anything to browser roles. Isolated PostgreSQL fixtures for
+these rules (two-hop definer chain, re-run after the revoke, column grants,
+function paths, policies, triggers) are in `tests/test_pds_matview_revoke_pg.py`;
+they run only against a disposable `*_fixture` database and skip without one.
+Future view migrations must preserve `security_invoker`
+and review their entire source graph.
 
 Recovery: if preconditions fail, nothing changes. After deployment, repair a
 specific source/caller permission contract while keeping owner RLS intact. Do not

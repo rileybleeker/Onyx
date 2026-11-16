@@ -4,13 +4,16 @@ A materialized view has no row security, so an authenticated SELECT grant on a p
 signed-in account read every row through the Data API. Phase 1 moved every browser read behind the
 owner-only facade GET /api/derived/<name>; sql/pds_matview_revoke_authenticated.sql takes the grant
 away. These tests pin the migration's contract without a database: what it revokes and from whom,
-that every check runs before the revoke inside one atomic statement, that a re-run is harmless, that
-the rollback restores exactly the old grant and nothing wider, that the post-apply check is read-only
-and probes both the owner and another account, and that no repo SQL hands a matview to a browser role
-again (recreate recipes, PART 1 of sql/pds_owner_only_read.sql).
+that every check runs before the revoke inside one atomic statement, that the reachability checks walk
+the whole dependency graph from all six on every run (a re-run included), that a re-run is harmless,
+that there is no rollback granting a browser role again, that the post-apply check is read-only, walks
+the same graph and probes both the owner and another account, and that no repo SQL hands a matview to
+a browser role again (recreate recipes, PART 1 of sql/pds_owner_only_read.sql).
 
-The live behaviour (owner and another account refused with 42501, service_role still reads) is
-checked after the migration is applied by sql/checks/verify_matview_revoke.sql.
+What the migration does on a real PostgreSQL (two-hop definer chain, re-run after the revoke, column
+grants, function paths) is in tests/test_pds_matview_revoke_pg.py (needs a disposable database). The
+live behaviour (owner and another account refused with 42501, service_role still reads) is checked
+after the migration is applied by sql/checks/verify_matview_revoke.sql.
 
 Run: python tests/test_pds_matview_revoke.py
      python tests/run_offline_tests.py tests/test_pds_matview_revoke.py
@@ -22,7 +25,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FORWARD = ROOT / "sql" / "pds_matview_revoke_authenticated.sql"
-ROLLBACK = ROOT / "sql" / "pds_matview_revoke_authenticated_rollback.sql"
 VERIFY = ROOT / "sql" / "checks" / "verify_matview_revoke.sql"
 OWNER_ONLY = ROOT / "sql" / "pds_owner_only_read.sql"
 
@@ -96,7 +98,7 @@ def test_forward_targets_exactly_the_six_browser_matviews() -> None:
     # Every name is a matview the repo's other SQL names (a typo would make the live check raise).
     named: set[str] = set()
     for p in _repo_sql_files():
-        if p in (FORWARD, ROLLBACK, VERIFY):
+        if p in (FORWARD, VERIFY):
             continue
         named |= set(re.findall(r"\bpds\.([a-z_]+_mat)\b", p.read_text(encoding="utf-8")))
     assert SIX <= named, sorted(SIX - named)
@@ -129,10 +131,12 @@ def test_forward_is_one_atomic_statement_and_every_check_precedes_the_revoke() -
         "has_table_privilege('service_role', rel, 'SELECT')",         # the facade keeps working
         "i.indisunique AND i.indpred IS NULL",                        # CONCURRENTLY refresh keeps its index
         "Unreviewed pds matview",                                     # nothing but the reviewed six
+        "WITH RECURSIVE reach(cls, obj)",                             # the whole dependency graph
         "'pg_rewrite'::regclass",                                     # no view / matview over one
+        "has_any_column_privilege('authenticated', c.oid, 'SELECT')", # ... readable on a single column
         "'pg_policy'::regclass",                                      # no row-security policy over one
         "has_function_privilege('authenticated', p.oid, 'EXECUTE')",  # no callable function over one
-        "pg_trigger",                                                 # no invoker trigger function over one
+        "pg_trigger",                                                 # no trigger function over one
     ):
         assert needle in before, needle
     assert before.count("RAISE EXCEPTION") >= 7
@@ -141,6 +145,48 @@ def test_forward_is_one_atomic_statement_and_every_check_precedes_the_revoke() -
     assert "has_any_column_privilege('authenticated', c.oid, 'SELECT')" in after
     assert "service_role lost SELECT" in after
     assert "lock_timeout" in before
+
+
+def _graph(code: str) -> str:
+    m = re.search(r"WITH RECURSIVE reach\(cls, obj\).*?FROM reach;", code, re.S)
+    assert m, "dependency graph query not found"
+    return m.group(0)
+
+
+def test_reachability_graph_starts_from_all_six_on_every_run() -> None:
+    body = re.findall(r"DO \$migration\$(.*?)\$migration\$;", _code(FORWARD), re.S)[0]
+    # Step 1 collects the six it verified; the graph starts from them, never from the matviews that
+    # still carry a grant (that list is empty on a re-run, which would skip every check).
+    assert "six := six || rel;" in body
+    checks = body[body.index("WITH RECURSIVE reach(cls, obj)"):body.index("EXECUTE format('REVOKE")]
+    assert "unnest(six)" in checks
+    assert "targets" not in checks, "a reachability check uses the grant list instead of all six"
+    graph = _graph(body)
+    # Recursive: views over views (two hops and more), functions with a recorded dependency on a
+    # node or on a matview's row type, functions whose source names a node (relations by relname,
+    # functions by proname, so a function calling a function is followed).
+    for needle in ("FROM reach cur", "CROSS JOIN LATERAL", "d.classid = 'pg_rewrite'::regclass", "w.ev_class",
+                   "d.classid = 'pg_proc'::regclass", "d.refclassid = 'pg_type'::regclass", "c.reltype",
+                   "p.prosrc ~", "c.relname FROM pg_class", "q.proname FROM pg_proc"):
+        assert needle in graph, needle
+    # What is checked on the graph: every relation but the six (table AND column privileges, both
+    # browser roles), every policy over a relation or function of it, every function of it.
+    for needle in ("c.oid = ANY (reach_rels) AND NOT c.oid = ANY (six)",
+                   "has_table_privilege('anon', c.oid, 'SELECT')",
+                   "has_any_column_privilege('anon', c.oid, 'SELECT')",
+                   "has_any_column_privilege('authenticated', c.oid, 'SELECT')",
+                   "d.refobjid = ANY (reach_rels)", "d.refobjid = ANY (reach_fns)",
+                   "has_function_privilege('anon', p.oid, 'EXECUTE')",
+                   "'event_trigger'::regtype", "pg_event_trigger",
+                   "d.classid NOT IN ('pg_proc'::regclass, 'pg_rewrite'::regclass, 'pg_policy'::regclass)"):
+        assert needle in checks, needle
+    # Fail closed: a void refresh function is NOT exempt; it passes only while no browser role may
+    # call it (sql/matview_refresh_concurrently.sql functions are SECURITY DEFINER).
+    assert "'void'::regtype" not in checks
+
+
+def test_verify_check_walks_the_same_graph_as_the_migration() -> None:
+    assert _graph(_code(VERIFY)) == _graph(_code(FORWARD))
 
 
 def test_forward_rerun_after_success_is_a_harmless_no_op() -> None:
@@ -163,28 +209,33 @@ def test_forward_drift_list_covers_public_anon_and_authenticated() -> None:
 def test_no_file_contains_a_statement_that_removes_anything() -> None:
     # The Supabase MCP connector refuses (or asks to confirm) a migration whose text holds the word,
     # comments included; and none of these files may remove data or objects.
-    for path in (FORWARD, ROLLBACK, VERIFY):
+    for path in (FORWARD, VERIFY):
         raw = path.read_text(encoding="utf-8")
         for word in ("drop", "truncate", "delete"):
             assert not re.search(rf"\b{word}", raw, re.I), f"{path.name}: {word}"
 
 
 # --------------------------------------------------------------------------------------------------
-# Rollback
+# Recovery keeps the grants revoked
 # --------------------------------------------------------------------------------------------------
 
-def test_rollback_restores_only_authenticated_select_on_the_six() -> None:
-    code = _code(ROLLBACK)
-    assert set(_expected_array(code)) == SIX
-    grants = _statements(code, "GRANT")
-    assert grants == ["GRANT SELECT ON TABLE pds.%I TO authenticated"], grants
-    assert _statements(code, "REVOKE") == []
-    low = code.lower()
-    assert "anon" not in low and "public" not in low  # never anon / PUBLIC
-    for wider in (r"\bGRANT\s+ALL\b", r"\bINSERT\b", r"\bUPDATE\b", r"ON\s+ALL\s+TABLES", r"DEFAULT\s+PRIVILEGES"):
-        assert not re.search(wider, code, re.I), wider
-    # Each target is checked to be a pds matview before anything is granted.
-    assert code.index("RAISE EXCEPTION") < code.index("EXECUTE format('GRANT")
+def _prose(text: str) -> str:
+    return " ".join(text.replace("--", " ").split())
+
+
+def test_there_is_no_rollback_that_grants_a_browser_role_again() -> None:
+    # SEC-01-B: recovery keeps broad grants revoked (fix the caller through the facade or a
+    # service-role server read, or turn its panel off); a matview grant would show every row to every
+    # signed-in account. So no file restores the grant, and the docs say what to do instead.
+    assert not (ROOT / "sql" / "pds_matview_revoke_authenticated_rollback.sql").exists()
+    header = _prose(FORWARD.read_text(encoding="utf-8").split("DO $migration$", 1)[0])
+    assert "no rollback that grants a browser role again" in header
+    assert "GRANT SELECT ON pds.<name>_mat TO service_role" in header
+    doc = (ROOT / "docs" / "owner-view-access.md").read_text(encoding="utf-8")
+    assert "There is no rollback that grants a browser role again" in _prose(doc)
+    assert "keep the grants revoked" in _prose(doc)
+    for path in [ROOT / "AGENTS.md", ROOT / "docs" / "owner-view-access.md", *_repo_sql_files()]:
+        assert "pds_matview_revoke_authenticated_rollback" not in path.read_text(encoding="utf-8"), path
 
 
 # --------------------------------------------------------------------------------------------------
@@ -211,7 +262,13 @@ def test_verify_check_is_read_only_and_probes_owner_and_another_account() -> Non
     # service_role keeps reading, the unique index stays, no other pds matview is open.
     assert "SET LOCAL ROLE service_role" in code
     assert "i.indisunique AND i.indpred IS NULL" in code
+    assert "relispopulated" in code
     assert "Other pds matviews readable by a browser role" in code
+    assert "has_any_column_privilege('authenticated', c.oid, 'SELECT')" in code
+    # The dependency graph is closed to browser roles (same query as the migration's step 3).
+    for needle in ("Browser-readable relation reaches a matview", "Row-security policy reaches a matview",
+                   "Function a browser role can reach reads a matview", "graph_closed_to_browser_roles"):
+        assert needle in code, needle
     # Output is counts and booleans only, never a row.
     assert "jsonb_build_object(" in code and "SELECT * FROM %s LIMIT 0" in code
     assert "row_to_json" not in raw and "to_jsonb(" not in raw
@@ -231,7 +288,7 @@ def test_part1_of_owner_only_read_never_grants_a_matview() -> None:
 
 
 def test_no_repo_sql_grants_a_matview_to_a_browser_role() -> None:
-    offenders = [f"{p.relative_to(ROOT)}: {hit}" for p in _repo_sql_files() if p != ROLLBACK
+    offenders = [f"{p.relative_to(ROOT)}: {hit}" for p in _repo_sql_files()
                  for hit in _browser_mat_grants(p.read_text(encoding="utf-8"))]
     assert offenders == [], offenders
 

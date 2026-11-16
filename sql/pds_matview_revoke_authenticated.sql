@@ -12,9 +12,16 @@
 --
 -- Apply ONLY after the facade is deployed and the browser is confirmed to read
 -- no *_mat directly (docs/owner-view-access.md). Then run
--- sql/checks/verify_matview_revoke.sql. Rollback (reopens the direct read; use
--- only while something that cannot use the facade is broken):
--- sql/pds_matview_revoke_authenticated_rollback.sql.
+-- sql/checks/verify_matview_revoke.sql.
+--
+-- There is deliberately no rollback that grants a browser role again: a grant
+-- on a matview shows every row to every signed-in account. Recovery keeps the
+-- grants revoked: a caller that still reads a *_mat with the browser session
+-- (it now gets 42501) moves to a GET /api/derived/<name> read in
+-- lib/derived-reads.ts or a service-role server read, or its panel is turned
+-- off until it is moved. If service_role ever lost SELECT (a recreate that
+-- skipped the recipe below), GRANT SELECT ON pds.<name>_mat TO service_role
+-- restores the facade without opening anything to anon / authenticated.
 --
 -- What it changes: REVOKE ALL ... FROM PUBLIC, anon, authenticated on each of
 -- the six matviews below that still carries such a grant (today:
@@ -25,9 +32,10 @@
 --
 -- One DO statement, so it is atomic: every check runs before the first REVOKE,
 -- and a failed check after it undoes the whole statement. Re-running after a
--- successful run changes nothing and passes. A check that fails means the
--- database is not what was reviewed: stop and review, never add a grant or
--- skip the check to make it pass.
+-- successful run changes nothing and passes; the reachability checks (step 3)
+-- run over all six on every run, not only over those that still carry a
+-- grant. A check that fails means the database is not what was reviewed: stop
+-- and review, never add a grant or skip the check to make it pass.
 --
 -- Recreating one of these matviews later: the pds default privileges
 -- (sql/rls_policies.sql) give authenticated SELECT on every new relation, so a
@@ -54,7 +62,10 @@ DECLARE
     browser_roles constant oid[] := ARRAY[0::oid, 'anon'::regrole::oid, 'authenticated'::regrole::oid];  -- 0 = PUBLIC
     mat_name text;
     rel oid;
+    six oid[] := '{}'::oid[];
     targets oid[];
+    reach_rels oid[];
+    reach_fns oid[];
     unexpected text;
     blocker text;
 BEGIN
@@ -76,6 +87,7 @@ BEGIN
                        WHERE i.indrelid = rel AND i.indisunique AND i.indpred IS NULL) THEN
             RAISE EXCEPTION 'pds.% has no unique non-partial index; review before applying', mat_name;
         END IF;
+        six := six || rel;
     END LOOP;
 
     -- 2. Every pds matview a browser role can still use, on the table or on a
@@ -92,48 +104,94 @@ BEGIN
         RAISE EXCEPTION 'Unreviewed pds matview readable by a browser role: %; review before applying', unexpected;
     END IF;
 
-    -- 3. Nothing a browser role can reach may read these matviews in its place:
-    --    a view or matview over one (an invoker view would break for the owner, a
-    --    definer view would keep exposing every row), a row-security policy that
-    --    queries one, or a function naming one that anon / authenticated may call
-    --    or that a trigger runs with the caller's rights.
-    SELECT string_agg(DISTINCT format('%s <- %s', m.oid::regclass, dc.oid::regclass), '; ')
+    -- 3. Nothing a browser role can reach may read the six in their place, however
+    --    indirectly. The graph starts from all six on every run (a re-run, when no
+    --    direct grant is left, checks the same graph) and follows, transitively:
+    --    views and matviews whose query uses a node (a private definer view over a
+    --    matview, then a readable view over that, is two hops); functions whose
+    --    SQL-standard body depends on a node or on a matview's row type; functions
+    --    whose source text names a node (plpgsql records no dependency). Each
+    --    function found is a node too, so a view over it, or a function calling
+    --    it, is followed in turn.
+    WITH RECURSIVE reach(cls, obj) AS (
+        SELECT 'pg_class'::regclass::oid, r FROM unnest(six) AS r
+      UNION
+        SELECT nxt.cls, nxt.obj
+        FROM reach cur
+        CROSS JOIN LATERAL (
+            SELECT 'pg_class'::regclass::oid AS cls, w.ev_class AS obj
+            FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+            WHERE d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = cur.cls AND d.refobjid = cur.obj
+              AND NOT (cur.cls = 'pg_class'::regclass AND w.ev_class = cur.obj)
+          UNION
+            SELECT 'pg_proc'::regclass::oid, d.objid
+            FROM pg_depend d
+            WHERE d.classid = 'pg_proc'::regclass
+              AND ((d.refclassid = cur.cls AND d.refobjid = cur.obj)
+                   OR (cur.cls = 'pg_class'::regclass AND d.refclassid = 'pg_type'::regclass
+                       AND d.refobjid = (SELECT c.reltype FROM pg_class c WHERE c.oid = cur.obj)))
+          UNION
+            SELECT 'pg_proc'::regclass::oid, p.oid
+            FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace
+            WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND NOT (cur.cls = 'pg_proc'::regclass AND p.oid = cur.obj)
+              AND p.prosrc ~ ('\m' || CASE WHEN cur.cls = 'pg_class'::regclass
+                                           THEN (SELECT c.relname FROM pg_class c WHERE c.oid = cur.obj)::text
+                                           ELSE (SELECT q.proname FROM pg_proc q WHERE q.oid = cur.obj)::text
+                                      END || '\M')
+        ) nxt
+    )
+    SELECT coalesce(array_agg(obj) FILTER (WHERE cls = 'pg_class'::regclass), '{}'::oid[]),
+           coalesce(array_agg(obj) FILTER (WHERE cls = 'pg_proc'::regclass), '{}'::oid[])
+    INTO reach_rels, reach_fns
+    FROM reach;
+
+    -- 3a. No relation in the graph (other than the six) that anon or authenticated
+    --     can read, on the table or on a single column: a definer view would keep
+    --     showing every row, an invoker view would break for the owner.
+    SELECT string_agg(c.oid::regclass::text, ', ' ORDER BY c.oid::regclass::text)
     INTO blocker
-    FROM pg_class m
-    JOIN pg_depend d ON d.refobjid = m.oid AND d.refclassid = 'pg_class'::regclass
-                    AND d.classid = 'pg_rewrite'::regclass
-    JOIN pg_rewrite w ON w.oid = d.objid
-    JOIN pg_class dc ON dc.oid = w.ev_class
-    WHERE m.oid = ANY (targets) AND dc.oid <> m.oid
-      AND (has_table_privilege('anon', dc.oid, 'SELECT')
-           OR has_table_privilege('authenticated', dc.oid, 'SELECT'));
+    FROM pg_class c
+    WHERE c.oid = ANY (reach_rels) AND NOT c.oid = ANY (six)
+      AND (has_table_privilege('anon', c.oid, 'SELECT')
+           OR has_table_privilege('authenticated', c.oid, 'SELECT')
+           OR has_any_column_privilege('anon', c.oid, 'SELECT')
+           OR has_any_column_privilege('authenticated', c.oid, 'SELECT'));
     IF blocker IS NOT NULL THEN
-        RAISE EXCEPTION 'A browser-readable relation reads a matview (%); move it first', blocker;
+        RAISE EXCEPTION 'A browser-readable relation reads a matview, directly or through other objects (%); move it first', blocker;
     END IF;
 
-    SELECT string_agg(DISTINCT format('%s <- policy %s on %s', m.oid::regclass, p.polname, p.polrelid::regclass), '; ')
+    -- 3b. No row-security policy that uses a relation or a function of the graph.
+    SELECT string_agg(DISTINCT format('policy %s on %s', p.polname, p.polrelid::regclass), '; ')
     INTO blocker
-    FROM pg_class m
-    JOIN pg_depend d ON d.refobjid = m.oid AND d.refclassid = 'pg_class'::regclass
-                    AND d.classid = 'pg_policy'::regclass
-    JOIN pg_policy p ON p.oid = d.objid
-    WHERE m.oid = ANY (targets);
+    FROM pg_policy p
+    JOIN pg_depend d ON d.classid = 'pg_policy'::regclass AND d.objid = p.oid
+    WHERE (d.refclassid = 'pg_class'::regclass AND d.refobjid = ANY (reach_rels))
+       OR (d.refclassid = 'pg_proc'::regclass AND d.refobjid = ANY (reach_fns));
     IF blocker IS NOT NULL THEN
-        RAISE EXCEPTION 'A row-security policy reads a matview (%); move it first', blocker;
+        RAISE EXCEPTION 'A row-security policy reads a matview, directly or through other objects (%); move it first', blocker;
     END IF;
 
-    SELECT string_agg(DISTINCT format('%s <- %s', m.oid::regclass, p.oid::regprocedure), '; ')
+    -- 3c. No function of the graph that anon or authenticated may call, that is a
+    --     trigger or event-trigger function, or that anything other than a view, a
+    --     policy or another function uses (a default, a constraint, an index, a
+    --     cast, an operator ...: not reviewed, so not allowed). A refresh function
+    --     passes only while no browser role may call it.
+    SELECT string_agg(DISTINCT p.oid::regprocedure::text, '; ')
     INTO blocker
-    FROM pg_class m
-    JOIN pg_proc p ON p.prosrc ~ ('\m' || m.relname || '\M')
-    JOIN pg_namespace pn ON pn.oid = p.pronamespace
-    WHERE m.oid = ANY (targets)
-      AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
+    FROM pg_proc p
+    WHERE p.oid = ANY (reach_fns)
       AND (has_function_privilege('anon', p.oid, 'EXECUTE')
            OR has_function_privilege('authenticated', p.oid, 'EXECUTE')
-           OR (NOT p.prosecdef AND EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)));
+           OR p.prorettype IN ('trigger'::regtype, 'event_trigger'::regtype)
+           OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)
+           OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = p.oid)
+           OR EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = p.oid
+                        AND d.classid NOT IN ('pg_proc'::regclass, 'pg_rewrite'::regclass, 'pg_policy'::regclass)));
     IF blocker IS NOT NULL THEN
-        RAISE EXCEPTION 'A function browser roles can reach reads a matview (%); move it first', blocker;
+        RAISE EXCEPTION 'A function browser roles can reach reads a matview, directly or through other objects (%); move it first', blocker;
     END IF;
 
     -- 4. Revoke. Table-level REVOKE also takes away any column privileges.
@@ -160,6 +218,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    RAISE NOTICE 'pds matviews revoked from browser roles: % (0 = already done)', cardinality(targets);
+    RAISE NOTICE 'pds matviews revoked from browser roles: % (0 = already done); graph checked: % relations, % functions',
+        cardinality(targets), cardinality(reach_rels), cardinality(reach_fns);
 END
 $migration$;

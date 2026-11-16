@@ -7,9 +7,12 @@
 --   - a Data API caller with role authenticated is refused (SQLSTATE 42501), both with the owner's
 --     claims and with a synthetic other account's claims: the owner reads through the server facade
 --     GET /api/derived/<name>, never directly;
---   - service_role still reads it, and its unique non-partial index (needed by REFRESH ... CONCURRENTLY)
---     is still there;
--- and that no other pds matview is readable by anon or authenticated.
+--   - service_role still reads it, it is populated, and its unique non-partial index (needed by
+--     REFRESH ... CONCURRENTLY) is still there;
+-- that nothing anon or authenticated can read or call reaches one of the six another way (the same
+-- dependency graph as step 3 of the migration: views over views, functions naming them, views and
+-- functions over those functions, policies), and that no other pds matview is readable by anon or
+-- authenticated.
 BEGIN READ ONLY;
 SET LOCAL statement_timeout = '45s';
 DO $check$
@@ -21,6 +24,9 @@ DECLARE
     subject text;
     readable boolean;
     leaked text;
+    six oid[];
+    reach_rels oid[];
+    reach_fns oid[];
     grant_checks integer := 0;
     denied_probes integer := 0;
     service_checks integer := 0;
@@ -48,15 +54,88 @@ BEGIN
                        AND i.indisunique AND i.indpred IS NULL) THEN
             RAISE EXCEPTION 'Unique non-partial index missing on %', relation_name;
         END IF;
+        IF NOT (SELECT c.relispopulated FROM pg_class c WHERE c.oid = relation_name::regclass) THEN
+            RAISE EXCEPTION 'Not populated (the facade read would fail): %', relation_name;
+        END IF;
         grant_checks := grant_checks + 1;
     END LOOP;
 
     SELECT string_agg(c.relname, ', ' ORDER BY c.relname) INTO leaked
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'pds' AND c.relkind = 'm'
-      AND (has_table_privilege('anon', c.oid, 'SELECT') OR has_table_privilege('authenticated', c.oid, 'SELECT'));
+      AND (has_table_privilege('anon', c.oid, 'SELECT') OR has_table_privilege('authenticated', c.oid, 'SELECT')
+           OR has_any_column_privilege('anon', c.oid, 'SELECT')
+           OR has_any_column_privilege('authenticated', c.oid, 'SELECT'));
     IF leaked IS NOT NULL THEN
         RAISE EXCEPTION 'Other pds matviews readable by a browser role: %', leaked;
+    END IF;
+
+    -- The dependency graph from the six, exactly as in step 3 of the migration.
+    six := ARRAY(SELECT n::regclass::oid FROM unnest(mat_names) AS n);
+    WITH RECURSIVE reach(cls, obj) AS (
+        SELECT 'pg_class'::regclass::oid, r FROM unnest(six) AS r
+      UNION
+        SELECT nxt.cls, nxt.obj
+        FROM reach cur
+        CROSS JOIN LATERAL (
+            SELECT 'pg_class'::regclass::oid AS cls, w.ev_class AS obj
+            FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+            WHERE d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = cur.cls AND d.refobjid = cur.obj
+              AND NOT (cur.cls = 'pg_class'::regclass AND w.ev_class = cur.obj)
+          UNION
+            SELECT 'pg_proc'::regclass::oid, d.objid
+            FROM pg_depend d
+            WHERE d.classid = 'pg_proc'::regclass
+              AND ((d.refclassid = cur.cls AND d.refobjid = cur.obj)
+                   OR (cur.cls = 'pg_class'::regclass AND d.refclassid = 'pg_type'::regclass
+                       AND d.refobjid = (SELECT c.reltype FROM pg_class c WHERE c.oid = cur.obj)))
+          UNION
+            SELECT 'pg_proc'::regclass::oid, p.oid
+            FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace
+            WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND NOT (cur.cls = 'pg_proc'::regclass AND p.oid = cur.obj)
+              AND p.prosrc ~ ('\m' || CASE WHEN cur.cls = 'pg_class'::regclass
+                                           THEN (SELECT c.relname FROM pg_class c WHERE c.oid = cur.obj)::text
+                                           ELSE (SELECT q.proname FROM pg_proc q WHERE q.oid = cur.obj)::text
+                                      END || '\M')
+        ) nxt
+    )
+    SELECT coalesce(array_agg(obj) FILTER (WHERE cls = 'pg_class'::regclass), '{}'::oid[]),
+           coalesce(array_agg(obj) FILTER (WHERE cls = 'pg_proc'::regclass), '{}'::oid[])
+    INTO reach_rels, reach_fns
+    FROM reach;
+
+    SELECT string_agg(c.oid::regclass::text, ', ' ORDER BY c.oid::regclass::text) INTO leaked
+    FROM pg_class c
+    WHERE c.oid = ANY (reach_rels) AND NOT c.oid = ANY (six)
+      AND (has_table_privilege('anon', c.oid, 'SELECT') OR has_table_privilege('authenticated', c.oid, 'SELECT')
+           OR has_any_column_privilege('anon', c.oid, 'SELECT')
+           OR has_any_column_privilege('authenticated', c.oid, 'SELECT'));
+    IF leaked IS NOT NULL THEN
+        RAISE EXCEPTION 'Browser-readable relation reaches a matview: %', leaked;
+    END IF;
+    SELECT string_agg(DISTINCT format('policy %s on %s', p.polname, p.polrelid::regclass), '; ') INTO leaked
+    FROM pg_policy p
+    JOIN pg_depend d ON d.classid = 'pg_policy'::regclass AND d.objid = p.oid
+    WHERE (d.refclassid = 'pg_class'::regclass AND d.refobjid = ANY (reach_rels))
+       OR (d.refclassid = 'pg_proc'::regclass AND d.refobjid = ANY (reach_fns));
+    IF leaked IS NOT NULL THEN
+        RAISE EXCEPTION 'Row-security policy reaches a matview: %', leaked;
+    END IF;
+    SELECT string_agg(DISTINCT p.oid::regprocedure::text, '; ') INTO leaked
+    FROM pg_proc p
+    WHERE p.oid = ANY (reach_fns)
+      AND (has_function_privilege('anon', p.oid, 'EXECUTE')
+           OR has_function_privilege('authenticated', p.oid, 'EXECUTE')
+           OR p.prorettype IN ('trigger'::regtype, 'event_trigger'::regtype)
+           OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)
+           OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = p.oid)
+           OR EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = p.oid
+                        AND d.classid NOT IN ('pg_proc'::regclass, 'pg_rewrite'::regclass, 'pg_policy'::regclass)));
+    IF leaked IS NOT NULL THEN
+        RAISE EXCEPTION 'Function a browser role can reach reads a matview: %', leaked;
     END IF;
 
     -- The owner and a synthetic other account, each as a Data API caller (role authenticated).
@@ -86,8 +165,12 @@ BEGIN
     EXECUTE format('SET LOCAL ROLE %I', initial_role);
     PERFORM set_config('onyx.matview_revoke_verification', jsonb_build_object(
         'matviews_without_browser_grants', grant_checks,
+        'matviews_populated', grant_checks,
         'authenticated_probes_denied', denied_probes,
         'service_role_reads', service_checks,
+        'graph_relations', cardinality(reach_rels),
+        'graph_functions', cardinality(reach_fns),
+        'graph_closed_to_browser_roles', true,
         'other_pds_matviews_closed', true)::text, true);
 END
 $check$;
