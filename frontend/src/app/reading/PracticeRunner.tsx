@@ -7,6 +7,7 @@ import { DONT_KNOW_ANSWER, gradeLocal, orderAnswerText, parseRubric, QUICK_SIZE,
 import { attemptFor, classifyReviewAnswer, GRADE_LABEL, intervalLabel, newOpKey, PRACTICE_GRADES, type PracticeGrade, type ReviewAttempt } from "@/lib/reading-practice";
 import {
   ATTEMPT_URL,
+  choiceOrder,
   classifyAttemptAnswer,
   classifyFlagAnswer,
   classifyOverrideAnswer,
@@ -49,7 +50,9 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  * GET /api/reading/practice/today, answered one at a time.
  *
  * - Phone (< 768 px): a full-screen sheet (fixed, safe-area padding) whose bottom bar stays above the keyboard
- *   (visualViewport). Desktop: the same card in place inside the Practice part, at most 640 px wide.
+ *   (visualViewport). Desktop: the same card in place inside the Practice part, at most 640 px wide. Which one
+ *   follows the media query live (a phone turned to landscape gets the in-place card), with no md: classes.
+ * - Quick 3 is the first 3 cards still open today, so a second Quick 3 the same day goes on where the first stopped.
  * - The answer stays hidden until Check or "I don't know". Code-graded formats show the verdict at once (before the
  *   POST returns; the server re-grades with the same function and its verdict wins); model-graded ones show
  *   "Saved · grading" and the key points, and the verdict arrives from the round's attempts, polled every 2 s while
@@ -60,8 +63,17 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  *   when the page hides. Nothing is written to disk.
  * - Skip for now stores nothing and moves the card to the end (a second Skip takes it out of today's round). An
  *   incorrect answer brings the idea back once at the end with another variant ("Again"; it never moves the
- *   schedule). Flags (Wrong, Unclear, Not in this chapter, Not read yet) are held 8 s with Undo, then sent; a held
- *   flag goes out when the page hides or the runner closes.
+ *   schedule); a model grade that comes after the round ended offers it on the summary instead. Flags (Wrong,
+ *   Unclear, Not in this chapter, Not read yet) are held 8 s with Undo, then sent; a held flag goes out when the page
+ *   hides or the runner closes. A sent Wrong / Unclear voids the answers it hit at once (no verdict, no XP, no
+ *   "moved up") and the round's attempts are read back.
+ * - The summary lists every answered card (this sitting and earlier today); a tap opens its result again, with the
+ *   feedback, Disagree, Grade it yourself and the flags. A resumed round reads its earlier answers' grades once on
+ *   open and polls for one still pending.
+ * - Closing (Done, ×, Esc, One more round) sends what is pending and tells the part when it has settled, so the part
+ *   re-reads the round only after the answers and flags landed.
+ * - Keys only act from inside the runner (or with nothing focused) and never on an event another widget handled;
+ *   Esc only with focus inside.
  * - The verdict is announced once (aria-live polite) as a word; every verdict on screen is an icon plus a word.
  *   Check / Next move focus predictably (to Next, then to the next prompt). Keys on a desktop: 1-4 pick an option,
  *   Enter checks a choice, Ctrl/Cmd+Enter checks a typed answer, N goes to the next card, Esc closes the menu or the
@@ -137,60 +149,95 @@ function newItem(card: PracticeCard, question: PracticeQuestion | null = card.qu
   };
 }
 
-const attemptKeyOf = (it: Item): string | null => it.req?.attempt_key ?? it.card.attempt_key ?? null;
+/** The answer's key (lower case, as the round's attempts are keyed): this sitting's request, or the earlier one. */
+const attemptKeyOf = (it: Item): string | null => (it.req?.attempt_key ?? it.card.attempt_key ?? null)?.toLowerCase() ?? null;
 const isDone = (it: Item) => it.phase === "past" || it.phase === "out";
 const answerable = (it: Item) => it.phase === "open" || it.phase === "refused";
 const canNext = (it: Item) => it.phase === "saved" || it.phase === "stale";
 
-/** The verdict on screen: a Disagree / self grade, then the server's grade, then the code grade shown at once. */
-function verdictOf(it: Item, results: Record<string, AttemptResult>): Verdict | null {
-  if (it.card.kind === "highlight") return null;
+type Results = Record<string, AttemptResult>;
+
+/** A stored answer a sent Wrong / Unclear flag voided: marked here at once, and read back as invalidated. */
+function isVoided(it: Item, results: Results, voided: ReadonlySet<string>): boolean {
+  if (voided.has(it.key) || it.receipt?.grading_status === "invalidated") return true;
+  const k = attemptKeyOf(it);
+  return !!k && results[k]?.grading_status === "invalidated";
+}
+
+/**
+ * The verdict on screen: a Disagree / self grade, then the server's grade, then the code grade shown at once. None
+ * for a voided answer (it earns no XP and moves nothing, so it shows no verdict either).
+ */
+function verdictOf(it: Item, results: Results, voided: ReadonlySet<string>): Verdict | null {
+  if (it.card.kind === "highlight" || isVoided(it, results, voided)) return null;
   if (it.change?.status === "saved") return it.change.verdict;
   const k = attemptKeyOf(it);
   const r = k ? results[k] : undefined;
-  if (r?.grading_status === "invalidated") return null;
   if (r?.grading_status === "graded" && r.verdict) return r.verdict;
   if (it.receipt) return it.receipt.grading_status === "graded" ? it.receipt.verdict : null;
   return it.local;
 }
-function isGrading(it: Item, results: Record<string, AttemptResult>): boolean {
-  if (!it.stored || it.card.kind === "highlight" || it.earlier) return false;
-  const k = attemptKeyOf(it);
-  if (k && results[k]?.grading_status === "invalidated") return false;
-  return verdictOf(it, results) === null;
+function isGrading(it: Item, results: Results, voided: ReadonlySet<string>): boolean {
+  if (!it.stored || it.card.kind === "highlight" || it.change?.status === "saved" || isVoided(it, results, voided)) return false;
+  // An answer from before this sitting (a resumed round): grading while the round's attempts, read when the runner
+  // opens, say so.
+  if (it.earlier) {
+    const k = attemptKeyOf(it);
+    return !!k && results[k]?.grading_status === "pending";
+  }
+  return verdictOf(it, results, voided) === null;
 }
 
+/**
+ * Phone versus desktop follows the media query live (a phone turned to landscape is wider than 767 px), and the
+ * classes are chosen from it, never from md: breakpoints: the phone sheet is drawn in document.body, where a
+ * breakpoint class would turn it into an in-place card outside the page.
+ */
 const PHONE_QUERY = "(max-width: 767px)";
-const SHEET_CLASS =
-  "fixed inset-0 z-50 flex flex-col bg-surface pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] " +
-  "md:relative md:inset-auto md:z-auto md:mx-auto md:block md:w-full md:max-w-[640px] md:bg-transparent md:pt-0 md:pb-0";
+const phoneQuery = (): MediaQueryList | null =>
+  typeof window !== "undefined" && typeof window.matchMedia === "function" ? window.matchMedia(PHONE_QUERY) : null;
+const PHONE_SHEET_CLASS = "fixed inset-0 z-50 flex flex-col bg-surface pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]";
+const DESKTOP_SHEET_CLASS = "relative mx-auto block w-full max-w-[640px]";
+/** How long closing waits for answers and flags on their way before the part re-reads anyway. */
+const SETTLE_MAX_MS = 10_000;
 const PRIMARY = "inline-flex min-h-11 items-center justify-center rounded-full bg-accent px-5 text-[15px] font-medium text-on-accent";
 const SECONDARY = "inline-flex min-h-11 items-center justify-center rounded-control border border-border-default px-3 text-[14px] text-text-primary";
 
 export interface PracticeRunnerProps {
   round: PracticeRound;
-  /** daily: the whole round; quick: its first 3 cards; extra: "One more round". */
+  /** daily: the whole round; quick: the first 3 cards still open today; extra: "One more round". */
   mode: "daily" | "quick" | "extra";
-  /** ×, Esc, Done. `changed`: something was stored or flagged; `finished`: the summary was reached. */
-  onClose: (changed: boolean, finished: boolean) => void;
-  /** "One more round" from the summary (offered when the round says more are left). */
-  onMore?: () => void;
+  /**
+   * ×, Esc, Done. `changed`: something was stored or flagged; `finished`: the summary was reached. `settled` is set
+   * when answers or flags were still on their way at close: it resolves once they are (at most SETTLE_MAX_MS), and the
+   * part re-reads then, so a reopened round never offers an answer still being stored or a chapter just held.
+   */
+  onClose: (changed: boolean, finished: boolean, settled?: Promise<void>) => void;
+  /** "One more round" from the summary (offered when the round says more are left); `settled` as for onClose. */
+  onMore?: (settled?: Promise<void>) => void;
   /** Re-read the round (after a "Not read yet" hold); cards it no longer holds leave this sitting. */
   onReread?: () => Promise<PracticeRound | null>;
   /** The clock and timers (tests pass a manual one). */
   timers?: Timers;
 }
 
+/** Quick 3 = the first 3 cards of the round still open today (a second Quick 3 the same day goes on from there). */
+const startingCards = (round: PracticeRound, mode: PracticeRunnerProps["mode"]): PracticeCard[] =>
+  mode === "quick" ? round.cards.filter((c) => !c.done).slice(0, QUICK_SIZE) : round.cards;
+
 export default function PracticeRunner({ round, mode, onClose, onMore, onReread, timers = realTimers }: PracticeRunnerProps) {
-  const [items, setItems] = useState<Record<string, Item>>(() => {
-    const cards = mode === "quick" ? round.cards.slice(0, QUICK_SIZE) : round.cards;
-    return Object.fromEntries(cards.map((c) => [c.key, newItem(c)]));
-  });
-  const [order, setOrder] = useState<string[]>(() => (mode === "quick" ? round.cards.slice(0, QUICK_SIZE) : round.cards).map((c) => c.key));
+  const [items, setItems] = useState<Record<string, Item>>(() => Object.fromEntries(startingCards(round, mode).map((c) => [c.key, newItem(c)])));
+  const [order, setOrder] = useState<string[]>(() => startingCards(round, mode).map((c) => c.key));
   const [currentKey, setCurrentKey] = useState<string | null>(null);
-  const [results, setResults] = useState<Record<string, AttemptResult>>({});
+  const [results, setResults] = useState<Results>({});
   const [flags, setFlags] = useState<HeldFlag[]>([]);
   const [voided, setVoided] = useState(0);
+  // Item keys whose stored answers a sent Wrong / Unclear flag voided (before the round's attempts say so).
+  const [voidedKeys, setVoidedKeys] = useState<ReadonlySet<string>>(() => new Set());
+  // "Again" repeats whose model grade arrived after the round was over: offered on the summary, never pushed on it.
+  const [againOffer, setAgainOffer] = useState<Item[]>([]);
+  // An answered card opened again from the summary (its result, feedback, Disagree, Grade it yourself, flags).
+  const [viewKey, setViewKey] = useState<string | null>(null);
   const [announce, setAnnounce] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
@@ -198,13 +245,15 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const [pollTick, setPollTick] = useState(0);
   const [sheet, setSheet] = useState<{ top: number; height: number } | null>(null);
   // A phone (< 768 px) gets the full-screen sheet, drawn in document.body: inside the page it would sit in the app
-  // shell's own stacking context, under the fixed mobile header and tab bar. Decided once (the runner is client-only).
-  const [phone] = useState(() => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(PHONE_QUERY).matches);
+  // shell's own stacking context, under the fixed mobile header and tab bar. Follows the media query (rotation).
+  const [phone, setPhone] = useState(() => phoneQuery()?.matches === true);
 
   const itemsRef = useRef(items);
   itemsRef.current = items;
   const resultsRef = useRef(results);
   resultsRef.current = results;
+  const voidedRef = useRef(voidedKeys);
+  voidedRef.current = voidedKeys;
   const alive = useRef(true);
   const busy = useRef(false);
   const changed = useRef(false);
@@ -213,6 +262,12 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const againDone = useRef(new Set<string>());
   // Requests sent and not confirmed (in flight, or no answer): re-sent with keepalive when the page hides.
   const outbox = useRef(new Map<string, AttemptRequest>());
+  // Requests on their way (answers, grades, highlight reviews, flags) and the answers among them: closing waits for
+  // them (leave) before the part re-reads.
+  const inflight = useRef(new Set<Promise<unknown>>());
+  const inflightKeys = useRef(new Set<string>());
+  const drained = useRef(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const promptRef = useRef<HTMLHeadingElement | null>(null);
   const nextRef = useRef<HTMLButtonElement | null>(null);
   const retryRef = useRef<HTMLButtonElement | null>(null);
@@ -230,13 +285,23 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       return { ...prev, [key]: { ...it, ...(typeof p === "function" ? p(it) : p) } };
     });
 
+  /** Keep a request in `inflight` until it settles (postJson never rejects). */
+  function track<T>(p: Promise<T>): Promise<T> {
+    inflight.current.add(p);
+    const done = () => {
+      inflight.current.delete(p);
+    };
+    void p.then(done, done);
+    return p;
+  }
+
   // The flag queue: created once, its state mirrored into `flags` for the screen.
   const queueRef = useRef<FlagQueue | null>(null);
   if (!queueRef.current) {
     queueRef.current = createFlagQueue({
       timers,
       send: async (f, keepalive) => {
-        const r = await postJson(FLAG_URL, { flag_key: f.flag_key, question_id: f.question_id, kind: f.kind }, { keepalive });
+        const r = await track(postJson(FLAG_URL, { flag_key: f.flag_key, question_id: f.question_id, kind: f.kind }, { keepalive }));
         return classifyFlagAnswer(r.status, r.body);
       },
       onChange: (list) => {
@@ -246,6 +311,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         changed.current = true;
         if (!alive.current) return;
         if (r.invalidated) setVoided((v) => v + r.invalidated);
+        if (f.kind === "wrong" || f.kind === "unclear") voidAnswers(f);
         if (f.kind === "not_read_yet") void reconcile();
       },
     });
@@ -264,6 +330,42 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     });
   }
 
+  /**
+   * The round's attempts, read once (the runner opening on a resumed round, a sent Wrong / Unclear flag). With
+   * `resume`, an earlier answer still waiting for its model grade starts the poll window from now.
+   */
+  async function refreshResults(resume = false) {
+    const r = await getJson(roundAttemptsUrl(round.round_key));
+    if (!alive.current || r.status !== 200) return;
+    const map = parseRoundAttempts(r.body);
+    setResults((prev) => ({ ...prev, ...Object.fromEntries(map) }));
+    if (!resume) return;
+    const now = timers.now();
+    setItems((prev) => {
+      let next: Record<string, Item> | null = null;
+      for (const [k, it] of Object.entries(prev)) {
+        const key = attemptKeyOf(it);
+        if (it.earlier && it.savedAt === null && key && map.get(key)?.grading_status === "pending") (next ??= { ...prev })[k] = { ...it, savedAt: now };
+      }
+      return next ?? prev;
+    });
+  }
+
+  /**
+   * A Wrong / Unclear flag the server confirmed voided answers: Unclear those to its question, Wrong those to every
+   * question of its idea. They leave the summary's XP and "moved up" at once; the round's attempts are then read
+   * back (the voided answers read invalidated, and a chapter recall answer no longer lists an idea flagged Wrong).
+   */
+  function voidAnswers(f: HeldFlag) {
+    const all = Object.values(itemsRef.current);
+    const ideaId = f.kind === "wrong" ? all.find((x) => x.question?.question_id === f.question_id)?.card.idea?.idea_id ?? null : null;
+    const keys = all
+      .filter((x) => x.stored && x.card.kind !== "highlight" && (x.question?.question_id === f.question_id || (ideaId !== null && x.card.idea?.idea_id === ideaId)))
+      .map((x) => x.key);
+    if (keys.length) setVoidedKeys((prev) => new Set([...prev, ...keys]));
+    void refreshResults();
+  }
+
   const hidden = useMemo(() => new Set(flags.filter((f) => f.status !== "refused").flatMap((f) => f.cardKeys)), [flags]);
   const visible = order.filter((k) => items[k] && items[k].phase !== "out" && !hidden.has(k));
   const curKey =
@@ -272,6 +374,11 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       : visible.find((k) => items[k].phase === "open") ?? null;
   const cur = curKey ? items[curKey] : null;
   const showSummary = cur === null;
+  // An answered card opened again from the summary.
+  const viewed = showSummary && viewKey && items[viewKey]?.stored ? items[viewKey] : null;
+  const active = cur ?? viewed;
+  const vOf = (it: Item) => verdictOf(it, results, voidedKeys);
+  const gOf = (it: Item) => isGrading(it, results, voidedKeys);
 
   // The card on screen changed: its own menu and disclosure state; the time it was shown (response time).
   useEffect(() => {
@@ -282,6 +389,13 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     if (!curKey) finished.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curKey]);
+
+  // A resumed round: read the answers stored earlier today once, so their grades, feedback and Disagree show (and
+  // a model grade still pending is polled for).
+  useEffect(() => {
+    if (Object.values(itemsRef.current).some((it) => it.earlier && it.card.kind !== "highlight" && attemptKeyOf(it))) void refreshResults(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Focus: one target per action, set once and cleared.
   useEffect(() => {
@@ -304,22 +418,23 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     setFocus((f) => (f === focus ? null : f));
   }, [focus, curKey]);
 
-  // A verdict on screen for the first time: announce it once; an incorrect stored answer brings the idea back once.
+  // A verdict on screen for the first time: announce it once; an incorrect stored answer brings the idea back once
+  // (at the end of the round while it is still going; offered on the summary when the grade came after it ended).
   const gradedSig = order
     .map((k) => items[k])
     .filter((it): it is Item => !!it)
-    .map((it) => `${it.key}:${verdictOf(it, results) ?? "-"}:${it.stored ? 1 : 0}`)
+    .map((it) => `${it.key}:${vOf(it) ?? "-"}:${it.stored ? 1 : 0}`)
     .join("|");
   useEffect(() => {
     const add: Item[] = [];
     for (const k of order) {
       const it = items[k];
       if (!it) continue;
-      const v = verdictOf(it, results);
+      const v = vOf(it);
       if (!v) continue;
       if (!announced.current.has(it.key)) {
         announced.current.add(it.key);
-        if (it.key === curKey) setAnnounce(`${VERDICT_VIEW[v].word}.`);
+        if (it.key === curKey || it.key === viewKey) setAnnounce(`${VERDICT_VIEW[v].word}.`);
       }
       if (it.stored && !it.earlier && !it.again && (v === "incorrect" || v === "dont_know") && it.card.kind === "idea" && it.card.again_question && !againDone.current.has(it.key)) {
         againDone.current.add(it.key);
@@ -327,8 +442,12 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       }
     }
     if (add.length) {
-      setItems((prev) => ({ ...prev, ...Object.fromEntries(add.map((a) => [a.key, a])) }));
-      setOrder((prev) => [...prev, ...add.map((a) => a.key).filter((k) => !prev.includes(k))]);
+      if (curKey === null) {
+        setAgainOffer((prev) => [...prev, ...add.filter((a) => !prev.some((p) => p.key === a.key))]);
+      } else {
+        setItems((prev) => ({ ...prev, ...Object.fromEntries(add.map((a) => [a.key, a])) }));
+        setOrder((prev) => [...prev, ...add.map((a) => a.key).filter((k) => !prev.includes(k))]);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gradedSig]);
@@ -336,12 +455,12 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   // Poll the round's attempts while a model grade is pending (every 2 s, up to a minute after each answer).
   const waitingSig = order
     .map((k) => items[k])
-    .filter((it): it is Item => !!it && isGrading(it, results) && it.savedAt !== null)
+    .filter((it): it is Item => !!it && gOf(it) && it.savedAt !== null)
     .map((it) => `${it.key}@${it.savedAt}`)
     .join("|");
   useEffect(() => {
     if (!waitingSig) return;
-    const waiting = Object.values(itemsRef.current).filter((it) => isGrading(it, resultsRef.current) && it.savedAt !== null);
+    const waiting = Object.values(itemsRef.current).filter((it) => isGrading(it, resultsRef.current, voidedRef.current) && it.savedAt !== null);
     const now = timers.now();
     if (!waiting.some((it) => now - (it.savedAt as number) < POLL_FOR_MS + 2 * POLL_EVERY_MS)) return;
     const id = timers.set(() => {
@@ -359,21 +478,38 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [waitingSig, pollTick]);
 
-  // Phone: the sheet follows the visual viewport, so the bottom bar stays above the keyboard; the page behind it
-  // does not scroll.
+  // Phone or desktop, live: rotating a phone past 767 px moves the runner in place (and back), its typed answer kept.
   useEffect(() => {
-    if (!phone || typeof window === "undefined") return;
+    const mq = phoneQuery();
+    if (!mq) return;
+    const update = () => setPhone(mq.matches);
+    update();
+    if (typeof mq.addEventListener === "function") mq.addEventListener("change", update);
+    else mq.addListener?.(update);
+    return () => {
+      if (typeof mq.removeEventListener === "function") mq.removeEventListener("change", update);
+      else mq.removeListener?.(update);
+    };
+  }, []);
+
+  // Phone: the sheet follows the visual viewport, so the bottom bar stays above the keyboard; the page behind it
+  // does not scroll. Undone when the runner closes or the phone turns wide enough for the in-place card.
+  useEffect(() => {
+    if (!phone || typeof window === "undefined" || typeof document === "undefined" || !document.documentElement || !document.body) {
+      setSheet(null);
+      return;
+    }
     const vv = window.visualViewport;
     const html = document.documentElement;
-    const prev = [html.style.overflow, document.body.style.overflow];
+    const body = document.body;
+    const prev = [html.style.overflow, body.style.overflow];
     html.style.overflow = "hidden";
-    document.body.style.overflow = "hidden";
-    if (!vv) {
-      return () => {
-        html.style.overflow = prev[0];
-        document.body.style.overflow = prev[1];
-      };
-    }
+    body.style.overflow = "hidden";
+    const restore = () => {
+      html.style.overflow = prev[0];
+      body.style.overflow = prev[1];
+    };
+    if (!vv) return restore;
     const update = () => setSheet({ top: vv.offsetTop, height: vv.height });
     update();
     vv.addEventListener("resize", update);
@@ -381,18 +517,49 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     return () => {
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
-      html.style.overflow = prev[0];
-      document.body.style.overflow = prev[1];
+      restore();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [phone]);
 
-  // The page hides (tab switch, app closed): send held flags and re-send unconfirmed answers with keepalive.
-  // Closing the runner does the same.
+  /**
+   * Send what is not settled: held flags (and unconfirmed ones) go out now, and unconfirmed answers are re-sent (the
+   * same request, so a stored one answers its receipt). With `keepalive` (the page is going away) every answer not
+   * confirmed is re-sent, including one on its way, whose fetch may die with the page; otherwise only those no
+   * request is carrying. Returns the work started plus the requests already on their way.
+   */
+  function sendPending(keepalive: boolean): Promise<unknown>[] {
+    const work: Promise<unknown>[] = [...inflight.current];
+    if (queue.list().some((f) => f.status === "held" || f.status === "unknown")) work.push(queue.flush(keepalive));
+    for (const [key, req] of outbox.current) if (keepalive || !inflightKeys.current.has(key)) work.push(postJson(ATTEMPT_URL, req, { keepalive }));
+    return work;
+  }
+
+  /**
+   * Leaving the runner (Done, ×, Esc, One more round): send what is pending and say when it has settled (at most
+   * SETTLE_MAX_MS), so the part re-reads the round after the answers and flags landed. undefined = nothing pending.
+   */
+  function leave(): Promise<void> | undefined {
+    if (drained.current) return undefined;
+    drained.current = true;
+    const work = sendPending(false);
+    if (!work.length) return undefined;
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+      void Promise.allSettled(work).then(finish);
+      timers.set(finish, SETTLE_MAX_MS);
+    });
+  }
+
+  // The page hides (tab switch, app closed): send held flags and re-send unconfirmed answers with keepalive. The
+  // runner going away without a close (the page navigating) does the same.
   useEffect(() => {
     const flushAll = () => {
-      void queue.flush(true);
-      for (const req of outbox.current.values()) void postJson(ATTEMPT_URL, req, { keepalive: true });
+      void sendPending(true);
     };
     const onVisibility = () => {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") flushAll();
@@ -406,7 +573,10 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       if (hasWindow) window.removeEventListener("pagehide", flushAll);
       if (hasDocument) document.removeEventListener("visibilitychange", onVisibility);
       alive.current = false;
-      flushAll();
+      if (!drained.current) {
+        drained.current = true;
+        flushAll();
+      }
       queue.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -414,7 +584,8 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
 
   /* ---------------------------- actions ---------------------------- */
 
-  const close = () => onClose(changed.current, finished.current);
+  const close = () => onClose(changed.current, finished.current, leave());
+  const more = () => onMore?.(leave());
 
   function answerOf(it: Item): string | null {
     const q = it.question;
@@ -434,7 +605,9 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   async function send(key: string, req: AttemptRequest) {
     busy.current = true;
     outbox.current.set(req.attempt_key, req);
-    const { status, body } = await postJson(ATTEMPT_URL, req);
+    inflightKeys.current.add(req.attempt_key);
+    const { status, body } = await track(postJson(ATTEMPT_URL, req));
+    inflightKeys.current.delete(req.attempt_key);
     busy.current = false;
     if (!alive.current) return;
     const out = classifyAttemptAnswer(status, body);
@@ -514,7 +687,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     patch(key, { phase: "saving", review: attempt, message: null });
     setFocus("next");
     busy.current = true;
-    const { status, body } = await postJson(REVIEW_URL, attempt);
+    const { status, body } = await track(postJson(REVIEW_URL, attempt));
     busy.current = false;
     if (!alive.current) return;
     const out = classifyReviewAnswer(status, body);
@@ -570,10 +743,11 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     setFocus(nextKey ? "prompt" : "summary");
   }
 
+  /** A flag on the card on screen, or on an answered card opened from the summary (then back to the summary). */
   function flag(kind: FlagKind) {
-    const it = cur;
+    const it = active;
     const q = it?.question;
-    if (!it || !q || it.phase === "saving" || it.phase === "unknown") return;
+    if (!it || !q || it.phase === "saving" || it.phase === "unknown" || hidden.has(it.key)) return;
     setMenuOpen(false);
     const ideaId = it.card.idea?.idea_id ?? null;
     const keys = visible.filter((k) => {
@@ -586,6 +760,11 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       return ideaId !== null && x.card.idea?.idea_id === ideaId;
     });
     queue.add({ flag_key: newOpKey(), question_id: q.question_id, kind, cardKeys: keys });
+    if (!cur) {
+      setViewKey(null);
+      setFocus("summary");
+      return;
+    }
     const nextKey = visible.find((k) => !keys.includes(k) && items[k].phase === "open") ?? null;
     setCurrentKey(nextKey);
     setFocus(nextKey ? "prompt" : "summary");
@@ -597,9 +776,34 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     // The flagged card comes back on screen, where it was.
     const back = f.cardKeys.find((k) => items[k] && answerable(items[k]));
     if (back) {
+      setViewKey(null);
       setCurrentKey(back);
       setFocus("prompt");
     }
+  }
+
+  /** Open an answered card from the summary: its result, feedback, Disagree, Grade it yourself and flags. */
+  function openAnswered(key: string) {
+    setViewKey(key);
+    setMenuOpen(false);
+    setSourcesOpen(false);
+    setFocus("prompt");
+  }
+  function backToSummary() {
+    setViewKey(null);
+    setMenuOpen(false);
+    setFocus("summary");
+  }
+
+  /** The "Again" repeats offered on the summary: they join the round now, at its end. */
+  function takeAgain(list: Item[]) {
+    if (!list.length) return;
+    setItems((prev) => ({ ...prev, ...Object.fromEntries(list.map((a) => [a.key, a])) }));
+    setOrder((prev) => [...prev, ...list.map((a) => a.key).filter((k) => !prev.includes(k))]);
+    setAgainOffer([]);
+    setViewKey(null);
+    setCurrentKey(list[0].key);
+    setFocus("prompt");
   }
 
   async function changeGrade(key: string, mode: "override" | "self", verdict: ModelVerdict) {
@@ -608,36 +812,53 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     if (!it || !k || busy.current || it.change?.status === "saved" || it.change?.status === "saving") return;
     patch(key, { change: { mode, verdict, status: "saving" } });
     busy.current = true;
-    const r = await postJson(overrideUrl(k), mode === "override" ? { verdict } : { self_grade: verdict });
+    const r = await track(postJson(overrideUrl(k), mode === "override" ? { verdict } : { self_grade: verdict }));
     busy.current = false;
     if (!alive.current) return;
     const out = classifyOverrideAnswer(r.status, r.body);
-    if (out.kind === "saved") changed.current = true;
-    patch(key, { change: { mode, verdict, status: out.kind, message: out.kind === "saved" ? undefined : out.message } });
+    if (out.kind === "saved") {
+      changed.current = true;
+      // The committed grade and schedule: "Next: ..." and the summary's next due read this receipt from now on.
+      patch(key, { change: { mode, verdict, status: "saved" }, receipt: out.value });
+      return;
+    }
+    patch(key, { change: { mode, verdict, status: out.kind, message: out.message } });
   }
 
   /* ---------------------------- keys ---------------------------- */
 
+  // Keys go to the runner only from inside it (or with nothing focused): never an event another widget already
+  // handled (the command palette, a G go-shortcut, an open hint), and Esc only with focus inside the runner, so
+  // closing a popover elsewhere never closes the round and drops a typed answer.
   const keyHandler = useRef<(e: KeyboardEvent) => void>(() => undefined);
   keyHandler.current = (e: KeyboardEvent) => {
+    if (e.defaultPrevented) return;
     const t = e.target as HTMLElement | null;
     const tag = t?.tagName ?? "";
+    const root = rootRef.current;
+    const inside = !!(root && t && typeof root.contains === "function" && root.contains(t));
+    const free = !t || tag === "BODY" || tag === "HTML";
+    if (!inside && !free) return;
     const typing = tag === "TEXTAREA" || tag === "INPUT" || t?.isContentEditable === true;
     const mods = e.ctrlKey || e.metaKey || e.altKey;
     if (e.key === "Escape") {
+      if (!inside) return;
       e.preventDefault?.();
       if (menuOpen) {
         setMenuOpen(false);
         setFocus("menu");
-      } else close();
+      } else if (viewed) backToSummary();
+      else close();
       return;
     }
     if (!cur) return;
     const rub = cur.question ? parseRubric(cur.question.rubric) : null;
     const choices = cur.hinted && rub?.format === "cued" ? rub.options ?? [] : [];
-    if (answerable(cur) && !typing && !mods && /^[1-4]$/.test(e.key) && choices.length) {
-      const i = Number(e.key) - 1;
-      if (i < choices.length) {
+    if (answerable(cur) && !typing && !mods && /^[1-4]$/.test(e.key) && choices.length && cur.question) {
+      // The key is the option's place on screen (the options are offered shuffled).
+      const shownOrder = choiceOrder(choices.length, `${cur.question.question_id}|${round.today}`);
+      const i = shownOrder[Number(e.key) - 1];
+      if (i !== undefined) {
         e.preventDefault?.();
         patch(cur.key, { choice: i });
       }
@@ -675,14 +896,15 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     .map((k) => items[k])
     .filter((it): it is Item => !!it && (it.stored || (!hidden.has(it.key) && !it.again)))
     .map((it) => {
-      const v = verdictOf(it, results);
-      const counts = it.stored && !it.earlier && !it.again && it.card.kind === "idea" && (it.card.preview?.counts ?? false);
+      const v = vOf(it);
+      // A voided answer earns no XP and moves no idea up (acceptance 9); it still counts as answered.
+      const counts = !isVoided(it, results, voidedKeys) && it.stored && !it.earlier && !it.again && it.card.kind === "idea" && (it.card.preview?.counts ?? false);
       return {
         roundCard: !it.again,
         answered: it.stored,
         counts,
         verdict: v,
-        grading: isGrading(it, results),
+        grading: gOf(it),
         stageBefore: it.card.idea?.stage ?? null,
         stageAfter: counts && v ? it.card.preview?.next[v]?.stage ?? null : null,
         nextReview: it.receipt?.next_review ?? it.reviewNext ?? null,
@@ -690,15 +912,48 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       };
     });
   const summary = summarize(summaryItems, round.today);
-  const recallItem = order.map((k) => items[k]).find((it) => it?.card.kind === "chapter_recall" && it.stored);
+  const recallItem = order.map((k) => items[k]).find((it) => it?.card.kind === "chapter_recall" && it.stored && !isVoided(it, results, voidedKeys));
   const recallResult = recallItem ? results[attemptKeyOf(recallItem) ?? ""] : undefined;
   const recallSplit = coveredSplit(recallResult?.covered_ideas);
   const pos = curKey ? visible.indexOf(curKey) + 1 : visible.length;
+  // The answered cards of this sitting and of earlier today, each openable from the summary.
+  const answeredList = order.map((k) => items[k]).filter((it): it is Item => !!it && it.stored && it.card.kind !== "highlight" && !!it.question);
+  // An "Again" offer whose idea was flagged since is dropped.
+  const againShown = againOffer.filter((a) => !voidedKeys.has(a.card.key) && !hidden.has(a.card.key));
+
+  const cardProps = (it: Item): CardViewProps => ({
+    it,
+    today: round.today,
+    pollOver: it.savedAt !== null && gOf(it) && timers.now() - it.savedAt > POLL_FOR_MS,
+    results,
+    voided: voidedKeys,
+    sourcesOpen,
+    setSourcesOpen,
+    refs: { promptRef, retryRef, inputRef, noteRef },
+    onAnswer: (v) => patch(it.key, { answer: v }),
+    onChoice: (i) => patch(it.key, { choice: i }),
+    onOrder: (o) => patch(it.key, { order: o }),
+    onRetry: () => retry(it.key),
+    onReveal: () => {
+      patch(it.key, { revealed: true });
+      setFocus("note");
+    },
+    onGradeHighlight: (g) => void gradeHighlight(it.key, g),
+    onChange: (m, v) => void changeGrade(it.key, m, v),
+  });
 
   const view = (
-    <div data-testid="practice-runner" role="region" aria-label="Practice round" className={SHEET_CLASS} style={sheet ? { top: sheet.top, height: sheet.height, bottom: "auto" } : undefined}>
+    <div
+      ref={rootRef}
+      data-testid="practice-runner"
+      data-layout={phone ? "sheet" : "inline"}
+      role="region"
+      aria-label="Practice round"
+      className={phone ? PHONE_SHEET_CLASS : DESKTOP_SHEET_CLASS}
+      style={phone && sheet ? { top: sheet.top, height: sheet.height, bottom: "auto" } : undefined}
+    >
       {/* Top bar */}
-      <div className="flex shrink-0 items-center gap-3 border-b border-border-subtle px-4 py-1 md:border-0 md:px-0">
+      <div className={`flex shrink-0 items-center gap-3 py-1 ${phone ? "border-b border-border-subtle px-4" : ""}`}>
         <span className="font-mono text-[13px] text-text-secondary">{showSummary ? `${summary.answered} / ${summary.total}` : `${pos} / ${visible.length}`}</span>
         <span aria-hidden="true" className="flex flex-wrap gap-1">
           {visible.map((k) => (
@@ -715,27 +970,11 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-3 md:overflow-visible md:px-0">
+      <div className={phone ? "flex-1 overflow-y-auto px-4 py-3" : "py-3"}>
         {cur ? (
-          <CardView
-            it={cur}
-            today={round.today}
-            pollOver={cur.savedAt !== null && isGrading(cur, results) && timers.now() - cur.savedAt > POLL_FOR_MS}
-            results={results}
-            sourcesOpen={sourcesOpen}
-            setSourcesOpen={setSourcesOpen}
-            refs={{ promptRef, retryRef, inputRef, noteRef }}
-            onAnswer={(v) => patch(cur.key, { answer: v })}
-            onChoice={(i) => patch(cur.key, { choice: i })}
-            onOrder={(o) => patch(cur.key, { order: o })}
-            onRetry={() => retry(cur.key)}
-            onReveal={() => {
-              patch(cur.key, { revealed: true });
-              setFocus("note");
-            }}
-            onGradeHighlight={(g) => void gradeHighlight(cur.key, g)}
-            onChange={(m, v) => void changeGrade(cur.key, m, v)}
-          />
+          <CardView {...cardProps(cur)} />
+        ) : viewed ? (
+          <CardView {...cardProps(viewed)} />
         ) : (
           <section data-testid="practice-summary" className="space-y-3">
             <h2 ref={summaryRef} tabIndex={-1} className="text-[17px] font-medium text-text-primary outline-none">
@@ -756,7 +995,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
                 </p>
                 {order
                   .map((k) => items[k])
-                  .filter((it): it is Item => !!it && isGrading(it, results) && results[attemptKeyOf(it) ?? ""]?.self_gradable === true)
+                  .filter((it): it is Item => !!it && gOf(it) && results[attemptKeyOf(it) ?? ""]?.self_gradable === true)
                   .map((it) => (
                     <SelfGrade key={it.key} it={it} onPick={(v) => void changeGrade(it.key, "self", v)} />
                   ))}
@@ -769,12 +1008,26 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
               </p>
             )}
             <CoveredList covered={recallSplit.covered} missed={recallSplit.missed} />
+            {answeredList.length > 0 && (
+              <ul aria-label="Your answers" className="space-y-1.5">
+                {answeredList.map((it) => (
+                  <li key={it.key}>
+                    <AnsweredRow it={it} verdict={vOf(it)} grading={gOf(it)} voided={isVoided(it, results, voidedKeys)} onOpen={() => openAnswered(it.key)} />
+                  </li>
+                ))}
+              </ul>
+            )}
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <button type="button" onClick={close} className={PRIMARY}>
                 Done
               </button>
+              {againShown.length > 0 && (
+                <button type="button" onClick={() => takeAgain(againShown)} className={SECONDARY}>
+                  {`Try again · ${againShown.length}`}
+                </button>
+              )}
               {onMore && round.extra_available > 0 && (
-                <button type="button" onClick={onMore} className={SECONDARY}>
+                <button type="button" onClick={more} className={SECONDARY}>
                   One more round
                 </button>
               )}
@@ -787,10 +1040,14 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         <FlagBars flags={flags} onUndo={undoFlag} onRetry={(k) => void queue.retry(k)} />
       </div>
 
-      {cur && (
-        <div className="shrink-0 border-t border-border-subtle bg-surface px-4 py-2 md:mt-3 md:border-0 md:bg-transparent md:px-0 md:py-0">
+      {active && (
+        <div className={phone ? "shrink-0 border-t border-border-subtle bg-surface px-4 py-2" : "mt-3"}>
           <div className="flex items-center gap-2">
-            {answerable(cur) ? (
+            {!cur ? (
+              <button type="button" onClick={backToSummary} className={SECONDARY}>
+                Back to summary
+              </button>
+            ) : answerable(cur) ? (
               cur.card.kind === "highlight" ? (
                 <span className="flex-1" />
               ) : (
@@ -816,46 +1073,57 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
                 Next
               </button>
             )}
-            <div className="relative ml-auto">
-              <button
-                ref={menuRef}
-                type="button"
-                aria-label="More actions"
-                aria-haspopup="menu"
-                aria-expanded={menuOpen}
-                onClick={() => setMenuOpen((o) => !o)}
-                className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-control border border-border-subtle text-text-secondary"
-              >
-                <MoreHorizontal aria-hidden="true" className="h-5 w-5" />
-              </button>
-              {menuOpen && (
-                <CardMenu
-                  it={cur}
-                  onSkip={skip}
-                  onShowChoices={() => {
-                    setMenuOpen(false);
-                    patch(cur.key, { hinted: true, choice: null });
-                  }}
-                  onFlag={flag}
-                />
-              )}
-            </div>
+            {hasMenu(active, !hidden.has(active.key)) && (
+              <div className="relative ml-auto">
+                <button
+                  ref={menuRef}
+                  type="button"
+                  aria-label="More actions"
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen}
+                  onClick={() => setMenuOpen((o) => !o)}
+                  className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-control border border-border-subtle text-text-secondary"
+                >
+                  <MoreHorizontal aria-hidden="true" className="h-5 w-5" />
+                </button>
+                {menuOpen && (
+                  <CardMenu
+                    it={active}
+                    canFlag={!hidden.has(active.key)}
+                    onSkip={skip}
+                    onShowChoices={() => {
+                      setMenuOpen(false);
+                      patch(active.key, { hinted: true, choice: null });
+                    }}
+                    onFlag={flag}
+                  />
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
     </div>
   );
-  return phone && typeof document !== "undefined" ? createPortal(view, document.body) : view;
+  // The phone sheet is drawn in document.body (a real element; never in a test's stand-in document).
+  const portalTo = phone && typeof document !== "undefined" && document.body?.nodeType === 1 ? document.body : null;
+  return portalTo ? createPortal(view, portalTo) : view;
 }
 
 /* ------------------------------------------------------------------ */
 
-function CardMenu({ it, onSkip, onShowChoices, onFlag }: { it: Item; onSkip: () => void; onShowChoices: () => void; onFlag: (k: FlagKind) => void }) {
+/** The flags a card offers: all four on an idea, Unclear and Not read yet on a chapter recall, none on a highlight. */
+const flagKindsOf = (it: Item): FlagKind[] =>
+  it.card.kind === "idea" ? ["wrong", "unclear", "not_in_chapter", "not_read_yet"] : it.card.kind === "chapter_recall" ? ["unclear", "not_read_yet"] : [];
+
+/** Whether the ⋯ menu has anything in it (an answered card already flagged offers nothing). */
+const hasMenu = (it: Item, canFlag: boolean) => answerable(it) || (canFlag && it.phase !== "saving" && it.phase !== "unknown" && flagKindsOf(it).length > 0);
+
+function CardMenu({ it, canFlag, onSkip, onShowChoices, onFlag }: { it: Item; canFlag: boolean; onSkip: () => void; onShowChoices: () => void; onFlag: (k: FlagKind) => void }) {
   const rub = it.question ? parseRubric(it.question.rubric) : null;
   const canChoices = answerable(it) && it.question?.format === "cued" && !it.hinted && rub?.format === "cued" && (rub.options?.length ?? 0) === 4;
   const busyNow = it.phase === "saving" || it.phase === "unknown";
-  const kinds: FlagKind[] =
-    it.card.kind === "idea" ? ["wrong", "unclear", "not_in_chapter", "not_read_yet"] : it.card.kind === "chapter_recall" ? ["unclear", "not_read_yet"] : [];
+  const kinds = canFlag ? flagKindsOf(it) : [];
   const item = "flex min-h-11 w-full items-center px-3 text-left text-[14px] text-text-primary hover:bg-white/[0.05]";
   return (
     <div role="menu" aria-label="Card actions" className="absolute bottom-full right-0 z-10 mb-2 w-56 overflow-hidden rounded-control border border-border-default bg-surface-raised py-1 shadow-card">
@@ -876,6 +1144,32 @@ function CardMenu({ it, onSkip, onShowChoices, onFlag }: { it: Item; onSkip: () 
           </button>
         ))}
     </div>
+  );
+}
+
+/** One answered card on the summary: its chapter, its prompt and how it went; a tap opens its result again. */
+function AnsweredRow({ it, verdict, grading, voided, onOpen }: { it: Item; verdict: Verdict | null; grading: boolean; voided: boolean; onOpen: () => void }) {
+  const ch = it.card.chapter;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="flex min-h-11 w-full items-center gap-3 rounded-control border border-border-subtle bg-white/[0.02] px-3 py-2 text-left text-[13px] text-text-primary hover:bg-white/[0.05]"
+    >
+      <span className="shrink-0 font-mono text-[11px] text-text-tertiary">{ch != null && ch >= 1 ? `Ch ${ch}` : ch === 0 ? "Book" : ""}</span>
+      <span className="min-w-0 flex-1 truncate">{it.question?.prompt}</span>
+      <span className="shrink-0 text-[12px]">
+        {voided ? (
+          <span className="text-text-tertiary">Voided</span>
+        ) : verdict ? (
+          <VerdictWord verdict={verdict} />
+        ) : grading ? (
+          <span className="text-text-secondary">Grading</span>
+        ) : (
+          <span className="text-text-tertiary">Saved</span>
+        )}
+      </span>
+    </button>
   );
 }
 
@@ -947,7 +1241,9 @@ interface CardViewProps {
   today: string;
   /** The poll for this card's model grade ran out ("Still grading · shows later"). */
   pollOver: boolean;
-  results: Record<string, AttemptResult>;
+  results: Results;
+  /** Item keys whose answers a sent Wrong / Unclear flag voided. */
+  voided: ReadonlySet<string>;
   sourcesOpen: boolean;
   setSourcesOpen: (open: boolean) => void;
   refs: {
@@ -965,15 +1261,18 @@ interface CardViewProps {
   onChange: (mode: "override" | "self", v: ModelVerdict) => void;
 }
 
-function CardView({ it, today, pollOver, results, sourcesOpen, setSourcesOpen, refs, onAnswer, onChoice, onOrder, onRetry, onReveal, onGradeHighlight, onChange }: CardViewProps) {
+function CardView({ it, today, pollOver, results, voided, sourcesOpen, setSourcesOpen, refs, onAnswer, onChoice, onOrder, onRetry, onReveal, onGradeHighlight, onChange }: CardViewProps) {
   const card = it.card;
   const q = it.question;
   const rub = q ? parseRubric(q.rubric) : null;
   const open = answerable(it);
   const answered = !open;
-  const verdict = verdictOf(it, results);
+  const verdict = verdictOf(it, results, voided);
   const result = results[attemptKeyOf(it) ?? ""];
-  const grading = isGrading(it, results);
+  const grading = isGrading(it, results, voided);
+  const isVoid = isVoided(it, results, voided);
+  // Stored and settled: on screen after Check, or opened again from the summary ("past").
+  const settled = it.phase === "saved" || it.phase === "past";
 
   if (card.kind === "highlight" && card.highlight) {
     const h = card.highlight;
@@ -1039,6 +1338,7 @@ function CardView({ it, today, pollOver, results, sourcesOpen, setSourcesOpen, r
   const options = rub?.format === "cued" ? rub.options ?? [] : [];
   const steps = rub?.format === "order" ? rub.steps : [];
   const offered = format === "order" ? offeredOrder(steps, `${q.question_id}|${today}`) : [];
+  const choicesShown = format === "cued" && it.hinted ? choiceOrder(options.length, `${q.question_id}|${today}`) : [];
 
   return (
     <article data-testid="practice-card" className="space-y-3">
@@ -1047,12 +1347,16 @@ function CardView({ it, today, pollOver, results, sourcesOpen, setSourcesOpen, r
         {q.prompt}
       </h2>
 
-      {/* The answer: typed / dictated, 4 choices (hinted), or steps to order. Read-only once checked. */}
-      {format === "order" ? (
+      {/* The answer: typed / dictated, 4 choices (hinted), or steps to order. Read-only once checked. An answer from
+          before this sitting is not sent back by the server, so it is not shown again. */}
+      {it.earlier ? (
+        <p className="text-[13px] text-text-tertiary">Answered earlier today</p>
+      ) : format === "order" ? (
         <OrderPicker steps={steps} offered={offered} picked={it.order} onChange={onOrder} disabled={answered} />
       ) : format === "cued" && it.hinted ? (
         <ChoiceList
           options={options}
+          order={choicesShown}
           picked={it.choice}
           onPick={onChoice}
           disabled={answered}
@@ -1075,20 +1379,22 @@ function CardView({ it, today, pollOver, results, sourcesOpen, setSourcesOpen, r
         <div data-testid="practice-result" className="space-y-3 rounded-control border border-border-subtle bg-white/[0.02] p-3">
           {/* Verdict line: an icon and a word; or "Saved · grading" while the model grades. */}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[14px]">
-            {verdict ? (
+            {isVoid ? (
+              <span className="text-text-secondary">Voided after your flag</span>
+            ) : verdict ? (
               <VerdictWord verdict={verdict} />
-            ) : it.phase === "saved" && grading ? (
+            ) : settled && grading ? (
               <span className="text-text-secondary">{pollOver && !result?.self_gradable ? "Still grading · shows later" : "Saved · grading"}</span>
             ) : it.phase === "saving" ? (
               <span className="text-text-secondary">Saving</span>
             ) : null}
             {it.phase === "saving" && verdict && <span className="text-[12px] text-text-tertiary">Saving</span>}
-            {it.phase === "saved" && verdict && (
+            {settled && verdict && (
               <span className="font-mono text-[12px] text-text-tertiary">
                 {nextLine({ today, verdict, preview: card.preview, receiptNext: it.receipt?.next_review ?? null, again: it.again })}
               </span>
             )}
-            {it.phase === "saved" && format === "chapter_recall" && card.recall?.next_due_on && (
+            {settled && !isVoid && format === "chapter_recall" && card.recall?.next_due_on && (
               <span className="font-mono text-[12px] text-text-tertiary">Next recall {inDays(today, card.recall.next_due_on)}</span>
             )}
           </div>
@@ -1133,7 +1439,7 @@ function CardView({ it, today, pollOver, results, sourcesOpen, setSourcesOpen, r
               {grading && result?.self_gradable && <SelfGrade it={it} onPick={(v) => onChange("self", v)} />}
 
               {/* Disagree: once, on a model grade. */}
-              {result?.overridable && it.change?.status !== "saved" && (
+              {!isVoid && result?.overridable && it.change?.status !== "saved" && (
                 <div role="group" aria-label="Disagree?" className="space-y-1">
                   <p className="text-[12px] text-text-tertiary">Disagree?</p>
                   <div className="flex flex-wrap gap-2">

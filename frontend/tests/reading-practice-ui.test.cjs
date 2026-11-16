@@ -2,7 +2,10 @@
 // BankApproval) and lib/reading-practice-client.ts under the hook harness: the answer stays hidden until Check or
 // "I don't know"; Skip stores nothing; a failure keeps the card and Retry sends the SAME request; the verdict is
 // announced once; focus moves predictably; Show choices sets hinted; Disagree once; a flag inside 8 s + Undo sends
-// nothing; held flags and unconfirmed answers go out with keepalive when the page hides; the 390 px classes; the keys.
+// nothing; held flags and unconfirmed answers go out with keepalive when the page hides; the 390 px classes (and a
+// phone turned to landscape); the keys (only from inside the runner); Quick 3 goes on from the first open card; a
+// resumed round reads its earlier grades; a sent Wrong voids the answer in the summary; closing with an answer on its
+// way says when it settled; a late "Again" is offered on the summary; the bank GET in S2's real shape.
 // Synthetic data only (invented prompts and answers); no network, no storage.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -129,6 +132,8 @@ function serverReceipt(cards, body, o = {}) {
 /* ------------------------------------------------------------------ */
 
 const ICONS = new Proxy({}, { get: () => function Icon() { return null; } });
+// The props the Practice part last gave its runner (the dynamic chunk is a stub here).
+const runnerProps = [];
 const STUBS = {
   "lucide-react": ICONS,
   "@/components/InfoHint": function InfoHint() {
@@ -142,6 +147,7 @@ const STUBS = {
   },
   "next/dynamic": () =>
     function DynamicRunner(p) {
+      runnerProps.push(p);
       return React.createElement("div", { "data-testid": "runner-stub", "data-mode": p.mode });
     },
 };
@@ -211,8 +217,19 @@ function mountRunner(t, { cards, answer, poll, override, review, flagAnswer, win
     ...(doc ? { document: doc } : {}),
   });
   const closed = [];
+  const settles = [];
   const h = mountClient("app/reading/PracticeRunner.tsx", {
-    props: { round: round(cards, { extra }), mode, onClose: (changed, finished) => closed.push({ changed, finished }), onMore: () => undefined, onReread, timers },
+    props: {
+      round: round(cards, { extra }),
+      mode,
+      onClose: (changed, finished, settled) => {
+        closed.push({ changed, finished });
+        settles.push(settled);
+      },
+      onMore: () => undefined,
+      onReread,
+      timers,
+    },
     stubs: STUBS,
   });
   const attempts = () => calls.filter((c) => c.url === C.ATTEMPT_URL);
@@ -220,7 +237,8 @@ function mountRunner(t, { cards, answer, poll, override, review, flagAnswer, win
   const live = () => h.find((n) => n.props["aria-live"] === "polite");
   const alerts = () => h.find((n) => n.props.role === "alert").map((n) => h.text(n));
   const root = () => h.find((n) => n.props["data-testid"] === "practice-runner")[0];
-  return { h, calls, timers, closed, attempts, flagsSent, live, alerts, root };
+  const polls = () => calls.filter((c) => c.url.startsWith("/api/reading/practice/round/"));
+  return { h, calls, timers, closed, settles, attempts, flagsSent, polls, live, alerts, root };
 }
 
 function typeAnswer(h, text) {
@@ -259,6 +277,8 @@ test("the answer stays hidden until Check; the code verdict shows before the POS
   r.h.click("Check");
   await r.h.flush();
   assert.match(r.h.text(), /Right/, "the code verdict is on screen before the POST answered");
+  assert.match(r.h.button("Sources 1").props.className, /min-h-11/, "the Sources chip, now a button, is a 44 px target");
+  assert.doesNotMatch(r.h.button("Sources 1").props.className, /min-h-7/);
   assert.match(r.h.text(), /Answer: alpha 1/);
   assert.match(r.h.text(), /Synthetic explanation 1\./);
   assert.equal(r.h.button("Next").props["aria-disabled"], true, "Next waits for the save (one request at a time)");
@@ -438,9 +458,17 @@ test("Show choices turns a recall card into 4 options (keys 1-4, Enter checks); 
   const radios = () => r.h.find((n) => n.type === "button" && n.props.role === "radio");
   assert.equal(radios().length, 4);
   assert.equal(r.h.find((n) => n.type === "textarea").length, 0);
-  win.fire("keydown", keyEvent("1"));
+  // The options are offered in a fixed shuffle (lib choiceOrder); the key is the place on screen.
+  const place = radios().findIndex((b) => /alpha 1/.test(r.h.text(b)));
+  assert.ok(place >= 0);
+  assert.deepEqual(
+    radios().map((b) => r.h.text(b).replace(/^\d/, "")),
+    C.choiceOrder(4, `101|${TODAY}`).map((i) => cuedRubric(1).options[i]),
+    "shown in the shuffled order",
+  );
+  win.fire("keydown", keyEvent(String(place + 1)));
   await r.h.flush();
-  assert.equal(radios()[0].props["aria-checked"], true);
+  assert.equal(radios()[place].props["aria-checked"], true);
   win.fire("keydown", keyEvent("Enter"));
   await r.h.flush();
   const [a] = r.attempts();
@@ -526,13 +554,10 @@ test("the page hiding re-sends an unconfirmed answer with keepalive (the same re
   r.h.click("Check");
   await r.h.flush();
   assert.match(r.alerts()[0], /Not sure it saved/);
-  // One request at a time: while the answer is unconfirmed the card cannot be flagged or skipped.
-  r.h.click("More actions");
-  await r.h.flush();
+  // One request at a time: while the answer is unconfirmed the card cannot be flagged or skipped (no ⋯ menu at all).
+  assert.equal(r.h.buttons("More actions").length, 0);
   assert.equal(r.h.buttons("Wrong").length, 0);
   assert.equal(r.h.buttons("Skip for now").length, 0);
-  r.h.click("More actions");
-  await r.h.flush();
   doc.visibilityState = "hidden";
   doc.fire("visibilitychange");
   await r.h.flush();
@@ -670,33 +695,299 @@ test("keys on a desktop: Ctrl/Cmd+Enter checks a typed answer, N goes on (not wh
   const win = fakeTarget();
   const r = mountRunner(t, { cards: [cued(1), cued(2)], win });
   await r.h.flush();
+  // The runner's own elements (the answer box, its buttons) are inside its root, as in the page.
+  const box = { tagName: "TEXTAREA" };
+  const inner = { tagName: "BUTTON" };
+  r.root().props.ref.current = { contains: (t) => t === box || t === inner };
   typeAnswer(r.h, "alpha 1");
   await r.h.flush();
-  win.fire("keydown", keyEvent("Enter", { ctrlKey: true, target: { tagName: "TEXTAREA" } }));
+  win.fire("keydown", keyEvent("Enter", { ctrlKey: true, target: box }));
   await r.h.flush();
   assert.equal(r.attempts().length, 1);
-  win.fire("keydown", keyEvent("n", { target: { tagName: "TEXTAREA" } }));
+  win.fire("keydown", keyEvent("n", { target: box }));
   await r.h.flush();
   assert.match(r.h.text(), /Synthetic prompt 1\?/, "N while typing is a letter");
   win.fire("keydown", keyEvent("n"));
   await r.h.flush();
   assert.match(r.h.text(), /Synthetic prompt 2\?/);
+  // Esc closes only with focus inside the runner: not from another widget, not on an event already handled.
   win.fire("keydown", keyEvent("Escape"));
+  win.fire("keydown", keyEvent("Escape", { target: { tagName: "INPUT" } }));
+  win.fire("keydown", keyEvent("Escape", { target: inner, defaultPrevented: true }));
+  await r.h.flush();
+  assert.deepEqual(r.closed, [], "Esc with nothing focused, from outside, or already handled closes nothing");
+  win.fire("keydown", keyEvent("Escape", { target: inner }));
   assert.deepEqual(r.closed, [{ changed: true, finished: false }]);
 });
 
-test("390 px: a full-screen sheet below md with safe-area padding, in place from md; 16 px input, 44 / 48 px targets", async (t) => {
+test("keys from another widget are not the runner's: an N the go-shortcut already handled, an N on a link outside", async (t) => {
+  const win = fakeTarget();
+  const r = mountRunner(t, { cards: [cued(1), cued(2)], win });
+  await r.h.flush();
+  r.root().props.ref.current = { contains: () => false };
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  win.fire("keydown", keyEvent("n", { defaultPrevented: true }));
+  win.fire("keydown", keyEvent("n", { target: { tagName: "A" } }));
+  await r.h.flush();
+  assert.match(r.h.text(), /Synthetic prompt 1\?/, "still on the answered card");
+  win.fire("keydown", keyEvent("n"));
+  await r.h.flush();
+  assert.match(r.h.text(), /Synthetic prompt 2\?/, "with nothing focused N goes on");
+});
+
+test("390 px: a full-screen sheet with safe-area padding and no breakpoint classes; turned to landscape it moves in place, the answer kept", async (t) => {
+  const mq = fakeTarget({ matches: true, media: "(max-width: 767px)" });
+  const win = fakeTarget({ matchMedia: () => mq });
+  const doc = fakeTarget({ visibilityState: "visible", documentElement: { style: { overflow: "" } }, body: { style: { overflow: "" } } });
+  const r = mountRunner(t, { cards: [cued(1), cued(2)], win, doc });
+  await r.h.flush();
+  const classes = () => r.root().props.className.split(/\s+/);
+  for (const c of ["fixed", "inset-0", "z-50", "flex-col", "pt-[env(safe-area-inset-top)]", "pb-[env(safe-area-inset-bottom)]"]) assert.ok(classes().includes(c), `phone class ${c}`);
+  assert.equal(classes().filter((c) => c.startsWith("md:")).length, 0, "no breakpoint class can turn the sheet into an in-place card");
+  assert.equal(r.root().props["data-layout"], "sheet");
+  assert.equal(doc.documentElement.style.overflow, "hidden", "the page behind the sheet does not scroll");
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  // Landscape (wider than 767 px): the in-place card, the page scrolls again, the typed answer is still there.
+  mq.matches = false;
+  mq.fire("change");
+  await r.h.flush();
+  for (const c of ["relative", "max-w-[640px]"]) assert.ok(classes().includes(c), `in-place class ${c}`);
+  assert.ok(!classes().includes("fixed"));
+  assert.equal(r.root().props["data-layout"], "inline");
+  assert.equal(doc.documentElement.style.overflow, "");
+  assert.equal(doc.body.style.overflow, "");
+  assert.equal(r.h.find((n) => n.type === "textarea")[0].props.value, "alpha 1");
+  mq.matches = true;
+  mq.fire("change");
+  await r.h.flush();
+  assert.equal(r.root().props["data-layout"], "sheet", "and back");
+  assert.equal(doc.documentElement.style.overflow, "hidden");
+  r.h.unmount();
+  assert.equal(doc.documentElement.style.overflow, "", "closing gives the page its scroll back");
+});
+
+test("desktop (no phone media query): the in-place card at most 640 px wide; 16 px input, 44 / 48 px targets", async (t) => {
   const r = mountRunner(t, { cards: [cued(1), cued(2)] });
   await r.h.flush();
-  const cls = r.root().props.className;
-  for (const c of ["fixed", "inset-0", "z-50", "pt-[env(safe-area-inset-top)]", "pb-[env(safe-area-inset-bottom)]", "md:relative", "md:inset-auto", "md:max-w-[640px]"]) {
-    assert.ok(cls.split(/\s+/).includes(c), `runner class ${c}`);
-  }
+  const cls = r.root().props.className.split(/\s+/);
+  for (const c of ["relative", "mx-auto", "w-full", "max-w-[640px]"]) assert.ok(cls.includes(c), `runner class ${c}`);
+  assert.ok(!cls.includes("fixed"));
   assert.match(r.h.find((n) => n.type === "textarea")[0].props.className, /text-\[16px\]/);
   assert.match(prompt(r.h).props.className, /text-\[17px\]/);
   for (const label of ["Check", "I don't know", "More actions", "Close practice"]) assert.match(r.h.button(label).props.className, /min-h-11/, label);
   await menu(r.h, "Show choices");
   for (const b of r.h.find((n) => n.type === "button" && n.props.role === "radio")) assert.match(b.props.className, /min-h-12/);
+});
+
+test("Quick 3 is the first 3 cards still open: a second Quick 3 the same day goes on from the 4th card", async (t) => {
+  const done = (n) => cued(n, { card: { done: true, attempt_key: `${n}a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a` } });
+  const r = mountRunner(t, { cards: [done(1), done(2), done(3), cued(4), cued(5), cued(6), cued(7)], mode: "quick" });
+  await r.h.flush();
+  assert.match(r.h.text(), /Synthetic prompt 4\?/, "not the summary of the first 3");
+  assert.match(r.h.text(), /1 \/ 3/, "three cards");
+  for (const n of [4, 5, 6]) {
+    assert.match(r.h.text(), new RegExp(`Synthetic prompt ${n}\\?`));
+    typeAnswer(r.h, `alpha ${n}`);
+    await r.h.flush();
+    r.h.click("Check");
+    await r.h.flush();
+    r.h.click("Next");
+    await r.h.flush();
+  }
+  assert.match(r.h.text(), /Round done/);
+  assert.match(r.h.text(), /3 of 3 · \+6 XP/);
+  assert.doesNotMatch(r.h.text(), /Synthetic prompt 7\?/);
+});
+
+const EARLIER_KEY = "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a";
+const earlierAttempt = (o = {}) => ({
+  attempt_key: EARLIER_KEY,
+  question_id: 101,
+  grading_status: "graded",
+  verdict: "partial",
+  score: 0.5,
+  hinted: false,
+  feedback: "Synthetic earlier feedback.",
+  rubric_hits: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "no" }],
+  grader: "model",
+  overridden: false,
+  grade_error: null,
+  overridable: true,
+  self_gradable: false,
+  covered_ideas: null,
+  ...o,
+});
+
+test("a resumed round reads its earlier answers once; the summary opens one again with its feedback and Disagree", async (t) => {
+  const earlier = { ...explain(1), done: true, attempt_key: EARLIER_KEY.toUpperCase() };
+  const r = mountRunner(t, { cards: [earlier, cued(2)], poll: () => response({ round_key: ROUND_KEY, attempts: [earlierAttempt()] }) });
+  await r.h.flush();
+  assert.equal(r.polls().length, 1, "one read of the round's attempts on open");
+  assert.match(r.h.text(), /Synthetic prompt 2\?/);
+  typeAnswer(r.h, "alpha 2");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Next");
+  await r.h.flush();
+  assert.match(r.h.text(), /Round done/);
+  assert.match(r.h.text(), /2 of 2 · \+2 XP/, "the earlier answer counted in its own sitting, not again");
+  const row = r.h.find((n) => n.type === "button" && /Explain synthetic idea 1/.test(r.h.text(n)))[0];
+  assert.ok(row, "the earlier answer is listed");
+  assert.match(r.h.text(row), /Partly/);
+  assert.match(row.props.className, /min-h-11/);
+  row.props.onClick();
+  await r.h.flush();
+  assert.match(r.h.text(), /Answered earlier today/, "the earlier answer's text is not sent back, so it is not shown");
+  assert.match(r.h.text(), /Synthetic earlier feedback\./);
+  assert.match(r.h.text(), /Disagree\?/);
+  r.h.click("Correct");
+  await r.h.flush();
+  const o = r.calls.find((c) => c.url.endsWith("/override"));
+  assert.equal(o.url, `/api/reading/practice/attempt/${EARLIER_KEY}/override`);
+  assert.match(r.h.text(), /Changed by you/);
+  assert.match(r.h.text(), /Next: in 2 days/, "the committed schedule from the override's receipt");
+  r.h.click("Back to summary");
+  await r.h.flush();
+  assert.match(r.h.text(), /Round done/);
+});
+
+test("a resumed answer still waiting for its model grade is polled for, and can be graded by hand once offered", async (t) => {
+  const earlier = { ...explain(1), done: true, attempt_key: EARLIER_KEY };
+  let graded = false;
+  const r = mountRunner(t, {
+    cards: [earlier],
+    poll: () =>
+      response({
+        round_key: ROUND_KEY,
+        attempts: [graded ? earlierAttempt() : earlierAttempt({ grading_status: "pending", verdict: null, score: null, feedback: null, rubric_hits: null, grader: null, overridable: false, self_gradable: true })],
+      }),
+  });
+  await r.h.flush();
+  assert.match(r.h.text(), /Round done/);
+  assert.match(r.h.text(), /1 still grading/);
+  assert.match(r.h.text(), /Grade it yourself/, "a failed or late grade can be graded by hand");
+  const before = r.polls().length;
+  graded = true;
+  await r.timers.advance(C.POLL_EVERY_MS, r.h);
+  assert.equal(r.polls().length, before + 1, "the poll runs for an earlier answer too");
+  assert.doesNotMatch(r.h.text(), /still grading/);
+});
+
+test("a sent Wrong flag on an answered card voids it: no verdict, no XP, no 'moved up', and the summary says so", async (t) => {
+  const cards = [cued(1, { again: false }), cued(2, { again: false })];
+  const r = mountRunner(t, { cards, flagAnswer: (b) => response({ success: true, kind: b.kind, invalidated: 1, replayed: true }) });
+  await r.h.flush();
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  assert.match(r.h.text(), /Right/);
+  await menu(r.h, "Wrong");
+  assert.match(r.h.text(), /Synthetic prompt 2\?/, "flagging from the result screen moves on");
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent().length, 1);
+  assert.ok(r.polls().length >= 1, "the round's attempts are read back after the flag");
+  typeAnswer(r.h, "alpha 2");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Next");
+  await r.h.flush();
+  const text = r.h.text();
+  assert.match(text, /2 of 2 · \+2 XP/, "only the answer that still counts earns XP");
+  assert.match(text, /1 idea moved up/);
+  assert.match(text, /1 answer voided after your correction/);
+  const row = r.h.find((n) => n.type === "button" && /Synthetic prompt 1\?/.test(r.h.text(n)))[0];
+  assert.match(r.h.text(row), /Voided/);
+  row.props.onClick();
+  await r.h.flush();
+  assert.match(r.h.text(), /Voided after your flag/);
+  assert.doesNotMatch(r.h.text(), /Disagree\?/);
+  assert.equal(r.h.buttons("More actions").length, 0, "a flagged card is not flagged again");
+});
+
+test("closing with an answer on its way: the part is told when it settled (one request, never re-sent)", async (t) => {
+  const gate = deferred();
+  const cards = [cued(1), cued(2)];
+  const r = mountRunner(t, { cards, answer: (b) => gate.promise.then(() => response(serverReceipt(cards, b))) });
+  await r.h.flush();
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Close practice");
+  assert.deepEqual(r.closed, [{ changed: false, finished: false }]);
+  const settled = r.settles[0];
+  assert.ok(settled && typeof settled.then === "function", "a settled promise while the answer is on its way");
+  let landed = false;
+  void settled.then(() => (landed = true));
+  await tick();
+  assert.equal(landed, false);
+  gate.resolve();
+  await r.h.flush();
+  assert.equal(landed, true, "settled once the answer landed");
+  assert.equal(r.attempts().length, 1, "the answer on its way is not sent twice");
+});
+
+test("closing with a held flag sends it at once and settles after; closing with nothing pending passes no promise", async (t) => {
+  const r = mountRunner(t, { cards: [cued(1), cued(2)] });
+  await r.h.flush();
+  await menu(r.h, "Unclear");
+  r.h.click("Close practice");
+  assert.equal(r.flagsSent().length, 1, "sent at close, not after 8 s");
+  await r.h.flush();
+  let landed = false;
+  void r.settles[0].then(() => (landed = true));
+  await tick();
+  assert.equal(landed, true);
+  const r2 = mountRunner(t, { cards: [cued(3)] });
+  await r2.h.flush();
+  r2.h.click("Close practice");
+  assert.equal(r2.settles[0], undefined);
+});
+
+test("a model grade that comes after the round ended offers Again on the summary instead of pushing a card", async (t) => {
+  const withVariant = {
+    ...explain(2),
+    again_question: { question_id: 202, version: 1, format: "cued", prompt: "Synthetic variant 2?", rubric: cuedRubric(2) },
+  };
+  let key = null;
+  const r = mountRunner(t, {
+    cards: [cued(1, { again: false }), withVariant],
+    poll: () =>
+      response({
+        round_key: ROUND_KEY,
+        attempts: key
+          ? [{ attempt_key: key, question_id: 102, grading_status: "graded", verdict: "incorrect", score: 0.1, hinted: false, feedback: null, rubric_hits: null, grader: "model", overridden: false, grade_error: null, overridable: true, self_gradable: false, covered_ideas: null }]
+          : [],
+      }),
+  });
+  await r.h.flush();
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Next");
+  await r.h.flush();
+  typeAnswer(r.h, "A synthetic explanation of several words.");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  key = r.attempts()[1].body.attempt_key;
+  r.h.click("Next");
+  await r.h.flush();
+  assert.match(r.h.text(), /Round done/);
+  await r.timers.advance(C.POLL_EVERY_MS, r.h);
+  assert.match(r.h.text(), /Round done/, "the summary stays");
+  assert.doesNotMatch(r.h.text(), /Synthetic variant 2\?/);
+  r.h.click("Try again · 1");
+  await r.h.flush();
+  assert.match(r.h.text(), /Synthetic variant 2\?/, "the repeat on a tap");
 });
 
 /* ------------------------------------------------------------------ */
@@ -727,7 +1018,26 @@ function mountPart(t, { roundAnswer, bankAnswer, approval, cache = {} }) {
   });
   return { h, calls, store, changed };
 }
-const bankBody = (o = {}) => ({ book_id: 7, enabled: false, paused_reason: null, approved_cents: null, spent_cents: 0, quiz_through: 4, chapters: [], estimate_cents: 1500, cap_cents: 1900, ...o });
+// GET /api/reading/bank exactly as lib/reading-bank-server.ts getBankOverview answers it (S2): the
+// pds.reading_bank_overview row, then `estimate` (remaining_cents = what is left to build, cap_cents = what a Turn on /
+// Allow more tap approves) and `monthly_cap_cents`. There is no top-level estimate, cap or next due date.
+const bankBody = (o = {}, est = {}) => ({
+  book_id: 7,
+  quiz_through: 4,
+  total_chapters: 12,
+  enabled: false,
+  approved_cents: null,
+  spent_cents: 0,
+  paused_reason: null,
+  mapping: "ok",
+  narrative: false,
+  hold_chapter: null,
+  hold_flag_key: null,
+  chapters: [],
+  ...o,
+  estimate: { book_cents: 1500, remaining_cents: 1500, cap_cents: 1900, per_chapter_cents: 125, ...est },
+  monthly_cap_cents: 3000,
+});
 
 test("practice part: with the SQL not applied the Review card stays exactly as before (no approval card)", async (t) => {
   const p = mountPart(t, { roundAnswer: () => response({ error: "bank_unavailable" }, 503), bankAnswer: () => response({ error: "bank_unavailable" }, 503) });
@@ -742,7 +1052,7 @@ test("practice part: bank off shows the approval card above the Review card; Tur
   let bankReads = 0;
   const p = mountPart(t, {
     roundAnswer: () => response({ ...round([]), enabled: false }),
-    bankAnswer: () => response(bankBody(bankReads++ ? { estimate_cents: 1700, cap_cents: 2200 } : {})),
+    bankAnswer: () => response(bankReads++ ? bankBody({}, { remaining_cents: 1700, cap_cents: 2200 }) : bankBody()),
     approval: () => response({ error: "estimate_changed" }, 409),
   });
   await p.h.flush();
@@ -778,9 +1088,9 @@ test("practice part: a cached round from another day is never shown; a budget pa
   stale.today = "2026-03-09";
   const gate = deferred();
   const p = mountPart(t, {
-    cache: { [C.practiceUrl("synthetic-book")]: stale, [C.bankUrl("synthetic-book")]: bankBody({ enabled: true, paused_reason: "budget", spent_cents: 1900, cap_cents: 2500 }) },
+    cache: { [C.practiceUrl("synthetic-book")]: stale, [C.bankUrl("synthetic-book")]: bankBody({ enabled: true, paused_reason: "budget", spent_cents: 1900 }, { remaining_cents: 400, cap_cents: 2500 }) },
     roundAnswer: () => gate.promise,
-    bankAnswer: () => response(bankBody({ enabled: true, paused_reason: "budget", spent_cents: 1900, cap_cents: 2500 })),
+    bankAnswer: () => response(bankBody({ enabled: true, paused_reason: "budget", spent_cents: 1900 }, { remaining_cents: 400, cap_cents: 2500 })),
   });
   await p.h.flush();
   assert.doesNotMatch(p.h.text(), /Synthetic prompt|1 ready/);
@@ -790,6 +1100,50 @@ test("practice part: a cached round from another day is never shown; a budget pa
   gate.resolve(response(round([])));
   await p.h.flush();
   assert.match(p.h.text(), /Nothing due/);
+});
+
+test("practice part: the bank GET exactly as S2 answers it turns the approval card on; a made-up top-level estimate is not read", async (t) => {
+  const p = mountPart(t, { roundAnswer: () => response({ ...round([]), enabled: false }), bankAnswer: () => response(bankBody()) });
+  await p.h.flush();
+  assert.match(p.h.text(), /Questions on every chapter/);
+  assert.match(p.h.text(), /About \$15 · cap \$19/);
+  const p2 = mountPart(t, {
+    roundAnswer: () => response({ ...round([]), enabled: false }),
+    bankAnswer: () => response({ ...bankBody(), estimate: undefined, estimate_cents: 1500, cap_cents: 1900 }),
+  });
+  await p2.h.flush();
+  assert.doesNotMatch(p2.h.text(), /Questions on every chapter/, "no approval without S2's estimate block");
+  assert.match(p2.h.text(), /REVIEW CARD/);
+});
+
+test("practice part: a runner closed with answers on their way keeps Start waiting and re-reads the round once they land", async (t) => {
+  runnerProps.length = 0;
+  let roundReads = 0;
+  const p = mountPart(t, {
+    roundAnswer: () => {
+      roundReads += 1;
+      return response(round([cued(1), cued(2)]));
+    },
+    bankAnswer: () => response(bankBody({ enabled: true, approved_cents: 1900 })),
+  });
+  await p.h.flush();
+  p.h.click("Start");
+  await p.h.flush();
+  const props = runnerProps[runnerProps.length - 1];
+  assert.equal(props.mode, "daily");
+  const gate = deferred();
+  const readsBefore = roundReads;
+  props.onClose(false, false, gate.promise);
+  await p.h.flush();
+  assert.equal(p.h.button("Start").props["aria-disabled"], true, "Start waits while the answers land");
+  assert.match(p.h.text(), /Saving/);
+  assert.equal(roundReads, readsBefore, "no re-read before they landed");
+  assert.deepEqual(p.changed, []);
+  gate.resolve();
+  await p.h.flush();
+  assert.equal(roundReads, readsBefore + 1, "re-read once after");
+  assert.deepEqual(p.changed, [1], "the overview too");
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined);
 });
 
 /* ------------------------------------------------------------------ */
@@ -845,9 +1199,10 @@ test("the round GET is parsed defensively; progress and the day check", () => {
 });
 
 test("bank notices, most urgent first; money in whole dollars", () => {
-  const b = (o) => C.parseBank(bankBody({ enabled: true, ...o }));
+  const b = (o, est) => C.parseBank(bankBody({ enabled: true, ...o }, est));
   assert.equal(C.bankNotice(b({ enabled: false })), null);
-  assert.deepEqual(C.bankNotice(b({ paused_reason: "budget", spent_cents: 1900, cap_cents: 2500 })), { kind: "paused", moreCents: 600 });
+  assert.deepEqual(C.bankNotice(b({ paused_reason: "budget", spent_cents: 1900 }, { cap_cents: 2500 })), { kind: "paused", moreCents: 600 });
+  assert.deepEqual(C.bankNotice(b({ paused_reason: "budget", spent_cents: 2500 }, { cap_cents: 2500 })), { kind: "paused", moreCents: null }, "the $25 cap is reached");
   const chapters = [
     { chapter: 1, locked: false, status: "ready" },
     { chapter: 2, locked: false, status: "thin" },
@@ -915,4 +1270,32 @@ test("links leave only as http(s); highlight sources are labelled by page", () =
   assert.equal(C.safeHref("data:text/html,x"), null);
   assert.equal(C.highlightLabel({ page: 52, location: null }), "Your highlight · p. 52");
   assert.equal(C.highlightLabel({ page: null, location: "1234" }), "Your highlight · loc. 1234");
+});
+
+test("Show choices: the options are offered shuffled by question and day, so the stored place of the answer is no hint", () => {
+  let first = 0;
+  const seen = new Set();
+  for (let q = 100; q < 140; q++) {
+    for (const day of ["2026-03-10", "2026-03-11"]) {
+      const o = C.choiceOrder(4, `${q}|${day}`);
+      assert.deepEqual([...o].sort((a, b) => a - b), [0, 1, 2, 3], "a permutation");
+      assert.deepEqual(C.choiceOrder(4, `${q}|${day}`), o, "the same on a reopened card");
+      if (o[0] === 0) first += 1;
+      seen.add(o.join(""));
+    }
+  }
+  assert.ok(first < 80, "the stored first option does not always lead");
+  assert.ok(seen.size > 1, "questions get different orders");
+});
+
+test("the bank GET in S2's shape: the estimate and the cap come from `estimate`; no next due date is sent", () => {
+  const b = C.parseBank(bankBody({ enabled: false, spent_cents: 300 }, { remaining_cents: 1240, cap_cents: 1900 }));
+  assert.equal(b.estimate_cents, 1240, "the estimate for what is left");
+  assert.equal(b.cap_cents, 1900);
+  assert.equal(b.spent_cents, 300);
+  assert.equal(b.next_due, null);
+  const old = C.parseBank({ book_id: 7, enabled: false, chapters: [], estimate_cents: 1500, cap_cents: 1900 });
+  assert.equal(old.estimate_cents, null, "top-level fields are not S2's contract");
+  assert.equal(old.cap_cents, null);
+  assert.equal(C.parseBank({ error: "bank_unavailable" }), null);
 });

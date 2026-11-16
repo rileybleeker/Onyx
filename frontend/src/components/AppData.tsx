@@ -14,7 +14,7 @@ import {
 } from "@/lib/client-cache";
 import { IdbCacheBackend, idbAvailable } from "@/lib/client-cache-idb";
 import { journalTodayUrl } from "@/lib/journal-file";
-import { bankUrl, practiceUrl, readingSlugOf } from "@/lib/reading-practice-client";
+import { bankUrl, practiceUrl, readingSlugOf } from "@/lib/reading-practice-urls";
 import {
   REWARM_AFTER_MS, REWARM_EVERY_MS, VISITS_KEY, browserIdle, configureWarmup, orderTargets, parseVisits, recordVisit, routeOf, runWarmup,
   type DataWarmer, type PrefetchMode, type WarmRun, type WarmTarget, type WarmupDeps,

@@ -35,7 +35,10 @@ export function VerdictWord({ verdict, className = "" }: { verdict: Verdict; cla
   );
 }
 
-/** "Ch 7 · Recall · Sources 2". The Sources chip opens "Where this comes from" only once the card is answered. */
+/**
+ * "Ch 7 · Recall · Sources 2". The Sources chip opens "Where this comes from" only once the card is answered; then it
+ * is a button with a 44 px tap target (the plain chips stay small).
+ */
 export function CardChips({
   chapter,
   format,
@@ -48,7 +51,8 @@ export function CardChips({
   /** Set once the card is answered (the sources can state the answer). */
   onSources?: () => void;
 }) {
-  const chip = "inline-flex min-h-7 items-center rounded px-2 text-[11px] font-mono text-text-secondary bg-white/[0.04] border border-border-subtle";
+  const base = "inline-flex items-center rounded px-2 text-[11px] font-mono text-text-secondary bg-white/[0.04] border border-border-subtle";
+  const chip = `${base} min-h-7`;
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {chapter != null && chapter >= 1 && <span className={chip}>Ch {chapter}</span>}
@@ -56,7 +60,7 @@ export function CardChips({
       <span className={chip}>{FORMAT_WORD[format]}</span>
       {sourceCount > 0 &&
         (onSources ? (
-          <button type="button" onClick={onSources} className={`${chip} hover:text-text-primary`}>
+          <button type="button" onClick={onSources} className={`${base} min-h-11 hover:text-text-primary`}>
             Sources <span className="ml-1">{sourceCount}</span>
           </button>
         ) : (
@@ -102,9 +106,15 @@ export function AnswerBox({
   );
 }
 
-/** Four options (after "Show choices"): 48 px rows, keys 1-4 on a desktop. After Check the right one is marked. */
+/**
+ * Four options (after "Show choices"): 48 px rows, keys 1-4 on a desktop (by place on screen). `order` lists the
+ * option indexes in the order they are offered (lib/reading-practice-client.ts choiceOrder: shuffled, so the stored
+ * position of the right one is no hint); `picked`, `correct` and onPick use the stored indexes. After Check the right
+ * one is marked.
+ */
 export function ChoiceList({
   options,
+  order,
   picked,
   onPick,
   disabled,
@@ -112,15 +122,18 @@ export function ChoiceList({
   answered,
 }: {
   options: string[];
+  order?: number[];
   picked: number | null;
   onPick: (i: number) => void;
   disabled: boolean;
   correct: number | null;
   answered: boolean;
 }) {
+  const shown = order && order.length === options.length ? order : options.map((_, i) => i);
   return (
     <div role="radiogroup" aria-label="Choices" className="space-y-2">
-      {options.map((opt, i) => {
+      {shown.map((i, place) => {
+        const opt = options[i];
         const isPicked = picked === i;
         const isRight = answered && correct === i;
         return (
@@ -138,7 +151,7 @@ export function ChoiceList({
             } ${disabled && !isPicked ? "opacity-70" : ""}`}
           >
             <span aria-hidden="true" className="w-4 shrink-0 font-mono text-[12px] text-text-tertiary">
-              {i + 1}
+              {place + 1}
             </span>
             <span className="flex-1">{opt}</span>
             {isRight && (
@@ -340,7 +353,7 @@ export function CoveredList({ covered, missed }: { covered: CoveredIdea[]; misse
                 <div className="text-text-primary">{i.title}</div>
                 <p className="text-text-secondary">{i.statement}</p>
                 <details className="mt-0.5">
-                  <summary className="inline-flex min-h-9 cursor-pointer list-none items-center text-[12px] text-text-tertiary [&::-webkit-details-marker]:hidden">
+                  <summary className="inline-flex min-h-11 cursor-pointer list-none items-center text-[12px] text-text-tertiary [&::-webkit-details-marker]:hidden">
                     Sources <span className="ml-1 font-mono">{i.source_count}</span>
                   </summary>
                   <SourcesList sources={i.sources} />

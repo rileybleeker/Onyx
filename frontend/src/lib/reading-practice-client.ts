@@ -23,37 +23,15 @@ import type { CardFormat, ModelVerdict, Verdict } from "./reading-recall";
 /* URLs                                                                 */
 /* ------------------------------------------------------------------ */
 
-export const PRACTICE_TODAY_URL = "/api/reading/practice/today";
-export const BANK_URL = "/api/reading/bank";
+export { BANK_URL, bankUrl, PRACTICE_TODAY_URL, practiceUrl, readingSlugOf } from "./reading-practice-urls";
 export const ATTEMPT_URL = "/api/reading/practice/attempt";
 export const FLAG_URL = "/api/reading/practice/flag";
 export const APPROVAL_URL = "/api/reading/bank/approval";
 export const REVIEW_URL = "/api/reading/review";
 export const READING_URL = "/api/reading";
 
-/**
- * The round of a book: the daily round, or "One more round" number n (1, 2, ...). The book is always named, so a
- * cached round can never belong to another book (components/AppData.tsx warms the same URL for the active book).
- */
-export function practiceUrl(slug: string | null, kind: "daily" | "extra" = "daily", n = 1): string {
-  const p = new URLSearchParams();
-  if (slug) p.set("book", slug);
-  if (kind === "extra") {
-    p.set("kind", "extra");
-    p.set("n", String(Math.max(1, Math.min(50, Math.trunc(n) || 1))));
-  }
-  const q = p.toString();
-  return q ? `${PRACTICE_TODAY_URL}?${q}` : PRACTICE_TODAY_URL;
-}
-export const bankUrl = (slug: string | null) => (slug ? `${BANK_URL}?book=${encodeURIComponent(slug)}` : BANK_URL);
 export const roundAttemptsUrl = (roundKey: string) => `/api/reading/practice/round/${encodeURIComponent(roundKey)}`;
 export const overrideUrl = (attemptKey: string) => `/api/reading/practice/attempt/${encodeURIComponent(attemptKey)}/override`;
-
-/** The slug of the active book in the cached /api/reading answer (what the warm-up asks the round for). */
-export function readingSlugOf(raw: unknown): string | null {
-  const slug = (raw as { overview?: { book?: { slug?: unknown } } | null } | null | undefined)?.overview?.book?.slug;
-  return typeof slug === "string" && /^[a-z0-9-]{1,80}$/.test(slug) ? slug : null;
-}
 
 /* ------------------------------------------------------------------ */
 /* The round GET                                                        */
@@ -158,16 +136,27 @@ export interface BankState {
   spent_cents: number;
   quiz_through: number;
   chapters: BankChapter[];
-  /** The server's estimate for the chapters still to build, and the cap the approval PUT must send (S2's route). */
+  /**
+   * The server's estimate for what is left to build (`estimate.remaining_cents`) and the cap a Turn on / Allow more
+   * tap must send (`estimate.cap_cents`: what is spent + that estimate x 1.25, rounded up, at most $25), from S2's
+   * getBankOverview. The route recomputes the cap and answers 409 estimate_changed when it moved.
+   */
   estimate_cents: number | null;
   cap_cents: number | null;
-  /** The next day an idea is due, when the route reports it ("Nothing due · next on Thu"). */
+  /**
+   * The next day an idea is due ("Nothing due · next on Thu"), once a read reports it. Neither the bank GET nor the
+   * round GET sends one yet (pds.reading_bank_overview has no next_due), so the idle part shows "Nothing due" alone.
+   */
   next_due: string | null;
 }
 
 const cents = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : null);
 
-/** GET /api/reading/bank: pds.reading_bank_overview plus the estimate (estimate_cents, cap_cents). null = not one. */
+/**
+ * GET /api/reading/bank: pds.reading_bank_overview's row (book_id, enabled, paused_reason, approved_cents,
+ * spent_cents, quiz_through, chapters[]) plus `estimate: {book_cents, remaining_cents, cap_cents, per_chapter_cents}`
+ * and `monthly_cap_cents` (lib/reading-bank-server.ts getBankOverview). null = not one (an error body).
+ */
 export function parseBank(raw: unknown): BankState | null {
   if (!isObj(raw) || typeof raw.book_id !== "number") return null;
   const chapters = (Array.isArray(raw.chapters) ? raw.chapters : [])
@@ -178,6 +167,7 @@ export function parseBank(raw: unknown): BankState | null {
       locked: c.locked === true,
       status: typeof c.status === "string" ? c.status : "pending",
     }));
+  const est = isObj(raw.estimate) ? raw.estimate : null;
   return {
     book_id: raw.book_id,
     enabled: raw.enabled === true,
@@ -186,8 +176,8 @@ export function parseBank(raw: unknown): BankState | null {
     spent_cents: cents(raw.spent_cents) ?? 0,
     quiz_through: int(raw.quiz_through),
     chapters,
-    estimate_cents: cents(raw.estimate_cents),
-    cap_cents: cents(raw.cap_cents),
+    estimate_cents: est ? cents(est.remaining_cents) : null,
+    cap_cents: est ? cents(est.cap_cents) : null,
     next_due: isYmd(raw.next_due) ? raw.next_due : null,
   };
 }
@@ -510,16 +500,29 @@ function hash32(s: string): number {
  * reopened card looks the same), never the answer itself. Returns indexes into `steps`.
  */
 export function offeredOrder(steps: string[], seed: string): number[] {
-  const idx = steps.map((_, i) => i);
+  const idx = shuffled(steps.length, seed);
+  if (idx.length > 1 && idx.every((v, i) => v === i)) idx.push(idx.shift() as number);
+  return idx;
+}
+
+/** A Fisher-Yates permutation of 0..n-1 fixed by `seed`. */
+function shuffled(n: number, seed: string): number[] {
+  const idx = Array.from({ length: Math.max(0, n) }, (_, i) => i);
   let h = hash32(seed);
   for (let i = idx.length - 1; i > 0; i--) {
     h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d) >>> 0;
     const j = h % (i + 1);
     [idx[i], idx[j]] = [idx[j], idx[i]];
   }
-  if (idx.length > 1 && idx.every((v, i) => v === i)) idx.push(idx.shift() as number);
   return idx;
 }
+
+/**
+ * The options of "Show choices" in the order they are offered (indexes into the stored options): shuffled by the
+ * question and the day, so where the generator put the right option is no hint, and a reopened card looks the same.
+ * Unlike offeredOrder the stored order may come out (forcing a change would itself say where the answer is not).
+ */
+export const choiceOrder = (count: number, seed: string): number[] => shuffled(count, `choices|${seed}`);
 
 /* ------------------------------------------------------------------ */
 /* Flags: held 8 s with Undo, flushed with keepalive when the page hides */

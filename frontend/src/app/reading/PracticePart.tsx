@@ -46,7 +46,9 @@ const prefetchRunner = () => {
  * Reads: two GETs in parallel on mount, both with no side effect and both cached (lib/client-cache.ts persists them:
  * book-derived content and schedules, no answers); a cached round is shown only for the overview's behavioral day.
  * Nothing is written and nothing is generated until a tap (inside the continuous scroll too). When the runner closes
- * after a change it re-reads the overview (`onChanged`) and the round once.
+ * after a change it re-reads the overview (`onChanged`) and the round once; when answers or flags were still on
+ * their way, it waits for them first (the runner's `settled`, at most 10 s) and keeps Start waiting meanwhile, so a
+ * reopened round never asks a question whose answer is still being stored.
  */
 export default function PracticePart({ o, review, onChanged }: { o: ReadingOverview; review: ReactNode; onChanged: () => void }) {
   const slug = o.book.slug;
@@ -64,6 +66,8 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
   const [allowMore, setAllowMore] = useState(false);
   const [menu, setMenu] = useState<"closed" | "open" | "confirm">("closed");
   const [offState, setOffState] = useState<{ saving: boolean; message: string | null }>({ saving: false, message: null });
+  // Answers or flags from a closed runner still on their way: Start waits, and the round is re-read once they land.
+  const [settling, setSettling] = useState(false);
   const alive = useRef(true);
 
   useEffect(() => {
@@ -128,18 +132,36 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
   const p = roundProgress(shown);
   const notice = bankNotice(bank);
 
+  /** After the runner: re-read the overview and the round (once what it left on its way has settled), then `then`. */
+  const afterRunner = useCallback(
+    (changed: boolean, settled: Promise<void> | undefined, then?: () => void) => {
+      const refresh = () => {
+        onChanged();
+        void load();
+        then?.();
+      };
+      if (settled) {
+        setSettling(true);
+        void settled.then(() => {
+          if (!alive.current) return;
+          setSettling(false);
+          refresh();
+        });
+      } else if (changed) refresh();
+      else then?.();
+    },
+    [onChanged, load],
+  );
+
   const closeRunner = useCallback(
-    (changed: boolean, finished: boolean) => {
+    (changed: boolean, finished: boolean, settled?: Promise<void>) => {
       const r = runner;
       setRunner(null);
       if (r && finished && r.mode !== "quick") setFinishedKey(r.round.round_key);
       if (r?.mode === "extra" && finished) setExtraN((n) => n + 1);
-      if (changed) {
-        onChanged();
-        void load();
-      }
+      afterRunner(changed, settled);
     },
-    [runner, onChanged, load],
+    [runner, afterRunner],
   );
 
   // "One more round": the next extra round that still has cards (an extra round finished earlier today is skipped).
@@ -196,12 +218,15 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
       type="button"
       onPointerEnter={prefetchRunner}
       onFocus={prefetchRunner}
-      onClick={() => shown && setRunner({ round: shown, mode })}
-      className={
+      aria-disabled={settling || undefined}
+      onClick={() => {
+        if (shown && !settling) setRunner({ round: shown, mode });
+      }}
+      className={`${
         primary
           ? "inline-flex min-h-11 items-center justify-center rounded-full bg-accent px-5 text-[15px] font-medium text-on-accent"
           : "inline-flex min-h-11 items-center px-2 text-[14px] text-accent underline-offset-2 hover:underline"
-      }
+      } ${settling ? "opacity-60" : ""}`}
     >
       {label}
     </button>
@@ -263,13 +288,11 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
             round={runner.round}
             mode={runner.mode}
             onClose={closeRunner}
-            onMore={() => {
+            onMore={(settled) => {
               // Offered on the summary only: this sitting finished its round.
               if (runner.mode === "daily") setFinishedKey(runner.round.round_key);
               setRunner(null);
-              onChanged();
-              void load();
-              void startExtra();
+              afterRunner(true, settled, () => void startExtra());
             }}
             onReread={async () => {
               if (runner.mode !== "extra") return loadRound();
@@ -292,9 +315,9 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
                     type="button"
                     onPointerEnter={prefetchRunner}
                     onFocus={prefetchRunner}
-                    aria-disabled={extraState === "loading" || undefined}
+                    aria-disabled={extraState === "loading" || settling || undefined}
                     onClick={() => {
-                      if (extraState !== "loading") void startExtra();
+                      if (extraState !== "loading" && !settling) void startExtra();
                     }}
                     className="inline-flex min-h-11 items-center justify-center rounded-full border border-accent/60 px-4 text-[14px] text-accent"
                   >
@@ -317,6 +340,11 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
                 <div className="flex flex-wrap items-center gap-2">
                   {startButton("daily", "Start", true)}
                   {p.ready > 3 && startButton("quick", "Quick 3", false)}
+                  {settling && (
+                    <span role="status" className="text-[12px] text-text-secondary">
+                      Saving
+                    </span>
+                  )}
                 </div>
                 {p.recallChapter !== null && (
                   <p className="text-[13px] text-text-secondary">
