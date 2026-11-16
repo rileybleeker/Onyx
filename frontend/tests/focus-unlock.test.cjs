@@ -1,6 +1,7 @@
 // Run with the rest of the suite (after deployment): node --test tests/focus-unlock.test.cjs
 // Focus habit unlock (lib/focus-unlock.ts, lib/focus-unlock-server.ts): the unlock decision under both
-// rules, the settings body, what the phone's status answer contains, the auth boundary, the two routes (run
+// rules, the settings body, what the phone's status answer contains, the auth boundary (isCiRoute, a check over the
+// whole of middleware.ts and middleware() run without the owner's session), the two routes (run
 // against a fake database) and the /install settings card (mounted with the real autosave on a manual clock).
 // SYNTHETIC DATA ONLY: invented habit names, ids and dates; a fake database; no network.
 const { test } = require("node:test");
@@ -295,7 +296,129 @@ test("middleware: the token opens /api/focus/unlock-status only, as an exact pat
   }
 });
 
-const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
+// The test above proves what isCiRoute() admits; it cannot see the rest of middleware.ts, where an early return,
+// a regex or a matcher exclusion would make the session-only /api/focus/config reachable while isCiRoute() still
+// answers as before. This check covers the whole file: its only mention of a focus path is isCiRoute's
+// `pathname === "/api/focus/unlock-status"`, and no startsWith() anywhere takes a focus path (master's whole-file
+// rule). Literals are read from the syntax tree, so quote style, line breaks and comments change nothing. Limit: a
+// path assembled at run time from pieces that do not contain "focus" is not seen; the middleware() run below covers
+// the paths it sends.
+function focusPathProblems(sf) {
+  const { ts } = SF;
+  const textOf = (n) => (ts.isRegularExpressionLiteral(n) ? n.text.replace(/\\/g, "") : SF.literalText(n));
+  const isLiteral = (n) => ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) || ts.isTemplateExpression(n) || ts.isRegularExpressionLiteral(n);
+  const mentions = (n) => /focus/i.test(textOf(n) ?? "");
+  const shown = (n) => n.getText().replace(/\s+/g, " ");
+  const problems = [];
+  for (const c of SF.collect(sf, (n) => ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === "startsWith")) {
+    if (c.arguments.some(mentions)) problems.push(`a focus prefix: ${shown(c)}`);
+  }
+  const isCi = SF.functionNamed(sf, "isCiRoute");
+  const exactComparison = (n) => {
+    let e = n;
+    while (ts.isParenthesizedExpression(e.parent)) e = e.parent;
+    const p = e.parent;
+    return ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken && SF.refName(p.left === e ? p.right : p.left) === "pathname";
+  };
+  let allowed = 0;
+  for (const n of SF.collect(sf, isLiteral).filter(mentions)) {
+    if (textOf(n) === "/api/focus/unlock-status" && isCi && SF.enclosingFunction(n) === isCi && exactComparison(n)) allowed += 1;
+    else problems.push(`a focus path outside isCiRoute's exact comparison: ${shown(n.parent)}`);
+  }
+  if (allowed !== 1) problems.push(`isCiRoute compares pathname with "/api/focus/unlock-status" ${allowed} times (want 1)`);
+  return problems;
+}
+
+function middlewareLike({ ci = `pathname === "/api/focus/unlock-status"`, body = "", matcher = "_next/static|sw.js" } = {}) {
+  return [
+    "function isCiRoute(pathname: string): boolean {",
+    `  return pathname === "/api/habits/sync" || ${ci};`,
+    "}",
+    "export async function middleware(request: NextRequest) {",
+    body,
+    "  return null;",
+    "}",
+    `export const config = { matcher: ["/((?!${matcher}).*)"] };`,
+  ].join("\n");
+}
+const focusProblemsOf = (parts) => focusPathProblems(SF.parseSource(middlewareLike(parts), "middleware.ts"));
+
+test("middleware focus-path check: re-formatted source passes; every way around isCiRoute is caught", () => {
+  assert.deepEqual(focusProblemsOf(), []);
+  assert.deepEqual(focusProblemsOf({ ci: "pathname ===\n    ('/api/focus/unlock-status') // the phone's one path" }), [], "quotes, parentheses, a line break and a comment change nothing");
+  // The first five open a focus path past the auth boundary or past the token check while isCiRoute("/api/focus/config")
+  // stays false; the last drops the phone's one path.
+  for (const mutant of [
+    { body: `  if (request.nextUrl.pathname.startsWith("/api/focus")) return NextResponse.next({ request });` },
+    { body: "  if (/^\\/api\\/focus\\//.test(request.nextUrl.pathname)) return NextResponse.next({ request });" },
+    { body: `  if (request.nextUrl.pathname === "/api/focus/unlock-status") return NextResponse.next({ request });` },
+    { matcher: "_next/static|sw.js|api/focus" },
+    { ci: `pathname.startsWith("/api/focus/unlock-status")` },
+    { ci: `pathname === "/api/habits/other"` },
+  ]) {
+    assert.notDeepEqual(focusProblemsOf(mutant), [], JSON.stringify(mutant));
+  }
+});
+
+test("middleware: no /api/focus prefix anywhere in the file; its one focus path is isCiRoute's exact comparison", () => {
+  assert.deepEqual(focusPathProblems(SF.parseFile("middleware.ts")), []);
+});
+
+// middleware() itself, run with Supabase and NextResponse stubbed. Synthetic account ids and token.
+const MW_OWNER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1";
+const MW_OTHER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2";
+const MW_TOKEN = "synthetic-ci-token";
+function loadMiddleware(claims) {
+  const prevOwner = process.env.ONYX_OWNER_USER_ID;
+  process.env.ONYX_OWNER_USER_ID = MW_OWNER;
+  try {
+    return loadTs("middleware.ts", {
+      "@supabase/ssr": { createServerClient: () => ({ auth: { getClaims: async () => ({ data: claims ? { claims } : null }) } }) },
+      "next/server": {
+        NextResponse: {
+          next: () => ({ kind: "next", cookies: { set() {} } }),
+          redirect: (url) => ({ kind: "redirect", url: String(url) }),
+          json: (body, init = {}) => ({ kind: "json", status: init.status ?? 200, body }),
+        },
+      },
+    }).middleware;
+  } finally {
+    if (prevOwner === undefined) delete process.env.ONYX_OWNER_USER_ID;
+    else process.env.ONYX_OWNER_USER_ID = prevOwner;
+  }
+}
+function mwRequest(pathname, headerValues = {}) {
+  const nextUrl = new URL(`https://onyx.example${pathname}`);
+  nextUrl.clone = () => new URL(nextUrl.href);
+  return { nextUrl, headers: new Headers(headerValues), cookies: { getAll: () => [], set() {} } };
+}
+
+test("middleware(): without the owner's session the CI token opens /api/focus/unlock-status and no other focus path", async () => {
+  const prevToken = process.env.ONYX_CI_TOKEN;
+  process.env.ONYX_CI_TOKEN = MW_TOKEN;
+  try {
+    const token = { "x-onyx-ci-token": MW_TOKEN };
+    for (const claims of [null, { sub: MW_OTHER }]) {
+      const who = claims ? "another account" : "signed out";
+      const middleware = loadMiddleware(claims);
+      assert.equal((await middleware(mwRequest("/api/focus/unlock-status", token))).kind, "next", `${who}: the phone's path, with the token`);
+      for (const h of [{}, { "x-onyx-ci-token": "synthetic-ci-tokeX" }]) {
+        const res = await middleware(mwRequest("/api/focus/unlock-status", h));
+        assert.deepEqual([res.kind, res.status], ["json", 401], `${who}: the phone's path without the right token`);
+      }
+      for (const p of ["/api/focus", "/api/focus/", "/api/focus/config", "/api/focus/config/", "/api/focus/unlock-status/", "/api/focus/unlock-status/x", "/api/focus/unlock-statusx", "/api/focusx/unlock-status"]) {
+        assert.notEqual((await middleware(mwRequest(p, token))).kind, "next", `${who}: ${p} is not opened by the token`);
+      }
+    }
+    // The settings route is session-only: the owner's session reaches it (so the refusals above come from the gate, not the stubs).
+    assert.equal((await loadMiddleware({ sub: MW_OWNER })(mwRequest("/api/focus/config"))).kind, "next");
+  } finally {
+    if (prevToken === undefined) delete process.env.ONYX_CI_TOKEN;
+    else process.env.ONYX_CI_TOKEN = prevToken;
+  }
+});
+
+const nextServer ={ NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
 const loadRoute = (rel, db) => loadTs(rel, { "@supabase/supabase-js": { createClient: () => db }, "next/server": nextServer });
 // Next.js answers a method only when the route exports a function of that name.
 const methodsOf = (route) => Object.keys(route).filter((k) => typeof route[k] === "function").sort();
