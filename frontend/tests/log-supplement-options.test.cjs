@@ -166,6 +166,10 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
     [URL.stacks]: () => response({ stacks: [STACK] }),
     [URL.history]: () => response({ rows: HISTORY_ROWS }),
   };
+  // Registered before withGlobals: node runs t.after hooks first-in-first-out, and the section's cleanup removes its
+  // visibilitychange listener from `document`, so the unmount has to run while the stand-in globals are still set.
+  let h;
+  t.after(() => h?.unmount());
   withGlobals(t, {
     document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
     fetch: async (url, init = {}) => {
@@ -183,7 +187,7 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
   const drafts = { current: null };
   const clear = (id) => { if (drafts.current.draft && (id == null || drafts.current.draft.id === id)) drafts.current = { draft: null, clear }; };
   drafts.current = { draft, clear };
-  const h = mountClient("app/log/sections/Supplements.tsx", {
+  h = mountClient("app/log/sections/Supplements.tsx", {
     stubs: {
       "@/components/FeedContext": { useInFeed: () => false },
       "lucide-react": { Check: () => null, Plus: () => null, X: () => null },
@@ -198,7 +202,6 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
       "@/lib/log-drafts": { useLogDrafts: () => drafts.current },
     },
   });
-  t.after(() => h.unmount());
   const options = () => h.find((n) => n.type === "button" && n.props.role === "radio");
   const optionNames = () => options().map((n) => h.text(n));
   const option = (name) => {
