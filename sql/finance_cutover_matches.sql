@@ -53,12 +53,12 @@ revoke all on pds.finance_cutover_matches from anon, authenticated;
 
 -- review_state (added 2026-11-16 after the review of round 6; NOT APPLIED YET: apply it before the merge). Every
 -- statement in this file is idempotent, so applying the whole file again is safe.
---   pending   a row kept for review (ambiguous / unconfirmed / stored_duplicate, in the ledger) that no WRITTEN
---             heartbeat has carried yet
---   reported  a written heartbeat carried it as cutover_review
+--   pending   a row kept for review (ambiguous / unconfirmed / stored_duplicate, in the ledger) that no run has
+--             carried on both of its heartbeats with both WRITTEN yet
+--   reported  both heartbeats of one run carried it as cutover_review and were written
 --   null      nothing to report (a match, or a decision on a row before the window, recorded for its hold only)
--- Each run reports every pending row, its own and earlier runs', and marks them reported only once one of its
--- heartbeats was written (sync_log_helper.write_sync), so a lost heartbeat, a failed run or a run stopped after
+-- Each run reports every pending row, its own and earlier runs', and marks them reported only once both of its
+-- heartbeats were written (sync_log_helper.write_sync), so a lost heartbeat, a failed run or a run stopped after
 -- the record was saved never hides a row kept for review; at worst one is reported twice. A decision that changes
 -- is pending again. A row recorded before this column existed keeps review_state null and is not reported again
 -- (none is expected: only this version of the ETL writes the table). Until this statement is applied, every run of

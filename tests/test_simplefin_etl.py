@@ -906,7 +906,8 @@ class FakeStore:
         self.created, self.links, self.txns, self.balances, self.beats = [], [], [], [], []
         self.saved, self.saved_rows = {}, []
         self.read_error = None   # raised by cutover_decisions when set
-        self.beat_ok = True      # what heartbeat() answers: False = the sync_log write was lost
+        self.beat_ok = True      # what heartbeat() answers: False = the sync_log write was lost; a set = only the
+                                 # heartbeats of these data types are written (one write lost, the other landed)
         self.marked = []         # keys passed to mark_reported, per call
 
     def accounts(self):
@@ -963,7 +964,7 @@ class FakeStore:
 
     def heartbeat(self, data_type, status, records, started, error, start=None, end=None):
         self.beats.append((data_type, status, records, error))
-        return self.beat_ok
+        return self.beat_ok if isinstance(self.beat_ok, bool) else data_type in self.beat_ok
 
 
 def body(errlist=()):
@@ -1636,9 +1637,9 @@ def test_run_recorded_twin_outside_the_date_window():
 
 def test_run_review_is_reported_until_a_heartbeat_carries_it():
     """Codex review (round 7): reporting is tracked apart from the decision (review_state). A row kept for review is
-    'pending' on record until a heartbeat carrying it is WRITTEN, then 'reported'. When both heartbeat writes are
+    'pending' on record until both heartbeats carrying it are WRITTEN, then 'reported'. When the heartbeat writes are
     lost, the run stops after it saved the record, or the mark fails, the next run reports it again, also when the
-    row is no longer in SimpleFIN's answer; once a written heartbeat carried it, it is not reported again."""
+    row is no longer in SimpleFIN's answer; once both written heartbeats carried it, it is not reported again."""
     w1 = sf.txn_key("S-WF", "w1")
     review = sf.format_notes({"cutover_review": 1})
     quiet = lambda *_: None  # noqa: E731
@@ -1717,6 +1718,46 @@ def test_run_review_is_reported_until_a_heartbeat_carries_it():
     lf.beat_ok = True
     assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=quiet) == 1
     assert lf.beats[-1][3] == sf.format_notes({"db_write_failed": 1, "cutover_review": 1}) and lf.marked == [[w1]]
+
+
+def test_run_review_stays_pending_when_one_heartbeat_is_lost():
+    """Codex review (round 8): the SimpleFIN card shows the worse of the two newest heartbeats with that one's text,
+    so when only one of a run's two heartbeats lands, the other kind's older heartbeat can be the one shown (an older
+    failed transactions heartbeat outranks this run's partial balances one) and the review note is hidden. A row kept
+    for review is therefore marked reported only when BOTH heartbeats were written; with either lost it stays
+    pending and the next run reports it again, on the successful path and on a failed run alike."""
+    w1 = sf.txn_key("S-WF", "w1")
+    review = sf.format_notes({"cutover_review": 1})
+    for landed in ({"balances"}, {"transactions"}):
+        store, lines = cutover_store(), []
+        store.beat_ok = set(landed)
+        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+        assert [b[3] for b in store.beats] == [review] * 2, "both heartbeats carry the review"
+        assert store.saved[w1]["review_state"] == "pending" and store.marked == [], landed
+        assert any("a heartbeat was not written" in line and "stay pending for the next run" in line for line in lines)
+        # The next run writes both: it reports the row again and only then marks it.
+        store.beat_ok = True
+        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+        assert [b[3] for b in store.beats[-2:]] == [review] * 2
+        assert store.marked == [[w1]] and store.saved[w1]["review_state"] == "reported"
+        out = "\n".join(lines)
+        assert w1 not in out and "rm-1" not in out, "counts only"
+
+    # A failed run (the ledger write fails) with one of its red heartbeats lost: still pending, reported again.
+    class LedgerFails(FakeStore):
+        def upsert_transactions(self, rows):
+            raise RuntimeError(pii_msg())
+
+    red = sf.format_notes({"db_write_failed": 1, "cutover_review": 1})
+    for landed in ({"balances"}, {"transactions"}):
+        lf = cutover_store(LedgerFails)
+        lf.beat_ok = set(landed)
+        assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 1
+        assert [b[3] for b in lf.beats] == [red] * 2 and lf.marked == []
+        assert lf.saved[w1]["review_state"] == "pending", landed
+        lf.beat_ok = True
+        assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 1
+        assert lf.beats[-1][3] == red and lf.marked == [[w1]] and lf.saved[w1]["review_state"] == "reported"
 
 
 def test_run_record_without_review_state_fails_before_writing():

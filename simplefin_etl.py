@@ -36,8 +36,8 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      the run no longer makes is recorded again as 'unconfirmed' (kept for review), never left behind. An equal
      amount alone never drops a row: a row with competing candidates ('ambiguous') or with a same-amount Rocket
      Money row nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review, on every run until a
-     heartbeat carrying it is written (review_state 'pending' -> 'reported'). Every match and every row kept for
-     review is recorded (also the decisions on rows dropped before the window, which hold or take a Rocket Money
+     run wrote BOTH heartbeats carrying it (review_state 'pending' -> 'reported'). Every match and every row kept
+     for review is recorded (also the decisions on rows dropped before the window, which hold or take a Rocket Money
      row) in pds.finance_cutover_matches (keys only; the run's whole set in one statement, so it is never on record
      in part) BEFORE the ledger is written: when that record cannot be read (other than not applied yet), cannot be
      written, or is missing while there are decisions to record, the run fails before writing anything, so a row is
@@ -1048,10 +1048,11 @@ def cutover_counts(decisions: Iterable[CutoverDecision]) -> Counter:
 
 def review_state(d: CutoverDecision, rec: Optional[dict]) -> Optional[str]:
     """The record's review_state for this decision (Codex review: reporting is tracked apart from the decision).
-    'pending' = a row kept for review that no written heartbeat has carried yet; 'reported' = one has; None = nothing
-    to report (a match, or a row not in the ledger: a decision before the window is recorded for its hold only). A
-    reported decision stays reported while it is unchanged; a new or changed review decision is pending; and a
-    pending report is never dropped, so it is carried until a heartbeat with it is written (run: mark_reported).
+    'pending' = a row kept for review that no run has carried on both written heartbeats yet; 'reported' = one
+    has; None = nothing to report (a match, or a row not in the ledger: a decision before the window is recorded for
+    its hold only). A reported decision stays reported while it is unchanged; a new or changed review decision is
+    pending; and a pending report is never dropped, so it is carried until both heartbeats with it are written (run:
+    mark_reported).
     `rec` is the recorded decision of this row, if any ({'decision', 'review_state', ...})."""
     rec = rec or {}
     prev = rec.get("review_state")
@@ -1074,7 +1075,7 @@ def decision_rows(decisions: Iterable[CutoverDecision], now: datetime, saved: Op
 
 def review_pending(saved: Optional[dict], rows: Iterable[dict] = ()) -> list[str]:
     """The keys of every row kept for review that is still to report once these decision rows are on record: this
-    run's new or changed review decisions, and those of earlier runs that no written heartbeat has carried yet (a
+    run's new or changed review decisions, and those of earlier runs not yet carried on both written heartbeats (a
     lost heartbeat, or a run stopped after it saved the record), also when the row is not in this answer."""
     merged = {k: rec.get("review_state") for k, rec in (saved or {}).items()}
     merged.update({r["sf_txn_key"]: r.get("review_state") for r in rows})
@@ -1326,7 +1327,7 @@ class Store:
         return out
 
     def mark_reported(self, keys: Iterable[str]) -> None:
-        """review_state 'pending' -> 'reported' for these keys: a written heartbeat has carried them (run())."""
+        """review_state 'pending' -> 'reported' for these keys: both heartbeats a run wrote carried them (run())."""
         keys = sorted(set(keys))
         for i in range(0, len(keys), 100):
             (_t(self.supa, "finance_cutover_matches").update({"review_state": "reported"})
@@ -1533,7 +1534,7 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
             out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}; to report: {to_report}"
                 + ("" if plan.saved is not None else " (no decision record yet)"))
         elif to_report:
-            out(f"  cutover review to report (no written heartbeat has carried it yet): {to_report}")
+            out(f"  cutover review to report (not yet carried on both written heartbeats): {to_report}")
         review_keys = {k for k, rec in (plan.saved or {}).items() if rec.get("decision") in REVIEW_DECISIONS}
         if review_keys:
             # Every row kept for review so far (all runs), still to check by hand (docs/financials-simplefin.md). Only
@@ -1561,7 +1562,7 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         out(f"FAILED: {msg}" + (f" ({detail})" if detail else ""))
         written = [store.heartbeat("transactions", "failed", 0, started, msg),
                    store.heartbeat("balances", "failed", 0, started, msg)]
-        mark_reported(store, review_keys, any(written), out)
+        mark_reported(store, review_keys, all(written), out)
         return 1
 
     # The cutover decisions are recorded BEFORE the ledger is written, and a run that cannot record them writes
@@ -1574,7 +1575,7 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     # decisions made without it; the table missing is then a failed run too (cutover_provenance_unsaved). The
     # workflow's concurrency group keeps two runs from deciding at once.
     # Reporting is tracked apart from the decision (review_state, Codex review): a row kept for review is 'pending'
-    # on record until a heartbeat that carries it is WRITTEN, then it is marked 'reported' (mark_reported). Every run
+    # on record until BOTH heartbeats carrying it are WRITTEN, then it is marked 'reported' (mark_reported). Every run
     # reports every pending row, this run's and earlier runs', also when the row is not in this answer, so a lost
     # heartbeat, a failed run or a run stopped after it saved the record never hides one. A row may be reported a
     # second time (the heartbeat was written but the mark was not), never not at all.
@@ -1612,19 +1613,22 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}")
     if note:
         out(f"  heartbeat codes: {note_codes_summary(plan.notes)}")
-    mark_reported(store, review_keys, any(written), out)
+    mark_reported(store, review_keys, all(written), out)
     return 0
 
 
 def mark_reported(store, keys: list[str], written: bool, out=print) -> None:
     """After a run's heartbeats: the rows kept for review that they carried are marked 'reported' on record, but only
-    when at least one of the two was written (the SimpleFIN card shows the worse of the two). Otherwise, and when the
-    mark itself fails, the rows stay 'pending' and the next run reports them again. Never fails the run; the log
-    gets counts and a type name only."""
+    when BOTH were written (`written` = all of them landed). The SimpleFIN card shows the worse of the two newest
+    heartbeats with that one's text, so with one write lost the other kind's older heartbeat can be the one shown (an
+    older failed transactions heartbeat outranks this run's partial balances one) and the review note would be
+    hidden; marking then would drop it for good (Codex review). Otherwise, and when the mark itself fails, the rows
+    stay 'pending' and the next run reports them again. Never fails the run; the log gets counts and a type name
+    only."""
     if not keys:
         return
     if not written:
-        out(f"  cutover review: no heartbeat was written; {len(keys)} row(s) stay pending for the next run")
+        out(f"  cutover review: a heartbeat was not written; {len(keys)} row(s) stay pending for the next run")
         return
     try:
         store.mark_reported(keys)
