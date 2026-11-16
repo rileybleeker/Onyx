@@ -338,6 +338,105 @@ test("offline recovery: a kept tap is offered (never sent) only while it still a
   assert.ok(W.WINDDOWN_PENDING_KEY.startsWith("onyx"), "wiped on sign-out with every onyx* key");
 });
 
+test("client to handler: the tap's request body is what the night route reads (rule_id, no unknown field)", () => {
+  for (const i of [intent(), intent({ answer: null, expect: "Yes" }), intent({ night: day(-1), answer: "No", expect: "none" })]) {
+    const parsed = W.parseNightBody(W.nightRequestBody(i));
+    assert.equal(parsed.ok, true, parsed.error);
+    assert.deepEqual({ ...parsed.value }, { night: i.night, answer: i.answer, expect: i.expect, today: i.today, ruleId: i.ruleId });
+  }
+  // The saver's own intent (camelCase ruleId) is not a valid body: the route refuses unknown fields and needs rule_id.
+  const asIs = W.parseNightBody(intent());
+  assert.equal(asIs.ok, false);
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /send\(WINDDOWN_NIGHT_URL, "POST", nightRequestBody\(intent\)/);
+  assert.ok(!/send\(WINDDOWN_NIGHT_URL, "POST", intent\)/.test(store), "the intent is never sent as it is");
+});
+
+test("a 200 is a saved answer only when it is the server's answer to this tap", () => {
+  const i = intent();
+  assert.doesNotThrow(() => W.confirmNightReply({ night: TODAY, answer: "Yes", previous: null, changed: true }, i));
+  assert.doesNotThrow(() => W.confirmNightReply({ night: TODAY, answer: null, previous: "Yes", changed: true }, intent({ answer: null, expect: "Yes" })), "a cleared night answers null");
+  for (const bad of [null, undefined, {}, "<html>sign in</html>", [], { night: day(-1), answer: "Yes" }, { night: TODAY }, { night: TODAY, answer: "Maybe" }]) {
+    assert.throws(() => W.confirmNightReply(bad, i), /confirm/);
+  }
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /confirmNightReply\(d, intent\)/);
+  assert.match(store, /if \(sessionEnded\(res\)\) \{\s+reportSessionEnded\(\);/, "a redirect to sign-in is a session end, never an answer");
+  assert.match(store, /if \(!data\) throw new Error\("Couldn't confirm it was saved\."\);/, "an unreadable 200 is retried, not confirmed");
+  // The goal, pause and hide writes are checked the same way.
+  assert.match(store, /hasKey\("rule"\)/);
+  assert.match(store, /hasKey\("pause"\)/);
+  assert.match(store, /d\.key !== WINDDOWN_PREF_KEY/);
+});
+
+test("a tap that reaches the server after 06:00 is refused as stale and its kept copy stays to be offered again", async () => {
+  const { timers, queue } = manualTimers();
+  const refusals = [];
+  let calls = 0;
+  const saver = new W.WindDownSaver({
+    timers,
+    send: async () => { calls++; if (calls === 1) throw new TypeError("offline"); throw new W.WindDownRefused(W.WINDDOWN_STALE_MESSAGE, W.WINDDOWN_STALE_CODE); },
+    onRefused: (_i, e) => refusals.push(e.code),
+  });
+  saver.submit(intent());
+  await flush();
+  assert.equal(saver.current.status, "retrying", "queued offline");
+  saver.retryNow();
+  await flush();
+  assert.equal(saver.current.status, "refused");
+  assert.equal(saver.current.code, "stale");
+  assert.deepEqual(refusals, ["stale"]);
+  assert.equal(queue.length, 0);
+  // The kept record of that tap (written while it was saving / retrying) is offered again on the new day.
+  const kept = W.parsePending(W.pendingRecord(intent({ today: TODAY }), Date.parse("2031-03-21T09:00:00Z")));
+  const offer = W.pendingToOffer(kept, payload({ today: day(1) }), Date.parse("2031-03-21T11:00:00Z"));
+  assert.deepEqual(offer, { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1 }, "the night Riley tapped, sent with the new day");
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /if \(e\.code !== WINDDOWN_STALE_CODE\) keep\(null\);/, "only a stale refusal keeps the tap");
+  assert.match(store, /if \(!snap\.recovery && !stale\) keep\(null\);/, "OK on the message does not drop the offered tap");
+});
+
+test("the session ending empties the store: no data, no retry, no write to the device afterwards", async () => {
+  const { timers, queue } = manualTimers();
+  const states = [];
+  let calls = 0;
+  let release;
+  const saver = new W.WindDownSaver({
+    timers,
+    send: () => { calls++; return calls === 1 ? Promise.reject(new TypeError("offline")) : new Promise((r) => { release = r; }); },
+    onState: (s) => states.push(s.status),
+    onSaved: () => states.push("onSaved"),
+  });
+  saver.submit(intent());
+  await flush();
+  assert.equal(saver.current.status, "retrying");
+  assert.equal(queue.length, 1);
+  saver.reset();
+  assert.equal(queue.length, 0, "the pending retry is cancelled");
+  assert.equal(saver.unsaved, false);
+  assert.equal(saver.current.status, "idle");
+  // A send that was already in flight when the session ended answers late: nothing happens.
+  saver.submit(intent({ night: day(-1) }));
+  await flush();
+  assert.equal(saver.current.status, "saving");
+  const before = states.length;
+  saver.reset();
+  release({ night: day(-1), answer: "Yes" });
+  await flush();
+  assert.equal(states.length, before, "no state, no onSaved, no retry after the reset");
+  assert.equal(saver.unsaved, false);
+  assert.equal(saver.submit(intent()), true, "a new session can tap again");
+  // The store hooks the cache's wipe (sign-out, 401, redirect to sign-in) and ignores reads that started before it.
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /clientCache\.onWipe\(resetAfterSessionEnd\)/);
+  const reset = store.slice(store.indexOf("function resetAfterSessionEnd()"), store.indexOf("function scheduleRollover"));
+  for (const part of [/epoch\+\+/, /saver\.reset\(\)/, /server = null/, /overlay = null/, /keep\(null\)/, /started = false/, /snap = INITIAL/]) assert.match(reset, part);
+  assert.match(store, /if \(mine === epoch\) accept\(raw, true\)/);
+  const cache = read("lib/client-cache.ts");
+  assert.match(cache, /onWipe\(listener: \(\) => void\)/);
+  assert.match(cache.slice(cache.indexOf("async wipe()")), /this\.generation\+\+;\s+for \(const fn of Array\.from\(this\.wipeListeners\)\)/);
+});
+
 test("opening a page writes nothing: the store only reads until a tap", () => {
   const store = read("lib/use-winddown.ts");
   const sub = store.slice(store.indexOf("function subscribe("), store.indexOf("const getSnapshot"));

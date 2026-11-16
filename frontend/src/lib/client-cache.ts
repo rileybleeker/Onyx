@@ -224,6 +224,7 @@ export class ClientCache {
   private flushing: Promise<void> = Promise.resolve();
   /** Bumped by wipe(): async work started before a wipe never writes after it. */
   private generation = 0;
+  private wipeListeners = new Set<() => void>();
   private readyResolved = false;
   private resolveReady!: () => void;
   private readyPromise: Promise<void>;
@@ -590,9 +591,19 @@ export class ClientCache {
     await backend.writeScope(next).catch(() => {});
   }
 
+  /**
+   * Run `listener` (synchronously, first thing) whenever wipe() runs: sign-out, a 401, a redirect to sign-in. For a
+   * module that keeps private data or a pending write of its own outside this cache and must drop it with the session.
+   */
+  onWipe(listener: () => void): () => void {
+    this.wipeListeners.add(listener);
+    return () => { this.wipeListeners.delete(listener); };
+  }
+
   /** Forget everything: memory, queued writes and the whole persisted store. Persistence stays off until attach(). */
   async wipe(): Promise<void> {
     this.generation++;
+    for (const fn of Array.from(this.wipeListeners)) { try { fn(); } catch { /* a listener never stops a wipe */ } }
     const backend = this.backend;
     const keys = this.keys();
     this.backend = null;

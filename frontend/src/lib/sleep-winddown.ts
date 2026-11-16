@@ -625,6 +625,29 @@ export function isMissingStorage(e: { code?: unknown } | null | undefined): bool
 
 /** `ruleId` = the goal version the screen showed for that night; `expect` = the answer it showed. */
 export interface NightIntent { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; ruleId: number }
+/**
+ * The request body of one tap, in the field names parseNightBody reads (`rule_id`, not the intent's camelCase
+ * `ruleId`: the route refuses unknown fields, so sending the intent as it is would refuse every tap).
+ */
+export function nightRequestBody(i: NightIntent): { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; rule_id: number } {
+  return { night: i.night, answer: i.answer, expect: i.expect, today: i.today, rule_id: i.ruleId };
+}
+/**
+ * A 200 only counts as saved when it is the server's answer to THIS tap: an object naming the night and the answer
+ * it holds. A sign-in page or a proxy's page that answered 200 is not one (it throws, so the tap is retried and
+ * kept, never confirmed). The server treats a repeat as a no-op, so a retry cannot count twice.
+ */
+export function confirmNightReply(data: unknown, intent: NightIntent): void {
+  const r = obj(data);
+  if (!r || r.night !== intent.night || !("answer" in r) || (r.answer !== null && r.answer !== "Yes" && r.answer !== "No")) {
+    throw new Error("Couldn't confirm it was saved.");
+  }
+}
+/** The refusal codes the client treats specially. */
+export const WINDDOWN_STALE_CODE = "stale";
+export const WINDDOWN_SESSION_ENDED_CODE = "session_ended";
+/** A tap that reached the server after the behavioral day turned over (offline across 06:00): kept, offered again. */
+export const WINDDOWN_STALE_MESSAGE = "A new day started before this was saved. The tap is offered again below while that night can still be answered here.";
 /** Two taps for one night that were never both sent: one tap going from the OLDER one's `expect` to the newer answer. */
 export function coalesceIntents(older: NightIntent | null, newer: NightIntent): NightIntent {
   return older && older.night === newer.night ? { ...newer, expect: older.expect, ruleId: older.ruleId } : newer;
@@ -668,6 +691,8 @@ export class WindDownSaver {
   private inflight = false;
   private queued: NightIntent | null = null;
   private timer: unknown = null;
+  /** Bumped by reset(): a send that was in flight then ends silently (no state, no callback, no retry). */
+  private gen = 0;
   private readonly delays: readonly number[];
   private readonly timers: SaverTimers;
   constructor(private readonly opts: SaverOptions) {
@@ -712,16 +737,30 @@ export class WindDownSaver {
     this.queued = null;
     this.set({ status: "idle" });
   }
+  /**
+   * The session ended (sign-out, 401, redirect to sign-in): forget everything, silently. A pending retry is cancelled
+   * and an answer that arrives later is ignored, so nothing is written to the device or the screen after the wipe.
+   */
+  reset() {
+    this.gen++;
+    this.clearTimer();
+    this.queued = null;
+    this.inflight = false;
+    this.state = { status: "idle" };
+  }
   private clearTimer() { if (this.timer !== null) { this.timers.clear(this.timer); this.timer = null; } }
   private async run(intent: NightIntent, attempt: number) {
+    const gen = this.gen;
     this.inflight = true;
     this.set({ status: "saving", intent });
     try {
       const answer = await this.opts.send(intent);
+      if (gen !== this.gen) return;
       this.inflight = false;
       this.set({ status: "saved", intent });
       this.opts.onSaved?.(intent, answer);
     } catch (e) {
+      if (gen !== this.gen) return;
       this.inflight = false;
       if (e instanceof WindDownRefused) {
         this.set({ status: "refused", intent, error: e.message, code: e.code });

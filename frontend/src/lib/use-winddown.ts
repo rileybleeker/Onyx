@@ -12,11 +12,15 @@
  *   device comes back online, a refusal shown and the answer reloaded). A tap for another night waits for the
  *   unsaved one to be saved or cancelled (the buttons say so); nothing unsaved is replaced. The tap is shown at once
  *   and kept on this device until the server confirmed it; a kept tap from a closed tab is OFFERED again (Save it /
- *   Discard), never sent on its own, and blocks new taps until it is resolved.
+ *   Discard), never sent on its own, and blocks new taps until it is resolved. A tap that reaches the server after the
+ *   behavioral day turned over (offline across 06:00) is refused as stale, and its kept copy stays: the reloaded day
+ *   offers it again for the night Riley tapped.
+ * - The session ending (sign-out, 401, redirect to sign-in) empties this store: the private data, any retry waiting
+ *   and the kept tap (clientCache.onWipe). A 200 that is a sign-in page is never taken for a saved answer.
  */
 
 import { useSyncExternalStore } from "react";
-import { GONE, cachedJson, clientCache, fetchJsonValue } from "@/lib/client-cache";
+import { GONE, cachedJson, clientCache, fetchJsonValue, reportSessionEnded, sessionEnded } from "@/lib/client-cache";
 import { unsavedWork } from "@/lib/unsaved-work";
 import { UI_PREFS_PATH } from "@/lib/ui-preferences";
 import {
@@ -26,11 +30,16 @@ import {
   WINDDOWN_PREF_KEY,
   WINDDOWN_RULE_URL,
   WINDDOWN_SAVED_EVENT,
+  WINDDOWN_SESSION_ENDED_CODE,
+  WINDDOWN_STALE_CODE,
+  WINDDOWN_STALE_MESSAGE,
   WINDDOWN_URL,
   WindDownRefused,
   WindDownSaver,
   answerOn,
+  confirmNightReply,
   msUntilRollover,
+  nightRequestBody,
   parsePending,
   parseWindDownPayload,
   pendingRecord,
@@ -68,12 +77,18 @@ const RELOAD_AFTER_MS = 60_000;
 const REMOUNT_RELOAD_MS = 5_000;
 let server: WindDownPayload | null = null;
 let overlay: { night: string; answer: NightAnswer | null } | null = null;
-let snap: WindDownSnapshot = {
+const INITIAL: WindDownSnapshot = {
   load: "loading", payload: null, refreshFailed: false, at: null, fresh: false, saver: { status: "idle" }, recovery: null, last: null, busy: null, actionError: null,
 };
+let snap: WindDownSnapshot = INITIAL;
 const listeners = new Set<() => void>();
+/** The page-wide hooks (cache fetcher, cache listener, document listeners, wipe listener) are installed once. */
+let hooked = false;
+/** This visit's first read has been started (false again after a session end, so the next mount starts afresh). */
 let started = false;
 let lastLoad = 0;
+/** Bumped when the session ends: a read that started before it never fills the emptied store. */
+let epoch = 0;
 
 function readKept(): NightIntent | null {
   try {
@@ -108,25 +123,52 @@ function accept(raw: unknown, fresh = false): boolean {
 /** Read the payload (cached copy first, then the server). Never writes. */
 export function reloadWindDown(): Promise<void> {
   lastLoad = Date.now();
+  const mine = epoch;
   return cachedJson(WINDDOWN_URL, { check: parseWindDownPayload }).then(
-    (raw) => { accept(raw, true); },
-    () => { emit(server ? { refreshFailed: true } : { load: "error" }); },
+    (raw) => { if (mine === epoch) accept(raw, true); },
+    () => { if (mine === epoch) emit(server ? { refreshFailed: true } : { load: "error" }); },
   );
 }
 
-async function send(url: string, method: string, body: unknown): Promise<Record<string, unknown>> {
+/**
+ * One write. `check` throws unless a success answer is the server's own for this request: an expired session answers a
+ * 200 sign-in page after a redirect, and that is neither a saved answer nor a reason to clear what was kept.
+ */
+async function send(url: string, method: string, body: unknown, check?: (data: Record<string, unknown>) => void): Promise<Record<string, unknown>> {
   const res = await fetch(url, { method, cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  let data: Record<string, unknown> = {};
-  try { data = (await res.json()) as Record<string, unknown>; } catch { /* no JSON body */ }
-  if (res.ok) return data;
-  const message = typeof data.error === "string" ? data.error : "Not saved.";
-  // A refusal is shown and not retried; a server error is retried.
-  if (res.status >= 400 && res.status < 500) throw new WindDownRefused(message, typeof data.code === "string" ? data.code : String(res.status));
+  if (sessionEnded(res)) {
+    reportSessionEnded();
+    throw new WindDownRefused("Your session ended. Sign in again.", WINDDOWN_SESSION_ENDED_CODE);
+  }
+  let parsed: unknown = null;
+  try { parsed = await res.json(); } catch { /* no JSON body */ }
+  const data = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  if (res.ok) {
+    if (!data) throw new Error("Couldn't confirm it was saved.");
+    check?.(data);
+    return data;
+  }
+  const message = data && typeof data.error === "string" ? data.error : "Not saved.";
+  // A refusal is shown and not retried; a server error (and a timeout / rate limit) is retried.
+  if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+    throw new WindDownRefused(message, data && typeof data.code === "string" ? data.code : String(res.status));
+  }
   throw new Error(message);
 }
+const hasKey = (key: string) => (d: Record<string, unknown>) => {
+  if (!d[key] || typeof d[key] !== "object") throw new Error("Couldn't confirm it was saved.");
+};
 
 const saver = new WindDownSaver({
-  send: (intent) => send(WINDDOWN_NIGHT_URL, "POST", intent),
+  send: async (intent) => {
+    try {
+      return await send(WINDDOWN_NIGHT_URL, "POST", nightRequestBody(intent), (d) => confirmNightReply(d, intent));
+    } catch (e) {
+      // The day turned over before the tap was saved: say so (the kept copy and the reloaded day offer it again).
+      if (e instanceof WindDownRefused && e.code === WINDDOWN_STALE_CODE) throw new WindDownRefused(WINDDOWN_STALE_MESSAGE, e.code);
+      throw e;
+    }
+  },
   onState: (s) => {
     if (s.status === "saving" || s.status === "retrying") keep(s.intent);
     emit({ saver: s });
@@ -143,43 +185,70 @@ const saver = new WindDownSaver({
     try { window.dispatchEvent(new CustomEvent(WINDDOWN_SAVED_EVENT)); } catch { /* no window */ }
     void reloadWindDown();
   },
-  onRefused: () => {
-    keep(null);
+  onRefused: (_intent, e) => {
+    // A stale refusal is the only one that keeps the tap: its night is still the one Riley tapped and may still be
+    // answerable on the new day, so the reload below offers it again (pendingToOffer). Every other refusal is final.
+    if (e.code !== WINDDOWN_STALE_CODE) keep(null);
     overlay = null;
     emit({ recovery: null });
     void reloadWindDown();
   },
 });
 
+/** The session ended: this store holds private data and maybe a write waiting to retry. Drop all of it, silently. */
+function resetAfterSessionEnd() {
+  epoch++;
+  saver.reset();
+  server = null;
+  overlay = null;
+  lastLoad = 0;
+  started = false;
+  keep(null);
+  unsavedWork.setDirty("sleep-winddown", false);
+  snap = INITIAL;
+  for (const fn of Array.from(listeners)) fn();
+}
+
 function scheduleRollover() {
   setTimeout(() => {
     // The behavioral day turned over (06:00 on this device): the screen's "tonight" is last night's.
-    if (document.visibilityState === "visible" && !saver.unsaved) void reloadWindDown();
+    if (started && document.visibilityState === "visible" && !saver.unsaved) void reloadWindDown();
     scheduleRollover();
   }, msUntilRollover(new Date()));
+}
+
+/** Page-wide hooks, installed on the first mount only. */
+function hook() {
+  // A write elsewhere (the check-in, /habits, chat) drops the cached copy and refetches it: show that answer.
+  // (A plain fetch, not cachedJson: invalidate() already runs the fetcher inside the cache's own revalidate.)
+  clientCache.register(WINDDOWN_URL, async () => {
+    const data = await fetchJsonValue(WINDDOWN_URL);
+    if (data !== GONE) parseWindDownPayload(data);
+    return data;
+  });
+  clientCache.subscribe(WINDDOWN_URL, (raw) => { if (raw !== undefined) accept(raw, true); });
+  clientCache.onWipe(resetAfterSessionEnd);
+  document.addEventListener("visibilitychange", () => {
+    if (started && document.visibilityState === "visible" && Date.now() - lastLoad > RELOAD_AFTER_MS && !saver.unsaved) void reloadWindDown();
+  });
+  window.addEventListener("online", () => saver.retryNow());
+  scheduleRollover();
+}
+/** This visit's first read: the cached copy at once, then the server. */
+function begin() {
+  const cached = clientCache.peek(WINDDOWN_URL);
+  const mine = epoch;
+  if (cached === undefined || !accept(cached)) void clientCache.read(WINDDOWN_URL).then((raw) => { if (mine === epoch && raw !== undefined && !server) accept(raw); });
+  void reloadWindDown();
 }
 
 function subscribe(fn: () => void): () => void {
   listeners.add(fn);
   if (typeof window !== "undefined") {
+    if (!hooked) { hooked = true; hook(); }
     if (!started) {
       started = true;
-      const cached = clientCache.peek(WINDDOWN_URL);
-      if (cached === undefined || !accept(cached)) void clientCache.read(WINDDOWN_URL).then((raw) => { if (raw !== undefined && !server) accept(raw); });
-      // A write elsewhere (the check-in, /habits, chat) drops the cached copy and refetches it: show that answer.
-      // (A plain fetch, not cachedJson: invalidate() already runs the fetcher inside the cache's own revalidate.)
-      clientCache.register(WINDDOWN_URL, async () => {
-        const data = await fetchJsonValue(WINDDOWN_URL);
-        if (data !== GONE) parseWindDownPayload(data);
-        return data;
-      });
-      clientCache.subscribe(WINDDOWN_URL, (raw) => { if (raw !== undefined) accept(raw, true); });
-      void reloadWindDown();
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible" && Date.now() - lastLoad > RELOAD_AFTER_MS && !saver.unsaved) void reloadWindDown();
-      });
-      window.addEventListener("online", () => saver.retryNow());
-      scheduleRollover();
+      begin();
     } else if (Date.now() - lastLoad > REMOUNT_RELOAD_MS && !saver.unsaved) {
       // Another page mounted in the same visit (Today -> Log, a nav click): the day or the goal may have moved on
       // another device since the last check. The cached copy shows at once; this is the revalidation.
@@ -189,7 +258,7 @@ function subscribe(fn: () => void): () => void {
   return () => { listeners.delete(fn); };
 }
 const getSnapshot = () => snap;
-const LOADING: WindDownSnapshot = snap;
+const LOADING: WindDownSnapshot = INITIAL;
 const getServerSnapshot = () => LOADING;
 
 export function useWindDown(): WindDownSnapshot {
@@ -224,8 +293,12 @@ export function undoLast() {
 export function retryNow() { saver.retryNow(); }
 /** Give up on a tap that is waiting to retry or was refused: the screen goes back to what the server holds. */
 export function dismissTap() {
+  const st = saver.current;
+  const stale = st.status === "refused" && st.code === WINDDOWN_STALE_CODE;
   saver.dismiss();
-  keep(null);
+  // A tap that is being offered again (after a stale refusal) keeps its copy until Riley picks Save it or Discard;
+  // the next read drops it when that night can no longer be answered here.
+  if (!snap.recovery && !stale) keep(null);
   overlay = null;
   emit({ saver: saver.current });
 }
@@ -249,7 +322,7 @@ async function action(kind: "rule" | "pause" | "hidden", run: () => Promise<unkn
     return true;
   } catch (e) {
     emit({ busy: null, actionError: e instanceof TypeError ? "Couldn't reach Onyx. Try again." : e instanceof Error && e.message ? e.message : "Not saved. Try again." });
-    if (e instanceof WindDownRefused) void reloadWindDown();
+    if (e instanceof WindDownRefused && e.code !== WINDDOWN_SESSION_ENDED_CODE) void reloadWindDown();
     return false;
   }
 }
@@ -263,17 +336,19 @@ export function saveGoal(goal: GoalInput): Promise<boolean> {
   try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz; } catch { /* default */ }
   return action("rule", () => send(WINDDOWN_RULE_URL, "POST", {
     habit_page_id: goal.habitPageId, target_time: goal.targetTime, wins_needed: goal.winsNeeded, window_nights: goal.windowNights, tz, today,
-  }));
+  }, hasKey("rule")));
 }
 export function addPause(startDate: string, endDate: string | null): Promise<boolean> {
   const today = snap.payload?.today;
   if (!today) return Promise.resolve(false);
-  return action("pause", () => send(WINDDOWN_PAUSE_URL, "POST", { start_date: startDate, end_date: endDate, today }));
+  return action("pause", () => send(WINDDOWN_PAUSE_URL, "POST", { start_date: startDate, end_date: endDate, today }, hasKey("pause")));
 }
 export function endPause(pauseId: number): Promise<boolean> {
-  return action("pause", () => send(WINDDOWN_PAUSE_URL, "PATCH", { pause_id: pauseId }));
+  return action("pause", () => send(WINDDOWN_PAUSE_URL, "PATCH", { pause_id: pauseId }, hasKey("pause")));
 }
 /** Hide from Today (and collapse on Log), or show again: the UI preference sleep.winddown. */
 export function setWindDownHidden(hidden: boolean): Promise<boolean> {
-  return action("hidden", () => send(UI_PREFS_PATH, "PUT", { key: WINDDOWN_PREF_KEY, value: { hidden } }));
+  return action("hidden", () => send(UI_PREFS_PATH, "PUT", { key: WINDDOWN_PREF_KEY, value: { hidden } }, (d) => {
+    if (d.key !== WINDDOWN_PREF_KEY) throw new Error("Couldn't confirm it was saved.");
+  }));
 }

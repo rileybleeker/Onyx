@@ -34,8 +34,9 @@ tool and not an experiment: it never claims that winding down improved sleep.
 - **Pending**: not answered while it can still be answered here (tonight and the two nights before, the check-in's
   window). **Unknown**: not answered after that. Neither is ever a win.
 - **Current streak**: consecutive wins back from tonight. Pending and paused nights are skipped (they neither count
-  nor break it). A confirmed miss ends it; an unknown night ends it too, labelled "not answered", never "missed".
-  The week's wins, the all-time count and the personal best stay.
+  nor break it). A confirmed miss ends it; an unknown night ends it too, labelled "not answered", never "missed"
+  (a streak counts nights Riley confirmed, so it is never carried across a night nobody reported; answering the night
+  on /habits later puts it back). The week's wins, the all-time count and the personal best stay.
 - **Paused** nights are labelled and left out of every count, even when the habit was answered Yes. A pause can only
   start tonight or later, and nights that passed keep their pause state (a database guard).
 - **Goal versions** are append-only (`pds.sleep_winddown_rules`): each night is judged by the version in force on it
@@ -58,6 +59,15 @@ tool and not an experiment: it never claims that winding down improved sleep.
   answer the server last held.
 - The tap is kept on the device until the server confirmed it; a tap from a closed tab is offered on the next visit
   (**Save it** / **Discard**), never sent on its own, and not offered at all when the goal changed since.
+- A tap that reaches the server after the behavioral day turned over (offline across 06:00, or a screen left open)
+  is refused as stale, and **its kept copy stays**: the screen reloads the new day and offers the tap again for the
+  night Riley tapped (Save it / Discard) while that night can still be answered here. Every other refusal drops it.
+- A success answer must be the server's own answer to that tap (the night and the answer it holds). A 200 sign-in
+  page after a redirect, or any unreadable 200, is never taken for a saved answer: the session ending empties the
+  store, anything else is retried and kept.
+- When the session ends (sign-out, a 401, a redirect to sign-in) the store empties itself through the client cache's
+  wipe: the private payload, the waiting retry, the kept tap and the unsaved-work flag; an answer that arrives
+  afterwards is ignored, so nothing is written to the device or the screen after the wipe.
 - Every tap carries the answer the screen showed (`expect`) and the goal version it showed (`rule_id`).
   `pds.sleep_winddown_set_night` (one locked transaction) refuses a screen from an earlier day (409 stale), a night
   outside the window, an answer that changed elsewhere since the screen showed it (409 changed; also when the check-in
@@ -86,6 +96,16 @@ a habit, an answer or a sleep value. Until the SQL is applied the GET answers `n
 
 Rollback: revert the code; the tables are then unused (nothing else depends on them) and the habit rows the button
 wrote stay ordinary habit answers.
+
+## Speed
+
+The panel is drawn from the client cache at once; the read is a revalidation and never blocks a paint. The
+`GET /api/sleep/winddown` read is two stages of parallel reads (goal, pauses, the hide preference and the behavioral
+day; then habit names, starts, WHOOP nights and the habit answers; a third only after a habit rename), and a deployment with
+no goal stops after the first.
+**Not measured on production yet**: the tables must exist first. Once the SQL is applied, the hourly `perf-timing`
+run samples Today and Log with the panel in place; the first red or slow run for this endpoint is the evidence to act
+on, and acceptance is not marked Done before its slowest call is recorded under the 1 s budget.
 
 ## Not built / follow-ups
 
