@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import type { NormalizedIngredient, NormalizedProduct } from "@/lib/dsld";
-import { chooseModel, effortConfig, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
+import { isUsableLabel } from "@/lib/label-extract";
+import { callTimeoutMs, chooseModel, effortConfig, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -265,6 +266,7 @@ export async function POST(req: NextRequest) {
   const pilot = pilotFromEnv(now);
   const choice = chooseModel("supplement_photo", crypto.randomUUID(), pilot, now);
   const started = Date.now();
+  const routeStart = started;
   let usage: Anthropic.Usage | null = null;
   // 1 once the model call is attempted (also when it throws); 0 when the request failed before it
   // (e.g. the reference table read), so those failures are not charged to the model.
@@ -284,6 +286,8 @@ export async function POST(req: NextRequest) {
     const prompt = buildPrompt(reference);
 
     attempts = 1;
+    // End the call inside the 60 s function limit (the SDK default outlasts it), so a slow call
+    // still writes its failure observation.
     const resp = await anthropic.messages.create({
       model: choice.model,
       max_tokens: 4096,
@@ -304,7 +308,7 @@ export async function POST(req: NextRequest) {
           ],
         },
       ],
-    });
+    }, { timeout: callTimeoutMs(routeStart, Date.now()), maxRetries: 0 });
     usage = resp.usage;
 
     const textBlock = resp.content.find((b) => b.type === "text");
@@ -333,7 +337,9 @@ export async function POST(req: NextRequest) {
 
     const aligned = alignWithReference(parsed, reference);
     const product = toNormalizedShape(aligned);
-    observe(true);
+    // Accepted only when the label produced a usable product (a name and named ingredients);
+    // the response is unchanged, so a thin read still reaches the review form to fix by hand.
+    observe(isUsableLabel(product));
 
     return NextResponse.json({
       product,

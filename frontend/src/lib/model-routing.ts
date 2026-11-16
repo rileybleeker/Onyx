@@ -184,6 +184,50 @@ export function pilotObservation(
   };
 }
 
+/** Function limit of the routes that call a model (their `maxDuration`), and the part of it kept for the rest of the request. */
+export const FUNCTION_BUDGET_MS = 60_000;
+export const FUNCTION_RESERVE_MS = 6_000;
+
+/**
+ * Time one model call may take so it ends (answer or timeout) inside the function budget, which
+ * lets the request write its own terminal observation instead of being killed with none. The SDK's
+ * default timeout is longer than the function limit, so routes pass this with `maxRetries: 0`.
+ */
+export function callTimeoutMs(routeStartMs: number, nowMs: number): number {
+  return Math.max(1_000, FUNCTION_BUDGET_MS - FUNCTION_RESERVE_MS - (nowMs - routeStartMs));
+}
+
+export type Arm = ModelChoice["arm"];
+
+/**
+ * Which dishes one estimate call takes. A call uses one model, so a batch holds only dishes of one
+ * arm. `rows` is the unestimated queue from its start (at least `from + n` rows when it has that
+ * many). Without `only`, the batch is the arm of the dish at `from` plus the later dishes of that
+ * arm in the window, and `armOffset` = how many dishes of that arm sit before `from`. With `only`
+ * (a retry after that arm's batch failed), `from` counts within that arm's dishes only, so a retry
+ * never calls the model for the other arm. Null = nothing at this offset.
+ */
+export function selectEstimateBatch<T>(
+  rows: readonly T[],
+  from: number,
+  n: number,
+  armOf: (row: T) => Arm,
+  only?: Arm,
+): { todo: T[]; arm: Arm; armOffset: number } | null {
+  if (only) {
+    const todo = rows.filter((r) => armOf(r) === only).slice(from, from + n);
+    return todo.length ? { todo, arm: only, armOffset: from } : null;
+  }
+  const queue = rows.slice(from);
+  if (queue.length === 0) return null;
+  const arm = armOf(queue[0]);
+  return {
+    todo: queue.filter((r) => armOf(r) === arm),
+    arm,
+    armOffset: rows.slice(0, from).filter((r) => armOf(r) === arm).length,
+  };
+}
+
 /** Pilot from process.env (server routes). */
 export function pilotFromEnv(nowMs: number): PilotConfig | null {
   return parsePilot(

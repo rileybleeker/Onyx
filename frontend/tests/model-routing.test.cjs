@@ -154,7 +154,7 @@ for (const [rel, task] of Object.entries(ROUTED)) {
 
 test("dish batches hold one arm, and the observation is written after the estimates are stored", () => {
   const src = read("app/api/delivery/items/import/route.ts");
-  assert.match(src, /queue\.filter\([^)]*\)\s*=>\s*i === 0 \|\| armOf\(r\)\.arm === choice\.arm\)/);
+  assert.match(src, /selectEstimateBatch\(data \?\? \[\], from, n, armOf, only\)/);
   const save = src.indexOf(".upsert(rows, { onConflict: \"est_key\"");
   const accepted = src.indexOf("observe(rows.length)");
   assert.ok(save > 0 && accepted > save, "accepted count logged only after the upsert");
@@ -216,4 +216,106 @@ test("the pilot's comparison fixtures exist for every routed task and look synth
     assert.ok(c.kcal_min <= c.kcal_max);
   }
   assert.equal(/@|https?:\/\//.test(JSON.stringify(fx)), false, "no addresses or links");
+});
+
+// --- behavioral: batches, retries, deadline, label acceptance -------------------------------------
+
+const LABEL = loadTs("lib/label-extract.ts");
+
+function dishes(n) {
+  return Array.from({ length: n }, (_, k) => ({ est_key: `dish-${k}` }));
+}
+
+test("a batch holds only the first dish's arm; the rest stay queued", () => {
+  const pilot = on({ ONYX_MODEL_PILOT_SHARE: "0.5" });
+  const rows = dishes(60);
+  const armOf = (r) => R.chooseModel("delivery_estimate", r.est_key, pilot, NOW).arm;
+  const b = R.selectEstimateBatch(rows, 0, 25, armOf);
+  assert.ok(b.todo.length >= 1);
+  assert.ok(b.todo.every((r) => armOf(r) === b.arm));
+  assert.equal(b.todo[0], rows[0]);
+  assert.equal(b.armOffset, 0);
+});
+
+test("a retry after a failed batch calls only that arm's dishes, never the other arm's", () => {
+  const pilot = on({ ONYX_MODEL_PILOT_SHARE: "0.5" });
+  const rows = dishes(80);
+  const armOf = (r) => R.chooseModel("delivery_estimate", r.est_key, pilot, NOW).arm;
+  const failed = R.selectEstimateBatch(rows, 0, 25, armOf);
+  const members = new Set(failed.todo);
+  // the harvester's one-dish retries: offset 0..n-1 within the failed arm, each limit 1
+  const retried = [];
+  for (let k = 0; k < failed.todo.length; k++) {
+    const one = R.selectEstimateBatch(rows, failed.armOffset + k, 1, armOf, failed.arm);
+    assert.equal(one.todo.length, 1);
+    assert.equal(one.arm, failed.arm);
+    retried.push(one.todo[0]);
+  }
+  for (const r of retried) assert.equal(armOf(r), failed.arm, "no other-arm dish retried");
+  assert.deepEqual(retried, failed.todo, "the retries walk exactly the failed batch");
+  assert.ok(members.size === retried.length);
+});
+
+test("armOffset counts same-arm dishes before a batch that starts after stepped-past dishes", () => {
+  const pilot = on({ ONYX_MODEL_PILOT_SHARE: "0.5" });
+  const rows = dishes(80);
+  const armOf = (r) => R.chooseModel("delivery_estimate", r.est_key, pilot, NOW).arm;
+  const b = R.selectEstimateBatch(rows, 7, 25, armOf);
+  const again = R.selectEstimateBatch(rows, b.armOffset, 1, armOf, b.arm);
+  assert.equal(again.todo[0], rows[7]);
+  assert.equal(R.selectEstimateBatch(rows, 0, 1, armOf, "pilot") && true, true);
+  assert.equal(R.selectEstimateBatch(rows.slice(0, 3), 3, 25, armOf), null);
+});
+
+test("without a pilot every dish is baseline and nothing is filtered out", () => {
+  const rows = dishes(30);
+  const armOf = (r) => R.chooseModel("delivery_estimate", r.est_key, null, NOW).arm;
+  const b = R.selectEstimateBatch(rows.slice(0, 25), 0, 25, armOf);
+  assert.equal(b.todo.length, 25);
+  assert.equal(b.arm, "baseline");
+});
+
+test("model calls end inside the 60 s function budget", () => {
+  assert.equal(R.callTimeoutMs(1000, 1000), 54_000);
+  assert.equal(R.callTimeoutMs(1000, 11_000), 44_000);
+  assert.equal(R.callTimeoutMs(1000, 80_000), 1_000, "never zero or negative");
+  for (const rel of ["app/api/delivery/items/import/route.ts", "app/api/supplements/extract-from-photo/route.ts"]) {
+    const src = read(rel);
+    assert.match(src, /timeout: callTimeoutMs\(routeStart, Date\.now\(\)\), maxRetries: 0/);
+  }
+});
+
+test("a failed estimate batch answers with its arm first, so the harvester can read it", () => {
+  const src = read("app/api/delivery/items/import/route.ts");
+  assert.match(src, /\{ \.\.\.extra, error: msg \}/);
+  const h = fs.readFileSync(path.join(__dirname, "..", "..", "tools", "ubereats_harvest", "harvest.mjs"), "utf8");
+  assert.match(h, /"arm":"\(baseline\|pilot\)","arm_offset"/);
+  assert.match(h, /arm: retryArm/);
+});
+
+test("a label read is accepted only with a product name and named ingredients", () => {
+  const ok = { full_name: "Generic Magnesium", ingredients: [{ name: "Magnesium", quantity: 200 }] };
+  assert.equal(LABEL.isUsableLabel(ok), true);
+  assert.equal(LABEL.isUsableLabel({ brand_name: "Generic", ingredients: [{ name: "X", quantity: null }] }), true);
+  for (const bad of [
+    null,
+    "text",
+    {},
+    { ingredients: [] },
+    { full_name: "Generic", ingredients: [] },
+    { full_name: "Generic" },
+    { full_name: "  ", brand_name: null, ingredients: [{ name: "X" }] },
+    { full_name: "Generic", ingredients: [{ name: "" }] },
+    { full_name: "Generic", ingredients: [{ name: null, quantity: 5 }] },
+    { full_name: "Generic", ingredients: [{ name: "X", quantity: "5" }] },
+    { full_name: "Generic", ingredients: [{ name: "X", quantity: -1 }] },
+  ]) {
+    assert.equal(LABEL.isUsableLabel(bad), false, JSON.stringify(bad));
+  }
+});
+
+test("the label route records success only through isUsableLabel", () => {
+  const src = read("app/api/supplements/extract-from-photo/route.ts");
+  assert.match(src, /observe\(isUsableLabel\(product\)\)/);
+  assert.equal(/observe\(true\)/.test(src), false);
 });

@@ -31,7 +31,9 @@ day even if the variables stay set.
 Arms are fixed per unit: each dish by its own `est_key`, a playlist or label request by a random
 id. One estimate call uses one model, so a dish batch holds only the dishes in the first dish's
 arm (the rest stay queued for the next call); a dish gets the same model in a batch and in the
-harvester's one-dish retry.
+harvester's one-dish retry. A failed batch's error names its arm and where that arm's dishes
+start; the harvester then retries one dish at a time inside that arm only (`arm` + an offset
+within the arm), so a failure never causes calls for the other arm's dishes.
 
 **Rollback:** delete `ONYX_MODEL_PILOT` (or let the end date pass) and redeploy. Every call goes
 back to the baseline. Estimates already stored keep the model they were made with
@@ -45,13 +47,15 @@ latency in ms and the input / output / cache read / cache write token counts. `c
 number of model calls attempted (counted before each call, so one that threw still counts) and
 `answered` the number that returned usage. The line is written once per request, after the
 outcome is known: a dish batch only after its estimates are stored (a failed save is logged with
-0 accepted). Never prompt,
+0 accepted). Each model call is given a deadline inside the 60 s function limit (the SDK default is longer),
+so a slow call ends as a failed, observed request rather than a killed one with no line. Never prompt,
 reply, dish, product or track text. Outside a pilot nothing is logged.
 
 Accepted results per task: a dish batch whose every dish got an estimate (and the count of
-estimated dishes); a playlist created; a label parsed into the product shape. The harvester's
-one-dish retries after a failed batch appear as their own lines, each in its dish's own arm,
-which is the arm of the batch that failed, so failures and retries count against the arm that
+estimated dishes); a playlist created; a label with a product name and at least one named ingredient (a read with no product name or
+an empty ingredient list counts as not accepted, though the review form still gets it). The harvester's
+one-dish retries after a failed batch appear as their own lines, each in the arm of the batch
+that failed (retries never leave that arm), so failures and retries count against the arm that
 caused them. Dish estimates and saved custom products also store the model
 (`delivery_item_nutrition.model`, `supplement_products.raw_json.model`).
 

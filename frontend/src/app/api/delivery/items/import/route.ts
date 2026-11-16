@@ -2,7 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildOrderItemRows, customizationsText, type HarvestOrder, type ItemCustomization } from "@/lib/delivery";
-import { chooseModel, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
+import {
+  callTimeoutMs,
+  chooseModel,
+  logPilotObservation,
+  pilotFromEnv,
+  pilotObservation,
+  selectEstimateBatch,
+  type Arm,
+} from "@/lib/model-routing";
 
 // Uber Eats item harvester endpoint (tools/ubereats_harvest/harvest.mjs on Riley's PC).
 // Auth: the middleware CI carve-out (x-onyx-ci-token) or a Supabase session.
@@ -27,6 +35,8 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const BATCH = 25;
 
 interface Body {
+  /** Retry only the dishes of this arm (named in a failed batch's answer); offset then counts within it. */
+  arm?: Arm;
   orders?: HarvestOrder[];
   estimate?: boolean;
   /** estimate only: dishes per call (1..BATCH) and how many queue rows to step past. */
@@ -109,7 +119,10 @@ export async function POST(req: NextRequest) {
       if (!Array.isArray(body.orders)) return NextResponse.json({ error: "orders must be an array" }, { status: 400 });
       return NextResponse.json(await importOrders(body.orders));
     }
-    if (body.estimate) return NextResponse.json(await estimateBatch(body.limit, body.offset));
+    if (body.estimate) {
+      const only = body.arm === "baseline" || body.arm === "pilot" ? body.arm : undefined;
+      return NextResponse.json(await estimateBatch(body.limit, body.offset, only));
+    };
     if (body.done) {
       // Count the queue here instead of trusting a number from the harvester: a run whose
       // estimate calls all failed used to report 0 left and was recorded as a success.
@@ -133,7 +146,21 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error("delivery items import failed:", msg);
-    return NextResponse.json({ error: msg }, { status: 500 });
+    // A failed estimate batch names its arm and where that arm's dishes start, so the harvester's
+    // one-dish retries stay inside the failed batch's arm.
+    const extra = e instanceof EstimateError ? { arm: e.arm, arm_offset: e.armOffset } : {};
+    // arm first: the harvester reads it from the start of a message it cuts at 300 characters.
+    return NextResponse.json({ ...extra, error: msg }, { status: 500 });
+  }
+}
+
+class EstimateError extends Error {
+  constructor(
+    message: string,
+    readonly arm: Arm,
+    readonly armOffset: number,
+  ) {
+    super(message);
   }
 }
 
@@ -150,7 +177,7 @@ async function importOrders(orders: HarvestOrder[]) {
   return { orders: orders.length, items: rows.length };
 }
 
-async function estimateBatch(limit?: number, offset?: number) {
+async function estimateBatch(limit?: number, offset?: number, only?: Arm) {
   // `offset` lets the harvester step past a dish that cannot be estimated (it retries a failed
   // batch one dish at a time), so one bad dish cannot block the queue forever.
   const n = Math.min(BATCH, Math.max(1, Math.floor(Number(limit)) || BATCH));
@@ -159,21 +186,22 @@ async function estimateBatch(limit?: number, offset?: number) {
     .from("delivery_items_unestimated")
     .select("est_key,store_name,merchant_kind,title,customizations,price,currency", { count: "exact" })
     .order("est_key")
-    .limit(from + n);
+    .limit(only ? 1000 : from + n);
   if (error) throw new Error(`delivery_items_unestimated: ${error.message}`);
-  const queue = (data ?? []).slice(from);
-  // Nothing at this offset: the dishes stepped past are still in the queue, so report them.
-  if (queue.length === 0) return { estimated: 0, remaining: count ?? 0 };
 
   // Each dish has its own arm (by its est_key), and one call uses one model, so a batch holds only
   // the dishes of the first dish's arm; the others stay queued for a later call. A dish therefore
   // gets the same model in a full batch and in the harvester's one-dish retry, and a failed batch
-  // is counted against the arm that ran it. Without a pilot every dish is baseline (no filtering).
-  const now = Date.now();
-  const pilot = pilotFromEnv(now);
-  const armOf = (r: (typeof queue)[number]) => chooseModel("delivery_estimate", String(r.est_key), pilot, now);
-  const choice = armOf(queue[0]);
-  const todo = queue.filter((r, i) => i === 0 || armOf(r).arm === choice.arm);
+  // is counted against the arm that ran it. A retry passes `only` (the failed batch's arm) so it
+  // never calls the model for the other arm's dishes. Without a pilot every dish is baseline.
+  const routeStart = Date.now();
+  const pilot = pilotFromEnv(routeStart);
+  const armOf = (r: { est_key: unknown }): Arm => chooseModel("delivery_estimate", String(r.est_key), pilot, routeStart).arm;
+  const picked = selectEstimateBatch(data ?? [], from, n, armOf, only);
+  // Nothing at this offset: the dishes stepped past are still in the queue, so report them.
+  if (!picked) return { estimated: 0, remaining: count ?? 0 };
+  const { todo } = picked;
+  const choice = chooseModel("delivery_estimate", String(todo[0].est_key), pilot, routeStart);
 
   const input = todo.map((r, id) => ({
     id,
@@ -200,13 +228,18 @@ async function estimateBatch(limit?: number, offset?: number) {
     );
   let parsed: { items: Estimate[] };
   try {
-    res = await anthropic.messages.create({
-      model: choice.model,
-      max_tokens: 16000,
-      system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
-      output_config: { effort: choice.effort ?? "low", format: { type: "json_schema", schema: SCHEMA } },
-      messages: [{ role: "user", content: JSON.stringify({ items: input }) }],
-    });
+    // The SDK's default timeout and retries outlast the 60 s function limit, which would kill the
+    // request before it could write its observation; end the call inside the budget instead.
+    res = await anthropic.messages.create(
+      {
+        model: choice.model,
+        max_tokens: 16000,
+        system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+        output_config: { effort: choice.effort ?? "low", format: { type: "json_schema", schema: SCHEMA } },
+        messages: [{ role: "user", content: JSON.stringify({ items: input }) }],
+      },
+      { timeout: callTimeoutMs(routeStart, Date.now()), maxRetries: 0 },
+    );
     if (res.stop_reason !== "end_turn") {
       throw new Error(`estimator stopped with ${res.stop_reason}`);
     }
@@ -215,7 +248,7 @@ async function estimateBatch(limit?: number, offset?: number) {
     parsed = JSON.parse(text) as { items: Estimate[] };
   } catch (e) {
     observe(0);
-    throw e;
+    throw new EstimateError(e instanceof Error ? e.message : String(e), picked.arm, picked.armOffset);
   }
 
   const rows = [];
@@ -248,7 +281,7 @@ async function estimateBatch(limit?: number, offset?: number) {
       .upsert(rows, { onConflict: "est_key", ignoreDuplicates: true });
     if (upErr) {
       observe(0);
-      throw new Error(`delivery_item_nutrition upsert: ${upErr.message}`);
+      throw new EstimateError(`delivery_item_nutrition upsert: ${upErr.message}`, picked.arm, picked.armOffset);
     }
   }
   observe(rows.length);
