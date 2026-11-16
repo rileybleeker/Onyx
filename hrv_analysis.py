@@ -4074,10 +4074,12 @@ def run_dose_response_continuous(df: pd.DataFrame) -> dict:
 # 7 days, and a value observed on a night with no HRV was never carried) while serving filled
 # the full frame, so training rows after an HRV gap carried other values than the live row.
 SPARSE_FILL_MAX_AGE_DAYS = 7
-# Stored in the model pickle as "preprocessing". hrv_predict.py serves a model with the fill it
-# was trained with (never a mixed pair) and refuses a value it does not know.
+# Stored in the model pickle as "preprocessing". hrv_predict.py serves a model stamped with this
+# version with this same fill (training and serving match) and refuses a value it does not know.
 SPARSE_FILL_VERSION = "calendar_ffill_7d_v1"
-# Pickles written before the field existed: served with the row-count fill they shipped with.
+# Pickles written before the field existed keep the OLD serving behaviour (7 rows forward on the
+# full frame) until the next retrain. That is not how they were trained (old training filled
+# after the outcome drop), so it keeps the old mismatch; only a retrain on SPARSE_FILL_VERSION fixes it.
 LEGACY_SPARSE_FILL_VERSION = "row_ffill_7_v0"
 SPARSE_FILL_VERSIONS = (SPARSE_FILL_VERSION, LEGACY_SPARSE_FILL_VERSION)
 
@@ -4120,9 +4122,10 @@ def fill_sparse_features(df: pd.DataFrame, cols=HIGH_VALUE_SPARSE_FEATURES,
 
 
 def _legacy_row_fill(df: pd.DataFrame) -> pd.DataFrame:
-    """Serving fill of models pickled before SPARSE_FILL_VERSION: 7 ROWS forward on the sorted
-    frame, whatever their dates. Kept only so such a pickle is served with the fill it shipped
-    with until the next retrain; never used for training."""
+    """Old serving fill, for models pickled before SPARSE_FILL_VERSION: 7 ROWS forward on the
+    sorted full frame, whatever their dates. Kept only so such a pickle keeps forecasting as it
+    did before until the next retrain; it does not match how that model was trained (old
+    training filled after the outcome drop). Never used for training."""
     d = df.copy()
     for col in HIGH_VALUE_SPARSE_FEATURES:
         if col in d.columns:
@@ -4131,7 +4134,8 @@ def _legacy_row_fill(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def model_preprocessing(bundle: dict) -> str:
-    """The sparse-feature fill a model pickle was trained with."""
+    """The sparse-feature fill version recorded in a model pickle (LEGACY_SPARSE_FILL_VERSION
+    for a pickle from before the field, meaning: serve it the old way)."""
     value = bundle.get("preprocessing")
     return LEGACY_SPARSE_FILL_VERSION if value is None else str(value)
 
@@ -4189,10 +4193,10 @@ def serve_features(df: pd.DataFrame, feat_cols: list[str],
                    preprocessing: str = SPARSE_FILL_VERSION,
                    now: datetime | None = None) -> tuple[pd.DataFrame, str] | tuple[None, None]:
     """Feature row for the live forecast: behavioral today's row (the sleep Riley goes to
-    tonight). `preprocessing` is the sparse-feature fill the model was trained with
-    (model_preprocessing of its pickle): SPARSE_FILL_VERSION is fill_sparse_features, the same
-    call prepare_ml_data makes; LEGACY_SPARSE_FILL_VERSION is the row-count fill of older
-    pickles. Any other value raises ValueError. `now` is for tests (default: the clock).
+    tonight). `preprocessing` is the fill version recorded in the model's pickle
+    (model_preprocessing): SPARSE_FILL_VERSION is fill_sparse_features, the same call
+    prepare_ml_data makes; LEGACY_SPARSE_FILL_VERSION is the old serving fill (7 rows) kept for
+    older pickles until the next retrain. Any other value raises ValueError. `now` is for tests (default: the clock).
     Returns (X_row, behavioral_date) or (None, None) if the row is missing."""
     if preprocessing not in SPARSE_FILL_VERSIONS:
         raise ValueError(f"unknown sparse-feature fill {preprocessing!r}; "

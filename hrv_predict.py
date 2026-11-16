@@ -311,10 +311,11 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
                   f"{al.ALIGNMENT_VERSION!r} — retrain (hrv-retrain-on-backfill.yml) before predicting.")
         return None
 
-    # Serve the model with the sparse-feature fill it was trained with, never a mixed pair.
-    # A pickle from before the field keeps forecasting with its own (row-count) fill until the
-    # next retrain writes one on the current fill; a fill this code does not know (a newer
-    # pickle after a code rollback) is refused.
+    # A model stamped with the current fill is served with that same fill, so training and
+    # serving match. A pickle from before the field keeps the old serving behaviour (7-row fill
+    # on the full frame, which never matched how it was trained) until the next retrain writes
+    # one on the current fill; a fill this code does not know (a newer pickle after a code
+    # rollback) is refused.
     fill_version = model_preprocessing(model_bundle)
     if fill_version not in SPARSE_FILL_VERSIONS:
         msg = (f"GUARD model_preprocessing: model pickle preprocessing={fill_version!r}, this code "
@@ -325,8 +326,8 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         return None
     if fill_version != SPARSE_FILL_VERSION:
         msg = (f"Model pickle predates the calendar-day sparse-feature fill ({SPARSE_FILL_VERSION}); "
-               f"forecasting with the fill it was trained with ({fill_version}) until the next retrain "
-               "(hrv-retrain-on-backfill.yml, daily at 12:00 UTC).")
+               f"forecasting with the old serving fill ({fill_version}), which does not match how this "
+               "model was trained, until the next retrain (hrv-retrain-on-backfill.yml, daily at 12:00 UTC).")
         log.warning(msg)
         report_preprocessing("partial", msg)
     else:

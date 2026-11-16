@@ -240,7 +240,7 @@ def test_model_preprocessing_and_serve_versions():
     cur, _ = h.serve_features(upto, feat_cols, now=now)
     old, _ = h.serve_features(upto, feat_cols, h.LEGACY_SPARSE_FILL_VERSION, now=now)
     assert np.isnan(cur[SPARSE_A].iloc[0])      # 8 days old
-    assert old[SPARSE_A].iloc[0] == 109.0       # the fill that model shipped with
+    assert old[SPARSE_A].iloc[0] == 109.0       # the old serving fill
     try:
         h.serve_features(upto, feat_cols, "calendar_ffill_7d_v9", now=now)
     except ValueError:
