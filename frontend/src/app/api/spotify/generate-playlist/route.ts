@@ -291,6 +291,20 @@ export async function POST(req: NextRequest) {
       },
     );
 
+  // Tool operations (Spotify, database) race the same request budget, and no tool starts after it
+  // has run out, so a hung one cannot keep the request open past its terminal observation.
+  const withinBudget = <T,>(work: Promise<T>): Promise<T> => {
+    if (stop.signal.aborted) {
+      work.catch(() => undefined);
+      return Promise.reject(new Error("Request time budget exceeded"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new Error("Request time budget exceeded"));
+      stop.signal.addEventListener("abort", onAbort, { once: true });
+      work.then(resolve, reject).finally(() => stop.signal.removeEventListener("abort", onAbort));
+    });
+  };
+
   const stream = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -324,6 +338,7 @@ export async function POST(req: NextRequest) {
           for (const block of assistantContent) {
             if (block.type !== "tool_use") continue;
 
+            if (stop.signal.aborted) throw new Error("Request time budget exceeded");
             send({ type: "tool_use", tool: block.name, input: block.input });
 
             let resultStr: string;
@@ -332,11 +347,11 @@ export async function POST(req: NextRequest) {
             try {
               if (block.name === "search_spotify_catalog") {
                 const inp = block.input as { query: string; limit?: number };
-                const tracks = await searchTracks(inp.query, inp.limit ?? 20);
+                const tracks = await withinBudget(searchTracks(inp.query, inp.limit ?? 20));
                 resultStr = JSON.stringify(tracks);
                 summary = `Catalog search "${inp.query}" → ${tracks.length} tracks`;
               } else if (block.name === "query_spotify_tracks_by_features") {
-                const rows = await runFeatureQuery(block.input as Record<string, unknown>);
+                const rows = await withinBudget(runFeatureQuery(block.input as Record<string, unknown>));
                 resultStr = JSON.stringify(rows);
                 summary = Array.isArray(rows)
                   ? `Filtered history → ${rows.length} tracks`
@@ -351,14 +366,14 @@ export async function POST(req: NextRequest) {
                   type: "status",
                   message: `Creating "${inp.name}" with ${inp.track_ids.length} tracks…`,
                 });
-                const result = await createPlaylist({
+                const result = await withinBudget(createPlaylist({
                   name: inp.name,
                   description: inp.description,
                   trackIds: inp.track_ids,
                   isPublic: false,
                   createdVia: "builder",
                   prompt: body.prompt,
-                });
+                }));
                 resultStr = JSON.stringify(result);
                 summary = `Created "${result.name}" · ${result.track_count} tracks`;
                 finalResult = result;

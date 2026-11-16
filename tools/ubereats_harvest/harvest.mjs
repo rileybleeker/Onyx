@@ -246,17 +246,20 @@ try {
         // grows only for a dish that actually failed or came back without an estimate.
         let retryArm = null;
         let retryOffset = 0;
+        // Dishes that failed alone, per arm: sent with full batches so each arm steps past only its own.
+        const armSkips = { baseline: 0, pilot: 0 };
+        const skippedTotal = () => skip + armSkips.baseline + armSkips.pilot;
         for (let i = 0; i < 400; i++) {
           const limit = single > 0 ? 1 : 25;
           let r;
           const retrying = limit === 1 && retryArm;
           try {
-            r = await post(retrying ? { estimate: true, limit, offset: retryOffset, arm: retryArm } : { estimate: true, limit, offset: skip });
+            r = await post(retrying ? { estimate: true, limit, offset: retryOffset, arm: retryArm } : { estimate: true, limit, offset: skip, skips: { ...armSkips } });
           } catch (e) {
             estimateError = e.message;
             log(`estimate call failed (limit ${limit}, offset ${retrying ? retryOffset : skip}): ${e.message}`);
             if (++failedInRow > 4) break;
-            if (limit === 1) { skip++; retryOffset++; single--; } else {
+            if (limit === 1) { if (retrying) armSkips[retryArm]++; else skip++; retryOffset++; single--; } else {
               single = 25;
               const m = /"arm":"(baseline|pilot)","arm_offset":(\d+)/.exec(e.message);
               retryArm = m ? m[1] : null;
@@ -274,8 +277,8 @@ try {
             retryArm = null;
             continue;
           }
-          if (limit === 1) { single--; if (!r.estimated) { skip++; retryOffset++; } } else if (!r.estimated) break;
-          if (remaining <= skip) break;
+          if (limit === 1) { single--; if (!r.estimated) { if (retrying) armSkips[retryArm]++; else skip++; retryOffset++; } } else if (!r.estimated) break;
+          if (remaining <= skippedTotal()) break;
         }
         log(`estimated ${estimated} dish(es); ${remaining === null ? "an unknown number" : remaining} left without an estimate`);
 

@@ -154,7 +154,7 @@ for (const [rel, task] of Object.entries(ROUTED)) {
 
 test("dish batches hold one arm, and the observation is written after the estimates are stored", () => {
   const src = read("app/api/delivery/items/import/route.ts");
-  assert.match(src, /selectEstimateBatch\(data \?\? \[\], from, n, armOf, only\)/);
+  assert.match(src, /selectEstimateBatch\(queue, from, n, armOf, only\)/);
   const save = src.indexOf(".upsert(rows, { onConflict: \"est_key\"");
   const accepted = src.indexOf("observe(rows.length)");
   assert.ok(save > 0 && accepted > save, "accepted count logged only after the upsert");
@@ -780,4 +780,17 @@ test("dish route: a retry inside an arm with no dish left says so, so the harves
   assert.equal(seen.length, 0, "no model call");
   const plain = await runDishCase([], { estimate: true, limit: 1, offset: 50 });
   assert.equal("arm_exhausted" in plain.res.body, false);
+});
+
+test("harvester keeps failed dishes per arm, and the route and playlist loop honour the budget", () => {
+  const h = fs.readFileSync(path.join(SRC, "../../tools/ubereats_harvest/harvest.mjs"), "utf8");
+  assert.match(h, /armSkips\[retryArm\]\+\+/);
+  assert.match(h, /skips: \{ \.\.\.armSkips \}/);
+  const route = read("app/api/delivery/items/import/route.ts");
+  assert.match(route, /seen\[a\]\+\+ >= skipN\[a\]/);
+  const pl = read("app/api/spotify/generate-playlist/route.ts");
+  assert.match(pl, /withinBudget\(searchTracks/);
+  assert.match(pl, /withinBudget\(runFeatureQuery/);
+  assert.match(pl, /withinBudget\(createPlaylist/);
+  assert.match(pl, /if \(stop\.signal\.aborted\) throw/);
 });

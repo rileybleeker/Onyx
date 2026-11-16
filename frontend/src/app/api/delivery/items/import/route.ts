@@ -48,6 +48,8 @@ interface Body {
   /** estimate only: dishes per call (1..BATCH) and how many queue rows to step past. */
   limit?: number;
   offset?: number;
+  /** Dishes already failed per arm; each arm's first N queued dishes are stepped past (full batches). */
+  skips?: { baseline?: number; pilot?: number };
   done?: boolean;
   error?: string;
   stats?: { orders?: number; items?: number; pages?: number; estimated?: number; estimateError?: string | null };
@@ -129,7 +131,7 @@ export async function POST(req: NextRequest) {
     }
     if (body.estimate) {
       const only = body.arm === "baseline" || body.arm === "pilot" ? body.arm : undefined;
-      return NextResponse.json(await estimateBatch(deadline, body.limit, body.offset, only));
+      return NextResponse.json(await estimateBatch(deadline, body.limit, body.offset, only, body.skips));
     }
     if (body.done) {
       // Count the queue here instead of trusting a number from the harvester: a run whose
@@ -185,7 +187,11 @@ async function importOrders(orders: HarvestOrder[]) {
   return { orders: orders.length, items: rows.length };
 }
 
-async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: number, only?: Arm) {
+function clampSkip(v: unknown): number {
+  return Math.min(500, Math.max(0, Math.floor(Number(v)) || 0));
+}
+
+async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: number, only?: Arm, skips?: Body["skips"]) {
   // `offset` lets the harvester step past a dish that cannot be estimated (it retries a failed
   // batch one dish at a time), so one bad dish cannot block the queue forever.
   const n = Math.min(BATCH, Math.max(1, Math.floor(Number(limit)) || BATCH));
@@ -194,7 +200,7 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
     .from("delivery_items_unestimated")
     .select("est_key,store_name,merchant_kind,title,customizations,price,currency", { count: "exact" })
     .order("est_key")
-    .limit(only ? 1000 : from + n)
+    .limit(only || skips ? 1000 : from + n)
     .abortSignal(deadline.signal);
   if (error) throw new Error(`delivery_items_unestimated: ${error.message}`);
 
@@ -206,7 +212,19 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
   const pickedAt = Date.now();
   const pilot = pilotFromEnv(pickedAt);
   const armOf = (r: { est_key: unknown }): Arm => chooseModel("delivery_estimate", String(r.est_key), pilot, pickedAt).arm;
-  const picked = selectEstimateBatch(data ?? [], from, n, armOf, only);
+  // Dishes that failed alone are stepped past per arm, so a failure in one arm never moves the
+  // other arm's queue. Their positions count in the arm's offset so a later retry stays aligned.
+  const skipN = { baseline: clampSkip(skips?.baseline), pilot: clampSkip(skips?.pilot) };
+  let queue = data ?? [];
+  if (!only && (skipN.baseline || skipN.pilot)) {
+    const seen = { baseline: 0, pilot: 0 };
+    queue = queue.filter((r) => {
+      const a = armOf(r);
+      return seen[a]++ >= skipN[a];
+    });
+  }
+  const picked0 = selectEstimateBatch(queue, from, n, armOf, only);
+  const picked = picked0 && !only ? { ...picked0, armOffset: picked0.armOffset + skipN[picked0.arm] } : picked0;
   // Nothing at this offset: the dishes stepped past are still in the queue, so report them. On a
   // retry inside one arm (`only`) this means that arm has no dish left at the offset: the
   // harvester then leaves its one-dish retries instead of counting a skipped dish.
