@@ -38,6 +38,7 @@ import numpy as np  # noqa: E402
 import experiment_admin as admin  # noqa: E402
 import experiment_analysis as ea  # noqa: E402
 import experiment_design as ed  # noqa: E402
+import experiment_fingerprint as ef  # noqa: E402
 
 GOLDEN_SEED = hashlib.sha256(b"onyx experiment framework golden test seed (synthetic)").digest()
 GOLDEN_SCHEDULE = "ABBABABAABBAABABBAABABBABAABAABBABBAABBABAABBABA"
@@ -293,6 +294,11 @@ def test_stopped_early_trial_is_reported_as_such():
     report = ea.analyze_trial(spec, data, stop + timedelta(days=1))
     assert report["stopped_early"] is True and report["last_day_analysed"] == stop.isoformat()
     assert report["days_in_scope"] <= 122 and report["n_nights"] < 122
+    # The stop withholds a firm decision and is named (review PIPE06-FOLLOWUP-R1).
+    check = {c["id"]: c for c in report["inference"]["checks"]}["stopping_not_outcome_dependent"]
+    assert check["status"] == "failed" and check["blocks_decision"] is True and stop.isoformat() in check["reason"]
+    assert report["decision_firm"] is False and report["decision"] == "inconclusive"
+    assert check["reason"] in report["decision_withheld"]
 
 
 # ---------------------------------------------------------------------------
@@ -525,8 +531,16 @@ def _reviewed(**changes):
     """A synthetic METHOD_REVIEW covering the template's configuration, restored afterwards."""
     saved = dict(ea.METHOD_REVIEW)
     try:
-        ea.METHOD_REVIEW.update(method=ea.INFERENCE_METHOD, calibration_report="synthetic-report-ref",
-                                independent_review="synthetic-review-ref", n_redraws=(10000,), alpha=(0.05,))
+        fingerprint = ef.inference_fingerprint()
+        ea.METHOD_REVIEW.update(
+            method=ea.INFERENCE_METHOD, interval_method=ea.INTERVAL_METHOD,
+            independent_review={"reference": "synthetic-review-ref", "reviewers": ("synthetic-a", "synthetic-b"),
+                                "verdicts": ("sound", "sound"), "reviewed_revision": "synthetic-revision",
+                                "inference_fingerprint": fingerprint},
+            calibration_report={"reference": "synthetic-report-ref", "revision": "synthetic-revision",
+                                "inference_fingerprint": fingerprint, "harness_fingerprint": "synthetic-harness",
+                                "review_ready": True, "suite_run": "synthetic-suite-run"},
+            n_redraws=(10000,), alpha=(0.05,), block_designs=((4, 2),), n_blocks=(7, 58))
         ea.METHOD_REVIEW.update(changes)
         yield
     finally:
@@ -568,6 +582,10 @@ def test_admin_seed_then_register_then_verify():
         assert "cannot be registered yet" in pending and "independent statistical review" in pending
         with _reviewed(n_redraws=(999,)):
             assert "re-draw counts, not this trial's 10000" in _refused(
+                lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
+        # ... and its block design: a calibration that never ran this many blocks does not cover it.
+        with _reviewed(n_blocks=(7, 40)):
+            assert "covers 7 to 40 scheduled blocks, not this trial's 58" in _refused(
                 lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
         assert store.rows["EXP-901"]["status"] == "draft" and store.sched == {}, "a refused registration writes nothing"
 

@@ -538,6 +538,11 @@ def test_stopped_early_and_too_few_nights_still_get_a_final_report():
     report = store.final()
     assert report["stopped_early"] is True and report["last_day_analysed"] == stop.isoformat()
     assert report["days_elapsed"] == 48 and report["n_nights"] == 48 and report["stop_reason"] == "synthetic reason"
+    # Review PIPE06-FOLLOWUP-R1: the stop withholds the decision whatever else holds, named in the report.
+    check = {c["id"]: c for c in report["inference"]["checks"]}["stopping_not_outcome_dependent"]
+    assert check["status"] == "failed" and check["reason"] in report["decision_withheld"]
+    assert report["decision"] == "inconclusive" and report["decision_firm"] is False
+    assert "p_value_no_effect" in report["inference"]["unsupported_outputs"]
     assert store.exp["status"] == "stopped_early", "a stopped trial keeps its status"
 
     # Stopped on day 6: the model cannot be fitted. The final report says so and carries no estimate.
@@ -745,9 +750,18 @@ def test_the_real_writer_end_to_end_against_an_in_memory_notion():
     assert page["properties"]["Status"]["status"]["name"] == "Complete"
     assert page["properties"]["Estimate (ms)"]["number"] == round(store.final()["estimate"], 2)
     # Until METHOD_REVIEW is recorded the decision is withheld (PIPE-06): the page reads Inconclusive.
+    # The production record is left as it is (no calibration report yet), so this is the withheld path.
+    final = store.final()
+    assert final["decision"] == "inconclusive" and final["decision_firm"] is False
+    assert final["decision_if_supported"] == "adopt_A" and final["decision_withheld"]
     assert page["properties"]["Decision"]["select"]["name"] == "Inconclusive"
     heading = [b for b in api.children[page["id"]] if b["type"] == "heading_2"]
     assert len(heading) == 1 and api.children[heading[0]["id"]], "the report body sits under one heading"
+    # The real writer carries the reason and the rule's own verdict onto the page body, word for word.
+    body = " ".join(api.text_of(heading[0]["id"]))
+    assert "No firm decision yet, so it reads Inconclusive: " in body
+    assert all(reason in body for reason in final["decision_withheld"]), "every withheld reason is on the page"
+    assert "The rule on its own gives: Adopt A." in body
     assert store.exp["notion_page_id"] == page["id"]
 
 

@@ -28,7 +28,8 @@ the observed yesterday's assignment. So the joint test needs one pass of re-draw
 (tau, gamma). The reported same-night p-value tests tau = 0 with gamma unknown (a nuisance) by
 Berger & Boos (1994): the largest joint p-value over a 1 - beta randomization confidence set for
 gamma, plus beta (nuisance_beta_for(R): 0.001, or 5 / (R + 1) with fewer re-draws). Its type I
-error is at most alpha whatever gamma is, whenever M holds. The interval is a certified enclosure
+error is at most alpha whatever gamma is, whenever M holds (a Monte Carlo test's guarantee, qualified
+below). The interval is a certified enclosure
 of every value that test does not reject (interval(), INTERVAL_METHOD: the accepted values need
 not form an interval, so nothing beyond its ends is accepted, by a bound proved strip by strip);
 the carryover p-value and interval are the same construction with the roles swapped. A value is
@@ -38,13 +39,32 @@ needs the randomized schedule and missing nights not caused by the arm, and reje
 say which night. The re-drawing never assumes anything about the HRV series, so autocorrelation
 does not break it.
 
+The re-draws are a Monte Carlo sample of R schedules from the registered design, and every p-value
+is (1 + extreme re-draws) / (R + 1): the standard Monte Carlo randomization test (Dwass 1957,
+Phipson and Smyth 2010). With re-draws drawn at random, independently of the observed schedule,
+its size is at most alpha. The deployed re-draws are not random: experiment_design.redraw_seed is a
+deterministic SHA-256 hash of the experiment id and the report date, public values that never touch
+the secret allocation seed (os.urandom, committed before the trial), and the final report is
+computed once, so the re-draws cannot be re-chosen after a p-value is seen. Every "at most alpha"
+and "at least 1 - alpha" in this module therefore rests on a pseudo-randomness assumption, the same
+one every seeded Monte Carlo test makes: the hash is treated as a random draw independent of the
+allocation. For the one fixed re-draw set a report uses, the size is alpha only up to Monte Carlo
+error, about sqrt(alpha (1 - alpha) / R) (0.002 at R = 10,000, alpha 0.05). The calibration report
+seeds its re-draws with the same deterministic rule, so it is the empirical evidence for the size
+and coverage that rule gives.
+
 analyze_trial() REFUSES to run before the pre-registered end (Riley's decision 1, doc section 13:
-analyse only at the pre-registered end). A trial stopped early is reported as such. It reports the
-decision rule's verdict as a firm decision only when every blocking check in assumption_checks()
-passes: missing nights not tied to the arm, the registered protocol's declaration and
-justification of the untestable parts of M (one-night carryover, constant effects, pre-trial day
-as control), the registered inference method, and a METHOD_REVIEW (calibration report plus
-independent review) covering the trial's alpha and re-draw count. Otherwise the decision is
+analyse only at the pre-registered end). A trial stopped early is reported as such, over the nights
+before the stop. It reports the decision rule's verdict as a firm decision only when every blocking
+check in assumption_checks() passes: missing nights not tied to the arm, the registered protocol's
+declaration and justification of the untestable parts of M (one-night carryover, constant effects,
+pre-trial day as control), a trial that ran to its pre-registered end (the re-draws and the
+calibration assume the analysed nights were fixed in advance, and a stop can follow what was seen,
+so an early stop withholds the decision whatever its reason), the registered inference method, and
+a METHOD_REVIEW (calibration report plus
+independent review) covering the trial's alpha, re-draw count and block design (block length,
+arm-A days per block, scheduled blocks) and recorded for the inference code that is running (its
+experiment_fingerprint fingerprint). Otherwise the decision is
 withheld ("inconclusive"), the reasons are in the report, and every output whose assumptions a
 failed check leaves unsupported is marked so.
 """
@@ -71,34 +91,192 @@ MIN_NUISANCE_TAIL = design.MIN_NUISANCE_TAIL
 nuisance_beta_for = design.nuisance_beta_for
 INFERENCE_METHOD = "joint_sharp_null_berger_boos_v1"
 INTERVAL_METHOD = "certified_enclosure_v1"
-# Filled in by the PR that records the seeded calibration report (experiment_calibration.py, run in
-# the scheduled validation phase) and the independent statistical review of INFERENCE_METHOD, with
-# the configuration the report calibrated. A trial's decision is firm only when its alpha and
-# re-draw count are among those (docs/experiment-framework.md 8.1); until then it is withheld.
+# The method record a firm decision needs (docs/experiment-framework.md 8.1 and 8.3): the independent
+# statistical review of INFERENCE_METHOD and the seeded calibration report (experiment_calibration.py,
+# run in the scheduled validation phase), with the configuration the report calibrated. Each half is a
+# structured record that names the code it covered by its inference fingerprint (experiment_fingerprint:
+# this module and the allocation / re-draw code of experiment_design, with docstrings, comments, this
+# record, its check and the explanation of the outputs left out). A trial's decision is firm only when
+# both halves are recorded, both fingerprints equal the fingerprint of the code that is running, and the
+# trial's alpha, re-draw count and block design are among those calibrated; until then it is withheld.
+# A design outside them is not covered even though the method is exact for any design under its
+# assumptions: the calibration is the check that the code delivers it, and it ran on its designs only.
+# Any change to the fingerprinted code therefore withholds every decision until both halves are
+# recorded again for it.
+# The review is recorded (doc 8.3). The calibration report is not: the PR that records a review-ready
+# report fills in calibration_report, n_redraws, alpha, block_designs and n_blocks (all copied from the
+# report's `covers`), with calibration_report =
+#   {"reference": where the report is kept, "revision": the commit it ran at (the report's `revision`),
+#    "inference_fingerprint" and "harness_fingerprint": copied from the report, "review_ready": True,
+#    "suite_run": the scheduled-suite run, at that fingerprint, in which tests/test_experiment_calibration.py
+#    passed, its strip-bound proofs of the certified interval included}
+# This record and method_review_problem are outside the fingerprint (a record cannot cover itself).
 METHOD_REVIEW: dict[str, Any] = {
-    "method": None,               # the INFERENCE_METHOD the report and the review cover
-    "calibration_report": None,   # reference to the passing seeded report (experiment_calibration.py)
-    "independent_review": None,   # reference to the independent statistical review
-    "n_redraws": (),              # re-draw counts the report calibrated
-    "alpha": (),                  # alpha levels it calibrated
+    "method": INFERENCE_METHOD,            # the INFERENCE_METHOD the report and the review cover
+    "interval_method": INTERVAL_METHOD,    # and its INTERVAL_METHOD
+    "calibration_report": None,            # the passing, review-ready seeded report (fields above)
+    # The independent statistical review (doc 8.3). It reviews the method; it is not an approval of any
+    # trial's outcome. Its fingerprint is the one experiment_fingerprint gives the reviewed revision, which
+    # is also the fingerprint of every later revision until the inference code changes. The method was
+    # reviewed at ce76f720 (the head of #375, squash-merged as ef17db5e with the same fingerprint 7a79a1a4...);
+    # review round 5 changed the review gate and the missing-night checks inside the fingerprint, and review
+    # round 6 added the early-stop check (stopping_not_outcome_dependent); the same two models reviewed each
+    # change (doc 8.3, the "Follow-up" sections), and the record names the revision and fingerprint of the
+    # last review.
+    "independent_review": {
+        "reference": "docs/experiment-framework.md 8.3",
+        "date": "2026-11-16",
+        "reviewers": ("openai/gpt-5.2", "google/gemini-2.5-pro"),
+        "verdicts": ("sound", "sound"),
+        "reviewed_revision": "0a3d37123eb2bea7e79c0e70ccb6431534641aca",
+        "inference_fingerprint": "25ea4dad9d45b77197af2e8bb909d70fb7a3d7f2ab2489f7cd1c4a31b0be2a7c",
+        "method_reviewed_revision": "ce76f720d8ff127cc90a012cc4ca7491ce2d9734",
+        "method_reviewed_fingerprint": "7a79a1a4cc2f89a1d5f9a8a5547e1e4ca63ad3b38de01cb9cc25783761969da0",
+        "summary": (
+            "independent statistical challenge of joint_sharp_null_berger_boos_v1 / certified_enclosure_v1 by two "
+            "non-Anthropic models on the analysis at ce76f720, the synthetic calibration design and the changes "
+            "recorded in doc 8.3; final verdicts sound (both). Adopted: the enclosure metric and the deployed re-draw "
+            "seeding rule in the calibration, the Monte Carlo qualification of every guarantee. Rejected with "
+            "reasons: float-tolerance snapping in _sets_moving / _piece (it would narrow the sets), a fresh random "
+            "re-draw seed at analysis time (once drawn it is as fixed as the public-hash seed)"),
+        # Doc 8.3 "Follow-up" sections: the same two models reviewed every change after ce76f720, the
+        # fingerprint binding, the round-5 gate changes and the round-6 early-stop check; final verdicts
+        # sound (both) each time.
+        "follow_up": (
+            "2026-11-16: binding to the code by experiment_fingerprint reviewed by both models, final verdicts sound; "
+            "adopted: source-order hashing, imports in the design closure, the skip-share bound in review_ready, the "
+            "near_singular stress scenario; the method-review check itself is outside the fingerprint by design "
+            "(held by its tests)",
+            "2026-11-16: review round 5 (the gate covers the calibrated block designs and the blocks a trial "
+            "analyses; missing-night checks fail closed) reviewed by both models, final verdicts sound; adopted: "
+            "numpy scalar p-values read, a Fisher p outside [0, 1] fails closed, the analysed-block lower bound; no "
+            "estimator, p-value, interval or re-draw code changed",
+            "2026-11-16: review round 6 (an early stop withholds the decision and marks the model and Fisher outputs "
+            "unsupported, stopping_not_outcome_dependent; calibration shards merge only under the harness and the "
+            "inference code that ran them) reviewed by both models at 0a3d3712, final verdicts sound; adopted "
+            "afterwards from gpt-5.2's recommendation: the merge-time inference fingerprint check (7ac3cf32, "
+            "harness only, outside the inference fingerprint, not itself reviewed); no estimator, p-value, "
+            "interval or re-draw code changed"),
+    },
+    "n_redraws": (),                       # re-draw counts the report calibrated
+    "alpha": (),                           # alpha levels it calibrated
+    # The designs it calibrated (doc 8.2): (block length, arm-A days per block) pairs, and n_blocks =
+    # (fewest blocks a supported scenario analysed, most blocks one scheduled). A trial is covered when its
+    # scheduled blocks lie in that range and it analyses at least the fewest. Outside them it is not: the
+    # method is exact for any design under the assumptions, but the calibration is the check that the code
+    # delivers that, and it ran only on these designs.
+    "block_designs": (),
+    "n_blocks": (),
 }
 
 
-def method_review_problem(alpha: float, n_redraws: int) -> str | None:
-    """Why a trial with this alpha and re-draw count has no recorded review of INFERENCE_METHOD
-    that covers it, or None when it has one."""
+def method_review_problem(alpha: float, n_redraws: int, *, block_len: int | None = None, n_a: int | None = None,
+                          n_blocks: int | None = None, n_blocks_analysed: int | None = None) -> str | None:
+    """Why a trial with this alpha, re-draw count and block design (block length, arm-A days per
+    block, scheduled blocks) has no recorded review of INFERENCE_METHOD that covers it, or None when
+    it has one. Both halves of METHOD_REVIEW must be structured records whose inference fingerprint is
+    the running code's (experiment_fingerprint), and the calibration must cover the trial's alpha,
+    re-draw count and design; anything else, an unreadable source or a design not given included,
+    withholds the decision. n_blocks_analysed is the number of scheduled blocks the analysis keeps
+    (excluded blocks and those after an early stop left out); None means all of them (registration,
+    before any is excluded), and fewer than the calibration's lowest block count withholds the
+    decision too. Its helpers stay inside it, so they stay outside the fingerprint with it."""
+    from experiment_fingerprint import inference_fingerprint
+
     review = METHOD_REVIEW
-    if not (review.get("calibration_report") and review.get("independent_review")):
+    report, record = review.get("calibration_report"), review.get("independent_review")
+    if not (report or record):
         return (f"the calibration report and the independent statistical review of {INFERENCE_METHOD} are not "
                 "recorded yet (experiment_analysis.METHOD_REVIEW)")
+    live = inference_fingerprint()
+
+    def filled(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def other_code(entry: dict[str, Any], what: str) -> str | None:
+        recorded = entry.get("inference_fingerprint")
+        if live is None:
+            return (f"the source of the running inference code cannot be read, so the recorded {what} cannot be "
+                    "checked against it (experiment_fingerprint)")
+        if recorded != live:
+            shown = recorded[:12] if filled(recorded) else "none"
+            return (f"the recorded {what} covers other inference code (fingerprint {shown}; the running code is "
+                    f"{live[:12]}): the code changed since, so the {what} must be recorded again for it")
+        return None
+
+    if record:
+        if not isinstance(record, dict):
+            return ("the recorded independent statistical review is not a structured record (reference, reviewers, "
+                    "verdicts, reviewed_revision, inference_fingerprint), so it cannot be checked against the code")
+        reviewers = record.get("reviewers")
+        verdicts = record.get("verdicts")
+        if not (filled(record.get("reference")) and filled(record.get("reviewed_revision"))):
+            return "the recorded independent statistical review has no reference or no reviewed revision"
+        if not (isinstance(reviewers, (list, tuple)) and len({r.strip() for r in reviewers if filled(r)}) >= 2
+                and len(reviewers) == len({r.strip() for r in reviewers if filled(r)})):
+            return "the recorded independent statistical review does not name at least two distinct reviewers"
+        if not (isinstance(verdicts, (list, tuple)) and len(verdicts) == len(reviewers)
+                and all(isinstance(v, str) and v.strip().lower() == "sound" for v in verdicts)):
+            return "the recorded independent statistical review does not record a sound verdict from every reviewer"
+        problem = other_code(record, "independent statistical review")
+        if problem:
+            return problem
+    if not report:
+        return (f"the seeded calibration report of {INFERENCE_METHOD} is not recorded yet "
+                "(experiment_analysis.METHOD_REVIEW): the independent statistical review is recorded, and a firm "
+                "decision needs both")
+    if not record:
+        return (f"the independent statistical review of {INFERENCE_METHOD} is not recorded yet "
+                "(experiment_analysis.METHOD_REVIEW): the calibration report is recorded, and a firm decision "
+                "needs both")
+    if not isinstance(report, dict):
+        return ("the recorded calibration report is not a structured record (reference, revision, "
+                "inference_fingerprint, harness_fingerprint, review_ready, suite_run), so it cannot be checked "
+                "against the code")
+    if not all(filled(report.get(key)) for key in ("reference", "revision", "harness_fingerprint", "suite_run")):
+        return ("the recorded calibration report lacks its reference, revision, harness fingerprint or the "
+                "scheduled-suite run that passed tests/test_experiment_calibration.py (the strip-bound proofs)")
+    if report.get("review_ready") is not True:
+        return "the recorded calibration report is not review-ready (experiment_calibration.py, doc 8.2)"
+    problem = other_code(report, "calibration report")
+    if problem:
+        return problem
     if review.get("method") != INFERENCE_METHOD:
         return f"the recorded review covers {review.get('method')!r}, not {INFERENCE_METHOD}"
+    if review.get("interval_method") != INTERVAL_METHOD:
+        return f"the recorded review covers the interval {review.get('interval_method')!r}, not {INTERVAL_METHOD}"
     counts = sorted({int(x) for x in review.get("n_redraws") or ()})
     if int(n_redraws) not in counts:
         return f"the calibration report covers {counts or 'no'} re-draw counts, not this trial's {int(n_redraws)}"
     levels = [float(x) for x in review.get("alpha") or ()]
     if not any(abs(float(alpha) - level) < 1e-12 for level in levels):
         return f"the calibration report covers alpha {levels or 'none'}, not this trial's {float(alpha):g}"
+
+    def whole(value: Any) -> bool:
+        return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+
+    analysed = n_blocks if n_blocks_analysed is None else n_blocks_analysed
+    if not (all(whole(v) for v in (block_len, n_a, n_blocks, analysed)) and 0 <= int(analysed) <= int(n_blocks)):
+        return ("the trial's block design (block length, arm-A days per block, scheduled and analysed blocks) is not "
+                "given, so it cannot be checked against the designs the calibration report covers")
+    designs = []
+    for pair in review.get("block_designs") or ():
+        if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(whole(v) for v in pair):
+            designs.append((int(pair[0]), int(pair[1])))
+    designs = sorted(set(designs))
+    if (int(block_len), int(n_a)) not in designs:
+        shown = ", ".join(f"blocks of {b} days with {a} on arm A" for b, a in designs) or "no block design"
+        return (f"the calibration report covers {shown}, not this trial's blocks of {int(block_len)} days with "
+                f"{int(n_a)} on arm A")
+    span = review.get("n_blocks") or ()
+    bounded = (isinstance(span, (list, tuple)) and len(span) == 2 and all(whole(v) for v in span)
+               and int(span[0]) <= int(span[1]))
+    if not (bounded and int(span[0]) <= int(n_blocks) <= int(span[1])):
+        covered = f"{int(span[0])} to {int(span[1])}" if bounded else "no"
+        return f"the calibration report covers {covered} scheduled blocks, not this trial's {int(n_blocks)}"
+    if int(analysed) < int(span[0]):
+        return (f"the trial analyses {int(analysed)} of its {int(n_blocks)} scheduled blocks (the others excluded or "
+                f"after an early stop), fewer than the {int(span[0])} the calibration report covers")
     return None
 
 
@@ -332,8 +510,10 @@ def redraw_fit(
 
 
 def joint_p_value(draws: Draws, comp: int, tau: float, gamma: float) -> float:
-    """Exact randomization p-value of component `comp` (0 = same night, 1 = next night) under the
-    joint sharp null H(tau, gamma) of model M. A singular re-draw counts as extreme (conservative)."""
+    """Monte Carlo randomization p-value of component `comp` (0 = same night, 1 = next night) under
+    the joint sharp null H(tau, gamma) of model M, on this re-draw sample: its size is at most alpha
+    as a Monte Carlo test, under the pseudo-randomness assumption of the module docstring and up to
+    Monte Carlo error for a fixed sample. A singular re-draw counts as extreme (conservative)."""
     stat = draws.a[:, comp] - tau * draws.g[:, comp] - gamma * draws.h[:, comp]
     observed = draws.obs[comp] - (tau if comp == 0 else gamma)
     extreme = np.isnan(stat) | (np.abs(stat) >= abs(observed) - TIE_TOL)
@@ -739,7 +919,9 @@ class _Certifier:
 def interval(draws: Draws, comp: int, alpha: float, beta: float | None = None) -> tuple[float, float]:
     """Interval for coefficient `comp`: a certified enclosure of every value its Berger-Boos test
     does not reject (p >= alpha), so it covers the true value with probability at least 1 - alpha
-    under model M. An end is infinite when the data cannot bound it or it could not be certified."""
+    under model M, as the Monte Carlo test's interval (the pseudo-randomness assumption of the module
+    docstring, up to Monte Carlo error for the report's fixed re-draw sample). An end is infinite when
+    the data cannot bound it or it could not be certified."""
     beta = nuisance_beta_for(draws.n) if beta is None else beta
     side = _Certifier(draws, comp, alpha, beta)
     low = side.end(-1.0)
@@ -842,7 +1024,15 @@ def days_for_power(noise_sd: float, n_days: int, effect_ms: float) -> int:
 ASSUMPTIONS: dict[str, str] = {
     "randomized_schedule": (
         "The arms followed the registered permuted-block schedule drawn from the committed seed. The report "
-        "job checks the stored schedule against the seed before analysing (GUARD experiment_schedule)."),
+        "job checks the stored schedule against the seed before analysing (GUARD experiment_schedule). The "
+        "re-draws are a Monte Carlo sample from the same design, seeded deterministically by a hash of public "
+        "values (the experiment id and the report date) that never touches the allocation seed, and the final "
+        "report is computed once. The p-values' 'at most alpha' (and the intervals' 'at least 1 - alpha') is "
+        "the Monte Carlo randomization test's guarantee for random re-draws, so here it rests on a "
+        "pseudo-randomness assumption: the hash is treated as a random draw independent of the allocation. For "
+        "the one fixed re-draw set of a report the size is alpha only up to Monte Carlo error (about "
+        "sqrt(alpha (1 - alpha) / R)). The calibration report uses the same seeding rule and is the empirical "
+        "evidence for it."),
     "one_night_carryover": (
         "The arm acts on the same night and the next night only: night D's outcome depends on the schedule "
         "through t_D and t_(D-1). Not tested by the analysis; the protocol must declare it "
@@ -860,6 +1050,13 @@ ASSUMPTIONS: dict[str, str] = {
     "pre_trial_day_is_control": (
         "The day before the trial counts as the control arm for the first night's carryover. Covered by the "
         "protocol's analysis.model_justification."),
+    "stopping_not_outcome_dependent": (
+        "The nights analysed were fixed before the trial: it ran to its pre-registered end, so when it ended did not "
+        "depend on the arms or the outcomes seen so far. The re-draws hold the analysed period fixed and the "
+        "calibration runs fixed-length trials only, so neither allows for a stop chosen after looking (each day's "
+        "arm is shown on Today and the HRV in its app, so a stop can follow a run of good or bad nights on one "
+        "arm). Checked: a stop before the planned end fails it, whatever the stop's reason, because no registered "
+        "stopping rule exists that the calibration covers. A stop on or after the planned end changes nothing."),
     "constant_multiplicative_effects": (
         "For the ln(HRV) sensitivity fit only: the model holds for ln(outcome), i.e. each arm multiplies the "
         "outcome by a constant factor on its own night and the next one. It cannot hold together with "
@@ -869,10 +1066,10 @@ ASSUMPTIONS: dict[str, str] = {
 }
 
 _MODEL = ["randomized_schedule", "one_night_carryover", "constant_additive_effects", "missing_not_caused_by_arm",
-          "pre_trial_day_is_control"]
-_FISHER = ["randomized_schedule", "missing_not_caused_by_arm"]
+          "pre_trial_day_is_control", "stopping_not_outcome_dependent"]
+_FISHER = ["randomized_schedule", "missing_not_caused_by_arm", "stopping_not_outcome_dependent"]
 _LOG_MODEL = ["randomized_schedule", "one_night_carryover", "constant_multiplicative_effects",
-              "missing_not_caused_by_arm", "pre_trial_day_is_control"]
+              "missing_not_caused_by_arm", "pre_trial_day_is_control", "stopping_not_outcome_dependent"]
 
 
 def secondary_missing_assumption(name: str) -> str:
@@ -896,12 +1093,16 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
     secondary    the names of its secondary outcomes; each gets "secondary_outcomes.<name>"
     An entry with approximate True is not certified even when every assumption it lists holds."""
     level = f"{100 * (1 - beta):g}%"
+    # Every guarantee below is a Monte Carlo randomization test's (module docstring, randomized_schedule).
+    mc = ("; as for every seeded Monte Carlo randomization test, this rests on the pseudo-randomness assumption "
+          "of randomized_schedule (the re-draws' hashed seed treated as random) and holds for the report's one "
+          "fixed re-draw set only up to Monte Carlo error")
     ols = ("OLS coefficient; approximately unbiased over the randomization when the assumptions hold (exact only "
            "with complete nights and a symmetric design: missing nights, the lag term and the fixed pre-trial day "
            "break the symmetry slightly)")
     enclosure = (f"a certified enclosure ({INTERVAL_METHOD}) of every value the test does not reject (p >= alpha), "
-                 f"so it covers the true value with probability at least {1 - alpha:g} when the assumptions hold; an "
-                 "infinite end means the nights cannot bound it, or it could not be certified. The accepted values "
+                 f"so it covers the true value with probability at least {1 - alpha:g} when the assumptions hold{mc}; "
+                 "an infinite end means the nights cannot bound it, or it could not be certified. The accepted values "
                  "need not form one piece, so the interval can contain 0 while the p-value rejects 0; the reverse "
                  "cannot happen")
     out: dict[str, dict[str, Any]] = {
@@ -913,27 +1114,28 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
             "null": "tau = 0 (no same-night effect), any carryover gamma", "needs": _MODEL,
             "method": (f"Berger-Boos: the largest joint sharp-null randomization p-value over a {level} randomization "
                        f"confidence set for gamma, plus {beta:g}"),
-            "validity": "type I error at most alpha when the assumptions hold, whatever gamma is"},
+            "validity": f"type I error at most alpha when the assumptions hold, whatever gamma is{mc}"},
         "ci_low / ci_high": {
             "null": "the tau0 values the p_value test of tau = tau0 does not reject", "needs": _MODEL,
             "validity": enclosure},
         "p_carryover": {
             "null": "gamma = 0 (no carryover), any same-night effect tau", "needs": _MODEL,
             "method": f"Berger-Boos as for p_value, with a {level} confidence set for tau",
-            "validity": "type I error at most alpha when the assumptions hold, whatever tau is"},
+            "validity": f"type I error at most alpha when the assumptions hold, whatever tau is{mc}"},
         "carryover_ci_low / carryover_ci_high": {
             "null": "the gamma0 values the p_carryover test of gamma = gamma0 does not reject", "needs": _MODEL,
             "validity": enclosure},
         "p_value_no_effect": {
             "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
             "validity": ("exact without the effect model (one-night carryover, constant effects), but still only "
-                         "with the randomized schedule and missing nights not caused by the arm; rejecting it says "
-                         "the arm acts on some night, not that the same-night effect is non-zero. Not read by the "
-                         "decision rule")},
+                         "with the randomized schedule, missing nights not caused by the arm and a trial that ran "
+                         "to its pre-registered end; rejecting it says "
+                         f"the arm acts on some night, not that the same-night effect is non-zero{mc}. Not read by "
+                         "the decision rule")},
         "p_carryover_no_effect": {
             "null": "Fisher's sharp null, tested with the carryover coefficient", "needs": _FISHER,
-            "validity": ("exact without the effect model, with the randomized schedule and missing nights not caused "
-                         "by the arm. Not read by the decision rule")},
+            "validity": ("exact without the effect model, with the randomized schedule, missing nights not caused "
+                         f"by the arm and a trial that ran to its pre-registered end{mc}. Not read by the decision rule")},
         "hac_se / hac_se_carryover": {
             "validity": "approximate Newey-West cross-check (lags count observed nights). Not read by the decision rule"},
     }
@@ -946,7 +1148,7 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
                 "needs": _LOG_MODEL,
                 "validity": (f"{berger_boos}, on ln(HRV): type I error at most alpha and coverage at least "
                              f"{1 - alpha:g} when the model holds on the log scale (constant_multiplicative_effects), "
-                             "which it cannot do together with the primary model unless the effects are zero. A "
+                             f"which it cannot do together with the primary model unless the effects are zero{mc}. A "
                              "sensitivity check, not read by the decision rule")}
         elif key == "per_protocol":
             out["sensitivity.per_protocol"] = {
@@ -968,7 +1170,7 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
                 "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
                 "validity": (f"exact: under that null the outcomes, and so {covariate}, are the same under every "
                              "schedule, so holding it fixed is right. Rejecting it says the arm acts on some night, "
-                             "not which. Not read by the decision rule")}
+                             f"not which{mc}. Not read by the decision rule")}
     for name in secondary:
         out[f"secondary_outcomes.{name}"] = {
             "estimand": f"tau and gamma for {name}: its own same-night effect and carryover",
@@ -976,35 +1178,53 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensit
             "needs": [*_MODEL, secondary_missing_assumption(name)],
             "validity": (f"{berger_boos}, for this series: valid when the model holds for it (one-night carryover, "
                          "its own constant effects) and its own missing nights are not caused by the arm (checked "
-                         "per series). A failed primary missingness check marks it too, the excluded blocks being "
-                         "shared. Reported next to the primary result; the decision rule never reads it")}
+                         f"per series){mc}. A failed primary missingness check marks it too, the excluded blocks "
+                         "being shared. Reported next to the primary result; the decision rule never reads it")}
     return out
 
 
 def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
                       spec: TrialSpec | None = None,
-                      secondary_missingness: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+                      secondary_missingness: dict[str, dict[str, Any]] | None = None,
+                      n_blocks_analysed: int | None = None) -> list[dict[str, Any]]:
     """What the data, the registered protocol and the method record can check. A failed or pending
     check with blocks_decision withholds the decision; `covers` names the assumptions a failed
     check leaves unsupported (the outputs that need them are marked unsupported in the report).
     Without a spec nothing is declared, so the protocol checks fail (closed). Each secondary
     outcome gets its own missingness check, which never withholds the decision (the rule does not
     read secondary outcomes) but marks that series' numbers unsupported when it fails.
+    n_blocks_analysed (analyze_trial passes it) is the number of scheduled blocks the analysis keeps,
+    for the method-review check; None = all of them.
+
+    An early stop: a trial stopped before its planned end (spec.stopped_on) fails
+    stopping_not_outcome_dependent, which withholds the decision and marks every output that needs
+    a fixed analysed period (all of them but the HAC cross-check). The stop may have followed the
+    arms and the HRV seen so far, the re-draws hold the analysed period fixed, and the calibration
+    runs fixed-length trials only; no registered stopping rule exists that could cover a stop, so
+    its reason does not matter. Without a spec the stop cannot be checked, so it fails closed too.
 
     Missing nights: a treatment trial fails the check on the 10-point rule (fail closed; the arm can
     change behaviour). In an A/A check both arms are the same instruction, so only a pipeline fault
     can tie missing nights to the arm; it fails on Fisher's exact test of the arm x missing table at
     the trial's alpha instead, because on a 4-week check the 10-point rule fires on chance alone
     about half the time when a fifth of nights are missing (14 nights per arm), which would void
-    the check's own no-effect test."""
+    the check's own no-effect test. Either way a check without a readable result (no Fisher p in
+    [0, 1], no boolean 10-point flag) fails closed."""
     kind = spec.kind if spec is not None else design.KIND_TREATMENT
     alpha = spec.alpha if spec is not None else 0.05
 
     def missing_failed(check: dict[str, Any]) -> bool:
+        # Fail closed: a check without a readable result (a malformed or older input) counts as failed.
+        if not isinstance(check, dict):
+            return True
         if kind == design.KIND_AA:
             fisher_p = check.get("fisher_p")
-            return isinstance(fisher_p, (int, float)) and not isinstance(fisher_p, bool) and fisher_p < alpha
-        return bool(check.get("threat"))
+            if (not isinstance(fisher_p, (int, float, np.integer, np.floating))
+                    or isinstance(fisher_p, (bool, np.bool_)) or not 0.0 <= float(fisher_p) <= 1.0):
+                return True                   # NaN, an infinity or a value outside [0, 1] is not a p-value
+            return float(fisher_p) < alpha
+        threat = check.get("threat")
+        return not isinstance(threat, (bool, np.bool_)) or bool(threat)
 
     if kind == design.KIND_AA:
         missing_rule = (f"missing nights are tied to the arm (Fisher exact p < {alpha:g}) although both arms carry the "
@@ -1024,9 +1244,32 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
                         "day as control")
     else:
         model_status, model_reason = "ok", "declared and justified in the registered protocol"
+    stopped_on = spec.stopped_on if spec is not None else None
+
+    def ran_to_end() -> bool:
+        # A stop on or after the planned end cuts no night; a stop date that cannot be compared fails closed.
+        try:
+            return spec is not None and (stopped_on is None or bool(stopped_on >= spec.planned_end))
+        except TypeError:
+            return False
+
+    if spec is None:
+        stop_status = "failed"
+        stop_reason = "no trial specification was given, so whether the trial ran to its pre-registered end cannot be checked"
+    elif not ran_to_end():
+        stop_status = "failed"
+        stop_reason = (f"the trial was stopped on {stopped_on}, before its pre-registered end on {spec.planned_end}: "
+                       "the stop may have followed the arms and the HRV seen so far, while the randomization tests, "
+                       "the intervals and the calibration assume the nights analysed were fixed in advance (no "
+                       "registered stopping rule covers a stop), so the numbers are reported but not supported")
+    else:
+        stop_status = "ok"
+        stop_reason = "the trial ran to its pre-registered end, so the nights analysed were fixed in advance"
     registered = spec.inference_method if spec is not None else None
-    review = method_review_problem(spec.alpha if spec is not None else 0.05,
-                                   spec.n_redraws if spec is not None else 10000)
+    review = method_review_problem(
+        alpha, spec.n_redraws if spec is not None else 10000,
+        **({"block_len": spec.block_len, "n_a": spec.n_a, "n_blocks": spec.n_days // spec.block_len,
+            "n_blocks_analysed": n_blocks_analysed} if spec is not None else {}))
     return [
         {"id": "missing_not_caused_by_arm", "status": "failed" if missing_failed(missingness) else "ok",
          "blocks_decision": True, "covers": ["missing_not_caused_by_arm"],
@@ -1034,6 +1277,8 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
         {"id": "model_justified", "status": model_status, "blocks_decision": True,
          "covers": ["one_night_carryover", "constant_additive_effects", "pre_trial_day_is_control"],
          "reason": model_reason},
+        {"id": "stopping_not_outcome_dependent", "status": stop_status, "blocks_decision": True,
+         "covers": ["stopping_not_outcome_dependent"], "reason": stop_reason},
         {"id": "carryover_set_bounded", "status": "ok" if primary.get("carryover_set_bounded") else "failed",
          "blocks_decision": False, "covers": [],
          "reason": ("the nights cannot bound the carryover, so the same-night test cannot reject (valid, "
@@ -1043,7 +1288,7 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
          "reason": (f"the registration recorded the inference method {registered!r}, not {INFERENCE_METHOD}: the "
                     "analysis that ran is not the one registered")},
         {"id": "method_reviewed", "status": "ok" if review is None else "pending", "blocks_decision": True,
-         "covers": [], "reason": review or "recorded for this trial's alpha and re-draw count"},
+         "covers": [], "reason": review or "recorded for this trial's alpha, re-draw count and block design"},
     ] + [
         {"id": secondary_missing_assumption(name), "status": "failed" if missing_failed(check) else "ok",
          "blocks_decision": False, "covers": [secondary_missing_assumption(name)],
@@ -1177,7 +1422,9 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
 
     missingness = missingness_check(t[in_scope], np.isnan(y[in_scope]))
     rule = decide(primary["estimate"], primary["ci_low"], primary["ci_high"], primary["p_value"], spec.mid_ms, spec.alpha)
-    checks = assumption_checks(primary, missingness, spec, secondary_missing)
+    n_blocks = n_sched // spec.block_len
+    n_blocks_analysed = n_blocks - len({b for b in excluded if 0 <= b < n_blocks})
+    checks = assumption_checks(primary, missingness, spec, secondary_missing, n_blocks_analysed=n_blocks_analysed)
     withheld = [c["reason"] for c in checks if c["blocks_decision"] and c["status"] != "ok"]
     outputs = output_semantics(primary["nuisance_beta"], spec.alpha, sensitivity=list(sensitivity),
                                secondary=list(secondary))

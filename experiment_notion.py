@@ -342,19 +342,27 @@ def inference_lines(report: dict[str, Any]) -> list[str]:
     lines.append(
         f"The p-values and intervals allow for carryover ({inference.get('method')}): they assume the arm acts on the "
         "same night and the next night only, by the same amount every night, that the day before the trial is like "
-        "the control arm, and that missing nights are not caused by the arm."
+        "the control arm, that missing nights are not caused by the arm, and that the trial ran to its pre-registered "
+        "end (so the nights analysed were fixed in advance)."
         + (" Some of that is not supported for this trial, so these numbers are not supported either." if
            unsupported & {"p_value", "ci_low / ci_high"} else ""))
     fisher = (outputs.get("p_value_no_effect") or {}).get("supported")
     p_text = _fmt(report.get("p_value_no_effect"), 4)
     if fisher is False or "p_value_no_effect" in unsupported:
+        # Name the assumption that failed (a report stored before the stop check carries only the missingness one).
+        failed = {str(a) for c in inference.get("checks") or [] if isinstance(c, dict) and c.get("status") == "failed"
+                  for a in (c.get("covers") or [])}
+        broken = [text for key, text in (("missing_not_caused_by_arm", "the arm may have caused missing nights"),
+                                         ("stopping_not_outcome_dependent", "the trial was stopped early"))
+                  if key in failed]
         lines.append(f"Fisher's test that the arm changes no night (randomization p = {p_text}) needs only the "
-                     "randomized schedule and missing nights not caused by the arm, and the second does not hold "
-                     "here, so it is not supported either.")
+                     "randomized schedule, missing nights not caused by the arm and a trial that ran to its "
+                     f"pre-registered end; here {' and '.join(broken) if broken else 'one of them does not hold'}, "
+                     "so it is not supported either.")
     else:
         lines.append(f"Without the one-night and equal-effect assumptions, but still with the randomized schedule and "
-                     f"missing nights not caused by the arm, 'the arm changes no night' has randomization p = {p_text} "
-                     "(it does not say which night).")
+                     f"missing nights not caused by the arm, and with the trial run to its pre-registered end, 'the "
+                     f"arm changes no night' has randomization p = {p_text} (it does not say which night).")
     # The interval encloses every accepted value and the accepted values need not form one piece,
     # so it can contain 0 while the test rejects 0 (never the reverse).
     p_value, low, high, alpha = (_as_number(report.get("p_value")), _bound(report.get("ci_low")),

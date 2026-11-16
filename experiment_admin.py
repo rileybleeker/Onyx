@@ -232,14 +232,14 @@ def cmd_register(store: Store, protocol_path: str, confirm: str, *, root: Path =
                                       seed_sha256=existing["seed_sha256"],
                                       inference_method=analysis.INFERENCE_METHOD)
     # A final report is written once and never changes, so a treatment trial registered before its
-    # inference method is reviewed for its alpha and re-draw count could never reach a firm decision
-    # (docs/experiment-framework.md 8.1). An A/A check is judged on Fisher's test and may run first.
+    # inference method is reviewed for its alpha, re-draw count and block design could never reach a firm
+    # decision (docs/experiment-framework.md 8.1). An A/A check is judged on Fisher's test and may run first.
     if design.trial_kind(protocol) == design.KIND_TREATMENT:
-        problem = analysis.method_review_problem(fields["alpha"], fields["n_redraws"])
+        problem = analysis.method_review_problem(fields["alpha"], fields["n_redraws"], block_len=fields["block_len"],
+                                                 n_a=fields["n_a_per_block"], n_blocks=fields["n_blocks"])
         if problem:
             raise AdminError(f"a treatment trial cannot be registered yet: {problem}. Its final decision could never "
-                             "be firm; record the calibration report and the independent review first (an A/A check "
-                             "may run before)")
+                             "be firm; record what METHOD_REVIEW is missing first (an A/A check may run before)")
     seed_hex = store.seed_hex(experiment_id)
     if not seed_hex or design.seed_commitment(bytes.fromhex(seed_hex)) != existing["seed_sha256"]:
         raise AdminError("GUARD experiment_schedule: the stored seed does not match its commitment")
@@ -284,7 +284,9 @@ def cmd_stop(store: Store, experiment_id: str, reason: str, confirm: str) -> lis
         raise AdminError(f"{experiment_id} is not an active trial")
     stopped_on = store.behavioral_today()
     store.stop(experiment_id, stopped_on, reason.strip())
-    return [f"{experiment_id} stopped early on {stopped_on}. It stays on record and can be analysed as stopped_early."]
+    return [f"{experiment_id} stopped early on {stopped_on}. It stays on record and can be analysed as stopped_early; "
+            "a stop before the planned end means its final report covers the nights before the stop and gives no firm "
+            "decision (docs/experiment-framework.md 8.1, stopping_not_outcome_dependent)."]
 
 
 def cmd_power(store: Store, window_days: int, effect_ms: float, *, n_trials: int = 500) -> list[str]:

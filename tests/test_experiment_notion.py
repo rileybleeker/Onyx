@@ -344,6 +344,22 @@ def test_a_withheld_decision_and_the_inference_assumptions_are_on_the_page():
     assert "(randomization p = 0.0030)" in text and "so it is not supported either" in text
     assert "but still with the randomized schedule" not in text, "an unsupported test is never offered as the fallback"
 
+    # An early stop (review PIPE06-FOLLOWUP-R1): the reason is on the page and the Fisher line names the stop,
+    # not missing nights.
+    stop_reason = "the trial was stopped on 2030-02-01, before its pre-registered end on 2030-03-29: synthetic"
+    stopped = {**inference, "checks": [
+        {"id": "missing_not_caused_by_arm", "status": "ok", "blocks_decision": True,
+         "covers": ["missing_not_caused_by_arm"], "reason": "synthetic missing rule"},
+        {"id": "stopping_not_outcome_dependent", "status": "failed", "blocks_decision": True,
+         "covers": ["stopping_not_outcome_dependent"], "reason": stop_reason}],
+        "unsupported_outputs": ["p_value", "ci_low / ci_high", "p_value_no_effect"],
+        "outputs": {"p_value_no_effect": {"supported": False}, "p_value": {"supported": False}}}
+    text = body(_final(decision="inconclusive", decision_if_supported="adopt_A", decision_firm=False,
+                       stopped_early=True, decision_withheld=[stop_reason], inference=stopped, p_value_no_effect=0.003))
+    assert f"No firm decision yet, so it reads Inconclusive: {stop_reason}." in text
+    assert "here the trial was stopped early, so it is not supported either" in text
+    assert "the arm may have caused missing nights" not in text and "stopped early)" in text
+
     # A check that limits the result without withholding it is named on the page.
     limited = {**inference, "checks": [
         {"id": "carryover_set_bounded", "status": "failed", "blocks_decision": False,
