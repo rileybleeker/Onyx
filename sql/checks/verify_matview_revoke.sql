@@ -154,7 +154,7 @@ BEGIN
     -- Step 3d of the migration, word for word: no reachable SECURITY DEFINER function
     -- runs SQL the graph cannot read unless it was reviewed.
     WITH RECURSIVE fn AS (
-        SELECT p.oid, p.proname, p.prosecdef, p.proowner, l.lanname,
+        SELECT 'f' AS kind, 'f' || p.oid AS k, p.oid, p.proname, p.prosecdef, p.proowner, l.lanname,
                pn.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS sig,
                p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src,
                '\m' || regexp_replace(p.proname, '([^[:alnum:]_])', '\\\1', 'g') || '\M' AS pat
@@ -162,41 +162,56 @@ BEGIN
         JOIN pg_namespace pn ON pn.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
         WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+      UNION ALL
+        SELECT 'v', 'v' || c.oid, c.oid, c.relname::text, false, c.relowner, 'sql',
+               'view ' || c.oid::regclass::text,
+               pg_get_viewdef(c.oid),
+               '\m' || regexp_replace(c.relname::text, '([^[:alnum:]_])', '\\1', 'g') || '\M'
+        FROM pg_class c JOIN pg_namespace cn ON cn.oid = c.relnamespace
+        WHERE c.relkind IN ('v', 'm') AND cn.nspname NOT IN ('pg_catalog', 'information_schema')
     ), priv AS (
-        SELECT f.oid FROM fn f
-        WHERE f.prosecdef
+        SELECT f.k FROM fn f
+        WHERE f.kind = 'f' AND f.prosecdef
           AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_any_column_privilege(f.proowner, g, 'SELECT'))
     ), calls(root, fn) AS (
-        SELECT oid, oid FROM priv
+        SELECT k, k FROM priv
       UNION
-        SELECT c.root, q.oid
-        FROM calls c JOIN fn cur ON cur.oid = c.fn JOIN fn q ON q.oid <> cur.oid
+        SELECT c.root, q.k
+        FROM calls c JOIN fn cur ON cur.k = c.fn JOIN fn q ON q.k <> cur.k
         WHERE cur.src ~* q.pat
            OR EXISTS (SELECT 1 FROM pg_depend d
-                      WHERE d.classid = 'pg_proc'::regclass AND d.objid = cur.oid
-                        AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid)
+                      WHERE ((cur.kind = 'f' AND d.classid = 'pg_proc'::regclass AND d.objid = cur.oid)
+                             OR (cur.kind = 'v' AND d.classid = 'pg_rewrite'::regclass
+                                 AND d.objid IN (SELECT w.oid FROM pg_rewrite w WHERE w.ev_class = cur.oid)))
+                        AND ((q.kind = 'f' AND d.refclassid = 'pg_proc'::regclass)
+                             OR (q.kind = 'v' AND d.refclassid = 'pg_class'::regclass))
+                        AND d.refobjid = q.oid)
     ), roots AS (
         SELECT c.root,
-               bool_or(q.lanname NOT IN ('sql', 'plpgsql')
-                       OR q.src ~* '\mexecute\M'
-                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)'
-                       OR q.src ~* '\mu&["'']') AS opaque,
+               bool_or(q.kind = 'f'
+                       AND (q.lanname NOT IN ('sql', 'plpgsql')
+                            OR q.src ~* '\mexecute\M'
+                            OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)'
+                            OR q.src ~* '\mu&["'']')) AS opaque,
+               bool_or(q.kind = 'v'
+                       AND (q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)'
+                            OR q.src ~* '\mu&["'']')) AS opaque_view,
                md5(string_agg(q.sig || '|' || q.lanname || '|' || q.prosecdef::text || '|' || q.src,
-                              E'\n' ORDER BY q.sig)) AS closure_md5
-        FROM calls c JOIN fn q ON q.oid = c.fn
+                              E'\n' ORDER BY q.sig) FILTER (WHERE q.kind = 'f')) AS closure_md5
+        FROM calls c JOIN fn q ON q.k = c.fn
         GROUP BY c.root
     )
     SELECT string_agg(f.sig, '; ' ORDER BY f.sig)
     INTO leaked
-    FROM roots r JOIN fn f ON f.oid = r.root
-    WHERE r.opaque
-      AND NOT (f.sig || '=' || r.closure_md5) = ANY (reviewed_opaque)
-      AND (has_function_privilege('anon', r.root, 'EXECUTE')
-           OR has_function_privilege('authenticated', r.root, 'EXECUTE')
-           OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = r.root)
-           OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = r.root)
-           OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = r.root)
-           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~* f.pat));
+    FROM roots r JOIN fn f ON f.k = r.root
+    WHERE (r.opaque_view
+           OR (r.opaque AND NOT (f.sig || '=' || r.closure_md5) = ANY (reviewed_opaque)))
+      AND (has_function_privilege('anon', f.oid, 'EXECUTE')
+           OR has_function_privilege('authenticated', f.oid, 'EXECUTE')
+           OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = f.oid)
+           OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = f.oid)
+           OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = f.oid)
+           OR EXISTS (SELECT 1 FROM fn o WHERE o.k <> f.k AND o.src ~* f.pat));
     IF leaked IS NOT NULL THEN
         RAISE EXCEPTION 'Unreviewed SECURITY DEFINER function a browser role can reach runs SQL the graph cannot read: %', leaked;
     END IF;

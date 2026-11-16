@@ -220,18 +220,22 @@ def test_dynamic_sql_definers_fail_closed_before_the_revoke() -> None:
         "calls(root, fn)", "FROM calls c",                            # ... plus everything they call
         r"'\m' || regexp_replace(p.proname, '([^[:alnum:]_])', '\\\1', 'g') || '\M' AS pat",
         "cur.src ~* q.pat",                                           # names matched in any case
-        "d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid",
+        "d.refclassid = 'pg_proc'::regclass",                           # calls found by dependency,
+        "pg_get_viewdef(c.oid)", "c.relkind IN ('v', 'm')",           # views are nodes too (SEC01B-R3 round 4)
+        "d.classid = 'pg_rewrite'::regclass",                         # a view's own dependencies are followed
+        "bool_or(q.kind = 'v'", "r.opaque_view",                      # an opaque view is never waved through
+        "FILTER (WHERE q.kind = 'f')",                                # the reviewed hash covers functions only
         "pg_get_function_sqlbody",                                    # SQL-standard bodies are read too
         "q.lanname NOT IN ('sql', 'plpgsql')",                        # other languages are opaque
         r"q.src ~* '\mexecute\M'",                                    # dynamic EXECUTE is opaque
         "_to_xml|ts_stat|ts_rewrite|dblink",                          # query-string builtins are opaque
         "u&[",                                                        # Unicode-escaped names are opaque
         "md5(string_agg(", "= ANY (reviewed_opaque)",                 # reviewed closures, by hash
-        "has_function_privilege('anon', r.root, 'EXECUTE')",          # reachable: callable,
-        "has_function_privilege('authenticated', r.root, 'EXECUTE')",
-        "pg_trigger t WHERE t.tgfoid = r.root",                       # a trigger,
-        "pg_event_trigger e WHERE e.evtfoid = r.root",                # an event trigger,
-        "d.refobjid = r.root",                                        # used by any object,
+        "has_function_privilege('anon', f.oid, 'EXECUTE')",           # reachable: callable,
+        "has_function_privilege('authenticated', f.oid, 'EXECUTE')",
+        "pg_trigger t WHERE t.tgfoid = f.oid",                        # a trigger,
+        "pg_event_trigger e WHERE e.evtfoid = f.oid",                 # an event trigger,
+        "d.refobjid = f.oid",                                         # used by any object,
         "o.src ~* f.pat",                                             # or named by another function
     ):
         assert needle in check, needle

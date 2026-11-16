@@ -53,7 +53,7 @@ closed on every SECURITY DEFINER function whose owner can read the graph (the wh
 table or any one column of it) and that a
 browser role can reach (anon / authenticated EXECUTE, a trigger or event trigger,
 any object that uses it, or another function that names it) when it, or anything it
-calls, is opaque: dynamic `EXECUTE`, a query-string builtin (`query_to_xml`,
+calls, or any view it names or depends on (views are followed too; a view's definition is read, and an opaque view is never put on the reviewed list), is opaque: dynamic `EXECUTE`, a query-string builtin (`query_to_xml`,
 `table_to_xml`, `ts_stat`, `dblink` and the like), a Unicode-escaped name (`U&"..."`)
 or a language other than sql / plpgsql. Such a function passes only when it and its whole call closure are on the
 migration's `reviewed_opaque` list with an unchanged hash (today one entry:

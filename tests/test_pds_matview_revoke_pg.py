@@ -354,6 +354,40 @@ def test_column_only_owner_definer_added_after_the_revoke_aborts_the_rerun() -> 
     _expect_abort(COLUMN_ONLY_OWNER, DYNAMIC_ABORT, "fixture_colowner_fn", revoke_first=True)
 
 
+# Review round 4 (Codex): a callable definer that selects a VIEW whose definition builds the matview name at
+# run time. The function's source names no matview and no function with dynamic SQL; the view carries it.
+ASSEMBLED_VIEW = """CREATE VIEW pds.fixture_xml_view AS
+SELECT query_to_xml('SELECT k FROM pds.' || 'hrv_' || 'residuals_mat', true, false, '') AS x;
+REVOKE ALL ON pds.fixture_xml_view FROM PUBLIC, anon, authenticated;
+CREATE FUNCTION pds.fixture_via_view() RETURNS SETOF xml LANGUAGE sql SECURITY DEFINER
+AS $f$ SELECT x FROM pds.fixture_xml_view $f$;"""
+
+
+def test_definer_selecting_a_view_with_an_assembled_name_aborts() -> None:
+    _expect_abort(ASSEMBLED_VIEW, DYNAMIC_ABORT, "fixture_via_view")
+
+
+def test_assembled_name_view_behind_a_definer_added_after_the_revoke_aborts_the_rerun() -> None:
+    _expect_abort(ASSEMBLED_VIEW, DYNAMIC_ABORT, "fixture_via_view", revoke_first=True)
+
+
+def test_definer_over_a_view_of_a_view_with_an_assembled_name_aborts() -> None:
+    _expect_abort("""CREATE VIEW pds.fixture_xml_inner AS
+SELECT query_to_xml('SELECT k FROM pds.' || 'tz_log_' || 'gaps_mat', true, false, '') AS x;
+CREATE VIEW pds.fixture_xml_outer AS SELECT x FROM pds.fixture_xml_inner;
+REVOKE ALL ON pds.fixture_xml_inner, pds.fixture_xml_outer FROM PUBLIC, anon, authenticated;
+CREATE FUNCTION pds.fixture_via_two_views() RETURNS SETOF xml LANGUAGE sql SECURITY DEFINER
+AS $f$ SELECT x FROM pds.fixture_xml_outer $f$;""", DYNAMIC_ABORT, "fixture_via_two_views")
+
+
+def test_assembled_name_view_nobody_can_reach_passes_and_reruns() -> None:
+    # The same view with no callable definer in front of it reaches no browser role.
+    _expect_success("""CREATE VIEW pds.fixture_xml_idle AS
+SELECT query_to_xml('SELECT k FROM pds.' || 'hrv_' || 'residuals_mat', true, false, '') AS x;
+REVOKE ALL ON pds.fixture_xml_idle FROM PUBLIC, anon, authenticated;""",
+                    MIGRATE, _assert_grants(False), MIGRATE, _assert_grants(False))
+
+
 if __name__ == "__main__":
     try:
         _dsn()
