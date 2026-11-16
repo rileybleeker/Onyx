@@ -172,7 +172,8 @@ class Store(admin.Store):
 
     def screen_rows(self, first: date, last: date) -> list[dict]:
         return self._paged(lambda lo, hi: self._t("phone_usage_daily").select(
-            "behavioral_date,sleep_start,synced_at,minutes_last_hour_before_sleep_est").gte(
+            "behavioral_date,sleep_start,synced_at,minutes_last_hour_before_sleep_est,export_complete,"
+            "pre_sleep_complete").gte(
             "behavioral_date", first.isoformat()).lte("behavioral_date", last.isoformat()).order("behavioral_date").range(lo, hi))
 
     def set_status(self, experiment_id: str, status: str) -> None:

@@ -24,6 +24,20 @@ struct UsageSegment: Codable {
     let items: [UsageItem]
 }
 
+/// Completeness of the export a chunk belongs to (PIPE-11; frontend/src/lib/screen-time-upload.ts).
+/// Every chunk of one sync carries the same run_id, window and stream_ended. Onyx marks the run's
+/// hours verified only when every chunk arrived and stream_ended is true; a watchdog stop, a failed
+/// chunk or an app stopped halfway leaves them unverified (not counted as complete days).
+struct RunInfo: Codable {
+    let run_id: String          // one UUID per sync run
+    let window_start: Date      // the start of the window asked for (local midnight, days back)
+    let window_end: Date        // when the export was read
+    let stream_ended: Bool      // false = stopped by the idle/timeout watchdog
+    let segment_count: Int      // hours in the whole run
+    let chunk_index: Int        // 0-based
+    let chunk_count: Int
+}
+
 struct UsagePayload: Codable {
     let device: String
     let device_name: String?
@@ -31,6 +45,7 @@ struct UsagePayload: Codable {
     let app_version: String
     let generated_at: Date
     let segments: [UsageSegment]
+    let run: RunInfo?           // nil only in the in-app preview; omitted from the JSON then
 }
 
 /// A failed sync, reported to the same route so /status turns red at once.
@@ -50,6 +65,8 @@ struct ExportResult {
     let deviceName: String?
     let deviceModel: String?
     let streamEnded: Bool       // false = stopped by the idle/timeout watchdog
+    let windowStart: Date       // the requested window (the DeviceActivityFilter interval)
+    let windowEnd: Date
 
     var totalMinutes: Double { segments.reduce(0) { $0 + $1.total_seconds } / 60 }
     var firstStart: Date? { segments.map(\.start).min() }

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { chunkRow, itemCountsBySegment, parseUploadRun, runStatusOf, segmentInWindow } from "@/lib/screen-time-upload";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -33,6 +34,17 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * answer `logged: true`, which tells the app not to report the same failure
  * again. A missing or refused token never reaches this route (middleware 401),
  * so those failures still surface only through the age-out.
+ *
+ * Completeness (PIPE-11, 2026-11-16, sql/phone_usage_completeness.sql): app
+ * builds from 2026-11-16 also send `run` (lib/screen-time-upload.ts) with every
+ * chunk. The hours are written first, then the chunk is recorded in
+ * pds.phone_usage_sync_chunks and pds.finalize_phone_usage_run marks the run's
+ * hours verified once every chunk arrived and Apple's stream ended on its own;
+ * the answer then carries `completeness` (the run's status). A watchdog stop, a
+ * missing chunk or an app stopped halfway leaves the hours unverified. A body
+ * without `run` (older builds) is stored exactly as before and stays
+ * unverified: completeness unknown, never complete. A malformed `run` is a
+ * rejected upload (400), like a malformed segment.
  *
  * Auth: a browser session, or the `x-onyx-ci-token` header (middleware
  * carve-out — the app stores the token in the iPhone Keychain).
@@ -126,7 +138,7 @@ export async function POST(req: NextRequest) {
 
   let body: {
     device?: unknown; device_name?: unknown; device_model?: unknown; segments?: unknown;
-    app_version?: unknown; failure?: unknown;
+    app_version?: unknown; failure?: unknown; run?: unknown;
   };
   try {
     body = await req.json();
@@ -158,6 +170,16 @@ export async function POST(req: NextRequest) {
   const deviceModel = text(body.device_model, 60);
   const now = Date.now();
 
+  // Completeness metadata: absent = an older app build (hours stay unverified).
+  const parsedRun = parseUploadRun(body.run, now, { maxFutureMs: MAX_FUTURE_MS, maxAgeMs: MAX_AGE_MS });
+  if (parsedRun.kind === "bad") {
+    return reject(`Bad run metadata: ${parsedRun.reason}`, `completeness metadata invalid (${parsedRun.reason})`);
+  }
+  const run = parsedRun.kind === "ok" ? parsedRun.run : null;
+  if (run && inputs.length === 0) {
+    return reject("A run chunk needs at least one segment", "a run chunk carried no segments");
+  }
+
   // Key by hour start so a duplicate in one payload cannot hit the same row
   // twice in a single upsert statement (Postgres rejects that).
   const segments = new Map<string, Record<string, unknown>>();
@@ -174,6 +196,9 @@ export async function POST(req: NextRequest) {
     if (new Date(end).getTime() <= startMs || startMs > now + MAX_FUTURE_MS || startMs < now - MAX_AGE_MS) {
       return reject(`Segment out of range: ${start} → ${end}`, "a segment is outside the accepted time range");
     }
+    if (run && !segmentInWindow(startMs, new Date(end).getTime(), run)) {
+      return reject(`Segment outside the run window: ${start} → ${end}`, "a segment is outside its run's window");
+    }
     segments.set(start, {
       device,
       segment_start: start,
@@ -186,6 +211,10 @@ export async function POST(req: NextRequest) {
       device_name: deviceName,
       device_model: deviceModel,
       synced_at: new Date(now).toISOString(),
+      // Provenance, always sent so an older build's upload clears a run's claim on the hour.
+      last_run_id: run?.runId ?? null,
+      last_run_item_count: null as number | null,
+      last_export_at: run?.windowEnd ?? null,
     });
 
     for (const it of Array.isArray(raw.items) ? (raw.items as ItemInput[]) : []) {
@@ -205,12 +234,21 @@ export async function POST(req: NextRequest) {
         seconds: Math.round((seconds + ((prev?.seconds as number) ?? 0)) * 10) / 10,
         pickups: kind === "app" ? (int(it.pickups) ?? 0) + ((prev?.pickups as number) ?? 0) : null,
         notifications: kind === "app" ? (int(it.notifications) ?? 0) + ((prev?.notifications as number) ?? 0) : null,
+        last_run_id: run?.runId ?? null,
       });
     }
   }
 
   if (items.size > MAX_ITEMS) {
     return reject(`Too many items (${items.size}); send fewer days per request`, `${items.size} items (limit ${MAX_ITEMS})`);
+  }
+  if (run) {
+    if (segments.size > run.segmentCount) {
+      return reject("The chunk has more hours than its run", "a run chunk has more hours than its run");
+    }
+    // The run's claim per hour: the finalization verifies an hour only while all of these are still its own.
+    const counts = itemCountsBySegment(items.values());
+    for (const [start, row] of segments) row.last_run_item_count = counts.get(start) ?? 0;
   }
 
   try {
@@ -228,8 +266,32 @@ export async function POST(req: NextRequest) {
         .upsert(itemRows.slice(i, i + CHUNK), { onConflict: "device,segment_start,kind,identifier" });
       if (error) throw new Error(`items: ${error.message}`);
     }
+    if (!run) {
+      await heartbeat(startedAt, "success", segRows.length, null);
+      return NextResponse.json({ ok: true, segments: segRows.length, items: itemRows.length });
+    }
+    // Acknowledge the chunk only now that its hours and items are stored, then let the database decide.
+    const ack = chunkRow(device, run, segRows as Array<{ segment_start: string; segment_end: string }>, text(body.app_version, 40));
+    const { error: chunkError } = await supabase
+      .from("phone_usage_sync_chunks")
+      .upsert(ack, { onConflict: "device,run_id,chunk_index" });
+    if (chunkError) throw new Error(`chunk: ${chunkError.message}`);
+    const { data: finalized, error: finalizeError } = await supabase.rpc("finalize_phone_usage_run", {
+      p_device: device,
+      p_run_id: run.runId,
+    });
+    if (finalizeError) throw new Error(`finalize: ${finalizeError.message}`);
+    const completeness = runStatusOf(finalized);
+    const verified = Number((finalized as { hours_verified?: unknown } | null)?.hours_verified ?? 0);
     await heartbeat(startedAt, "success", segRows.length, null);
-    return NextResponse.json({ ok: true, segments: segRows.length, items: itemRows.length });
+    return NextResponse.json({
+      ok: true,
+      segments: segRows.length,
+      items: itemRows.length,
+      completeness,
+      hours_verified: Number.isFinite(verified) ? verified : 0,
+      chunk: { index: run.chunkIndex, count: run.chunkCount },
+    });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     console.error("screen-time usage write failed:", message);
@@ -244,14 +306,16 @@ export async function POST(req: NextRequest) {
 const SETUP_CHECK_DAILY_COLUMNS =
   "behavioral_date,hours_reported,total_minutes,late_night_minutes,after_midnight_minutes,pickups,notifications," +
   "apps_used,first_pickup,last_active_hour_end,sleep_start,minutes_last_hour_before_sleep_est,minutes_during_sleep_est," +
-  "minutes_by_app,minutes_by_category,synced_at";
+  "minutes_by_app,minutes_by_category,synced_at," +
+  // appended by sql/phone_usage_completeness.sql (PIPE-11)
+  "hours_verified,export_complete,completeness,pre_sleep_complete,during_sleep_complete";
 
 export async function GET() {
   const [daily, hours] = await Promise.all([
     supabase.from("phone_usage_daily").select(SETUP_CHECK_DAILY_COLUMNS).order("behavioral_date", { ascending: false }).limit(7),
     supabase
       .from("phone_usage_segments")
-      .select("device, segment_start, segment_end, total_seconds, first_pickup, onyx_behavioral_date, synced_at")
+      .select("device, segment_start, segment_end, total_seconds, first_pickup, onyx_behavioral_date, synced_at, verified_at")
       .order("segment_start", { ascending: false })
       .limit(24),
   ]);

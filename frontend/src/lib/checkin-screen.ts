@@ -12,13 +12,14 @@ import { parseScreenRow } from "@/lib/screen-time";
  *
  * The minutes count only when the row is for the asked day and is bedtimeReady (lib/screen-time.ts):
  * a sync happened after the day ended (synced_at >= day + 1 at 06:00 ET, the HRV pipeline's rule),
- * the sleep is scored, and the sync is at least an hour past sleep onset. Otherwise null, which
- * leaves the question blank.
+ * the whole day and the hour before sleep onset are backed by a complete export (export_complete,
+ * pre_sleep_complete: PIPE-11), the sleep is scored, and the sync is at least an hour past sleep
+ * onset. Otherwise null, which leaves the question blank (never a No from missing hours).
  */
 
 /** Columns the check-in reads from pds.phone_usage_daily (the last one feeds the app-habit pre-fills). */
 export const CHECKIN_SCREEN_COLUMNS =
-  "behavioral_date, sleep_start, synced_at, minutes_last_hour_before_sleep_est, minutes_by_app";
+  "behavioral_date, sleep_start, synced_at, minutes_last_hour_before_sleep_est, minutes_by_app, export_complete, pre_sleep_complete";
 
 export function settledLastHourMinutes(raw: unknown, date: string): number | null {
   const day = parseScreenRow(raw);

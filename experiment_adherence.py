@@ -17,8 +17,12 @@ The only objective source so far is Screen Time's estimate of phone minutes in t
 WHOOP sleep onset. That number reads 0, not NULL, as soon as the sleep is scored, even when the
 phone has not sent the hours around bedtime yet, so it counts only once it is SETTLED: the same
 readiness rule as frontend/src/lib/screen-time.ts (bedtimeReady) and
-hrv_analysis.py:merge_screen_time_features. The database view pds.experiment_day_status does not
-apply that rule, which is why the report job resolves adherence here and not from the view.
+hrv_analysis.py:merge_screen_time_features, including the export completeness flags of
+pds.phone_usage_daily (PIPE-11): an upload the app's watchdog cut short, a missing chunk or an app
+build that reports no completeness is never settled, so such a day is "unknown" objectively and
+falls back to the check-in answer (or stays unknown), never to adherent. The database view
+pds.experiment_day_status does not apply that rule, which is why the report job resolves adherence
+here and not from the view.
 """
 from __future__ import annotations
 
@@ -49,10 +53,14 @@ def settled_screen_minutes(row: dict[str, Any] | None, day: date) -> float | Non
     number can be trusted:
 
       * a sync happened after the day ended (synced_at >= day + 1 at 06:00 ET),
+      * the whole day and the hour before sleep onset are backed by a complete export
+        (export_complete and pre_sleep_complete are literally True; missing = not settled),
       * the WHOOP sleep that closes the day is scored (sleep_start is set),
       * that sync is at least an hour past sleep onset.
     """
     if not row or str(row.get("behavioral_date"))[:10] != day.isoformat():
+        return None
+    if row.get("export_complete") is not True or row.get("pre_sleep_complete") is not True:
         return None
     synced, sleep_start = _instant(row.get("synced_at")), _instant(row.get("sleep_start"))
     minutes = row.get("minutes_last_hour_before_sleep_est")

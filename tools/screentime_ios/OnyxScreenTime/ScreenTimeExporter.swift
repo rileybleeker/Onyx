@@ -163,7 +163,9 @@ enum ScreenTimeExporter {
             segments: segments,
             deviceName: await store.deviceName,
             deviceModel: await store.deviceModel,
-            streamEnded: ended
+            streamEnded: ended,
+            windowStart: firstDay,
+            windowEnd: now
         )
     }
 

@@ -25,10 +25,17 @@ function row(date, over = {}) {
     minutes_by_app: { "App One": 200, "App Two": 100 },
     minutes_by_category: { Alpha: 250, "(none)": 50 },
     synced_at: `${S.addDays(date, 1)}T15:00:00+00:00`, // 10:00 ET the next morning
+    // A complete export backs the whole day and both sleep windows (sql/phone_usage_completeness.sql).
+    export_complete: true,
+    completeness: "complete",
+    pre_sleep_complete: true,
+    during_sleep_complete: true,
     ...over,
   };
 }
 const PARTIAL = { synced_at: "2030-01-12T20:00:00Z" }; // same afternoon, for a row dated 2030-01-12
+// What an app build without completeness metadata leaves: the view cannot vouch for any hour.
+const LEGACY = { export_complete: false, completeness: "unknown", pre_sleep_complete: false, during_sleep_complete: false };
 
 test("a day is complete only once a sync happened at or after 06:00 ET the next day", () => {
   assert.equal(S.isDayComplete("2030-01-10", "2030-01-11T10:59:00Z"), false); // 05:59 ET
@@ -39,6 +46,61 @@ test("a day is complete only once a sync happened at or after 06:00 ET the next 
   // July: UTC-4, so 06:00 ET = 10:00Z.
   assert.equal(S.isDayComplete("2030-07-10", "2030-07-11T09:59:00Z"), false);
   assert.equal(S.isDayComplete("2030-07-10", "2030-07-11T10:00:00Z"), true);
+});
+
+test("completeness: the upload time alone never makes a day complete (PIPE-11)", () => {
+  // Synced the next morning, but sent by an app build that reports no completeness.
+  const legacy = S.parseScreenRow(row("2030-01-10", LEGACY));
+  assert.equal(S.isDayComplete("2030-01-10", legacy.syncedAt), true, "the time rule alone would pass");
+  assert.deepEqual([legacy.complete, legacy.completeness, legacy.bedtimeReady, legacy.duringSleepReady], [false, "unknown", false, false]);
+  assert.equal(legacy.lastHourBeforeSleepMin, null);
+  assert.equal(legacy.duringSleepMin, null);
+  // A run the watchdog stopped, or one with a chunk missing: partial, never complete.
+  const cut = S.parseScreenRow(row("2030-01-10", { export_complete: false, completeness: "partial" }));
+  assert.deepEqual([cut.complete, cut.completeness, cut.lastHourBeforeSleepMin], [false, "partial", null]);
+  // Missing flags (an older database or an older cached answer) count as not complete, never as complete.
+  const bare = row("2030-01-10");
+  for (const k of ["export_complete", "completeness", "pre_sleep_complete", "during_sleep_complete"]) delete bare[k];
+  assert.deepEqual([S.parseScreenRow(bare).complete, S.parseScreenRow(bare).completeness], [false, "unknown"]);
+  // Only a literal true counts.
+  assert.equal(S.parseScreenRow(row("2030-01-10", { export_complete: "true" })).complete, false);
+  assert.equal(S.parseScreenRow(row("2030-01-10", { export_complete: 1 })).complete, false);
+  // The view says complete, but no sync after the day ended yet: still partial.
+  const early = S.parseScreenRow(row("2030-01-10", { synced_at: "2030-01-10T20:00:00Z" }));
+  assert.deepEqual([early.complete, early.completeness], [false, "partial"]);
+});
+
+test("completeness: missing bedtime coverage is unknown, not zero, and the two sleep windows are separate", () => {
+  // Day complete, but the hour before onset is not backed: the last-hour estimate (here 0) is withheld.
+  const noPre = S.parseScreenRow(row("2030-01-10", { pre_sleep_complete: false, minutes_last_hour_before_sleep_est: 0 }));
+  assert.equal(noPre.complete, true);
+  assert.equal(noPre.bedtimeReady, false);
+  assert.equal(noPre.lastHourBeforeSleepMin, null, "unknown, never 0 from hours that were not sent");
+  assert.equal(noPre.duringSleepMin, 5, "the sleep window itself is backed");
+  // The sleep ended after the export, so only the pre-sleep estimate is usable.
+  const noDuring = S.parseScreenRow(row("2030-01-10", { during_sleep_complete: false }));
+  assert.deepEqual([noDuring.bedtimeReady, noDuring.duringSleepReady], [true, false]);
+  assert.deepEqual([noDuring.lastHourBeforeSleepMin, noDuring.duringSleepMin], [25, null]);
+  assert.equal(S.parseScreenRow(row("2030-01-10", { pre_sleep_complete: null })).bedtimeReady, false);
+  const s = S.summarize(S.shapeScreenRows([row("2030-01-10", { during_sleep_complete: false }), row("2030-01-11")]));
+  assert.equal(s.bedtimeDays, 2);
+  assert.equal(s.avgDuringSleepMin, 5, "only the night whose sleep is backed");
+});
+
+test("summary: unverified days are counted apart from days still syncing, and both are left out", () => {
+  const days = S.shapeScreenRows([
+    row("2030-01-09", { total_minutes: 999, ...LEGACY }),
+    row("2030-01-10", { total_minutes: 200 }),
+    row("2030-01-11", { total_minutes: 999, export_complete: false, completeness: "partial" }),
+    row("2030-01-12", { total_minutes: 999, ...PARTIAL }),
+  ]);
+  const s = S.summarize(days);
+  assert.deepEqual([s.completeDays, s.partialDays, s.unverifiedDays], [1, 2, 1]);
+  assert.equal(s.avgTotalMin, 200);
+  const pts = S.chartPoints(days);
+  assert.deepEqual(pts.map((p) => p.total), [null, 200, null, null]);
+  assert.deepEqual(pts.map((p) => p.totalPartial), [999, null, 999, 999]);
+  assert.deepEqual(S.topEntries(days, "byApp").map((e) => e.minutes), [200, 100]);
 });
 
 test("numeric strings parse, bad rows drop, one row per day, ascending", () => {
@@ -185,6 +247,9 @@ test("page is force-dynamic, not ISR, noindex; reader is server-only with explic
   assert.ok(reader.startsWith('import "server-only";'));
   assert.ok(!/select\(\s*["'`]\*/.test(reader));
   assert.ok(!S.SCREEN_TIME_COLUMNS.includes("*"));
+  for (const col of ["export_complete", "completeness", "pre_sleep_complete", "during_sleep_complete"]) {
+    assert.ok(S.SCREEN_TIME_COLUMNS.split(",").includes(col), col);
+  }
 
   // The client chart file gets rows as props: no Supabase import, no fetch.
   const charts = fs.readFileSync(path.join(SRC, "app/screen-time/ScreenTimeCharts.tsx"), "utf8");
@@ -251,6 +316,15 @@ test("failed query, empty window and data are three different screens", async ()
   assert.ok(ok.html.includes("Uncategorised"));
   assert.ok(ok.html.includes("2 complete days"));
   assert.ok(ok.html.includes("1 day is still syncing"));
+  const mixed = await renderPage({
+    kind: "ok",
+    windowDays: 30,
+    days: S.shapeScreenRows([row("2030-01-09", LEGACY), row("2030-01-10", LEGACY), row("2030-01-11"), row("2030-01-12", PARTIAL)]),
+    skippedRows: 0,
+    sync: null,
+  });
+  assert.ok(mixed.html.includes("1 complete day"));
+  assert.ok(mixed.html.includes("1 day is still syncing, 2 days have no completeness check and left out."));
   assert.ok(ok.html.includes("5h")); // average daily total of the two complete days (300 min)
   assert.ok(!ok.html.includes(FAILED) && !ok.html.includes(EMPTY));
   for (const r of [failed, empty, ok]) assert.ok(r.html.includes('data-testid="page-heading"'));
