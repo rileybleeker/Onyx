@@ -351,8 +351,8 @@ def test_cutover_ambiguous_overlap_is_kept_and_visible():
     assert sf.cutover_counts(decisions) == {"matched exact": 1, "ambiguous": 2}
     # Each review row is reported once: not again when the same decision is already recorded.
     assert sf.new_review_count(decisions, None) == 2
-    assert sf.new_review_count(decisions, {"d": "ambiguous", "e": "ambiguous"}) == 0
-    assert sf.new_review_count(decisions, {"d": "ambiguous", "e": "unconfirmed"}) == 1
+    assert sf.new_review_count(decisions, {"d": {"decision": "ambiguous"}, "e": {"decision": "ambiguous"}}) == 0
+    assert sf.new_review_count(decisions, {"d": {"decision": "ambiguous"}, "e": {"decision": "unconfirmed"}}) == 1
     # Recoverable: the record names the candidates, by key only.
     rows = sf.decision_rows(decisions, NOW)
     assert {tuple(sorted(r)) for r in rows} == {tuple(sorted(
@@ -371,6 +371,88 @@ def test_cutover_stored_rows_are_never_dropped():
     got = decided(decisions)
     assert got["s1"] == ("stored_duplicate", "merchant", ("h1",)) and got["n1"] == ("matched", "exact", ("h2",))
     assert "s2" not in got, "unstored rows pair first in an exact group; the stored copy stays as it was"
+
+
+def test_cutover_late_posted_row_is_judged_on_evidence():
+    """A row transacted before the cutover window but posted inside it was pending when Rocket Money last looked:
+    it is matched on evidence like any other, never dropped on its date alone."""
+    hist = [hrow("h1", "2026-11-05", 900, "DEMO TOYS ATLANTA")]   # Rocket Money dates by transaction day
+    sf_rows = [
+        row("late", "2026-11-05", 1200, desc="DEMO BOOKS ATLANTA", original="2026-11-12"),  # no twin: kept
+        row("twin", "2026-11-05", 900, desc="DEMO TOYS ATLANTA", original="2026-11-12"),    # its twin is h1: dropped
+        row("old", "2026-11-05", 400, desc="DEMO LAMPS ATLANTA"),                           # every date before: dropped
+    ]
+    kept, dropped, decisions = sf.apply_cutover(sf_rows, hist, CUT, set())
+    assert [r["txn_key"] for r in kept] == ["late"]
+    assert dropped == {"before the Rocket Money cutover": 1, "already in the Rocket Money history": 1}
+    assert decided(decisions) == {"twin": ("matched", "exact", ("h1",))}
+
+
+def test_cutover_twin_before_the_window_takes_its_history_row():
+    """A Rocket Money row whose SimpleFIN twin is before the window belongs to that twin: a later purchase of the
+    same amount at the same merchant is never matched to it."""
+    hist = [hrow("h1", "2026-11-07", 525, "DEMO CAFE ATLANTA", name="Demo Cafe")]
+    exact = [row("s1", "2026-11-07", 525, desc="DEMO CAFE ATLANTA"),         # before the window, exact twin of h1
+             row("s2", "2026-11-09", 525, desc="DEMO CAFE ATLANTA")]         # a new purchase two days later
+    kept, dropped, decisions = sf.apply_cutover(exact, hist, CUT, set())
+    assert [r["txn_key"] for r in kept] == ["s2"] and decided(decisions) == {}
+    assert dropped == {"before the Rocket Money cutover": 1}
+    # Merchant evidence only (the descriptions differ): one history row, two candidates: never guessed.
+    merchant = [row("s1", "2026-11-07", 525, desc="SQ *DEMO CAFE"), row("s2", "2026-11-09", 525, desc="SQ *DEMO CAFE")]
+    kept, dropped, decisions = sf.apply_cutover(merchant, hist, CUT, set())
+    assert [r["txn_key"] for r in kept] == ["s2"]
+    assert decided(decisions) == {"s2": ("ambiguous", None, ("h1",))}
+
+
+def test_cutover_distinct_merchants_are_not_identity():
+    """Codex review: a generic description with different payees, and two merchants that share only the kind of
+    business and the city, are different purchases."""
+    pos = [hrow("h1", "2026-11-11", 600, "POS PURCHASE", name="Other Shop")]
+    kept, dropped, decisions = sf.apply_cutover([row("a", "2026-11-11", 600, desc="POS PURCHASE", name="Demo Cafe")], pos, CUT, set())
+    assert [r["txn_key"] for r in kept] == ["a"] and not dropped
+    assert decided(decisions) == {"a": ("unconfirmed", None, ("h1",))}
+    assert sf.exact_key(row("a", "2026-11-11", 600, desc="POS PURCHASE")) is None
+    assert sf.exact_key(row("a", "2026-11-11", 600, desc="COFFEE SHOP")) is None      # a kind of business, no name
+    # Same distinctive description, contradicting payees: not exact either.
+    kiosk = [hrow("h2", "2026-11-11", 650, "PLAZA KIOSK 0042", name="Other Shop")]
+    b = row("b", "2026-11-11", 650, desc="PLAZA KIOSK 0042", name="Demo Cafe")
+    kept, dropped, decisions = sf.apply_cutover([b], kiosk, CUT, set())
+    assert [r["txn_key"] for r in kept] == ["b"] and decided(decisions) == {"b": ("unconfirmed", None, ("h2",))}
+    assert sf.names_conflict(b, kiosk[0])
+    # Two coffee shops in one city: two of three words shared, but not the one that names the business.
+    a = row("c", "2026-11-11", 450, desc="DEMOBEANS COFFEE ATLANTA")
+    h = hrow("h3", "2026-11-11", 450, "OTHERBREW COFFEE ATLANTA")
+    assert not sf.merchant_evidence(a, h)
+    kept, dropped, decisions = sf.apply_cutover([a], [h], CUT, set())
+    assert [r["txn_key"] for r in kept] == ["c"] and decided(decisions) == {"c": ("unconfirmed", None, ("h3",))}
+    assert sf.merchant_evidence(a, hrow("h4", "2026-11-10", 450, "DEMOBEANS #12", name="Demobeans Coffee"))
+
+
+def test_cutover_recorded_matches_hold_across_runs():
+    """Codex review: a Rocket Money row an earlier run matched stays taken when its SimpleFIN row is missing from a
+    later (narrower or incomplete) response, and a settled match is not reopened by a new same-merchant row."""
+    hist = [hrow("h1", "2026-11-10", 800, "DEMO BAKERY ATLANTA", name="Demo Bakery")]
+    s1 = row("s1", "2026-11-11", 800, desc="DEMO BAKERY 0042 ATLANTA GA")
+    s2 = row("s2", "2026-11-12", 800, desc="DEMO BAKERY 0042 ATLANTA GA")    # a second purchase, seen later
+    kept, dropped, first = sf.apply_cutover([s1], hist, CUT, set())
+    assert not kept and decided(first) == {"s1": ("matched", "merchant", ("h1",))}
+    saved = {r["sf_txn_key"]: r for r in sf.decision_rows(first, NOW)}
+    claims = sf.recorded_claims(saved)
+    assert claims == {"h1": {"s1"}}
+    # s1 missing from this answer: h1 stays taken, s2 is kept (without the record it would have been dropped).
+    kept, dropped, decisions = sf.apply_cutover([s2], hist, CUT, set(), claims)
+    assert [r["txn_key"] for r in kept] == ["s2"] and not dropped and decided(decisions) == {}
+    assert sf.apply_cutover([s2], hist, CUT, set())[0] == []
+    # Both present: the settled match holds and the new row is kept (not both turned ambiguous).
+    kept, dropped, decisions = sf.apply_cutover([s1, s2], hist, CUT, set(), claims)
+    assert [r["txn_key"] for r in kept] == ["s2"] and decided(decisions) == {"s1": ("matched", "merchant", ("h1",))}
+    assert decided(sf.apply_cutover([s1, s2], hist, CUT, set())[2]) == {
+        "s1": ("ambiguous", None, ("h1",)), "s2": ("ambiguous", None, ("h1",))}
+    # A record that no longer fits this row (another amount) is not forced on it.
+    moved = dict(s1, amount_cents=900)
+    assert sf.apply_cutover([moved], hist, CUT, set(), claims)[0] == [moved]
+    assert sf.recorded_claims(None) == {}
+    assert sf.recorded_claims({"x": {"decision": "ambiguous", "history_txn_keys": ["h1"]}}) == {}
 
 
 # --- categories -------------------------------------------------------------------------------------------------
@@ -453,7 +535,8 @@ class FakeStore:
 
     def save_cutover_decisions(self, rows):
         self.saved_rows.extend(rows)
-        self.saved.update({r["sf_txn_key"]: r["decision"] for r in rows})
+        self.saved.update({r["sf_txn_key"]: {"decision": r["decision"], "history_txn_keys": list(r["history_txn_keys"])}
+                           for r in rows})
 
     def history_for_learning(self, since):
         return list(self._history)
@@ -693,8 +776,34 @@ def test_run_cutover_record_unavailable_is_partial_and_keeps_rows():
     assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
     assert "sf:S-WF:w1" in {t["source_txn_id"] for t in store.txns}
     assert store.beats[0][1] == "partial"
-    assert store.beats[0][3] == sf.format_notes({"cutover_review": 1, "cutover_provenance_unsaved": 1})
+    # Only the missing record is reported while it cannot be saved (every run says so; the review rows wait) ...
+    assert store.beats[0][3] == sf.format_notes({"cutover_provenance_unsaved": 1})
     assert "does not exist" not in "\n".join(lines)
+    # ... and the first run that records the decisions reports the review rows, once.
+    applied = cutover_store()
+    applied.txns = list(store.txns)
+    assert sf.run(applied, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert applied.beats[0][3] == sf.format_notes({"cutover_review": 1})
+    assert sf.run(applied, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert applied.beats[2][1] == "success"
+
+
+def test_run_recorded_match_survives_a_response_without_its_row():
+    """End to end through the record: run 1 matches a row to its Rocket Money twin; run 2's answer lacks that row
+    and has a new same-merchant purchase, which is written, not matched to the taken twin."""
+    window = [hrow("rm-3", "2026-11-10", 800, "DEMO BAKERY ATLANTA", name="Demo Bakery")]
+    store = FakeStore(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+    first, second = body(), body()
+    next(a for a in first["accounts"] if a["id"] == "S-WF")["transactions"] = [
+        txn("b1", "2026-11-11", "-8.00", "DEMO BAKERY 0042 ATLANTA GA")]
+    next(a for a in second["accounts"] if a["id"] == "S-WF")["transactions"] = [
+        txn("b2", "2026-11-12", "-8.00", "DEMO BAKERY 0042 ATLANTA GA")]
+    assert sf.run(store, Http(get=Res(200, first)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert not any(t["source_txn_id"] == "sf:S-WF:b1" for t in store.txns)
+    assert [r["decision"] for r in store.saved_rows] == ["matched"]
+    assert sf.run(store, Http(get=Res(200, second)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
+    assert any(t["source_txn_id"] == "sf:S-WF:b2" for t in store.txns), "the new purchase is kept"
+    assert store.beats[2][1] == "success"
 
 
 if __name__ == "__main__":

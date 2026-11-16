@@ -12,7 +12,10 @@
 --   ambiguous         more than one candidate on either side; kept
 --   unconfirmed       a same-amount Rocket Money row is near but no merchant evidence; kept
 -- evidence: 'exact' (same date, amount, currency, description) or 'merchant' (shared merchant words, one to one).
--- The ETL works without this table (the SimpleFIN card then reads partial with cutover_provenance_unsaved).
+-- The ETL reads the table back each run: a Rocket Money row a recorded decision matched stays taken, also when a
+-- later SimpleFIN answer no longer has the row that matched it. The ETL works without this table (each run then
+-- matches on its own response and the SimpleFIN card reads partial with cutover_provenance_unsaved).
+-- Not applied yet: Riley applies it before or with the merge of the change that added it.
 
 create table if not exists pds.finance_cutover_matches (
   sf_txn_key        text primary key,          -- the SimpleFIN row's txn_key (= finance_transactions.txn_key when kept)
