@@ -362,6 +362,10 @@ test("middleware focus-path check: re-formatted source passes; every way around 
 
 test("middleware: no /api/focus prefix anywhere in the file; its one focus path is isCiRoute's exact comparison", () => {
   assert.deepEqual(focusPathProblems(SF.parseFile("middleware.ts")), []);
+  // Master's plain-text rule, kept word for word next to the syntax-tree check: the file's text (comments included)
+  // never contains startsWith("/api/focus.
+  const src = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
+  assert.ok(!/startsWith\("\/api\/focus/.test(src), "never a /api/focus prefix");
 });
 
 // middleware() itself, run with Supabase and NextResponse stubbed. Synthetic account ids and token.
