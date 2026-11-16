@@ -118,7 +118,7 @@ amber with `[cutover_provenance_unsaved]`. Any other error reading it fails the 
 
 **Before merging the change that added this (2026-11-16), Riley:**
 
-1. applies `sql/finance_cutover_matches.sql` (before the merge, not with it);
+1. applies `sql/finance_cutover_matches.sql` (before the merge, not with it; done 2026-11-16);
 2. runs `python simplefin_etl.py --dry-run` locally from that branch (it writes nothing) and checks the counts-only
    `cutover decisions`, `new for review` and per-account `kept for review` lines. The first scheduled run after the
    merge decides the cutover window again: rows the earlier equal-amount rule dropped without recording them are

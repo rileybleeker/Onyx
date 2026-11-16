@@ -18,7 +18,7 @@
 -- response on its own, saves nothing and the SimpleFIN card reads partial with cutover_provenance_unsaved; any
 -- other error reading it fails the run before anything is written (db_read_failed), so the record is never
 -- rewritten from decisions made without it.
--- Not applied yet: Riley applies it BEFORE merging the change that added it.
+-- Applied 2026-11-16 (Supabase MCP, before the merge of the change that added it).
 
 create table if not exists pds.finance_cutover_matches (
   sf_txn_key        text primary key,          -- the SimpleFIN row's txn_key (= finance_transactions.txn_key when kept)
