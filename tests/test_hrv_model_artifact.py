@@ -367,7 +367,11 @@ def test_every_refusal_happens_before_unpickling():
         assert _TRIPPED == []
 
         # the pickle replaced after its manifest was written (or a crash between the two writes)
-        other = pickle.dumps({**_bundle(_Tripwire()), "provenance": manifest["provenance"]})
+        # (different bytes: the same bundle and provenance would pickle to the original's exact
+        # bytes and checksum, so nothing would be replaced)
+        other = pickle.dumps({**_bundle(_Tripwire()), "pred_std": 11.0,
+                              "provenance": manifest["provenance"]})
+        assert ma.sha256_bytes(other) != sha
         path.write_bytes(other)
         _refused(lambda: _load(path), "does not match its manifest")
         _refused(lambda: _load(path, expected=sha), "selected")
