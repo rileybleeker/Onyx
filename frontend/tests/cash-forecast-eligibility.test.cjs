@@ -82,15 +82,18 @@ test("a stale cash balance withholds the amount; the projection is still drawn a
   assert.ok(stale.warnings.some((w) => /older than 48 hours/.test(w)));
 });
 
-test("boundaries: exactly 48 hours is fresh, 48 hours and a minute is stale; a balance under $100 never marks it stale", () => {
+test("boundaries: exactly 48 hours is fresh, 48 hours and a minute is stale, whatever the balance's size", () => {
   assert.equal(C.FORECAST.staleBalanceHours, 48);
   assert.equal(run({ balances: [bal("chk", 400_000, ago(48)), bal("sav", 900_000)] }).eligibility.eligible, true);
   const justOver = new Date(NOW.getTime() - 48 * HOUR - 60_000).toISOString();
   assert.deepEqual(codes(run({ balances: [bal("chk", 400_000, justOver), bal("sav", 900_000)] })), ["stale-balance"]);
   const small = C.FORECAST.smallBalanceCents;
-  assert.equal(run({ balances: [bal("chk", 400_000), bal("sav", small - 1, ago(24 * 10))] }).eligibility.eligible, true, "a small account that rarely updates");
-  assert.deepEqual(codes(run({ balances: [bal("chk", 400_000), bal("sav", small, ago(24 * 10))] })), ["stale-balance"]);
-  assert.deepEqual(codes(run({ balances: [bal("chk", 400_000), bal("sav", -small, ago(24 * 10))] })), ["stale-balance"], "an overdrawn balance counts by size");
+  for (const cents of [0, 1, small - 1, small, -1, -(small - 1), -small]) {
+    assert.deepEqual(codes(run({ balances: [bal("chk", 400_000), bal("sav", cents, ago(24 * 10))] })), ["stale-balance"], `an old balance of ${cents} cents withholds the amount`);
+  }
+  // The projection's stale badge still ignores a small one (an account that rarely updates); only the amount is gated.
+  assert.equal(run({ balances: [bal("chk", 400_000), bal("sav", small - 1, ago(24 * 10))] }).opening.stale, false);
+  assert.equal(run({ balances: [bal("chk", 400_000), bal("sav", small, ago(24 * 10))] }).opening.stale, true);
 });
 
 test("a pool account with no balance withholds the amount (counted as $0 in the estimate)", () => {
@@ -242,32 +245,58 @@ test("Today reads the same gate: cashForecastCheck mirrors the forecast's eligib
   assert.equal(A.cashForecastCheck({ ...run(), eligibility: undefined }).eligible, false, "an older stored forecast is not an all-clear");
 });
 
-// ─── small stale balances, accounts Riley leaves out, and a check that stops holding ─────────────
-test("a small balance too old to trust is not counted in the amount and is named next to it", () => {
+// ─── stale small balances, accounts Riley leaves out, unreadable balances, a check that stops holding ──
+test("an old zero, small or overdrawn balance withholds the amount until Riley leaves the account out", () => {
   const small = C.FORECAST.smallBalanceCents - 1;
-  const fresh = run({ balances: [bal("chk", 400_000), bal("sav", small)] });
-  const old = run({ balances: [bal("chk", 400_000), bal("sav", small, ago(24 * 10))] });
-  assert.equal(old.eligibility.eligible, true, "it does not withhold the amount");
-  assert.deepEqual(old.eligibility.leftOut, [{ account: "sav", label: "Demo Savings", asOf: ago(24 * 10), why: "small" }]);
-  assert.equal(old.headlines.safeToMoveCents, Math.max(0, fresh.headlines.safeToMoveCents - small), "its balance is taken out of the amount");
-  assert.deepEqual(old.days, fresh.days, "the projection still counts it");
-  assert.equal(old.eligibility.cashAsOf, ago(2), "as of the balances the amount counts, not the old one");
-  const tile = E.safeToMoveTile(old, 50_000);
-  assert.equal(tile.kind, "amount");
-  assert.equal(tile.leftOut.length, 1);
-  assert.match(tile.leftOut[0].text, /^Demo Savings is not counted: a small balance last updated Jun 5/);
-  assert.doesNotMatch(tile.leftOut[0].text, /\$/, "no amount in the text");
-  assert.equal(tile.leftOut[0].chosen, false);
-  assert.match(tile.asOf, /^Jun 15,/);
-  // Withheld for another reason: the tile is still dated by the balances it would count, never by the old small one.
-  const withheld = E.safeToMoveTile(run({ balances: [bal("chk", 400_000), bal("sav", small, ago(24 * 90))], quality: { planUnavailable: true } }), 50_000);
-  assert.equal(withheld.kind, "unavailable");
-  assert.match(withheld.asOf, /^Jun 15,/);
-  // An overdrawn small balance keeps lowering the amount: only a positive balance is taken out.
-  const overdrawn = run({ balances: [bal("chk", 400_000), bal("sav", -small, ago(24 * 10))] });
-  assert.equal(overdrawn.eligibility.eligible, true);
-  const overdrawnFresh = run({ balances: [bal("chk", 400_000), bal("sav", -small)] });
-  assert.equal(overdrawn.headlines.safeToMoveCents, overdrawnFresh.headlines.safeToMoveCents);
+  const leave = { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] };
+  for (const cents of [0, small, -small]) {
+    const old = run({ balances: [bal("chk", 400_000), bal("sav", cents, ago(24 * 10))] });
+    assert.equal(old.eligibility.eligible, false, `${cents}: an old balance is no proof the account is not overdrawn now`);
+    assert.deepEqual(old.eligibility.reasons.map((r) => [r.code, r.account]), [["stale-balance", "sav"]], "offers Leave it out");
+    assert.equal(old.headlines.safeToMoveCents, null);
+    assert.equal("leftOut" in old.eligibility, false, "nothing is left out automatically");
+    const tile = E.safeToMoveTile(old, 50_000);
+    assert.equal(tile.kind, "unavailable");
+    assert.deepEqual(tile.leftOut, []);
+    assert.match(tile.asOf, /^Jun 15,/, "dated by the balances it would count, never by the old one");
+    // Riley's explicit choice narrows what the amount counts: it comes back, the account is named.
+    const chosen = run({ balances: [bal("chk", 400_000), bal("sav", cents, ago(24 * 10))], settings: leave });
+    assert.equal(chosen.eligibility.eligible, true, `${cents}: left out`);
+    assert.deepEqual(chosen.eligibility.leftOut, [{ account: "sav", label: "Demo Savings", asOf: ago(24 * 10), why: "chosen" }]);
+    const fresh = run({ balances: [bal("chk", 400_000), bal("sav", cents)], settings: leave });
+    assert.equal(chosen.headlines.safeToMoveCents, fresh.headlines.safeToMoveCents, "only its positive part is taken out; an overdraft keeps lowering it");
+    assert.deepEqual(chosen.days, run({ balances: [bal("chk", 400_000), bal("sav", cents, ago(24 * 10))] }).days, "the projection still counts it");
+  }
+  // A stored result written with an automatic "small" left-out entry is malformed: never eligible.
+  const ok = JSON.parse(JSON.stringify(run()));
+  assert.equal(E.eligibilityOf({ ...ok, eligibility: { ...ok.eligibility, leftOut: [{ account: "sav", label: "Demo Savings", asOf: ago(240), why: "small" }] } }).reasons[0].code, "unverified");
+});
+
+test("a balance read that failed withholds the amount, also when Riley left the account out; a later good read recovers", () => {
+  const unread = { balanceUnreadable: ["sav"] };
+  // The 60-day read had no row for savings and its older read failed: unknown, not missing.
+  const failed = run({ balances: [bal("chk", 400_000)], quality: unread });
+  assert.deepEqual(failed.eligibility.reasons.map((r) => [r.code, r.account]), [["balance-unreadable", undefined]], "no Leave it out on this reason");
+  assert.match(failed.eligibility.reasons[0].text, /Demo Savings could not be read/);
+  assert.equal(failed.headlines.safeToMoveCents, null);
+  const tile = E.safeToMoveTile(failed, 50_000);
+  assert.equal(tile.kind, "unavailable");
+  assert.deepEqual(tile.reasons.map((r) => r.account), [undefined], "the tile offers no Leave it out for it");
+  // Left out: the read failure still withholds the amount (an unread balance could be an overdraft).
+  const leftOut = run({ balances: [bal("chk", 400_000)], quality: unread, settings: { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] } });
+  assert.equal(leftOut.eligibility.eligible, false);
+  assert.deepEqual(codes(leftOut), ["balance-unreadable"]);
+  assert.equal(leftOut.headlines.safeToMoveCents, null);
+  assert.deepEqual(leftOut.eligibility.leftOut.map((l) => [l.account, l.why]), [["sav", "chosen"]], "still named as left out, and can be counted again");
+  // Every pool account it names withholds; one that is not a pool account changes nothing.
+  assert.equal(run({ quality: { balanceUnreadable: ["card"] } }).eligibility.eligible, true);
+  assert.deepEqual(E.eligibilityOf(JSON.parse(JSON.stringify(failed))).reasons.map((r) => r.code), ["balance-unreadable"], "a known code when stored");
+  // Recovery: the next read answers (no failure reported) and the account is left out again: the amount comes back.
+  const recovered = run({ balances: [bal("chk", 400_000)], settings: { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] } });
+  assert.equal(recovered.eligibility.eligible, true);
+  assert.equal(typeof recovered.headlines.safeToMoveCents, "number");
+  // Without the choice it is an ordinary missing balance again, with Leave it out offered.
+  assert.deepEqual(run({ balances: [bal("chk", 400_000)] }).eligibility.reasons.map((r) => [r.code, r.account]), [["missing-balance", "sav"]]);
 });
 
 test("an account Riley leaves out clears its reason, is not counted in the amount, and can be counted again", () => {
@@ -358,7 +387,7 @@ test("source: the tile shows the reason inside the same part as the amount; ever
   assert.match(view, /nextExpiry\(/, "re-checked at the next expiry");
   assert.match(view, /visibilitychange/, "and when the page comes back into view");
   assert.match(view, /<CompareTable [^>]*now=\{checkNow\}/, "the what-if uses the same clock");
-  assert.match(view, /\{ key: "safe-to-move", account, leaveOut: out \}/, "one account per change, merged on the server");
+  assert.match(view, /\{ key: "safe-to-move", account, leaveOut: out \}/, "one account per change, applied on the server with a compare-and-swap");
   const compare = fs.readFileSync(path.join(SRC, "app/financials/forecast/TaxAndWhatIf.tsx"), "utf8");
   assert.match(compare, /safeToMoveOf\(base, now\), safeToMoveOf\(scen, now\)/);
   assert.match(compare, /eligibilityOf\(base, now\)/);
@@ -372,6 +401,8 @@ test("source: the tile shows the reason inside the same part as the amount; ever
   const server = fs.readFileSync(path.join(SRC, "lib/finance-result-cache-server.ts"), "utf8");
   assert.match(server, /cashForecastCheck\(/, "Today's alerts answer carries the same check");
   const loader = fs.readFileSync(path.join(SRC, "lib/cash-forecast-server.ts"), "utf8");
-  assert.match(loader, /planUnavailable: setupPending, planInvalid/);
+  assert.match(loader, /planUnavailable: setupPending,\s+planInvalid/);
   assert.match(loader, /historyTruncated: bal\.truncated \|\| txn\.truncated/);
+  assert.match(loader, /balanceUnreadable: unreadable/, "a failed older-balance read reaches the gate");
+  assert.match(loader, /applyLeaveOut\(leaveOutStore\(/, "Leave it out goes through the compare-and-swap");
 });

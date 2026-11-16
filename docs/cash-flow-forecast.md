@@ -77,9 +77,10 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 
 | Reason code | When |
 |---|---|
-| `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small older one (counted as $0 in the estimate) |
+| `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small or negative older one (counted as $0 in the estimate) |
 | `invalid-balance` | only a non-USD row, no usable amount, an unreadable date, or a date more than 1 h in the future |
-| `stale-balance` | a pool balance of $100 or more older than 48 h (`smallBalanceCents`, `staleBalanceHours`), or a stored result read after its `validUntil` |
+| `stale-balance` | a pool balance of ANY size older than 48 h (`staleBalanceHours`; an old small or zero balance is no proof the account is not overdrawn now), or a stored result read after its `validUntil` |
+| `balance-unreadable` | the read of a pool account's older balance failed (not "no row": the read itself errored), so its balance is unknown. Leaving the account out does not clear it, and the reason offers no Leave it out |
 | `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
 | `history-truncated` | a paged read of the balances or the history stopped at its page limit |
 | `plan-unavailable` | the planned items or the plan drivers could not be read (`setupPending`) |
@@ -89,15 +90,20 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 | `invalid-input` | an input that is not a number reached the projection |
 | `unverified` | a stored result from before the gate (no `eligibility`), or a malformed one: never eligible |
 
-**Left out of the amount, named next to it** (`eligibility.leftOut`; the projection still counts them): a pool
-balance under $100 that is older than 48 h (an account that rarely updates; for a cash account with no row in the
-60-day read the loader reads its newest snapshot and keeps it when it is under $100 or negative), and any pool
-account Riley leaves out with "Leave it out" beside a balance reason (driver `safe-to-move` = `{leaveOut: [account
-keys]}`; "Count it again" removes it; each tap sends one account, `{key: "safe-to-move", account, leaveOut}`, and
-the server merges it into the saved list, so a page whose drivers read failed or a second tab never overwrites the
-other choices). A left-out account's positive balance is taken out of the opening and the lowest point, so the
-amount never rests on it; an overdraft keeps lowering the amount, also once it is older than the 60-day read.
-Without that choice an account the feed can no longer refresh would withhold the amount for good.
+**Left out of the amount, named next to it** (`eligibility.leftOut`; the projection still counts them): only a pool
+account Riley leaves out with "Leave it out" beside a balance reason. Nothing is left out automatically: a stale
+balance withholds the amount whatever its size (2026-11-16, Codex review of PIPE-02: an old small balance does not
+show the account cannot be overdrawn now). For a cash account with no row in the 60-day read the loader reads its
+newest snapshot and keeps it when it is under $100 or negative, so the reason says "older than 48 hours" and a debt
+is never dropped to $0. The choice is the driver `safe-to-move` = `{leaveOut: [account keys]}`; "Count it again"
+removes it. Each tap sends one account, `{key: "safe-to-move", account, leaveOut}` (the only accepted body for that
+driver; a whole-list `value` is refused), and the server applies it with a compare-and-swap on the row's
+`updated_at` (`applyLeaveOut`: read, merge the one change, write only if the row is still the version read, else read
+again; at most 5 tries, then 409 and nothing saved). So two tabs changing different accounts at the same moment both
+keep their change, and two changes to the same account are applied in turn, the last one to commit deciding. A
+left-out account's positive balance is taken out of the opening and the lowest point, so the amount never rests on
+it; an overdraft keeps lowering the amount, also once it is older than the 60-day read. Leaving an account out never
+clears `balance-unreadable`.
 
 **When the check stops holding.** `eligibility.validUntil` = the first counted balance's time + 48 h. The stored
 results (`pds.finance_result_cache`) are served up to an hour fresh and longer while a refresh is pending or

@@ -28,6 +28,7 @@ const CODES: Record<EligibilityCode, true> = {
   "missing-balance": true,
   "invalid-balance": true,
   "stale-balance": true,
+  "balance-unreadable": true,
   "freshness-unknown": true,
   "short-history": true,
   "history-truncated": true,
@@ -51,7 +52,9 @@ function parseReason(x: unknown): EligibilityReason | null {
 function parseLeftOut(x: unknown): LeftOutAccount | null {
   if (!x || typeof x !== "object") return null;
   const l = x as { account?: unknown; label?: unknown; asOf?: unknown; why?: unknown };
-  if (typeof l.account !== "string" || typeof l.label !== "string" || (l.why !== "small" && l.why !== "chosen")) return null;
+  // Only Riley's choice leaves an account out ("chosen"); any other value is malformed, so the stored result is never
+  // eligible.
+  if (typeof l.account !== "string" || typeof l.label !== "string" || l.why !== "chosen") return null;
   if (l.asOf !== null && typeof l.asOf !== "string") return null;
   return { account: l.account, label: l.label, asOf: l.asOf, why: l.why };
 }
@@ -131,7 +134,7 @@ export interface TileReason {
   text: string;
   account?: string;
 }
-/** A pool account the amount does not count, as the tile names it; `chosen` = Riley left it out (can count it again). */
+/** A pool account the amount does not count, as the tile names it: Riley left it out (and can count it again). */
 export interface TileLeftOut {
   account: string;
   text: string;
@@ -164,13 +167,12 @@ export type SafeToMoveTile =
 
 function leftOutText(l: LeftOutAccount): string {
   const when = cashAsOfLabel(l.asOf);
-  if (l.why === "chosen") return `${l.label} is not counted: you left it out${when ? ` (last balance ${when})` : ""}.`;
-  return `${l.label} is not counted: a small balance last updated ${when ?? "a while ago"}.`;
+  return `${l.label} is not counted: you left it out${when ? ` (last balance ${when})` : ""}.`;
 }
 
 /**
  * The time of the oldest balance the amount COUNTS, as a label: left-out accounts are named separately with their own
- * date (an old small or chosen one never dates the tile); a backtest opening has no checked balance and keeps its own.
+ * date (one Riley left out never dates the tile); a backtest opening has no checked balance and keeps its own.
  */
 function countedAsOf(e: ForecastEligibility, result: Pick<ForecastResult, "opening">): string | null {
   return cashAsOfLabel(e.cashAsOf ?? (e.leftOut?.length ? null : (result.opening?.asOf ?? null)));

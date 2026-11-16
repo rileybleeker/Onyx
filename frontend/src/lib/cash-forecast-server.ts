@@ -6,7 +6,7 @@ import { fixedCategory } from "@/lib/finance-categories";
 import { computeGoals, type GoalRow, type GoalView } from "@/lib/finance-goals";
 import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
 import { forecastCash, poolAccountKeys, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
-import { driversToInputs, itemRowToPlanned, mergeLeaveOut, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
+import { applyLeaveOut, driversToInputs, itemRowToPlanned, nextLeaveOutVersion, type DriverRow, type ItemInput, type ItemRow, type LeaveOutStore } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, taxYearsFor, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
 import { addDays } from "@/lib/procurement-recurring";
@@ -112,31 +112,36 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const accounts: ForecastAccount[] = parsedAccounts.map((a) => ({ account_key: a.account_key, account_type: a.account_type, label: accountLabel(a) }));
     const balances: ForecastBalance[] = bal.rows.map(parseBalance).filter((b): b is NonNullable<typeof b> => !!b);
     // A cash account with no balance in the 60-day read (one the feed no longer refreshes, or a closed one): its
-    // newest snapshot when it is SMALL, so the engine leaves it out of safe to move and names it instead of
-    // withholding the amount for good (a small account that rarely updates), and when it is NEGATIVE (an overdraft,
-    // any size), so a known debt keeps lowering the amount even after Riley left the account out; a large negative
-    // one is too old to trust and withholds the amount until Riley leaves it out. A larger positive one stays
-    // missing: the projection keeps counting it as $0 (as before) and the amount stays withheld until Riley leaves
-    // it out. One limit-1 read per such account, only when there is one; a failed read leaves it missing. Forecast
-    // only: goals keep the 60-day balances.
+    // newest snapshot is read on its own and kept when it is SMALL or NEGATIVE (an overdraft, any size). Either way it
+    // is too old to trust, so it withholds the amount (stale-balance) until Riley leaves the account out; a negative
+    // one keeps lowering the amount after he does, so a known debt is never dropped to $0. A larger positive one
+    // stays missing: the projection keeps counting it as $0 (as before) and the amount stays withheld until Riley
+    // leaves it out. One limit-1 read per such account, only when there is one. A read that FAILS is not "no balance":
+    // the account goes to quality.balanceUnreadable, which withholds the amount even when Riley left the account out
+    // (an unread balance could be an overdraft). Forecast only: goals keep the 60-day balances.
     const seen = new Set(bal.rows.map((r) => (r as { account_key?: unknown }).account_key));
     const unseen = poolAccountKeys(accounts).filter((k) => !seen.has(k));
     const older: ForecastBalance[] = [];
+    const unreadable: string[] = [];
     if (unseen.length) {
       const reads = await Promise.all(
         unseen.map((k) =>
           Promise.resolve(db.from("finance_balance_snapshots").select(BAL_COLS).eq("account_key", k).order("captured_at", { ascending: false }).limit(1)).catch(() => null),
         ),
       );
-      for (const res of reads) {
-        if (!res || res.error) continue;
+      reads.forEach((res, i) => {
+        if (!res || res.error) {
+          console.error(`older balance read failed: ${res?.error?.code ?? "unknown"}`);
+          unreadable.push(unseen[i]);
+          return;
+        }
         for (const raw of res.data ?? []) {
           const b = parseBalance(raw);
           if (!b || !Number.isFinite(b.balance_cents)) continue;
           const signed = b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
           if (signed < 0 || Math.abs(b.balance_cents) < FORECAST.smallBalanceCents) older.push(b);
         }
-      }
+      });
     }
     const fixes = await fixesRead;
     const txns: ForecastTxn[] = [];
@@ -185,7 +190,13 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const manual = itemRows.map(itemRowToPlanned);
     // What the reads could not deliver: each withholds the safe-to-move amount in the base plan AND the what-if,
     // because both are computed from this one input (result.eligibility, lib/cash-forecast.ts).
-    const quality = { historyTruncated: bal.truncated || txn.truncated, planUnavailable: setupPending, planInvalid, categoriesUnavailable: fixes.failed === true };
+    const quality = {
+      historyTruncated: bal.truncated || txn.truncated,
+      planUnavailable: setupPending,
+      planInvalid,
+      categoriesUnavailable: fixes.failed === true,
+      ...(unreadable.length ? { balanceUnreadable: unreadable } : {}),
+    };
     const baseInput = { today, now, accounts, txns, balances: older.length ? [...balances, ...older] : balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS }, quality };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
     let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
@@ -345,19 +356,57 @@ export async function saveDriver(key: string, value: Record<string, unknown> | n
 }
 
 /**
- * Leave one pool account out of the safe-to-move amount, or count it again: read the saved list and write it back
- * with this one change (lib/cash-forecast-store.ts mergeLeaveOut), so the page's possibly stale or empty copy of the
- * drivers never overwrites the other choices. A failed read saves nothing.
+ * The "safe-to-move" driver row as a compare-and-swap store (lib/cash-forecast-store.ts applyLeaveOut): the version is
+ * the row's updated_at as read, and every write is conditional on it (an UPDATE / DELETE whose WHERE also names that
+ * updated_at, an INSERT that fails on the primary key), so a write that lost a race changes nothing and is retried.
+ * Logs a database code only.
+ */
+export function leaveOutStore(db: ReturnType<typeof serviceClient>): LeaveOutStore {
+  const KEY = "safe-to-move";
+  const table = () => db.from("finance_plan_drivers");
+  const failed = (what: string, code: unknown) => {
+    console.error(`plan driver ${what} failed: ${typeof code === "string" ? code : "unknown"}`);
+    return "error" as const;
+  };
+  return {
+    async read() {
+      const { data, error } = await table().select("value,updated_at").eq("key", KEY);
+      if (error) {
+        failed("read", error.code);
+        return { ok: false };
+      }
+      const row = (data ?? [])[0] as { value?: unknown; updated_at?: unknown } | undefined;
+      if (!row) return { ok: true, row: null };
+      if (typeof row.updated_at !== "string") {
+        failed("read", "no-version");
+        return { ok: false };
+      }
+      return { ok: true, row: { value: row.value ?? null, version: row.updated_at } };
+    },
+    async insert(value) {
+      const { error } = await table().insert({ key: KEY, value, updated_at: nextLeaveOutVersion(null, Date.now()) });
+      if (!error) return "ok";
+      return error.code === "23505" ? "conflict" : failed("insert", error.code);
+    },
+    async update(version, value) {
+      const { data, error } = await table().update({ value, updated_at: nextLeaveOutVersion(version, Date.now()) }).eq("key", KEY).eq("updated_at", version).select("key");
+      if (error) return failed("update", error.code);
+      return (data ?? []).length ? "ok" : "conflict";
+    },
+    async remove(version) {
+      const { data, error } = await table().delete().eq("key", KEY).eq("updated_at", version).select("key");
+      if (error) return failed("remove", error.code);
+      return (data ?? []).length ? "ok" : "conflict";
+    },
+  };
+}
+
+/**
+ * Leave one pool account out of the safe-to-move amount, or count it again: applied to the saved list with a
+ * compare-and-swap and a bounded retry (applyLeaveOut), so two tabs changing different accounts both keep their change
+ * and the page's possibly stale or empty copy of the drivers is never written back. A failed read saves nothing; a
+ * change still colliding after the last retry answers 409 and saves nothing.
  */
 export async function changeLeaveOut(account: string, leaveOut: boolean): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
-  const db = serviceClient();
-  const { data, error } = await db.from("finance_plan_drivers").select("key,value").eq("key", "safe-to-move");
-  if (error) {
-    console.error(`plan driver read failed: ${error.code ?? "unknown"}`);
-    return { ok: false, status: 500, error: "could not save" };
-  }
-  const merged = mergeLeaveOut(((data ?? [])[0] as { value?: unknown } | undefined)?.value ?? null, account, leaveOut);
-  if (!merged.ok) return { ok: false, status: 400, error: merged.error };
-  const saved = await saveDriver("safe-to-move", merged.value);
-  return saved.ok ? { ok: true } : { ok: false, status: 500, error: "could not save" };
+  return applyLeaveOut(leaveOutStore(serviceClient()), account, leaveOut);
 }

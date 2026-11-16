@@ -23,8 +23,9 @@ const PROFILE = {
 
 // Every table the loader reads; each query resolves to the table's rows (filters are not needed here, except on the
 // balance snapshots: gte / eq / order / limit, so the 60-day read and the newest-snapshot read differ). A table in
-// `failing` answers a database error instead.
-function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = [], balances = [], drivers = [] } = {}) {
+// `failing` answers a database error instead. `olderRead` = how the per-account newest-snapshot read (the one with
+// eq on account_key) answers: "error" (a database error) or "reject" (the request itself fails); default: rows.
+function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = [], balances = [], drivers = [], olderRead = "rows" } = {}) {
   const tables = {
     finance_accounts: [{ account_key: "demo-checking", institution: "Demo Bank", account_name: "Checking", account_type: "Cash", mask: "0001" }, ...accounts],
     finance_balance_snapshots: [{ account_key: "demo-checking", captured_at: new Date(now.getTime() - 3_600_000).toISOString(), balance_cents: 5_000_000, currency: "USD", kind: "asset" }, ...balances],
@@ -51,13 +52,18 @@ function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = []
         }
         return rows;
       };
+      const olderOne = () => table === "finance_balance_snapshots" && calls.some(([k, a]) => k === "eq" && a[0] === "account_key");
       const answer = () => {
         if (failing.includes(table)) return { data: null, error: { code: "57014", message: "synthetic failure" }, count: null };
+        if (olderOne() && olderRead === "error") return { data: null, error: { code: "57014", message: "synthetic failure" }, count: null };
         const rows = rowsNow();
         return { data: rows, error: null, count: rows.length };
       };
       const b = new Proxy({}, {
-        get: (_, k) => (k === "then" ? (res, rej) => Promise.resolve(answer()).then(res, rej) : (...a) => (calls.push([k, a]), b)),
+        get: (_, k) =>
+          k === "then"
+            ? (res, rej) => (olderOne() && olderRead === "reject" ? Promise.reject(new Error("synthetic network failure")) : Promise.resolve(answer())).then(res, rej)
+            : (...a) => (calls.push([k, a]), b),
       });
       return b;
     },
@@ -229,15 +235,20 @@ test("category fixes that could not be read: no amount in the base plan or the w
   assert.deepEqual(load.scenario.result.eligibility.reasons.map((r) => r.code), ["categories-unavailable"]);
 });
 
-test("a cash account the feed stopped refreshing: a small one is left out and named, a larger one waits for Riley", async () => {
+test("a cash account the feed stopped refreshing withholds the amount whatever its size, until Riley leaves it out", async () => {
   const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
   const old = (cents) => ({ account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - 90 * 86_400_000).toISOString(), balance_cents: cents, currency: "USD", kind: "asset" });
-  // Small: its newest snapshot (outside the 60-day read) is read on its own; the amount leaves it out and names it.
+  // Small: its newest snapshot (outside the 60-day read) is read on its own; too old to trust, so no amount.
   const small = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(4_000)] })(AT);
-  assert.equal(small.result.eligibility.eligible, true);
-  assert.deepEqual(small.result.eligibility.leftOut.map((l) => [l.account, l.why]), [["demo-wallet", "small"]]);
+  assert.deepEqual(small.result.eligibility.reasons.map((r) => [r.code, r.account]), [["stale-balance", "demo-wallet"]]);
+  assert.equal("leftOut" in small.result.eligibility, false, "nothing is left out automatically");
   assert.equal(small.result.opening.cents, 5_004_000, "the projection counts its last balance");
-  assert.equal(typeof small.result.headlines.safeToMoveCents, "number");
+  assert.equal(small.result.headlines.safeToMoveCents, null);
+  // Left out by Riley: the amount comes back and the account is named, dated by its last balance.
+  const smallChosen = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(4_000)], drivers: [{ key: "safe-to-move", value: { leaveOut: ["demo-wallet"] } }] })(AT);
+  assert.equal(smallChosen.result.eligibility.eligible, true);
+  assert.deepEqual(smallChosen.result.eligibility.leftOut.map((l) => [l.account, l.why, l.asOf]), [["demo-wallet", "chosen", old(0).captured_at]]);
+  assert.equal(typeof smallChosen.result.headlines.safeToMoveCents, "number");
   // Larger: it stays missing (the projection counts it as $0) and withholds the amount, naming the account.
   const large = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(400_000)] })(AT);
   assert.deepEqual(large.result.eligibility.reasons.map((r) => [r.code, r.account]), [["missing-balance", "demo-wallet"]]);
@@ -272,6 +283,104 @@ test("an overdraft older than the 60-day read still lowers the amount, even when
   // A liability-kind snapshot is a debt whatever its sign.
   const owed = await loader({ txns: everyday(AT), accounts: [wallet], balances: [{ ...old(400_000), kind: "liability" }], drivers: leave })(AT);
   assert.equal(owed.result.headlines.safeToMoveCents, debt.result.headlines.safeToMoveCents);
+});
+
+test("a failed older-balance read is unknown, not $0: no amount even when Riley left the account out; a good read recovers", async () => {
+  const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
+  const overdraft = { account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - 90 * 86_400_000).toISOString(), balance_cents: -400_000, currency: "USD", kind: "asset" };
+  const leave = [{ key: "safe-to-move", value: { leaveOut: ["demo-wallet"] } }];
+  for (const olderRead of ["error", "reject"]) {
+    // Left out: the unread balance (here an overdraft) must not become $0 and an eligible amount.
+    const failed = await loader({ txns: everyday(AT), accounts: [wallet], balances: [overdraft], drivers: leave, olderRead })(AT, { otherIncome: 6_000 });
+    assert.equal(failed.kind, "ok", `${olderRead}: the forecast is still drawn`);
+    assert.deepEqual(failed.result.eligibility.reasons.map((r) => [r.code, r.account]), [["balance-unreadable", undefined]], `${olderRead}: no Leave it out on it`);
+    assert.equal(failed.result.headlines.safeToMoveCents, null);
+    assert.deepEqual(failed.scenario.result.eligibility.reasons.map((r) => r.code), ["balance-unreadable"], "the what-if reads the same inputs");
+    assert.equal(failed.scenario.result.headlines.safeToMoveCents, null);
+    assert.ok(failed.result.days.length > 0);
+    // Not left out: still "could not be read", never "no recent balance".
+    const open = await loader({ txns: everyday(AT), accounts: [wallet], balances: [overdraft], olderRead })(AT);
+    assert.deepEqual(open.result.eligibility.reasons.map((r) => r.code), ["balance-unreadable"]);
+  }
+  // Recovery: the same read answering again brings the amount back, with the debt still lowering it.
+  const recovered = await loader({ txns: everyday(AT), accounts: [wallet], balances: [overdraft], drivers: leave })(AT);
+  assert.equal(recovered.result.eligibility.eligible, true);
+  assert.equal(recovered.result.opening.cents, 4_600_000, "the debt is read again");
+  assert.equal(typeof recovered.result.headlines.safeToMoveCents, "number");
+  // No older read is made (and none can fail) when every cash account has a balance in the 60-day read.
+  const inWindow = await loader({ txns: everyday(AT), olderRead: "error" })(AT);
+  assert.equal(inWindow.result.eligibility.eligible, true);
+});
+
+test("Leave it out on the server: every write is conditional on the version read, and a lost race is reported as a conflict", async () => {
+  // A stand-in for pds.finance_plan_drivers that records each query and answers what `answers` says for it.
+  function driversDb(answers) {
+    const queries = [];
+    return {
+      queries,
+      from(table) {
+        assert.equal(table, "finance_plan_drivers");
+        const q = { calls: [] };
+        queries.push(q);
+        const b = new Proxy({}, {
+          get: (_, k) => (k === "then" ? (res, rej) => Promise.resolve(answers(q)).then(res, rej) : (...a) => (q.calls.push([k, ...a]), b)),
+        });
+        return b;
+      },
+    };
+  }
+  const kind = (q) => q.calls[0][0];
+  const S = loadTs("lib/cash-forecast-server.ts", {
+    "server-only": {},
+    "@/lib/finance-ledger-server": { serviceClient: () => null, fetchPaged: async () => ({ rows: [], truncated: false }), loadCategoryFixes: async () => ({}) },
+  });
+  const V = "2030-06-15T16:00:00.000456+00:00";
+  // read: the row's updated_at is its version.
+  const reading = driversDb(() => ({ data: [{ value: { leaveOut: ["a"] }, updated_at: V }], error: null }));
+  assert.deepEqual(await S.leaveOutStore(reading).read(), { ok: true, row: { value: { leaveOut: ["a"] }, version: V } });
+  assert.deepEqual(reading.queries[0].calls, [["select", "value,updated_at"], ["eq", "key", "safe-to-move"]]);
+  assert.deepEqual(await S.leaveOutStore(driversDb(() => ({ data: [], error: null }))).read(), { ok: true, row: null });
+  assert.deepEqual(await S.leaveOutStore(driversDb(() => ({ data: null, error: { code: "57014" } }))).read(), { ok: false });
+  assert.deepEqual(await S.leaveOutStore(driversDb(() => ({ data: [{ value: {}, updated_at: null }], error: null }))).read(), { ok: false }, "no version, no write");
+  // update / remove: WHERE key AND updated_at = the version read; no row matched = a conflict, nothing written.
+  for (const [method, args] of [["update", [V, { leaveOut: ["a", "b"] }]], ["remove", [V]]]) {
+    const matched = driversDb(() => ({ data: [{ key: "safe-to-move" }], error: null }));
+    assert.equal(await S.leaveOutStore(matched)[method](...args), "ok", method);
+    const calls = matched.queries[0].calls;
+    assert.equal(kind(matched.queries[0]), method === "update" ? "update" : "delete");
+    assert.ok(calls.some((c) => c[0] === "eq" && c[1] === "key" && c[2] === "safe-to-move"), `${method} names the key`);
+    assert.ok(calls.some((c) => c[0] === "eq" && c[1] === "updated_at" && c[2] === V), `${method} is conditional on the version read`);
+    if (method === "update") assert.ok(calls[0][1].updated_at > "2030-06-15T16:00:00.000456", "the new version is later than the one read");
+    assert.equal(await S.leaveOutStore(driversDb(() => ({ data: [], error: null })))[method](...args), "conflict", `${method}: lost the race`);
+    assert.equal(await S.leaveOutStore(driversDb(() => ({ data: null, error: { code: "57014" } })))[method](...args), "error");
+  }
+  // insert: a row that appeared since the read (primary key) is a conflict, any other error an error.
+  const inserted = driversDb(() => ({ data: null, error: null }));
+  assert.equal(await S.leaveOutStore(inserted).insert({ leaveOut: ["a"] }), "ok");
+  assert.equal(kind(inserted.queries[0]), "insert");
+  assert.equal(inserted.queries[0].calls[0][1].key, "safe-to-move");
+  assert.equal(await S.leaveOutStore(driversDb(() => ({ data: null, error: { code: "23505" } }))).insert({ leaveOut: ["a"] }), "conflict");
+  assert.equal(await S.leaveOutStore(driversDb(() => ({ data: null, error: { code: "57014" } }))).insert({ leaveOut: ["a"] }), "error");
+  // End to end over the stand-in: a second tab's change lands between this read and this write; both survive.
+  let row = { value: { leaveOut: ["a"] }, updated_at: "v0" };
+  let raced = false;
+  const live = driversDb((q) => {
+    const eq = (col) => q.calls.find((c) => c[0] === "eq" && c[1] === col)?.[2];
+    if (kind(q) === "select") return { data: row ? [row] : [], error: null };
+    if (!raced) {
+      raced = true;
+      row = { value: { leaveOut: ["a", "c"] }, updated_at: "v1" };
+    }
+    if (kind(q) === "update") {
+      if (!row || eq("updated_at") !== row.updated_at) return { data: [], error: null };
+      row = { value: q.calls[0][1].value, updated_at: q.calls[0][1].updated_at };
+      return { data: [{ key: "safe-to-move" }], error: null };
+    }
+    throw new Error(`unexpected ${kind(q)}`);
+  });
+  const Store = loadTs("lib/cash-forecast-store.ts");
+  assert.deepEqual(await Store.applyLeaveOut(S.leaveOutStore(live), "b", true), { ok: true });
+  assert.deepEqual([...row.value.leaveOut].sort(), ["a", "b", "c"], "the other tab's choice is kept");
 });
 
 test("a saved tax profile or move plan that no longer parses withholds the amount, in the base plan and the what-if", async () => {

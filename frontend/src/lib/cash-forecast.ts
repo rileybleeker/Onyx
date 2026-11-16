@@ -141,6 +141,12 @@ export interface InputQuality {
   planInvalid?: boolean;
   /** Riley's category fixes could not be read, so transfers and card payments are classified from raw categories. */
   categoriesUnavailable?: boolean;
+  /**
+   * Pool accounts whose balance read FAILED (not "no row": the read itself errored), so their balance is unknown and
+   * could be an overdraft. Each withholds the amount even when Riley left the account out: leaving an account out
+   * narrows what the amount counts, it does not make an unread balance known.
+   */
+  balanceUnreadable?: readonly string[];
 }
 /** Why the forecast's inputs do not support an actionable amount. */
 export type EligibilityCode =
@@ -149,6 +155,7 @@ export type EligibilityCode =
   | "missing-balance"
   | "invalid-balance"
   | "stale-balance"
+  | "balance-unreadable"
   | "freshness-unknown"
   | "short-history"
   | "history-truncated"
@@ -161,17 +168,23 @@ export interface EligibilityReason {
   code: EligibilityCode;
   /** One short sentence, shown next to the withheld amount and on Today. */
   text: string;
-  /** The pool account a balance reason is about: Riley can leave it out of the amount to clear the reason. */
+  /**
+   * The pool account a balance reason is about: Riley can leave it out of the amount to clear the reason. Absent on
+   * a reason leaving an account out cannot clear (an unreadable balance).
+   */
   account?: string;
 }
-/** A pool account whose balance the safe-to-move amount does not count (its positive part is taken out). */
+/**
+ * A pool account whose balance the safe-to-move amount does not count (its positive part is taken out). Only Riley's
+ * explicit choice (driver "safe-to-move") leaves an account out: a stale balance of any size withholds the amount.
+ */
 export interface LeftOutAccount {
   account: string;
   label: string;
   /** Its newest balance time (ISO); null when it has none. */
   asOf: string | null;
-  /** "small": under FORECAST.smallBalanceCents and older than the freshness limit; "chosen": Riley left it out. */
-  why: "small" | "chosen";
+  /** Riley left it out ("Leave it out"). The only value: nothing leaves an account out automatically. */
+  why: "chosen";
 }
 /**
  * Whether the inputs were complete and fresh enough for the ACTIONABLE number (safe to move). When false the
@@ -1008,6 +1021,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
   // What the actionable amount does not count, and how long its check holds (eligibility below).
   const staleMs = FORECAST.staleBalanceHours * 3_600_000;
   const leaveOut = new Set(settings.safeToMoveLeaveOut ?? []);
+  const unreadable = new Set(quality.balanceUnreadable ?? []);
   const leftOut: LeftOutAccount[] = [];
   let leftOutCents = 0;
   let cashAsOf: string | null = null;
@@ -1021,12 +1035,18 @@ export function forecastCash(input: ForecastInput): ForecastResult {
       const label = accountsByKey.get(k)?.label ?? k;
       const chosen = leaveOut.has(k);
       const b = latest.get(k);
+      // A balance read that failed: the balance is unknown (it could be an overdraft), so the amount is withheld
+      // whether or not Riley left the account out, and the reason carries no account (leaving it out cannot clear it).
+      if (unreadable.has(k)) reason("balance-unreadable", `The balance for ${label} could not be read.`);
       if (!b || !Number.isFinite(b.balance_cents)) {
         warnings.push(`No balance for ${label}: counted as $0.`);
         if (chosen) leftOut.push({ account: k, label, asOf: null, why: "chosen" });
-        // A row in another currency (or with no usable amount) is there but cannot be counted: invalid, not missing.
-        else if (b || input.balances.some((x) => x.account_key === k)) reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`, k);
-        else reason("missing-balance", `No recent balance for ${label}.`, k);
+        // An unreadable one is already named above: not "missing", the read did not answer.
+        else if (!unreadable.has(k)) {
+          // A row in another currency (or with no usable amount) is there but cannot be counted: invalid, not missing.
+          if (b || input.balances.some((x) => x.account_key === k)) reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`, k);
+          else reason("missing-balance", `No recent balance for ${label}.`, k);
+        }
         continue;
       }
       found++;
@@ -1058,14 +1078,11 @@ export function forecastCash(input: ForecastInput): ForecastResult {
         reason("invalid-balance", `The balance for ${label} is dated in the future.`, k);
         continue;
       }
+      // A balance too old to trust withholds the amount whatever its size: an old small or zero balance is no proof
+      // the account is not overdrawn now. Leaving the account out ("Leave it out", Riley's explicit choice) is the
+      // only way to stop it counting.
       if (tooOld) {
-        if (big) reason("stale-balance", `The balance for ${label} is older than ${FORECAST.staleBalanceHours} hours.`, k);
-        else {
-          // A small balance too old to trust is not counted in the amount (and is named next to it) instead of
-          // withholding it: the amount never rests on it, and an account that rarely updates cannot lock it out.
-          leftOut.push({ account: k, label, asOf: b.captured_at, why: "small" });
-          leftOutCents += Math.max(0, signedCents);
-        }
+        reason("stale-balance", `The balance for ${label} is older than ${FORECAST.staleBalanceHours} hours.`, k);
         continue;
       }
       // A fresh balance the amount counts: the check holds until it turns staleBalanceHours old.
@@ -1332,8 +1349,8 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     lowestLikely,
     // Withheld unless every input was read, complete and fresh: an amount Riley could act on must not rest on a
     // stale balance or on planned obligations that could not be read.
-    // Accounts left out (Riley's choice, or a small balance too old to trust) take their positive balance out of
-    // both the opening and the lowest point: the same as starting the path without it.
+    // Accounts Riley left out take their positive balance out of both the opening and the lowest point: the same as
+    // starting the path without it (an overdraft on one keeps lowering the amount).
     safeToMoveCents: eligibility.eligible && lowest ? Math.max(0, Math.min(opening, lowest.cents) - leftOutCents - buffer) : null,
     end13w: at(Math.min(91, H)),
     end12m: at(Math.min(365, H)),

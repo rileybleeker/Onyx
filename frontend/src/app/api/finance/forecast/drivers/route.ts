@@ -8,7 +8,8 @@ const answer = (body: unknown, status = 200) => NextResponse.json(body, { status
 
 // PUT /api/finance/forecast/drivers  body {key: 'settings' | 'card:<account_key>' | 'growth:<account_key>', value: {...} | null}
 //   or {key: 'safe-to-move', account: <account_key>, leaveOut: boolean} (one account left out of / counted again in
-//   the safe-to-move amount, merged with the saved list on the server).
+//   the safe-to-move amount, applied to the saved list with a compare-and-swap; 409 if it kept colliding with
+//   another change; the only accepted 'safe-to-move' body).
 // Saves one forecast driver (buffer line, a card's APR / promo end, an account's expected return). Owner
 // session only, same-origin JSON, at most 2 KB. Writes one row of pds.finance_plan_drivers.
 export async function PUT(req: NextRequest) {
@@ -29,7 +30,7 @@ export async function PUT(req: NextRequest) {
   } catch {
     return answer({ error: "saving is not configured" }, 503);
   }
-  // {key: 'safe-to-move', account, leaveOut}: one account's change, merged on the server with the saved list.
+  // {key: 'safe-to-move', account, leaveOut}: one account's change, applied with a compare-and-swap (applyLeaveOut).
   const change = parseLeaveOutChange(body, known);
   if (change) {
     if (!change.ok) return answer({ error: change.error }, 400);
