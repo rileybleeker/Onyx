@@ -470,30 +470,66 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         # the parent already failed: its own verification acted; a person decides
         self.assertIsNone(mt.smoke_culprit(self.E, "fail", 600))
 
+    def at(self, offset_s):
+        """A synthetic created_at, offset_s seconds after NOW, in the form GitHub writes."""
+        return mt.iso_utc(self.NOW + offset_s)
+
     def test_failed_smoke_fixed_by_a_newer_exact_pass_is_a_stale_rollback(self):
-        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "pass"), (self.P, "unknown")]), self.N)
-        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "unknown"), (self.P, "pass")]), self.P)
-        self.assertIsNone(mt.smoke_fixed_later("fail", [(self.N, "fail"), (self.P, "unknown")]))
-        self.assertIsNone(mt.smoke_fixed_later("fail", []))
+        later, t = self.at(60), self.NOW
+        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "pass", later), (self.P, "unknown", "")], t), self.N)
+        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "unknown", ""), (self.P, "pass", later)], t), self.P)
+        self.assertIsNone(mt.smoke_fixed_later("fail", [(self.N, "fail", later), (self.P, "unknown", "")], t))
+        self.assertIsNone(mt.smoke_fixed_later("fail", [], t))
         # a commit whose own smoke receipt is not a failure is never "fixed" by a later pass
-        self.assertIsNone(mt.smoke_fixed_later("pass", [(self.N, "pass")]))
-        self.assertIsNone(mt.smoke_fixed_later("unknown", [(self.N, "pass")]))
+        self.assertIsNone(mt.smoke_fixed_later("pass", [(self.N, "pass", later)], t))
+        self.assertIsNone(mt.smoke_fixed_later("unknown", [(self.N, "pass", later)], t))
 
-    def rows(self, *states):
-        """Synthetic commit statuses, newest first, written by the workflow's own token."""
-        return [self.status(st) for st in states]
+    def test_a_newer_commits_pass_counts_only_when_recorded_after_the_failure(self):
+        # Codex R6: an older descendant pass, then a new failure (a Vercel rollback, changed live data), proves
+        # nothing about that failure; neither does a pass whose time cannot be read, or a failure with no time
+        for unattributed in (False, True):
+            own = "unknown" if unattributed else "fail"
+            self.assertIsNone(mt.smoke_fixed_later(own, [(self.N, "pass", self.at(-60))], self.NOW, unattributed))
+            self.assertIsNone(mt.smoke_fixed_later(own, [(self.N, "pass", self.at(0))], self.NOW, unattributed))
+            self.assertIsNone(mt.smoke_fixed_later(own, [(self.N, "pass", "")], self.NOW, unattributed))
+            self.assertIsNone(mt.smoke_fixed_later(own, [(self.N, "pass", "2027-01-15T08:00:00")], self.NOW,
+                                                   unattributed))  # no zone: never read in the runner's zone
+            self.assertIsNone(mt.smoke_fixed_later(own, [(self.N, "pass", self.at(60))], None, unattributed))
+            # a newer commit's old pass is skipped; an even newer one that passed after the failure counts
+            chain = [(self.N, "pass", self.at(120)), (self.P, "pass", self.at(-60))]
+            self.assertEqual(mt.smoke_fixed_later(own, chain, self.NOW, unattributed), self.N)
+            chain = [(self.N, "pass", self.at(-30)), (self.P, "pass", self.at(-60))]
+            self.assertIsNone(mt.smoke_fixed_later(own, chain, self.NOW, unattributed))
 
-    def fixed(self, receipts, own_states=("success",), later=None, unattributed=False):
+    def test_receipt_times(self):
+        self.assertEqual(mt.receipt_time(mt.iso_utc(self.NOW)), self.NOW)
+        self.assertEqual(mt.iso_utc(self.NOW + 0.9), mt.iso_utc(self.NOW))  # GitHub's resolution: whole seconds
+        self.assertEqual(mt.receipt_time("2027-01-15T08:00:00+00:00"), mt.receipt_time("2027-01-15T08:00:00Z"))
+        for bad in ("", None, "not a time", "2027-01-15T08:00:00"):
+            self.assertIsNone(mt.receipt_time(bad), bad)
+
+    def rows(self, *states, newest=0):
+        """Synthetic commit statuses, newest first, written by the workflow's own token. The newest is recorded
+        `newest` seconds after NOW, each older one a minute before the one above it."""
+        return [self.status(st, created_at=self.at(newest - 60 * i)) for i, st in enumerate(states)]
+
+    def fixed(self, receipts, own_states=("success",), later=None, unattributed=False, failed_at=None):
         later = [(self.N, ["success"])] if later is None else later
         with patch.object(mt, "later_chain", return_value=later), \
                 patch.object(mt, "production_states", return_value=list(own_states)), \
                 patch.object(mt, "smoke_rows", side_effect=lambda sha: receipts.get(sha, [])):
-            return mt.already_fixed(self.E, unattributed=unattributed)
+            return mt.already_fixed(self.E, unattributed=unattributed, failed_at=failed_at)
 
     def test_already_fixed_checks_the_smoke_receipts_after_the_build(self):
-        self.assertEqual(self.fixed({self.E: self.rows("failure"), self.N: self.rows("success")}), self.N)
+        receipts = {self.E: self.rows("failure"), self.N: self.rows("success", newest=600)}
+        self.assertEqual(self.fixed(receipts), self.N)  # no time given: E's own failure receipt is the failure
+        self.assertEqual(self.fixed(receipts, failed_at=self.NOW + 5), self.N)  # the receipt job's observed_at
+        # the newer pass is from before this failure: it proves nothing, the revert goes ahead
+        receipts = {self.E: self.rows("failure"), self.N: self.rows("success", newest=-600)}
+        self.assertIsNone(self.fixed(receipts))
+        self.assertIsNone(self.fixed(receipts, failed_at=self.NOW + 5))
         # smoke passed (and never failed): nothing to fix
-        self.assertIsNone(self.fixed({self.E: self.rows("success"), self.N: self.rows("success")}))
+        self.assertIsNone(self.fixed({self.E: self.rows("success"), self.N: self.rows("success", newest=600)}))
 
     def test_a_later_pass_of_the_commit_itself_is_recovery(self):
         # Codex round 2: the failure did not last, so the queued revert would take a working change off the site
@@ -505,22 +541,48 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
         self.assertFalse(mt.smoke_recovered([self.status("success", creator="someone"), self.status("failure")]))
         self.assertFalse(mt.smoke_recovered([]))
         self.assertEqual(self.fixed({self.E: self.rows("success", "failure")}, later=[]), self.E)
+        # with the failure's own time: only a pass recorded after it
+        self.assertTrue(mt.smoke_recovered(self.rows("success", newest=60), self.NOW))
+        self.assertFalse(mt.smoke_recovered(self.rows("success", newest=0), self.NOW))
+        self.assertFalse(mt.smoke_recovered(self.rows("success", newest=-60), self.NOW))
+        self.assertFalse(mt.smoke_recovered([self.status("success")], self.NOW))  # no readable time
+        self.assertFalse(mt.smoke_recovered(self.rows("failure", "success", newest=60), self.NOW))
         # a drill on a commit that only ever passed still opens its revert
         self.assertIsNone(self.fixed({self.E: self.rows("success")}, later=[]))
         self.assertIn("did not last", mt.fixed_how(self.E, self.E))
         self.assertIn(f"fixed by `{self.N[:7]}`", mt.fixed_how(self.E, self.N))
 
-    def test_an_unattributed_halt_is_resolved_by_any_newer_exact_pass(self):
+    def test_an_unattributed_halt_is_resolved_by_a_newer_exact_pass_after_the_failure(self):
         # Codex round 2: a newer commit containing this one passed on its own deployment, so production works again
-        self.assertEqual(mt.smoke_fixed_later("unknown", [(self.N, "pass")], unattributed=True), self.N)
-        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "pass")], unattributed=True), self.N)
-        self.assertIsNone(mt.smoke_fixed_later("unknown", [(self.N, "unknown")], unattributed=True))
-        self.assertIsNone(mt.smoke_fixed_later("unknown", [], unattributed=True))
-        receipts = {self.E: self.rows("pending"), self.N: self.rows("success")}  # the halt left only "pending"
-        self.assertEqual(self.fixed(receipts, unattributed=True), self.N)
+        later = self.at(60)
+        self.assertEqual(mt.smoke_fixed_later("unknown", [(self.N, "pass", later)], self.NOW, True), self.N)
+        self.assertEqual(mt.smoke_fixed_later("fail", [(self.N, "pass", later)], self.NOW, True), self.N)
+        self.assertIsNone(mt.smoke_fixed_later("unknown", [(self.N, "unknown", "")], self.NOW, True))
+        self.assertIsNone(mt.smoke_fixed_later("unknown", [], self.NOW, True))
+        receipts = {self.E: self.rows("pending"), self.N: self.rows("success", newest=600)}  # the halt left "pending"
+        self.assertEqual(self.fixed(receipts, unattributed=True, failed_at=self.NOW), self.N)
         self.assertIsNone(self.fixed(receipts))  # a revert still needs sha's own exact failure first
-        # a build halt: a newer good build containing it settles it, as for a revert
+        # Codex R6: a halt whose failure time is not known (its receipt could not be written) keeps the halt
+        self.assertIsNone(self.fixed(receipts, unattributed=True))
+        # a build halt: a newer good build containing it settles it, as for a revert, with or without a time
         self.assertEqual(self.fixed({}, own_states=["failure"], unattributed=True), self.N)
+
+    def test_an_old_recovery_never_hides_a_new_unattributed_failure(self):
+        # Codex R6: an exact failure, then a pass on the commit's own deployment, then a run that failed twice without
+        # confirmed provenance. Pending never overwrites the old pass, so it is still the newest exact receipt: it
+        # must not count as recovery from the NEW failure, observed after it.
+        history = self.rows("success", "failure", newest=-600)  # failed at NOW-660, recovered at NOW-600
+        failed_at = self.NOW  # the new double unverified failure, as the receipt job observed it
+        self.assertFalse(mt.smoke_recovered(history, failed_at))
+        self.assertIsNone(self.fixed({self.E: history}, later=[], unattributed=True, failed_at=failed_at))
+        # an older descendant pass, from before the new failure, does not resolve it either
+        old_descendant = {self.E: history, self.N: self.rows("success", newest=-300)}
+        self.assertIsNone(self.fixed(old_descendant, unattributed=True, failed_at=failed_at))
+        # a pass recorded after the new failure does: on the commit itself, or on a newer commit containing it
+        self.assertEqual(self.fixed({self.E: self.rows("success", "success", "failure", newest=120)}, later=[],
+                                    unattributed=True, failed_at=failed_at), self.E)
+        self.assertEqual(self.fixed({self.E: history, self.N: self.rows("success", newest=300)},
+                                    unattributed=True, failed_at=failed_at), self.N)
 
     def test_already_fixed_never_reads_receipts_for_a_failed_build_and_survives_an_unreadable_one(self):
         with patch.object(mt, "later_chain", return_value=[(self.N, ["failure"])]), \
@@ -532,26 +594,27 @@ class SmokeCulpritAndStaleRollback(unittest.TestCase):
                 patch.object(mt, "production_states", return_value=["success"]), \
                 patch.object(mt, "smoke_rows", side_effect=mt.GhError("HTTP 502")):
             self.assertIsNone(mt.already_fixed(self.E))  # unknown, never a crash before the revert or halt
-            self.assertIsNone(mt.already_fixed(self.E, unattributed=True))
+            self.assertIsNone(mt.already_fixed(self.E, unattributed=True, failed_at=self.NOW))
 
 
 class RollbackReconciles(unittest.TestCase):
     """rollback() and the train re-read the deployment history and the smoke receipts before acting (Codex round 2).
     GitHub and git are faked; nothing is created or pushed."""
     E, N = "e" * 40, "f" * 40
+    NOW = 1_800_000_000.0
 
-    def run_rollback(self, fixer):
+    def run_rollback(self, fixer, failed_at=None):
         calls = []
 
         def fake_gh(*a, check=True):
             calls.append(a)
             return ""
-        fixed = fixer if callable(fixer) else (lambda sha, unattributed=False: fixer)
+        fixed = fixer if callable(fixer) else (lambda sha, unattributed=False, failed_at=None: fixer)
         subject = type("Proc", (), {"stdout": "feat: synthetic change\n"})()
         with patch.object(mt, "gh", side_effect=fake_gh), patch.object(mt, "ensure_labels"), \
                 patch.object(mt, "note"), patch.object(mt, "already_fixed", side_effect=fixed), \
                 patch.object(mt.subprocess, "run", return_value=subject):
-            code = mt.rollback(self.E, "synthetic reason", halt_only=True)
+            code = mt.rollback(self.E, "synthetic reason", halt_only=True, failed_at=failed_at)
         return code, calls
 
     def test_a_halt_is_dropped_when_a_newer_commit_already_passed(self):
@@ -560,21 +623,65 @@ class RollbackReconciles(unittest.TestCase):
         self.assertFalse([c for c in calls if c[:2] == ("issue", "create")])
 
     def test_a_halt_goes_ahead_without_evidence_or_with_an_unreadable_history(self):
-        def unreadable(sha, unattributed=False):
+        def unreadable(sha, unattributed=False, failed_at=None):
             raise mt.GhError("HTTP 502")
         for fixer in (None, unreadable):
             code, calls = self.run_rollback(fixer)
             self.assertEqual(code, 1)
             self.assertTrue([c for c in calls if c[:2] == ("issue", "create")], fixer)
 
-    def test_the_halt_check_reads_the_unattributed_rule(self):
+    def test_the_halt_check_reads_the_unattributed_rule_with_the_failure_time(self):
         seen = []
 
-        def fixed(sha, unattributed=False):
-            seen.append((sha, unattributed))
+        def fixed(sha, unattributed=False, failed_at=None):
+            seen.append((sha, unattributed, failed_at))
             return None
+        self.run_rollback(fixed, failed_at=self.NOW)
         self.run_rollback(fixed)
-        self.assertEqual(seen, [(self.E, True)])
+        self.assertEqual(seen, [(self.E, True, self.NOW), (self.E, True, None)])
+
+    def test_fail_pass_then_a_double_unverified_failure_still_halts(self):
+        # Codex R6, end to end through rollback() with the real reconciliation: the commit failed exactly, passed on
+        # its own deployment, and now failed twice without confirmed provenance (its receipt stayed the old pass).
+        def status(state, offset):
+            return dict(context=mt.SMOKE_CONTEXT, state=state, creator="github-actions[bot]",
+                        created_at=mt.iso_utc(self.NOW + offset))
+        history = {self.E: [status("success", -600), status("failure", -660)]}
+
+        def run(receipts, failed_at, later=()):
+            calls = []
+
+            def fake_gh(*a, check=True):
+                calls.append(a)
+                return ""
+            subject = type("Proc", (), {"stdout": "feat: synthetic change\n"})()
+            with patch.object(mt, "gh", side_effect=fake_gh), patch.object(mt, "ensure_labels"), \
+                    patch.object(mt, "note"), patch.object(mt.subprocess, "run", return_value=subject), \
+                    patch.object(mt, "later_chain", return_value=list(later)), \
+                    patch.object(mt, "production_states", return_value=["success"]), \
+                    patch.object(mt, "smoke_rows", side_effect=lambda sha: receipts.get(sha, [])):
+                code = mt.rollback(self.E, "synthetic reason", halt_only=True, failed_at=failed_at)
+            return code, [c for c in calls if c[:2] == ("issue", "create")]
+        for failed_at in (self.NOW, None):  # the new failure's time, or none at all
+            code, issues = run(history, failed_at)
+            self.assertEqual((code, len(issues)), (1, 1), failed_at)
+        # an older pass of a newer commit containing it does not drop the halt either
+        code, issues = run(dict(history, **{self.N: [status("success", -300)]}), self.NOW, [(self.N, ["success"])])
+        self.assertEqual((code, len(issues)), (1, 1))
+        # a pass recorded after the new failure does
+        code, issues = run(dict(history, **{self.N: [status("success", 300)]}), self.NOW, [(self.N, ["success"])])
+        self.assertEqual((code, len(issues)), (0, 0))
+
+    def test_rollback_reads_the_failure_time_from_the_command_line(self):
+        seen = []
+        with patch.object(mt, "rollback", side_effect=lambda *a: seen.append(a) or 0):
+            mt.main(["rollback", "--sha", self.E, "--reason", "r", "--halt-only",
+                     "--failed-at", mt.iso_utc(self.NOW)])
+            mt.main(["rollback", "--sha", self.E, "--reason", "r", "--failed-at", ""])
+            mt.main(["rollback", "--sha", self.E, "--reason", "r", "--failed-at", "not a time"])
+            mt.main(["rollback", "--sha", self.E, "--reason", "r"])
+        self.assertEqual(seen, [(self.E, "r", True, self.NOW), (self.E, "r", False, None),
+                                (self.E, "r", False, None), (self.E, "r", False, None)])
 
     def test_a_queued_revert_of_a_commit_that_passed_again_is_closed(self):
         calls = []
@@ -793,6 +900,7 @@ class SmokeCommands(unittest.TestCase):
         fail = ("fail", "failure", "failed on host")
         code, out, status = self.receipt([fail, fail])
         self.assertEqual((code, out["action"], out["culprit"]), (0, "revert", self.E))
+        self.assertEqual(out["observed_at"], mt.iso_utc(self.NOW))  # rollback reconciles only after this time
         self.assertIn("state=failure", status)
         self.assertIn(f"context={mt.SMOKE_CONTEXT}", status)
         self.assertTrue(status[3].endswith(f"/statuses/{self.E}"))
@@ -830,6 +938,7 @@ class SmokeCommands(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertNotIn("action", out)  # the workflow then halts without a revert
         self.assertNotIn("culprit", out)
+        self.assertNotIn("observed_at", out)  # and with no failure time, no smoke pass can cancel that halt
 
     def test_receipt_only_on_a_master_commit(self):
         # a dispatch with a PR head must not put a pending status on that PR (the train would wait on it)
@@ -911,6 +1020,10 @@ class SmokeWorkflowContract(unittest.TestCase):
         self.assertIn("(needs.receipt.result == 'failure' && needs.smoke.result == 'failure' && "
                       "(needs.smoke-retry.result == 'failure' || needs.smoke-retry.result == 'skipped'))", wf)
         self.assertNotIn("needs.smoke-retry.result == 'cancelled'", wf)
+        # Codex R6: the failure time travels from the receipt to rollback, which reconciles only after it
+        self.assertIn("observed_at: ${{ steps.r.outputs.observed_at }}", wf)
+        self.assertIn("FAILED_AT: ${{ needs.receipt.outputs.observed_at }}", wf)
+        self.assertIn('--failed-at "$FAILED_AT"', wf)
         # rollback() reads deployments and commit statuses; job permissions replace the workflow's
         rollback_job = wf.split("\n  rollback:\n", 1)[1]
         self.assertIn("statuses: read", rollback_job)
