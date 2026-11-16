@@ -223,6 +223,12 @@ class EightSleepClient:
 
         Unlike the /intervals collection (capped at the 10 most recent
         sessions), this per-ID endpoint serves sessions of any age.
+
+        Used only by the temp self-heal and eight_sleep_temp_backfill.py, whose
+        log is the public Actions log: a retried network error is logged by
+        type only (quote_errors=False), because its text is not ours and can
+        quote the request (user and session ids). The final error still
+        propagates and the heal counts it by type and code (_safe_error).
         """
         try:
             resp = retry_http(
@@ -230,7 +236,7 @@ class EightSleepClient:
                     f"{CLIENT_API_URL}/users/{user_id}/intervals/{session_id}",
                     headers=self._headers(),
                 ),
-                max_attempts=3, log=log,
+                max_attempts=3, log=log, quote_errors=False,
             )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
@@ -848,8 +854,9 @@ def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,
     too: httpx's per-request INFO lines, whose URLs carry the user and session
     ids and the healed row's date, are turned down while it runs
     (quiet_http_logs), and an error is reported by type and code only
-    (_safe_error), never its text. Returns counters; `scan_error` is set if
-    the candidate query failed.
+    (_safe_error), never its text; so is a network error retried inside a
+    lookup (get_interval logs its retries by type). Returns counters;
+    `scan_error` is set if the candidate query failed.
     """
     stats = _new_heal_stats()
     if max_rows <= 0:

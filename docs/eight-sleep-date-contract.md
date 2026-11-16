@@ -144,7 +144,9 @@ date the `/intervals` list returned last.
   `calendar_date=eq.<date>` filter of its UPDATE). A failed candidate query, a failed lookup
   or a crash of the step is reported by its type and HTTP status or database code only
   (`_safe_error`), never the error text, which can quote a request URL or a response body;
-  that text went to the public log and both heartbeats. Its counters are unchanged.
+  that text went to the public log and both heartbeats. A network error retried inside a
+  lookup is logged by type only too (`retry_http(..., quote_errors=False)` in `get_interval`;
+  the other callers of `retry_helper.py` are unchanged). Its counters are unchanged.
 - `eight_sleep_temp_backfill.py --compare [--max-lookups N]`: the read-only comparison in the
   plan below.
 - Comments in `sql/adr_0001_04_other_onyx_dates.sql`, `eight_sleep_schema.sql`, `hrv_alignment.py`

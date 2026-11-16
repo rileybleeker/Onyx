@@ -454,6 +454,121 @@ def test_heal_through_the_real_http_clients_logs_no_ids_or_dates_on_any_logger()
         assert token not in text, (token, text)
 
 
+def test_retry_http_quote_errors_false_logs_a_network_error_by_type_only() -> None:
+    """retry_helper.retry_http(quote_errors=False): the retry warning carries the
+    exception type, never its text; the default still quotes it (other ETLs
+    are unchanged); the final exception propagates as it is either way."""
+    import logging
+
+    import httpx
+    import retry_helper
+
+    url = "https://client-api.8slp.net/v1/users/u-left/intervals/SID-NET"
+    leak = f"connect failed for {url} (2026-11-03)"
+
+    def run(**kw):
+        seen: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        logger = logging.getLogger("test_retry_quote_errors")
+        handler = _Capture(level=logging.DEBUG)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        calls = []
+
+        def call():
+            calls.append(1)
+            raise httpx.ConnectError(leak, request=httpx.Request("GET", url))
+
+        saved_sleep = retry_helper.time.sleep
+        retry_helper.time.sleep = lambda *_: None
+        try:
+            retry_helper.retry_http(call, max_attempts=3, base_wait=0, log=logger, **kw)
+        except httpx.ConnectError as exc:
+            raised = str(exc)
+        else:
+            raise AssertionError("the last attempt's ConnectError must propagate")
+        finally:
+            retry_helper.time.sleep = saved_sleep
+            logger.removeHandler(handler)
+        return seen, calls, raised
+
+    seen, calls, raised = run(quote_errors=False)
+    assert len(calls) == 3 and len(seen) == 2, (calls, seen)
+    assert all("Network error on attempt" in m and "ConnectError" in m for m in seen), seen
+    for token in ("SID-NET", "u-left", "8slp.net", "2026-11-03", "connect failed"):
+        assert token not in " | ".join(seen), (token, seen)
+    assert raised == leak, "only the log line changes; the exception is untouched"
+
+    seen, _, _ = run()
+    assert all("connect failed" in m for m in seen), "the default still quotes the text"
+
+
+def test_heal_network_error_retries_are_logged_by_type_only() -> None:
+    """A transport error during a lookup (DNS, connect, read timeout) is retried
+    by retry_http, which logs a warning per retry on the ETL's own logger, not
+    an HTTP logger, so quiet_http_logs does not cover it. Its text can quote
+    the request URL (user and session ids), so get_interval logs the retries by
+    type only; the row stays NULL, is counted as failed and the final error is
+    logged by type. Real EightSleepClient behind a transport that raises."""
+    import logging
+
+    import httpx
+
+    url_seen: list[str] = []
+
+    def provider(request):
+        url_seen.append(str(request.url))
+        raise httpx.ConnectError(
+            f"connect failed for {request.url} (user u-left, night 2026-11-03)",
+            request=request)
+
+    client = es.EightSleepClient("e", "p", "America/New_York")
+    client.token = "t"
+    client.http.close()
+    client.http = httpx.Client(transport=httpx.MockTransport(provider))
+    sb = FakeSupabase([_trend_row("2026-11-03", sid="SID-NET")])
+
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(f"{record.name}: {self.format(record)}")
+
+    handler = _Capture(level=logging.DEBUG)
+    root = logging.getLogger()
+    names = (*es.HTTP_LOGGERS, "eight_sleep_etl", "retry_helper")
+    saved_levels = {n: logging.getLogger(n).level for n in names}
+    saved_root, saved_sleep = root.level, es.time.sleep
+    for n in names:
+        logging.getLogger(n).setLevel(logging.NOTSET)
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    es.time.sleep = lambda *_: None       # retry_http's backoff between attempts
+    try:
+        stats = es.self_heal_temps(client, sb, USERS, TODAY, delay_s=0)
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(saved_root)
+        es.time.sleep = saved_sleep
+        for n, level in saved_levels.items():
+            logging.getLogger(n).setLevel(level)
+        client.close()
+
+    assert len(url_seen) == 3 and "/users/u-left/intervals/SID-NET" in url_seen[0], url_seen
+    assert stats["failed"] == 1 and stats["healed"] == 0, stats
+    assert sb.rows[0]["median_bed_temp"] is None and sb.updates == [], "row stays NULL"
+    text = " | ".join(seen + [es._selfheal_summary(stats, 20)])
+    retries = [m for m in seen if "Network error on attempt" in m]
+    assert len(retries) == 2 and all("ConnectError" in m for m in retries), seen
+    assert "a lookup failed (ConnectError)" in text, text
+    for token in ("SID-NET", "u-left", "8slp.net", "2026-11-03", "connect failed"):
+        assert token not in text, (token, text)
+
+
 def test_missing_session_unknown_side_and_empty_timeseries() -> None:
     sb = FakeSupabase([
         _trend_row("2026-11-06", sid="NOTFOUND"),                       # 404 -> None
