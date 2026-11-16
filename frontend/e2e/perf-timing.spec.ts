@@ -25,8 +25,8 @@ const stats = require("./perf-stats.cjs");
  *     network-quiet for QUIET_MS after data-ready (at most WINDOW_CAP_MS); `req`, `total` and `endpoints`, and the
  *     speed budget, use it;
  *   - a FIXED window (harness version 2, `window`) from the navigation itself (navigation start for a full load; for
- *     an in-app navigation, the first pointer event on the link, so Playwright's actionability checks before the click
- *     never use the window up; a click whose pointer event was not seen on the same document gets an unknown window,
+ *     an in-app navigation, the press on the link (its pointerdown), so Playwright's actionability checks before the
+ *     click never use the window up; a click whose press was not seen on the same document gets an unknown window,
  *     recorded with the reason and never counted): every request that started in it, split by purpose (routed = before data-ready,
  *     background = after it, prefetch = router prefetch) and by origin (network, memory / disk / prefetch cache,
  *     service worker, or unknown, from the browser's own network log). A fixed window makes request totals comparable
@@ -53,12 +53,15 @@ const stats = require("./perf-stats.cjs");
  * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): reported on
  * every run that has it and never part of the budget's exit code until it has been repeated across scheduled runs.
  * Each phone test has a time budget (no navigation or tap starts after it; the rest are reported as not tried) and a
- * timeout covering the budget plus one worst-case step, so it cannot time out either. Nor does a phone failure fail
- * it (a bounce to the login page included, `observeOnly`): the workflow's speed-budget step runs only when this
- * measuring step passed, so the result file records why the phone loop ended (`stopped`) and the report lists the rest
- * as not measured, never as a pass; a bounce on a desktop page still fails the run. A manual deep run (more than
- * PHONE_MAX_RUN_NAVIGATIONS navigations per page) skips it, so the run stays inside the job timeout and its speed
- * budget is always evaluated. Its taps only navigate and open / close the menu; nothing is written.
+ * deadline of its own after the budget plus one worst-case step (`observeOnly`): a step that never returns (a page
+ * that stopped answering, whose page.evaluate() has no timeout) is recorded as interrupted, not measured, and its
+ * browser context is closed, before Playwright's test timeout, which cannot be caught inside the test and would fail
+ * the run. Nor does a phone failure fail it (a bounce to the login page included): the workflow's speed-budget step
+ * runs only when this measuring step passed, so the result file records why the phone loop ended (`stopped`) and the
+ * report lists the rest as not measured, never as a pass; a bounce or a hang on a desktop page still fails the run.
+ * A manual deep run (more than PHONE_MAX_RUN_NAVIGATIONS navigations per page) skips it, so the run stays inside the
+ * job timeout and its speed budget is always evaluated. Its taps only navigate and open / close the menu; nothing is
+ * written.
  *
  * This is NOT part of the smoke suite: playwright.config.ts only matches
  * smoke.spec.ts, and this file is run through e2e/perf.config.ts.
@@ -80,12 +83,17 @@ const FIXED_WINDOW_NAVS = 4;
 // then is unfinished (cost unknown), whatever happens later.
 const DRAIN_MS = 2_000;
 const FULL_LOAD_WINDOW_RULE = `navigations 1-${FIXED_WINDOW_NAVS} of each page`;
-const IN_APP_WINDOW_RULE = "from the first pointer event on the link, rounds 2 and later (round 1 keeps version 1 spacing)";
+const IN_APP_WINDOW_RULE = "from the press on the link (pointerdown), rounds 2 and later (round 1 keeps version 1 spacing)";
 // Worst case of one measured full load: about:blank and the CPU setting, the page load, data-ready, the network-quiet
 // wait (or the fixed window, whichever is longer), the drain, the in-page reads and the pause.
 const NAV_WORST_MS = GOTO_TIMEOUT_MS + READY_TIMEOUT_MS + Math.max(WINDOW_CAP_MS, FIXED_WINDOW_MS) + DRAIN_MS + PAUSE_MS + 10_000;
 // After an observe-only test's loop: the production SHA read (10 s timeout), closing the context, writing the result.
-const FINISH_RESERVE_MS = 60_000;
+const FINISH_MS = 30_000;
+// An observe-only test's own deadline (observeOnly) comes this long before its Playwright timeout: room for its
+// bounded cleanup (closing the context, then letting the body unwind, each at most DEADLINE_CLEANUP_MS) plus a margin,
+// so the deadline always fires first and the test never times out.
+const DEADLINE_CLEANUP_MS = 15_000;
+const DEADLINE_RESERVE_MS = 2 * DEADLINE_CLEANUP_MS + 15_000;
 // Mirror of AGENTS_API in src/lib/agents-api.ts (the sms-reminders Worker).
 const AGENTS_HOST = "sms-reminders.rileybleeklm.workers.dev";
 
@@ -108,6 +116,11 @@ const TAP_TIMEOUT_MS = 10_000;
 // Worst case of one tap: the tap, its ready wait, the settle time, and for a tap that failed the recovery load of the
 // screen it should have left on (page load + ready), plus the in-page reads and the pause.
 const TAP_WORST_MS = TAP_TIMEOUT_MS + READY_TIMEOUT_MS + INPUT_SETTLE_MS + GOTO_TIMEOUT_MS + READY_TIMEOUT_MS + TAP_PAUSE_MS + 10_000;
+// Each phone test's own deadline: its time budget, one worst-case step started just before the budget ran out, and the
+// normal finish. Only a step that never returns reaches it (see observeOnly); the test's timeout is DEADLINE_RESERVE_MS
+// later.
+const PHONE_SERIES_DEADLINE_MS = PHONE_SERIES_BUDGET_MS + NAV_WORST_MS + FINISH_MS;
+const PHONE_INPUT_DEADLINE_MS = PHONE_INPUT_BUDGET_MS + TAP_WORST_MS + FINISH_MS;
 
 const AUTH_FILE = path.join(__dirname, ".auth/state.json");
 const OUT_DIR = path.join(__dirname, "..", "perf-results");
@@ -378,11 +391,13 @@ interface Sample {
   readyAtMs?: number | null;
   clickAtMs?: number | null;
   /**
-   * In-app only: the first pointer event on the link (request clock), where the fixed window starts. Null when it was
-   * not observed: the window is then recorded as unknown (`window.anchor: "unobserved"` and its reason), never counted.
+   * In-app only: the press on the link (request clock), where the fixed window starts. Null when it was not observed:
+   * the window is then recorded as unknown (`window.anchor: "unobserved"` and its reason), never counted.
    */
   pointerAtMs?: number | null;
-  /** In-app only: Playwright's actionability wait, from just before the click call to that pointer event (ms). */
+  /** In-app only: the event that set it (pointerdown; mousedown or click only if no pointerdown was seen), or null. */
+  pointerEvent?: string | null;
+  /** In-app only: Playwright's actionability wait, from just before the click call to that press (ms). */
   clickWaitMs?: number | null;
   /** In-app only: the click loaded a new document (a full reload); its times are on the shared clock. */
   newDocument?: boolean;
@@ -600,17 +615,28 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
       const linkSel = `aside a[href="${spec.route}"]:not([data-off])`;
       const link = page.locator(linkSel).first();
       await link.scrollIntoViewIfNeeded({ timeout: 10_000 });
-      // Mark the old page, restart the chart watch and listen for the first pointer event on the link (the pointer
-      // arriving on it, the press, the click): when the click really began, after Playwright's actionability checks.
+      // Mark the old page, restart the chart watch and listen for the press on the link (pointerdown, which comes
+      // before mousedown and click): when the click really began, after Playwright's actionability checks. The pointer
+      // merely arriving over the link (pointerover) is not used: a link moving under a mouse resting from the previous
+      // click (the sidebar scrolls its active item into view) fires it before Playwright's own move, too early.
       [clickedAt, clickOrigin] = await page.evaluate(({ sel, link }) => {
         document.querySelectorAll(sel).forEach((e) => e.setAttribute("data-pf-old", ""));
-        const w = window as unknown as { __pfWatchChart: () => void; __pfPointerAt?: number | null; __pfPointerOff?: () => void };
+        const w = window as unknown as {
+          __pfWatchChart: () => void;
+          __pfPointerAt?: number | null;
+          __pfPointerType?: string | null;
+          __pfPointerOff?: () => void;
+        };
         w.__pfWatchChart();
         w.__pfPointerOff?.();
         w.__pfPointerAt = null;
-        const types = ["pointerover", "pointerdown", "mousedown", "click"];
+        w.__pfPointerType = null;
+        const types = ["pointerdown", "mousedown", "click"];
         const onPointer = (e: Event) => {
-          if (w.__pfPointerAt == null && e.target instanceof Element && e.target.closest(link)) w.__pfPointerAt = e.timeStamp;
+          if (w.__pfPointerAt == null && e.target instanceof Element && e.target.closest(link)) {
+            w.__pfPointerAt = e.timeStamp;
+            w.__pfPointerType = e.type;
+          }
         };
         for (const t of types) addEventListener(t, onPointer, { capture: true, passive: true });
         w.__pfPointerOff = () => {
@@ -655,9 +681,9 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
 
     // Keep observing until the page has been network-quiet (silent revalidations and late chart fetches are part of
     // the cost of a page view; harness 1, unchanged) AND, in harness 2, the fixed window is over. The window starts at
-    // the navigation itself: navigation start for a full load; for an in-app one, the first pointer event on the link
-    // (scrolling to the link, marking the old page and Playwright's actionability checks come before it and never use
-    // the window up). When that input was not observed (the read failed, no event was seen, or the click loaded a new
+    // the navigation itself: navigation start for a full load; for an in-app one, the press on the link (pointerdown;
+    // scrolling to the link, marking the old page and Playwright's actionability checks come before it and never use
+    // the window up). When that input was not observed (the read failed, no press was seen, or the click loaded a new
     // document) the window's start is unknown: it is recorded as unknown with the reason and nothing is counted in it
     // (perf-stats.cjs ANCHOR_KINDS). The click call's time is never used instead, because Playwright's actionability
     // wait comes after it and could use the window up. The quiet moment is kept: the version 1 totals count only
@@ -666,20 +692,22 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     let anchorKind = "navigation-start";
     let anchorReason: string | null = null;
     if (mode === "click") {
-      const pointer = await page
+      const read = await page
         .evaluate(() => {
-          const w = window as unknown as { __pfPointerAt?: number | null; __pfPointerOff?: () => void };
+          const w = window as unknown as { __pfPointerAt?: number | null; __pfPointerType?: string | null; __pfPointerOff?: () => void };
           w.__pfPointerOff?.();
           w.__pfPointerOff = undefined;
-          return [w.__pfPointerAt ?? null, performance.timeOrigin] as [number | null, number];
+          return { pointer: [w.__pfPointerAt ?? null, performance.timeOrigin] as [number | null, number], type: w.__pfPointerType ?? null };
         })
         .catch(() => null);
+      const pointer = read ? read.pointer : null;
       // Same document only, measured on the page's own clock from the mark, then put on the request clock.
       const input = stats.inputAnchorOf({ pointer, clickOrigin, markedAt: clickedAt, clickAtMs: sample.clickAtMs });
       anchorKind = input.kind;
       anchorReason = input.reason;
       sample.clickWaitMs = input.clickWaitMs;
       sample.pointerAtMs = input.anchorMs;
+      sample.pointerEvent = input.kind === "input" && read ? read.type : null;
       // Unobserved: observation still runs to the click call plus the window, so the spacing before the next click is
       // unchanged; nothing in that span is counted.
       anchor = input.anchorMs ?? sample.clickAtMs ?? 0;
@@ -856,21 +884,26 @@ interface SeriesOptions {
   label: string;
   /** Observe-only: no navigation starts once this long has passed since the test began (the rest are not tried). */
   budgetMs?: number;
+  /**
+   * Observe-only: the test's own deadline (observeOnly). Given the context to close and how to write the result file
+   * as interrupted; the series starts no navigation once it fired. Absent for an enforced page.
+   */
+  run?: ObserveRun | null;
 }
 
 /** N full loads of one page in a fresh context (navigation 1 = empty browser cache), written as <slug>.json. */
 async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions) {
   const began = Date.now();
-  // An enforced page keeps its version 1 allowance. An observe-only page gets a time budget, and its timeout covers the
-  // budget plus one navigation's worst case (the 45 s page load included) plus the finish, so it cannot time out.
-  test.setTimeout(
-    o.budgetMs != null
-      ? o.budgetMs + NAV_WORST_MS + FINISH_RESERVE_MS
-      : o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + DRAIN_MS + PAUSE_MS + 5_000) + 90_000
-  );
+  // An enforced page keeps its version 1 allowance. An observe-only (phone) series is run through observeOnly(), which
+  // set its timeout: its time budget plus one navigation's worst case plus the finish (PHONE_SERIES_DEADLINE_MS, its
+  // own deadline) and the deadline's cleanup reserve, so it cannot time out.
+  if (o.budgetMs == null) {
+    test.setTimeout(o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + DRAIN_MS + PAUSE_MS + 5_000) + 90_000);
+  }
 
   // Fresh context per page => navigation 1 really has an empty HTTP cache.
   const context = await browser.newContext({ ...o.device, storageState: AUTH_FILE });
+  o.run?.own(context);
   await context.addInitScript(INIT_SCRIPT);
   const page = await context.newPage();
   const origin = new URL(test.info().project.use.baseURL as string).origin;
@@ -882,23 +915,37 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
   const startedAt = new Date().toISOString();
   const deployed = { start: await deployedSha(context, origin), end: null as string | null };
   let stopped: string | null = null;
+  const meta = (why: string | null): ResultMeta => ({
+    slug: o.slug, label: o.label, route: spec.route, note: spec.note ?? null, navigations: o.navigations, startedAt,
+    scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS, windowRule: FULL_LOAD_WINDOW_RULE, stopped: why,
+  });
+  // The navigation in progress (observe-only deadline: it is recorded as interrupted, not measured, never a pass).
+  let inFlight: number | null = null;
+  o.run?.onInterrupt((deadlineMs) => {
+    const rows: Sample[] = inFlight == null ? [...samples] : [...samples, { i: inFlight, cold: inFlight === 0, ok: false, error: stats.INTERRUPTED_ERROR }];
+    writeResult(meta(stats.interruptedStop(deadlineMs, rows.length, o.navigations, "navigations")), browser.version(), rows);
+  });
   try {
     for (let i = 0; i < o.navigations; i++) {
+      if (o.run?.interrupted) break;
       if (o.budgetMs != null && Date.now() - began >= o.budgetMs) {
         stopped = `time budget of ${o.budgetMs / 1000} s used up: ${i} of ${o.navigations} navigations tried`;
         break;
       }
       const windowMs = i < FIXED_WINDOW_NAVS ? FIXED_WINDOW_MS : 0;
       let s: Sample;
+      inFlight = i;
       try {
         s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs, beforeGoto });
       } catch (e) {
         // measureOnce throws only on a bounce to the login page. On an observe-only page that navigation is kept as
         // not measured (the catch below ends the series); an enforced page fails as before, its file unchanged.
         if (!o.scenario.enforced) samples.push({ i, cold: i === 0, ok: false, error: stats.errorLine(e) });
+        inFlight = null;
         throw e;
       }
       samples.push(s);
+      inFlight = null;
       // Two navigations in a row that never reach data-ready mean the page (or this
       // script's selector for it) is broken: stop instead of burning 30 s per navigation.
       if (i >= 1 && samples.every((x) => !x.ok)) break;
@@ -915,15 +962,13 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
     deployed.end = await deployedSha(context, origin);
     await probe.detach();
     await context.close();
-    writeResult(
-      {
-        slug: o.slug, label: o.label, route: spec.route, note: spec.note ?? null, navigations: o.navigations, startedAt,
-        scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS, windowRule: FULL_LOAD_WINDOW_RULE, stopped,
-      },
-      browser.version(),
-      samples
-    );
+    // Observe-only: written once, here or by the deadline if that came first (its file then stands). Enforced: as before.
+    const write = () => writeResult(meta(stopped), browser.version(), samples);
+    if (o.run) o.run.writeOnce(write);
+    else write();
   }
+  // Interrupted at the deadline: the result file and the log line were written by it; nothing more to say.
+  if (o.run?.interrupted) return;
 
   const okCount = samples.filter((s) => s.ok).length;
   console.log(`${o.label}: ${okCount}/${samples.length} navigations reached data-ready${stopped ? ` (${stopped})` : ""}`);
@@ -1000,20 +1045,80 @@ test("timing in-app navigation from Today", async ({ browser }) => {
 // ---------------------------------------------------------------------------
 
 /**
+ * What an observe-only test body shares with its deadline (observeOnly): the browser context to close and how to
+ * write its result file as interrupted. The result file is written ONCE: by the body's own finally, or by the deadline
+ * when that came first (the body may still unwind afterwards, once its context is closed, and must not overwrite it).
+ */
+class ObserveRun {
+  /** True once the deadline fired: the body starts no new navigation or tap. */
+  interrupted = false;
+  private context: BrowserContext | null = null;
+  private interruptWrite: ((deadlineMs: number) => void) | null = null;
+  private written = false;
+
+  /** The body's context: the deadline closes it, which ends any call still waiting on it. */
+  own(context: BrowserContext) {
+    this.context = context;
+  }
+
+  /** How to write the result file as interrupted (the step in progress not measured). Not set yet = no file. */
+  onInterrupt(write: (deadlineMs: number) => void) {
+    this.interruptWrite = write;
+  }
+
+  /** Writes the result file unless it was already written. */
+  writeOnce(write: () => void) {
+    if (this.written) return;
+    this.written = true;
+    write();
+  }
+
+  /** The deadline: stop the body, write its file as interrupted, close its context (observeOnly bounds the close). */
+  async interrupt(deadlineMs: number) {
+    this.interrupted = true;
+    const write = this.interruptWrite;
+    if (write) {
+      try {
+        this.writeOnce(() => write(deadlineMs));
+      } catch (e) {
+        console.log(`could not write the interrupted result file (${stats.errorLine(e, 120)}); reported as not measured`);
+      }
+    }
+    await this.context?.close().catch(() => {});
+  }
+}
+
+/**
  * Runs the body of an observe-only test (`scenario.enforced: false`) so that it never fails the run: the workflow's
  * enforced speed-budget step runs only when the measuring step passed, so a phone failure (a bounce to the login page,
- * a context that could not be set up) must not decide the run's exit code or keep the budget from being evaluated.
- * Failures inside a series or the taps are recorded in the result file as not measured (`stopped`); one before a result
- * file was written leaves that file absent, which the report lists as "no result file written (not measured, not a
- * pass)". Logged as one line with no address. An enforced scenario runs the body as it is, so it fails as before; the
- * desktop pages never go through this.
+ * a context that could not be set up, a step that never returns) must not decide the run's exit code or keep the
+ * budget from being evaluated.
+ *   - Failures inside a series or the taps are recorded in the result file as not measured (`stopped`); one before a
+ *     result file was written leaves that file absent, which the report lists as "no result file written (not
+ *     measured, not a pass)".
+ *   - Its own deadline, `deadlineMs` after the start (stats.withDeadline): Playwright's test timeout cannot be caught
+ *     inside the test, and a step that never returns (page.evaluate() on a page that stopped answering has no
+ *     timeout) would reach it. At the deadline the result file is written as interrupted (the step in progress not
+ *     measured, the rest not tried; `stopped` says so), the context is closed (at most DEADLINE_CLEANUP_MS) and the
+ *     test ends, DEADLINE_RESERVE_MS before its timeout. A deadline before the result file could be set up leaves it
+ *     absent (not measured).
+ * Logged as one line with no address. The test's timeout is set here: the deadline plus the reserve. An enforced
+ * scenario gets the same timeout but runs the body as it is, so it fails as before (a hang included); the desktop
+ * pages never go through this.
  */
-async function observeOnly(scenario: ScenarioMeta, label: string, body: () => Promise<void>): Promise<void> {
-  if (scenario.enforced) return body();
-  try {
-    await body();
-  } catch (e) {
-    console.log(`${label}: not measured (${stats.errorLine(e, 160)}); observe-only, so it does not fail the run, and it is not a pass`);
+async function observeOnly(scenario: ScenarioMeta, label: string, deadlineMs: number, body: (run: ObserveRun | null) => Promise<void>): Promise<void> {
+  test.setTimeout(deadlineMs + DEADLINE_RESERVE_MS);
+  if (scenario.enforced) return body(null);
+  const run = new ObserveRun();
+  const r = await stats.withDeadline(() => body(run), {
+    deadlineMs,
+    cleanupMs: DEADLINE_CLEANUP_MS,
+    onDeadline: () => run.interrupt(deadlineMs),
+  });
+  if (r.outcome === "failed") {
+    console.log(`${label}: not measured (${stats.errorLine(r.error, 160)}); observe-only, so it does not fail the run, and it is not a pass`);
+  } else if (r.outcome === "interrupted") {
+    console.log(`${label}: interrupted at its ${Math.round(deadlineMs / 1000)} s deadline (a step did not finish); recorded as not measured, not a pass; observe-only, so it does not fail the run`);
   }
 }
 
@@ -1022,10 +1127,10 @@ for (const slug of PHONE_PAGES) {
   test(`timing phone ${spec.label}`, async ({ browser }) => {
     test.skip(!PHONE_THIS_RUN, PHONE_SKIP_REASON);
     const label = `${spec.label}, 390 px`;
-    await observeOnly(SCENARIO.phoneLoad, label, () =>
+    await observeOnly(SCENARIO.phoneLoad, label, PHONE_SERIES_DEADLINE_MS, (run) =>
       timePageSeries(browser, spec, {
         device: PHONE, scenario: SCENARIO.phoneLoad, navigations: PHONE_NAVIGATIONS, slug: `phone-${spec.slug}`, label,
-        budgetMs: PHONE_SERIES_BUDGET_MS,
+        budgetMs: PHONE_SERIES_BUDGET_MS, run,
       })
     );
   });
@@ -1150,11 +1255,12 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
   test.skip(!PHONE_THIS_RUN, PHONE_SKIP_REASON);
   const began = Date.now();
   const planned = PHONE_ROUNDS * PHONE_STEPS.length;
-  // Observe-only, so bounded: no tap starts after PHONE_INPUT_BUDGET_MS, and the timeout covers the budget plus one
-  // tap's worst case (its ready wait and the recovery load included) plus the finish, so the test cannot time out.
-  test.setTimeout(PHONE_INPUT_BUDGET_MS + TAP_WORST_MS + FINISH_RESERVE_MS);
-  await observeOnly(SCENARIO.phoneInput, "Phone taps, 390 px", async () => {
+  // Observe-only, so bounded: no tap starts after PHONE_INPUT_BUDGET_MS, and its own deadline (observeOnly, which also
+  // sets the timeout) comes after the budget plus one tap's worst case (its ready wait and the recovery load included)
+  // plus the finish: only a step that never returns reaches it, and the test still cannot time out.
+  await observeOnly(SCENARIO.phoneInput, "Phone taps, 390 px", PHONE_INPUT_DEADLINE_MS, async (run) => {
     const context = await browser.newContext({ ...PHONE, storageState: AUTH_FILE });
+    run?.own(context);
     await context.addInitScript(INIT_SCRIPT);
     await context.addInitScript(INPUT_SCRIPT);
     const page = await context.newPage();
@@ -1164,6 +1270,19 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
     const deployed = { start: await deployedSha(context, origin), end: null as string | null };
     const samples: InputSample[] = [];
     let stopped: string | null = null;
+    const meta = (why: string | null): ResultMeta => ({
+      slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
+      note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
+      scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null, stopped: why,
+    });
+    // The tap in progress (deadline: it is recorded as interrupted, not measured, never a pass).
+    let inFlight: { round: number; action: string } | null = null;
+    run?.onInterrupt((deadlineMs) => {
+      const rows: InputSample[] = inFlight == null
+        ? [...samples]
+        : [...samples, { i: samples.length, round: inFlight.round, action: inFlight.action, ok: false, error: stats.INTERRUPTED_ERROR }];
+      writeResult(meta(stats.interruptedStop(deadlineMs, rows.length, planned, "taps")), browser.version(), rows);
+    });
     try {
       // Log not loading leaves every tap untried: the report shows "0 of N taps were tried" and why, never a pass.
       const opened = await openAndWait(page, "/log", logReady);
@@ -1172,14 +1291,17 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
       rounds: for (let round = 0; opened === "ready" && round < PHONE_ROUNDS; round++) {
         let previousOk = true;
         for (const step of PHONE_STEPS) {
+          if (run?.interrupted) break rounds;
           if (Date.now() - began >= PHONE_INPUT_BUDGET_MS) {
             stopped = `time budget of ${PHONE_INPUT_BUDGET_MS / 1000} s used up: ${samples.length} of ${planned} taps tried`;
             break rounds;
           }
+          inFlight = { round, action: step.action };
           const s: InputSample = step.needsPrevious && !previousOk
             ? { i: samples.length, round, action: step.action, ok: false, error: "skipped: the step before was not measured" }
             : await measureTap(page, step, round, samples.length);
           samples.push(s);
+          inFlight = null;
           previousOk = s.ok;
           if (!s.ok) {
             const back = step.leaveAt === "/log" ? logReady : todayReady;
@@ -1203,16 +1325,12 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
     } finally {
       deployed.end = await deployedSha(context, origin);
       await context.close();
-      writeResult(
-        {
-          slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
-          note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
-          scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null, stopped,
-        },
-        browser.version(),
-        samples
-      );
+      // Written once: here, or by the deadline if that came first (its file then stands).
+      const write = () => writeResult(meta(stopped), browser.version(), samples);
+      if (run) run.writeOnce(write);
+      else write();
     }
+    if (run?.interrupted) return; // the deadline wrote the result file and the log line
     // Observed only: never fails the run. A tap that could not be measured is listed as missing in the report and in
     // the budget step's "observed only" lines, never counted as fast.
     console.log(`phone taps: ${samples.filter((s) => s.ok).length}/${planned} measured${stopped ? ` (${stopped})` : ""}`);

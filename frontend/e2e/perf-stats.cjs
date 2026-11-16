@@ -160,6 +160,59 @@ function observeOnlyStop(err, tried, planned, unit) {
   return `${what}: ${tried} of ${planned} ${unit} tried`;
 }
 
+/** The error of the navigation / tap an observe-only test was in when its own deadline passed: not measured. */
+const INTERRUPTED_ERROR = "interrupted: did not finish before the test's deadline";
+
+/**
+ * Why an observe-only loop ended at its own deadline (`withDeadline`), for its result file's `stopped`: a step did not
+ * finish in time (a page or a browser call that never answered). `tried` counts the step it was in, which is recorded
+ * as not measured (INTERRUPTED_ERROR); the rest were not tried. Never a pass.
+ */
+function interruptedStop(deadlineMs, tried, planned, unit) {
+  const s = finite(deadlineMs) ? `${Math.round(deadlineMs / 1000)} s` : "unknown";
+  return `interrupted at the test's deadline (${s}; a step did not finish): ${tried} of ${planned} ${unit} tried`;
+}
+
+/** Resolves with `value` after `ms`, unless `cancel()` is called first (the timer never outlives its use). */
+function timer(ms, value, setTimer = setTimeout, clearTimer = clearTimeout) {
+  let id;
+  const done = new Promise((resolve) => {
+    id = setTimer(() => resolve(value), ms);
+  });
+  return { done, cancel: () => clearTimer(id) };
+}
+
+/**
+ * Runs an observe-only test body (`body()`) with a deadline of its own. Playwright's test timeout cannot be caught from
+ * inside the test: a step that never returns (a page.evaluate() on a page that stopped answering has no timeout of its
+ * own) would time the test out, fail the measuring step, and the workflow would then skip the enforced speed budget.
+ * So the deadline comes first, `deadlineMs` after the call, well before the test's timeout:
+ *   - the body finished or threw: resolves { outcome: "done" } or { outcome: "failed", error } at once;
+ *   - the deadline passed: calls `onDeadline()` (which records the run as interrupted, not measured, and closes the
+ *     browser context so any call still waiting on it ends), waits at most `cleanupMs` for it, then at most `cleanupMs`
+ *     for the body to unwind, and resolves { outcome: "interrupted" }. The body is never awaited past that, and its
+ *     later failure (its context was closed) is swallowed.
+ * Never rejects, and leaves no timer running.
+ */
+async function withDeadline(body, { deadlineMs, cleanupMs, onDeadline, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  const t = (ms, value) => timer(ms, value, setTimer, clearTimer);
+  const work = Promise.resolve()
+    .then(body)
+    .then(() => ({ outcome: "done" }), (error) => ({ outcome: "failed", error }));
+  const deadline = t(deadlineMs, { outcome: "interrupted" });
+  const first = await Promise.race([work, deadline.done]);
+  deadline.cancel();
+  if (first.outcome !== "interrupted") return first;
+  const bounded = async (p) => {
+    const cap = t(cleanupMs, null);
+    await Promise.race([p, cap.done]);
+    cap.cancel();
+  };
+  await bounded(Promise.resolve().then(onDeadline).catch(() => {}));
+  await bounded(work);
+  return first;
+}
+
 /** n plus robust spread (median, quartiles, MAD) of one population; never throws on empty input. */
 function robust(values) {
   const xs = (values || []).filter(finite).sort((a, b) => a - b);
@@ -221,8 +274,9 @@ const DATA_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
 /**
  * How a fixed window's start was found. It is part of the method: only the first two give a comparable window.
  *   navigation-start  a full load: request clock 0;
- *   input             an in-app click: the first pointer event on the link, seen on the same document at or after the
- *                     click was prepared (`inputAnchorOf`);
+ *   input             an in-app click: the press on the link (its pointerdown; mousedown or click only when no
+ *                     pointerdown was seen), seen on the same document at or after the click was prepared
+ *                     (`inputAnchorOf`). The pointer merely arriving over the link is not a press and is not used;
  *   unobserved        an in-app click whose input was not seen (the pointer read failed or saw no event, or the click
  *                     loaded a new document). Where its window starts is unknown, so the window is recorded as
  *                     unknown (`complete: false`, no counts) and never counted. The click call's own time is NOT used
@@ -240,8 +294,8 @@ function anchorKindOf(anchorMs, anchorKind) {
 
 /**
  * Where an in-app click's fixed window starts, from the pointer read made after the click (perf-timing.spec.ts):
- *   pointer      [page time of the first pointer event on the link or null, that document's time origin], or null
- *                when the read itself failed;
+ *   pointer      [page time of the press on the link (pointerdown, else mousedown or click) or null, that
+ *                document's time origin], or null when the read itself failed;
  *   clickOrigin  time origin of the document the click was prepared on;
  *   markedAt     page time on that document just before the click call;
  *   clickAtMs    the same moment on the request clock.
@@ -972,23 +1026,44 @@ function budgetViolations(pages, ms = SPEED_BUDGET_MS) {
 const INPUT_PAINT_MS = 200;
 
 /**
- * What the observe-only scenarios would break if they were enforced: the same page rules as the budget, plus for
- * phone taps any tap that was not measured, any tap to ready of `ms` or more and any input to next paint of
- * INPUT_PAINT_MS or more. Reported on every run and never turns the run red: a new metric is enforced only after it
- * has been stable across repeated scheduled runs (promote it by setting `enforced: true` on its scenario).
+ * The budget lines of ONE phone-tap result (`meta.kind: "input"`, a loadRun() input), whether or not it is enforced:
+ * fewer taps tried than planned, any tap that was not measured, any tap to ready of `ms` or more and any input to next
+ * paint of INPUT_PAINT_MS or more. A missing measurement is never a pass.
+ */
+function inputBreaches(run, ms = SPEED_BUDGET_MS) {
+  const out = [];
+  const r = (v) => Math.round(v);
+  const summary = (run && run.summary) || { total: 0, actions: [] };
+  const expected = finite(run && run.expected) ? run.expected : null;
+  if (expected != null && summary.total < expected) out.push(`${run.label}: only ${summary.total} of ${expected} taps were tried`);
+  for (const a of summary.actions || []) {
+    if (a.failed > 0) out.push(`${run.label}: ${a.action}: ${a.failed} of ${a.total} taps not measured (${Object.keys(a.errors).join(", ")}), not a pass`);
+    if (finite(a.readyMs.max) && a.readyMs.max >= ms) out.push(`${run.label}: ${a.action}: tap to ready ${r(a.readyMs.max)} ms (slowest of ${a.readyMs.n})`);
+    if (finite(a.inputMs.max) && a.inputMs.max >= INPUT_PAINT_MS) out.push(`${run.label}: ${a.action}: input to next paint ${r(a.inputMs.max)} ms (slowest of ${a.inputMs.n}, over ${INPUT_PAINT_MS} ms)`);
+  }
+  return out;
+}
+
+/**
+ * The enforced part of the phone taps: every input result that is not observe-only (`enforced: false`). Today the
+ * phone-input scenario is observe-only, so this is empty; promoting it (`enforced: true` on its scenario in
+ * perf-timing.spec.ts) makes its untried, unmeasured and slow taps breaches, exactly the lines observedViolations()
+ * printed for it before. perf-report.cjs --budget adds these to budgetViolations() for the exit code.
+ */
+function inputBudgetViolations(inputs, ms = SPEED_BUDGET_MS) {
+  return (inputs || []).filter((p) => p.enforced !== false).flatMap((p) => inputBreaches(p, ms));
+}
+
+/**
+ * What the observe-only scenarios would break if they were enforced: the same page rules as the budget, plus the
+ * phone-tap rules (inputBreaches). Only results with `enforced: false`: an enforced (promoted) one is judged by
+ * budgetViolations() / inputBudgetViolations() instead, never listed twice. Reported on every run and never turns the
+ * run red: a new metric is enforced only after it has been stable across repeated scheduled runs (promote it by
+ * setting `enforced: true` on its scenario).
  */
 function observedViolations(pages, inputs, ms = SPEED_BUDGET_MS) {
   const out = (pages || []).filter((p) => p.enforced === false).flatMap((p) => pageBreaches(p, ms));
-  const r = (v) => Math.round(v);
-  for (const run of inputs || []) {
-    const expected = finite(run.expected) ? run.expected : null;
-    if (expected != null && run.summary.total < expected) out.push(`${run.label}: only ${run.summary.total} of ${expected} taps were tried`);
-    for (const a of run.summary.actions) {
-      if (a.failed > 0) out.push(`${run.label}: ${a.action}: ${a.failed} of ${a.total} taps not measured (${Object.keys(a.errors).join(", ")}), not a pass`);
-      if (finite(a.readyMs.max) && a.readyMs.max >= ms) out.push(`${run.label}: ${a.action}: tap to ready ${r(a.readyMs.max)} ms (slowest of ${a.readyMs.n})`);
-      if (finite(a.inputMs.max) && a.inputMs.max >= INPUT_PAINT_MS) out.push(`${run.label}: ${a.action}: input to next paint ${r(a.inputMs.max)} ms (slowest of ${a.inputMs.n}, over ${INPUT_PAINT_MS} ms)`);
-    }
-  }
+  for (const run of (inputs || []).filter((p) => p.enforced === false)) out.push(...inputBreaches(run, ms));
   return out;
 }
 
@@ -1001,10 +1076,15 @@ module.exports = {
   errorLine,
   isLoginBounce,
   observeOnlyStop,
+  INTERRUPTED_ERROR,
+  interruptedStop,
+  withDeadline,
   VIAS,
   PURPOSES,
   budgetViolations,
   observedViolations,
+  inputBreaches,
+  inputBudgetViolations,
   pageBreaches,
   robust,
   viaOf,

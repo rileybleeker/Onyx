@@ -578,13 +578,22 @@ test('observedViolations: untried, unmeasured and slow phone taps are reported',
     tap(0, 'tap Today tab', { readyMs: 1400, inputMs: 260 }),
     tap(1, 'open More menu', { ok: false, error: 'no input recorded', inputMs: null, readyMs: null }),
   ]);
-  const lines = stats.observedViolations([], [{ label: 'Phone taps, 390 px', expected: 12, summary }]);
-  assert.deepEqual(lines, [
+  const taps = { label: 'Phone taps, 390 px', expected: 12, summary, enforced: false };
+  const lines = stats.observedViolations([], [taps]);
+  const expected = [
     'Phone taps, 390 px: only 2 of 12 taps were tried',
     'Phone taps, 390 px: tap Today tab: tap to ready 1400 ms (slowest of 1)',
     `Phone taps, 390 px: tap Today tab: input to next paint 260 ms (slowest of 1, over ${stats.INPUT_PAINT_MS} ms)`,
     'Phone taps, 390 px: open More menu: 1 of 1 taps not measured (no input recorded), not a pass',
-  ]);
+  ];
+  assert.deepEqual(lines, expected);
+  assert.deepEqual(stats.inputBudgetViolations([taps]), [], 'observe-only taps are never enforced');
+  // Promoted (`enforced: true` on the phone-input scenario): the same lines become enforced breaches, and are not
+  // listed again as observed.
+  const promoted = { ...taps, enforced: true };
+  assert.deepEqual(stats.inputBudgetViolations([promoted]), expected);
+  assert.deepEqual(stats.observedViolations([], [promoted]), []);
+  assert.deepEqual(stats.inputBreaches(promoted), expected, 'one rule set, whether enforced or observed');
 });
 
 function writeRun(files) {
@@ -719,6 +728,138 @@ test('report: a phone result that stopped on a bounce is listed as cut short, no
   assert.ok(!report.missingObserved(e).some((l) => l.includes('stopped early')));
   assert.ok(stats.budgetViolations(e.pages).includes('/ (Today): only 2 of 4 navigations were measured'));
   for (const d of [dir, enforced]) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('budgetOutcome: a phone-tap scenario promoted to enforced turns the run red on an unmeasured or slow tap', () => {
+  const desktop = [v2sample(0, 600), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phoneScenario = { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false };
+  const tapsFile = (enforced, samples) => ({
+    meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 2, scenario: { name: 'phone-input', enforced } }), samples,
+  });
+  const run = (enforced, samples) => report.loadRun(writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples: desktop },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-log.json': { meta: v2meta('phone-log', '/log, 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-input.json': tapsFile(enforced, samples),
+  }));
+  const fast = [tap(0, 'tap Log tab'), tap(1, 'open More menu')];
+  const bad = [tap(0, 'tap Log tab', { readyMs: 1200 }), tap(1, 'open More menu', { ok: false, error: 'ready-timeout', readyMs: null })];
+
+  // Observe-only (today): the bad taps are printed, never in the exit code.
+  const observeOnly = run(false, bad);
+  const o = report.budgetOutcome([observeOnly]);
+  assert.deepEqual(o.over, [], 'observe-only taps never decide the exit code');
+  assert.ok(o.observed.includes('Phone taps, 390 px: tap Log tab: tap to ready 1200 ms (slowest of 1)'));
+  assert.ok(o.observed.some((l) => l.startsWith('Phone taps, 390 px: open More menu: 1 of 1 taps not measured')));
+
+  // Promoted: the same taps are enforced breaches (exit code 1), and are not listed again as observed.
+  const promoted = run(true, bad);
+  assert.equal(promoted.inputs[0].enforced, true);
+  const p = report.budgetOutcome([promoted]);
+  assert.deepEqual(p.over, [
+    'Phone taps, 390 px: tap Log tab: tap to ready 1200 ms (slowest of 1)',
+    'Phone taps, 390 px: open More menu: 1 of 1 taps not measured (ready-timeout), not a pass',
+  ]);
+  assert.ok(!p.observed.some((l) => l.startsWith('Phone taps, 390 px')));
+  assert.match(report.render([promoted]), /### Phone input responsiveness \(enforced\)/);
+
+  // Promoted and fast, but fewer taps than planned: an untried tap is a breach too, never a pass.
+  const short = run(true, fast.slice(0, 1));
+  assert.deepEqual(report.budgetOutcome([short]).over, ['Phone taps, 390 px: only 1 of 2 taps were tried']);
+  // Promoted, every tap measured and fast: the budget is met.
+  const good = run(true, fast);
+  assert.deepEqual(report.budgetOutcome([good]).over, []);
+  for (const r of [observeOnly, promoted, short, good]) fs.rmSync(r.dir, { recursive: true, force: true });
+});
+
+test('interruptedStop: a step that did not finish before the deadline, with how far the loop got', () => {
+  assert.equal(stats.interruptedStop(255_000, 3, 4, 'navigations'),
+    "interrupted at the test's deadline (255 s; a step did not finish): 3 of 4 navigations tried");
+  assert.equal(stats.interruptedStop(undefined, 0, 12, 'taps'), "interrupted at the test's deadline (unknown; a step did not finish): 0 of 12 taps tried");
+  assert.match(stats.INTERRUPTED_ERROR, /^interrupted\b/);
+  assert.equal(stats.isLoginBounce(stats.INTERRUPTED_ERROR), false, 'an interruption is never read as a bounce');
+});
+
+// withDeadline with tiny real timers: the observe-only deadline that Playwright's own test timeout cannot give.
+const DL = { deadlineMs: 30, cleanupMs: 30 };
+const never = () => new Promise(() => {});
+
+test('withDeadline: a body that finishes or throws in time is returned as it is; the deadline never fires', async () => {
+  let fired = 0;
+  const done = await stats.withDeadline(async () => {}, { ...DL, onDeadline: () => { fired++; } });
+  assert.deepEqual(done, { outcome: 'done' });
+  const err = new Error('bounced-to-login: saved session is not valid');
+  const failed = await stats.withDeadline(async () => { throw err; }, { ...DL, onDeadline: () => { fired++; } });
+  assert.equal(failed.outcome, 'failed');
+  assert.equal(failed.error, err);
+  const sync = await stats.withDeadline(() => { throw new Error('setup'); }, { ...DL, onDeadline: () => { fired++; } });
+  assert.equal(sync.outcome, 'failed', 'a synchronous throw is a failure, never a crash');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(fired, 0, 'the deadline timer was cancelled');
+});
+
+test('withDeadline: a body that never returns is interrupted at the deadline, its cleanup and unwind both bounded', async () => {
+  // The stalled page.evaluate(): the body never settles, and even the cleanup (closing the context) never returns.
+  let fired = 0;
+  const began = Date.now();
+  const r = await stats.withDeadline(never, { ...DL, onDeadline: () => { fired++; return never(); } });
+  const took = Date.now() - began;
+  assert.deepEqual(r, { outcome: 'interrupted' });
+  assert.equal(fired, 1, 'the deadline runs its cleanup once');
+  assert.ok(took >= DL.deadlineMs - 5, `not before the deadline (${took} ms)`);
+  assert.ok(took < 2_000, `bounded: deadline + two cleanup bounds, not the body (${took} ms)`);
+  // A cleanup that throws is bounded and swallowed the same way.
+  const t = await stats.withDeadline(never, { ...DL, onDeadline: () => { throw new Error('close failed'); } });
+  assert.deepEqual(t, { outcome: 'interrupted' });
+});
+
+test('withDeadline: closing the context at the deadline ends the stalled call; its late failure is swallowed, still interrupted', async () => {
+  // The body's pending call rejects once the context is closed (as Playwright's calls do): no unhandled rejection,
+  // and the outcome stays "interrupted" (the result file written at the deadline stands).
+  let close;
+  const stalled = new Promise((_, reject) => { close = () => reject(new Error('Target page, context or browser has been closed')); });
+  const order = [];
+  const body = async () => {
+    try {
+      await stalled;
+    } finally {
+      order.push('body unwound');
+    }
+  };
+  const r = await stats.withDeadline(body, { ...DL, onDeadline: async () => { order.push('deadline'); close(); } });
+  assert.deepEqual(r, { outcome: 'interrupted' });
+  assert.deepEqual(order, ['deadline', 'body unwound'], 'the body unwound inside the bounded wait, after the deadline wrote the file');
+});
+
+test('report: a phone result interrupted at its deadline is cut short, its step in progress not measured, unbound, never enforced', () => {
+  const desktop = [v2sample(0, 600), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phoneScenario = { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: 4, enforced: false };
+  // What the deadline writes: the navigations done, the one in progress as interrupted, no end-of-page /api/version read.
+  const series = [v2sample(0, 700), v2sample(1, 450), { i: 2, cold: false, ok: false, error: stats.INTERRUPTED_ERROR }];
+  const interrupted = (tried, planned, unit) => stats.interruptedStop(255_000, tried, planned, unit);
+  const dir = writeRun({
+    'today.json': { meta: v2meta('today', '/ (Today)'), samples: desktop },
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: phoneScenario, deployed: { start: SHA_A, end: null },
+      stopped: interrupted(3, 4, 'navigations') }), samples: series },
+    'phone-log.json': { meta: v2meta('phone-log', '/log, 390 px', { scenario: phoneScenario }), samples: desktop },
+    'phone-input.json': { meta: v2meta('phone-input', 'Phone taps, 390 px', { kind: 'input', planned: 12, scenario: { name: 'phone-input', enforced: false },
+      deployed: { start: SHA_A, end: null }, stopped: interrupted(2, 12, 'taps') }),
+      samples: [tap(0, 'tap Today tab'), { i: 1, round: 0, action: 'open More menu', ok: false, error: stats.INTERRUPTED_ERROR }] },
+  });
+  const run = report.loadRun(dir);
+  const phone = run.pages.find((p) => p.slug === 'phone-today');
+  assert.equal(phone.revision, 'partial', 'no end read: not bound to a build');
+  assert.equal(phone.summary.failed, 1, 'the navigation in progress is not measured, never fast');
+  assert.ok(report.missingObserved(run).includes(
+    "/ (Today), 390 px: stopped early, interrupted at the test's deadline (255 s; a step did not finish): 3 of 4 navigations tried; the rest not measured, not a pass"));
+  const { observed, over } = report.budgetOutcome([run]);
+  assert.deepEqual(over, [], 'an interrupted observe-only result never decides the exit code');
+  assert.ok(observed.includes('/ (Today), 390 px: only 3 of 4 navigations were measured'));
+  assert.ok(observed.some((l) => l.startsWith('/ (Today), 390 px: 1 of 3 navigations never reached data-ready')));
+  assert.ok(observed.includes('Phone taps, 390 px: only 2 of 12 taps were tried'));
+  assert.ok(observed.some((l) => l.startsWith('Phone taps, 390 px: open More menu: 1 of 1 taps not measured (interrupted')));
+  assert.ok(!/NaN|undefined/.test(report.render([run])));
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('report: pooled table keeps revisions and harness versions apart and never pools an unbound result', () => {

@@ -149,7 +149,9 @@ function render(runs) {
     out.push("### Most expensive API and database calls per page view (warm median)\n");
     out.push(stats.endpointTable(run.pages) + "\n");
     if (run.inputs.length) {
-      out.push("### Phone input responsiveness (observed, not enforced yet)\n");
+      // A phone-tap scenario promoted to enforced (`enforced: true`) is in the budget's exit code; the heading says so.
+      const enforcedTaps = run.inputs.some((p) => p.enforced !== false);
+      out.push(`### Phone input responsiveness (${enforcedTaps ? "enforced" : "observed, not enforced yet"})\n`);
       out.push(stats.inputTable(run.inputs) + "\n");
     }
     const missing = missingObserved(run);
@@ -167,6 +169,19 @@ function render(runs) {
     out.push(stats.pooledTable(runs) + "\n");
   }
   return out.join("\n");
+}
+
+/**
+ * What --budget prints and decides. `observed` = the observe-only scenarios' lines (today the phone: results not
+ * recorded or cut short, and what they would break), printed on every run and never part of the exit code. `over` =
+ * the enforced budget: every page that is not observe-only (budgetViolations) AND every phone-tap result that is not
+ * observe-only (inputBudgetViolations), so promoting a phone scenario with `enforced: true` makes its breaches turn
+ * the run red. Any `over` line = exit code 1.
+ */
+function budgetOutcome(runs) {
+  const observed = (runs || []).flatMap((r) => [...missingObserved(r), ...stats.observedViolations(r.pages, r.inputs)]);
+  const over = (runs || []).flatMap((r) => [...stats.budgetViolations(r.pages), ...stats.inputBudgetViolations(r.inputs)]);
+  return { observed, over };
 }
 
 function main(argv) {
@@ -195,10 +210,8 @@ function main(argv) {
   if (!mdOut) process.stdout.write(md);
   if (budget) {
     for (const r of runs) console.log(`Production build measured: ${revisionLine(r)}`);
-    // Observe-only scenarios (the phone): printed on every run, never part of the exit code.
-    const observed = runs.flatMap((r) => [...missingObserved(r), ...stats.observedViolations(r.pages, r.inputs)]);
+    const { observed, over } = budgetOutcome(runs);
     if (observed.length) console.log(`Observed only, not enforced yet (repeat across scheduled runs before enforcing):\n- ` + observed.join("\n- "));
-    const over = runs.flatMap((r) => stats.budgetViolations(r.pages));
     if (over.length) {
       console.error(`Speed budget broken (nothing may take ${stats.SPEED_BUDGET_MS} ms):\n- ` + over.join("\n- "));
       process.exit(1);
@@ -209,4 +222,4 @@ function main(argv) {
 
 if (require.main === module) main(process.argv.slice(2));
 
-module.exports = { loadRun, render, revisionLine, missingObserved, OBSERVED_SLUGS };
+module.exports = { loadRun, render, revisionLine, missingObserved, budgetOutcome, OBSERVED_SLUGS };
