@@ -24,14 +24,16 @@ const stats = require("./perf-stats.cjs");
  *   - the network-quiet window (harness version 1, unchanged): requests that started before the page had been
  *     network-quiet for QUIET_MS after data-ready (at most WINDOW_CAP_MS); `req`, `total` and `endpoints`, and the
  *     speed budget, use it;
- *   - a FIXED window (harness version 2, `window`) from the navigation itself (navigation start for a full load, the
- *     click for an in-app navigation): every request that started in it, split by purpose (routed = before data-ready,
+ *   - a FIXED window (harness version 2, `window`) from the navigation itself (navigation start for a full load; for
+ *     an in-app navigation, the first pointer event on the link, so Playwright's actionability checks before the click
+ *     never use the window up): every request that started in it, split by purpose (routed = before data-ready,
  *     background = after it, prefetch = router prefetch) and by origin (network, memory / disk / prefetch cache,
  *     service worker, or unknown, from the browser's own network log). A fixed window makes request totals comparable
- *     between pages and runs; the quiet window closes at a different moment on each. Requests still open at the
- *     window's end get a short drain (DRAIN_MS); any still open then is reported as unfinished, never as free.
+ *     between pages and runs; the quiet window closes at a different moment on each. The window's cost is decided at
+ *     one moment, its end plus DRAIN_MS: a request that started in it and is still open then is reported as unfinished
+ *     (cost unknown), never as free, however long the network-quiet wait went on.
  *     Windows are taken on the first FIXED_WINDOW_NAVS navigations of a page only (all of them in the hourly
- *     4-navigation run), so a manual deep run keeps version 1 spacing for the rest and stays well inside the job timeout.
+ *     4-navigation run), so a manual deep run keeps version 1 spacing for the rest.
  * Plus long tasks (main-thread blocking) in the fixed window and when the continuous scroll's first neighbour page
  * appeared in it. Query strings, headers, cookies and response bodies are never recorded, so the JSON holds no
  * credentials and no health data (full URLs are held in memory only, to match the network log, and never written).
@@ -41,13 +43,16 @@ const stats = require("./perf-stats.cjs");
  * cache. Its first round is the first visit of a session Today already PREWARMED (client cache, router prefetch,
  * HTTP cache), never a cold visit, and is labelled that way; each click records how long Today had been open
  * (`sinceTodayMs`). The first round keeps version 1 spacing (no fixed window), so the prewarm before each first visit
- * is as long as under version 1; later rounds get the fixed window from the click. Written as nav-<slug>.json,
- * labelled "<route> (in-app)".
+ * is as long as under version 1; later rounds get the fixed window from the click. `ready` is still timed from just
+ * before Playwright's click (version 1, unchanged). Written as nav-<slug>.json, labelled "<route> (in-app)".
  *
  * A phone scenario (390 px, Chromium iPhone emulation, CPU slowed 4x) loads Today and Log and times taps on the
- * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): it is
- * reported on every run and never turns the run red until it has been repeated across scheduled runs. Its taps only
- * navigate and open / close the menu; nothing is written.
+ * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): reported on
+ * every run that has it and never part of the budget's exit code until it has been repeated across scheduled runs.
+ * Each phone test has a time budget (no navigation or tap starts after it; the rest are reported as not tried) and a
+ * timeout covering the budget plus one worst-case step, so it cannot time out either. A manual deep run (more than
+ * PHONE_MAX_RUN_NAVIGATIONS navigations per page) skips it, so the run stays inside the job timeout and its speed
+ * budget is always evaluated. Its taps only navigate and open / close the menu; nothing is written.
  *
  * This is NOT part of the smoke suite: playwright.config.ts only matches
  * smoke.spec.ts, and this file is run through e2e/perf.config.ts.
@@ -58,16 +63,23 @@ const PAUSE_MS = 1_000; // between navigations, so the run does not hammer produ
 const QUIET_MS = 1_500; // network must be idle this long after data-ready to close the window
 const WINDOW_CAP_MS = 15_000; // never wait longer than this after data-ready
 const READY_TIMEOUT_MS = 30_000;
+const GOTO_TIMEOUT_MS = 45_000;
 // Fixed observation windows from navigation start (harness 2). A full load covers the continuous scroll's start
 // (2 s after the page opened) and the warm-up's start (2.5 s after load, then idle slots); a click has no document.
 const FIXED_WINDOW_MS = 6_000;
 const IN_APP_WINDOW_MS = 4_000;
 // Fixed windows on the first navigations of a full-load series only (cold + 3 warm; the hourly run has 4 in all).
 const FIXED_WINDOW_NAVS = 4;
-// After the window: wait at most this long for requests that started in it to finish (else: unfinished, cost unknown).
+// After the window: requests that started in it and finished by its end plus this long are measured; any still open
+// then is unfinished (cost unknown), whatever happens later.
 const DRAIN_MS = 2_000;
 const FULL_LOAD_WINDOW_RULE = `navigations 1-${FIXED_WINDOW_NAVS} of each page`;
-const IN_APP_WINDOW_RULE = "from the click, rounds 2 and later (round 1 keeps version 1 spacing)";
+const IN_APP_WINDOW_RULE = "from the first pointer event on the link, rounds 2 and later (round 1 keeps version 1 spacing)";
+// Worst case of one measured full load: about:blank and the CPU setting, the page load, data-ready, the network-quiet
+// wait (or the fixed window, whichever is longer), the drain, the in-page reads and the pause.
+const NAV_WORST_MS = GOTO_TIMEOUT_MS + READY_TIMEOUT_MS + Math.max(WINDOW_CAP_MS, FIXED_WINDOW_MS) + DRAIN_MS + PAUSE_MS + 10_000;
+// After an observe-only test's loop: the production SHA read (10 s timeout), closing the context, writing the result.
+const FINISH_RESERVE_MS = 60_000;
 // Mirror of AGENTS_API in src/lib/agents-api.ts (the sms-reminders Worker).
 const AGENTS_HOST = "sms-reminders.rileybleeklm.workers.dev";
 
@@ -77,9 +89,19 @@ const PHONE = devices["iPhone 13"];
 const PHONE_CPU_SLOWDOWN = 4;
 const PHONE_NAVIGATIONS = Math.min(4, NAVIGATIONS); // bounded: a manual 15-navigation run does not grow it
 const PHONE_ROUNDS = Math.min(3, NAVIGATIONS);
+// Observe-only, so bounded in wall-clock time: no phone navigation / tap starts after its budget (normally about a
+// minute is used); the rest are reported as not tried. Skipped on a manual deep run (see the header).
+const PHONE_THIS_RUN = NAVIGATIONS <= stats.PHONE_MAX_RUN_NAVIGATIONS;
+const PHONE_SKIP_REASON = `deep run (${NAVIGATIONS} navigations per page): the observe-only phone scenario runs on runs of ${stats.PHONE_MAX_RUN_NAVIGATIONS} or fewer (the hourly run)`;
+const PHONE_SERIES_BUDGET_MS = 150_000;
+const PHONE_INPUT_BUDGET_MS = 180_000;
 const PHONE_PAGES = ["today", "log"];
 const INPUT_SETTLE_MS = 1_000; // after a tap's ready, long tasks are still collected this long
 const TAP_PAUSE_MS = 500;
+const TAP_TIMEOUT_MS = 10_000;
+// Worst case of one tap: the tap, its ready wait, the settle time, and for a tap that failed the recovery load of the
+// screen it should have left on (page load + ready), plus the in-page reads and the pause.
+const TAP_WORST_MS = TAP_TIMEOUT_MS + READY_TIMEOUT_MS + INPUT_SETTLE_MS + GOTO_TIMEOUT_MS + READY_TIMEOUT_MS + TAP_PAUSE_MS + 10_000;
 
 const AUTH_FILE = path.join(__dirname, ".auth/state.json");
 const OUT_DIR = path.join(__dirname, "..", "perf-results");
@@ -349,6 +371,10 @@ interface Sample {
   /** Request clock (ms since this navigation started): data-ready, the click, the network-quiet close. */
   readyAtMs?: number | null;
   clickAtMs?: number | null;
+  /** In-app only: the first pointer event on the link (request clock), where the fixed window starts. */
+  pointerAtMs?: number | null;
+  /** In-app only: Playwright's actionability wait, from just before the click call to that pointer event (ms). */
+  clickWaitMs?: number | null;
   /** In-app only: ms since Today was opened (its load and warm-up) when this click was made. */
   sinceTodayMs?: number | null;
   quietAtMs?: number | null;
@@ -544,12 +570,13 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
   page.on("requestfinished", onFinished);
   page.on("requestfailed", onFailed);
 
-  let clickedAt = 0; // page clock at the click (in-app mode); its timings are measured from it
+  let clickedAt = 0; // page clock just before the click call (in-app mode); `ready` and the chart are timed from it
+  let clickOrigin = 0; // that document's time origin (a different one later = the click reloaded the document)
   let vercelCache: string | undefined;
   let vercelId: string | undefined;
   try {
     if (mode === "load") {
-      const resp = await page.goto(spec.route, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      const resp = await page.goto(spec.route, { waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
       sample.status = resp ? resp.status() : null;
       const headers = resp ? resp.headers() : {};
       vercelCache = headers["x-vercel-cache"];
@@ -559,13 +586,27 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
       sample.region = vercelId ? vercelId.split("::").slice(0, -1).join(">") : null;
     } else {
       // Shown copy only: every page also has an off (display:none) copy in Quick access or its section.
-      const link = page.locator(`aside a[href="${spec.route}"]:not([data-off])`).first();
+      const linkSel = `aside a[href="${spec.route}"]:not([data-off])`;
+      const link = page.locator(linkSel).first();
       await link.scrollIntoViewIfNeeded({ timeout: 10_000 });
-      clickedAt = await page.evaluate((sel) => {
+      // Mark the old page, restart the chart watch and listen for the first pointer event on the link (the pointer
+      // arriving on it, the press, the click): when the click really began, after Playwright's actionability checks.
+      [clickedAt, clickOrigin] = await page.evaluate(({ sel, link }) => {
         document.querySelectorAll(sel).forEach((e) => e.setAttribute("data-pf-old", ""));
-        (window as unknown as { __pfWatchChart: () => void }).__pfWatchChart();
-        return performance.now();
-      }, ROUTE_CONTENT);
+        const w = window as unknown as { __pfWatchChart: () => void; __pfPointerAt?: number | null; __pfPointerOff?: () => void };
+        w.__pfWatchChart();
+        w.__pfPointerOff?.();
+        w.__pfPointerAt = null;
+        const types = ["pointerover", "pointerdown", "mousedown", "click"];
+        const onPointer = (e: Event) => {
+          if (w.__pfPointerAt == null && e.target instanceof Element && e.target.closest(link)) w.__pfPointerAt = e.timeStamp;
+        };
+        for (const t of types) addEventListener(t, onPointer, { capture: true, passive: true });
+        w.__pfPointerOff = () => {
+          for (const t of types) removeEventListener(t, onPointer, { capture: true });
+        };
+        return [performance.now(), performance.timeOrigin] as [number, number];
+      }, { sel: ROUTE_CONTENT, link: linkSel });
       sample.clickAtMs = Date.now() - t0;
       if (opts.sessionStartedAt != null) sample.sinceTodayMs = Date.now() - opts.sessionStartedAt;
       await link.click({ timeout: 10_000 });
@@ -595,10 +636,30 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
 
     // Keep observing until the page has been network-quiet (silent revalidations and late chart fetches are part of
     // the cost of a page view; harness 1, unchanged) AND, in harness 2, the fixed window is over. The window starts at
-    // the navigation itself: navigation start for a full load, the click for an in-app one (scrolling to the link and
-    // marking the old page come before it and never use the window up). The quiet moment is kept: the version 1
-    // totals count only requests that started before it.
-    const anchor = mode === "click" ? sample.clickAtMs ?? 0 : 0;
+    // the navigation itself: navigation start for a full load; for an in-app one, the first pointer event on the link
+    // (scrolling to the link, marking the old page and Playwright's actionability checks come before it and never use
+    // the window up), else just before the click call. The quiet moment is kept: the version 1 totals count only
+    // requests that started before it.
+    let anchor = mode === "click" ? sample.clickAtMs ?? 0 : 0;
+    if (mode === "click") {
+      const pointer = await page
+        .evaluate(() => {
+          const w = window as unknown as { __pfPointerAt?: number | null; __pfPointerOff?: () => void };
+          w.__pfPointerOff?.();
+          w.__pfPointerOff = undefined;
+          return [w.__pfPointerAt ?? null, performance.timeOrigin] as [number | null, number];
+        })
+        .catch(() => null);
+      // Same document only, measured on the page's own clock from the mark, then put on the request clock.
+      if (pointer && pointer[0] != null && pointer[1] === clickOrigin && pointer[0] >= clickedAt) {
+        sample.clickWaitMs = pointer[0] - clickedAt;
+        anchor += sample.clickWaitMs;
+        sample.pointerAtMs = anchor;
+      } else {
+        sample.clickWaitMs = null;
+        sample.pointerAtMs = null;
+      }
+    }
     const winEnd = anchor + windowMs;
     const winStart = Date.now();
     let quietAt: number | null = null;
@@ -616,12 +677,14 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     }
     const observedMs = Date.now() - t0;
     sample.quietAtMs = quietAt;
-    // Requests that started in the window and are still open get a short drain, so a slow late request is measured
-    // instead of counted as free; whatever is still open after it is reported as unfinished (cost unknown).
+    // The window's cost is decided at ONE moment, its end plus DRAIN_MS: a request that started in the window and
+    // finished by then is measured, one still open then is unfinished (cost unknown), even if it finished later while
+    // the network-quiet wait above went on (that wait closes at a different moment on every navigation, so it must not
+    // decide which requests count as finished). Observation goes on to that moment only while such a request is open.
+    const settleBy = winEnd + DRAIN_MS;
     if (windowMs > 0) {
       const openInWindow = () => [...open.values()].some((r) => r.startMs >= anchor && r.startMs < winEnd);
-      const drainFrom = Date.now();
-      while (openInWindow() && Date.now() - drainFrom < DRAIN_MS) await page.waitForTimeout(100);
+      while (openInWindow() && Date.now() - t0 < settleBy) await page.waitForTimeout(100);
     }
     await Promise.allSettled(sizeJobs);
 
@@ -675,6 +738,8 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
       Object.assign(sample, timings);
     }
     const toRequestClock = (pageMs: number) => timeOrigin + pageMs - t0;
+    // Sizes of requests that finished during the in-page reads above (the first wait took a snapshot of the list).
+    await Promise.allSettled(sizeJobs);
 
     // Origin and purpose of every request, in the order they started (the network log is matched by URL in order).
     for (const rec of records) {
@@ -693,7 +758,7 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     sample.total = folded.total;
     sample.endpoints = folded.endpoints;
     if (windowMs > 0) {
-      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs, anchorMs: anchor });
+      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs, anchorMs: anchor, settleByMs: settleBy });
       sample.longTasks = stats.foldLongTasks(long.map((x) => [toRequestClock(x[0]), x[1]]), anchor, winEnd, sample.readyAtMs);
       sample.feedAtMs = feedAt == null ? null : inWindow(toRequestClock(feedAt));
       sample.firstPrefetchAtMs = prefetchStarts.length ? Math.min(...prefetchStarts) - anchor : null;
@@ -725,6 +790,8 @@ interface ResultMeta {
   windowRule: string | null;
   kind?: "input";
   planned?: number;
+  /** Observe-only: why the loop stopped before every planned navigation / tap was tried (its time budget ran out). */
+  stopped?: string | null;
 }
 
 function writeResult(meta: ResultMeta, browserVersion: string, samples: unknown[]) {
@@ -756,11 +823,20 @@ interface SeriesOptions {
   navigations: number;
   slug: string;
   label: string;
+  /** Observe-only: no navigation starts once this long has passed since the test began (the rest are not tried). */
+  budgetMs?: number;
 }
 
 /** N full loads of one page in a fresh context (navigation 1 = empty browser cache), written as <slug>.json. */
 async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions) {
-  test.setTimeout(o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + DRAIN_MS + PAUSE_MS + 5_000) + 90_000);
+  const began = Date.now();
+  // An enforced page keeps its version 1 allowance. An observe-only page gets a time budget, and its timeout covers the
+  // budget plus one navigation's worst case (the 45 s page load included) plus the finish, so it cannot time out.
+  test.setTimeout(
+    o.budgetMs != null
+      ? o.budgetMs + NAV_WORST_MS + FINISH_RESERVE_MS
+      : o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + DRAIN_MS + PAUSE_MS + 5_000) + 90_000
+  );
 
   // Fresh context per page => navigation 1 really has an empty HTTP cache.
   const context = await browser.newContext({ ...o.device, storageState: AUTH_FILE });
@@ -774,8 +850,13 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
   const samples: Sample[] = [];
   const startedAt = new Date().toISOString();
   const deployed = { start: await deployedSha(context, origin), end: null as string | null };
+  let stopped: string | null = null;
   try {
     for (let i = 0; i < o.navigations; i++) {
+      if (o.budgetMs != null && Date.now() - began >= o.budgetMs) {
+        stopped = `time budget of ${o.budgetMs / 1000} s used up: ${i} of ${o.navigations} navigations tried`;
+        break;
+      }
       const windowMs = i < FIXED_WINDOW_NAVS ? FIXED_WINDOW_MS : 0;
       const s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs, beforeGoto });
       samples.push(s);
@@ -791,7 +872,7 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
     writeResult(
       {
         slug: o.slug, label: o.label, route: spec.route, note: spec.note ?? null, navigations: o.navigations, startedAt,
-        scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS, windowRule: FULL_LOAD_WINDOW_RULE,
+        scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS, windowRule: FULL_LOAD_WINDOW_RULE, stopped,
       },
       browser.version(),
       samples
@@ -799,7 +880,7 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
   }
 
   const okCount = samples.filter((s) => s.ok).length;
-  console.log(`${o.label}: ${okCount}/${samples.length} navigations reached data-ready`);
+  console.log(`${o.label}: ${okCount}/${samples.length} navigations reached data-ready${stopped ? ` (${stopped})` : ""}`);
   // A page that never reached data-ready in ANY navigation is a failed measurement, not a slow one.
   // (A page that reached it only sometimes is caught by the speed budget: every missing navigation is a breach.)
   // An observe-only scenario (the phone) is reported, never fails the run: the report lists its missing
@@ -875,8 +956,10 @@ test("timing in-app navigation from Today", async ({ browser }) => {
 for (const slug of PHONE_PAGES) {
   const spec = PAGES.find((p) => p.slug === slug)!;
   test(`timing phone ${spec.label}`, async ({ browser }) => {
+    test.skip(!PHONE_THIS_RUN, PHONE_SKIP_REASON);
     await timePageSeries(browser, spec, {
       device: PHONE, scenario: SCENARIO.phoneLoad, navigations: PHONE_NAVIGATIONS, slug: `phone-${spec.slug}`, label: `${spec.label}, 390 px`,
+      budgetMs: PHONE_SERIES_BUDGET_MS,
     });
   });
 }
@@ -908,7 +991,7 @@ const PHONE_STEPS: TapStep[] = [
 
 async function openAndWait(page: Page, route: string, readyExpr: string): Promise<boolean> {
   try {
-    await page.goto(route, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    await page.goto(route, { waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
     if (/^\/login/.test(new URL(page.url()).pathname)) throw new Error("bounced-to-login: saved session is not valid");
     await page.waitForFunction(readyExpr, undefined, { timeout: READY_TIMEOUT_MS, polling: "raf" });
     return true;
@@ -933,7 +1016,7 @@ async function measureTap(page: Page, step: TapStep, round: number, i: number): 
       }
       return { since: performance.now(), origin: performance.timeOrigin };
     }, { sel: ROUTE_CONTENT, nav: !!step.paths });
-    await target.tap({ timeout: 10_000 });
+    await target.tap({ timeout: TAP_TIMEOUT_MS });
     const readyExpr = step.paths
       ? `(${JSON.stringify(step.paths)}.includes(location.pathname) && !document.querySelector(${JSON.stringify(OLD_CONTENT)})) ? ${step.ready} : false`
       : step.ready;
@@ -983,8 +1066,12 @@ async function measureTap(page: Page, step: TapStep, round: number, i: number): 
 }
 
 test("timing phone input responsiveness, 390 px", async ({ browser }) => {
+  test.skip(!PHONE_THIS_RUN, PHONE_SKIP_REASON);
+  const began = Date.now();
   const planned = PHONE_ROUNDS * PHONE_STEPS.length;
-  test.setTimeout(planned * (READY_TIMEOUT_MS * 2 + INPUT_SETTLE_MS + TAP_PAUSE_MS + 10_000) + 120_000);
+  // Observe-only, so bounded: no tap starts after PHONE_INPUT_BUDGET_MS, and the timeout covers the budget plus one
+  // tap's worst case (its ready wait and the recovery load included) plus the finish, so the test cannot time out.
+  test.setTimeout(PHONE_INPUT_BUDGET_MS + TAP_WORST_MS + FINISH_RESERVE_MS);
   const context = await browser.newContext({ ...PHONE, storageState: AUTH_FILE });
   await context.addInitScript(INIT_SCRIPT);
   await context.addInitScript(INPUT_SCRIPT);
@@ -994,12 +1081,17 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
   const startedAt = new Date().toISOString();
   const deployed = { start: await deployedSha(context, origin), end: null as string | null };
   const samples: InputSample[] = [];
+  let stopped: string | null = null;
   try {
     // Log not loading leaves every tap untried: the report shows "0 of N taps were tried", never a pass.
     const opened = await openAndWait(page, "/log", logReady);
-    for (let round = 0; opened && round < PHONE_ROUNDS; round++) {
+    rounds: for (let round = 0; opened && round < PHONE_ROUNDS; round++) {
       let previousOk = true;
       for (const step of PHONE_STEPS) {
+        if (Date.now() - began >= PHONE_INPUT_BUDGET_MS) {
+          stopped = `time budget of ${PHONE_INPUT_BUDGET_MS / 1000} s used up: ${samples.length} of ${planned} taps tried`;
+          break rounds;
+        }
         const s: InputSample = step.needsPrevious && !previousOk
           ? { i: samples.length, round, action: step.action, ok: false, error: "skipped: the step before was not measured" }
           : await measureTap(page, step, round, samples.length);
@@ -1022,7 +1114,7 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
       {
         slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
         note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
-        scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null,
+        scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null, stopped,
       },
       browser.version(),
       samples
@@ -1030,5 +1122,5 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
   }
   // Observed only: never fails the run. A tap that could not be measured is listed as missing in the report and in
   // the budget step's "observed only" lines, never counted as fast.
-  console.log(`phone taps: ${samples.filter((s) => s.ok).length}/${planned} measured`);
+  console.log(`phone taps: ${samples.filter((s) => s.ok).length}/${planned} measured${stopped ? ` (${stopped})` : ""}`);
 });

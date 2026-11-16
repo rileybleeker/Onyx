@@ -316,6 +316,28 @@ test('foldWindow: a request still open when observation stopped is unfinished, i
   assert.equal(stats.foldWindow([rec('api', 100)], { windowMs: 6000, readyAtMs: 500, observedMs: 6000 }).costComplete, true);
 });
 
+test('foldWindow: the cost is decided at the window end plus the drain, whatever the quiet wait did afterwards', () => {
+  // Window [0, 6000), cost decided at 8000. A request finishing at 9000 is unfinished whether observation stopped at
+  // 8000 or a long network-quiet wait kept it going to 15000; one finishing at 7900 is measured either way.
+  const records = () => [rec('rest', 1000, { endMs: 7900, durMs: 6900 }), rec('api', 5000, { endMs: 9000, durMs: 4000 })];
+  for (const observedMs of [8000, 15000]) {
+    const w = stats.foldWindow(records(), { windowMs: 6000, readyAtMs: 2000, observedMs, settleByMs: 8000 });
+    assert.equal(w.settleByMs, 8000);
+    assert.equal(w.total.pending, 1, `observed to ${observedMs}`);
+    assert.equal(w.costComplete, false);
+    assert.equal(w.purpose.routed.ms, 6900, 'the request that finished by 8000 is measured');
+    assert.equal(w.purpose.background.pending, 1);
+    assert.equal(w.purpose.background.ms, 0, 'the late one adds no duration');
+    assert.equal(w.total.bytes, 1000, 'and no size');
+  }
+  const inApp = stats.foldWindow(records(), { windowMs: 4000, readyAtMs: 2000, observedMs: 15000, anchorMs: 1000, settleByMs: 7000 });
+  assert.equal(inApp.settleByMs, 6000, 'reported from the window start');
+  assert.equal(inApp.total.pending, 1);
+  const noCut = stats.foldWindow(records(), { windowMs: 6000, readyAtMs: 2000, observedMs: 15000 });
+  assert.equal(noCut.total.pending, 0, 'without a decision moment, every finished request counts (older callers)');
+  assert.equal(noCut.settleByMs, null);
+});
+
 test('windowTable: unfinished requests, the service-worker count and a window anchored at the click are shown', () => {
   const pend = (i, ready) => v2sample(i, ready, {
     window: stats.foldWindow([rec('rest', 50), rec('api', ready + 100, { via: 'service-worker' }), rec('api', ready + 300, { endMs: undefined, durMs: undefined, via: undefined })],
@@ -529,6 +551,25 @@ test('report: version 2 files show scenario, revision, the fixed window and the 
   assert.deepEqual(stats.budgetViolations(run.pages), [], 'the slow cold phone load is not enforced');
   assert.ok(stats.observedViolations(run.pages, run.inputs).some((l) => l.startsWith('Phone taps, 390 px: only 2 of 4 taps')));
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('report: a deep run skips the phone scenario and says so once, never as a measurement', () => {
+  const n = stats.PHONE_MAX_RUN_NAVIGATIONS + 1;
+  const samples = Array.from({ length: n }, (_, i) => v2sample(i, i === 0 ? 900 : 400 + i));
+  const dir = writeRun({ 'today.json': { meta: v2meta('today', '/ (Today)', { navigations: n }), samples } });
+  const run = report.loadRun(dir);
+  assert.deepEqual(run.missing, [], 'no phone file is listed as missing');
+  assert.equal(run.phoneSkipped, true);
+  const lines = report.missingObserved(run);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^Phone scenario, 390 px: not run on a deep run/);
+  assert.match(report.render([run]), /Observe-only results not recorded/);
+  // The hourly run (4 navigations) still lists an absent phone file as not measured.
+  const hourly = writeRun({ 'today.json': { meta: v2meta('today', '/ (Today)'), samples: samples.slice(0, 4) } });
+  const h = report.loadRun(hourly);
+  assert.equal(h.phoneSkipped, false);
+  assert.equal(h.missing.length, report.OBSERVED_SLUGS.length);
+  for (const d of [dir, hourly]) fs.rmSync(d, { recursive: true, force: true });
 });
 
 test('report: pooled table keeps revisions and harness versions apart and never pools an unbound result', () => {

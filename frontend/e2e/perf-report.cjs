@@ -77,15 +77,23 @@ function loadRun(dir) {
   pages.sort((a, b) => rank(a.slug) - rank(b.slug));
   const harness = Math.max(1, ...pages.map((p) => p.harness || 1), ...inputs.map((p) => p.harness || 1));
   // Observe-only result files a version 2 run always writes (the phone scenario). One that is absent (its test died
-  // before writing, or never started) is reported as not measured, never silently left out.
+  // before writing, or never started) is reported as not measured, never silently left out. A manual deep run (more
+  // than PHONE_MAX_RUN_NAVIGATIONS navigations per page) skips the phone scenario on purpose: said once, as not run.
   const present = new Set([...pages, ...inputs].map((p) => p.slug));
-  const missing = harness >= 2 ? OBSERVED_SLUGS.filter((x) => !present.has(x.slug)) : [];
-  return { dir, meta, pages, inputs, harness, missing, window: window_ };
+  const deep = pages.some((p) => p.enforced !== false && Number.isFinite(p.expected) && p.expected > stats.PHONE_MAX_RUN_NAVIGATIONS);
+  const absent = harness >= 2 ? OBSERVED_SLUGS.filter((x) => !present.has(x.slug)) : [];
+  const missing = deep ? [] : absent;
+  const phoneSkipped = deep && absent.length > 0;
+  return { dir, meta, pages, inputs, harness, missing, phoneSkipped, window: window_ };
 }
 
-/** Lines for the observe-only result files a version 2 run did not write. */
+/** Lines for the observe-only result files a version 2 run did not write (or, on a deep run, did not try). */
 function missingObserved(run) {
-  return (run.missing || []).map((x) => `${x.label}: no result file written (not measured, not a pass)`);
+  const lines = (run.missing || []).map((x) => `${x.label}: no result file written (not measured, not a pass)`);
+  if (run.phoneSkipped) {
+    lines.push(`Phone scenario, 390 px: not run on a deep run (more than ${stats.PHONE_MAX_RUN_NAVIGATIONS} navigations per page); the hourly run measures it`);
+  }
+  return lines;
 }
 
 /**
@@ -121,7 +129,10 @@ function render(runs) {
     out.push(stats.robustTable(run.pages) + "\n");
     out.push("### Scenario, cache state and production revision\n");
     out.push(stats.scenarioTable(run.pages) + "\n");
-    out.push(`### Routed readiness and background work (fixed window from navigation start, warm median)\n`);
+    out.push(`### Routed readiness and background work (fixed window from navigation start or the click, warm median)\n`);
+    out.push(
+      "Routed = started before data-ready, background = after it. The split is by start time only, so on a slow page routed also holds continuous-scroll neighbour and warm-up reads that started before data-ready.\n"
+    );
     out.push(stats.windowTable(run.pages) + "\n");
     out.push("### Requests per page view (warm median)\n");
     out.push(stats.requestsTable(run.pages) + "\n");

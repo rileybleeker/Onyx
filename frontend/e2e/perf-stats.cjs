@@ -127,6 +127,12 @@ function normRegion(raw) {
 const HARNESS_VERSION = 2;
 /** Below this many samples a p95 is the worst sample or close to it: the report says so. */
 const LOW_N = 10;
+/**
+ * The observe-only phone scenario runs only on runs of at most this many navigations per page (the hourly run). A
+ * manual deep run skips it so its extra minutes never push the run into the job timeout, where it would be cancelled
+ * before the speed budget is evaluated; the report says it was not run, never that it was measured.
+ */
+const PHONE_MAX_RUN_NAVIGATIONS = 4;
 
 /** n plus robust spread (median, quartiles, MAD) of one population; never throws on empty input. */
 function robust(values) {
@@ -173,6 +179,9 @@ function viaOf(info) {
  *   background = started after data-ready (neighbour pages of the continuous scroll, the warm-up's data reads,
  *                silent revalidation);
  *   unknown    = the page never reached data-ready, so there is nothing to split on.
+ * The split is by start time only: on a page slow enough that the continuous scroll (about 2 s after the page opened)
+ * or the warm-up (about 2.5 s after load) starts before data-ready, their requests count as routed. So "routed" is an
+ * upper bound on what the routed page itself waited for, exact only for a page that is ready before those start.
  */
 const PURPOSES = ["routed", "background", "prefetch", "unknown"];
 function purposeOf(rec, readyAtMs) {
@@ -192,11 +201,16 @@ const DATA_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
  * every page). `observedMs` = how long the navigation was observed (request clock); a window not observed to its end
  * after the anchor is `complete: false` and is never counted as a measurement. A request still open when observation
  * stopped is counted as `pending`: its duration and size are unknown and are never added as zero (`costComplete`).
- * In the result, `readyAtMs` and `observedMs` are relative to the window start.
+ * `settleByMs` (request clock) is the one moment the window's cost is decided at (the window's end plus the drain):
+ * a request that finished after it is `pending` too, even when observation went on longer (the network-quiet wait
+ * of version 1 closes at a different moment on every navigation), so the same request is counted the same way
+ * whatever else was on the network. In the result, `readyAtMs`, `observedMs` and `settleByMs` are relative to the
+ * window start.
  */
-function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0 }) {
+function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0, settleByMs = null }) {
   const anchor = finite(anchorMs) ? anchorMs : 0;
   const end = anchor + windowMs;
+  const settleBy = finite(settleByMs) ? settleByMs : null;
   const bucket = () => ({ n: 0, data: 0, ms: 0, bytes: 0, pending: 0, network: 0, cached: 0, serviceWorker: 0, unknownVia: 0, cls: {} });
   const purpose = {};
   for (const p of PURPOSES) purpose[p] = bucket();
@@ -216,7 +230,10 @@ function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0 }) 
     if (r.startMs >= end) continue;
     const b = purpose[purposeOf(r, readyAtMs)];
     const v = VIAS.includes(r.via) ? r.via : "unknown";
-    const finished = finite(r.durMs) || finite(r.endMs);
+    const settled = finite(r.durMs) || finite(r.endMs);
+    // Finished after the moment the cost is decided at: unfinished, whatever happened later.
+    const late = settleBy != null && finite(r.endMs) && r.endMs > settleBy;
+    const finished = settled && !late;
     b.n += 1;
     if (DATA_CLASSES.has(r.cls)) b.data += 1;
     if (finished) {
@@ -240,6 +257,7 @@ function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0 }) 
     anchorMs: anchor,
     readyAtMs: finite(readyAtMs) ? readyAtMs - anchor : null,
     observedMs: finite(observedMs) ? observedMs - anchor : null,
+    settleByMs: settleBy != null ? settleBy - anchor : null,
     complete: finite(observedMs) && finite(windowMs) && observedMs - anchor >= windowMs,
     costComplete: pending === 0,
     beforeAnchor,
@@ -620,7 +638,8 @@ function scenarioTable(pages) {
  * Routed readiness against background work, in the fixed window (warm median). The window starts at navigation start
  * for a full load and at the click for an in-app navigation; requests that started before the click (the previous
  * page's leftovers, preparing the click) are counted apart and excluded. Routed = started before data-ready,
- * background = after it (continuous-scroll neighbours, warm-up data, revalidation), prefetch = router prefetches. Each
+ * background = after it (continuous-scroll neighbours, warm-up data, revalidation), prefetch = router prefetches; the
+ * split is by start time only, so on a slow page routed also holds neighbour and warm-up reads that began early. Each
  * count is split into network / browser cache / service worker / unknown; requests whose origin the browser did not
  * report are counted as unknown, never as network or cache. A request still open when observation stopped is listed
  * as unfinished (cost unknown), never as a zero-cost request.
@@ -854,6 +873,7 @@ module.exports = {
   INPUT_PAINT_MS,
   HARNESS_VERSION,
   LOW_N,
+  PHONE_MAX_RUN_NAVIGATIONS,
   VIAS,
   PURPOSES,
   budgetViolations,
