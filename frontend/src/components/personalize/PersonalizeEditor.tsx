@@ -49,8 +49,8 @@ import { clearAndEnd, editingSession, endEdit, subscribe, updateDraftFor } from 
 import { AREAS_KEY } from "@/lib/nav-areas";
 import type { GridApi } from "./PartGrid";
 import { announce, setSpeaker } from "./editor-shared";
-import { createBannerHost, openingFocusTarget, returnFocusTarget } from "./banner-focus";
-import { personalizeOpener } from "./start";
+import { closingFocusCandidates, createBannerHost, openingFocusTarget, returnFocusTarget } from "./banner-focus";
+import { personalizeOpener, personalizeOpenerInModal } from "./start";
 
 export { SidebarArranger, DrawerArranger } from "./NavArranger";
 
@@ -891,9 +891,10 @@ export function Banner() {
     };
   }, [host, isOpen]);
 
-  // Keyboard: the banner takes focus when it opens and gives it back when it closes (banner-focus.ts). After the
-  // commit's own effects (the phone drawer that held Personalize puts focus on its More tab while it closes). A
-  // drawer that stays open (the side-panel session on a phone) keeps focus inside it.
+  // Keyboard: the banner takes focus when it opens if focus was lost (an opener that stays enabled keeps it) and
+  // gives it back when it closes (banner-focus.ts). After the commit's own effects (the phone drawer that held
+  // Personalize puts focus on its More tab while it closes). A drawer that stays open (the side-panel session on a
+  // phone) keeps focus inside it.
   useEffect(() => {
     const el = ref.current;
     if (!host || !el) return;
@@ -904,12 +905,13 @@ export function Banner() {
     });
     return () => {
       cancelAnimationFrame(raf);
-      const candidates = [personalizeOpener(), before];
+      const opener = personalizeOpener();
+      const inModal = personalizeOpenerInModal();
       // The session has ended: wait one frame for the Personalize button to be enabled again.
       requestAnimationFrame(() => {
         const active = document.activeElement;
         if (active && active !== document.body && active.isConnected) return; // Riley has already moved on
-        returnFocusTarget(candidates)?.focus({ preventScroll: true });
+        returnFocusTarget(closingFocusCandidates(document, opener, inModal, before))?.focus({ preventScroll: true });
       });
     };
   }, [host, isOpen]);

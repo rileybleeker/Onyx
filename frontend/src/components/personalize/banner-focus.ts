@@ -5,11 +5,15 @@
  * - The banner is drawn in a host that is the FIRST child of <body>, so it comes first in the Tab order (it is fixed
  *   at the top of the screen; a host appended to <body> put Cancel and Done after every control of the page and of
  *   the continuous scroll).
- * - When the banner opens it takes focus (the Personalize button that started it turns disabled, which dropped
- *   focus on <body>: the next Tab then landed on Sign out). Except while a modal dialog it is not part of is open:
- *   the side-panel session started from the phone drawer keeps the drawer open, and focus stays inside it.
+ * - When the banner opens it takes focus if focus was lost (the side panel's Personalize button turns disabled,
+ *   which dropped focus on <body>: the next Tab then landed on Sign out; the command palette closes). A control that
+ *   still holds focus keeps it (Today's overview "Personalize" stays enabled, and its cards' handles come next).
+ *   While a modal dialog the banner is not part of is open, focus stays inside it: the side-panel session started
+ *   from the phone drawer keeps the drawer open.
  * - When it closes (Cancel, Done, Clear) focus goes back to the control that started it, or else to the control
- *   that had focus when the banner opened (on a phone: the More tab, as the drawer holding Personalize is closed).
+ *   that had focus when the banner opened (on a phone: the More tab, as the drawer holding Personalize is closed),
+ *   or else, when it was started from inside a dialog that has closed since (the command palette, which hands focus
+ *   back to nothing), to the Search control that opens the palette.
  */
 
 /** The minimal element surface used here (an HTMLElement in the app, a stub in tests). */
@@ -68,14 +72,19 @@ interface Container {
 }
 
 /**
- * Where focus goes when the banner opens (null: leave it where it is). Normally the banner itself. While a modal
- * dialog the banner is not part of is open, focus must not leave that dialog (the banner sits under its backdrop,
- * and a screen reader would follow focus out of the modal): a control inside it that has focus keeps it, otherwise
- * (the disabled Personalize button dropped focus) the arranger's first control, else the dialog's first control.
+ * Where focus goes when the banner opens (null: leave it where it is). The banner itself when focus was lost (on
+ * <body>, or on a control that can no longer take it, like the disabled Personalize button); a control that still
+ * holds focus keeps it. While a modal dialog the banner is not part of is open, focus must not leave that dialog
+ * (the banner sits under its backdrop, and a screen reader would follow focus out of the modal): a control inside it
+ * that has focus keeps it, otherwise (the disabled Personalize button dropped focus) the arranger's first control,
+ * else the dialog's first control.
  */
 export function openingFocusTarget(doc: FocusDoc, banner: unknown): Focusable | null {
   const modal = doc.querySelector(MODAL_DIALOG) as Partial<Container> | null;
   if (!modal || typeof modal.contains !== "function" || typeof modal.querySelector !== "function" || modal.contains(banner)) {
+    // Focus not lost (an opener that stays enabled, like Today's overview "Personalize"): left where it is.
+    const active = doc.activeElement;
+    if (active && active !== doc.body && canTakeFocus(active)) return null;
     return canTakeFocus(banner) ? banner : null;
   }
   const active = doc.activeElement;
@@ -84,4 +93,24 @@ export function openingFocusTarget(doc: FocusDoc, banner: unknown): Focusable | 
     modal.querySelector(`[${ARRANGER_ATTR}] button:not([disabled])`),
     modal.querySelector("button:not([disabled]), a[href]"),
   ]);
+}
+
+/** Attribute on the visible controls that open the command palette (the side panel's Search, the phone's top bar). */
+export const PALETTE_TRIGGER_ATTR = "data-palette-trigger";
+
+/**
+ * Where focus may go when the banner closes, in order (returnFocusTarget takes the first that can take it): the
+ * control that started Personalize, what had focus when the banner opened, and, when Personalize was started from
+ * inside a modal dialog (the command palette, which unmounts with its input and gives focus back to nothing), the
+ * palette's Search controls; only the shown one can take focus.
+ */
+export function closingFocusCandidates(
+  doc: { querySelectorAll: (selector: string) => ArrayLike<unknown> },
+  opener: unknown,
+  openerInModal: boolean,
+  before: unknown,
+): unknown[] {
+  const list: unknown[] = [opener, before];
+  if (openerInModal) list.push(...Array.from(doc.querySelectorAll(`[${PALETTE_TRIGGER_ATTR}]`)));
+  return list;
 }

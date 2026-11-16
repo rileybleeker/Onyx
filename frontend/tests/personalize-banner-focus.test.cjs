@@ -47,7 +47,7 @@ test('closing the banner gives focus back to the opener first, else to what had 
   const drawerButton = control('drawer Personalize', { inert: true });
   assert.equal(focus.returnFocusTarget([drawerButton, before]), before, 'phone: the drawer is closed, so the More tab');
   const palette = control('palette input', { connected: false });
-  assert.equal(focus.returnFocusTarget([palette, null]), null, 'command palette gone and nothing before: leave focus alone');
+  assert.equal(focus.returnFocusTarget([palette, null]), null, 'no candidate can take focus: leave it alone (closingFocusCandidates adds the Search control for the palette)');
   assert.equal(focus.returnFocusTarget([]), null);
 });
 
@@ -70,7 +70,7 @@ test('the banner is drawn in that host, takes focus, and publishes its height on
   assert.match(banner, /role="region"[^>]*tabIndex=\{-1\}/, 'the region can take focus');
   assert.match(banner, /openingFocusTarget\(document, el\)\?\.focus\(\{ preventScroll: true \}\)/, 'never focused past an open modal');
   assert.doesNotMatch(banner, /\bel\.focus\(/, 'no unconditional focus');
-  assert.match(banner, /returnFocusTarget\(candidates\)/);
+  assert.match(banner, /returnFocusTarget\(closingFocusCandidates\(document, opener, inModal, before\)\)/);
   assert.match(banner, /document\.documentElement[\s\S]*setProperty\("--pz-banner-h"/, 'height on <html> for scroll padding');
 });
 
@@ -79,6 +79,11 @@ test('Personalize remembers the control that started it before the session disab
   const body = start.slice(start.indexOf('export function personalizeNow'));
   assert.ok(body.indexOf('opener =') > 0 && body.indexOf('opener =') < body.indexOf('startPersonalize()'), 'opener read first');
   assert.match(start, /export function personalizeOpener\(\)/);
+  // Review round 2 (Codex): whether it sat in a modal dialog (the command palette closes with its input).
+  const inModal = body.indexOf('openerInModal = opener?.closest(MODAL_DIALOG) != null;');
+  assert.ok(inModal > body.indexOf('opener =') && inModal < body.indexOf('startPersonalize()'), 'read with the opener');
+  assert.match(start, /import \{ MODAL_DIALOG \} from "\.\/banner-focus";/);
+  assert.match(start, /export function personalizeOpenerInModal\(\)/);
 });
 
 // Review round 1 (2026-11-16): Tailwind 4's outline-none sets --tw-outline-style: none on the element, and
@@ -112,6 +117,52 @@ test('opening: the banner takes focus when no modal dialog is open (or it is ins
   assert.equal(focus.openingFocusTarget(docWith(null, body, body), banner), banner, 'desktop: focus to the banner');
   assert.equal(focus.openingFocusTarget(docWith(dialog([banner]), body, body), banner), banner, 'a dialog holding the banner');
   assert.equal(focus.openingFocusTarget(docWith(null, body, body), control('hidden banner', { rects: 0 })), null, 'not shown: leave focus alone');
+});
+
+// Review round 2 (Claude): an opener that stays enabled (Today's overview "Personalize") still holds focus, and the
+// cards' handles come right after it; only focus that was lost goes to the banner.
+test('opening: a control that still holds focus keeps it; lost focus goes to the banner', () => {
+  const banner = control('banner');
+  const body = { name: 'body' };
+  const overview = control('overview Personalize');
+  assert.equal(focus.openingFocusTarget(docWith(null, overview, body), banner), null, 'enabled opener: left alone');
+  assert.equal(banner.focused, 0);
+  const disabled = control('side panel Personalize', { disabled: true });
+  assert.equal(focus.openingFocusTarget(docWith(null, disabled, body), banner), banner, 'Firefox keeps the disabled button active');
+  const gone = control('palette input', { connected: false });
+  assert.equal(focus.openingFocusTarget(docWith(null, gone, body), banner), banner, 'the closed command palette');
+  assert.equal(focus.openingFocusTarget(docWith(null, null, body), banner), banner, 'no active element');
+});
+
+// Review round 2 (Codex): Personalize started from the command palette. The palette unmounts with its input and
+// gives focus back to nothing, so Done / Cancel used to leave focus on <body>.
+test('closing: started from the closed command palette, focus goes to the Search control that is shown', () => {
+  const sidePanelSearch = control('side panel Search');
+  const topBarSearch = control('phone top bar Search', { rects: 0 });
+  const doc = { querySelectorAll: (sel) => (sel === `[${focus.PALETTE_TRIGGER_ATTR}]` ? [topBarSearch, sidePanelSearch] : []) };
+  const input = control('palette input', { connected: false });
+  assert.equal(focus.returnFocusTarget(focus.closingFocusCandidates(doc, input, true, null)), sidePanelSearch, 'desktop');
+  const phoneDoc = { querySelectorAll: () => [control('side panel Search', { rects: 0 }), control('top bar Search')] };
+  assert.equal(focus.returnFocusTarget(focus.closingFocusCandidates(phoneDoc, input, true, null)).name, 'top bar Search', 'phone');
+  // Order: the opener, then what had focus at opening, then the Search control.
+  const opener = control('sidebar Personalize');
+  const before = control('More tab');
+  assert.equal(focus.returnFocusTarget(focus.closingFocusCandidates(doc, opener, false, before)), opener);
+  assert.equal(focus.returnFocusTarget(focus.closingFocusCandidates(doc, control('drawer Personalize', { inert: true }), true, before)), before, 'phone drawer: the More tab first');
+  // Started outside any dialog: no Search fallback (an opener that went away leaves focus alone).
+  // Spread into this realm: the helper runs in its own vm context, whose arrays deepStrictEqual would not match.
+  assert.deepEqual([...focus.closingFocusCandidates(doc, input, false, null)], [input, null]);
+  assert.equal(focus.returnFocusTarget(focus.closingFocusCandidates(doc, input, false, null)), null);
+});
+
+test('the palette Search controls carry the attribute the banner looks for', () => {
+  const attr = `${focus.PALETTE_TRIGGER_ATTR}=""`;
+  const sidebar = read('components/Sidebar.tsx');
+  const search = sidebar.slice(sidebar.indexOf('{/* Command palette trigger */}'), sidebar.indexOf('Search…'));
+  assert.ok(search.includes(attr), 'side panel Search');
+  const mobile = read('components/MobileNav.tsx');
+  const top = mobile.slice(mobile.lastIndexOf('<button', mobile.indexOf('aria-label="Search"')), mobile.indexOf('aria-label="Search"'));
+  assert.ok(top.includes(attr), 'phone top bar Search');
 });
 
 test('opening: the phone drawer left open by a side-panel session keeps focus inside it', () => {

@@ -173,10 +173,36 @@ test('the skip link targets the opened page title, then the page, then <main>', 
   assert.equal(pageContentTarget(docWith({ h1: title, main })), main, '<main> first when there is one');
   assert.equal(pageContentTarget(docWith({})), null, 'nothing to skip to');
 });
+// Review round 2 (2026-11-16): the page in view, not always the routed one, when the continuous scroll has moved on.
+test('the skip link targets the page in view of the continuous scroll', () => {
+  const { pageContentTarget } = sidebarModule;
+  const page = (route, kids = {}) => ({ route, getAttribute: (a) => (a === 'data-feed-route' ? route : null), querySelector: (sel) => kids[sel] ?? null });
+  const TITLE = '[data-testid="page-heading"], [data-testid="feed-page-heading"]';
+  const routedTitle = { name: 'routed title' };
+  const neighbourTitle = { name: 'neighbour title' };
+  const routed = page('/log', { '[data-testid="page-heading"]': routedTitle, [TITLE]: routedTitle });
+  const neighbour = page('/nutrition', { [TITLE]: neighbourTitle });
+  const loading = page('/habits');
+  const docWith = (pages) => ({
+    querySelectorAll: (sel) => (sel === '[data-feed-root] > [data-feed-route]' ? pages : []),
+    querySelector: (sel) => (sel === '[data-feed-root] > div[data-feed-route]' ? routed : null),
+  });
+  const doc = docWith([routed, neighbour, loading]);
+  assert.equal(pageContentTarget(doc, '/nutrition'), neighbourTitle, 'a neighbour in view: its title');
+  assert.equal(pageContentTarget(doc, '/habits'), loading, 'still a skeleton: the page itself');
+  assert.equal(pageContentTarget(doc, '/log'), routedTitle, 'the routed page');
+  assert.equal(pageContentTarget(doc, '/status'), routedTitle, 'not in the scroll: the routed page');
+  assert.equal(pageContentTarget(doc, null), routedTitle, 'no page in view given');
+});
 test('the skip link never falls through to the browser jump, and the side panel is marked for the fallback', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'Sidebar.tsx'), 'utf8');
   const body = src.slice(src.indexOf('function skipToPage'), src.indexOf('export default function Sidebar'));
   assert.ok(body.indexOf('event.preventDefault()') >= 0 && body.indexOf('event.preventDefault()') < body.indexOf('if (!target) return'), 'prevented before the target check');
+  // A tabindex the link adds goes again on blur (left in place, a click on the page's text would focus the page).
+  const added = body.indexOf('target.setAttribute("tabindex", "-1");');
+  const removed = body.indexOf('target.addEventListener("blur", () => target.removeAttribute("tabindex"), { once: true });');
+  assert.ok(added > 0 && removed > added && removed < body.indexOf('target.focus('), 'tabindex removed on blur when the link added it');
+  assert.match(src, /onClick=\{\(e\) => skipToPage\(e, current\)\}/, 'the page in view');
   assert.match(src, /<aside data-side-panel=""/);
   assert.match(sidebarModule.AFTER_SIDE_PANEL, /^\[data-side-panel\] ~ /);
 });

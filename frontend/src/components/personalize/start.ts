@@ -1,10 +1,17 @@
 import { startPersonalize } from "@/lib/personalize-registry";
+import { MODAL_DIALOG } from "./banner-focus";
 
 /** The control that started the current Personalize session (focus goes back to it when the banner closes). */
 let opener: HTMLElement | null = null;
+/** Whether it was inside a modal dialog (the command palette, the phone drawer), which may have closed since. */
+let openerInModal = false;
 
 export function personalizeOpener(): HTMLElement | null {
   return opener;
+}
+
+export function personalizeOpenerInModal(): boolean {
+  return openerInModal;
 }
 
 /**
@@ -17,6 +24,7 @@ export function personalizeNow(): "page" | "app" {
   if (typeof document !== "undefined") {
     const active = document.activeElement;
     opener = active instanceof HTMLElement && active !== document.body ? active : null;
+    openerInModal = opener?.closest(MODAL_DIALOG) != null;
   }
   if (startPersonalize()) return "page";
   void import("./app-session").then((m) => m.startAppSession()).catch((e: unknown) => logFailure("start", e));

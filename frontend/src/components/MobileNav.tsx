@@ -200,6 +200,7 @@ export default function MobileNav() {
             )}
             <button
               onClick={() => window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE))}
+              data-palette-trigger=""
               className="w-11 h-11 -mr-1 flex items-center justify-center rounded-control text-text-secondary hover:text-text-primary transition-colors"
               aria-label="Search"
             >
