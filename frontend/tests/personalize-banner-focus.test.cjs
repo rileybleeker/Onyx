@@ -70,7 +70,8 @@ test('the banner is drawn in that host, takes focus, and publishes its height on
   assert.match(banner, /role="region"[^>]*tabIndex=\{-1\}/, 'the region can take focus');
   assert.match(banner, /openingFocusTarget\(document, el\)\?\.focus\(\{ preventScroll: true \}\)/, 'never focused past an open modal');
   assert.doesNotMatch(banner, /\bel\.focus\(/, 'no unconditional focus');
-  assert.match(banner, /returnFocusTarget\(closingFocusCandidates\(document, opener, inModal, before\)\)/);
+  assert.match(banner, /closingFocusTarget\(document, closingFocusCandidates\(document, opener, inModal, before\)\)\?\.focus\(/, 'never focused behind an open modal');
+  assert.doesNotMatch(banner, /returnFocusTarget\(closingFocusCandidates/, 'the closing path goes through closingFocusTarget');
   assert.match(banner, /document\.documentElement[\s\S]*setProperty\("--pz-banner-h"/, 'height on <html> for scroll padding');
 });
 
@@ -84,6 +85,14 @@ test('Personalize remembers the control that started it before the session disab
   assert.ok(inModal > body.indexOf('opener =') && inModal < body.indexOf('startPersonalize()'), 'read with the opener');
   assert.match(start, /import \{ MODAL_DIALOG \} from "\.\/banner-focus";/);
   assert.match(start, /export function personalizeOpenerInModal\(\)/);
+  // Review round 3 (Claude): the opener is forgotten once the banner has closed, so a session started some other
+  // way never sends focus to an earlier session's opener; not on React's development double run (still open).
+  assert.match(start, /export function clearPersonalizeOpener\(\) \{\s*opener = null;\s*openerInModal = false;\s*\}/);
+  const editor = read('components/personalize/PersonalizeEditor.tsx');
+  const banner = editor.slice(editor.indexOf('export function Banner()'), editor.indexOf('// ---- tables'));
+  const cleanup = banner.slice(banner.indexOf('const opener = personalizeOpener();'));
+  assert.ok(cleanup.length > 0, 'closing cleanup found');
+  assert.ok(cleanup.indexOf('if (editingSession() === null) clearPersonalizeOpener();') > cleanup.indexOf('personalizeOpenerInModal()'), 'cleared after it was read, only when the session has ended');
 });
 
 // Review round 1 (2026-11-16): Tailwind 4's outline-none sets --tw-outline-style: none on the element, and
@@ -191,4 +200,40 @@ test('the drawer arranger carries the attribute the banner looks for', () => {
   const mobile = read('components/MobileNav.tsx');
   assert.match(mobile, /role=\{drawerOpen \? "dialog" : undefined\}/);
   assert.match(mobile, /aria-modal=\{drawerOpen \? true : undefined\}/);
+});
+
+// Review round 3 (Codex): Personalize started from the phone's command palette (or from Today's overview), then More
+// opened and Done or Cancel pressed in the drawer's arranger. The drawer stays open as a modal dialog, so focus must
+// stay inside it, not go to the top bar's Search (or the overview's Personalize) behind its backdrop.
+test('closing: a modal dialog still open keeps focus inside it', () => {
+  const topBarSearch = control('phone top bar Search');
+  const sidePanelSearch = control('side panel Search', { rects: 0 });
+  const doc = { querySelectorAll: (sel) => (sel === `[${focus.PALETTE_TRIGGER_ATTR}]` ? [sidePanelSearch, topBarSearch] : []) };
+  const input = control('palette input', { connected: false });
+  const close = control('Close navigation');
+  const drawerPersonalize = control('drawer Personalize');
+  const drawer = dialog([close, drawerPersonalize], { [focus.MODAL_FIRST_CONTROL]: close });
+  const withDrawer = { querySelector: (sel) => (sel === focus.MODAL_DIALOG ? drawer : null) };
+  const noDialog = { querySelector: () => null };
+  const fromPalette = focus.closingFocusCandidates(doc, input, true, null);
+  assert.equal(focus.closingFocusTarget(noDialog, fromPalette), topBarSearch, 'no dialog open: the Search control that is shown');
+  assert.equal(focus.closingFocusTarget(withDrawer, fromPalette), close, 'drawer still open: its first control, never Search behind it');
+  assert.equal(topBarSearch.focused, 0);
+  // Started from Today's overview (enabled opener behind the drawer): kept inside the drawer as well.
+  const overview = control('overview Personalize');
+  assert.equal(focus.closingFocusTarget(withDrawer, focus.closingFocusCandidates(doc, overview, false, null)), close);
+  // Started from the drawer's own Personalize (side-panel session, drawer kept open): back to that button.
+  assert.equal(focus.closingFocusTarget(withDrawer, focus.closingFocusCandidates(doc, drawerPersonalize, true, null)), drawerPersonalize);
+  // A candidate inside the dialog that cannot take focus is skipped; nothing in it at all: focus left alone.
+  const off = control('drawer Personalize', { disabled: true });
+  const withOff = { querySelector: (sel) => (sel === focus.MODAL_DIALOG ? dialog([off, close], { [focus.MODAL_FIRST_CONTROL]: close }) : null) };
+  assert.equal(focus.closingFocusTarget(withOff, [off, topBarSearch]), close);
+  const empty = { querySelector: (sel) => (sel === focus.MODAL_DIALOG ? dialog([]) : null) };
+  assert.equal(focus.closingFocusTarget(empty, [topBarSearch, null]), null);
+});
+
+test('the open-time first control of a dialog and the closing fallback use the same selector', () => {
+  assert.equal(focus.MODAL_FIRST_CONTROL, FIRST_CONTROL);
+  const src = read('components/personalize/banner-focus.ts');
+  assert.equal((src.match(/modal\.querySelector\(MODAL_FIRST_CONTROL\)/g) || []).length, 2, 'opening and closing');
 });

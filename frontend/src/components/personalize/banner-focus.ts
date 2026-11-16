@@ -13,7 +13,9 @@
  * - When it closes (Cancel, Done, Clear) focus goes back to the control that started it, or else to the control
  *   that had focus when the banner opened (on a phone: the More tab, as the drawer holding Personalize is closed),
  *   or else, when it was started from inside a dialog that has closed since (the command palette, which hands focus
- *   back to nothing), to the Search control that opens the palette.
+ *   back to nothing), to the Search control that opens the palette. While a modal dialog is open at that moment
+ *   (the phone drawer, opened during the session, stays open when Done or Cancel is pressed in its arranger), focus
+ *   stays inside it: never a control behind it.
  */
 
 /** The minimal element surface used here (an HTMLElement in the app, a stub in tests). */
@@ -56,6 +58,9 @@ export function createBannerHost(doc: Document): HTMLElement {
 /** An open modal dialog (the phone's navigation drawer while it is open, the command palette). */
 export const MODAL_DIALOG = '[role="dialog"][aria-modal="true"]';
 
+/** A modal dialog's first control, where focus goes inside it when nothing better can take it. */
+export const MODAL_FIRST_CONTROL = "button:not([disabled]), a[href]";
+
 /** Attribute on the phone drawer's side-panel arranger (NavArranger's DrawerArranger). */
 export const ARRANGER_ATTR = "data-pz-arranger";
 
@@ -91,7 +96,7 @@ export function openingFocusTarget(doc: FocusDoc, banner: unknown): Focusable | 
   if (active && active !== doc.body && modal.contains(active) && canTakeFocus(active)) return null;
   return returnFocusTarget([
     modal.querySelector(`[${ARRANGER_ATTR}] button:not([disabled])`),
-    modal.querySelector("button:not([disabled]), a[href]"),
+    modal.querySelector(MODAL_FIRST_CONTROL),
   ]);
 }
 
@@ -113,4 +118,18 @@ export function closingFocusCandidates(
   const list: unknown[] = [opener, before];
   if (openerInModal) list.push(...Array.from(doc.querySelectorAll(`[${PALETTE_TRIGGER_ATTR}]`)));
   return list;
+}
+
+/**
+ * Where focus goes when the banner closes (null: leave it alone): the first of `candidates` (closingFocusCandidates)
+ * that can take it. While a modal dialog is open, only a candidate inside that dialog, else the dialog's first
+ * control: Personalize started from the command palette (or from Today's overview), then the phone drawer opened and
+ * Done or Cancel pressed in its arranger, which leaves the drawer open; the Search control in the top bar, or the
+ * overview's Personalize, sit behind its backdrop, and a screen reader would follow focus out of the modal.
+ */
+export function closingFocusTarget(doc: Pick<FocusDoc, "querySelector">, candidates: readonly unknown[]): Focusable | null {
+  const modal = doc.querySelector(MODAL_DIALOG) as Partial<Container> | null;
+  if (!modal || typeof modal.contains !== "function" || typeof modal.querySelector !== "function") return returnFocusTarget(candidates);
+  const contains = modal.contains.bind(modal);
+  return returnFocusTarget([...candidates.filter((c) => c != null && contains(c)), modal.querySelector(MODAL_FIRST_CONTROL)]);
 }

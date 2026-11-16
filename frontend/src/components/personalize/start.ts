@@ -14,6 +14,12 @@ export function personalizeOpenerInModal(): boolean {
   return openerInModal;
 }
 
+/** Forget the opener once the banner has closed (it is read once per session). */
+export function clearPersonalizeOpener() {
+  opener = null;
+  openerInModal = false;
+}
+
 /**
  * "Personalize" from the sidebar, the phone drawer or the command palette, on any page: the page's own parts when
  * it has some, otherwise the app-wide arrangement (side panel order, which the continuous scroll follows). The

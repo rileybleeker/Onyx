@@ -49,8 +49,8 @@ import { clearAndEnd, editingSession, endEdit, subscribe, updateDraftFor } from 
 import { AREAS_KEY } from "@/lib/nav-areas";
 import type { GridApi } from "./PartGrid";
 import { announce, setSpeaker } from "./editor-shared";
-import { closingFocusCandidates, createBannerHost, openingFocusTarget, returnFocusTarget } from "./banner-focus";
-import { personalizeOpener, personalizeOpenerInModal } from "./start";
+import { closingFocusCandidates, closingFocusTarget, createBannerHost, openingFocusTarget } from "./banner-focus";
+import { clearPersonalizeOpener, personalizeOpener, personalizeOpenerInModal } from "./start";
 
 export { SidebarArranger, DrawerArranger } from "./NavArranger";
 
@@ -907,11 +907,15 @@ export function Banner() {
       cancelAnimationFrame(raf);
       const opener = personalizeOpener();
       const inModal = personalizeOpenerInModal();
-      // The session has ended: wait one frame for the Personalize button to be enabled again.
+      // Used once: a later session started some other way never sends focus to this session's opener. Only when the
+      // session has really ended (React's development double effect run cleans up while it is still open).
+      if (editingSession() === null) clearPersonalizeOpener();
+      // The session has ended: wait one frame for the Personalize button to be enabled again. A modal dialog still
+      // open (the phone drawer, opened during the session) keeps focus inside it.
       requestAnimationFrame(() => {
         const active = document.activeElement;
         if (active && active !== document.body && active.isConnected) return; // Riley has already moved on
-        returnFocusTarget(closingFocusCandidates(document, opener, inModal, before))?.focus({ preventScroll: true });
+        closingFocusTarget(document, closingFocusCandidates(document, opener, inModal, before))?.focus({ preventScroll: true });
       });
     };
   }, [host, isOpen]);

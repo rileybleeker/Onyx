@@ -146,7 +146,9 @@ html:has([data-pz-key="layout.check-in"]) {
     scroll-padding-bottom: calc(env(safe-area-inset-bottom) + 9rem);
   }
   /* Jump targets whose scroll-mt-24 was sized to clear the phone header on its own (ChartCard, SectionHeader, the
-     meal photo box): with the 3.5rem padding above, 2.5rem keeps them landing where they did (6rem below the top). */
+     meal photo box): with the 3.5rem padding above, 2.5rem keeps them landing where they did (6rem below the top).
+     This rule is unlayered, so below 768 px it beats every Tailwind utility: do not give an element with scroll-mt-24
+     another scroll-margin utility that applies on a phone (it would be ignored there; an md: one is fine). */
   .scroll-mt-24 {
     scroll-margin-top: 2.5rem;
   }
