@@ -1,5 +1,8 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
 
+// Worker-scoped capture settings must be file-level, including for private production checks below.
+test.use({ trace: "off", screenshot: "off", video: "off" });
+
 /**
  * Production smoke-test tripwire.
  *
@@ -845,7 +848,7 @@ test("/financials keeps the CSV preview tool behind its disclosure", async ({ pa
 // Read-only acceptance of the two capture carryovers. A fresh authenticated context contains no intake drafts.
 // No screenshots/traces/content logs, and no interaction that could enter or change user data.
 test.describe("Capture carryovers — read-only opening", () => {
-  test.use({ serviceWorkers: "block", trace: "off", screenshot: "off", video: "off" });
+  test.use({ serviceWorkers: "block" });
 
   for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
     for (const target of ["log", "reading"] as const) {
