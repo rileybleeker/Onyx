@@ -242,7 +242,8 @@ try {
         let failedInRow = 0;
         // A failed batch names its model arm (the route sends each arm's dishes in separate calls
         // during a model pilot); the one-dish retries then stay inside that arm, so the other
-        // arm's dishes are not called one by one. retryOffset counts within the arm.
+        // arm's dishes are not called one by one. retryOffset counts within the arm, and `skip`
+        // grows only for a dish that actually failed or came back without an estimate.
         let retryArm = null;
         let retryOffset = 0;
         for (let i = 0; i < 400; i++) {
@@ -266,6 +267,13 @@ try {
           failedInRow = 0;
           estimated += r.estimated || 0;
           remaining = r.remaining ?? 0;
+          if (retrying && r.arm_exhausted) {
+            // That arm has no dish left at retryOffset: no dish was skipped, so leave the one-dish
+            // retries (counting nothing) and carry on with full batches.
+            single = 0;
+            retryArm = null;
+            continue;
+          }
           if (limit === 1) { single--; if (!r.estimated) { skip++; retryOffset++; } } else if (!r.estimated) break;
           if (remaining <= skip) break;
         }

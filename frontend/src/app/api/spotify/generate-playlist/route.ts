@@ -22,15 +22,18 @@ import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist, CreatePlaylistResult } from "@/lib/spotify-server";
 import {
+  attemptTimeoutMs,
   callWithCountedRetries,
   chooseModel,
   effortConfig,
-  isRetryableStatus,
+  isRetryableModelError,
   logPilotObservation,
   MODEL_CALL_RETRIES,
   pilotFromEnv,
   pilotObservation,
   PLAYLIST_CALL_TIMEOUT_MS,
+  PLAYLIST_REQUEST_BUDGET_MS,
+  retryAfterMs,
 } from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
@@ -245,9 +248,19 @@ export async function POST(req: NextRequest) {
     );
   };
 
+  // Ends the tool loop when the request budget runs out: the call in flight is aborted (body read
+  // included) and no further call starts, so the request still ends in the catch below and is
+  // observed. A client that disconnects does not stop the loop (a playlist asked for is still
+  // made, as before); `send` swallows the closed stream and the request is observed at the end.
+  const requestAt = started + PLAYLIST_REQUEST_BUDGET_MS;
+  const stop = new AbortController();
+  const budget = AbortSignal.timeout(PLAYLIST_REQUEST_BUDGET_MS);
+  budget.addEventListener("abort", () => stop.abort(budget.reason), { once: true });
+
   // Every model call of the tool loop. The SDK's own retries are off (they would hide attempts
   // from the count) and the route retries the same errors the SDK would, at most
-  // MODEL_CALL_RETRIES times, counting each attempt; a hung call ends at the deadline.
+  // MODEL_CALL_RETRIES times, counting each attempt and waiting as long as the provider's
+  // Retry-After asks, but never past the request budget; a hung call ends at its deadline.
   const callModel = (messages: Anthropic.MessageParam[]) =>
     callWithCountedRetries(
       () =>
@@ -260,12 +273,18 @@ export async function POST(req: NextRequest) {
             messages,
             ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
           },
-          { timeout: PLAYLIST_CALL_TIMEOUT_MS, maxRetries: 0 },
+          {
+            timeout: Math.min(PLAYLIST_CALL_TIMEOUT_MS, attemptTimeoutMs(requestAt, Date.now())),
+            maxRetries: 0,
+            signal: stop.signal,
+          },
         ),
       {
         retries: MODEL_CALL_RETRIES,
-        isRetryable: (e) =>
-          e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && isRetryableStatus(e.status)),
+        isRetryable: (e) => isRetryableModelError(e, (x) => x instanceof Anthropic.APIConnectionError),
+        retryAfterMs: (e) => retryAfterMs(e, Date.now()),
+        deadlineMs: requestAt,
+        signal: stop.signal,
         onAttempt: () => {
           attempts++;
         },
@@ -396,6 +415,9 @@ export async function POST(req: NextRequest) {
           message: e instanceof Error ? e.message : String(e),
         });
       } finally {
+        // Every path observes once (the flag makes repeats no-ops), including a request whose
+        // client disconnected or whose last event could not be sent.
+        observe();
         try {
           controller.close();
         } catch {

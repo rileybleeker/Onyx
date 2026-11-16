@@ -33,7 +33,10 @@ id. One estimate call uses one model, so a dish batch holds only the dishes in t
 arm (the rest stay queued for the next call); a dish gets the same model in a batch and in the
 harvester's one-dish retry. A failed batch's error names its arm and where that arm's dishes
 start; the harvester then retries one dish at a time inside that arm only (`arm` + an offset
-within the arm), so a failure never causes calls for the other arm's dishes.
+within the arm), so a failure never causes calls for the other arm's dishes. When that arm has
+no dish left at the offset the route answers `arm_exhausted`, and the harvester goes back to full
+batches without counting a skipped dish (only a dish that failed or came back without an estimate
+is stepped past).
 
 **Rollback:** delete `ONYX_MODEL_PILOT` (or let the end date pass) and redeploy. Every call goes
 back to the baseline. Estimates already stored keep the model they were made with
@@ -47,14 +50,21 @@ latency in ms and the input / output / cache read / cache write token counts. `c
 number of provider attempts (counted before each attempt, so one that threw still counts),
 `answered` the number that returned usage and `unpriced` the difference. Every routed call runs
 with the SDK's own retries off (`maxRetries: 0`), so no attempt happens out of sight of the
-count: the dish and label routes make one attempt per request (the harvester's retries are
-separate, observed requests), and the playlist route retries the errors the SDK would retry
-(connection errors and timeouts, 408, 409, 429, 5xx) itself, at most twice per call, counting
-each attempt (`callWithCountedRetries`). The line is written once per request, after the
-outcome is known: a dish batch only after its estimates are stored (a failed save is logged with
-0 accepted). Each model call has a deadline: inside the 60 s function limit for the dish and
-label routes (the SDK default is longer), 60 s per attempt for the playlist route, so a slow call
-ends as a failed, observed attempt rather than a killed request with no line. Never prompt,
+count. Instead every route retries the errors the SDK would retry (connection errors and
+timeouts, 408, 409, 429, 5xx, or whatever the provider's `x-should-retry` header says) itself, at
+most twice per call, waiting as long as the provider's `retry-after-ms` / `retry-after` asks
+(else a short exponential wait), and counting each attempt (`callWithCountedRetries`). This holds
+with or without a pilot, so turning retries over to the route keeps the retries production had.
+A retry starts only when its wait plus one second still ends before the request's deadline;
+otherwise the last error ends the request. The harvester's own retries after a failed batch are
+separate, observed requests. The line is written once per request, after the outcome is known: a
+dish batch only after its estimates are stored (a failed save is logged with 0 accepted).
+Deadlines: the dish and label routes count their 60 s function limit from the handler's entry
+(`routeDeadline`): the model call, every attempt, retry wait and the response body read, ends by
+50 s (the SDK's `timeout` stops only at the response headers, so the call also gets an abort
+signal), and the database reads and writes end by 54 s. The playlist route has 60 s per attempt
+and 280 s for the whole tool loop (a client that disconnects does not stop it). A slow call
+therefore ends as a failed, observed attempt rather than a killed request with no line. Never prompt,
 reply, dish, product or track text. Outside a pilot nothing is logged.
 
 Accepted results per task: a dish batch whose every dish got an estimate (and the count of

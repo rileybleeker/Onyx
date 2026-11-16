@@ -8,8 +8,8 @@
 // after the pilot's observations meet PILOT_CRITERIA (docs/model-routing-pilot.md).
 //
 // No imports and no clock: the routes pass the time in. Only pilotFromEnv (reads process.env),
-// logPilotObservation (console) and the default wait between retries in callWithCountedRetries
-// (setTimeout) touch anything outside the function arguments.
+// logPilotObservation (console), routeDeadline (AbortSignal.timeout) and the default wait and
+// clock in callWithCountedRetries (setTimeout, Date.now) touch anything outside the arguments.
 
 export type RoutedTask = "delivery_estimate" | "playlist" | "supplement_photo";
 export type Effort = "low" | "medium" | "high";
@@ -224,17 +224,68 @@ export function pilotCostEvidence(lines: ReadonlyArray<{ calls?: unknown; answer
 export const MODEL_CALL_RETRIES = 2;
 /** Deadline for one playlist model call (the SDK default is 10 minutes, so a hung call would never be observed). */
 export const PLAYLIST_CALL_TIMEOUT_MS = 60_000;
+/**
+ * Whole playlist request (tool loop and retry waits). The route sets no `maxDuration`, so this
+ * stays under the platform's default function limit; past it, no retry is started.
+ */
+export const PLAYLIST_REQUEST_BUDGET_MS = 280_000;
 
 /** HTTP statuses the SDK itself retries (request timeout, conflict, rate limit, server errors). */
 export function isRetryableStatus(status: unknown): boolean {
   return typeof status === "number" && (status === 408 || status === 409 || status === 429 || status >= 500);
 }
 
+interface HeadersLike {
+  get(name: string): string | null | undefined;
+}
+
+function errorHeaders(e: unknown): HeadersLike | null {
+  const h = (e as { headers?: unknown } | null)?.headers;
+  return h && typeof (h as HeadersLike).get === "function" ? (h as HeadersLike) : null;
+}
+
+/**
+ * The SDK's own retry rule for a failed call: a connection error (as `isConnectionError` says;
+ * the routes pass the SDK's class) is retried; otherwise the provider's `x-should-retry` header
+ * decides when present, else the status (isRetryableStatus). A call aborted by the route's own
+ * deadline or by a disconnect is neither, so it is not retried.
+ */
+export function isRetryableModelError(e: unknown, isConnectionError: (e: unknown) => boolean): boolean {
+  if (isConnectionError(e)) return true;
+  const header = errorHeaders(e)?.get("x-should-retry");
+  if (header === "true") return true;
+  if (header === "false") return false;
+  return isRetryableStatus((e as { status?: unknown } | null)?.status);
+}
+
+/**
+ * The wait the provider asked for before a retry, as the SDK reads it: `retry-after-ms`, else
+ * `retry-after` in seconds or as an HTTP date. Null when the error carries no usable header.
+ */
+export function retryAfterMs(e: unknown, nowMs: number): number | null {
+  const h = errorHeaders(e);
+  if (!h) return null;
+  const ms = parseFloat(h.get("retry-after-ms") ?? "");
+  if (Number.isFinite(ms) && ms >= 0) return ms;
+  const raw = h.get("retry-after");
+  if (!raw) return null;
+  const seconds = parseFloat(raw);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : null;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - nowMs) : null;
+}
+
+/** Shortest time worth starting one more attempt with before a deadline. */
+export const MIN_ATTEMPT_MS = 1_000;
+
 /**
  * Run one model call with bounded retries done HERE, so every provider attempt is counted
  * (`onAttempt` fires before each one). The call must be made with the SDK's `maxRetries: 0`; a
- * retry happens only when `isRetryable` says so, after a short exponential wait. The last error is
- * thrown when the retries run out or the error is not retryable.
+ * retry happens only when `isRetryable` says so, after the wait the provider asked for
+ * (`retryAfterMs`, e.g. a 429's Retry-After) or else a short exponential wait. With `deadlineMs`
+ * a retry is started only when that wait plus MIN_ATTEMPT_MS still ends before the deadline;
+ * otherwise, when the retries run out, when the error is not retryable or when `signal` was
+ * aborted meanwhile, the last error is thrown. An already aborted `signal` starts no attempt.
  */
 export async function callWithCountedRetries<T>(
   call: () => Promise<T>,
@@ -242,6 +293,10 @@ export async function callWithCountedRetries<T>(
     retries: number;
     isRetryable: (e: unknown) => boolean;
     onAttempt: () => void;
+    retryAfterMs?: (e: unknown) => number | null;
+    deadlineMs?: number;
+    signal?: AbortSignal;
+    now?: () => number;
     waitMs?: (retry: number) => number;
     sleep?: (ms: number) => Promise<void>;
   },
@@ -249,13 +304,19 @@ export async function callWithCountedRetries<T>(
   const retries = Math.max(0, Math.floor(o.retries));
   const waitMs = o.waitMs ?? ((r: number) => Math.min(8_000, 500 * 2 ** r));
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = o.now ?? (() => Date.now());
+  if (o.signal?.aborted) throw o.signal.reason ?? new Error("aborted");
   for (let attempt = 0; ; attempt++) {
     o.onAttempt();
     try {
       return await call();
     } catch (e) {
       if (attempt >= retries || !o.isRetryable(e)) throw e;
-      await sleep(waitMs(attempt));
+      const asked = o.retryAfterMs?.(e);
+      const wait = asked != null && Number.isFinite(asked) && asked >= 0 ? asked : waitMs(attempt);
+      if (o.deadlineMs !== undefined && now() + wait + MIN_ATTEMPT_MS > o.deadlineMs) throw e;
+      await sleep(wait);
+      if (o.signal?.aborted) throw e;
     }
   }
 }
@@ -263,14 +324,42 @@ export async function callWithCountedRetries<T>(
 /** Function limit of the routes that call a model (their `maxDuration`), and the part of it kept for the rest of the request. */
 export const FUNCTION_BUDGET_MS = 60_000;
 export const FUNCTION_RESERVE_MS = 6_000;
+/** Part of the request deadline kept after the model call for storing its result. */
+export const MODEL_WRITE_RESERVE_MS = 4_000;
 
 /**
- * Time one model call may take so it ends (answer or timeout) inside the function budget, which
- * lets the request write its own terminal observation instead of being killed with none. The SDK's
- * default timeout is longer than the function limit, so routes pass this with `maxRetries: 0`.
+ * Absolute deadlines for a request with a FUNCTION_BUDGET_MS limit, counted from the handler's
+ * entry (`startMs`), so time spent on database reads before the model call is inside the budget.
+ *  - `at` / `signal`: the whole request's work (reads, model call, writes) ends by then; pass
+ *    `signal` to every database query (`.abortSignal(signal)`).
+ *  - `modelAt` / `modelSignal`: the model call (all attempts, retry waits and reading the
+ *    response body) ends by then, leaving MODEL_WRITE_RESERVE_MS for storing its result. The SDK's
+ *    `timeout` stops only at the response headers, so the call also gets `modelSignal`, which
+ *    aborts the body read as well.
+ * Ending inside the budget lets the request write its own terminal observation instead of being
+ * killed with none.
  */
-export function callTimeoutMs(routeStartMs: number, nowMs: number): number {
-  return Math.max(1_000, FUNCTION_BUDGET_MS - FUNCTION_RESERVE_MS - (nowMs - routeStartMs));
+export interface RouteDeadline {
+  at: number;
+  modelAt: number;
+  signal: AbortSignal;
+  modelSignal: AbortSignal;
+}
+
+export function routeDeadline(startMs: number, nowMs: number): RouteDeadline {
+  const at = startMs + FUNCTION_BUDGET_MS - FUNCTION_RESERVE_MS;
+  const modelAt = at - MODEL_WRITE_RESERVE_MS;
+  return {
+    at,
+    modelAt,
+    signal: AbortSignal.timeout(Math.max(0, at - nowMs)),
+    modelSignal: AbortSignal.timeout(Math.max(0, modelAt - nowMs)),
+  };
+}
+
+/** SDK `timeout` for one attempt that must end by `deadlineMs` (never zero or negative). */
+export function attemptTimeoutMs(deadlineMs: number, nowMs: number): number {
+  return Math.max(MIN_ATTEMPT_MS, deadlineMs - nowMs);
 }
 
 export type Arm = ModelChoice["arm"];

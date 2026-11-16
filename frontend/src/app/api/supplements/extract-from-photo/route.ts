@@ -3,7 +3,19 @@ import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import type { NormalizedIngredient, NormalizedProduct } from "@/lib/dsld";
 import { isUsableLabel } from "@/lib/label-extract";
-import { callTimeoutMs, chooseModel, effortConfig, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
+import {
+  attemptTimeoutMs,
+  callWithCountedRetries,
+  chooseModel,
+  effortConfig,
+  isRetryableModelError,
+  logPilotObservation,
+  MODEL_CALL_RETRIES,
+  pilotFromEnv,
+  pilotObservation,
+  retryAfterMs,
+  routeDeadline,
+} from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -60,11 +72,12 @@ interface RefEntry {
  * vocabulary. Voted UNII per group: pick the most-common UNII observed for
  * that group across all products. Same for category.
  */
-async function buildReferenceTable(): Promise<RefEntry[]> {
+async function buildReferenceTable(signal: AbortSignal): Promise<RefEntry[]> {
   const { data, error } = await supabase
     .from("supplement_products")
     .select("ingredients")
-    .eq("is_active", true);
+    .eq("is_active", true)
+    .abortSignal(signal);
   if (error) throw new Error(`Reference fetch failed: ${error.message}`);
 
   type Tally = Map<string, number>;
@@ -244,6 +257,8 @@ export const maxDuration = 60;
  * Anthropic call.
  */
 export async function POST(req: NextRequest) {
+  // The function budget counts from the handler's entry (body parsing and the reference read are inside it).
+  const deadline = routeDeadline(Date.now(), Date.now());
   const { image_base64, media_type } = (await req.json()) as {
     image_base64?: string;
     media_type?: string;
@@ -266,10 +281,10 @@ export async function POST(req: NextRequest) {
   const pilot = pilotFromEnv(now);
   const choice = chooseModel("supplement_photo", crypto.randomUUID(), pilot, now);
   const started = Date.now();
-  const routeStart = started;
   let usage: Anthropic.Usage | null = null;
-  // 1 once the model call is attempted (also when it throws); 0 when the request failed before it
-  // (e.g. the reference table read), so those failures are not charged to the model.
+  // Provider attempts, counted before each one (retries included, also when it throws); 0 when the
+  // request failed before the model call (e.g. the reference table read), so those failures are
+  // not charged to the model.
   let attempts = 0;
   const observe = (ok: boolean) =>
     logPilotObservation(
@@ -282,13 +297,14 @@ export async function POST(req: NextRequest) {
     );
 
   try {
-    const reference = await buildReferenceTable();
+    const reference = await buildReferenceTable(deadline.signal);
     const prompt = buildPrompt(reference);
 
-    attempts = 1;
-    // End the call inside the 60 s function limit (the SDK default outlasts it), so a slow call
-    // still writes its failure observation.
-    const resp = await anthropic.messages.create({
+    // The SDK's default timeout and retries outlast the 60 s function limit. The route retries the
+    // errors the SDK would (MODEL_CALL_RETRIES, honouring Retry-After, counting each attempt) only
+    // while the model deadline allows, and `modelSignal` ends the call, body read included, inside
+    // it, so a slow call still writes its failure observation.
+    const resp = await callWithCountedRetries(() => anthropic.messages.create({
       model: choice.model,
       max_tokens: 4096,
       ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
@@ -308,7 +324,16 @@ export async function POST(req: NextRequest) {
           ],
         },
       ],
-    }, { timeout: callTimeoutMs(routeStart, Date.now()), maxRetries: 0 });
+    }, { timeout: attemptTimeoutMs(deadline.modelAt, Date.now()), maxRetries: 0, signal: deadline.modelSignal }), {
+      retries: MODEL_CALL_RETRIES,
+      isRetryable: (e) => isRetryableModelError(e, (x) => x instanceof Anthropic.APIConnectionError),
+      retryAfterMs: (e) => retryAfterMs(e, Date.now()),
+      deadlineMs: deadline.modelAt,
+      signal: deadline.modelSignal,
+      onAttempt: () => {
+        attempts++;
+      },
+    });
     usage = resp.usage;
 
     const textBlock = resp.content.find((b) => b.type === "text");

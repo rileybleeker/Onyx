@@ -168,9 +168,15 @@ test("playlist and label requests count attempted calls before each create, obse
   assert.match(pl, /callWithCountedRetries\(\s*\(\) =>\s*anthropic\.messages\.create\(/);
   assert.match(pl, /onAttempt: \(\) => \{\s*attempts\+\+;/);
   assert.match(pl, /if \(observed\) return;/);
-  const ph = read("app/api/supplements/extract-from-photo/route.ts");
-  assert.match(ph, /attempts = 1;\s*const resp = await anthropic\.messages\.create\(/);
-  for (const src of [pl, ph]) assert.match(src, /calls: attempts/);
+  // The label and dish routes: one create each, inside callWithCountedRetries (their attempt
+  // counting is checked by driving the real routes through a stub SDK below).
+  for (const rel of ["app/api/supplements/extract-from-photo/route.ts", "app/api/delivery/items/import/route.ts"]) {
+    const src = read(rel);
+    assert.equal(createCalls(src).length, 1, rel);
+    assert.match(src, /callWithCountedRetries\(\s*\(\) =>\s*anthropic\.messages\.create\(/, rel);
+    assert.match(src, /calls: attempts/, rel);
+  }
+  assert.match(pl, /calls: attempts/);
 });
 
 test("dish estimates record the model of the arm that made them", () => {
@@ -278,16 +284,37 @@ test("without a pilot every dish is baseline and nothing is filtered out", () =>
   assert.equal(b.arm, "baseline");
 });
 
-test("model calls end inside the 60 s function budget", () => {
-  assert.equal(R.callTimeoutMs(1000, 1000), 54_000);
-  assert.equal(R.callTimeoutMs(1000, 11_000), 44_000);
-  assert.equal(R.callTimeoutMs(1000, 80_000), 1_000, "never zero or negative");
+const dishSrc = () => read("app/api/delivery/items/import/route.ts");
+
+test("route deadlines count from the handler's entry and end the model call before the writes", () => {
+  const d = R.routeDeadline(1000, 1000);
+  assert.equal(d.at, 1000 + R.FUNCTION_BUDGET_MS - R.FUNCTION_RESERVE_MS);
+  assert.equal(d.modelAt, d.at - R.MODEL_WRITE_RESERVE_MS);
+  assert.ok(d.signal instanceof AbortSignal && d.modelSignal instanceof AbortSignal);
+  assert.equal(d.signal.aborted, false);
+  // A request whose budget is already used up gets signals that are (about to be) aborted.
+  assert.equal(R.attemptTimeoutMs(50_000, 10_000), 40_000);
+  assert.equal(R.attemptTimeoutMs(50_000, 80_000), R.MIN_ATTEMPT_MS, "never zero or negative");
   for (const rel of ["app/api/delivery/items/import/route.ts", "app/api/supplements/extract-from-photo/route.ts"]) {
     const src = read(rel);
-    assert.match(src, /timeout: callTimeoutMs\(routeStart, Date\.now\(\)\), maxRetries: 0/);
+    assert.match(src, /routeDeadline\(/, rel);
+    assert.match(src, /timeout: attemptTimeoutMs\(deadline\.modelAt, Date\.now\(\)\), maxRetries: 0, signal: deadline\.modelSignal/, rel);
+    assert.match(src, /retries: MODEL_CALL_RETRIES,/, rel);
+    assert.match(src, /deadlineMs: deadline\.modelAt,/, rel);
+    // Every database read and write of the request is cut off at the request deadline.
+    assert.match(src, /\.abortSignal\((deadline\.)?signal\)/, rel);
   }
-  // The playlist route has no function limit; its calls get a fixed deadline, SDK retries off.
-  assert.match(read("app/api/spotify/generate-playlist/route.ts"), /timeout: PLAYLIST_CALL_TIMEOUT_MS, maxRetries: 0/);
+  assert.match(read("app/api/supplements/extract-from-photo/route.ts"), /buildReferenceTable\(deadline\.signal\)/);
+  assert.match(dishSrc(), /\.upsert\(rows, \{ onConflict: "est_key", ignoreDuplicates: true \}\)\s*\.abortSignal\(deadline\.signal\)/);
+  // The dish route starts its deadline before parsing the body or reading the queue.
+  const dish = read("app/api/delivery/items/import/route.ts");
+  assert.ok(dish.indexOf("routeDeadline(startedAt.getTime()") < dish.indexOf("await req.json()"));
+  // The playlist route has no function limit: 60 s per attempt, a whole-request budget, SDK retries off.
+  const pl = read("app/api/spotify/generate-playlist/route.ts");
+  assert.match(pl, /timeout: Math\.min\(PLAYLIST_CALL_TIMEOUT_MS, attemptTimeoutMs\(requestAt, Date\.now\(\)\)\)/);
+  assert.match(pl, /maxRetries: 0,\s*signal: stop\.signal/);
+  // Every request is observed, also one whose client disconnected mid-loop.
+  assert.match(pl, /\} finally \{[\s\S]{0,240}?observe\(\);/);
 });
 
 test("a failed estimate batch answers with its arm first, so the harvester can read it", () => {
@@ -296,6 +323,8 @@ test("a failed estimate batch answers with its arm first, so the harvester can r
   const h = fs.readFileSync(path.join(__dirname, "..", "..", "tools", "ubereats_harvest", "harvest.mjs"), "utf8");
   assert.match(h, /"arm":"\(baseline\|pilot\)","arm_offset"/);
   assert.match(h, /arm: retryArm/);
+  // An arm with no dish left ends the one-dish retries without counting a skipped dish.
+  assert.match(h, /if \(retrying && r\.arm_exhausted\) \{[\s\S]*?single = 0;[\s\S]*?retryArm = null;[\s\S]*?continue;/);
 });
 
 test("a label read is accepted only with a product name and named ingredients", () => {
@@ -363,6 +392,71 @@ test("callWithCountedRetries counts every attempt, retries only retryable errors
   assert.equal(R.MODEL_CALL_RETRIES, 2);
 });
 
+test("callWithCountedRetries waits as long as the provider asks, but never past the deadline", async () => {
+  const waits = [];
+  const clock = { t: 0 };
+  const opts = (extra) => ({
+    retries: 2,
+    isRetryable: () => true,
+    onAttempt: () => {},
+    now: () => clock.t,
+    sleep: async (ms) => {
+      waits.push(ms);
+      clock.t += ms;
+    },
+    waitMs: () => 500,
+    ...extra,
+  });
+  const failThenOk = () => {
+    let n = 0;
+    return async () => {
+      if (n++ === 0) throw new Error("rate limited");
+      return "ok";
+    };
+  };
+  // Retry-After honoured when it fits.
+  assert.equal(await R.callWithCountedRetries(failThenOk(), opts({ retryAfterMs: () => 30_000, deadlineMs: 50_000 })), "ok");
+  assert.deepEqual(waits, [30_000]);
+  // A wait that would end past the deadline (less one attempt) is not started: the error ends it.
+  waits.length = 0;
+  clock.t = 0;
+  let attempts = 0;
+  await assert.rejects(
+    R.callWithCountedRetries(failThenOk(), opts({ retryAfterMs: () => 49_500, deadlineMs: 50_000, onAttempt: () => attempts++ })),
+    /rate limited/,
+  );
+  assert.equal(attempts, 1);
+  assert.deepEqual(waits, []);
+  // No header: the route's own backoff.
+  waits.length = 0;
+  clock.t = 0;
+  assert.equal(await R.callWithCountedRetries(failThenOk(), opts({ retryAfterMs: () => null })), "ok");
+  assert.deepEqual(waits, [500]);
+  // An aborted signal starts no attempt at all.
+  const ctl = new AbortController();
+  ctl.abort(new Error("gone"));
+  attempts = 0;
+  await assert.rejects(R.callWithCountedRetries(async () => "never", opts({ signal: ctl.signal, onAttempt: () => attempts++ })), /gone/);
+  assert.equal(attempts, 0);
+});
+
+test("retryAfterMs and isRetryableModelError read the provider's headers like the SDK", () => {
+  const err = (status, headers) => Object.assign(new Error("x"), { status, headers: new Headers(headers) });
+  assert.equal(R.retryAfterMs(err(429, { "retry-after-ms": "1500" }), 0), 1500);
+  assert.equal(R.retryAfterMs(err(429, { "retry-after": "30" }), 0), 30_000);
+  const now = Date.parse("2026-11-16T12:00:00Z");
+  assert.equal(R.retryAfterMs(err(429, { "retry-after": "Mon, 16 Nov 2026 12:00:10 GMT" }), now), 10_000);
+  assert.equal(R.retryAfterMs(err(429, {}), 0), null);
+  assert.equal(R.retryAfterMs(new Error("no headers"), 0), null);
+  const conn = (e) => e && e.conn === true;
+  assert.equal(R.isRetryableModelError(Object.assign(new Error("c"), { conn: true }), conn), true);
+  assert.equal(R.isRetryableModelError(err(529, {}), conn), true);
+  assert.equal(R.isRetryableModelError(err(400, {}), conn), false);
+  assert.equal(R.isRetryableModelError(err(400, { "x-should-retry": "true" }), conn), true);
+  assert.equal(R.isRetryableModelError(err(503, { "x-should-retry": "false" }), conn), false);
+  assert.equal(R.isRetryableModelError(Object.assign(new Error("aborted"), { status: undefined }), conn), false);
+});
+
 test("retryable statuses match the SDK's own rule", () => {
   for (const s of [408, 409, 429, 500, 503, 529]) assert.equal(R.isRetryableStatus(s), true, String(s));
   for (const s of [400, 401, 403, 404, 413, 422, undefined, null, "500"]) assert.equal(R.isRetryableStatus(s), false, String(s));
@@ -418,6 +512,13 @@ function stubSdk(script, seenOptions) {
             };
           }
           if (step === "answer_end") return { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }], usage: { ...USAGE } };
+          // Route-specific answers built from the request, and error statuses carrying headers.
+          if (typeof step === "function") return { usage: { ...USAGE }, ...step(_params) };
+          if (step && typeof step === "object") {
+            const e = new StubAPIError(step.status, "Error status");
+            e.headers = new Headers(step.headers || {});
+            throw e;
+          }
           throw new Error(`script ran out (${String(step)})`);
         },
       };
@@ -492,4 +593,191 @@ test("the playlist measurement fixtures are internally consistent", () => {
     assert.equal(c.expect.unpriced, c.expect.calls - c.expect.answered);
     assert.equal(c.expect.cost_complete, c.expect.unpriced === 0);
   }
+});
+
+// --- the label and dish routes, driven through a stub SDK: attempts counted, retries kept -------
+
+async function withPilot(task, fn) {
+  const until = new Date(Date.now() + 3 * DAY).toISOString().slice(0, 10);
+  const saved = { p: process.env.ONYX_MODEL_PILOT, u: process.env.ONYX_MODEL_PILOT_UNTIL, s: process.env.ONYX_MODEL_PILOT_SHARE };
+  process.env.ONYX_MODEL_PILOT = task;
+  process.env.ONYX_MODEL_PILOT_UNTIL = until;
+  delete process.env.ONYX_MODEL_PILOT_SHARE;
+  const lines = [];
+  const origInfo = console.info;
+  const origError = console.error;
+  const origSetTimeout = global.setTimeout;
+  console.info = (msg) => lines.push(JSON.parse(msg));
+  console.error = () => {};
+  // Retry waits go through setTimeout; run them at once so the test does not sleep.
+  global.setTimeout = (f) => origSetTimeout(f, 0);
+  try {
+    return { result: await fn(), lines };
+  } finally {
+    console.info = origInfo;
+    console.error = origError;
+    global.setTimeout = origSetTimeout;
+    for (const [k, v] of [["ONYX_MODEL_PILOT", saved.p], ["ONYX_MODEL_PILOT_UNTIL", saved.u], ["ONYX_MODEL_PILOT_SHARE", saved.s]]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const jsonResponse = { NextResponse: { json: (body, init) => ({ body, status: (init && init.status) || 200 }) }, NextRequest: class {} };
+const LABEL_ANSWER = () => ({
+  stop_reason: "end_turn",
+  content: [{
+    type: "text",
+    text: JSON.stringify({
+      brand_name: "Generic", full_name: "Generic Magnesium", serving_size: 1, serving_unit: "Capsule(s)", servings_per_container: 60,
+      physical_state: "Capsule",
+      ingredients: [{ name: "Magnesium", ingredient_group: "Magnesium", unii_code: null, category: "mineral", quantity: 200, unit: "mg", percent_dv: null, forms: [], notes: null }],
+    }),
+  }],
+});
+
+async function runLabelCase(script) {
+  const seen = [];
+  const { result, lines } = await withPilot("supplement_photo", async () => {
+    const route = loadTs("app/api/supplements/extract-from-photo/route.ts", {
+      "@anthropic-ai/sdk": stubSdk([...script], seen),
+      "@supabase/supabase-js": {
+        createClient: () => ({ from: () => ({ select: () => ({ eq: () => ({ abortSignal: async () => ({ data: [], error: null }) }) }) }) }),
+      },
+      "next/server": jsonResponse,
+    });
+    return route.POST({ json: async () => ({ image_base64: "AAAA", media_type: "image/jpeg" }) });
+  });
+  return { res: result, lines, seen };
+}
+
+test("label route: a retryable error is retried (as the SDK did) and every attempt is counted", async () => {
+  const { res, lines, seen } = await runLabelCase(["http_529", LABEL_ANSWER]);
+  assert.equal(res.status, 200);
+  assert.equal(seen.length, 2);
+  for (const o of seen) {
+    assert.equal(o.maxRetries, 0);
+    assert.ok(o.signal instanceof AbortSignal, "the model call gets the deadline signal");
+    assert.ok(o.timeout > 0 && o.timeout <= R.FUNCTION_BUDGET_MS - R.FUNCTION_RESERVE_MS - R.MODEL_WRITE_RESERVE_MS);
+  }
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].calls, 2);
+  assert.equal(lines[0].answered, 1);
+  assert.equal(lines[0].unpriced, 1);
+  assert.equal(lines[0].ok, true);
+});
+
+test("label route: retries stop at the limit, a non-retryable error is not retried", async () => {
+  const exhausted = await runLabelCase(["http_529", "http_529", "http_529", LABEL_ANSWER]);
+  assert.equal(exhausted.res.status, 502);
+  assert.equal(exhausted.seen.length, 1 + R.MODEL_CALL_RETRIES);
+  assert.equal(exhausted.lines[0].calls, 1 + R.MODEL_CALL_RETRIES);
+  assert.equal(exhausted.lines[0].ok, false);
+  const hard = await runLabelCase(["http_400", LABEL_ANSWER]);
+  assert.equal(hard.seen.length, 1);
+  assert.equal(hard.lines[0].calls, 1);
+});
+
+test("label route: a Retry-After that would outlast the function limit ends the request instead of waiting", async () => {
+  const { res, seen, lines } = await runLabelCase([{ status: 429, headers: { "retry-after": "120" } }, LABEL_ANSWER]);
+  assert.equal(res.status, 502);
+  assert.equal(seen.length, 1);
+  assert.equal(lines[0].calls, 1);
+  // A short one is honoured and the retry goes through.
+  const short = await runLabelCase([{ status: 429, headers: { "retry-after-ms": "5" } }, LABEL_ANSWER]);
+  assert.equal(short.res.status, 200);
+  assert.equal(short.seen.length, 2);
+});
+
+function dishSupabase(dishes, upserts) {
+  return {
+    createClient: () => ({
+      from: (table) => ({
+        select: () => ({
+          order: () => ({
+            limit: (n) => ({
+              abortSignal: async (sig) => {
+                assert.ok(sig instanceof AbortSignal, `${table} read gets the request signal`);
+                return { data: dishes.slice(0, n), error: null, count: dishes.length };
+              },
+            }),
+          }),
+        }),
+        upsert: (rows) => ({
+          abortSignal: async (sig) => {
+            assert.ok(sig instanceof AbortSignal, `${table} write gets the request signal`);
+            upserts.push(rows);
+            return { error: null };
+          },
+        }),
+      }),
+    }),
+  };
+}
+
+// Answers every dish in the request with a synthetic estimate.
+const DISH_ANSWER = (params) => {
+  const { items } = JSON.parse(params.messages[0].content);
+  return {
+    stop_reason: "end_turn",
+    content: [{
+      type: "text",
+      text: JSON.stringify({
+        items: items.map((it) => ({ id: it.id, kind: "food", kcal: 500, protein_g: 20, carbs_g: 50, fat_g: 20, alcohol_g: 0, confidence: "medium", basis: "typical" })),
+      }),
+    }],
+  };
+};
+
+async function runDishCase(script, body = { estimate: true }) {
+  const dishes = ["k01", "k02", "k03", "k04"].map((k) => ({
+    est_key: k, store_name: "Generic Diner", merchant_kind: "restaurant", title: "Generic bowl", customizations: null, price: 12, currency: "USD",
+  }));
+  const seen = [];
+  const upserts = [];
+  const { result, lines } = await withPilot("delivery_estimate", async () => {
+    const route = loadTs("app/api/delivery/items/import/route.ts", {
+      "@anthropic-ai/sdk": stubSdk([...script], seen),
+      "@supabase/supabase-js": dishSupabase(dishes, upserts),
+      "next/server": jsonResponse,
+    });
+    return route.POST({ json: async () => body });
+  });
+  return { res: result, lines, seen, upserts };
+}
+
+test("dish route: a transient error is retried inside the deadline, not failed for the whole batch", async () => {
+  const { res, lines, seen, upserts } = await runDishCase(["http_529", DISH_ANSWER]);
+  assert.equal(res.status, 200);
+  assert.ok(res.body.estimated >= 1);
+  assert.equal(seen.length, 2);
+  for (const o of seen) {
+    assert.equal(o.maxRetries, 0);
+    assert.ok(o.signal instanceof AbortSignal);
+  }
+  assert.equal(upserts.length, 1);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].calls, 2);
+  assert.equal(lines[0].unpriced, 1);
+  assert.equal(lines[0].accepted, res.body.estimated);
+});
+
+test("dish route: a failed batch still names its arm first, with every attempt counted", async () => {
+  const { res, lines, seen } = await runDishCase(["http_400"]);
+  assert.equal(res.status, 500);
+  assert.deepEqual(Object.keys(res.body).slice(0, 2), ["arm", "arm_offset"]);
+  assert.equal(seen.length, 1);
+  assert.equal(lines[0].calls, 1);
+  assert.equal(lines[0].accepted, 0);
+});
+
+test("dish route: a retry inside an arm with no dish left says so, so the harvester leaves its retries", async () => {
+  const { res, seen } = await runDishCase([], { estimate: true, limit: 1, offset: 50, arm: "pilot" });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.estimated, 0);
+  assert.equal(res.body.arm_exhausted, true);
+  assert.equal(seen.length, 0, "no model call");
+  const plain = await runDishCase([], { estimate: true, limit: 1, offset: 50 });
+  assert.equal("arm_exhausted" in plain.res.body, false);
 });
