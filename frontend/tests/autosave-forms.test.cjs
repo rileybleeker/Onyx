@@ -123,7 +123,8 @@ const PRODUCTS = [
   { product_id: "synthetic-product-2", brand_name: "Synthetic Brand", full_name: "Synthetic powder", serving_size: 5, serving_unit: "g", ingredient_count: 2 },
 ];
 const NEW_STACK = { stack_id: null, name: "", description: null, remind_time: null, items: [] };
-const SAVED_STACK = { stack_id: 7, name: "Synthetic stack", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] };
+// As the page opens a stored stack: with the version its list read (SupplementsClient passes `version`).
+const SAVED_STACK = { stack_id: 7, name: "Synthetic stack", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }], version: 3 };
 const STACK_NAME = byPlaceholder("e.g. Morning stack");
 const STACK_DESCRIPTION = byPlaceholder("e.g. taken right after waking");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -132,6 +133,86 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // comparison. What the server does with them is tested in tests/supplement-stack-save.test.cjs.
 const STACK_FIELDS = ["stack_id", "name", "description", "remind_time", "items"];
 const stackFields = (body) => Object.fromEntries(STACK_FIELDS.filter((k) => k in body).map((k) => [k, body[k]]));
+
+// The stacks route as the editor meets it. Every request is checked by the route's own parser and answered by the
+// route's own mapping (lib/supplement-stack-save.ts: parseStackSave, saveStack), against a small in-memory stand-in
+// for pds.save_supplement_stack's version contract: a create starts at version 1 and every write adds one; a resend
+// of the stored save id is a replay; a create whose key is stored is adopted only with a save id and only when the
+// writes since were this editor's own; an update with no version is refused 409 "reload" and one made against an
+// older version 409 "stale", unless the newer write was this editor's own unanswered save (after_save_ids). So a
+// PATCH that production would refuse is refused here too. The full model of the function (rollback, names, items)
+// is in tests/supplement-stack-save.test.cjs.
+const STACK_SAVE = loadTs("lib/supplement-stack-save.ts");
+const dbError = (code) => ({ data: null, error: { code } });
+function stackServer(seed = []) {
+  const stacks = seed.map((s) => ({ client_key: null, items: [], ...s, last_save_id: null }));
+  let seq = Math.max(40, ...stacks.map((s) => s.stack_id));
+  const db = {
+    rpc: async (fn, a) => {
+      if (fn !== STACK_SAVE.STACK_SAVE_RPC) return dbError("PGRST202");
+      let row = null;
+      if (a.p_stack_id != null) {
+        row = stacks.find((s) => s.stack_id === a.p_stack_id) ?? null;
+        if (!row) return dbError("OXS03");
+      } else if (a.p_client_key) {
+        row = stacks.find((s) => s.client_key === a.p_client_key) ?? null;
+      }
+      const existing = a.p_stack_id == null && row !== null;
+      let created = false;
+      let replayed = false;
+      if (!row) {
+        row = { stack_id: ++seq, client_key: a.p_client_key, version: 1, last_save_id: a.p_save_id, items: [] };
+        stacks.push(row);
+        created = true;
+      } else if (a.p_save_id && row.last_save_id === a.p_save_id) {
+        replayed = true;
+      } else {
+        if (existing ? a.p_save_id == null : a.p_expected_version == null) return dbError("OXS05");
+        const own = row.last_save_id != null && (a.p_after_save_ids ?? []).includes(row.last_save_id);
+        if (!(existing ? own : row.version === a.p_expected_version || own)) return dbError("OXS01");
+        row.version += 1;
+        row.last_save_id = a.p_save_id;
+      }
+      if (!replayed && (created || a.p_items != null)) row.items = a.p_items ?? [];
+      Object.assign(row, replayed ? {} : a.p_header);
+      return { data: { stack_id: row.stack_id, version: row.version, item_count: row.items.length, created, existing, replayed }, error: null };
+    },
+  };
+  return {
+    stacks,
+    async answer(call) {
+      if (call.url !== "/api/supplements/stacks" || !["POST", "PATCH"].includes(call.method)) {
+        return response({ error: `Synthetic server: no ${call.method} ${call.url}` }, 404);
+      }
+      const parsed = STACK_SAVE.parseStackSave(call.body, call.method === "POST" ? "create" : "update");
+      if (!parsed.ok) return response({ error: parsed.error, code: "invalid" }, 400);
+      const quiet = console.error;
+      console.error = () => {}; // saveStack logs a refusal's code; the tests read the answer instead
+      try {
+        const r = await STACK_SAVE.saveStack(db, parsed.value);
+        return response(r.body, r.status);
+      } finally {
+        console.error = quiet;
+      }
+    },
+  };
+}
+
+test("the synthetic stacks server refuses what production refuses: an update with no version, or one made against an older version", async () => {
+  const server = stackServer([{ stack_id: 7, version: 3 }]);
+  const base = { stack_id: 7, name: "Synthetic stack", items: [{ product_id: "synthetic-product-1", doses: 1 }], after_save_ids: [] };
+  const send = async (body) => {
+    const res = await server.answer({ url: "/api/supplements/stacks", method: "PATCH", body });
+    return [res.status, (await res.json()).code];
+  };
+  assert.deepEqual(await send({ ...base, save_id: "00000000-0000-4000-8000-000000000001", expected_version: null }), [409, "reload"]);
+  assert.deepEqual(await send({ ...base, save_id: "00000000-0000-4000-8000-000000000002" }), [409, "reload"], "a missing version is a reload too");
+  assert.deepEqual(await send({ ...base, save_id: "00000000-0000-4000-8000-000000000003", expected_version: 2 }), [409, "stale"]);
+  assert.equal(server.stacks[0].version, 3, "nothing refused was written");
+  assert.deepEqual(await send({ ...base, save_id: "00000000-0000-4000-8000-000000000004", expected_version: 3 }), [200, undefined]);
+  assert.equal(server.stacks[0].version, 4);
+  assert.deepEqual(await send({ ...base, save_id: "00000000-0000-4000-8000-000000000005", expected_version: 3, extra: 1 }), [400, "invalid"], "the route's parser refuses unknown fields");
+});
 
 async function mountStack(t, { stack = NEW_STACK, answer } = {}) {
   const events = { closed: 0, saved: 0 };
@@ -149,7 +230,8 @@ async function nameAndProduct(h) {
 }
 
 test("stack editor: a new stack is created once it has a name and a product; later edits update that stack", async (t) => {
-  const h = await mountStack(t, { answer: (call) => response({ stack_id: 41, item_count: 1, version: call.method === "POST" ? 1 : 2 }) });
+  const server = stackServer();
+  const h = await mountStack(t, { answer: server.answer });
   change(one(h, STACK_NAME, "the name field"), "Synthetic stack");
   await h.flush();
   await h.tick(60_000);
@@ -176,17 +258,24 @@ test("stack editor: a new stack is created once it has a name and a product; lat
   assert.notEqual(update.body.save_id, create.body.save_id, "a new change is a new save");
   assert.deepEqual(update.body.after_save_ids, [], "nothing was left unanswered");
   assert.equal("client_key" in update.body, false, "an update names its stack, not a key");
+  // A stack this editor created keeps "Stack created" as its saved line; a refused update would show "Not saved".
+  assert.match(h.text(), /Stack created/, "the server accepted the update");
+  assert.doesNotMatch(h.text(), /Not saved|Not confirmed/);
+  assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version, s.description]), [[41, 2, "Synthetic description"]], "one stack, written twice");
 });
 
 test("stack editor: a create whose answer is lost is shown, retried with the same key, and then edited in place", async (t) => {
-  // The editor's half: the failure is shown and the create is resent with the same key and save id. The server's
-  // reply is faked here; that the stacks route and pds.save_supplement_stack really answer such a resend with the
-  // stack they made (one stack, replayed) is tested in tests/supplement-stack-save.test.cjs.
+  // The editor's half: the failure is shown and the create is resent with the same key and save id. The first create
+  // reaches the synthetic server and is stored there; only its answer is lost. The resend is then answered as a
+  // replay of that stack (with its version), and the edit after it must carry that version: the server refuses an
+  // update without one. The real route and pds.save_supplement_stack are tested in tests/supplement-stack-save.test.cjs.
+  const server = stackServer();
   let posts = 0;
   const h = await mountStack(t, {
-    answer: (call) => {
+    answer: async (call) => {
+      const res = await server.answer(call);
       if (call.method === "POST" && ++posts === 1) throw new TypeError("Synthetic lost answer");
-      return response({ stack_id: 41, item_count: 1, existing: posts > 1 });
+      return res;
     },
   });
   await nameAndProduct(h);
@@ -202,15 +291,23 @@ test("stack editor: a create whose answer is lost is shown, retried with the sam
   assert.equal(sent[1].body.client_key, sent[0].body.client_key, "the same key: the server answers with the stack it already made");
   assert.equal(sent[1].body.save_id, sent[0].body.save_id, "the same save id: a create that went through is replayed, not written twice");
   assert.match(h.text(), /Stack created/);
+  assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version]), [[41, 1]], "one stack: the resend was a replay");
   change(one(h, STACK_DESCRIPTION, "the description field"), "Synthetic description");
   await h.flush();
   await h.tick(1200);
   assert.deepEqual(methods(h), ["POST /api/supplements/stacks", "POST /api/supplements/stacks", "PATCH /api/supplements/stacks"]);
+  const update = h.net.writes()[2].body;
+  assert.equal(update.expected_version, 1, "the edit carries the version the replayed create answered");
+  assert.deepEqual(update.after_save_ids, [], "the replay answered the lost create, so nothing is left unanswered");
+  assert.match(h.text(), /Stack created/, "the server accepted the edit");
+  assert.doesNotMatch(h.text(), /Not saved|Not confirmed/);
+  assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version, s.description]), [[41, 2, "Synthetic description"]]);
 });
 
 test("stack editor: a refused create is shown with Retry and not sent again on its own", async (t) => {
+  const server = stackServer();
   let refuse = true;
-  const h = await mountStack(t, { answer: () => (refuse ? response({ error: "Synthetic refusal" }, 400) : response({ stack_id: 41 })) });
+  const h = await mountStack(t, { answer: (call) => (refuse ? response({ error: "Synthetic refusal" }, 400) : server.answer(call)) });
   await nameAndProduct(h);
   await h.tick(400);
   assert.match(h.text(), /Not saved: Synthetic refusal/);
@@ -222,23 +319,31 @@ test("stack editor: a refused create is shown with Retry and not sent again on i
   await h.flush();
   assert.equal(h.net.writes().length, 2);
   assert.match(h.text(), /Stack created/);
+  assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version]), [[41, 1]]);
 });
 
 test("stack editor: leaving a field sends its change at once, and only once", async (t) => {
-  const h = await mountStack(t, { stack: SAVED_STACK, answer: () => response({ stack_id: 7 }) });
+  const server = stackServer([{ stack_id: 7, version: 3 }]);
+  const h = await mountStack(t, { stack: SAVED_STACK, answer: server.answer });
   const name = one(h, STACK_NAME, "the name field");
   change(name, "Synthetic stack, renamed");
   await h.flush();
   one(h, STACK_NAME, "the name field").props.onBlur();
   await h.flush();
   assert.deepEqual(h.net.writes().map((c) => [c.method, stackFields(c.body)]), [["PATCH", { stack_id: 7, name: "Synthetic stack, renamed", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] }]]);
+  assert.equal(h.net.writes()[0].body.expected_version, 3, "the version the stack was opened with");
+  assert.match(h.text(), /Saved/, "the server accepted it");
+  assert.deepEqual(server.stacks.map((s) => [s.version, s.name]), [[4, "Synthetic stack, renamed"]]);
   await h.tick(60_000);
   assert.equal(h.net.writes().length, 1, "the pause that followed sent nothing more");
 });
 
 test("stack editor: Close with a change that could not be saved stays open; once saved it closes and the page re-reads", async (t) => {
+  // During the outage the save does not reach the synthetic server; the editor cannot know that, so it resends the
+  // same save (same id, same version) once the server answers again.
+  const server = stackServer([{ stack_id: 7, version: 3 }]);
   let down = true;
-  const h = await mountStack(t, { stack: SAVED_STACK, answer: () => (down ? response({ code: "unconfirmed", error: "Synthetic outage" }, 503) : response({ stack_id: 7 })) });
+  const h = await mountStack(t, { stack: SAVED_STACK, answer: (call) => (down ? response({ code: "unconfirmed", error: "Synthetic outage" }, 503) : server.answer(call)) });
   change(one(h, STACK_NAME, "the name field"), "Synthetic stack, renamed");
   await h.flush();
   h.click("Close");
@@ -249,6 +354,10 @@ test("stack editor: Close with a change that could not be saved stays open; once
   down = false;
   await h.tick(2000);
   assert.match(h.text(), /Saved/);
+  const [first, retry] = h.net.writes().map((c) => c.body);
+  assert.deepEqual([first.expected_version, retry.expected_version], [3, 3], "both carry the version the stack was opened with");
+  assert.equal(retry.save_id, first.save_id, "the retry is the same save");
+  assert.deepEqual(server.stacks.map((s) => [s.version, s.name]), [[4, "Synthetic stack, renamed"]], "written once");
   h.click("Close");
   await h.flush();
   assert.equal(h.net.writes().length, 2, "nothing is sent twice");
@@ -257,12 +366,8 @@ test("stack editor: Close with a change that could not be saved stays open; once
 
 test("stack editor: after a create, Close and another new stack make a second stack with its own key", async (t) => {
   // Like the stacks route: a create repeated with a key answers the stack that key made, a new key makes a new one.
-  const made = new Map();
-  const answer = (call) => {
-    if (call.method !== "POST") return response({ stack_id: call.body.stack_id });
-    if (!made.has(call.body.client_key)) made.set(call.body.client_key, 41 + made.size);
-    return response({ stack_id: made.get(call.body.client_key), item_count: call.body.items.length });
-  };
+  const server = stackServer();
+  const answer = server.answer;
   let host = null;
   // SupplementsClient keeps the editor mounted between opens (stack null = closed) and passes a fresh object for
   // every "New stack", so the editor's refs (stack id, key) outlive one stack.
@@ -299,6 +404,7 @@ test("stack editor: after a create, Close and another new stack make a second st
     { name: "Synthetic stack A", description: null, remind_time: null, items: [{ product_id: "synthetic-product-1", doses: 1 }] },
     { name: "Synthetic stack B", description: null, remind_time: null, items: [{ product_id: "synthetic-product-2", doses: 1 }] },
   ], "the second create carries only the second stack");
+  assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version, s.name]), [[41, 1, "Synthetic stack A"], [42, 1, "Synthetic stack B"]], "two stacks, each written once");
 });
 
 // ─── supplement intake editor (mounted) ──────────────────────────────────────
