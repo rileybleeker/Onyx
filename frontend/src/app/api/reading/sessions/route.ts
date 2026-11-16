@@ -2,6 +2,7 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
+import { removalAnswer, runRemovalCleanup } from "@/lib/reading-removal";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -37,10 +38,14 @@ export async function POST(req: NextRequest) {
   });
   // 409 discarded: this client_key's entry was discarded (sql/reading_session_discards.sql), so nothing is created
   // under it again; the /log form continues an entry edited since under a new key.
+  // 503: a keyed create needs pds.create_reading_session (one transaction); until it is there nothing is stored and the
+  // form retries (never the create in separate requests, which a Discard could land between).
   if (!result.ok) {
     return result.discarded
       ? NextResponse.json({ error: result.error, discarded: true }, { status: 409 })
-      : NextResponse.json({ error: result.error }, { status: 400 });
+      : result.unavailable
+        ? NextResponse.json({ error: result.error }, { status: 503 })
+        : NextResponse.json({ error: result.error }, { status: 400 });
   }
 
   const overview = await getOverview(supabase, result.book.slug).catch(() => null);
@@ -108,7 +113,8 @@ function originRefused(req: NextRequest): { status: number; error: string } | nu
  * created: `removed: null` tells the form nothing of the entry is stored, and nothing can be stored under that key
  * any more. Repeating it is safe.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check.
- * Answers: 200 { success, removed: id | null, unfinished, overview }, 400 for a key that is not a UUID, 503 while the
+ * Answers: 200 { success, removed: id | null, unfinished, overview } (a retry of a removal whose answer was lost
+ * answers its id and replays its Notion cleanup), 400 for a key that is not a UUID, 503 while the
  * discard cannot be recorded (SQL not applied), 500 on a database failure (the form retries both).
  */
 export async function DELETE(req: NextRequest) {
@@ -116,15 +122,12 @@ export async function DELETE(req: NextRequest) {
   if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
   const r = await deleteSessionByClientKey(supabase, req.nextUrl.searchParams.get("client_key") ?? "");
   if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
-  if (!r.removed) return NextResponse.json({ success: true, removed: null, unfinished: false, overview: null });
-  const { removed, book, unfinished } = r;
-  const overview = await getOverview(supabase, book.slug).catch(() => null);
+  if (!r.removed && !r.cleanup) return NextResponse.json({ success: true, removed: null, unfinished: false, overview: null });
+  // A fresh removal, or a retry of one whose answer was lost: the Notion cleanup it still owes runs after the
+  // response (lib/reading-removal.ts). A create's own after() that was still writing the Notion entry trashes it
+  // once it sees the row gone.
+  const { book, overview, removedId, owed } = await removalAnswer(supabase, r);
+  if (owed) after(() => runRemovalCleanup(supabase, r, book, overview));
 
-  // A create's own after() that was still writing the Notion entry trashes it once it sees the row gone.
-  after(async () => {
-    await removeMirroredBlock(removed.notion_block_id);
-    await mirrorProgress(book, overview?.chaptersDone ?? 0, overview?.sessions?.[0]?.session_date ?? null);
-  });
-
-  return NextResponse.json({ success: true, removed: removed.session_id, unfinished, overview });
+  return NextResponse.json({ success: true, removed: removedId, unfinished: r.unfinished, overview });
 }

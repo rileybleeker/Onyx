@@ -104,19 +104,20 @@ test("parseSessionUpdate: strict body", () => {
 /** `noClientKey`: the column is not there yet (sql/reading_sessions_client_key.sql not applied). */
 /** `missFirstKeyLookup`: the first client_key read finds nothing (another create with the key is still in flight). */
 /**
- * `noDiscards`: sql/reading_session_discards.sql is not applied (no function, no trigger). `discardError`: the discard
- * call fails with this code. Otherwise pds.discard_reading_session_key records the key and answers the session it made,
- * and the insert trigger refuses a discarded key (OXR01), as the SQL does. A keyed create is pds.create_reading_session:
+ * `noDiscards`: sql/reading_session_discards.sql is not applied (no function, no trigger). `discardError`: the removal
+ * call fails with this code. Otherwise pds.remove_reading_session records the key, removes the session with the finish
+ * and habit Yes it caused and writes the cleanup row, in one step, and the insert trigger refuses a discarded key
+ * (OXR01), as the SQL does. A keyed create is pds.create_reading_session:
  * the session, the finish and the habit Yes in one transaction holding the key's lock, which the discard takes too
  * (modelled as a per-key queue). `hooks.beforeInsert` runs right before an insert reaches the table (before the lock):
  * what the database does while a create is still under way on the server. `hooks.inCreate` runs inside the keyed
  * create's transaction, after its insert and before its finish and habit stamp; anything it starts that needs the
- * key's lock waits for that transaction to commit. `booksReadError`: every read of pds.books fails.
+ * key's lock waits for that transaction to commit. `booksReadError`: every read of pds.books fails (the removal too).
  */
 function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null, booksReadError = false } = {}) {
   let keyLookups = 0;
   const tables = JSON.parse(JSON.stringify(seed));
-  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards"]) tables[t] ??= [];
+  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals"]) tables[t] ??= [];
   const log = [];
   const hooks = { beforeInsert: null, inCreate: null };
   const locks = new Map();
@@ -207,16 +208,58 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
     };
     return b;
   }
-  const discard = async (key) => {
-    log.push({ table: "reading_session_discards", op: "rpc", payload: { client_key: key } });
+  /**
+   * pds.remove_reading_session: one transaction (sql/reading_session_discards.sql). The key (given, or the session's
+   * own) is recorded as discarded under its lock; the delete, the finish taken back, the habit Yes it made and the
+   * cleanup row commit together. Nothing found: the cleanup row of an earlier removal of that id / key.
+   */
+  const remove = async (a) => {
+    log.push({ table: "remove_reading_session", op: "rpc", payload: { session_id: a.p_session_id, client_key: a.p_client_key } });
     if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
     if (discardError) return { data: null, error: { code: discardError, message: "database failure" } };
     if (noClientKey) return { data: null, error: { code: "42703", message: "column client_key does not exist" } };
-    return withLock(key, () => {
-      if (!tables.reading_session_discards.some((d) => d.client_key === key)) tables.reading_session_discards.push({ client_key: key });
-      const row = tables.reading_sessions.find((r) => r.client_key === key);
-      return { data: row ? row.session_id : null, error: null };
-    });
+    if (booksReadError) return { data: null, error: { code: "57014", message: "statement timeout" } };
+    const key = a.p_client_key ?? tables.reading_sessions.find((r) => r.session_id === a.p_session_id)?.client_key ?? null;
+    const tx = () => {
+      const row = a.p_client_key
+        ? tables.reading_sessions.find((r) => r.client_key === a.p_client_key)
+        : tables.reading_sessions.find((r) => r.session_id === a.p_session_id);
+      // A Kindle session raises (the transaction rolls back, so no discard is recorded either).
+      if (row && row.source !== "manual" && row.source !== "chat") return { data: null, error: { code: "OXR02", message: "kindle" } };
+      if (key && !tables.reading_session_discards.some((d) => d.client_key === key)) tables.reading_session_discards.push({ client_key: key });
+      if (!row) {
+        const rem = a.p_client_key
+          ? [...tables.reading_session_removals].reverse().find((r) => r.client_key === a.p_client_key)
+          : tables.reading_session_removals.find((r) => r.session_id === a.p_session_id);
+        return { data: JSON.parse(JSON.stringify({ removed: false, removal: rem ?? null })), error: null };
+      }
+      const b = tables.books.find((x) => x.book_id === row.book_id);
+      if (!b) return { data: null, error: { code: "OXR03", message: "book missing" } };
+      tables.reading_sessions = tables.reading_sessions.filter((r) => r.session_id !== row.session_id);
+      let unfinished = false;
+      const total = b.total_chapters;
+      if (
+        b.status === "finished" && total > 0 && (row.chapter_through ?? 0) >= total && b.finished_on === row.session_date &&
+        !tables.reading_sessions.some((s) => s.book_id === b.book_id && s.chapter_through >= total)
+      ) {
+        Object.assign(b, { status: "reading", finished_on: null });
+        unfinished = true;
+      }
+      let habitRemoved = false;
+      const sameHabit = tables.books.filter((x) => x.habit_name === b.habit_name).map((x) => x.book_id);
+      if (
+        a.p_habit_created_on && a.p_habit_created_on === row.session_date && b.habit_name &&
+        !tables.reading_sessions.some((s) => s.session_date === row.session_date && sameHabit.includes(s.book_id))
+      ) {
+        const before = tables.habit_journal.length;
+        tables.habit_journal = tables.habit_journal.filter((h) => !(h.cycle_date === row.session_date && h.question === b.habit_name && h.answer === "Yes"));
+        habitRemoved = tables.habit_journal.length < before;
+      }
+      const removal = { session_id: row.session_id, client_key: row.client_key ?? null, book_id: row.book_id, session_date: row.session_date, notion_block_id: row.notion_block_id ?? null, unfinished, removed_at: "2026-11-15T21:00:00Z", mirror_done_at: null };
+      tables.reading_session_removals = tables.reading_session_removals.filter((r) => r.session_id !== row.session_id).concat([removal]);
+      return { data: JSON.parse(JSON.stringify({ removed: true, session: row, book: b, unfinished, habit_removed: habitRemoved, removal })), error: null };
+    };
+    return key ? withLock(key, tx) : tx();
   };
   /** pds.create_reading_session: one transaction under the key's lock (sql/reading_session_discards.sql). */
   const createKeyed = async (a) => {
@@ -284,8 +327,8 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
     rpc: async (name, args) =>
       name === "behavioral_today_now"
         ? { data: "2026-11-15", error: null }
-        : name === "discard_reading_session_key"
-          ? discard(args.p_key)
+        : name === "remove_reading_session"
+          ? remove(args)
           : name === "create_reading_session"
             ? createKeyed(args)
             : { data: null, error: null },
@@ -482,15 +525,20 @@ test("deleteSessionByClientKey (Discard after a lost create answer): removes the
   assert.deepEqual(db.tables.reading_session_discards.map((d) => d.client_key), [KEY], "the key is recorded as discarded (lower case)");
 
   const again = await R.deleteSessionByClientKey(db, KEY);
-  assert.deepEqual(again, { ok: true, removed: null }, "repeating it is safe: nothing of the entry is stored");
+  assert.equal(again.ok, true);
+  assert.equal(again.removed, null, "repeating it is safe: nothing of the entry is stored");
+  assert.equal(again.cleanup.sessionId, 41, "the earlier removal's cleanup comes back, so a lost answer's Notion cleanup is replayed");
+  assert.equal(again.cleanup.done, false);
   assert.equal(db.tables.reading_session_discards.length, 1);
+  assert.equal(db.tables.books[0].status, "reading", "the database part is not repeated");
   const empty = fakeDb({ books: [BOOK] });
-  assert.deepEqual(await R.deleteSessionByClientKey(empty, KEY), { ok: true, removed: null }, "a create that never arrived");
+  assert.deepEqual(await R.deleteSessionByClientKey(empty, KEY), { ok: true, removed: null, unfinished: false, cleanup: null }, "a create that never arrived");
   assert.deepEqual(
     empty.log.filter((l) => l.op !== "select").map((l) => `${l.table}:${l.op}`),
-    ["reading_session_discards:rpc"],
-    "only the discard is recorded: no session, habit or book write",
+    ["remove_reading_session:rpc"],
+    "one database call: only the discard is recorded, no session, habit or book write",
   );
+  assert.deepEqual(empty.tables.reading_session_discards.map((d) => d.client_key), [KEY]);
   assert.equal((await R.deleteSessionByClientKey(db, "not-a-key")).status, 400);
 });
 
@@ -499,7 +547,7 @@ test("deleteSessionByClientKey: a create of that key arriving after the discard 
   // first and finds nothing; the create reaches the insert afterwards and is refused by the trigger.
   const db = fakeDb({ books: [BOOK] });
   const r = await R.deleteSessionByClientKey(db, KEY);
-  assert.deepEqual(r, { ok: true, removed: null });
+  assert.deepEqual(r, { ok: true, removed: null, unfinished: false, cleanup: null });
   const late = await R.logSession(db, create());
   assert.equal(late.ok, false);
   assert.equal(late.discarded, true, "the route answers 409 discarded");
@@ -515,7 +563,7 @@ test("deleteSessionByClientKey: a create of that key arriving after the discard 
     during = await R.deleteSessionByClientKey(racing, KEY);
   };
   const raced = await R.logSession(racing, create());
-  assert.deepEqual(during, { ok: true, removed: null });
+  assert.deepEqual(during, { ok: true, removed: null, unfinished: false, cleanup: null });
   assert.equal(raced.ok, false);
   assert.equal(raced.discarded, true);
   assert.equal(racing.tables.reading_sessions.length, 0);
@@ -558,15 +606,19 @@ test("deleteSession by id records the session's key as discarded: a create of it
   assert.equal(refused.status, 503);
   assert.match(refused.error, /reading_session_discards\.sql/);
   assert.equal(before.tables.reading_sessions.length, 1, "nothing removed without the discard record");
+  // No fallback to separate requests without the function, also for a session with no key (Codex review of PR 376).
   const keylessBefore = fakeDb({ books: [BOOK], reading_sessions: [session({})] }, { noDiscards: true });
-  assert.equal((await R.deleteSession(keylessBefore, 41, null)).ok, true, "a session with no key needs no record");
+  assert.equal((await R.deleteSession(keylessBefore, 41, null)).status, 503);
+  assert.equal(keylessBefore.tables.reading_sessions.length, 1);
   const failing = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { discardError: "XX000" });
   assert.equal((await R.deleteSession(failing, 41, null)).status, 500);
   assert.equal(failing.tables.reading_sessions.length, 1);
-  // A session with no key (chat, an older create) is removed with no discard call.
+  // A session with no key (chat, an older create) is removed in the same one call, with no discard recorded.
   const keyless = fakeDb({ books: [BOOK], reading_sessions: [session({})] });
   assert.equal((await R.deleteSession(keyless, 41, null)).ok, true);
-  assert.equal(keyless.log.some((l) => l.op === "rpc"), false);
+  assert.equal(keyless.tables.reading_sessions.length, 0);
+  assert.equal(keyless.tables.reading_session_discards.length, 0);
+  assert.equal(keyless.log.filter((l) => l.op !== "select").length, 1, "one database call");
 });
 
 test("a Discard landing while a keyed create is still committing removes the session AND the finish it caused (Codex T01-R4)", async () => {
@@ -589,46 +641,65 @@ test("a Discard landing while a keyed create is still committing removes the ses
   assert.equal(db.tables.books[0].status, "reading", "no finished book for a removed session");
   assert.equal(db.tables.books[0].finished_on, null);
   assert.equal(db.tables.habit_journal.length, 1, "the create made the habit Yes before the discard: kept by the documented rule (unknown to the form)");
-  // Nothing of the create ran after the removal: a repeat finds nothing and a late retry is refused.
-  assert.deepEqual(await R.deleteSessionByClientKey(db, KEY), { ok: true, removed: null });
+  // Nothing of the create ran after the removal: a repeat finds nothing to remove and a late retry is refused.
+  const repeat = await R.deleteSessionByClientKey(db, KEY);
+  assert.equal(repeat.removed, null);
+  assert.equal(repeat.cleanup.sessionId, made.session.session_id);
   const late = await R.logSession(db, create({ chapter_through: 12 }));
   assert.equal(late.discarded, true);
   assert.equal(db.tables.books[0].status, "reading");
 });
 
-test("deleteSessionByClientKey: a failed read is never 'nothing stored' (Codex T01-R5)", async () => {
-  // The book read fails while the session exists: the answer is an error and the session stays.
+test("removal: a failed database call is never 'nothing stored' (Codex T01-R5)", async () => {
+  // The removal's own reads fail while the session exists: the answer is an error and the session stays.
   const db = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] }, { booksReadError: true });
   const r = await R.deleteSessionByClientKey(db, KEY);
   assert.equal(r.ok, false);
   assert.equal(r.status, 500);
   assert.equal(db.tables.reading_sessions.length, 1, "still stored: the form keeps the entry and retries");
   const byId = await R.deleteSession(db, 41, null);
-  assert.equal(byId.status, 500, "the same read failure on a removal by id is not a 404 either");
+  assert.equal(byId.status, 500, "the same failure on a removal by id is not a 404 either");
   assert.equal(db.tables.reading_sessions.length, 1);
-  // The session the discard found is gone by the time it is removed (another request removed it): confirmed absent.
-  const gone = fakeDb({ books: [BOOK], reading_sessions: [session({ client_key: KEY })] });
-  const baseRpc = gone.rpc;
-  gone.rpc = async (name, args) => {
-    const out = await baseRpc(name, args);
-    if (name === "discard_reading_session_key") gone.tables.reading_sessions.length = 0;
-    return out;
-  };
-  assert.deepEqual(await R.deleteSessionByClientKey(gone, KEY), { ok: true, removed: null });
+  // A session that is gone with no removal of it on record is a 404, as before.
+  assert.equal((await R.deleteSession(fakeDb({ books: [BOOK] }), 99, null)).status, 404);
 });
 
-test("logSession: before sql/reading_session_discards.sql is applied a keyed create still works as before", async () => {
-  // No fence yet: a Discard by key answers 503 and a keyed session is not removed by id, so nothing can land
-  // between the separate steps of the earlier create path.
+test("removal whose answer was lost: the database part committed whole, the retry replays only the Notion cleanup (PR 376 review)", async () => {
+  // The removal committed (session gone, finish and habit Yes taken back, cleanup row written), but its answer never
+  // reached the route, so the Notion entry was not trashed. The retry finds the session gone and gets that row back.
+  const finished = { ...BOOK, status: "finished", finished_on: "2026-11-15" };
+  const db = fakeDb({ books: [finished], reading_sessions: [session({ chapter_from: 10, chapter_through: 12, notion_block_id: "blk-1" })], habit_journal: [yes("2026-11-15")] });
+  const first = await R.deleteSession(db, 41, "2026-11-15");
+  assert.equal(first.ok, true);
+  assert.equal(db.tables.books[0].status, "reading", "the finish is taken back in the same transaction as the delete");
+  assert.equal(db.tables.habit_journal.length, 0);
+  assert.equal(first.cleanup.notionBlockId, "blk-1", "the Notion entry still to trash is written down with it");
+  const retry = await R.deleteSession(db, 41, "2026-11-15");
+  assert.equal(retry.ok, true, "not a 404: the route replays the cleanup");
+  assert.equal(retry.removed, null);
+  assert.equal(retry.unfinished, true);
+  assert.deepEqual([retry.cleanup.sessionId, retry.cleanup.notionBlockId, retry.cleanup.done], [41, "blk-1", false]);
+  assert.equal(db.log.filter((l) => l.op === "rpc").length, 2, "the retry is one read-and-answer call: no second delete, finish or habit write");
+  // Once the route has trashed the entry it marks the row done; a later retry replays nothing.
+  await R.markRemovalMirrored(db, 41);
+  assert.equal((await R.deleteSession(db, 41, null)).cleanup.done, true);
+});
+
+test("logSession: without pds.create_reading_session a keyed create is refused (503), never done in steps (PR 376 review)", async () => {
+  // A missing create function does not prove the discard fence is missing too (a partly applied file, a stale schema
+  // cache), so the create is not done in separate requests a Discard could land between: nothing is stored.
   const db = fakeDb({ books: [BOOK] }, { noDiscards: true });
   const r = await R.logSession(db, create({ chapter_through: 12, date: "2026-11-15" }));
-  assert.equal(r.ok, true);
-  assert.equal(r.finished, true);
-  assert.equal(r.habitCreated, true);
-  assert.equal(db.tables.reading_sessions[0].client_key, KEY);
+  assert.equal(r.ok, false);
+  assert.equal(r.unavailable, true, "the POST route answers 503 and the form retries");
+  assert.match(r.error, /reading_session_discards\.sql/);
+  assert.equal(db.tables.reading_sessions.length, 0);
+  assert.equal(db.tables.habit_journal.length, 0);
+  assert.equal(db.tables.books[0].status, "reading");
+  assert.equal(db.log.some((l) => l.op === "insert" || l.op === "upsert" || l.op === "update"), false, "no separate write");
+  const plain = await R.logSession(db, create({ client_key: null }));
+  assert.equal(plain.ok, true, "callers without a key (chat) are unaffected");
   assert.equal((await R.deleteSessionByClientKey(db, KEY)).status, 503);
-  assert.equal((await R.deleteSession(db, r.session.session_id, null)).status, 503);
-  assert.equal(db.tables.reading_sessions.length, 1);
 });
 
 test("Notion mirror race check: only a change that alters the entry counts", () => {
@@ -668,6 +739,11 @@ test("source pins: no Save button on the reading forms; keys and habit days trav
   assert.doesNotMatch(del, /logSession\(/, "it never creates a session to find one");
   const postFn = post.slice(post.indexOf("export async function POST"), post.indexOf("export async function DELETE"));
   assert.match(postFn, /result\.discarded[\s\S]{0,160}status: 409/, "a discarded key's create answers 409");
+  assert.match(postFn, /result\.unavailable[\s\S]{0,120}status: 503/, "a keyed create without the create function answers 503");
+  assert.match(del, /runRemovalCleanup\(/, "a removal's Notion cleanup (also a replayed one) runs after the response");
+  const idDel = route.slice(route.indexOf("export async function DELETE"));
+  assert.match(idDel, /runRemovalCleanup\(/);
+  assert.doesNotMatch(idDel, /removeMirroredBlock\(/, "the cleanup goes through the helper that marks it done");
   assert.match(log, /was discarded/, "the /log form continues an entry edited after its discard under a new key");
   const mw = read("middleware.ts");
   const ci = mw.slice(mw.indexOf("function isCiRoute"), mw.indexOf("}", mw.indexOf("function isCiRoute")));
@@ -685,14 +761,22 @@ test("sql/reading_session_discards.sql: additive, service-role only, one lock pe
   assert.match(sql, /BEFORE INSERT OR UPDATE OF client_key ON pds\.reading_sessions/);
   assert.match(sql, /ERRCODE = 'OXR01'/);
   const locks = sql.match(/pg_advisory_xact_lock\(\s*pg_catalog\.hashtextextended\('pds\.reading_sessions\.client_key:' \|\|/g) ?? [];
-  assert.equal(locks.length, 3, "the trigger, the keyed create and the discard take the same lock");
+  assert.equal(locks.length, 3, "the trigger, the keyed create and the removal take the same lock");
   const fn = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.create_reading_session("));
   const body = fn.slice(0, fn.indexOf("$$;"));
   assert.match(body, /INSERT INTO pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*INSERT INTO pds\.habit_journal/, "session, finish and habit in one function (T01-R4)");
   assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.create_reading_session\([^)]*\) TO service_role/);
   const lib = read("lib/reading.ts");
   assert.match(lib, /DISCARDED_KEY_CODE = "OXR01"/, "lib/reading.ts maps the trigger's code");
-  assert.match(lib, /rpc\("discard_reading_session_key", \{ p_key: key \}\)/);
+  assert.match(lib, /rpc\("remove_reading_session", \{/, "a removal is one database call");
+  assert.doesNotMatch(lib, /discard_reading_session_key/);
+  assert.doesNotMatch(lib, /insert\(key \?/, "no keyed create in separate requests");
+  const rm = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.remove_reading_session("));
+  const rmBody = rm.slice(0, rm.indexOf("$$;"));
+  assert.match(rmBody, /INSERT INTO pds\.reading_session_discards[\s\S]*DELETE FROM pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*DELETE FROM pds\.habit_journal[\s\S]*INSERT INTO pds\.reading_session_removals/, "discard, delete, finish, habit and cleanup row in one function");
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.reading_session_removals/);
+  assert.match(sql, /REVOKE ALL ON pds\.reading_session_removals FROM anon, authenticated/);
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.remove_reading_session\(bigint, uuid, date\) TO service_role/);
   assert.match(lib, /rpc\("create_reading_session", \{/, "a keyed create is one database call");
 });
 

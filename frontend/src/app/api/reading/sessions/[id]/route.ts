@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
 import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
+import { removalAnswer, runRemovalCleanup } from "@/lib/reading-removal";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -23,7 +24,8 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * or trashed), and the progress callout is rewritten.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check, JSON only and a size cap.
  * Answers: 200 { success, session, xp_gained, finished, overview } / { success, removed, unfinished, overview },
- * 400 with the reason, 404 for a session that no longer exists, 409 for a Kindle session.
+ * 400 with the reason, 404 for a session that no longer exists (and no removal of it on record), 409 for a Kindle
+ * session, 503 while sql/reading_session_discards.sql is not applied (nothing removed; the form retries).
  */
 
 const MAX_BYTES = 48 * 1024;
@@ -111,14 +113,19 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   const habitCreatedOn = ymdOrNull(req.nextUrl.searchParams.get("habit_created_on"));
   if (habitCreatedOn === undefined) return NextResponse.json({ error: "habit_created_on must be YYYY-MM-DD" }, { status: 400 });
 
+  // One transaction (lib/reading.ts deleteSession): the delete, the finish and habit Yes taken back, and the Notion
+  // cleanup still owed. A retry of a removal whose answer was lost finds the session gone and gets that cleanup back,
+  // so the entry is still trashed (Codex review of PR 376); the database part is never repeated.
   const r = await deleteSession(supabase, id, habitCreatedOn);
   if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
-  const overview = await getOverview(supabase, r.book.slug).catch(() => null);
+  const { book, overview, removedId, owed } = await removalAnswer(supabase, r);
+  if (owed) after(() => runRemovalCleanup(supabase, r, book, overview));
 
-  after(async () => {
-    await removeMirroredBlock(r.session.notion_block_id);
-    await mirrorProgress(r.book, overview?.chaptersDone ?? 0, newestDate(overview, null));
+  return NextResponse.json({
+    success: true,
+    removed: removedId,
+    unfinished: r.unfinished,
+    habit_removed: r.removed ? r.habitRemoved : false,
+    overview,
   });
-
-  return NextResponse.json({ success: true, removed: r.session.session_id, unfinished: r.unfinished, habit_removed: r.habitRemoved, overview });
 }

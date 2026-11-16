@@ -622,7 +622,9 @@ function missingColumn(error: { code?: string } | null | undefined): boolean {
  */
 const DISCARDED_KEY_CODE = "OXR01";
 export const DISCARDED_ENTRY_ERROR = "This reading entry was discarded.";
-const DISCARD_UNAVAILABLE = "Discard isn't available until sql/reading_session_discards.sql is applied.";
+const DISCARD_UNAVAILABLE = "Removing a session isn't available until sql/reading_session_discards.sql is applied.";
+/** A keyed create needs pds.create_reading_session; without it the create is refused (503), never done in steps. */
+const KEYED_CREATE_UNAVAILABLE = "Reading sessions can't be saved here until sql/reading_session_discards.sql is applied.";
 
 /** sql/reading_session_discards.sql (or the client_key column it reads) is not applied yet. */
 function discardsMissing(error: { code?: string } | null | undefined): boolean {
@@ -630,18 +632,80 @@ function discardsMissing(error: { code?: string } | null | undefined): boolean {
 }
 
 /**
- * Record that `key`'s entry was discarded, then answer the session that key made (null = none). One database call
- * (pds.discard_reading_session_key) holding the key's lock: a create of the key still committing is waited for and
- * found, and a create arriving after it is refused, so "none" is final (Codex review of PR 376).
+ * What a removal still owes outside the database (pds.reading_session_removals): the session's Notion entry to trash
+ * and the book page's progress line. `done` = the entry was trashed (mirror_done_at set); a removal whose answer was
+ * lost is found here by its retry and the route replays the cleanup (Codex review of PR 376).
  */
-async function discardKey(
+export interface RemovalCleanup {
+  sessionId: number;
+  bookId: number;
+  sessionDate: string | null;
+  notionBlockId: string | null;
+  unfinished: boolean;
+  done: boolean;
+}
+
+function cleanupOf(raw: unknown): RemovalCleanup | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const sessionId = Number(r.session_id);
+  const bookId = Number(r.book_id);
+  if (!Number.isFinite(sessionId) || !Number.isFinite(bookId)) return null;
+  return {
+    sessionId,
+    bookId,
+    sessionDate: typeof r.session_date === "string" ? r.session_date : null,
+    notionBlockId: typeof r.notion_block_id === "string" && r.notion_block_id ? r.notion_block_id : null,
+    unfinished: r.unfinished === true,
+    done: r.mirror_done_at !== null && r.mirror_done_at !== undefined,
+  };
+}
+
+const KINDLE_SESSION_CODE = "OXR02";
+const BOOK_MISSING_CODE = "OXR03";
+const BOOK_KEYS = BOOK_COLS.split(",").map((c) => c.trim());
+
+type RemovalOutcome =
+  | { kind: "removed"; session: ReadingSession; book: Book; unfinished: boolean; habitRemoved: boolean; cleanup: RemovalCleanup | null }
+  | { kind: "absent"; cleanup: RemovalCleanup | null }
+  | { kind: "failed"; status: number; error: string };
+
+/**
+ * One removal in ONE database call (pds.remove_reading_session, sql/reading_session_discards.sql): the key is recorded
+ * as discarded under its lock, then the session is deleted, the finish it caused and the habit Yes it made are taken
+ * back, and the Notion cleanup still owed is written down, all in one transaction. A removal whose answer is lost
+ * leaves nothing half done in the database, and its retry gets that cleanup row (`absent`). A missing function (the
+ * file not applied, or not yet in PostgREST's schema cache) is 503 and nothing is removed: there is no fallback to
+ * separate requests (Codex review of PR 376).
+ */
+async function removeSessionTx(
   supabase: Supa,
-  key: string,
-): Promise<{ ok: true; sessionId: number | null } | { ok: false; missing: boolean; error: string }> {
-  const { data, error } = await supabase.rpc("discard_reading_session_key", { p_key: key });
-  if (error) return { ok: false, missing: discardsMissing(error), error: error.message };
-  const id = data === null || data === undefined ? null : Number(data);
-  return { ok: true, sessionId: id !== null && Number.isFinite(id) && id > 0 ? id : null };
+  by: { sessionId: number } | { clientKey: string },
+  habitCreatedOn: string | null,
+): Promise<RemovalOutcome> {
+  const { data, error } = await supabase.rpc("remove_reading_session", {
+    p_session_id: "sessionId" in by ? by.sessionId : null,
+    p_client_key: "clientKey" in by ? by.clientKey : null,
+    p_habit_created_on: habitCreatedOn,
+  });
+  if (error) {
+    if (error.code === KINDLE_SESSION_CODE) return { kind: "failed", status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
+    if (error.code === BOOK_MISSING_CODE) return { kind: "failed", status: 404, error: "The session's book no longer exists." };
+    if (discardsMissing(error)) return { kind: "failed", status: 503, error: DISCARD_UNAVAILABLE };
+    return { kind: "failed", status: 500, error: error.message };
+  }
+  const out = (data ?? {}) as { removed?: boolean; session?: Record<string, unknown>; book?: Record<string, unknown>; unfinished?: boolean; habit_removed?: boolean; removal?: unknown };
+  if (out.removed !== true) return { kind: "absent", cleanup: cleanupOf(out.removal) };
+  if (!out.session || !out.book) return { kind: "failed", status: 500, error: "The removal was not confirmed. Try again." };
+  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, out.session?.[k] ?? null])) as unknown as ReadingSession;
+  const book = Object.fromEntries(BOOK_KEYS.map((k) => [k, out.book?.[k] ?? null])) as unknown as Book;
+  return { kind: "removed", session, book, unfinished: out.unfinished === true, habitRemoved: out.habit_removed === true, cleanup: cleanupOf(out.removal) };
+}
+
+/** The removal's Notion cleanup is done (its entry trashed, or it had none): a later retry replays nothing. */
+export async function markRemovalMirrored(supabase: Supa, sessionId: number): Promise<void> {
+  const { error } = await supabase.from("reading_session_removals").update({ mirror_done_at: new Date().toISOString() }).eq("session_id", sessionId);
+  if (error) console.error("reading: removal cleanup mark failed:", error.code ?? "unknown");
 }
 
 const KEYED_CREATE_NEEDS_COLUMN = "Reading sessions can't be saved here until sql/reading_sessions_client_key.sql is applied.";
@@ -765,7 +829,7 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
 export async function logSession(
   supabase: Supa,
   input: LogSessionInput,
-): Promise<LogSessionResult | { ok: false; error: string; discarded?: true }> {
+): Promise<LogSessionResult | { ok: false; error: string; discarded?: true; unavailable?: true }> {
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
   if (input.require_client_key && !key) return { ok: false, error: SESSION_KEY_REQUIRED };
   /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
@@ -854,22 +918,14 @@ export async function logSession(
       if (missingColumn(error)) return { ok: false, error: KEYED_CREATE_NEEDS_COLUMN };
       return { ok: false, error: error.message ?? "Couldn't save the session." };
     }
-    // atomic.kind === "unavailable": sql/reading_session_discards.sql is not applied, so there is no discard fence
-    // either (a Discard by key answers 503 and a keyed session is not removed by id), and nothing can land between
-    // the steps below. The create goes ahead as before.
+    // atomic.kind === "unavailable": pds.create_reading_session is not there (the file not applied, or not yet in
+    // PostgREST's schema cache). The discard fence may be there all the same (a partly applied file, a stale cache),
+    // so the create is NOT done in separate requests, which a Discard could land between (Codex review of PR 376):
+    // 503, nothing stored, and the form retries.
+    return { ok: false, error: KEYED_CREATE_UNAVAILABLE, unavailable: true };
   }
-  let { data, error } = await supabase.from("reading_sessions").insert(key ? { ...row, client_key: key } : row).select(SESSION_COLS).single();
-  if (error && key && error.code === "23505") {
-    // The same create arrived twice at once: the other one made the session.
-    const prior = await sessionByClientKey(supabase, key);
-    const replayed = prior ? await replay(prior, book) : null;
-    if (replayed) return replayed;
-  }
-  // The key's entry was discarded (an earlier Discard reached the server): never created again under it.
-  if (error && key && error.code === DISCARDED_KEY_CODE) return { ok: false, error: DISCARDED_ENTRY_ERROR, discarded: true };
-  // A keyed create is never stored without its key: a retry could not find it (a second session) and a Discard
-  // could not remove it (Codex review of PR 376). Keyed creates need sql/reading_sessions_client_key.sql applied.
-  if (error && key && missingColumn(error)) return { ok: false, error: input.require_client_key ? SESSION_KEY_REQUIRED : KEYED_CREATE_NEEDS_COLUMN };
+  // Keyless creates only (chat and other callers): a plain insert, then the finish and the habit stamp.
+  const { data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single();
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
 
@@ -1128,81 +1184,57 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
   };
 }
 
+/** The answer of a removal: what it removed, or (`removed: null`) that nothing of it is stored any more. */
+export type SessionRemoval =
+  | { ok: true; removed: ReadingSession; book: Book; unfinished: boolean; habitRemoved: boolean; cleanup: RemovalCleanup | null }
+  /**
+   * Nothing to remove. `cleanup` = an earlier removal of the same session (or key) whose answer may have been lost:
+   * the route replays the Notion cleanup it still owes (`done` false). Its database part already committed with it.
+   */
+  | { ok: true; removed: null; unfinished: boolean; cleanup: RemovalCleanup | null }
+  | { ok: false; status: number; error: string };
+
 /**
  * Remove a manual or chat session (the autosaving form's "Remove this session"). A book this session finished
  * (finished on its day, and no other session reaches the last chapter) goes back to reading. The day's habit Yes
  * is taken back only when this session made it (`habitCreatedOn`) and no other session with the same habit is on
- * that day.
+ * that day. All of it, and the session's client_key recorded as discarded (a create of that key still under way is
+ * then refused instead of bringing the session back, Codex T01-R6), is ONE transaction (pds.remove_reading_session):
+ * a removal whose answer is lost has removed everything or nothing, and its retry finds the cleanup row and gets
+ * `removed: null` with it, so the route still trashes the Notion entry (Codex review of PR 376).
+ * A session that is gone with no removal of it on record answers 404, as before. Without the function
+ * (sql/reading_session_discards.sql not applied, or not yet in PostgREST's schema cache): 503 and nothing removed,
+ * also for a session with no key; the form keeps it and retries.
  */
-export async function deleteSession(
-  supabase: Supa,
-  sessionId: number,
-  habitCreatedOn: string | null = null,
-  opts: { keyDiscarded?: boolean } = {},
-): Promise<{ ok: true; book: Book; session: ReadingSession; unfinished: boolean; habitRemoved: boolean } | { ok: false; status: number; error: string }> {
-  const cur = await editableSession(supabase, sessionId);
-  if (!cur.ok) return cur;
-  const { session } = cur;
-  let book = cur.book;
-  if (!opts.keyDiscarded) {
-    // The session's client_key (a /log entry's) is recorded as discarded first: a create of that key still under
-    // way (an earlier send whose answer was lost) is then refused instead of bringing the session back. Without that
-    // record (sql/reading_session_discards.sql not applied: 503; a database failure: 500) nothing is removed, so the
-    // form keeps the entry and retries (Codex T01-R6). A session with no key (chat, older creates) needs no record;
-    // without the client_key column no session has one.
-    const { data: k, error: kErr } = await supabase.from("reading_sessions").select("client_key").eq("session_id", sessionId).maybeSingle();
-    if (kErr && !missingColumn(kErr)) return { ok: false, status: 500, error: kErr.message };
-    const key = kErr ? null : ((k as { client_key?: string | null } | null)?.client_key ?? null);
-    if (key) {
-      const d = await discardKey(supabase, key);
-      if (!d.ok) return d.missing ? { ok: false, status: 503, error: DISCARD_UNAVAILABLE } : { ok: false, status: 500, error: d.error };
-    }
-  }
-  const { error } = await supabase.from("reading_sessions").delete().eq("session_id", sessionId);
-  if (error) return { ok: false, status: 500, error: error.message };
-
-  const unfinished = await undoFinishIfOnlyThis(supabase, book, session, sessionId);
-  if (unfinished) book = { ...book, status: "reading", finished_on: null };
-  const habitRemoved = habitCreatedOn !== null && habitCreatedOn === session.session_date ? await unstampHabitIfUnused(supabase, book, session.session_date, sessionId) : false;
-  return { ok: true, book, session, unfinished, habitRemoved };
+export async function deleteSession(supabase: Supa, sessionId: number, habitCreatedOn: string | null = null): Promise<SessionRemoval> {
+  const r = await removeSessionTx(supabase, { sessionId }, habitCreatedOn);
+  if (r.kind === "failed") return { ok: false, status: r.status, error: r.error };
+  if (r.kind === "removed") return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished, habitRemoved: r.habitRemoved, cleanup: r.cleanup };
+  if (!r.cleanup) return { ok: false, status: 404, error: "That session no longer exists." };
+  return { ok: true, removed: null, unfinished: r.cleanup.unfinished, cleanup: r.cleanup };
 }
 
 /**
  * Discard of an autosaving /log entry whose create may have been stored although its answer never arrived (PROD-T01):
- * the key is first recorded as discarded (pds.discard_reading_session_key, under the key's lock), so a create of it
- * that is still running on the server either committed before (and is found here) or is refused after; then the
- * session that key made, if any, is removed exactly like DELETE /api/reading/sessions/[id] (a finish it caused goes
- * back to reading, its Notion entry is trashed by the route). Whether that create made the day's habit row is unknown
- * (its answer was lost), so the habit Yes stays, the same rule as an edit of a replayed create.
+ * one transaction (pds.remove_reading_session) records the key as discarded under the key's lock, so a create of it
+ * still running on the server either committed before (its session is found and removed here) or is refused after,
+ * and removes that session exactly like DELETE /api/reading/sessions/[id] (a finish it caused goes back to reading;
+ * the route trashes its Notion entry). Whether that create made the day's habit row is unknown (its answer was lost),
+ * so the habit Yes stays, the same rule as an edit of a replayed create.
  * The create side is one transaction too (pds.create_reading_session: session, finish and habit Yes together), so the
  * session found here comes with every effect its create had, and none can follow after its removal (Codex T01-R4).
- * `removed: null` = no session has this key (confirmed by a read, never assumed from a 404) and none can be created
- * with it any more: nothing of the entry is stored.
- * When the discard cannot be recorded (sql/reading_session_discards.sql or the client_key column not applied: 503;
+ * `removed: null` = no session has this key (the database said so inside that transaction, never assumed from a
+ * 404) and none can be created with it any more: nothing of the entry is stored. `cleanup` then carries an earlier
+ * removal of the key whose Notion cleanup the route replays (a removal whose answer was lost, or one that raced this).
+ * When the removal cannot be recorded (sql/reading_session_discards.sql or the client_key column not applied: 503;
  * a database failure: 500) the answer is an error, never "nothing stored": the form keeps the entry and retries.
  */
-export async function deleteSessionByClientKey(
-  supabase: Supa,
-  clientKey: string,
-): Promise<
-  | { ok: true; removed: null }
-  | { ok: true; removed: ReadingSession; book: Book; unfinished: boolean }
-  | { ok: false; status: number; error: string }
-> {
+export async function deleteSessionByClientKey(supabase: Supa, clientKey: string): Promise<SessionRemoval> {
   if (!UUID_RE.test(clientKey)) return { ok: false, status: 400, error: "client_key must be a UUID" };
-  const d = await discardKey(supabase, clientKey.toLowerCase());
-  if (!d.ok) {
-    return d.missing ? { ok: false, status: 503, error: DISCARD_UNAVAILABLE } : { ok: false, status: 500, error: d.error };
-  }
-  if (d.sessionId === null) return { ok: true, removed: null };
-  const r = await deleteSession(supabase, d.sessionId, null, { keyDiscarded: true });
-  if (r.ok) return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished };
-  if (r.status !== 404) return r;
-  // "Nothing stored" only once the session is confirmed absent: a 404 alone is not proof (Codex T01-R5).
-  const { data: still, error: stillErr } = await supabase.from("reading_sessions").select("session_id").eq("session_id", d.sessionId).maybeSingle();
-  if (stillErr) return { ok: false, status: 500, error: stillErr.message };
-  if (still) return { ok: false, status: 500, error: "The session could not be removed. Try again." };
-  return { ok: true, removed: null };
+  const r = await removeSessionTx(supabase, { clientKey: clientKey.toLowerCase() }, null);
+  if (r.kind === "failed") return { ok: false, status: r.status, error: r.error };
+  if (r.kind === "removed") return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished, habitRemoved: r.habitRemoved, cleanup: r.cleanup };
+  return { ok: true, removed: null, unfinished: r.cleanup?.unfinished ?? false, cleanup: r.cleanup };
 }
 
 export interface AddHighlightInput {
