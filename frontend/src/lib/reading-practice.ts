@@ -251,7 +251,7 @@ export const REVIEW_ALERT_HEADING: Record<"unknown" | "refused" | "stale", strin
 /**
  * Classify the review route's answer. `status` null = no answer at all (offline, timeout, reload). 409 key_reused
  * means this card's key already stored a grade (an earlier try whose answer was lost, then a different grade):
- * the card is graded, so it advances, and the overview reload shows which grade it was.
+ * the card is graded, so it advances, and says which grade it kept when it can (storedEarlierGrade).
  *
  * `retryOfUnconfirmed`: this request reused the key of an earlier try whose answer never came. A refusal of it
  * (session, origin, size, rate limit: all answered before the receipt is looked up) proves nothing about that
@@ -276,6 +276,23 @@ export function classifyReviewAnswer(status: number | null, body: unknown, retry
     return { kind: "refused", message: "Onyx refused this grade." };
   }
   return { kind: "unknown", message: "Onyx answered with an error before confirming the grade." };
+}
+
+/**
+ * After a 409 key_reused the card is graded, but not with the grade just tapped: an earlier try under the same key
+ * (same highlight, so only the grade differs) was stored. `maybeStored` = the grades sent under that key whose
+ * answer never came or was a server error (a try refused before the receipt lookup cannot have been stored, so it is
+ * not listed). One grade other than the tap: that is the stored one. None or several: it cannot be named (null).
+ */
+export function storedEarlierGrade(maybeStored: readonly PracticeGrade[], tapped: PracticeGrade): PracticeGrade | null {
+  const other = Array.from(new Set(maybeStored)).filter((g) => g !== tapped);
+  return other.length === 1 ? other[0] : null;
+}
+
+/** The status line after a key_reused advance: which grade the card kept, when it can be named. */
+export function earlierSaveNotice(stored: PracticeGrade | null, tapped: PracticeGrade): string {
+  const head = stored ? `Saved earlier as ${GRADE_LABEL[stored]}` : "Saved earlier";
+  return `${head}: an earlier try of that card reached Onyx, so your ${GRADE_LABEL[tapped]} tap was not stored.`;
 }
 
 /**

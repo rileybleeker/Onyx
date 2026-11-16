@@ -40,6 +40,7 @@ function mount(t, { due = [card(1), card(2)], answer }) {
   return { h, sent, events, alerts, header };
 }
 
+const notice = (h) => h.text(h.find((n) => n.props["data-testid"] === "reading-review-notice")[0]);
 const ok = (body, o = {}) => response({ success: true, xp_gained: 15, next_review: "2026-03-11", interval_days: 1, op_key: body.op_key, replayed: false, ...o });
 
 test("grade buttons show the interval the scheduler stores: the first Good is 1 day", () => {
@@ -218,7 +219,7 @@ test("a pending grade blocks every grade button and says why; a second tap sends
 
 test("a different grade after an unconfirmed try reuses the key; key_reused means the first one was stored", async (t) => {
   const { h, sent, events, alerts } = mount(t, {
-    answer: (body, n) => (n === 1 ? response({ error: "failed" }, 500) : response({ error: "key_reused" }, 409)),
+    answer: (body, n) => (n === 1 ? response({ error: "failed" }, 500) : n === 2 ? response({ error: "key_reused" }, 409) : ok(body)),
   });
   await h.flush();
   h.click(REVEAL);
@@ -232,6 +233,59 @@ test("a different grade after an unconfirmed try reuses the key; key_reused mean
   assert.equal(sent[1].grade, "easy");
   assert.deepEqual(events.graded, [0], "the card is graded (by the earlier try): advance, no XP claimed");
   assert.match(h.text(), /Synthetic passage 2/);
+  assert.equal(
+    notice(h),
+    "Saved earlier as Good: an earlier try of that card reached Onyx, so your Easy tap was not stored.",
+    "the card says the Easy tap was not stored and names the grade that was",
+  );
+  h.click(REVEAL);
+  await h.flush();
+  h.click("Good, next review in 1 day");
+  await h.flush();
+  assert.equal(notice(h), "", "the line clears when the next grade is sent");
+});
+
+// A try refused before the receipt lookup (here a 429 on a Retry) cannot have been stored, so it does not count as a
+// candidate: the stored grade is still named.
+test("key_reused after a refused Retry still names the one grade that could have been stored", async (t) => {
+  {
+    const { h, sent } = mount(t, {
+      answer: (body, n) =>
+        n === 1 ? response({ error: "gateway" }, 504) : n === 2 ? response({ error: "bad_request" }, 429) : response({ error: "key_reused" }, 409),
+    });
+    await h.flush();
+    h.click(REVEAL);
+    await h.flush();
+    h.click("Good, next review in 1 day");
+    await h.flush();
+    h.click("Easy, next review in 3 days"); // refused before the receipt lookup: cannot be the stored one
+    await h.flush();
+    assert.match(h.text(), /Save not confirmed: Onyx refused this retry/);
+    h.click("Again, next review in 1 day");
+    await h.flush();
+    assert.equal(sent.length, 3);
+    assert.ok(sent.every((b) => b.op_key === sent[0].op_key), "one key for the card");
+    assert.equal(notice(h), "Saved earlier as Good: an earlier try of that card reached Onyx, so your Again tap was not stored.");
+  }
+});
+
+// Two tries under the key that may both have been stored (server errors): the line cannot name one, and says so.
+test("key_reused after two unconfirmed grades does not guess which one was stored", async (t) => {
+  {
+    const { h } = mount(t, {
+      answer: (body, n) => (n <= 2 ? response({ error: "failed" }, 500) : response({ error: "key_reused" }, 409)),
+    });
+    await h.flush();
+    h.click(REVEAL);
+    await h.flush();
+    h.click("Good, next review in 1 day");
+    await h.flush();
+    h.click("Easy, next review in 3 days");
+    await h.flush();
+    h.click("Again, next review in 1 day");
+    await h.flush();
+    assert.equal(notice(h), "Saved earlier: an earlier try of that card reached Onyx, so your Again tap was not stored.");
+  }
 });
 
 test("a refusal writes nothing: no Retry, any grade can be picked, and the next try has a new key", async (t) => {
@@ -421,6 +475,12 @@ test("pure helpers: answer classification, key reuse, and a graded card never re
   assert.equal(P.classifyReviewAnswer(409, { error: "archived" }).message, "This highlight was removed.");
   assert.deepEqual(P.classifyReviewAnswer(409, { error: "key_reused" }), { kind: "saved", xp: 0, replayed: true, earlier: true });
   assert.deepEqual(P.classifyReviewAnswer(200, { success: true, xp_gained: 15, replayed: true }), { kind: "saved", xp: 15, replayed: true, earlier: false });
+  assert.equal(P.storedEarlierGrade(["good"], "easy"), "good");
+  assert.equal(P.storedEarlierGrade(["good", "good"], "easy"), "good");
+  assert.equal(P.storedEarlierGrade(["good", "easy"], "easy"), "good", "the tap itself is not the stored grade");
+  assert.equal(P.storedEarlierGrade(["good", "again"], "easy"), null, "two candidates: not named");
+  assert.equal(P.storedEarlierGrade([], "easy"), null);
+  assert.equal(P.earlierSaveNotice(null, "easy"), "Saved earlier: an earlier try of that card reached Onyx, so your Easy tap was not stored.");
   let n = 0;
   const mk = () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`;
   const a = P.attemptFor(null, { highlight_id: 1, review_count: 0 }, "good", mk);

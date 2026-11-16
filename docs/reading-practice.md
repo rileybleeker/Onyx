@@ -65,7 +65,9 @@ Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 K
   Retry. It never says "Not saved": a grade that committed and only lost its answer ends up here too. The card
   keeps ONE operation key until it hears a definite answer, so Retry, or a different grade, reuses it: a grade that
   did land is answered from its receipt, and `key_reused` (another grade was stored first under that key) counts as
-  graded. A reload loses the key, which stays safe: every grade carries the card's review count, and
+  graded: the card advances and a status line says the tapped grade was not stored, naming the grade that was
+  ("Saved earlier as Good") when only one earlier try under the key could have been stored (a try with no answer or
+  a server error; a try refused before the receipt lookup cannot), else "Saved earlier". A reload loses the key, which stays safe: every grade carries the card's review count, and
   a grade on an older state of the row is `409 changed`, so a card is still graded once.
 - A refusal (4xx) wrote nothing: "Not saved", no Retry, any grade can be picked, the next try gets a new key.
   A refusal of a RETRY (the request reused the key of a try whose answer never came; refused before the receipt is

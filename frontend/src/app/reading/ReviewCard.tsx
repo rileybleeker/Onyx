@@ -6,12 +6,14 @@ import type { Highlight, ReadingOverview } from "@/lib/reading";
 import {
   attemptFor,
   classifyReviewAnswer,
+  earlierSaveNotice,
   GRADE_LABEL,
   intervalLabel,
   PRACTICE_GRADES,
   remainingQueue,
   REVIEW_ALERT_HEADING,
   reviewPreview,
+  storedEarlierGrade,
   type PracticeGrade,
   type ReviewAttempt,
 } from "@/lib/reading-practice";
@@ -32,7 +34,9 @@ import {
  *   until the re-read lands; a re-read that fails keeps the card stale with its own message and Refresh. The message
  *   is a role=alert line with a word and an icon, not color alone.
  * - Success advances exactly once (this card's graded ids are kept, so a reload that raced the grade cannot bring
- *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line.
+ *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line. When the answer
+ *   is key_reused (an earlier try under the key was stored with another grade), a status line says the tap was not
+ *   stored and names the grade that was, when only one earlier try could have been stored.
  * - Retry and Refresh leave the screen while they work, so focus never drops to the page: both put it on the note
  *   (which stays on screen) while they work; a Retry that fails again then puts it on the new Retry button, a
  *   Refresh on the next card once the re-read overview replaces this one, or back on Refresh when the re-read
@@ -71,6 +75,11 @@ export default function ReviewCard({
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   // The last request whose outcome is unknown: the next tap on this card reuses its key.
   const [pending, setPending] = useState<ReviewAttempt | null>(null);
+  // The grades sent under the pending key that may have been stored (no answer, or a server error): after a
+  // key_reused answer, the stored grade is one of them.
+  const maybeStored = useRef<{ op_key: string; grades: PracticeGrade[] } | null>(null);
+  // "Saved earlier as ...": shown after a key_reused advance until the next grade or Refresh.
+  const [notice, setNotice] = useState<string | null>(null);
   const [focus, setFocus] = useState<"next" | "note" | "retry" | null>(null);
   // Set by Refresh: when the re-read overview puts another card on top, focus moves to it.
   const focusNextCard = useRef(false);
@@ -136,6 +145,8 @@ export default function ReviewCard({
     const attempt = attemptFor(pending, cur, g);
     // This tap reuses the key of a try whose answer never came: a refusal of it settles nothing about that try.
     const retryOfUnconfirmed = pending !== null && pending.op_key === attempt.op_key;
+    const earlier = maybeStored.current?.op_key === attempt.op_key ? maybeStored.current.grades : [];
+    setNotice(null);
     // A Refresh that left this card on top must not move focus when a later answer changes it.
     focusNextCard.current = false;
     inFlight.current = true;
@@ -158,6 +169,8 @@ export default function ReviewCard({
     if (!alive.current) return;
     const out = classifyReviewAnswer(httpStatus, body, retryOfUnconfirmed);
     if (out.kind === "saved") {
+      maybeStored.current = null;
+      if (out.earlier) setNotice(earlierSaveNotice(storedEarlierGrade(earlier, g), g));
       setPending(null);
       setStatus({ kind: "idle" });
       setRevealedId(null);
@@ -168,7 +181,13 @@ export default function ReviewCard({
     }
     // Refused (a first try under this key) or stale (no receipt under it): nothing is stored under this key, so it is
     // not reused. A refused Retry comes back as unknown and keeps the key until its receipt is read.
-    if (out.kind !== "unknown") setPending(null);
+    if (out.kind !== "unknown") {
+      setPending(null);
+      maybeStored.current = null;
+    } else if (httpStatus === null || httpStatus >= 500) {
+      // Only a try that may have reached the function (no answer, or a server error) can have been stored.
+      maybeStored.current = { op_key: attempt.op_key, grades: earlier.includes(g) ? earlier : [...earlier, g] };
+    }
     // The card left the top while the request was out (the overview was re-read): its message would sit on another card.
     if (curRef.current?.highlight_id !== attempt.highlight_id) {
       setStatus({ kind: "idle" });
@@ -183,6 +202,7 @@ export default function ReviewCard({
   // and moves focus to that card (the cardKey effect); one that leaves this card unblocks it; a failed one keeps it
   // stale, with focus back on Refresh.
   const refresh = (g: PracticeGrade) => {
+    setNotice(null);
     setStatus({ kind: "refreshing", grade: g });
     focusNextCard.current = true;
     setFocus("note");
@@ -226,6 +246,10 @@ export default function ReviewCard({
         <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
         <span className="text-[11px] font-mono text-text-tertiary">{header}</span>
       </div>
+      {/* Always in the page, so the line is announced when it is filled after the card advanced. */}
+      <p role="status" data-testid="reading-review-notice" className={notice ? "mt-2 text-[12px] text-text-secondary" : "sr-only"}>
+        {notice ?? ""}
+      </p>
       {cur && preview ? (
         <div className="mt-2" data-testid="reading-review-card">
           <blockquote className="text-[14px] text-text-primary leading-relaxed border-l-2 border-accent/60 pl-3">{cur.passage}</blockquote>
