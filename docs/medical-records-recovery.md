@@ -150,10 +150,20 @@ every Onyx table.
    same `documents/<id>` path with its file type (service role), run the check against the newest
    manifest.
 2. **Rows lost, files fine.** Restore to a new project from the daily backup (or decrypt the newest
-   off-site snapshot), upsert `medical_documents` then `lab_results` by id, run the check.
+   off-site snapshot), upsert `medical_documents` then `lab_results` by id, run the check against
+   production. The temporary project holds real records: never run the check against it, and never
+   name it with `--drill-project` (that would treat it as a drill target, where the check downloads
+   every file).
 3. **Project gone.** Supabase removes a deleted project's backups, so only the off-site copy helps:
    new project, apply the schema files, upsert the rows from the snapshot, upload the files, point
-   Vercel and the PC's key file at the new project, run the check.
+   Vercel and the PC's key file at the new project. The check only accepts the production project
+   it was built for (section 7), so before it can check the restored records it has to be pointed at
+   the new project in a reviewed commit: set `PRODUCTION_REF` in `tools/medical_recovery/recovery_check.py`
+   to the new project's ref (the default URL and the only origin that receives the production keys
+   follow from it) and update the production ref in `tests/test_medical_recovery_check.py`. There is
+   deliberately no flag or environment variable for this. Until that commit is in, the new project
+   is refused like any other host. Never use `--drill-project` with it instead: the new project holds
+   real records, and a drill target is where the check downloads files. Then run the check.
 
 ## 6. Recovery drill with made-up files (runs only after Riley authorizes it)
 
@@ -298,7 +308,10 @@ python tools\medical_recovery\recovery_check.py --json       # the same as JSON 
   was not named. Every request is checked against that one origin before it is sent; the personal
   access token is checked against the Management API's origin. Redirects are never followed (a 3xx
   is reported as unreadable), no proxy from the environment is used, and a signed download link is
-  fetched only when it is the target's own signed route for that very file.
+  fetched only when it is the target's own signed route for that very file. The production project
+  is one constant in the check (`PRODUCTION_REF`), with no flag or variable to change it; if
+  production ever moves to a new project, it is changed in a reviewed commit first (section 5,
+  case 3).
 - Keys on production: `SUPABASE_SERVICE_ROLE_KEY` or `~/.onyx_supabase_secret`;
   `SUPABASE_ANON_KEY` (the public key the site ships); `SUPABASE_USER_ACCESS_TOKEN` (a signed-in
   user's access token, which expires within an hour, for the signed-in-user probe). Keys on a drill
@@ -341,7 +354,12 @@ python tools\medical_recovery\recovery_check.py --json       # the same as JSON 
 
   A stale or rotated key, any other answer (for example "Invalid Compact JWS"), a malformed listing
   and a listing with a malformed entry (`[null]`, `["x"]`, an entry without a name) are incomplete,
-  never a privacy pass. Without a user token the signed-in-user checks are incomplete. On
+  never a privacy pass. Each probe stands on its own: a reach one probe saw (a table that answered,
+  a listed entry, a served file) is a FAIL even when a later probe could not be read, while a
+  refusal still counts only after the key was accepted (and, for a file, after the role's own
+  listing answered). On a drill target the same holds for the downloads: a file found missing, the
+  wrong size or not parsing stays a FAIL when a later download fails, and the files not tried by
+  then stay unknown. Without a user token the signed-in-user checks are incomplete. On
   production that token is Riley's own sign-in (decision 7); the catalog query in section 6 step 10
   is the manual alternative.
 - **A production run therefore ends INCOMPLETE at best.** Its only unknowns are then the two byte

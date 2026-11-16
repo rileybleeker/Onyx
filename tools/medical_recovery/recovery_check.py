@@ -19,13 +19,17 @@ docs/medical-records-recovery.md:
      malformed listing is "incomplete", never a pass. Storage checks a download (GET) and a HEAD / info
      request as separate operations, so the direct-file probes are a real GET on a drill target (made-up
      files) and a HEAD on production (no byte of a real record is sent): there a HEAD that succeeds is a
-     FAIL, and a refused HEAD leaves the download refusal unknown, never a pass.
+     FAIL, and a refused HEAD leaves the download refusal unknown, never a pass. Each probe stands on
+     its own: a reach one probe saw (a table, a listed entry, a served file) is a FAIL even when a later
+     probe could not be read, and the same holds for a downloaded drill file that is missing, the wrong
+     size or does not parse.
   3. Is there a recent database backup?  Supabase's Management API backup list (needs a personal
      access token in SUPABASE_ACCESS_TOKEN; the Supabase MCP has no backup tool). Storage files are
      NOT in those backups (Supabase docs), which is why the doc's off-site plan exists.
 
 Where requests go: the target is decided from the exact origin before any key is read. Production is
-exactly https://<production ref>.supabase.co; a drill target is a local Supabase stack (localhost /
+exactly https://<PRODUCTION_REF>.supabase.co (one constant, with no flag or variable to change it: a move
+to a new project changes it in a reviewed commit first); a drill target is a local Supabase stack (localhost /
 127.0.0.1 / ::1) or a throwaway hosted project named with --drill-project, never production. Any other
 URL is refused with nothing read or sent. Every request is checked against that one origin before it
 is sent (the personal access token against the Management API's), redirects are never followed (a 3xx
@@ -93,8 +97,11 @@ PAGE = 1000
 MAX_ROWS = 50_000
 BACKUP_MAX_AGE_HOURS = 36
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-DEFAULT_URL = "https://fewweioupmsnbccqtxdl.supabase.co"
+# The production project: the one constant to change, in a reviewed commit, if production ever moves to a
+# new project (docs/medical-records-recovery.md section 5). There is deliberately no flag or variable for it:
+# it decides which origin may receive the production keys and on which project files are never downloaded.
 PRODUCTION_REF = "fewweioupmsnbccqtxdl"
+DEFAULT_URL = f"https://{PRODUCTION_REF}.supabase.co"
 DEFAULT_KEY_FILE = Path.home() / ".onyx_supabase_secret"
 MANAGEMENT_API = "https://api.supabase.com"
 # (scheme, host, port): the only origin that may receive the production keys, and the only origin the
@@ -224,7 +231,7 @@ def classify(url: str, drill_project: Optional[str]) -> Optional[str]:
     if host in LOCAL_HOSTS:
         return "drill"
     m = re.fullmatch(r"([a-z0-9]{20})\.supabase\.co", host)
-    if (m and scheme == "https" and port == 443 and drill_project and m.group(1) == drill_project
+    if (m and scheme == "https" and port == 443 and drill_project and m.group(1) == drill_project.strip().lower()
             and m.group(1) != PRODUCTION_REF):
         return "drill"
     return None
@@ -738,10 +745,12 @@ class Inventory:
     objects: dict[str, dict] = field(default_factory=dict)  # "documents/<id>" -> {"size", "type"}
     unexpected_paths: int = 0                              # files or folders outside documents/<id>
     bucket: Optional[dict] = None
-    # {"tables_reached": n, "files_listed": n, "file_served": bool|None, "public_url_served": bool|None,
-    #  "file_probe": "get" (drill: a refusal proves a download is refused) | "head" (production: it does not)}
+    # {"tables_reached": n, "files_listed": n|None, "file_served": bool|None (None: no file to probe),
+    #  "public_url_served": bool|None, "file_probe": "get" (drill: a refusal proves a download is refused) |
+    #  "head" (production: it does not), "unknown": [fields not established: "tables", "files_listed",
+    #  "file_served", "public_url_served"]}. A reach in a field stands even when another field is unknown.
     anon: Optional[dict] = None
-    # {"tables_reached", "files_listed", "file_served", "file_probe"} for a signed-in user
+    # the same without "public_url_served", for a signed-in user
     authenticated: Optional[dict] = None
     # drill target only: path -> {"served": False} or {"served": True, "size", "sha256", "parses"}, for every
     # listed file and every ready document's path
@@ -776,10 +785,19 @@ def evaluate(inv: Inventory) -> dict:
     unread = {u["stage"] for u in inv.unreadable}
 
     def add(name: str, failures: int, *, warn: bool = False, stage: Optional[str] = None) -> None:
+        # for counts worked out from a read that may be missing (an empty list would read as failures)
         if stage and stage in unread:
             checks.append(_check(name, "unknown"))
         else:
             checks.append(_check(name, ("warn" if warn else "fail") if failures else "pass", failures))
+
+    def observed(name: str, failures: int, unknown: bool) -> None:
+        # for failures each seen directly (a reach, a file that does not parse): they stand whatever else
+        # could not be read; with none seen, a gap in the reading leaves the check unknown, never a pass
+        if failures:
+            checks.append(_check(name, "fail", failures))
+        else:
+            checks.append(_check(name, "unknown" if unknown else "pass", None if unknown else failures))
 
     # privacy
     if inv.bucket is None:
@@ -791,32 +809,35 @@ def evaluate(inv: Inventory) -> dict:
         types = b.get("allowed_mime_types")
         checks.append(_check("bucket_types", "pass" if isinstance(types, list) and set(types) == EXPECTED_TYPES else "fail"))
 
-    def refused(name: str, served, probe) -> None:
-        # reached = fail; refused = pass only when the probe was a GET (a download), because Storage checks
-        # HEAD / info and GET as separate operations: a refused HEAD leaves the download unknown
-        if served is None:
-            checks.append(_check(name, "skip"))
-        elif served:
+    def refused(name: str, role: dict, fld: str) -> None:
+        # reached = fail, whatever else is unknown; not established = unknown; no file to probe = skip;
+        # refused = pass only when the probe was a GET (a download), because Storage checks HEAD / info and
+        # GET as separate operations: a refused HEAD leaves the download unknown
+        served = role.get(fld)
+        if served:
             checks.append(_check(name, "fail"))
+        elif fld in (role.get("unknown") or ()):
+            checks.append(_check(name, "unknown"))
+        elif served is None:
+            checks.append(_check(name, "skip"))
         else:
-            checks.append(_check(name, "pass" if probe == "get" else "unknown"))
+            checks.append(_check(name, "pass" if role.get("file_probe") == "get" else "unknown"))
 
-    if inv.anon is None:
-        checks += [_check(n, "unknown") for n in ("anon_tables_refused", "anon_files_hidden", "anon_file_refused",
-                                                   "public_url_refused")]
-    else:
-        add("anon_tables_refused", int(inv.anon.get("tables_reached", 0)))
-        add("anon_files_hidden", int(inv.anon.get("files_listed", 0)))
-        refused("anon_file_refused", inv.anon.get("file_served"), inv.anon.get("file_probe"))
-        refused("public_url_refused", inv.anon.get("public_url_served"), inv.anon.get("file_probe"))
-    if inv.authenticated is None:
-        checks += [_check(n, "unknown") for n in ("authenticated_tables_refused", "authenticated_files_hidden",
-                                                   "authenticated_file_refused")]
-    else:
-        add("authenticated_tables_refused", int(inv.authenticated.get("tables_reached", 0)))
-        add("authenticated_files_hidden", int(inv.authenticated.get("files_listed", 0)))
-        refused("authenticated_file_refused", inv.authenticated.get("file_served"),
-                inv.authenticated.get("file_probe"))
+    def role_checks(prefix: str, role: Optional[dict], extra: tuple[str, ...] = ()) -> None:
+        names = (f"{prefix}_tables_refused", f"{prefix}_files_hidden", f"{prefix}_file_refused")
+        if role is None:
+            checks.extend(_check(n, "unknown") for n in names + extra)
+            return
+        unknown = set(role.get("unknown") or ())
+        observed(names[0], int(role.get("tables_reached") or 0), "tables" in unknown)
+        observed(names[1], int(role.get("files_listed") or 0),
+                 "files_listed" in unknown or role.get("files_listed") is None)
+        refused(names[2], role, "file_served")
+        if extra:
+            refused(extra[0], role, "public_url_served")
+
+    role_checks("anon", inv.anon, ("public_url_refused",))
+    role_checks("authenticated", inv.authenticated)
 
     # metadata relationships
     docs_ok = "documents" not in unread
@@ -840,15 +861,20 @@ def evaluate(inv: Inventory) -> dict:
     add("file_sizes_match", size_bad, stage=both)
     add("file_types_match", type_bad, stage=both)
     # the bytes themselves: the listing (and a HEAD request) read the storage.objects row, which comes back
-    # with a database restore while the bytes may not; only a download proves them (drill target only)
-    if inv.opened is None or not docs_ok or "download" in unread:
+    # with a database restore while the bytes may not; only a download proves them (drill target only).
+    # A file found missing or the wrong size stays a failure when a later download could not be read; the
+    # files not tried by then leave the check unknown.
+    download_cut = "download" in unread
+    if inv.opened is None or not docs_ok:
         checks += [_check(n, "unknown") for n in ("files_stored", "stored_sizes_match")]
     else:
         declared = {d.get("storage_path"): d.get("size_bytes") for d in ready
                     if PATH_RE.match(str(d.get("storage_path") or ""))}
-        served = {p: inv.opened[p] for p in declared if (inv.opened.get(p) or {}).get("served")}
-        add("files_stored", len(declared) - len(served))
-        add("stored_sizes_match", sum(1 for p, v in served.items() if v.get("size") != declared[p]))
+        tried = {p: inv.opened[p] for p in declared if p in inv.opened}
+        served = {p: v for p, v in tried.items() if v.get("served")}
+        untried = len(declared) > len(tried)
+        observed("files_stored", len(tried) - len(served), untried)
+        observed("stored_sizes_match", sum(1 for p, v in served.items() if v.get("size") != declared[p]), untried)
     add("storage_paths_valid", sum(1 for d in inv.documents if not PATH_RE.match(str(d.get("storage_path") or ""))),
         stage="documents" if not docs_ok else None)
     link_stage = None if labs_ok and docs_ok else ("labs" if not labs_ok else "documents")
@@ -865,9 +891,8 @@ def evaluate(inv: Inventory) -> dict:
 
     # downloaded files (drill target only): their structure, which is not the same as opening them
     if inv.opened is not None:
-        add("files_parse_as_declared_type",
-            sum(1 for v in inv.opened.values() if v.get("served") and not v.get("parses")),
-            stage="download" if "download" in unread else None)
+        observed("files_parse_as_declared_type",
+                 sum(1 for v in inv.opened.values() if v.get("served") and not v.get("parses")), download_cut)
         if "signed" in unread:
             checks.append(_check("signed_link_serves_file", "unknown"))
         elif inv.signed_ok is not None:
@@ -882,8 +907,9 @@ def evaluate(inv: Inventory) -> dict:
         if inv.opened is None:
             checks.append(_check("manifest_hashes_match", "skip"))
         else:
-            add("manifest_hashes_match", sum(1 for p, v in m_objects.items()
-                                             if p in inv.opened and inv.opened[p].get("sha256") != v.get("sha256")))
+            observed("manifest_hashes_match", sum(1 for p, v in m_objects.items()
+                                                  if p in inv.opened and inv.opened[p].get("sha256") != v.get("sha256")),
+                     download_cut)
         m_docs = inv.manifest.get("document_rows") or {}
         m_labs = inv.manifest.get("lab_rows") or {}
         labs_by_id = {r.get("id"): r for r in inv.labs}
@@ -971,13 +997,59 @@ def summarize_backups(answer, now: datetime) -> dict:
 
 # ---------------------------------------------------------------- collection
 def _probe_role(target: Target, stage: str, apikey: str, bearer: str, check_path: str,
-                sample: Optional[str]) -> dict:
-    target.key_accepted(stage, apikey, bearer, check_path)
-    out = {"tables_reached": sum(1 for t in TABLES if target.role_reaches_table(stage, apikey, bearer, t)),
-           "files_listed": target.role_list_count(stage, apikey, bearer)}
-    # after the listing answered (the credential is accepted): can the role reach one file directly?
-    out["file_served"] = target.role_file_served(stage, apikey, bearer, sample) if sample else None
-    out["file_probe"] = target.file_probe
+                sample: Optional[str], note: Callable[[Unreadable], None]) -> dict:
+    """What one role (the anon key, or a signed-in user's token) reaches, each probe on its own.
+
+    A reach one probe observed (a table that answered, a listed entry, a served file) stays a FAIL
+    whatever a later probe answers: an error further on never turns a confirmed exposure into
+    "unknown". A refusal counts only once the credential was accepted: a table or listing refusal after
+    the key check passed, a file refusal after that and once the role's own listing answered. Every
+    error is noted, and what could not be established is named in "unknown". A credential the key check
+    refused outright (401 / 403) can reach nothing, so the role's other probes are not sent."""
+    out: dict = {"tables_reached": 0, "files_listed": None, "file_served": None, "file_probe": target.file_probe,
+                 "unknown": []}
+    try:
+        target.key_accepted(stage, apikey, bearer, check_path)
+        key_ok = True
+    except Unreadable as e:
+        note(e)
+        if e.denied:
+            out["unknown"] += ["tables", "files_listed", "file_served"]
+            return out
+        key_ok = False  # neither refused nor confirmed (a gateway error, say): reaches still count
+    tables_open = 0
+    for table in TABLES:
+        try:
+            if target.role_reaches_table(stage, apikey, bearer, table):
+                out["tables_reached"] += 1
+            elif not key_ok:
+                tables_open += 1  # a refusal, but of a credential nobody confirmed
+        except Unreadable as e:
+            note(e)
+            tables_open += 1
+    if tables_open:
+        out["unknown"].append("tables")
+    listed = False
+    try:
+        out["files_listed"] = target.role_list_count(stage, apikey, bearer)
+        listed = True
+        if not out["files_listed"] and not key_ok:
+            out["unknown"].append("files_listed")
+    except Unreadable as e:
+        note(e)
+        out["unknown"].append("files_listed")
+    if sample:
+        # can the role reach one file directly? (listing and download are separate permissions)
+        try:
+            served = target.role_file_served(stage, apikey, bearer, sample)
+        except Unreadable as e:
+            note(e)
+            out["unknown"].append("file_served")
+        else:
+            if served or (key_ok and listed):
+                out["file_served"] = served
+            else:
+                out["unknown"].append("file_served")
     return out
 
 
@@ -1026,12 +1098,15 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
 
     sample = next(iter(sorted(inv.objects)), None)
     if anon_key:
-        try:
-            anon = _probe_role(target, "anon", anon_key, anon_key, "/auth/v1/settings", sample)
-            anon["public_url_served"] = target.public_url_served(sample) if sample else None
-            inv.anon = anon
-        except Unreadable as e:
-            note(e)
+        inv.anon = _probe_role(target, "anon", anon_key, anon_key, "/auth/v1/settings", sample, note)
+        inv.anon["public_url_served"] = None
+        if sample:
+            # no credential is sent on the public URL, so its answer stands on its own
+            try:
+                inv.anon["public_url_served"] = target.public_url_served(sample)
+            except Unreadable as e:
+                note(e)
+                inv.anon["unknown"].append("public_url_served")
     else:
         inv.unreadable.append({"stage": "anon", "reason": "no anon key", "ask": ACCESS_ASK["anon"]})
     if not user_token:
@@ -1041,10 +1116,7 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
         inv.unreadable.append({"stage": "authenticated", "reason": "the anon key is needed as the apikey",
                                "ask": ACCESS_ASK["anon"]})
     else:
-        try:
-            inv.authenticated = _probe_role(target, "authenticated", anon_key, user_token, "/auth/v1/user", sample)
-        except Unreadable as e:
-            note(e)
+        inv.authenticated = _probe_role(target, "authenticated", anon_key, user_token, "/auth/v1/user", sample, note)
     if target.file_probe == "head" and any(p and False in (p.get("file_served"), p.get("public_url_served"))
                                            for p in (inv.anon, inv.authenticated)):
         inv.unreadable.append({"stage": "download_privacy", "reason": (

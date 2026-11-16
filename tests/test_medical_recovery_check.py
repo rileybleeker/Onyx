@@ -19,7 +19,10 @@ and files:
     download refusal UNKNOWN, never a pass; a stale / invalid key, a table probe answered without a
     permission code, a listing answered with anything but a list or "bucket not found" (e.g.
     "Invalid Compact JWS"), a malformed listing and a listing with a malformed entry ([null],
-    ["x"], a nameless entry) are INCOMPLETE, never a pass;
+    ["x"], a nameless entry) are INCOMPLETE, never a pass; each probe stands on its own, so a reach
+    seen before a later probe failed (a listing error, a file or public-URL probe that kept failing,
+    a key check answered by a gateway error) stays a FAIL, and so does a drill file that does not
+    parse when a later download could not be read;
   * origins: only the exact production origin may receive the production keys; any other URL
     (another host, http, another port, a path, a user name, a look-alike host, a hosted project not
     named with --drill-project) is refused before any key is read; a drill target never gets
@@ -532,6 +535,47 @@ def test_download_only_exposure_fails_on_the_drill_and_is_never_a_pass_on_produc
     assert_private_output(text)
 
 
+def test_exposure_seen_before_a_later_error_stays_a_fail():
+    # each probe stands on its own: a table the role reached is a FAIL even when its listing, its file probe
+    # or the public URL could not be read afterwards; it is never folded into "unknown"
+    docs, labs, files = healthy()
+    for later in ({"anon_list_answer": (400, BAD_JWS)},
+                  {"fail": {f"/storage/v1/object/{rc.BUCKET}/": [503] * 3}},
+                  {"fail": {f"/storage/v1/object/public/{rc.BUCKET}/": [503] * 3}}):
+        code, text, report, _ = run(FakeServer(docs, labs, files, anon_table=True, **later))
+        assert code == 1 and report["status"] == "fail", (later, text)
+        assert result(report, "anon_tables_refused") == {"name": "anon_tables_refused", "result": "fail",
+                                                         "count": 2}, later
+        assert any(u["stage"] == "anon" for u in report["incomplete"]), later
+        assert_private_output(text)
+    # the key check itself unanswered (a gateway error): a reached table still fails, while a refusal of a
+    # credential nobody confirmed (here the empty listing) stays unknown
+    server = FakeServer(docs, labs, files, user_table=True, fail={"/auth/v1/user": [503] * 3})
+    code, _, report, _ = run(server)
+    assert code == 1 and result(report, "authenticated_tables_refused")["result"] == "fail"
+    assert result(report, "authenticated_files_hidden")["result"] == "unknown"
+    assert result(report, "authenticated_file_refused")["result"] == "unknown"
+    code, _, report, _ = run(FakeServer(docs, labs, files, fail={"/auth/v1/settings": [503] * 3}))
+    assert code == 2 and result(report, "anon_tables_refused")["result"] == "unknown"
+    assert result(report, "anon_files_hidden")["result"] == "unknown"
+
+
+def test_bad_file_seen_before_a_later_download_error_stays_a_fail():
+    # the drill: a file that no longer parses stays a FAIL when a later download could not be read; the file
+    # after the error was never tried, so whether it is stored stays unknown
+    docs, labs, files = healthy()
+    bad = dict(files)
+    bad[f"documents/{uid(1)}"] = ("application/pdf", b"X" + PDF[1:])  # same size, no longer a PDF
+    server = FakeServer(docs, labs, bad, lost_bytes={f"documents/{uid(4)}"}, lost_answer=(400, BAD_JWS))
+    code, text, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 1 and report["status"] == "fail", text
+    assert result(report, "files_parse_as_declared_type") == {"name": "files_parse_as_declared_type",
+                                                              "result": "fail", "count": 1}
+    assert result(report, "files_stored")["result"] == "unknown"
+    assert any(u["stage"] == "download" for u in report["incomplete"])
+    assert_private_output(text)
+
+
 def test_missing_anon_key_is_incomplete_not_pass():
     docs, labs, files = healthy()
     code, _, report, _ = run(FakeServer(docs, labs, files), anon=None)
@@ -781,6 +825,8 @@ def test_unknown_origin_is_refused_before_any_key_is_read():
     assert rc.classify(LOCAL, None) == "drill" and rc.classify("http://localhost:54321", None) == "drill"
     assert rc.classify("http://[::1]:54321", None) == "drill" and rc.classify(DRILL, DRILL_REF) == "drill"
     assert rc.classify(DRILL, None) is None and rc.classify(PROD, rc.PRODUCTION_REF) == "production"
+    assert rc.classify(DRILL, DRILL_REF.upper()) == "drill"  # a ref typed in capitals names the same project
+    assert rc.DEFAULT_URL == PROD  # one constant, PRODUCTION_REF, names production
     for url in UNKNOWN_ORIGINS:
         assert rc.classify(url, None) is None, url
 
