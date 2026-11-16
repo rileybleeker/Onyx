@@ -711,6 +711,9 @@ def test_a_trial_without_a_declared_model_never_gets_a_firm_decision():
         # missing fisher_p). Each also marks Fisher's test unsupported, like a failed check.
         for missing, kind in (({"threat": False}, ed.KIND_AA), ({"threat": False, "fisher_p": None}, ed.KIND_AA),
                               ({"threat": False, "fisher_p": float("nan")}, ed.KIND_AA),
+                              ({"threat": False, "fisher_p": float("inf")}, ed.KIND_AA),
+                              ({"threat": False, "fisher_p": 1.2}, ed.KIND_AA),
+                              ({"threat": False, "fisher_p": -0.1}, ed.KIND_AA),
                               ({"threat": False, "fisher_p": True}, ed.KIND_AA),
                               ({"threat": False, "fisher_p": "0.4"}, ed.KIND_AA), (None, ed.KIND_AA),
                               ({}, ed.KIND_TREATMENT), ({"threat": None}, ed.KIND_TREATMENT),

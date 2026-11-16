@@ -1172,8 +1172,8 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
     can tie missing nights to the arm; it fails on Fisher's exact test of the arm x missing table at
     the trial's alpha instead, because on a 4-week check the 10-point rule fires on chance alone
     about half the time when a fifth of nights are missing (14 nights per arm), which would void
-    the check's own no-effect test. Either way a check without a readable result (no Fisher p, no
-    boolean 10-point flag) fails closed."""
+    the check's own no-effect test. Either way a check without a readable result (no Fisher p in
+    [0, 1], no boolean 10-point flag) fails closed."""
     kind = spec.kind if spec is not None else design.KIND_TREATMENT
     alpha = spec.alpha if spec is not None else 0.05
 
@@ -1184,8 +1184,8 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
         if kind == design.KIND_AA:
             fisher_p = check.get("fisher_p")
             if (not isinstance(fisher_p, (int, float, np.integer, np.floating))
-                    or isinstance(fisher_p, (bool, np.bool_)) or not math.isfinite(float(fisher_p))):
-                return True
+                    or isinstance(fisher_p, (bool, np.bool_)) or not 0.0 <= float(fisher_p) <= 1.0):
+                return True                   # NaN, an infinity or a value outside [0, 1] is not a p-value
             return float(fisher_p) < alpha
         threat = check.get("threat")
         return not isinstance(threat, (bool, np.bool_)) or bool(threat)
