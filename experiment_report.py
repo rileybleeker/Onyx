@@ -345,7 +345,11 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     allows. The same-night p_value also allows for any carryover, which makes it conservative and,
     on a 4-week check, close to 1 (doc 8.1), so it is used only for a report stored before
     p_value_no_effect existed. `p_source` names the one used.
-    The other two items are the rest of Phase 2's "done when" (doc 12): every trial day was revealed
+    That p counts only when the report marks it supported (inference.outputs[p_source].supported):
+    missing nights caused by the arm invalidate Fisher's test too, so a non-significant p from an
+    unsupported test is not a pass (`inference_supported`, with the failed checks' reasons in
+    `unsupported_reasons`). A report stored before the inference block existed carries no mark.
+    The last two items are the rest of Phase 2's "done when" (doc 12): every trial day was revealed
     on Today, and 90% or more of the days have a check-in answer. Report re-runs being idempotent is
     shown by the tests and by the final report being written once.
     """
@@ -363,8 +367,20 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     analysed = number(p_value) and not report.get("not_analysable")
     false_effect = bool(p_value < float(exp["alpha"])) if analysed else None
     answer_pct = round(100.0 * answered / n_done, 1) if n_done else None
+    # Whether the test the check reads rests on assumptions that held (None = no inference block).
+    inference = report.get("inference") if isinstance(report.get("inference"), dict) else {}
+    outputs = inference.get("outputs") if isinstance(inference.get("outputs"), dict) else {}
+    entry = outputs.get(p_source) if isinstance(outputs.get(p_source), dict) else {}
+    supported = entry.get("supported") if isinstance(entry.get("supported"), bool) else None
+    if supported is None and p_source in (inference.get("unsupported_outputs") or []):
+        supported = False
+    needs = set(entry.get("needs") or [])
+    unsupported_reasons = [str(c.get("reason")) for c in inference.get("checks") or []
+                           if isinstance(c, dict) and c.get("status") == "failed"
+                           and (needs & set(c.get("covers") or []) or not needs)] if supported is False else []
     done = {
         "no_false_effect": false_effect is False,
+        "inference_supported": supported is not False,
         "every_day_revealed": n_done > 0 and days_revealed == n_done,
         "answers_on_90pct_of_days": answer_pct is not None and answer_pct >= AA_MIN_ANSWER_PCT,
     }
@@ -372,6 +388,8 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
         "expected": "no difference: both arms carried the same instruction",
         "p_source": p_source,
         "p_value": float(p_value) if analysed else None,
+        "p_supported": supported,
+        "unsupported_reasons": unsupported_reasons,
         "false_effect": false_effect,
         "days": n_done,
         "days_revealed": days_revealed,
@@ -522,6 +540,8 @@ def _final(store: Store, exp: dict[str, Any], today: date, arms: list[str], seed
 
     data = analysis.TrialData(
         arms=arms, outcome=y, excluded_blocks=set(exclusions["blocks"]), adherent=adherent,
+        # Built from earlier nights, inside the trial too, so they depend on earlier arms: these fits'
+        # p-value and interval are approximate, their no-effect p exact (analysis.output_semantics).
         covariates={"hrv_lag1": lag1, "hrv_7d_mean": mean7},
         # Eight Sleep keys a night by its wake-up day, so the sleep that closes day D is on row D + 1.
         secondary_outcomes={"eight_sleep_hrv": series("eight_sleep_hrv", offset=1), "whoop_rhr": series("whoop_rhr")})

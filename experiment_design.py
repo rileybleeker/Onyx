@@ -361,7 +361,9 @@ def validate_protocol(p: dict[str, Any], *, today: date, alignment_version: str,
 
     # Per-trial support for the parts of the model the analysis cannot test (doc 8.1).
     carryover = analysis.get("carryover_nights", CARRYOVER_NIGHTS if kind == KIND_AA else None)
-    if carryover != CARRYOVER_NIGHTS or isinstance(carryover, bool):
+    # An integer only: the report job reads the field as an int, so 1.0 would register but leave
+    # the final report's decision withheld for good (it is written once).
+    if not isinstance(carryover, int) or isinstance(carryover, bool) or carryover != CARRYOVER_NIGHTS:
         problems.append(
             f"analysis.carryover_nights must be {CARRYOVER_NIGHTS}: the daily block design models one night of "
             "carryover; a treatment that can act longer needs the period design (doc 4.2), which is not built yet")

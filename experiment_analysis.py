@@ -138,7 +138,10 @@ class TrialData:
     excluded_blocks: set[int] = field(default_factory=set)   # whole blocks left out (flight / declared pause)
     adherent: np.ndarray | None = None                # optional bool per day, for the per-protocol estimate
     # Optional pre-registered extras, one array per scheduled day each (NaN = not available):
-    covariates: dict[str, np.ndarray] | None = None          # pre-treatment covariates, one sensitivity fit each
+    # covariates, one sensitivity fit each. Not pre-treatment when built from earlier trial nights
+    # (hrv_lag1, hrv_7d_mean): those depend on earlier arms under the model, so the fits' p-value
+    # and interval are approximate (output_semantics), and only their no-effect p is exact.
+    covariates: dict[str, np.ndarray] | None = None
     secondary_outcomes: dict[str, np.ndarray] | None = None  # other outcomes, same model, never part of the decision
 
 
@@ -771,8 +774,10 @@ def randomization_analysis(
     t_obs   0/1 per scheduled day (1 = arm A), length n_blocks * block_len
     y       outcome per day, NaN where there is none (those nights are left out, never imputed)
     dow     weekday 0..6 per day
-    covariates  optional (n_days, k) pre-treatment covariates for the sensitivity analysis; a day
-                with a NaN covariate is left out
+    covariates  optional (n_days, k) covariates for the sensitivity analysis, added to the nuisance
+                columns and held fixed across the re-draws; a day with a NaN covariate is left out.
+                The joint-null identity needs them not to depend on the schedule: a covariate built
+                from earlier trial outcomes does, so with one only p_value_no_effect stays exact
     with_p  False: estimates and counts only (per-protocol fit, planning)
     nuisance_beta  None = nuisance_beta_for(n_redraws), the registered level
     """
@@ -849,28 +854,57 @@ ASSUMPTIONS: dict[str, str] = {
         "analysis.model_justification."),
     "missing_not_caused_by_arm": (
         "Whether a night has an outcome, and which blocks are left out, does not depend on the schedule. "
-        "Checked only for a large imbalance: missing shares more than 10 points apart between the arms fail it; "
-        "a smaller difference does not prove it."),
+        "Checked only for a large imbalance: missing shares more than 10 points apart between the arms fail it "
+        "(in an A/A check, where only a pipeline fault can tie missing nights to identical arms, Fisher's exact "
+        "test of the arm x missing table at alpha instead); passing does not prove it."),
     "pre_trial_day_is_control": (
         "The day before the trial counts as the control arm for the first night's carryover. Covered by the "
         "protocol's analysis.model_justification."),
+    "constant_multiplicative_effects": (
+        "For the ln(HRV) sensitivity fit only: the model holds for ln(outcome), i.e. each arm multiplies the "
+        "outcome by a constant factor on its own night and the next one. It cannot hold together with "
+        "constant_additive_effects unless the effects are zero, so the primary result and this fit do not both "
+        "rest on a true model. Neither tested nor declared by the protocol; the fit is a sensitivity check the "
+        "decision rule never reads."),
 }
 
 _MODEL = ["randomized_schedule", "one_night_carryover", "constant_additive_effects", "missing_not_caused_by_arm",
           "pre_trial_day_is_control"]
 _FISHER = ["randomized_schedule", "missing_not_caused_by_arm"]
+_LOG_MODEL = ["randomized_schedule", "one_night_carryover", "constant_multiplicative_effects",
+              "missing_not_caused_by_arm", "pre_trial_day_is_control"]
 
 
-def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05) -> dict[str, dict[str, Any]]:
-    """Null hypothesis, assumptions and validity of every number the report carries."""
+def secondary_missing_assumption(name: str) -> str:
+    """The id of the assumption that a secondary outcome's own missing nights are not caused by the arm."""
+    return f"missing_not_caused_by_arm:{name}"
+
+
+def secondary_assumptions(names: Any) -> dict[str, str]:
+    """The per-series missingness assumption of each secondary outcome (added to the report's list)."""
+    return {secondary_missing_assumption(name): (
+        f"Whether a night has a {name} value does not depend on the schedule. Checked per series with the "
+        "primary outcome's rule (missing_not_caused_by_arm); passing does not prove it.") for name in names}
+
+
+def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05, *, sensitivity: Any = (),
+                     secondary: Any = ()) -> dict[str, dict[str, Any]]:
+    """Null hypothesis, assumptions and validity of every number the report carries.
+
+    sensitivity  the keys of the report's sensitivity block (ln_outcome, per_protocol,
+                 covariate_<name>); each gets an entry "sensitivity.<key>"
+    secondary    the names of its secondary outcomes; each gets "secondary_outcomes.<name>"
+    An entry with approximate True is not certified even when every assumption it lists holds."""
     level = f"{100 * (1 - beta):g}%"
     ols = ("OLS coefficient; approximately unbiased over the randomization when the assumptions hold (exact only "
            "with complete nights and a symmetric design: missing nights, the lag term and the fixed pre-trial day "
            "break the symmetry slightly)")
     enclosure = (f"a certified enclosure ({INTERVAL_METHOD}) of every value the test does not reject (p >= alpha), "
                  f"so it covers the true value with probability at least {1 - alpha:g} when the assumptions hold; an "
-                 "infinite end means the nights cannot bound it, or it could not be certified")
-    return {
+                 "infinite end means the nights cannot bound it, or it could not be certified. The accepted values "
+                 "need not form one piece, so the interval can contain 0 while the p-value rejects 0; the reverse "
+                 "cannot happen")
+    out: dict[str, dict[str, Any]] = {
         "estimate": {"estimand": "tau: same-night effect, arm A minus arm B, intention to treat", "needs": _MODEL,
                      "validity": ols},
         "carryover": {"estimand": "gamma: the effect on the next night", "needs": _MODEL, "validity": ols},
@@ -903,15 +937,80 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05) -> dict[s
         "hac_se / hac_se_carryover": {
             "validity": "approximate Newey-West cross-check (lags count observed nights). Not read by the decision rule"},
     }
+    berger_boos = "the same Berger-Boos test and certified interval as p_value and ci_low / ci_high"
+    for key in sensitivity:
+        if key == "ln_outcome":
+            out["sensitivity.ln_outcome"] = {
+                "estimand": "tau on ln(HRV); estimate_pct = 100 * (exp(estimate_ln) - 1), the same-night change in %",
+                "null": "p_value: tau = 0 on ln(HRV), any carryover on that scale; the interval: the tau0 not rejected",
+                "needs": _LOG_MODEL,
+                "validity": (f"{berger_boos}, on ln(HRV): type I error at most alpha and coverage at least "
+                             f"{1 - alpha:g} when the model holds on the log scale (constant_multiplicative_effects), "
+                             "which it cannot do together with the primary model unless the effects are zero. A "
+                             "sensitivity check, not read by the decision rule")}
+        elif key == "per_protocol":
+            out["sensitivity.per_protocol"] = {
+                "estimand": "tau on adherent days only", "needs": _MODEL,
+                "validity": ("estimate only: leaving out non-adherent days is no longer a randomized comparison, so "
+                             "there is no p-value or interval. Not read by the decision rule")}
+        elif key.startswith("covariate_"):
+            covariate = key[len("covariate_"):]
+            out[f"sensitivity.{key}"] = {
+                "estimand": f"tau with {covariate} added to the nuisance columns",
+                "null": "p_value: tau = 0, any gamma; the interval: the tau0 not rejected", "needs": _MODEL,
+                "approximate": True,
+                "validity": (f"approximate, not certified: {covariate} is built from earlier trial nights, whose "
+                             "outcomes depend on earlier arms under the model, but the re-draws hold it fixed, so "
+                             "the identity behind the exact joint test holds only at tau = gamma = 0. Read the "
+                             "fit's p_value_no_effect for an exact test. A sensitivity check, not read by the "
+                             "decision rule")}
+            out[f"sensitivity.{key}.p_value_no_effect"] = {
+                "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
+                "validity": (f"exact: under that null the outcomes, and so {covariate}, are the same under every "
+                             "schedule, so holding it fixed is right. Rejecting it says the arm acts on some night, "
+                             "not which. Not read by the decision rule")}
+    for name in secondary:
+        out[f"secondary_outcomes.{name}"] = {
+            "estimand": f"tau and gamma for {name}: its own same-night effect and carryover",
+            "null": f"p_value: tau = 0 for {name}, any carryover; the interval: the tau0 not rejected",
+            "needs": [*_MODEL, secondary_missing_assumption(name)],
+            "validity": (f"{berger_boos}, for this series: valid when the model holds for it (one-night carryover, "
+                         "its own constant effects) and its own missing nights are not caused by the arm (checked "
+                         "per series). A failed primary missingness check marks it too, the excluded blocks being "
+                         "shared. Reported next to the primary result; the decision rule never reads it")}
+    return out
 
 
 def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
-                      spec: TrialSpec | None = None) -> list[dict[str, Any]]:
+                      spec: TrialSpec | None = None,
+                      secondary_missingness: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """What the data, the registered protocol and the method record can check. A failed or pending
     check with blocks_decision withholds the decision; `covers` names the assumptions a failed
     check leaves unsupported (the outputs that need them are marked unsupported in the report).
-    Without a spec nothing is declared, so the protocol checks fail (closed)."""
+    Without a spec nothing is declared, so the protocol checks fail (closed). Each secondary
+    outcome gets its own missingness check, which never withholds the decision (the rule does not
+    read secondary outcomes) but marks that series' numbers unsupported when it fails.
+
+    Missing nights: a treatment trial fails the check on the 10-point rule (fail closed; the arm can
+    change behaviour). In an A/A check both arms are the same instruction, so only a pipeline fault
+    can tie missing nights to the arm; it fails on Fisher's exact test of the arm x missing table at
+    the trial's alpha instead, because on a 4-week check the 10-point rule fires on chance alone
+    about half the time when a fifth of nights are missing (14 nights per arm), which would void
+    the check's own no-effect test."""
     kind = spec.kind if spec is not None else design.KIND_TREATMENT
+    alpha = spec.alpha if spec is not None else 0.05
+
+    def missing_failed(check: dict[str, Any]) -> bool:
+        if kind == design.KIND_AA:
+            fisher_p = check.get("fisher_p")
+            return isinstance(fisher_p, (int, float)) and not isinstance(fisher_p, bool) and fisher_p < alpha
+        return bool(check.get("threat"))
+
+    if kind == design.KIND_AA:
+        missing_rule = (f"missing nights are tied to the arm (Fisher exact p < {alpha:g}) although both arms carry the "
+                        "same instruction, which only a pipeline fault can cause")
+    else:
+        missing_rule = "missing nights differ between the arms by more than 10 points"
     justification = (spec.model_justification or "").strip() if spec is not None else ""
     carryover = spec.carryover_nights if spec is not None else None
     if kind == design.KIND_AA:
@@ -929,10 +1028,9 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
     review = method_review_problem(spec.alpha if spec is not None else 0.05,
                                    spec.n_redraws if spec is not None else 10000)
     return [
-        {"id": "missing_not_caused_by_arm", "status": "failed" if missingness.get("threat") else "ok",
+        {"id": "missing_not_caused_by_arm", "status": "failed" if missing_failed(missingness) else "ok",
          "blocks_decision": True, "covers": ["missing_not_caused_by_arm"],
-         "reason": ("missing nights differ between the arms by more than 10 points; the randomization tests assume "
-                    "the arm did not cause missing nights")},
+         "reason": f"{missing_rule}; the randomization tests assume the arm did not cause missing nights"},
         {"id": "model_justified", "status": model_status, "blocks_decision": True,
          "covers": ["one_night_carryover", "constant_additive_effects", "pre_trial_day_is_control"],
          "reason": model_reason},
@@ -946,6 +1044,12 @@ def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
                     "analysis that ran is not the one registered")},
         {"id": "method_reviewed", "status": "ok" if review is None else "pending", "blocks_decision": True,
          "covers": [], "reason": review or "recorded for this trial's alpha and re-draw count"},
+    ] + [
+        {"id": secondary_missing_assumption(name), "status": "failed" if missing_failed(check) else "ok",
+         "blocks_decision": False, "covers": [secondary_missing_assumption(name)],
+         "reason": (f"{name}: {missing_rule}, so that secondary outcome's p-value and interval are not "
+                    "supported")}
+        for name, check in (secondary_missingness or {}).items()
     ]
 
 
@@ -1042,33 +1146,41 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
             }
         except ValueError as exc:
             sensitivity["per_protocol"] = {"estimate": None, "note": str(exc)}
-    # Doc 8: the primary model plus one pre-treatment covariate at a time. A night whose covariate
-    # is missing is left out, so these fits can use fewer nights than the primary one.
+    # Doc 8: the primary model plus one covariate at a time. A night whose covariate is missing is
+    # left out, so these fits can use fewer nights than the primary one. hrv_lag1 / hrv_7d_mean are
+    # built from earlier trial nights, so they depend on earlier arms: the fits' p_value and
+    # interval are approximate and their p_value_no_effect is the exact test (output_semantics).
     for name, values in (data.covariates or {}).items():
         try:
             fit = randomization_analysis(t, y, dow, **common, covariates=_per_day(values, n_sched, name))
-            sensitivity[f"covariate_{name}"] = {key: fit[key] for key in ("estimate", "ci_low", "ci_high", "p_value", "n_nights")}
+            sensitivity[f"covariate_{name}"] = {key: fit[key] for key in (
+                "estimate", "ci_low", "ci_high", "p_value", "p_value_no_effect", "n_nights")}
         except ValueError as exc:
             sensitivity[f"covariate_{name}"] = {"estimate": None, "note": str(exc)}
 
     # Doc 6.1 "outcome.secondary": the same model on another series (a second sensor, resting HR).
     # Reported next to the primary result; the decision rule never reads them.
+    # Each series has its own missing nights, checked like the primary outcome's.
     secondary: dict[str, Any] = {}
+    secondary_missing: dict[str, dict[str, Any]] = {}
     for name, values in (data.secondary_outcomes or {}).items():
         y2 = _per_day(values, n_sched, name).copy()
         if used_days < n_sched:
             y2[used_days:] = np.nan
+        secondary_missing[name] = missingness_check(t[in_scope], np.isnan(y2[in_scope]))
         try:
             fit = randomization_analysis(t, y2, dow, **common)
             secondary[name] = {key: fit[key] for key in ("estimate", "carryover", "ci_low", "ci_high", "p_value", "n_nights")}
         except ValueError as exc:
             secondary[name] = {"estimate": None, "note": str(exc)}
+        secondary[name]["missingness"] = secondary_missing[name]
 
     missingness = missingness_check(t[in_scope], np.isnan(y[in_scope]))
     rule = decide(primary["estimate"], primary["ci_low"], primary["ci_high"], primary["p_value"], spec.mid_ms, spec.alpha)
-    checks = assumption_checks(primary, missingness, spec)
+    checks = assumption_checks(primary, missingness, spec, secondary_missing)
     withheld = [c["reason"] for c in checks if c["blocks_decision"] and c["status"] != "ok"]
-    outputs = output_semantics(primary["nuisance_beta"], spec.alpha)
+    outputs = output_semantics(primary["nuisance_beta"], spec.alpha, sensitivity=list(sensitivity),
+                               secondary=list(secondary))
     unsupported = unsupported_outputs(outputs, checks)
 
     report = {
@@ -1096,7 +1208,7 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
             "interval_method": INTERVAL_METHOD,
             "registered_method": spec.inference_method,
             "nuisance_beta": primary["nuisance_beta"],
-            "assumptions": dict(ASSUMPTIONS),
+            "assumptions": {**ASSUMPTIONS, **secondary_assumptions(secondary)},
             "checks": checks,
             "outputs": outputs,
             # Numbers whose assumptions a failed check leaves unsupported (each output also carries "supported").

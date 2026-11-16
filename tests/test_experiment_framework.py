@@ -372,6 +372,10 @@ def test_protocol_declares_the_untestable_model_and_the_registered_method():
     # Doc 8.1: one night of carryover, declared and justified per trial; anything longer is the period design.
     assert "carryover_nights must be 1" in _problems(_protocol_text(**{"carryover_nights: 1 ": "carryover_nights: 2 "}))
     assert "carryover_nights must be 1" in _problems(_protocol_text(**{"  carryover_nights: 1 ": "  # carryover_nights: 1 "}))
+    # An integer only: the report job reads it as an int, so 1.0 would register and then leave the
+    # (written-once) final report's decision withheld for good.
+    for text in ("1.0", "true", "'1'"):
+        assert "carryover_nights must be 1" in _problems(_protocol_text(**{"carryover_nights: 1 ": f"carryover_nights: {text} "})), text
     justification = ("  model_justification: >-\n"
                      "    Phone use in the last hour acts on that night's sleep; nothing in it is expected to last past\n"
                      "    the next night, and the effect should be about the same size every night. The day before the\n"

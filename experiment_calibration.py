@@ -33,8 +33,14 @@ Synthetic inputs only, declared in SCENARIOS (round planning values, no personal
 reads the database, the clock or a credential; the output holds rates and counts only.
 
 Run in the scheduled validation phase, never before a merge (AGENTS.md "Read this first"), at the
-registered re-draw count (10,000 in the template; it takes hours):
+registered re-draw count (10,000 in the template). A full run is many hours in one process, more
+than one Actions job allows, so it runs on the PC or as one job per scenario, merged afterwards.
+Scenario j's trial i always draws from default_rng([seed, j, i]), so a shard holds exactly the rows
+a full run would; --merge refuses shards of different configurations or a scenario twice:
     python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --out calibration.json
+    python experiment_calibration.py --sims 1000 --redraws 10000 --seed 20261116 --scenario no_effect --out s1.json
+    python experiment_calibration.py --merge s1.json s2.json ... --out calibration.json
+The scheduled test (tests/test_experiment_calibration.py) runs a bounded smoke subset only.
 """
 from __future__ import annotations
 
@@ -229,24 +235,65 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
             else:
                 rows.append(row)
         scenarios.append(summarize(s, rows, skipped, alpha))
+    return _assemble(_config(alpha=alpha, beta=beta, n_sims=n_sims, n_redraws=n_redraws, seed=seed), scenarios)
+
+
+# The fields that must agree for shards to be merged into one report.
+CONFIG_KEYS = ("method", "interval_method", "alpha", "nuisance_beta", "z_mc", "n_sims", "n_redraws", "seed",
+               "generator")
+
+
+def _config(*, alpha: float, beta: float, n_sims: int, n_redraws: int, seed: int) -> dict[str, Any]:
+    return {"method": ea.INFERENCE_METHOD, "interval_method": ea.INTERVAL_METHOD,
+            "alpha": alpha, "nuisance_beta": beta, "z_mc": Z_MC,
+            "n_sims": n_sims, "n_redraws": n_redraws, "seed": seed, "generator": design.GENERATOR}
+
+
+def _assemble(config: dict[str, Any], scenarios: list[dict[str, Any]]) -> dict[str, Any]:
+    """The report around per-scenario summaries, in SCENARIOS order."""
+    order = {s.name: j for j, s in enumerate(SCENARIOS)}
+    scenarios = sorted(scenarios, key=lambda x: order[x["name"]])
     supported = [x for x in scenarios if x["supported"]]
     every_supported = {s.name for s in SCENARIOS if s.supported} <= {x["name"] for x in scenarios}
+    passed = bool(supported) and every_supported and all(x["ok"] for x in supported)
     return {
-        "method": ea.INFERENCE_METHOD,
-        "interval_method": ea.INTERVAL_METHOD,
-        "alpha": alpha, "nuisance_beta": beta, "z_mc": Z_MC,
-        "n_sims": n_sims, "n_redraws": n_redraws, "seed": seed,
-        "generator": design.GENERATOR,
+        **config,
         # What a METHOD_REVIEW entry may cover once this report passed with every supported scenario.
-        "covers": {"method": ea.INFERENCE_METHOD, "n_redraws": [n_redraws], "alpha": [alpha]},
+        "covers": {"method": config["method"], "n_redraws": [config["n_redraws"]], "alpha": [config["alpha"]]},
         "all_supported_scenarios": every_supported,
         "scenarios": scenarios,
-        "passed": bool(supported) and every_supported and all(x["ok"] for x in supported),
+        "passed": passed,
         # Only a full run may back a METHOD_REVIEW entry: every supported scenario, at least
-        # REVIEW_MIN_SIMS trials each (the tolerances widen as the trial count falls).
-        "review_ready": (bool(supported) and every_supported and all(x["ok"] for x in supported)
-                         and n_sims >= REVIEW_MIN_SIMS),
+        # REVIEW_MIN_SIMS trials ANALYSED in each (skipped, unfittable trials do not count; the
+        # tolerances widen as the count falls).
+        "review_ready": passed and min(x["n_analysed"] for x in supported) >= REVIEW_MIN_SIMS,
     }
+
+
+def merge_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """One report from shards run with the same configuration (each with its own scenarios).
+    Refuses shards that disagree on any CONFIG_KEYS field or that both hold a scenario."""
+    if not reports:
+        raise ValueError("nothing to merge")
+    config = {key: reports[0].get(key) for key in CONFIG_KEYS}
+    if config["method"] != ea.INFERENCE_METHOD or config["interval_method"] != ea.INTERVAL_METHOD:
+        raise ValueError(f"the shards calibrated {config['method']!r} / {config['interval_method']!r}, "
+                         f"not {ea.INFERENCE_METHOD} / {ea.INTERVAL_METHOD}")
+    scenarios: list[dict[str, Any]] = []
+    for index, report in enumerate(reports):
+        other = {key: report.get(key) for key in CONFIG_KEYS}
+        if other != config:
+            differs = sorted(key for key in CONFIG_KEYS if other[key] != config[key])
+            raise ValueError(f"shard {index + 1} has another configuration ({', '.join(differs)})")
+        scenarios += report.get("scenarios") or []
+    names = [x["name"] for x in scenarios]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise ValueError("a scenario is in more than one shard: " + ", ".join(repeated))
+    unknown = sorted(set(names) - {s.name for s in SCENARIOS})
+    if unknown:
+        raise ValueError("unknown scenario(s): " + ", ".join(unknown))
+    return _assemble(config, scenarios)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -256,10 +303,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alpha", type=float, default=ALPHA, help="the trials' alpha")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--scenario", action="append", help="run only this scenario (repeatable)")
+    parser.add_argument("--merge", nargs="+", metavar="SHARD", help="merge shard reports instead of running")
     parser.add_argument("--out", help="also write the JSON report to this file")
     args = parser.parse_args(argv)
-    report = run_calibration(n_sims=args.sims, n_redraws=args.redraws, seed=args.seed, names=args.scenario,
-                             alpha=args.alpha)
+    if args.merge:
+        shards = []
+        for path in args.merge:
+            with open(path, encoding="utf-8") as fh:
+                shards.append(json.load(fh))
+        report = merge_reports(shards)
+    else:
+        report = run_calibration(n_sims=args.sims, n_redraws=args.redraws, seed=args.seed, names=args.scenario,
+                                 alpha=args.alpha)
     text = json.dumps(report, indent=2, sort_keys=False)
     print(text)
     if args.out:

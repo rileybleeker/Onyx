@@ -19,11 +19,17 @@ Covers
     another inference method; it marks the outputs those failures leave unsupported (Fisher's
     test too when the arm causes missing nights), keeps the rule's verdict visible, and still
     refuses before the pre-registered end;
-  * the calibration harness: deterministic, every supported scenario (zero same-night effect with
-    a carryover, serial dependence and drift, missing nights and excluded blocks, a short trial,
-    effects with and without carryover) within its prespecified Monte Carlo tolerance, and the
-    unsupported scenarios reported without a verdict, the missingness check withholding the
-    decision when the arm causes missing nights.
+  * the sensitivity and secondary numbers state what they rest on: ln(HRV) the model on the log
+    scale, the covariate fits labelled approximate (the covariate depends on earlier arms) with
+    an exact Fisher p, each secondary series its own missingness check, which marks only that
+    series and never withholds the decision;
+  * the calibration harness: deterministic, a bounded smoke run of the audit's scenarios (zero
+    same-night effect with a carryover, serial dependence and drift, missing nights and excluded
+    blocks) plus one without carryover within the prespecified Monte Carlo tolerance for that many
+    trials, the unsupported scenarios reported without a verdict (the missingness check withholding
+    the decision when the arm causes missing nights), shards merging into the report a full run
+    would give, and review_ready counting analysed trials. The full-tolerance report (1,000 trials
+    per scenario at the registered re-draw count) is the CLI's job (doc 8.2), not this file's.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -31,6 +37,7 @@ Run: python tests/test_experiment_calibration.py   (the scheduled suite, never b
 """
 import json
 import sys
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -241,7 +248,12 @@ def test_randomization_analysis_reports_the_assumption_visible_outputs():
         assert key in fit, key
     assert fit["nuisance_beta"] == ea.nuisance_beta_for(999) and fit["carryover_set_bounded"] is True
     assert fit["ci_low"] < fit["estimate"] < fit["ci_high"] and fit["carryover_ci_low"] < fit["carryover"] < fit["carryover_ci_high"]
-    assert (fit["p_value"] < 0.05) == (fit["ci_low"] > 0 or fit["ci_high"] < 0), "the interval and the p-value agree"
+    # Only one direction is guaranteed: the interval encloses every accepted value, and the accepted
+    # values need not form one piece, so it can contain 0 while the test rejects 0 (never the reverse).
+    if fit["ci_low"] > 0 or fit["ci_high"] < 0:
+        assert fit["p_value"] < 0.05, "an interval that leaves out 0 means the test rejects 0"
+    if fit["p_value"] >= 0.05:
+        assert fit["ci_low"] <= 0 <= fit["ci_high"], "an accepted 0 is inside the interval"
     quick = ea.randomization_analysis(t, y, dow, n_redraws=1, with_p=False)
     assert "p_value" not in quick and quick["estimate"] == fit["estimate"]
 
@@ -432,9 +444,86 @@ def test_a_trial_without_a_declared_model_never_gets_a_firm_decision():
         spec, data = _spec_and_data(effect=0.0, kind=ed.KIND_AA, model_justification=None)
         checks = {c["id"]: c for c in ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))["inference"]["checks"]}
         assert checks["model_justified"]["status"] == "ok"
+        # Missing nights in an A/A check are judged by Fisher's exact test at alpha, not the 10-point
+        # rule, which with a fifth of nights missing fires by chance on about half of 4-week checks; a
+        # treatment trial keeps the rule.
+        bounded = {"carryover_set_bounded": True}
+        chance = {"threat": True, "fisher_p": 0.4}
+        tied = {"threat": True, "fisher_p": 0.01}
+        for missing, kind, status in ((chance, ed.KIND_AA, "ok"), (tied, ed.KIND_AA, "failed"),
+                                      (chance, ed.KIND_TREATMENT, "failed"),
+                                      ({"threat": False, "fisher_p": 0.01}, ed.KIND_TREATMENT, "ok")):
+            judged = {c["id"]: c for c in ea.assumption_checks(bounded, missing, replace(spec, kind=kind))}
+            assert judged["missing_not_caused_by_arm"]["status"] == status, (missing, kind)
+        aa_reason = {c["id"]: c for c in ea.assumption_checks(bounded, tied, spec)}["missing_not_caused_by_arm"]["reason"]
+        assert "Fisher exact p < 0.05" in aa_reason and "same instruction" in aa_reason
         # Without a spec nothing is declared, so the protocol checks fail closed.
         closed = {c["id"]: c["status"] for c in ea.assumption_checks({"carryover_set_bounded": True}, {"threat": False})}
         assert closed["model_justified"] == "failed" and closed["registered_method"] == "failed"
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
+def test_sensitivity_and_secondary_outputs_state_their_assumptions():
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        ea.METHOD_REVIEW.update(REVIEWED)
+        spec, data = _spec_and_data(n_blocks=30, seed=333)
+        rng = np.random.default_rng(334)
+        t = np.array([1.0 if a == "A" else 0.0 for a in data.arms])
+        n = len(t)
+        # Built from earlier trial nights, like hrv_lag1: it depends on earlier arms.
+        lag = np.concatenate([[70.0], data.outcome[:-1]])
+        steady = 55 + rng.normal(0, 3, n)
+        skewed = 55 + rng.normal(0, 3, n)
+        skewed[(rng.random(n) < 0.45) & (t == 1)] = np.nan      # this series loses arm-A nights only
+        data.covariates = {"lag": lag}
+        data.secondary_outcomes = {"steady": steady, "skewed": skewed}
+        report = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
+        inference = report["inference"]
+        outputs = inference["outputs"]
+        expected = {"sensitivity.ln_outcome", "sensitivity.covariate_lag", "sensitivity.covariate_lag.p_value_no_effect",
+                    "secondary_outcomes.steady", "secondary_outcomes.skewed"}
+        assert expected <= set(outputs), sorted(outputs)
+        assert "sensitivity.per_protocol" not in outputs, "only the fits the report carries get an entry"
+        for name, entry in outputs.items():
+            assert set(entry.get("needs", [])) <= set(inference["assumptions"]), name
+
+        # ln(HRV): the model on the log scale, which cannot hold with the additive one unless nothing acts.
+        ln_needs = outputs["sensitivity.ln_outcome"]["needs"]
+        assert "constant_multiplicative_effects" in ln_needs and "constant_additive_effects" not in ln_needs
+        # The covariate fit: its p-value and interval are labelled approximate; its Fisher p is the exact one.
+        covariate = outputs["sensitivity.covariate_lag"]
+        assert covariate["approximate"] is True and "not certified" in covariate["validity"]
+        assert outputs["sensitivity.covariate_lag.p_value_no_effect"]["needs"] == ["randomized_schedule",
+                                                                                     "missing_not_caused_by_arm"]
+        assert 0 < report["sensitivity"]["covariate_lag"]["p_value_no_effect"] <= 1
+        assert "approximate" not in outputs["p_value"], "the primary numbers are not approximate"
+
+        # Each secondary series has its own missingness check: it marks only that series, never the decision.
+        checks = {c["id"]: c for c in inference["checks"]}
+        assert checks["missing_not_caused_by_arm:skewed"]["status"] == "failed"
+        assert checks["missing_not_caused_by_arm:skewed"]["blocks_decision"] is False
+        assert checks["missing_not_caused_by_arm:steady"]["status"] == "ok"
+        assert report["secondary_outcomes"]["skewed"]["missingness"]["threat"] is True
+        assert outputs["secondary_outcomes.skewed"]["supported"] is False
+        assert outputs["secondary_outcomes.steady"]["supported"] is True
+        assert inference["unsupported_outputs"] == ["secondary_outcomes.skewed"]
+        assert report["decision_firm"] is True and report["decision"] == "adopt_A", \
+            "a secondary outcome's missing nights never withhold the decision"
+
+        # Without a declared model the sensitivity and secondary numbers go unsupported with the primary
+        # ones; the covariate fit's Fisher p, which needs no effect model, stays supported.
+        undeclared = replace(spec, model_justification=None)
+        missing = {name: fit["missingness"] for name, fit in report["secondary_outcomes"].items()}
+        checks = ea.assumption_checks(report, report["missingness"], undeclared, missing)
+        again = ea.output_semantics(report["nuisance_beta"], 0.05, sensitivity=list(report["sensitivity"]),
+                                    secondary=list(report["secondary_outcomes"]))
+        unsupported = set(ea.unsupported_outputs(again, checks))
+        assert {"p_value", "sensitivity.ln_outcome", "sensitivity.covariate_lag", "secondary_outcomes.steady",
+                "secondary_outcomes.skewed"} <= unsupported
+        assert again["sensitivity.covariate_lag.p_value_no_effect"]["supported"] is True
     finally:
         ea.METHOD_REVIEW.clear()
         ea.METHOD_REVIEW.update(saved)
@@ -477,31 +566,70 @@ def test_calibration_is_deterministic_and_json():
         raise AssertionError("an unknown scenario must be refused")
 
 
-def test_supported_scenarios_meet_their_prespecified_tolerances():
-    report = cal.run_calibration(n_sims=100, n_redraws=999, seed=20261117, names=SUPPORTED)
-    assert report["passed"] is True, json.dumps(report["scenarios"], indent=1)
+# A bounded smoke run: the scheduled suite stops a test file after 10 minutes, and a full run is
+# hours. The scenarios the audit named (no same-night effect with a carryover, with serial
+# dependence, with missing nights and excluded blocks) plus one without carryover, 40 trials each
+# at 499 re-draws, judged at the prespecified tolerance for 40 trials.
+SMOKE = ["carryover_only", "carryover_only_serial", "missing_and_excluded", "effect_only"]
+SMOKE_SIMS, SMOKE_REDRAWS = 40, 499
+
+
+def test_smoke_scenarios_meet_their_prespecified_tolerances():
+    report = cal.run_calibration(n_sims=SMOKE_SIMS, n_redraws=SMOKE_REDRAWS, seed=20261117, names=SMOKE)
     by_name = {s["name"]: s for s in report["scenarios"]}
-    for name in SUPPORTED:
+    assert list(by_name) == SMOKE
+    for name in SMOKE:
         scenario = by_name[name]
-        assert scenario["ok"] is True and scenario["n_analysed"] >= 90, name
+        assert scenario["supported"] is True and scenario["n_analysed"] >= SMOKE_SIMS - 4, name
         metrics = scenario["metrics"]
         assert {"direct_coverage", "carryover_coverage", "joint_type1"} <= set(metrics), name
-        assert all(m["ok"] is True for m in metrics.values()), (name, metrics)
+        assert all(m["ok"] is True for m in metrics.values()), (name, json.dumps(metrics))
+        assert scenario["ok"] is True, name
         assert scenario["informational"]["joint_within_exact_band"] in (True, False)
     # The scenario the audit named: no same-night effect, a non-zero carryover.
     assert "direct_type1" in by_name["carryover_only"]["metrics"]
     assert "direct_type1" in by_name["carryover_only_serial"]["metrics"]
+    assert "direct_type1" in by_name["missing_and_excluded"]["metrics"]
     assert "carryover_type1" in by_name["effect_only"]["metrics"]
     # Power at the planted effect is reported, never judged (the planning check overstates it).
     assert 0.0 <= by_name["effect_only"]["informational"]["direct_power"] <= 1.0
-    assert "direct_power" not in by_name["no_effect"]["informational"]
-    # What the report may back: its own configuration; 100 trials are not a review-ready run.
-    assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [999], "alpha": [0.05]}
-    assert report["all_supported_scenarios"] is True and report["review_ready"] is False
+    assert "direct_power" not in by_name["carryover_only"]["informational"]
+    # What the report may back: its own configuration, and a subset run never passes.
+    assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [SMOKE_REDRAWS], "alpha": [0.05]}
+    assert report["all_supported_scenarios"] is False
+    assert report["passed"] is False and report["review_ready"] is False
+
+
+def test_review_ready_counts_analysed_trials_and_shards_merge():
+    config = cal._config(alpha=0.05, beta=ea.nuisance_beta_for(10000), n_sims=1000, n_redraws=10000, seed=1)
+    fake = [{"name": s.name, "supported": s.supported, "ok": True if s.supported else None, "n_analysed": 1000}
+            for s in cal.SCENARIOS]
+    assert cal._assemble(config, fake)["review_ready"] is True
+    fake[0] = {**fake[0], "n_analysed": 990}            # ten of the 1,000 trials could not be fitted
+    short = cal._assemble(config, fake)
+    assert short["passed"] is True and short["review_ready"] is False, "skipped trials do not count"
+
+    # Shards run with one configuration give exactly the report one run would.
+    names = ["no_effect", "carryover_only"]
+    whole = json.loads(json.dumps(cal.run_calibration(n_sims=3, n_redraws=199, seed=8, names=names)))
+    shards = [json.loads(json.dumps(cal.run_calibration(n_sims=3, n_redraws=199, seed=8, names=[name])))
+              for name in reversed(names)]
+    assert cal.merge_reports(shards) == whole
+    for bad, words in ((shards + [shards[0]], "more than one shard"),
+                       ([shards[0], {**shards[1], "seed": 9}], "seed"),
+                       ([shards[0], {**shards[1], "n_redraws": 999}], "n_redraws"),
+                       ([{**shards[0], "method": "synthetic_other_v9"}], "synthetic_other_v9"),
+                       ([], "nothing to merge")):
+        try:
+            cal.merge_reports(bad)
+        except ValueError as exc:
+            assert words in str(exc), (words, str(exc))
+        else:
+            raise AssertionError(f"merge must refuse: {words}")
 
 
 def test_unsupported_scenarios_are_reported_without_a_verdict():
-    report = cal.run_calibration(n_sims=40, n_redraws=999, seed=20261118, names=UNSUPPORTED)
+    report = cal.run_calibration(n_sims=20, n_redraws=SMOKE_REDRAWS, seed=20261118, names=UNSUPPORTED)
     by_name = {s["name"]: s for s in report["scenarios"]}
     for name in UNSUPPORTED:
         assert by_name[name]["supported"] is False and by_name[name]["ok"] is None
@@ -518,8 +646,14 @@ def test_cli_writes_the_report():
         out = Path(tmp) / "calibration.json"
         code = cal.main(["--sims", "3", "--redraws", "199", "--seed", "9", "--scenario", "no_effect", "--out", str(out)])
         saved = json.loads(out.read_text(encoding="utf-8"))
+        cal.main(["--sims", "3", "--redraws", "199", "--seed", "9", "--scenario", "carryover_only",
+                  "--out", str(Path(tmp) / "b.json")])
+        merged_out = Path(tmp) / "merged.json"
+        cal.main(["--merge", str(out), str(Path(tmp) / "b.json"), "--out", str(merged_out)])
+        merged = json.loads(merged_out.read_text(encoding="utf-8"))
     assert saved["n_sims"] == 3 and saved["scenarios"][0]["name"] == "no_effect"
     assert code == (0 if saved["passed"] else 1)
+    assert [s["name"] for s in merged["scenarios"]] == ["no_effect", "carryover_only"]
 
 
 if __name__ == "__main__":

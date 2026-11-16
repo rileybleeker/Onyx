@@ -256,6 +256,39 @@ def _count(value: Any) -> str:
     return "n/a" if value is None else str(value)
 
 
+def _bound(value: Any) -> float | None:
+    """An interval end as a number, the stored 'inf' / '-inf' included; None when it is missing."""
+    if value in ("inf", "-inf"):
+        return float(value)
+    if isinstance(value, float) and value in (float("inf"), float("-inf")):
+        return value
+    return _as_number(value)
+
+
+def _outputs(report: dict[str, Any]) -> dict[str, Any]:
+    inference = report.get("inference")
+    outputs = inference.get("outputs") if isinstance(inference, dict) else None
+    return outputs if isinstance(outputs, dict) else {}
+
+
+def output_note(report: dict[str, Any], key: str) -> str:
+    """What a sensitivity or secondary number rests on, from inference.outputs[key]; empty for a
+    report stored before those entries existed (it then renders as it always did)."""
+    entry = _outputs(report).get(key)
+    if not isinstance(entry, dict):
+        return ""
+    if entry.get("supported") is False:
+        return " Not supported for this trial: an assumption it needs failed (see the checks)."
+    if entry.get("approximate"):
+        return (" Approximate: the covariate is built from earlier trial nights, which the arms can change, so this "
+                "p-value and interval are not certified.")
+    if key == "sensitivity.ln_outcome":
+        return " Assumes the arms multiply HRV by a constant factor (the effect model on the log scale)."
+    if key.startswith("secondary_outcomes."):
+        return " Assumes the same effect model for this series and that its missing nights are not caused by the arm."
+    return ""
+
+
 def aa_lines(report: dict[str, Any]) -> list[str]:
     """The A/A verdict, first on the page of an A/A check (docs/experiment-framework.md 12.2)."""
     check = report.get("aa_check")
@@ -271,9 +304,13 @@ def aa_lines(report: dict[str, Any]) -> list[str]:
                 f"{_count(check.get('days_revealed'))} of {_count(check.get('days'))} days were revealed on Today and "
                 f"{_count(check.get('days_answered'))} have a check-in answer."]
     reasons = []
+    if done.get("inference_supported") is False:
+        why = "; ".join(str(x) for x in check.get("unsupported_reasons") or []) or "a check it needs failed"
+        reasons.append(f"the {which} ({_fmt(p_used, 4)}) is not supported for this check ({why}), so it says nothing "
+                       "about the pipeline")
     if check.get("false_effect") is None:
         reasons.append("the model could not be fitted, so the check has no result")
-    elif check.get("false_effect"):
+    elif check.get("false_effect") and done.get("inference_supported") is not False:
         reasons.append(f"the analysis reported a difference between identical arms ({which} = {_fmt(p_used, 4)} "
                        f"< {_fmt(report.get('alpha'))}). By chance alone this happens about 1 time in 20; review the "
                        "pipeline before registering a real trial")
@@ -318,6 +355,14 @@ def inference_lines(report: dict[str, Any]) -> list[str]:
         lines.append(f"Without the one-night and equal-effect assumptions, but still with the randomized schedule and "
                      f"missing nights not caused by the arm, 'the arm changes no night' has randomization p = {p_text} "
                      "(it does not say which night).")
+    # The interval encloses every accepted value and the accepted values need not form one piece,
+    # so it can contain 0 while the test rejects 0 (never the reverse).
+    p_value, low, high, alpha = (_as_number(report.get("p_value")), _bound(report.get("ci_low")),
+                                 _bound(report.get("ci_high")), _as_number(report.get("alpha")))
+    if None not in (p_value, low, high, alpha) and p_value < alpha and low <= 0 <= high:
+        lines.append("The test rejects no same-night effect, but the interval still contains 0: the interval "
+                     "encloses every value the test does not reject, and those need not form one piece, so it can "
+                     "be wider than the test. The decision rule reads the p-value.")
     if report.get("carryover_ci_low") is not None:
         lines.append(f"Carryover interval: {_fmt(report.get('carryover_ci_low'))} to "
                      f"{_fmt(report.get('carryover_ci_high'))} ms.")
@@ -363,11 +408,19 @@ def report_blocks(report: dict[str, Any]) -> list[dict]:
                               "declared after their block had started."))
     missing = r.get("missingness") or {}
     if missing:
+        # An A/A check judges missing nights with Fisher's exact test, not the 10-point rule (doc 12.2).
+        aa_ok = r.get("aa_check") and any(
+            isinstance(c, dict) and c.get("id") == "missing_not_caused_by_arm" and c.get("status") == "ok"
+            for c in ((r.get("inference") or {}).get("checks") or []))
+        threat = ""
+        if missing.get("threat"):
+            threat = (" More than 10 points apart, but with identical arms only a pipeline fault can tie missing nights "
+                      "to the arm, and the A/A check reads Fisher's exact test, which does not find one."
+                      if aa_ok else " More than 10 points apart: a threat to the result.")
         blocks.append(_bullet(
             f"Missing nights: {_fmt(100 * (_as_number(missing.get('missing_share_a')) or 0), 1, '%')} on arm A, "
             f"{_fmt(100 * (_as_number(missing.get('missing_share_b')) or 0), 1, '%')} on arm B (Fisher p = "
-            f"{_fmt(missing.get('fisher_p'), 3)})." + (" More than 10 points apart: a threat to the result."
-                                                      if missing.get("threat") else "")))
+            f"{_fmt(missing.get('fisher_p'), 3)})." + threat))
     adherence = r.get("adherence") or {}
     if adherence:
         blocks.append(_bullet(
@@ -379,22 +432,36 @@ def report_blocks(report: dict[str, Any]) -> list[dict]:
     sens = r.get("sensitivity") or {}
     ln = sens.get("ln_outcome") or {}
     if ln:
-        blocks.append(_bullet(f"Sensitivity, ln(HRV): {_fmt(ln.get('estimate_pct'), 1, '%')} (p = {_fmt(ln.get('p_value'), 4)})."))
+        blocks.append(_bullet(f"Sensitivity, ln(HRV): {_fmt(ln.get('estimate_pct'), 1, '%')} (p = {_fmt(ln.get('p_value'), 4)})."
+                              + output_note(r, "sensitivity.ln_outcome")))
     pp = sens.get("per_protocol") or {}
     if pp:
         blocks.append(_bullet(f"Sensitivity, per protocol: {_fmt(pp.get('estimate'), 2, ' ms')} on "
                               f"{_count(pp.get('n_nights'))} nights. {r.get('per_protocol_rule') or ''} Not a randomized "
-                              "comparison, so no p-value."))
+                              "comparison, so no p-value." + output_note(r, "sensitivity.per_protocol")))
     for name, fit in sens.items():
         if name.startswith("covariate_"):
+            fisher = ""
+            if fit.get("p_value_no_effect") is not None:
+                fisher_entry = _outputs(r).get(f"sensitivity.{name}.p_value_no_effect") or {}
+                fisher = (f" Fisher's no-effect p for this fit: {_fmt(fit.get('p_value_no_effect'), 4)}"
+                          + (" (not supported for this trial either)." if fisher_entry.get("supported") is False
+                             else " (exact)."))
             blocks.append(_bullet(f"Sensitivity, plus {name[len('covariate_'):]} as a covariate: "
                                   f"{_fmt(fit.get('estimate'), 2, ' ms')} (interval {_fmt(fit.get('ci_low'))} to "
                                   f"{_fmt(fit.get('ci_high'))}, p = {_fmt(fit.get('p_value'), 4)}, "
-                                  f"{_count(fit.get('n_nights'))} nights)."))
+                                  f"{_count(fit.get('n_nights'))} nights)." + output_note(r, f"sensitivity.{name}")
+                                  + fisher))
     for name, fit in (r.get("secondary_outcomes") or {}).items():
+        missing = fit.get("missingness") if isinstance(fit.get("missingness"), dict) else {}
+        shares = ""
+        if missing:
+            shares = (f" Missing nights: {_fmt(100 * (_as_number(missing.get('missing_share_a')) or 0), 1, '%')} on "
+                      f"arm A, {_fmt(100 * (_as_number(missing.get('missing_share_b')) or 0), 1, '%')} on arm B.")
         blocks.append(_bullet(f"Secondary outcome {name}: {_fmt(fit.get('estimate'))} (interval {_fmt(fit.get('ci_low'))} "
                               f"to {_fmt(fit.get('ci_high'))}, p = {_fmt(fit.get('p_value'), 4)}, "
-                              f"{_count(fit.get('n_nights'))} nights). Not part of the decision rule."))
+                              f"{_count(fit.get('n_nights'))} nights). Not part of the decision rule."
+                              + output_note(r, f"secondary_outcomes.{name}") + shares))
     for item in r.get("not_run") or []:
         blocks.append(_bullet(f"Registered but not run: {item}"))
 

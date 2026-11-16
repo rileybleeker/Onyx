@@ -771,7 +771,9 @@ def test_aa_check_verdict_rules():
     revealed = {_day(i).isoformat() for i in range(28)}
     ok = er.aa_check(exp, {"p_value": 0.41}, 28, revealed, 28)
     assert ok["passed"] is True and ok["false_effect"] is False and ok["answer_pct"] == 100.0
-    assert ok["phase2_done"] == {"no_false_effect": True, "every_day_revealed": True, "answers_on_90pct_of_days": True}
+    assert ok["phase2_done"] == {"no_false_effect": True, "inference_supported": True, "every_day_revealed": True,
+                                 "answers_on_90pct_of_days": True}
+    assert ok["p_supported"] is None and ok["unsupported_reasons"] == [], "an older report carries no support mark"
     bad = er.aa_check(exp, {"p_value": 0.01}, 28, revealed, 28)
     assert bad["passed"] is False and bad["false_effect"] is True
     assert er.aa_check(exp, {"p_value": 0.41}, 28, revealed - {_day(3).isoformat()}, 28)["phase2_done"]["every_day_revealed"] is False
@@ -790,6 +792,30 @@ def test_aa_check_verdict_rules():
     clear = er.aa_check(exp, {"p_value": 0.01, "p_value_no_effect": 0.41}, 28, revealed, 28)
     assert clear["false_effect"] is False and clear["passed"] is True
     assert ok["p_source"] == "p_value" and ok["p_value"] == 0.41, "a report from before the no-effect p falls back"
+
+    # A non-significant p from a test the report marks unsupported is not a pass: missing nights
+    # caused by the arm invalidate Fisher's test too (synthetic payload, no analysis run).
+    reason = "missing nights differ between the arms by more than 10 points"
+    inference = {
+        "checks": [{"id": "missing_not_caused_by_arm", "status": "failed", "blocks_decision": True,
+                    "covers": ["missing_not_caused_by_arm"], "reason": reason},
+                   {"id": "carryover_set_bounded", "status": "failed", "blocks_decision": False, "covers": [],
+                    "reason": "synthetic unrelated limit"}],
+        "outputs": {"p_value_no_effect": {"needs": ["randomized_schedule", "missing_not_caused_by_arm"],
+                                          "supported": False},
+                    "p_value": {"needs": ["randomized_schedule", "missing_not_caused_by_arm"], "supported": False}},
+        "unsupported_outputs": ["p_value_no_effect", "p_value"]}
+    hidden = er.aa_check(exp, {"p_value": 0.9, "p_value_no_effect": 0.41, "inference": inference}, 28, revealed, 28)
+    assert hidden["false_effect"] is False and hidden["p_supported"] is False
+    assert hidden["phase2_done"]["inference_supported"] is False and hidden["passed"] is False
+    assert hidden["unsupported_reasons"] == [reason], "only the checks the test needs are named"
+    # Only the unsupported-outputs list (an older shape of the mark) is enough to refuse the pass too.
+    listed = {**inference, "outputs": {}}
+    assert er.aa_check(exp, {"p_value_no_effect": 0.41, "inference": listed}, 28, revealed, 28)["passed"] is False
+    supported = {**inference, "checks": [], "unsupported_outputs": [],
+                 "outputs": {"p_value_no_effect": {"needs": ["randomized_schedule"], "supported": True}}}
+    fine = er.aa_check(exp, {"p_value_no_effect": 0.41, "inference": supported}, 28, revealed, 28)
+    assert fine["passed"] is True and fine["p_supported"] is True
 
 
 def test_aa_trial_end_to_end_reports_its_verdict():
@@ -834,7 +860,7 @@ def test_aa_trials_rarely_report_a_false_effect():
     aa_exp = FakeStore(AA_END, n_blocks=AA_BLOCKS, kind=ed.KIND_AA).exp
     every_day = {_day(i).isoformat() for i in range(28)}
     sigma, rho, n = 21.4, 0.476, 28
-    significant = exact = adopted = analysed = flagged = 0
+    significant = exact = adopted = analysed = flagged = unsupported = 0
     for _ in range(300):
         e = np.empty(n)
         e[0] = rng.normal(0, sigma)
@@ -851,7 +877,9 @@ def test_aa_trials_rarely_report_a_false_effect():
         significant += report["p_value"] < 0.05
         exact += report["p_value_no_effect"] < 0.05
         adopted += report["decision_if_supported"] == "adopt_A"
-        flagged += er.aa_check(aa_exp, report, 28, every_day, 28)["false_effect"] is True
+        verdict = er.aa_check(aa_exp, report, 28, every_day, 28)
+        flagged += verdict["false_effect"] is True
+        unsupported += verdict["phase2_done"]["inference_supported"] is False
     assert analysed >= 290
     # Identical arms satisfy Fisher's no-effect null exactly: about 5%. The registered same-night
     # test also allows for any carryover, so on 28 days it is conservative: at most about 5%.
@@ -859,6 +887,9 @@ def test_aa_trials_rarely_report_a_false_effect():
     # The A/A verdict reads the exact test, so it can fail (about 1 run in 20), unlike the near-1
     # same-night p on four weeks; a check that could never fail would not check the pipeline.
     assert flagged == exact, "aa_check flags exactly the runs Fisher's no-effect test rejects"
+    # Random missing nights rarely void the check: with identical arms it reads Fisher's exact test
+    # of the missing nights at alpha, not the 10-point rule, which would fire on about half of these.
+    assert unsupported / analysed <= 0.09, f"missing nights voided {unsupported / analysed:.3f} of the checks"
     rate = significant / analysed
     assert rate <= 0.09, f"false-positive rate {rate:.3f} on identical arms"
     assert adopted <= significant, "adopt_A needs a significant result"
