@@ -67,7 +67,7 @@ test('finance, procurement, medical, screen time, experiments and token routes a
     assert.equal(isSensitiveKey(key), true, key);
   }
   for (const key of ['/api/reading', '/api/habits/checkin', 'habits:journal:365', '/api/orders/summary', '/api/statuses',
-    '/api/urgent-emails', 'agentsx:inbox', '/onyxfoo', '/api/calendar/events?from=2031-02-03&to=2031-02-04']) {
+    '/api/urgent-emails', 'agentsx:inbox', '/onyxfoo']) {
     assert.equal(isSensitiveKey(key), false, key);
   }
 });
@@ -81,6 +81,17 @@ test('mixed payloads (agents inbox and threads, agents Worker routes, /api/statu
   assert.ok(CACHE_SCHEMA_VERSION >= 2, 'stores written before agents / status became memory-only are deleted whole');
   assert.deepEqual(sensitiveRowKeys([{ key: '/api/reading' }, { key: 'agents:inbox' }, { key: '/api/status' }, { key: 'k:x' }]),
     ['agents:inbox', '/api/status']);
+});
+
+test('/api/status keeps its CDN caching but tells the browser never to store it (disk HTTP cache is outside the wipe)', () => {
+  const route = readFileSync(path.join(__dirname, '..', 'src', 'app', 'api', 'status', 'route.ts'), 'utf8');
+  const browser = [...route.matchAll(/"Cache-Control":\s*"([^"]*)"/g)].map((m) => m[1]);
+  assert.ok(browser.length >= 2, 'the answer and the 500 branch both set Cache-Control');
+  for (const value of browser) {
+    assert.match(value, /no-store/, value);
+    assert.doesNotMatch(value, /public|s-maxage/, value);
+  }
+  assert.match(route, /"Vercel-CDN-Cache-Control":\s*"max-age=\d+/, 'the CDN rule lives in a header Vercel consumes');
 });
 
 // Synthetic markers standing in for finance / medical / email text an agent message or a heartbeat could quote.

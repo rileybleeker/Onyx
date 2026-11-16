@@ -395,7 +395,8 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
 const STATUS_URL = "/api/status";
 // The page's one read starts with the HTML instead of after the JavaScript and hydration (lib/early-fetch.ts; speed
 // budget, 2026-11-15: the cold first visit took 1022 ms in perf-timing run 43676849680). Same request as load()'s
-// own fetch (the browser's default cache mode: /api/status is edge-cached for 30 s). GET only.
+// own fetch (the browser's default cache mode: /api/status is edge-cached for 30 s; it answers `private, no-store`, so
+// the browser never keeps a copy on disk). GET only.
 const STATUS_EARLY = earlyFetchScript(STATUS_URL, false, { noStore: false });
 
 export default function StatusPage() {

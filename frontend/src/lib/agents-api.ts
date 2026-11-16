@@ -93,22 +93,31 @@ async function call<T>(path: string, init: RequestInit = {}, retried = false): P
  * token if needed.
  */
 async function earlyInbox(): Promise<InboxResponse> {
-  const p = takeEarlyFetch(`${AGENTS_API}/onyx/inbox`);
+  return fromEarly<InboxResponse>(takeEarlyFetch(`${AGENTS_API}/onyx/inbox`), "/onyx/inbox");
+}
+
+/** The answer of a GET the HTML started, when it answered OK; otherwise `path` is asked as usual. */
+async function fromEarly<T>(p: Promise<Response> | null, path: string): Promise<T> {
   const res = p ? await p.catch(() => null) : null;
   if (res && res.ok) {
-    try { return (await res.json()) as InboxResponse; } catch { /* ask again below */ }
+    try { return (await res.json()) as T; } catch { /* ask again below */ }
   }
-  return call<InboxResponse>("/onyx/inbox");
+  return call<T>(path);
 }
 
 export const agentsApi = {
-  messages: (q: { after?: number; before?: number; limit?: number; thread?: string } = {}) => {
+  /**
+   * `early`: the first read of a conversation opened by a full page load of /agents?t=<thread> (takes the GET
+   * app/agents/EarlyInbox.tsx started for exactly this URL, lib/today-early.ts agentsThreadFirstUrl, if any).
+   */
+  messages: (q: { after?: number; before?: number; limit?: number; thread?: string } = {}, opts: { early?: boolean } = {}) => {
     const p = new URLSearchParams();
     if (q.thread) p.set("thread", q.thread);
     if (q.after) p.set("after", String(q.after));
     if (q.before) p.set("before", String(q.before));
     if (q.limit) p.set("limit", String(q.limit));
-    return call<MessagesResponse>(`/onyx/messages?${p}`);
+    const path = `/onyx/messages?${p}`;
+    return opts.early ? fromEarly<MessagesResponse>(takeEarlyFetch(`${AGENTS_API}${path}`), path) : call<MessagesResponse>(path);
   },
   /** `early`: the first load of a full Today visit (takes the GET its HTML started, if any). */
   inbox: (opts: { early?: boolean } = {}) => (opts.early ? earlyInbox() : call<InboxResponse>("/onyx/inbox")),

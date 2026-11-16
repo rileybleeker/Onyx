@@ -17,6 +17,7 @@ import {
   type MessagesResponse,
   type PushState,
 } from "@/lib/agents-api";
+import { AGENTS_THREAD_FIRST_LIMIT } from "@/lib/today-early";
 import { agentInfo, Avatar, CardBody, CardButtons, dayLabel, Linkified, parseUtc, settledLabel, timeLabel } from "./agent-ui";
 
 // One conversation in the Agents inbox: an agent (its cards, its notes, Riley's replies), the morning briefing, or
@@ -103,6 +104,8 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
   const stickToBottomRef = useRef(true);
   const lastReadSentRef = useRef(0);
   const jumpedRef = useRef(false);
+  // The first read of a full page load takes the GET the HTML started (app/agents/EarlyInbox.tsx), once.
+  const earlyRef = useRef(true);
 
   // ---- viewport: keep the composer above the iOS keyboard ----
   useEffect(() => {
@@ -165,8 +168,13 @@ export default function AgentsChat({ thread, reply }: { thread: string; reply?: 
   const poll = useCallback(async () => {
     try {
       const full = !lastIdRef.current;
-      const res = await agentsApi.messages({ thread, after: lastIdRef.current || undefined, limit: lastIdRef.current ? 100 : 60 });
-      if (full && res.messages.length < 60) setHasOlder(false);
+      const early = full && earlyRef.current;
+      earlyRef.current = false;
+      const res = await agentsApi.messages(
+        { thread, after: lastIdRef.current || undefined, limit: full ? AGENTS_THREAD_FIRST_LIMIT : 100 },
+        { early },
+      );
+      if (full && res.messages.length < AGENTS_THREAD_FIRST_LIMIT) setHasOlder(false);
       if (full) {
         // The first answer replaces a cached copy outright: the server is the source of truth.
         const sorted = [...res.messages].sort((a, b) => a.id - b.id);

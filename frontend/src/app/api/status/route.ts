@@ -262,6 +262,16 @@ const NYC_CHECK_STALE_MS = 15 * 60 * 1000;
 // information_schema 2026-11-14; id, sync_end, date_range_* and created_at are not read from these rows.
 const SYNC_LOG_COLS = "source, data_type, sync_start, status, records_synced, duration_seconds, error_message";
 
+// The /status page polls every 60 s and tolerates ~60 s staleness: Vercel's CDN keeps the answer 30 s (+30 s stale
+// while it revalidates), so repeat hits skip the ~16 Supabase queries. That rule is in Vercel-CDN-Cache-Control,
+// which Vercel consumes and never forwards. The browser gets `private, no-store`: the answer carries heartbeat
+// error text that can name a bank or a provider, so it is never written to the device's HTTP cache, where sign-out
+// could not clear it (SEC-03, 2026-11-16; the client cache keeps it in memory only for the same reason).
+const STATUS_CACHE_HEADERS = {
+  "Cache-Control": "private, no-store",
+  "Vercel-CDN-Cache-Control": "max-age=30, stale-while-revalidate=30",
+};
+
 export async function GET() {
   try {
     // Every read below is independent, so they are all sent at once (one round trip, not six in a row).
@@ -1497,16 +1507,11 @@ export async function GET() {
     return NextResponse.json(
       { sources, recentHistory, driftAlerts, tzGaps, fetchedAt: new Date().toISOString() } satisfies StatusResponse,
       {
-        headers: {
-          // The /status page polls every 60s and tolerates ~60s staleness.
-          // s-maxage=30 + swr=30 lets Vercel's edge serve repeat hits without
-          // re-running the ~16 Supabase queries, worst-case ~60s stale.
-          "Cache-Control": "public, s-maxage=30, stale-while-revalidate=30",
-        },
+        headers: STATUS_CACHE_HEADERS,
       }
     );
   } catch (err) {
     console.error("Status API error:", err);
-    return NextResponse.json({ error: "Failed to fetch status" }, { status: 500 });
+    return NextResponse.json({ error: "Failed to fetch status" }, { status: 500, headers: { "Cache-Control": "private, no-store" } });
   }
 }

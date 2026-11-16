@@ -910,7 +910,8 @@ test("/api/status: only the reconnect-by date leaves the server, and only from d
   assert.match(due.body.sources.spotify.reconnectBy, /^\d{4}-\d{2}-\d{2}$/);
   assert.equal(due.body.sources.spotify.status, "partial", "a healthy card reads Degraded from day 165");
   assert.equal(due.body.sources.spotify.errorMessage, null);
-  assert.ok(String(due.headers["Cache-Control"]).includes("s-maxage"), "this response is cacheable, hence the next checks");
+  assert.match(String(due.headers["Vercel-CDN-Cache-Control"]), /max-age=\d+/, "this response is CDN-cacheable, hence the next checks");
+  assert.match(String(due.headers["Cache-Control"]), /no-store/, "the browser never keeps a copy");
   const text = JSON.stringify(due.body);
   assertNoSecrets(text, "/api/status");
   for (const leak of ["access_token", "refresh_token", "token_data", "authorized_at", "obtained_at", String(at)]) {

@@ -26,8 +26,10 @@ const TABS_BOOT = tabsBootScript(DEFAULT_TAB_SLOTS.map((h) => (h === MORE_SLOT ?
 const LOG_HREF = "/log";
 
 /**
- * The Agents unread count the app already has: the cached inbox (Today, the Agents inbox and the warm-up
- * keep it fresh) and every setBadge() call (marking read in a conversation). No polling of its own.
+ * The Agents unread count the app already has: the in-memory inbox (Today, the Agents inbox and the warm-up
+ * keep it fresh) and every setBadge() call (marking read in a conversation). No polling of its own. The inbox is a
+ * memory-only key (lib/client-cache.ts isSensitiveKey), so after a cold start the count appears once the first
+ * inbox read of the session lands (Today's starts with the HTML; elsewhere the warm-up reads it after 2.5 s).
  */
 function useAgentsBadge(): number {
   const [n, setN] = useState(0);
@@ -39,12 +41,10 @@ function useAgentsBadge(): number {
     const last = lastAgentsBadge();
     if (last !== null) setN(last);
     else fromInbox(clientCache.peek(CACHE_KEYS.agentsInbox));
-    let alive = true;
-    void clientCache.read(CACHE_KEYS.agentsInbox).then((v) => { if (alive && lastAgentsBadge() === null) fromInbox(v); });
     const off = clientCache.subscribe(CACHE_KEYS.agentsInbox, fromInbox);
     const onBadge = (e: Event) => { const d = (e as CustomEvent<number>).detail; if (typeof d === "number") setN(d); };
     window.addEventListener(AGENTS_BADGE_EVENT, onBadge);
-    return () => { alive = false; off(); window.removeEventListener(AGENTS_BADGE_EVENT, onBadge); };
+    return () => { off(); window.removeEventListener(AGENTS_BADGE_EVENT, onBadge); };
   }, []);
   return n;
 }
