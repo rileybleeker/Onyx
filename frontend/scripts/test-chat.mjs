@@ -792,14 +792,21 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   list = contract.rememberPendingSend(list, { conv: convOf(1), id: idOf(1), at: 3 });
   assert.deepEqual(list.map((p) => [p.id, !!p.seen]), [[idOf(2), false], [idOf(1), false]]);
   assert.deepEqual(contract.settledPendingSends(list, idOf(2)).map((p) => p.id), [idOf(1)]);
-  // At most PENDING_SEND_MAX; a seen one goes before an unresolved one that was never shown.
+  // An unresolved send is never dropped to make room (SEC04-R6): eleven and more all stay, also across a reload, and
+  // the oldest conversation still matches its own id. Past PENDING_SEND_MAX only resolved (seen) ones go.
   let many = [];
-  for (let i = 0; i < contract.PENDING_SEND_MAX; i++) many = contract.rememberPendingSend(many, { conv: convOf(10 + i), id: idOf(10 + i), at: i });
-  many = contract.seenPendingSends(many, idOf(13));
-  many = contract.rememberPendingSend(many, { conv: convOf(99), id: idOf(99), at: 99 });
-  assert.equal(many.length, contract.PENDING_SEND_MAX);
-  assert.equal(many.some((p) => p.id === idOf(13)), false);
-  assert.equal(many[0].id, idOf(10), "the oldest unresolved one is kept");
+  const count = contract.PENDING_SEND_MAX + 2;
+  for (let i = 0; i < count; i++) many = contract.rememberPendingSend(many, { conv: convOf(10 + i), id: idOf(10 + i), at: i });
+  assert.equal(many.length, count, "every unresolved send is kept");
+  const reloaded = contract.parsePendingSends(JSON.stringify(many));
+  assert.equal(reloaded.length, count);
+  assert.equal(contract.unresolvedPendingSend(reloaded, convOf(10))?.id, idOf(10), "the oldest one still matches after a reload");
+  let mixed = contract.seenPendingSends(many, idOf(13));
+  mixed = contract.rememberPendingSend(mixed, { conv: convOf(99), id: idOf(99), at: 99 });
+  assert.equal(mixed.some((p) => p.id === idOf(13)), false, "a resolved one goes past the cap");
+  assert.equal(mixed.length, count, "no unresolved one went with it");
+  assert.equal(mixed[0].id, idOf(10), "the oldest unresolved one is kept");
+  assert.equal(mixed.at(-1).id, idOf(99));
 
   // A resolved (seen) send never matches a later message; an unresolved one does.
   const both = [{ conv: convOf(1), id: idOf(1), at: 1, seen: true }, { conv: convOf(2), id: idOf(2), at: 2 }];
@@ -812,6 +819,41 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   assert.match(key ?? "", /^[0-9a-f]{64}$/);
   assert.equal(key, await contract.conversationKey([{ ...user("Log Synthetic Focus"), extra: "ignored" }]));
   assert.notEqual(key, await contract.conversationKey([user("Log Synthetic Calm")]));
+});
+
+test("eleven and more unanswered sends: after a reload the oldest conversation sent again is still its own request, nothing logged twice", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const idOf = (i) => `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`;
+  // What the page keeps in localStorage: each send is remembered before it goes out, and none of the answers arrives
+  // (the tab is closed or suspended every time), so nothing is ever settled.
+  let stored = null;
+  const sends = [];
+  for (let i = 0; i < contract.PENDING_SEND_MAX + 1; i++) {
+    const messages = [user(`Log Synthetic Focus, note ${i}`)];
+    const conv = await contract.conversationKey(messages);
+    stored = JSON.stringify(contract.rememberPendingSend(contract.parsePendingSends(stored), { conv, id: idOf(i), at: i }));
+    await route(logFocus, { supabase: db, intake: w.intake }).post({ request_id: idOf(i), messages });
+    sends.push({ messages, id: idOf(i) });
+  }
+  assert.equal(w.effects.size, contract.PENDING_SEND_MAX + 1);
+  // A reload: the list is read back, every send is still there.
+  const reloaded = contract.parsePendingSends(stored);
+  assert.deepEqual(reloaded.map((p) => p.id), sends.map((s) => s.id));
+  // The oldest conversation sent again is recognised, so the page asks Retry or New instead of minting a new id.
+  const oldest = sends[0];
+  const match = contract.unresolvedPendingSend(reloaded, await contract.conversationKey(oldest.messages));
+  assert.equal(match?.id, oldest.id);
+  // Retry that message: the server answers from its ledger and logs nothing again.
+  const retry = route(logFocus, { supabase: db, intake: w.intake });
+  const body = await (await retry.post({ request_id: match.id, messages: oldest.messages })).json();
+  assert.equal(retry.writes(), 0);
+  assert.equal(w.effects.size, contract.PENDING_SEND_MAX + 1, "nothing logged twice");
+  assert.equal(body.receipts[0].status, "unchanged");
+  // The page shows each remembered send's account in turn after a reload (none is dropped to make room).
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /recoveryQueue\.current = readPendingSends\(\)\.filter\(\(p\) => !p\.seen\)\.map\(\(p\) => p\.id\)\.reverse\(\);/);
+  assert.match(page, /settlePendingSend\(id\);\s*showNextRecovery\(\);/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1188,6 +1230,94 @@ test("a habit write whose answer was lost is 'may be saved' (then only checked),
   });
   const refusedBody = await (await route(afterTool("mark_habit_complete", { habit: "Synthetic Stretching" }), { supabase: refused }).post({ request_id: RID, messages: [user("I did Synthetic Stretching today")] })).json();
   assert.equal(refusedBody.receipts[0].status, "not_saved");
+});
+
+// SEC04-R7: a failed write is a refusal only when its code is known to roll the statement back (lib/write-outcome.ts).
+// A coded error can still leave the outcome unknown (08007 transaction_resolution_unknown, a lost connection, 40003
+// statement_completion_unknown, a shutdown, PostgREST's connection errors), and so does any code not on the list.
+const OUTCOME_UNKNOWN_CODES = ["", "08007", "08006", "08003", "40003", "40000", "57P01", "57014", "53100", "58030", "XX000", "OXZ99", "ZZ999", "PT400", "PGRST000", "PGRST001", "PGRST003", "PGRST116", "PGRST124", "PGRSTX00"];
+const DEFINITE_REFUSAL_CODES = ["23514", "23503", "23502", "23505", "22P02", "42501", "42703", "42P01", "P0001", "25006", "40001", "40P01", "OXC01", "PGRST102", "PGRST204", "PGRST205", "PGRST301"];
+
+test("a failed write counts as refused only for a code known to roll the statement back; any other error may be saved", () => {
+  const outcome = compile("../src/lib/write-outcome.ts");
+  for (const code of OUTCOME_UNKNOWN_CODES) {
+    assert.equal(outcome.definiteDbRefusal({ code }), false, code);
+    assert.equal(outcome.ambiguousDbError({ code, message: "synthetic" }), true, code);
+  }
+  for (const code of DEFINITE_REFUSAL_CODES) {
+    assert.equal(outcome.definiteDbRefusal({ code }), true, code);
+    assert.equal(outcome.ambiguousDbError({ code, message: "synthetic" }), false, code);
+  }
+  assert.equal(outcome.ambiguousDbError({ message: "TypeError: fetch failed" }), true, "no code");
+  assert.equal(outcome.ambiguousDbError({ code: 23514 }), true, "a code that is not a string proves nothing");
+  assert.equal(outcome.ambiguousDbError(null), false, "no error");
+  assert.equal(outcome.definiteDbRefusal(null), false);
+});
+
+test("a habit write answered with a code that does not prove a rollback is 'may be saved'; its retry only checks and starts no new write", async () => {
+  const call = { habit: "Synthetic Stretching", answer: "Yes" };
+  const body = { request_id: RID, messages: [user("I did Synthetic Stretching today")] };
+  const upserts = (db) => db.log.filter((c) => c.table === "habit_journal" && c.op === "upsert").length;
+  for (const code of ["08007", "40003", "OXZ99", "PGRST001"]) {
+    // Carried out, then answered with that code (08007: the connection went while the commit was being resolved).
+    const db = ledgerDb({
+      tables: { habit_journal: [], habit_name_map: [] },
+      lose: ({ table, op }) => (table === "habit_journal" && op === "upsert" ? { code, message: "synthetic detail" } : null),
+    });
+    const first = await (await route(afterTool("mark_habit_complete", call), { supabase: db }).post(body)).json();
+    assert.equal(first.receipts[0].status, "unknown", code);
+    assert.doesNotMatch(JSON.stringify(first), /synthetic detail/, `${code}: the database text is not passed on`);
+    assert.equal(db.rows("chat_operations")[0].status, "unknown", `${code}: never recorded as refused`);
+    db.setLoss(null);
+    // The retry: the same call is only checked (the day holds that answer: confirmed); a call for another habit is
+    // refused, because the earlier try may have written (an unknown row is not a refused one).
+    const retry = await (await route([
+      { stop_reason: "tool_use", content: [toolUse("mark_habit_complete", call, "a"), toolUse("mark_habit_complete", { habit: "Synthetic Reading", answer: "Yes" }, "b")] },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
+    ], { supabase: db }).post(body)).json();
+    assert.equal(upserts(db), 1, `${code}: the retry wrote nothing`);
+    assert.deepEqual(retry.receipts.map((r) => r.status), ["unchanged", "not_saved"], code);
+    assert.deepEqual(db.rows("habit_journal").map((h) => h.question), ["Synthetic Stretching"], code);
+    assert.equal(db.rows("chat_operations").length, 1, code);
+    assert.equal(db.rows("chat_operations")[0].status, "done", code);
+  }
+
+  // Not carried out, but answered 08007 all the same: still "may be saved" (unknown, not refused). The retry reads the
+  // day, finds nothing and writes nothing: the uncertainty is never settled by a fresh write.
+  const db = ledgerDb({
+    tables: { habit_journal: [], habit_name_map: [] },
+    fail: ({ table, op }) => (table === "habit_journal" && op === "upsert" ? { code: "08007" } : null),
+  });
+  assert.equal((await (await route(afterTool("mark_habit_complete", call), { supabase: db }).post(body)).json()).receipts[0].status, "unknown");
+  db.setFailure(null);
+  const retry = await (await route(afterTool("mark_habit_complete", call), { supabase: db }).post(body)).json();
+  assert.equal(upserts(db), 1, "only the first try's upsert");
+  assert.equal(db.rows("habit_journal").length, 0);
+  assert.equal(retry.receipts[0].status, "unknown");
+  assert.equal(db.rows("chat_operations")[0].status, "unknown");
+});
+
+test("a habit write the database refused (a constraint, a guard trigger, an unknown column) is 'not saved', and its retry may write", async () => {
+  const call = { habit: "Synthetic Stretching", answer: "Yes" };
+  const body = { request_id: RID, messages: [user("I did Synthetic Stretching today")] };
+  for (const code of ["23514", "P0001", "PGRST204"]) {
+    let refuse = true;
+    const db = ledgerDb({
+      tables: { habit_journal: [], habit_name_map: [] },
+      fail: ({ table, op }) => (refuse && table === "habit_journal" && op === "upsert" ? { code, message: "synthetic check" } : null),
+    });
+    const first = await (await route(afterTool("mark_habit_complete", call), { supabase: db }).post(body)).json();
+    assert.equal(first.receipts[0].status, "not_saved", code);
+    assert.equal(db.rows("chat_operations")[0].status, "refused", code);
+    assert.equal(db.rows("habit_journal").length, 0, code);
+    // Nothing was written, so a retry (once the cause is gone) runs the same call again under the same operation.
+    refuse = false;
+    const retry = await (await route(afterTool("mark_habit_complete", call), { supabase: db }).post(body)).json();
+    assert.equal(retry.receipts[0].status, "saved", code);
+    assert.equal(db.rows("habit_journal").length, 1, code);
+    assert.equal(db.rows("chat_operations").length, 1, code);
+    assert.equal(db.rows("chat_operations")[0].status, "done", code);
+  }
 });
 
 test("a reading session whose key column cannot be read is refused, never written without its key", async () => {

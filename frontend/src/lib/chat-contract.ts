@@ -85,8 +85,10 @@ export function newRequestId(): string {
  * of logging again) or "Send as a new message" (a new id, a new action). They do NOT expire: an answer may have been
  * lost after a write committed, however long ago, so each stays until it is resolved: its answer arrives, the server
  * refuses the id for good, or the server's definite account of it (what it saved, or that it never arrived) was shown
- * after a reload and dismissed. A resolved send never matches a later message. At most PENDING_SEND_MAX are kept
- * (the oldest seen ones go first). An "onyx" key, so signing out (or another account) wipes them.
+ * after a reload and dismissed. A resolved send never matches a later message. There is no cap on unresolved sends:
+ * one dropped to make room would lose its retry choice and its account, and the same message sent again would get a
+ * new id and could log everything a second time. PENDING_SEND_MAX only bounds the list by dropping resolved (`seen`)
+ * entries from an earlier version, oldest first. An "onyx" key, so signing out (or another account) wipes them.
  */
 export const PENDING_SEND_KEY = "onyx.chat.pending";
 export const PENDING_SEND_MAX = 10;
@@ -122,14 +124,21 @@ export function parsePendingSends(raw: string | null): PendingSend[] {
   }
 }
 
-/** The list with this send added (replacing an entry for the same conversation or id), at most PENDING_SEND_MAX. */
+/**
+ * The list with this send added. It replaces the entry with the same id (a retry of it) and the entry with the same
+ * conversation: the page only sends an unresolved conversation again after asking, so that entry is either this send
+ * (Retry that message) or one Riley chose to send as a new message, an explicit decision about it. Unresolved entries
+ * are never dropped to make room (SEC-04): past PENDING_SEND_MAX only resolved (`seen`) ones go, oldest first.
+ */
 export function rememberPendingSend(list: ReadonlyArray<PendingSend>, send: PendingSend): PendingSend[] {
   const next = [...list.filter((p) => p.conv !== send.conv && p.id !== send.id), send];
-  while (next.length > PENDING_SEND_MAX) {
-    const seen = next.findIndex((p) => p.seen);
-    next.splice(seen >= 0 ? seen : 0, 1);
-  }
-  return next;
+  let excess = next.length - PENDING_SEND_MAX;
+  if (excess <= 0) return next;
+  return next.filter((p) => {
+    if (!p.seen || excess <= 0) return true;
+    excess--;
+    return false;
+  });
 }
 
 /** The list without this request (its answer arrived, or the server refused its id for good). */

@@ -434,7 +434,7 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       unreadable = insErr.code === "23505";
     }
     if (insErr) {
-      // A database refusal wrote nothing; an error with no database code may have come after the commit.
+      // Only a definite refusal (lib/write-outcome.ts) wrote nothing; any other error may have come after the commit.
       return unreadable || ambiguousDbError(insErr)
         ? { ok: false, error: INTAKE_MAYBE_LOGGED, incomplete: true }
         : { ok: false, error: insErr.message };

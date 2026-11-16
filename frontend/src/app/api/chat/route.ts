@@ -1199,8 +1199,9 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       )
       .select()
       .single();
-    // A database refusal wrote nothing; an error with no database code may have come after the commit (its answer
-    // lost on the way): "may be saved, check first", so a retry looks instead of writing again.
+    // Only a definite refusal (lib/write-outcome.ts: a code known to roll the statement back) wrote nothing. Any other
+    // error, coded or not (08007 transaction_resolution_unknown, a lost connection, a code not on that list), may have
+    // come after the commit: "may be saved, check first", so a retry only checks (op.check) instead of writing again.
     if (error) return JSON.stringify(ambiguousDbError(error) ? { error: HABIT_MAYBE_SAVED, incomplete: true } : { error: error.message });
 
     // Also update Notion "Last Completed"

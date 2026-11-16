@@ -57,10 +57,10 @@ function settlePendingSend(requestId: string) {
 type Recovery = { state: "running" | "settled" | "none" | "unknown"; receipts: WriteReceipt[] };
 
 const RECOVERY_TEXT: Record<Recovery["state"], string> = {
-  running: "Your last message before the reload is still running.",
-  settled: "Your last message before the reload got this far:",
-  none: "Your last message before the reload did not reach Onyx, so nothing was saved.",
-  unknown: "Onyx could not check your last message before the reload. If it asked to log something, check the relevant page before sending it again.",
+  running: "A message you sent before the reload is still running.",
+  settled: "A message you sent before the reload got this far:",
+  none: "A message you sent before the reload did not reach Onyx, so nothing was saved.",
+  unknown: "Onyx could not check a message you sent before the reload. If it asked to log something, check the relevant page before sending it again.",
 };
 
 export default function ChatPage() {
@@ -81,6 +81,8 @@ export default function ChatPage() {
   // A new send that matched a remembered send whose answer never arrived, waiting for Riley's choice.
   const [matched, setMatched] = useState<MatchedSend | null>(null);
   const recoveryId = useRef<string | null>(null);
+  // The remembered sends found when this page loaded and not shown yet, newest first (their accounts, one at a time).
+  const recoveryQueue = useRef<string[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const loading = pending !== null;
@@ -116,17 +118,26 @@ export default function ChatPage() {
     // a new send of the same conversation asks whether it is that send again).
     const id = recoveryId.current;
     if (id && (recovery?.state === "settled" || recovery?.state === "none")) settlePendingSend(id);
-    recoveryId.current = null;
-    setRecovery(null);
+    showNextRecovery();
   }
 
-  // A send was still waiting for its answer when this page was last left: show what the newest one not yet shown saved.
+  /**
+   * Show the account of the next remembered send found when this page loaded (newest first) that is still unresolved,
+   * so every one of them can be checked and dismissed in one visit, however many there are (none is ever dropped).
+   */
+  function showNextRecovery() {
+    const unresolved = new Set(readPendingSends().filter((p) => !p.seen).map((p) => p.id));
+    let next = recoveryQueue.current.shift();
+    while (next !== undefined && !unresolved.has(next)) next = recoveryQueue.current.shift();
+    recoveryId.current = next ?? null;
+    setRecovery(null);
+    if (next) void checkPendingSend(next);
+  }
+
+  // Sends were still waiting for their answers when this page was last left: show what each saved, newest first.
   useEffect(() => {
-    const unseen = readPendingSends().filter((p) => !p.seen);
-    const pendingSend = unseen[unseen.length - 1];
-    if (!pendingSend) return;
-    recoveryId.current = pendingSend.id;
-    void checkPendingSend(pendingSend.id);
+    recoveryQueue.current = readPendingSends().filter((p) => !p.seen).map((p) => p.id).reverse();
+    showNextRecovery();
   }, []);
 
   async function send(again?: string, choice?: SendChoice) {
@@ -157,7 +168,9 @@ export default function ChatPage() {
     setMatched(null);
     failedSend.current = null;
     setResendText(null);
+    // A new message ends the accounts shown for this load; the remaining ones are shown again after the next reload.
     recoveryId.current = null;
+    recoveryQueue.current = [];
     setRecovery(null);
     setPending(text);
     setInput("");
@@ -297,8 +310,8 @@ export default function ChatPage() {
       )}
       {recovery && (
         <div role="status" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3 max-h-[40dvh] overflow-y-auto">
-          <p>{recovery.state === "settled" && recovery.receipts.length === 0 ? "Your last message before the reload saved nothing." : RECOVERY_TEXT[recovery.state]}</p>
-          <ChatReceipts receipts={recovery.receipts} heading="Your last message before the reload" />
+          <p>{recovery.state === "settled" && recovery.receipts.length === 0 ? "A message you sent before the reload saved nothing." : RECOVERY_TEXT[recovery.state]}</p>
+          <ChatReceipts receipts={recovery.receipts} heading="That message" />
           <div className="mt-2 flex gap-2">
             {recovery.state === "running" && (
               <button type="button" onClick={() => { if (recoveryId.current) void checkPendingSend(recoveryId.current); }} className="text-sm text-accent border border-border-subtle rounded-control px-3 py-1.5">

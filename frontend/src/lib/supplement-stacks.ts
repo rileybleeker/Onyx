@@ -20,8 +20,9 @@ import { REMOVED_SINCE_CODE, REMOVED_SINCE_ERROR, ambiguousDbError } from "./wri
  * writing the stack again, also when two calls race (the unique index fails the
  * whole second insert). Without a key nothing changes.
  *
- * A failed insert whose error has no database code may have committed before
- * its answer was lost (lib/write-outcome.ts): with a key the rows are read back
+ * A failed insert whose error is not a definite refusal (lib/write-outcome.ts:
+ * no code, a lost connection, 08007, any code not on its list) may have
+ * committed before its answer was lost: with a key the rows are read back
  * and returned when they are there; otherwise the result says `incomplete`
  * ("may be logged, check first"), never a clean "not logged".
  */

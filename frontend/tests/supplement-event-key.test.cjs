@@ -117,20 +117,48 @@ test("a failed stack insert writes nothing and says so", async () => {
   const d = db({ fail: ({ table, op }) => (table === "supplement_intake" && op === "insert" ? { code: "23503", message: "synthetic failure" } : null) });
   const out = await stacks.logStackIntake(d, 7, { event_key: KEY });
   assert.equal(out.ok, false);
-  assert.equal(out.incomplete, undefined, "a database refusal (it has a SQLSTATE) is a clean 'not logged'");
+  assert.equal(out.incomplete, undefined, "a definite refusal (a foreign-key violation rolls the insert back) is a clean 'not logged'");
   assert.equal(d.rows("supplement_intake").length, 0);
 });
 
 // The insert commits and its answer is lost on the way (supabase-js reports a network failure as an error with no
-// code, not a throw).
-const loseFirstInsert = () => {
+// code, not a throw; a connection lost while the commit was resolved comes back as 08007).
+const loseFirstInsert = (code = "") => {
   let lost = false;
   return ({ table, op }) => {
     if (lost || table !== "supplement_intake" || op !== "insert") return null;
     lost = true;
-    return { code: "", message: "TypeError: fetch failed (synthetic)" };
+    return { code, message: "TypeError: fetch failed (synthetic)" };
   };
 };
+
+// SEC04-R7: having a code does not prove nothing was written. 08007 (transaction_resolution_unknown), a lost
+// connection, a PostgREST connection error and any code not on the refusal list in lib/write-outcome.ts may come
+// after the commit, so they are never a clean "not logged".
+test("a keyed insert answered with a code that does not prove a rollback is found under its key, else 'may be logged'", async () => {
+  for (const code of ["08007", "08006", "OXZ99", "PGRST001"]) {
+    const insertFails = ({ table, op }) => (table === "supplement_intake" && op === "insert" ? { code, message: "synthetic" } : null);
+    // Not written: the read-back under the key finds nothing, which still does not prove the insert was refused.
+    const d = db({ fail: insertFails });
+    const stack = await stacks.logStackIntake(d, 7, { event_key: KEY });
+    assert.equal(stack.ok, false, code);
+    assert.equal(stack.incomplete, true, code);
+    assert.equal(stack.error, stacks.STACK_MAYBE_LOGGED, code);
+    const d2 = db({ fail: insertFails });
+    const single = await intake.logSupplementIntake(d2, { product: "Synthetic Calm", event_key: KEY });
+    assert.equal(single.ok, false, code);
+    assert.equal(single.incomplete, true, code);
+    assert.equal(single.error, intake.INTAKE_MAYBE_LOGGED, code);
+    // Written, then answered with that code: found under its key, one set of rows.
+    const d3 = db({ lose: loseFirstInsert(code) });
+    const found = await stacks.logStackIntake(d3, 7, { event_key: KEY });
+    assert.equal(found.ok, true, code);
+    assert.equal(found.replayed, true, code);
+    assert.equal(d3.rows("supplement_intake").length, 2, code);
+    // Without a key (the /log and /supplements pages): "may be logged" too.
+    assert.equal((await stacks.logStackIntake(db({ fail: insertFails }), 7, {})).incomplete, true, code);
+  }
+});
 
 test("a keyed stack insert that committed but lost its answer is found under its key: success, one set of rows", async () => {
   const d = db({ lose: loseFirstInsert() });
