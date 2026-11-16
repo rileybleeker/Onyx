@@ -6,7 +6,9 @@ tag 6022 = body fat %) from the Health Planet API (healthplanet.jp) and:
   1. upserts one row per measurement instant into pds.tanita_measurements
      (the ADR-0001 date quad is trigger-populated from measured_at)
   2. rolls up the earliest measurement per ET day into pds.weight_log
-     (source='tanita'; manual /nutrition rows are never overwritten)
+     (source='tanita'; manual rows are never overwritten — the precedence is
+     decided atomically by pds.upsert_tanita_weight_days,
+     sql/weight_log_tanita_rollup.sql)
 
 Usage:
     python tanita_etl.py --auth        # One-time OAuth bootstrap (local only)
@@ -378,11 +380,17 @@ def upsert_measurements(sb: Client, rows: list[dict]) -> int:
     return len(rows)
 
 
-def rollup_weight_log(sb: Client, rows: list[dict]) -> int:
-    """Earliest measurement per ET day → pds.weight_log (morning weigh-in wins).
+WEIGHT_ROLLUP_RPC = "upsert_tanita_weight_days"
+WEIGHT_ROLLUP_SQL = "sql/weight_log_tanita_rollup.sql"
+ROLLUP_COUNT_KEYS = ("inserted", "updated", "unchanged", "skipped_manual")
+ROLLUP_CHUNK = 1000   # days per call; ~3 years of daily weigh-ins
 
-    Tanita only owns rows it wrote: any existing row with source != 'tanita'
-    (the manual /nutrition quick-log) takes precedence and is left untouched.
+
+def daily_rollup_rows(rows: list[dict]) -> list[dict]:
+    """Earliest measurement with a weight per ET day (morning weigh-in wins).
+
+    Pure. Returns one {log_date, weight_kg, logged_at} payload row per ET day,
+    oldest day first; logged_at is that measurement's own instant (provenance).
     """
     by_day: dict[str, dict] = {}
     for r in rows:
@@ -393,41 +401,71 @@ def rollup_weight_log(sb: Client, rows: list[dict]) -> int:
         cur = by_day.get(et_day)
         if cur is None or inst < datetime.fromisoformat(cur["measured_at"]):
             by_day[et_day] = r
-
-    if not by_day:
-        return 0
-
-    dates = sorted(by_day.keys())
-    manual_dates: set[str] = set()
-    CHUNK = 100
-    for i in range(0, len(dates), CHUNK):
-        existing = (
-            sb.schema("pds")
-            .table("weight_log")
-            .select("log_date,source")
-            .in_("log_date", dates[i:i + CHUNK])
-            .execute()
-        )
-        manual_dates.update(
-            row["log_date"] for row in (existing.data or []) if row["source"] != "tanita"
-        )
-
-    out_rows = [
-        {
-            "log_date": d,
-            "weight_kg": r["weight_kg"],
-            "source": "tanita",
-            "logged_at": r["measured_at"],
-        }
+    return [
+        {"log_date": d, "weight_kg": r["weight_kg"], "logged_at": r["measured_at"]}
         for d, r in sorted(by_day.items())
-        if d not in manual_dates
     ]
-    if not out_rows:
-        return 0
-    sb.schema("pds").table("weight_log").upsert(out_rows, on_conflict="log_date").execute()
-    if manual_dates:
-        log.info(f"Skipped {len(manual_dates)} manual weight_log day(s): {sorted(manual_dates)}")
-    return len(out_rows)
+
+
+def _is_missing_rollup_function(exc: Exception) -> bool:
+    """True when PostgREST / Postgres says the rollup function does not exist."""
+    code = str(getattr(exc, "code", "") or "")
+    text = f"{getattr(exc, 'message', '') or ''} {exc}"
+    return (code in ("PGRST202", "42883")
+            or "Could not find the function" in text) and WEIGHT_ROLLUP_RPC in text
+
+
+def _confirmed_counts(data, n_sent: int) -> dict[str, int]:
+    """The function's counts, or RuntimeError when they do not account for every row sent."""
+    counts = {}
+    if isinstance(data, dict):
+        for k in ROLLUP_COUNT_KEYS:
+            v = data.get(k)
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                counts[k] = v
+    rows_ok = isinstance(data, dict) and data.get("rows", n_sent) == n_sent
+    if not rows_ok or len(counts) != len(ROLLUP_COUNT_KEYS) or sum(counts.values()) != n_sent:
+        # Counts only: the reply is never echoed (it could carry row data).
+        raise RuntimeError(
+            f"pds.{WEIGHT_ROLLUP_RPC} did not confirm the {n_sent} day(s) sent; "
+            "the weight_log rollup cannot be confirmed."
+        )
+    return counts
+
+
+def rollup_weight_log(sb: Client, rows: list[dict]) -> dict[str, int]:
+    """Earliest measurement per ET day -> pds.weight_log, through one conditional upsert.
+
+    Tanita only owns rows it wrote: a row with source != 'tanita' (the manual Log
+    weight form) takes precedence and is left untouched. That decision is made by
+    pds.upsert_tanita_weight_days inside its single INSERT ... ON CONFLICT ...
+    WHERE source = 'tanita' (sql/weight_log_tanita_rollup.sql), never by a read
+    here first: the old read-then-upsert overwrote a manual save that landed
+    between the two requests (audit PIPE-05).
+
+    There is deliberately no fallback to a plain upsert when the function is
+    missing: that is the racy path. The run stops with an error naming the SQL
+    file; the raw measurements were already stored and weight_log is unchanged.
+
+    Returns {inserted, updated, unchanged, skipped_manual} day counts.
+    """
+    totals = {k: 0 for k in ROLLUP_COUNT_KEYS}
+    payload = daily_rollup_rows(rows)
+    for i in range(0, len(payload), ROLLUP_CHUNK):
+        chunk = payload[i:i + ROLLUP_CHUNK]
+        try:
+            res = sb.schema("pds").rpc(WEIGHT_ROLLUP_RPC, {"p_rows": chunk}).execute()
+        except Exception as e:  # noqa: BLE001
+            if _is_missing_rollup_function(e):
+                raise RuntimeError(
+                    f"pds.{WEIGHT_ROLLUP_RPC} does not exist in the database. Apply "
+                    f"{WEIGHT_ROLLUP_SQL} once (Supabase SQL editor), then re-run. "
+                    "Raw measurements were stored; weight_log was not changed by this step."
+                ) from e
+            raise
+        for k, v in _confirmed_counts(res.data, len(chunk)).items():
+            totals[k] += v
+    return totals
 
 
 # ---------------------------------------------------------------------------
@@ -487,12 +525,15 @@ def run_etl(days: int = DEFAULT_DAYS):
 
         rows = parse_measurements(items)
         n_meas = upsert_measurements(sb, rows)
-        n_days = rollup_weight_log(sb, rows)
+        days_out = rollup_weight_log(sb, rows)
 
         log_sync(sb, status="success", records=n_meas, started_at=started)
+        # Counts only (Actions logs are public): no dates, no weights.
         log.info(
-            f"Tanita ETL complete: {n_meas} measurement(s) upserted, "
-            f"{n_days} weight_log day(s) rolled up ({days}d window, {len(windows)} request(s))."
+            f"Tanita ETL complete: {n_meas} measurement(s) upserted; weight_log days: "
+            f"{days_out['inserted']} inserted, {days_out['updated']} updated, "
+            f"{days_out['unchanged']} unchanged, {days_out['skipped_manual']} kept as manual "
+            f"({days}d window, {len(windows)} request(s))."
         )
     except TanitaAuthError as e:
         # Refresh token died mid-run (rare: reactive 401 refresh inside _request).
