@@ -30,11 +30,17 @@
 --   pds.reading_session_removals          that cleanup ledger: a retried
 --                                         removal whose answer was lost
 --                                         replays it
---   pds.reading_session_habit_stamps      what a keyed create did to the day's
---                                         habit row (whether it made it, the
---                                         answer it replaced, the row version
---                                         it left), so a removal can take that
---                                         back without the create's answer
+--   pds.move_reading_session(...)         an edit that moves a session to
+--                                         another day or book, with the habit
+--                                         part of the move, in ONE transaction
+--   pds.reading_habit_provenance          what reading stamps did to a day's
+--                                         habit row (whether they made it, the
+--                                         answer they replaced, the row version
+--                                         they left), one row per habit row, so
+--                                         the last session of that day going
+--                                         takes it back without any answer from
+--                                         the browser (pds.stamp_reading_habit /
+--                                         pds.settle_reading_habit)
 --
 -- All take the same transaction-scoped advisory lock per key, so a create
 -- and a removal of one key run one after the other: a removal that comes
@@ -55,15 +61,21 @@
 -- The habit part of a removal is decided on the server too (Codex T01-R7):
 -- whether the create made the day's habit row used to travel only in the
 -- create's answer, so a Discard after a lost answer left the Yes behind. The
--- create now writes that down with the session, and the removal reads it.
+-- create now writes that down, and the removal reads it. It is kept per habit
+-- row, not per session (round 2 of the review): several sessions of one day
+-- share the row, so only the last of them going takes the Yes back, in
+-- whichever order they go, and a session moved to another day takes its old
+-- day's Yes back the same way (also after a replayed create, whose answer
+-- carried no habit day). A failed habit part rolls its removal or move back
+-- and is reported, never swallowed.
 --
 -- lib/reading.ts does not fall back to separate requests when a function of
 -- this file is missing (or not yet in PostgREST's schema cache): a keyed
--- create and every removal answer 503 and the form retries.
+-- create, every removal and every move answer 503 and the form retries.
 --
 -- What is stored: a random UUID the browser made, session / book ids, the
 -- session's day, a Notion block id, the habit's name with the answer and
--- category the create replaced, a row version and times. No reading text. Service role
+-- category reading replaced, a row version and times. No reading text. Service role
 -- only (RLS on, no policies, nothing for anon or the signed-in owner).
 --
 -- Additive and safe to re-run.
@@ -130,31 +142,176 @@ GRANT SELECT, INSERT, UPDATE ON pds.reading_session_removals TO service_role;
 COMMENT ON TABLE pds.reading_session_removals IS
   'Removed /log Reading sessions whose Notion cleanup may still be owed (mirror_done_at NULL); replayed on a retried removal (PROD-T01).';
 
--- What a keyed create did to the day's habit row (pds.create_reading_session writes it in the same transaction as
--- the session; pds.remove_reading_session reads it and removes it with the session). had_row = the row existed before the create;
--- prev_answer / prev_category = its values then (the create upserts answer Yes, category learning); row_version =
--- the row's xmin as the create left it. A removal takes the create's change back only while the row is still that
--- version: any later write to the row (Riley answering the habit on /check-in or /habits, another tool) gives it a new
--- xmin, and that answer is kept. A version that does not compare equal (the row rewritten, removed and re-added, or
--- reported differently after VACUUM FREEZE) reads as changed, so the answer is kept: the safe direction.
-CREATE TABLE IF NOT EXISTS pds.reading_session_habit_stamps (
-    session_id     bigint      PRIMARY KEY,
-    client_key     uuid,
+-- Who made the day's habit Yes (Codex T01-R7, and the round-2 review of PR 376). One row per habit row a reading
+-- stamp touched, keyed by the habit row itself (day, question), NOT by the session: several sessions of one day share
+-- the habit row, so a record per session could only describe the first stamp (a second session's stamp over the
+-- first one's Yes looked like "the row was already Yes", and removing both sessions in either order left a Yes with no
+-- session behind it). Every reading stamp (pds.stamp_reading_habit: the keyed create, a moved session, the keyless
+-- chat create) writes it in the same transaction as the habit row:
+--   had_row / prev_answer / prev_category  the row as it was before reading first stamped it (kept across later
+--                                          reading stamps while nothing else wrote the row in between)
+--   row_version                            the row's xmin as the latest reading stamp left it
+-- pds.settle_reading_habit reads it once the last session of that day and habit is gone (removed or moved away):
+-- while the row is still that version, a row reading made is deleted and a row it changed gets its earlier answer
+-- and category back. Any later write to the row (Riley answering the habit on /check-in or /habits, another tool)
+-- gives it a new xmin, and that answer is kept; a version that does not compare equal (the row rewritten, removed and
+-- re-added) reads as changed, so the answer is kept: the safe direction. No answer from the browser is needed, so a
+-- Discard after a lost create answer, or a move after a replayed create, takes the Yes back too.
+-- The xmin comparison assumes the stamp and the other writer are different transactions, as every request is.
+CREATE TABLE IF NOT EXISTS pds.reading_habit_provenance (
     cycle_date     date        NOT NULL,
     question       text        NOT NULL,
     had_row        boolean     NOT NULL,
     prev_answer    text,
     prev_category  text,
     row_version    text        NOT NULL,
-    stamped_at     timestamptz NOT NULL DEFAULT now()
+    stamped_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (cycle_date, question)
 );
 
-ALTER TABLE pds.reading_session_habit_stamps ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON pds.reading_session_habit_stamps FROM anon, authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON pds.reading_session_habit_stamps TO service_role;
+ALTER TABLE pds.reading_habit_provenance ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON pds.reading_habit_provenance FROM anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON pds.reading_habit_provenance TO service_role;
 
-COMMENT ON TABLE pds.reading_session_habit_stamps IS
-  'What a keyed /log Reading create did to the day''s habit row, so its removal can take that back without the create''s answer (PROD-T01, Codex T01-R7).';
+COMMENT ON TABLE pds.reading_habit_provenance IS
+  'What reading sessions did to a day''s habit row, so the last of them going takes it back (PROD-T01, Codex T01-R7).';
+
+-- The habit row's lock: every stamp and settle of one (day, question) runs one after the other, so a settle never
+-- misses a session committed by a stamp it raced with, and a stamp never misses a settle. Always taken AFTER the
+-- client_key lock and any book row lock; two of them (a move) are taken in one fixed order.
+CREATE OR REPLACE FUNCTION pds.reading_habit_lock(p_cycle_date date, p_question text)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = ''
+AS $$
+BEGIN
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended('pds.habit_journal.reading:' || p_cycle_date::text || ':' || p_question, 0));
+END;
+$$;
+
+-- Stamp the habit Yes for a reading session on that day and record it (above), in one step. Raises on failure: a
+-- caller that keeps going without the stamp wraps it in an exception block, so the row and its record both roll back.
+-- Answers {marked, created}; created = no row existed for that day before.
+CREATE OR REPLACE FUNCTION pds.stamp_reading_habit(p_cycle_date date, p_question text)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = ''
+AS $$
+DECLARE
+    v_had     boolean;
+    v_ans     text;
+    v_cat     text;
+    v_cur     text;
+    v_prov    pds.reading_habit_provenance%ROWTYPE;
+    v_keep    boolean;
+    v_version text;
+BEGIN
+    IF p_cycle_date IS NULL OR p_question IS NULL THEN
+        RETURN pg_catalog.jsonb_build_object('marked', false, 'created', false);
+    END IF;
+    PERFORM pds.reading_habit_lock(p_cycle_date, p_question);
+
+    SELECT h.answer, h.category, h.xmin::text INTO v_ans, v_cat, v_cur FROM pds.habit_journal AS h
+     WHERE h.cycle_date = p_cycle_date AND h.question = p_question
+     FOR UPDATE;
+    v_had := FOUND;
+    SELECT * INTO v_prov FROM pds.reading_habit_provenance AS p
+     WHERE p.cycle_date = p_cycle_date AND p.question = p_question
+     FOR UPDATE;
+    -- An earlier reading stamp's record still describes this row only while nothing else wrote it since.
+    v_keep := FOUND AND v_had AND v_prov.row_version = v_cur;
+
+    INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
+    VALUES (p_cycle_date, p_question, 'learning', 'Yes')
+    ON CONFLICT (cycle_date, question) DO UPDATE SET category = EXCLUDED.category, answer = EXCLUDED.answer;
+    SELECT h.xmin::text INTO v_version FROM pds.habit_journal AS h
+     WHERE h.cycle_date = p_cycle_date AND h.question = p_question;
+
+    IF v_keep THEN
+        UPDATE pds.reading_habit_provenance AS p SET row_version = v_version, stamped_at = now()
+         WHERE p.cycle_date = p_cycle_date AND p.question = p_question;
+    ELSE
+        INSERT INTO pds.reading_habit_provenance (cycle_date, question, had_row, prev_answer, prev_category, row_version)
+        VALUES (p_cycle_date, p_question, v_had, CASE WHEN v_had THEN v_ans END, CASE WHEN v_had THEN v_cat END, v_version)
+        ON CONFLICT (cycle_date, question) DO UPDATE SET
+            had_row = EXCLUDED.had_row, prev_answer = EXCLUDED.prev_answer, prev_category = EXCLUDED.prev_category,
+            row_version = EXCLUDED.row_version, stamped_at = now();
+    END IF;
+
+    RETURN pg_catalog.jsonb_build_object('marked', true, 'created', NOT v_had);
+END;
+$$;
+
+-- A reading session left (day, question): removed, or moved to another day or book. Call it AFTER the session row is
+-- deleted or moved, in the same transaction. While another session of a book with that habit is still on that day
+-- nothing changes (its Yes stands, and the record stays for it). Otherwise:
+--   * the record above decides: a row reading made is deleted, a row it changed gets its earlier answer and category
+--     back, but only while the row is still the version reading left (a later answer given anywhere else is kept);
+--     the record goes either way;
+--   * no record (a session stamped before this file): p_habit_created_on = that day (the browser's word that its
+--     create made the row) deletes the day's Yes, as before.
+-- Raises on failure (Codex review of PR 376, round 2): a removal or a move whose habit part fails rolls back whole and
+-- is retried, instead of reporting success with a Yes left behind.
+CREATE OR REPLACE FUNCTION pds.settle_reading_habit(p_cycle_date date, p_question text, p_habit_created_on date)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = ''
+AS $$
+DECLARE
+    v_prov     pds.reading_habit_provenance%ROWTYPE;
+    v_cur      text;
+    v_n        integer;
+    v_removed  boolean := false;
+    v_restored boolean := false;
+BEGIN
+    IF p_cycle_date IS NULL OR p_question IS NULL THEN
+        RETURN pg_catalog.jsonb_build_object('removed', false, 'restored', false, 'kept', false);
+    END IF;
+    PERFORM pds.reading_habit_lock(p_cycle_date, p_question);
+
+    IF EXISTS (SELECT 1 FROM pds.reading_sessions AS s JOIN pds.books AS b ON b.book_id = s.book_id
+                WHERE s.session_date = p_cycle_date AND b.habit_name = p_question) THEN
+        RETURN pg_catalog.jsonb_build_object('removed', false, 'restored', false, 'kept', true);
+    END IF;
+
+    SELECT * INTO v_prov FROM pds.reading_habit_provenance AS p
+     WHERE p.cycle_date = p_cycle_date AND p.question = p_question
+     FOR UPDATE;
+    IF FOUND THEN
+        SELECT h.xmin::text INTO v_cur FROM pds.habit_journal AS h
+         WHERE h.cycle_date = p_cycle_date AND h.question = p_question
+         FOR UPDATE;
+        IF FOUND AND v_cur = v_prov.row_version THEN
+            IF NOT v_prov.had_row THEN
+                DELETE FROM pds.habit_journal AS h WHERE h.cycle_date = p_cycle_date AND h.question = p_question;
+                GET DIAGNOSTICS v_n = ROW_COUNT;
+                v_removed := v_n > 0;
+            ELSE
+                UPDATE pds.habit_journal AS h
+                   SET answer = v_prov.prev_answer, category = v_prov.prev_category
+                 WHERE h.cycle_date = p_cycle_date AND h.question = p_question
+                   AND (h.answer IS DISTINCT FROM v_prov.prev_answer OR h.category IS DISTINCT FROM v_prov.prev_category);
+                GET DIAGNOSTICS v_n = ROW_COUNT;
+                v_restored := v_n > 0;
+                v_removed := v_restored AND v_prov.prev_answer IS DISTINCT FROM 'Yes';
+            END IF;
+        END IF;
+        -- The record belongs to the reading stamps of that day, and the last of them is gone.
+        DELETE FROM pds.reading_habit_provenance AS p WHERE p.cycle_date = p_cycle_date AND p.question = p_question;
+    ELSIF p_habit_created_on IS NOT NULL AND p_habit_created_on = p_cycle_date THEN
+        DELETE FROM pds.habit_journal AS h
+         WHERE h.cycle_date = p_cycle_date AND h.question = p_question AND h.answer = 'Yes';
+        GET DIAGNOSTICS v_n = ROW_COUNT;
+        v_removed := v_n > 0;
+    END IF;
+
+    RETURN pg_catalog.jsonb_build_object('removed', v_removed, 'restored', v_restored, 'kept', false);
+END;
+$$;
 
 -- Remove a manual or chat session in ONE transaction: by id ("Remove this session") or by the client_key of its
 -- create (Discard after a lost create answer). Exactly one of p_session_id / p_client_key.
@@ -162,17 +319,16 @@ COMMENT ON TABLE pds.reading_session_habit_stamps IS
 --    is waited for (and its session removed here) and one arriving later is refused by the trigger.
 --  * The delete, the finish it caused (back to reading when no other session reaches the last chapter, the same
 --    rule as lib/reading.ts undoFinishIfOnlyThis) and the habit change it made commit together with the cleanup row
---    above, so a removal whose answer is lost leaves nothing half done in the database. The habit change is taken
---    back only when no other session of a book with the same habit is on that day, and then:
---      - a keyed create's own record (pds.reading_session_habit_stamps, same day and habit) decides: a row the create
---        made is deleted, a row it changed gets its earlier answer and category back, but only while the row is
---        still the version the create left (a later answer given anywhere else is kept). No answer from the browser
---        is needed, so a Discard after a lost create answer takes it back too (Codex T01-R7);
---      - otherwise (a session without that record: keyless, from before this file, or moved to another day by an
---        edit) p_habit_created_on = its day deletes the day's Yes, as before.
+--    above, so a removal whose answer is lost leaves nothing half done in the database. The habit part is
+--    pds.settle_reading_habit: taken back only when no other session of a book with the same habit is on that day,
+--    from the habit row's own record (no answer from the browser needed, Codex T01-R7), else by p_habit_created_on
+--    for a session stamped before this file.
+--  * A failure of any part (the habit part included) rolls the whole removal back and is reported, so the form
+--    retries it; nothing is ever reported removed with its habit Yes left behind (Codex review of PR 376, round 2).
 --  * Nothing found: answers removed = false and the cleanup row of an earlier removal of that id or key (or
 --    null), so the caller can replay what that removal still owes outside the database.
--- Raises OXR02 for a Kindle session (lib/reading.ts answers 409) and OXR03 when the session's book is missing (404).
+-- Raises OXR02 for a Kindle session (lib/reading.ts answers 409) and OXR03 when the session's book is missing (404,
+-- the session still stored).
 CREATE OR REPLACE FUNCTION pds.remove_reading_session(
     p_session_id       bigint,
     p_client_key       uuid,
@@ -188,13 +344,10 @@ DECLARE
     v_row        pds.reading_sessions%ROWTYPE;
     v_book       pds.books%ROWTYPE;
     v_rem        pds.reading_session_removals%ROWTYPE;
-    v_stamp      pds.reading_session_habit_stamps%ROWTYPE;
-    v_has_stamp  boolean;
-    v_version    text;
+    v_settle     jsonb;
     v_unfinished boolean := false;
     v_habit_gone boolean := false;
     v_restored   boolean := false;
-    v_n          integer;
 BEGIN
     IF (p_session_id IS NULL) = (p_client_key IS NULL) THEN
         RAISE EXCEPTION 'exactly one of session_id and client_key is required' USING ERRCODE = '22023';
@@ -255,55 +408,12 @@ BEGIN
         v_book.finished_on := NULL;
     END IF;
 
-    SELECT * INTO v_stamp FROM pds.reading_session_habit_stamps AS t WHERE t.session_id = v_row.session_id;
-    v_has_stamp := FOUND;
-
-    IF v_book.habit_name IS NOT NULL
-       AND NOT EXISTS (SELECT 1 FROM pds.reading_sessions AS s
-                        WHERE s.session_date = v_row.session_date
-                          AND s.book_id IN (SELECT b.book_id FROM pds.books AS b WHERE b.habit_name = v_book.habit_name)) THEN
-        IF v_has_stamp AND v_stamp.cycle_date = v_row.session_date AND v_stamp.question = v_book.habit_name THEN
-            -- The create's own record (Codex T01-R7). Best-effort like the delete below: a refused write keeps the
-            -- removal and leaves the row as it is.
-            BEGIN
-                SELECT h.xmin::text INTO v_version FROM pds.habit_journal AS h
-                 WHERE h.cycle_date = v_row.session_date AND h.question = v_book.habit_name
-                 FOR UPDATE;
-                IF FOUND AND v_version = v_stamp.row_version THEN
-                    IF NOT v_stamp.had_row THEN
-                        DELETE FROM pds.habit_journal AS h
-                         WHERE h.cycle_date = v_row.session_date AND h.question = v_book.habit_name;
-                        GET DIAGNOSTICS v_n = ROW_COUNT;
-                        v_habit_gone := v_n > 0;
-                    ELSE
-                        UPDATE pds.habit_journal AS h
-                           SET answer = v_stamp.prev_answer, category = v_stamp.prev_category
-                         WHERE h.cycle_date = v_row.session_date AND h.question = v_book.habit_name
-                           AND (h.answer IS DISTINCT FROM v_stamp.prev_answer OR h.category IS DISTINCT FROM v_stamp.prev_category);
-                        GET DIAGNOSTICS v_n = ROW_COUNT;
-                        v_restored := v_n > 0;
-                        v_habit_gone := v_restored AND v_stamp.prev_answer IS DISTINCT FROM 'Yes';
-                    END IF;
-                END IF;
-            EXCEPTION WHEN OTHERS THEN
-                v_habit_gone := false;
-                v_restored := false;
-            END;
-        ELSIF p_habit_created_on IS NOT NULL AND p_habit_created_on = v_row.session_date THEN
-            -- Best-effort, as before (lib/reading.ts unstampHabitIfUnused): a refused habit delete keeps the removal.
-            BEGIN
-                DELETE FROM pds.habit_journal AS h
-                 WHERE h.cycle_date = v_row.session_date AND h.question = v_book.habit_name AND h.answer = 'Yes';
-                GET DIAGNOSTICS v_n = ROW_COUNT;
-                v_habit_gone := v_n > 0;
-            EXCEPTION WHEN OTHERS THEN
-                v_habit_gone := false;
-            END;
-        END IF;
+    -- No exception block: a failed habit part rolls the removal back (the caller answers an error and is retried).
+    IF v_book.habit_name IS NOT NULL THEN
+        v_settle := pds.settle_reading_habit(v_row.session_date, v_book.habit_name, p_habit_created_on);
+        v_habit_gone := COALESCE((v_settle ->> 'removed')::boolean, false);
+        v_restored := COALESCE((v_settle ->> 'restored')::boolean, false);
     END IF;
-
-    -- The record belongs to the session and goes with it.
-    DELETE FROM pds.reading_session_habit_stamps AS t WHERE t.session_id = v_row.session_id;
 
     INSERT INTO pds.reading_session_removals (session_id, client_key, book_id, session_date, notion_block_id, unfinished)
     VALUES (v_row.session_id, v_row.client_key, v_row.book_id, v_row.session_date, v_row.notion_block_id, v_unfinished)
@@ -327,10 +437,8 @@ $$;
 -- the stored row and what happened. A discarded key raises OXR01 (the trigger);
 -- a second create of the same key raises 23505 (the unique index), and
 -- lib/reading.ts then answers the stored session. A failed habit stamp does not
--- stop the create (as in lib/reading.ts stampHabit): habit_marked is false.
--- What the stamp did to the habit row is written to
--- pds.reading_session_habit_stamps in the same step (both or neither), so a
--- removal of the session can take it back without this function's answer.
+-- stop the create (as in lib/reading.ts stampHabit): habit_marked is false, and
+-- the stamp's record (pds.reading_habit_provenance) rolls back with it.
 CREATE OR REPLACE FUNCTION pds.create_reading_session(
     p_client_key      uuid,
     p_book_id         bigint,
@@ -356,10 +464,7 @@ DECLARE
     v_finished boolean := false;
     v_marked   boolean := false;
     v_created  boolean := false;
-    v_had      boolean;
-    v_prev_ans text;
-    v_prev_cat text;
-    v_version  text;
+    v_stamp    jsonb;
 BEGIN
     IF p_client_key IS NULL THEN
         RAISE EXCEPTION 'client_key is required' USING ERRCODE = '22023';
@@ -385,26 +490,9 @@ BEGIN
 
     IF v_habit IS NOT NULL THEN
         BEGIN
-            SELECT h.answer, h.category INTO v_prev_ans, v_prev_cat FROM pds.habit_journal AS h
-             WHERE h.cycle_date = p_session_date AND h.question = v_habit
-             FOR UPDATE;
-            v_had := FOUND;
-            INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
-            VALUES (p_session_date, v_habit, 'learning', 'Yes')
-            ON CONFLICT (cycle_date, question) DO UPDATE SET category = EXCLUDED.category, answer = EXCLUDED.answer;
-            SELECT h.xmin::text INTO v_version FROM pds.habit_journal AS h
-             WHERE h.cycle_date = p_session_date AND h.question = v_habit;
-            INSERT INTO pds.reading_session_habit_stamps
-                (session_id, client_key, cycle_date, question, had_row, prev_answer, prev_category, row_version)
-            VALUES
-                (v_row.session_id, p_client_key, p_session_date, v_habit, v_had,
-                 CASE WHEN v_had THEN v_prev_ans END, CASE WHEN v_had THEN v_prev_cat END, v_version)
-            ON CONFLICT (session_id) DO UPDATE SET
-                client_key = EXCLUDED.client_key, cycle_date = EXCLUDED.cycle_date, question = EXCLUDED.question,
-                had_row = EXCLUDED.had_row, prev_answer = EXCLUDED.prev_answer, prev_category = EXCLUDED.prev_category,
-                row_version = EXCLUDED.row_version, stamped_at = now();
-            v_marked := true;
-            v_created := NOT v_had;
+            v_stamp := pds.stamp_reading_habit(p_session_date, v_habit);
+            v_marked := COALESCE((v_stamp ->> 'marked')::boolean, false);
+            v_created := COALESCE((v_stamp ->> 'created')::boolean, false);
         EXCEPTION WHEN OTHERS THEN
             v_marked := false;
             v_created := false;
@@ -419,11 +507,126 @@ BEGIN
 END;
 $$;
 
+-- An edit that moves a manual or chat session to another day or book (PATCH /api/reading/sessions/[id]): the
+-- session's new values and the habit part of the move in ONE transaction (Codex review of PR 376, round 2). The new
+-- day's habit is stamped (best-effort, as on a create) and the old day's is settled (pds.settle_reading_habit: from
+-- the habit row's own record, so a session whose create answer was lost and replayed, which the browser knows no
+-- habit_created_on for, still takes its old day's Yes back). A failed settle rolls the whole move back, so the
+-- session never sits on its new day with the old day's Yes left behind and nothing to retry. The book's finish
+-- follows in lib/reading.ts as for any edit.
+-- Answers {moved: false} when the session no longer exists, else {moved: true, session, habit_marked,
+-- habit_created, habit_removed, habit_restored}. Raises OXR02 for a Kindle session and OXR03 when the target book
+-- does not exist.
+CREATE OR REPLACE FUNCTION pds.move_reading_session(
+    p_session_id       bigint,
+    p_book_id          bigint,
+    p_session_date     date,
+    p_chapter_from     integer,
+    p_chapter_through  integer,
+    p_minutes          integer,
+    p_medium           text,
+    p_recall           text,
+    p_question         text,
+    p_habit_created_on date
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = ''
+AS $$
+DECLARE
+    v_row       pds.reading_sessions%ROWTYPE;
+    v_old_date  date;
+    v_old_habit text;
+    v_new_habit text;
+    v_old_lock  text;
+    v_new_lock  text;
+    v_stamp     jsonb;
+    v_settle    jsonb;
+    v_marked    boolean := false;
+    v_created   boolean := false;
+    v_removed   boolean := false;
+    v_restored  boolean := false;
+BEGIN
+    IF p_session_id IS NULL OR p_book_id IS NULL OR p_session_date IS NULL THEN
+        RAISE EXCEPTION 'session_id, book_id and session_date are required' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT * INTO v_row FROM pds.reading_sessions AS s WHERE s.session_id = p_session_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN pg_catalog.jsonb_build_object('moved', false);
+    END IF;
+    IF v_row.source IS DISTINCT FROM 'manual' AND v_row.source IS DISTINCT FROM 'chat' THEN
+        RAISE EXCEPTION 'Kindle sessions are written by the harvester' USING ERRCODE = 'OXR02';
+    END IF;
+
+    v_old_date := v_row.session_date;
+    SELECT b.habit_name INTO v_old_habit FROM pds.books AS b WHERE b.book_id = v_row.book_id;
+    SELECT b.habit_name INTO v_new_habit FROM pds.books AS b WHERE b.book_id = p_book_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no such book' USING ERRCODE = 'OXR03';
+    END IF;
+
+    -- Both habit rows' locks in one fixed order, so two moves crossing the same days cannot wait on each other.
+    IF v_old_habit IS NOT NULL THEN v_old_lock := v_old_date::text || ':' || v_old_habit; END IF;
+    IF v_new_habit IS NOT NULL THEN v_new_lock := p_session_date::text || ':' || v_new_habit; END IF;
+    IF v_old_lock IS NOT NULL AND v_new_lock IS NOT NULL AND v_new_lock < v_old_lock THEN
+        PERFORM pds.reading_habit_lock(p_session_date, v_new_habit);
+        PERFORM pds.reading_habit_lock(v_old_date, v_old_habit);
+    ELSE
+        IF v_old_lock IS NOT NULL THEN PERFORM pds.reading_habit_lock(v_old_date, v_old_habit); END IF;
+        IF v_new_lock IS NOT NULL THEN PERFORM pds.reading_habit_lock(p_session_date, v_new_habit); END IF;
+    END IF;
+
+    UPDATE pds.reading_sessions AS s
+       SET book_id = p_book_id, session_date = p_session_date, chapter_from = p_chapter_from,
+           chapter_through = p_chapter_through, minutes = p_minutes, medium = p_medium, recall = p_recall,
+           question = p_question
+     WHERE s.session_id = p_session_id
+    RETURNING * INTO v_row;
+
+    IF v_new_habit IS NOT NULL THEN
+        BEGIN
+            v_stamp := pds.stamp_reading_habit(p_session_date, v_new_habit);
+            v_marked := COALESCE((v_stamp ->> 'marked')::boolean, false);
+            v_created := COALESCE((v_stamp ->> 'created')::boolean, false);
+        EXCEPTION WHEN OTHERS THEN
+            v_marked := false;
+            v_created := false;
+        END;
+    END IF;
+
+    -- The day the session left (a no-op while it, or another session, is still on that day and habit). No exception
+    -- block: a failure rolls the move back.
+    IF v_old_habit IS NOT NULL THEN
+        v_settle := pds.settle_reading_habit(v_old_date, v_old_habit, p_habit_created_on);
+        v_removed := COALESCE((v_settle ->> 'removed')::boolean, false);
+        v_restored := COALESCE((v_settle ->> 'restored')::boolean, false);
+    END IF;
+
+    RETURN pg_catalog.jsonb_build_object(
+        'moved', true,
+        'session', pg_catalog.to_jsonb(v_row),
+        'habit_marked', v_marked,
+        'habit_created', v_created,
+        'habit_removed', v_removed,
+        'habit_restored', v_restored);
+END;
+$$;
+
 REVOKE ALL ON FUNCTION pds.reading_sessions_refuse_discarded_key() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION pds.reading_habit_lock(date, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION pds.reading_habit_lock(date, text) TO service_role;
+REVOKE ALL ON FUNCTION pds.stamp_reading_habit(date, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION pds.stamp_reading_habit(date, text) TO service_role;
+REVOKE ALL ON FUNCTION pds.settle_reading_habit(date, text, date) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION pds.settle_reading_habit(date, text, date) TO service_role;
 REVOKE ALL ON FUNCTION pds.remove_reading_session(bigint, uuid, date) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION pds.remove_reading_session(bigint, uuid, date) TO service_role;
 REVOKE ALL ON FUNCTION pds.create_reading_session(uuid, bigint, date, integer, integer, integer, text, text, text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION pds.create_reading_session(uuid, bigint, date, integer, integer, integer, text, text, text, text) TO service_role;
+REVOKE ALL ON FUNCTION pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date) TO service_role;
 
--- Make PostgREST pick up the new function without waiting for a restart.
+-- Make PostgREST pick up the new functions without waiting for a restart.
 NOTIFY pgrst, 'reload schema';

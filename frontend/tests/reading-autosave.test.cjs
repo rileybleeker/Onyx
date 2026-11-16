@@ -113,16 +113,80 @@ test("parseSessionUpdate: strict body", () => {
  * what the database does while a create is still under way on the server. `hooks.inCreate` runs inside the keyed
  * create's transaction, after its insert and before its finish and habit stamp; anything it starts that needs the
  * key's lock waits for that transaction to commit. `booksReadError`: every read of pds.books fails (the removal too).
+ * Every reading stamp (keyed create, move, keyless stamp) records the habit row in pds.reading_habit_provenance, one
+ * row per (day, question), and the last session of a day going settles it (pds.settle_reading_habit).
+ * `settleError`: that settle raises, which rolls back the whole removal or move it is part of.
  */
-function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null, booksReadError = false } = {}) {
+function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null, booksReadError = false, settleError = null } = {}) {
   let keyLookups = 0;
   const tables = JSON.parse(JSON.stringify(seed));
-  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals", "reading_session_habit_stamps"]) tables[t] ??= [];
+  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals", "reading_habit_provenance"]) tables[t] ??= [];
   // The habit rows' versions (xmin in the database): every write to a row gives it a new one.
   const versions = new Map();
   let nextVersion = 1;
   const habitKey = (date, question) => `${date}|${question}`;
   const bump = (date, question) => versions.set(habitKey(date, question), nextVersion++);
+  /** A transaction: on a raised error every table and row version goes back to how it was (ROLLBACK). */
+  const atomically = (fn) => {
+    const snap = JSON.parse(JSON.stringify(tables));
+    const snapVersions = new Map(versions);
+    try {
+      return fn();
+    } catch (e) {
+      for (const k of Object.keys(tables)) delete tables[k];
+      Object.assign(tables, snap);
+      versions.clear();
+      for (const [k, v] of snapVersions) versions.set(k, v);
+      return { data: null, error: { code: e.code ?? "P0001", message: e.message } };
+    }
+  };
+  /** pds.stamp_reading_habit: the Yes and its record (kept while nothing else wrote the row since the last stamp). */
+  const stampTx = (date, question) => {
+    const hit = tables.habit_journal.find((h) => h.cycle_date === date && h.question === question);
+    const prov = tables.reading_habit_provenance.find((x) => x.cycle_date === date && x.question === question);
+    const keep = !!prov && !!hit && prov.row_version === versions.get(habitKey(date, question));
+    const before = hit ? { answer: hit.answer, category: hit.category } : null;
+    if (hit) Object.assign(hit, { category: "learning", answer: "Yes" });
+    else tables.habit_journal.push({ cycle_date: date, question, category: "learning", answer: "Yes" });
+    bump(date, question);
+    const version = versions.get(habitKey(date, question));
+    if (keep) prov.row_version = version;
+    else {
+      tables.reading_habit_provenance = tables.reading_habit_provenance.filter((x) => !(x.cycle_date === date && x.question === question));
+      tables.reading_habit_provenance.push({ cycle_date: date, question, had_row: !!hit, prev_answer: before?.answer ?? null, prev_category: before?.category ?? null, row_version: version });
+    }
+    return { marked: true, created: !hit };
+  };
+  /** pds.settle_reading_habit: after a session left (date, question). Throws `settleError` (the caller rolls back). */
+  const settleTx = (date, question, createdOn) => {
+    if (settleError) throw Object.assign(new Error("habit write refused"), { code: settleError });
+    const sameHabit = tables.books.filter((x) => x.habit_name === question).map((x) => x.book_id);
+    if (tables.reading_sessions.some((x) => x.session_date === date && sameHabit.includes(x.book_id))) return { removed: false, restored: false };
+    const prov = tables.reading_habit_provenance.find((x) => x.cycle_date === date && x.question === question);
+    let removed = false;
+    let restored = false;
+    if (prov) {
+      const h = tables.habit_journal.find((x) => x.cycle_date === date && x.question === question);
+      if (h && versions.get(habitKey(date, question)) === prov.row_version) {
+        if (!prov.had_row) {
+          tables.habit_journal = tables.habit_journal.filter((x) => x !== h);
+          versions.delete(habitKey(date, question));
+          removed = true;
+        } else if (h.answer !== prov.prev_answer || h.category !== prov.prev_category) {
+          Object.assign(h, { answer: prov.prev_answer, category: prov.prev_category });
+          bump(date, question);
+          restored = true;
+          removed = prov.prev_answer !== "Yes";
+        }
+      }
+      tables.reading_habit_provenance = tables.reading_habit_provenance.filter((x) => x !== prov);
+    } else if (createdOn && createdOn === date) {
+      const before = tables.habit_journal.length;
+      tables.habit_journal = tables.habit_journal.filter((h) => !(h.cycle_date === date && h.question === question && h.answer === "Yes"));
+      removed = tables.habit_journal.length < before;
+    }
+    return { removed, restored };
+  };
   const log = [];
   const hooks = { beforeInsert: null, inCreate: null };
   const locks = new Map();
@@ -254,38 +318,15 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
         Object.assign(b, { status: "reading", finished_on: null });
         unfinished = true;
       }
-      let habitRemoved = false;
-      let habitRestored = false;
-      const sameHabit = tables.books.filter((x) => x.habit_name === b.habit_name).map((x) => x.book_id);
-      const stamp = tables.reading_session_habit_stamps.find((t) => t.session_id === row.session_id);
-      if (b.habit_name && !tables.reading_sessions.some((s) => s.session_date === row.session_date && sameHabit.includes(s.book_id))) {
-        if (stamp && stamp.cycle_date === row.session_date && stamp.question === b.habit_name) {
-          // The create's own record decides, while the habit row is still the version that create left (T01-R7).
-          const h = tables.habit_journal.find((x) => x.cycle_date === row.session_date && x.question === b.habit_name);
-          if (h && versions.get(habitKey(h.cycle_date, h.question)) === stamp.row_version) {
-            if (!stamp.had_row) {
-              tables.habit_journal = tables.habit_journal.filter((x) => x !== h);
-              versions.delete(habitKey(h.cycle_date, h.question));
-              habitRemoved = true;
-            } else if (h.answer !== stamp.prev_answer || h.category !== stamp.prev_category) {
-              Object.assign(h, { answer: stamp.prev_answer, category: stamp.prev_category });
-              bump(h.cycle_date, h.question);
-              habitRestored = true;
-              habitRemoved = stamp.prev_answer !== "Yes";
-            }
-          }
-        } else if (a.p_habit_created_on && a.p_habit_created_on === row.session_date) {
-          const before = tables.habit_journal.length;
-          tables.habit_journal = tables.habit_journal.filter((h) => !(h.cycle_date === row.session_date && h.question === b.habit_name && h.answer === "Yes"));
-          habitRemoved = tables.habit_journal.length < before;
-        }
-      }
-      tables.reading_session_habit_stamps = tables.reading_session_habit_stamps.filter((t) => t.session_id !== row.session_id);
+      // The habit part (pds.settle_reading_habit): no exception block, so a failure rolls the removal back.
+      const settled = b.habit_name ? settleTx(row.session_date, b.habit_name, a.p_habit_created_on) : { removed: false, restored: false };
+      const habitRemoved = settled.removed;
+      const habitRestored = settled.restored;
       const removal = { session_id: row.session_id, client_key: row.client_key ?? null, book_id: row.book_id, session_date: row.session_date, notion_block_id: row.notion_block_id ?? null, unfinished, removed_at: "2026-11-15T21:00:00Z", mirror_done_at: null };
       tables.reading_session_removals = tables.reading_session_removals.filter((r) => r.session_id !== row.session_id).concat([removal]);
       return { data: JSON.parse(JSON.stringify({ removed: true, session: row, book: b, unfinished, habit_removed: habitRemoved, habit_restored: habitRestored, removal })), error: null };
     };
-    return key ? withLock(key, tx) : tx();
+    return key ? withLock(key, () => atomically(tx)) : atomically(tx);
   };
   /** pds.create_reading_session: one transaction under the key's lock (sql/reading_session_discards.sql). */
   const createKeyed = async (a) => {
@@ -335,27 +376,44 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       }
       let marked = false;
       let created = false;
-      if (b && b.habit_name) {
-        const hit = tables.habit_journal.find((h) => h.cycle_date === a.p_session_date && h.question === b.habit_name);
-        const prev = hit ? { answer: hit.answer, category: hit.category } : null;
-        if (hit) Object.assign(hit, { category: "learning", answer: "Yes" });
-        else tables.habit_journal.push({ cycle_date: a.p_session_date, question: b.habit_name, category: "learning", answer: "Yes" });
-        bump(a.p_session_date, b.habit_name);
-        // What this create did to the habit row, written with the session (pds.reading_session_habit_stamps).
-        tables.reading_session_habit_stamps.push({
-          session_id: row.session_id,
-          client_key: a.p_client_key,
-          cycle_date: a.p_session_date,
-          question: b.habit_name,
-          had_row: !!hit,
-          prev_answer: prev ? prev.answer : null,
-          prev_category: prev ? prev.category : null,
-          row_version: versions.get(habitKey(a.p_session_date, b.habit_name)),
-        });
-        marked = true;
-        created = !hit;
-      }
+      if (b && b.habit_name) ({ marked, created } = stampTx(a.p_session_date, b.habit_name));
       return { data: JSON.parse(JSON.stringify({ session: row, finished, habit_marked: marked, habit_created: created })), error: null };
+    });
+  };
+  /** pds.stamp_reading_habit called on its own (a keyless create). */
+  const stampAlone = async (a) => {
+    log.push({ table: "stamp_reading_habit", op: "rpc", payload: { cycle_date: a.p_cycle_date } });
+    if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
+    return atomically(() => ({ data: stampTx(a.p_cycle_date, a.p_question), error: null }));
+  };
+  /** pds.move_reading_session: the session's new values, the new day's stamp and the old day's settle, one transaction. */
+  const move = async (a) => {
+    log.push({ table: "move_reading_session", op: "rpc", payload: { session_id: a.p_session_id } });
+    if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
+    return atomically(() => {
+      const row = tables.reading_sessions.find((r) => r.session_id === a.p_session_id);
+      if (!row) return { data: { moved: false }, error: null };
+      if (row.source !== "manual" && row.source !== "chat") return { data: null, error: { code: "OXR02", message: "kindle" } };
+      const oldBook = tables.books.find((x) => x.book_id === row.book_id);
+      const newBook = tables.books.find((x) => x.book_id === a.p_book_id);
+      if (!newBook) return { data: null, error: { code: "OXR03", message: "no such book" } };
+      const oldDate = row.session_date;
+      Object.assign(row, {
+        book_id: a.p_book_id,
+        session_date: a.p_session_date,
+        chapter_from: a.p_chapter_from,
+        chapter_through: a.p_chapter_through,
+        minutes: a.p_minutes,
+        medium: a.p_medium,
+        recall: a.p_recall,
+        question: a.p_question,
+      });
+      const stamp = newBook.habit_name ? stampTx(a.p_session_date, newBook.habit_name) : { marked: false, created: false };
+      const settled = oldBook?.habit_name ? settleTx(oldDate, oldBook.habit_name, a.p_habit_created_on) : { removed: false, restored: false };
+      return {
+        data: JSON.parse(JSON.stringify({ moved: true, session: row, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored })),
+        error: null,
+      };
     });
   };
   return {
@@ -370,7 +428,11 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
           ? remove(args)
           : name === "create_reading_session"
             ? createKeyed(args)
-            : { data: null, error: null },
+            : name === "stamp_reading_habit"
+              ? stampAlone(args)
+              : name === "move_reading_session"
+                ? move(args)
+                : { data: null, error: null },
   };
 }
 
@@ -713,7 +775,115 @@ test("lost create answer, then Discard: the Yes the create made goes, from its o
   assert.equal(r.removed.session_id, made.session.session_id);
   assert.equal(r.habitRemoved, true);
   assert.equal(db.tables.habit_journal.length, 0, "no habit Yes left for a removed session");
-  assert.equal(db.tables.reading_session_habit_stamps.length, 0, "the record goes with the session");
+  assert.equal(db.tables.reading_habit_provenance.length, 0, "the record goes with the last session of the day");
+});
+
+test("two sessions on one day, removed in either order: the last one going takes the Yes back (Codex review of PR 376, round 2)", async () => {
+  const K2 = "2b3c4d5e-6f70-4182-93a4-b5c6d7e8f901";
+  for (const order of [[KEY, K2], [K2, KEY]]) {
+    const db = fakeDb({ books: [BOOK] });
+    const a = await R.logSession(db, create({ date: "2026-11-15", chapter_through: 5 }));
+    const b = await R.logSession(db, create({ date: "2026-11-15", chapter_through: 6, client_key: K2 }));
+    assert.equal(a.habitCreated, true);
+    assert.equal(b.habitCreated, false, "the second stamp found the first one's Yes");
+    const first = await R.deleteSessionByClientKey(db, order[0]);
+    assert.equal(first.habitRemoved, false, "the other session still holds the Yes");
+    assert.deepEqual(db.tables.habit_journal, [yes("2026-11-15")]);
+    const last = await R.deleteSessionByClientKey(db, order[1]);
+    assert.equal(last.habitRemoved, true, `the last one going takes it back (${order[0] === KEY ? "first" : "second"} removed first)`);
+    assert.equal(db.tables.habit_journal.length, 0, "no Yes with no session behind it");
+    assert.equal(db.tables.reading_habit_provenance.length, 0);
+  }
+  // Over an explicit No: both gone, the No (and its category) comes back.
+  const no = { cycle_date: "2026-11-15", question: HABIT, category: "other", answer: "No" };
+  const db = fakeDb({ books: [BOOK], habit_journal: [no] });
+  await R.logSession(db, create({ date: "2026-11-15" }));
+  await R.logSession(db, create({ date: "2026-11-15", chapter_through: 6, client_key: K2 }));
+  await R.deleteSessionByClientKey(db, KEY);
+  await R.deleteSessionByClientKey(db, K2);
+  assert.deepEqual(db.tables.habit_journal, [no]);
+  // A keyless (chat) session sharing the day counts the same way: its stamp is recorded too.
+  const mixed = fakeDb({ books: [BOOK] });
+  const chat = await R.logSession(mixed, create({ date: "2026-11-15", client_key: null, source: "chat" }));
+  await R.logSession(mixed, create({ date: "2026-11-15", chapter_through: 6 }));
+  await R.deleteSessionByClientKey(mixed, KEY);
+  assert.deepEqual(mixed.tables.habit_journal, [yes("2026-11-15")], "the chat session still holds it");
+  await R.deleteSession(mixed, chat.session.session_id, null);
+  assert.equal(mixed.tables.habit_journal.length, 0, "the chat session's stamp made the row, and it was the last one");
+});
+
+test("a move after a replayed create (no habit day known to the browser) takes the old day's Yes back (Codex review of PR 376, round 2)", async () => {
+  const db = fakeDb({ books: [BOOK] });
+  const made = await R.logSession(db, create({ date: "2026-11-15" }));
+  const replayed = await R.logSession(db, create({ date: "2026-11-15" }));
+  assert.equal(replayed.replayed, true);
+  assert.equal(replayed.habitCreated, null, "the replay cannot say whether the create made the habit row");
+  const moved = await R.updateSession(db, made.session.session_id, upd({ chapter_through: 5, date: "2026-11-13", habit_created_on: null }));
+  assert.equal(moved.ok, true);
+  assert.equal(moved.session.session_date, "2026-11-13");
+  assert.deepEqual(db.tables.habit_journal.map((h) => h.cycle_date), ["2026-11-13"], "the old day's Yes went with the session");
+  assert.equal(moved.habitCreatedOn, "2026-11-13");
+  assert.deepEqual(db.log.filter((l) => l.op === "rpc" && l.table === "move_reading_session").length, 1, "the move is one database call");
+  // Removing it afterwards takes the new day's Yes back too, still from the habit row's own record.
+  const r = await R.deleteSessionByClientKey(db, KEY);
+  assert.equal(r.habitRemoved, true);
+  assert.equal(db.tables.habit_journal.length, 0);
+  // An answer given on the old day after the move is not touched by anything later.
+  const other = fakeDb({ books: [BOOK], reading_sessions: [session({})], habit_journal: [yes("2026-11-15")] });
+  await R.updateSession(other, 41, upd({ date: "2026-11-14", habit_created_on: null }));
+  assert.ok(other.tables.habit_journal.some((h) => h.cycle_date === "2026-11-15"), "a Yes reading did not make stays (no record, no day from the form)");
+});
+
+test("a move: the habit part failing rolls the whole move back; without the SQL it is refused (503), never done in steps", async () => {
+  const failing = fakeDb({ books: [BOOK], reading_sessions: [session({})] }, { settleError: "P0001" });
+  const r = await R.updateSession(failing, 41, upd({ date: "2026-11-13" }));
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 500, "an error the form retries");
+  assert.equal(failing.tables.reading_sessions[0].session_date, "2026-11-15", "the session did not move");
+  assert.equal(failing.tables.habit_journal.length, 0, "and the new day got no Yes");
+  const before = fakeDb({ books: [BOOK], reading_sessions: [session({})], habit_journal: [yes("2026-11-15")] }, { noDiscards: true });
+  const refused = await R.updateSession(before, 41, upd({ date: "2026-11-13", habit_created_on: "2026-11-15" }));
+  assert.equal(refused.status, 503);
+  assert.match(refused.error, /reading_session_discards\.sql/);
+  assert.equal(before.tables.reading_sessions[0].session_date, "2026-11-15");
+  assert.deepEqual(before.tables.habit_journal, [yes("2026-11-15")]);
+  // An edit that does not move the session needs no function.
+  assert.equal((await R.updateSession(before, 41, upd({ chapter_through: 5 }))).ok, true);
+  // A session gone by the time the move runs is a 404; a Kindle one a 409.
+  const gone = fakeDb({ books: [BOOK], reading_sessions: [session({})] });
+  const realRpc = gone.rpc;
+  gone.rpc = async (name, args) => {
+    if (name === "move_reading_session") gone.tables.reading_sessions = [];
+    return realRpc(name, args);
+  };
+  assert.equal((await R.updateSession(gone, 41, upd({ date: "2026-11-13" }))).status, 404);
+});
+
+test("a removal whose habit part fails rolls back whole and is reported, never 'removed' with a Yes left (Codex review of PR 376, round 2)", async () => {
+  const db = fakeDb({ books: [BOOK] }, { settleError: "P0001" });
+  await R.logSession(db, create({ date: "2026-11-15" }));
+  for (const r of [await R.deleteSessionByClientKey(db, KEY), await R.deleteSession(db, db.tables.reading_sessions[0].session_id, null)]) {
+    assert.equal(r.ok, false);
+    assert.equal(r.status, 500, "the form keeps the entry and retries");
+    assert.equal(r.gone, undefined, "never read as 'already removed'");
+  }
+  assert.equal(db.tables.reading_sessions.length, 1, "the session is still stored");
+  assert.equal(db.tables.reading_session_discards.length, 0, "no discard recorded");
+  assert.equal(db.tables.reading_session_removals.length, 0, "no removal on record");
+  assert.deepEqual(db.tables.habit_journal, [yes("2026-11-15")]);
+});
+
+test("deleteSession: only the database's own 'no such session' is gone; a missing book (session still stored) is not", async () => {
+  const gone = await R.deleteSession(fakeDb({ books: [BOOK] }), 99, null);
+  assert.equal(gone.status, 404);
+  assert.equal(gone.gone, true);
+  const bookless = fakeDb({ books: [], reading_sessions: [session({})] });
+  const r = await R.deleteSession(bookless, 41, null);
+  assert.equal(r.status, 404);
+  assert.equal(r.gone, undefined, "the route sends no session_gone code for it");
+  const route = read("app/api/reading/sessions/[id]/route.ts");
+  assert.match(route, /r\.gone \? \{ error: r\.error, code: SESSION_GONE_CODE \}/, "the code goes only with gone");
+  assert.doesNotMatch(route, /r\.status === 404 \? \{ error: r\.error, code: SESSION_GONE_CODE/);
 });
 
 test("lost create answer, then an independent answer to the habit, then Discard: that answer is kept (Codex T01-R7)", async () => {
@@ -866,7 +1036,7 @@ test("sql/reading_session_discards.sql: additive, service-role only, one lock pe
   assert.equal(locks.length, 3, "the trigger, the keyed create and the removal take the same lock");
   const fn = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.create_reading_session("));
   const body = fn.slice(0, fn.indexOf("$$;"));
-  assert.match(body, /INSERT INTO pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*INSERT INTO pds\.habit_journal/, "session, finish and habit in one function (T01-R4)");
+  assert.match(body, /INSERT INTO pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*pds\.stamp_reading_habit\(/, "session, finish and habit in one function (T01-R4)");
   assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.create_reading_session\([^)]*\) TO service_role/);
   const lib = read("lib/reading.ts");
   assert.match(lib, /DISCARDED_KEY_CODE = "OXR01"/, "lib/reading.ts maps the trigger's code");
@@ -875,16 +1045,34 @@ test("sql/reading_session_discards.sql: additive, service-role only, one lock pe
   assert.doesNotMatch(lib, /insert\(key \?/, "no keyed create in separate requests");
   const rm = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.remove_reading_session("));
   const rmBody = rm.slice(0, rm.indexOf("$$;"));
-  assert.match(rmBody, /INSERT INTO pds\.reading_session_discards[\s\S]*DELETE FROM pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*DELETE FROM pds\.habit_journal[\s\S]*INSERT INTO pds\.reading_session_removals/, "discard, delete, finish, habit and cleanup row in one function");
+  assert.match(rmBody, /INSERT INTO pds\.reading_session_discards[\s\S]*DELETE FROM pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*pds\.settle_reading_habit\([\s\S]*INSERT INTO pds\.reading_session_removals/, "discard, delete, finish, habit and cleanup row in one function");
   assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.reading_session_removals/);
   assert.match(sql, /REVOKE ALL ON pds\.reading_session_removals FROM anon, authenticated/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.remove_reading_session\(bigint, uuid, date\) TO service_role/);
   assert.match(lib, /rpc\("create_reading_session", \{/, "a keyed create is one database call");
-  // Codex T01-R7: what the create did to the habit row is written in the create and read by the removal.
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.reading_session_habit_stamps/);
-  assert.match(sql, /REVOKE ALL ON pds\.reading_session_habit_stamps FROM anon, authenticated/);
-  assert.match(body, /INSERT INTO pds\.habit_journal[\s\S]*INSERT INTO pds\.reading_session_habit_stamps/, "the record is written in the same step as the stamp");
-  assert.match(rmBody, /FROM pds\.reading_session_habit_stamps[\s\S]*h\.xmin::text[\s\S]*v_version = v_stamp\.row_version/, "the removal reads the record and checks the row version");
+  // Codex T01-R7 + round 2: what reading stamps did to the habit row is recorded per habit row (not per session), in
+  // the stamp itself, and the last session of a day going settles it; neither swallows a failed settle.
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS pds\.reading_habit_provenance/);
+  assert.match(sql, /PRIMARY KEY \(cycle_date, question\)/);
+  assert.match(sql, /REVOKE ALL ON pds\.reading_habit_provenance FROM anon, authenticated/);
+  assert.doesNotMatch(sql, /reading_session_habit_stamps/);
+  const fnBody = (name) => {
+    const at = sql.slice(sql.indexOf(`CREATE OR REPLACE FUNCTION pds.${name}(`));
+    return at.slice(0, at.indexOf("$$;"));
+  };
+  const stampBody = fnBody("stamp_reading_habit");
+  assert.match(stampBody, /INSERT INTO pds\.habit_journal[\s\S]*pds\.reading_habit_provenance/, "the record is written in the same step as the stamp");
+  const settleBody = fnBody("settle_reading_habit");
+  assert.match(settleBody, /FROM pds\.reading_sessions[\s\S]*FROM pds\.reading_habit_provenance[\s\S]*h\.xmin::text[\s\S]*v_cur = v_prov\.row_version/, "other sessions first, then the record and its row version");
+  assert.doesNotMatch(settleBody, /EXCEPTION WHEN/, "a failed settle raises");
+  assert.match(body, /pds\.stamp_reading_habit\(/, "the keyed create stamps through the recording stamp");
+  assert.match(rmBody, /pds\.settle_reading_habit\(/);
+  assert.doesNotMatch(rmBody, /EXCEPTION WHEN/, "no part of a removal is swallowed");
+  const moveBody = fnBody("move_reading_session");
+  assert.match(moveBody, /UPDATE pds\.reading_sessions[\s\S]*pds\.stamp_reading_habit\([\s\S]*pds\.settle_reading_habit\(v_old_date/, "the move, its stamp and its settle in one function");
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION pds\.move_reading_session\([^)]*\) TO service_role/);
+  assert.match(lib, /rpc\("move_reading_session", \{/, "a move is one database call");
+  assert.doesNotMatch(lib, /unstampHabitIfUnused/);
 });
 
 test("sql/reading_sessions_client_key.sql: additive only (the Supabase connector refuses any DROP)", () => {

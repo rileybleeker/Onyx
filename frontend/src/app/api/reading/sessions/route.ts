@@ -132,8 +132,9 @@ export async function DELETE(req: NextRequest) {
   // A fresh removal, or a retry of one whose answer was lost: the Notion cleanup it still owes runs after the
   // response (lib/reading-removal.ts). A create's own after() that was still writing the Notion entry trashes it
   // once it sees the row gone.
-  const { book, overview, removedId, owed } = await removalAnswer(supabase, r);
-  if (owed) after(() => runRemovalCleanup(supabase, r, book, overview));
+  const answer = await removalAnswer(supabase, r);
+  const { overview, removedId } = answer;
+  if (answer.owed) after(() => runRemovalCleanup(supabase, r, answer));
 
   return NextResponse.json({ ...receipt, removed: removedId, unfinished: r.unfinished, overview });
 }

@@ -777,6 +777,60 @@ async function createKeyedSession(
   return { kind: "created", session, finished: out.finished === true, habit: { marked: out.habit_marked === true, created: out.habit_created === true } };
 }
 
+const MOVE_UNAVAILABLE = "Moving a session to another day or book isn't available until sql/reading_session_discards.sql is applied.";
+
+/**
+ * A session moved to another day or book (pds.move_reading_session, sql/reading_session_discards.sql): its new values
+ * and the habit part of the move in ONE transaction (Codex review of PR 376, round 2). The new day's habit is stamped
+ * and the old day's is settled from the habit row's own record, so the old day's Yes goes back also when the browser
+ * knows no habit day (a create whose answer was lost and replayed). A failed habit part rolls the move back (500, the
+ * form retries). Without the function: 503 and nothing moved, never a move in separate requests.
+ */
+async function moveSessionTx(
+  supabase: Supa,
+  sessionId: number,
+  patch: {
+    book_id: number;
+    session_date: string;
+    chapter_from: number;
+    chapter_through: number;
+    minutes: number | null;
+    medium: string | null;
+    recall: string | null;
+    question: string | null;
+  },
+  habitCreatedOn: string | null,
+): Promise<
+  | { ok: true; session: ReadingSession; marked: boolean; created: boolean }
+  | { ok: false; status: number; error: string }
+> {
+  const { data, error } = await supabase.rpc("move_reading_session", {
+    p_session_id: sessionId,
+    p_book_id: patch.book_id,
+    p_session_date: patch.session_date,
+    p_chapter_from: patch.chapter_from,
+    p_chapter_through: patch.chapter_through,
+    p_minutes: patch.minutes,
+    p_medium: patch.medium,
+    p_recall: patch.recall,
+    p_question: patch.question,
+    p_habit_created_on: habitCreatedOn,
+  });
+  if (error) {
+    if (error.code === KINDLE_SESSION_CODE) return { ok: false, status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
+    if (error.code === BOOK_MISSING_CODE) return { ok: false, status: 400, error: "No such book" };
+    if (discardsMissing(error)) return { ok: false, status: 503, error: MOVE_UNAVAILABLE };
+    return { ok: false, status: 500, error: error.message ?? "Couldn't move the session." };
+  }
+  const out = (data ?? null) as { moved?: unknown; session?: unknown; habit_marked?: unknown; habit_created?: unknown } | null;
+  if (!out || typeof out !== "object" || typeof out.moved !== "boolean") return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
+  if (!out.moved) return { ok: false, status: 404, error: "That session no longer exists." };
+  const raw = out.session;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
+  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, (raw as Record<string, unknown>)[k] ?? null])) as unknown as ReadingSession;
+  return { ok: true, session, marked: out.habit_marked === true, created: out.habit_created === true };
+}
+
 /** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
 function isConfirmedRefusal(error: { code?: string }): boolean {
   const code = String(error.code ?? "");
@@ -800,9 +854,24 @@ async function furthestChapter(supabase: Supa, bookId: number, except: number | 
 const sessionXp = (through: number, prevMax: number, recall: string | null) =>
   Math.max(0, through - prevMax) * XP.perChapter + ((recall ?? "").length >= 40 ? XP.perRecall : 0);
 
-/** Stamp the book's habit Yes on `date`; `created` = no row for that day existed before. */
+/**
+ * Stamp the book's habit Yes on `date`; `created` = no row for that day existed before. Used by keyless creates (chat).
+ * Goes through pds.stamp_reading_habit (sql/reading_session_discards.sql), which records what the stamp did to the
+ * habit row in the same transaction, so whichever session of that day goes last takes the Yes back (Codex review of
+ * PR 376, round 2). Without that function (the file not applied yet) the plain upsert as before: a keyless create
+ * never needed the discard fence.
+ */
 async function stampHabit(supabase: Supa, book: Book, date: string): Promise<{ marked: boolean; created: boolean }> {
   if (!book.habit_name) return { marked: false, created: false };
+  const { data: stamped, error: rpcError } = await supabase.rpc("stamp_reading_habit", { p_cycle_date: date, p_question: book.habit_name });
+  if (!rpcError) {
+    const out = (stamped ?? {}) as { marked?: unknown; created?: unknown };
+    return { marked: out.marked === true, created: out.created === true };
+  }
+  if (!["PGRST202", "42883"].includes(String(rpcError.code))) {
+    console.error("reading: habit stamp failed:", rpcError.code ?? "unknown");
+    return { marked: false, created: false };
+  }
   const { data: had } = await supabase.from("habit_journal").select("answer").eq("cycle_date", date).eq("question", book.habit_name).maybeSingle();
   const { error } = await supabase
     .from("habit_journal")
@@ -812,28 +881,6 @@ async function stampHabit(supabase: Supa, book: Book, date: string): Promise<{ m
     return { marked: false, created: false };
   }
   return { marked: true, created: !had };
-}
-
-/**
- * Take back a habit Yes a session made on `date` (the session moved to another day, or was removed): only when no
- * other session of a book with the same habit is on that day. A row the session did not create is never touched
- * (the caller decides that).
- */
-async function unstampHabitIfUnused(supabase: Supa, book: Book, date: string, exceptSession: number): Promise<boolean> {
-  if (!book.habit_name) return false;
-  const { data: sameHabit } = await supabase.from("books").select("book_id").eq("habit_name", book.habit_name);
-  const ids = new Set<number>([book.book_id, ...((sameHabit ?? []) as Array<{ book_id: number }>).map((b) => b.book_id)]);
-  const { data: others, error } = await supabase
-    .from("reading_sessions")
-    .select("session_id")
-    .eq("session_date", date)
-    .in("book_id", [...ids])
-    .neq("session_id", exceptSession)
-    .limit(1);
-  if (error || others?.length) return false;
-  const { error: dErr } = await supabase.from("habit_journal").delete().eq("cycle_date", date).eq("question", book.habit_name).eq("answer", "Yes");
-  if (dErr) console.error("reading: habit unstamp failed:", dErr.message);
-  return !dErr;
 }
 
 /**
@@ -1113,9 +1160,11 @@ async function editableSession(
  *  - reaching the last chapter finishes the book; editing back below it (or moving the session to another book)
  *    sets a finish this session caused back to reading when no other session reaches the last chapter; a moved
  *    finishing session moves the finish day with it;
- *  - a new day (or book) stamps that book's habit Yes there; the old day's Yes is taken back only when this
- *    session made it (`habit_created_on`, which the server reported) and no other session of a book with the same
- *    habit is on that day. A row the session did not make (Riley's own answer) is never touched.
+ *  - a new day (or book) stamps that book's habit Yes there, and the old day's Yes is taken back when no other
+ *    session of a book with the same habit is on that day and reading made it (the habit row's own record in the
+ *    database, else `habit_created_on` for a session stamped before that record existed), in the same transaction
+ *    as the move (pds.move_reading_session). A row reading did not make, or one answered again since (Riley's own
+ *    answer), is never touched.
  */
 export async function updateSession(supabase: Supa, sessionId: number, input: SessionUpdate): Promise<SessionEditResult> {
   const cur = await editableSession(supabase, sessionId);
@@ -1153,12 +1202,30 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
     recall: input.recall?.trim() || null,
     question: input.question?.trim() || null,
   };
-  const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
-  if (error) return { ok: false, status: 500, error: error.message };
-  const session = data as ReadingSession;
+  const sameBook = book.book_id === previousBook.book_id;
+  const moved = date !== previous.session_date || !sameBook;
+
+  // A move (another day or book) writes the session together with its habit part in one transaction: the new day is
+  // stamped, and the old day's Yes is taken back from the habit row's own record when this was the last session there
+  // (Codex review of PR 376, round 2: before, a move after a replayed create, whose answer carried no habit day, left
+  // the old day's Yes behind). Any other edit is a plain update of the session.
+  let session: ReadingSession;
+  let habitMarked = false;
+  let habitCreatedOn = input.habit_created_on;
+  if (moved) {
+    const mv = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on);
+    if (!mv.ok) return mv;
+    session = mv.session;
+    habitMarked = mv.marked;
+    const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
+    habitCreatedOn = sameRow ? input.habit_created_on : mv.created ? date : null;
+  } else {
+    const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
+    if (error) return { ok: false, status: 500, error: error.message };
+    session = data as ReadingSession;
+  }
 
   const xpGained = sessionXp(through, prevMax, patch.recall);
-  const sameBook = book.book_id === previousBook.book_id;
   const total = book.total_chapters;
   const reachesEnd = !!total && through >= total;
 
@@ -1190,25 +1257,6 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
     }
   }
 
-  // The habit: stamp the new day; take back the old day's row only when this session made it.
-  let habitMarked = false;
-  let habitCreatedOn = input.habit_created_on;
-  const moved = date !== previous.session_date || !sameBook;
-  if (moved) {
-    const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
-    const stamp = await stampHabit(supabase, book, date);
-    habitMarked = stamp.marked;
-    if (!sameRow && input.habit_created_on && input.habit_created_on === previous.session_date) {
-      await unstampHabitIfUnused(supabase, previousBook, previous.session_date, sessionId);
-    }
-    habitCreatedOn = sameRow ? input.habit_created_on : stamp.created ? date : null;
-    // The keyed create's record of the habit row (sql/reading_session_discards.sql) describes the day the session
-    // left: from here on its removal goes by habit_created_on as before (Codex T01-R7). Best-effort: a record left
-    // in place only keeps a Yes its row version no longer matches, the safe direction.
-    const { error: recordError } = await supabase.from("reading_session_habit_stamps").delete().eq("session_id", sessionId);
-    if (recordError && !discardsMissing(recordError) && recordError.code !== "PGRST205") console.error("reading: habit record cleanup failed:", recordError.code ?? "unknown");
-  }
-
   return {
     ok: true,
     book: { ...book, status, finished_on: finishedOn },
@@ -1231,13 +1279,18 @@ export type SessionRemoval =
    * the route replays the Notion cleanup it still owes (`done` false). Its database part already committed with it.
    */
   | { ok: true; removed: null; unfinished: boolean; cleanup: RemovalCleanup | null }
-  | { ok: false; status: number; error: string };
+  /**
+   * `gone` = the database said, inside the removal's transaction, that no such session exists and none of it is on
+   * record: the only failure the form may read as "already removed" (route code session_gone). Every other failure
+   * (a 404 for a missing book included, where the session is still stored) leaves the entry on screen.
+   */
+  | { ok: false; status: number; error: string; gone?: true };
 
 /**
  * Remove a manual or chat session (the autosaving form's "Remove this session"). A book this session finished
  * (finished on its day, and no other session reaches the last chapter) goes back to reading. The day's habit Yes
- * is taken back only when this session made it and no other session with the same habit is on that day: a keyed
- * create's own record in the database decides (Codex T01-R7), else `habitCreatedOn`. All of it, and the session's client_key recorded as discarded (a create of that key still under way is
+ * is taken back only when reading made it and no other session with the same habit is on that day: the habit row's
+ * own record in the database decides (Codex T01-R7), else `habitCreatedOn`. All of it, and the session's client_key recorded as discarded (a create of that key still under way is
  * then refused instead of bringing the session back, Codex T01-R6), is ONE transaction (pds.remove_reading_session):
  * a removal whose answer is lost has removed everything or nothing, and its retry finds the cleanup row and gets
  * `removed: null` with it, so the route still trashes the Notion entry (Codex review of PR 376).
@@ -1249,7 +1302,7 @@ export async function deleteSession(supabase: Supa, sessionId: number, habitCrea
   const r = await removeSessionTx(supabase, { sessionId }, habitCreatedOn);
   if (r.kind === "failed") return { ok: false, status: r.status, error: r.error };
   if (r.kind === "removed") return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished, habitRemoved: r.habitRemoved, cleanup: r.cleanup };
-  if (!r.cleanup) return { ok: false, status: 404, error: "That session no longer exists." };
+  if (!r.cleanup) return { ok: false, status: 404, error: "That session no longer exists.", gone: true };
   return { ok: true, removed: null, unfinished: r.cleanup.unfinished, cleanup: r.cleanup };
 }
 
@@ -1259,9 +1312,9 @@ export async function deleteSession(supabase: Supa, sessionId: number, habitCrea
  * still running on the server either committed before (its session is found and removed here) or is refused after,
  * and removes that session exactly like DELETE /api/reading/sessions/[id] (a finish it caused goes back to reading;
  * the route trashes its Notion entry). Whether that create made the day's habit row is not taken from the browser
- * (its answer was lost): the create wrote it down with the session (pds.reading_session_habit_stamps), and the
- * removal takes back the Yes it made (or gives back the answer it replaced) unless the row was answered again since
- * (Codex T01-R7).
+ * (its answer was lost): the create wrote it down with the habit row (pds.reading_habit_provenance), and the
+ * removal takes back the Yes reading made (or gives back the answer it replaced) when this is the last session of
+ * that day, unless the row was answered again since (Codex T01-R7). A failed habit part fails the whole removal.
  * The create side is one transaction too (pds.create_reading_session: session, finish and habit Yes together), so the
  * session found here comes with every effect its create had, and none can follow after its removal (Codex T01-R4).
  * `removed: null` = no session has this key (the database said so inside that transaction, never assumed from a

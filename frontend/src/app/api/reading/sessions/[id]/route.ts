@@ -19,15 +19,17 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * /api/reading/sessions, then send every later edit of the same form here (lib/reading.ts updateSession: the same
  * rules as logSession; Kindle sessions are refused with 409), and "Remove this session" deletes it (deleteSession).
  * An edit or removal undoes what the session's earlier values did: a finish it caused goes back to reading when no
- * other session reaches the last chapter, and the habit Yes it MADE (`habit_created_on`, reported by the create and
- * by every edit, sent back by the form) is taken back from a day it leaves when no other session is on that day.
+ * other session reaches the last chapter, and the habit Yes reading made is taken back from a day it leaves when no
+ * other session is on that day (the habit row's own record in the database, else `habit_created_on`, reported by the
+ * create and by every edit and sent back by the form, for a session stamped before that record existed).
  * The Notion quote block follows best-effort after the response (updated in place, moved to the other book's page,
  * or trashed), and the progress callout is rewritten.
  * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check, JSON only and a size cap.
  * Answers: 200 { success, session, xp_gained, finished, overview } / { success, removed: id, unfinished, overview },
  * 400 with the reason, 404 { error, code: "session_gone" } for a session that no longer exists (and no removal of it
  * on record; the form takes a removal as done only on that 200 for its id or this 404, Codex T01-R8), 409 for a Kindle
- * session, 503 while sql/reading_session_discards.sql is not applied (nothing removed; the form retries).
+ * session, 503 while sql/reading_session_discards.sql is not applied (a removal, or an edit that moves the session to
+ * another day or book: nothing changed; the form retries).
  */
 
 const MAX_BYTES = 48 * 1024;
@@ -119,11 +121,13 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   // cleanup still owed. A retry of a removal whose answer was lost finds the session gone and gets that cleanup back,
   // so the entry is still trashed (Codex review of PR 376); the database part is never repeated.
   const r = await deleteSession(supabase, id, habitCreatedOn);
-  // 404 carries a code so the form can tell this answer (the session is gone, nothing on record) from any other 404
-  // page, which never counts as a removal (Codex T01-R8).
-  if (!r.ok) return NextResponse.json(r.status === 404 ? { error: r.error, code: SESSION_GONE_CODE } : { error: r.error }, { status: r.status });
-  const { book, overview, removedId, owed } = await removalAnswer(supabase, r);
-  if (owed) after(() => runRemovalCleanup(supabase, r, book, overview));
+  // Only the database's own "no such session, none of it on record" carries the code, so the form can tell it from
+  // any other 404 (a missing book, where the session is still stored, or another page), which never counts as a
+  // removal (Codex T01-R8).
+  if (!r.ok) return NextResponse.json(r.gone ? { error: r.error, code: SESSION_GONE_CODE } : { error: r.error }, { status: r.status });
+  const answer = await removalAnswer(supabase, r);
+  const { overview, removedId } = answer;
+  if (answer.owed) after(() => runRemovalCleanup(supabase, r, answer));
 
   return NextResponse.json({
     success: true,
