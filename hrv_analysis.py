@@ -103,6 +103,7 @@ except ImportError:
 import hashlib
 
 import hrv_alignment as al
+import hrv_model_artifact as model_artifact
 
 warnings.filterwarnings("ignore")
 
@@ -4505,14 +4506,24 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     # Last night's HRV (the newest scored sleep).
     today_hrv = float(df[TARGET].dropna().iloc[-1]) if df[TARGET].dropna().shape[0] > 0 else None
 
-    # Save model
+    # Save model: one artifact with its training provenance and checksum, in the pickle and in
+    # the sidecar manifest (audit PIPE-08, hrv_model_artifact.py). The workflow caches it under
+    # its content key and publishes it only after this whole run succeeded.
     model_path = OUTPUT_DIR / "xgboost_hrv_model.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump({"model": production_model, "feat_cols": feat_cols,
-                     "pred_std": pred_std, "model_version": MODEL_VERSION,
-                     "alignment": al.ALIGNMENT_VERSION,
-                     "preprocessing": SPARSE_FILL_VERSION}, f)
-    log.info(f"  Model saved: {model_path}")
+    artifact_manifest = model_artifact.write_artifact(
+        {"model": production_model, "feat_cols": feat_cols,
+         "pred_std": pred_std, "model_version": MODEL_VERSION,
+         "alignment": al.ALIGNMENT_VERSION,
+         "preprocessing": SPARSE_FILL_VERSION},
+        model_artifact.build_provenance(
+            model_version=MODEL_VERSION,
+            data_cutoff=model_df["calendar_date"].iloc[-1],
+            training_rows=len(X), feat_cols=feat_cols,
+            input_data_hash=INPUT_DATA_HASH,
+            alignment_version=al.ALIGNMENT_VERSION,
+            preprocessing_version=SPARSE_FILL_VERSION),
+        model_path)
+    log.info(f"  Model saved: {model_path} (artifact {artifact_manifest['artifact_sha256'][:12]})")
 
     results = {
         "model": production_model,
@@ -4529,6 +4540,8 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "controllable_importance": controllable_importance,
         "top_drivers": top_drivers,
         "tomorrow_pred": tomorrow_pred,
+        # Checksum of the saved artifact: stored on the live forecast row it produced.
+        "artifact_sha256": artifact_manifest["artifact_sha256"],
         # Behavioral date of the predicted sleep (stored as prediction_date; the page
         # shows the wake-up date = this + 1).
         "serve_date": serve_date,
@@ -5442,6 +5455,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
             "training_window_start": xgb_results.get("train_start"),
             "training_window_end": xgb_results.get("train_end"),
             "input_data_hash": INPUT_DATA_HASH,
+            model_artifact.LINK_COLUMN: xgb_results.get("artifact_sha256"),
         })
 
     # SARIMAX 1–7 day forecasts
@@ -5506,8 +5520,13 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
     log.info(f"  Upserting {len(rows)} prediction rows…")
     # Audit P1 (G1): on_conflict targets the 4-tuple including model_version
     # so backtest reruns from different versions accumulate as separate rows.
-    upsert_batch("hrv_predictions", rows,
-                 "prediction_date,model,horizon_days,model_version")
+    # The live XGBoost row names its artifact; until sql/hrv_model_artifacts.sql is applied the
+    # rows are stored without that column (PIPE-08).
+    if not model_artifact.upsert_with_artifact_link(
+            lambda batch: upsert_batch("hrv_predictions", batch,
+                                       "prediction_date,model,horizon_days,model_version"), rows):
+        log.warning(f"  pds.hrv_predictions has no {model_artifact.LINK_COLUMN} column yet: "
+                    "forecast stored without its artifact (apply sql/hrv_model_artifacts.sql)")
 
 
 def store_metrics(eval_results: dict) -> None:
