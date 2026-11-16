@@ -11,7 +11,8 @@ import { AutosaveRefused } from "@/lib/autosave";
  *  - after_save_ids: the earlier saves whose answer never came. The server accepts a save when the stack is still at
  *    expected_version, or when its last write was one of these (then every write since was this editor's own).
  * Anything else means another window (or a late request) changed the stack: the server answers 409 and the editor
- * offers to load the latest version instead of overwriting it.
+ * offers to load the latest version instead of overwriting it. An update the editor cannot give a version for (its
+ * list was read before the migration) gets 409 "reload", handled the same way.
  */
 
 export interface StackSaveFields {
@@ -80,7 +81,9 @@ export class StackConflict extends AutosaveRefused {
 
 /**
  * The editor's fetch: like lib/autosave.ts saveRequest (a 4xx is a refusal, a 5xx or a network failure is retried),
- * plus a StackConflict for the 409 stale answer. Answers the parsed JSON of a successful save.
+ * plus a StackConflict for the 409 stale / reload answers. A 503 "not_set_up" (the database function is missing) is a
+ * refusal too: nothing was written and retrying cannot help until the migration is applied, so the editor shows the
+ * message with Retry instead of retrying on its own. Answers the parsed JSON of a successful save.
  */
 export async function stackSaveRequest(
   method: "POST" | "PATCH",
@@ -97,7 +100,8 @@ export async function stackSaveRequest(
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (res.ok) return json;
   const text = typeof json.error === "string" && json.error ? json.error : `Save failed (${res.status}).`;
-  if (res.status === 409 && json.code === "stale") throw new StackConflict(text);
+  if (res.status === 409 && (json.code === "stale" || json.code === "reload")) throw new StackConflict(text);
+  if (res.status === 503 && json.code === "not_set_up") throw new AutosaveRefused(text);
   if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(text);
   throw new Error(text);
 }

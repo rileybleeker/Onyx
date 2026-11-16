@@ -149,6 +149,11 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   // created/edited; null = closed.
   const [stacks, setStacks] = useState<Stack[]>([]);
   const [editingStack, setEditingStack] = useState<EditableStack | null>(null);
+  /**
+   * The stack list is being read again after the editor saved: until it answers, the list still holds the versions
+   * from before those saves, so reopening a stack then would start from an old version and get a false 409.
+   */
+  const [stacksReloading, setStacksReloading] = useState(false);
   // Single-row deletes the server refused: the row is back on the list, listed here with Retry.
   const [failedDeletes, setFailedDeletes] = useState<{ intake_id: number; label: string }[]>([]);
 
@@ -538,8 +543,9 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                           })),
                         })
                       }
-                      className="px-2 py-2 text-[10px] font-mono text-text-tertiary hover:text-text-primary transition-colors"
-                      title="Edit stack"
+                      disabled={stacksReloading}
+                      className="px-2 py-2 text-[10px] font-mono text-text-tertiary hover:text-text-primary disabled:opacity-40 transition-colors"
+                      title={stacksReloading ? "Loading the saved stack…" : "Edit stack"}
                     >
                       edit
                     </button>
@@ -785,7 +791,12 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
         onClose={() => setEditingStack(null)}
         onSaved={async () => {
           setEditingStack(null);
-          await loadStacks();
+          setStacksReloading(true);
+          try {
+            await loadStacks();
+          } finally {
+            setStacksReloading(false);
+          }
         }}
       />
 

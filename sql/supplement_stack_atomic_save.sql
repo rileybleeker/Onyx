@@ -11,9 +11,12 @@
 -- Contract (called only by frontend/src/lib/supplement-stack-save.ts through PostgREST, service role):
 --   p_stack_id          the stack to update; NULL = create (or adopt the stack p_client_key already created)
 --   p_client_key        create only: the editor's random UUID for this new stack (sql/supplement_stack_client_key.sql)
---   p_expected_version  the version the editor last saw (supplement_stack.version); NULL = unknown (legacy client)
+--   p_expected_version  the version the editor last saw (supplement_stack.version). Required for an update: NULL (a
+--                       tab still running an older build, or a stack list read before this file was applied) is
+--                       refused with OXS05, so a body that knows no version can never overwrite a newer save.
 --   p_save_id           a random UUID per save attempt; stored as last_save_id. A resend of a save that already went
 --                       through (lost answer) is answered from the stored row with replayed = true, nothing written.
+--                       Required when a create finds its client_key already stored (adoption); NULL there is OXS05.
 --   p_after_save_ids    JSON array of the editor's earlier save ids whose answer it never got. When the stack's
 --                       last_save_id is one of them, every write since the editor's version was its own.
 --   p_header            JSON object with any of: name, description, remind_time, is_active (absent = unchanged)
@@ -27,11 +30,15 @@
 --   OXS02  a product_id is not in pds.supplement_products                            -> HTTP 400
 --   OXS03  p_stack_id does not exist                                                -> HTTP 404
 --   OXS04  another active stack already has this name                               -> HTTP 409
+--   OXS05  reload required: an update without p_expected_version, or a create that finds its client_key stored
+--          without a p_save_id (both come from a page that is out of date)              -> HTTP 409
 --   23505  two saves met at a unique index at the same moment (nothing written)      -> HTTP 503, retried
 --
 -- Concurrency: an update locks the stack row (SELECT ... FOR UPDATE) before checking the version, so two saves of
--- one stack take turns and the second is checked against the first's result. Two creates with one client_key meet
--- at the client_key unique index (INSERT ... ON CONFLICT DO NOTHING waits for the other, then adopts its row).
+-- one stack take turns and the second is checked against the first's result. A create with a client_key first takes
+-- a transaction-scoped advisory lock on that key, so a retry sent while the first copy is still running waits for
+-- it, then finds its row and adopts it (instead of seeing the new row only at the name check and answering "name in
+-- use"). The INSERT ... ON CONFLICT DO NOTHING on the client_key index stays as a second guard.
 --
 -- Every UPDATE of a stack row, from any path (this function, the archive route, an older build of the app), adds
 -- one to `version` (trigger below) and clears last_save_id unless that same statement set a new one, so an editor
@@ -46,7 +53,12 @@
 --
 -- Apply once (Supabase SQL editor or an approved migration), BEFORE the app build that calls it is deployed.
 -- Until it exists the route answers 503 "not set up" and changes nothing (it never falls back to the old
--- multi-request save). Check afterwards: sql/checks/verify_supplement_stack_atomic_save.sql.
+-- multi-request save). Deploy order:
+--   1. apply this file;
+--   2. run sql/checks/verify_supplement_stack_atomic_save.sql (read-only, safe on production): every flag true;
+--   3. only then merge the app change that calls the function.
+-- The behaviour checks (rollback, versions, replays, the concurrent create) run on a Supabase branch or a local
+-- copy only: sql/checks/verify_supplement_stack_atomic_save_branch.sql and race_supplement_stack_create_branch.sql.
 
 -- 1. Columns -----------------------------------------------------------------------------------------------------
 
@@ -273,6 +285,9 @@ BEGIN
         END IF;
         v_found := true;
     ELSIF p_client_key IS NOT NULL THEN
+        -- One create per key at a time (released at commit): a concurrent retry of this create waits here, then
+        -- the lookup below (a new statement, so a new snapshot) sees the committed row and adopts it.
+        PERFORM pg_advisory_xact_lock(hashtextextended('pds.supplement_stack.client_key:' || p_client_key::text, 0));
         SELECT * INTO v_row FROM pds.supplement_stack WHERE client_key = p_client_key FOR UPDATE;
         IF FOUND THEN
             v_found := true;
@@ -306,13 +321,19 @@ BEGIN
         IF p_save_id IS NOT NULL AND v_row.last_save_id = p_save_id THEN
             v_replayed := true;
         ELSE
-            -- 4. Version check. A legacy request (no save id) or an unknown baseline is serialized last-writer-wins.
+            -- 4. Version check. A request that cannot say which version it was made against (an older build, a
+            --    list read before this file was applied) is refused: it could be a late body overwriting a newer save.
             IF v_existing THEN
                 -- Create retried after a lost answer: only this editor's own earlier saves may have written since.
-                v_ok := p_save_id IS NULL OR (v_row.last_save_id IS NOT NULL AND v_row.last_save_id = ANY (v_after));
+                IF p_save_id IS NULL THEN
+                    RAISE EXCEPTION 'save_supplement_stack: reload required (create retried without a save id)' USING ERRCODE = 'OXS05';
+                END IF;
+                v_ok := v_row.last_save_id IS NOT NULL AND v_row.last_save_id = ANY (v_after);
             ELSE
-                v_ok := p_expected_version IS NULL
-                        OR v_row.version = p_expected_version
+                IF p_expected_version IS NULL THEN
+                    RAISE EXCEPTION 'save_supplement_stack: reload required (update without a version)' USING ERRCODE = 'OXS05';
+                END IF;
+                v_ok := v_row.version = p_expected_version
                         OR (v_row.last_save_id IS NOT NULL AND v_row.last_save_id = ANY (v_after));
             END IF;
             IF NOT v_ok THEN

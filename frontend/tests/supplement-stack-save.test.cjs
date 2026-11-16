@@ -2,8 +2,10 @@
 // (audit PROD-07, 2026-11-16): POST / PATCH /api/supplements/stacks check the whole body, then make ONE call to
 // pds.save_supplement_stack (sql/supplement_stack_atomic_save.sql). The database function is replaced by an in-memory
 // model of its contract (one transaction: a failure restores everything; version check; client_key adoption; replay
-// of a save id); the real function is checked by sql/checks/verify_supplement_stack_atomic_save.sql after it is
-// applied. Every name and id below is invented.
+// of a save id; refusal of a body that knows no version); the real function is checked on a Supabase branch by
+// sql/checks/verify_supplement_stack_atomic_save_branch.sql and race_supplement_stack_create_branch.sql, and on
+// production only by the read-only sql/checks/verify_supplement_stack_atomic_save.sql. Every name and id below is
+// invented.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -64,9 +66,9 @@ function makeDb() {
       } else {
         const after = a.p_after_save_ids || [];
         const own = row.last_save_id != null && after.includes(row.last_save_id);
-        const ok = existing
-          ? a.p_save_id == null || own
-          : a.p_expected_version == null || row.version === a.p_expected_version || own;
+        // An out-of-date page (no version on an update, no save id on an adoption) is refused: OXS05 "reload".
+        if (existing ? a.p_save_id == null : a.p_expected_version == null) throw failWith("OXS05");
+        const ok = existing ? own : row.version === a.p_expected_version || own;
         if (!ok) throw failWith("OXS01");
         const name = "name" in h ? h.name : row.name;
         const active = "is_active" in h ? h.is_active : row.is_active;
@@ -339,13 +341,47 @@ test("an archive (or any other update) means a different writer: the open editor
   assert.deepEqual(itemsOf(current.db, id), [["prod-a", 1], ["prod-b", 2]]);
 });
 
-test("a body from the previous build (no version fields) is still one transaction, last writer wins", async () => {
+test("a body that knows no version (previous build, delayed legacy retry) is refused with 409 reload; nothing changes", async () => {
   const db = reset();
   const id = await seedStack(db);
-  const r = await patch({ stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }] });
-  assert.equal(r.status, 200);
-  assert.equal(current.db.rpcCalls.at(-1).args.p_expected_version, null);
-  assert.deepEqual(itemsOf(current.db, id), [["prod-c", 1]]);
+  // A newer save from the current editor first.
+  const newer = await patch({ stack_id: id, name: "Test stack", items: [{ product_id: "prod-a", doses: 3 }], expected_version: 1, save_id: uuid(850) });
+  assert.equal(newer.status, 200);
+  for (const late of [
+    { stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }] }, // previous build: no version fields
+    { stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }], save_id: uuid(851) }, // list read before the migration
+  ]) {
+    const r = await patch(late);
+    assert.equal(r.status, 409, JSON.stringify(late));
+    assert.equal(r.body.code, "reload");
+    assert.equal(current.db.rpcCalls.at(-1).args.p_expected_version, null);
+  }
+  assert.deepEqual(itemsOf(current.db, id), [["prod-a", 3]], "the newer save stays");
+  assert.equal(current.db.stacks[0].version, 2);
+});
+
+test("an exact resend of a save that went through is still a replay, even without a version", async () => {
+  const db = reset();
+  const id = await seedStack(db);
+  const body = { stack_id: id, name: "Test stack", items: [{ product_id: "prod-b", doses: 1 }] };
+  assert.equal((await patch({ ...body, expected_version: 1, save_id: uuid(860) })).status, 200);
+  const again = await patch({ ...body, save_id: uuid(860) });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.replayed, true);
+  assert.equal(again.body.version, 2);
+});
+
+test("a retried create without a save id (previous build) is refused when its stack exists; a first create still works", async () => {
+  reset();
+  const key = uuid(870);
+  const first = await post({ ...BODY, client_key: key });
+  assert.equal(first.status, 200, "a brand-new stack from the previous build is created");
+  assert.equal(first.body.created, true);
+  const retry = await post({ ...BODY, items: [{ product_id: "prod-c", doses: 1 }], client_key: key });
+  assert.equal(retry.status, 409);
+  assert.equal(retry.body.code, "reload");
+  assert.equal(current.db.stacks.length, 1);
+  assert.deepEqual(itemsOf(current.db, first.body.stack_id), [["prod-a", 1], ["prod-b", 2]]);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -415,6 +451,7 @@ test("a database without the save function answers 503 and never falls back to t
 
 test("error answers are mapped from the code only", () => {
   assert.deepEqual([lib.stackSaveFailure("OXS01").status, lib.stackSaveFailure("OXS01").code], [409, "stale"]);
+  assert.deepEqual([lib.stackSaveFailure("OXS05").status, lib.stackSaveFailure("OXS05").code], [409, "reload"]);
   assert.equal(lib.stackSaveFailure("OXS02").status, 400);
   assert.equal(lib.stackSaveFailure("OXS03").status, 404);
   assert.equal(lib.stackSaveFailure("OXS04").status, 409);
@@ -461,6 +498,15 @@ test("stackSaveRequest: 409 stale is a StackConflict, other 4xx a refusal, 5xx a
   await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, answer(409, { error: "changed", code: "stale" })), (e) => {
     assert.equal(e.name, "StackConflict");
     assert.ok(e instanceof autosave.AutosaveRefused, "a conflict is a refusal (not retried)");
+    return true;
+  });
+  await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, answer(409, { error: "reload", code: "reload" })), (e) => {
+    assert.equal(e.name, "StackConflict", "an out-of-date page is offered the latest version too");
+    return true;
+  });
+  await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, answer(503, { error: "not set up", code: "not_set_up" })), (e) => {
+    assert.ok(e instanceof autosave.AutosaveRefused, "a missing database function is shown with Retry, not retried on its own");
+    assert.notEqual(e.name, "StackConflict");
     return true;
   });
   await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, answer(409, { error: "name", code: "name_taken" })), (e) => {
@@ -513,8 +559,35 @@ test("the SQL is additive, service-role only and one transaction with a row lock
   assert.doesNotMatch(sql, /DELETE FROM pds\.supplement_stack\b(?!_item)/, "a stack row is never removed (intake provenance)");
   // Every custom code the function raises has a non-500 answer in the route.
   const codes = [...new Set([...sql.matchAll(/ERRCODE = '(OXS\d\d)'/g)].map((m) => m[1]))];
-  assert.deepEqual(codes.sort(), ["OXS01", "OXS02", "OXS03", "OXS04"]);
+  assert.deepEqual(codes.sort(), ["OXS01", "OXS02", "OXS03", "OXS04", "OXS05"]);
   for (const c of codes) assert.notEqual(lib.stackSaveFailure(c).status, 500, c);
+  // A body that knows no version is refused, never saved last-writer-wins.
+  assert.match(sql, /IF p_expected_version IS NULL THEN\s+RAISE EXCEPTION [^;]*ERRCODE = 'OXS05'/);
+  assert.match(sql, /IF p_save_id IS NULL THEN\s+RAISE EXCEPTION [^;]*ERRCODE = 'OXS05'/);
+  assert.doesNotMatch(sql, /v_ok := p_expected_version IS NULL|v_ok := p_save_id IS NULL/);
+});
+
+test("a create with a client key takes the key's advisory lock before looking the key up or checking the name", () => {
+  const lock = sql.indexOf("pg_advisory_xact_lock(hashtextextended('pds.supplement_stack.client_key:' || p_client_key::text, 0))");
+  assert.ok(lock > 0, "the client-key lock is there");
+  const lookup = sql.indexOf("WHERE client_key = p_client_key FOR UPDATE");
+  const nameCheck = sql.indexOf("lower(s.name) = lower(v_name)");
+  assert.ok(lookup > lock, "the lookup comes after the lock (a waiting retry then sees the committed row)");
+  assert.ok(nameCheck > lock, "the name check comes after the lock (no false 'name in use' for its own stack)");
+});
+
+test("the production check is read-only; the behaviour checks refuse a database with real stacks", () => {
+  const checks = path.join(SRC, "..", "..", "sql", "checks");
+  const prod = fs.readFileSync(path.join(checks, "verify_supplement_stack_atomic_save.sql"), "utf8");
+  assert.match(prod, /^BEGIN TRANSACTION READ ONLY;/m);
+  const code = prod.replace(/--.*$/gm, "");
+  assert.doesNotMatch(code, /\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|SET\s+(LOCAL\s+)?ROLE)\b/i, "no write, DDL or role switch");
+  assert.doesNotMatch(code, /\bs\.name\b|SELECT\s+name\b|description/i, "counts only, never a stack name or description");
+  for (const f of ["verify_supplement_stack_atomic_save_branch.sql", "race_supplement_stack_create_branch.sql"]) {
+    const b = fs.readFileSync(path.join(checks, f), "utf8");
+    assert.match(b, /NEVER RUN THIS ON PRODUCTION/, f);
+    assert.match(b, /IF EXISTS \(SELECT 1 FROM pds\.supplement_stack\) OR EXISTS \(SELECT 1 FROM pds\.supplement_stack_item\) THEN\s+RAISE EXCEPTION 'refusing to run/, f);
+  }
 });
 
 test("the route saves only through the function; the editor sends versions and handles 409", () => {
@@ -536,4 +609,7 @@ test("the route saves only through the function; the editor sends versions and h
   assert.match(modal, /Load the latest version/);
   const page = read("app/supplements/SupplementsClient.tsx");
   assert.match(page, /version: s\.version \?\? null/);
+  // After a save the list is read again; until then a stack cannot be reopened from its old version.
+  assert.match(page, /setStacksReloading\(true\);\s+try \{\s+await loadStacks\(\);\s+\} finally \{\s+setStacksReloading\(false\);/);
+  assert.match(page, /disabled=\{stacksReloading\}/);
 });

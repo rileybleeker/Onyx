@@ -90,9 +90,10 @@ async function readBody(req: NextRequest): Promise<unknown> {
  *
  * client_key (the stack editor's autosave sends one random UUID per new stack): when a stack with that key exists
  * already (the editor retried after a lost answer), that stack is brought up to this body and returned with
- * existing: true instead of inserting a second one, but only when its last write was this editor's own (save ids);
- * a resend of a save that already went through answers replayed: true and writes nothing. There is no keyless
- * fallback: a database without the function answers 503 and creates nothing.
+ * existing: true instead of inserting a second one, but only when its last write was this editor's own (save ids;
+ * without a save_id that is 409 "reload"); a resend of a save that already went through answers replayed: true and
+ * writes nothing. A retry sent while the first copy is still running waits for it and then adopts it. There is no
+ * keyless fallback: a database without the function answers 503 and creates nothing.
  */
 export async function POST(req: NextRequest) {
   const parsed = parseStackSave(await readBody(req), "create");
@@ -109,8 +110,10 @@ export async function POST(req: NextRequest) {
  * Updates the header fields that are present (remind_time: 'HH:MM' sets it, empty or null turns the reminder off,
  * omitted leaves it alone). `items`, when present, is the COMPLETE list and replaces the old one in the same
  * transaction ([] clears the stack on purpose; anything that is not a valid array is refused with 400 and nothing
- * changes). With expected_version the save is refused with 409 { code: "stale" } when the stack changed since that
- * version, unless the change was this editor's own unanswered save (after_save_ids).
+ * changes). The save is refused with 409 { code: "stale" } when the stack changed since expected_version, unless the
+ * change was this editor's own unanswered save (after_save_ids). A body without expected_version (a tab running the
+ * previous build) is refused with 409 { code: "reload" } and changes nothing; an exact resend of a save that already
+ * went through (same save_id) is still answered as a replay.
  */
 export async function PATCH(req: NextRequest) {
   const parsed = parseStackSave(await readBody(req), "update");

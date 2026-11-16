@@ -9,8 +9,9 @@ import { parseRemindTime } from "@/lib/supplement-reminders";
  *
  * Request fields the editor adds (lib/supplement-stack-chain.ts): expected_version (the version it last saw),
  * save_id (a UUID per save; a resend of a save that already went through is answered with replayed: true) and
- * after_save_ids (its earlier saves whose answer it never got). A body without them (a tab still running the
- * previous build) is saved atomically as last-writer-wins.
+ * after_save_ids (its earlier saves whose answer it never got). An update without expected_version, or a retried
+ * create without save_id (a tab still running the previous build, or a list read before the migration), is refused
+ * with 409 "reload": it cannot show that it is not a late body overwriting a newer save.
  *
  * Errors are mapped from the database CODE only, never its message text (a unique violation also names the
  * client_key index, and must never be read as "no such column").
@@ -170,15 +171,18 @@ export function stackRpcArgs(req: StackSaveRequest): Record<string, unknown> {
   };
 }
 
-export type StackSaveCode = "stale" | "unknown_product" | "not_found" | "name_taken" | "conflict" | "invalid" | "not_set_up" | "failed";
+export type StackSaveCode = "stale" | "reload" | "unknown_product" | "not_found" | "name_taken" | "conflict" | "invalid" | "not_set_up" | "failed";
 
 export const STACK_STALE_MESSAGE = "This stack was changed somewhere else. Load the latest version, then make your change again.";
+export const STACK_RELOAD_MESSAGE = "This page is out of date. Reload it, then make your change again. Nothing was changed.";
 
 /** Answer for a database error, by code only. Every one of these means nothing was changed. */
 export function stackSaveFailure(code: string | null | undefined): { status: number; code: StackSaveCode; error: string } {
   switch (code) {
     case "OXS01":
       return { status: 409, code: "stale", error: STACK_STALE_MESSAGE };
+    case "OXS05":
+      return { status: 409, code: "reload", error: STACK_RELOAD_MESSAGE };
     case "OXS02":
     case "23503":
       return { status: 400, code: "unknown_product", error: "A product in this stack is not in your library. Nothing was changed." };
