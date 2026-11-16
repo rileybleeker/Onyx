@@ -47,8 +47,10 @@ const FORMS = [
 ];
 
 for (const [file, hooks, retired] of FORMS) {
-  test(`${file}: every saver shows its own status line with Retry, and no Save button is left`, () => {
-    assert.deepEqual(F.autosaveFormProblems(F.parseFile(file), { hooks, retired }), []);
+  test(`${file}: every saver shows its own status line with Retry, sends a typed field when it is left, and no Save button is left`, () => {
+    const sf = F.parseFile(file);
+    assert.deepEqual(F.autosaveFormProblems(sf, { hooks, retired }), []);
+    assert.deepEqual(F.blurFlushProblems(sf, { hooks }), []);
   });
 }
 
@@ -70,14 +72,46 @@ test("the form check reads structure, not formatting: wrapped JSX passes; a hidd
   assert.notDeepEqual(check(`${status}\n<button onClick={save}>\n  Save\n</button>`), [], "a wrapped Save button is back");
   assert.notDeepEqual(check(`${status}\n<button>{saving ? "Saving…" : "Save"}</button>`), [], "a Save button behind a ternary");
   assert.notDeepEqual(check(`${status}\n<LogSaveButton onClick={save} />`), [], "LogSaveButton says Save by default");
-  assert.equal(F.blurFlushes(form(`<input\n  onBlur={\n    () => {\n      void autosave.flush();\n    }\n  }\n/>`)), true);
-  assert.equal(F.blurFlushes(form(`<input onBlur={() => setTouched(true)} />`)), false);
+  const blur = (body) => F.blurFlushProblems(form(body), { hooks: ["useAutosave"] });
+  assert.deepEqual(blur(`<input\n  onBlur={\n    () => {\n      void autosave.flush();\n    }\n  }\n/>`), [], "a wrapped blur handler");
+  assert.notDeepEqual(blur(`<input onBlur={() => setTouched(true)} />`), [], "a typed field whose blur sends nothing");
+  assert.deepEqual(blur(`<input type="checkbox" onChange={() => autosave.change({ a: "x" })} />\n<input type="search" />`), [], "taps only: nothing to send on leaving");
 });
 
-test("typed fields of the larger forms also save when they are left (blur)", () => {
-  for (const file of ["app/health/HealthClient.tsx", "app/health/records/RecordsClient.tsx", "app/nyc/NycClient.tsx", "app/financials/budgets/BudgetsView.tsx", "app/financials/forecast/TaxAndWhatIf.tsx"]) {
-    assert.equal(F.blurFlushes(F.parseFile(file)), true, file);
-  }
+test("the form check looks at each saver in its own component: another component's status line or blur never covers it", () => {
+  const status = `<AutosaveStatus state={autosave.state} onRetry={() => void autosave.retry()} />`;
+  const field = `<input onChange={(e) => autosave.change(e.target.value)} onBlur={() => void autosave.flush()} />`;
+  // Two components of one file, each with a saver named `autosave` (PlanConfig, BudgetsView and RecordsClient do this).
+  const twoForms = (first, second) =>
+    F.parseSource(
+      `function FirstForm() {\n  const autosave = useAutosave("first", { save: async () => {} });\n  return <div>${first}</div>;\n}\n` +
+        `const SecondForm = () => {\n  const autosave = useAutosave("second", { save: async () => {} });\n  return <div>${second}</div>;\n};\n`,
+      "synthetic-two.tsx",
+    );
+  const statusProblems = (first, second) => F.autosaveFormProblems(twoForms(first, second), { hooks: ["useAutosave"] });
+  const blurProblems = (first, second) => F.blurFlushProblems(twoForms(first, second), { hooks: ["useAutosave"] });
+  assert.deepEqual(statusProblems(status, status), [], "each form shows its own status line");
+  const noSecond = statusProblems(status, `<p>Changes save on their own.</p>`);
+  assert.equal(noSecond.length, 1, "the second form's failures would be invisible");
+  assert.match(noSecond[0], /SecondForm/);
+  const noFirst = statusProblems(`<p>Changes save on their own.</p>`, status);
+  assert.equal(noFirst.length, 1);
+  assert.match(noFirst[0], /FirstForm/);
+  assert.deepEqual(blurProblems(`${status}${field}`, `${status}${field}`), []);
+  const noBlur = blurProblems(`${status}${field}`, `${status}<input onChange={(e) => autosave.change(e.target.value)} />`);
+  assert.equal(noBlur.length, 1, "leaving the second form's field would send nothing");
+  assert.match(noBlur[0], /SecondForm/);
+  // A local helper counts only when it flushes THIS saver.
+  const helper = (target) =>
+    F.blurFlushProblems(
+      F.parseSource(
+        `function Helpers() {\n  const a = useAutosave("a", {});\n  const b = useAutosave("b", {});\n  const flush = () => void ${target}.flush();\n` +
+          `  return <div><textarea onBlur={flush} /><AutosaveStatus state={a.state} onRetry={a.retry} /></div>;\n}\n`,
+        "synthetic-helpers.tsx",
+      ),
+      { hooks: ["useAutosave"] },
+    );
+  assert.deepEqual(helper("a").map((m) => /"b"/.test(m)), [true], "flushing a does not cover b");
 });
 
 // ─── supplement stack editor (mounted) ───────────────────────────────────────
@@ -324,7 +358,7 @@ test("care planner: a new item is created once it has a label and a date; later 
   assert.equal(server.stored.size, 1);
 });
 
-test("care planner: a create whose answer was lost is sent again with the newer edits, and they reach Onyx", async (t) => {
+test("care planner: a create whose answer was lost is shown with Retry, and the newer edits reach Onyx as that one item", async (t) => {
   let posts = 0;
   const server = careServer([], { lose: (call) => call.method === "POST" && ++posts === 1 });
   const h = await mountCare(t, server);
@@ -334,17 +368,19 @@ test("care planner: a create whose answer was lost is sent again with the newer 
   await h.flush();
   await h.tick(1200);
   assert.match(h.text(), /Not saved: Couldn.t save that to Onyx\./, "the failure is visible");
-  await h.tick(120_000);
-  assert.equal(h.net.writes().length, 1, "not sent again on its own");
+  assert.ok(h.button("Retry"), "with Retry");
+  // Whether a lost answer is also retried on its own is not pinned here (AGENTS.md: only a refusal waits for
+  // Retry; this page treats every failure as one today). What must hold: one item, with the newest edits.
   change(one(h, CARE_TITLE, "the label field"), "Synthetic checkup, moved");
   await h.flush();
-  await h.tick(1200);
-  const [first, second, update] = h.net.writes();
-  assert.deepEqual(methods(h), ["POST /api/care/items", "POST /api/care/items", `PATCH /api/care/items/${first.body.id}`]);
-  assert.equal(second.body.id, first.body.id, "the same item id: the server answers with the row it stored first");
-  assert.equal(update.body.title, "Synthetic checkup, moved");
+  await h.tick(60_000);
+  const writes = h.net.writes();
+  const id = writes[0].body.id;
+  assert.ok(writes.length >= 2, "the newer edit was sent");
+  assert.ok(writes.every((c) => (c.method === "POST" ? c.url === "/api/care/items" && c.body.id === id : c.url === `/api/care/items/${id}`)), "every write is for the one item: a create sent again carries the same id");
   assert.equal(server.stored.size, 1, "one item, not two");
-  assert.equal(server.stored.get(first.body.id).title, "Synthetic checkup, moved", "the newer label reached Onyx");
+  assert.equal(server.stored.get(id).title, "Synthetic checkup, moved", "the newer label reached Onyx");
+  assert.doesNotMatch(h.text(), /Not saved|Couldn.t save/, "and the page no longer says it failed");
 });
 
 test("care planner: switching to another item sends the open edit first and keeps it when it cannot be saved", async (t) => {
@@ -363,16 +399,16 @@ test("care planner: switching to another item sends the open edit first and keep
   assert.match(h.text(), /The item in the form is not saved yet\. Retry it/);
   assert.equal(one(h, CARE_TITLE, "the label field").props.value, "Synthetic eye exam, rescheduled", "the edit stays in the form");
   assert.match(h.text(), /Edit care item/);
-  await h.tick(120_000);
-  assert.equal(h.net.writes().length, 1);
+  // (Whether a 5xx is also retried on its own is not pinned here; see the lost-answer test above.)
   refuse = false;
   h.click("Retry");
   await h.flush();
   assert.equal(server.stored.get(X.id).title, "Synthetic eye exam, rescheduled");
+  const sent = h.net.writes().length;
   editButtonOf(h, "Synthetic dental cleaning").props.onClick();
   await h.flush();
   assert.equal(one(h, CARE_TITLE, "the label field").props.value, "Synthetic dental cleaning", "now the form follows the other item");
-  assert.equal(h.net.writes().length, 2, "switching after the save sent nothing more");
+  assert.equal(h.net.writes().length, sent, "switching after the save sent nothing more");
 });
 
 // ─── finance pages: the shared hook and the overall budget (mounted) ─────────
@@ -719,6 +755,50 @@ test("stacks route: works before the client_key column exists, and refuses a key
   assert.deepEqual(db2.ops, [], "nothing read or written");
 });
 
+test("stack editor + stacks route: after a create, Close and another new stack make a second stack with its own key", async (t) => {
+  const db = fakeSupabase();
+  const route = loadRoute("app/api/supplements/stacks/route.ts", db);
+  const toRoute = async (call) => {
+    const res = await route[call.method](jsonRequest(call.body));
+    return response(res.body, res.status);
+  };
+  let host = null;
+  // SupplementsClient keeps the editor mounted between opens (stack null = closed) and passes a fresh object for
+  // every "New stack", so the editor's refs (stack id, key) outlive one stack.
+  const probe = (load, hooks) => {
+    const StackEditorModal = load("components/StackEditorModal.tsx").default;
+    return function StackEditorHost() {
+      const [stack, setStack] = hooks.useState(() => ({ ...NEW_STACK }));
+      host = { open: (next) => setStack(next) };
+      return jsx(StackEditorModal, { open: stack !== null, stack, products: PRODUCTS, onClose: () => setStack(null), onSaved: () => setStack(null) });
+    };
+  };
+  const h = await mountForm(t, probe, { answer: toRoute });
+  async function createAndClose(name, productId) {
+    change(one(h, STACK_NAME, "the name field"), name);
+    await h.flush();
+    change(one(h, (n) => n.type === "select", "the product picker"), productId);
+    await h.flush();
+    await h.tick(400);
+    assert.match(h.text(), /Stack created/);
+    h.click("Close");
+    await h.flush();
+    assert.equal(h.find(STACK_NAME).length, 0, "the editor closed");
+  }
+  await createAndClose("Synthetic stack A", "synthetic-product-1");
+  host.open({ ...NEW_STACK });
+  await h.flush();
+  assert.equal(one(h, STACK_NAME, "the name field").props.value, "", "the new stack starts empty");
+  await createAndClose("Synthetic stack B", "synthetic-product-2");
+  const writes = h.net.writes();
+  assert.deepEqual(writes.map((c) => c.method), ["POST", "POST"], "two creates; the first stack is never PATCHed from the second");
+  assert.notEqual(writes[1].body.client_key, writes[0].body.client_key, "each new stack has its own key");
+  assert.deepEqual(db.tables.supplement_stack.map((r) => r.name), ["Synthetic stack A", "Synthetic stack B"], "two stacks: the first was not adopted and renamed");
+  const [a, b] = db.tables.supplement_stack.map((r) => r.stack_id);
+  assert.deepEqual(itemsOf(db, a).map((r) => r.product_id), ["synthetic-product-1"]);
+  assert.deepEqual(itemsOf(db, b).map((r) => r.product_id), ["synthetic-product-2"]);
+});
+
 test("the stack key migration is additive (no DROP; the Supabase connector declines it)", () => {
   const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "supplement_stack_client_key.sql"), "utf8");
   assert.doesNotMatch(sql, /drop/i);
@@ -748,7 +828,8 @@ test("NYC note: a note still waiting is sent before another lead opens, and one 
   assert.ok(guard && F.ts.isIfStatement(guard), "the switch waits on the note's flush");
   assert.ok(F.collect(guard.thenStatement, F.ts.isReturnStatement).length > 0, "a failed flush stops the switch");
   assert.ok(F.inOrder(toggle.body, (s) => F.hasCall(s, "noteSave.flush"), (s) => F.hasCall(s, "setExpandedId")), "sent before another lead opens");
-  assert.match(fs.readFileSync(path.join(SRC, "app/nyc/NycClient.tsx"), "utf8"), /is not saved yet\. Retry it/, "the message Riley sees");
+  const said = F.calls(guard.thenStatement).filter((c) => c.name === "setSaveError").map((c) => F.literalText(c.node.arguments[0]));
+  assert.ok(said.some((text) => /is not saved yet\. Retry it/.test(text ?? "")), "the failed flush tells Riley why the lead did not open");
 });
 
 test("tax profile: a recorded payment never races the profile autosave (both write the whole profile)", () => {
@@ -764,8 +845,37 @@ test("Say it suggestions save on their own in Supplements and Uber Eats (each tr
   const tried = F.topLevelConst(sup, "triedDrafts");
   assert.ok(tried && F.ts.isNewExpression(tried) && F.refName(tried.expression) === "Set", "module memory, not a ref: a remount (scroll, leaving /log) never logs a suggestion twice");
   assert.ok(F.inOrder(sup, (s) => F.hasCall(s, "triedDrafts.add"), (s) => F.hasCall(s, "saveSuggestionsRef.current")), "marked tried before its save starts");
-  assert.ok(F.calls(sup).some((c) => c.name === "triedDrafts.has"), "a tried suggestion is not sent again");
-  assert.ok(F.calls(sup).some((c) => c.name === "logged.has"), "a suggestion already logged today is left out");
+  // The one effect that logs Say it suggestions starts with a guard that returns for a draft already tried: without
+  // it, a reload of the stacks or the day runs the effect again and logs the same suggestions a second time.
+  const { ts } = F;
+  const effects = F.calls(sup).filter((c) => c.name === "useEffect" && F.hasCall(c.node, "triedDrafts.add"));
+  assert.equal(effects.length, 1, "one effect logs the suggestions");
+  const effect = effects[0].node.arguments[0];
+  assert.ok(effect && (ts.isArrowFunction(effect) || ts.isFunctionExpression(effect)) && ts.isBlock(effect.body), "the effect has a body");
+  const guard = effect.body.statements[0];
+  assert.ok(guard && ts.isIfStatement(guard), "the effect starts with its guard");
+  const then = guard.thenStatement;
+  assert.ok(ts.isReturnStatement(then) || (ts.isBlock(then) && then.statements.length > 0 && ts.isReturnStatement(then.statements[0])), "the guard returns before anything is scheduled");
+  const asked = F.calls(guard.expression).filter((c) => c.name === "triedDrafts.has" && c.node.arguments[0]?.getText() === "suggestionDraftId");
+  assert.equal(asked.length, 1, "the guard asks whether this draft was tried");
+  assert.ok(F.onlyThroughOr(asked[0].node, guard.expression), "a tried draft alone returns (one || of the guard: not negated, not and-ed)");
+  assert.ok(F.calls(effect).some((c) => c.name === "triedDrafts.add" && c.node.arguments[0]?.getText() === "suggestionDraftId"), "the draft it logs is the draft it marks tried");
+  // A suggestion already logged for its draft is left out of the list: `.filter((s) => !logged?.has(s.key))`, with
+  // `logged` this draft's entry in the module-level loggedItems.
+  const logged = F.topLevelConst(sup, "loggedItems");
+  assert.ok(logged && ts.isNewExpression(logged) && F.refName(logged.expression) === "Map", "logged items are module memory too");
+  const exclusions = F.calls(sup).filter((c) => c.name === "logged.has").filter(({ node }) => {
+    const not = node.parent;
+    if (!ts.isPrefixUnaryExpression(not) || not.operator !== ts.SyntaxKind.ExclamationToken) return false;
+    const fn = not.parent;
+    if (!ts.isArrowFunction(fn) || fn.body !== not || fn.parameters.length === 0) return false;
+    const filter = fn.parent;
+    if (!ts.isCallExpression(filter) || filter.arguments[0] !== fn || !/\.filter$/.test(F.refName(filter.expression) ?? "")) return false;
+    if (node.arguments[0]?.getText() !== `${fn.parameters[0].name.getText()}.key`) return false;
+    const scope = F.enclosingFunction(fn);
+    return F.collect(scope, (n) => ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === "logged" && !!n.initializer && F.refName(n.initializer) === "loggedItems.get()").length > 0;
+  });
+  assert.equal(exclusions.length, 1, "a suggestion already logged is filtered out of the list");
   const supButtons = F.jsxElements(sup).filter((e) => e.tag === "LogSaveButton");
   assert.ok(supButtons.some((b) => F.buttonLabels(b).includes("Retry")), "a failed suggestion offers Retry");
   // "Log a product" keeps its Log tap on purpose: logging a dose is the action itself.

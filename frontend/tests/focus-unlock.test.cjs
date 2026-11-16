@@ -474,6 +474,29 @@ test("settings card: hiding the page sends a waiting change at once, with keepal
   assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
 });
 
+test("settings card: leaving the page (pagehide) sends a waiting change once, with keepalive", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  assert.equal(h.page.fire("pagehide"), true, "the card listens for the page being left");
+  await h.flush();
+  assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
+  await h.tick(60_000);
+  assert.equal(puts(h).length, 1, "the pause that followed sent nothing more");
+});
+
+test("settings card: leaving the card (unmount, a route change) sends a waiting change once, with keepalive, then stops", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  assert.equal(puts(h).length, 0, "still waiting for the pause");
+  h.unmount();
+  await h.flush();
+  assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
+  await h.tick(60_000);
+  assert.equal(puts(h).length, 1, "nothing more once the card is gone");
+});
+
 test("settings card: settings that could not load show the error and offer nothing to send", async (t) => {
   const h = await mountCard(t, { config: response({ error: "Synthetic load failure" }, 500) });
   assert.match(h.text(), /Couldn.t load the Focus settings\./);

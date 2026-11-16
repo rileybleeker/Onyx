@@ -6,11 +6,14 @@
 // The first argument is a src path (its default export is mounted) or a factory `(load, hooks) => Component`, for a
 // small probe component around a real hook: `load(rel)` loads src modules with the same stubs and one module cache
 // as the rest of the mount, so the probe and the code it drives share every class and singleton.
+// `cache` (a Map, see load-ts.cjs) may arrive pre-seeded: a module registered under its src file (e.g. "lib/autosave.ts")
+// is what EVERY import of that file gets, whether written "@/lib/autosave" or "./autosave".
 const assert = require("node:assert/strict");
 const { loadTs } = require("./load-ts.cjs");
 
-function mountClient(relPath, { props = {}, stubs = {} } = {}) {
+function mountClient(relPath, { props = {}, stubs = {}, cache = new Map() } = {}) {
   let ids = 0;
+  let live = true;
   let dirty = true;
   let frame;
   let effects = [];
@@ -23,7 +26,8 @@ function mountClient(relPath, { props = {}, stubs = {} } = {}) {
     useState(initialValue) {
       const [slots, i] = slot();
       if (!(i in slots)) slots[i] = typeof initialValue === "function" ? initialValue() : initialValue;
-      return [slots[i], (value) => { const next = typeof value === "function" ? value(slots[i]) : value; if (!Object.is(next, slots[i])) { slots[i] = next; dirty = true; } }];
+      // After unmount a state update does nothing, as in React (a late answer cannot render the form again).
+      return [slots[i], (value) => { if (!live) return; const next = typeof value === "function" ? value(slots[i]) : value; if (!Object.is(next, slots[i])) { slots[i] = next; dirty = true; } }];
     },
     useRef(value) { const [slots, i] = slot(); return slots[i] ??= { current: value }; },
     useMemo(create, deps) {
@@ -36,12 +40,11 @@ function mountClient(relPath, { props = {}, stubs = {} } = {}) {
       const [slots, i] = slot();
       if (!slots[i] || deps === undefined || !equal(slots[i].deps, deps)) {
         const old = slots[i];
-        slots[i] = { deps };
+        slots[i] = { deps, effect: true };
         effects.push(() => { old?.cleanup?.(); slots[i].cleanup = effect(); });
       }
     },
   };
-  const cache = new Map();
   const load = (rel) => loadTs(rel, { react: hooks, ...stubs }, { cache });
   const Component = typeof relPath === "function" ? relPath(load, hooks) : load(relPath).default;
   function expand(node, id = "root") {
@@ -86,9 +89,20 @@ function mountClient(relPath, { props = {}, stubs = {} } = {}) {
     assert.ok(!node.props.disabled, `button enabled: ${label}`);
     return node.props.onClick?.();
   };
-  // Run every effect cleanup (timers, listeners), as React does on unmount.
+  // Run every effect cleanup (timers, listeners) once, as React does on unmount; nothing renders afterwards. A second
+  // call (a test's own unmount, then the mount's t.after) does nothing.
   function unmount() {
-    for (const f of frames.values()) for (const s of f.slots) s?.cleanup?.();
+    if (!live) return;
+    live = false;
+    dirty = false;
+    for (const f of frames.values()) {
+      for (const s of f.slots) {
+        if (!s || typeof s !== "object" || !s.effect || typeof s.cleanup !== "function") continue;
+        const cleanup = s.cleanup;
+        s.cleanup = undefined;
+        cleanup();
+      }
+    }
   }
   return { flush, text, nodes, button, buttons, click, unmount, find: (pred) => nodes().filter(pred) };
 }

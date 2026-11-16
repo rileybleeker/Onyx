@@ -113,50 +113,125 @@ function buttonLabels(el) {
 }
 const isButton = (el) => el.tag === "button" || /Button$/.test(el.tag);
 
-/**
- * The names each call of one of `hooks` is bound to, one group per call: `const autosave = useAutosave(...)` ->
- * ["autosave"]; `const { saver, undo } = useWeightAutosave(...)` -> ["saver", "undo"].
- */
-function hookBindings(node, hooks) {
-  const groups = [];
-  for (const d of collect(node, ts.isVariableDeclaration)) {
-    const init = d.initializer;
-    if (!init || !ts.isCallExpression(init) || !hooks.includes(refName(init.expression))) continue;
-    if (ts.isIdentifier(d.name)) groups.push([d.name.text]);
-    else if (ts.isObjectBindingPattern(d.name)) groups.push(d.name.elements.filter((e) => ts.isIdentifier(e.name)).map((e) => e.name.text));
-  }
-  return groups;
+const isFunctionLike = (n) => ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n) || ts.isMethodDeclaration(n);
+/** The nearest function around `node` (the component a hook is called in), or the file itself at module scope. */
+function enclosingFunction(node) {
+  for (let n = node.parent; n; n = n.parent) if (isFunctionLike(n)) return n;
+  return node.getSourceFile();
+}
+/** A readable name for a function from enclosingFunction: its own name, the const it is assigned to, or a fallback. */
+function scopeName(scope) {
+  if (ts.isSourceFile(scope)) return "module scope";
+  if (scope.name && ts.isIdentifier(scope.name)) return scope.name.text;
+  if (scope.parent && ts.isVariableDeclaration(scope.parent) && ts.isIdentifier(scope.parent.name)) return scope.parent.name.text;
+  return "an anonymous function";
 }
 
 /**
+ * Every call of one of `hooks` bound to names: { names, scope }. `const autosave = useAutosave(...)` -> names
+ * ["autosave"]; `const { saver, undo } = useWeightAutosave(...)` -> ["saver", "undo"]. `scope` is the component the
+ * hook is called in (enclosingFunction), so a check about one saver looks at that component only: two components
+ * of one file may each name their saver `autosave`.
+ */
+function saverBindings(node, hooks) {
+  const out = [];
+  for (const d of collect(node, ts.isVariableDeclaration)) {
+    const init = d.initializer;
+    if (!init || !ts.isCallExpression(init) || !hooks.includes(refName(init.expression))) continue;
+    let names = null;
+    if (ts.isIdentifier(d.name)) names = [d.name.text];
+    else if (ts.isObjectBindingPattern(d.name)) names = d.name.elements.filter((e) => ts.isIdentifier(e.name)).map((e) => e.name.text);
+    if (names) out.push({ names, scope: enclosingFunction(d) });
+  }
+  return out;
+}
+/** The names each call of one of `hooks` is bound to, one group per call (saverBindings without the scope). */
+const hookBindings = (node, hooks) => saverBindings(node, hooks).map((b) => b.names);
+
+/**
  * What a form that saves itself must show (AGENTS.md "Input saves itself"): a saver from the shared hook, a status
- * line for EVERY saver it binds that shows that saver's own state and offers Retry (so a failed save is never
- * invisible), and no button still carrying a retired Save label. Answers the problems found; [] = fine.
+ * line for EVERY saver that shows that saver's own state, in the component holding the saver, and offers Retry (so
+ * a failed save is never invisible), and no button still carrying a retired Save label. A status line in another
+ * component of the file does not count, even when its saver has the same name. Answers the problems found; [] = fine.
  */
 function autosaveFormProblems(sf, { hooks, retired = [] }) {
   const problems = [];
-  const groups = hookBindings(sf, hooks);
-  if (groups.length === 0) problems.push(`no saver from ${hooks.join(" / ")}`);
+  const savers = saverBindings(sf, hooks);
+  if (savers.length === 0) problems.push(`no saver from ${hooks.join(" / ")}`);
   const elements = jsxElements(sf);
-  const statuses = elements.filter((e) => e.tag === "AutosaveStatus");
-  for (const s of statuses) {
+  for (const s of elements.filter((e) => e.tag === "AutosaveStatus")) {
     if (s.attrs.state?.kind !== "expr" || !/\.state$/.test(s.attrs.state.ref ?? "")) problems.push("an <AutosaveStatus> without state={<saver>.state}");
     if (s.attrs.onRetry?.kind !== "expr") problems.push("an <AutosaveStatus> without onRetry (a failed save could not be retried)");
   }
-  const shown = new Set(statuses.map((s) => (s.attrs.state?.ref ?? "").replace(/\.state$/, "")));
-  for (const g of groups) if (!g.some((name) => shown.has(name))) problems.push(`saver "${g.join(", ")}" has no <AutosaveStatus state={…state}>`);
+  for (const { names, scope } of savers) {
+    const shown = jsxElements(scope).filter((e) => e.tag === "AutosaveStatus").map((e) => (e.attrs.state?.ref ?? "").replace(/\.state$/, ""));
+    if (!names.some((name) => shown.includes(name))) problems.push(`saver "${names.join(", ")}" in ${scopeName(scope)} has no <AutosaveStatus state={…state}>`);
+  }
   for (const b of elements.filter(isButton)) for (const label of buttonLabels(b)) if (retired.includes(label)) problems.push(`a ${b.tag} still says "${label}"`);
   return problems;
 }
 
-/** True when some onBlur handler calls a `flush` (`onBlur={() => void autosave.flush()}`, `onBlur={flush}`). */
-function blurFlushes(sf) {
-  const isFlush = (name) => /(^|\.)flush$/.test(name ?? "");
-  return jsxElements(sf).some((e) => {
-    const a = e.attrs.onBlur;
-    if (a?.kind !== "expr" || !a.expr) return false;
-    return isFlush(a.ref) || calls(a.expr).some((c) => isFlush(c.name));
-  });
+// Inputs that are not typed into: a tap on them saves after a short delay, so leaving them has nothing to send.
+const UNTYPED_INPUTS = new Set(["checkbox", "radio", "hidden", "file", "search", "button", "submit", "reset", "range", "color"]);
+/** A field Riley types into: a textarea, or an input that is not a checkbox, radio, search box, picker or button. */
+const isTypedField = (e) => e.tag === "textarea" || (e.tag === "input" && !(e.attrs.type?.kind === "string" && UNTYPED_INPUTS.has(e.attrs.type.text)));
+
+/**
+ * A test for the names that flush one of `names` inside `scope`: `<name>.flush`, or a local helper that calls it
+ * (`const flush = () => void autosave.flush();`, `async function done() { await autosave.flush(); }`).
+ */
+function flushesOf(scope, names) {
+  const own = (name) => names.some((n) => name === `${n}.flush`);
+  const helpers = new Set();
+  for (const d of collect(scope, ts.isVariableDeclaration)) {
+    if (ts.isIdentifier(d.name) && d.initializer && calls(d.initializer).some((c) => own(c.name))) helpers.add(d.name.text);
+  }
+  for (const f of collect(scope, (n) => ts.isFunctionDeclaration(n) && !!n.name && n !== scope)) {
+    if (f.body && calls(f.body).some((c) => own(c.name))) helpers.add(f.name.text);
+  }
+  return (name) => !!name && (own(name) || helpers.has(name));
+}
+
+/**
+ * Leaving a typed field sends what is waiting (AGENTS.md: "at once on Enter / blur"), checked per saver: in the
+ * component holding a saver that has a typed field, some onBlur must flush THAT saver (`onBlur={() => void
+ * autosave.flush()}`, `onBlur={flush}`). A saver whose component has only taps (a select, checkboxes) needs none.
+ * Answers the problems found; [] = fine.
+ */
+function blurFlushProblems(sf, { hooks }) {
+  const problems = [];
+  for (const { names, scope } of saverBindings(sf, hooks)) {
+    const elements = jsxElements(scope);
+    if (!elements.some(isTypedField)) continue;
+    const flushes = flushesOf(scope, names);
+    const leaves = elements.some((e) => {
+      const a = e.attrs.onBlur;
+      if (a?.kind !== "expr" || !a.expr) return false;
+      return flushes(a.ref) || calls(a.expr).some((c) => flushes(c.name));
+    });
+    if (!leaves) problems.push(`saver "${names.join(", ")}" in ${scopeName(scope)}: no typed field sends its change when it is left (onBlur -> flush)`);
+  }
+  return problems;
+}
+
+/** True when `node` decides `top` on its own: every step from it up to `top` is a parenthesis or an `||`. */
+function onlyThroughOr(node, top) {
+  for (let n = node; n !== top; n = n.parent) {
+    const p = n.parent;
+    if (!p) return false;
+    if (ts.isParenthesizedExpression(p)) continue;
+    if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.BarBarToken) continue;
+    return false;
+  }
+  return true;
+}
+
+/** The text a string or template literal shows, substitutions left out (`Your note${x} is not saved` -> "Your note is not saved"); null otherwise. */
+function literalText(expr) {
+  if (!expr) return null;
+  if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
+  if (ts.isTemplateExpression(expr)) return expr.head.text + expr.templateSpans.map((s) => s.literal.text).join("");
+  return null;
 }
 
 /** Module specifiers this file imports or re-exports from. */
@@ -213,9 +288,13 @@ module.exports = {
   hasCall,
   jsxElements,
   buttonLabels,
+  enclosingFunction,
+  saverBindings,
   hookBindings,
   autosaveFormProblems,
-  blurFlushes,
+  blurFlushProblems,
+  onlyThroughOr,
+  literalText,
   imports,
   functionNamed,
   topLevelConst,

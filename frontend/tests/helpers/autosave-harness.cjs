@@ -28,9 +28,10 @@ function manualTimers() {
 }
 
 /**
- * The "@/lib/autosave" stub for a mount: the real module (so AutosaveRefused, saveRequest and messageOf are the ones
- * every importer sees) with an Autosaver that schedules on `timers`. The real lib/use-autosave.ts builds its saver
- * from this export, so the hook under test is the shipped one, page-hidden and unmount handling included.
+ * lib/autosave.ts for a mount: the real module (so AutosaveRefused, saveRequest and messageOf are the ones every
+ * importer sees) with an Autosaver that schedules on `timers`. The real lib/use-autosave.ts builds its saver from
+ * this export, so the hook under test is the shipped one, page-hidden and unmount handling included. Register it
+ * with clockCache, not as a stub of one import spec.
  */
 function autosaveOnClock(timers) {
   const real = loadTs("lib/autosave.ts");
@@ -41,6 +42,16 @@ function autosaveOnClock(timers) {
   }
   return { ...real, __esModule: true, Autosaver };
 }
+
+/** Where load-ts.cjs keeps lib/autosave.ts in a module cache, whichever spec imported it. */
+const AUTOSAVE_FILE = "lib/autosave.ts";
+/**
+ * A module cache (for loadTs or mountClient) that already holds the clock-backed lib/autosave.ts under its file, so
+ * EVERY import of it, "@/lib/autosave" or a relative "./autosave", gets that one module: one AutosaveRefused class
+ * and one clock. A stub of the "@/lib/autosave" spec alone would hand a relative import a second, real copy (its
+ * own AutosaveRefused, real timers): a refusal retried on its own, saves fired on the real clock.
+ */
+const clockCache = (timers) => new Map([[AUTOSAVE_FILE, { exports: autosaveOnClock(timers) }]]);
 
 /** Run every scheduler timer due within `ms`, in order, letting the page settle (`settle()`) after each one. */
 async function advance(timers, settle, ms) {
@@ -159,9 +170,9 @@ async function mountAutosaving(t, target, { props = {}, stubs = {}, answer = () 
       restore();
     }
   });
-  h = mountClient(target, { props, stubs: { "@/lib/autosave": autosaveOnClock(timers), "lucide-react": { Check: () => null }, ...stubs } });
+  h = mountClient(target, { props, cache: clockCache(timers), stubs: { "lucide-react": { Check: () => null }, ...stubs } });
   await h.flush();
   return Object.assign({}, h, { net, page, timers, tick: (ms) => advance(timers, () => h.flush(), ms) });
 }
 
-module.exports = { manualTimers, autosaveOnClock, advance, eventTarget, pageEvents, partGridPassThrough, recordingFetch, replaceGlobals, mountAutosaving };
+module.exports = { manualTimers, autosaveOnClock, clockCache, advance, eventTarget, pageEvents, partGridPassThrough, recordingFetch, replaceGlobals, mountAutosaving };

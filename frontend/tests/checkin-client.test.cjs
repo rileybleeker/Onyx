@@ -6,7 +6,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
-const { manualTimers, autosaveOnClock, advance, pageEvents, partGridPassThrough } = require("./helpers/autosave-harness.cjs");
+const { manualTimers, clockCache, advance, pageEvents, partGridPassThrough } = require("./helpers/autosave-harness.cjs");
 
 const DAY = "Synthetic daytime question?";
 const SLEEP = "Synthetic sleep question?";
@@ -121,10 +121,10 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "@/components/personalize/PartGrid": partGridPassThrough(),
     // The /log Say it drafts (only the embedded check-in reads them; covered by tests/log-drafts.test.cjs).
     "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }), setLogDraft: () => {} },
-    // The real scheduler on the manual clock. lib/use-autosave.ts is NOT stubbed: the shipped hook runs, with its
-    // page-hidden (keepalive) and unmount handling, and builds its saver from this module.
-    "@/lib/autosave": autosaveOnClock(timers),
-  }).default;
+    // The real scheduler on the manual clock, registered under its file (clockCache) so every import of it gets the
+    // same module. lib/use-autosave.ts is NOT stubbed: the shipped hook runs, with its page-hidden (keepalive) and
+    // unmount handling, and builds its saver from that module.
+  }, { cache: clockCache(timers) }).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;
     if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
