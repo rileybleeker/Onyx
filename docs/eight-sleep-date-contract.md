@@ -26,10 +26,11 @@ Rules the ETL follows (since 2026-11-16):
 1. Onyx never dates an Eight Sleep row itself. `calendar_date` is the provider day.
 2. Values from `/intervals` (bed and room temperature, fallback biometrics) attach to a trend
    day by **session id**, never by the interval's own timestamp. The id is the day's
-   `mainSessionId`, else its only `sessionIds` entry when the day has exactly one session. A day
-   with several sessions and no `mainSessionId` has no known main session (the list order is not
-   documented, so the first may be a nap): nothing is attached, its stored temperatures stay, and
-   the self-heal and the comparison below count it as having no session. Unknown stays unknown.
+   `mainSessionId`, else the day's one session when `sessionIds` and the ids in `sessions[]`
+   together name exactly one. A day with several sessions and no `mainSessionId` has no known
+   main session (the list order is not documented, so the first may be a nap): nothing is
+   attached, never the first id, its stored temperatures stay, and the self-heal and the
+   comparison below count it as having no session. Unknown stays unknown.
 3. No row is written without a trend day. An interval whose night is still processing, or
    whose trends chunk failed, writes nothing; the next run (7-day window) or the temp
    self-heal (per-ID lookup) picks it up.
@@ -118,8 +119,9 @@ check the week around it read-only); rows older than the window are not touched.
 The condition is an onset at or after 06:00 local on the same date the sleep ends (onset - 6 h
 = the wake-up date). A sleep that starts in the afternoon or evening and ends after midnight is
 not affected: its onset - 6 h falls on the day before its wake-up date, where the move puts it.
-Rare; left as a documented limit. Fixing it means re-keying Eight Sleep by the main session's
-onset in `hrv_alignment.py`, which needs an `ALIGNMENT_VERSION` bump and a retrain.
+Rare; kept as a documented limit (decided 2026-11-16: no `ALIGNMENT_VERSION` change now).
+Fixing it is a follow-up: re-key Eight Sleep by the main session's onset in `hrv_alignment.py`,
+with an `ALIGNMENT_VERSION` bump and a retrain.
 
 **I. Nap on the same day.** Main session 01:00-08:00, nap 15:00-16:30 on 2026-04-14. The
 provider puts both in day 2026-04-14 and sums the stages for the day totals; the
@@ -153,7 +155,7 @@ date the `/intervals` list returned last.
 
 ## Affected-history plan (not run)
 
-1. Read-only comparison, from a PC with `.env`:
+1. Read-only comparison, a later step (not part of this change; Riley decides when it runs):
    `python eight_sleep_temp_backfill.py --compare`. It pages through every row of the table,
    looks up each stored row's main session (one call per distinct session, at most 1000 unless
    `--max-lookups N` raises it) and prints counts only: `scanned`, `truncated`, `rows`, `same`,
@@ -163,12 +165,32 @@ date the `/intervals` list returned last.
    checked" counts), `complete` (the scan finished) and `clean`. It writes nothing. Every run
    starts again from the newest row, so an identical re-run repeats the same capped lookups:
    when `over_cap` is not 0, re-run with `--max-lookups` at least `lookups + over_cap` (the
-   command prints that number). Provider and HTTP logging is turned down while it runs, but treat the whole
-   transcript as private: it is about Riley's rows, and a crash traceback can still carry a
-   provider id. **Timing:** the first runs after this change is deployed rewrite the temperatures
-   of the nights in the 7-day window with correctly paired values and keep no copy of the old
-   ones. If a pre-fix count for the most recent week is wanted, run the comparison before the
-   deploy; after it, that week reads as `same` whatever it held before.
+   command prints that number).
+   - **It needs credentials that are not on Riley's PC.** `eight_sleep_etl` reads
+     `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `EIGHTSLEEP_EMAIL` and `EIGHTSLEEP_PASSWORD`
+     (and `EIGHTSLEEP_CLIENT_ID` / `EIGHTSLEEP_CLIENT_SECRET` when set) from the environment or a
+     `.env` as soon as it is imported. The PC has no `.env` and the Eight Sleep login is held
+     only as GitHub Actions secrets, so on the PC as it is the command stops with a `KeyError`
+     before it reads anything. The route is one PowerShell session that holds those variables
+     for that session only: the service-role key read from `~/.onyx_supabase_secret`, the Eight
+     Sleep login typed in by Riley from where Riley keeps it. Never write them to a file in this
+     repository or under OneDrive, and never paste them into a chat.
+   - **No Actions route.** A `workflow_dispatch` input on `eight-sleep-etl.yml` would reuse the
+     existing secrets, but `.github/**` is a protected path and the Actions log is public: the
+     counts (`differ` above all) are aggregates of Riley's own nights, so they must not be
+     printed there. Such a route would need to keep its counts out of the log; it is not built.
+   - **Owner and receipt.** Riley runs it, or decides who runs it with the credentials. The
+     receipt is the one counts line, recorded privately in the Notes of the HIST-ETL-01
+     roadmap row, never in this repository, a PR or a public log. Provider and HTTP logging is
+     turned down while it runs, but treat the whole transcript as private: a crash traceback
+     can still carry a provider id.
+   - **Timing.** The first runs after this change reaches `master` (the scheduled run checks
+     out `master`) rewrite the temperatures of the nights in their window (7 days on the
+     schedule, more with a wider `-f days=N` catch-up) with correctly paired values and keep no
+     copy of the old ones. If the comparison has not run before the merge, the pre-fix state of
+     those nights is lost: they read as `same` whatever they held. Older history stays
+     measurable, because nothing else rewrites a stored temperature (the self-heal fills only
+     NULL ones).
 2. Closing rule. Claim 4 closes as "no harm" only when `clean = True`: `complete = True` (the
    whole table was read and `truncated`, `failed`, `over_cap` and `partial` are all 0),
    `differ = 0` **and** `not_verifiable = 0`. `complete = True` with `differ = 0` but
@@ -188,12 +210,12 @@ date the `/intervals` list returned last.
 
 These open items are also recorded in the Notes of the HIST-ETL-01 roadmap row.
 
-- The daytime-onset pairing (case H).
+- The daytime-onset pairing (case H): a documented limit, its fix a follow-up.
 - Whether the session `timezone` field is the Pod's own setting. Settling it needs one request
   with a different `?tz=`, an extra provider call this change does not make. Until then the
   GUARD may never fire even after a move (if the field only echoes the request).
 - Whether stored temperatures were actually harmed by the old start-date pairing (claim 4):
-  pending the comparison above.
+  pending the comparison above, which needs credentials and runs privately.
 - That `/intervals` items use the same id as the trend `mainSessionId` is assumed, not observed
   on a collection payload; rule 6 reports it if it ever fails.
 - Temperature units: `tempBedC` / `tempRoomC` are Celsius by name; not re-checked here.

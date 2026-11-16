@@ -33,6 +33,17 @@ when it reports over_cap > 0, re-run with a larger --max-lookups (at least
 lookups + over_cap) instead. Provider and HTTP logging is
 turned down while it runs, but treat the whole transcript as private anyway
 (a crash traceback can still carry a provider id).
+
+Credentials (every mode): importing eight_sleep_etl needs SUPABASE_URL,
+SUPABASE_SERVICE_ROLE_KEY, EIGHTSLEEP_EMAIL and EIGHTSLEEP_PASSWORD in the
+environment or a .env. Riley's PC has no .env and the Eight Sleep login is
+held only as GitHub Actions secrets, so there the script stops with a
+KeyError before it reads anything. Run --compare only in a shell session that
+holds those variables for that session (never saved to a file in the repo or
+under OneDrive), and never from Actions: its log is public and the counts are
+aggregates of Riley's nights. Record the counts line privately (the
+HIST-ETL-01 roadmap row), never in the repo, a PR or a public log. Details:
+docs/eight-sleep-date-contract.md, "Affected-history plan".
 """
 
 import sys

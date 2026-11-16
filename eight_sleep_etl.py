@@ -743,12 +743,13 @@ def _new_heal_stats() -> dict:
 def _session_id_from_raw(raw) -> str | None:
     """The main session id of a trends payload (or of a stored raw_json).
 
-    mainSessionId when present; else the sole sessionIds entry when the day
-    has exactly one session. A day with several sessions and no
-    mainSessionId has no known main session (the list order is not
-    documented, so the first one may be a nap): None, so nothing is paired
-    with it and stored temps stay as they are. raw_json is a dict on current
-    rows and a JSON string on older ones.
+    mainSessionId when present; else the day's one session, when sessionIds
+    (a list) and the ids in sessions[] name exactly one distinct session. A
+    day with several sessions and no mainSessionId has no known main session
+    (the list order is not documented, so the first one may be a nap): None,
+    never the first id, so nothing is paired with it and stored temps stay as
+    they are. A sessionIds that is not a list counts as no ids. raw_json is a
+    dict on current rows and a JSON string on older ones.
     """
     if isinstance(raw, str):
         try:
@@ -760,8 +761,12 @@ def _session_id_from_raw(raw) -> str | None:
     main_id = raw.get("mainSessionId")
     if main_id:
         return str(main_id)
-    session_ids = [i for i in (raw.get("sessionIds") or []) if i]
-    return str(session_ids[0]) if len(session_ids) == 1 else None
+    listed = raw.get("sessionIds")
+    ids = {str(i) for i in listed if i} if isinstance(listed, list) else set()
+    sessions = raw.get("sessions")
+    if isinstance(sessions, list):
+        ids |= {str(s["id"]) for s in sessions if isinstance(s, dict) and s.get("id")}
+    return ids.pop() if len(ids) == 1 else None
 
 
 def self_heal_temps(client, sb: Client, users: dict[str, str], today: date,

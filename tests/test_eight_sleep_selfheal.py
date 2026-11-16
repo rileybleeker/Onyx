@@ -389,6 +389,17 @@ def test_session_id_parsing_handles_json_string_and_sessionids_fallback() -> Non
     assert es._session_id_from_raw({"sessionIds": ["B", "C"]}) is None
     assert es._session_id_from_raw({"mainSessionId": "", "sessionIds": ["B", "C"]}) is None
     assert es._session_id_from_raw({"mainSessionId": None, "sessionIds": []}) is None
+    # Never the first id: sessions[] naming a second session makes the day
+    # ambiguous even when sessionIds lists one, and a sessionIds that is not a
+    # list (a bare string would otherwise be read letter by letter) is no ids.
+    assert es._session_id_from_raw(
+        {"sessionIds": ["B"], "sessions": [{"id": "B"}, {"id": "C"}]}) is None
+    assert es._session_id_from_raw({"sessions": [{"id": "N"}, {"id": "M"}]}) is None
+    assert es._session_id_from_raw({"sessionIds": ["B"], "sessions": [{"id": "B"}]}) == "B"
+    assert es._session_id_from_raw({"sessions": [{"id": "D"}]}) == "D"
+    assert es._session_id_from_raw({"sessionIds": ["B", "B"]}) == "B"
+    assert es._session_id_from_raw({"sessionIds": "X"}) is None
+    assert es._session_id_from_raw({"sessionIds": "XY"}) is None
     assert es._session_id_from_raw("not json") is None
     assert es._session_id_from_raw(None) is None
     sb = FakeSupabase([_trend_row("2026-11-01", raw='{"mainSessionId": "S1"}')])  # double-encoded
