@@ -1940,3 +1940,9 @@ export async function recordChatAnswer(
     return { ok: false, status: a.status, error: String(a.body.error) };
   }
 }
+
+/**
+ * For lib/reading-checkpoint-server.ts (READ-QUIZ-01 S5), the checkpoint quiz's round: the card mapping, the answered
+ * ideas and the error mapper stay the ones this file's own round uses.
+ */
+export { answerOf, answeredIdeaIds, cardOut };

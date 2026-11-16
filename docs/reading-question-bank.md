@@ -19,6 +19,9 @@ the UI (S4), the chapter map / checkpoint / XP (S5) and the chat tools (S6) buil
 | `frontend/src/lib/reading-bank.ts` | Generation core: cost, blocked hosts, citations, build gates, planner, heartbeat text |
 | `frontend/src/lib/reading-recall.ts` | Practice engine: the round, local grading, score math, schedule replay |
 | `frontend/src/lib/reading-model.ts` | The one model call helper (`bankModelCall`) and the price table |
+| `sql/reading_bank_checkpoint.sql` | Two read-only functions the checkpoint quiz needs (S5); MCP-safe, apply after `sql/reading_question_bank.sql` |
+| `frontend/src/lib/reading-checkpoint.ts`, `reading-checkpoint-server.ts` | Which ideas a checkpoint quiz asks, and `GET /api/reading/practice/checkpoint` (S5) |
+| `frontend/src/lib/reading-map.ts` | Chapter map, chapter sheet and checkpoint quiz: parsers, tile states, the quiz result (S5) |
 
 ## Apply order (Riley approves production schema writes)
 
@@ -295,3 +298,32 @@ highlights step links the new passage again or the idea has other evidence, and 
 - Logs and heartbeats carry counts, chapter numbers and codes from a fixed list (`BANK_CODES`) only, never a title
   or any text.
 - Code, tests and docs are generic; tests use a synthetic book.
+
+## Chapter map, checkpoint quiz, XP (S5)
+
+- **Chapter map** (`/reading`, part `chapter-map` in the "Chapters" group, shown only while the book's questions are on):
+  one tile per chapter (5 per row on a phone, 10 on desktop), each an icon plus a word: Locked, Building / Failed
+  (dashed), Few sources, In progress (recalled share in four steps), Covered (every core idea Explained), Needs review
+  (two lapses in 7 days). The header reads "Recalled N of M ideas · Kept K" and the 7- and 21-day recall with their n and
+  the definition. A narrative book's locked chapters show no title; a locked chapter is not a button. A tap opens the
+  chapter sheet (bottom sheet on a phone, side panel on desktop): recalled bar, Practice 5, the ideas with stage dots
+  (no statement before an idea was asked), flagged questions with Restore, "Built <date> · prompt <version>", Rebuild
+  chapter (confirm with its cost). A "Not read yet" hold is named under the header with Restore.
+- **Checkpoint quiz** (replaces the "quiz me" chat link on a checkpoint tile once the chapter is quizzable and the
+  chapters up to it hold 10 ideas): 10 questions, one per idea, from chapters 1..N, core ideas first, detail never, at
+  least half from the latest act (the chapters since the previous checkpoint), at least 3 explain questions, no idea
+  answered in the last 7 days. `GET /api/reading/practice/checkpoint?book=&chapter=N` builds it from
+  `pds.reading_bank_checkpoint_pool` (light rows, spoiler gate applied) and `pds.reading_bank_idea_cards` (the ten picked
+  ideas); same day, same quiz, and a reopened quiz keeps the cards answered in it. Answers carry `round_kind
+  "checkpoint"` and the quiz key (one per book, day and checkpoint: `sha256(book|day|checkpoint-quiz|chapter)`); the
+  runner has no Skip and no "Again". **Done** waits until every answer is saved and graded, then records the result
+  once through `POST /api/reading/quiz` with `op_key` = the quiz key (retried with the same request); the pass mark is
+  80%. Leaving without Done records nothing (the tile says "Answered · record result"); a quiz recorded today closes
+  that day's quiz.
+- **XP**: `XP.perPracticeCorrect = 2` / `perPracticePartial = 1` over the day's first counted answer of each idea
+  (checkpoint answers and invalidated answers left out in SQL); a day with a chapter question answered is a review day
+  (`perReviewDay` once per day, never twice) and counts for the Reviewer badge. No new badge, no new streak.
+  `computeOverview` carries `practice` (the bank's summary, null while the SQL is missing) and `xp.practice`; the chat
+  summary carries the counts only; Today shows one line "Practice · N ready" from the same summary.
+- **Apply order**: `sql/reading_bank_checkpoint.sql` after `sql/reading_question_bank.sql`. Until it is applied the
+  checkpoint route answers 503 `bank_unavailable` and the quiz says it is unavailable; nothing else changes.

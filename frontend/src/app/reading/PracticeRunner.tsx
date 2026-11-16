@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { MoreHorizontal, X } from "lucide-react";
+import { Check, Minus, MoreHorizontal, X } from "lucide-react";
 import { DONT_KNOW_ANSWER, gradeLocal, orderAnswerText, parseRubric, QUICK_SIZE, type ModelVerdict, type Verdict } from "@/lib/reading-recall";
 import { attemptFor, classifyReviewAnswer, GRADE_LABEL, intervalLabel, newOpKey, PRACTICE_GRADES, type PracticeGrade, type ReviewAttempt } from "@/lib/reading-practice";
 import {
@@ -47,6 +47,8 @@ import {
   type SummaryItem,
   type Timers,
 } from "@/lib/reading-practice-client";
+import { classifyQuizAnswer, passed as quizPassed, QUIZ_URL, quizRequest } from "@/lib/reading-map";
+import { CHECKPOINT_PASS } from "@/lib/reading";
 import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, OrderPicker, VerdictWord, WhereFrom } from "./PracticeCards";
 
 /**
@@ -91,6 +93,13 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  *   recall answer that listed the idea leaves with its Covered / Missed lists; the round is re-read.
  * - Keys only act from inside the runner (or with nothing focused) and never on an event another widget handled;
  *   Esc only with focus inside.
+ * - Chapter mode ("Practice 5" on a chapter sheet) is a round like any other. Checkpoint mode (READ-QUIZ-01 S5) is a
+ *   quiz: its answers carry round_kind "checkpoint" and the quiz_key, there is no Skip and no "Again" (one answer per
+ *   idea), and the summary is the quiz result: right of total, the 80% line, the answers to open again. Done waits
+ *   until every answer is saved and graded (Disagree and "Grade it yourself" stay possible until then), then records
+ *   the result once through POST /api/reading/quiz with op_key = quiz_key (a lost answer is retried with the SAME
+ *   request, so it is stored once); leaving without Done records nothing. The score is the answers graded right, the
+ *   total every answer the server still counts (a Wrong / Unclear flag voids one, a "Not read yet" hold does not).
  * - The verdict is announced once (aria-live polite) as a word; every verdict on screen is an icon plus a word.
  *   Check / Next move focus predictably (to Next, then to the next prompt). Keys on a desktop: 1-4 pick an option,
  *   Enter checks a choice, Ctrl/Cmd+Enter checks a typed answer, N goes to the next card, Esc closes the menu or the
@@ -104,6 +113,13 @@ interface Change {
   verdict: ModelVerdict;
   status: "saving" | "saved" | "unknown" | "refused";
   message?: string;
+}
+
+interface QuizSave {
+  status: "idle" | "saving" | "saved" | "unknown" | "refused";
+  message?: string;
+  passed?: boolean;
+  xp?: number;
 }
 
 interface Item {
@@ -285,10 +301,22 @@ const SETTLE_MAX_MS = 10_000;
 const PRIMARY = "inline-flex min-h-11 items-center justify-center rounded-full bg-accent px-5 text-[15px] font-medium text-on-accent";
 const SECONDARY = "inline-flex min-h-11 items-center justify-center rounded-control border border-border-default px-3 text-[14px] text-text-primary";
 
+export interface CheckpointInfo {
+  slug: string;
+  chapter: number;
+  /** "ch12". */
+  key: string;
+  quizKey: string;
+}
+
 export interface PracticeRunnerProps {
   round: PracticeRound;
   /** daily: the whole round; quick: the first 3 cards still open today; extra: "One more round". */
-  mode: "daily" | "quick" | "extra";
+  mode: "daily" | "quick" | "extra" | "chapter" | "checkpoint";
+  /** Checkpoint mode: the quiz this round belongs to ("ch12" is the key its result is recorded under). */
+  checkpoint?: CheckpointInfo;
+  /** The quiz result was stored (the first time, or a replay of the same request). */
+  onRecorded?: (r: { score: number; total: number; passed: boolean; xp: number }) => void;
   /**
    * ×, Esc, Done. `changed`: something was stored or flagged; `finished`: the summary was reached. `settled` is set
    * when answers or flags were still on their way at close: it resolves once they are (at most SETTLE_MAX_MS), and the
@@ -312,7 +340,9 @@ export interface PracticeRunnerProps {
 const startingCards = (round: PracticeRound, mode: PracticeRunnerProps["mode"]): PracticeCard[] =>
   mode === "quick" ? round.cards.filter((c) => !c.done).slice(0, QUICK_SIZE) : round.cards;
 
-export default function PracticeRunner({ round, mode, onClose, onMore, onReread, outbox: held, timers = realTimers }: PracticeRunnerProps) {
+export default function PracticeRunner({ round, mode, checkpoint, onClose, onMore, onReread, onRecorded, outbox: held, timers = realTimers }: PracticeRunnerProps) {
+  // A checkpoint quiz: answers carry the quiz key, there is no Skip and no "Again", and Done records the result.
+  const isQuiz = mode === "checkpoint" && !!checkpoint;
   const ownOutbox = useRef<AttemptOutbox | null>(null);
   if (!ownOutbox.current) ownOutbox.current = new Map();
   // Requests sent and not confirmed: re-sent with keepalive when the page hides, and kept past this runner when it closes.
@@ -339,6 +369,8 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const [focus, setFocus] = useState<"prompt" | "next" | "retry" | "summary" | "menu" | "input" | "note" | null>("prompt");
   const [pollTick, setPollTick] = useState(0);
+  // Checkpoint mode: the result's save (idle -> saving -> saved, or unknown / refused with Retry or a way out).
+  const [rec, setRec] = useState<QuizSave>({ status: "idle" });
   const [sheet, setSheet] = useState<{ top: number; height: number } | null>(null);
   // A phone (< 768 px) gets the full-screen sheet, drawn in document.body: inside the page it would sit in the app
   // shell's own stacking context, under the fixed mobile header and tab bar. Follows the media query (rotation).
@@ -375,6 +407,10 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const noteRef = useRef<HTMLParagraphElement | null>(null);
   const onRereadRef = useRef(onReread);
   onRereadRef.current = onReread;
+  const onRecordedRef = useRef(onRecorded);
+  onRecordedRef.current = onRecorded;
+  // The result's request, kept so Retry sends the SAME one (the score cannot differ between two tries).
+  const quizReq = useRef<ReturnType<typeof quizRequest> | null>(null);
 
   const patch = (key: string, p: Partial<Item> | ((it: Item) => Partial<Item>)) =>
     setItems((prev) => {
@@ -642,7 +678,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         announced.current.add(it.key);
         if (it.key === curKey || it.key === viewKey) setAnnounce(`${VERDICT_VIEW[v].word}.`);
       }
-      if (it.stored && !it.earlier && !it.again && (v === "incorrect" || v === "dont_know") && it.card.kind === "idea" && it.card.again_question && !againDone.current.has(it.key) && !gatedRef.current.has(it.card.key)) {
+      if (!isQuiz && it.stored && !it.earlier && !it.again && (v === "incorrect" || v === "dont_know") && it.card.kind === "idea" && it.card.again_question && !againDone.current.has(it.key) && !gatedRef.current.has(it.card.key)) {
         againDone.current.add(it.key);
         if (it.card.again_question.question_id !== it.question?.question_id) add.push(newItem(it.card, it.card.again_question, true));
       }
@@ -880,10 +916,12 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       version: q.version,
       round_key: round.round_key,
       round_date: round.today,
-      round_kind: round.kind,
+      round_kind: isQuiz ? "checkpoint" : round.kind,
       answer,
       hinted,
       response_ms: Math.max(0, Math.min(3_600_000, Math.round(timers.now() - shown))),
+      // Only a checkpoint answer carries the quiz key (the route refuses one without the other).
+      ...(isQuiz && checkpoint ? { quiz_key: checkpoint.quizKey } : {}),
     };
     patch(key, { phase: "saving", req, local: g.kind === "graded" ? g.verdict : null, message: null });
     setFocus("next");
@@ -955,7 +993,8 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
 
   function skip() {
     const it = cur;
-    if (!it || !answerable(it)) return;
+    // A quiz has no Skip: every question is answered once (I don't know is an answer).
+    if (!it || !answerable(it) || isQuiz) return;
     setMenuOpen(false);
     if (it.skips >= 1) {
       patch(it.key, { phase: "out" });
@@ -1056,6 +1095,30 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     patch(key, { change: { mode, verdict, status: out.kind, message: out.message } });
   }
 
+  /**
+   * Done on a checkpoint quiz: record the result once. The request is built the first time and kept, so Retry after a
+   * lost answer sends the same one (op_key = quiz_key: a stored result answers its own receipt, never a second row).
+   */
+  async function recordQuiz(score: number, total: number) {
+    if (!isQuiz || !checkpoint || rec.status === "saving" || rec.status === "saved") return;
+    const req = quizReq.current ?? quizRequest(checkpoint.slug, checkpoint.key, checkpoint.quizKey, score, total);
+    quizReq.current = req;
+    setRec({ status: "saving" });
+    const r = await track(postJson(QUIZ_URL, req));
+    if (!alive.current) return;
+    const out = classifyQuizAnswer(r.status, r.body);
+    if (out.kind === "saved") {
+      changed.current = true;
+      setRec({ status: "saved", passed: out.passed, xp: out.xp });
+      onRecordedRef.current?.({ score: req.score, total: req.total, passed: out.passed, xp: out.xp });
+      setFocus("summary");
+      return;
+    }
+    // A refusal stored nothing: the next Done builds a new request from what is on screen.
+    if (out.kind === "refused") quizReq.current = null;
+    setRec({ status: out.kind, message: out.message });
+  }
+
   /* ---------------------------- keys ---------------------------- */
 
   // Keys go to the runner only from inside it (or with nothing focused): never an event another widget already
@@ -1132,7 +1195,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     .map((it) => {
       const v = vOf(it);
       // A voided answer earns no XP and moves no idea up (acceptance 9); it still counts as answered.
-      const counts = !isVoided(it, results, voidedKeys) && it.stored && !it.earlier && !it.again && it.card.kind === "idea" && (it.card.preview?.counts ?? false);
+      const counts = !isQuiz && !isVoided(it, results, voidedKeys) && it.stored && !it.earlier && !it.again && it.card.kind === "idea" && (it.card.preview?.counts ?? false);
       return {
         roundCard: !it.again,
         answered: it.stored,
@@ -1146,6 +1209,17 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       };
     });
   const summary = summarize(summaryItems, round.today);
+  // Checkpoint mode: what the result is made of. An answer counts while the server still counts it (a Wrong / Unclear
+  // flag voids one; a "Not read yet" hold does not), the score is the ones graded right, and Done waits until every
+  // answer is saved and graded (an answer on its way, a model grade, a Disagree being saved, a grade not read yet).
+  const quizItems = isQuiz ? order.map((k) => items[k]).filter((it): it is Item => !!it && it.stored && it.card.kind === "idea" && !isVoided(it, results, voidedKeys)) : [];
+  const quizVerdicts = quizItems.map((it) => vOf(it));
+  const quizScore = quizVerdicts.filter((v) => v === "correct").length;
+  const quizTotal = quizItems.length;
+  const quizUnread = quizItems.filter((it, i) => quizVerdicts[i] === null && !gOf(it)).length;
+  const quizUnsent = Object.values(items).some((it) => it.phase === "saving" || it.phase === "unknown" || it.change?.status === "saving");
+  const quizWaiting = summary.stillGrading > 0 || quizUnread > 0 || quizUnsent;
+  const quizPct = quizTotal > 0 ? Math.round((100 * quizScore) / quizTotal) : 0;
   const recallItem = order.map((k) => items[k]).find((it) => it?.card.kind === "chapter_recall" && it.stored && !gated.has(it.card.key) && !isVoided(it, results, voidedKeys));
   const recallResult = recallItem ? results[attemptKeyOf(recallItem) ?? ""] : undefined;
   const recallSplit = coveredSplit(recallResult?.covered_ideas);
@@ -1213,12 +1287,43 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
         ) : (
           <section data-testid="practice-summary" className="space-y-3">
             <h2 ref={summaryRef} tabIndex={-1} className="text-[17px] font-medium text-text-primary outline-none">
-              Round done
+              {isQuiz && checkpoint ? `Checkpoint · ch ${checkpoint.chapter}` : "Round done"}
             </h2>
-            <p className="font-mono text-[15px] text-text-primary">
-              {summary.answered} of {summary.total} · +{summary.xp} XP
-            </p>
-            {summary.movedUp > 0 && (
+            {isQuiz ? (
+              <div className="space-y-1.5">
+                <p data-testid="quiz-score" className="font-mono text-[15px] text-text-primary">
+                  {quizScore} of {quizTotal} · {quizPct}%
+                </p>
+                {quizUnsent ? (
+                  <p role="status" className="text-[14px] text-text-secondary">
+                    Saving answers
+                  </p>
+                ) : quizUnread > 0 ? (
+                  <p role="status" className="flex flex-wrap items-center gap-2 text-[14px] text-text-secondary">
+                    <span>Checking answers</span>
+                    <button type="button" onClick={() => void refreshResults(true)} className="inline-flex min-h-11 items-center px-1 text-accent">
+                      Read grades again
+                    </button>
+                  </p>
+                ) : summary.stillGrading === 0 && quizTotal > 0 ? (
+                  <p data-testid="quiz-pass" className={`inline-flex items-center gap-1.5 text-[14px] font-medium ${quizPassed(quizScore, quizTotal) ? "text-up" : "text-mid"}`}>
+                    {quizPassed(quizScore, quizTotal) ? <Check aria-hidden="true" className="h-4 w-4" /> : <Minus aria-hidden="true" className="h-4 w-4" />}
+                    <span>{quizPassed(quizScore, quizTotal) ? "Passed" : "Not yet"}</span>
+                    <span className="font-mono text-[12px] font-normal text-text-tertiary">{Math.round(CHECKPOINT_PASS * 100)}% passes</span>
+                  </p>
+                ) : null}
+                {rec.status === "saved" && (
+                  <p data-testid="quiz-recorded" className="text-[14px] text-text-secondary">
+                    Recorded · <span className="font-mono">+{rec.xp ?? 0} XP</span>
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="font-mono text-[15px] text-text-primary">
+                {summary.answered} of {summary.total} · +{summary.xp} XP
+              </p>
+            )}
+            {!isQuiz && summary.movedUp > 0 && (
               <p className="text-[14px] text-text-secondary">
                 <span className="font-mono">{summary.movedUp}</span> {summary.movedUp === 1 ? "idea" : "ideas"} moved up
               </p>
@@ -1252,10 +1357,32 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
                 ))}
               </ul>
             )}
+            {isQuiz && (rec.status === "unknown" || rec.status === "refused") && (
+              <AlertLine heading={rec.status === "unknown" ? "Not sure it saved:" : "Not saved:"} message={rec.message ?? ""}>
+                {rec.status === "unknown" && (
+                  <button type="button" onClick={() => void recordQuiz(quizScore, quizTotal)} className={SECONDARY}>
+                    Retry
+                  </button>
+                )}
+              </AlertLine>
+            )}
             <div className="flex flex-wrap items-center gap-2 pt-1">
-              <button type="button" onClick={close} className={PRIMARY}>
-                Done
-              </button>
+              {isQuiz && quizTotal > 0 && rec.status !== "saved" ? (
+                <button
+                  type="button"
+                  aria-disabled={quizWaiting || rec.status === "saving" || undefined}
+                  onClick={() => {
+                    if (!quizWaiting && rec.status !== "saving") void recordQuiz(quizScore, quizTotal);
+                  }}
+                  className={`${PRIMARY} ${quizWaiting || rec.status === "saving" ? "opacity-40" : ""}`}
+                >
+                  Done
+                </button>
+              ) : (
+                <button type="button" onClick={close} className={PRIMARY}>
+                  {isQuiz && rec.status === "saved" ? "Close" : "Done"}
+                </button>
+              )}
               {againShown.length > 0 && (
                 <button type="button" onClick={() => takeAgain(againShown)} className={SECONDARY}>
                   {`Try again · ${againShown.length}`}
@@ -1344,6 +1471,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
                     it={active}
                     canFlag={!hidden.has(active.key)}
                     onSkip={skip}
+                    canSkip={!isQuiz}
                     onShowChoices={() => {
                       setMenuOpen(false);
                       patch(active.key, { hinted: true, choice: null });
@@ -1372,7 +1500,7 @@ const flagKindsOf = (it: Item): FlagKind[] =>
 /** Whether the ⋯ menu has anything in it (an answered card already flagged offers nothing). */
 const hasMenu = (it: Item, canFlag: boolean) => answerable(it) || (canFlag && it.phase !== "saving" && it.phase !== "unknown" && flagKindsOf(it).length > 0);
 
-function CardMenu({ it, canFlag, onSkip, onShowChoices, onFlag }: { it: Item; canFlag: boolean; onSkip: () => void; onShowChoices: () => void; onFlag: (k: FlagKind) => void }) {
+function CardMenu({ it, canFlag, onSkip, canSkip, onShowChoices, onFlag }: { it: Item; canFlag: boolean; onSkip: () => void; canSkip: boolean; onShowChoices: () => void; onFlag: (k: FlagKind) => void }) {
   const rub = it.question ? parseRubric(it.question.rubric) : null;
   const canChoices = answerable(it) && it.question?.format === "cued" && !it.hinted && rub?.format === "cued" && (rub.options?.length ?? 0) === 4;
   const busyNow = it.phase === "saving" || it.phase === "unknown";
@@ -1380,7 +1508,7 @@ function CardMenu({ it, canFlag, onSkip, onShowChoices, onFlag }: { it: Item; ca
   const item = "flex min-h-11 w-full items-center px-3 text-left text-[14px] text-text-primary hover:bg-white/[0.05]";
   return (
     <div role="menu" aria-label="Card actions" className="absolute bottom-full right-0 z-10 mb-2 w-56 overflow-hidden rounded-control border border-border-default bg-surface-raised py-1 shadow-card">
-      {answerable(it) && (
+      {answerable(it) && canSkip && (
         <button type="button" role="menuitem" onClick={onSkip} className={item}>
           Skip for now
         </button>

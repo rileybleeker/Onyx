@@ -491,6 +491,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // A sync that never ran, or whose heartbeat could not be read (lastSync null), is not a current answer either.
   const syncStale = !!email && syncLateness(lastSync, now.getTime(), LABEL_SYNC_STALE_MS);
   const book = reading.state === "ready" ? reading.value : null;
+  // Chapter questions ready for today's round (READ-QUIZ-01): from the overview's own summary, so no extra request; 0 while the bank is off or an older cached overview has none.
+  const practiceReady = book?.practice?.enabled ? Math.min(8, Math.max(0, book.practice.due || 0) + Math.max(0, book.practice.newReady || 0)) : 0;
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
   // The package email check behind the summary is late or failing (an older answer without the field: not known yet,
   // and its fresh read is already running).
@@ -1015,6 +1017,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         {reading.state === "ready" && (book ? <>
           <p className="mt-3 text-base font-medium text-text-primary">{book.book.title}</p>
           <p className="mt-1 text-sm text-text-secondary">{Number.isFinite(book.chaptersDone) && Number.isFinite(book.totalChapters) && book.totalChapters > 0 && book.chaptersDone >= 0 && book.chaptersDone <= book.totalChapters ? `${book.chaptersDone} of ${book.totalChapters} chapters recorded.` : "Chapter progress is not available."}</p>
+          {practiceReady > 0 && <p className="mt-1 text-sm"><Link href="/reading" className={linkStyle}>Practice · <span className="font-mono">{practiceReady}</span> ready</Link></p>}
           <p className="mt-1 text-xs text-text-secondary">Recorded progress may lag your latest reading.</p>
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>
