@@ -31,6 +31,11 @@ function makeDb() {
     failAfterItemClear: false,
     /** The next call answers this error (as PostgREST would), with a message that must never reach the answer. */
     nextError: null,
+    /**
+     * The next call COMMITS, then its answer is lost: "throw" (the call rejects), "empty" (no row and no error) or
+     * "nocode" (an error with an empty code, as supabase-js reports a dropped connection).
+     */
+    loseAnswer: null,
     /** GET: answer for each select (by whether it asks for `version`). */
     selectAnswer: () => ({ data: [], error: null }),
   };
@@ -110,8 +115,15 @@ function makeDb() {
       if (fn !== "save_supplement_stack") return { data: null, error: { code: "PGRST202" } };
       const snapshot = JSON.stringify({ stacks: db.stacks, items: db.items, seq: db.seq });
       try {
-        return { data: save(args), error: null };
+        const data = save(args);
+        const lose = db.loseAnswer;
+        db.loseAnswer = null;
+        if (lose === "throw") throw Object.assign(new Error("socket hang up"), { committed: true });
+        if (lose === "empty") return { data: null, error: null };
+        if (lose === "nocode") return { data: null, error: { code: "", message: "TypeError: fetch failed private detail" } };
+        return { data, error: null };
       } catch (e) {
+        if (e.committed) throw e; // the transaction committed; only the answer is gone
         const s = JSON.parse(snapshot); // one transaction: everything goes back
         db.stacks = s.stacks;
         db.items = s.items;
@@ -295,6 +307,64 @@ test("a save whose answer was lost is resent with the same id and answered as a 
   assert.deepEqual(chain.unanswered, []);
 });
 
+// A save that committed but whose answer never arrived must not be reported as "Nothing was changed" (Codex R2,
+// PR 365): the route says the outcome is not confirmed, the editor keeps the save id, and the resend is a replay.
+test("commit, then the answer is lost: the route says the save may have gone through, and the resend is a replay", async () => {
+  for (const lose of ["throw", "empty", "nocode"]) {
+    const db = reset();
+    const id = await seedStack(db);
+    const chain = new chainLib.StackSaveChain(1, idGen(320));
+    const body = { stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 3 }] };
+    const f1 = chain.next(body);
+    current.db.loseAnswer = lose;
+    const lost = await patch({ ...body, ...f1 });
+    assert.ok(lost.status >= 500, `${lose}: a 5xx, retried by the editor`);
+    assert.equal(lost.body.code, "unconfirmed", lose);
+    assert.doesNotMatch(lost.body.error, /Nothing was changed/i, `${lose}: never claims nothing changed`);
+    assert.match(lost.body.error, /may or may not have been saved/);
+    assert.doesNotMatch(JSON.stringify(lost.body), /private detail|socket hang up|fetch failed/, "no database or transport text");
+    assert.deepEqual(itemsOf(current.db, id), [["prod-c", 3]], `${lose}: the save did commit`);
+    // The editor's fetch turns this answer into an unconfirmed outcome: retried, not a refusal, id kept.
+    await assert.rejects(
+      chainLib.stackSaveRequest("PATCH", {}, false, async () => ({ ok: false, status: lost.status, json: async () => lost.body })),
+      (e) => {
+        assert.equal(e.name, "StackSaveUnconfirmed");
+        assert.ok(!(e instanceof autosave.AutosaveRefused), "retried with backoff and Retry, not shown as a refusal");
+        assert.doesNotMatch(e.message, /Nothing was changed/i);
+        return true;
+      },
+    );
+    assert.deepEqual(chain.unanswered, [f1.save_id], "the save id stays unanswered");
+    const f2 = chain.next(body);
+    assert.equal(f2.save_id, f1.save_id, "Retry sends the same save id");
+    const again = await patch({ ...body, ...f2 });
+    assert.equal(again.status, 200, lose);
+    assert.equal(again.body.replayed, true, `${lose}: answered as a replay`);
+    assert.equal(again.body.version, 2, `${lose}: written once`);
+    assert.deepEqual(itemsOf(current.db, id), [["prod-c", 3]]);
+  }
+});
+
+test("a create that committed but lost its answer is resent with the same key and id: one stack, replayed", async () => {
+  const db = reset();
+  const chain = new chainLib.StackSaveChain(null, idGen(340));
+  const key = uuid(339);
+  const f1 = chain.next(BODY);
+  db.loseAnswer = "throw";
+  const lost = await post({ ...BODY, client_key: key, ...f1 });
+  assert.equal(lost.status, 502);
+  assert.equal(lost.body.code, "unconfirmed");
+  assert.doesNotMatch(lost.body.error, /Nothing was changed/i);
+  assert.equal(current.db.stacks.length, 1, "the create did commit");
+  const f2 = chain.next(BODY);
+  assert.equal(f2.save_id, f1.save_id);
+  const again = await post({ ...BODY, client_key: key, ...f2 });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.replayed, true);
+  assert.equal(again.body.stack_id, current.db.stacks[0].stack_id);
+  assert.equal(current.db.stacks.length, 1, "no second stack");
+});
+
 test("after a lost answer, the next (changed) save is accepted: the stack's last write was this editor's own", async () => {
   const db = reset();
   const id = await seedStack(db);
@@ -458,8 +528,20 @@ test("error answers are mapped from the code only", () => {
   assert.equal(lib.stackSaveFailure("23505").status, 503);
   assert.equal(lib.stackSaveFailure("23505").code, "conflict");
   assert.equal(lib.stackSaveFailure("22023").status, 400);
-  assert.equal(lib.stackSaveFailure("XX000").status, 500);
-  assert.equal(lib.stackSaveFailure(undefined).status, 500);
+  // A code this file does not know (or none) leaves the outcome open: never "Nothing was changed".
+  for (const code of ["XX000", "", "57014", undefined, null]) {
+    const f = lib.stackSaveFailure(code);
+    assert.equal(f.status, 500, String(code));
+    assert.equal(f.code, "unconfirmed", String(code));
+    assert.doesNotMatch(f.error, /Nothing was changed/i, String(code));
+  }
+  assert.equal(lib.stackSaveUnconfirmed().status, 502);
+  assert.equal(lib.stackSaveUnconfirmed().code, "unconfirmed");
+  // Only known refusals (the function raised, its transaction rolled back) say nothing changed.
+  for (const code of ["OXS05", "OXS02", "23503", "OXS04", "22023", "22P02", "23514", "PGRST202", "42883", "42703", "PGRST204"]) {
+    assert.match(lib.stackSaveFailure(code).error, /Nothing was changed\./, code);
+  }
+  assert.equal(lib.STACK_UNCONFIRMED_MESSAGE, chainLib.STACK_UNCONFIRMED_TEXT, "server and editor show the same text");
 });
 
 test("the stored stack's name conflict and a missing stack are answered without writing", async () => {
@@ -516,8 +598,31 @@ test("stackSaveRequest: 409 stale is a StackConflict, other 4xx a refusal, 5xx a
   });
   await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, answer(503, { error: "later" })), (e) => {
     assert.ok(!(e instanceof autosave.AutosaveRefused), "503 is retried");
+    assert.equal(e.name, "StackSaveUnconfirmed", "a 5xx the editor cannot place leaves the outcome open");
     return true;
   });
+  await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, answer(503, { error: "two saves met", code: "conflict" })), (e) => {
+    assert.ok(!(e instanceof autosave.AutosaveRefused), "a conflict wrote nothing and is retried");
+    assert.equal(e.name, "Error");
+    assert.equal(e.message, "two saves met");
+    return true;
+  });
+  // No answer, a gateway page instead of JSON, or a success that is not a saved stack: the save may have gone through.
+  const unconfirmedCases = [
+    ["the request failed in transit", async () => { throw new TypeError("Failed to fetch"); }],
+    ["a gateway timeout page", async () => ({ ok: false, status: 504, json: async () => { throw new SyntaxError("not json"); } })],
+    ["a success whose body is not JSON", async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("cut off"); } })],
+    ["a success that names no stack", async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })],
+  ];
+  for (const [label, impl] of unconfirmedCases) {
+    await assert.rejects(chainLib.stackSaveRequest("PATCH", {}, false, impl), (e) => {
+      assert.equal(e.name, "StackSaveUnconfirmed", label);
+      assert.ok(!(e instanceof autosave.AutosaveRefused), `${label}: retried`);
+      assert.equal(e.message, chainLib.STACK_UNCONFIRMED_TEXT, label);
+      assert.doesNotMatch(e.message, /Nothing was changed/i, label);
+      return true;
+    });
+  }
   const ok = await chainLib.stackSaveRequest("POST", { a: 1 }, true, async (url, init) => {
     assert.equal(url, "/api/supplements/stacks");
     assert.equal(init.method, "POST");
@@ -604,6 +709,10 @@ test("the route saves only through the function; the editor sends versions and h
   assert.match(modal, /stackSaveRequest\("PATCH", \{ stack_id: stackIdRef\.current, \.\.\.body, \.\.\.fields \}/);
   assert.match(modal, /if \(e instanceof AutosaveRefused\) chain\.current\.refused\(fields\)/);
   assert.match(modal, /if \(e instanceof StackConflict\) setConflict\(true\)/);
+  // No clear answer: shown as "Not confirmed" (not "Not saved"), and the id is NOT dropped (only a refusal drops it).
+  assert.match(modal, /setUnconfirmed\(e instanceof StackSaveUnconfirmed\)/);
+  assert.match(modal, /errorLabel=\{unconfirmed \? "Not confirmed:" : undefined\}/);
+  assert.doesNotMatch(modal, /StackSaveUnconfirmed\) chain\.current\.refused/);
   assert.match(modal, /chain\.current\.accepted\(json\.version\)/);
   assert.match(modal, /new StackSaveChain\(stack\.stack_id \? \(stack\.version \?\? null\) : null, newClientKey\)/);
   assert.match(modal, /Load the latest version/);

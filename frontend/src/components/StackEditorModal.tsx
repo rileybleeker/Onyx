@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused } from "@/lib/autosave";
-import { StackConflict, StackSaveChain, stackSaveRequest } from "@/lib/supplement-stack-chain";
+import { StackConflict, StackSaveChain, StackSaveUnconfirmed, stackSaveRequest } from "@/lib/supplement-stack-chain";
 import { useAutosave } from "@/lib/use-autosave";
 
 /** A product from the /supplements library picker (subset of the page's Product). */
@@ -101,6 +101,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
   const chain = useRef<StackSaveChain>(new StackSaveChain(null, newClientKey));
   /** The stack changed somewhere else since it was loaded: nothing more is sent until the latest is loaded. */
   const [conflict, setConflict] = useState(false);
+  /** The last save got no clear answer: it may have gone through. Shown as "Not confirmed", retried with its save id. */
+  const [unconfirmed, setUnconfirmed] = useState(false);
 
   const autosave = useAutosave<StackForm>("stack-editor", {
     delayMs: 500,
@@ -124,11 +126,14 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           json = await stackSaveRequest("PATCH", { stack_id: stackIdRef.current, ...body, ...fields }, keepalive);
         }
       } catch (e) {
-        // A refusal wrote nothing; a network or server failure may have gone through (its id stays unanswered).
+        // A refusal wrote nothing; a network or server failure may have gone through (its id stays unanswered, so the
+        // retry sends the same save id and a save that went through is answered as a replay, not written twice).
         if (e instanceof AutosaveRefused) chain.current.refused(fields);
         if (e instanceof StackConflict) setConflict(true);
+        setUnconfirmed(e instanceof StackSaveUnconfirmed);
         throw e;
       }
+      setUnconfirmed(false);
       chain.current.accepted(json.version);
       if (creating) {
         const id = Number(json.stack_id);
@@ -155,6 +160,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     clientKey.current = stack.stack_id ? null : newClientKey();
     chain.current = new StackSaveChain(stack.stack_id ? (stack.version ?? null) : null, newClientKey);
     setConflict(false);
+    setUnconfirmed(false);
     savedAny.current = false;
     resetAutosave(stack.stack_id ? formOf(stack.name, stack.description ?? "", stack.remind_time ?? "", stack.items) : undefined);
   }, [stack, resetAutosave]);
@@ -448,6 +454,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
               state={autosave.state}
               onRetry={() => void autosave.retry()}
               showIncomplete
+              errorLabel={unconfirmed ? "Not confirmed:" : undefined}
               savedText={isNew && stackId !== null ? "Stack created" : "Saved"}
             />
             <button

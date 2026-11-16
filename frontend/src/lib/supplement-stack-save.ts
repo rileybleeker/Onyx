@@ -15,6 +15,12 @@ import { parseRemindTime } from "@/lib/supplement-reminders";
  *
  * Errors are mapped from the database CODE only, never its message text (a unique violation also names the
  * client_key index, and must never be read as "no such column").
+ *
+ * Only a known refusal code (the function raised it, so its transaction rolled back) is answered "Nothing was changed".
+ * When no clear answer came back (the call threw, the reply was not a saved row, or an error code this file does not
+ * know: a lost connection reaches supabase-js as an error with an empty code), the save may have committed before its
+ * answer was lost, so the answer is code "unconfirmed" (5xx, retried): the editor keeps the save id and resends the
+ * same save, which the function then answers as a replay instead of writing it twice.
  */
 
 export const STACK_SAVE_RPC = "save_supplement_stack";
@@ -171,12 +177,18 @@ export function stackRpcArgs(req: StackSaveRequest): Record<string, unknown> {
   };
 }
 
-export type StackSaveCode = "stale" | "reload" | "unknown_product" | "not_found" | "name_taken" | "conflict" | "invalid" | "not_set_up" | "failed";
+export type StackSaveCode = "stale" | "reload" | "unknown_product" | "not_found" | "name_taken" | "conflict" | "invalid" | "not_set_up" | "unconfirmed";
 
 export const STACK_STALE_MESSAGE = "This stack was changed somewhere else. Load the latest version, then make your change again.";
 export const STACK_RELOAD_MESSAGE = "This page is out of date. Reload it, then make your change again. Nothing was changed.";
+/** No clear answer: the save may or may not have gone through. Never says "Nothing was changed". */
+export const STACK_UNCONFIRMED_MESSAGE =
+  "No clear answer came back, so this change may or may not have been saved. Retry sends the same save again; it is never saved twice.";
 
-/** Answer for a database error, by code only. Every one of these means nothing was changed. */
+/**
+ * Answer for a database error, by code only. Every known code means the function refused the save and its transaction
+ * rolled back, so nothing was changed. Any other code (or none) is "unconfirmed": the outcome is not known.
+ */
 export function stackSaveFailure(code: string | null | undefined): { status: number; code: StackSaveCode; error: string } {
   switch (code) {
     case "OXS01":
@@ -207,8 +219,15 @@ export function stackSaveFailure(code: string | null | undefined): { status: num
     case "PGRST204":
       return { status: 503, code: "not_set_up", error: "Saving stacks is not set up yet (database migration pending). Nothing was changed." };
     default:
-      return { status: 500, code: "failed", error: "The stack could not be saved. Nothing was changed." };
+      // Not a refusal this file knows (a lost connection, a gateway timeout, an unexpected server error): the save may
+      // have committed before the answer was lost. Retried with the same save id, which is then answered as a replay.
+      return { status: 500, code: "unconfirmed", error: STACK_UNCONFIRMED_MESSAGE };
   }
+}
+
+/** The answer when no usable reply came back at all (the call threw, or the reply was not a saved row). */
+export function stackSaveUnconfirmed(): { status: number; code: StackSaveCode; error: string } {
+  return { status: 502, code: "unconfirmed", error: STACK_UNCONFIRMED_MESSAGE };
 }
 
 export interface StackSaveRow {
@@ -231,23 +250,28 @@ type RpcDb = {
   rpc: (fn: string, args: Record<string, unknown>) => PromiseLike<{ data: unknown; error: { code?: string } | null }>;
 };
 
-/** One call, one transaction. `status`/`body` are the HTTP answer. */
+/**
+ * One call, one transaction. `status`/`body` are the HTTP answer. A known refusal says nothing was changed; a call that
+ * threw, an unknown error code or a reply that is not a saved row is "unconfirmed" (the save may have committed).
+ */
 export async function saveStack(db: RpcDb, req: StackSaveRequest): Promise<{ status: number; body: Record<string, unknown> }> {
   let res: { data: unknown; error: { code?: string } | null };
   try {
     res = await db.rpc(STACK_SAVE_RPC, stackRpcArgs(req));
   } catch {
-    const f = stackSaveFailure(null);
+    console.error("supplement stack save: no answer from the database (outcome unconfirmed)");
+    const f = stackSaveUnconfirmed();
     return { status: f.status, body: { error: f.error, code: f.code } };
   }
   if (res.error) {
     const f = stackSaveFailure(res.error.code);
-    console.error("supplement stack save failed:", res.error.code ?? "no code");
+    console.error("supplement stack save failed:", res.error.code || "no code", f.code);
     return { status: f.status, body: { error: f.error, code: f.code } };
   }
   const row = res.data as StackSaveRow | null;
   if (!row || !isPositiveInt(row.stack_id) || !isPositiveInt(row.version)) {
-    const f = stackSaveFailure(null);
+    console.error("supplement stack save: the reply was not a saved row (outcome unconfirmed)");
+    const f = stackSaveUnconfirmed();
     return { status: f.status, body: { error: f.error, code: f.code } };
   }
   return { status: 200, body: { ok: true, ...row } };
