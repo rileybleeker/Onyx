@@ -42,12 +42,16 @@ errors are short codes.
 - No answer or a server error: an inline "Not saved" alert (a word and an icon, not color alone) with Retry. The
   card keeps ONE operation key until it hears a definite answer, so Retry, or a different grade, reuses it: a
   grade that did land is answered from its receipt, and `key_reused` (another grade was stored first under that
-  key) counts as graded.
+  key) counts as graded. A reload loses the key, which stays safe: every grade carries the card's review count, and
+  a grade on an older state of the row is `409 changed`, so a card is still graded once.
 - A refusal (4xx) wrote nothing: no Retry, any grade can be picked, the next try gets a new key. Graded on another
   screen, archived or gone (409 / 404): grades are blocked and Refresh re-reads the overview.
 - Success advances exactly once: the card's graded highlight ids are kept for the day, so a reload that raced the
   grade cannot bring a card back. Focus moves to the next card's reveal button or to the "Nothing due" line; the
   reveal moves focus to the note. Each failure is announced once (the alert is removed while a retry is saving).
+  Retry and Refresh leave the screen while they work, so focus never drops to the page: a Retry that fails again
+  puts focus on the new Retry button, and Refresh puts it on the note, then on the next card once the re-read
+  overview replaces this one.
 - Controls are at least 44 px high with 12 px between grade buttons, on desktop and at 390 px.
 
 Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under the hook harness, synthetic cards).

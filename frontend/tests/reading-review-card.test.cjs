@@ -183,6 +183,55 @@ test("the last card: success shows the Nothing due line (the focus target)", asy
   assert.equal(done[0].props.tabIndex, -1);
 });
 
+// The harness renders no DOM and never assigns refs, so a test puts a recording stand-in in each ref object (the
+// same object is reused on every render) and reads which element the card asked to focus.
+const recordFocus = (node, name, log) => {
+  assert.ok(node.props.ref && typeof node.props.ref === "object", `${name} carries a ref`);
+  node.props.ref.current = { focus: () => log.push(name) };
+};
+
+test("a Retry that fails again puts focus on the new Retry button, and the failure is one alert", async (t) => {
+  const focused = [];
+  const { h, sent, alerts } = mount(t, {
+    answer: () => {
+      throw new TypeError("offline");
+    },
+  });
+  await h.flush();
+  h.click(REVEAL);
+  await h.flush();
+  h.click("Good, next review in 1 day");
+  await h.flush();
+  recordFocus(h.button("Retry Good"), "retry", focused);
+  h.click("Retry Good");
+  await h.flush();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].op_key, sent[0].op_key, "the retry reuses the key");
+  assert.deepEqual(focused, ["retry"], "focus returns to Retry instead of dropping to the page");
+  assert.equal(alerts().length, 1, "one alert for the failure on screen");
+});
+
+test("Refresh puts focus on the note, then on the next card once the re-read overview replaces this one", async (t) => {
+  const focused = [];
+  withGlobals(t, { fetch: async () => response({ error: "changed" }, 409) });
+  const props = { o: overview([card(1), card(2)]), onGraded: () => {}, onRefresh: () => (props.o = overview([card(2)])) };
+  const h = mountClient("app/reading/ReviewCard.tsx", { props, stubs: { "lucide-react": { AlertTriangle: () => null } } });
+  await h.flush();
+  recordFocus(h.button(REVEAL), "reveal", focused);
+  h.click(REVEAL);
+  await h.flush();
+  recordFocus(h.find((n) => n.type === "p" && n.props.tabIndex === -1 && /Synthetic note 1/.test(h.text(n)))[0], "note", focused);
+  focused.length = 0;
+  h.click("Good, next review in 1 day");
+  await h.flush();
+  assert.match(h.text(), /graded on another screen/);
+  h.click("Refresh");
+  await h.flush();
+  assert.deepEqual(focused, ["note", "reveal"], "note while the overview is re-read, then the next card's reveal button");
+  assert.match(h.text(), /Synthetic passage 2/);
+  assert.equal(h.find((n) => n.props.role === "alert").length, 0, "the next card starts without the old message");
+});
+
 test("pure helpers: answer classification, key reuse, and a graded card never returns from a stale reload", () => {
   assert.equal(P.classifyReviewAnswer(null, null).kind, "unknown");
   assert.equal(P.classifyReviewAnswer(500, { error: "failed" }).kind, "unknown");

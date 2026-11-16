@@ -28,6 +28,9 @@ import {
  *   (409): Refresh. The message is a role=alert line with a word and an icon, not color alone.
  * - Success advances exactly once (this card's graded ids are kept, so a reload that raced the grade cannot bring
  *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line.
+ * - Retry and Refresh leave the screen while they work, so focus never drops to the page: a Retry that fails again
+ *   puts focus on the new Retry button (or on the note when there is none), a Refresh puts it on the note and then
+ *   on the next card once the re-read overview replaces this one.
  */
 
 const fmtDate = (d: string | null | undefined) =>
@@ -60,7 +63,10 @@ export default function ReviewCard({
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   // The last request whose outcome is unknown: the next tap on this card reuses its key.
   const [pending, setPending] = useState<ReviewAttempt | null>(null);
-  const [focus, setFocus] = useState<"next" | "note" | null>(null);
+  const [focus, setFocus] = useState<"next" | "note" | "retry" | null>(null);
+  // Set by Refresh: when the re-read overview puts another card on top, focus moves to it.
+  const focusNextCard = useRef(false);
+  const retryRef = useRef<HTMLButtonElement | null>(null);
   const inFlight = useRef(false);
   const alive = useRef(true);
   const revealRef = useRef<HTMLButtonElement | null>(null);
@@ -90,14 +96,20 @@ export default function ReviewCard({
     if (inFlight.current) return;
     setStatus((s) => (s.kind === "idle" ? s : { kind: "idle" }));
     setPending((p) => (p && cur && p.highlight_id === cur.highlight_id && p.expected_review_count === cur.review_count ? p : null));
+    if (focusNextCard.current) {
+      focusNextCard.current = false;
+      setFocus("next");
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cardKey]);
 
   useEffect(() => {
     if (!focus) return;
-    if (focus === "next") (revealRef.current ?? doneRef.current)?.focus();
+    if (focus === "next") (revealRef.current ?? doneRef.current ?? noteRef.current)?.focus();
+    else if (focus === "retry") (retryRef.current ?? noteRef.current)?.focus();
     else noteRef.current?.focus();
-    setFocus(null);
+    // Functional: a target another effect set in this same pass (Refresh, then the next card) is kept.
+    setFocus((f) => (f === focus ? null : f));
   }, [focus, cardKey, revealedId]);
 
   const preview = useMemo(() => (cur ? reviewPreview(cur, o.today) : null), [cur, o.today]);
@@ -109,7 +121,8 @@ export default function ReviewCard({
   const saving = status.kind === "saving";
   const blocked = saving || status.kind === "stale";
 
-  const grade = async (g: PracticeGrade) => {
+  // `fromRetry`: the Retry button that was pressed leaves the screen while this request is out.
+  const grade = async (g: PracticeGrade, fromRetry = false) => {
     if (!cur || inFlight.current || status.kind === "stale") return;
     const attempt = attemptFor(pending, cur, g);
     inFlight.current = true;
@@ -145,9 +158,11 @@ export default function ReviewCard({
     // The card left the top while the request was out (the overview was re-read): its message would sit on another card.
     if (curRef.current?.highlight_id !== attempt.highlight_id) {
       setStatus({ kind: "idle" });
+      if (fromRetry) setFocus("next");
       return;
     }
     setStatus({ kind: out.kind, grade: g, message: out.message });
+    if (fromRetry) setFocus("retry");
   };
 
   const header = queue.length
@@ -222,8 +237,9 @@ export default function ReviewCard({
                   </span>
                   {status.kind === "unknown" && (
                     <button
+                      ref={retryRef}
                       type="button"
-                      onClick={() => void grade(status.grade)}
+                      onClick={() => void grade(status.grade, true)}
                       className="min-h-11 px-3 rounded-control border border-border-default text-text-primary"
                     >
                       Retry {GRADE_LABEL[status.grade]}
@@ -234,6 +250,8 @@ export default function ReviewCard({
                       type="button"
                       onClick={() => {
                         setStatus({ kind: "idle" });
+                        focusNextCard.current = true;
+                        setFocus("note");
                         onRefresh();
                       }}
                       className="min-h-11 px-3 rounded-control border border-border-default text-text-primary">
