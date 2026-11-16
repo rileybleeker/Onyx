@@ -43,6 +43,9 @@ const SENSITIVE: RegExp[] = [
   /^\/api\/(finance|procurement|medical|care|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
   // reading questions: raw quiz answers and grading feedback (PROD-T07, sql/reading_learning_questions.sql).
   /^\/api\/reading\/questions(\/|\?|$)/,
+  // reading practice (READ-QUIZ-01): a round's attempts (grader feedback on Riley's answers) and the bank export.
+  /^\/api\/reading\/practice\/round(\/|\?|$)/,
+  /^\/api\/reading\/bank\/export(\/|\?|$)/,
   /^\/(financials|procurement|screen-time|health\/records)(\/|\?|$)/,
   /^(finance|procurement|medical|care|screen-time|spotify|experiments):/,
   // Mixed payloads (SEC-03, 2026-11-16): the agents inbox and conversations (message bodies and cards can quote
@@ -89,6 +92,10 @@ export function writeInvalidates(path: string): string[] {
   if (path.startsWith("/onyx/")) return ["agents:"];
   // POSTs that change no cached data, or whose page refreshes what changed itself.
   if (NO_INVALIDATE.includes(path)) return [];
+  // A practice answer or a Disagree / self grade (READ-QUIZ-01): the runner keeps its own state and refreshes
+  // /api/reading and the round once when it closes, so a tap invalidates nothing (flags, approval and run use the
+  // area default below).
+  if (/^\/api\/reading\/practice\/attempt(\/[^/?#]+\/override)?$/.test(path)) return [];
   // A /habits tap: that page keeps its own cached journal in step (a 365-day re-read per tap would be waste);
   // the check-in screen and the habit list still re-read.
   if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list", "/api/sleep/winddown"];
