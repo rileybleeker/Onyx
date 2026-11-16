@@ -903,24 +903,190 @@ test("weight route: a restore may set the source back to the scale's, and nothin
 
 // ─── pages too large to mount offline: structural checks (syntax tree) ───────
 
-test("NYC note: a note still waiting is sent before another lead opens, and one that failed keeps its lead open", () => {
-  const src = F.parseFile("app/nyc/NycClient.tsx");
-  const toggle = F.functionNamed(src, "toggleExpand");
-  assert.ok(toggle, "toggleExpand is the lead switch");
-  const guard = toggle.body.statements.find((s) => F.hasCall(s, "noteSave.flush"));
-  assert.ok(guard && F.ts.isIfStatement(guard), "the switch waits on the note's flush");
-  assert.ok(F.collect(guard.thenStatement, F.ts.isReturnStatement).length > 0, "a failed flush stops the switch");
-  assert.ok(F.inOrder(toggle.body, (s) => F.hasCall(s, "noteSave.flush"), (s) => F.hasCall(s, "setExpandedId")), "sent before another lead opens");
-  const said = F.calls(guard.thenStatement).filter((c) => c.name === "setSaveError").map((c) => F.literalText(c.node.arguments[0]));
-  assert.ok(said.some((text) => /is not saved yet\. Retry it/.test(text ?? "")), "the failed flush tells Riley why the lead did not open");
+// Both checks below state the two facts master's text patterns held (`if (!(await noteSave.flush())) {` and
+// `await autosave.flush(); paying.current = true;`): the flush is AWAITED, so nothing moves on before its answer,
+// and that answer is read the right way round. Each answers the problems found ([] = fine); the self-tests after
+// them feed re-formatted source that must pass and mutants that must not.
+const isAsync = (fn) => !!fn && (F.ts.getModifiers?.(fn) ?? fn.modifiers ?? []).some((m) => m.kind === F.ts.SyntaxKind.AsyncKeyword);
+const unparen = (e) => {
+  while (e && F.ts.isParenthesizedExpression(e)) e = e.expression;
+  return e;
+};
+/** True when `expr` is `await <name>()` (parentheses allowed). */
+const awaitsCall = (expr, name) => {
+  const a = unparen(expr);
+  const c = a && F.ts.isAwaitExpression(a) ? unparen(a.expression) : null;
+  return !!c && F.ts.isCallExpression(c) && F.refName(c.expression) === name;
+};
+/** A statement that IS `<target> = <value>;` (a statement holding one deeper inside, such as a block, does not count). */
+const setsTo = (target, value) => (s) =>
+  F.ts.isExpressionStatement(s) && F.ts.isBinaryExpression(s.expression) && s.expression.operatorToken.kind === F.ts.SyntaxKind.EqualsToken && F.refName(s.expression.left) === target && s.expression.right.getText() === value;
+/** True when a call's value is awaited (`await put(…)`, `await (put(…))`). */
+const isAwaited = (call) => {
+  let n = call.parent;
+  while (n && F.ts.isParenthesizedExpression(n)) n = n.parent;
+  return !!n && F.ts.isAwaitExpression(n);
+};
+
+function nycSwitchProblems(sf) {
+  const { ts } = F;
+  const toggle = F.functionNamed(sf, "toggleExpand");
+  if (!toggle?.body) return ["toggleExpand (the lead switch) not found"];
+  const problems = [];
+  if (!isAsync(toggle)) problems.push("toggleExpand is not async, so it cannot wait for the note's flush");
+  const steps = toggle.body.statements;
+  const guards = steps.filter((s) => F.hasCall(s, "noteSave.flush"));
+  if (guards.length !== 1 || !ts.isIfStatement(guards[0])) return [...problems, `the switch asks noteSave.flush in ${guards.length} statements; one if statement expected`];
+  const guard = guards[0];
+  // Exactly !(await noteSave.flush()): flush() answers true when nothing is left unsaved, so it is the FAILED flush
+  // (negated) that keeps the lead open, and only an awaited answer is a boolean (a promise is always truthy).
+  const not = unparen(guard.expression);
+  if (!(ts.isPrefixUnaryExpression(not) && not.operator === ts.SyntaxKind.ExclamationToken && awaitsCall(not.operand, "noteSave.flush"))) {
+    problems.push(`the switch's guard is \`${guard.expression.getText()}\`, not !(await noteSave.flush())`);
+  }
+  const then = guard.thenStatement;
+  const last = ts.isBlock(then) ? then.statements[then.statements.length - 1] : then;
+  if (!last || !ts.isReturnStatement(last)) problems.push("a failed flush does not end the switch with a return");
+  if (F.hasCall(then, "setExpandedId")) problems.push("a failed flush still switches the lead");
+  const said = F.calls(then).filter((c) => c.name === "setSaveError").map((c) => F.literalText(c.node.arguments[0]));
+  if (!said.some((text) => /is not saved yet\. Retry it/.test(text ?? ""))) problems.push("a failed flush does not tell Riley why the lead did not open");
+  const opens = steps.findIndex((s) => F.hasCall(s, "setExpandedId"));
+  if (opens === -1) problems.push("the switch never opens a lead");
+  else if (opens < steps.indexOf(guard)) problems.push("another lead opens before the note is sent");
+  return problems;
+}
+
+function taxPaymentProblems(sf) {
+  const { ts } = F;
+  const problems = [];
+  // The profile autosave holds (its ready() answers a reason) while paying.current is set.
+  const holds = F.collect(sf, (n) => ts.isPropertyAssignment(n) && n.name.getText() === "ready").some((p) =>
+    F.collect(p.initializer, ts.isConditionalExpression).some((c) => {
+      const cond = unparen(c.condition);
+      return ts.isPropertyAccessExpression(cond) && F.refName(cond) === "paying.current" && F.literalText(unparen(c.whenTrue)) === "Recording the payment…";
+    }),
+  );
+  if (!holds) problems.push('the profile autosave\'s ready() does not hold with "Recording the payment…" while paying.current is set');
+  const blocks = F.collect(sf, (n) => ts.isBlock(n) && n.statements.some(setsTo("paying.current", "true")));
+  if (blocks.length !== 1) return [...problems, `${blocks.length} blocks set paying.current = true; one expected`];
+  const steps = blocks[0].statements;
+  if (!isAsync(F.enclosingFunction(blocks[0]))) problems.push("the payment's function is not async");
+  const start = steps.findIndex(setsTo("paying.current", "true"));
+  // The statement right before it is `await autosave.flush();`: what was waiting is sent, and nothing else is
+  // awaited in between (a pause there would let the profile autosave start a send that races the payment).
+  const before = steps[start - 1];
+  if (!(before && ts.isExpressionStatement(before) && awaitsCall(before.expression, "autosave.flush"))) {
+    problems.push(`the statement before paying.current = true is \`${before ? before.getText() : "(none)"}\`, not await autosave.flush();`);
+  }
+  const writes = F.calls(blocks[0]).filter((c) => c.name === "put" && F.literalText(c.node.arguments[0]) === "tax");
+  if (writes.length !== 1) return [...problems, `the payment writes the tax profile ${writes.length} times; once expected`];
+  if (!isAwaited(writes[0].node)) problems.push("the payment write is not awaited, so paying.current is cleared while it is still on its way");
+  const write = steps.findIndex((s) => s.pos <= writes[0].node.pos && writes[0].node.end <= s.end);
+  const end = steps.findIndex(setsTo("paying.current", "false"));
+  if (!(start < write && write < end)) problems.push("the payment is not written between paying.current = true and paying.current = false");
+  const keepsPaid = F.collect(sf, (n) => ts.isPropertyAssignment(n) && n.name.getText() === "estimatesPaid" && ts.isArrayLiteralExpression(n.initializer) && n.initializer.elements.some((e) => ts.isSpreadElement(e) && F.refName(e.expression) === "paid.current"));
+  if (keepsPaid.length === 0) problems.push("a new payment is not added to the ones already recorded (estimatesPaid: [...paid.current, …])");
+  return problems;
+}
+
+test("NYC note: a note still waiting is sent (and awaited) before another lead opens, and one that failed keeps its lead open", () => {
+  assert.deepEqual(nycSwitchProblems(F.parseFile("app/nyc/NycClient.tsx")), []);
 });
 
-test("tax profile: a recorded payment never races the profile autosave (both write the whole profile)", () => {
-  const tax = F.parseFile("app/financials/forecast/TaxAndWhatIf.tsx");
-  assert.ok(F.inOrder(tax, (s) => F.hasCall(s, "autosave.flush"), F.assigns("paying.current", "true")), "what was waiting is sent before the payment write starts");
-  assert.ok(F.strings(tax).includes("Recording the payment…"), "the profile autosave holds while the payment is written");
-  const keepsPaid = F.collect(tax, (n) => F.ts.isPropertyAssignment(n) && n.name.getText() === "estimatesPaid" && F.ts.isArrayLiteralExpression(n.initializer) && n.initializer.elements.some((e) => F.ts.isSpreadElement(e) && F.refName(e.expression) === "paid.current"));
-  assert.ok(keepsPaid.length > 0, "a new payment is added to the ones already recorded");
+test("tax profile: a recorded payment waits for the profile autosave and never races it (both write the whole profile)", () => {
+  assert.deepEqual(taxPaymentProblems(F.parseFile("app/financials/forecast/TaxAndWhatIf.tsx")), []);
+});
+
+const nycLike = ({ async = "async ", guard = "!(await noteSave.flush())", stop = "return;", early = "", open = "setExpandedId(lead.id);" } = {}) => `
+export default function NycClient() {
+  ${async}function toggleExpand(lead: NycLead) {
+    setSelectedId(lead.id);
+    ${early}
+    if (${guard}) {
+      setSaveError(\`Your note\${open ? " here" : ""} is not saved yet. Retry it (under the note) before opening another lead.\`);
+      ${stop}
+    }
+    ${open}
+  }
+  return null;
+}`;
+const nycProblems = (parts) => nycSwitchProblems(F.parseSource(nycLike(parts), "NycClient.tsx"));
+
+test("NYC switch check: re-formatted source passes; an unawaited, inverted or non-stopping flush is caught", () => {
+  assert.deepEqual(nycProblems(), []);
+  assert.deepEqual(nycProblems({ guard: "\n      !(\n        await (noteSave.flush())\n      ) // waits\n    " }), [], "wrapping and comments do not matter");
+  for (const mutant of [
+    { guard: "!noteSave.flush()" }, // not awaited: a promise is truthy, so the guard never fires
+    { guard: "!(noteSave.flush())" },
+    { guard: "await noteSave.flush()" }, // inverted: a SAVED note keeps the lead shut, a failed one switches
+    { guard: "!!(await noteSave.flush())" },
+    { guard: "!(await noteSave.flush()) && false" },
+    { async: "" },
+    { stop: "" }, // the failed flush falls through and switches anyway
+    { stop: "setExpandedId(lead.id); return;" },
+    { early: "setExpandedId(lead.id);" },
+    { early: "void noteSave.flush();", guard: "!saved" },
+    { open: "" },
+  ]) {
+    assert.notDeepEqual(nycProblems(mutant), [], JSON.stringify(mutant));
+  }
+});
+
+const taxLike = ({
+  ready = 'paying.current ? "Recording the payment…" : null',
+  async = "async ",
+  flush = "await autosave.flush();",
+  between = "",
+  write = 'await put("tax", buildFrom(value.f, value.oneOffs, extra))',
+  after = "",
+  paidList = "[...paid.current, ...(extra ? [extra] : [])]",
+} = {}) => `
+export function TaxCard() {
+  const paying = useRef(false);
+  const autosave = useFinanceAutosave("forecast-tax", run, (v) => put("tax", buildFrom(v.f, v.oneOffs)), { ready: (v) => (${ready}) });
+  const buildFrom = (f, oneOffs, extra) => ({ estimatesPaid: ${paidList} });
+  return (
+    <button
+      onClick={() => {
+        run(${async}() => {
+          ${flush}
+          ${between}
+          paying.current = true;
+          const value = latest.current;
+          const e = ${write};
+          ${after}
+          paying.current = false;
+          return e;
+        });
+      }}
+    >
+      Record payment
+    </button>
+  );
+}`;
+const taxProblems = (parts) => taxPaymentProblems(F.parseSource(taxLike(parts), "TaxAndWhatIf.tsx"));
+
+test("tax payment check: re-formatted source passes; an unawaited flush or write, a pause in between or a lost hold is caught", () => {
+  assert.deepEqual(taxProblems(), []);
+  assert.deepEqual(
+    taxProblems({ flush: "await (\n            autosave.flush()\n          ); // first", write: 'await (put(\n            "tax",\n            buildFrom(value.f, value.oneOffs, extra),\n          ))' }),
+    [],
+    "wrapping and comments do not matter",
+  );
+  for (const mutant of [
+    { flush: "autosave.flush();" }, // not awaited: the waiting profile send races the payment
+    { flush: "void autosave.flush();" },
+    { flush: "" },
+    { flush: "", after: "await autosave.flush();" },
+    { between: "await load();" }, // something else awaited in between: the autosave can start a send meanwhile
+    { write: 'put("tax", buildFrom(value.f, value.oneOffs, extra))' }, // paying.current cleared while the write runs
+    { async: "", flush: "autosave.flush();", write: 'put("tax", buildFrom(value.f, value.oneOffs, extra))' },
+    { ready: "null" },
+    { ready: '!paying.current ? "Recording the payment…" : null' },
+    { paidList: "[...(extra ? [extra] : [])]" },
+  ]) {
+    assert.notDeepEqual(taxProblems(mutant), [], JSON.stringify(mutant));
+  }
 });
 
 test("Say it suggestions save on their own in Supplements and Uber Eats (each tried once, then Retry)", () => {

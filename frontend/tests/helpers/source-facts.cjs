@@ -260,12 +260,6 @@ function inOrder(node, first, then) {
     return i !== -1 && j !== -1 && i < j;
   });
 }
-/** A statement that assigns `target` (refName) the value `value` (source text), e.g. paying.current = true. */
-const assigns = (target, value) => (stmt) =>
-  collect(stmt, (n) => ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken).some((n) => refName(n.left) === target && n.right.getText() === value);
-
-/** Every string literal value in the file (plain and no-substitution template strings). */
-const strings = (node) => collect(node, (n) => ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)).map((n) => n.text);
 
 /**
  * A function declared in a src file, compiled and returned so a test can call it (a security rule such as
@@ -302,7 +296,5 @@ module.exports = {
   functionNamed,
   topLevelConst,
   inOrder,
-  assigns,
-  strings,
   loadFunction,
 };
