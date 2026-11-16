@@ -360,22 +360,44 @@ test("a stored forecast and Today's check stop offering an amount once a counted
   const first = await h.S.cachedForecast(at);
   assert.equal(typeof first.result.headlines.safeToMoveCents, "number");
   await h.drain();
-  // 45 minutes on: the stored load is still fresh (not recomputed), but its check no longer holds.
-  const later = addMs(at, 45 * 60_000);
-  const served = await h.S.cachedForecast(later);
-  assert.equal(h.calls.forecast, 1, "served from the stored row");
-  assert.equal(served.result.headlines.safeToMoveCents, null);
-  assert.equal(served.result.eligibility.eligible, false);
-  assert.equal(served.result.eligibility.reasons[0].code, "stale-balance");
-  assert.equal(served.scenario.result.headlines.safeToMoveCents, null, "the what-if agrees");
-  assert.equal(typeof h.db.rows.get("forecast").body.result.headlines.safeToMoveCents, "number", "the stored row itself is not rewritten");
-  // Today at the same two moments.
+  // Today's first answer at the same moment, stored alongside.
   assert.deepEqual((await h.S.cachedMoneyAlerts(at)).cash, { eligible: true, reasons: [] });
   await h.drain();
+  const callsBefore = h.calls.forecast;
+  // 45 minutes on: the stored load is still in its fresh hour, but its check no longer holds, so the page recomputes
+  // it (the ledger now gives the real, per-account reason) instead of serving a withheld copy.
+  const later = addMs(at, 45 * 60_000);
+  const recomputed = synthForecast(later);
+  h.state.forecast = () => forecastLoad(recomputed);
+  const served = await h.S.cachedForecast(later);
+  assert.equal(h.calls.forecast, callsBefore + 1, "an expired check is recomputed, not served");
+  assert.equal(served.result.headlines.safeToMoveCents, null);
+  assert.equal(served.result.eligibility.eligible, false);
+  assert.deepEqual(served.result.eligibility.reasons.map((r) => [r.code, r.account]), [["stale-balance", "chk"]], "the real reason, naming the account");
+  assert.equal(served.scenario.result.headlines.safeToMoveCents, null, "the what-if agrees");
+  await h.drain();
+  assert.equal(h.db.rows.get("forecast").body.result.headlines.safeToMoveCents, null, "the recomputed load is stored");
+  assert.equal(h.calls.forecast, callsBefore + 1);
+  await h.S.cachedForecast(addMs(later, 60_000));
+  assert.equal(h.calls.forecast, callsBefore + 1, "and served from then on (its own check holds no expiry that has passed)");
+  // The computed value is checked against the clock too: a load whose check has already expired is withheld.
+  const h2 = harness({ forecast: forecastLoad(result), budgets: { kind: "empty" } });
+  const old = await h2.S.cachedForecast(later);
+  assert.equal(h2.calls.forecast, 1);
+  assert.equal(old.result.headlines.safeToMoveCents, null);
+  assert.equal(old.result.eligibility.reasons[0].code, "stale-balance");
+  // Today: the stored answer's check has expired, so it is answered at once marked updating (Today asks again with
+  // ?fresh=1), and its verdict is not eligible.
+  h.state.forecast = () => forecastLoad(recomputed);
   const laterAlerts = await h.S.cachedMoneyAlerts(later);
   assert.equal(laterAlerts.cash.eligible, false);
   assert.match(laterAlerts.cash.reasons[0], /gone stale/);
+  assert.equal(laterAlerts.updating, true, "expired: being recomputed");
   assert.equal("validUntil" in laterAlerts.cash, false, "the answer carries only the verdict");
+  await h.drain();
+  const followUp = await h.S.cachedMoneyAlerts(addMs(later, 4_000), "fresh-only");
+  assert.equal(followUp.updating, undefined, "the follow-up gets the recomputed answer");
+  assert.deepEqual(followUp.cash.reasons, recomputed.eligibility.reasons.map((r) => r.text));
   // An older answer served while its refresh is pending (or after a refresh failed) is not eligible either.
   const dayLater = await h.S.cachedMoneyAlerts(addMs(at, 26 * HOUR));
   assert.equal(dayLater.updating, true);

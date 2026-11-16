@@ -975,6 +975,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         </ul>}
         {moneyStatus && <p className={`mt-3 text-sm ${moneyStatus.tone === "warn" ? "text-mid" : "text-text-secondary"}`}>{moneyStatus.text}</p>}
         <p className="mt-2 text-xs text-text-secondary">From your forecast and budgets. Onyx never moves money.</p>
+        {/* The cash forecast's check failed: its reasons (and Leave it out) are on the forecast page. */}
+        {money.cash && !money.cash.eligible && <Link href="/financials/forecast" className={`${linkStyle} mt-4 mr-4 inline-block`}>Open cash forecast</Link>}
         <Link href="/financials/budgets" className={`${linkStyle} mt-4 inline-block`}>Open budgets</Link>
       </section>
       </Part>}

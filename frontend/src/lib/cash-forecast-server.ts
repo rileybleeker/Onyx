@@ -6,7 +6,7 @@ import { fixedCategory } from "@/lib/finance-categories";
 import { computeGoals, type GoalRow, type GoalView } from "@/lib/finance-goals";
 import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
 import { forecastCash, poolAccountKeys, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
-import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
+import { driversToInputs, itemRowToPlanned, mergeLeaveOut, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, taxYearsFor, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
 import { addDays } from "@/lib/procurement-recurring";
@@ -113,10 +113,12 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const balances: ForecastBalance[] = bal.rows.map(parseBalance).filter((b): b is NonNullable<typeof b> => !!b);
     // A cash account with no balance in the 60-day read (one the feed no longer refreshes, or a closed one): its
     // newest snapshot when it is SMALL, so the engine leaves it out of safe to move and names it instead of
-    // withholding the amount for good (a small account that rarely updates). A larger one stays missing: the
-    // projection keeps counting it as $0 (as before) and the amount stays withheld until Riley leaves it out. One
-    // limit-1 read per such account, only when there is one; a failed read leaves it missing. Forecast only: goals
-    // keep the 60-day balances.
+    // withholding the amount for good (a small account that rarely updates), and when it is NEGATIVE (an overdraft,
+    // any size), so a known debt keeps lowering the amount even after Riley left the account out; a large negative
+    // one is too old to trust and withholds the amount until Riley leaves it out. A larger positive one stays
+    // missing: the projection keeps counting it as $0 (as before) and the amount stays withheld until Riley leaves
+    // it out. One limit-1 read per such account, only when there is one; a failed read leaves it missing. Forecast
+    // only: goals keep the 60-day balances.
     const seen = new Set(bal.rows.map((r) => (r as { account_key?: unknown }).account_key));
     const unseen = poolAccountKeys(accounts).filter((k) => !seen.has(k));
     const older: ForecastBalance[] = [];
@@ -130,7 +132,9 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
         if (!res || res.error) continue;
         for (const raw of res.data ?? []) {
           const b = parseBalance(raw);
-          if (b && Number.isFinite(b.balance_cents) && Math.abs(b.balance_cents) < FORECAST.smallBalanceCents) older.push(b);
+          if (!b || !Number.isFinite(b.balance_cents)) continue;
+          const signed = b.kind === "liability" ? -Math.abs(b.balance_cents) : b.balance_cents;
+          if (signed < 0 || Math.abs(b.balance_cents) < FORECAST.smallBalanceCents) older.push(b);
         }
       }
     }
@@ -158,13 +162,18 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const [itemsRes, driversRes] = await planRead;
     if (itemsRes.error || driversRes.error) setupPending = true;
     const itemRows = ((itemsRes.data ?? []) as ItemRow[]).map((r) => ({ ...r, amount_cents: Number(r.amount_cents) }));
-    const drivers = ((driversRes.data ?? []) as DriverRow[]).filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
+    const driverRows = (driversRes.data ?? []) as DriverRow[];
+    const drivers = driverRows.filter((d) => d && typeof d.key === "string" && d.value && typeof d.value === "object");
     const { settings, cardTerms, growth, adjustments: savedAdjust } = driversToInputs(drivers);
 
     // Tax plan; its payments, refunds and after-tax bonus become planned cash lines.
     // The move plan (driver "move") is the single source of the move date: it also sets the tax residency change.
     const move = parseMovePlan(drivers.find((d) => d.key === "move")?.value);
     const rawProfile = parseTaxProfile(drivers.find((d) => d.key === "tax")?.value);
+    // A saved tax profile or move plan that no longer parses (stored by older code, or a parser change) drops its
+    // tax payments or move costs from the forecast: that withholds the amount too (quality.planInvalid).
+    const hasDriver = (key: string) => driverRows.some((d) => d && d.key === key);
+    const planInvalid = (hasDriver("tax") && !rawProfile) || (hasDriver("move") && !move);
     const profile = rawProfile && move ? { ...rawProfile, moveDate: move.date } : rawProfile;
     const year = Number(today.slice(0, 4));
     // Tax years by cash date (taxYearsFor): every year with a line inside the forecast window, including LAST year
@@ -176,7 +185,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const manual = itemRows.map(itemRowToPlanned);
     // What the reads could not deliver: each withholds the safe-to-move amount in the base plan AND the what-if,
     // because both are computed from this one input (result.eligibility, lib/cash-forecast.ts).
-    const quality = { historyTruncated: bal.truncated || txn.truncated, planUnavailable: setupPending, categoriesUnavailable: fixes.failed === true };
+    const quality = { historyTruncated: bal.truncated || txn.truncated, planUnavailable: setupPending, planInvalid, categoriesUnavailable: fixes.failed === true };
     const baseInput = { today, now, accounts, txns, balances: older.length ? [...balances, ...older] : balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS }, quality };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
     let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
@@ -333,4 +342,22 @@ export async function saveDriver(key: string, value: Record<string, unknown> | n
     return { ok: false };
   }
   return { ok: true };
+}
+
+/**
+ * Leave one pool account out of the safe-to-move amount, or count it again: read the saved list and write it back
+ * with this one change (lib/cash-forecast-store.ts mergeLeaveOut), so the page's possibly stale or empty copy of the
+ * drivers never overwrites the other choices. A failed read saves nothing.
+ */
+export async function changeLeaveOut(account: string, leaveOut: boolean): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  const db = serviceClient();
+  const { data, error } = await db.from("finance_plan_drivers").select("key,value").eq("key", "safe-to-move");
+  if (error) {
+    console.error(`plan driver read failed: ${error.code ?? "unknown"}`);
+    return { ok: false, status: 500, error: "could not save" };
+  }
+  const merged = mergeLeaveOut(((data ?? [])[0] as { value?: unknown } | undefined)?.value ?? null, account, leaveOut);
+  if (!merged.ok) return { ok: false, status: 400, error: merged.error };
+  const saved = await saveDriver("safe-to-move", merged.value);
+  return saved.ok ? { ok: true } : { ok: false, status: 500, error: "could not save" };
 }

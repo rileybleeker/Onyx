@@ -137,6 +137,8 @@ export interface InputQuality {
   historyTruncated?: boolean;
   /** The planned items or the plan drivers (settings, tax profile, move, stream changes) could not be read. */
   planUnavailable?: boolean;
+  /** A saved tax profile or move plan was read but no longer parses, so its tax payments or move costs are missing. */
+  planInvalid?: boolean;
   /** Riley's category fixes could not be read, so transfers and card payments are classified from raw categories. */
   categoriesUnavailable?: boolean;
 }
@@ -151,6 +153,7 @@ export type EligibilityCode =
   | "short-history"
   | "history-truncated"
   | "plan-unavailable"
+  | "plan-invalid"
   | "categories-unavailable"
   | "invalid-input"
   | "unverified";
@@ -970,6 +973,7 @@ export function forecastCash(input: ForecastInput): ForecastResult {
     reason("history-truncated", "Part of the balance or transaction history was not read.");
   }
   if (quality.planUnavailable) reason("plan-unavailable", "Planned items or plan settings could not be read, so planned payments and taxes may be missing.");
+  if (quality.planInvalid) reason("plan-invalid", "Your saved tax profile or move plan could not be read, so planned taxes or move costs may be missing.");
   if (quality.categoriesUnavailable) reason("categories-unavailable", "Your category fixes could not be read, so some transfers or card payments may be counted as spending.");
 
   const base: ForecastResult = {

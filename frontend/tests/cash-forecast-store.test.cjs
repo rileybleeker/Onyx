@@ -66,6 +66,26 @@ test("the safe-to-move driver: known accounts only, deduplicated, empty removes 
   assert.equal("safeToMoveLeaveOut" in S.driversToInputs([{ key: "safe-to-move", value: { leaveOut: [] } }]).settings, false);
 });
 
+test("leaving one account out (or counting it again) is merged with the saved list, never replacing it", () => {
+  const known = new Set(["acct1", "acct2", "acct3"]);
+  assert.deepEqual(S.parseLeaveOutChange({ key: "safe-to-move", account: "acct2", leaveOut: true }, known), { ok: true, account: "acct2", leaveOut: true });
+  assert.equal(S.parseLeaveOutChange({ key: "safe-to-move", value: { leaveOut: ["acct1"] } }, known), null, "the whole-list body is parseDriverBody's");
+  assert.equal(S.parseLeaveOutChange({ key: "settings", account: "acct1", leaveOut: true }, known), null);
+  assert.equal(S.parseLeaveOutChange({ key: "safe-to-move", account: "other", leaveOut: true }, known).ok, false, "an unknown account");
+  assert.equal(S.parseLeaveOutChange({ key: "safe-to-move", account: "acct1", leaveOut: "yes" }, known).ok, false);
+  assert.equal(S.parseLeaveOutChange({ key: "safe-to-move", account: "acct1", leaveOut: true, value: null }, known).ok, false, "no extra fields");
+  // The saved list keeps the other accounts (a page whose drivers read failed sends only its one change).
+  assert.deepEqual(S.mergeLeaveOut({ leaveOut: ["acct1"] }, "acct2", true), { ok: true, value: { leaveOut: ["acct1", "acct2"] } });
+  assert.deepEqual(S.mergeLeaveOut({ leaveOut: ["acct1", "acct2"] }, "acct1", false), { ok: true, value: { leaveOut: ["acct2"] } });
+  assert.deepEqual(S.mergeLeaveOut({ leaveOut: ["acct1"] }, "acct1", true), { ok: true, value: { leaveOut: ["acct1"] } }, "already left out: unchanged");
+  assert.deepEqual(S.mergeLeaveOut({ leaveOut: ["acct1"] }, "acct1", false), { ok: true, value: null }, "the last one counted again removes the driver");
+  assert.deepEqual(S.mergeLeaveOut(null, "acct3", true), { ok: true, value: { leaveOut: ["acct3"] } }, "nothing saved yet");
+  assert.deepEqual(S.mergeLeaveOut({ leaveOut: ["acct1", 7, "acct1"] }, "acct2", true), { ok: true, value: { leaveOut: ["acct1", "acct2"] } }, "junk and repeats are dropped");
+  const full = { leaveOut: Array.from({ length: S.MAX_LEAVE_OUT }, (_, i) => `a${i}`) };
+  assert.equal(S.mergeLeaveOut(full, "acct1", true).ok, false, "never past the limit");
+  assert.equal(S.mergeLeaveOut(full, "a0", false).ok, true);
+});
+
 test("rows map to engine inputs", () => {
   const p = S.itemRowToPlanned({ id: "i1", label: "Demo", item_date: "2031-01-29", amount_cents: "5000", certainty: "likely", repeat_unit: "month", repeat_every: 2, repeat_count: 3, note: null });
   assert.deepEqual(p, { id: "i1", label: "Demo", date: "2031-01-29", amountCents: 5000, certainty: "likely", repeat: { unit: "month", every: 2, count: 3 }, account: undefined });

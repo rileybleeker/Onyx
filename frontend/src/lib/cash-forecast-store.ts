@@ -102,6 +102,34 @@ export function itemRowToPlanned(r: ItemRow): PlannedItem {
 export const MAX_LEAVE_OUT = 20;
 
 /**
+ * Body {key: 'safe-to-move', account, leaveOut}: leave ONE pool account out of the safe-to-move amount (leaveOut true)
+ * or count it again (false). The server merges it into the saved list (mergeLeaveOut), so a page whose drivers read
+ * failed, or a second open tab, never overwrites the other choices. null = not this body (parseDriverBody reads it).
+ */
+export function parseLeaveOutChange(
+  body: unknown,
+  knownAccounts: ReadonlySet<string>,
+): { ok: true; account: string; leaveOut: boolean } | { ok: false; error: string } | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (b.key !== "safe-to-move" || !("account" in b)) return null;
+  for (const k of Object.keys(b)) if (k !== "key" && k !== "account" && k !== "leaveOut") return { ok: false, error: `unknown field ${k}` };
+  if (typeof b.account !== "string" || !knownAccounts.has(b.account)) return { ok: false, error: "unknown account" };
+  if (typeof b.leaveOut !== "boolean") return { ok: false, error: "leaveOut must be true or false" };
+  return { ok: true, account: b.account, leaveOut: b.leaveOut };
+}
+
+/** The saved "safe-to-move" driver value with one account left out or counted again; null value = remove the driver. */
+export function mergeLeaveOut(current: unknown, account: string, leaveOut: boolean): { ok: true; value: Record<string, unknown> | null } | { ok: false; error: string } {
+  const raw = current && typeof current === "object" ? (current as { leaveOut?: unknown }).leaveOut : undefined;
+  const list = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === "string") : [];
+  const next = list.filter((a, i) => a !== account && list.indexOf(a) === i);
+  if (leaveOut) next.push(account);
+  if (next.length > MAX_LEAVE_OUT) return { ok: false, error: `at most ${MAX_LEAVE_OUT} accounts can be left out` };
+  return { ok: true, value: next.length ? { leaveOut: next } : null };
+}
+
+/**
  * Body {key, value}: key 'settings' | 'card:<account_key>' | 'growth:<account_key>' | 'safe-to-move' (value
  * {leaveOut: account keys}: pool accounts left out of the safe-to-move amount); value null removes the driver.
  */

@@ -32,6 +32,7 @@ const CODES: Record<EligibilityCode, true> = {
   "short-history": true,
   "history-truncated": true,
   "plan-unavailable": true,
+  "plan-invalid": true,
   "categories-unavailable": true,
   "invalid-input": true,
   unverified: true,
@@ -99,6 +100,20 @@ export function asOfNow<T extends { eligibility?: unknown; headlines: { safeToMo
   return { ...r, eligibility: after, headlines: { ...r.headlines, safeToMoveCents: null } };
 }
 
+/**
+ * The earliest `validUntil` among `results` that is still ahead of `nowMs` (ms), or null when none is: when a view
+ * left open must look again (a forecast page or a scroll section open past the check's expiry flips to withheld).
+ */
+export function nextExpiry(results: readonly ({ eligibility?: unknown } | null | undefined)[], nowMs: number): number | null {
+  let next: number | null = null;
+  for (const r of results) {
+    const until = eligibilityOf(r).validUntil;
+    const t = until ? Date.parse(until) : NaN;
+    if (Number.isFinite(t) && t > nowMs && (next === null || t < next)) next = t;
+  }
+  return next;
+}
+
 /** "Nov 15, 3:00 PM ET" for a balance time (a date-only value reads "Nov 15"); null when it does not parse. */
 export function cashAsOfLabel(iso: string | null | undefined): string | null {
   if (!iso) return null;
@@ -153,6 +168,14 @@ function leftOutText(l: LeftOutAccount): string {
   return `${l.label} is not counted: a small balance last updated ${when ?? "a while ago"}.`;
 }
 
+/**
+ * The time of the oldest balance the amount COUNTS, as a label: left-out accounts are named separately with their own
+ * date (an old small or chosen one never dates the tile); a backtest opening has no checked balance and keeps its own.
+ */
+function countedAsOf(e: ForecastEligibility, result: Pick<ForecastResult, "opening">): string | null {
+  return cashAsOfLabel(e.cashAsOf ?? (e.leftOut?.length ? null : (result.opening?.asOf ?? null)));
+}
+
 export function safeToMoveTile(result: Pick<ForecastResult, "headlines" | "opening"> & { eligibility?: unknown }, bufferCents: number, now?: Date | number): SafeToMoveTile {
   const e = eligibilityOf(result, now);
   const leftOut: TileLeftOut[] = (e.leftOut ?? []).map((l) => ({ account: l.account, text: leftOutText(l), chosen: l.why === "chosen" }));
@@ -162,11 +185,9 @@ export function safeToMoveTile(result: Pick<ForecastResult, "headlines" | "openi
     const reasons: TileReason[] = e.reasons.length
       ? e.reasons.map((r) => (r.account ? { text: r.text, account: r.account } : { text: r.text }))
       : [{ text: "The forecast inputs could not be checked." }];
-    return { kind: "unavailable", reasons: reasons.slice(0, 3), more: reasons.slice(3), asOf: cashAsOfLabel(result.opening?.asOf ?? null), leftOut };
+    return { kind: "unavailable", reasons: reasons.slice(0, 3), more: reasons.slice(3), asOf: countedAsOf(e, result), leftOut };
   }
   const buffer = Number.isFinite(bufferCents) ? Math.max(0, bufferCents) : 0;
-  // The time of the oldest balance the amount COUNTS (left-out accounts are named separately with their own date;
-  // a backtest opening has no checked balance and keeps its own date).
-  const asOf = cashAsOfLabel(e.cashAsOf ?? (e.leftOut?.length ? null : (result.opening?.asOf ?? null)));
+  const asOf = countedAsOf(e, result);
   return { kind: "amount", cents, perWeekCents: cents > 0 ? Math.floor(cents / 13) : null, bufferCents: buffer, bufferSet: buffer > 0, asOf, leftOut };
 }

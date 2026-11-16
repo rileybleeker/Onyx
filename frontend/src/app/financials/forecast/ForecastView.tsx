@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Area, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/lib/chart-theme";
 import type { ForecastResult } from "@/lib/cash-forecast";
-import { safeToMoveTile } from "@/lib/cash-forecast-eligibility";
+import { nextExpiry, safeToMoveTile } from "@/lib/cash-forecast-eligibility";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { AccuracyRow, ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
 import type { ScenarioParams } from "@/lib/cash-forecast-scenario";
@@ -32,6 +32,41 @@ const dateLabel = (iso: string, opts: Intl.DateTimeFormatOptions = { month: "sho
 const card = "rounded-card shadow-card border border-border-subtle bg-surface-card p-4";
 const input = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
 const button = "rounded-control border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
+
+/**
+ * The client's clock for the safe-to-move check, so a page (or a scroll section, or a copy kept by the client cache)
+ * left open past the check's expiry withholds the amount instead of showing it as actionable. undefined until
+ * mounted, so the first render equals the server's (the server already applied its own clock). Re-read at the
+ * earliest expiry ahead and whenever the page comes back into view (a sleeping laptop delays timers).
+ */
+function useCheckClock(results: readonly ({ eligibility?: unknown } | null | undefined)[]): number | undefined {
+  const [now, setNow] = useState<number | undefined>(undefined);
+  const untils = results.map((r) => (r?.eligibility as { validUntil?: unknown } | undefined)?.validUntil ?? "").join("|");
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = () => {
+      const t = Date.now();
+      setNow(t);
+      if (timer) clearTimeout(timer);
+      timer = null;
+      const next = nextExpiry(results, t);
+      // +1 s past the expiry; setTimeout's longest delay is about 24.8 days.
+      if (next !== null) timer = setTimeout(tick, Math.min(next - t + 1_000, 2 ** 31 - 1));
+    };
+    tick();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+    // The check's expiry times are what matter; the result objects change identity on every refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [untils]);
+  return now;
+}
 
 async function send(url: string, method: string, body?: unknown): Promise<string | null> {
   try {
@@ -84,17 +119,13 @@ export default function ForecastView({
   const h = result.headlines;
   const buffer = Number((drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0);
   // Safe to move: an amount only when the inputs were complete and fresh (result.eligibility), else the reasons.
-  const safe = safeToMoveTile(result, buffer);
+  // checkNow = this browser's clock (after mount): an amount whose check has expired since it was computed is withheld.
+  const checkNow = useCheckClock([result, scenario?.result]);
+  const safe = safeToMoveTile(result, buffer, checkNow);
   // Pool accounts Riley left out of the amount (driver "safe-to-move"): an account the feed no longer refreshes would
   // otherwise withhold it for good. Leaving one out takes its balance out of the amount; the projection keeps it.
-  const leaveOut = (() => {
-    const v = (drivers.find((d) => d.key === "safe-to-move")?.value as { leaveOut?: unknown } | undefined)?.leaveOut;
-    return Array.isArray(v) ? v.filter((a): a is string => typeof a === "string") : [];
-  })();
-  const setLeftOut = (account: string, out: boolean) => {
-    const next = out ? [...leaveOut.filter((a) => a !== account), account] : leaveOut.filter((a) => a !== account);
-    return run(() => send("/api/finance/forecast/drivers", "PUT", { key: "safe-to-move", value: next.length ? { leaveOut: next } : null }));
-  };
+  // One account per request, merged with the saved list on the server (never this page's copy of the drivers).
+  const setLeftOut = (account: string, out: boolean) => run(() => send("/api/finance/forecast/drivers", "PUT", { key: "safe-to-move", account, leaveOut: out }));
   const reasonItem = (r: { text: string; account?: string }) => (
     <li key={r.text}>
       {r.text}
@@ -240,7 +271,7 @@ export default function ForecastView({
           </Part>
           {scenario && (
             <Part id="compare" title="Base plan vs what-if">
-              <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} />
+              <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} now={checkNow} />
             </Part>
           )}
         </PartGroup>

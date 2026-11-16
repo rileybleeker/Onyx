@@ -170,14 +170,27 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
 const taxDue = (tax: TaxYearResult[], year: number) => tax.find((t) => t.year === year)?.jurisdictions.reduce((s, j) => s + Math.max(0, j.balanceCents), 0) ?? 0;
 const refunds = (tax: TaxYearResult[], year: number) => tax.find((t) => t.year === year)?.jurisdictions.reduce((s, j) => s + Math.max(0, -j.balanceCents), 0) ?? 0;
 
-export function CompareTable({ base, baseTax, scen, scenTax }: { base: ForecastResult; baseTax: TaxYearResult[]; scen: ForecastResult; scenTax: TaxYearResult[] }) {
+export function CompareTable({
+  base,
+  baseTax,
+  scen,
+  scenTax,
+  now,
+}: {
+  base: ForecastResult;
+  baseTax: TaxYearResult[];
+  scen: ForecastResult;
+  scenTax: TaxYearResult[];
+  /** The browser's clock (ms) once mounted: a check that has expired since the forecast was computed withholds the amount. */
+  now?: number;
+}) {
   const y = Number(base.today.slice(0, 4));
   const interest = (r: ForecastResult) => r.cards.reduce((s, c) => s + c.interestNext12Cents, 0);
   // Safe to move uses the same gate as the headline tile: null = withheld (incomplete or stale inputs).
-  const withheld = Array.from(new Set([...eligibilityOf(base).reasons, ...eligibilityOf(scen).reasons].map((r) => r.text)));
+  const withheld = Array.from(new Set([...eligibilityOf(base, now).reasons, ...eligibilityOf(scen, now).reasons].map((r) => r.text)));
   const rows: [string, number | null | undefined, number | null | undefined][] = [
     ["Lowest point, 13 weeks (cautious)", base.headlines.lowest?.cents, scen.headlines.lowest?.cents],
-    ["Safe to move", safeToMoveOf(base), safeToMoveOf(scen)],
+    ["Safe to move", safeToMoveOf(base, now), safeToMoveOf(scen, now)],
     ["Cash in 13 weeks (likely)", base.headlines.end13w?.likely, scen.headlines.end13w?.likely],
     ["Cash in 12 months (likely)", base.headlines.end12m?.likely, scen.headlines.end12m?.likely],
     ["Net worth in 12 months", base.netWorth[11]?.netWorth, scen.netWorth[11]?.netWorth],

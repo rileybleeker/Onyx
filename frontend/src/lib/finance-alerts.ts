@@ -43,13 +43,17 @@ export function cashForecastCheck(forecast: ForecastResult | null): CashForecast
   const e = eligibilityOf(forecast);
   return { eligible: e.eligible, reasons: e.reasons.slice(0, 3).map((r) => r.text), ...(e.validUntil ? { validUntil: e.validUntil } : {}) };
 }
+/** True once the stored check's validUntil has passed (or does not parse): it no longer holds at `now`. */
+export function cashCheckExpired(check: CashForecastCheck, now: Date): boolean {
+  const until = check.validUntil === undefined ? null : Date.parse(check.validUntil);
+  return until !== null && !(Number.isFinite(until) && until > now.getTime());
+}
 /**
  * A stored check as Today is told it at `now`: once a balance it counted has turned 48 hours old (validUntil, or a
  * validUntil that does not parse), it is not eligible. The answer never carries validUntil itself.
  */
 export function cashCheckAt(check: CashForecastCheck, now: Date): CashForecastCheck {
-  const until = check.validUntil === undefined ? null : Date.parse(check.validUntil);
-  const expired = until !== null && !(Number.isFinite(until) && until > now.getTime());
+  const expired = cashCheckExpired(check, now);
   const reasons = expired ? [EXPIRED_REASON.text, ...check.reasons.filter((t) => t !== EXPIRED_REASON.text)].slice(0, 3) : check.reasons;
   return { eligible: check.eligible && !expired && reasons.length === 0, reasons };
 }

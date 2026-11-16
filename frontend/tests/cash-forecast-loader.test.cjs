@@ -249,3 +249,42 @@ test("a cash account the feed stopped refreshing: a small one is left out and na
   assert.deepEqual(chosen.result.eligibility.leftOut.map((l) => [l.account, l.why, l.asOf]), [["demo-wallet", "chosen", null]]);
   assert.equal(typeof chosen.result.headlines.safeToMoveCents, "number");
 });
+
+test("an overdraft older than the 60-day read still lowers the amount, even when Riley left the account out", async () => {
+  const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
+  const old = (cents, days = 90) => ({ account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - days * 86_400_000).toISOString(), balance_cents: cents, currency: "USD", kind: "asset" });
+  const leave = [{ key: "safe-to-move", value: { leaveOut: ["demo-wallet"] } }];
+  // Not left out: a large overdraft too old to trust is read (not dropped to $0) and withholds the amount.
+  const open = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(-400_000)] })(AT);
+  assert.deepEqual(open.result.eligibility.reasons.map((r) => [r.code, r.account]), [["stale-balance", "demo-wallet"]]);
+  assert.equal(open.result.opening.cents, 4_600_000, "the projection counts the debt");
+  assert.equal(open.result.headlines.safeToMoveCents, null);
+  // Left out: the amount comes back, and the debt keeps lowering it (only a positive balance is taken out).
+  const debt = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(-400_000)], drivers: leave })(AT);
+  const none = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(400_000)], drivers: leave })(AT);
+  assert.equal(debt.result.eligibility.eligible, true);
+  assert.deepEqual(debt.result.eligibility.leftOut.map((l) => [l.account, l.why, l.asOf]), [["demo-wallet", "chosen", old(0).captured_at]]);
+  assert.equal(typeof debt.result.headlines.safeToMoveCents, "number");
+  assert.ok(Math.abs(debt.result.headlines.safeToMoveCents - (none.result.headlines.safeToMoveCents - 400_000)) <= 1, "$4,000 less than with no debt");
+  // Crossing the boundary changes nothing: the same overdraft read inside the 60-day window gives the same amount.
+  const inside = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(-400_000, 59)], drivers: leave })(AT);
+  assert.equal(inside.result.headlines.safeToMoveCents, debt.result.headlines.safeToMoveCents);
+  // A liability-kind snapshot is a debt whatever its sign.
+  const owed = await loader({ txns: everyday(AT), accounts: [wallet], balances: [{ ...old(400_000), kind: "liability" }], drivers: leave })(AT);
+  assert.equal(owed.result.headlines.safeToMoveCents, debt.result.headlines.safeToMoveCents);
+});
+
+test("a saved tax profile or move plan that no longer parses withholds the amount, in the base plan and the what-if", async () => {
+  const badTax = await loader({ txns: everyday(AT), profile: { salaryAnnualCents: "lots" } })(AT, { otherIncome: 6_000 });
+  assert.equal(badTax.profile, null);
+  assert.deepEqual(badTax.result.eligibility.reasons.map((r) => r.code), ["plan-invalid"]);
+  assert.equal(badTax.result.headlines.safeToMoveCents, null);
+  assert.deepEqual(badTax.scenario.result.eligibility.reasons.map((r) => r.code), ["plan-invalid"]);
+  assert.ok(badTax.result.days.length > 0, "the projection is still drawn");
+  const badMove = await loader({ txns: everyday(AT), drivers: [{ key: "move", value: { when: "soon" } }] })(AT);
+  assert.equal(badMove.move, null);
+  assert.deepEqual(badMove.result.eligibility.reasons.map((r) => r.code), ["plan-invalid"]);
+  // No tax profile or move plan saved at all is not a reason (nothing is missing).
+  const none = await loader({ txns: everyday(AT), profile: null })(AT);
+  assert.equal(none.result.eligibility.eligible, true);
+});

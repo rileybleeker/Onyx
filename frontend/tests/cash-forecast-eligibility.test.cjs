@@ -143,6 +143,13 @@ test("a truncated history read and a failed plan read each withhold the amount; 
   assert.equal(noPlan.headlines.safeToMoveCents, null);
   const both = run({ quality: { historyTruncated: true, planUnavailable: true }, balances: [bal("chk", 400_000, ago(72)), bal("sav", 900_000)] });
   assert.deepEqual(codes(both).sort(), ["history-truncated", "plan-unavailable", "stale-balance"]);
+  // A saved tax profile or move plan that no longer parses: its taxes or move costs are missing, so no amount.
+  const invalid = run({ quality: { planInvalid: true } });
+  assert.deepEqual(codes(invalid), ["plan-invalid"]);
+  assert.match(invalid.eligibility.reasons[0].text, /tax profile or move plan could not be read/);
+  assert.equal(invalid.headlines.safeToMoveCents, null);
+  assert.deepEqual(invalid.days, fresh.days);
+  assert.deepEqual(E.eligibilityOf(JSON.parse(JSON.stringify(invalid))).reasons.map((r) => r.code), ["plan-invalid"], "a known code");
 });
 
 test("fewer than the minimum weeks of history: everyday spending is not projected, so no amount", () => {
@@ -252,6 +259,10 @@ test("a small balance too old to trust is not counted in the amount and is named
   assert.doesNotMatch(tile.leftOut[0].text, /\$/, "no amount in the text");
   assert.equal(tile.leftOut[0].chosen, false);
   assert.match(tile.asOf, /^Jun 15,/);
+  // Withheld for another reason: the tile is still dated by the balances it would count, never by the old small one.
+  const withheld = E.safeToMoveTile(run({ balances: [bal("chk", 400_000), bal("sav", small, ago(24 * 90))], quality: { planUnavailable: true } }), 50_000);
+  assert.equal(withheld.kind, "unavailable");
+  assert.match(withheld.asOf, /^Jun 15,/);
   // An overdrawn small balance keeps lowering the amount: only a positive balance is taken out.
   const overdrawn = run({ balances: [bal("chk", 400_000), bal("sav", -small, ago(24 * 10))] });
   assert.equal(overdrawn.eligibility.eligible, true);
@@ -298,6 +309,12 @@ test("a stored result stops being actionable once a counted balance turns 48 hou
   assert.equal(expired.eligibility.eligible, false);
   assert.equal(E.safeToMoveOf(expired), null, "a reader without a clock agrees");
   assert.equal(typeof out.headlines.safeToMoveCents, "number", "the stored copy itself is not changed");
+  // nextExpiry: when a view left open must look again (the earliest expiry still ahead, base plan or what-if).
+  assert.equal(E.nextExpiry([out], until - 1), until);
+  assert.equal(E.nextExpiry([out, { eligibility: { ...out.eligibility, validUntil: new Date(until - HOUR).toISOString() } }], until - 2 * HOUR), until - HOUR);
+  assert.equal(E.nextExpiry([out], until), null, "already passed: nothing to wait for");
+  assert.equal(E.nextExpiry([null, undefined, { eligibility: { eligible: false, reasons: [] } }], until), null, "no expiry");
+  assert.equal(E.nextExpiry([{ eligibility: { ...out.eligibility, validUntil: "soon" } }], 0), null, "an unreadable one is ignored (it is never eligible anyway)");
   // A malformed expiry, left-out entry or reason account is never eligible.
   assert.equal(E.eligibilityOf({ ...out, eligibility: { ...out.eligibility, validUntil: "soon" } }).eligible, false);
   assert.equal(E.eligibilityOf({ ...out, eligibility: { ...out.eligibility, leftOut: [{ account: "x" }] } }).eligible, false);
@@ -336,9 +353,15 @@ test("source: the tile shows the reason inside the same part as the amount; ever
   assert.match(part, /safe\.more\.map/, "every reason is reachable inside the part");
   assert.match(part, /safe\.leftOut\.map/, "accounts left out are named inside the part");
   assert.doesNotMatch(view, /headlines\.safeToMoveCents|h\.safeToMoveCents/, "never the raw headline");
-  assert.match(view, /safeToMoveTile\(result, buffer\)/);
+  assert.match(view, /safeToMoveTile\(result, buffer, checkNow\)/, "checked against the browser's clock once mounted");
+  assert.match(view, /useCheckClock\(\[result, scenario\?\.result\]\)/);
+  assert.match(view, /nextExpiry\(/, "re-checked at the next expiry");
+  assert.match(view, /visibilitychange/, "and when the page comes back into view");
+  assert.match(view, /<CompareTable [^>]*now=\{checkNow\}/, "the what-if uses the same clock");
+  assert.match(view, /\{ key: "safe-to-move", account, leaveOut: out \}/, "one account per change, merged on the server");
   const compare = fs.readFileSync(path.join(SRC, "app/financials/forecast/TaxAndWhatIf.tsx"), "utf8");
-  assert.match(compare, /safeToMoveOf\(base\), safeToMoveOf\(scen\)/);
+  assert.match(compare, /safeToMoveOf\(base, now\), safeToMoveOf\(scen, now\)/);
+  assert.match(compare, /eligibilityOf\(base, now\)/);
   assert.doesNotMatch(compare, /headlines\.safeToMoveCents/);
   // Client views never bundle the engine: types only from lib/cash-forecast.
   for (const src of [view, compare]) {
@@ -349,6 +372,6 @@ test("source: the tile shows the reason inside the same part as the amount; ever
   const server = fs.readFileSync(path.join(SRC, "lib/finance-result-cache-server.ts"), "utf8");
   assert.match(server, /cashForecastCheck\(/, "Today's alerts answer carries the same check");
   const loader = fs.readFileSync(path.join(SRC, "lib/cash-forecast-server.ts"), "utf8");
-  assert.match(loader, /planUnavailable: setupPending/);
+  assert.match(loader, /planUnavailable: setupPending, planInvalid/);
   assert.match(loader, /historyTruncated: bal\.truncated \|\| txn\.truncated/);
 });

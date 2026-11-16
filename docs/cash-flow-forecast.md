@@ -83,6 +83,7 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 | `freshness-unknown` | the caller passed no clock, so the dates could not be checked |
 | `history-truncated` | a paged read of the balances or the history stopped at its page limit |
 | `plan-unavailable` | the planned items or the plan drivers could not be read (`setupPending`) |
+| `plan-invalid` | a saved tax profile or move plan was read but no longer parses, so its taxes or move costs are missing |
 | `categories-unavailable` | Riley's category fixes could not be read (a missing table is not a failure), so transfers and card payments may be misclassified |
 | `short-history` | fewer than `minBaselineWeeks` of history, so everyday spending is not projected |
 | `invalid-input` | an input that is not a number reached the projection |
@@ -90,21 +91,28 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 
 **Left out of the amount, named next to it** (`eligibility.leftOut`; the projection still counts them): a pool
 balance under $100 that is older than 48 h (an account that rarely updates; for a cash account with no row in the
-60-day read the loader reads its newest snapshot and keeps it only when it is under $100), and any pool account
-Riley leaves out with "Leave it out" beside a balance reason (driver `safe-to-move` = `{leaveOut: [account keys]}`;
-"Count it again" removes it). A left-out account's positive balance is taken out of the opening and the lowest
-point, so the amount never rests on it; an overdraft keeps lowering the amount. Without that choice an account
-the feed can no longer refresh would withhold the amount for good.
+60-day read the loader reads its newest snapshot and keeps it when it is under $100 or negative), and any pool
+account Riley leaves out with "Leave it out" beside a balance reason (driver `safe-to-move` = `{leaveOut: [account
+keys]}`; "Count it again" removes it; each tap sends one account, `{key: "safe-to-move", account, leaveOut}`, and
+the server merges it into the saved list, so a page whose drivers read failed or a second tab never overwrites the
+other choices). A left-out account's positive balance is taken out of the opening and the lowest point, so the
+amount never rests on it; an overdraft keeps lowering the amount, also once it is older than the 60-day read.
+Without that choice an account the feed can no longer refresh would withhold the amount for good.
 
 **When the check stops holding.** `eligibility.validUntil` = the first counted balance's time + 48 h. The stored
 results (`pds.finance_result_cache`) are served up to an hour fresh and longer while a refresh is pending or
 failed, so `cachedForecast` (`forecastLoadAt`) and the alerts answer (`cashCheckAt`) re-check it when they serve:
-past it, the amount is withheld in the base plan and the what-if, and Today's check is not eligible.
+past it, the amount is withheld in the base plan and the what-if, and Today's check is not eligible. A stored
+result whose check has expired counts as stale even inside its fresh hour: the page recomputes it (so the reason
+names the account and offers Leave it out), and Today gets it at once marked `updating` and asks again. The
+browser re-checks too: the forecast tile and the what-if row use the browser's clock once mounted, at the next
+`validUntil` and whenever the page comes back into view, so a page or scroll section left open never keeps an
+expired amount.
 
 The tile shows the first three reasons inside the same Personalize part as the amount (the rest folded below
 them), the accounts left out, and the time of the oldest cash balance the amount counts. The what-if comparison
 and Today read the same result: `/api/finance/alerts` answers `cash: {eligible, reasons}` and Today shows the
-Money panel with the reason instead of "No alerts to act on". The amount itself is unchanged when the inputs are
+Money panel with the reason and a link to the forecast instead of "No alerts to act on". The amount itself is unchanged when the inputs are
 complete and nothing is left out.
 
 ### 4.2 Sign convention
