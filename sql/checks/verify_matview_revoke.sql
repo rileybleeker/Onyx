@@ -13,7 +13,8 @@
 -- dependency graph as step 3 of the migration: views over views, functions naming them, views and
 -- functions over those functions, policies), that no SECURITY DEFINER function a browser role can
 -- reach runs SQL that graph cannot read (dynamic SQL, another language) unless it is on the reviewed
--- list (the migration's step 3d), and that no other pds matview is readable by anon or authenticated.
+-- list (the migration's step 3d; names matched without regard to case, column-only owners included),
+-- and that no other pds matview is readable by anon or authenticated.
 BEGIN READ ONLY;
 SET LOCAL statement_timeout = '45s';
 DO $check$
@@ -106,10 +107,11 @@ BEGIN
             FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace
             WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
               AND NOT (cur.cls = 'pg_proc'::regclass AND p.oid = cur.obj)
-              AND p.prosrc ~ ('\m' || CASE WHEN cur.cls = 'pg_class'::regclass
-                                           THEN (SELECT c.relname FROM pg_class c WHERE c.oid = cur.obj)::text
-                                           ELSE (SELECT q.proname FROM pg_proc q WHERE q.oid = cur.obj)::text
-                                      END || '\M')
+              AND p.prosrc ~* ('\m' || regexp_replace(
+                      CASE WHEN cur.cls = 'pg_class'::regclass
+                           THEN (SELECT c.relname FROM pg_class c WHERE c.oid = cur.obj)::text
+                           ELSE (SELECT q.proname FROM pg_proc q WHERE q.oid = cur.obj)::text
+                      END, '([^[:alnum:]_])', '\\\1', 'g') || '\M')
         ) nxt
     )
     SELECT coalesce(array_agg(obj) FILTER (WHERE cls = 'pg_class'::regclass), '{}'::oid[]),
@@ -154,7 +156,8 @@ BEGIN
     WITH RECURSIVE fn AS (
         SELECT p.oid, p.proname, p.prosecdef, p.proowner, l.lanname,
                pn.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS sig,
-               p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src
+               p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src,
+               '\m' || regexp_replace(p.proname, '([^[:alnum:]_])', '\\\1', 'g') || '\M' AS pat
         FROM pg_proc p
         JOIN pg_namespace pn ON pn.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
@@ -162,13 +165,13 @@ BEGIN
     ), priv AS (
         SELECT f.oid FROM fn f
         WHERE f.prosecdef
-          AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_table_privilege(f.proowner, g, 'SELECT'))
+          AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_any_column_privilege(f.proowner, g, 'SELECT'))
     ), calls(root, fn) AS (
         SELECT oid, oid FROM priv
       UNION
         SELECT c.root, q.oid
         FROM calls c JOIN fn cur ON cur.oid = c.fn JOIN fn q ON q.oid <> cur.oid
-        WHERE cur.src ~ ('\m' || q.proname || '\M')
+        WHERE cur.src ~* q.pat
            OR EXISTS (SELECT 1 FROM pg_depend d
                       WHERE d.classid = 'pg_proc'::regclass AND d.objid = cur.oid
                         AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid)
@@ -176,7 +179,8 @@ BEGIN
         SELECT c.root,
                bool_or(q.lanname NOT IN ('sql', 'plpgsql')
                        OR q.src ~* '\mexecute\M'
-                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)') AS opaque,
+                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)'
+                       OR q.src ~* '\mu&["'']') AS opaque,
                md5(string_agg(q.sig || '|' || q.lanname || '|' || q.prosecdef::text || '|' || q.src,
                               E'\n' ORDER BY q.sig)) AS closure_md5
         FROM calls c JOIN fn q ON q.oid = c.fn
@@ -192,12 +196,16 @@ BEGIN
            OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = r.root)
            OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = r.root)
            OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = r.root)
-           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~ ('\m' || f.proname || '\M')));
+           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~* f.pat));
     IF leaked IS NOT NULL THEN
         RAISE EXCEPTION 'Unreviewed SECURITY DEFINER function a browser role can reach runs SQL the graph cannot read: %', leaked;
     END IF;
 
     -- The owner and a synthetic other account, each as a Data API caller (role authenticated).
+    -- With schema USAGE in place, a refusal can only come from the matview privilege itself.
+    IF NOT has_schema_privilege('authenticated', 'pds', 'USAGE') THEN
+        RAISE EXCEPTION 'Role authenticated has no USAGE on schema pds; the denial probe would prove nothing';
+    END IF;
     EXECUTE 'SET LOCAL ROLE authenticated';
     FOREACH subject IN ARRAY ARRAY[owner_id::text, '00000000-0000-0000-0000-000000000001'] LOOP
         PERFORM set_config('request.jwt.claim.sub', subject, true);

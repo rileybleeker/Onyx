@@ -44,21 +44,27 @@ any node, and views, policies and functions over those functions. It aborts,
 changing nothing, if anon or authenticated can read a relation in that graph
 (table or column), call a function in it, or if a policy, trigger or any other
 object uses one, or if any other pds matview is still readable. That graph only
-sees what the catalog records and what function source text names, so SQL built at
+sees what the catalog records and what function source text names (matched without
+regard to case, since PostgreSQL folds an unquoted `PDS.HRV_RESIDUALS_MAT` to the
+lower-case name), so SQL built at
 run time is outside it (a function running `EXECUTE 'SELECT ... FROM pds.' ||
 'hrv_' || 'residuals_mat'` names no object). The migration therefore also fails
-closed on every SECURITY DEFINER function whose owner can read the graph and that a
+closed on every SECURITY DEFINER function whose owner can read the graph (the whole
+table or any one column of it) and that a
 browser role can reach (anon / authenticated EXECUTE, a trigger or event trigger,
 any object that uses it, or another function that names it) when it, or anything it
 calls, is opaque: dynamic `EXECUTE`, a query-string builtin (`query_to_xml`,
-`table_to_xml`, `ts_stat`, `dblink` and the like) or a language other than sql /
-plpgsql. Such a function passes only when it and its whole call closure are on the
+`table_to_xml`, `ts_stat`, `dblink` and the like), a Unicode-escaped name (`U&"..."`)
+or a language other than sql / plpgsql. Such a function passes only when it and its whole call closure are on the
 migration's `reviewed_opaque` list with an unchanged hash (today one entry:
 Supabase's `public.rls_auto_enable()` event-trigger function, which enables row
 security on new tables in `public` and reads no table); a changed body, language,
 definer flag or callee fails the check again. The check can stop on a harmless
 function: then review that function and either make it unreachable or add its
-entry (never a pds function; those are rewritten), never loosen the rule. The grants must
+entry (never a pds function; those are rewritten), never loosen the rule. A stop on
+`public.rls_auto_enable()` after a Supabase platform upgrade means its body or a
+callee changed: re-review it and refresh its hash in both the migration and
+`sql/checks/verify_matview_revoke.sql`. The grants must
 not come back: the recreate recipes in `sql/perf_matrix_matview.sql` and
 `sql/perf_tier2_matviews.sql` grant only `service_role` and revoke `anon` /
 `authenticated` (the pds default privileges in `sql/rls_policies.sql` grant
@@ -72,7 +78,9 @@ the recipe), `GRANT SELECT ON pds.<name>_mat TO service_role` restores the facad
 without opening anything to browser roles. Isolated PostgreSQL fixtures for
 these rules (two-hop definer chain, re-run after the revoke, column grants,
 function paths, policies, triggers, run-time assembled matview names with a re-run,
-dynamic SQL in a callee, a trigger or a SQL-standard body) are in `tests/test_pds_matview_revoke_pg.py`;
+dynamic SQL in a callee, a trigger or a SQL-standard body, Unicode-escaped names,
+upper-case names on a first run and a re-run, owners holding SELECT on a single column
+on a first run and a re-run) are in `tests/test_pds_matview_revoke_pg.py`;
 they run only against a disposable `*_fixture` database and skip without one.
 Future view migrations must preserve `security_invoker`
 and review their entire source graph.

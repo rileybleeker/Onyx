@@ -44,6 +44,12 @@
 -- closed on every SECURITY DEFINER function that browser roles can reach and
 -- whose own or callees' SQL the graph cannot read, unless that function and
 -- everything it calls is on the reviewed_opaque list with an unchanged hash.
+-- Names are matched in source text without regard to case (PostgreSQL folds
+-- an unquoted PDS.HRV_RESIDUALS_MAT to the lower-case name), and an owner
+-- that can read only some columns of a relation counts as able to read it.
+-- If step 3d aborts on public.rls_auto_enable() (or another reviewed entry)
+-- after a Supabase platform upgrade, its body or a callee changed: re-review
+-- the new body and refresh its hash; never loosen the rule.
 --
 -- Recreating one of these matviews later: the pds default privileges
 -- (sql/rls_policies.sql) give authenticated SELECT on every new relation, so a
@@ -128,7 +134,8 @@ BEGIN
     --    views and matviews whose query uses a node (a private definer view over a
     --    matview, then a readable view over that, is two hops); functions whose
     --    SQL-standard body depends on a node or on a matview's row type; functions
-    --    whose source text names a node (plpgsql records no dependency). Each
+    --    whose source text names a node (plpgsql records no dependency), matched
+    --    without regard to case because PostgreSQL folds unquoted names. Each
     --    function found is a node too, so a view over it, or a function calling
     --    it, is followed in turn.
     WITH RECURSIVE reach(cls, obj) AS (
@@ -154,10 +161,11 @@ BEGIN
             FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace
             WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
               AND NOT (cur.cls = 'pg_proc'::regclass AND p.oid = cur.obj)
-              AND p.prosrc ~ ('\m' || CASE WHEN cur.cls = 'pg_class'::regclass
-                                           THEN (SELECT c.relname FROM pg_class c WHERE c.oid = cur.obj)::text
-                                           ELSE (SELECT q.proname FROM pg_proc q WHERE q.oid = cur.obj)::text
-                                      END || '\M')
+              AND p.prosrc ~* ('\m' || regexp_replace(
+                      CASE WHEN cur.cls = 'pg_class'::regclass
+                           THEN (SELECT c.relname FROM pg_class c WHERE c.oid = cur.obj)::text
+                           ELSE (SELECT q.proname FROM pg_proc q WHERE q.oid = cur.obj)::text
+                      END, '([^[:alnum:]_])', '\\\1', 'g') || '\M')
         ) nxt
     )
     SELECT coalesce(array_agg(obj) FILTER (WHERE cls = 'pg_class'::regclass), '{}'::oid[]),
@@ -214,13 +222,15 @@ BEGIN
 
     -- 3d. What the graph cannot see. A function that builds its SQL at run time
     --     (EXECUTE, or query_to_xml / table_to_xml / ts_stat / dblink and the
-    --     like) or is written in a language other than sql / plpgsql can read a
-    --     matview without naming it ('pds.' || 'hrv_' || 'residuals_mat' is in no
-    --     catalog entry and in no source text). Only a SECURITY DEFINER function
-    --     whose owner can read a relation of the graph turns that into a leak:
+    --     like), spells a name with Unicode escapes (U&"..."), or is written in a
+    --     language other than sql / plpgsql can read a matview without naming it
+    --     ('pds.' || 'hrv_' || 'residuals_mat' is in no catalog entry and in no
+    --     source text). Only a SECURITY DEFINER function whose owner can read a
+    --     relation of the graph (the whole table or any one column of it) turns
+    --     that into a leak:
     --     anything else runs as its caller, which the revoke refuses. So for each
     --     such definer function the check takes it plus everything it calls
-    --     (functions its source names or its SQL body depends on, transitively:
+    --     (functions its source names, in any case, or its SQL body depends on, transitively:
     --     they run as its owner too). If any of them is opaque, it aborts unless
     --     the function is unreachable by browser roles (no anon / authenticated
     --     EXECUTE, no trigger or event trigger, no object that uses it, no
@@ -230,7 +240,8 @@ BEGIN
     WITH RECURSIVE fn AS (
         SELECT p.oid, p.proname, p.prosecdef, p.proowner, l.lanname,
                pn.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS sig,
-               p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src
+               p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), '') AS src,
+               '\m' || regexp_replace(p.proname, '([^[:alnum:]_])', '\\\1', 'g') || '\M' AS pat
         FROM pg_proc p
         JOIN pg_namespace pn ON pn.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
@@ -238,13 +249,13 @@ BEGIN
     ), priv AS (
         SELECT f.oid FROM fn f
         WHERE f.prosecdef
-          AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_table_privilege(f.proowner, g, 'SELECT'))
+          AND EXISTS (SELECT 1 FROM unnest(reach_rels) AS g WHERE has_any_column_privilege(f.proowner, g, 'SELECT'))
     ), calls(root, fn) AS (
         SELECT oid, oid FROM priv
       UNION
         SELECT c.root, q.oid
         FROM calls c JOIN fn cur ON cur.oid = c.fn JOIN fn q ON q.oid <> cur.oid
-        WHERE cur.src ~ ('\m' || q.proname || '\M')
+        WHERE cur.src ~* q.pat
            OR EXISTS (SELECT 1 FROM pg_depend d
                       WHERE d.classid = 'pg_proc'::regclass AND d.objid = cur.oid
                         AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid)
@@ -252,7 +263,8 @@ BEGIN
         SELECT c.root,
                bool_or(q.lanname NOT IN ('sql', 'plpgsql')
                        OR q.src ~* '\mexecute\M'
-                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)') AS opaque,
+                       OR q.src ~* '\m((query|cursor|table|schema|database)_to_xml|ts_stat|ts_rewrite|dblink)'
+                       OR q.src ~* '\mu&["'']') AS opaque,
                md5(string_agg(q.sig || '|' || q.lanname || '|' || q.prosecdef::text || '|' || q.src,
                               E'\n' ORDER BY q.sig)) AS closure_md5
         FROM calls c JOIN fn q ON q.oid = c.fn
@@ -268,7 +280,7 @@ BEGIN
            OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = r.root)
            OR EXISTS (SELECT 1 FROM pg_event_trigger e WHERE e.evtfoid = r.root)
            OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = r.root)
-           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~ ('\m' || f.proname || '\M')));
+           OR EXISTS (SELECT 1 FROM fn o WHERE o.oid <> r.root AND o.src ~* f.pat));
     IF blocker IS NOT NULL THEN
         RAISE EXCEPTION 'A SECURITY DEFINER function browser roles can reach runs SQL the graph cannot read (%); review it, then make it unreachable or add it to reviewed_opaque', blocker;
     END IF;

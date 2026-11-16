@@ -24,7 +24,11 @@ what it does:
     SQL: aborts; a SQL-standard body calling query_to_xml on an assembled name: aborts; a definer
     trigger function with dynamic SQL that nobody may call directly: aborts; a definer with dynamic
     SQL that no browser role may call and nothing uses (like the perf refresh function): passes, and a
-    re-run passes.
+    re-run passes; a callable definer naming a matview with a Unicode escape (U&"..."): aborts.
+  - Review round 2: a callable definer reading PDS.HRV_RESIDUALS_MAT in upper case (PostgreSQL folds
+    it to the lower-case name): aborts, on the first run and on a re-run after the revoke; a callable
+    definer calling a private function by its upper-case name: aborts; a callable definer with dynamic
+    SQL whose owner holds SELECT on only one column of a matview: aborts, first run and re-run.
 Every aborted run must leave the grants exactly as they were (the migration is one atomic statement).
 
 Safety: each case is ONE transaction that ends in ROLLBACK, and its first statement refuses to run
@@ -297,6 +301,57 @@ def test_unreachable_definer_with_dynamic_sql_passes_and_reruns() -> None:
 AS $f$ BEGIN EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY pds.%I', 'hrv_' || 'residuals_mat'); END $f$;""",
                     "REVOKE EXECUTE ON FUNCTION pds.fixture_dyn_refresh() FROM PUBLIC, anon, authenticated;",
                     MIGRATE, _assert_grants(False), MIGRATE, _assert_grants(False))
+
+
+def test_definer_naming_a_matview_with_a_unicode_escape_aborts() -> None:
+    # U&"..." spells hrv_residuals_mat with \005f for the underscores: no source text names it.
+    _expect_abort("""CREATE FUNCTION pds.fixture_uescape() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY SELECT k FROM pds.U&"hrv\005fresiduals\005fmat"; END $f$;""",
+                  DYNAMIC_ABORT, "fixture_uescape")
+
+
+# Review round 2 (Codex): PostgreSQL folds unquoted names, so the source text may spell them in any case.
+UPPER_CASE = """CREATE FUNCTION pds.fixture_upper() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY SELECT K FROM PDS.HRV_RESIDUALS_MAT; END $f$;"""
+
+
+def test_upper_case_matview_name_in_a_callable_definer_aborts() -> None:
+    _expect_abort(UPPER_CASE, FUNCTION_ABORT, "fixture_upper")
+
+
+def test_upper_case_matview_name_added_after_the_revoke_aborts_the_rerun() -> None:
+    _expect_abort(UPPER_CASE, FUNCTION_ABORT, "fixture_upper", revoke_first=True)
+
+
+def test_callable_definer_calling_a_private_function_in_upper_case_aborts() -> None:
+    _expect_abort("""CREATE FUNCTION pds.fixture_inner_uc() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY SELECT k FROM pds.hrv_prediction_gaps_mat; END $f$;
+REVOKE EXECUTE ON FUNCTION pds.fixture_inner_uc() FROM PUBLIC;
+CREATE FUNCTION pds.fixture_caller_uc() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY SELECT * FROM PDS.FIXTURE_INNER_UC(); END $f$;""", FUNCTION_ABORT, "fixture_caller_uc")
+
+
+# Review round 2 (Codex): an owner holding SELECT on a single column can still read that column.
+COLUMN_ONLY_OWNER = """DO $colowner$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fixture_colowner') THEN
+        CREATE ROLE fixture_colowner NOLOGIN;
+    END IF;
+END
+$colowner$;
+GRANT USAGE ON SCHEMA pds TO fixture_colowner;
+GRANT SELECT (k) ON pds.hrv_residuals_mat TO fixture_colowner;
+CREATE FUNCTION pds.fixture_colowner_fn() RETURNS SETOF integer LANGUAGE plpgsql SECURITY DEFINER
+AS $f$ BEGIN RETURN QUERY EXECUTE 'SELECT k FROM ' || 'pds.' || 'hrv_' || 'residuals_mat'; END $f$;
+ALTER FUNCTION pds.fixture_colowner_fn() OWNER TO fixture_colowner;"""
+
+
+def test_column_only_owner_definer_with_dynamic_sql_aborts() -> None:
+    _expect_abort(COLUMN_ONLY_OWNER, DYNAMIC_ABORT, "fixture_colowner_fn")
+
+
+def test_column_only_owner_definer_added_after_the_revoke_aborts_the_rerun() -> None:
+    _expect_abort(COLUMN_ONLY_OWNER, DYNAMIC_ABORT, "fixture_colowner_fn", revoke_first=True)
 
 
 if __name__ == "__main__":

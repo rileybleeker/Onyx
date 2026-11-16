@@ -167,8 +167,12 @@ def test_reachability_graph_starts_from_all_six_on_every_run() -> None:
     # functions by proname, so a function calling a function is followed).
     for needle in ("FROM reach cur", "CROSS JOIN LATERAL", "d.classid = 'pg_rewrite'::regclass", "w.ev_class",
                    "d.classid = 'pg_proc'::regclass", "d.refclassid = 'pg_type'::regclass", "c.reltype",
-                   "p.prosrc ~", "c.relname FROM pg_class", "q.proname FROM pg_proc"):
+                   "p.prosrc ~*", "c.relname FROM pg_class", "q.proname FROM pg_proc",
+                   "regexp_replace("):
         assert needle in graph, needle
+    # Case-insensitive (SEC01B round 2): PostgreSQL folds an unquoted PDS.HRV_RESIDUALS_MAT to the
+    # lower-case name, so a case-sensitive match would miss it. No case-sensitive name match is left.
+    assert not re.search(r"prosrc ~ \(", graph), "case-sensitive name match in the graph"
     # What is checked on the graph: every relation but the six (table AND column privileges, both
     # browser roles), every policy over a relation or function of it, every function of it.
     for needle in ("c.oid = ANY (reach_rels) AND NOT c.oid = ANY (six)",
@@ -212,23 +216,28 @@ def test_dynamic_sql_definers_fail_closed_before_the_revoke() -> None:
     for needle in (
         "f.prosecdef",                                                # definer functions only ...
         "unnest(reach_rels)",                                         # ... whose owner reads the graph
-        "has_table_privilege(f.proowner, g, 'SELECT')",
+        "has_any_column_privilege(f.proowner, g, 'SELECT')",          # (a column-only owner too)
         "calls(root, fn)", "FROM calls c",                            # ... plus everything they call
-        r"cur.src ~ ('\m' || q.proname || '\M')",
+        r"'\m' || regexp_replace(p.proname, '([^[:alnum:]_])', '\\\1', 'g') || '\M' AS pat",
+        "cur.src ~* q.pat",                                           # names matched in any case
         "d.refclassid = 'pg_proc'::regclass AND d.refobjid = q.oid",
         "pg_get_function_sqlbody",                                    # SQL-standard bodies are read too
         "q.lanname NOT IN ('sql', 'plpgsql')",                        # other languages are opaque
         r"q.src ~* '\mexecute\M'",                                    # dynamic EXECUTE is opaque
         "_to_xml|ts_stat|ts_rewrite|dblink",                          # query-string builtins are opaque
+        "u&[",                                                        # Unicode-escaped names are opaque
         "md5(string_agg(", "= ANY (reviewed_opaque)",                 # reviewed closures, by hash
         "has_function_privilege('anon', r.root, 'EXECUTE')",          # reachable: callable,
         "has_function_privilege('authenticated', r.root, 'EXECUTE')",
         "pg_trigger t WHERE t.tgfoid = r.root",                       # a trigger,
         "pg_event_trigger e WHERE e.evtfoid = r.root",                # an event trigger,
         "d.refobjid = r.root",                                        # used by any object,
-        r"o.src ~ ('\m' || f.proname || '\M')",                       # or named by another function
+        "o.src ~* f.pat",                                             # or named by another function
     ):
         assert needle in check, needle
+    # No case-sensitive name match and no table-only owner test is left (SEC01B round 2).
+    assert not re.search(r"src ~ [(q]", check), "case-sensitive name match in step 3d"
+    assert "has_table_privilege(f.proowner" not in check
     after = body[body.index(check):]
     assert after.index("IF blocker IS NOT NULL") < after.index("RAISE EXCEPTION 'A SECURITY DEFINER function")
     assert "targets" not in check
