@@ -262,16 +262,19 @@ def aa_lines(report: dict[str, Any]) -> list[str]:
     if not check:
         return []
     done = check.get("phase2_done") or {}
+    # The p the check used (Fisher's no-effect test since 2026-11-16); older checks carry none.
+    p_used = check.get("p_value") if check.get("p_value") is not None else report.get("p_value")
+    which = "no-effect randomization p" if check.get("p_source") == "p_value_no_effect" else "p"
     if check.get("passed"):
         return [f"A/A check PASSED: both arms had the same instruction and the registered analysis found no "
-                f"difference (p = {_fmt(report.get('p_value'), 4)}, alpha {_fmt(report.get('alpha'))}); "
+                f"difference ({which} = {_fmt(p_used, 4)}, alpha {_fmt(report.get('alpha'))}); "
                 f"{_count(check.get('days_revealed'))} of {_count(check.get('days'))} days were revealed on Today and "
                 f"{_count(check.get('days_answered'))} have a check-in answer."]
     reasons = []
     if check.get("false_effect") is None:
         reasons.append("the model could not be fitted, so the check has no result")
     elif check.get("false_effect"):
-        reasons.append(f"the analysis reported a difference between identical arms (p = {_fmt(report.get('p_value'), 4)} "
+        reasons.append(f"the analysis reported a difference between identical arms ({which} = {_fmt(p_used, 4)} "
                        f"< {_fmt(report.get('alpha'))}). By chance alone this happens about 1 time in 20; review the "
                        "pipeline before registering a real trial")
     if done.get("every_day_revealed") is False:
@@ -293,11 +296,28 @@ def inference_lines(report: dict[str, Any]) -> list[str]:
         rule = DECISION_NAMES.get(str(report.get("decision_if_supported")), str(report.get("decision_if_supported")))
         reasons = "; ".join(str(x) for x in report.get("decision_withheld") or []) or "see the report payload"
         lines.append(f"No firm decision yet, so it reads Inconclusive: {reasons}. The rule on its own gives: {rule}.")
+    # Checks that do not withhold the decision but limit what it can say (e.g. an unbounded carryover).
+    for check in inference.get("checks") or []:
+        if isinstance(check, dict) and not check.get("blocks_decision") and check.get("status") not in (None, "ok"):
+            lines.append(f"Limit: {check.get('reason')}.")
+    outputs = inference.get("outputs") if isinstance(inference.get("outputs"), dict) else {}
+    unsupported = set(inference.get("unsupported_outputs") or [])
     lines.append(
         f"The p-values and intervals allow for carryover ({inference.get('method')}): they assume the arm acts on the "
-        "same night and the next night only, by the same amount every night, and that missing nights are not caused "
-        f"by the arm. Without any of that, 'the arm changes no night' has randomization p = "
-        f"{_fmt(report.get('p_value_no_effect'), 4)} (it does not say which night).")
+        "same night and the next night only, by the same amount every night, that the day before the trial is like "
+        "the control arm, and that missing nights are not caused by the arm."
+        + (" Some of that is not supported for this trial, so these numbers are not supported either." if
+           unsupported & {"p_value", "ci_low / ci_high"} else ""))
+    fisher = (outputs.get("p_value_no_effect") or {}).get("supported")
+    p_text = _fmt(report.get("p_value_no_effect"), 4)
+    if fisher is False or "p_value_no_effect" in unsupported:
+        lines.append(f"Fisher's test that the arm changes no night (randomization p = {p_text}) needs only the "
+                     "randomized schedule and missing nights not caused by the arm, and the second does not hold "
+                     "here, so it is not supported either.")
+    else:
+        lines.append(f"Without the one-night and equal-effect assumptions, but still with the randomized schedule and "
+                     f"missing nights not caused by the arm, 'the arm changes no night' has randomization p = {p_text} "
+                     "(it does not say which night).")
     if report.get("carryover_ci_low") is not None:
         lines.append(f"Carryover interval: {_fmt(report.get('carryover_ci_low'))} to "
                      f"{_fmt(report.get('carryover_ci_high'))} ms.")

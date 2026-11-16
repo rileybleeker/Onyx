@@ -28,16 +28,25 @@ the observed yesterday's assignment. So the joint test needs one pass of re-draw
 (tau, gamma). The reported same-night p-value tests tau = 0 with gamma unknown (a nuisance) by
 Berger & Boos (1994): the largest joint p-value over a 1 - beta randomization confidence set for
 gamma, plus beta (nuisance_beta_for(R): 0.001, or 5 / (R + 1) with fewer re-draws). Its type I
-error is at most alpha whatever gamma is, whenever M holds. The interval inverts that test; the
-carryover p-value and interval are the same construction with the roles swapped. Fisher's sharp null of no effect on any night is
-reported too (p_value_no_effect): exact with no model, but rejecting it does not say which night.
-The re-drawing never assumes anything about the HRV series, so autocorrelation does not break it.
+error is at most alpha whatever gamma is, whenever M holds. The interval is a certified enclosure
+of every value that test does not reject (interval(), INTERVAL_METHOD: the accepted values need
+not form an interval, so nothing beyond its ends is accepted, by a bound proved strip by strip);
+the carryover p-value and interval are the same construction with the roles swapped. A value is
+rejected when p < alpha, the same boundary as the decision rule. Fisher's sharp null of no effect
+on any night is reported too (p_value_no_effect): exact without the effect model, but it still
+needs the randomized schedule and missing nights not caused by the arm, and rejecting it does not
+say which night. The re-drawing never assumes anything about the HRV series, so autocorrelation
+does not break it.
 
 analyze_trial() REFUSES to run before the pre-registered end (Riley's decision 1, doc section 13:
 analyse only at the pre-registered end). A trial stopped early is reported as such. It reports the
-decision rule's verdict as a firm decision only when the checks in assumption_checks() pass and
-the method's calibration and independent review are recorded in METHOD_REVIEW; otherwise the
-decision is withheld ("inconclusive") and the reasons are in the report.
+decision rule's verdict as a firm decision only when every blocking check in assumption_checks()
+passes: missing nights not tied to the arm, the registered protocol's declaration and
+justification of the untestable parts of M (one-night carryover, constant effects, pre-trial day
+as control), the registered inference method, and a METHOD_REVIEW (calibration report plus
+independent review) covering the trial's alpha and re-draw count. Otherwise the decision is
+withheld ("inconclusive"), the reasons are in the report, and every output whose assumptions a
+failed check leaves unsupported is marked so.
 """
 from __future__ import annotations
 
@@ -56,13 +65,41 @@ _WIDEN = 1e-9              # relative widening of every extreme set: a floating-
 # Berger & Boos (1994): level of the confidence set for the other coefficient. It is 0.001, raised
 # to 5 / (R + 1) when there are fewer than 4,999 re-draws, so the set always rests on at least the
 # 5 most extreme re-draws (with 999, the protocol minimum, a single re-draw would decide it).
-NUISANCE_BETA = 0.001
-MIN_NUISANCE_TAIL = 5
+# Defined in experiment_design so the protocol rules can check that alpha leaves room above it.
+NUISANCE_BETA = design.NUISANCE_BETA
+MIN_NUISANCE_TAIL = design.MIN_NUISANCE_TAIL
+nuisance_beta_for = design.nuisance_beta_for
 INFERENCE_METHOD = "joint_sharp_null_berger_boos_v1"
+INTERVAL_METHOD = "certified_enclosure_v1"
 # Filled in by the PR that records the seeded calibration report (experiment_calibration.py, run in
-# the scheduled validation phase) and the independent statistical review of INFERENCE_METHOD.
-# Until both are set, analyze_trial withholds the decision (docs/experiment-framework.md 8.1).
-METHOD_REVIEW: dict[str, str | None] = {"calibration_report": None, "independent_review": None}
+# the scheduled validation phase) and the independent statistical review of INFERENCE_METHOD, with
+# the configuration the report calibrated. A trial's decision is firm only when its alpha and
+# re-draw count are among those (docs/experiment-framework.md 8.1); until then it is withheld.
+METHOD_REVIEW: dict[str, Any] = {
+    "method": None,               # the INFERENCE_METHOD the report and the review cover
+    "calibration_report": None,   # reference to the passing seeded report (experiment_calibration.py)
+    "independent_review": None,   # reference to the independent statistical review
+    "n_redraws": (),              # re-draw counts the report calibrated
+    "alpha": (),                  # alpha levels it calibrated
+}
+
+
+def method_review_problem(alpha: float, n_redraws: int) -> str | None:
+    """Why a trial with this alpha and re-draw count has no recorded review of INFERENCE_METHOD
+    that covers it, or None when it has one."""
+    review = METHOD_REVIEW
+    if not (review.get("calibration_report") and review.get("independent_review")):
+        return (f"the calibration report and the independent statistical review of {INFERENCE_METHOD} are not "
+                "recorded yet (experiment_analysis.METHOD_REVIEW)")
+    if review.get("method") != INFERENCE_METHOD:
+        return f"the recorded review covers {review.get('method')!r}, not {INFERENCE_METHOD}"
+    counts = sorted({int(x) for x in review.get("n_redraws") or ()})
+    if int(n_redraws) not in counts:
+        return f"the calibration report covers {counts or 'no'} re-draw counts, not this trial's {int(n_redraws)}"
+    levels = [float(x) for x in review.get("alpha") or ()]
+    if not any(abs(float(alpha) - level) < 1e-12 for level in levels):
+        return f"the calibration report covers alpha {levels or 'none'}, not this trial's {float(alpha):g}"
+    return None
 
 
 class AnalysisNotAllowed(RuntimeError):
@@ -81,6 +118,12 @@ class TrialSpec:
     n_redraws: int = 10000
     control_arm: str = "B"
     stopped_on: date | None = None        # set when Riley stopped the trial early
+    # From the registered protocol (experiment_design.validate_protocol). They decide whether the
+    # untestable parts of the model are supported for THIS trial (assumption_checks).
+    kind: str = design.KIND_TREATMENT
+    carryover_nights: int | None = None   # analysis.carryover_nights; the model needs 1
+    model_justification: str | None = None   # analysis.model_justification
+    inference_method: str | None = None   # analysis.inference_method, fixed at registration
 
     @property
     def n_days(self) -> int:
@@ -430,11 +473,6 @@ def _sets_fixed(d: np.ndarray, h: np.ndarray, k: float) -> _ExtremeSets:
     return _ExtremeSets(n_all=n_all, outside=(a[~closed], b[~closed]))
 
 
-def nuisance_beta_for(n_redraws: int) -> float:
-    """The registered nuisance level for a trial with n_redraws re-draws (fixed by the protocol's count)."""
-    return max(NUISANCE_BETA, MIN_NUISANCE_TAIL / (n_redraws + 1))
-
-
 def accept_count(beta: float, n_redraws: int) -> int:
     """Smallest number of extreme re-draws whose p-value (1 + count) / (R + 1) is above beta."""
     return max(0, math.floor(beta * (n_redraws + 1) - 1) + 1)
@@ -464,46 +502,246 @@ def bb_p_value(draws: Draws, comp: int, value: float, beta: float | None = None)
     return min(1.0, beta + (1 + worst) / (draws.n + 1)), (low, high)
 
 
+def _step_out(p: Callable[[float], float], start: float, direction: float, step: float, alpha: float,
+              scale: float) -> tuple[float, float]:
+    """From an accepted value `start`, double the step until the test rejects, then bisect.
+    Returns (accepted, rejected) values at most 1e-7 scales apart (relative to the distance from
+    `start` when that is larger); rejected is +-inf when 64 doublings never reject. A value is
+    accepted when p(v) >= alpha, the same boundary as the decision rule's p < alpha."""
+    inside, dist = start, step
+    outside = None
+    for _ in range(64):
+        x = start + direction * dist
+        if p(x) >= alpha:
+            inside, dist = x, dist * 2
+            continue
+        outside = x
+        break
+    if outside is None:
+        return inside, math.inf * direction
+    lo, hi = inside, outside
+    for _ in range(60):
+        if abs(hi - lo) <= 1e-7 * max(scale, 1e-3 * abs(lo - start)):
+            break
+        mid = (lo + hi) / 2
+        if p(mid) >= alpha:
+            lo = mid
+        else:
+            hi = mid
+    return float(lo), float(hi)
+
+
 def invert_p_value(p: Callable[[float], float], center: float, alpha: float, scale: float) -> tuple[float, float]:
-    """An interval holding the values v with p(v) > alpha around `center` (where p is 1): step out
-    until the test rejects, look further out for another accepted value before settling, then
-    bisect. On purpose this is a hull, not the connected part around `center`: an accepted value
-    found beyond a rejected gap widens the interval (a superset, so coverage can only rise)."""
+    """Numerical inversion of p around `center` (where p is 1): step out until the test rejects,
+    then bisect. It finds only the boundary of the accepted values next to the center, so it is
+    NOT an enclosure of every accepted value; interval() adds the certificate that is. Used as is
+    only for the calibration's informational interval of the previous method."""
+    return (_step_out(p, center, -1.0, scale, alpha, scale)[0], _step_out(p, center, 1.0, scale, alpha, scale)[0])
 
-    def bound(direction: float) -> float:
-        inside, dist = center, scale
-        outside = None
-        for _ in range(64):
-            x = center + direction * dist
-            if p(x) > alpha:
-                inside, dist = x, dist * 2
-                continue
-            hit = next((v for v in (center + direction * dist * k for k in (4.0, 3.0, 2.0, 1.5)) if p(v) > alpha), None)
-            if hit is None:
-                outside = x
-                break
-            inside, dist = hit, abs(hit - center) * 2
-        if outside is None:
-            return math.inf * direction
-        lo, hi = inside, outside
-        for _ in range(40):
-            if abs(hi - lo) <= 1e-7 * scale:
-                break
-            mid = (lo + hi) / 2
-            if p(mid) <= alpha:
-                hi = mid
-            else:
-                lo = mid
-        return float(lo)
 
-    return bound(-1.0), bound(1.0)
+# ---------------------------------------------------------------------------
+# The certified interval (doc 8.1): an enclosure of EVERY accepted value
+# ---------------------------------------------------------------------------
+#
+# The Berger-Boos acceptance set {v : p(v) >= alpha} need not be an interval, and a search that
+# steps out from the estimate can miss an accepted region further out. interval() therefore
+# certifies that nothing beyond its ends is accepted. For a strip of parameter values [t1, t2],
+# _strip_bound() computes an upper bound on p(v) for EVERY v in the strip:
+#
+#   re-draw r is extreme at (v, x) when |P_r| >= |Q_r| with P_r, Q_r affine in (v, x), i.e. when
+#   P - Q and P + Q have the same sign: the union of two convex pieces of the (v, x) plane. Over a
+#   strip each piece projects onto x as one interval (computed exactly up to an outer rounding), so
+#   "extreme at x for SOME v in the strip" is a count over intervals. Counting the nuisance test
+#   that way gives a superset of every nuisance set in the strip, and counting the tested
+#   statistic that way, maximised over that superset, gives at least the count p() maximises.
+#
+# Far from the estimate the strip [V, inf) is certified in the coordinates w = 1 / v, z = x / v
+# (multiplying |P| >= |Q| by |w| keeps the form affine), so the whole half-line is covered with
+# finitely many strips. A strip that cannot be certified is split; a piece that stays uncertain
+# at the smallest width is either accepted (the search steps out past it) or kept inside the
+# interval. When the budget runs out that end is infinite. Every way out errs on the wide side,
+# so the interval holds every value the test does not reject (up to floating-point ties).
+
+CERT_FIRST = 0.25       # the first strip beyond an end, in scales; strips double outward
+CERT_FAR = 1e4          # past the center +- this many scales the rest of the half-line is one strip in w = 1 / v
+CERT_MIN = 1e-6         # smallest strip, relative to its distance from the center (or to the tail's length)
+CERT_BUDGET = 4000      # strip bounds per side; when spent, that side of the interval is left unbounded
+
+
+def _piece(constraints: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], t1: float,
+           t2: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One convex piece of each re-draw's extreme region: the (t, z) where every constraint
+    c + a t + b z >= 0 holds (tolerance tol). Returns (lo, hi, ok): for t in [t1, t2] every such z
+    lies in [lo, hi]; ok is False where there is none. An outer bound: a constraint that cannot be
+    turned into a bound on z (b = 0, or a tie that holds everywhere) is dropped unless it fails
+    on the whole strip."""
+    n = constraints[0][0].shape[0]
+    ok = np.ones(n, dtype=bool)
+    bounds = []                                    # (is_lower, is_upper, intercept, slope): z >= / <= intercept + slope t
+    for c, a, b, tol in constraints:
+        at1, at2 = c + a * t1, c + a * t2
+        tie = (np.abs(b) <= 1e-9) & (np.maximum(np.abs(at1), np.abs(at2)) <= tol)
+        flat = ~tie & (b == 0.0)
+        ok &= ~(flat & (np.maximum(at1, at2) < -tol))
+        live = ~tie & ~flat
+        safe_b = np.where(live, b, 1.0)
+        bounds.append((live & (b > 0), live & (b < 0), np.where(live, -c / safe_b, 0.0),
+                       np.where(live, -a / safe_b, 0.0)))
+    # The lower end of the z-slice is the max of the lower bounds (convex in t), the upper end the
+    # min of the upper bounds (concave), so their extremes over the strip, and the ends of the t
+    # where the slice is non-empty, are at t1, t2 or where the two bounds cross.
+    (l1, u1, i1, s1), (l2, u2, i2, s2) = bounds
+    both = (l1 | u1) & (l2 | u2) & (s1 != s2)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        tc = np.where(both, (i2 - i1) / np.where(both, s1 - s2, 1.0), t1)
+    tc = np.where((tc >= min(t1, t2)) & (tc <= max(t1, t2)), tc, t1)
+    los, his = [], []
+    with np.errstate(invalid="ignore", over="ignore"):
+        for t in (np.full(n, float(t1)), np.full(n, float(t2)), tc):
+            lo, hi = np.full(n, -np.inf), np.full(n, np.inf)
+            for is_lower, is_upper, icpt, slope in bounds:
+                value = icpt + slope * t
+                lo = np.where(is_lower, np.maximum(lo, value), lo)
+                hi = np.where(is_upper, np.minimum(hi, value), hi)
+            los.append(lo)
+            his.append(hi)
+    lo_all, hi_all = np.array(los), np.array(his)
+    slack = 1e-9 * (1.0 + np.abs(np.where(np.isfinite(lo_all), lo_all, 0.0))
+                    + np.abs(np.where(np.isfinite(hi_all), hi_all, 0.0)))
+    feasible = ~(lo_all > hi_all + slack)          # a NaN compares False: kept (the wide side)
+    ok &= feasible.any(axis=0)
+    zlo = np.where(feasible, lo_all, np.inf).min(axis=0)
+    zhi = np.where(feasible, hi_all, -np.inf).max(axis=0)
+    zlo = np.where(np.isnan(zlo), -np.inf, zlo)
+    zhi = np.where(np.isnan(zhi), np.inf, zhi)
+    zhi = np.maximum(zhi, zlo)
+    return zlo - _widen(zlo), zhi + _widen(zhi), ok
+
+
+def _affine_sets(p: tuple, q: tuple, t1: float, t2: float) -> _ExtremeSets:
+    """For each re-draw, the z at which |P| >= |Q| for SOME t in [t1, t2], where
+    P = p[0] + p[1] t + p[2] z and Q = q[0] + q[1] t + q[2] z (arrays over re-draws or scalars),
+    as an _ExtremeSets of outer intervals. A non-finite re-draw is extreme everywhere."""
+    p0, pt, pz, q0, qt, qz = (np.asarray(v, dtype=float) for v in np.broadcast_arrays(*p, *q))
+    p0, pt, pz, q0, qt, qz = (np.atleast_1d(v) for v in (p0, pt, pz, q0, qt, qz))
+    finite = np.isfinite(p0) & np.isfinite(pt) & np.isfinite(pz) & np.isfinite(q0) & np.isfinite(qt) & np.isfinite(qz)
+    p0, pt, pz, q0, qt, qz = (np.where(finite, v, 0.0) for v in (p0, pt, pz, q0, qt, qz))
+    tlim = max(abs(t1), abs(t2))
+    tol = 1e-9 * (1.0 + np.abs(p0) + np.abs(q0) + (np.abs(pt) + np.abs(qt)) * tlim) + TIE_TOL
+    # |P| >= |Q| - TIE_TOL lies inside {P - Q >= -TIE_TOL, P + Q >= -TIE_TOL} U {both <= TIE_TOL}.
+    d0, dt, dz = p0 - q0, pt - qt, pz - qz
+    s0, st, sz = p0 + q0, pt + qt, pz + qz
+    lo1, hi1, ok1 = _piece([(d0 + TIE_TOL, dt, dz, tol), (s0 + TIE_TOL, st, sz, tol)], t1, t2)
+    lo2, hi2, ok2 = _piece([(-d0 + TIE_TOL, -dt, -dz, tol), (-s0 + TIE_TOL, -st, -sz, tol)], t1, t2)
+    ok1, ok2 = ok1 & finite, ok2 & finite
+    touching = ok1 & ok2 & (lo1 <= hi2) & (lo2 <= hi1)
+    first_ok = ok1 | ok2
+    first_lo = np.where(touching, np.minimum(lo1, lo2), np.where(ok1, lo1, lo2))[first_ok]
+    first_hi = np.where(touching, np.maximum(hi1, hi2), np.where(ok1, hi1, hi2))[first_ok]
+    second = ok1 & ok2 & ~touching
+    lo = np.concatenate([first_lo, lo2[second]])
+    hi = np.concatenate([first_hi, hi2[second]])
+    whole = np.isneginf(lo) & np.isposinf(hi)
+    left = np.isneginf(lo) & ~np.isposinf(hi)
+    right = ~np.isneginf(lo) & np.isposinf(hi)
+    bounded = ~np.isneginf(lo) & ~np.isposinf(hi)
+    return _ExtremeSets(n_all=int((~finite).sum() + whole.sum()), bounded=(lo[bounded], hi[bounded]),
+                        left=hi[left], right=lo[right])
+
+
+def _strip_bound(draws: Draws, comp: int, t1: float, t2: float, tail: bool, beta: float, m: int) -> float:
+    """An upper bound on bb_p_value(draws, comp, v) for every v in a strip: v in [t1, t2], or,
+    with tail, every v whose 1 / v is in [t1, t2] (both of one sign or 0)."""
+    other = 1 - comp
+    basis_c, basis_o = draws.basis(comp), draws.basis(other)
+    obs_c, obs_o = float(draws.obs[comp]), float(draws.obs[other])
+    # Tested statistic with the nuisance at x: |a_c - v g - x h| against |obs_c - v| (bb_p_value).
+    fixed = ((draws.a[:, comp], -basis_c[:, comp], -basis_o[:, comp]), (obs_c, -1.0, 0.0))
+    # The nuisance test at x: |a_o - v g - x h| against |obs_o - x| (nuisance_set).
+    moving = ((draws.a[:, other], -basis_c[:, other], -basis_o[:, other]), (obs_o, 0.0, -1.0))
+    centers = [obs_o]
+    if tail:                                        # t = 1 / v, z = x / v: (const, v, x) -> (v, const, x)
+        fixed = tuple((f[1], f[0], f[2]) for f in fixed)
+        moving = tuple((f[1], f[0], f[2]) for f in moving)
+        centers = [obs_o * t1, obs_o * t2]
+    low, high = _affine_sets(*moving, t1, t2).hull(m, center=centers[0])
+    low, high = min([low, *centers]), max([high, *centers])
+    worst = _affine_sets(*fixed, t1, t2).sup(low, high)
+    return beta + (1 + worst) / (draws.n + 1)
+
+
+class _Certifier:
+    """One side of the certified interval for coefficient `comp`."""
+
+    def __init__(self, draws: Draws, comp: int, alpha: float, beta: float):
+        self.draws, self.comp, self.alpha, self.beta = draws, comp, alpha, beta
+        self.m = accept_count(beta, draws.n)
+        self.center, self.scale = float(draws.obs[comp]), draws.scale(comp)
+        self.used = 0
+
+    def p(self, v: float) -> float:
+        return bb_p_value(self.draws, self.comp, v, self.beta)[0]
+
+    def _segments(self, edge: float, d: float) -> list[tuple[bool, float, float]]:
+        """Strips from `edge` outward, near to far: doubling widths, then the rest of the half-line in 1 / v."""
+        segs, start, width = [], edge, CERT_FIRST * self.scale
+        while d * start < CERT_FAR * self.scale + abs(self.center):
+            segs.append((False, start, start + d * width))
+            start, width = start + d * width, width * 2
+        segs.append((True, 1.0 / start, 0.0))
+        return segs
+
+    def first_uncertain(self, edge: float, d: float) -> tuple[bool, float, float] | None | str:
+        """The nearest strip beyond `edge` that cannot be certified at the smallest width, None when
+        every v beyond `edge` is certified rejected, "budget" when the budget ran out."""
+        for tail, a, b in self._segments(edge, d):
+            unit = CERT_MIN * (abs(a) if tail else max(self.scale, abs(a - self.center)))
+            stack = [(a, b)]
+            while stack:
+                near, far = stack.pop()
+                if self.used >= CERT_BUDGET:
+                    return "budget"
+                self.used += 1
+                if _strip_bound(self.draws, self.comp, min(near, far), max(near, far), tail, self.beta,
+                                self.m) < self.alpha:
+                    continue
+                if abs(far - near) <= unit:
+                    return tail, near, far
+                mid = 0.5 * (near + far)
+                stack.append((mid, far))
+                stack.append((near, mid))           # the near half first
+        return None
+
+    def end(self, d: float) -> float:
+        """The interval's end in direction d: a value beyond which no value is accepted, or +-inf."""
+        _, edge = _step_out(self.p, self.center, d, self.scale, self.alpha, self.scale)
+        while math.isfinite(edge):
+            found = self.first_uncertain(edge, d)
+            if found is None:
+                return float(edge)
+            if found == "budget":
+                break
+            tail, near, far = found
+            if tail and far == 0.0:
+                break                                  # uncertain up to the limit: unbounded
+            v_mid = 1.0 / (0.5 * (near + far)) if tail else 0.5 * (near + far)
+            v_far = 1.0 / far if tail else far
+            if self.p(v_mid) >= self.alpha:            # really accepted out there: step out past it
+                _, edge = _step_out(self.p, v_mid, d, max(self.scale, abs(v_far - v_mid)), self.alpha, self.scale)
+            else:                                      # not certified: keep the strip inside the interval
+                edge = v_far
+        return math.inf * d
 
 
 def interval(draws: Draws, comp: int, alpha: float, beta: float | None = None) -> tuple[float, float]:
-    """Interval for coefficient `comp` by inverting its Berger-Boos test (coverage at least
-    1 - alpha under model M)."""
-    return invert_p_value(lambda v: bb_p_value(draws, comp, v, beta)[0], float(draws.obs[comp]), alpha,
-                          draws.scale(comp))
+    """Interval for coefficient `comp`: a certified enclosure of every value its Berger-Boos test
+    does not reject (p >= alpha), so it covers the true value with probability at least 1 - alpha
+    under model M. An end is infinite when the data cannot bound it or it could not be certified."""
+    beta = nuisance_beta_for(draws.n) if beta is None else beta
+    side = _Certifier(draws, comp, alpha, beta)
+    low = side.end(-1.0)
+    side.used = 0
+    return low, side.end(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -602,29 +840,40 @@ ASSUMPTIONS: dict[str, str] = {
         "job checks the stored schedule against the seed before analysing (GUARD experiment_schedule)."),
     "one_night_carryover": (
         "The arm acts on the same night and the next night only: night D's outcome depends on the schedule "
-        "through t_D and t_(D-1). Not tested by the analysis; the protocol must justify it, and a treatment "
-        "that can last longer uses the period design (section 4.2)."),
+        "through t_D and t_(D-1). Not tested by the analysis; the protocol must declare it "
+        "(analysis.carryover_nights: 1) and justify it (analysis.model_justification), and a treatment that can "
+        "last longer uses the period design (section 4.2)."),
     "constant_additive_effects": (
         "The same-night effect tau and the carryover gamma are the same on every night and add to the outcome: "
-        "Y_D(t) = Y_D(0) + tau * t_D + gamma * t_(D-1). Not tested by the analysis."),
+        "Y_D(t) = Y_D(0) + tau * t_D + gamma * t_(D-1). Not tested by the analysis; covered by the protocol's "
+        "analysis.model_justification."),
     "missing_not_caused_by_arm": (
         "Whether a night has an outcome, and which blocks are left out, does not depend on the schedule. "
-        "Checked: missing shares more than 10 points apart between the arms fail it."),
-    "pre_trial_day_is_control": "The day before the trial counts as the control arm for the first night's carryover.",
+        "Checked only for a large imbalance: missing shares more than 10 points apart between the arms fail it; "
+        "a smaller difference does not prove it."),
+    "pre_trial_day_is_control": (
+        "The day before the trial counts as the control arm for the first night's carryover. Covered by the "
+        "protocol's analysis.model_justification."),
 }
 
 _MODEL = ["randomized_schedule", "one_night_carryover", "constant_additive_effects", "missing_not_caused_by_arm",
           "pre_trial_day_is_control"]
+_FISHER = ["randomized_schedule", "missing_not_caused_by_arm"]
 
 
 def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05) -> dict[str, dict[str, Any]]:
     """Null hypothesis, assumptions and validity of every number the report carries."""
     level = f"{100 * (1 - beta):g}%"
+    ols = ("OLS coefficient; approximately unbiased over the randomization when the assumptions hold (exact only "
+           "with complete nights and a symmetric design: missing nights, the lag term and the fixed pre-trial day "
+           "break the symmetry slightly)")
+    enclosure = (f"a certified enclosure ({INTERVAL_METHOD}) of every value the test does not reject (p >= alpha), "
+                 f"so it covers the true value with probability at least {1 - alpha:g} when the assumptions hold; an "
+                 "infinite end means the nights cannot bound it, or it could not be certified")
     return {
         "estimate": {"estimand": "tau: same-night effect, arm A minus arm B, intention to treat", "needs": _MODEL,
-                     "validity": "OLS coefficient; unbiased over the randomization when the assumptions hold"},
-        "carryover": {"estimand": "gamma: the effect on the next night", "needs": _MODEL,
-                      "validity": "OLS coefficient; unbiased over the randomization when the assumptions hold"},
+                     "validity": ols},
+        "carryover": {"estimand": "gamma: the effect on the next night", "needs": _MODEL, "validity": ols},
         "two_night_total": {"estimand": "tau + gamma", "needs": _MODEL, "validity": "point estimate only"},
         "p_value": {
             "null": "tau = 0 (no same-night effect), any carryover gamma", "needs": _MODEL,
@@ -633,45 +882,83 @@ def output_semantics(beta: float = NUISANCE_BETA, alpha: float = 0.05) -> dict[s
             "validity": "type I error at most alpha when the assumptions hold, whatever gamma is"},
         "ci_low / ci_high": {
             "null": "the tau0 values the p_value test of tau = tau0 does not reject", "needs": _MODEL,
-            "validity": f"covers tau with probability at least {1 - alpha:g} when the assumptions hold"},
+            "validity": enclosure},
         "p_carryover": {
             "null": "gamma = 0 (no carryover), any same-night effect tau", "needs": _MODEL,
             "method": f"Berger-Boos as for p_value, with a {level} confidence set for tau",
             "validity": "type I error at most alpha when the assumptions hold, whatever tau is"},
         "carryover_ci_low / carryover_ci_high": {
             "null": "the gamma0 values the p_carryover test of gamma = gamma0 does not reject", "needs": _MODEL,
-            "validity": f"covers gamma with probability at least {1 - alpha:g} when the assumptions hold"},
+            "validity": enclosure},
         "p_value_no_effect": {
-            "null": "Fisher's sharp null: the schedule changes no night's outcome",
-            "needs": ["randomized_schedule", "missing_not_caused_by_arm"],
-            "validity": ("exact with no model of the effect; rejecting it says the arm acts on some night, not that "
-                         "the same-night effect is non-zero. Not read by the decision rule")},
+            "null": "Fisher's sharp null: the schedule changes no night's outcome", "needs": _FISHER,
+            "validity": ("exact without the effect model (one-night carryover, constant effects), but still only "
+                         "with the randomized schedule and missing nights not caused by the arm; rejecting it says "
+                         "the arm acts on some night, not that the same-night effect is non-zero. Not read by the "
+                         "decision rule")},
         "p_carryover_no_effect": {
-            "null": "Fisher's sharp null, tested with the carryover coefficient",
-            "needs": ["randomized_schedule", "missing_not_caused_by_arm"],
-            "validity": "exact with no model of the effect. Not read by the decision rule"},
+            "null": "Fisher's sharp null, tested with the carryover coefficient", "needs": _FISHER,
+            "validity": ("exact without the effect model, with the randomized schedule and missing nights not caused "
+                         "by the arm. Not read by the decision rule")},
         "hac_se / hac_se_carryover": {
             "validity": "approximate Newey-West cross-check (lags count observed nights). Not read by the decision rule"},
     }
 
 
-def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any]) -> list[dict[str, Any]]:
-    """What the data and the method record can check. A failed or pending check with
-    blocks_decision withholds the decision."""
-    reviewed = all(METHOD_REVIEW.get(key) for key in ("calibration_report", "independent_review"))
+def assumption_checks(primary: dict[str, Any], missingness: dict[str, Any],
+                      spec: TrialSpec | None = None) -> list[dict[str, Any]]:
+    """What the data, the registered protocol and the method record can check. A failed or pending
+    check with blocks_decision withholds the decision; `covers` names the assumptions a failed
+    check leaves unsupported (the outputs that need them are marked unsupported in the report).
+    Without a spec nothing is declared, so the protocol checks fail (closed)."""
+    kind = spec.kind if spec is not None else design.KIND_TREATMENT
+    justification = (spec.model_justification or "").strip() if spec is not None else ""
+    carryover = spec.carryover_nights if spec is not None else None
+    if kind == design.KIND_AA:
+        model_status = "ok"
+        model_reason = "an A/A check: both arms are the same instruction, so the model holds with no effect"
+    elif carryover != design.CARRYOVER_NIGHTS or not justification:
+        model_status = "failed"
+        model_reason = ("the registered protocol does not declare one night of carryover (analysis.carryover_nights: "
+                        "1) with a justification (analysis.model_justification) for the parts of the model the "
+                        "analysis cannot test: one-night carryover, constant additive effects and the pre-trial "
+                        "day as control")
+    else:
+        model_status, model_reason = "ok", "declared and justified in the registered protocol"
+    registered = spec.inference_method if spec is not None else None
+    review = method_review_problem(spec.alpha if spec is not None else 0.05,
+                                   spec.n_redraws if spec is not None else 10000)
     return [
         {"id": "missing_not_caused_by_arm", "status": "failed" if missingness.get("threat") else "ok",
-         "blocks_decision": True,
-         "reason": ("missing nights differ between the arms by more than 10 points; the randomization test assumes "
+         "blocks_decision": True, "covers": ["missing_not_caused_by_arm"],
+         "reason": ("missing nights differ between the arms by more than 10 points; the randomization tests assume "
                     "the arm did not cause missing nights")},
+        {"id": "model_justified", "status": model_status, "blocks_decision": True,
+         "covers": ["one_night_carryover", "constant_additive_effects", "pre_trial_day_is_control"],
+         "reason": model_reason},
         {"id": "carryover_set_bounded", "status": "ok" if primary.get("carryover_set_bounded") else "failed",
-         "blocks_decision": False,
+         "blocks_decision": False, "covers": [],
          "reason": ("the nights cannot bound the carryover, so the same-night test cannot reject (valid, "
                     "uninformative); a longer trial or the period design is needed")},
-        {"id": "method_reviewed", "status": "ok" if reviewed else "pending", "blocks_decision": True,
-         "reason": (f"the calibration report and the independent statistical review of {INFERENCE_METHOD} are not "
-                    "recorded yet (experiment_analysis.METHOD_REVIEW)")},
+        {"id": "registered_method", "status": "ok" if registered == INFERENCE_METHOD else "failed",
+         "blocks_decision": True, "covers": [],
+         "reason": (f"the registration recorded the inference method {registered!r}, not {INFERENCE_METHOD}: the "
+                    "analysis that ran is not the one registered")},
+        {"id": "method_reviewed", "status": "ok" if review is None else "pending", "blocks_decision": True,
+         "covers": [], "reason": review or "recorded for this trial's alpha and re-draw count"},
     ]
+
+
+def unsupported_outputs(outputs: dict[str, dict[str, Any]], checks: list[dict[str, Any]]) -> list[str]:
+    """Marks every output whose assumptions a failed check leaves unsupported
+    (outputs[name]["supported"]) and returns their names."""
+    failed = {a for c in checks if c.get("status") == "failed" for a in c.get("covers", [])}
+    out = []
+    for name, entry in outputs.items():
+        entry["supported"] = not (set(entry.get("needs", [])) & failed)
+        if not entry["supported"]:
+            out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -779,8 +1066,10 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
 
     missingness = missingness_check(t[in_scope], np.isnan(y[in_scope]))
     rule = decide(primary["estimate"], primary["ci_low"], primary["ci_high"], primary["p_value"], spec.mid_ms, spec.alpha)
-    checks = assumption_checks(primary, missingness)
+    checks = assumption_checks(primary, missingness, spec)
     withheld = [c["reason"] for c in checks if c["blocks_decision"] and c["status"] != "ok"]
+    outputs = output_semantics(primary["nuisance_beta"], spec.alpha)
+    unsupported = unsupported_outputs(outputs, checks)
 
     report = {
         "experiment_id": spec.experiment_id,
@@ -804,11 +1093,16 @@ def analyze_trial(spec: TrialSpec, data: TrialData, as_of: date) -> dict[str, An
         "missingness": missingness,
         "inference": {
             "method": INFERENCE_METHOD,
+            "interval_method": INTERVAL_METHOD,
+            "registered_method": spec.inference_method,
             "nuisance_beta": primary["nuisance_beta"],
             "assumptions": dict(ASSUMPTIONS),
             "checks": checks,
-            "outputs": output_semantics(primary["nuisance_beta"], spec.alpha),
-            "review": dict(METHOD_REVIEW),
+            "outputs": outputs,
+            # Numbers whose assumptions a failed check leaves unsupported (each output also carries "supported").
+            "unsupported_outputs": unsupported,
+            "review": {key: (list(value) if isinstance(value, (tuple, list)) else value)
+                       for key, value in METHOD_REVIEW.items()},
         },
         "sensitivity": sensitivity,
         "secondary_outcomes": secondary,

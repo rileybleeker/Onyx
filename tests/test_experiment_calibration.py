@@ -8,10 +8,17 @@ Covers
   * the extreme-set bookkeeping behind Berger-Boos (_sets_moving / _sets_fixed, hull, sup)
     against brute force on a dense grid, including the f = +-1, h = 0, NaN and tie cases;
   * bb_p_value is never below beta plus the joint p-value at any carryover inside its set, is 1
-    at the estimate, and its interval holds the estimate; the registered nuisance level;
-  * analyze_trial withholds the decision while the method review is not recorded and when the
-    arm causes missing nights, keeps the rule's verdict visible, and still refuses before the
-    pre-registered end;
+    at the estimate, and its interval holds every accepted value; the registered nuisance level;
+  * the certified interval: _strip_bound is never below the p-value inside its strip (original
+    and 1 / v coordinates), and on hand-built re-draws whose acceptance set has a rejected gap
+    the interval still holds the far accepted region, or is unbounded when values far out are
+    accepted, where stepping out from the estimate alone stops at the gap; p = alpha is accepted;
+  * analyze_trial withholds the decision while the method review is not recorded (or does not
+    cover the trial's alpha and re-draw count), when the arm causes missing nights, and when the
+    registered protocol does not declare and justify the untestable parts of the model or names
+    another inference method; it marks the outputs those failures leave unsupported (Fisher's
+    test too when the arm causes missing nights), keeps the rule's verdict visible, and still
+    refuses before the pre-registered end;
   * the calibration harness: deterministic, every supported scenario (zero same-night effect with
     a carryover, serial dependence and drift, missing nights and excluded blocks, a short trial,
     effects with and without carryover) within its prespecified Monte Carlo tolerance, and the
@@ -214,11 +221,16 @@ def test_bb_p_value_bounds_the_joint_p_values_inside_its_set():
             for x in grid:
                 theta = (value, x) if comp == 0 else (x, value)
                 assert p >= min(1.0, beta + ea.joint_p_value(draws, comp, *theta)) - 1e-12, (comp, value, x)
-    lo, hi = ea.interval(draws, 0, 0.05)
-    assert lo < draws.obs[0] < hi
-    assert ea.bb_p_value(draws, 0, lo)[0] > 0.05 and ea.bb_p_value(draws, 0, hi)[0] > 0.05, "the ends are not rejected"
-    clo, chi = ea.interval(draws, 1, 0.05)
-    assert clo < draws.obs[1] < chi
+    for comp in (0, 1):
+        lo, hi = ea.interval(draws, comp, 0.05)
+        assert lo < draws.obs[comp] < hi
+        # The ends are just past the accepted values (rejected there) and every accepted value is inside.
+        for end in (lo, hi):
+            assert not np.isfinite(end) or ea.bb_p_value(draws, comp, end)[0] < 0.05, "an end is a rejected value"
+        scale = draws.scale(comp)
+        grid = float(draws.obs[comp]) + scale * np.linspace(-30, 30, 1201)
+        accepted = [v for v in grid if ea.bb_p_value(draws, comp, v)[0] >= 0.05]
+        assert accepted and min(accepted) >= lo and max(accepted) <= hi, "the interval holds every accepted value"
 
 
 def test_randomization_analysis_reports_the_assumption_visible_outputs():
@@ -229,29 +241,122 @@ def test_randomization_analysis_reports_the_assumption_visible_outputs():
         assert key in fit, key
     assert fit["nuisance_beta"] == ea.nuisance_beta_for(999) and fit["carryover_set_bounded"] is True
     assert fit["ci_low"] < fit["estimate"] < fit["ci_high"] and fit["carryover_ci_low"] < fit["carryover"] < fit["carryover_ci_high"]
-    assert (fit["p_value"] <= 0.05) == (fit["ci_low"] > 0 or fit["ci_high"] < 0), "the interval and the p-value agree"
+    assert (fit["p_value"] < 0.05) == (fit["ci_low"] > 0 or fit["ci_high"] < 0), "the interval and the p-value agree"
     quick = ea.randomization_analysis(t, y, dow, n_redraws=1, with_p=False)
     assert "p_value" not in quick and quick["estimate"] == fit["estimate"]
 
     semantics = ea.output_semantics(fit["nuisance_beta"])
     assert "tau = 0" in semantics["p_value"]["null"] and "one_night_carryover" in semantics["p_value"]["needs"]
     assert "one_night_carryover" not in semantics["p_value_no_effect"]["needs"]
+    assert set(semantics["p_value_no_effect"]["needs"]) == {"randomized_schedule", "missing_not_caused_by_arm"}, \
+        "Fisher's test still needs the schedule and missing nights not caused by the arm"
     assert set(semantics["p_value"]["needs"]) <= set(ea.ASSUMPTIONS)
+    assert ea.INTERVAL_METHOD in semantics["ci_low / ci_high"]["validity"]
+    assert "approximately unbiased" in semantics["estimate"]["validity"]
+
+
+# ---------------------------------------------------------------------------
+# The certified interval: every accepted value, even past a rejected gap
+# ---------------------------------------------------------------------------
+
+def _gap_draws(n_far=3, n_near=2, n_redraws=199):
+    """Hand-built Draws whose same-night acceptance set is not an interval (doc 8.1).
+
+    Observed (0, 0); the nuisance plays no part (its columns are 0). n_far re-draws are extreme at
+    v <= 10 and v >= 30 (|30 - 2v| >= |v|), n_near on [-120, 40] (|60 - v/2| >= |v|), the rest only
+    at v = 0. With 199 re-draws, beta = 0.025 and alpha = 0.05 a value is accepted with 4 or more
+    extreme re-draws, so 3 + 2 accepts [-120, 10] and [30, 40] and rejects the gap between."""
+    a, g, h = np.zeros((n_redraws, 2)), np.zeros((n_redraws, 2)), np.zeros((n_redraws, 2))
+    a[:n_far, 0], g[:n_far, 0] = 30.0, 2.0
+    a[n_far:n_far + n_near, 0], g[n_far:n_far + n_near, 0] = 60.0, 0.5
+    return ea.Draws(obs=np.zeros(2), a=a, g=g, h=h)
+
+
+def test_interval_holds_an_accepted_region_past_a_rejected_gap():
+    draws = _gap_draws()
+    p = lambda v: ea.bb_p_value(draws, 0, v)[0]  # noqa: E731
+    assert p(35.0) >= 0.05 and p(20.0) < 0.05 and p(50.0) < 0.05 and p(-50.0) >= 0.05 and p(-130.0) < 0.05
+    # Stepping out from the estimate stops at the first rejection, near 10: that alone misses [30, 40].
+    near_lo, near_hi = ea.invert_p_value(p, 0.0, 0.05, draws.scale(0))
+    assert near_hi < 11.0
+    lo, hi = ea.interval(draws, 0, 0.05)
+    assert 40.0 <= hi < 40.01 and -120.01 < lo <= -120.0, (lo, hi)
+    grid = np.linspace(-300.0, 300.0, 12001)
+    accepted = [v for v in grid if p(v) >= 0.05]
+    assert min(accepted) >= lo and max(accepted) <= hi, "every accepted grid value is inside the interval"
+
+
+def test_interval_is_unbounded_when_values_far_out_are_accepted():
+    # 5 re-draws extreme at v <= 10 and v >= 30: accepted on (-inf, 10] and [30, inf), rejected between.
+    draws = _gap_draws(n_far=5, n_near=0)
+    p = lambda v: ea.bb_p_value(draws, 0, v)[0]  # noqa: E731
+    assert p(20.0) < 0.05 and p(1e6) >= 0.05
+    assert ea.invert_p_value(p, 0.0, 0.05, draws.scale(0))[1] < 11.0
+    assert ea.interval(draws, 0, 0.05) == (-np.inf, np.inf)
+
+
+def test_accepted_boundary_value_is_accepted():
+    # One boundary everywhere: p >= alpha is accepted (the decision rule adopts only on p < alpha).
+    step = lambda v: 0.05 if abs(v) <= 2.0 else 0.01  # noqa: E731
+    lo, hi = ea.invert_p_value(step, 0.0, 0.05, 1.0)
+    assert -2.0 - 1e-6 <= lo <= -2.0 + 1e-6 and 2.0 - 1e-6 <= hi <= 2.0 + 1e-6
+
+
+def test_strip_bound_is_at_least_the_p_value_everywhere_in_the_strip():
+    # The certificate is sound only if _strip_bound never falls below bb_p_value inside its strip,
+    # in the original coordinates and in the tail coordinates w = 1 / v.
+    t, y, dow, excluded = _trial(341, carryover=6.0, n_blocks=30, excluded_blocks=2)
+    draws, _ = ea.redraw_fit(t, y, dow, excluded_blocks=excluded, n_redraws=499, redraw_seed=17)
+    rng = np.random.default_rng(342)
+    for comp in (0, 1):
+        beta = ea.nuisance_beta_for(draws.n)
+        m = ea.accept_count(beta, draws.n)
+        center, scale = float(draws.obs[comp]), draws.scale(comp)
+        for _ in range(25):
+            t1 = center + scale * rng.uniform(-40, 40)
+            t2 = t1 + scale * rng.choice([1e-4, 0.01, 0.3, 2.0, 15.0])
+            bound = ea._strip_bound(draws, comp, t1, t2, False, beta, m)
+            worst = max(ea.bb_p_value(draws, comp, v, beta)[0] for v in np.linspace(t1, t2, 25))
+            assert bound >= worst - 1e-12, (comp, t1, t2, bound, worst)
+        for sign in (1.0, -1.0):
+            start = sign * (abs(center) + 50 * scale)
+            bound = ea._strip_bound(draws, comp, min(1 / start, 0.0), max(1 / start, 0.0), True, beta, m)
+            for k in (1.0, 1.7, 10.0, 1e3, 1e6):
+                assert bound >= ea.bb_p_value(draws, comp, start * k, beta)[0] - 1e-12, (comp, sign, k)
+    # And with the hand-built gap: a strip inside the gap is certified, one that touches [30, 40] is not.
+    gap = _gap_draws()
+    beta, m = ea.nuisance_beta_for(gap.n), ea.accept_count(ea.nuisance_beta_for(gap.n), gap.n)
+    assert ea._strip_bound(gap, 0, 15.0, 25.0, False, beta, m) < 0.05
+    assert ea._strip_bound(gap, 0, 25.0, 31.0, False, beta, m) >= 0.05
+    assert ea._strip_bound(gap, 0, 0.0, 1 / 50.0, True, beta, m) < 0.05, "past 50 only the 3 far re-draws are extreme"
 
 
 # ---------------------------------------------------------------------------
 # The report: firm decisions only when nothing withholds them
 # ---------------------------------------------------------------------------
 
-def _spec_and_data(effect=25.0, n_blocks=40, missing_a_extra=0.0, seed=331):
+DECLARED = dict(carryover_nights=1, model_justification="synthetic: acts on its own night only, the same every night",
+                inference_method=ea.INFERENCE_METHOD)
+
+
+def _spec_and_data(effect=25.0, n_blocks=40, missing_a_extra=0.0, seed=331, **spec_kw):
     rng = np.random.default_rng(seed)
     start = date(2030, 1, 7)
     arms = ed.generate_schedule(rng.bytes(32), n_blocks)
     t = np.array([1.0 if a == "A" else 0.0 for a in arms])
     y = 70 + rng.normal(0, 10, len(t)) + effect * t
     y[rng.random(len(t)) < missing_a_extra * t] = np.nan     # only arm-A nights go missing, and only when asked
-    spec = ea.TrialSpec("EXP-901", start, start + timedelta(days=len(t) - 1), mid_ms=8.0, n_redraws=999)
+    spec = ea.TrialSpec("EXP-901", start, start + timedelta(days=len(t) - 1), mid_ms=8.0, n_redraws=999,
+                        **{**DECLARED, **spec_kw})
     return spec, ea.TrialData(arms=arms, outcome=y)
+
+
+REVIEWED = dict(method=ea.INFERENCE_METHOD, calibration_report="synthetic-report-ref",
+                independent_review="synthetic-review-ref", n_redraws=(999,), alpha=(0.05,))
+
+
+def _without(report, *keys):
+    return {k: v for k, v in report.items() if k not in keys}
 
 
 def test_decision_is_withheld_until_the_method_review_is_recorded():
@@ -263,6 +368,7 @@ def test_decision_is_withheld_until_the_method_review_is_recorded():
             continue
         raise AssertionError("the inference change must not open an early look")
     as_of = spec.planned_end + timedelta(days=1)
+    status_keys = ("decision", "decision_firm", "decision_withheld", "inference")
     saved = dict(ea.METHOD_REVIEW)
     try:
         ea.METHOD_REVIEW.update(calibration_report=None, independent_review=None)
@@ -272,19 +378,63 @@ def test_decision_is_withheld_until_the_method_review_is_recorded():
         assert "independent statistical review" in pending["decision_withheld"][0]
         checks = {c["id"]: c for c in pending["inference"]["checks"]}
         assert checks["method_reviewed"]["status"] == "pending" and checks["missing_not_caused_by_arm"]["status"] == "ok"
+        assert checks["model_justified"]["status"] == "ok" and checks["registered_method"]["status"] == "ok"
         assert pending["inference"]["method"] == ea.INFERENCE_METHOD and set(pending["inference"]["assumptions"]) == set(ea.ASSUMPTIONS)
+        assert pending["inference"]["unsupported_outputs"] == [], "a pending review leaves every output supported"
 
-        ea.METHOD_REVIEW.update(calibration_report="synthetic-report-ref", independent_review="synthetic-review-ref")
+        ea.METHOD_REVIEW.update(REVIEWED)
         firm = ea.analyze_trial(spec, data, as_of)
         assert firm["decision"] == "adopt_A" and firm["decision_firm"] is True and firm["decision_withheld"] == []
-        assert {k: v for k, v in firm.items() if k not in ("decision", "decision_firm", "decision_withheld", "inference")} == \
-            {k: v for k, v in pending.items() if k not in ("decision", "decision_firm", "decision_withheld", "inference")}, \
+        assert _without(firm, *status_keys) == _without(pending, *status_keys), \
             "the review changes the verdict's status, never a number"
+
+        # The review covers a configuration: another re-draw count or alpha stays pending.
+        ea.METHOD_REVIEW.update(n_redraws=(10000,))
+        other = ea.analyze_trial(spec, data, as_of)
+        assert other["decision_firm"] is False and any("not this trial's 999" in r for r in other["decision_withheld"])
+        ea.METHOD_REVIEW.update(REVIEWED)
 
         skewed_spec, skewed = _spec_and_data(missing_a_extra=0.35, seed=332)
         threat = ea.analyze_trial(skewed_spec, skewed, skewed_spec.planned_end + timedelta(days=1))
         assert threat["missingness"]["threat"] is True and threat["decision"] == "inconclusive"
         assert threat["decision_firm"] is False and any("missing nights" in r for r in threat["decision_withheld"])
+        # Fisher's test needs missing nights not caused by the arm too: it is marked unsupported with the rest.
+        outputs = threat["inference"]["outputs"]
+        assert outputs["p_value_no_effect"]["supported"] is False and outputs["p_value"]["supported"] is False
+        assert {"p_value", "p_value_no_effect", "ci_low / ci_high"} <= set(threat["inference"]["unsupported_outputs"])
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
+def test_a_trial_without_a_declared_model_never_gets_a_firm_decision():
+    # With the method globally reviewed, the per-trial support for the untestable assumptions still decides.
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        ea.METHOD_REVIEW.update(REVIEWED)
+        for changes, check_id in ((dict(model_justification=None), "model_justified"),
+                                  (dict(model_justification="   "), "model_justified"),
+                                  (dict(carryover_nights=2), "model_justified"),
+                                  (dict(carryover_nights=None), "model_justified"),
+                                  (dict(inference_method=None), "registered_method"),
+                                  (dict(inference_method="synthetic_other_v9"), "registered_method")):
+            spec, data = _spec_and_data(**changes)
+            report = ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))
+            checks = {c["id"]: c for c in report["inference"]["checks"]}
+            assert checks[check_id]["status"] == "failed" and report["decision_firm"] is False, changes
+            assert report["decision"] == "inconclusive" and report["decision_if_supported"] == "adopt_A", changes
+            assert checks[check_id]["reason"] in report["decision_withheld"], changes
+            if check_id == "model_justified":
+                outputs = report["inference"]["outputs"]
+                assert outputs["p_value"]["supported"] is False and outputs["ci_low / ci_high"]["supported"] is False
+                assert outputs["p_value_no_effect"]["supported"] is True, "Fisher's test does not need the effect model"
+        # An A/A check needs no justification: identical arms satisfy the model with no effect.
+        spec, data = _spec_and_data(effect=0.0, kind=ed.KIND_AA, model_justification=None)
+        checks = {c["id"]: c for c in ea.analyze_trial(spec, data, spec.planned_end + timedelta(days=1))["inference"]["checks"]}
+        assert checks["model_justified"]["status"] == "ok"
+        # Without a spec nothing is declared, so the protocol checks fail closed.
+        closed = {c["id"]: c["status"] for c in ea.assumption_checks({"carryover_set_bounded": True}, {"threat": False})}
+        assert closed["model_justified"] == "failed" and closed["registered_method"] == "failed"
     finally:
         ea.METHOD_REVIEW.clear()
         ea.METHOD_REVIEW.update(saved)
@@ -317,6 +467,8 @@ def test_calibration_is_deterministic_and_json():
     assert '"method": "%s"' % ea.INFERENCE_METHOD in text
     assert [s["name"] for s in first["scenarios"]] == ["no_effect", "two_night_carryover"]
     assert first["nuisance_beta"] == ea.nuisance_beta_for(199)
+    assert first["passed"] is False and first["all_supported_scenarios"] is False, "a subset run never passes"
+    assert cal.DEFAULT_REDRAWS == 10000, "the default calibrates the template's registered re-draw count"
     try:
         cal.run_calibration(n_sims=1, names=["not_a_scenario"])
     except ValueError as exc:
@@ -333,12 +485,19 @@ def test_supported_scenarios_meet_their_prespecified_tolerances():
         scenario = by_name[name]
         assert scenario["ok"] is True and scenario["n_analysed"] >= 90, name
         metrics = scenario["metrics"]
-        assert {"direct_coverage", "carryover_coverage", "joint_exact"} <= set(metrics), name
+        assert {"direct_coverage", "carryover_coverage", "joint_type1"} <= set(metrics), name
         assert all(m["ok"] is True for m in metrics.values()), (name, metrics)
+        assert scenario["informational"]["joint_within_exact_band"] in (True, False)
     # The scenario the audit named: no same-night effect, a non-zero carryover.
     assert "direct_type1" in by_name["carryover_only"]["metrics"]
     assert "direct_type1" in by_name["carryover_only_serial"]["metrics"]
     assert "carryover_type1" in by_name["effect_only"]["metrics"]
+    # Power at the planted effect is reported, never judged (the planning check overstates it).
+    assert 0.0 <= by_name["effect_only"]["informational"]["direct_power"] <= 1.0
+    assert "direct_power" not in by_name["no_effect"]["informational"]
+    # What the report may back: its own configuration; 100 trials are not a review-ready run.
+    assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [999], "alpha": [0.05]}
+    assert report["all_supported_scenarios"] is True and report["review_ready"] is False
 
 
 def test_unsupported_scenarios_are_reported_without_a_verdict():

@@ -295,6 +295,10 @@ def test_aa_verdict_leads_the_report_and_an_unanalysable_trial_prints_no_none():
     assert line.startswith("A/A check NOT PASSED") and "difference between identical arms" in line
     assert "about 1 time in 20" in line and "only 20 of 28 days have a check-in answer" in line
     assert en.aa_lines(_final()) == [], "a treatment trial has no A/A line"
+    # Since 2026-11-16 the check reads Fisher's no-effect p and the page names that p, not the same-night one.
+    fisher = {**passed, "p_source": "p_value_no_effect", "p_value": 0.37}
+    first = en.aa_lines(_final(p_value=0.98, aa_check=fisher))[0]
+    assert "no-effect randomization p = 0.3700" in first and "0.9800" not in first
 
     tiny = {"report_kind": "final", "as_of": "2030-01-14", "stopped_early": True, "decision": None,
             "not_analysable": "only 4 nights with an outcome; too few to fit the model",
@@ -321,10 +325,34 @@ def test_a_withheld_decision_and_the_inference_assumptions_are_on_the_page():
     assert "allow for carryover (joint_sharp_null_berger_boos_v1)" in text and "p = 0.0004" in text
     assert "Carryover interval: -3.25 to unbounded ms." in text and "None" not in text
 
+    # Fisher's fallback is not presented as assumption-free: it still needs the schedule and the missing nights.
+    assert "but still with the randomized schedule and missing nights not caused by the arm" in text
+    assert "Without any of that" not in text
+
     firm = body(_final(decision_if_supported="adopt_A", decision_firm=True, decision_withheld=[], inference=inference))
     assert "No firm decision" not in firm and "allow for carryover" in firm
     # A report stored before the inference block existed renders exactly as it did.
     assert "allow for carryover" not in body(_final()) and en.inference_lines(_final()) == []
+
+    # Missing nights caused by the arm: every p-value is marked unsupported, Fisher's included.
+    skewed = {**inference, "unsupported_outputs": ["p_value", "ci_low / ci_high", "p_value_no_effect"],
+              "outputs": {"p_value_no_effect": {"supported": False}, "p_value": {"supported": False}}}
+    text = body(_final(decision="inconclusive", decision_if_supported="adopt_A", decision_firm=False,
+                       decision_withheld=["missing nights differ between the arms"], inference=skewed,
+                       p_value_no_effect=0.003))
+    assert "these numbers are not supported either" in text
+    assert "(randomization p = 0.0030)" in text and "so it is not supported either" in text
+    assert "but still with the randomized schedule" not in text, "an unsupported test is never offered as the fallback"
+
+    # A check that limits the result without withholding it is named on the page.
+    limited = {**inference, "checks": [
+        {"id": "carryover_set_bounded", "status": "failed", "blocks_decision": False,
+         "reason": "the nights cannot bound the carryover, so the same-night test cannot reject"},
+        {"id": "method_reviewed", "status": "pending", "blocks_decision": True, "reason": "synthetic pending review"}]}
+    text = body(_final(decision_firm=False, decision_if_supported="inconclusive",
+                       decision_withheld=["synthetic pending review"], inference=limited))
+    assert "Limit: the nights cannot bound the carryover, so the same-night test cannot reject." in text
+    assert "Limit: synthetic pending review" not in text, "a blocking check is listed with the withheld reasons only"
 
 
 # ---------------------------------------------------------------------------

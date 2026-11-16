@@ -340,6 +340,11 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     """The verdict of an A/A check (protocol kind: aa), None for a treatment trial.
 
     Both arms carried the same instruction, so a significant difference can only be a false one.
+    With identical arms Fisher's sharp null (the schedule changes no night) holds exactly, so the
+    check reads its randomization p (p_value_no_effect): exact, and as sensitive as the design
+    allows. The same-night p_value also allows for any carryover, which makes it conservative and,
+    on a 4-week check, close to 1 (doc 8.1), so it is used only for a report stored before
+    p_value_no_effect existed. `p_source` names the one used.
     The other two items are the rest of Phase 2's "done when" (doc 12): every trial day was revealed
     on Today, and 90% or more of the days have a check-in answer. Report re-runs being idempotent is
     shown by the tests and by the final report being written once.
@@ -349,8 +354,13 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     start = _day(exp["start_date"])
     days = [(start + timedelta(days=i)).isoformat() for i in range(n_done)]
     days_revealed = sum(1 for d in days if d in revealed)
-    p_value = report.get("p_value")
-    analysed = isinstance(p_value, (int, float)) and not isinstance(p_value, bool) and not report.get("not_analysable")
+
+    def number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    p_source = "p_value_no_effect" if number(report.get("p_value_no_effect")) else "p_value"
+    p_value = report.get(p_source)
+    analysed = number(p_value) and not report.get("not_analysable")
     false_effect = bool(p_value < float(exp["alpha"])) if analysed else None
     answer_pct = round(100.0 * answered / n_done, 1) if n_done else None
     done = {
@@ -360,6 +370,8 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     }
     return {
         "expected": "no difference: both arms carried the same instruction",
+        "p_source": p_source,
+        "p_value": float(p_value) if analysed else None,
         "false_effect": false_effect,
         "days": n_done,
         "days_revealed": days_revealed,
@@ -465,11 +477,20 @@ def _final(store: Store, exp: dict[str, Any], today: date, arms: list[str], seed
            day_rows: list[dict], screen_rows: list[dict], alignment_version: str) -> dict[str, Any]:
     """Run the registered analysis. experiment_analysis.analyze_trial refuses before the end."""
     experiment_id, start, n_sched = exp["experiment_id"], _day(exp["start_date"]), int(exp["n_days"])
+    # The registered protocol's declarations for the untestable parts of the model (doc 8.1).
+    registered = (exp.get("protocol") or {}).get("analysis") if isinstance(exp.get("protocol"), dict) else None
+    registered = registered if isinstance(registered, dict) else {}
+    carryover_nights = registered.get("carryover_nights")
+    justification = registered.get("model_justification")
     spec = analysis.TrialSpec(
         experiment_id=experiment_id, start=start, planned_end=_day(exp["planned_end"]), mid_ms=float(exp["mid_ms"]),
         block_len=int(exp["block_len"]), n_a=int(exp["n_a_per_block"]), alpha=float(exp["alpha"]),
         n_redraws=int(exp["n_redraws"]), control_arm=exp.get("control_arm") or "B",
-        stopped_on=_day(exp["stopped_on"]) if exp.get("stopped_on") else None)
+        stopped_on=_day(exp["stopped_on"]) if exp.get("stopped_on") else None,
+        kind=design.trial_kind(exp.get("protocol")),
+        carryover_nights=carryover_nights if isinstance(carryover_nights, int) and not isinstance(carryover_nights, bool) else None,
+        model_justification=justification if isinstance(justification, str) else None,
+        inference_method=registered.get("inference_method") if isinstance(registered.get("inference_method"), str) else None)
     analysis.assert_reportable(spec, today)
 
     first, last = start - timedelta(days=7), start + timedelta(days=n_sched)

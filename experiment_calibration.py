@@ -10,9 +10,16 @@ value, against Monte Carlo tolerances fixed here before any run:
   direct_coverage     ci_low <= tau <= ci_high                          rate >= 1 - alpha - Z_MC * se
   carryover_type1     p_carryover < alpha when gamma = 0                rate <= alpha + Z_MC * se
   carryover_coverage  carryover_ci_low <= gamma <= carryover_ci_high    rate >= 1 - alpha - Z_MC * se
-  joint_exact         joint sharp-null p at the true (tau, gamma)       |rate - alpha| <= Z_MC * se
+  joint_type1         joint sharp-null p at the true (tau, gamma)       rate <= alpha + Z_MC * se
 
-  se = sqrt(alpha * (1 - alpha) / n), n = trials analysed in that scenario.
+  se = sqrt(alpha * (1 - alpha) / n), n = trials analysed in that scenario. The joint test is exact
+  up to the discreteness of the re-draws, so its rate is also reported against alpha +- Z_MC * se
+  (informational: a discrete or degenerate design may reject less often, which is not invalid).
+  Power at the planted effect is informational too (the planning check overstates it, doc 7.3).
+
+The report records the configuration it calibrated (method, alpha, re-draw count): a
+METHOD_REVIEW entry covers exactly those, and a trial's decision is firm only when its alpha
+and re-draw count are among them (experiment_analysis.method_review_problem).
 
 Supported scenarios satisfy the working model of experiment_analysis (one-night carryover,
 constant additive effects, missing nights and excluded blocks independent of the arm) and must
@@ -25,8 +32,9 @@ see whether the old mechanism mattered.
 Synthetic inputs only, declared in SCENARIOS (round planning values, no personal data). Nothing
 reads the database, the clock or a credential; the output holds rates and counts only.
 
-Run in the scheduled validation phase, never before a merge (AGENTS.md "Read this first"):
-    python experiment_calibration.py --sims 1000 --redraws 999 --seed 20261116 --out calibration.json
+Run in the scheduled validation phase, never before a merge (AGENTS.md "Read this first"), at the
+registered re-draw count (10,000 in the template; it takes hours):
+    python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --out calibration.json
 """
 from __future__ import annotations
 
@@ -45,7 +53,8 @@ import experiment_design as design
 ALPHA = 0.05
 Z_MC = 3.0                  # Monte Carlo tolerance in binomial standard errors, fixed before any run
 DEFAULT_SIMS = 1000
-DEFAULT_REDRAWS = 999       # the protocol minimum (experiment_design.validate_protocol); validity holds at any count
+REVIEW_MIN_SIMS = 1000      # trials per scenario a report needs before it may back METHOD_REVIEW
+DEFAULT_REDRAWS = 10000     # the template's registered count; a trial is covered only at a calibrated count
 DEFAULT_SEED = 20261116
 BASELINE = 70.0             # synthetic outcome level (ms)
 
@@ -177,15 +186,20 @@ def summarize(s: Scenario, rows: list[dict[str, Any]], skipped: int, alpha: floa
         metrics["carryover_type1"] = _metric(r, (r <= tol["rejection_max"]) if judged else None, max=tol["rejection_max"])
     r = rate("carryover_covered")
     metrics["carryover_coverage"] = _metric(r, (r >= tol["coverage_min"]) if judged else None, min=tol["coverage_min"])
-    r = rate("p_joint_truth", lambda p: p < alpha)
-    metrics["joint_exact"] = _metric(r, (tol["exact_low"] <= r <= tol["exact_high"]) if judged else None,
-                                     low=tol["exact_low"], high=tol["exact_high"])
+    joint = rate("p_joint_truth", lambda p: p < alpha)
+    metrics["joint_type1"] = _metric(joint, (joint <= tol["rejection_max"]) if judged else None, max=tol["rejection_max"])
     informational = {
+        "joint_within_exact_band": bool(tol["exact_low"] <= joint <= tol["exact_high"]) if n else None,
+        "exact_band": [round(tol["exact_low"], 4), round(tol["exact_high"], 4)],
         "no_effect_test_rejects": round(rate("p_no_effect", lambda p: p < alpha), 4),
         "legacy_interval_coverage": round(rate("legacy_covered"), 4),
         "carryover_set_unbounded": round(rate("carryover_set_unbounded"), 4),
         "missingness_check_withholds": round(rate("missingness_withholds"), 4),
     }
+    if s.direct != 0:
+        informational["direct_power"] = round(rate("p_direct", lambda p: p < alpha), 4)
+    if s.carryover != 0:
+        informational["carryover_power"] = round(rate("p_carryover", lambda p: p < alpha), 4)
     verdicts = [m["ok"] for m in metrics.values() if m["ok"] is not None]
     return {
         "name": s.name, "supported": s.supported, "description": s.description,
@@ -216,13 +230,22 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
                 rows.append(row)
         scenarios.append(summarize(s, rows, skipped, alpha))
     supported = [x for x in scenarios if x["supported"]]
+    every_supported = {s.name for s in SCENARIOS if s.supported} <= {x["name"] for x in scenarios}
     return {
         "method": ea.INFERENCE_METHOD,
+        "interval_method": ea.INTERVAL_METHOD,
         "alpha": alpha, "nuisance_beta": beta, "z_mc": Z_MC,
         "n_sims": n_sims, "n_redraws": n_redraws, "seed": seed,
         "generator": design.GENERATOR,
+        # What a METHOD_REVIEW entry may cover once this report passed with every supported scenario.
+        "covers": {"method": ea.INFERENCE_METHOD, "n_redraws": [n_redraws], "alpha": [alpha]},
+        "all_supported_scenarios": every_supported,
         "scenarios": scenarios,
-        "passed": bool(supported) and all(x["ok"] for x in supported),
+        "passed": bool(supported) and every_supported and all(x["ok"] for x in supported),
+        # Only a full run may back a METHOD_REVIEW entry: every supported scenario, at least
+        # REVIEW_MIN_SIMS trials each (the tolerances widen as the trial count falls).
+        "review_ready": (bool(supported) and every_supported and all(x["ok"] for x in supported)
+                         and n_sims >= REVIEW_MIN_SIMS),
     }
 
 
@@ -230,11 +253,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Seeded synthetic calibration of the N-of-1 trial inference")
     parser.add_argument("--sims", type=int, default=DEFAULT_SIMS, help="synthetic trials per scenario")
     parser.add_argument("--redraws", type=int, default=DEFAULT_REDRAWS, help="re-draws per trial")
+    parser.add_argument("--alpha", type=float, default=ALPHA, help="the trials' alpha")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--scenario", action="append", help="run only this scenario (repeatable)")
     parser.add_argument("--out", help="also write the JSON report to this file")
     args = parser.parse_args(argv)
-    report = run_calibration(n_sims=args.sims, n_redraws=args.redraws, seed=args.seed, names=args.scenario)
+    report = run_calibration(n_sims=args.sims, n_redraws=args.redraws, seed=args.seed, names=args.scenario,
+                             alpha=args.alpha)
     text = json.dumps(report, indent=2, sort_keys=False)
     print(text)
     if args.out:
