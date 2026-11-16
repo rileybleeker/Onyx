@@ -378,8 +378,10 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
       </div>
       <div className="mt-1 text-[11px] font-mono text-text-tertiary">
         {c.quiz ? (
-          <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
+          <span className={c.quiz.verification !== "invalidated" && c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
             quiz {c.quiz.score}/{c.quiz.total}
+            {/* A question in it was corrected later (lib/reading-questions.ts): kept, earns no XP. */}
+            {c.quiz.verification === "invalidated" ? " · corrected" : ""}
           </span>
         ) : c.reached ? (
           <Link href="/chat" className="text-accent/80 underline underline-offset-2">

@@ -52,6 +52,54 @@ errors are short codes.
 
 Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under the hook harness, synthetic cards).
 
+## Learning questions: source versions and attempt receipts (PROD-T07)
+
+`sql/reading_learning_questions.sql` (apply after `reading_practice_receipts.sql`), `lib/reading-questions.ts`,
+`lib/reading-questions-server.ts`, `GET / POST /api/reading/questions`.
+
+- **Questions and versions.** `pds.reading_questions` holds one row per version of a question: `question_key`
+  (stable across versions), `version`, prompt, optional rubric (expected answer / grading guide), the source it is
+  drawn from and a sha-256 of that source's normalized text, computed by the database (`pds.reading_source_text`)
+  when the version is written. The client never sends a hash.
+- **Permitted sources only.** `highlight` (a highlight of the same book, passage + comment, not archived),
+  `session` (the recall note of a session of the same book; the session's `question` field, a question for a
+  client, is never read) and `chapter` (a chapter of the same book). Journals, email, health, finance and client
+  material cannot be a source: the column's check allows nothing else.
+- **Attempts.** `pds.reading_question_attempts` keys each answer by the client's UUID. The same key and answer
+  replays; another answer under that key is `409 key_reused`. The answer is stored as `pending`; grading
+  (`correct`, `grader` model | self, feedback, `graded_at`) is a separate call, so an answer whose grading never
+  finished stays visible. Grading again with the same grade replays, another grade is `409 already_graded`.
+- **Quiz results.** A quiz result recorded under op_key K (`/api/reading/quiz`, `recordQuiz`) is checked against
+  the answers given with `quiz_key` K: refused while any is ungraded (`409 attempts_pending`) or when its score /
+  total differ from the graded answers (`409 score_mismatch`); `question_count` is then set. A result without such
+  answers (every result stored before this change, and the chat's results until its tool sends questions) has
+  `question_count` NULL and is shown as `unverified` in the overview and the chat summary; it still counts for XP.
+- **Corrections.** `op: "correct"` with the version on screen (`expected_version`) makes the next version and
+  supersedes the old one (kept, with the reason). Every answer to an older version is marked `invalidated` (kept,
+  with its grade and the reason), and a recorded result that counted one gets `invalidated_count` > 0: the
+  checkpoint tile shows it as "corrected", and it earns no XP and no pass badge. Answering a question whose prompt,
+  rubric or source text no longer matches the stored version is `409 question_changed`, never silently accepted.
+- **Inspection and export.** `GET /api/reading/questions?book=<slug>` (owner session, `no-store`) returns every
+  version with its source reference, hash and `source_status` now (`same`, `changed` or `removed`) and every
+  attempt with its raw answer. It is the export. The client cache keeps this key in memory only
+  (`isSensitiveKey`), never in IndexedDB.
+- **Source deletion.** Removing a source (archiving a highlight, deleting a session) never removes a question or an
+  attempt: the version keeps its hash, inspection shows `removed`, and the question cannot be answered again until
+  it is corrected to a permitted source.
+- **Raw-exchange retention (defined, not yet scheduled).** `pds.reading_clear_question_answers(days)` clears the
+  answer and feedback text of attempts graded or invalidated more than `days` ago (at least 30), keeping the
+  answer's hash, the grade and every timestamp. Proposed: 180 days, run daily. Scheduling it is a rollout decision
+  for Riley; nothing runs it yet. Pending (ungraded) answers are never cleared.
+- Access: tables and functions are service_role only (row level security on, no policies, nothing granted to anon
+  or authenticated). Errors are codes; no prompt, answer or feedback text is logged.
+- **Not wired yet:** no screen or chat tool writes questions. The chat quiz flow (`record_reading_quiz`, chat
+  route) should record each question with `op: "answer"` / `"grade"` and the quiz's op_key as `quiz_key`, then the
+  result under that op_key; that change waits for the chat replay work (SEC-04) to land.
+
+Tests: `frontend/tests/reading-questions.test.cjs` (synthetic): parsing (only permitted sources), the single RPC
+per operation, replay / conflict codes, export, verification and XP rules, the memory-only cache key, and SQL
+guards (permitted sources, database-made hashes, lock order, invalidate-never-remove, grants, additive only).
+
 ## Rollback
 
 Revert the route and card code. The additive columns, the receipt table and the functions can stay (read-only for

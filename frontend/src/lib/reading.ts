@@ -10,6 +10,7 @@ import {
   type PracticeGrade,
   type RpcAnswer,
 } from "@/lib/reading-practice";
+import { quizVerification, type QuizVerification } from "@/lib/reading-questions";
 
 /**
  * Reading module — shared server logic for /api/reading/* and the chat tools.
@@ -118,6 +119,12 @@ export interface Quiz {
   total: number;
   notes: string | null;
   quiz_date: string;
+  /** Graded answers this result was checked against (sql/reading_learning_questions.sql); null/absent = unverifiable. */
+  question_count?: number | null;
+  /** Answers in it whose question was corrected later: > 0 = invalidated (shown, not counted). */
+  invalidated_count?: number | null;
+  /** Set by computeOverview (lib/reading-questions.ts quizVerification). */
+  verification?: QuizVerification;
 }
 
 // Explicit column lists instead of select("*") (re-audit 2026-06-07,
@@ -132,7 +139,6 @@ export const SESSION_COLS =
   "session_id, book_id, session_date, chapter_from, chapter_through, minutes, medium, recall, question, notion_block_id, created_at, source, in_chapter, highlight_count, updated_at";
 export const HIGHLIGHT_COLS =
   "highlight_id, book_id, chapter, location, passage, comment, concept, source, review_count, ease, interval_days, next_review, last_reviewed, archived, notion_block_id, created_at, updated_at, position, position_end, page, highlighted_at, note_at, behavioral_date";
-const QUIZ_COLS = "quiz_id, book_id, checkpoint, score, total, notes, quiz_date, taken_at";
 
 export interface Checkpoint {
   key: string; // 'ch12'
@@ -338,7 +344,10 @@ export function computeOverview(input: {
   quizzes: Quiz[];
   chapters?: ChapterSpan[];
 }): ReadingOverview {
-  const { book, today, sessions, highlights, reviews, quizzes } = input;
+  const { book, today, sessions, highlights, reviews } = input;
+  // Every result stays listed with its verification; one whose question was corrected later earns nothing.
+  const quizzes = input.quizzes.map((q) => ({ ...q, verification: quizVerification(q) }));
+  const countedQuizzes = quizzes.filter((q) => q.verification !== "invalidated");
   const chapters = input.chapters ?? [];
   const totalChapters = book.total_chapters ?? 0;
   const chaptersDone = Math.min(
@@ -380,7 +389,7 @@ export function computeOverview(input: {
   const recallSessions = sessions.filter((s) => (s.recall ?? "").trim().length >= 40).length;
   const reviewDays = new Set(reviews.map((r) => r.review_date));
   const reviewsToday = reviews.filter((r) => r.review_date === today).length;
-  const quizPoints = quizzes.reduce((a, q) => a + q.score, 0);
+  const quizPoints = countedQuizzes.reduce((a, q) => a + q.score, 0);
   const checkpoints = computeCheckpoints(book, sessions, quizzes, today, start, target);
   const onTimeCheckpoints = checkpoints.filter((c) => c.reached && c.onTime === true).length;
   const xp: XpBreakdown = {
@@ -401,7 +410,7 @@ export function computeOverview(input: {
     perLevel: XP.perLevel,
   };
 
-  const badges = computeBadges({ book, sessions, highlights, reviews, quizzes, checkpoints, chaptersDone, totalChapters, best });
+  const badges = computeBadges({ book, sessions, highlights, reviews, quizzes: countedQuizzes, checkpoints, chaptersDone, totalChapters, best });
 
   // Burn-up series: one point per day from start to target.
   const burnup: ReadingOverview["burnup"] = [];
@@ -1241,6 +1250,7 @@ export function summarizeForChat(o: ReadingOverview) {
     checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null })),
     position: o.position,
     recent_sessions: o.sessions.slice(0, 10).map((s) => ({
+      id: s.session_id,
       date: s.session_date,
       chapters: s.chapter_through != null ? `${s.chapter_from ?? "?"}-${s.chapter_through}` : s.in_chapter != null ? `reading ch ${s.in_chapter} (no chapter completed)` : "?",
       source: s.source,
@@ -1251,6 +1261,6 @@ export function summarizeForChat(o: ReadingOverview) {
     })),
     highlights: o.highlights.slice(0, 40).map((h) => ({ id: h.highlight_id, chapter: h.chapter, concept: h.concept, passage: h.passage, comment: h.comment })),
     due_reviews: o.dueReviews.map((h) => ({ id: h.highlight_id, passage: h.passage, comment: h.comment })),
-    quizzes: o.quizzes.map((q) => ({ checkpoint: q.checkpoint, score: `${q.score}/${q.total}`, date: q.quiz_date })),
+    quizzes: o.quizzes.map((q) => ({ checkpoint: q.checkpoint, score: `${q.score}/${q.total}`, date: q.quiz_date, verification: q.verification ?? quizVerification(q) })),
   };
 }

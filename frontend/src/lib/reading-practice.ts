@@ -189,7 +189,12 @@ export type PracticeFailure = { ok: false; status: number; error: string };
 
 /** Map an RPC call's result to a failure, or null when it applied (or replayed). No fallback write exists. */
 export function rpcFailure(data: RpcAnswer | null | undefined, error: { code?: string } | null | undefined): PracticeFailure | null {
-  if (error) return isMissingSchema(error) ? { ok: false, status: 503, error: "practice_unavailable" } : { ok: false, status: 500, error: "failed" };
+  if (error) {
+    // A quiz result checked against its per-question answers (sql/reading_learning_questions.sql trigger).
+    if (error.code === "OXQ01") return { ok: false, status: 409, error: "attempts_pending" };
+    if (error.code === "OXQ02") return { ok: false, status: 409, error: "score_mismatch" };
+    return isMissingSchema(error) ? { ok: false, status: 503, error: "practice_unavailable" } : { ok: false, status: 500, error: "failed" };
+  }
   if (!data || typeof data !== "object") return { ok: false, status: 500, error: "failed" };
   if (data.ok === true) return null;
   const status = Number.isInteger(data.http) && (data.http as number) >= 400 && (data.http as number) < 600 ? (data.http as number) : 500;
