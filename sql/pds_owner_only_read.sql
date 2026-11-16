@@ -11,8 +11,9 @@
 --   authenticated  reads tables only through owner_read (auth.uid() = the one
 --                  Onyx account). Ordinary browser views also require the
 --                  invoker migration documented in docs/owner-view-access.md.
---                  Direct matview access remains a separate migration; app
---                  middleware cannot protect a direct Data API read.
+--                  Materialized views have no row security, so they are
+--                  service-role only (sql/pds_matview_revoke_authenticated.sql;
+--                  the browser reads them through GET /api/derived/<name>).
 --   service_role   unchanged (ETLs, API routes, ISR prefetch)
 -- Frontend side: lib/supabase.ts reads with the service role on the server
 -- and with the signed-in session in the browser; middleware.ts only accepts
@@ -31,7 +32,8 @@
 
 -- ---------------------------------------------------------------------------
 -- PART 1 (additive): owner read access for the signed-in account.
--- Service-role-only relations are skipped.
+-- Service-role-only relations are skipped, and so are materialized views
+-- (relkind 'm'): no row security, so a grant would show every row.
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
@@ -43,7 +45,7 @@ BEGIN
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'pds'
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v')
           AND c.relname NOT IN ('ci_tokens', 'phone_usage_segments', 'phone_usage_items', 'phone_usage_daily', 'inbox_emails', 'today_cleared_emails',
                                 'online_order_events', 'online_orders', 'online_order_marks',
                                 'finance_accounts', 'finance_transactions', 'finance_balance_snapshots')

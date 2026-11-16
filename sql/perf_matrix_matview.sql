@@ -51,7 +51,10 @@
 --     ON pds.daily_health_matrix_behavioral_mat (onyx_behavioral_date);
 --   CREATE INDEX idx_dhmb_mat_calendar_date
 --     ON pds.daily_health_matrix_behavioral_mat (calendar_date);
---   GRANT SELECT ON pds.daily_health_matrix_behavioral_mat TO anon, authenticated;
+--   REVOKE ALL ON pds.daily_health_matrix_behavioral_mat FROM PUBLIC, anon, authenticated;
+--   GRANT SELECT ON pds.daily_health_matrix_behavioral_mat TO service_role;
+--   (service role only since 2026-11-16, sql/pds_matview_revoke_authenticated.sql: no row
+--   security on a matview; the pds default privileges would grant authenticated again)
 -- NEVER use DROP VIEW ... CASCADE on the canonical view (it would silently
 -- destroy the matview and 404 every repointed frontend read).
 -- Enforcement: the refresh function diffs pg_attribute column sets between

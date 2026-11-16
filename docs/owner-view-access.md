@@ -27,19 +27,28 @@ caller migration is the owner-only facade (SEC-01-B, 2026-11-16): the browser no
 longer reads any `*_mat`; each read is a fixed server query in `lib/queries.ts` /
 `lib/queries-hrv.ts` reached through `GET /api/derived/<name>` (owner session via
 middleware, same-origin, no-store, not in `isCiRoute()`; names and date rule in
-`lib/derived-reads.ts`). The `authenticated` SELECT grants on the matviews are
-revoked in a separate reviewed migration, only after that facade is deployed and
-the browser reads are confirmed gone. In the repo no view reads any of the six
-(the one view over a matview, `pds.daily_micronutrient_totals`, reads
+`lib/derived-reads.ts`). The `authenticated` SELECT grants on the six matviews
+are then revoked by `sql/pds_matview_revoke_authenticated.sql` (one atomic DO
+statement; apply only after the facade is deployed and the browser reads are
+confirmed gone), checked afterwards with `sql/checks/verify_matview_revoke.sql`
+(read-only: no browser-role privilege, role `authenticated` refused with the
+owner's and a synthetic other account's claims, `service_role` still reads, the
+unique indexes remain). In the repo no view reads any of the six (the one view
+over a matview, `pds.daily_micronutrient_totals`, reads
 `supplement_intake_by_compound_mat`, already service-role only); the revoke
-migration re-checks `pg_depend` and function bodies on the live database and
-aborts if anything else reads them. The same change must stop the grants coming
-back: the recreate recipes in `sql/perf_matrix_matview.sql` and
+migration re-checks views, row-security policies and function bodies on the live
+database and aborts, changing nothing, if a browser role could reach a matview
+another way or if any other pds matview is still readable. The grants must not
+come back: the recreate recipes in `sql/perf_matrix_matview.sql` and
 `sql/perf_tier2_matviews.sql` grant only `service_role` and revoke `anon` /
 `authenticated` (the pds default privileges in `sql/rls_policies.sql` grant
 `authenticated` SELECT on every new relation, matviews included), and PART 1 of
-`sql/pds_owner_only_read.sql` skips matviews. Future view migrations must
-preserve `security_invoker` and review their entire source graph.
+`sql/pds_owner_only_read.sql` skips matviews. If a caller that cannot use the
+facade breaks, move it to a facade read or a service-role server read;
+`sql/pds_matview_revoke_authenticated_rollback.sql` restores the old
+`authenticated` SELECT (never anon) and reopens the direct read, so it is a
+last resort until the caller is moved. Future view migrations must preserve
+`security_invoker` and review their entire source graph.
 
 Recovery: if preconditions fail, nothing changes. After deployment, repair a
 specific source/caller permission contract while keeping owner RLS intact. Do not
