@@ -42,7 +42,10 @@ signed link, the app's own viewing path) and write or compare a manifest of ever
 hash, every document's path / size / type / state and every lab result's document link. The parse is
 structural (no decoder renders a page), so "a restored file opens" is reported as not checked: a
 person opens one in a viewer during the drill. On production those options are refused: real records
-are never downloaded by this tool.
+are never downloaded by this tool. A manifest is compared only once manifest_problem() accepts it (the
+shape build_manifest() writes, counts that match its rows, every ready document's file listed, every lab
+link inside it, not empty): the comparisons walk its entries, so an emptied or cut-short manifest would
+otherwise let an empty restore PASS. One that is refused is never compared and never written.
 A missing key, a refused read (401 / 403) or a read that keeps failing is reported as "incomplete"
 with the exact access to ask for, never as a pass.
 
@@ -88,6 +91,8 @@ EXPECTED_TYPES = frozenset({
     "application/pdf", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
 })
 PATH_RE = re.compile(r"^documents/[0-9a-f-]{36}$")
+ID_RE = re.compile(r"^[0-9a-f-]{36}$")  # a row id (UUID), the same shape as the id in a storage path
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Only ids, paths, sizes, types and states: no text column (title, provider, notes, test name,
 # value, unit, range, lab) is ever requested.
 DOC_SELECT = "id,storage_path,mime_type,size_bytes,status,removed_at"
@@ -113,6 +118,12 @@ MANAGEMENT_ORIGIN = ("https", "api.supabase.com", 443)
 DRILL_ENV = {"service": "RECOVERY_DRILL_SERVICE_KEY", "anon": "RECOVERY_DRILL_ANON_KEY",
              "user": "RECOVERY_DRILL_USER_TOKEN"}
 MANIFEST_VERSION = 1
+# The fields build_manifest() writes, at the top level and per row: a manifest with any other shape is
+# refused before it is compared with anything (manifest_problem()).
+MANIFEST_KEYS = frozenset({"version", "created_at", "documents", "labs", "lab_results_linked", "objects",
+                           "document_rows", "lab_rows"})
+DOC_STATE_KEYS = frozenset({"storage_path", "size_bytes", "mime_type", "status", "removed"})
+LAB_STATE_KEYS = frozenset({"document_id", "removed"})
 # PostgREST's answers that mean "this role may not read it" (permission denied; schema not exposed
 # to the request). Anything else (an invalid JWT, a missing table, a gateway error) proves nothing.
 REFUSAL_CODES = frozenset({"42501", "PGRST106"})
@@ -898,9 +909,15 @@ def evaluate(inv: Inventory) -> dict:
         elif inv.signed_ok is not None:
             checks.append(_check("signed_link_serves_file", "pass" if inv.signed_ok else "fail"))
 
-    # manifest (a backup's, or the drill's seed): files, and every row's identity, state and link
-    if inv.manifest is not None:
-        m_objects = inv.manifest.get("objects") or {}
+    # manifest (a backup's, or the drill's seed): files, and every row's identity, state and link. The
+    # comparisons walk the manifest's own entries, so a manifest that is malformed, cut short or empty is
+    # never compared (an empty restore would match it): it leaves the restore unknown.
+    manifest_issue = manifest_problem(inv.manifest) if inv.manifest is not None else None
+    if manifest_issue:
+        checks.append(_check("manifest_valid", "unknown"))
+    elif inv.manifest is not None:
+        checks.append(_check("manifest_valid", "pass"))
+        m_objects = inv.manifest["objects"]
         add("manifest_files_present", sum(1 for p in m_objects if p not in inv.objects), stage=both)
         add("manifest_sizes_match", sum(1 for p, v in m_objects.items()
                                         if p in inv.objects and inv.objects[p].get("size") != v.get("size")), stage=both)
@@ -910,8 +927,8 @@ def evaluate(inv: Inventory) -> dict:
             observed("manifest_hashes_match", sum(1 for p, v in m_objects.items()
                                                   if p in inv.opened and inv.opened[p].get("sha256") != v.get("sha256")),
                      download_cut)
-        m_docs = inv.manifest.get("document_rows") or {}
-        m_labs = inv.manifest.get("lab_rows") or {}
+        m_docs = inv.manifest["document_rows"]
+        m_labs = inv.manifest["lab_rows"]
         labs_by_id = {r.get("id"): r for r in inv.labs}
         doc_stage = "documents" if not docs_ok else None
         add("manifest_document_rows", sum(1 for i in m_docs if i not in by_id), stage=doc_stage)
@@ -933,8 +950,11 @@ def evaluate(inv: Inventory) -> dict:
         checks.append(_check("database_backup_recent",
                              "pass" if age is not None and age <= BACKUP_MAX_AGE_HOURS else "fail"))
 
+    incomplete = list(inv.unreadable)
+    if manifest_issue:
+        incomplete.append({"stage": "manifest", "reason": f"the manifest was not compared: {manifest_issue}"})
     results = {c["result"] for c in checks}
-    status = "fail" if "fail" in results else "incomplete" if "unknown" in results or inv.unreadable else "pass"
+    status = "fail" if "fail" in results else "incomplete" if "unknown" in results or incomplete else "pass"
     counts = {
         "documents": len(inv.documents),
         "documents_ready": len(ready),
@@ -948,8 +968,8 @@ def evaluate(inv: Inventory) -> dict:
     report = {"status": status, "counts": counts, "checks": checks}
     if inv.backups is not None:
         report["backups"] = dict(inv.backups)
-    if inv.unreadable:
-        report["incomplete"] = inv.unreadable
+    if incomplete:
+        report["incomplete"] = incomplete
     # Never a check of this tool, so never part of its PASS: recovery acceptance also needs it, recorded in
     # the private drill receipt.
     report["not_checked"] = [dict(NOT_CHECKED)]
@@ -1183,7 +1203,8 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
 def build_manifest(inv: Inventory, now: datetime) -> dict:
     """What a backup (or the drill's seed) holds: every file's size and hash, every document's path /
     size / type / state, every lab result's document link and removal, and the row counts. It holds
-    ids, so it is kept privately (drill folder, or encrypted with the off-site copy), never in the repo."""
+    ids, so it is kept privately (drill folder, or encrypted with the off-site copy), never in the repo.
+    main() writes it only when manifest_problem() accepts it, the same rule --manifest applies."""
     if inv.opened is None:
         raise ValueError("a manifest needs the files opened (local drill target only)")
     return {
@@ -1199,11 +1220,80 @@ def build_manifest(inv: Inventory, now: datetime) -> dict:
     }
 
 
+class ManifestInvalid(ValueError):
+    """A manifest that cannot be the reference for a restore. Its message is one of manifest_problem()'s
+    fixed reasons: it names a rule, never an id, a path or a value, so it may be printed."""
+
+
+def _whole(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def manifest_problem(data) -> Optional[str]:
+    """Why a manifest cannot be the reference a restore is judged against, or None when it can.
+
+    The comparisons in evaluate() walk the manifest's own entries, so a manifest whose maps are empty, cut
+    short or malformed would let an empty or broken restore PASS. Accepted only when: it has exactly the
+    fields build_manifest() writes, every entry has the shape and the values the database allows (the
+    checks of sql/medical_records_schema.sql), the counts agree with the rows it lists, every ready document
+    (removed or not: removal keeps the file) has its file in objects at its declared size, every lab link
+    names a document in the manifest, no two documents share a path, and it holds something to compare.
+    That is what any manifest written from a PASS holds. The reason names a rule, never an id or a path."""
+    if not isinstance(data, dict) or data.get("version") != MANIFEST_VERSION:
+        return "not a version-1 recovery manifest"
+    if set(data) != MANIFEST_KEYS:
+        return "unexpected or missing top-level fields"
+    if not isinstance(data["created_at"], str) or _parse_time(data["created_at"]) is None:
+        return "created_at is not a time"
+    objects, docs, labs = data["objects"], data["document_rows"], data["lab_rows"]
+    if not all(isinstance(m, dict) for m in (objects, docs, labs)):
+        return "objects, document_rows and lab_rows must be maps"
+    if not all(_whole(data[k]) for k in ("documents", "labs", "lab_results_linked")):
+        return "a count is not a whole number"
+    for path, v in objects.items():
+        if not (isinstance(path, str) and PATH_RE.match(path) and isinstance(v, dict) and set(v) == {"size", "sha256"}
+                and _whole(v["size"]) and v["size"] <= EXPECTED_LIMIT
+                and isinstance(v["sha256"], str) and SHA256_RE.match(v["sha256"])):
+            return "an objects entry is malformed"
+    paths: set[str] = set()
+    for i, s in docs.items():
+        if not (isinstance(i, str) and ID_RE.match(i) and isinstance(s, dict) and set(s) == DOC_STATE_KEYS
+                and isinstance(s["storage_path"], str) and PATH_RE.match(s["storage_path"])
+                and _whole(s["size_bytes"]) and 1 <= s["size_bytes"] <= EXPECTED_LIMIT
+                and isinstance(s["mime_type"], str) and s["mime_type"] in EXPECTED_TYPES
+                and s["status"] in ("pending", "ready") and isinstance(s["removed"], bool)):
+            return "a document_rows entry is malformed"
+        if s["storage_path"] in paths:
+            return "two document rows share a storage path"
+        paths.add(s["storage_path"])
+        if s["status"] == "ready":
+            obj = objects.get(s["storage_path"])
+            if obj is None:
+                return "a ready document's file is not in objects"
+            if obj["size"] != s["size_bytes"]:
+                return "a ready document's file size differs from its row"
+    for i, s in labs.items():
+        if not (isinstance(i, str) and ID_RE.match(i) and isinstance(s, dict) and set(s) == LAB_STATE_KEYS
+                and (s["document_id"] is None or (isinstance(s["document_id"], str) and ID_RE.match(s["document_id"])))
+                and isinstance(s["removed"], bool)):
+            return "a lab_rows entry is malformed"
+        if s["document_id"] is not None and s["document_id"] not in docs:
+            return "a lab link names a document that is not in the manifest"
+    if (data["documents"] != len(docs) or data["labs"] != len(labs)
+            or data["lab_results_linked"] != sum(1 for s in labs.values() if s["document_id"] is not None)):
+        return "the counts do not match the rows it lists"
+    if not (objects or docs or labs):
+        return "it holds nothing to compare a restore against"
+    return None
+
+
 def load_manifest(path: Path) -> dict:
+    """The manifest at `path`, refused (ManifestInvalid) unless manifest_problem() accepts it. A file that
+    is not JSON raises the plain ValueError json gives (its message is not printed)."""
     data = json.loads(path.read_text(encoding="utf-8"))
-    if (not isinstance(data, dict) or data.get("version") != MANIFEST_VERSION
-            or not all(isinstance(data.get(k), dict) for k in ("objects", "document_rows", "lab_rows"))):
-        raise ValueError("not a version-1 recovery manifest")
+    problem = manifest_problem(data)
+    if problem:
+        raise ManifestInvalid(problem)
     return data
 
 
@@ -1325,6 +1415,10 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
     if args.manifest:
         try:
             manifest = load_manifest(args.manifest)
+        except ManifestInvalid as e:
+            # a malformed, cut-short or empty reference would let an empty restore PASS: never compared
+            print(f"incomplete: the manifest was refused ({e}); nothing was compared or sent", file=out)
+            return 2
         except (OSError, ValueError) as e:
             print(f"incomplete: manifest could not be read ({type(e).__name__})", file=out)
             return 2
@@ -1341,7 +1435,13 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
             # a broken or partly read state must never become the reference a restore is judged against
             print(f"refused: the baseline is {report['status']}, not PASS; no manifest written", file=out)
             return code
-        args.write_manifest.write_text(json.dumps(build_manifest(inv, now), indent=2), encoding="utf-8")
+        built = build_manifest(inv, now)
+        problem = manifest_problem(built)
+        if problem:
+            # never write a reference that a later --manifest run would refuse (an empty store, say)
+            print(f"refused: this baseline does not make a usable manifest ({problem}); no manifest written", file=out)
+            return 2
+        args.write_manifest.write_text(json.dumps(built, indent=2), encoding="utf-8")
     return code
 
 

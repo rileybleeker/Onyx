@@ -37,7 +37,11 @@ and files:
     failed daily backups when PITR is off;
   * the drill: files are opened, backups skipped and a manifest written only on a local stack or a
     named throwaway project, never on production (refused before any request); the manifest is
-    written only from a PASS; a wipe is detected against the manifest and a full restore passes,
+    written only from a PASS and only when it is a usable reference (an empty store writes none); a
+    manifest that was emptied, cut short (counts that do not match its rows, a ready document without
+    its file or at another size, a lab link to a document it does not list) or malformed is refused
+    before anything is sent and never compared, so an empty restore cannot PASS against it; a wipe is
+    detected against the manifest and a full restore passes,
     including the signed-link fetch; a drill target never reads the production key file; the file
     check is reported as a structural parse, and "a restored file opens" as not checked;
   * paging past PostgREST's 1000-row cap; placeholder files and orphans warn instead of failing.
@@ -1075,6 +1079,92 @@ def test_manifest_is_not_written_from_an_incomplete_read():
         server = FakeServer(docs, labs, files, fail={"/rest/v1/lab_results": [503, 503, 503]})
         code, text, _, _ = run(server, "--skip-backups", "--write-manifest", str(manifest), url=LOCAL)
         assert code == 2 and "refused" in text and not manifest.exists()
+
+
+def test_a_manifest_that_is_emptied_cut_short_or_malformed_is_refused():
+    # the comparisons walk the manifest's own entries: an emptied or cut-short manifest would let an empty
+    # restore PASS, so it is refused before anything is sent (incomplete), naming the rule only
+    docs, labs, files = healthy()
+
+    def emptied_maps(m):  # the counts kept, every list emptied
+        m.update(objects={}, document_rows={}, lab_rows={})
+
+    def all_empty(m):
+        m.update(objects={}, document_rows={}, lab_rows={}, documents=0, labs=0, lab_results_linked=0)
+
+    def object_not_a_map(m):
+        m["objects"][f"documents/{uid(1)}"] = "x"
+
+    def ready_file_dropped(m):
+        del m["objects"][f"documents/{uid(1)}"]
+
+    def ready_size_changed(m):
+        m["objects"][f"documents/{uid(1)}"]["size"] += 1
+
+    def link_outside(m):
+        m["lab_rows"][uid(10_001)]["document_id"] = uid(99)
+
+    def bad_status(m):
+        m["document_rows"][uid(1)]["status"] = "done"
+
+    def shared_path(m):
+        m["document_rows"][uid(2)]["storage_path"] = f"documents/{uid(1)}"
+
+    def extra_field(m):
+        m["extra"] = 1
+
+    def bool_count(m):
+        m["labs"] = True
+
+    def bad_hash(m):
+        m["objects"][f"documents/{uid(2)}"]["sha256"] = "x" * 64
+
+    cases = [(emptied_maps, "the counts do not match the rows it lists"),
+             (all_empty, "it holds nothing to compare a restore against"),
+             (object_not_a_map, "an objects entry is malformed"),
+             (ready_file_dropped, "a ready document's file is not in objects"),
+             (ready_size_changed, "a ready document's file size differs from its row"),
+             (link_outside, "a lab link names a document that is not in the manifest"),
+             (bad_status, "a document_rows entry is malformed"),
+             (shared_path, "two document rows share a storage path"),
+             (extra_field, "unexpected or missing top-level fields"),
+             (bool_count, "a count is not a whole number"),
+             (bad_hash, "an objects entry is malformed")]
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = seed_manifest(tmp, docs, labs, files).read_text(encoding="utf-8")
+        assert rc.manifest_problem(json.loads(raw)) is None  # a manifest written from a PASS is accepted
+        for mutate, reason in cases:
+            m = json.loads(raw)
+            mutate(m)
+            assert rc.manifest_problem(m) == reason, mutate.__name__
+            path = Path(tmp) / f"{mutate.__name__}.json"
+            path.write_text(json.dumps(m), encoding="utf-8")
+            server = FakeServer([], [], {})  # an empty restore: with a refused manifest it can never PASS
+            code, text, _, _ = run(server, "--skip-backups", "--open-files", "--manifest", str(path), url=LOCAL)
+            assert code == 2 and "the manifest was refused" in text and reason in text, mutate.__name__
+            assert server.calls == [], "nothing is sent once the manifest is refused"
+            assert_private_output(text)
+
+
+def test_evaluate_never_compares_an_invalid_manifest():
+    # a manifest handed to evaluate() directly gets the same rule: unknown, not compared, never a pass
+    bad = {"version": 1, "created_at": "2026-01-15T12:00:00+00:00", "documents": 4, "labs": 2,
+           "lab_results_linked": 1, "objects": {}, "document_rows": {}, "lab_rows": {}}
+    report = rc.evaluate(rc.Inventory(manifest=bad))
+    assert result(report, "manifest_valid")["result"] == "unknown"
+    assert not any(c["name"].startswith("manifest_") and c["name"] != "manifest_valid" for c in report["checks"])
+    assert report["status"] != "pass"
+    assert any(u["stage"] == "manifest" and "counts do not match" in u["reason"] for u in report["incomplete"])
+
+
+def test_an_empty_store_writes_no_manifest():
+    # nothing in it to compare a restore against: never written, so it can never be a reference
+    assert rc.manifest_problem(rc.build_manifest(rc.Inventory(opened={}), NOW)) == (
+        "it holds nothing to compare a restore against")
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = Path(tmp) / "m.json"
+        code, text, _, _ = run(FakeServer([], [], {}), "--skip-backups", "--write-manifest", str(manifest), url=LOCAL)
+        assert code == 2 and "no manifest written" in text and not manifest.exists()
 
 
 def test_manifest_is_not_written_from_a_failing_baseline():

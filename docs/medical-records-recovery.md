@@ -286,7 +286,12 @@ $schema = (Resolve-Path sql\medical_records_schema.sql).Path
 
 **SEC-06 closes only when** the production backup dates have been read (section 2), the option A
 job is running, a drill has passed against its copy (including a person opening a restored file),
-and the receipt is saved. A merge of this document does not close it.
+a production run of the check has no unknowns but the two byte checks and the three
+download-refusal checks (section 7), a fresh catalog read on production stands in for those
+download refusals (no policy on any `storage` table, RLS on for `storage.objects` and
+`storage.buckets`, the bucket private: the queries of section 2 and step 10; this check cannot
+prove them on production because it never downloads a real record), and the receipt holding all of
+it is saved. A merge of this document does not close it.
 
 ## 7. The check: `tools/medical_recovery/recovery_check.py`
 
@@ -368,6 +373,14 @@ python tools\medical_recovery\recovery_check.py --json       # the same as JSON 
 - On production it never downloads a file: `--open-files`, `--write-manifest` and `--skip-backups`
   run only on a drill target and are refused before any request otherwise (so a production report
   never reads PASS without backup evidence). A manifest is written only from a PASS.
+- A manifest is used only when it is a real reference. The comparisons walk the manifest's own
+  entries, so a manifest whose lists were emptied or cut short would let an empty restore PASS.
+  `--manifest` therefore refuses, before anything is sent (incomplete, exit 2), a manifest that has
+  other fields than the check writes, an entry of another shape or with a value the database does
+  not allow, counts that do not match the rows it lists, a ready document without its file (or at
+  another size), a lab result linked to a document it does not list, two documents with one path,
+  or nothing in it at all. The same rule applies when one is written: a baseline that would make such
+  a manifest (an empty store, say) writes none. The refusal names the rule, never an id or a path.
 - Network errors, 429 and 5xx are retried twice (1 s, 2 s). A read that keeps failing, a refused
   read (401 / 403, with the exact access to ask for), a missing key or token is **incomplete**
   (exit 2), never a pass. A refused target also exits 2. A failed check exits 1; a pass exits 0.
