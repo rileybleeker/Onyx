@@ -265,30 +265,112 @@ def test_match_accounts():
 
 
 # --- cutover ----------------------------------------------------------------------------------------------------
-def row(key, d, cents, account="wf1", desc="X", source="simplefin", name=None):
+def row(key, d, cents, account="wf1", desc="X", source="simplefin", name=None, currency="USD", original=None):
     return {"txn_key": key, "account_key": account, "txn_date": d, "amount_cents": cents, "description": desc,
-            "name": name or desc, "source": source, "category": None}
+            "name": name or desc, "source": source, "category": None, "currency": currency, "original_date": original}
 
 
-def test_cutover():
-    hist = [row("h1", "2026-11-10", 500, source="rocketmoney"), row("h2", "2026-11-11", 700, source="rocketmoney"),
-            row("h3", "2026-11-11", 700, source="rocketmoney")]
+def hrow(key, d, cents, desc, name=None, **kw):
+    return row(key, d, cents, desc=desc, name=name, source="rocketmoney", **kw)
+
+
+CUT = date(2026, 11, 11)
+
+
+def decided(decisions):
+    return {d.sf_txn_key: (d.decision, d.evidence, d.history_txn_keys) for d in decisions}
+
+
+def test_merchant_evidence():
+    a = row("a", "2026-11-11", 500, desc="DEMO CAFE 0042 ATLANTA GA")
+    assert sf.merchant_evidence(a, hrow("h", "2026-11-10", 500, "Demo Cafe", name="Demo Cafe"))
+    assert sf.merchant_evidence(a, hrow("h", "2026-11-10", 500, "SQ *DEMO CAFE ATLANTA"))
+    assert not sf.merchant_evidence(a, hrow("h", "2026-11-11", 500, "OTHER SHOP 0042 ATLANTA GA"))  # city alone is not it
+    assert not sf.merchant_evidence(row("a", "2026-11-11", 500, desc="DEMO ATLANTA"), hrow("h", "2026-11-11", 500, "SHOP ATLANTA"))
+    assert not sf.merchant_evidence(row("a", "2026-11-11", 500, desc="POS DEBIT PURCHASE"), hrow("h", "2026-11-11", 500, "POS DEBIT PURCHASE"))
+    assert not sf.merchant_evidence(row("a", "2026-11-11", 500, desc="#1234"), hrow("h", "2026-11-11", 500, "#1234"))
+    assert sf.exact_key(row("a", "2026-11-11", 500, desc="#1234")) is None   # no letters: no exact evidence either
+
+
+def test_cutover_equal_amount_is_not_identity():
+    """PIPE-04: an equal amount on a nearby date never drops a row on its own."""
+    hist = [hrow("h1", "2026-11-11", 1500, "DEMO GROCER 0101 ATLANTA")]
     sf_rows = [
-        row("a", "2026-11-01", 900),      # long before the cutover: history has it
-        row("b", "2026-11-11", 500),      # twin of h1 one day apart
-        row("c", "2026-11-11", 700),      # twin of h2
-        row("d", "2026-11-12", 700),      # twin of h3 (each history row is used once)
-        row("e", "2026-11-12", 700),      # a third 7.00: no twin left, kept
-        row("f", "2026-11-10", 300),      # pending when Rocket Money last looked: kept
-        row("g", "2026-11-13", 999),      # after the cutover: kept
-        row("s", "2026-11-02", 111),      # stored by an earlier SimpleFIN run: always rewritten
+        row("a", "2026-11-11", 1500, desc="OTHER PHARMACY 0202 ATLANTA"),   # same day and amount, another merchant
+        row("b", "2026-11-11", 1500, desc="DEMO GROCER 0101 ATLANTA", currency="EUR"),   # another currency
     ]
-    kept, dropped = sf.apply_cutover(sf_rows, hist, date(2026, 11, 11), {"s"})
-    assert sorted(r["txn_key"] for r in kept) == ["e", "f", "g", "s"]
-    assert dropped["before the Rocket Money cutover"] == 1 and dropped["already in the Rocket Money history"] == 3
-    again, _ = sf.apply_cutover(list(reversed(sf_rows)), hist, date(2026, 11, 11), {"s"})
-    assert sorted(r["txn_key"] for r in again) == ["e", "f", "g", "s"]   # order-independent
-    assert len(sf.apply_cutover(sf_rows, hist, None, set())[0]) == len(sf_rows)
+    kept, dropped, decisions = sf.apply_cutover(sf_rows, hist, CUT, set())
+    assert sorted(r["txn_key"] for r in kept) == ["a", "b"] and not dropped
+    assert decided(decisions) == {"a": ("unconfirmed", None, ("h1",))}     # flagged for review, still kept
+    assert all(d.account_key == "wf1" and d.cutover_date == "2026-11-11" for d in decisions)
+
+
+def test_cutover_true_duplicates_match_deterministically():
+    hist = [
+        hrow("h1", "2026-11-10", 500, "DEMO CAFE 0017 ATLANTA"),
+        hrow("h2", "2026-11-11", 700, "DEMO DELI ATLANTA"), hrow("h3", "2026-11-11", 700, "DEMO DELI ATLANTA"),
+        hrow("h4", "2026-11-09", 4200, "Demo Gym", name="Demo Gym", original="2026-11-12"),
+    ]
+    sf_rows = [
+        row("a", "2026-11-01", 900, desc="LONG BEFORE"),                 # before the cutover window: history has it
+        row("b", "2026-11-11", 500, desc="DEMO CAFE ATLANTA GA"),        # one day from h1, same merchant, one to one
+        row("c", "2026-11-11", 700, desc="DEMO DELI ATLANTA"),           # two identical purchases on the same day:
+        row("d", "2026-11-11", 700, desc="DEMO DELI ATLANTA"),           # ... both are in the history: both match
+        row("e", "2026-11-14", 4200, desc="DEMO GYM MONTHLY"),           # 5 days from h4's date, 2 from its original
+        row("f", "2026-11-10", 300, desc="NOT IN THE HISTORY"),          # pending when Rocket Money last looked: kept
+        row("g", "2026-11-20", 999, desc="AFTER THE CUTOVER"),           # kept
+        row("s", "2026-11-02", 111, desc="STORED EARLIER"),              # stored by an earlier SimpleFIN run: kept
+    ]
+    kept, dropped, decisions = sf.apply_cutover(sf_rows, hist, CUT, {"s"})
+    assert sorted(r["txn_key"] for r in kept) == ["f", "g", "s"]
+    assert dropped == {"before the Rocket Money cutover": 1, "already in the Rocket Money history": 4}
+    got = decided(decisions)
+    assert got["b"] == ("matched", "merchant", ("h1",)) and got["e"] == ("matched", "merchant", ("h4",))
+    assert {got["c"][2], got["d"][2]} == {("h2",), ("h3",)} and got["c"][:2] == got["d"][:2] == ("matched", "exact")
+    assert "f" not in got and "g" not in got
+    # Order-independent, and idempotent: a second run that sees the kept rows as stored decides the same.
+    again = sf.apply_cutover(list(reversed(sf_rows)), list(reversed(hist)), CUT, {"s"})
+    assert [r["txn_key"] for r in again[0]] == [r["txn_key"] for r in kept] and again[2] == decisions
+    rerun = sf.apply_cutover(sf_rows, hist, CUT, {"s"} | {r["txn_key"] for r in kept})
+    assert sorted(r["txn_key"] for r in rerun[0]) == ["f", "g", "s"] and rerun[2] == decisions
+    assert sf.apply_cutover(sf_rows, hist, None, set())[0] == sf_rows
+
+
+def test_cutover_ambiguous_overlap_is_kept_and_visible():
+    hist = [hrow("h1", "2026-11-11", 700, "DEMO DELI ATLANTA"), hrow("h2", "2026-11-11", 700, "DEMO DELI ATLANTA")]
+    sf_rows = [
+        row("c", "2026-11-11", 700, desc="DEMO DELI ATLANTA"),     # exact twin of one of them
+        row("d", "2026-11-12", 700, desc="DEMO DELI ATLANTA"),     # the other history row, or a new purchase?
+        row("e", "2026-11-12", 700, desc="DEMO DELI ATLANTA"),     # two candidates for one row: never guessed
+    ]
+    kept, dropped, decisions = sf.apply_cutover(sf_rows, hist, CUT, set())
+    got = decided(decisions)
+    assert got["c"] == ("matched", "exact", ("h1",))
+    assert got["d"] == got["e"] == ("ambiguous", None, ("h2",))
+    assert sorted(r["txn_key"] for r in kept) == ["d", "e"] and dropped["already in the Rocket Money history"] == 1
+    assert sf.cutover_counts(decisions) == {"matched exact": 1, "ambiguous": 2}
+    # Each review row is reported once: not again when the same decision is already recorded.
+    assert sf.new_review_count(decisions, None) == 2
+    assert sf.new_review_count(decisions, {"d": "ambiguous", "e": "ambiguous"}) == 0
+    assert sf.new_review_count(decisions, {"d": "ambiguous", "e": "unconfirmed"}) == 1
+    # Recoverable: the record names the candidates, by key only.
+    rows = sf.decision_rows(decisions, NOW)
+    assert {tuple(sorted(r)) for r in rows} == {tuple(sorted(
+        ["sf_txn_key", "account_key", "decision", "evidence", "history_txn_keys", "cutover_date", "decided_at"]))}
+    assert next(r for r in rows if r["sf_txn_key"] == "d")["history_txn_keys"] == ["h2"]
+    assert not any("DEMO" in str(v) or v == 700 for r in rows for v in r.values())
+
+
+def test_cutover_stored_rows_are_never_dropped():
+    hist = [hrow("h1", "2026-11-10", 500, "DEMO CAFE ATLANTA"), hrow("h2", "2026-11-11", 800, "DEMO BAKERY ATLANTA")]
+    sf_rows = [row("s1", "2026-11-11", 500, desc="DEMO CAFE ATLANTA GA"),    # stored earlier, but a history twin exists
+               row("n1", "2026-11-11", 800, desc="DEMO BAKERY ATLANTA"),     # exact twin, not stored: dropped
+               row("s2", "2026-11-11", 800, desc="DEMO BAKERY ATLANTA")]     # stored copy of the same: kept, not paired
+    kept, dropped, decisions = sf.apply_cutover(sf_rows, hist, CUT, {"s1", "s2"})
+    assert sorted(r["txn_key"] for r in kept) == ["s1", "s2"]
+    got = decided(decisions)
+    assert got["s1"] == ("stored_duplicate", "merchant", ("h1",)) and got["n1"] == ("matched", "exact", ("h2",))
+    assert "s2" not in got, "unstored rows pair first in an exact group; the stored copy stays as it was"
 
 
 # --- categories -------------------------------------------------------------------------------------------------
@@ -351,6 +433,7 @@ class FakeStore:
         self._accounts, self.kinds, self.cutovers = accounts, kinds or {}, cutovers or {}
         self._window, self._history = window or [], history or []
         self.created, self.links, self.txns, self.balances, self.beats = [], [], [], [], []
+        self.saved, self.saved_rows = {}, []
 
     def accounts(self):
         return [dict(a) for a in self._accounts]
@@ -362,7 +445,15 @@ class FakeStore:
         return self.cutovers.get(key)
 
     def window_rows(self, since):
-        return list(self._window)
+        stored = {t["txn_key"]: dict(t) for t in self.txns}   # what earlier runs on this store wrote
+        return list(self._window) + list(stored.values())
+
+    def cutover_decisions(self):
+        return dict(self.saved)
+
+    def save_cutover_decisions(self, rows):
+        self.saved_rows.extend(rows)
+        self.saved.update({r["sf_txn_key"]: r["decision"] for r in rows})
 
     def history_for_learning(self, since):
         return list(self._history)
@@ -543,6 +634,67 @@ def test_skipped_account_is_partial():
     assert store.beats[0][1] == "partial" and store.beats[0][3] == sf.format_notes({"account_unmatched": 1})
     assert "Wells Fargo" not in store.beats[0][3] and "Some Account" not in store.beats[0][3]
     assert not any(t["source_txn_id"].startswith("sf:S-WFX") for t in store.txns)
+
+
+def cutover_body():
+    b = body()
+    wf = next(a for a in b["accounts"] if a["id"] == "S-WF")
+    wf["transactions"] = [
+        txn("w1", "2026-11-11", "-15.00", "OTHER PHARMACY 0202 ATLANTA"),   # same day and amount as a grocer row
+        txn("w2", "2026-11-10", "-7.00", "DEMO DELI ATLANTA"),              # the history has exactly this
+    ]
+    return b
+
+
+def cutover_store(cls=None):
+    window = [hrow("rm-1", "2026-11-11", 1500, "DEMO GROCER 0101 ATLANTA"), hrow("rm-2", "2026-11-10", 700, "DEMO DELI ATLANTA")]
+    return (cls or FakeStore)(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+
+
+def test_run_cutover_review_reported_once_and_recorded():
+    store = cutover_store()
+    lines = []
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+    written = {t["source_txn_id"] for t in store.txns}
+    assert "sf:S-WF:w1" in written, "a different purchase of the same amount is kept"
+    assert "sf:S-WF:w2" not in written, "the exact duplicate is not written twice"
+    assert store.beats[0][1] == "partial" and store.beats[0][3] == sf.format_notes({"cutover_review": 1})
+    assert sorted(r["decision"] for r in store.saved_rows) == ["matched", "unconfirmed"]
+    out = "\n".join(lines)
+    assert "cutover decisions: {" in out
+    for private in ("PHARMACY", "GROCER", "DELI", "rm-1", "rm-2", "15.00", "1500"):
+        assert private not in out, f"routine output must be counts only, found {private!r}"
+    # The next run: the kept row is stored now and its decision is recorded, so nothing new to report.
+    lines2 = []
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines2.append) == 0
+    assert [(b[1], b[3]) for b in store.beats[2:]] == [("success", None), ("success", None)]
+    assert sum(1 for t in store.txns if t["source_txn_id"] == "sf:S-WF:w1") == 2   # rewritten in place (same key)
+    assert len({t["txn_key"] for t in store.txns if t["source_txn_id"] == "sf:S-WF:w1"}) == 1
+    assert not any(t["source_txn_id"] == "sf:S-WF:w2" for t in store.txns)
+    # The dry run is the reconciliation preview: counts per account, nothing written.
+    dry, lines3 = cutover_store(), []
+    assert sf.run(dry, Http(get=Res(200, cutover_body())), ACCESS, 60, True, now=NOW, out=lines3.append) == 0
+    assert not (dry.txns or dry.saved_rows or dry.beats)
+    preview = "\n".join(lines3)
+    assert "kept for review {'unconfirmed': 1}" in preview and "new for review: 1" in preview
+    assert "PHARMACY" not in preview and "GROCER" not in preview
+
+
+def test_run_cutover_record_unavailable_is_partial_and_keeps_rows():
+    class NoTable(FakeStore):
+        def cutover_decisions(self):
+            raise RuntimeError("relation pds.finance_cutover_matches does not exist")
+
+        def save_cutover_decisions(self, rows):
+            raise RuntimeError("relation pds.finance_cutover_matches does not exist")
+
+    store = cutover_store(NoTable)
+    lines = []
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+    assert "sf:S-WF:w1" in {t["source_txn_id"] for t in store.txns}
+    assert store.beats[0][1] == "partial"
+    assert store.beats[0][3] == sf.format_notes({"cutover_review": 1, "cutover_provenance_unsaved": 1})
+    assert "does not exist" not in "\n".join(lines)
 
 
 if __name__ == "__main__":

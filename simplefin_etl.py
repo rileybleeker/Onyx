@@ -16,9 +16,14 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
   2. Transactions (posted only; pending are not requested) -> rows with the ledger's sign (expense-positive).
      Investment accounts are balances-only, as they were under Rocket Money (trades and dividends are not spending).
   3. Cutover from the Rocket Money history, per account: rows dated more than OVERLAP_DAYS before the last Rocket
-     Money row are dropped (that history already has them); rows near or after it are dropped only when a Rocket
-     Money row with the same amount within OVERLAP_DAYS is not yet claimed. Rows Rocket Money never saw (it
-     skipped pending ones) are kept. Rows already stored by an earlier SimpleFIN run are always rewritten in place.
+     Money row are dropped (that history already has them). A row near or after it is dropped only on identity
+     evidence (PIPE-04; the two feeds share no transaction id): same account, amount and currency, and either the
+     same date and normalized description ('exact', paired one for one) or a date within OVERLAP_DAYS and a shared
+     merchant word where that one SimpleFIN row and that one Rocket Money row have no other such candidate
+     ('merchant'). An equal amount alone never drops a row: a row with competing candidates ('ambiguous') or with
+     a same-amount Rocket Money row nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review.
+     Every decision is recorded in pds.finance_cutover_matches (keys only). Rows Rocket Money never saw (it skipped
+     pending ones) are kept. Rows already stored by an earlier SimpleFIN run are always rewritten in place.
   4. Category (SimpleFIN sends none; /financials needs one to keep card payments and transfers out of spending):
      a payment/transfer pair (same amount, opposite sign, two of Riley's accounts, within PAIR_DAYS, one side worded
      like a payment or transfer) -> "Credit Card Payment" or "Internal Transfers"; else the category Rocket Money
@@ -131,6 +136,8 @@ NOTE_CODES: dict[str, str] = {
     "account_no_id": "SimpleFIN sent an account without an id; it was skipped",
     "account_unmatched": "an account was not imported: it could not be matched uniquely to a ledger account (run simplefin_etl.py --dry-run locally)",
     "account_type_unset": "a new account is balances-only until its finance_accounts.account_type is set",
+    "cutover_review": "rows near the Rocket Money cutover were kept though a same-amount Rocket Money row is near: check for duplicates (simplefin_etl.py --dry-run locally)",
+    "cutover_provenance_unsaved": "the cutover match record was not saved (apply sql/finance_cutover_matches.sql); the next run retries",
 }
 NOTE_LIMIT = 300      # past this the later codes keep only their token (format_notes); lib/finance-status.ts agrees
 NOTE_MAX_COUNT = 9999
@@ -557,38 +564,176 @@ def match_accounts(sf_accounts: list[SfAccount], ledger: list[dict]) -> dict[str
     return result
 
 
-def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[date], stored_keys: set[str]) -> tuple[list[dict], Counter]:
-    """Drops SimpleFIN rows the Rocket Money history already holds (see module docstring, step 3). Deterministic."""
+# Cutover identity evidence (PIPE-04). Words that say nothing about which merchant it was.
+GENERIC_WORDS = frozenset({
+    "POS", "PURCHASE", "DEBIT", "CREDIT", "CARD", "ONLINE", "PAYMENT", "PMT", "ACH", "WEB", "RECURRING", "CHECKCARD",
+    "VISA", "MASTERCARD", "TRANSACTION", "WITHDRAWAL", "DEPOSIT", "AUTHORIZED", "PENDING", "INC", "LLC", "LTD", "CORP",
+    "THE", "AND", "FOR", "FROM", "WWW", "COM", "NET", "ORG", "HTTP", "HTTPS", "USA", "PAYPAL", "SQ", "TST",
+})
+REVIEW_DECISIONS = ("stored_duplicate", "ambiguous", "unconfirmed")
+MAX_CANDIDATES = 10    # Rocket Money keys kept per decision record
+
+
+def _currency(row: dict) -> str:
+    return (row.get("currency") or "USD").strip().upper()
+
+
+def _row_dates(row: dict) -> set[date]:
+    out = {date.fromisoformat(row["txn_date"])}
+    if row.get("original_date"):
+        out.add(date.fromisoformat(row["original_date"]))
+    return out
+
+
+def date_gap(a: dict, b: dict) -> int:
+    """Smallest day gap between the two rows' dates (each has a date and maybe an original / posted date)."""
+    return min(abs((x - y).days) for x in _row_dates(a) for y in _row_dates(b))
+
+
+def exact_key(row: dict) -> Optional[tuple]:
+    """Same account (callers compare one account), date, amount, currency and normalized description."""
+    d = norm_text(row.get("description"))
+    return (row["txn_date"], row["amount_cents"], _currency(row), d) if d else None
+
+
+def merchant_tokens(row: dict) -> frozenset:
+    words = set(norm_text(row.get("description")).split()) | set(norm_text(row.get("name")).split())
+    return frozenset(w for w in words if len(w) >= 3 and w not in GENERIC_WORDS)
+
+
+def merchant_evidence(a: dict, b: dict) -> bool:
+    """The descriptions share merchant words: more than half of the shorter side's distinctive words (so a shared
+    city name alone, 'DEMO ATLANTA' vs 'SHOP ATLANTA', is not evidence)."""
+    ta, tb = merchant_tokens(a), merchant_tokens(b)
+    shared = len(ta & tb)
+    return shared > 0 and 2 * shared > min(len(ta), len(tb))
+
+
+@dataclass(frozen=True)
+class CutoverDecision:
+    sf_txn_key: str
+    account_key: str
+    decision: str              # matched | stored_duplicate | ambiguous | unconfirmed
+    evidence: Optional[str]    # exact | merchant (matched / stored_duplicate), else None
+    history_txn_keys: tuple    # the Rocket Money twin, or the candidates
+    cutover_date: str = ""     # the account's last Rocket Money date the decision was made against
+
+
+def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[date],
+                  stored_keys: set[str]) -> tuple[list[dict], Counter, list[CutoverDecision]]:
+    """SimpleFIN rows -> (kept, dropped counts, decisions) against one account's Rocket Money history (module
+    docstring, step 3). Deterministic and order-independent. A row is dropped only when it is matched on identity
+    evidence; a row stored by an earlier run is always kept (a match then marks it 'stored_duplicate')."""
     kept: list[dict] = []
     dropped: Counter = Counter()
     if cutover is None:
-        return list(sf_rows), dropped
+        return list(sf_rows), dropped, []
     floor = cutover - timedelta(days=OVERLAP_DAYS)
     pool = sorted(
         (h for h in history if date.fromisoformat(h["txn_date"]) >= floor - timedelta(days=OVERLAP_DAYS)),
         key=lambda h: (h["txn_date"], h["txn_key"]),
     )
-    used: set[str] = set()
+    zone: list[dict] = []
     for r in sorted(sf_rows, key=lambda r: (r["txn_date"], r["txn_key"])):
-        if r["txn_key"] in stored_keys:
+        if date.fromisoformat(r["txn_date"]) >= floor:
+            zone.append(r)
+        elif r["txn_key"] in stored_keys:
             kept.append(r)
-            continue
-        d = date.fromisoformat(r["txn_date"])
-        if d < floor:
+        else:
             dropped["before the Rocket Money cutover"] += 1
+
+    used: set[str] = set()
+    found: dict[str, tuple] = {}   # sf txn_key -> (decision, evidence, history keys)
+
+    # 1. Exact: same date, amount, currency and description. Such rows cannot be told apart, so pairing them one
+    #    for one in key order is exact whichever pairs; rows not stored yet pair first (stored ones stay anyway).
+    by_key: dict[tuple, list] = defaultdict(list)
+    for h in pool:
+        k = exact_key(h)
+        if k:
+            by_key[k].append(h)
+    groups: dict[tuple, list] = defaultdict(list)
+    for r in zone:
+        k = exact_key(r)
+        if k and k in by_key:
+            groups[k].append(r)
+    for k, rs in groups.items():
+        for r, h in zip(sorted(rs, key=lambda r: (r["txn_key"] in stored_keys, r["txn_key"])),
+                        sorted(by_key[k], key=lambda h: h["txn_key"])):
+            used.add(h["txn_key"])
+            found[r["txn_key"]] = ("matched", "exact", (h["txn_key"],))
+
+    # 2. Merchant: same amount and currency, dates within OVERLAP_DAYS, shared merchant words. Only a one-to-one
+    #    group (one SimpleFIN row, one Rocket Money row, no other evidence either side) is a match; anything larger
+    #    is ambiguous and every SimpleFIN row in it is kept.
+    rest = [r for r in zone if r["txn_key"] not in found]
+    free = [h for h in pool if h["txn_key"] not in used]
+    near = {r["txn_key"]: [h for h in free if h["amount_cents"] == r["amount_cents"] and _currency(h) == _currency(r)
+                           and date_gap(r, h) <= OVERLAP_DAYS] for r in rest}
+    parent: dict[tuple, tuple] = {}
+
+    def root(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for r in rest:
+        for h in near[r["txn_key"]]:
+            if merchant_evidence(r, h):
+                parent[root(("h", h["txn_key"]))] = root(("s", r["txn_key"]))
+    comps: dict[tuple, dict] = {}
+    for node in sorted(parent):
+        comps.setdefault(root(node), {"s": [], "h": []})[node[0]].append(node[1])
+    for comp in comps.values():
+        hs = tuple(sorted(comp["h"]))
+        if len(comp["s"]) == 1 and len(hs) == 1:
+            used.add(hs[0])
+            found[comp["s"][0]] = ("matched", "merchant", hs)
+        else:
+            for sk in comp["s"]:
+                found[sk] = ("ambiguous", None, hs[:MAX_CANDIDATES])
+
+    # 3. Unconfirmed: an unclaimed Rocket Money row with the same amount is near, but nothing says it is the same
+    #    purchase (the case an amount-only rule used to drop). Kept.
+    for r in rest:
+        if r["txn_key"] in found:
             continue
-        twin = next(
-            (h for h in pool
-             if h["txn_key"] not in used and h["amount_cents"] == r["amount_cents"]
-             and abs((date.fromisoformat(h["txn_date"]) - d).days) <= OVERLAP_DAYS),
-            None,
-        )
-        if twin:
-            used.add(twin["txn_key"])
+        cands = tuple(sorted(h["txn_key"] for h in near[r["txn_key"]] if h["txn_key"] not in used))
+        if cands:
+            found[r["txn_key"]] = ("unconfirmed", None, cands[:MAX_CANDIDATES])
+
+    decisions: list[CutoverDecision] = []
+    for r in zone:
+        decision, evidence, hkeys = found.get(r["txn_key"], (None, None, ()))
+        stored = r["txn_key"] in stored_keys
+        if decision == "matched" and not stored:
             dropped["already in the Rocket Money history"] += 1
         else:
             kept.append(r)
-    return kept, dropped
+        if decision:
+            decision = "stored_duplicate" if decision == "matched" and stored else decision
+            decisions.append(CutoverDecision(r["txn_key"], r["account_key"], decision, evidence, hkeys, cutover.isoformat()))
+    return kept, dropped, sorted(decisions, key=lambda d: d.sf_txn_key)
+
+
+def cutover_counts(decisions: Iterable[CutoverDecision]) -> Counter:
+    """Decisions -> counts for the log: matched exact / matched merchant / stored_duplicate / ambiguous / unconfirmed."""
+    return Counter(f"{d.decision} {d.evidence}" if d.decision == "matched" else d.decision for d in decisions)
+
+
+def decision_rows(decisions: Iterable[CutoverDecision], now: datetime) -> list[dict]:
+    """pds.finance_cutover_matches rows: keys, the decision and its evidence only (no amount, date or text)."""
+    return [{
+        "sf_txn_key": d.sf_txn_key, "account_key": d.account_key, "decision": d.decision, "evidence": d.evidence,
+        "history_txn_keys": list(d.history_txn_keys), "cutover_date": d.cutover_date, "decided_at": now.isoformat(),
+    } for d in decisions]
+
+
+def new_review_count(decisions: Iterable[CutoverDecision], saved: Optional[dict]) -> int:
+    """Rows kept for review whose decision is not recorded yet (each one is reported once, when first seen)."""
+    return sum(1 for d in decisions
+               if d.decision in REVIEW_DECISIONS and (saved is None or saved.get(d.sf_txn_key) != d.decision))
 
 
 def learn_categories(history: Iterable[dict]) -> dict[str, dict[str, str]]:
@@ -766,7 +911,7 @@ class Store:
         return date.fromisoformat(data[0]["txn_date"]) if data else None
 
     def window_rows(self, since: date) -> list[dict]:
-        cols = "txn_key,account_key,txn_date,amount_cents,name,description,source"
+        cols = "txn_key,account_key,txn_date,original_date,amount_cents,currency,name,description,source"
         return read_all(lambda: _t(self.supa, "finance_transactions").select(cols)
                         .gte("txn_date", since.isoformat()).order("txn_date").order("txn_key"))
 
@@ -793,6 +938,15 @@ class Store:
         if rows:
             _t(self.supa, "finance_balance_snapshots").upsert(rows, on_conflict="account_key,captured_at").execute()
 
+    def cutover_decisions(self) -> dict[str, str]:
+        """The recorded cutover decisions (sf_txn_key -> decision); a small table (cutover-window rows only)."""
+        rows = read_all(lambda: _t(self.supa, "finance_cutover_matches").select("sf_txn_key,decision").order("sf_txn_key"))
+        return {r["sf_txn_key"]: r["decision"] for r in rows}
+
+    def save_cutover_decisions(self, rows: list[dict]) -> None:
+        for i in range(0, len(rows), CHUNK):
+            _t(self.supa, "finance_cutover_matches").upsert(rows[i:i + CHUNK], on_conflict="sf_txn_key").execute()
+
     def heartbeat(self, data_type: str, status: str, records: int, started: float, error: Optional[str],
                   start: Optional[date] = None, end: Optional[date] = None) -> None:
         from sync_log_helper import log_sync
@@ -817,6 +971,7 @@ class Plan:
     categories: Counter
     dropped: Counter
     skipped: Counter
+    cutover: list = field(default_factory=list)   # CutoverDecision per SimpleFIN row near the cutover (keys only)
 
 
 def et_today(now: Optional[datetime] = None) -> date:
@@ -837,6 +992,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     new_accounts, links, txns, balances, per_account = [], [], [], [], []
     dropped: Counter = Counter()
     skipped: Counter = Counter()
+    decisions: list[CutoverDecision] = []
     window_start = today - timedelta(days=days)
     pool = store.window_rows(window_start - timedelta(days=PAIR_DAYS + OVERLAP_DAYS * 2))
     stored_sf = {p["txn_key"] for p in pool if p.get("source") == SOURCE}
@@ -885,16 +1041,19 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
         rows, skip = normalize_transactions(a, key)
         skipped.update(skip)
         cutover = store.cutover(key) if m.action != "new" else None
-        kept, drop = apply_cutover(rows, history_by_account.get(key, []), cutover, stored_sf)
+        kept, drop, decided = apply_cutover(rows, history_by_account.get(key, []), cutover, stored_sf)
         dropped.update(drop)
+        decisions.extend(decided)
         line["kept"], line["dropped"] = len(kept), sum(drop.values())
         line["cutover"] = cutover.isoformat() if cutover else None
+        line["review"] = {k: n for k, n in cutover_counts(decided).items() if k in REVIEW_DECISIONS}
         txns.extend(kept)
         per_account.append(line)
 
     learned = learn_categories(store.history_for_learning(today - timedelta(days=365 * LEARN_YEARS)))
     categories = assign_categories(txns, pool, learned, account_types)
-    return Plan(matches, sf_accounts, new_accounts, links, txns, balances, notes, per_account, categories, dropped, skipped)
+    return Plan(matches, sf_accounts, new_accounts, links, txns, balances, notes, per_account, categories, dropped, skipped,
+                cutover=decisions)
 
 
 def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[datetime] = None, out=print) -> int:
@@ -921,10 +1080,20 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
                 what = "balances only"
             else:
                 what = f"keep {line['kept']}, drop {line['dropped']}, cutover {line.get('cutover')}"
+                if line.get("review"):
+                    what += f", kept for review {line['review']}"
             flag = f" | SimpleFIN issue: {', '.join(line['issues'])}" if line.get("issues") else ""
             out(f"  {line['institution']} | {line['name']} | last4 {line.get('mask') or '-'} | {line['action']}{why} | {what}{flag}")
         out(f"  transactions to write: {len(plan.transactions)}; balances: {len(plan.balances)}; new accounts: {len(plan.new_accounts)}")
         out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
+        if plan.cutover:
+            # Reconciliation preview of the cutover window, counts only (pds.finance_cutover_matches has the keys).
+            try:
+                saved = store.cutover_decisions()
+            except Exception:
+                saved = None
+            out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}; new for review: "
+                f"{new_review_count(plan.cutover, saved)}" + ("" if saved is not None else " (no decision record yet)"))
         if plan.notes:
             out(f"  heartbeat note: {format_notes(plan.notes)}")
         return 0
@@ -943,6 +1112,21 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         store.heartbeat("balances", "failed", 0, started, msg)
         return 1
 
+    if plan.cutover:
+        # Provenance of every cutover decision; best-effort (the ledger writes above are done). A kept-for-review
+        # row is reported in the heartbeat once, the first run that records it.
+        try:
+            saved = store.cutover_decisions()
+        except Exception:
+            saved = None
+        review = new_review_count(plan.cutover, saved)
+        if review:
+            plan.notes["cutover_review"] += review
+        try:
+            store.save_cutover_decisions(decision_rows(plan.cutover, now or datetime.now(timezone.utc)))
+        except Exception:
+            plan.notes["cutover_provenance_unsaved"] += 1
+
     note = format_notes(plan.notes)
     status = "partial" if note else "success"
     store.heartbeat("transactions", status, len(plan.transactions), started, note, start, today)
@@ -950,6 +1134,8 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     out(f"{status}: {len(plan.accounts)} account(s), {len(plan.transactions)} transaction(s), "
         f"{len(plan.balances)} balance(s), {len(plan.new_accounts)} new account(s), {len(plan.links)} linked")
     out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
+    if plan.cutover:
+        out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}")
     if note:
         out(f"  heartbeat codes: {note_codes_summary(plan.notes)}")
     return 0
