@@ -155,31 +155,49 @@ test("leave out: two tabs changing DIFFERENT accounts at the same moment both ke
   const m = memoryStore({ leaveOut: ["acct1"] });
   m.hooks.push(async () => assert.deepEqual(await S.applyLeaveOut(m.store, "acct3", true), { ok: true }, "tab B"));
   assert.deepEqual(await S.applyLeaveOut(m.store, "acct2", true), { ok: true }, "tab A");
+  assert.equal(m.hooks.length, 0, "tab B ran between A's read and A's write");
   assert.deepEqual([...m.saved()].sort(), ["acct1", "acct2", "acct3"]);
   // Counting one again while another tab leaves a different one out: both stand.
   const r = memoryStore({ leaveOut: ["acct1", "acct2"] });
   r.hooks.push(async () => assert.deepEqual(await S.applyLeaveOut(r.store, "acct3", true), { ok: true }));
   assert.deepEqual(await S.applyLeaveOut(r.store, "acct1", false), { ok: true });
+  assert.equal(r.hooks.length, 0, "the other tab ran");
   assert.deepEqual([...r.saved()].sort(), ["acct2", "acct3"], "acct1 counted again, acct3 left out, acct2 untouched");
   // Both tabs creating the first row: the second insert conflicts and is re-applied as an update.
   const e = memoryStore(null);
   e.hooks.push(async () => assert.deepEqual(await S.applyLeaveOut(e.store, "acct1", true), { ok: true }));
   assert.deepEqual(await S.applyLeaveOut(e.store, "acct2", true), { ok: true });
+  assert.equal(e.hooks.length, 0, "the other tab ran");
   assert.deepEqual([...e.saved()].sort(), ["acct1", "acct2"]);
   // Counting the last one again while another tab leaves one out: the removal conflicts, the addition is kept.
   const d = memoryStore({ leaveOut: ["acct1"] });
   d.hooks.push(async () => assert.deepEqual(await S.applyLeaveOut(d.store, "acct2", true), { ok: true }));
   assert.deepEqual(await S.applyLeaveOut(d.store, "acct1", false), { ok: true });
+  assert.equal(d.hooks.length, 0, "the other tab ran");
   assert.deepEqual(d.saved(), ["acct2"]);
 });
 
 test("leave out: two changes to the SAME account apply in turn, and the one committing last decides", async () => {
-  // A leaves acct2 out; B counts it again and commits in between. A reads again (acct2 counted) and re-applies.
+  // A reads ["acct1", "acct2"] and counts acct2 again (a real change, so A writes). Between A's read and A's write,
+  // tab B commits three changes: counts acct2 again, leaves acct3 out, leaves acct2 out again. A's write conflicts;
+  // A reads again and re-applies its one change to the list as B left it, so acct2 ends counted (A committed last)
+  // and B's acct3 is kept. A blind write of A's first merge would have saved ["acct1"] and lost acct3.
   const m = memoryStore({ leaveOut: ["acct1", "acct2"] });
-  m.hooks.push(async () => assert.deepEqual(await S.applyLeaveOut(m.store, "acct2", false), { ok: true }, "B commits first"));
-  assert.deepEqual(await S.applyLeaveOut(m.store, "acct2", true), { ok: true }, "A commits last");
-  assert.deepEqual([...m.saved()].sort(), ["acct1", "acct2"], "A's change, applied on top of B's, never on a stale copy");
-  assert.equal(m.box.reads, 3, "A read twice (again after the conflict), B once");
+  let ran = false;
+  m.hooks.push(async () => {
+    assert.deepEqual(await S.applyLeaveOut(m.store, "acct2", false), { ok: true }, "B counts acct2 again");
+    assert.deepEqual(m.saved(), ["acct1"], "B's first change was written");
+    assert.deepEqual(await S.applyLeaveOut(m.store, "acct3", true), { ok: true }, "B leaves acct3 out");
+    assert.deepEqual(await S.applyLeaveOut(m.store, "acct2", true), { ok: true }, "B leaves acct2 out again");
+    assert.deepEqual([...m.saved()].sort(), ["acct1", "acct2", "acct3"], "B's last change was written");
+    ran = true;
+  });
+  assert.deepEqual(await S.applyLeaveOut(m.store, "acct2", false), { ok: true }, "A commits last");
+  assert.equal(ran, true, "the competing tab ran between A's read and A's write");
+  assert.equal(m.hooks.length, 0);
+  assert.deepEqual([...m.saved()].sort(), ["acct1", "acct3"], "A's change decides acct2, applied on top of B's, never on a stale copy");
+  assert.equal(m.box.reads, 5, "A read twice (again after the conflict), B three times");
+  assert.equal(m.box.writes, 5, "B wrote three times, A twice (its first write conflicted)");
 });
 
 test("leave out: bounded retry, then 409 with nothing of this change saved; a failed read or write saves nothing", async () => {

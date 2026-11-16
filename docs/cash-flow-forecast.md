@@ -78,7 +78,7 @@ when every input it rests on was read, complete and fresh (`ForecastResult.eligi
 | Reason code | When |
 |---|---|
 | `missing-balance` / `no-balance` | a pool account has no balance row in the 60-day read and no small or negative older one (counted as $0 in the estimate) |
-| `invalid-balance` | only a non-USD row, no usable amount, an unreadable date, or a date more than 1 h in the future |
+| `invalid-balance` | only a non-USD row, a newer row in another currency than the newest US-dollar one (the newest snapshot decides, in any currency), no usable amount, an unreadable date, or a date more than 1 h in the future |
 | `stale-balance` | a pool balance of ANY size older than 48 h (`staleBalanceHours`; an old small or zero balance is no proof the account is not overdrawn now), or a stored result read after its `validUntil` |
 | `balance-unreadable` | the read of a pool account's older balance failed (not "no row": the read itself errored), so its balance is unknown. Leaving the account out does not clear it, and the reason offers no Leave it out |
 | `freshness-unknown` | the caller passed no clock, so the dates could not be checked |

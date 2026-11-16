@@ -573,6 +573,14 @@ function latestBalances(balances: readonly ForecastBalance[]): Map<string, Forec
   }
   return out;
 }
+/**
+ * Whether `account` has a snapshot in another currency that is not older than the US-dollar one taken at `atMs`
+ * (latestBalances skips those rows), or one whose date cannot be compared. Then the US-dollar balance is not known to
+ * be the account's current one, so the safe-to-move gate must not count it as fresh.
+ */
+function supersededByOtherCurrency(balances: readonly ForecastBalance[], account: string, atMs: number): boolean {
+  return balances.some((x) => x.account_key === account && (x.currency ?? "USD").toUpperCase() !== "USD" && !(Date.parse(x.captured_at) < atMs));
+}
 /** Owed on a card (positive) from its balance row: liabilities are stored as their size, sometimes negative. */
 const owedFrom = (b: ForecastBalance | undefined): number => (b ? Math.abs(b.balance_cents) : 0);
 
@@ -1068,6 +1076,14 @@ export function forecastCash(input: ForecastInput): ForecastResult {
       }
       if (!Number.isFinite(at)) {
         reason("invalid-balance", `The balance for ${label} has no readable date.`, k);
+        continue;
+      }
+      // The account's NEWEST snapshot decides, in any currency: a newer row in another currency means this older
+      // US-dollar balance is not its current one, however fresh it looks. Withheld like any unusable balance (the
+      // estimate keeps the last US-dollar balance; Leave it out clears the reason).
+      if (supersededByOtherCurrency(input.balances, k, at)) {
+        warnings.push(`The newest balance for ${label} is not in US dollars: the estimate uses its last US-dollar balance.`);
+        reason("invalid-balance", `The balance for ${label} is not a usable US-dollar amount.`, k);
         continue;
       }
       if (age === null) {

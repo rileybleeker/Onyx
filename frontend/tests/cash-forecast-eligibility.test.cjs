@@ -124,6 +124,35 @@ test("invalid balances withhold the amount: another currency only, no readable d
   assert.ok(Number.isFinite(nan.opening.cents), "a bad amount never poisons the estimate");
 });
 
+test("the newest snapshot decides in any currency: a newer row in another currency withholds a fresh older US-dollar one", () => {
+  // Savings: a fresh US-dollar balance 3 h old, then a newer one 1 h old in another currency.
+  const newerEur = run({ balances: [bal("chk", 400_000), bal("sav", 900_000, ago(3)), bal("sav", 800_000, ago(1), { currency: "EUR" }), bal("card", 50_000)] });
+  assert.equal(newerEur.state, "ok");
+  assert.equal(newerEur.eligibility.eligible, false);
+  assert.deepEqual(codes(newerEur), ["invalid-balance"]);
+  assert.match(newerEur.eligibility.reasons[0].text, /Demo Savings.*US-dollar/);
+  assert.equal(newerEur.eligibility.reasons[0].account, "sav", "Leave it out can clear it, like any unusable balance");
+  assert.equal(newerEur.headlines.safeToMoveCents, null);
+  assert.equal(E.safeToMoveOf(newerEur), null);
+  assert.equal(newerEur.opening.cents, 1_300_000, "the estimate keeps the last US-dollar balance; the other currency is never mixed in");
+  assert.ok(newerEur.warnings.some((w) => /Demo Savings.*not in US dollars/.test(w)));
+  assert.equal(newerEur.eligibility.cashAsOf, ago(2), "the withheld balance is not one the amount counts");
+  // A row in another currency with a date that cannot be compared: not known to be older, so withheld too.
+  const undatedEur = run({ balances: [bal("chk", 400_000), bal("sav", 900_000), bal("sav", 800_000, "not a time", { currency: "EUR" })] });
+  assert.deepEqual(codes(undatedEur), ["invalid-balance"]);
+  // An OLDER row in another currency changes nothing: the newest snapshot is the fresh US-dollar one.
+  const olderEur = run({ balances: [bal("chk", 400_000), bal("sav", 900_000), bal("sav", 800_000, ago(30), { currency: "EUR" }), bal("card", 50_000)] });
+  assert.deepEqual(gate(olderEur.eligibility), { eligible: true, reasons: [] });
+  assert.equal(olderEur.headlines.safeToMoveCents, run().headlines.safeToMoveCents);
+  // Recovery: the next US-dollar snapshot is newest again and the amount comes back.
+  const next = run({ balances: [bal("chk", 400_000), bal("sav", 800_000, ago(4), { currency: "EUR" }), bal("sav", 900_000, ago(2)), bal("card", 50_000)] });
+  assert.equal(next.eligibility.eligible, true);
+  // Riley leaving the account out clears the reason (his explicit choice), as for every other balance reason.
+  const left = run({ balances: [bal("chk", 400_000), bal("sav", 900_000, ago(3)), bal("sav", 800_000, ago(1), { currency: "EUR" }), bal("card", 50_000)], settings: { paths: 60, bufferCents: 50_000, safeToMoveLeaveOut: ["sav"] } });
+  assert.equal(left.eligibility.eligible, true);
+  assert.deepEqual(left.eligibility.leftOut, [{ account: "sav", label: "Demo Savings", asOf: ago(3), why: "chosen" }]);
+});
+
 test("without a clock the freshness cannot be verified; a backtest opening needs no balance rows", () => {
   const noClock = run({ now: undefined });
   assert.deepEqual(codes(noClock), ["freshness-unknown"]);
