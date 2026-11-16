@@ -24,18 +24,25 @@ const stats = require("./perf-stats.cjs");
  *   - the network-quiet window (harness version 1, unchanged): requests that started before the page had been
  *     network-quiet for QUIET_MS after data-ready (at most WINDOW_CAP_MS); `req`, `total` and `endpoints`, and the
  *     speed budget, use it;
- *   - a FIXED window from navigation start (harness version 2, `window`): every request that started in it, split by
- *     purpose (routed = before data-ready, background = after it, prefetch = router prefetch) and by origin (network,
- *     memory / disk / prefetch cache, service worker, or unknown, from the browser's own network log). A fixed window
- *     makes request totals comparable between pages and runs; the quiet window closes at a different moment on each.
+ *   - a FIXED window (harness version 2, `window`) from the navigation itself (navigation start for a full load, the
+ *     click for an in-app navigation): every request that started in it, split by purpose (routed = before data-ready,
+ *     background = after it, prefetch = router prefetch) and by origin (network, memory / disk / prefetch cache,
+ *     service worker, or unknown, from the browser's own network log). A fixed window makes request totals comparable
+ *     between pages and runs; the quiet window closes at a different moment on each. Requests still open at the
+ *     window's end get a short drain (DRAIN_MS); any still open then is reported as unfinished, never as free.
+ *     Windows are taken on the first FIXED_WINDOW_NAVS navigations of a page only (all of them in the hourly
+ *     4-navigation run), so a manual deep run keeps version 1 spacing for the rest and stays well inside the job timeout.
  * Plus long tasks (main-thread blocking) in the fixed window and when the continuous scroll's first neighbour page
- * appeared. Query strings, headers, cookies and response bodies are never recorded, so the JSON holds no
+ * appeared in it. Query strings, headers, cookies and response bodies are never recorded, so the JSON holds no
  * credentials and no health data (full URLs are held in memory only, to match the network log, and never written).
  *
  * A second test opens the app at / (Today), lets it settle (the idle warm-up included) and then CLICKS each page's
  * sidebar link in turn, timing click to data-ready: the in-app navigation Riley actually does, served from the client
  * cache. Its first round is the first visit of a session Today already PREWARMED (client cache, router prefetch,
- * HTTP cache), never a cold visit, and is labelled that way. Written as nav-<slug>.json, labelled "<route> (in-app)".
+ * HTTP cache), never a cold visit, and is labelled that way; each click records how long Today had been open
+ * (`sinceTodayMs`). The first round keeps version 1 spacing (no fixed window), so the prewarm before each first visit
+ * is as long as under version 1; later rounds get the fixed window from the click. Written as nav-<slug>.json,
+ * labelled "<route> (in-app)".
  *
  * A phone scenario (390 px, Chromium iPhone emulation, CPU slowed 4x) loads Today and Log and times taps on the
  * bottom bar (input to next paint, tap to ready, blocking time). It is OBSERVED ONLY (`enforced: false`): it is
@@ -55,6 +62,12 @@ const READY_TIMEOUT_MS = 30_000;
 // (2 s after the page opened) and the warm-up's start (2.5 s after load, then idle slots); a click has no document.
 const FIXED_WINDOW_MS = 6_000;
 const IN_APP_WINDOW_MS = 4_000;
+// Fixed windows on the first navigations of a full-load series only (cold + 3 warm; the hourly run has 4 in all).
+const FIXED_WINDOW_NAVS = 4;
+// After the window: wait at most this long for requests that started in it to finish (else: unfinished, cost unknown).
+const DRAIN_MS = 2_000;
+const FULL_LOAD_WINDOW_RULE = `navigations 1-${FIXED_WINDOW_NAVS} of each page`;
+const IN_APP_WINDOW_RULE = "from the click, rounds 2 and later (round 1 keeps version 1 spacing)";
 // Mirror of AGENTS_API in src/lib/agents-api.ts (the sms-reminders Worker).
 const AGENTS_HOST = "sms-reminders.rileybleeklm.workers.dev";
 
@@ -336,6 +349,8 @@ interface Sample {
   /** Request clock (ms since this navigation started): data-ready, the click, the network-quiet close. */
   readyAtMs?: number | null;
   clickAtMs?: number | null;
+  /** In-app only: ms since Today was opened (its load and warm-up) when this click was made. */
+  sinceTodayMs?: number | null;
   quietAtMs?: number | null;
   window?: Record<string, unknown>;
   longTasks?: Record<string, unknown>;
@@ -468,8 +483,10 @@ async function deployedSha(context: BrowserContext, origin: string): Promise<str
 
 interface MeasureOptions {
   probe?: CacheProbe;
-  /** Observe a fixed window of this many ms from navigation start (0 = network-quiet window only, harness 1). */
+  /** Observe a fixed window of this many ms from the navigation (0 = network-quiet window only, harness 1). */
   windowMs?: number;
+  /** In-app only: Date.now() when Today was opened, so each click records how long the session had been warming. */
+  sessionStartedAt?: number;
   /** Runs after about:blank, before the measured navigation (re-applies the phone CPU slowdown). */
   beforeGoto?: () => Promise<unknown>;
 }
@@ -550,6 +567,7 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
         return performance.now();
       }, ROUTE_CONTENT);
       sample.clickAtMs = Date.now() - t0;
+      if (opts.sessionStartedAt != null) sample.sinceTodayMs = Date.now() - opts.sessionStartedAt;
       await link.click({ timeout: 10_000 });
     }
     sample.cacheState = stats.cacheStateOf({ mode, first: i === 0, vercelCache, vercelId });
@@ -576,8 +594,12 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     }
 
     // Keep observing until the page has been network-quiet (silent revalidations and late chart fetches are part of
-    // the cost of a page view; harness 1, unchanged) AND, in harness 2, the fixed window from navigation start is
-    // over. The quiet moment is kept: the version 1 totals count only requests that started before it.
+    // the cost of a page view; harness 1, unchanged) AND, in harness 2, the fixed window is over. The window starts at
+    // the navigation itself: navigation start for a full load, the click for an in-app one (scrolling to the link and
+    // marking the old page come before it and never use the window up). The quiet moment is kept: the version 1
+    // totals count only requests that started before it.
+    const anchor = mode === "click" ? sample.clickAtMs ?? 0 : 0;
+    const winEnd = anchor + windowMs;
     const winStart = Date.now();
     let quietAt: number | null = null;
     for (;;) {
@@ -589,11 +611,18 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
           quietAt = now - t0;
         }
       }
-      if (quietAt != null && now - t0 >= windowMs) break;
+      if (quietAt != null && (windowMs <= 0 || now - t0 >= winEnd)) break;
       await page.waitForTimeout(100);
     }
     const observedMs = Date.now() - t0;
     sample.quietAtMs = quietAt;
+    // Requests that started in the window and are still open get a short drain, so a slow late request is measured
+    // instead of counted as free; whatever is still open after it is reported as unfinished (cost unknown).
+    if (windowMs > 0) {
+      const openInWindow = () => [...open.values()].some((r) => r.startMs >= anchor && r.startMs < winEnd);
+      const drainFrom = Date.now();
+      while (openInWindow() && Date.now() - drainFrom < DRAIN_MS) await page.waitForTimeout(100);
+    }
     await Promise.allSettled(sizeJobs);
 
     const m = await page.evaluate(
@@ -653,7 +682,10 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
       rec.via = stats.viaOf(info);
       if (!rec.prefetch && rec.cls === "rsc" && info?.lowPriority) rec.prefetch = true; // full prefetches go at low priority
     }
-    const prefetchStarts = records.filter((r) => r.prefetch).map((r) => r.startMs);
+    // Moments reported relative to the window start, and only inside the window (null otherwise), so they describe
+    // the same span as the window's counts.
+    const inWindow = (t: number | null) => (t != null && Number.isFinite(t) && t >= anchor && t < winEnd ? t - anchor : null);
+    const prefetchStarts = records.filter((r) => r.prefetch && r.startMs >= anchor && r.startMs < winEnd).map((r) => r.startMs);
 
     // Harness 1 totals: the requests that started before the network-quiet moment.
     const folded = stats.foldRequests(quietAt == null ? records : records.filter((r) => r.startMs <= quietAt!));
@@ -661,10 +693,10 @@ async function measureOnce(page: Page, spec: PageSpec, origin: string, i: number
     sample.total = folded.total;
     sample.endpoints = folded.endpoints;
     if (windowMs > 0) {
-      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs });
-      sample.longTasks = stats.foldLongTasks(long.map((x) => [toRequestClock(x[0]), x[1]]), 0, windowMs, sample.readyAtMs);
-      sample.feedAtMs = feedAt == null ? null : toRequestClock(feedAt);
-      sample.firstPrefetchAtMs = prefetchStarts.length ? Math.min(...prefetchStarts) : null;
+      sample.window = stats.foldWindow(records, { windowMs, readyAtMs: sample.readyAtMs, observedMs, anchorMs: anchor });
+      sample.longTasks = stats.foldLongTasks(long.map((x) => [toRequestClock(x[0]), x[1]]), anchor, winEnd, sample.readyAtMs);
+      sample.feedAtMs = feedAt == null ? null : inWindow(toRequestClock(feedAt));
+      sample.firstPrefetchAtMs = prefetchStarts.length ? Math.min(...prefetchStarts) - anchor : null;
     }
     sample.ok = !sample.error && sample.ready != null;
   } catch (e) {
@@ -689,6 +721,8 @@ interface ResultMeta {
   scenario: ScenarioMeta;
   deployed: { start: string | null; end: string | null };
   windowMs: number;
+  /** Which navigations got the fixed window (part of the method: pooling keeps different rules apart). */
+  windowRule: string | null;
   kind?: "input";
   planned?: number;
 }
@@ -726,7 +760,7 @@ interface SeriesOptions {
 
 /** N full loads of one page in a fresh context (navigation 1 = empty browser cache), written as <slug>.json. */
 async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions) {
-  test.setTimeout(o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + PAUSE_MS + 5_000) + 90_000);
+  test.setTimeout(o.navigations * (READY_TIMEOUT_MS + WINDOW_CAP_MS + FIXED_WINDOW_MS + DRAIN_MS + PAUSE_MS + 5_000) + 90_000);
 
   // Fresh context per page => navigation 1 really has an empty HTTP cache.
   const context = await browser.newContext({ ...o.device, storageState: AUTH_FILE });
@@ -742,7 +776,8 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
   const deployed = { start: await deployedSha(context, origin), end: null as string | null };
   try {
     for (let i = 0; i < o.navigations; i++) {
-      const s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs: FIXED_WINDOW_MS, beforeGoto });
+      const windowMs = i < FIXED_WINDOW_NAVS ? FIXED_WINDOW_MS : 0;
+      const s = await measureOnce(page, spec, origin, i, "load", { probe, windowMs, beforeGoto });
       samples.push(s);
       // Two navigations in a row that never reach data-ready mean the page (or this
       // script's selector for it) is broken: stop instead of burning 30 s per navigation.
@@ -756,7 +791,7 @@ async function timePageSeries(browser: Browser, spec: PageSpec, o: SeriesOptions
     writeResult(
       {
         slug: o.slug, label: o.label, route: spec.route, note: spec.note ?? null, navigations: o.navigations, startedAt,
-        scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS,
+        scenario: { ...o.scenario, cpuSlowdown: cpu.applied }, deployed, windowMs: FIXED_WINDOW_MS, windowRule: FULL_LOAD_WINDOW_RULE,
       },
       browser.version(),
       samples
@@ -781,7 +816,7 @@ for (const spec of PAGES) {
 // In-app navigation: open the app, let Today and the idle warm-up settle, then click through the sidebar.
 const ROUNDS = Math.min(4, NAVIGATIONS);
 test("timing in-app navigation from Today", async ({ browser }) => {
-  test.setTimeout((ROUNDS * IN_APP.length + 1) * (READY_TIMEOUT_MS + WINDOW_CAP_MS + PAUSE_MS + 15_000) + 90_000);
+  test.setTimeout((ROUNDS * IN_APP.length + 1) * (READY_TIMEOUT_MS + WINDOW_CAP_MS + IN_APP_WINDOW_MS + DRAIN_MS + PAUSE_MS + 15_000) + 90_000);
   const context = await browser.newContext({ ...DESKTOP, storageState: AUTH_FILE });
   await context.addInitScript(INIT_SCRIPT);
   const page = await context.newPage();
@@ -801,7 +836,11 @@ test("timing in-app navigation from Today", async ({ browser }) => {
     prewarmedForMs = Date.now() - openedAt;
     for (let round = 0; round < ROUNDS; round++) {
       for (const spec of specs) {
-        byRoute.get(spec.route)!.push(await measureOnce(page, spec, origin, round, "click", { probe, windowMs: IN_APP_WINDOW_MS }));
+        // Round 1 keeps version 1 spacing (network-quiet only): its clicks are the enforced first in-app visits, and a
+        // fixed window there would give every later route a longer Today warm-up before its first click than under
+        // version 1. Later rounds are warm and get the fixed window from the click.
+        const windowMs = round === 0 ? 0 : IN_APP_WINDOW_MS;
+        byRoute.get(spec.route)!.push(await measureOnce(page, spec, origin, round, "click", { probe, windowMs, sessionStartedAt: openedAt }));
         await page.waitForTimeout(PAUSE_MS);
       }
       // A first round with no page reaching data-ready means the clicking itself is broken: stop (the missing rounds
@@ -817,7 +856,7 @@ test("timing in-app navigation from Today", async ({ browser }) => {
         {
           slug: `nav-${spec.slug}`, label: `${spec.route} (in-app)`, route: spec.route,
           note: "clicked from the sidebar after Today settled; the first round is the first visit of a prewarmed session",
-          navigations: ROUNDS, startedAt, scenario: { ...SCENARIO.inApp, prewarmedForMs }, deployed, windowMs: IN_APP_WINDOW_MS,
+          navigations: ROUNDS, startedAt, scenario: { ...SCENARIO.inApp, prewarmedForMs }, deployed, windowMs: IN_APP_WINDOW_MS, windowRule: IN_APP_WINDOW_RULE,
         },
         browser.version(),
         byRoute.get(spec.route)!
@@ -983,7 +1022,7 @@ test("timing phone input responsiveness, 390 px", async ({ browser }) => {
       {
         slug: "phone-input", label: "Phone taps, 390 px", route: "/log", kind: "input", planned,
         note: "taps on the bottom bar and the More menu; read-only", navigations: PHONE_ROUNDS, startedAt,
-        scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0,
+        scenario: { ...SCENARIO.phoneInput, cpuSlowdown: cpu.applied }, deployed, windowMs: 0, windowRule: null,
       },
       browser.version(),
       samples

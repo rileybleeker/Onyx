@@ -280,6 +280,68 @@ test('foldWindow: a window not observed to its end is incomplete, and an unknown
   assert.equal(neverReady.purpose.unknown.n, 1, 'no data-ready: nothing is called routed or background');
 });
 
+test('foldWindow: an in-app window starts at the click; earlier records are counted apart and a full window follows the input', () => {
+  // Click at 1500 ms on the request clock (after scrolling to the link and marking the old page), window 4000 ms:
+  // [1500, 5500). The rsc and api requests before the click are the previous page's or the preparation's, not this page's.
+  const records = [rec('rsc', 100), rec('api', 900), rec('rsc', 1500, { prefetch: true }), rec('rest', 1600), rec('api', 5400), rec('api', 5600)];
+  const w = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5550, anchorMs: 1500 });
+  assert.equal(w.anchorMs, 1500);
+  assert.deepEqual(w.beforeAnchor, { n: 2, data: 1 });
+  assert.equal(w.total.n, 3, 'the hover prefetch at the click, the routed read, one background read; 5600 is past the window');
+  assert.equal(w.purpose.prefetch.n, 1);
+  assert.equal(w.purpose.routed.n, 1);
+  assert.equal(w.purpose.background.n, 1);
+  assert.equal(w.readyAtMs, 400, 'reported from the window start');
+  assert.equal(w.observedMs, 4050);
+  assert.equal(w.complete, true, 'observed 4050 ms after the click');
+  const cut = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000, anchorMs: 1500 });
+  assert.equal(cut.complete, false, 'only 3500 ms after the click: a late click never passes for a full window');
+  const fromStart = stats.foldWindow(records, { windowMs: 4000, readyAtMs: 1900, observedMs: 5000 });
+  assert.equal(fromStart.anchorMs, 0);
+  assert.deepEqual(fromStart.beforeAnchor, { n: 0, data: 0 }, 'a full load anchors at navigation start');
+});
+
+test('foldWindow: a request still open when observation stopped is unfinished, its cost unknown, never zero', () => {
+  const open = rec('api', 3000, { endMs: undefined, durMs: undefined, bytes: 0, via: undefined });
+  const w = stats.foldWindow([rec('api', 100), open], { windowMs: 6000, readyAtMs: 500, observedMs: 6000 });
+  assert.equal(w.complete, true);
+  assert.equal(w.total.n, 2, 'it started in the window, so it is counted');
+  assert.equal(w.total.pending, 1);
+  assert.equal(w.costComplete, false);
+  assert.equal(w.purpose.background.pending, 1);
+  assert.equal(w.purpose.background.ms, 0, 'no duration is invented for the open request');
+  assert.equal(w.purpose.background.unknownVia, 1, 'no response seen: origin unknown, not network');
+  assert.equal(w.purpose.routed.ms, 100);
+  assert.equal(w.total.bytes, 1000, 'only the finished request has a size');
+  assert.equal(stats.foldWindow([rec('api', 100)], { windowMs: 6000, readyAtMs: 500, observedMs: 6000 }).costComplete, true);
+});
+
+test('windowTable: unfinished requests, the service-worker count and a window anchored at the click are shown', () => {
+  const pend = (i, ready) => v2sample(i, ready, {
+    window: stats.foldWindow([rec('rest', 50), rec('api', ready + 100, { via: 'service-worker' }), rec('api', ready + 300, { endMs: undefined, durMs: undefined, via: undefined })],
+      { windowMs: 6000, readyAtMs: ready, observedMs: 6050 }),
+  });
+  const s = stats.summarizePage([pend(0, 900), pend(1, 400), pend(2, 420), v2sample(3, 410)]);
+  const md = stats.windowTable([{ label: '/x', summary: s }]);
+  assert.match(md, /\| \/x \| 6000 from navigation start \| 4 \/ 4 \(4\) \|/);
+  assert.match(md, /\| 0 \/ 0 \/ 1 \/ 1 \|/, 'background: network / cached / SW / unknown');
+  assert.match(md, /\| 0 \| 1 \(2 of 3 windows\) \| - \|/, 'prefetch n, unfinished, before the click (n/a for a full load)');
+  // In-app: round 1 has no fixed window (version 1 spacing), later rounds start the window at the click.
+  const click = (i, ready) => ({
+    ...v2sample(i, ready),
+    cacheState: stats.cacheStateOf({ mode: 'click', first: false }),
+    window: stats.foldWindow([rec('rsc', 10), rec('rest', 1300)], { windowMs: 4000, readyAtMs: 1200 + ready, observedMs: 5300, anchorMs: 1200 }),
+  });
+  const first = { ...sample(0, 500, 2), cacheState: stats.cacheStateOf({ mode: 'click', first: true }) };
+  const nav = stats.summarizePage([first, click(1, 300), click(2, 310), click(3, 320)]);
+  assert.equal(nav.coldWindow, null, 'the first in-app visit has no fixed window');
+  const navMd = stats.windowTable([{ label: '/x (in-app)', summary: nav }]);
+  assert.match(navMd, /\| \/x \(in-app\) \| 4000 from the click \| 3 \/ 3 \(4\) \|/);
+  assert.match(navMd, /\| 0 \| 0 \| 1 \| /, 'prefetch n, unfinished, one request before the click');
+  assert.match(navMd, /\| - \|$/, 'no first-navigation window');
+  assert.ok(!/NaN|undefined/.test(md + navMd));
+});
+
 test('foldLongTasks: blocking time is the part over 50 ms, bounded by the window, split at data-ready', () => {
   const t = stats.foldLongTasks([[100, 120], [300, 60], [700, 200], [7000, 500], [null, 90]], 0, 6000, 500);
   assert.equal(t.n, 3);
@@ -304,6 +366,12 @@ test('revisionOf and scenarioOf: version 1 files have no revision and keep the o
   assert.equal(stats.revisionOf({ deployed: { start: 'a'.repeat(40), end: 'a'.repeat(40) } }), 'a'.repeat(40));
   assert.equal(stats.revisionOf({ deployed: { start: 'a'.repeat(40), end: 'b'.repeat(40) } }), 'mixed');
   assert.equal(stats.revisionOf({ deployed: { start: null, end: null } }), 'unknown');
+  // Only one of the two /api/version reads succeeded: a deploy may have landed unseen, so the result is unbound.
+  assert.equal(stats.revisionOf({ deployed: { start: 'a'.repeat(40), end: null } }), 'partial', 'end read failed');
+  assert.equal(stats.revisionOf({ deployed: { start: null, end: 'b'.repeat(40) } }), 'partial', 'start read failed');
+  assert.equal(stats.isExactRevision('a'.repeat(40)), true);
+  for (const r of ['mixed', 'partial', 'unknown', null, undefined]) assert.equal(stats.isExactRevision(r), false, String(r));
+  assert.deepEqual(['a'.repeat(40), 'mixed', 'partial', 'unknown', null].map(stats.revisionTag), ['aaaaaaa', 'mixed', 'partial', 'unknown', 'not recorded']);
   assert.deepEqual(stats.scenarioOf({ slug: 'nav-sleep' }), { name: 'in-app-prewarmed', enforced: true, harness: 1, detail: null });
   assert.deepEqual(stats.scenarioOf({ slug: 'sleep' }), { name: 'full-load', enforced: true, harness: 1, detail: null });
   assert.equal(stats.scenarioOf({ harness: 2, scenario: { name: 'phone-full-load', enforced: false } }).enforced, false);
@@ -409,7 +477,8 @@ function writeRun(files) {
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 const v2meta = (slug, label, over = {}) => ({ slug, label, navigations: 4, startedAt: 'T', harness: 2, github: {}, runner: {},
-  scenario: { name: 'full-load', viewport: '1280x720', cpuSlowdown: 1, enforced: true }, deployed: { start: SHA_A, end: SHA_A }, ...over });
+  scenario: { name: 'full-load', viewport: '1280x720', cpuSlowdown: 1, enforced: true }, deployed: { start: SHA_A, end: SHA_A },
+  fixedWindowMs: 6000, windowRule: 'navigations 1-4 of each page', ...over });
 
 test('report: a version 1 artifact still loads as the baseline, its new columns read "not recorded", never 0', () => {
   const samples = [sample(0, 600, 2), sample(1, 400, 2), sample(2, 410, 2), sample(3, 420, 2)];
@@ -419,6 +488,7 @@ test('report: a version 1 artifact still loads as the baseline, its new columns 
   });
   const run = report.loadRun(dir);
   assert.equal(run.harness, 1);
+  assert.deepEqual(run.missing, [], 'a version 1 run never had the phone scenario');
   assert.deepEqual(run.pages.map((p) => [p.slug, p.scenario, p.enforced, p.revision]), [
     ['sleep', 'full-load', true, null], ['nav-sleep', 'in-app-prewarmed', true, null],
   ]);
@@ -448,7 +518,11 @@ test('report: version 2 files show scenario, revision, the fixed window and the 
   const md = report.render([run]);
   assert.match(md, /\| \/ \(Today\), 390 px \| phone-full-load \| 390x664, CPU 4x slower \| observed only \|/);
   assert.match(md, /\| \/ \(Today\) \| full-load \| 1280x720 \| enforced \| empty \/ HIT \/ unknown \|/);
-  assert.match(md, /\| \/ \(Today\) \| 6000 \| 4\/4 \|/);
+  assert.match(md, /\| \/ \(Today\) \| 6000 from navigation start \| 4 \/ 4 \(4\) \|/);
+  // phone-log.json was not written: reported as not measured, in the report and in the observed lines.
+  assert.deepEqual(run.missing.map((x) => x.slug), ['phone-log']);
+  assert.deepEqual(report.missingObserved(run), ['/log, 390 px: no result file written (not measured, not a pass)']);
+  assert.match(md, /Observe-only results not recorded/);
   assert.match(md, /Phone input responsiveness \(observed, not enforced yet\)/);
   assert.match(md, /\| Phone taps, 390 px \| tap Log tab \| 1\/1 \|/);
   assert.ok(!/NaN|undefined/.test(md));
@@ -457,7 +531,7 @@ test('report: version 2 files show scenario, revision, the fixed window and the 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('report: pooled table keeps revisions and harness versions apart and flags a deploy during measurement', () => {
+test('report: pooled table keeps revisions and harness versions apart and never pools an unbound result', () => {
   const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
   const legacy = [sample(0, 600, 2), sample(1, 300, 2), sample(2, 310, 2), sample(3, 320, 2)];
   const dirs = [
@@ -465,13 +539,40 @@ test('report: pooled table keeps revisions and harness versions apart and flags 
     writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples } }),
     writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples } }),
     writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { deployed: { start: SHA_A, end: SHA_B } }), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { deployed: { start: SHA_A, end: SHA_B } }), samples } }),
+    writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { deployed: { start: null, end: SHA_A } }), samples } }),
   ];
   const runs = dirs.map(report.loadRun);
+  assert.equal(report.revisionLine(runs[5]), 'partial (1 result)');
   const md = report.render(runs);
   assert.match(md, /different harness versions \(1, 2\)/);
   assert.match(md, /not evidence of a speed-up/);
-  assert.match(md, /\| \/sleep \| 1 \| not recorded \| 1 \| 3 \|/);
-  assert.match(md, /\| \/sleep \| 2 \| aaaaaaa \| 2 \| 6 \|/, 'two runs of the same build pool to n=6');
-  assert.match(md, /\| \/sleep \| 2 \| mixed \(deploy during the page\) \| 1 \| 3 \|.*not bound to one build/);
+  assert.match(md, /\| \/sleep \| 1 \| full-load \| not recorded \/ CPU not recorded \| not recorded \| not recorded \| 1 \| 3 \|.*no build recorded \(harness 1\): not pooled/);
+  assert.match(md, /\| \/sleep \| 2 \| full-load \| 1280x720 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/, 'two runs of the same build and method pool to n=6');
+  const mixedRows = md.split('\n').filter((l) => l.includes('| mixed (deploy during the page) |'));
+  assert.equal(mixedRows.length, 2, 'two runs that each spanned a deploy stay one row per run');
+  for (const row of mixedRows) assert.match(row, /\| 1 \| 3 \|.*not bound to one build, not pooled/);
+  assert.match(md, /\| unbound \(only one of the start \/ end reads succeeded\) \| 1 \| 3 \|.*only one \/api\/version read succeeded: not bound to one build, not pooled/,
+    'a one-sided read is shown as unbound, never as the SHA it did read');
   for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('report: pooled table keeps the CPU slowdown actually in force apart (a failed 4x throttle measured at 1x never pools with 4x)', () => {
+  const samples = [v2sample(0, 900), v2sample(1, 400), v2sample(2, 420), v2sample(3, 410)];
+  const phone = (cpu) => ({
+    'phone-today.json': { meta: v2meta('phone-today', '/ (Today), 390 px', { scenario: { name: 'phone-full-load', viewport: '390x664', cpuSlowdown: cpu, enforced: false } }), samples },
+  });
+  const dirs = [writeRun(phone(4)), writeRun(phone(1)), writeRun(phone(4))];
+  const md = report.render(dirs.map(report.loadRun));
+  const rows = md.split('\n').filter((l) => l.startsWith('| / (Today), 390 px | 2 | phone-full-load |'));
+  assert.equal(rows.length, 2, 'one row for 4x, one for 1x');
+  assert.match(md, /\| 390x664 \/ CPU 4x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/, 'the two 4x runs pool');
+  assert.match(md, /\| 390x664 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/, 'the 1x run stays on its own');
+  // A different fixed window is a different method too.
+  const other = writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep', { fixedWindowMs: 8000 }), samples } });
+  const same = writeRun({ 'sleep.json': { meta: v2meta('sleep', '/sleep'), samples } });
+  const md2 = report.render([other, same].map(report.loadRun));
+  assert.match(md2, /\| 8000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/);
+  assert.match(md2, /\| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 1 \| 3 \|/);
+  for (const d of [...dirs, other, same]) fs.rmSync(d, { recursive: true, force: true });
 });

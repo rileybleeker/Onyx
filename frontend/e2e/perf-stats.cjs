@@ -184,28 +184,49 @@ function purposeOf(rec, readyAtMs) {
 const DATA_CLASSES = new Set(["rest", "api", "worker", "supabase-auth"]);
 
 /**
- * The requests that STARTED inside a fixed window from navigation start ([0, windowMs) on the request clock), split
- * by purpose and by origin. A fixed window makes request totals comparable between pages and runs (the network-quiet
- * window closes at a different moment on every page). `observedMs` = how long the navigation was actually observed;
- * a window that was not observed to its end is `complete: false` and is never counted as a measurement.
+ * The requests that STARTED inside a fixed window [anchorMs, anchorMs + windowMs) on the request clock, split by
+ * purpose and by origin. The anchor is the navigation itself: 0 (navigation start) for a full load, the click for an
+ * in-app navigation, so preparing the click (scrolling to the link, marking the old page) never uses up the window and
+ * the previous page's leftover work is counted apart as `beforeAnchor`, never in this page's buckets. A fixed window
+ * makes request totals comparable between pages and runs (the network-quiet window closes at a different moment on
+ * every page). `observedMs` = how long the navigation was observed (request clock); a window not observed to its end
+ * after the anchor is `complete: false` and is never counted as a measurement. A request still open when observation
+ * stopped is counted as `pending`: its duration and size are unknown and are never added as zero (`costComplete`).
+ * In the result, `readyAtMs` and `observedMs` are relative to the window start.
  */
-function foldWindow(records, { windowMs, readyAtMs, observedMs }) {
-  const bucket = () => ({ n: 0, data: 0, ms: 0, bytes: 0, network: 0, cached: 0, serviceWorker: 0, unknownVia: 0, cls: {} });
+function foldWindow(records, { windowMs, readyAtMs, observedMs, anchorMs = 0 }) {
+  const anchor = finite(anchorMs) ? anchorMs : 0;
+  const end = anchor + windowMs;
+  const bucket = () => ({ n: 0, data: 0, ms: 0, bytes: 0, pending: 0, network: 0, cached: 0, serviceWorker: 0, unknownVia: 0, cls: {} });
   const purpose = {};
   for (const p of PURPOSES) purpose[p] = bucket();
   const via = {};
   for (const v of VIAS) via[v] = 0;
+  const beforeAnchor = { n: 0, data: 0 };
   let n = 0;
   let bytes = 0;
+  let pending = 0;
   for (const r of records || []) {
-    if (!r || !finite(r.startMs) || r.startMs >= windowMs) continue;
+    if (!r || !finite(r.startMs)) continue;
+    if (r.startMs < anchor) {
+      beforeAnchor.n += 1;
+      if (DATA_CLASSES.has(r.cls)) beforeAnchor.data += 1;
+      continue;
+    }
+    if (r.startMs >= end) continue;
     const b = purpose[purposeOf(r, readyAtMs)];
     const v = VIAS.includes(r.via) ? r.via : "unknown";
-    const dur = finite(r.durMs) ? r.durMs : finite(r.endMs) ? r.endMs - r.startMs : 0;
+    const finished = finite(r.durMs) || finite(r.endMs);
     b.n += 1;
     if (DATA_CLASSES.has(r.cls)) b.data += 1;
-    b.ms += dur;
-    b.bytes += r.bytes || 0;
+    if (finished) {
+      b.ms += finite(r.durMs) ? r.durMs : r.endMs - r.startMs;
+      b.bytes += r.bytes || 0;
+      bytes += r.bytes || 0;
+    } else {
+      b.pending += 1;
+      pending += 1;
+    }
     if (v === "network") b.network += 1;
     else if (CACHED_VIAS.has(v)) b.cached += 1;
     else if (v === "service-worker") b.serviceWorker += 1;
@@ -213,14 +234,16 @@ function foldWindow(records, { windowMs, readyAtMs, observedMs }) {
     b.cls[r.cls] = (b.cls[r.cls] || 0) + 1;
     via[v] += 1;
     n += 1;
-    bytes += r.bytes || 0;
   }
   return {
     windowMs,
-    readyAtMs: finite(readyAtMs) ? readyAtMs : null,
-    observedMs: finite(observedMs) ? observedMs : null,
-    complete: finite(observedMs) && finite(windowMs) && observedMs >= windowMs,
-    total: { n, bytes },
+    anchorMs: anchor,
+    readyAtMs: finite(readyAtMs) ? readyAtMs - anchor : null,
+    observedMs: finite(observedMs) ? observedMs - anchor : null,
+    complete: finite(observedMs) && finite(windowMs) && observedMs - anchor >= windowMs,
+    costComplete: pending === 0,
+    beforeAnchor,
+    total: { n, bytes, pending },
     purpose,
     via,
   };
@@ -268,12 +291,33 @@ function cacheStateOf({ mode, first, vercelCache, vercelId }) {
   return { browser, cdn, fn, fnWarmth: fn === "ran" ? "unknown" : "n/a" };
 }
 
-/** The production build a result file measured: its SHA, "mixed" when a deploy landed mid-page, null if not recorded. */
+/**
+ * The production build a result file measured, from /api/version read at the start and at the end of the page:
+ *   the SHA       only when BOTH reads succeeded and agree (the only value that binds a result to one build);
+ *   "mixed"       both reads succeeded and differ (a deploy landed during the page);
+ *   "partial"     only one read succeeded: a deploy may have landed and nobody saw it, so the result is unbound;
+ *   "unknown"     neither read succeeded;
+ *   null          not recorded at all (harness 1).
+ */
 function revisionOf(meta) {
   const d = meta && meta.deployed;
   if (!d) return null;
-  if (d.start && d.end && d.start !== d.end) return "mixed";
-  return d.start || d.end || "unknown";
+  const start = d.start || null;
+  const end = d.end || null;
+  if (start && end) return start === end ? start : "mixed";
+  if (start || end) return "partial";
+  return "unknown";
+}
+
+/** True only for a revision bound to one build (an exact SHA from revisionOf, never mixed / partial / unknown / null). */
+function isExactRevision(rev) {
+  return typeof rev === "string" && /^[0-9a-f]{7,40}$/i.test(rev);
+}
+
+/** Short tag of a revision: 7 characters of an exact SHA, else what made it unbound. */
+function revisionTag(rev) {
+  if (isExactRevision(rev)) return String(rev).slice(0, 7);
+  return rev === "mixed" || rev === "partial" || rev === "unknown" ? rev : "not recorded";
 }
 
 /** Scenario name, enforcement and harness version of a result file (version 1 files carry none of them). */
@@ -362,11 +406,24 @@ function summarizePage(samples) {
     const purpose = {};
     for (const p of PURPOSES) {
       purpose[p] = {};
-      for (const f of ["n", "data", "network", "cached", "serviceWorker", "unknownVia", "bytes", "ms"]) purpose[p][f] = median(ws.map((w) => w.purpose?.[p]?.[f]));
+      for (const f of ["n", "data", "network", "cached", "serviceWorker", "unknownVia", "pending", "bytes", "ms"]) purpose[p][f] = median(ws.map((w) => w.purpose?.[p]?.[f]));
     }
     const via = {};
     for (const v of VIAS) via[v] = median(ws.map((w) => w.via?.[v]));
-    return { windowMs: ws[0].windowMs, n: ws.length, total: median(ws.map((w) => w.total?.n)), bytes: median(ws.map((w) => w.total?.bytes)), purpose, via };
+    return {
+      windowMs: ws[0].windowMs,
+      n: ws.length,
+      // Anchored at the click (in-app) rather than at navigation start: what started before it is shown apart.
+      anchored: ws.some((w) => finite(w.anchorMs) && w.anchorMs > 0),
+      beforeAnchor: median(ws.map((w) => w.beforeAnchor?.n)),
+      total: median(ws.map((w) => w.total?.n)),
+      bytes: median(ws.map((w) => w.total?.bytes)),
+      // Windows in which a request was still open when observation stopped: its cost is unknown, never zero.
+      pending: median(ws.map((w) => w.total?.pending)),
+      withPending: ws.filter((w) => finite(w.total?.pending) && w.total.pending > 0).length,
+      purpose,
+      via,
+    };
   };
   const stateKey = (c) => (c ? `${c.browser} cdn:${c.cdn} fn:${c.fn}` : null);
   const restStates = {};
@@ -467,7 +524,12 @@ const num = (v) => (finite(v) ? (Number.isInteger(v) ? String(v) : v.toFixed(1))
 const pair = (t) => (t && t.n > 0 ? `${ms(t.p50)} / ${ms(t.p95)}` : "-");
 
 const isPrewarmed = (p) => p.scenario === "in-app-prewarmed" || (!p.scenario && String(p.slug || "").startsWith("nav-"));
-const short = (sha) => (sha === "mixed" ? "mixed (deploy during the page)" : sha === "unknown" ? "unknown" : sha ? String(sha).slice(0, 7) : "not recorded");
+const short = (sha) =>
+  isExactRevision(sha) ? String(sha).slice(0, 7)
+    : sha === "mixed" ? "mixed (deploy during the page)"
+      : sha === "partial" ? "unbound (only one of the start / end reads succeeded)"
+        : sha === "unknown" ? "unknown (neither read succeeded)"
+          : "not recorded";
 
 function timingTable(pages) {
   const out = [];
@@ -555,31 +617,39 @@ function scenarioTable(pages) {
 }
 
 /**
- * Routed readiness against background work, in the fixed window from navigation start (warm median). Routed =
- * started before data-ready, background = after it (continuous-scroll neighbours, warm-up data, revalidation),
- * prefetch = router prefetches. Each count is split into network / browser cache; requests whose origin the
- * browser did not report are counted as unknown, never as either.
+ * Routed readiness against background work, in the fixed window (warm median). The window starts at navigation start
+ * for a full load and at the click for an in-app navigation; requests that started before the click (the previous
+ * page's leftovers, preparing the click) are counted apart and excluded. Routed = started before data-ready,
+ * background = after it (continuous-scroll neighbours, warm-up data, revalidation), prefetch = router prefetches. Each
+ * count is split into network / browser cache / service worker / unknown; requests whose origin the browser did not
+ * report are counted as unknown, never as network or cache. A request still open when observation stopped is listed
+ * as unfinished (cost unknown), never as a zero-cost request.
  */
 function windowTable(pages) {
   const out = [];
-  out.push("| Page | Fixed window (ms) | Complete windows | Data ready p50 / p90 (n) | Routed: requests network / cached / unknown | Routed data calls | Background: requests network / cached / unknown | Background data calls | Prefetch n | KB routed / background | Neighbour page shown at p50 (ms) | First prefetch at p50 (ms) | Blocking time p50 before ready / window (ms) |");
-  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+  out.push("| Page | Fixed window (ms, from) | Windows complete / recorded (navigations) | Data ready p50 / p90 (n) | Routed: requests network / cached / SW / unknown | Routed data calls | Background: requests network / cached / SW / unknown | Background data calls | Prefetch n | Unfinished at window end (cost unknown) | Started before the click (excluded) | KB routed / background | Neighbour page shown at p50 (ms into the window) | First prefetch at p50 (ms into the window) | Blocking time p50 before ready / window (ms) | First navigation: routed / background / prefetch requests |");
+  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const p of pages) {
     const s = p.summary;
     const w = s.window;
     const rr = s.readyRobust || { n: 0 };
     const readyCell = rr.n ? `${ms(rr.p50)} / ${ms(rr.p90)} (${rr.n})` : "-";
-    const counts = s.harness2 && s.windows ? `${s.windows.complete}/${s.total}` : "not recorded (harness 1)";
+    const counts = s.harness2 && s.windows ? `${s.windows.complete} / ${s.windows.recorded} (${s.total})` : "not recorded (harness 1)";
+    const cw = s.coldWindow;
+    const firstCell = cw ? `${num(cw.purpose.routed.n)} / ${num(cw.purpose.background.n)} / ${num(cw.purpose.prefetch.n)}` : "-";
     if (!w) {
-      out.push(`| ${p.label} | - | ${counts} | ${readyCell} | - | - | - | - | - | - | - | - | - |`);
+      out.push(`| ${p.label} | - | ${counts} | ${readyCell} | - | - | - | - | - | - | - | - | - | - | - | ${firstCell} |`);
       continue;
     }
     const r = w.purpose.routed;
     const b = w.purpose.background;
-    const split = (x) => `${num(x.network)} / ${num(x.cached)} / ${num(x.unknownVia)}`;
+    const split = (x) => `${num(x.network)} / ${num(x.cached)} / ${num(x.serviceWorker)} / ${num(x.unknownVia)}`;
     const blocking = `${ms(s.blockingBeforeReady.p50)} / ${ms(s.blocking.p50)}`;
+    const from = w.anchored ? "the click" : "navigation start";
+    const unfinished = w.withPending > 0 ? `${num(w.pending)} (${w.withPending} of ${w.n} windows)` : "0";
+    const before = w.anchored ? num(w.beforeAnchor) : "-";
     out.push(
-      `| ${p.label} | ${ms(w.windowMs)} | ${counts} | ${readyCell} | ${split(r)} | ${num(r.data)} | ${split(b)} | ${num(b.data)} | ${num(w.purpose.prefetch.n)} | ${kb(r.bytes)} / ${kb(b.bytes)} | ${ms(s.feedAt.p50)} | ${ms(s.firstPrefetchAt.p50)} | ${blocking} |`
+      `| ${p.label} | ${ms(w.windowMs)} from ${from} | ${counts} | ${readyCell} | ${split(r)} | ${num(r.data)} | ${split(b)} | ${num(b.data)} | ${num(w.purpose.prefetch.n)} | ${unfinished} | ${before} | ${kb(r.bytes)} / ${kb(b.bytes)} | ${ms(s.feedAt.p50)} | ${ms(s.firstPrefetchAt.p50)} | ${blocking} | ${firstCell} |`
     );
   }
   return out.join("\n");
@@ -619,30 +689,53 @@ function inputTable(inputs) {
 }
 
 /**
- * Data ready pooled over several runs (directories), one row per page, harness version and production revision, so
- * samples of different builds or methods are never mixed. Only pooled numbers with a real n are a basis for enforcing
- * a new metric.
+ * Data ready pooled over several runs (directories), one row per page and METHOD: harness version, scenario, viewport,
+ * the CPU slowdown actually in force, the fixed window and its rule, and the production revision. Samples of different
+ * builds or methods are never mixed (a phone run whose CPU throttle failed, measured at 1x, never pools with a 4x one).
+ * Only results bound to one exact build pool across runs; a mixed, unbound, unknown or unrecorded revision keeps one
+ * row per run ("not pooled"). Only pooled numbers with a real n are a basis for enforcing a new metric.
  */
+function methodOf(p) {
+  const d = p.detail || {};
+  return {
+    scenario: p.scenario || "full-load",
+    viewport: d.viewport || "not recorded",
+    cpu: finite(d.cpuSlowdown) ? d.cpuSlowdown : null,
+    windowMs: finite(p.windowMs) ? p.windowMs : null,
+    windowRule: p.windowRule || null,
+  };
+}
+
 function pooledTable(runs) {
   if (!runs || runs.length < 2) return "";
   const groups = new Map();
-  for (const run of runs) {
+  runs.forEach((run, runIdx) => {
     for (const p of run.pages) {
-      const key = `${p.label}|${p.harness || 1}|${p.revision || ""}`;
-      const g = groups.get(key) || { label: p.label, harness: p.harness || 1, revision: p.revision || null, runs: 0, values: [], failed: 0 };
+      const m = methodOf(p);
+      const exact = isExactRevision(p.revision);
+      const key = [p.label, p.harness || 1, m.scenario, m.viewport, m.cpu, m.windowMs, m.windowRule, p.revision || "", exact ? "" : `run${runIdx}`].join("|");
+      const g = groups.get(key) || { label: p.label, harness: p.harness || 1, method: m, revision: p.revision || null, exact, runs: 0, values: [], failed: 0 };
       g.runs += 1;
       g.values.push(...(((p.summary.timing || {}).ready || {}).values || []));
       g.failed += p.summary.failed || 0;
       groups.set(key, g);
     }
-  }
+  });
+  const unbound = {
+    mixed: "a deploy landed during measurement: not bound to one build, not pooled",
+    partial: "only one /api/version read succeeded: not bound to one build, not pooled",
+    unknown: "no /api/version read succeeded: not bound to one build, not pooled",
+  };
   const out = [];
-  out.push("| Page | Harness | Production revision | Runs | Warm n | p50 | p90 | p95 | max | Not reached | Note |");
-  out.push("|---|---|---|---|---|---|---|---|---|---|---|");
+  out.push("| Page | Harness | Scenario | Viewport / CPU | Fixed window (ms) | Production revision | Runs | Warm n | p50 | p90 | p95 | max | Not reached | Note |");
+  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const g of groups.values()) {
     const r = robust(g.values);
-    const note = g.revision === "mixed" ? "a deploy landed during measurement: not bound to one build" : lowNote(r);
-    out.push(`| ${g.label} | ${g.harness} | ${short(g.revision)} | ${g.runs} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${g.failed} | ${note} |`);
+    const m = g.method;
+    const view = `${m.viewport} / ${m.cpu == null ? "CPU not recorded" : `CPU ${m.cpu}x`}`;
+    const win = m.windowMs == null ? "not recorded" : `${ms(m.windowMs)}${m.windowRule ? ` (${m.windowRule})` : ""}`;
+    const note = g.exact ? lowNote(r) : unbound[g.revision] || "no build recorded (harness 1): not pooled";
+    out.push(`| ${g.label} | ${g.harness} | ${m.scenario} | ${view} | ${win} | ${short(g.revision)} | ${g.runs} | ${r.n} | ${ms(r.p50)} | ${ms(r.p90)} | ${ms(r.p95)} | ${ms(r.max)} | ${g.failed} | ${note} |`);
   }
   return out.join("\n");
 }
@@ -773,6 +866,8 @@ module.exports = {
   foldLongTasks,
   cacheStateOf,
   revisionOf,
+  isExactRevision,
+  revisionTag,
   scenarioOf,
   summarizeInput,
   scenarioTable,

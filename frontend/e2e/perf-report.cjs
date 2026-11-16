@@ -22,6 +22,12 @@ const ORDER = [
   "today", "log", "check-in", "analytics-hrv", "sleep", "nutrition", "supplements", "agents", "status", "caffeine", "caffeine-720",
   "financials", "financials-budgets", "financials-forecast",
 ];
+// The observe-only phone scenario of harness 2 (PHONE_PAGES and the input test in e2e/perf-timing.spec.ts).
+const OBSERVED_SLUGS = [
+  { slug: "phone-today", label: "/ (Today), 390 px" },
+  { slug: "phone-log", label: "/log, 390 px" },
+  { slug: "phone-input", label: "Phone taps, 390 px" },
+];
 // In-app (clicked) navigations are written as nav-<slug>.json and listed after the full page loads, same order;
 // the phone scenario's page loads (phone-<slug>.json) come last.
 const rank = (slug) => {
@@ -55,6 +61,10 @@ function loadRun(dir) {
       harness: sc.harness,
       detail: sc.detail,
       revision: stats.revisionOf(raw.meta),
+      // The fixed window and the rule for which navigations got one (harness 2): part of the method, so pooling keeps
+      // results measured with different windows apart.
+      windowMs: Number.isFinite(raw.meta.fixedWindowMs) ? raw.meta.fixedWindowMs : null,
+      windowRule: raw.meta.windowRule || null,
     };
     if (raw.meta.kind === "input") {
       // Phone taps: observe-only, summarised per action, never part of the enforced budget.
@@ -66,14 +76,26 @@ function loadRun(dir) {
   }
   pages.sort((a, b) => rank(a.slug) - rank(b.slug));
   const harness = Math.max(1, ...pages.map((p) => p.harness || 1), ...inputs.map((p) => p.harness || 1));
-  return { dir, meta, pages, inputs, harness, window: window_ };
+  // Observe-only result files a version 2 run always writes (the phone scenario). One that is absent (its test died
+  // before writing, or never started) is reported as not measured, never silently left out.
+  const present = new Set([...pages, ...inputs].map((p) => p.slug));
+  const missing = harness >= 2 ? OBSERVED_SLUGS.filter((x) => !present.has(x.slug)) : [];
+  return { dir, meta, pages, inputs, harness, missing, window: window_ };
 }
 
-/** "abc1234 (13 pages), mixed (1 page)": the production builds a run measured. */
+/** Lines for the observe-only result files a version 2 run did not write. */
+function missingObserved(run) {
+  return (run.missing || []).map((x) => `${x.label}: no result file written (not measured, not a pass)`);
+}
+
+/**
+ * "abc1234 (13 results), mixed (1 result)": the production builds a run measured. Only an exact SHA (both
+ * /api/version reads agreed) binds a result to a build; "partial" = only one read succeeded, "unknown" = neither.
+ */
 function revisionLine(run) {
   const t = {};
   for (const p of [...run.pages, ...run.inputs]) {
-    const k = p.revision ? (p.revision === "mixed" || p.revision === "unknown" ? p.revision : String(p.revision).slice(0, 7)) : "not recorded";
+    const k = stats.revisionTag(p.revision);
     t[k] = (t[k] || 0) + 1;
   }
   return Object.entries(t).map(([k, v]) => `${k} (${v} ${v === 1 ? "result" : "results"})`).join(", ");
@@ -108,6 +130,11 @@ function render(runs) {
     if (run.inputs.length) {
       out.push("### Phone input responsiveness (observed, not enforced yet)\n");
       out.push(stats.inputTable(run.inputs) + "\n");
+    }
+    const missing = missingObserved(run);
+    if (missing.length) {
+      out.push("### Observe-only results not recorded\n");
+      out.push(missing.map((l) => `- ${l}`).join("\n") + "\n");
     }
     const notes = stats.runNotes(run.pages);
     if (notes) out.push("### Notes on this run\n\n" + notes + "\n");
@@ -148,7 +175,7 @@ function main(argv) {
   if (budget) {
     for (const r of runs) console.log(`Production build measured: ${revisionLine(r)}`);
     // Observe-only scenarios (the phone): printed on every run, never part of the exit code.
-    const observed = runs.flatMap((r) => stats.observedViolations(r.pages, r.inputs));
+    const observed = runs.flatMap((r) => [...missingObserved(r), ...stats.observedViolations(r.pages, r.inputs)]);
     if (observed.length) console.log(`Observed only, not enforced yet (repeat across scheduled runs before enforcing):\n- ` + observed.join("\n- "));
     const over = runs.flatMap((r) => stats.budgetViolations(r.pages));
     if (over.length) {
@@ -161,4 +188,4 @@ function main(argv) {
 
 if (require.main === module) main(process.argv.slice(2));
 
-module.exports = { loadRun, render, revisionLine };
+module.exports = { loadRun, render, revisionLine, missingObserved, OBSERVED_SLUGS };
