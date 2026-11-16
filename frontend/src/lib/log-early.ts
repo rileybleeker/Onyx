@@ -19,6 +19,8 @@ export const LOG_READING_URL = "/api/reading";
 export const LOG_SUPPLEMENTS_TODAY_URL = "/api/supplements/today";
 export const LOG_SUPPLEMENTS_STACKS_URL = "/api/supplements/stacks";
 export const LOG_SUPPLEMENTS_PRODUCTS_URL = "/api/supplements/products";
+/** Orders the Supplements section's product options (most used first); the options never wait for it. */
+export const LOG_SUPPLEMENTS_HISTORY_URL = "/api/supplements/history?days=30&perPage=200";
 /** Same as BEHAVIORAL_TODAY_URL in lib/log-ubereats.ts (the Uber Eats section's day). */
 export const LOG_BEHAVIORAL_TODAY_URL = "/api/behavioral-today";
 /** Prefix of journalTodayUrl() in lib/journal-file.ts: `?from=<New York date>&to=<same>&limit=20`. */
@@ -36,6 +38,7 @@ export const LOG_EARLY_GETS = [
   LOG_SUPPLEMENTS_TODAY_URL,
   LOG_SUPPLEMENTS_STACKS_URL,
   LOG_SUPPLEMENTS_PRODUCTS_URL,
+  LOG_SUPPLEMENTS_HISTORY_URL,
   LOG_WEIGHT_URL,
   LOG_READING_URL,
   LOG_BEHAVIORAL_TODAY_URL,
