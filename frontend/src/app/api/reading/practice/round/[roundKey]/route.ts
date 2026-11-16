@@ -14,9 +14,11 @@ const NO_STORE = { "Cache-Control": "no-store" };
  *
  * The attempts of one round, for the runner's poll while a model grade is pending and for the summary: verdict,
  * score, grading status, grader feedback, the rubric marks (ids only), override state and whether Disagree or
- * "Grade it yourself" applies. Never the answer text; an attempt whose question version is not open now
+ * "Grade it yourself" applies (Disagree is off once a checkpoint's result was recorded: `quiz_closed`). A chapter
+ * recall answer also lists `covered_ideas` (statement, key points, sources, stage and the verdict it gave each idea)
+ * for the Covered / Missed list. Never the answer text; an attempt whose question version is not open now
  * (pds.reading_bank_question_open: above the spoiler gate, another edition, or a chapter recall listing an idea
- * that moved above the gate) is left out, feedback included. Read only. The client cache keeps this key in memory
+ * that moved above the gate) is left out, feedback and covered ideas included. Read only. The client cache keeps this key in memory
  * only (feedback is about Riley's answers).
  *
  * Auth: owner session only (middleware; NEVER add this to isCiRoute). no-store. Errors: 400 bad_request,

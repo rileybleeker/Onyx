@@ -28,7 +28,8 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * Auth: owner session only (middleware; NEVER add this to isCiRoute). Same-origin, JSON only, 16 KB cap, unknown
  * fields refused. Errors are short codes: 400 bad_request / bad_answer / states_missing, 404 not_found, 409
  * key_reused / question_changed / retired / locked / chapter_changed / raced / quiz_closed / already_answered /
- * quiz_other_book / source_not_permitted, 503 bank_unavailable / schema_checks. No answer text is ever logged.
+ * quiz_other_book / source_not_permitted / bank_off (the book's questions were turned off: no new answer, a retry of a
+ * stored one still gets its receipt), 503 bank_unavailable / schema_checks. No answer text is ever logged.
  */
 export async function POST(req: NextRequest) {
   const read = await readBankBody(req, ATTEMPT_MAX_BODY_BYTES);

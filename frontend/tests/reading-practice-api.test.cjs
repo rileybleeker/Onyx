@@ -5,6 +5,7 @@
 // model client. Synthetic book ("The Lighthouse Ledger", invented chapters) and invented answers only.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const { createHash } = require("node:crypto");
 const { loadTs } = require("./helpers/load-ts.cjs");
 
 const TODAY = "2031-03-10";
@@ -44,6 +45,16 @@ function makeDb() {
     jobs: new Map(),
     flags: new Map(),
     recalls: [],
+    // The book's bank switch (pds.reading_bank_books: approved, or turned off by Riley).
+    enabled: true,
+    // Checkpoint quiz results recorded (pds.reading_quizzes.op_key).
+    quizzes: new Set(),
+    // PostgREST's max rows per request (null = no cap), and a count that runs ahead of the rows (a row removed between
+    // the count and the read), for pds.reading_bank_events paging.
+    maxRows: null,
+    countBias: 0,
+    // true: the daily deck carries only due, new and answered-today ideas, as pds.reading_bank_deck picks them.
+    deckPicks: false,
     rpc: [],
     reads: [],
     finished: [],
@@ -135,9 +146,15 @@ function fakeSupabase(db) {
     reading_bank_round: ({ p_slug, p_chapter }) => {
       if (p_slug === "missing-book") return null;
       const t = through();
-      const live = [...db.ideas.values()].filter((i) => i.status === "active" && i.unlock_chapter <= t && (p_chapter == null || i.chapter === p_chapter));
+      const answeredIds = new Set([...db.attempts.values()].filter((a) => a.attempt_date === db.today).map((a) => a.idea_id));
+      const picked = (i) => {
+        if (!db.deckPicks || p_chapter != null) return true;
+        const nr = stateOf(i.idea_id)?.next_review ?? null;
+        return nr === null || nr <= db.today || answeredIds.has(i.idea_id);
+      };
+      const live = [...db.ideas.values()].filter((i) => i.status === "active" && i.unlock_chapter <= t && (p_chapter == null || i.chapter === p_chapter) && picked(i));
       return {
-        book_id: BOOK, today: db.today, quiz_through: t, chapter: p_chapter ?? null, enabled: true,
+        book_id: BOOK, today: db.today, quiz_through: t, chapter: p_chapter ?? null, enabled: db.enabled !== false,
         ideas: live.map((i) => {
           const s = stateOf(i.idea_id);
           return {
@@ -178,7 +195,8 @@ function fakeSupabase(db) {
           }
         }
       }
-      return out;
+      // The function's ORDER BY: idea, answered_at, attempt key.
+      return out.sort((x, y) => x.idea_id - y.idea_id || String(x.answered_at).localeCompare(String(y.answered_at)) || String(x.attempt_key).localeCompare(String(y.attempt_key)));
     },
     reading_bank_attempt: ({ p }) => {
       const k = p.attempt_key;
@@ -308,6 +326,7 @@ function fakeSupabase(db) {
     },
   };
 
+  const sha = (t) => createHash("sha256").update(t, "utf8").digest("hex");
   const tables = {
     reading_questions: (cols) => [...db.questions.values()].map((q) => {
       const row = { ...q };
@@ -315,10 +334,39 @@ function fakeSupabase(db) {
         const s = q.idea_id ? stateOf(q.idea_id) : null;
         row.reading_ideas = q.idea_id ? { reading_idea_state: s ? { state_version: s.state_version } : null } : null;
       }
+      if (cols.includes("books(")) {
+        row.books = { reading_bank_books: { approved_at: "2031-01-01T00:00:00Z", paused_reason: db.enabled === false ? "owner" : null } };
+      }
       return row;
     }),
-    reading_idea_state: () => [...db.states.entries()].map(([idea_id, s]) => ({ idea_id, ...s })),
-    reading_ideas: () => [...db.ideas.values()].map((i) => ({ ...i })),
+    reading_idea_state: (cols) => [...db.states.entries()].map(([idea_id, s]) => {
+      const row = { idea_id, ...s };
+      if (cols.includes("reading_ideas(")) {
+        const i = db.ideas.get(idea_id);
+        row.reading_ideas = i ? { chapter: i.chapter, status: i.status } : null;
+      }
+      return row;
+    }),
+    // The evidence embed as pds.reading_idea_evidence -> reading_bank_sources -> book_highlights stores it: a highlight
+    // source keeps the sha256 of the passage it was stored against (`edited` on a fixture source = the passage moved).
+    reading_ideas: (cols) => [...db.ideas.values()].map((i) => {
+      const row = { ...i };
+      if (cols.includes("reading_idea_state(")) {
+        const s = stateOf(i.idea_id);
+        row.reading_idea_state = s ? { stage: s.stage } : null;
+      }
+      if (cols.includes("reading_idea_evidence(")) {
+        row.reading_idea_evidence = (i.sources ?? []).map((src, n) => ({
+          reading_bank_sources: {
+            source_id: i.idea_id * 100 + n, kind: src.kind, url: src.url, domain: src.domain, title: src.title, cited_text: src.cited_text,
+            highlight_id: src.highlight_id, passage_sha: src.kind === "highlight" ? sha(src.passage) : null,
+            book_highlights: src.kind === "highlight" ? { passage: src.edited ? `${src.passage} (edited)` : src.passage, location: src.location, page: src.page, archived: false } : null,
+          },
+        }));
+      }
+      return row;
+    }),
+    reading_quizzes: () => [...db.quizzes].map((op_key) => ({ op_key })),
     reading_question_attempts: (cols) => [...db.attempts.values()].map((a) => {
       const row = { ...a };
       if (cols.includes("reading_questions(")) {
@@ -332,11 +380,29 @@ function fakeSupabase(db) {
 
   const missingError = { code: "PGRST202", message: "function not found" };
   return {
-    rpc: async (name, args) => {
-      db.rpc.push(name);
-      if (db.missing && name !== "behavioral_today_now") return { data: null, error: missingError };
-      if (!rpcs[name]) throw new Error(`unexpected rpc ${name}`);
-      return { data: structuredClone(rpcs[name](structuredClone(args ?? {}))), error: null };
+    // A PostgREST call: .order() and .range() as supabase-js chains them, the exact count when asked for, and the
+    // project's max rows on a table-valued answer.
+    rpc: (name, args, opts) => {
+      let range = null;
+      const run = () => {
+        db.rpc.push(name);
+        if (db.missing && name !== "behavioral_today_now") return { data: null, error: missingError, count: null };
+        if (!rpcs[name]) throw new Error(`unexpected rpc ${name}`);
+        let data = structuredClone(rpcs[name](structuredClone(args ?? {})));
+        const count = opts?.count === "exact" && Array.isArray(data) ? data.length + db.countBias : null;
+        if (Array.isArray(data)) {
+          const from = range ? range[0] : 0;
+          const to = range ? range[1] + 1 : data.length;
+          data = data.slice(from, Math.min(to, from + (db.maxRows ?? Infinity)));
+        }
+        return { data, error: null, count };
+      };
+      const b = {
+        order: () => b,
+        range: (from, to) => ((range = [from, to]), b),
+        then: (yes, no) => Promise.resolve().then(run).then(yes, no),
+      };
+      return b;
     },
     from: (name) => {
       const filters = [];
@@ -355,6 +421,7 @@ function fakeSupabase(db) {
         select: (c) => ((cols = c), q),
         eq: (c, v) => (filters.push((r) => r[c] === v), q),
         in: (c, vs) => (filters.push((r) => vs.includes(r[c])), q),
+        gt: (c, v) => (filters.push((r) => r[c] > v), q),
         not: (c, op, v) => (filters.push((r) => (op === "is" && v === null ? r[c] != null : true)), q),
         order: () => q,
         limit: (n) => ((limit = n), q),
@@ -888,6 +955,54 @@ test("the round's attempts follow the spoiler gate: a recall answer listing an i
   assert.deepEqual((await listed()).attempts, []);
 });
 
+test("a chapter recall's round attempt lists the covered and missed ideas with statements and sources; they leave with it above the gate", async () => {
+  const db = makeDb();
+  db.ideas.set(105, { ...db.ideas.get(101), idea_id: 105, title: "Synthetic idea 105", statement: "Synthetic statement 105.", sources: structuredClone(db.ideas.get(101).sources) });
+  addRecall(db, 1100, 1, [101, 105]);
+  const r = load(db, fakeModel(modelReply({ points: [{ id: "i101", hit: "yes" }, { id: "i105", hit: "no" }], wrong_claims: [], feedback: "Missed the second point." })));
+  const rec = await r.attempt.POST(post(answer({ question_id: 1100, answer: "The keeper keeps a careful ledger of the tides" })));
+  const listed = async () => (await r.round.GET(get(), ctx({ roundKey: ROUND }))).body.attempts.find((x) => x.attempt_key === rec.body.attempt_key);
+  // While grading: the ideas are listed at once (what the chapter covers), with no verdict yet.
+  assert.deepEqual((await listed()).covered_ideas.map((i) => [i.idea_id, i.verdict]), [[101, null], [105, null]]);
+  await r.queue[0]();
+  const graded = await listed();
+  const missed = graded.covered_ideas.find((i) => i.idea_id === 105);
+  assert.deepEqual([missed.verdict, missed.hit, missed.statement, missed.stage], ["incorrect", "no", "Synthetic statement 105.", 1]);
+  assert.deepEqual(missed.key_points, ["Synthetic key point"]);
+  assert.equal(missed.sources.length, 3);
+  assert.equal(missed.source_count, 2, "two pages of one site count once, plus the highlight");
+  assert.equal(missed.sources.find((s) => s.kind === "highlight").passage, "Synthetic highlight passage");
+  assert.equal(graded.covered_ideas.find((i) => i.idea_id === 101).verdict, "correct");
+  assert.ok(!JSON.stringify(graded).includes("careful ledger"), "never the answer text");
+  // A highlight whose passage changed since is no longer a source of the idea.
+  db.ideas.get(105).sources[2].edited = true;
+  assert.equal((await listed()).covered_ideas.find((i) => i.idea_id === 105).sources.some((s) => s.kind === "highlight"), false);
+  // An idea flagged Wrong since is no longer listed.
+  db.ideas.get(101).status = "retired";
+  assert.deepEqual((await listed()).covered_ideas.map((i) => i.idea_id), [105]);
+  db.ideas.get(101).status = "active";
+  // "Not in this chapter" moved 105 above the gate: the attempt, its statement and its sources leave together.
+  db.ideas.get(105).unlock_chapter = 9;
+  const body = (await r.round.GET(get(), ctx({ roundKey: ROUND }))).body;
+  assert.equal(body.attempts.some((x) => x.attempt_key === rec.body.attempt_key), false);
+  assert.ok(!JSON.stringify(body).includes("Synthetic statement 105."));
+});
+
+test("Disagree is not offered on a checkpoint answer once its quiz result was recorded", async () => {
+  const db = makeDb();
+  const r = load(db, fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "yes" }], wrong_claims: [], feedback: "Right." })));
+  const quiz = key();
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, round_kind: "checkpoint", quiz_key: quiz, answer: "The keeper logs each change before dawn" })));
+  await r.queue[0]();
+  const row = async () => (await r.round.GET(get(), ctx({ roundKey: ROUND }))).body.attempts.find((x) => x.attempt_key === res.body.attempt_key);
+  const open = await row();
+  assert.deepEqual([open.overridable, open.quiz_closed, open.quiz_key], [true, false, quiz]);
+  db.quizzes.add(quiz);
+  const done = await row();
+  assert.deepEqual([done.overridable, done.quiz_closed], [false, true]);
+  assert.equal(done.covered_ideas, null, "only a chapter recall answer lists covered ideas");
+});
+
 /* ------------------------------------------------------------------ */
 /* Flags                                                                */
 /* ------------------------------------------------------------------ */
@@ -964,6 +1079,70 @@ test("chat: questions come through the same gate; a recorded answer is graded at
   assert.deepEqual([two.ok, two.attempt_key, two.replayed], [true, one.attempt_key, true]);
   assert.equal(db.attempts.size, 1);
   assert.equal(r.S.chatAttemptKey("toolu_synthetic_1"), one.attempt_key);
+});
+
+test("chat weak mode finds a lapsed idea scheduled for a later day, through the chapter's gated deck", async () => {
+  const db = makeDb();
+  db.deckPicks = true;
+  const lapsed = { book_id: BOOK, stage: 1, ease: 2.3, interval_days: 9, review_count: 3, next_review: addDays(TODAY, 9), last_reviewed: addDays(TODAY, -4),
+    lapses: 1, last_verdict: "correct", stage_success_on: null, last_question_ids: [1003], state_version: 3, dirty: false };
+  db.states.set(102, lapsed);
+  db.states.set(104, { ...lapsed, next_review: addDays(TODAY, 2) }); // chapter 5, above the gate: never returned
+  const r = load(db);
+  assert.ok(!(await r.today.GET(get())).body.cards.some((c) => c.idea?.idea_id === 102), "not due: the daily deck does not carry it");
+  const qs = await r.S.questionsForChat(r.supabase, { mode: "weak", count: 5 });
+  assert.equal(qs.ok, true);
+  assert.deepEqual(qs.questions.map((q) => q.chapter), [2]);
+  assert.ok(!JSON.stringify(qs).includes("storm log"), "the locked chapter's idea never leaves the server");
+});
+
+/* ------------------------------------------------------------------ */
+/* The bank switch and long histories                                   */
+/* ------------------------------------------------------------------ */
+
+test("a book turned off takes no new answers (nothing stored, no paid grade queued); a retry of a stored answer still gets its receipt", async () => {
+  const db = makeDb();
+  const r = load(db);
+  const first = answer();
+  assert.equal((await r.attempt.POST(post(first))).status, 200);
+  db.enabled = false;
+  const fresh = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  assert.deepEqual([fresh.status, fresh.body], [409, { error: "bank_off" }]);
+  assert.equal(db.attempts.size, 1);
+  assert.equal(db.jobs.size, 0, "no grade job");
+  assert.equal(r.queue.length, 0, "nothing runs after the response");
+  const retry = await r.attempt.POST(post(first));
+  assert.deepEqual([retry.status, retry.body.attempt_key, retry.body.replayed, retry.body.verdict], [200, first.attempt_key, true, "correct"]);
+  assert.equal((await r.today.GET(get())).body.enabled, false);
+  const chat = await r.S.recordChatAnswer(r.supabase, { question_id: 1002, version: 1, answer: "The keeper writes each change", verdict: "correct", tool_use_id: "toolu_synthetic_off" });
+  assert.deepEqual(chat, { ok: false, status: 409, error: "bank_off" });
+  assert.equal(db.attempts.size, 1);
+});
+
+test("a replay reads every answer of an idea across pages; a history shorter than its count writes nothing", async () => {
+  const db = makeDb();
+  const r = load(db);
+  for (let n = 5; n >= 1; n--) {
+    const k = key();
+    const day = addDays(TODAY, -3 * n);
+    db.attempts.set(k, {
+      attempt_key: k, question_id: 1001, idea_id: 101, covers: null, attempt_date: day, answer: "tide tables", answered_at: `${day}T12:00:00.000Z`,
+      grading_status: "graded", verdict: "correct", score: 1, grader: "local", hinted: false, round_key: key(), round_kind: "daily", quiz_key: null,
+      ext_hash: "synthetic", grade_tries: 0, grade_error: null, feedback: null, rubric_hits: null, overridden_at: null, model_verdict: null,
+    });
+  }
+  db.maxRows = 2; // a project whose max rows is 2: every page holds at most two rows
+  const res = await r.attempt.POST(post(answer()));
+  assert.equal(res.status, 200);
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_events").length, 3, "three pages");
+  assert.equal(db.states.get(101).review_count, 6, "all five earlier answers and this one were replayed");
+  // A count that runs ahead of the rows (one removed between the count and the read): the replay is refused.
+  db.countBias = 1;
+  const before = db.attempts.size;
+  const short = await r.attempt.POST(post(answer({ question_id: 1005, answer: "fog bell" })));
+  assert.deepEqual([short.status, short.body], [500, { error: "failed" }]);
+  assert.equal(db.attempts.size, before, "nothing stored");
+  assert.equal(db.states.get(103), undefined, "no schedule written");
 });
 
 /* ------------------------------------------------------------------ */

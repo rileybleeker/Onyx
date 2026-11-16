@@ -417,36 +417,57 @@ interface QuestionRow {
   retired_at: string | null;
   /** The idea's state_version, read with the question (undefined when it was not read). */
   state_version?: number;
+  /** Whether the question's book has the bank turned on (pds.reading_bank_deck's `enabled` rule). */
+  enabled: boolean;
 }
 const QUESTION_COLS = "question_id,version,book_id,format,prompt,rubric,idea_id,bank_chapter,unlock_chapter,superseded_at,retired_at";
+const BANK_BOOK_EMBED = "books(reading_bank_books(approved_at,paused_reason))";
+
+type BankBookRow = { approved_at?: unknown; paused_reason?: unknown } | null | undefined;
+/** Turned on: approved once and not turned off since (a budget pause stops generation, not practice). */
+const bankOn = (b: BankBookRow) => !!b && b.approved_at != null && b.paused_reason !== "owner";
 
 /**
- * One question version. With `withState`, the idea's state_version rides in the same statement (an embed over the
- * foreign keys), so it is read strictly before the idea's events: a replay built on an older version can only fail
- * the compare-and-set, never pass it. When the embed cannot be resolved the plain row is read instead.
+ * One question version, with whether its book has the bank turned on (the book's reading_bank_books row rides in the
+ * same statement). With `withState`, the idea's state_version rides along too, so it is read strictly before the
+ * idea's events: a replay built on an older version can only fail the compare-and-set, never pass it. When the
+ * embeds cannot be resolved the plain row is read instead, and the bank row on its own.
  */
 async function readQuestion(supabase: Supa, questionId: number, withState: boolean): Promise<QuestionRow | null> {
-  if (withState) {
-    const { data, error } = await supabase
-      .from("reading_questions")
-      .select(`${QUESTION_COLS},reading_ideas(reading_idea_state(state_version))`)
-      .eq("question_id", questionId)
-      .maybeSingle();
-    if (!error) {
-      if (!data) return null;
-      const row = data as QuestionRow & { reading_ideas?: unknown };
+  const { data, error } = await supabase
+    .from("reading_questions")
+    .select(`${QUESTION_COLS},${BANK_BOOK_EMBED}${withState ? ",reading_ideas(reading_idea_state(state_version))" : ""}`)
+    .eq("question_id", questionId)
+    .maybeSingle();
+  if (!error) {
+    if (!data) return null;
+    const row = data as unknown as Omit<QuestionRow, "enabled"> & { reading_ideas?: unknown; books?: unknown };
+    const book = one(row.books as { reading_bank_books?: unknown } | { reading_bank_books?: unknown }[] | null | undefined);
+    const out = { ...row, enabled: bankOn(one(book?.reading_bank_books as BankBookRow | BankBookRow[])) } as QuestionRow & { reading_ideas?: unknown; books?: unknown };
+    delete out.books;
+    if (withState) {
       const idea = one(row.reading_ideas as { reading_idea_state?: unknown } | { reading_idea_state?: unknown }[] | null | undefined);
       const st = idea ? one(idea.reading_idea_state as { state_version?: unknown } | { state_version?: unknown }[] | null | undefined) : null;
-      const out: QuestionRow = { ...row };
-      delete (out as { reading_ideas?: unknown }).reading_ideas;
       out.state_version = idea ? num(st?.state_version, 0) : undefined;
-      return out;
     }
-    if (!["PGRST200", "PGRST201"].includes(String(error.code))) throw readFailed(error);
+    delete out.reading_ideas;
+    return out;
   }
-  const { data, error } = await supabase.from("reading_questions").select(QUESTION_COLS).eq("question_id", questionId).maybeSingle();
+  if (!["PGRST200", "PGRST201"].includes(String(error.code))) throw readFailed(error);
+  const plain = await supabase.from("reading_questions").select(QUESTION_COLS).eq("question_id", questionId).maybeSingle();
+  if (plain.error) throw readFailed(plain.error);
+  if (!plain.data) return null;
+  const q = plain.data as Omit<QuestionRow, "enabled">;
+  const bank = await supabase.from("reading_bank_books").select("approved_at,paused_reason").eq("book_id", q.book_id).maybeSingle();
+  if (bank.error) throw readFailed(bank.error);
+  return { ...q, enabled: bankOn(bank.data as BankBookRow) };
+}
+
+/** Whether an answer is stored under this key already (a retry of it is answered with its receipt). */
+async function attemptStored(supabase: Supa, attemptKey: string): Promise<boolean> {
+  const { data, error } = await supabase.from("reading_question_attempts").select("attempt_key").eq("attempt_key", attemptKey).maybeSingle();
   if (error) throw readFailed(error);
-  return (data as QuestionRow | null) ?? null;
+  return !!data;
 }
 
 /** state_version per idea (0 = no state row yet, as pds.reading_bank_states_ok counts it). */
@@ -472,13 +493,57 @@ interface EventRow {
   round_kind: string | null;
 }
 
-/** pds.reading_bank_events for some ideas, grouped by idea (invalidated answers excluded; pending ones kept). */
+/** Rows asked for per page of pds.reading_bank_events (PostgREST's default max rows). */
+export const EVENTS_PAGE = 1000;
+/** A history longer than this many pages is refused rather than replayed in part. */
+export const EVENTS_MAX_PAGES = 20;
+
+/**
+ * pds.reading_bank_events for some ideas, grouped by idea (invalidated answers excluded; pending ones kept).
+ *
+ * Every row, or a refusal: PostgREST caps a table-valued RPC at its max rows like any read, and a replay over part of
+ * the history would write a wrong schedule. So the rows are read in pages in a fixed order (idea, time, attempt key:
+ * unique per row), the first page carries the exact count, the page size is what that page returned (a project whose
+ * max rows is below 1000 still reads every row), and a history that comes back shorter than its count (or longer than
+ * EVENTS_MAX_PAGES pages) throws, so no state is written from it. One request in the usual case (well under 1000 rows).
+ */
 async function readEvents(supabase: Supa, bookId: number, ids: number[]): Promise<Map<number, BankEvent[]>> {
   const out = new Map<number, BankEvent[]>();
   if (!ids.length) return out;
-  const { data, error } = await supabase.rpc("reading_bank_events", { p_book: bookId, p_ideas: ids });
-  if (error) throw readFailed(error);
-  for (const r of (data ?? []) as EventRow[]) {
+  const page = (from: number, to: number, withCount: boolean) =>
+    supabase
+      .rpc("reading_bank_events", { p_book: bookId, p_ideas: ids }, withCount ? { count: "exact" } : undefined)
+      .order("idea_id", { ascending: true })
+      .order("answered_at", { ascending: true })
+      .order("attempt_key", { ascending: true })
+      .range(from, to);
+  const first = await page(0, EVENTS_PAGE - 1, true);
+  if (first.error) throw readFailed(first.error);
+  const rows: EventRow[] = [...((first.data ?? []) as EventRow[])];
+  const total = typeof first.count === "number" ? first.count : null;
+  const step = rows.length || EVENTS_PAGE;
+  let last = rows.length;
+  for (let n = 1; rows.length && (total !== null ? rows.length < total : last >= EVENTS_PAGE); n++) {
+    if (n >= EVENTS_MAX_PAGES) throw refuse(500, "failed");
+    const res = await page(rows.length, rows.length + step - 1, false);
+    // A range past the end (rows removed since the count) is PostgREST's 416 PGRST103: the count check below decides.
+    if (res.error && res.error.code === "PGRST103") break;
+    if (res.error) throw readFailed(res.error);
+    const got = (res.data ?? []) as EventRow[];
+    rows.push(...got);
+    last = got.length;
+    if (!got.length) break;
+  }
+  // A row moved across a page boundary by a write in between is read twice: one copy per (idea, attempt).
+  const seen = new Set<string>();
+  const unique = rows.filter((r) => {
+    const k = `${Number(r.idea_id)}|${String(r.attempt_key)}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  if (total !== null && unique.length < total) throw refuse(500, "failed");
+  for (const r of unique) {
     const id = Number(r.idea_id);
     const list = out.get(id) ?? [];
     list.push({
@@ -830,6 +895,17 @@ export async function recordAttempt(supabase: Supa, input: AttemptInput): Promis
       grader_version: GRADE_PROMPT_VERSION,
     };
 
+    // A book Riley turned off takes no new answers (nothing is graded or spent for it any more). A retry of an answer
+    // stored while it was on still gets its receipt: pds.reading_bank_attempt looks the key up first and answers it
+    // (or 409 key_reused) without grading anything, and its grade job is not run again from here.
+    if (!q.enabled) {
+      if (!(await attemptStored(supabase, input.attempt_key))) return { status: 409, body: { error: "bank_off" }, pendingKey: null };
+      const replay = await supabase.rpc("reading_bank_attempt", { p: base });
+      const off = bankFailure(replay.data, replay.error);
+      if (off) return { status: off.status, body: { error: off.error }, pendingKey: null };
+      return { status: 200, body: receiptBody(replay.data as Record<string, unknown>), pendingKey: null };
+    }
+
     let data: unknown = null;
     let error: DbError = null;
     let ids: number[] = [];
@@ -953,6 +1029,7 @@ interface AttemptRow {
   grade_error: string | null;
   ext_hash: string | null;
   hinted: boolean;
+  quiz_key?: string | null;
   feedback?: string | null;
   rubric_hits?: unknown;
   model_verdict?: string | null;
@@ -1264,23 +1341,134 @@ export async function selfGrade(supabase: Supa, attemptKey: string, verdict: Mod
 /* GET /api/reading/practice/round/[roundKey]                           */
 /* ------------------------------------------------------------------ */
 
+/** One idea a chapter recall answer covered, for the result screen's Covered / Missed list. */
+export interface CoveredIdea {
+  idea_id: number;
+  chapter: number;
+  importance: string;
+  kind: string;
+  title: string;
+  statement: string;
+  key_points: string[];
+  /** The idea's stage now (New 0 .. Kept 4). */
+  stage: number;
+  /** The verdict this answer gave the idea (its own mark; else the answer's verdict), null while grading. */
+  verdict: Verdict | null;
+  /** The model's mark for the idea, when the grade carried marks. */
+  hit: Hit | null;
+  sources: PracticeSource[];
+  source_count: number;
+}
+
+const COVERED_IDEA_COLS =
+  "idea_id,chapter,importance,kind,title,statement,key_points,status," +
+  "reading_idea_state(stage)," +
+  "reading_idea_evidence(reading_bank_sources(source_id,kind,url,domain,title,cited_text,highlight_id,passage_sha,book_highlights(passage,location,page,archived)))";
+
+type CoveredRead = Omit<CoveredIdea, "verdict" | "hit">;
+type CoveredSource = DeckSource & { source_id?: unknown; passage_sha?: unknown; book_highlights?: unknown };
+
+/**
+ * The ideas a chapter recall answer covered, with their sources and stage, read in one statement. Only an active
+ * idea that still rests on valid evidence is returned, with the same source rule as pds.reading_bank_deck (a web
+ * citation, or a highlight that is not archived and whose passage still has the sha256 it was stored against).
+ * The caller lists them only for an attempt pds.reading_bank_question_open says is open, which holds every idea
+ * its rubric lists below the spoiler gate and of the current edition.
+ */
+async function readCoveredIdeas(supabase: Supa, ids: number[]): Promise<Map<number, CoveredRead>> {
+  const out = new Map<number, CoveredRead>();
+  if (!ids.length) return out;
+  const { data, error } = await supabase.from("reading_ideas").select(COVERED_IDEA_COLS).in("idea_id", ids);
+  if (error) throw readFailed(error);
+  for (const row of (data ?? []) as unknown as Record<string, unknown>[]) {
+    if (row.status !== "active") continue;
+    const srcs = ((Array.isArray(row.reading_idea_evidence) ? row.reading_idea_evidence : []) as { reading_bank_sources?: unknown }[])
+      .map((e) => one(e.reading_bank_sources as CoveredSource | CoveredSource[] | null | undefined))
+      .filter((s): s is CoveredSource => !!s)
+      .sort((a, b) => num(a.source_id) - num(b.source_id));
+    const valid: DeckSource[] = [];
+    for (const s of srcs) {
+      if (s.kind === "web") {
+        valid.push({ kind: "web", url: s.url ?? null, domain: s.domain ?? null, title: s.title ?? null, cited_text: s.cited_text ?? null, highlight_id: null, passage: null, location: null, page: null });
+        continue;
+      }
+      const h = one(s.book_highlights as { passage?: unknown; location?: unknown; page?: unknown; archived?: unknown } | null | undefined);
+      if (s.kind !== "highlight" || !h || h.archived === true || typeof h.passage !== "string" || sha256Hex(h.passage) !== s.passage_sha) continue;
+      valid.push({
+        kind: "highlight",
+        url: null,
+        domain: null,
+        title: null,
+        cited_text: null,
+        highlight_id: num(s.highlight_id) || null,
+        passage: h.passage,
+        location: typeof h.location === "string" ? h.location : null,
+        page: h.page == null ? null : num(h.page),
+      });
+    }
+    if (!valid.length) continue;
+    const src = sourcesOut(valid);
+    const st = one(row.reading_idea_state as { stage?: unknown } | { stage?: unknown }[] | null | undefined);
+    const id = Number(row.idea_id);
+    out.set(id, {
+      idea_id: id,
+      chapter: num(row.chapter),
+      importance: String(row.importance),
+      kind: String(row.kind),
+      title: String(row.title),
+      statement: String(row.statement),
+      key_points: Array.isArray(row.key_points) ? row.key_points.map(String) : [],
+      stage: num(st?.stage, 0),
+      sources: src.list,
+      source_count: src.count,
+    });
+  }
+  return out;
+}
+
+/** The quiz keys among these that already have a recorded result (Done): their answers can no longer be disagreed with. */
+async function closedQuizKeys(supabase: Supa, keys: string[]): Promise<Set<string>> {
+  if (!keys.length) return new Set();
+  const { data, error } = await supabase.from("reading_quizzes").select("op_key").in("op_key", keys);
+  if (error) throw readFailed(error);
+  return new Set(((data ?? []) as { op_key: unknown }[]).map((r) => String(r.op_key).toLowerCase()));
+}
+
+/** A chapter recall answer's ideas in its rubric's order (plus any it covered that the rubric no longer lists). */
+function recallIdeaOrder(a: Pick<AttemptRow, "covers">, q: Pick<AttemptQuestion, "rubric">): number[] {
+  const listed = rubricIdeaIds(q.rubric);
+  const covers = uniqueIds(a.covers ?? []);
+  if (!covers.length) return listed;
+  return [...listed.filter((id) => covers.includes(id)), ...covers.filter((id) => !listed.includes(id))];
+}
+
 /**
  * The attempts of one round: verdict, score, grading status, feedback, the rubric marks (ids only), override state
  * and whether Disagree / Grade it yourself apply. Never the answer text. The client keeps this key in memory only.
+ * A chapter recall answer (graded or still grading) also lists `covered_ideas`: each idea it covered with its
+ * statement, key points, sources, stage and the verdict the answer gave it, so the result screen shows what was
+ * covered and what was missed, with where each missed idea comes from.
  *
  * Spoiler gate: an attempt is listed only while pds.reading_bank_question_open says its question version is open,
  * the same rule as T07's export: unlocked, of the current edition, and (for a chapter recall answer) every idea its
  * rubric lists unlocked. So a "Not read yet" hold, a table of contents change, or a covered idea moved to the end of
- * the book after the answer ("Not in this chapter") hides the attempt and its feedback, which may restate that idea.
+ * the book after the answer ("Not in this chapter") hides the attempt, its feedback and its covered ideas, which may
+ * restate that idea. Disagree is not offered on a checkpoint answer once its quiz result was recorded
+ * (pds.reading_bank_override answers 409 quiz_closed then).
+ *
+ * Reads: the attempts, then each book's quiz_through, then in parallel the open check per question, the recorded
+ * quizzes and the covered ideas. Known limit: the open check is one call per distinct question of the round, because
+ * that SQL function takes one question; a set-based version would belong in sql/reading_question_bank.sql.
  */
 export async function getRoundAttempts(supabase: Supa, roundKey: string, nowMs = Date.now()): Promise<BankAnswer> {
   try {
     const { data, error } = await supabase
       .from("reading_question_attempts")
-      .select(`${ATTEMPT_COLS},feedback,rubric_hits,model_verdict,${ATTEMPT_QUESTION}`)
+      .select(`${ATTEMPT_COLS},quiz_key,feedback,rubric_hits,model_verdict,${ATTEMPT_QUESTION}`)
       .eq("round_key", roundKey)
       .not("ext_hash", "is", null)
-      .order("answered_at", { ascending: true });
+      .order("answered_at", { ascending: true })
+      .order("attempt_key", { ascending: true });
     if (error) throw readFailed(error);
     const rows = ((data ?? []) as AttemptRow[]).map((a) => ({ a, q: one(a.reading_questions as AttemptQuestion | AttemptQuestion[] | null | undefined) }));
     const books = uniqueIds(rows.map((r) => r.q?.book_id));
@@ -1293,27 +1481,46 @@ export async function getRoundAttempts(supabase: Supa, roundKey: string, nowMs =
       }),
     );
     // A question above the gate by its own unlock chapter is left out without asking; the rest are asked once each.
-    const candidates = rows.filter((r) => r.q && num(r.q.unlock_chapter, Number.MAX_SAFE_INTEGER) <= (through.get(Number(r.q.book_id)) ?? 0));
+    const candidates = rows
+      .filter((r): r is { a: AttemptRow; q: AttemptQuestion } => !!r.q)
+      .filter((r) => num(r.q.unlock_chapter, Number.MAX_SAFE_INTEGER) <= (through.get(Number(r.q.book_id)) ?? 0));
+    const listsCovered = (a: AttemptRow, q: AttemptQuestion) => q.format === "chapter_recall" && (a.grading_status === "graded" || a.grading_status === "pending");
     const open = new Map<number, boolean>();
-    await Promise.all(
-      [...new Map(candidates.map((r) => [Number(r.a.question_id), through.get(Number(r.q!.book_id)) ?? 0] as [number, number]))].map(async ([qid, t]) => {
-        const { data: o, error: oe } = await supabase.rpc("reading_bank_question_open", { p_question: qid, p_through: t });
-        if (oe) throw readFailed(oe);
-        open.set(qid, o === true);
-      }),
-    );
+    const [, closed, covered] = await Promise.all([
+      Promise.all(
+        [...new Map(candidates.map((r) => [Number(r.a.question_id), through.get(Number(r.q.book_id)) ?? 0] as [number, number]))].map(async ([qid, t]) => {
+          const { data: o, error: oe } = await supabase.rpc("reading_bank_question_open", { p_question: qid, p_through: t });
+          if (oe) throw readFailed(oe);
+          open.set(qid, o === true);
+        }),
+      ),
+      closedQuizKeys(supabase, [...new Set(candidates.map((r) => uuid(r.a.quiz_key)).filter((k): k is string => !!k))]),
+      readCoveredIdeas(supabase, uniqueIds(candidates.filter((r) => listsCovered(r.a, r.q)).flatMap((r) => recallIdeaOrder(r.a, r.q)))),
+    ]);
     const attempts = candidates
       .filter((r) => open.get(Number(r.a.question_id)) === true)
       .map(({ a, q }) => {
         const hits = Array.isArray(a.rubric_hits)
           ? (a.rubric_hits as unknown[]).filter((h): h is PointHit => plainObject(h) && typeof h.id === "string" && ["yes", "partial", "no"].includes(String(h.hit))).map((h) => ({ id: h.id, hit: h.hit }))
           : null;
+        const quizKey = uuid(a.quiz_key);
+        const quizClosed = !!quizKey && closed.has(quizKey);
+        const graded = a.grading_status === "graded" && !!a.verdict;
+        const coveredIdeas: CoveredIdea[] | null = listsCovered(a, q)
+          ? recallIdeaOrder(a, q)
+              .filter((id) => covered.has(id))
+              .map((id) => ({
+                ...covered.get(id)!,
+                verdict: graded ? recallEventVerdict(a.verdict as Verdict, hits, id) : null,
+                hit: hits?.find((h) => h.id === recallPointId(id))?.hit ?? null,
+              }))
+          : null;
         return {
           attempt_key: a.attempt_key,
           question_id: Number(a.question_id),
           idea_id: a.idea_id == null ? null : Number(a.idea_id),
           covers: a.covers ? uniqueIds(a.covers) : null,
-          format: q!.format,
+          format: q.format,
           attempt_date: a.attempt_date,
           grading_status: a.grading_status,
           verdict: a.verdict ?? null,
@@ -1325,8 +1532,11 @@ export async function getRoundAttempts(supabase: Supa, roundKey: string, nowMs =
           model_verdict: a.model_verdict ?? null,
           overridden: a.overridden_at != null,
           grade_error: a.grade_error ? bankCode(a.grade_error) : null,
-          overridable: a.grading_status === "graded" && a.grader === "model" && q!.format !== "chapter_recall" && a.overridden_at == null,
+          quiz_key: quizKey,
+          quiz_closed: quizClosed,
+          overridable: a.grading_status === "graded" && a.grader === "model" && q.format !== "chapter_recall" && a.overridden_at == null && !quizClosed,
           self_gradable: selfGradable(a, nowMs),
+          covered_ideas: coveredIdeas,
         };
       });
     return { status: 200, body: { round_key: roundKey, attempts } };
@@ -1468,11 +1678,56 @@ function chatReference(q: DeckQuestion): Record<string, unknown> {
   return {};
 }
 
+/** The most chapters a weak-mode chat read opens beyond the daily deck (one gated chapter deck each, in parallel). */
+export const WEAK_CHAPTERS_MAX = 6;
+
+const isWeakIdea = (i: DeckIdea) => num(i.lapses, 0) > 0 || i.last_verdict === "incorrect" || i.last_verdict === "dont_know";
+
+/**
+ * Weak ideas the daily deck does not carry: an idea that lapsed and is now scheduled for a later day is not due, so
+ * it is not in it. Their ids come from the schedule table (a lapse, or a last answer that was wrong); their content
+ * comes only through the SQL gate, from the chapter deck (pds.reading_bank_round with that chapter) of each chapter
+ * they sit in, the chapters with the most lapses first, so a locked or stale idea is never returned.
+ * Limit: a chapter deck lists 20 ideas with the never-asked ones first, so a chapter holding more than 20 never-asked
+ * ideas (at most 24 are stored per chapter) can hold back a weak one there.
+ */
+async function weakIdeasBeyondDeck(supabase: Supa, slug: string | null, deck: Deck): Promise<DeckIdea[]> {
+  const sel = "idea_id,lapses,last_verdict,reading_ideas(chapter,status)";
+  const [lapsed, wrong] = await Promise.all([
+    supabase.from("reading_idea_state").select(sel).eq("book_id", deck.book_id).gt("lapses", 0).limit(500),
+    supabase.from("reading_idea_state").select(sel).eq("book_id", deck.book_id).in("last_verdict", ["incorrect", "dont_know"]).limit(500),
+  ]);
+  if (lapsed.error) throw readFailed(lapsed.error);
+  if (wrong.error) throw readFailed(wrong.error);
+  const inDeck = new Set(deck.ideas.map((i) => i.idea_id));
+  const weak = new Set<number>();
+  const weight = new Map<number, number>();
+  type WeakRow = { idea_id: unknown; lapses: unknown; reading_ideas?: unknown };
+  for (const r of [...((lapsed.data ?? []) as WeakRow[]), ...((wrong.data ?? []) as WeakRow[])]) {
+    const id = Number(r.idea_id);
+    const idea = one(r.reading_ideas as { chapter?: unknown; status?: unknown } | { chapter?: unknown; status?: unknown }[] | null | undefined);
+    if (!idea || idea.status !== "active" || inDeck.has(id)) continue;
+    const ch = num(idea.chapter, -1);
+    if (ch < 0 || ch > deck.quiz_through) continue;
+    weak.add(id);
+    weight.set(ch, Math.max(weight.get(ch) ?? 0, num(r.lapses, 0)));
+  }
+  if (!weak.size) return [];
+  const chapters = [...weight].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, WEAK_CHAPTERS_MAX).map(([c]) => c);
+  const decks = await Promise.all(chapters.map((c) => readDeck(supabase, slug, c)));
+  const out: DeckIdea[] = [];
+  for (const d of decks) {
+    if (!d || d.book_id !== deck.book_id) continue;
+    for (const i of d.ideas) if (weak.has(i.idea_id)) out.push(i);
+  }
+  return out;
+}
+
 /**
  * Unlocked bank questions for the chat (get_reading_questions), through the same SQL gate as the round:
  * due = due ideas first, then new ones; chapter = one chapter's ideas; weak = ideas with a lapse or a last answer
- * that was wrong. Ideas answered today are left out. At most CHAT_QUESTIONS_MAX.
- * Limit: `weak` without a chapter sees only the ideas the daily deck carries (due, new, answered today).
+ * that was wrong, whether or not they are due (weakIdeasBeyondDeck adds the ones scheduled for later). Ideas
+ * answered today are left out. At most CHAT_QUESTIONS_MAX.
  */
 export async function questionsForChat(
   supabase: Supa,
@@ -1489,8 +1744,18 @@ export async function questionsForChat(
     const today = deck.today;
     const rank = (i: DeckIdea) => (i.next_review !== null && i.next_review <= today ? 0 : i.next_review === null ? 1 : 2);
     const imp = (i: DeckIdea) => (i.importance === "core" ? 0 : i.importance === "supporting" ? 1 : 2);
-    if (input.mode === "weak") ideas = ideas.filter((i) => num(i.lapses, 0) > 0 || i.last_verdict === "incorrect" || i.last_verdict === "dont_know");
-    else if (input.mode === "due") ideas = ideas.filter((i) => rank(i) < 2);
+    if (input.mode === "weak") {
+      ideas = ideas.filter(isWeakIdea);
+      if (chapter === null && ideas.filter((i) => pickQuestion(i)).length < count) {
+        const have = new Set(ideas.map((i) => i.idea_id));
+        const more = await weakIdeasBeyondDeck(supabase, input.book ?? null, deck);
+        for (const i of more) {
+          if (have.has(i.idea_id) || answered.has(i.idea_id) || !isWeakIdea(i)) continue;
+          have.add(i.idea_id);
+          ideas.push(i);
+        }
+      }
+    } else if (input.mode === "due") ideas = ideas.filter((i) => rank(i) < 2);
     ideas.sort((a, b) => rank(a) - rank(b) || imp(a) - imp(b) || a.chapter - b.chapter || a.idea_id - b.idea_id);
     const questions: ChatQuestion[] = [];
     for (const i of ideas) {
@@ -1543,6 +1808,9 @@ export async function recordChatAnswer(
     // pds.reading_bank_attempt after it looked the key up, so a replayed tool call still gets its stored answer.
     if (q.version !== input.version) return { ok: false, status: 409, error: "question_changed" };
     const attemptKey = chatAttemptKey(input.tool_use_id);
+    // A book turned off takes no new answers (the chat offers the old free quiz then); a replayed tool call of an
+    // answer stored while it was on still gets that answer.
+    if (!q.enabled && !(await attemptStored(supabase, attemptKey))) return { ok: false, status: 409, error: "bank_off" };
     const { data, error } = await supabase.rpc("reading_bank_attempt", {
       p: {
         attempt_key: attemptKey,
