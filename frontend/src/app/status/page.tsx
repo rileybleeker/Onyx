@@ -11,6 +11,7 @@ import { sameJson } from "@/lib/format";
 import { clientCache } from "@/lib/client-cache";
 import { earlyFetchScript, earlyOr } from "@/lib/early-fetch";
 import SpotifyReconnect from "@/components/SpotifyReconnect";
+import KindleRunNow from "@/components/KindleRunNow";
 import { needsSpotifyReconnect } from "@/lib/spotify-reconnect";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
@@ -216,7 +217,7 @@ const HISTORY_COLUMNS: TableColumn[] = [
 const SOURCE_TILES_GRID =
   "pz-grid pz-tiles [&>[data-w=full]]:col-span-full! sm:[&>[data-w=half]]:col-span-2!";
 
-function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus }) {
+function SourceCard({ sourceKey, info, onRefresh }: { sourceKey: string; info: SourceStatus; onRefresh?: () => void }) {
   const badge = SOURCE_BADGE[sourceKey] ?? sourceKey.toUpperCase();
   const badgeColor = SOURCE_BADGE_COLOR[sourceKey] ?? "text-text-tertiary";
   const dotColor = STATUS_DOT[info.status];
@@ -273,6 +274,9 @@ function SourceCard({ sourceKey, info }: { sourceKey: string; info: SourceStatus
       {sourceKey === "spotify" && (needsSpotifyReconnect(info.errorMessage) || info.reconnectBy) && (
         <SpotifyReconnect reconnectBy={info.reconnectBy} />
       )}
+
+      {/* Kindle: ask the PC to harvest now (event driven: a Realtime push to the PC's idle listener). */}
+      {sourceKey === "kindle" && <KindleRunNow onDone={onRefresh} />}
     </div>
   );
 }
@@ -676,7 +680,7 @@ function StatusView({ early }: { early: boolean }) {
       <PartGroup id="sources" title="Source cards" gridClassName={SOURCE_TILES_GRID}>
         {sourceList.map(({ key, info }) => (
           <Part key={key} id={key} title={info.label} width="quarter">
-            <SourceCard sourceKey={key} info={info} />
+            <SourceCard sourceKey={key} info={info} onRefresh={load} />
           </Part>
         ))}
       </PartGroup>

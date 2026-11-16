@@ -55,6 +55,29 @@ It never wakes the PC. (Before 2026-11-09 the task was a bare `schtasks … node
 it popped a console window, refused to start on battery — result `0x800710E0` — and skipped every
 run missed during sleep, which left the heartbeat 32 h stale.)
 
+## Run now (from Onyx)
+
+The Kindle card on `/status` has a **Run now** button. It is event driven: nothing on the PC polls.
+
+1. The button calls `POST /api/kindle/run` (owner session only), which inserts a row into
+   `pds.pc_run_requests` (`sql/pc_run_requests.sql`, service-role only).
+2. Supabase Realtime pushes that INSERT to `run-listener.mjs`, one idle Node process on the PC that
+   holds a single websocket (its only traffic is Realtime's keep-alive every 25 s).
+3. The listener starts the "Onyx Kindle Harvest" task (so a pressed run and a scheduled run never
+   collide on the Chrome profile) and writes back on the row: started / already running, then the
+   harvester's exit code when it ends. The button shows each step.
+
+If the PC is asleep or off, the button says so after 15 s; a press up to 2 minutes old is still
+answered when the PC reconnects. Set up (or restart after a code change), no admin needed:
+
+```powershell
+pwsh -File C:\Users\riley\Onyx\tools\kindle_harvest\register-listener.ps1
+```
+
+It puts a shortcut in the Startup folder (runs the listener hidden at every sign-in) and starts it
+now. Needs `~/.onyx_supabase_secret` (the same service key file as the PC activity logger). The log
+is `listener.log` (times, events and request ids only).
+
 ## Adding a book
 
 1. Create the `pds.books` row (slug, total_chapters, dates, Notion page, habit name).
