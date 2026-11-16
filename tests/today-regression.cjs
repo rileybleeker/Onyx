@@ -605,8 +605,8 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(couldn't refresh/).isVisible());
         await page.setViewportSize({ width: 1440, height: 1000 });
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-        // Off again: the full page as before.
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        // Off again: the full page as before (exact: the quiet panel also has 'Turn off the quiet view').
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.waitFor({ state: 'detached' });
         assert(await page.locator('#today-full').isVisible());
         assert.deepEqual(await page.evaluate(() => window.quietPuts[window.quietPuts.length - 1].value), { v: 1, on: false, budget: 1, learning: true });
