@@ -2,7 +2,8 @@
 // (app/log/sections/Reading.tsx) keeps an entry that is not saved yet when the section is unmounted (the continuous
 // scroll dropping the Log page, a navigation, a hidden part) and shows it again on the next mount; a create that
 // failed offline keeps its client_key, so Retry creates the session once; opening the section never sends anything;
-// an entry made before the behavioral day rolls keeps its own day; Discard / Remove / New session pressed while a
+// an entry made before the behavioral day rolls keeps its own day, also when 06:00 comes later on this device's clock
+// than on the Eastern one (travelling west); Discard / Remove / New session pressed while a
 // field has focus are never pre-empted by the form's blur save (the press keeps focus, Tab to them skips the save, a
 // touch press that still blurs the field is remembered, a touch that became a scroll is not); a session end stops a
 // save under way (no replay PATCH, no refetch); a copy mounted while the previous copy's create was out shows the day
@@ -125,6 +126,9 @@ function setup(t) {
   // D1 until rollDay(), then D2 for every instant from then on.
   let serverToday = D1;
   let rollAt = Infinity;
+  // This device's own clock (lib/checkin deviceBehavioralDay): null = it is on Eastern time and rolls with rollAt;
+  // a number = it is in another zone and rolls on its own (travelling west: 06:00 local comes after 06:00 Eastern).
+  let deviceRollAt = null;
   // The shared Say it draft store (lib/log-drafts.ts), reading section only: one draft or none.
   let draft = null;
   let draftSeq = 0;
@@ -169,7 +173,10 @@ function setup(t) {
     "@/lib/autosave": autosaveLib,
     "@/lib/unsaved-work": { ...unsavedLib, unsavedWork: work },
     "@/lib/autosave-retain": { ...retainLib, formRetainer: retainer },
-    "@/lib/checkin": { fallbackBehavioralToday: (d) => (d.getTime() >= rollAt ? D2 : D1) },
+    "@/lib/checkin": {
+      fallbackBehavioralToday: (d) => (d.getTime() >= rollAt ? D2 : D1),
+      deviceBehavioralDay: (d) => (d.getTime() >= (deviceRollAt ?? rollAt) ? D2 : D1),
+    },
     "@/lib/client-cache": {
       cachedJson: async () => {
         reads += 1;
@@ -269,6 +276,16 @@ function setup(t) {
     async rollDay() {
       await new Promise((resolve) => setTimeout(resolve, 3));
       rollAt = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 3));
+    },
+    /** This device is in a zone west of Eastern (Pacific): from now on its clock rolls only on rollDeviceDay(). */
+    awayFromEastern() {
+      deviceRollAt = Infinity;
+    },
+    /** 06:00 on this device's own clock passes now (after awayFromEastern); nothing is re-read. */
+    async rollDeviceDay() {
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      deviceRollAt = Date.now();
       await new Promise((resolve) => setTimeout(resolve, 3));
     },
     posts: () => calls.filter((c) => c.method === "POST"),
@@ -577,6 +594,62 @@ test("an entry started on its own day, before the roll, still lets the server's 
   await h.type("Through ch.", "3");
   await h.tick(1500);
   assert.equal(h.posts()[0].body.date, null);
+  assert.equal([...h.rows.values()][0].session_date, D1);
+});
+
+test("travelling west: an entry started before 06:00 local and sent after is created for its own day, though 06:00 Eastern passed earlier", async (t) => {
+  // Riley is on Pacific time. 06:00 Eastern (03:00 local) has passed, so the Eastern clock already says D2, but the
+  // server, which follows where Riley is, still says D1 and confirms it. The entry is started then and sent after
+  // 06:00 local, with no new answer in between: an Eastern-only rollover check saw no roll and sent no day.
+  const h = setup(t);
+  h.awayFromEastern();
+  await h.rollDay(); // 06:00 Eastern
+  await h.mount(); // the overview is read: D1, confirmed after 06:00 Eastern
+  await h.type("Minutes", "25"); // started on D1, local time
+  assert.equal(h.calls.length, 0);
+  await h.rollDeviceDay(); // 06:00 local passes; the overview is not read again
+  h.serverToday = D2;
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, D1, "sent for the day it was started on: the server's own today has moved on");
+  assert.equal([...h.rows.values()][0].session_date, D1, "never the next day");
+  assert.equal(h.value("Day"), D1);
+});
+
+test("travelling west: an entry started after 06:00 local, on a screen last read before it, leaves the day to the server", async (t) => {
+  // The other side of the same clock: the day on screen (D1) is stale by the time the entry is started, so it is not
+  // pinned to the entry; the server's behavioral today applies and the form then shows the stored day.
+  const h = setup(t);
+  h.awayFromEastern();
+  await h.rollDay(); // 06:00 Eastern
+  await h.mount(); // confirmed D1
+  await h.rollDeviceDay(); // 06:00 local passes before anything is entered; nothing is re-read
+  h.serverToday = D2;
+  await h.type("Minutes", "25");
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, null, "the day on screen is stale: the server's behavioral today applies");
+  assert.equal([...h.rows.values()][0].session_date, D2);
+  assert.equal(h.value("Day"), D2, "and the form shows the day the session was stored on");
+});
+
+test("travelling west, overview unreadable: a cached day that is this device's day is kept when the entry is sent after 06:00 local", async (t) => {
+  // No answer confirms the day (the read fails); the cached D1 is the day on this device's clock, though not on the
+  // Eastern one, so the entry keeps it and carries it once 06:00 local has passed.
+  const h = setup(t);
+  h.awayFromEastern();
+  await h.rollDay(); // 06:00 Eastern
+  h.readMode = "offline";
+  await h.mount();
+  await h.type("Minutes", "25");
+  await h.rollDeviceDay();
+  h.serverToday = D2;
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, D1);
   assert.equal([...h.rows.values()][0].session_date, D1);
 });
 

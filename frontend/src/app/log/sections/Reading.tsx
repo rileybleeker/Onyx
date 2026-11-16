@@ -9,7 +9,7 @@ import { sameJson } from "@/lib/format";
 import { useLogDrafts, type ReadingLogDraft } from "@/lib/log-drafts";
 import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
-import { fallbackBehavioralToday } from "@/lib/checkin";
+import { deviceBehavioralDay, fallbackBehavioralToday } from "@/lib/checkin";
 import { isBlankSession, newClientKey, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
 import { useRetainedAutosave } from "@/lib/use-autosave";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
@@ -145,10 +145,11 @@ type ReadingFormData = {
   entrySent: boolean;
   /**
    * The day this entry is for when no day was chosen: the day on screen when it was started, if that day was current
-   * then (the server's last answer said so and the day has not rolled since, or it is the clock's day); else the day
-   * on screen at the first send, if the server had confirmed it by then. The first send lets the server's behavioral
-   * today apply while that is still this day; every later send of the same create (a retry, also one running while
-   * the section is away) and a first send after the day rolled carry it, so the session never moves to the next day.
+   * then (the server's last answer said so and the day has not rolled since on the Eastern or this device's clock, or
+   * it is the day by one of those clocks); else the day on screen at the first send, if the server had confirmed it by
+   * then. The first send lets the server's behavioral today apply while that is still this day; every later send of
+   * the same create (a retry, also one running while the section is away) and a first send after the day rolled on
+   * either clock carry it, so the session never moves to the next day (dayRolledSince).
    * Null = unknown (the day on screen could be stale, e.g. an offline first paint from the cache): the server decides,
    * and the form then shows the day it stored.
    */
@@ -171,6 +172,21 @@ const PRESS_MS = 1000;
 function skipsBlurSave(next: EventTarget | null): boolean {
   const el = next as { closest?: (selector: string) => unknown } | null;
   return !!el && typeof el.closest === "function" && !!el.closest(`[${BLUR_SKIP_ATTR}]`);
+}
+
+/**
+ * Whether the behavioral day may have rolled between `at` and now. The server's day follows where Riley is (travel-aware,
+ * pds.behavioral_today_now), so 06:00 is checked on two clocks: Eastern, and this device's own zone, which a phone
+ * keeps on local time while travelling. A roll on either counts. Eastern alone missed 06:00 Pacific (09:00 Eastern): an
+ * entry started before it and sent after went out without its day and was stored on the next one (PROD-T01).
+ */
+function dayRolledSince(at: number, now = new Date()): boolean {
+  const then = new Date(at);
+  return fallbackBehavioralToday(then) !== fallbackBehavioralToday(now) || deviceBehavioralDay(then) !== deviceBehavioralDay(now);
+}
+/** `day` is behavioral today by the Eastern clock or by this device's clock (a guess while no answer confirms it). */
+function isClockDay(day: string, now = new Date()): boolean {
+  return day === fallbackBehavioralToday(now) || day === deviceBehavioralDay(now);
 }
 
 const newReadingData = (): ReadingFormData => ({
@@ -201,10 +217,10 @@ export default function ReadingSection() {
   overviewRef.current = o;
   // When the server last answered with the overview (not a cached copy): its `today` was current then.
   const confirmedAt = useRef<number | null>(null);
-  /** The day on screen is the server's today: confirmed by an answer, and the day has not rolled since (Eastern guess). */
+  /** The day on screen is the server's today: confirmed by an answer, and 06:00 has not passed since on either clock. */
   const shownDayIsCurrent = () => {
     const at = confirmedAt.current;
-    return at !== null && fallbackBehavioralToday(new Date(at)) === fallbackBehavioralToday(new Date());
+    return at !== null && !dayRolledSince(at);
   };
   /** `day` is the server's behavioral today now: the overview on screen says so, and that is still current. */
   const isCurrentDay = (day: string) => shownDayIsCurrent() && overviewRef.current?.today === day;
@@ -428,7 +444,7 @@ export default function ReadingSection() {
     if (!kept.entryStarted && kept.sessionId === null) {
       kept.entryStarted = true;
       const shown = next.date || cur?.today || "";
-      kept.entryDay = shown && (isCurrentDay(shown) || shown === fallbackBehavioralToday(new Date())) ? shown : null;
+      kept.entryDay = shown && (isCurrentDay(shown) || isClockDay(shown)) ? shown : null;
     }
     autosave.change(valueOf(next));
   };
