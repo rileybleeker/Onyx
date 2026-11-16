@@ -822,3 +822,74 @@ test("a retry whose earlier calls were all refused runs a repeated call twice, a
   assert.equal(write.effects.size, 2);
   assert.deepEqual(db.rows("chat_operations").map((r) => [r.ordinal, r.status]), [[1, "done"], [2, "done"]]);
 });
+
+test("a retry that cannot read the ledger back for the earlier try's writes says so (null), never 'nothing was saved'", async () => {
+  const state = { failList: false };
+  const { open, errors } = setup({ fail: ({ table, op }) => (state.failList && table === "chat_operations" && op === "select" ? { code: "08006" } : null) });
+  const write = keyedWrite();
+  await (await open()).run(STACK, input(), write.execute());
+  const retry = await open();
+  assert.equal(retry.retry, true);
+  assert.equal((await retry.earlierReceipts()).length, 1, "readable: the earlier write is listed");
+  state.failList = true;
+  assert.equal(await retry.earlierReceipts(), null, "unreadable: unknown, not an empty list");
+  assert.deepEqual(errors.at(-1), ["list", "08006"]);
+  // A first try has no earlier try: nothing to read, an empty list.
+  const fresh = await (await setup()).open({ request: "33333333-3333-4333-8333-333333333333" });
+  assert.deepEqual(plain(await fresh.earlierReceipts()), []);
+});
+
+test("abandoning an id that never reached the ledger refuses the request if it arrives late; one that arrived is not abandoned", async () => {
+  const { db, store, open } = setup();
+  const late = "44444444-4444-4444-8444-444444444444";
+  // Not in the ledger: recorded as abandoned (no lease), and again when asked twice.
+  assert.deepEqual(plain(await ops.abandonRequest(store, OWNER, late, receipts.buildWriteReceipt)), { status: "abandoned", receipts: [] });
+  assert.deepEqual(plain(await ops.abandonRequest(store, OWNER, late, receipts.buildWriteReceipt)), { status: "abandoned", receipts: [] });
+  const row = db.rows("chat_requests").filter((r) => r.request_id === late);
+  assert.equal(row.length, 1);
+  assert.equal(row[0].conversation_sha, ops.ABANDONED_CONVERSATION_SHA);
+  assert.equal(row[0].lease_until, null);
+  // The request itself arrives now: a conflict, so nothing runs under it.
+  const arrived = await ops.openLedger(store, { ownerId: OWNER, requestId: late, conversationSha: CONVERSATION, buildReceipt: receipts.buildWriteReceipt });
+  assert.equal(arrived.kind, "conflict");
+  // Read back like any request: settled, nothing saved.
+  assert.deepEqual(plain(await ops.requestOutcome(store, OWNER, late, receipts.buildWriteReceipt)), { status: "settled", receipts: [] });
+  // A request that reached the ledger first is never abandoned: its account comes back instead, and it still replays.
+  const write = keyedWrite();
+  const firstTry = await open();
+  await firstTry.run(STACK, input(), write.execute());
+  await firstTry.release();
+  const before = db.rows("chat_requests").find((r) => r.request_id === REQUEST).conversation_sha;
+  const kept = plain(await ops.abandonRequest(store, OWNER, REQUEST, receipts.buildWriteReceipt));
+  assert.equal(kept.status, "settled");
+  assert.deepEqual(kept.receipts.map((r) => r.status), ["saved"]);
+  assert.equal(db.rows("chat_requests").find((r) => r.request_id === REQUEST).conversation_sha, before);
+  assert.equal((await open()).retry, true, "the request still replays");
+  // Another owner's id is its own row.
+  assert.equal((await ops.abandonRequest(store, OTHER_OWNER, REQUEST, receipts.buildWriteReceipt)).status, "abandoned");
+  assert.equal(db.rows("chat_requests").find((r) => r.request_id === REQUEST && r.owner_id === OWNER).conversation_sha, before);
+});
+
+test("an abandon whose answer is lost or refused is a failure (the page keeps the id), never 'abandoned'", async () => {
+  const id = "55555555-5555-4555-8555-555555555555";
+  const lost = setup({ lose: ({ table, op }) => (table === "chat_requests" && op === "insert" ? { message: "fetch failed" } : null) });
+  assert.equal((await ops.abandonRequest(lost.store, OWNER, id, receipts.buildWriteReceipt)).status, "failed");
+  const missing = setup({ fail: ({ table }) => (table === "chat_requests" ? { code: "42P01" } : null) });
+  assert.equal((await ops.abandonRequest(missing.store, OWNER, id, receipts.buildWriteReceipt)).status, "unavailable");
+});
+
+test("a removal and a keyed insert of the same operation take one lock, so a removed write never comes back (SQL)", () => {
+  const sql = require("node:fs").readFileSync(require("node:path").join(__dirname, "../../sql/chat_operations.sql"), "utf8");
+  const lock = "pg_advisory_xact_lock(hashtextextended('pds.chat_operation:' || k::text, 0))";
+  const body = (fn) => new RegExp(`FUNCTION pds\.${fn}\(\)[\s\S]*?\$\$;`).exec(sql)?.[0] ?? "";
+  // The insert guard waits for a running removal of the key BEFORE it looks for the tombstone.
+  const guard = body("chat_operation_not_removed");
+  assert.ok(guard.includes(lock) && guard.indexOf(lock) < guard.indexOf("chat_operation_tombstones t"), "lock, then the tombstone check");
+  // The removal takes it before the row goes (BEFORE DELETE), on both keyed tables.
+  assert.ok(body("chat_operation_lock_removed").includes(lock));
+  for (const table of ["supplement_intake", "reading_sessions"]) {
+    assert.match(sql, new RegExp(`TRIGGER ${table}_chat_lock\s+BEFORE DELETE ON pds\.${table}\s+FOR EACH ROW WHEN \(OLD\.client_(event_)?key IS NOT NULL\)\s+EXECUTE FUNCTION pds\.chat_operation_lock_removed`));
+  }
+  assert.ok(body("chat_operation_tombstone").includes(lock));
+  assert.doesNotMatch(sql, /\bDROP\b/i, "applied through the Supabase MCP, which declines any DROP");
+});

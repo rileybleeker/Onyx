@@ -581,7 +581,16 @@ export interface LogSessionInput {
    * the first one made, with no second XP, habit stamp or Notion entry (sql/reading_sessions_client_key.sql).
    */
   client_key?: string | null;
+  /**
+   * Onyx Chat (SEC-04): the session must be stored WITH its key, because a retried chat message can only find it by
+   * that key. A key that is not a UUID, or a key column that is missing, is then refused (SESSION_KEY_REQUIRED) and
+   * nothing is written, never a session without its key. Without it (the /log form) a missing column is still written
+   * without the key, as before sql/reading_sessions_client_key.sql existed.
+   */
+  require_client_key?: boolean;
 }
+/** logSession refused a session that had to carry its client_key (require_client_key): nothing was written. */
+export const SESSION_KEY_REQUIRED = "client_key could not be stored with this session, so nothing was written";
 export interface LogSessionResult {
   ok: true;
   book: Book;
@@ -680,6 +689,7 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
 
 export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
+  if (input.require_client_key && !key) return { ok: false, error: SESSION_KEY_REQUIRED };
   /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
   const replay = async (prior: ReadingSession, fallback: Book | null): Promise<LogSessionResult | null> => {
     const { data: b } = await supabase.from("books").select(BOOK_COLS).eq("book_id", prior.book_id).maybeSingle();
@@ -743,7 +753,12 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     const replayed = prior ? await replay(prior, book) : null;
     if (replayed) return replayed;
   }
-  if (error && key && missingColumn(error)) ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
+  if (error && key && missingColumn(error)) {
+    // The key column is not there: the insert above was refused, so nothing was written. Chat needs the key (a retry
+    // finds the session only by it): refused. Any other caller writes the session without the key, as before.
+    if (input.require_client_key) return { ok: false, error: SESSION_KEY_REQUIRED };
+    ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
+  }
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
 

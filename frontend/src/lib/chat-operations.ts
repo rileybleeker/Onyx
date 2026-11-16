@@ -112,6 +112,11 @@ export interface LedgerStore {
   releaseRequest(owner_id: string, request_id: string, attempt_id: string): Promise<void>;
   /** The request's row, or null when this id was never seen for this owner. */
   getRequest(owner_id: string, request_id: string): Promise<{ lease_until: string | null } | null>;
+  /**
+   * Record this id as abandoned (ABANDONED_CONVERSATION_SHA, no lease) when no row exists for it; one atomic insert.
+   * "abandoned" = recorded now or earlier; "exists" = the request itself reached the ledger first.
+   */
+  abandonRequest(owner_id: string, request_id: string): Promise<"abandoned" | "exists">;
   /** Insert a pending row for this call, or return the row already in that place (created = false). Atomic. */
   claim(key: OperationKey, intent_sha: string, intent: unknown, context?: OperationContext | null): Promise<{ row: OperationRow; created: boolean }>;
   listForRequest(owner_id: string, request_id: string): Promise<OperationRow[]>;
@@ -532,16 +537,18 @@ export class ChatLedger {
 
   /**
    * Receipts of calls an earlier try made that this try did not repeat (the model answered differently this time, or
-   * asked for something else), so Riley still sees what was already saved. Empty on a first try.
+   * asked for something else), so Riley still sees what was already saved. Empty on a first try. null = the ledger
+   * could not be read: what the earlier try saved is UNKNOWN, never "nothing" (the route then says so and the page
+   * keeps the request remembered, so its account can still be read back after a reload).
    */
-  async earlierReceipts(): Promise<WriteReceipt[]> {
+  async earlierReceipts(): Promise<WriteReceipt[] | null> {
     if (!this.retry) return [];
     let rows: OperationRow[];
     try {
       rows = await this.opts.store.listForRequest(this.opts.ownerId, this.opts.requestId);
     } catch (e) {
       this.report("list", e);
-      return [];
+      return null;
     }
     const out: WriteReceipt[] = [];
     for (const row of rows) {
@@ -792,6 +799,38 @@ export async function requestOutcome(
   }
 }
 
+/**
+ * The conversation hash an abandoned request id is recorded under. No conversation hashes to it, so when the request
+ * itself arrives later (it was still on its way when the page asked), its claim is a conflict and it runs nothing.
+ */
+export const ABANDONED_CONVERSATION_SHA = "0".repeat(64);
+
+/**
+ * Riley dismissed "this message never reached Onyx" after a reload (POST /api/chat/operations). An id that is not in
+ * the ledger is not proof that it never will be: the request may still be on its way (another tab, a slow network),
+ * and the page forgetting the id would let the same message be sent again under a new id, so both would write. So
+ * the id is recorded as abandoned first, in one insert: from then on the request itself is refused if it arrives. If
+ * it reached the ledger before that insert, nothing is recorded and its account is returned instead (what it saved),
+ * exactly as GET answers. "abandoned" is the only answer after which the page forgets the id. Never throws.
+ */
+export type AbandonOutcome = { status: "abandoned"; receipts: [] } | RequestOutcome;
+
+export async function abandonRequest(
+  store: LedgerStore,
+  ownerId: string,
+  requestId: string,
+  buildReceipt: ReceiptBuilder,
+  now: number = Date.now(),
+): Promise<AbandonOutcome> {
+  try {
+    if ((await store.abandonRequest(ownerId, requestId)) === "abandoned") return { status: "abandoned", receipts: [] };
+  } catch (e) {
+    if (e instanceof LedgerUnavailable) return { status: "unavailable", code: e.code, receipts: [] };
+    return { status: "failed", code: errorCode(e), receipts: [] };
+  }
+  return requestOutcome(store, ownerId, requestId, buildReceipt, now);
+}
+
 /* ------------------------------------------------------------------ */
 /* Supabase store and read-only reconcilers                            */
 /* ------------------------------------------------------------------ */
@@ -865,6 +904,22 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
       if (!data) return null;
       const until = (data as { lease_until?: unknown }).lease_until;
       return { lease_until: typeof until === "string" ? until : null };
+    },
+
+    async abandonRequest(owner_id, request_id) {
+      // No lease: nothing runs under an abandoned id. A lost answer to this insert is a failure (the page keeps the
+      // id); the next check then finds the row (settled, nothing saved).
+      const { error } = await requests().insert({ owner_id, request_id, conversation_sha: ABANDONED_CONVERSATION_SHA });
+      if (!error) return "abandoned";
+      if (error.code !== "23505") fail(error);
+      const { data, error: readError } = await requests()
+        .select("conversation_sha")
+        .eq("owner_id", owner_id)
+        .eq("request_id", request_id)
+        .maybeSingle();
+      if (readError) fail(readError);
+      if (!data) fail({ code: "missing_after_conflict" });
+      return (data as { conversation_sha?: unknown }).conversation_sha === ABANDONED_CONVERSATION_SHA ? "abandoned" : "exists";
     },
 
     async claim(key, intent_sha, intent, context) {

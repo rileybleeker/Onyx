@@ -225,7 +225,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_book_highlights_client_key
 -- tombstone (the operation id and the table, nothing else): the chat route
 -- reads it before a keyed write and answers "removed since, not written
 -- again", and the insert guard below refuses an insert under that key
--- (SQLSTATE OXC01), also when a removal and a retry cross. Only keys that are
+-- (SQLSTATE OXC01), also when a removal and a retry cross: the removal and
+-- the insert each take the same per-key transaction lock first (an advisory
+-- lock on the operation id), so the insert's tombstone check waits for a
+-- removal of that key that is still running and then sees its tombstone.
+-- Without the lock the check could run before the removal committed, the
+-- insert would then wait on the unique index for the removed row and go in
+-- once the removal committed, bringing the removed write back. Only keys that are
 -- chat operation ids get one (the /log reading form's own client keys never
 -- do), so every other path is unchanged. A tombstone goes with its operation
 -- (ON DELETE CASCADE), so a future ledger retention window covers it too.
@@ -255,6 +261,33 @@ END $$;
 REVOKE ALL ON pds.chat_operation_tombstones FROM anon, authenticated;
 GRANT ALL ON pds.chat_operation_tombstones TO service_role;
 
+-- One transaction lock per operation id (pg_advisory_xact_lock on a hash of
+-- it), held until commit or rollback. The removal takes it in a BEFORE DELETE
+-- trigger (so before the row is removed and before the tombstone is written)
+-- and the insert guard takes it before it looks for a tombstone. In READ
+-- COMMITTED each statement of a plpgsql function reads a fresh snapshot, so a
+-- guard that waited for the lock sees the tombstone the removal committed. An
+-- insert that holds the lock first and meets the row being removed gets a
+-- unique violation at once (that row is only locked at that point, not yet
+-- removed), so the two never wait on each other. A hash collision with another
+-- key only makes the two wait in turn.
+--
+-- TG_ARGV[0] = the key column. Takes the key's lock before the row is removed.
+CREATE OR REPLACE FUNCTION pds.chat_operation_lock_removed()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pds
+AS $$
+DECLARE
+  k UUID := (to_jsonb(OLD) ->> TG_ARGV[0])::uuid;
+BEGIN
+  IF k IS NOT NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended('pds.chat_operation:' || k::text, 0));
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
 -- TG_ARGV[0] = the key column of the table the trigger is on. SECURITY DEFINER
 -- so a removal by any role allowed to remove the row also records its
 -- tombstone (the ledger tables are service-role only).
@@ -268,6 +301,8 @@ DECLARE
   k UUID := (to_jsonb(OLD) ->> TG_ARGV[0])::uuid;
 BEGIN
   IF k IS NOT NULL THEN
+    -- Already held since the BEFORE DELETE trigger ran (taking it again only stacks it).
+    PERFORM pg_advisory_xact_lock(hashtextextended('pds.chat_operation:' || k::text, 0));
     INSERT INTO pds.chat_operation_tombstones (op_id, target)
     SELECT o.op_id, TG_TABLE_NAME FROM pds.chat_operations o WHERE o.op_id = k
     ON CONFLICT (op_id) DO NOTHING;
@@ -282,10 +317,14 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pds
 AS $$
+DECLARE
+  k UUID := (to_jsonb(NEW) ->> TG_ARGV[0])::uuid;
 BEGIN
+  -- Wait for a removal of this key that is still running, then check (a fresh snapshot sees its tombstone).
+  PERFORM pg_advisory_xact_lock(hashtextextended('pds.chat_operation:' || k::text, 0));
   IF EXISTS (
     SELECT 1 FROM pds.chat_operation_tombstones t
-    WHERE t.op_id = (to_jsonb(NEW) ->> TG_ARGV[0])::uuid
+    WHERE t.op_id = k
   ) THEN
     RAISE EXCEPTION 'this chat write was removed after it was saved' USING ERRCODE = 'OXC01';
   END IF;
@@ -293,8 +332,19 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION pds.chat_operation_lock_removed() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pds.chat_operation_tombstone() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pds.chat_operation_not_removed() FROM PUBLIC;
+
+CREATE OR REPLACE TRIGGER supplement_intake_chat_lock
+  BEFORE DELETE ON pds.supplement_intake
+  FOR EACH ROW WHEN (OLD.client_event_key IS NOT NULL)
+  EXECUTE FUNCTION pds.chat_operation_lock_removed('client_event_key');
+
+CREATE OR REPLACE TRIGGER reading_sessions_chat_lock
+  BEFORE DELETE ON pds.reading_sessions
+  FOR EACH ROW WHEN (OLD.client_key IS NOT NULL)
+  EXECUTE FUNCTION pds.chat_operation_lock_removed('client_key');
 
 CREATE OR REPLACE TRIGGER supplement_intake_chat_tombstone
   AFTER DELETE ON pds.supplement_intake

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSends, rememberPendingSend, settledPendingSends, unresolvedPendingSend, type ChatMessage, type PendingSend } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSends, rememberPendingSend, requestIdForSend, settledPendingSends, unresolvedPendingSend, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
@@ -17,15 +17,12 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
  * answer never arrived is also remembered on this device until it is resolved (hash + id only, PENDING_SEND_KEY, no
  * expiry). When the same conversation is sent again after a reload or a closed tab, Riley chooses: retry that send
  * (its id, so nothing is saved twice) or send it as a new message (a new id). A remembered send whose account Riley
- * has already seen and dismissed is resolved and never matches again.
+ * has already seen and dismissed is resolved and never matches again. Which id a send uses: requestIdForSend.
  */
-interface FailedSend { text: string; requestId: string; at: number }
+type FailedSend = FailedSendRef;
 
 /** A new send that is the same conversation as a remembered send whose answer never arrived: Riley picks. */
 interface MatchedSend { text: string; requestId: string; at: number }
-
-/** How a send picks its request id: as usual, the remembered send's id (a retry of it), or a new one (a new message). */
-type SendChoice = { retryOf: string } | { fresh: true };
 
 function readPendingSends(): PendingSend[] {
   try {
@@ -59,7 +56,7 @@ type Recovery = { state: "running" | "settled" | "none" | "unknown"; receipts: W
 const RECOVERY_TEXT: Record<Recovery["state"], string> = {
   running: "A message you sent before the reload is still running.",
   settled: "A message you sent before the reload got this far:",
-  none: "A message you sent before the reload did not reach Onyx, so nothing was saved.",
+  none: "A message you sent before the reload has not reached Onyx, so nothing was saved. Dismissing it also cancels it, in case it is still on its way.",
   unknown: "Onyx could not check a message you sent before the reload. If it asked to log something, check the relevant page before sending it again.",
 };
 
@@ -80,6 +77,10 @@ export default function ChatPage() {
   const [recovery, setRecovery] = useState<Recovery | null>(null);
   // A new send that matched a remembered send whose answer never arrived, waiting for Riley's choice.
   const [matched, setMatched] = useState<MatchedSend | null>(null);
+  // A retry's answer said what an earlier try saved could not be read back (unknown, not "nothing").
+  const [earlierUnconfirmed, setEarlierUnconfirmed] = useState(false);
+  // Dismissing "has not reached Onyx" is waiting for the server to record the id as abandoned.
+  const [dismissing, setDismissing] = useState(false);
   const recoveryId = useRef<string | null>(null);
   // The remembered sends found when this page loaded and not shown yet, newest first (their accounts, one at a time).
   const recoveryQueue = useRef<string[]>([]);
@@ -111,13 +112,55 @@ export default function ChatPage() {
     if (recoveryId.current === id) setRecovery(next);
   }
 
-  function dismissRecovery() {
-    // Once the server gave a definite account (settled / none) and Riley saw and dismissed it, the remembered send is
-    // resolved: it is forgotten, so the same message sent later is a new message, never a replay of this one. "Still
-    // running" or "could not check" is not an account: that send stays remembered (shown again after a reload, and
-    // a new send of the same conversation asks whether it is that send again).
+  /**
+   * Record a send that "has not reached Onyx" as abandoned on the server (POST /api/chat/operations), so that if it is
+   * still on its way it runs nothing when it arrives. "abandoned" = recorded; otherwise its account (it reached Onyx
+   * first) or "could not check".
+   */
+  async function abandonPendingSend(id: string): Promise<"abandoned" | Recovery> {
+    try {
+      const res = await fetch("/api/chat/operations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: id, action: "abandon" }),
+        cache: "no-store",
+      });
+      const data = res.redirected ? null : await res.json().catch(() => null);
+      const status = data?.status;
+      if (res.ok && status === "abandoned") return "abandoned";
+      if (res.ok && (status === "running" || status === "settled")) return { state: status, receipts: parseReceipts(data?.receipts) };
+    } catch {
+      /* offline: "could not check" */
+    }
+    return { state: "unknown", receipts: [] };
+  }
+
+  async function dismissRecovery() {
+    // Once the server gave a definite account of what the send saved (settled) and Riley saw and dismissed it, the
+    // remembered send is resolved: it is forgotten, so the same message sent later is a new message, never a replay
+    // of this one. "Has not reached Onyx" (none) is not definite on its own (it may still be on its way): it is
+    // forgotten only once the server recorded the id as abandoned, which also refuses it if it arrives late; when it
+    // arrived first, its account is shown instead. "Still running" or "could not check" is not an account: that send
+    // stays remembered (shown again after a reload, and a new send of the same conversation asks whether it is that
+    // send again).
     const id = recoveryId.current;
-    if (id && (recovery?.state === "settled" || recovery?.state === "none")) settlePendingSend(id);
+    if (id && recovery?.state === "settled") {
+      settlePendingSend(id);
+      showNextRecovery();
+      return;
+    }
+    if (id && recovery?.state === "none") {
+      setDismissing(true);
+      const outcome = await abandonPendingSend(id);
+      setDismissing(false);
+      // A new message was sent meanwhile.
+      if (recoveryId.current !== id) return;
+      if (outcome === "abandoned") {
+        settlePendingSend(id);
+        showNextRecovery();
+      } else setRecovery(outcome);
+      return;
+    }
     showNextRecovery();
   }
 
@@ -149,11 +192,7 @@ export default function ChatPage() {
       return;
     }
     sending.current = true;
-    const previous = failedSend.current;
-    let requestId: string | null =
-      choice && "retryOf" in choice ? choice.retryOf
-        : !choice && previous && previous.text === text && previous.at === messages.length ? previous.requestId
-          : null;
+    let requestId: string | null = requestIdForSend(choice, failedSend.current, text, messages.length);
     // The same conversation as a send whose answer never arrived (before a reload or a closed tab): never reused
     // silently, Riley chooses (retry that send, or send this as a new message). Seen and dismissed ones are gone.
     const conv = await conversationKey(updated);
@@ -166,6 +205,7 @@ export default function ChatPage() {
       }
     }
     setMatched(null);
+    setEarlierUnconfirmed(false);
     failedSend.current = null;
     setResendText(null);
     // A new message ends the accounts shown for this load; the remaining ones are shown again after the next reload.
@@ -189,6 +229,10 @@ export default function ChatPage() {
       });
       const data = await res.json().catch(() => null);
       written = parseReceipts(data?.receipts);
+      // What an earlier try of this message saved could not be read back: unknown, so it is said, and the send stays
+      // remembered (not settled below), so its account can still be read back after a reload.
+      const earlierUnknown = data?.earlier_unconfirmed === true;
+      setEarlierUnconfirmed(earlierUnknown);
       // A busy answer comes from the ledger itself (another try of this message is still running).
       if (data?.replay_safe === true || (res.status === 409 && data?.code === "request_in_progress")) safe = true;
       else if (res.ok) safe = false;
@@ -202,7 +246,7 @@ export default function ChatPage() {
       if (!res.ok || typeof data?.response !== "string" || !data?.response.trim()) {
         throw new Error(typeof data?.error === "string" ? data.error : "Onyx could not finish this response.");
       }
-      settlePendingSend(requestId);
+      if (!earlierUnknown) settlePendingSend(requestId);
       setMessages([...updated, { role: "assistant", content: data.response, ...(written.length > 0 ? { receipts: written } : {}) }]);
     } catch (err) {
       setInput(text);
@@ -228,6 +272,7 @@ export default function ChatPage() {
     failedSend.current = null;
     setResendText(null);
     setMatched(null);
+    setEarlierUnconfirmed(false);
     setMessages([]);
     setInput("");
     setError(null);
@@ -294,6 +339,11 @@ export default function ChatPage() {
           <ChatReceipts receipts={errorReceipts} heading="Before it stopped, this request had already done the following" />
         </div>
       )}
+      {earlierUnconfirmed && (
+        <p role="status" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3">
+          Onyx could not read back what an earlier try of this message saved, so it may not all be listed. Check the relevant page before logging any of it again.
+        </p>
+      )}
       {matched && input.trim() === matched.text && messages.length === matched.at && (
         <div role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3">
           <p>You sent this same message before and it did not finish, so it may already have saved something.</p>
@@ -318,7 +368,7 @@ export default function ChatPage() {
                 Check again
               </button>
             )}
-            <button type="button" onClick={dismissRecovery} className="text-sm text-text-secondary border border-border-subtle rounded-control px-3 py-1.5">
+            <button type="button" onClick={() => void dismissRecovery()} disabled={dismissing} className="text-sm text-text-secondary border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
               Dismiss
             </button>
           </div>

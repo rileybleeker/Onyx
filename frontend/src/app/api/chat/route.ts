@@ -610,6 +610,8 @@ async function currentBookId(): Promise<number | undefined> {
 
 /** logSession / addHighlight refusals from before anything was written. Any other error came from a write. */
 const SESSION_NOT_WRITTEN = /^(No active book found|chapter_through must be|chapter_through cannot exceed)/;
+/** lib/reading.ts SESSION_KEY_REQUIRED: a session that must carry its key could not (nothing was written). */
+const SESSION_KEY_REFUSED = /^client_key could not be stored with this session/;
 const SESSION_MAYBE_WRITTEN =
   "The database did not confirm this reading session, and it may have been saved anyway. Do not log it again: tell the user to check /reading first.";
 const HIGHLIGHT_NOT_WRITTEN = /^(No active book found|passage is required|client_key must be a UUID)/;
@@ -1288,9 +1290,13 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       question: (input.question as string) || null,
       source: "chat" as const,
       // The library's own idempotency key (sql/reading_sessions_client_key.sql): a retry gets the stored session back.
-      ...(opId ? { client_key: opId } : {}),
+      // Required: logSession refuses rather than write the session without it (its key column missing, even after
+      // the read above found it), because a retry could never find an unkeyed session again (fail closed).
+      ...(opId ? { client_key: opId, require_client_key: true } : {}),
     };
     let result = await logSession(supabase, sessionInput);
+    // The key could not go on the session: refused before anything was written.
+    if (!result.ok && SESSION_KEY_REFUSED.test(result.error)) return JSON.stringify({ error: KEY_UNAVAILABLE });
     if (!result.ok && opId && !SESSION_NOT_WRITTEN.test(result.error)) {
       // The insert failed in a way that may have committed (its answer lost on the way): find it by its key.
       const found = await sessionByKey(opId);
@@ -1319,8 +1325,9 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     const blockId = result.session.notion_block_id ?? (inspected ? null : await mirrorSession(book, result.session));
     if (blockId && !result.session.notion_block_id) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
     const o = await getOverview(supabase, book.slug).catch(() => null);
-    // Rewrites one progress line in Notion: the same text when it is already up to date.
-    await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    // Rewrites one progress line in Notion: the same text when it is already up to date. Not for an earlier call's
+    // session (read only): its date could put an older "last session" over a newer one written since.
+    if (!inspected) await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
     return JSON.stringify({
       success: true,
       book: book.title,
@@ -1603,16 +1610,26 @@ export async function POST(req: NextRequest) {
   // The page sent a request_id but the ledger could not record it (tables missing, or any other failure): write
   // tools are refused, lookups still answer.
   let writesPaused = false;
-  const withReceipts = <T extends object>(body: T): T | (T & { receipts?: WriteReceipt[]; replay_safe?: true }) => {
+  // On a retry, the ledger could not be read back for what an earlier try saved: that is unknown, not "nothing", so
+  // the answer says so (earlier_unconfirmed) and the page keeps the request remembered instead of settling it.
+  let earlierUnconfirmed = false;
+  const withReceipts = <T extends object>(body: T): T | (T & { receipts?: WriteReceipt[]; replay_safe?: true; earlier_unconfirmed?: true }) => {
     if (receipts.length === 0 && !ledger) return body;
-    return { ...body, ...(receipts.length > 0 ? { receipts } : {}), ...(ledger ? { replay_safe: true as const } : {}) };
+    return {
+      ...body,
+      ...(receipts.length > 0 ? { receipts } : {}),
+      ...(ledger ? { replay_safe: true as const } : {}),
+      ...(earlierUnconfirmed ? { earlier_unconfirmed: true as const } : {}),
+    };
   };
   // On a retry, the receipts of what an earlier try saved that this try did not repeat, listed first.
   let earlierAdded = false;
   const addEarlierReceipts = async () => {
     if (earlierAdded || !ledger?.retry) return;
     earlierAdded = true;
-    receipts.unshift(...(await ledger.earlierReceipts()));
+    const earlier = await ledger.earlierReceipts();
+    if (earlier === null) earlierUnconfirmed = true;
+    else receipts.unshift(...earlier);
   };
   // The ledger being opened (it takes this try's lease on the request), so `finally` can give the lease back.
   let opening: Promise<OpenedLedger> | null = null;

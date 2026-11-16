@@ -77,6 +77,23 @@ export function newRequestId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/** How a send picks its request id: as usual, the remembered send's id (a retry of it), or a new one (a new message). */
+export type SendChoice = { retryOf: string } | { fresh: true };
+
+/** The send of this page that failed (no answer, or an error): its text, its request id and where it was sent. */
+export interface FailedSendRef { text: string; requestId: string; at: number }
+
+/**
+ * The request id a send reuses; null = it gets a new one (unless it matches a remembered send, which the page asks
+ * about first). Riley's choice wins: "Retry that message" reuses that send's id, "Send as a new message" never reuses
+ * one. Otherwise only the same text sent again from the same point in the conversation (`at` = number of messages
+ * before it) reuses the failed send's id; an edited message, or one sent after the conversation moved on, is new.
+ */
+export function requestIdForSend(choice: SendChoice | undefined, previous: FailedSendRef | null, text: string, at: number): string | null {
+  if (choice) return "retryOf" in choice ? choice.retryOf : null;
+  return previous && previous.text === text && previous.at === at ? previous.requestId : null;
+}
+
 /**
  * Sends whose answer never arrived (the tab was closed or reloaded, the phone suspended the app) are remembered on
  * this device under this key: per send a SHA-256 of the conversation as sent and its request id, never the text.
@@ -84,8 +101,10 @@ export function newRequestId(): string {
  * never reuses the id silently: Riley picks "Retry that message" (the id: the server answers from its ledger instead
  * of logging again) or "Send as a new message" (a new id, a new action). They do NOT expire: an answer may have been
  * lost after a write committed, however long ago, so each stays until it is resolved: its answer arrives, the server
- * refuses the id for good, or the server's definite account of it (what it saved, or that it never arrived) was shown
- * after a reload and dismissed. A resolved send never matches a later message. There is no cap on unresolved sends:
+ * refuses the id for good, or the server's definite account of what it saved was shown after a reload and
+ * dismissed. "It never arrived" is not definite on its own (the request may still be on its way): dismissing that
+ * first records the id as abandoned on the server (POST /api/chat/operations), which also refuses the request if it
+ * arrives late, and only then is the send forgotten. A resolved send never matches a later message. There is no cap on unresolved sends:
  * one dropped to make room would lose its retry choice and its account, and the same message sent again would get a
  * new id and could log everything a second time. PENDING_SEND_MAX only bounds the list by dropping resolved (`seen`)
  * entries from an earlier version, oldest first. An "onyx" key, so signing out (or another account) wipes them.

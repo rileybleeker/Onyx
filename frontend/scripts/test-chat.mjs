@@ -29,6 +29,8 @@ const contract = compile("../src/lib/chat-contract.ts");
 const receiptsLib = compile("../src/lib/chat-receipts.ts");
 const stepsLib = compile("../src/lib/steps.ts");
 const readingPractice = compile("../src/lib/reading-practice.ts");
+let portionCompiled = null;
+const portionLib = () => (portionCompiled ??= compile("../src/lib/delivery-portion.ts"));
 const user = content => ({ role: "user", content });
 test("accepts ordinary text conversation and rejects malformed/tool-injected history", () => {
   assert.equal(contract.validateChatMessages([user("Help plan a week")]), true);
@@ -754,8 +756,17 @@ test("a playlist call that may have reached Spotify is reported as possibly done
 test("the chat page sends a request id and reuses it only for the same text at the same point", () => {
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   assert.match(page, /body: JSON\.stringify\(\{ request_id: requestId, messages: updated\.map/);
-  assert.match(page, /previous && previous\.text === text && previous\.at === messages\.length \? previous\.requestId : null/);
+  assert.match(page, /requestIdForSend\(choice, failedSend\.current, text, messages\.length\)/);
   assert.match(page, /failedSend\.current = \{ text, requestId, at: messages\.length \}/);
+  // Which id a send uses (lib/chat-contract.ts requestIdForSend): only the same text from the same point reuses it.
+  const failed = { text: "Log Synthetic Focus", requestId: RID, at: 2 };
+  assert.equal(contract.requestIdForSend(undefined, failed, "Log Synthetic Focus", 2), RID, "same text, same point: the same request");
+  assert.equal(contract.requestIdForSend(undefined, failed, "Log Synthetic Calm", 2), null, "an edited message is a new request");
+  assert.equal(contract.requestIdForSend(undefined, failed, "Log Synthetic Focus", 4), null, "sent after the conversation moved on: new");
+  assert.equal(contract.requestIdForSend(undefined, null, "Log Synthetic Focus", 2), null, "nothing failed: new");
+  const other = "22222222-2222-4222-8222-222222222222";
+  assert.equal(contract.requestIdForSend({ retryOf: other }, failed, "Log Synthetic Focus", 2), other, "Retry that message: that send's id");
+  assert.equal(contract.requestIdForSend({ fresh: true }, failed, "Log Synthetic Focus", 2), null, "Send as a new message: never reused");
   assert.match(page, /Send the same message again/);
   assert.equal(contract.parseRequestId(undefined), null);
   assert.equal(contract.parseRequestId("not-a-uuid"), false);
@@ -964,12 +975,14 @@ test("a session an earlier try wrote is only read on the retry: a habit answer c
   };
   // The first try's Notion append never answered (no block id stored), then the try stopped before the ledger
   // recorded the session.
-  const readingNotion = { mirrorSession: async () => { mirrors++; return null; }, mirrorProgress: async () => {} };
+  const progress = [];
+  const readingNotion = { mirrorSession: async () => { mirrors++; return null; }, mirrorProgress: async (_book, done, date) => { progress.push([done, date]); } };
   const call = { chapter_through: 2, medium: "paper" };
   const body = { request_id: RID, messages: [user("I finished the synthetic book on paper")] };
   await route(afterTool("log_reading_session", call), { supabase: db, reading, readingNotion }).post(body);
   assert.equal(db.rows("chat_operations")[0].status, "pending");
   assert.equal(mirrors, 1);
+  assert.equal(progress.length, 1, "the first try's own session updates the progress line");
   state.failFinish = false;
   // Since then Riley cleared that day's reading habit and set the book back to reading.
   await db.from("habit_journal").delete().eq("question", "Read synthetic");
@@ -979,6 +992,7 @@ test("a session an earlier try wrote is only read on the retry: a habit answer c
   assert.equal(db.rows("habit_journal").length, 0, "the cleared answer is not stamped again");
   assert.equal(db.rows("books")[0].status, "reading", "the book is not finished again");
   assert.equal(mirrors, 1, "no second Notion entry");
+  assert.equal(progress.length, 1, "no progress line rewritten from the earlier session's date (a newer one may be there)");
   assert.equal(db.rows("reading_sessions").length, 1);
   const result = JSON.parse(r.requests()[1].messages.at(-1).content[0].content);
   assert.equal(result.success, true);
@@ -1331,6 +1345,31 @@ test("a reading session whose key column cannot be read is refused, never writte
   }
 });
 
+test("a keyed reading session is never written without its key, even when the key column vanishes after the check", async () => {
+  // The read of the key column works, then the insert is refused because the column is missing (a stale schema
+  // cache or a rollback between the two): lib/reading.ts logSession refuses (require_client_key), nothing unkeyed.
+  const db = ledgerDb();
+  const inputs = [];
+  const reading = {
+    logSession: async (_client, input) => { inputs.push(input); return { ok: false, error: "client_key could not be stored with this session, so nothing was written" }; },
+    getOverview: async () => null,
+  };
+  const r = route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: db, reading });
+  const body = await (await r.post({ request_id: RID, messages: [user("I read chapter 2")] })).json();
+  assert.equal(inputs.length, 1, "no second, unkeyed attempt");
+  assert.equal(inputs[0].require_client_key, true);
+  assert.equal(inputs[0].client_key, db.rows("chat_operations")[0].op_id);
+  assert.equal(body.receipts[0].status, "not_saved");
+  const result = JSON.parse(r.requests()[1].messages.at(-1).content[0].content);
+  assert.match(result.error, /could not set up safe logging/);
+  // The route's pattern and the library's text are the same words.
+  const routeSource = readFileSync(new URL("../src/app/api/chat/route.ts", import.meta.url), "utf8");
+  const libSource = readFileSync(new URL("../src/lib/reading.ts", import.meta.url), "utf8");
+  const libText = /export const SESSION_KEY_REQUIRED = "([^"]+)"/.exec(libSource)?.[1];
+  const routePattern = /const SESSION_KEY_REFUSED = \/\^([^/]+)\//.exec(routeSource)?.[1];
+  assert.ok(libText && routePattern && libText.startsWith(routePattern), "route pattern matches lib/reading.ts SESSION_KEY_REQUIRED");
+});
+
 test("GET /api/chat/operations reads a request back by its id alone, for the signed-in owner only", async () => {
   const db = ledgerDb();
   const w = keyedIntake();
@@ -1339,6 +1378,7 @@ test("GET /api/chat/operations reads a request back by its id alone, for the sig
     "@supabase/supabase-js": { createClient: () => db },
     "@/lib/chat-contract": contract,
     "@/lib/chat-receipts": receiptsLib,
+    "@/lib/delivery-portion": portionLib(),
   });
   const get = (id) => recovery.GET({ nextUrl: new URL(`https://onyx.example/api/chat/operations${id === undefined ? "" : `?request_id=${id}`}`) });
   const writes = () => db.log.filter((c) => c.op !== "select").length;
@@ -1358,6 +1398,104 @@ test("GET /api/chat/operations reads a request back by its id alone, for the sig
   assert.match(page, /input\.trim\(\) === resendText/, "the resend button only sends the message the composer still holds");
 });
 
+/** POST /api/chat/operations as the browser sends it (same origin, JSON). */
+function abandonRoute(db, session = signedIn) {
+  const recovery = compile("../src/app/api/chat/operations/route.ts", {
+    "@supabase/supabase-js": { createClient: () => db },
+    "@/lib/chat-contract": contract,
+    "@/lib/chat-receipts": receiptsLib,
+    "@/lib/delivery-portion": portionLib(),
+    "@/lib/supabase-server": session,
+  });
+  return (body, headers = {}) => recovery.POST({
+    headers: new Headers({ origin: "https://onyx.example", host: "onyx.example", "content-type": "application/json", ...headers }),
+    nextUrl: new URL("https://onyx.example/api/chat/operations"),
+    json: async () => body,
+  });
+}
+
+test("dismissing 'has not reached Onyx' records the id as abandoned: the request arriving late runs nothing", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const post = abandonRoute(db);
+  const late = "44444444-4444-4444-8444-444444444444";
+  const response = await post({ request_id: late, action: "abandon" });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "private, no-store");
+  assert.deepEqual(await response.json(), { status: "abandoned", receipts: [] });
+  assert.equal(db.rows("chat_requests").length, 1);
+  assert.equal(db.rows("chat_operations").length, 0, "nothing but that one ledger row");
+  // The send was still on its way (another tab, a slow network) and arrives now: refused before the model runs.
+  const arrived = route(logFocus, { supabase: db, intake: w.intake });
+  const answer = await arrived.post({ request_id: late, messages: [user("Log Synthetic Focus")] });
+  assert.equal(answer.status, 409);
+  assert.equal((await answer.json()).code, "request_conflict");
+  assert.equal(arrived.calls(), 0);
+  assert.equal(w.effects.size, 0, "nothing logged");
+  // Dismissed twice (a double tap, a lost answer): still abandoned, one row.
+  assert.equal((await (await post({ request_id: late, action: "abandon" })).json()).status, "abandoned");
+  assert.equal(db.rows("chat_requests").length, 1);
+});
+
+test("an id that reached Onyx before the dismissal is not abandoned: its account comes back and it still replays", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  const data = await (await abandonRoute(db)({ request_id: RID, action: "abandon" })).json();
+  assert.equal(data.status, "settled");
+  assert.deepEqual(data.receipts.map((r) => r.status), ["saved"]);
+  // Retry that message still answers from the ledger.
+  const retry = route(logFocus, { supabase: db, intake: w.intake });
+  const replay = await (await retry.post(body)).json();
+  assert.equal(retry.writes(), 0);
+  assert.equal(replay.receipts[0].status, "unchanged");
+});
+
+test("the abandon POST takes only a same-origin JSON {request_id, action} from the owner, and fails closed", async () => {
+  const db = ledgerDb();
+  const post = abandonRoute(db);
+  const id = "55555555-5555-4555-8555-555555555555";
+  assert.equal((await post({ request_id: id, action: "abandon" }, { origin: "https://elsewhere.example" })).status, 403);
+  assert.equal((await post({ request_id: id, action: "abandon" }, { "content-type": "text/plain" })).status, 415);
+  assert.equal((await post({ request_id: id, action: "abandon" }, { "content-length": "4096" })).status, 413);
+  assert.equal((await post({ request_id: id, action: "abandon", extra: 1 })).status, 400);
+  assert.equal((await post({ request_id: id, action: "delete" })).status, 400);
+  assert.equal((await post({ request_id: "not-a-uuid", action: "abandon" })).status, 400);
+  assert.equal((await post([id])).status, 400);
+  assert.equal(db.rows("chat_requests").length, 0, "nothing recorded for a refused request");
+  const noOwner = { createSupabaseServer: async () => ({ auth: { getClaims: async () => ({ data: null }) } }) };
+  assert.equal((await abandonRoute(db, noOwner)({ request_id: id, action: "abandon" })).status, 503);
+  // The insert's answer is lost: a failure, so the page keeps the id (never "abandoned").
+  const lossy = ledgerDb({ lose: ({ table, op }) => (table === "chat_requests" && op === "insert" ? { message: "fetch failed" } : null) });
+  const lostAnswer = await abandonRoute(lossy)({ request_id: id, action: "abandon" });
+  assert.equal(lostAnswer.status, 503);
+  assert.equal((await lostAnswer.json()).status, "failed");
+});
+
+test("a retry whose earlier writes cannot be read back says so, and the page keeps the send remembered", async () => {
+  const state = { failList: false };
+  const db = ledgerDb({ fail: ({ table, op }) => (state.failList && table === "chat_operations" && op === "select" ? { code: "08006" } : null) });
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  // The retry: the model asks for nothing this time, and the ledger cannot list what the first try saved.
+  state.failList = true;
+  const response = await route([], { supabase: db, intake: w.intake }).post(body);
+  assert.equal(response.status, 200);
+  const data = await response.json();
+  assert.equal(data.earlier_unconfirmed, true, "unknown, not 'nothing was saved'");
+  assert.equal("receipts" in data, false);
+  // Readable again: the earlier write is listed and the flag is gone.
+  state.failList = false;
+  const readable = await (await route([], { supabase: db, intake: w.intake }).post(body)).json();
+  assert.equal("earlier_unconfirmed" in readable, false);
+  assert.equal(readable.receipts.length, 1);
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /const earlierUnknown = data\?\.earlier_unconfirmed === true;/);
+  assert.match(page, /if \(!earlierUnknown\) settlePendingSend\(requestId\);/);
+});
+
 test("the chat page never reuses a remembered send silently: Riley picks retry or new, and a dismissed account is resolved", () => {
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   // A match stops the send and asks; only "Retry that message" reuses the id, "Send as a new message" makes a new one.
@@ -1367,8 +1505,12 @@ test("the chat page never reuses a remembered send silently: Riley picks retry o
   assert.match(page, /Retry that message/);
   assert.match(page, /Send as a new message/);
   assert.match(page, /if \(!requestId && !choice && conv\)/, "a choice skips the question");
-  // Dismissing a definite account (what it saved, or that it never arrived) forgets the send.
-  assert.match(page, /recovery\?\.state === "settled" \|\| recovery\?\.state === "none"\)\) settlePendingSend\(id\)/);
+  // Dismissing a definite account of what it saved forgets the send. "Has not reached Onyx" is forgotten only once the
+  // server recorded the id as abandoned (a late arrival then runs nothing); otherwise its account is shown instead.
+  assert.match(page, /if \(id && recovery\?\.state === "settled"\) \{\s*settlePendingSend\(id\);/);
+  assert.match(page, /if \(id && recovery\?\.state === "none"\) \{[\s\S]*?await abandonPendingSend\(id\)[\s\S]*?if \(outcome === "abandoned"\) \{\s*settlePendingSend\(id\);/);
+  assert.doesNotMatch(page, /state === "none"\)\) settlePendingSend/, "absence alone never forgets the send");
+  assert.match(page, /JSON\.stringify\(\{ request_id: id, action: "abandon" \}\)/);
   assert.doesNotMatch(page, /seenPendingSends/);
   // New chat clears the question.
   assert.match(page, /function newChat\(\) \{[\s\S]*?setMatched\(null\);/);
