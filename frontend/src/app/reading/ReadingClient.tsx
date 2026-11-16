@@ -6,7 +6,7 @@ import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { CONCEPTS, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
@@ -16,6 +16,7 @@ import { sameJson } from "@/lib/format";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
+import ReviewCard from "./ReviewCard";
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -80,8 +81,11 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         setOverview((prev) => (sameJson(prev, json.overview) ? prev : json.overview));
         setBooks((prev) => (sameJson(prev, json.books ?? []) ? prev : json.books ?? []));
         if (json.overview && !which) setSlug(json.overview.book.slug);
+        return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Couldn't load");
+        // The Review card's Refresh keeps its card blocked and says so (ReviewCard.tsx).
+        return false;
       } finally {
         setLoading(false);
       }
@@ -209,7 +213,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
 
       <PartGroup id="section-practice" title="Review & capture">
         <Part id="review" title="Review">
-          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
+          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />
         </Part>
 
         {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
@@ -377,8 +381,11 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
       </div>
       <div className="mt-1 text-[11px] font-mono text-text-tertiary">
         {c.quiz ? (
-          <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
+          <span className={c.quiz.verification !== "invalidated" && c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
             quiz {c.quiz.score}/{c.quiz.total}
+            {/* A question in it was corrected later (lib/reading-questions.ts): kept, earns no XP. Unverified = recorded
+                without its per-question answers, so the score can't be checked (still counted). */}
+            {c.quiz.verification === "invalidated" ? " · corrected" : c.quiz.verification === "unverified" ? " · unverified" : ""}
           </span>
         ) : c.reached ? (
           <Link href="/chat" className="text-accent/80 underline underline-offset-2">
@@ -389,83 +396,6 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
         )}
       </div>
     </div>
-  );
-}
-
-function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number) => void }) {
-  const [queue, setQueue] = useState<Highlight[]>(o.dueReviews);
-  const [revealed, setRevealed] = useState(false);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    setQueue(o.dueReviews);
-    setRevealed(false);
-  }, [o.dueReviews]);
-
-  const cur = queue[0];
-  const nextDue = useMemo(() => {
-    const future = o.highlights.map((h) => h.next_review).filter((d): d is string => !!d && d > o.today).sort();
-    return future[0] ?? null;
-  }, [o.highlights, o.today]);
-
-  const grade = async (g: Grade) => {
-    if (!cur || busy) return;
-    setBusy(true);
-    try {
-      const res = await fetch("/api/reading/review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ highlight_id: cur.highlight_id, grade: g }) });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setQueue((q) => q.slice(1));
-      setRevealed(false);
-      onGraded(json.xp_gained ?? 0);
-    } catch {
-      /* toast handled by parent reload */
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
-      <div className="flex items-baseline justify-between">
-        <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
-        <span className="text-[11px] font-mono text-text-tertiary">
-          {queue.length ? `${queue.length} due` : o.reviewsToday ? `${o.reviewsToday} done today` : nextDue ? `next ${fmtDate(nextDue)}` : "nothing scheduled"}
-        </span>
-      </div>
-      {cur ? (
-        <div className="mt-2">
-          <blockquote className="text-[14px] text-text-primary leading-relaxed border-l-2 border-accent/60 pl-3">{cur.passage}</blockquote>
-          <div className="mt-2 text-[11px] font-mono text-text-tertiary">
-            {cur.chapter != null ? `ch ${cur.chapter}` : ""} {cur.concept ? `· ${cur.concept}` : ""}
-          </div>
-          {!revealed ? (
-            <button onClick={() => setRevealed(true)} className="mt-3 px-3 py-1.5 text-[13px] rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary">
-              Say what this means, then reveal your note
-            </button>
-          ) : (
-            <>
-              <p className="mt-3 text-[13px] text-text-secondary italic">{cur.comment || "No comment on this one. Add one below."}</p>
-              <div className="mt-3 flex gap-2">
-                <GradeBtn label="Again" sub="1d" onClick={() => grade("again")} disabled={busy} className="border-[var(--color-down)]/50 text-[var(--color-down)]" />
-                <GradeBtn label="Good" sub={cur.interval_days ? `${Math.max(1, Math.round(cur.interval_days * Number(cur.ease)))}d` : "3d"} onClick={() => grade("good")} disabled={busy} className="border-border-default text-text-primary" />
-                <GradeBtn label="Easy" sub="longer" onClick={() => grade("easy")} disabled={busy} className="border-accent/60 text-accent" />
-              </div>
-            </>
-          )}
-        </div>
-      ) : (
-        <p className="mt-2 text-[13px] text-text-tertiary">Nothing due. New highlights come up the next day, then at growing intervals based on your grades.</p>
-      )}
-    </section>
-  );
-}
-
-function GradeBtn({ label, sub, onClick, disabled, className }: { label: string; sub: string; onClick: () => void; disabled: boolean; className: string }) {
-  return (
-    <button onClick={onClick} disabled={disabled} className={`flex-1 h-11 rounded-control border bg-white/[0.02] disabled:opacity-40 ${className}`}>
-      <div className="text-[13px] font-medium leading-none">{label}</div>
-      <div className="text-[10px] font-mono opacity-70 mt-1">{sub}</div>
-    </button>
   );
 }
 

@@ -1,4 +1,17 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import {
+  isMissingSchema,
+  isOpKey,
+  newOpKey,
+  PRACTICE_GRADES,
+  QUIZ_CHECKPOINT_MAX,
+  rpcFailure,
+  scheduleAfterGrade,
+  type PracticeFailure,
+  type PracticeGrade,
+  type RpcAnswer,
+} from "@/lib/reading-practice";
+import { quizVerification, type QuizVerification } from "@/lib/reading-questions";
 
 /**
  * Reading module — shared server logic for /api/reading/* and the chat tools.
@@ -16,7 +29,7 @@ type Supa = SupabaseClient<any, any, any>;
 
 export type Medium = "audio" | "kindle" | "paper" | "other";
 export type HighlightSource = "manual" | "kindle" | "audible" | "paper" | "photo";
-export type Grade = "again" | "good" | "easy";
+export type Grade = PracticeGrade;
 
 export interface Book {
   book_id: number;
@@ -107,6 +120,12 @@ export interface Quiz {
   total: number;
   notes: string | null;
   quiz_date: string;
+  /** Graded answers this result was checked against (sql/reading_learning_questions.sql); null/absent = unverifiable. */
+  question_count?: number | null;
+  /** Answers in it whose question was corrected later: > 0 = invalidated (shown, not counted). */
+  invalidated_count?: number | null;
+  /** Set by computeOverview (lib/reading-questions.ts quizVerification). */
+  verification?: QuizVerification;
 }
 
 // Explicit column lists instead of select("*") (re-audit 2026-06-07,
@@ -121,7 +140,6 @@ export const SESSION_COLS =
   "session_id, book_id, session_date, chapter_from, chapter_through, minutes, medium, recall, question, notion_block_id, created_at, source, in_chapter, highlight_count, updated_at";
 export const HIGHLIGHT_COLS =
   "highlight_id, book_id, chapter, location, passage, comment, concept, source, review_count, ease, interval_days, next_review, last_reviewed, archived, notion_block_id, created_at, updated_at, position, position_end, page, highlighted_at, note_at, behavioral_date";
-const QUIZ_COLS = "quiz_id, book_id, checkpoint, score, total, notes, quiz_date, taken_at";
 
 export interface Checkpoint {
   key: string; // 'ch12'
@@ -327,7 +345,10 @@ export function computeOverview(input: {
   quizzes: Quiz[];
   chapters?: ChapterSpan[];
 }): ReadingOverview {
-  const { book, today, sessions, highlights, reviews, quizzes } = input;
+  const { book, today, sessions, highlights, reviews } = input;
+  // Every result stays listed with its verification; one whose question was corrected later earns nothing.
+  const quizzes = input.quizzes.map((q) => ({ ...q, verification: quizVerification(q) }));
+  const countedQuizzes = quizzes.filter((q) => q.verification !== "invalidated");
   const chapters = input.chapters ?? [];
   const totalChapters = book.total_chapters ?? 0;
   const chaptersDone = Math.min(
@@ -369,7 +390,7 @@ export function computeOverview(input: {
   const recallSessions = sessions.filter((s) => (s.recall ?? "").trim().length >= 40).length;
   const reviewDays = new Set(reviews.map((r) => r.review_date));
   const reviewsToday = reviews.filter((r) => r.review_date === today).length;
-  const quizPoints = quizzes.reduce((a, q) => a + q.score, 0);
+  const quizPoints = countedQuizzes.reduce((a, q) => a + q.score, 0);
   const checkpoints = computeCheckpoints(book, sessions, quizzes, today, start, target);
   const onTimeCheckpoints = checkpoints.filter((c) => c.reached && c.onTime === true).length;
   const xp: XpBreakdown = {
@@ -390,7 +411,7 @@ export function computeOverview(input: {
     perLevel: XP.perLevel,
   };
 
-  const badges = computeBadges({ book, sessions, highlights, reviews, quizzes, checkpoints, chaptersDone, totalChapters, best });
+  const badges = computeBadges({ book, sessions, highlights, reviews, quizzes: countedQuizzes, checkpoints, chaptersDone, totalChapters, best });
 
   // Burn-up series: one point per day from start to target.
   const burnup: ReadingOverview["burnup"] = [];
@@ -487,7 +508,11 @@ function computeCheckpoints(
     const reached = !!reachedOn;
     const onTime = reached ? reachedOn! <= due : today > due ? false : null;
     const key = `ch${chapter}`;
-    const quiz = quizzes.find((q) => q.checkpoint === key) ?? null;
+    // Newest first (the read orders by taken_at desc): the newest result still counted, else the newest corrected one.
+    const quiz =
+      quizzes.find((q) => q.checkpoint === key && q.verification !== "invalidated") ??
+      quizzes.find((q) => q.checkpoint === key) ??
+      null;
     return { key, chapter, due, reached, onTime, quiz };
   });
 }
@@ -654,18 +679,16 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
 }
 
 export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
-  const book = input.book_id
-    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
-    : await getBook(supabase, input.slug ?? null);
-  if (!book) return { ok: false, error: "No active book found" };
-
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
-  const replay = async (prior: ReadingSession): Promise<LogSessionResult> => {
+  /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
+  const replay = async (prior: ReadingSession, fallback: Book | null): Promise<LogSessionResult | null> => {
     const { data: b } = await supabase.from("books").select(BOOK_COLS).eq("book_id", prior.book_id).maybeSingle();
+    const ofSession = (b as Book | null) ?? fallback;
+    if (!ofSession) return null;
     const prevMax = await furthestChapter(supabase, prior.book_id, prior.session_id);
     return {
       ok: true,
-      book: (b as Book | null) ?? book,
+      book: ofSession,
       session: prior,
       xpGained: sessionXp(prior.chapter_through ?? 0, prevMax, prior.recall),
       finished: false,
@@ -674,10 +697,19 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
       replayed: true,
     };
   };
+  // A retried create answers its stored session BEFORE the book is resolved: the session it made may have finished
+  // the book (no active book any more) or another book may be active now, and the retry of a create whose answer was
+  // lost must still get that session back, not "No active book found".
   if (key) {
     const prior = await sessionByClientKey(supabase, key);
-    if (prior) return replay(prior);
+    const replayed = prior ? await replay(prior, null) : null;
+    if (replayed) return replayed;
   }
+
+  const book = input.book_id
+    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+    : await getBook(supabase, input.slug ?? null);
+  if (!book) return { ok: false, error: "No active book found" };
 
   const through = Math.floor(Number(input.chapter_through));
   if (!Number.isFinite(through) || through < 0) return { ok: false, error: "chapter_through must be a non-negative integer" };
@@ -708,7 +740,8 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
   if (error && key && error.code === "23505") {
     // The same create arrived twice at once: the other one made the session.
     const prior = await sessionByClientKey(supabase, key);
-    if (prior) return replay(prior);
+    const replayed = prior ? await replay(prior, book) : null;
+    if (replayed) return replayed;
   }
   if (error && key && missingColumn(error)) ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
   if (error) return { ok: false, error: error.message };
@@ -1070,78 +1103,177 @@ export async function addHighlight(
 }
 
 /**
- * SM-2 lite. again → interval 1 day, ease −0.2 (floor 1.3). good → first review 3 days,
- * then interval × ease. easy → interval × ease × 1.3, ease +0.15. Returns the updated row.
+ * The review scheduler lives in lib/reading-practice.ts (SM-2 lite), shared by the commit below and the review
+ * card's previews, so the interval shown under a grade button is the one the server stores.
  */
-export function scheduleAfterGrade(h: Pick<Highlight, "ease" | "interval_days" | "review_count">, grade: Grade, today: string) {
-  let ease = Number(h.ease) || 2.5;
-  let interval = h.interval_days || 0;
-  if (grade === "again") {
-    ease = Math.max(1.3, ease - 0.2);
-    interval = 1;
-  } else if (grade === "good") {
-    interval = interval === 0 ? 1 : interval === 1 ? 3 : Math.round(interval * ease);
-  } else {
-    ease = Math.min(3.0, ease + 0.15);
-    interval = interval === 0 ? 3 : Math.round(interval * ease * 1.3);
+export { scheduleAfterGrade };
+
+export interface GradeInput {
+  highlight_id: number;
+  grade: Grade;
+  /** Operation key from the review card (one per card until a definite answer); absent = one is made here. */
+  op_key?: string | null;
+  /** The card's review count on screen: another grade in between answers 409 changed. */
+  expected_review_count?: number | null;
+  /** Behavioral day override (tests); default pds.behavioral_today_now(). */
+  date?: string | null;
+}
+
+export interface GradeReceipt {
+  op_key: string;
+  review_id: number;
+  review_date: string;
+  grade: Grade;
+  interval_days: number;
+  next_review: string;
+  review_count: number;
+}
+
+export type GradeResult =
+  | { ok: true; highlight: Highlight | null; firstReviewToday: boolean; replayed: boolean; receipt: GradeReceipt }
+  | PracticeFailure;
+
+/**
+ * Grade one highlight: ONE call of pds.reading_grade_review (sql/reading_practice_receipts.sql), which locks the
+ * highlight, stores the review, writes the schedule computed here and records the receipt in one transaction. The
+ * same op_key answers the stored receipt again (a retry after a lost answer); there is no direct-write fallback
+ * (a missing function is 503 practice_unavailable). When another write lands between the read and the lock
+ * (`raced`), the row is read again and the schedule recomputed, at most three times.
+ */
+export async function gradeHighlight(supabase: Supa, input: GradeInput): Promise<GradeResult> {
+  if (!PRACTICE_GRADES.includes(input.grade)) return { ok: false, status: 400, error: "bad_grade" };
+  if (!(Number.isInteger(input.highlight_id) && input.highlight_id > 0)) return { ok: false, status: 400, error: "bad_highlight" };
+  if (input.op_key != null && !isOpKey(input.op_key)) return { ok: false, status: 400, error: "bad_op_key" };
+  const opKey = input.op_key ?? newOpKey();
+  const today = input.date ?? (await behavioralToday(supabase));
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data: h, error } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", input.highlight_id).maybeSingle();
+    if (error) return { ok: false, status: 500, error: "failed" };
+    const row = (h as Highlight | null) ?? null;
+    // A missing row still goes to the function: the receipt of an earlier try answers first, else 404.
+    const basis = row ? { review_count: row.review_count, interval_days: row.interval_days, ease: Number(row.ease) } : null;
+    const schedule = row ? scheduleAfterGrade(row, input.grade, today) : null;
+    const { data, error: rpcError } = await supabase.rpc("reading_grade_review", {
+      p: {
+        op_key: opKey,
+        highlight_id: input.highlight_id,
+        grade: input.grade,
+        review_date: today,
+        basis,
+        schedule: schedule && { ease: schedule.ease, interval_days: schedule.interval_days, next_review: schedule.next_review },
+        client_review_count: input.expected_review_count ?? null,
+      },
+    });
+    const answer = data as RpcAnswer | null;
+    const failed = rpcFailure(answer, rpcError);
+    if (failed) {
+      if (failed.error === "raced" && attempt < 2) continue;
+      return failed.error === "raced" ? { ok: false, status: 409, error: "changed" } : failed;
+    }
+    const a = answer as RpcAnswer;
+    let highlight = (a.highlight as Highlight | undefined) ?? null;
+    if (a.replayed) {
+      // The receipt holds the schedule as committed; the row itself may have moved on since. Best effort.
+      const { data: now } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", input.highlight_id).maybeSingle();
+      highlight = (now as Highlight | null) ?? null;
+    }
+    if (highlight) highlight = { ...highlight, ease: Number(highlight.ease) };
+    return {
+      ok: true,
+      highlight,
+      firstReviewToday: a.first_review_today === true,
+      replayed: a.replayed === true,
+      receipt: {
+        op_key: opKey,
+        review_id: Number(a.review_id),
+        review_date: String(a.review_date),
+        grade: a.grade as Grade,
+        interval_days: Number(a.interval_days),
+        next_review: String(a.next_review),
+        review_count: Number(a.review_count),
+      },
+    };
   }
-  interval = Math.max(1, Math.min(interval, 365));
-  return {
-    ease: Math.round(ease * 100) / 100,
-    interval_days: interval,
-    next_review: addDays(today, interval),
-    last_reviewed: today,
-    review_count: (h.review_count ?? 0) + 1,
-  };
+  return { ok: false, status: 409, error: "changed" };
 }
 
-export async function gradeHighlight(
-  supabase: Supa,
-  highlight_id: number,
-  grade: Grade,
-  date?: string | null,
-): Promise<{ ok: true; highlight: Highlight; firstReviewToday: boolean } | { ok: false; error: string }> {
-  if (!["again", "good", "easy"].includes(grade)) return { ok: false, error: "grade must be again | good | easy" };
-  const { data: h, error } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", highlight_id).maybeSingle();
-  if (error) return { ok: false, error: error.message };
-  if (!h) return { ok: false, error: "highlight not found" };
-  const today = date ?? (await behavioralToday(supabase));
-
-  const { count } = await supabase
-    .from("reading_reviews")
-    .select("review_id", { count: "exact", head: true })
-    .eq("review_date", today);
-  const firstReviewToday = (count ?? 0) === 0;
-
-  const { error: rErr } = await supabase.from("reading_reviews").insert({ highlight_id, review_date: today, grade });
-  if (rErr) return { ok: false, error: rErr.message };
-  const patch = scheduleAfterGrade(h as Highlight, grade, today);
-  const { data: updated, error: uErr } = await supabase.from("book_highlights").update(patch).eq("highlight_id", highlight_id).select(HIGHLIGHT_COLS).single();
-  if (uErr) return { ok: false, error: uErr.message };
-  return { ok: true, highlight: updated as Highlight, firstReviewToday };
+export interface QuizInput {
+  slug?: string | null;
+  book_id?: number | null;
+  checkpoint: string;
+  score: number;
+  total: number;
+  notes?: string | null;
+  date?: string | null;
+  /** Operation key: the same key + result answers the stored receipt (no second row, no second points). */
+  op_key?: string | null;
 }
 
-export async function recordQuiz(
-  supabase: Supa,
-  input: { slug?: string | null; book_id?: number | null; checkpoint: string; score: number; total: number; notes?: string | null; date?: string | null },
-): Promise<{ ok: true; quiz: Quiz; passed: boolean } | { ok: false; error: string }> {
-  const book = input.book_id
-    ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
-    : await getBook(supabase, input.slug ?? null);
-  if (!book) return { ok: false, error: "No active book found" };
+export type QuizResult = { ok: true; quiz: Quiz; passed: boolean; replayed: boolean; op_key: string } | PracticeFailure;
+
+/**
+ * The book a quiz operation key's stored receipt was recorded for (pds.reading_practice_ops; book_id null = nothing is
+ * stored under this key, or a review is). A failed read is a failure, never "no receipt": guessing the active book
+ * instead could turn the retry of a stored result into 409 key_reused. Codes only.
+ */
+async function quizReceiptBook(supabase: Supa, opKey: string): Promise<{ ok: true; book_id: number | null } | PracticeFailure> {
+  const { data, error } = await supabase.from("reading_practice_ops").select("kind, result").eq("op_key", opKey.toLowerCase()).maybeSingle();
+  if (error) return isMissingSchema(error) ? { ok: false, status: 503, error: "practice_unavailable" } : { ok: false, status: 500, error: "failed" };
+  const row = data as { kind?: unknown; result?: { book_id?: unknown } | null } | null;
+  const id = row?.kind === "quiz" ? Number(row.result?.book_id) : NaN;
+  return { ok: true, book_id: Number.isInteger(id) && id > 0 ? id : null };
+}
+
+/**
+ * Record a checkpoint quiz result: ONE call of pds.reading_record_quiz (quiz row + receipt, one transaction). Each
+ * stored row is one durable attempt and counts toward XP; a retry under the same op_key stores nothing new.
+ * Without a key (an older page, and the chat tool until it passes its operation id) one is made here, so that call is
+ * atomic but a retry of it is a new attempt. A caller that retries must hold one op_key across its tries, and must
+ * classify a failure with failureMayHaveWritten (lib/reading-practice.ts), never by the message text.
+ */
+export async function recordQuiz(supabase: Supa, input: QuizInput): Promise<QuizResult> {
+  if (input.op_key != null && !isOpKey(input.op_key)) return { ok: false, status: 400, error: "bad_op_key" };
+  // A key that already stored a result is bound to the book it was stored for. With no book named, the retry of a
+  // result whose answer was lost uses THAT book, not the one active now (the active book may have changed in
+  // between), so it answers its receipt instead of 409 key_reused or 404. A named book is part of the request.
+  let bookId: number | null = null;
+  if (!input.book_id && !input.slug && input.op_key != null) {
+    const bound = await quizReceiptBook(supabase, input.op_key);
+    if (!bound.ok) return bound;
+    bookId = bound.book_id;
+  }
+  if (bookId == null) {
+    const book = input.book_id
+      ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
+      : await getBook(supabase, input.slug ?? null);
+    if (!book) return { ok: false, status: 404, error: "No active book found" };
+    bookId = book.book_id;
+  }
   const score = Math.round(Number(input.score));
   const total = Math.round(Number(input.total));
-  if (!(total > 0) || !(score >= 0) || score > total) return { ok: false, error: "score must be between 0 and total" };
+  if (!(total > 0) || !(score >= 0) || score > total) return { ok: false, status: 400, error: "score must be between 0 and total" };
   const checkpoint = input.checkpoint?.trim();
-  if (!checkpoint) return { ok: false, error: "checkpoint is required (e.g. ch12)" };
-  const quiz_date = input.date ?? (await behavioralToday(supabase));
-  const { data, error } = await supabase
-    .from("reading_quizzes")
-    .insert({ book_id: book.book_id, checkpoint, score, total, notes: input.notes?.trim() || null, quiz_date })
-    .select(QUIZ_COLS)
-    .single();
-  if (error) return { ok: false, error: error.message };
-  return { ok: true, quiz: data as Quiz, passed: score / total >= 0.8 };
+  if (!checkpoint) return { ok: false, status: 400, error: "checkpoint is required (e.g. ch12)" };
+  if (checkpoint.length > QUIZ_CHECKPOINT_MAX) return { ok: false, status: 400, error: "checkpoint is too long" };
+  const notes = input.notes?.trim() || null;
+  const opKey = input.op_key ?? newOpKey();
+  const { data, error } = await supabase.rpc("reading_record_quiz", {
+    p: { op_key: opKey, book_id: bookId, checkpoint, score, total, notes, quiz_date: input.date ?? null },
+  });
+  const failed = rpcFailure(data as RpcAnswer | null, error);
+  if (failed) return failed;
+  const a = data as RpcAnswer;
+  const quiz: Quiz = {
+    quiz_id: Number(a.quiz_id),
+    book_id: Number(a.book_id),
+    checkpoint: String(a.checkpoint),
+    score: Number(a.score),
+    total: Number(a.total),
+    notes,
+    quiz_date: String(a.quiz_date),
+  };
+  return { ok: true, quiz, passed: a.passed === true, replayed: a.replayed === true, op_key: opKey };
 }
 
 /** Compact text summary for the chat tool (so the model can coach and quiz). */
@@ -1158,6 +1290,7 @@ export function summarizeForChat(o: ReadingOverview) {
     checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null })),
     position: o.position,
     recent_sessions: o.sessions.slice(0, 10).map((s) => ({
+      id: s.session_id,
       date: s.session_date,
       chapters: s.chapter_through != null ? `${s.chapter_from ?? "?"}-${s.chapter_through}` : s.in_chapter != null ? `reading ch ${s.in_chapter} (no chapter completed)` : "?",
       source: s.source,
@@ -1168,6 +1301,6 @@ export function summarizeForChat(o: ReadingOverview) {
     })),
     highlights: o.highlights.slice(0, 40).map((h) => ({ id: h.highlight_id, chapter: h.chapter, concept: h.concept, passage: h.passage, comment: h.comment })),
     due_reviews: o.dueReviews.map((h) => ({ id: h.highlight_id, passage: h.passage, comment: h.comment })),
-    quizzes: o.quizzes.map((q) => ({ checkpoint: q.checkpoint, score: `${q.score}/${q.total}`, date: q.quiz_date })),
+    quizzes: o.quizzes.map((q) => ({ checkpoint: q.checkpoint, score: `${q.score}/${q.total}`, date: q.quiz_date, verification: q.verification ?? quizVerification(q) })),
   };
 }

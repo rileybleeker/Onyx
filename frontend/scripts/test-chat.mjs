@@ -17,6 +17,7 @@ function compile(path, imports = {}, sandboxConsole = { error() {} }) {
 const contract = compile("../src/lib/chat-contract.ts");
 const receiptsLib = compile("../src/lib/chat-receipts.ts");
 const stepsLib = compile("../src/lib/steps.ts");
+const readingPractice = compile("../src/lib/reading-practice.ts");
 const user = content => ({ role: "user", content });
 test("accepts ordinary text conversation and rejects malformed/tool-injected history", () => {
   assert.equal(contract.validateChatMessages([user("Help plan a week")]), true);
@@ -37,7 +38,7 @@ function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite 
     "@/lib/spotify-server": spotify,
     "@/lib/supplement-stacks": stacks,
     "@/lib/supplement-intake": {currentTimeZone: async()=>"UTC", behavioralToday: async()=>today, logSupplementIntake: async(_client, input)=>{writes++; onWrite(writes); return typeof intake === "function" ? intake(input) : intake;}},
-    "@/lib/reading": reading, "@/lib/reading-notion": readingNotion,
+    "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-practice": readingPractice,
   }, sandboxConsole);
   return {post: body => exports.POST({json:async()=>body,signal:new AbortController().signal}), raw:exports.POST, calls:()=>calls,writes:()=>writes,requests:()=>requests};
 }
@@ -151,7 +152,7 @@ test("a health data question still runs its tool and returns the result to the m
 });
 test("unexpected failures return a generic error without leaking details",async()=>{
   class Boom { messages = { create: async () => { throw new Error("secret upstream detail"); } }; }
-  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{}});
+  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-practice":readingPractice});
   const response=await exports.POST({json:async()=>({messages:[user("Explain")]}),signal:new AbortController().signal});
   assert.equal(response.status,500);
   assert.doesNotMatch(JSON.stringify(await response.json()),/secret upstream detail/);
@@ -173,7 +174,7 @@ test("suggestions never create a playlist: only an explicit request does",async(
 test("server logs only the error class and status, never the message, while the client gets generic text",async()=>{
   const logged=[];
   class Boom { messages = { create: async () => { const e=new Error("secret upstream detail with user text: my private note"); e.name="APIError"; e.status=529; throw e; } }; }
-  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{}},{error:(...args)=>logged.push(args)});
+  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-practice":readingPractice},{error:(...args)=>logged.push(args)});
   const response=await exports.POST({json:async()=>({messages:[user("my private note")]}),signal:new AbortController().signal});
   assert.equal(response.status,500);
   assert.match((await response.json()).error,/Unable to finish this request/);
@@ -445,7 +446,7 @@ test("when a request stops after a write, the error response still carries the r
   // A failure in the model call after the write: generic error text, receipt kept.
   let calls = 0;
   class FailsSecond { messages = { create: async () => { if (++calls === 1) return { stop_reason: "tool_use", content: [toolUse("log_supplement_intake", { product: "Synthetic Focus" })] }; throw new Error("upstream"); } }; }
-  const exports = compile("../src/app/api/chat/route.ts", { "@anthropic-ai/sdk": FailsSecond, "@supabase/supabase-js": { createClient: () => ({}) }, "@/lib/chat-contract": contract, "@/lib/chat-receipts": receiptsLib, "@/lib/steps": stepsLib, "@/lib/spotify-server": {}, "@/lib/supplement-stacks": {}, "@/lib/supplement-intake": { currentTimeZone: async () => "UTC", behavioralToday: async () => "2026-11-11", logSupplementIntake: async () => intake }, "@/lib/reading": {}, "@/lib/reading-notion": {} });
+  const exports = compile("../src/app/api/chat/route.ts", { "@anthropic-ai/sdk": FailsSecond, "@supabase/supabase-js": { createClient: () => ({}) }, "@/lib/chat-contract": contract, "@/lib/chat-receipts": receiptsLib, "@/lib/steps": stepsLib, "@/lib/spotify-server": {}, "@/lib/supplement-stacks": {}, "@/lib/supplement-intake": { currentTimeZone: async () => "UTC", behavioralToday: async () => "2026-11-11", logSupplementIntake: async () => intake }, "@/lib/reading": {}, "@/lib/reading-notion": {}, "@/lib/reading-practice": readingPractice });
   const failed = await exports.POST({ json: async () => ({ messages: [user("Log Synthetic Focus")] }), signal: new AbortController().signal });
   assert.equal(failed.status, 500);
   const failedBody = await failed.json();
