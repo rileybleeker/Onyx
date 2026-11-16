@@ -40,8 +40,8 @@ test("typed fields also save when they are left (blur), not only after the pause
 
 test("a new stack and a new care item are created once complete, then edited in place", () => {
   const stack = read("components/StackEditorModal.tsx");
-  assert.match(stack, /stackIdRef\.current === null\)[\s\S]{0,200}method: "POST"/);
-  assert.match(stack, /method: "PATCH", body: \{ stack_id: stackIdRef\.current/);
+  assert.match(stack, /const creating = stackIdRef\.current === null;[\s\S]{0,200}stackSaveRequest\("POST"/);
+  assert.match(stack, /stackSaveRequest\("PATCH", \{ stack_id: stackIdRef\.current/);
   assert.match(stack, /if \(!f\.name\.trim\(\)\) return "Give the stack a name\."/);
   const care = read("app/health/HealthClient.tsx");
   assert.match(care, /exists \? \{ type: 'update', id, patch: fields \} : \{ type: 'create'/);
@@ -50,13 +50,15 @@ test("a new stack and a new care item are created once complete, then edited in 
 
 test("a retried stack create returns the same stack (client_key), and the SQL is additive", () => {
   const modal = read("components/StackEditorModal.tsx");
-  assert.match(modal, /body: \{ \.\.\.body, client_key: clientKey\.current \}/, "the create carries the key");
+  assert.match(modal, /\{ \.\.\.body, client_key: clientKey\.current, \.\.\.fields \}/, "the create carries the key");
   assert.match(modal, /clientKey\.current = stack\.stack_id \? null : newClientKey\(\)/, "one key per new stack");
+  // The lookup, adoption and concurrent-insert handling moved into pds.save_supplement_stack (one transaction,
+  // sql/supplement_stack_atomic_save.sql); its behaviour is in tests/supplement-stack-save.test.cjs.
+  const atomic = fs.readFileSync(path.join(SRC, "..", "..", "sql", "supplement_stack_atomic_save.sql"), "utf8");
+  assert.match(atomic, /WHERE client_key = p_client_key FOR UPDATE/, "looks the key up first");
+  assert.match(atomic, /ON CONFLICT \(client_key\) WHERE client_key IS NOT NULL DO NOTHING/, "a concurrent insert of the same key is adopted");
   const route = read("app/api/supplements/stacks/route.ts");
-  assert.match(route, /\.eq\("client_key", key\)\.maybeSingle\(\)/, "looks the key up first");
-  assert.match(route, /existing: true/, "answers with the stack already there");
-  assert.match(route, /stackErr\.code === "23505"/, "a concurrent insert of the same key is adopted");
-  assert.match(route, /missingKeyColumn/, "works before the column exists");
+  assert.doesNotMatch(route, /missingKeyColumn/, "no keyless fallback");
   const sql = fs.readFileSync(path.join(SRC, "..", "..", "sql", "supplement_stack_client_key.sql"), "utf8");
   assert.doesNotMatch(sql, /drop/i, "no DROP anywhere (the Supabase connector declines it)");
   assert.match(sql, /ADD COLUMN IF NOT EXISTS client_key uuid/);

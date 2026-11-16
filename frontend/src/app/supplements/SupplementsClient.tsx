@@ -86,6 +86,8 @@ interface Stack {
   items: StackItem[];
   item_count: number;
   total_doses: number;
+  /** Sent back with each editor save (409 when the stack changed elsewhere); absent before the migration. */
+  version?: number | null;
 }
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -527,6 +529,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                           name: s.name,
                           description: s.description,
                           remind_time: s.remind_time,
+                          version: s.version ?? null,
                           items: s.items.map((i) => ({
                             product_id: i.product_id,
                             doses: Number(i.doses),

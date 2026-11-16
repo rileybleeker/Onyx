@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
-import { saveRequest } from "@/lib/autosave";
+import { AutosaveRefused } from "@/lib/autosave";
+import { StackConflict, StackSaveChain, stackSaveRequest } from "@/lib/supplement-stack-chain";
 import { useAutosave } from "@/lib/use-autosave";
 
 /** A product from the /supplements library picker (subset of the page's Product). */
@@ -30,6 +31,8 @@ export interface EditableStack {
   /** Local 'HH:MM' for the push reminder; null / empty = reminders off. */
   remind_time?: string | null;
   items: StackItemDraft[];
+  /** pds.supplement_stack.version as loaded (null = a new stack, or a server without versions). */
+  version?: number | null;
 }
 
 interface Props {
@@ -76,6 +79,11 @@ function notReady(f: StackForm): string | null {
  * client_key (one UUID per new stack), so a create retried after a lost answer returns that stack instead of a second
  * copy (sql/supplement_stack_client_key.sql). Done (or a tap outside) sends what is waiting and closes; a failed save
  * keeps the editor open with its message.
+ *
+ * Each save is one transaction on the server (header + the complete item list, sql/supplement_stack_atomic_save.sql)
+ * and carries the version this editor last saw plus save ids (lib/supplement-stack-chain.ts). When the stack was
+ * changed somewhere else in the meantime the server refuses with 409; the editor then stops sending and offers to load
+ * the latest version instead of overwriting it.
  */
 export default function StackEditorModal({ open, stack, products, onClose, onSaved }: Props) {
   const [name, setName] = useState("");
@@ -90,6 +98,9 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
   const stackIdRef = useRef<number | null>(null);
   const clientKey = useRef<string | null>(null);
   const savedAny = useRef(false);
+  const chain = useRef<StackSaveChain>(new StackSaveChain(null, newClientKey));
+  /** The stack changed somewhere else since it was loaded: nothing more is sent until the latest is loaded. */
+  const [conflict, setConflict] = useState(false);
 
   const autosave = useAutosave<StackForm>("stack-editor", {
     delayMs: 500,
@@ -102,16 +113,29 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         remind_time: f.remind_time || null,
         items: f.items,
       };
-      if (stackIdRef.current === null) {
-        clientKey.current ??= newClientKey();
-        const json = await saveRequest("/api/supplements/stacks", { method: "POST", body: { ...body, client_key: clientKey.current }, keepalive });
+      const fields = chain.current.next(body);
+      const creating = stackIdRef.current === null;
+      let json: Record<string, unknown>;
+      try {
+        if (creating) {
+          clientKey.current ??= newClientKey();
+          json = await stackSaveRequest("POST", { ...body, client_key: clientKey.current, ...fields }, keepalive);
+        } else {
+          json = await stackSaveRequest("PATCH", { stack_id: stackIdRef.current, ...body, ...fields }, keepalive);
+        }
+      } catch (e) {
+        // A refusal wrote nothing; a network or server failure may have gone through (its id stays unanswered).
+        if (e instanceof AutosaveRefused) chain.current.refused(fields);
+        if (e instanceof StackConflict) setConflict(true);
+        throw e;
+      }
+      chain.current.accepted(json.version);
+      if (creating) {
         const id = Number(json.stack_id);
         if (Number.isFinite(id)) {
           stackIdRef.current = id;
           setStackId(id);
         }
-      } else {
-        await saveRequest("/api/supplements/stacks", { method: "PATCH", body: { stack_id: stackIdRef.current, ...body }, keepalive });
       }
       savedAny.current = true;
     },
@@ -129,6 +153,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     stackIdRef.current = stack.stack_id ?? null;
     setStackId(stack.stack_id ?? null);
     clientKey.current = stack.stack_id ? null : newClientKey();
+    chain.current = new StackSaveChain(stack.stack_id ? (stack.version ?? null) : null, newClientKey);
+    setConflict(false);
     savedAny.current = false;
     resetAutosave(stack.stack_id ? formOf(stack.name, stack.description ?? "", stack.remind_time ?? "", stack.items) : undefined);
   }, [stack, resetAutosave]);
@@ -148,8 +174,12 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
 
   if (!open || !stack) return null;
 
+  /** Fields and buttons that change the stack stop while a delete runs or after a 409 (load the latest first). */
+  const locked = deleting || conflict;
+
   /** Every edit goes through here: typing waits for a pause, a tap is sent almost at once. */
   function send(next: Partial<{ name: string; description: string; remindTime: string; items: StackItemDraft[] }>, typed = false) {
+    if (conflict) return;
     const f = formOf(next.name ?? name, next.description ?? description, next.remindTime ?? remindTime, next.items ?? items);
     autosave.change(f, { delayMs: typed ? 1200 : 400 });
   }
@@ -181,6 +211,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
    * already saved and now left without a name or products (its last complete version stays saved; Close leaves).
    */
   async function done() {
+    if (conflict) return loadLatest();
     if (notReady(formOf(name, description, remindTime, items)) && stackIdRef.current !== null) return;
     await closeNow();
   }
@@ -190,10 +221,17 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
    * complete change that could not be saved keeps the editor open (its status line has Retry).
    */
   async function closeNow() {
+    if (conflict) return loadLatest();
     const ok = await autosave.flush();
     if (!ok && !notReady(formOf(name, description, remindTime, items))) return;
     if (savedAny.current) onSaved();
     else onClose();
+  }
+
+  /** After a 409: the refused change is let go and the stacks are read again (open the stack again to edit it). */
+  function loadLatest() {
+    autosave.reset();
+    onSaved();
   }
 
   async function archive() {
@@ -251,7 +289,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
             send({ name: e.target.value }, true);
           }}
           onBlur={() => void autosave.flush()}
-          disabled={deleting}
+          disabled={locked}
           placeholder="e.g. Morning stack"
           className="w-full mb-3 px-3 py-2 text-[14px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
@@ -267,7 +305,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
             send({ description: e.target.value }, true);
           }}
           onBlur={() => void autosave.flush()}
-          disabled={deleting}
+          disabled={locked}
           placeholder="e.g. taken right after waking"
           className="w-full mb-4 px-3 py-2 text-[13px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
         />
@@ -284,7 +322,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
               send({ remindTime: e.target.value }, true);
             }}
             onBlur={() => void autosave.flush()}
-            disabled={deleting}
+            disabled={locked}
             aria-label="Reminder time"
             className="px-3 py-2 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           />
@@ -295,7 +333,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
                 setRemindTime("");
                 send({ remindTime: "" });
               }}
-              disabled={deleting}
+              disabled={locked}
               className="px-2 py-1 text-[11px] font-mono text-text-tertiary hover:text-text-primary disabled:opacity-40 transition-colors"
             >
               clear
@@ -344,14 +382,14 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
                     value={it.doses}
                     onChange={(e) => setDoses(it.product_id, e.target.value)}
                     onBlur={() => void autosave.flush()}
-                    disabled={deleting}
+                    disabled={locked}
                     className="w-[64px] px-2 py-1 text-[13px] tabular-nums bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
                     title="Doses logged for this product"
                   />
                   <span className="text-[10px] text-text-tertiary font-mono shrink-0">dose</span>
                   <button
                     onClick={() => removeItem(it.product_id)}
-                    disabled={deleting}
+                    disabled={locked}
                     className="px-1 text-[14px] text-text-tertiary/60 hover:text-red-400 disabled:opacity-40 transition-colors"
                     aria-label="Remove product"
                   >
@@ -368,7 +406,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           <select
             value={addProductId}
             onChange={(e) => addItem(e.target.value)}
-            disabled={deleting || available.length === 0}
+            disabled={locked || available.length === 0}
             className="flex-1 px-3 py-2 text-[12px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           >
             <option value="">
@@ -383,6 +421,15 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         </div>
 
         {error && <p className="text-[11px] font-mono text-red-400 mb-3 break-words">{error}</p>}
+        {conflict && (
+          <button
+            type="button"
+            onClick={loadLatest}
+            className="mb-3 px-3 py-2 text-[12px] font-medium text-text-primary border border-border-subtle rounded-control hover:border-accent/50 transition-colors"
+          >
+            Load the latest version
+          </button>
+        )}
 
         <div className="flex items-center justify-between gap-2">
           {stackId !== null ? (
