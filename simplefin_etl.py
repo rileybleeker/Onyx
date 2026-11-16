@@ -585,7 +585,7 @@ GENERIC_WORDS = frozenset({
     "THE", "AND", "FOR", "FROM", "WWW", "COM", "NET", "ORG", "HTTP", "HTTPS", "USA", "PAYPAL", "SQ", "TST",
 })
 # Words that name a kind of business, not which one. They count toward the shared words, but never as the word that
-# identifies the merchant: "STARBUCKS COFFEE ATLANTA" and "CARIBOU COFFEE ATLANTA" share two of three words and are
+# identifies the merchant: "DEMOBREW COFFEE ATLANTA" and "OTHERBREW COFFEE ATLANTA" share two of three words and are
 # still two merchants.
 TRADE_WORDS = frozenset({
     "COFFEE", "CAFE", "ESPRESSO", "TEA", "DELI", "BAKERY", "BAGEL", "DONUT", "DONUTS", "GROCER", "GROCERY", "GROCERIES",
@@ -704,7 +704,7 @@ def merchant_evidence(a: dict, b: dict) -> bool:
     are shared; the distinctive words of one side (its merchant words other than TRADE_WORDS) are ALL on the other
     side, so a bank text and its cleaned name agree ('DEMO CAFE 0042 ATLANTA GA' vs 'Demo Cafe') but two shops that
     share a first word, a city or a kind of business do not ('DEMO BOTTLE COFFEE' vs 'DEMO DONKEY COFFEE', 'DEMO
-    ATLANTA' vs 'SHOP ATLANTA', 'STARBUCKS COFFEE' vs 'CARIBOU COFFEE'); the shared words include the word that
+    ATLANTA' vs 'SHOP ATLANTA', 'DEMOBREW COFFEE' vs 'OTHERBREW COFFEE'); the shared words include the word that
     names the business on one side; and neither the payee names nor the store numbers contradict each other
     (identity_conflict: merchant_tokens drop the digits, so 'DEMO DELI 0042' and 'DEMO DELI 0099' share every word
     and are still two shops)."""
