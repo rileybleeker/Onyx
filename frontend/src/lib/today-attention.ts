@@ -14,10 +14,10 @@
  * - Snooze and "hide here" are display marks on this device, keyed by a hash of the id and of the obligation's
  *   `version`; a mark stops applying when its snooze ends or the circumstance changes (new message, nearer
  *   deadline, higher urgency ...), and never outlives the item's own due time: from `resurfaceAt` (the start of a
- *   date-only deadline's day, or DUE_LEAD_MS before a timed one) no mark applies, and an item already there cannot
- *   be set aside (`canSetAside`). A marked item stays open: the full Today view lists it as before. An
- *   `aggregate` (a count of items Today cannot name one by one) is never set aside: hiding a count would also hide
- *   a different item that later takes the same count. A `pinned` item (today's experiment arm: opening Today
+ *   date-only deadline's day in Eastern time, the zone the server dates it in, or DUE_LEAD_MS before a timed one)
+ *   no mark applies, and an item already there cannot be set aside (`canSetAside`). A marked item stays open: the
+ *   full Today view lists it as before. An `aggregate` (a count of items Today cannot name one by one) is never set
+ *   aside: hiding a count would also hide a different item that later takes the same count. A `pinned` item (today's experiment arm: opening Today
  *   reveals it, so it must be seen) is never set aside and never cut by the budget.
  * - A source that is checking, failed, stale or partial is "unknown": the quiet view never calls such a day clear.
  *
@@ -178,27 +178,62 @@ export function expiryInstant(s: string | null | undefined): number | null {
   return Number.isFinite(t) ? t : null;
 }
 
-/** The end of the local day `days` after `now` (0 = today). */
-function endOfLocalDay(now: Date, days: number): number {
-  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, 23, 59, 59, 999);
-  return d.getTime();
+// ─── Eastern days ──────────────────────────────────────────────────────────────────────────────────────────
+// Email deadlines (GET /api/urgent-email `deadline.date`), money alert dates (the forecast's days) and renewal dates
+// are America/New_York calendar days, decided on the server. Their day boundaries and the days left are worked out
+// in that zone here too, never in the device's: on a phone west of Eastern time a deadline would otherwise turn
+// urgent hours late, and a snooze or hide could outlast the start of its day.
+
+/** The zone every server-dated deadline Today reads is in. */
+export const DEADLINE_TZ = "America/New_York";
+const DAY_MS = 24 * HOUR;
+let easternParts: Intl.DateTimeFormat | null = null;
+
+/** The Eastern wall clock at instant `ms`, as the UTC instant with the same wall-clock fields. */
+function easternWall(ms: number): number {
+  if (!easternParts) {
+    easternParts = new Intl.DateTimeFormat("en-US", {
+      timeZone: DEADLINE_TZ, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+  }
+  const p: Record<string, number> = {};
+  for (const part of easternParts.formatToParts(new Date(ms))) if (part.type !== "literal") p[part.type] = Number(part.value);
+  // An engine that writes midnight as hour 24 means 00 of the same day.
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour === 24 ? 0 : p.hour, p.minute, p.second, ms - Math.floor(ms / 1000) * 1000);
 }
-/** The start (00:00) of the local day `days` after `now` (0 = today). */
-function startOfLocalDay(now: Date, days: number): number {
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, 0, 0, 0, 0).getTime();
+/** The instant (ms) of 00:00 Eastern on the calendar day `utcDay` (a Date.UTC midnight naming that day). */
+function easternMidnight(utcDay: number): number {
+  // The offset at a first guess, then again at the result: right on both sides of a clock change (00:00 is never
+  // skipped or repeated in this zone, which changes its clocks at 02:00).
+  let t = utcDay - (easternWall(utcDay) - utcDay);
+  t = utcDay - (easternWall(t) - t);
+  return t;
+}
+/** Today's Eastern calendar day at `now`, as a Date.UTC midnight. */
+function easternToday(now: Date): number {
+  const wall = easternWall(now.getTime());
+  return wall - (((wall % DAY_MS) + DAY_MS) % DAY_MS);
+}
+/** `now`'s Eastern calendar date, "YYYY-MM-DD" (a budget's month is its first seven characters). */
+export function easternDate(now: Date): string {
+  return new Date(easternToday(now)).toISOString().slice(0, 10);
+}
+/** The Eastern calendar day `days` after `now`'s (0 = today): its start and its end (ms). */
+function easternDayAfter(now: Date, days: number): { start: number; end: number } {
+  const day = easternToday(now) + days * DAY_MS;
+  return { start: easternMidnight(day), end: easternMidnight(day + DAY_MS) - 1 };
 }
 /**
- * A "YYYY-MM-DD" date as the local day it names: whole days from `now`'s day (0 = today, negative = passed), its
- * start and its end; null otherwise. The day is fixed by the date, so a copy kept past midnight still names it.
+ * A "YYYY-MM-DD" date as the Eastern day it names: whole days from `now`'s Eastern day (0 = today, negative =
+ * passed), its start and its end; null otherwise. The day is fixed by the date, so a copy kept past midnight still
+ * names it.
  */
-function localDay(date: string | null | undefined, now: Date): { daysLeft: number; start: number; end: number } | null {
+function easternDay(date: string | null | undefined, now: Date): { daysLeft: number; start: number; end: number } | null {
   const m = date ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(date) : null;
   if (!m) return null;
-  const start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();
-  const end = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999).getTime();
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-  // Rounded: a day with a clock change is 23 or 25 hours long.
-  return { daysLeft: Math.round((start - startOfLocalDay(now, 0)) / (24 * HOUR)), start, end };
+  const day = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  if (!Number.isFinite(day)) return null;
+  return { daysLeft: Math.round((day - easternToday(now)) / DAY_MS), start: easternMidnight(day), end: easternMidnight(day + DAY_MS) - 1 };
 }
 
 /** "2 h", "45 min": how long until an instant `left` ms away. */
@@ -258,10 +293,10 @@ export function requestObligations(requests: readonly RequestLike[], now: Date):
  */
 function emailDeadline(d: EmailItemLike["deadline"], now: Date): { daysLeft: number; label: string; start: number; end: number } | null {
   if (!d) return null;
-  const day = localDay(d.date, now);
+  const day = easternDay(d.date, now);
   if (day) return { label: d.label, ...day };
   const days = Number.isFinite(d.daysLeft) ? Math.max(0, Math.round(d.daysLeft)) : 0;
-  return { daysLeft: days, label: d.label, start: startOfLocalDay(now, days), end: endOfLocalDay(now, days) };
+  return { daysLeft: days, label: d.label, ...easternDayAfter(now, days) };
 }
 
 /**
@@ -425,7 +460,7 @@ const MONEY_URGENT_REASON: Readonly<Record<Exclude<MoneyAlert["kind"], "budget">
  */
 export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now: Date = new Date()): Obligation[] {
   const seen = new Map<string, number>();
-  type Day = NonNullable<ReturnType<typeof localDay>>;
+  type Day = NonNullable<ReturnType<typeof easternDay>>;
   const soon = (d: Day | null): d is Day => !!d && d.daysLeft <= 1;
   return alerts.map((a) => {
     const colon = a.title.indexOf(": ");
@@ -433,8 +468,8 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now
     const base = `money:${a.kind}:${subject}`;
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
-    const due = localDay(a.due, now);
-    const likelyDue = a.kind === "low-cash" ? localDay(a.likelyDue, now) : null;
+    const due = easternDay(a.due, now);
+    const likelyDue = a.kind === "low-cash" ? easternDay(a.likelyDue, now) : null;
     // The days that make it urgent: its own date (for low cash only when the likely path breaches too), and for low
     // cash the likely path's own first day below the line.
     const pressing = [a.kind !== "low-cash" || a.severity === "high" ? due : null, likelyDue].filter(soon);
@@ -450,7 +485,7 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now
       href: a.href,
       external: false,
       urgency,
-      dueAt: deadline ? endOfLocalDay(now, Math.max(0, deadline.daysLeft)) : null,
+      dueAt: deadline ? easternDayAfter(now, Math.max(0, deadline.daysLeft)).end : null,
       resurfaceAt: deadline ? deadline.start : null,
       reason: imminent && urgentReason ? urgentReason(pressing.some((d) => d.daysLeft <= 0) ? "today" : "tomorrow") : MONEY_REASON[a.kind] ?? "Money alert",
       version: `${urgency}|${a.severity}|${a.title.replace(/-?\$[\d,]+(?:\.\d+)?/g, "$")}|${due ? a.due : ""}${a.kind === "budget" ? `|${period}` : ""}`,
@@ -459,8 +494,8 @@ export function moneyObligations(alerts: readonly MoneyAlert[], period = "", now
   });
 }
 
-/** Renewals due within the summary's window, named one by one; the unnamed rest as one count. */
-export function renewalObligations(summary: RenewalSummary | null): Obligation[] {
+/** Renewals due within the summary's window, named one by one; the unnamed rest as one count. `r.date` is an Eastern day. */
+export function renewalObligations(summary: RenewalSummary | null, now: Date = new Date()): Obligation[] {
   if (!summary || summary.status !== "ready" || summary.count <= 0) return [];
   // Merchant + date, numbered when two renewals of one answer share them, so they are never folded together.
   const seen = new Map<string, number>();
@@ -468,6 +503,7 @@ export function renewalObligations(summary: RenewalSummary | null): Obligation[]
     const base = `renewals:${r.merchant}:${r.date}`;
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
+    const day = easternDay(r.date, now);
     return {
       id: n === 1 ? base : `${base}#${n}`,
       source: "renewals",
@@ -476,9 +512,9 @@ export function renewalObligations(summary: RenewalSummary | null): Obligation[]
       href: "/procurement",
       external: false,
       urgency: r.days <= 0 ? "high" : "normal",
-      dueAt: /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? new Date(`${r.date}T00:00:00`).getTime() : null,
-      // Due on its day: a renewal today cannot be set aside.
-      resurfaceAt: /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? new Date(`${r.date}T00:00:00`).getTime() : null,
+      dueAt: day ? day.start : null,
+      // Due from the start of its Eastern day: a renewal today cannot be set aside.
+      resurfaceAt: day ? day.start : null,
       reason: r.days <= 0 ? "Renews today" : `Renews within ${summary.withinDays} days`,
       // The daily countdown is not a new circumstance; reaching the renewal day is.
       version: r.days <= 0 ? "due" : "soon",
@@ -890,7 +926,7 @@ export function todayAttention(input: TodayAttentionInput): { obligations: Oblig
     experimentObligations(input.experiment?.trial ?? null),
     calendarObligations(input.calendar.events, now),
     moneyObligations(input.money.alerts, input.money.period ?? "", now),
-    renewalObligations(input.renewals.summary),
+    renewalObligations(input.renewals.summary, now),
     packageObligations(input.packages.summary),
     readingObligations(input.reading.overview),
   ]);

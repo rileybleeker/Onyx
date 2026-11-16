@@ -3,8 +3,10 @@
 // Today reads, deduplicated by source identity only, ranked deterministically, budgeted for the quiet view, with
 // device-only snooze / "hide here" marks that lapse when the snooze ends or the circumstance changes, and sources
 // that could not confirm their answer reported as unknown, never as a clear day. SYNTHETIC DATA ONLY.
-// A zone with daylight saving time, so the snooze test can check the two days a year the clock changes (every other
-// test builds and compares local times, so it holds in any zone). Set before any Date is made.
+// A zone with daylight saving time, so the snooze test can check the two days a year the clock changes. It is also
+// the zone email, money and renewal deadlines are dated in, so the tests that build those days on the local clock
+// mean Eastern days; the "Eastern deadlines" test switches the device to a zone west of it and back. Set before any
+// Date is made.
 process.env.TZ = "America/New_York";
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -587,4 +589,63 @@ test("urgent email: a request posted on a merged thread is a new circumstance; c
   const next = A.urgentEmailObligations([item(["E1", "E2"], "/agents?t=inbox-triage#m1")], [], NOW)[0];
   assert.equal(next.id, hidden.id);
   assert.equal(A.markApplies(marks[A.markKey(next)], next, MS), null);
+});
+
+test("Eastern deadlines: a device west of Eastern time counts email, money and renewal days in Eastern time", () => {
+  const was = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  try {
+    const utc = (d, h, m = 0) => Date.UTC(2030, 2, d, h, m, 0);
+    // The device really is three hours behind Eastern (EST) here, or this test proves nothing.
+    assert.equal(new Date(utc(7, 4)).getHours(), 20, "device clock: 20:00 Pacific");
+    const item = (key) => ({ key, sources: ["Gmail"], sourceDetail: "Gmail", title: "Synthetic " + key, from: null, reasons: [], nextStep: "Reply", at: new Date(utc(6, 12)).toISOString(), atVerb: "Received", gmailHref: null, requestHref: null, clear: { cards: [], emails: [] } });
+    const email = (key, date, daysLeft = 1) => ({ key, threadId: "1", messageId: "m" + key, account: "owner@example.com", from: "x", subject: "s", receivedAt: new Date(utc(6, 12)).toISOString(), labels: ["Agent/Deadline"], deadline: { daysLeft, label: "Synthetic day", date }, reasons: [], nextStep: "x", href: null });
+
+    // 20:00 Pacific on Mar 6 is 23:00 Eastern: a deadline on Mar 7 is tomorrow, and the day starts at 00:00 Eastern
+    // (05:00 UTC), three hours before the device's own midnight.
+    const evening = new Date(utc(7, 4));
+    const [o] = A.urgentEmailObligations([item("email:t1")], [email("t1", "2030-03-07")], evening);
+    assert.deepEqual([o.urgency, o.reason], ["urgent", "Deadline tomorrow (Synthetic day)"]);
+    assert.equal(o.resurfaceAt, utc(7, 5), "back at 00:00 Eastern, not at the device's midnight");
+    assert.equal(o.dueAt, utc(8, 5) - 1, "due until the end of the Eastern day");
+    assert.equal(A.canSetAside(o, evening.getTime()), true);
+    assert.equal(A.snoozeEnd(o, evening), utc(7, 5), "a snooze never outlasts the start of the Eastern deadline day");
+    const hide = A.markFor(o, "hide", evening.getTime());
+    assert.equal(A.markApplies(hide, o, utc(7, 5) - 1), "hidden");
+    // 21:30 Pacific on Mar 6 = 00:30 Eastern on Mar 7: the deadline is today, so nothing keeps it aside.
+    const after = new Date(utc(7, 5, 30));
+    const [today] = A.urgentEmailObligations([item("email:t1")], [email("t1", "2030-03-07")], after);
+    assert.equal(today.reason, "Deadline today (Synthetic day)");
+    assert.equal(A.canSetAside(today, after.getTime()), false);
+    assert.equal(A.markApplies(hide, today, after.getTime()), null);
+    // An answer from before `deadline.date` existed counts its days from today's Eastern day too.
+    const [old] = A.urgentEmailObligations([item("email:t2")], [{ ...email("t2", undefined, 0), deadline: { daysLeft: 0, label: "Synthetic day" } }], after);
+    assert.deepEqual([old.resurfaceAt, old.dueAt], [utc(7, 5), utc(8, 5) - 1]);
+
+    // A tax payment due Mar 8, seen at 22:00 Pacific on Mar 6 (01:00 Eastern on Mar 7): tomorrow, so urgent. On the
+    // device's clock it would still be two days away and only "high".
+    const night = new Date(utc(7, 6));
+    const tax = { kind: "tax", severity: "high", title: "Synthetic tax: due soon", detail: "Synthetic.", href: "/financials/forecast", due: "2030-03-08" };
+    const [money] = A.moneyObligations([tax], "2030-03", night);
+    assert.deepEqual([money.urgency, money.reason], ["urgent", "A tax payment is due tomorrow"]);
+    assert.deepEqual([money.resurfaceAt, money.dueAt], [utc(8, 5), utc(9, 5) - 1]);
+    assert.equal(A.snoozeEnd(money, night), utc(7, 14), "the ordinary snooze (06:00 on the device) is earlier here");
+    assert.equal(A.canSetAside(money, utc(8, 5)), false, "from 00:00 Eastern on its day it cannot be set aside");
+
+    // A renewal on Mar 8 is due from 00:00 Eastern that day.
+    const [ren] = A.renewalObligations({ status: "ready", count: 1, withinDays: 3, soon: [{ merchant: "Synthetic plan", days: 1, date: "2030-03-08", label: "renews tomorrow" }] }, night);
+    assert.deepEqual([ren.dueAt, ren.resurfaceAt], [utc(8, 5), utc(8, 5)]);
+
+    // The day the clock changes (Sun Mar 10, 2030) is 23 hours long in Eastern time: it starts at 05:00 UTC and ends
+    // at 04:00 UTC the next day.
+    const [dst] = A.moneyObligations([{ ...tax, due: "2030-03-10" }], "2030-03", new Date(utc(9, 18)));
+    assert.equal(dst.urgency, "urgent");
+    assert.deepEqual([dst.resurfaceAt, dst.dueAt], [utc(10, 5), utc(11, 4) - 1]);
+
+    // The budget month and the Eastern date follow Eastern time: 22:00 Pacific on Mar 31 is already April 1.
+    assert.equal(A.easternDate(new Date(Date.UTC(2030, 3, 1, 5, 0, 0))), "2030-04-01");
+    assert.equal(A.easternDate(night), "2030-03-07");
+  } finally {
+    process.env.TZ = was;
+  }
 });

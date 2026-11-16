@@ -25,7 +25,7 @@ import { earlyOr } from "@/lib/early-fetch";
 import TodayOverview from "@/components/overview/TodayOverview";
 // Import-free too (bundled by name in the same test): the attention model (PROD-T04) and the quiet view settings,
 // snooze / hide marks and row widths (PROD-T05).
-import { MAX_BUDGET, MIN_BUDGET, SOURCE_LABEL, URGENCY_LABEL, canSetAside, fullList, markFor, markKey, parseMarks, pruneMarks, selectQuiet, snoozeEnd, syncLateness, todayAttention,
+import { MAX_BUDGET, MIN_BUDGET, SOURCE_LABEL, URGENCY_LABEL, canSetAside, easternDate, fullList, markFor, markKey, parseMarks, pruneMarks, selectQuiet, snoozeEnd, syncLateness, todayAttention,
   type AttentionMark, type Obligation, type SourceProbe, type SourceStatus } from "@/lib/today-attention";
 import { adoptQuiet, lifeLayout, pushQuiet, quietBootScript, quietUnsent, readMarks, readQuiet, removeQuietBoot, serverQuiet, setQuiet, subscribeQuiet, syncQuiet,
   writeMarks, type QuietSettings } from "@/lib/today-view";
@@ -585,8 +585,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         ? { load: "ready", refreshFailed: money.refreshFailed, checking: (money.updating && !money.refreshFailed) || lifeChecks.money.state === "checking", partial: money.partial !== null, asOf: money.asOf ?? iso(lifeChecks.money.at) }
         : lifeProbe("money", false),
       alerts: money?.alerts ?? [],
-      // Budgets are monthly: a budget alert hidden this month comes back next month.
-      period: todayDate.slice(0, 7),
+      // Budgets are monthly (the Eastern month the server computes them for): a budget alert hidden this month comes
+      // back next month.
+      period: easternDate(now).slice(0, 7),
     },
     // An `updating` answer is checking until its follow-up read lands, and stale (not confirmed) when that failed.
     renewals: { probe: lifeProbe("renewals", !!renewals, renewals?.updating ? { checking: !renewals.refreshFailed, refreshFailed: lifeChecks.renewals.state === "failed" || renewals.refreshFailed, asOf: renewals.asOf } : {}), summary: renewals },
