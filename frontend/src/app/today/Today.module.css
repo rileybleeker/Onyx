@@ -36,8 +36,3 @@
 .captureLink:last-child { border: 1px solid var(--color-border-default); padding-bottom: 12px; } .captureLink svg, .caption { display: none; }
 .jumpLinks { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } .jumpLinks a { padding: 12px; }
 }
-/* Phones: the page's scroll padding (globals.css, PROD-T11) already clears the fixed header (safe area + 3.5rem),
-   so the section jumps keep landing 100px below the top (below the notch where there is one), not 3.5rem lower. */
-@media (max-width: 767.98px) {
-.panel h2 { scroll-margin-top: calc(100px - 3.5rem); }
-}
