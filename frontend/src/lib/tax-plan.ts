@@ -6,9 +6,21 @@
  * the safe harbour, and the payments that close each gap, as dated cash lines for the forecast.
  * Not a filed return: no itemizing, credits, AMT or equity; FICA is assumed to be withheld exactly.
  */
-import { lastBusinessDayOfMonth, type PlannedItem } from "./cash-forecast";
+import { isBusinessDay, lastBusinessDayOfMonth, type PlannedItem } from "./cash-forecast";
 import { FORECAST } from "./cash-forecast-config";
-import { bracketTax, marginalRate, taxTables, type YearTables } from "./tax-tables";
+import {
+  bracketTax,
+  lastPublishedFederalYear,
+  marginalRate,
+  nyResidentTax,
+  round4,
+  TABLES_CHECKED,
+  taxTables,
+  type Bracket,
+  type RuleBasis,
+  type TableSource,
+  type YearTables,
+} from "./tax-tables";
 
 export type Jur = "federal" | "GA" | "NC" | "NY" | "NYC";
 export const JUR_LABEL: Record<Jur, string> = { federal: "Federal", GA: "Georgia", NC: "North Carolina", NY: "New York State", NYC: "New York City" };
@@ -57,30 +69,120 @@ export interface TaxProfile {
 }
 
 export const DEFAULT_BRACKET_INDEX_PCT = 2.7;
-const LAST_PUBLISHED_FEDERAL_YEAR = 2026;
-/** Tax tables for a year with the profile's overrides: indexed federal figures for unpublished years, state rates. */
+/**
+ * Tax tables for a year with the profile's entries applied. Published figures are used as they are; a year whose
+ * federal figures are not published yet indexes the last published year's by `bracketIndexPct` (an assumption, or
+ * "override" when Riley entered the percentage); an entered Georgia or North Carolina rate replaces the table's for
+ * every year ("override", the table's own figure named in the note).
+ */
 export function tablesFor(profile: TaxProfile, year: number): YearTables {
   const t = taxTables(year);
   let out: YearTables = t;
-  const idx = (profile.bracketIndexPct ?? DEFAULT_BRACKET_INDEX_PCT) / 100;
-  const n = year - LAST_PUBLISHED_FEDERAL_YEAR;
-  if (n > 0 && idx !== 0) {
-    const f = Math.pow(1 + idx, n);
-    const r50 = (x: number) => Math.round((x * f) / 50) * 50;
+  const from = lastPublishedFederalYear();
+  const n = year - from;
+  if (t.federal.basis === "assumption" && n > 0) {
+    const entered = typeof profile.bracketIndexPct === "number";
+    const pct = profile.bracketIndexPct ?? DEFAULT_BRACKET_INDEX_PCT;
+    const f = Math.pow(1 + pct / 100, n);
+    // The IRS rounds indexed brackets down to a multiple of $25 and the standard deduction down to $50; the SSA
+    // rounds the wage base to the nearest $300.
+    const down = (x: number, step: number) => Math.floor((x * f) / step) * step;
     out = {
       ...t,
-      estimated: `${year} federal brackets, standard deduction and wage base = ${LAST_PUBLISHED_FEDERAL_YEAR}'s indexed ${(idx * 100).toFixed(1)}% a year (estimate; edit in the tax profile).`,
       federal: {
         ...t.federal,
-        single: t.federal.single.map((b) => ({ ...b, upTo: b.upTo === null ? null : r50(b.upTo) })),
-        standardDeduction: r50(t.federal.standardDeduction),
+        single: t.federal.single.map((b) => ({ ...b, upTo: b.upTo === null ? null : down(b.upTo, 25) })),
+        standardDeduction: down(t.federal.standardDeduction, 50),
         ssWageBase: Math.round((t.federal.ssWageBase * f) / 300) * 300,
+        basis: entered ? "override" : "assumption",
+        note: `${year} federal brackets, standard deduction and wage base are not published yet: ${from}'s indexed ${pct.toFixed(1)}% a year (${entered ? "your entry in the tax profile" : "the plan's default; edit it in the tax profile"}).`,
       },
     };
   }
-  if (typeof profile.gaRatePct === "number") out = { ...out, ga: { ...out.ga, rate: profile.gaRatePct, note: `Georgia rate ${profile.gaRatePct}% (entered).` } };
-  if (typeof profile.ncRatePct === "number") out = { ...out, nc: { ...out.nc, rate: profile.ncRatePct, supplementalRate: profile.ncRatePct + 0.1 } };
-  return out;
+  if (typeof profile.gaRatePct === "number") {
+    const was = `${out.ga.rate}% ${out.ga.basis === "published" ? "published" : "assumed"} for ${year}`;
+    out = { ...out, ga: { ...out.ga, rate: profile.gaRatePct, basis: "override", note: `Georgia rate ${profile.gaRatePct}% is your entry (the table has ${was}).` } };
+  }
+  if (typeof profile.ncRatePct === "number") {
+    const was = `${out.nc.rate}% ${out.nc.basis === "published" ? "published" : "assumed"} for ${year}`;
+    out = { ...out, nc: { ...out.nc, rate: profile.ncRatePct, supplementalRate: Math.round((profile.ncRatePct + 0.1) * 100) / 100, basis: "override", note: `North Carolina rate ${profile.ncRatePct}% is your entry (the table has ${was}).` } };
+  }
+  const parts = [out.federal, out.ga, out.nc, out.ny, out.nyc].filter((x) => x.basis !== "published" && x.note).map((x) => x.note as string);
+  return { ...out, estimated: parts.length ? parts.join(" ") : null };
+}
+
+/** Where a year's figures for one jurisdiction come from, for the page: published, an assumption, or your entry. */
+export interface TaxRuleStatus {
+  jur: Jur;
+  label: string;
+  basis: RuleBasis;
+  /** The figures in one line, e.g. "4.99% flat, standard deduction $15,000". */
+  figures: string;
+  note: string | null;
+  sources: TableSource[];
+  /** Set when the official figures should be published by now but the built-in table still has an assumption. */
+  stale: string | null;
+}
+const dollarsText = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
+const rangeText = (b: readonly Bracket[]) => `${b[0].rate}% to ${b[b.length - 1].rate}%`;
+export function taxRuleStatus(t: YearTables, jur: Jur, today: string): TaxRuleStatus {
+  const part = jur === "federal" ? t.federal : jur === "GA" ? t.ga : jur === "NC" ? t.nc : jur === "NY" ? t.ny : t.nyc;
+  const fed = t.federal.single;
+  const top = fed.length > 1 ? fed[fed.length - 2].upTo : null;
+  const figures =
+    jur === "federal"
+      ? `standard deduction ${dollarsText(t.federal.standardDeduction)}, brackets ${rangeText(fed)}${top ? ` (${fed[fed.length - 1].rate}% over ${dollarsText(top)})` : ""}, Social Security wage base ${dollarsText(t.federal.ssWageBase)}`
+      : jur === "GA"
+        ? `${t.ga.rate}% flat, standard deduction ${dollarsText(t.ga.standardDeduction)}`
+        : jur === "NC"
+          ? `${t.nc.rate}% flat, standard deduction ${dollarsText(t.nc.standardDeduction)}, withholding ${t.nc.supplementalRate}%`
+          : jur === "NY"
+            ? `brackets ${rangeText(t.ny.single)}, standard deduction ${dollarsText(t.ny.standardDeduction)}${t.ny.recapture ? `, recapture above ${dollarsText(t.ny.recapture.startAgi)} of NY income` : ""}`
+            : `brackets ${rangeText(t.nyc.single)}`;
+  const stale = part.staleAfter && today > part.staleAfter
+    ? `${JUR_LABEL[jur]} ${t.year}: the official figures are normally published by ${part.staleAfter}, and the built-in table still has an assumption. Update lib/tax-tables.ts.`
+    : null;
+  return { jur, label: JUR_LABEL[jur], basis: part.basis, figures, note: part.note, sources: part.sources, stale };
+}
+/** The built-in tables are re-checked every year (each November to January); past a year since the check, say so. */
+export function tablesReviewMessage(today: string, checked: string = TABLES_CHECKED): string | null {
+  const due = `${Number(checked.slice(0, 4)) + 1}${checked.slice(4)}`;
+  return today > due ? `The built-in tax tables were last checked against their sources on ${checked}; check every year's figures again (due ${due}).` : null;
+}
+
+/** What the estimate leaves out, shown beside it on the page. */
+export const TAX_LIMITATIONS: readonly string[] = [
+  "One single filer with the standard deduction: no itemizing, credits, AMT or equity compensation; FICA is assumed to be withheld exactly.",
+  "Not modeled: the federal deductions for tips, overtime and car-loan interest, Georgia's tips and overtime exclusions and retirement exclusion, half of self-employment tax as a deduction, NYC credits, the MCTMT and Yonkers.",
+  "Part-year rules: Georgia prorates its standard deduction by the Georgia share of income (Form 500 Schedule 3); New York taxes the income percentage of the full-year tax, rounded to four decimals (IT-203); NYC prorates the standard deduction by full months of residence (IT-360.1). No special accruals.",
+  "New York's tax benefit recapture is included (worksheets 7-11, single), derived from the brackets: within about $2 of the published worksheet amounts.",
+  "North Carolina: nonresident tax on the share of days worked there, credited by Georgia or New York up to their own tax on that income.",
+  "Payment dates move past weekends, federal holidays and DC Emancipation Day like IRS due dates (IRC 7503); the states are assumed to use the same dates. A refund is assumed on April 30.",
+];
+
+/** The next day that is not a weekend, a federal holiday or DC Emancipation Day (IRC 7503: a due date on one moves). */
+export function taxDueDate(nominal: string): string {
+  let d = nominal;
+  for (let i = 0; i < 10 && !(isBusinessDay(d) && d !== emancipationDay(Number(d.slice(0, 4)))); i++) d = shiftDay(d, 1);
+  return d;
+}
+/** DC Emancipation Day (April 16; observed the Friday before when a Saturday, the Monday after when a Sunday). */
+function emancipationDay(year: number): string {
+  const w = new Date(Date.UTC(year, 3, 16)).getUTCDay();
+  return w === 6 ? `${year}-04-15` : w === 0 ? `${year}-04-17` : `${year}-04-16`;
+}
+/**
+ * Full months a filer who moves into New York City is a city resident in `year` (IT-360.1-I: a part of a month over
+ * half of it counts as a month, half or less does not). Moved April 1 = 9 months; September 4 = 4 months.
+ */
+export function cityResidentMonths(moveDate: string | null, year: number): number {
+  if (!moveDate) return 0;
+  if (moveDate < `${year}-01-01`) return 12;
+  if (!moveDate.startsWith(`${year}-`)) return 0;
+  const m = Number(moveDate.slice(5, 7));
+  const dim = daysIn(year, m);
+  const residentDays = dim - Number(moveDate.slice(8, 10)) + 1;
+  return 12 - m + (residentDays > dim / 2 ? 1 : 0);
 }
 
 const PROJECT_YEARS = 4;
@@ -174,6 +276,13 @@ export interface TaxYearResult {
   safeHarbor: { requiredCents: number; coveredCents: number; met: boolean; basis: string };
   fixes: string[];
   assumptions: string[];
+  /** Where each jurisdiction's figures come from (published / assumption / your entry), with sources. */
+  rules: TaxRuleStatus[];
+  /** Built-in figures that should have been updated by now (an assumption past its publication date, an old check). */
+  stale: string[];
+  limitations: readonly string[];
+  /** The day the built-in tables were last checked against their sources. */
+  tablesChecked: string;
 }
 
 const c = (dollars: number): number => Math.round(dollars * 100);
@@ -220,20 +329,20 @@ export function oneOffNetCents(profile: TaxProfile, oneOff: TaxOneOff): number {
   return Math.round(g - fed - ss - medicare - nc);
 }
 
-const DUE = (year: number) => [`${year}-04-15`, `${year}-06-15`, `${year}-09-15`, `${year + 1}-01-15`];
+/** Estimated tax due dates for a tax year (Form 1040-ES; IT-2105 and the Georgia / NC vouchers use the same), moved past a weekend or holiday. */
+export const taxDueDates = (year: number): string[] => [`${year}-04-15`, `${year}-06-15`, `${year}-09-15`, `${year + 1}-01-15`].map(taxDueDate);
 
 export function computeTaxYear(profile: TaxProfile, year: number, today: string): TaxYearResult {
   const t = tablesFor(profile, year);
   const assumptions: string[] = [];
-  if (t.estimated) assumptions.push(t.estimated);
-  assumptions.push(t.ga.note, `North Carolina ${t.nc.rate}% (nonresident, on the share of days worked there).`, `New York: ${t.ny.note}`);
+  assumptions.push(`North Carolina ${t.nc.rate}% (nonresident, on the share of days worked there).`);
   const wages = wagesFor(profile, year);
   const W = wages.reduce((s, w) => s + w.cents, 0);
   const preTax = Math.min(profile.preTaxAnnualCents, W);
   const other = otherIncomeFor(profile, year);
   const agi = Math.max(0, W - preTax + other);
   const isNY = (date: string) => !!profile.moveDate && date >= profile.moveDate;
-  const nyMonths = profile.moveDate && profile.moveDate.startsWith(`${year}-`) ? 12 - Number(profile.moveDate.slice(5, 7)) + 1 : profile.moveDate && profile.moveDate < `${year}-01-01` ? 12 : 0;
+  const nyMonths = cityResidentMonths(profile.moveDate, year);
   const preTaxShare = W > 0 ? preTax / W : 0;
 
   // Federal.
@@ -270,18 +379,21 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
   const ncDuringGa = agi > 0 ? Math.round(ncSource * (gaIncome / Math.max(1, gaIncome + nyIncome))) : 0;
   const ncTaxDuringGa = ncSource > 0 ? Math.round(ncTax * (ncDuringGa / ncSource)) : 0;
 
-  const gaExempt = agi > 0 ? c(t.ga.exemption) * (gaIncome / agi) : 0;
+  const gaExempt = agi > 0 ? c(t.ga.standardDeduction) * (gaIncome / agi) : 0;
   const gaBefore = gaIncome > 0 ? Math.round(Math.max(0, gaIncome - gaExempt) * (t.ga.rate / 100)) : 0;
   const gaCredit = Math.min(ncTaxDuringGa, Math.round(ncDuringGa * (t.ga.rate / 100)), gaBefore);
   const gaTax = gaBefore - gaCredit;
 
-  const nyFull = c(bracketTax(Math.max(0, d(agi) - t.ny.standardDeduction), t.ny.single));
-  const nyBefore = nyIncome > 0 && agi > 0 ? Math.round(nyFull * (nyIncome / agi)) : 0;
+  // Full-year resident tax on all income (recapture included, on the whole year's NY AGI), times the income
+  // percentage rounded to four decimals (IT-203 line 45).
+  const nyFull = c(nyResidentTax(d(agi), Math.max(0, d(agi) - t.ny.standardDeduction), t.ny));
+  const nyBefore = nyIncome > 0 && agi > 0 ? Math.round(nyFull * round4(nyIncome / agi)) : 0;
   const ncDuringNy = ncSource - ncDuringGa;
   const nyCredit = Math.min(ncTax - ncTaxDuringGa, nyBefore, Math.max(0, ncDuringNy) > 0 ? nyBefore : 0);
   const nyTax = nyBefore - Math.max(0, nyCredit);
-  const nycTax = nyIncome > 0 ? c(bracketTax(Math.max(0, d(nyIncome) - (t.ny.standardDeduction * nyMonths) / 12), t.nyc.single)) : 0;
-  if (profile.moveDate) assumptions.push(`Moves to New York City on ${profile.moveDate}: income paid before is Georgia's, after is New York's (New York's rate is set by the whole year's income).`);
+  // NYC: resident-period income less the standard deduction prorated by full resident months (IT-360.1 chart).
+  const nycTax = nyIncome > 0 ? c(bracketTax(Math.max(0, d(nyIncome) - Math.round((t.ny.standardDeduction * nyMonths) / 12)), t.nyc.single)) : 0;
+  if (profile.moveDate) assumptions.push(`Moves to New York City on ${profile.moveDate}: income paid before is Georgia's, after is New York's (New York's rate is set by the whole year's income; ${nyMonths} NYC resident months in ${year}).`);
   if (ncShare === 0) assumptions.push("No days worked in North Carolina: its withholding comes back as a refund on a nonresident return.");
 
   const paid = (jur: Jur) => profile.estimatesPaid.filter((e) => e.year === year && e.jur === jur).reduce((s, e) => s + e.cents, 0);
@@ -314,12 +426,12 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
 
   // Payments that close each gap, on the remaining due dates; refunds after filing.
   const payments: TaxPayment[] = [];
-  const due = DUE(year).filter((x) => x > today);
+  const due = taxDueDates(year).filter((x) => x > today);
   for (const j of jurisdictions) {
     if (j.balanceCents > (j.jur === "federal" ? 100_000 : 50_000)) {
       const label = `${j.label} estimated tax ${year}`;
       if (!due.length) {
-        payments.push({ year, jur: j.jur, label: `${j.label} tax due with the ${year} return`, date: `${year + 1}-04-15`, cents: -j.balanceCents, kind: "estimate" });
+        payments.push({ year, jur: j.jur, label: `${j.label} tax due with the ${year} return`, date: taxDueDate(`${year + 1}-04-15`), cents: -j.balanceCents, kind: "estimate" });
         continue;
       }
       // Income concentrated early (a January bonus before a move) is paid at the first date; else split evenly.
@@ -342,6 +454,11 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
   if (covered < required) fixes.push(`Federal safe harbour (${basis}) needs ${usd(required)} paid; ${usd(covered)} is projected.`);
   for (const j of jurisdictions) if (j.jur !== "federal" && j.balanceCents > 50_000) fixes.push(`${j.label}: your employer does not withhold it, so pay ${usd(j.balanceCents)} by estimated payments.`);
 
+  const rules = jurisdictions.map((j) => taxRuleStatus(t, j.jur, today));
+  const stale = rules.filter((r) => r.stale).map((r) => r.stale as string);
+  const review = tablesReviewMessage(today);
+  if (review) stale.push(review);
+
   return {
     year,
     wagesCents: W,
@@ -351,6 +468,10 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
     safeHarbor: { requiredCents: required, coveredCents: covered, met: covered >= required, basis },
     fixes,
     assumptions,
+    rules,
+    stale,
+    limitations: TAX_LIMITATIONS,
+    tablesChecked: TABLES_CHECKED,
   };
 }
 

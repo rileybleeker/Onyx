@@ -271,6 +271,7 @@ export function TaxSection({ tax, profile, busy, run }: { tax: TaxYearResult[]; 
               {x}
             </p>
           ))}
+          <TaxRules t={t} />
           <details className="mt-1 text-[12px] text-text-tertiary">
             <summary>Assumptions</summary>
             <ul className="mt-1 space-y-1">
@@ -283,6 +284,70 @@ export function TaxSection({ tax, profile, busy, run }: { tax: TaxYearResult[]; 
       ))}
       <TaxProfileForm profile={profile} busy={busy} run={run} />
     </section>
+  );
+}
+
+const BASIS_LABEL: Record<string, string> = { published: "published", assumption: "assumption", override: "your entry" };
+
+/**
+ * Where the year's tax figures come from: one line naming each jurisdiction's basis (published / assumption / your
+ * entry), a visible warning when a built-in table should have been updated, and the figures, sources and limits
+ * behind a disclosure. Older stored results have no `rules`: nothing is shown for them.
+ */
+function TaxRules({ t }: { t: TaxYearResult }) {
+  const rules = t.rules ?? [];
+  if (!rules.length) return null;
+  return (
+    <>
+      <p className="mt-1 text-[12px] text-text-secondary">
+        Tax figures:{" "}
+        {rules.map((r, i) => (
+          <span key={r.jur}>
+            {i > 0 && " · "}
+            {r.label} <span className={r.basis === "published" ? "text-text-tertiary" : "text-mid"}>{BASIS_LABEL[r.basis] ?? r.basis}</span>
+          </span>
+        ))}
+      </p>
+      {(t.stale ?? []).map((s) => (
+        <p key={s} className="text-[12px] text-mid">
+          {s}
+        </p>
+      ))}
+      <details className="mt-1 text-[12px] text-text-tertiary">
+        <summary>Tax tables and limits</summary>
+        <ul className="mt-1 space-y-1">
+          {rules.map((r) => (
+            <li key={r.jur}>
+              <span className="text-text-secondary">
+                {r.label} ({BASIS_LABEL[r.basis] ?? r.basis}):
+              </span>{" "}
+              {r.figures}.{r.note ? ` ${r.note}` : ""}
+              {r.sources.length > 0 && (
+                <span>
+                  {" "}
+                  Sources:{" "}
+                  {r.sources.map((s, i) => (
+                    <span key={s.url + s.title}>
+                      {i > 0 && "; "}
+                      <a className="underline hover:text-text-secondary" href={s.url} target="_blank" rel="noreferrer noopener">
+                        {s.title}
+                      </a>{" "}
+                      ({s.effective}; checked {s.retrieved})
+                    </span>
+                  ))}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+        <p className="mt-2">Built-in tables last checked {t.tablesChecked}. How the estimate works and what it leaves out:</p>
+        <ul className="mt-1 list-disc space-y-1 pl-4">
+          {(t.limitations ?? []).map((l) => (
+            <li key={l}>{l}</li>
+          ))}
+        </ul>
+      </details>
+    </>
   );
 }
 
@@ -384,10 +449,10 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         {field("Last year's AGI ($)", "priorAgi")}
         {field("Raise each January (%)", "raise", "text", "w-20")}
       </div>
-      <p className="mt-3 text-[12px] text-text-secondary">Tax rules (blank = the built-in tables):</p>
+      <p className="mt-3 text-[12px] text-text-secondary">Tax rules (blank = the built-in tables; an entry is shown as &quot;your entry&quot;):</p>
       <div className="mt-1 flex flex-wrap gap-3">
         {field("Federal brackets rise (%/yr, unpublished years)", "index", "text", "w-20", "2.7")}
-        {field("Georgia rate (%)", "gaRate", "text", "w-20", "5.09")}
+        {field("Georgia rate (%)", "gaRate", "text", "w-20", "4.99")}
         {field("NC rate (%)", "ncRate", "text", "w-20", "3.99")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Employer withholds state tax for

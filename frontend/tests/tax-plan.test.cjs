@@ -42,7 +42,7 @@ test("Georgia resident all year with NC withholding: Georgia owed, NC refunded, 
   const t = TT.taxTables(2030);
   assert.equal(j.federal.taxCents, Math.round(TT.bracketTax(120_000 - t.federal.standardDeduction, t.federal.single) * 100));
   assert.equal(j.GA.withheldCents, 0);
-  assert.equal(j.GA.taxCents, Math.round((12_000_000 - 1_200_000) * (t.ga.rate / 100)));
+  assert.equal(j.GA.taxCents, Math.round((12_000_000 - t.ga.standardDeduction * 100) * (t.ga.rate / 100)));
   assert.equal(j.NC.taxCents, 0);
   assert.ok(j.NC.balanceCents < 0, "NC withholding comes back");
   assert.ok(r.payments.some((p) => p.jur === "GA" && p.cents < 0));
@@ -57,8 +57,10 @@ test("a January bonus before a March move is Georgia's; New York taxes the rest 
   assert.equal(j.GA.incomeCents, Math.round(6_000_000 + 2 * salary));
   assert.equal(j.NY.incomeCents, Math.round(10 * salary));
   const t = TT.taxTables(2031);
-  const nyFull = TT.bracketTax((r.agiCents - 800_000) / 100, t.ny.single) * 100;
-  assert.ok(Math.abs(j.NY.taxCents - Math.round(nyFull * (j.NY.incomeCents / r.agiCents))) <= 1);
+  // Full-year resident tax on all income (the recapture applies: NY AGI over $157,650), times the IT-203 income
+  // percentage rounded to four decimals.
+  const nyFull = Math.round(TT.nyResidentTax(r.agiCents / 100, (r.agiCents - 800_000) / 100, t.ny) * 100);
+  assert.ok(Math.abs(j.NY.taxCents - Math.round(nyFull * TT.round4(j.NY.incomeCents / r.agiCents))) <= 1);
   assert.ok(j.NYC.taxCents > 0);
   // Georgia paid at the first due date (income concentrated early), New York spread over four.
   assert.equal(r.payments.filter((x) => x.jur === "GA").length, 1);
@@ -140,10 +142,14 @@ test("every year's bonus: generated each January, an explicit one wins, raises g
 test("tax rules are configurable: bracket indexing for unpublished years, state rates, employer withholding", () => {
   const p = { ...base, employmentStart: "2026-01-01", bracketIndexPct: undefined };
   const t28 = T.tablesFor(p, 2028);
-  assert.equal(t28.federal.standardDeduction, Math.round((16_100 * Math.pow(1.027, 2)) / 50) * 50);
+  // 2028 is indexed one year from the published 2027 figures, rounded down like the IRS ($50 / $25).
+  assert.equal(t28.federal.standardDeduction, Math.floor((16_600 * 1.027) / 50) * 50);
+  assert.equal(t28.federal.single[0].upTo, Math.floor((12_800 * 1.027) / 25) * 25);
   assert.match(t28.estimated, /indexed 2\.7%/);
-  assert.equal(T.tablesFor({ ...p, bracketIndexPct: 0 }, 2028).federal.standardDeduction, 16_100);
-  assert.equal(T.tablesFor({ ...p, gaRatePct: 4.99 }, 2026).ga.rate, 4.99);
+  assert.equal(t28.federal.basis, "assumption");
+  assert.equal(T.tablesFor({ ...p, bracketIndexPct: 0 }, 2028).federal.standardDeduction, 16_600);
+  assert.equal(T.tablesFor({ ...p, bracketIndexPct: 0 }, 2028).federal.basis, "override", "an entered index is your entry");
+  assert.equal(T.tablesFor({ ...p, gaRatePct: 4.5 }, 2026).ga.rate, 4.5);
   const none = T.computeTaxYear({ ...p, employerStateWithholding: "none" }, 2026, "2026-03-01");
   assert.equal(none.jurisdictions.find((j) => j.jur === "NC").withheldCents, 0);
 });
@@ -213,4 +219,180 @@ test("other income what-if: dated receipts, taxed in the year received, nothing 
   // Parsed from the URL; the start only travels with an amount.
   assert.deepEqual(S.parseScenarioParams((k) => ({ otherIncome: "12000", otherIncomeStart: "2031-03-10" })[k] ?? null), { otherIncome: 12_000, otherIncomeStart: "2031-03-10" });
   assert.deepEqual(S.parseScenarioParams((k) => ({ otherIncomeStart: "2031-03-10" })[k] ?? null), {});
+});
+
+// ─── Published tables, assumptions and your entries ───────────────────────────────────────────
+// Boundary fixtures are the "plus" amounts printed in the official schedules: IRS Rev. Proc. 2025-32 / 2026-35
+// Table 3 (single), NY Tax Law 601(c)(1)(vii) / (viii) and the IT-2105-I (2026) tax computation worksheets.
+
+const near = (actual, expected, tol, msg) => assert.ok(Math.abs(actual - expected) <= tol, `${msg}: ${actual} vs ${expected}`);
+
+test("federal 2026 and 2027 are the published tables: every bracket edge matches the revenue procedure", () => {
+  const edges = {
+    2026: [[12_400, 1_240], [50_400, 5_800], [105_700, 17_966], [201_775, 41_024], [256_225, 58_448], [640_600, 192_979.25]],
+    2027: [[12_800, 1_280], [52_025, 5_987], [109_125, 18_549], [208_325, 42_357], [264_550, 60_349], [661_375, 199_237.75]],
+  };
+  for (const [year, list] of Object.entries(edges)) {
+    const t = TT.taxTables(Number(year));
+    assert.equal(t.federal.basis, "published");
+    assert.equal(t.federal.staleAfter, null);
+    for (const [edge, tax] of list) near(TT.bracketTax(edge, t.federal.single), tax, 0.01, `${year} tax at $${edge}`);
+    assert.ok(t.federal.sources.every((s) => /^https:\/\//.test(s.url) && /^\d{4}-\d{2}-\d{2}$/.test(s.retrieved) && s.effective.length > 0));
+  }
+  assert.equal(TT.taxTables(2026).federal.standardDeduction, 16_100);
+  assert.equal(TT.taxTables(2027).federal.standardDeduction, 16_600);
+  assert.equal(TT.taxTables(2026).federal.ssWageBase, 184_500);
+  assert.equal(TT.taxTables(2027).federal.ssWageBase, 192_300);
+  assert.equal(TT.lastPublishedFederalYear(), 2027);
+});
+
+test("2027 federal figures replace the extrapolation; 2028 and later stay explicit estimates", () => {
+  const p = { ...base, employmentStart: "2026-01-01", bracketIndexPct: undefined };
+  const t27 = T.tablesFor(p, 2027);
+  assert.deepEqual(t27.federal.single, TT.taxTables(2027).federal.single, "no indexing of a published year");
+  assert.equal(t27.federal.basis, "published");
+  assert.equal(T.tablesFor({ ...p, bracketIndexPct: 9 }, 2027).federal.standardDeduction, 16_600, "an entered index never touches a published year");
+  const r28 = T.computeTaxYear(p, 2028, "2027-06-01");
+  const fed = r28.rules.find((r) => r.jur === "federal");
+  assert.equal(fed.basis, "assumption");
+  assert.match(fed.note, /not published yet/);
+  assert.equal(fed.stale, null, "not stale before the IRS normally publishes");
+  // After the date the 2028 figures are normally out, the plan says the table needs updating.
+  const late = T.computeTaxYear(p, 2028, "2027-12-01");
+  assert.ok(late.rules.find((r) => r.jur === "federal").stale);
+  assert.ok(late.stale.some((s) => /Federal 2028/.test(s)));
+  // An entered index is shown as your entry, never as published.
+  assert.equal(T.computeTaxYear({ ...p, bracketIndexPct: 3 }, 2028, "2027-06-01").rules.find((r) => r.jur === "federal").basis, "override");
+});
+
+test("Georgia 2026 is 4.99% with a $15,000 standard deduction (HB 463); an entered rate is your entry", () => {
+  const t = TT.taxTables(2026);
+  assert.equal(t.ga.rate, 4.99);
+  assert.equal(t.ga.standardDeduction, 15_000);
+  assert.equal(t.ga.basis, "published");
+  // Synthetic full-year Georgia resident on the 2026 tables: 4.99% of income above $15,000.
+  const p = { ...base, employmentStart: "2026-01-01", bracketIndexPct: undefined, oneOffs: [] };
+  const r26 = T.computeTaxYear(p, 2026, "2026-02-01");
+  assert.equal(r26.jurisdictions.find((j) => j.jur === "GA").taxCents, Math.round((12_000_000 - 1_500_000) * 0.0499));
+  const rule = r26.rules.find((r) => r.jur === "GA");
+  assert.equal(rule.basis, "published");
+  assert.match(rule.figures, /4\.99% flat, standard deduction \$15,000/);
+  // 2027 depends on the December 1 revenue report: an assumption at 2026's figures, stale once the report is due.
+  const t27 = TT.taxTables(2027);
+  assert.equal(t27.ga.basis, "assumption");
+  assert.equal(t27.ga.rate, 4.99);
+  assert.equal(t27.ga.standardDeduction, 15_000);
+  assert.match(t27.ga.note, /December 1/);
+  assert.equal(T.computeTaxYear(p, 2027, "2026-11-20").rules.find((r) => r.jur === "GA").stale, null);
+  assert.ok(T.computeTaxYear(p, 2027, "2026-12-20").rules.find((r) => r.jur === "GA").stale);
+  // Your entry replaces the rate for every year and says what the table had.
+  const entered = T.computeTaxYear({ ...p, gaRatePct: 4.5 }, 2026, "2026-02-01");
+  const er = entered.rules.find((r) => r.jur === "GA");
+  assert.equal(er.basis, "override");
+  assert.match(er.note, /your entry \(the table has 4\.99% published for 2026\)/);
+  assert.equal(entered.jurisdictions.find((j) => j.jur === "GA").taxCents, Math.round((12_000_000 - 1_500_000) * 0.045));
+});
+
+test("North Carolina follows the enacted schedule (S.L. 2026-41) with withholding at the rate + 0.10", () => {
+  const rates = { 2026: [3.99, 4.09], 2027: [3.49, 3.59], 2029: [3.49, 3.59], 2030: [3.24, 3.34], 2033: [2.99, 3.09] };
+  for (const [y, [rate, wh]] of Object.entries(rates)) {
+    const nc = TT.taxTables(Number(y)).nc;
+    assert.equal(nc.rate, rate, `${y} rate`);
+    assert.equal(nc.supplementalRate, wh, `${y} withholding`);
+    assert.equal(nc.standardDeduction, 12_750);
+    assert.equal(nc.basis, "published");
+  }
+  assert.equal(TT.taxTables(2035).nc.basis, "assumption", "the 2035+ triggers are not modeled");
+});
+
+test("New York schedules: the statute's dollar amounts at every bracket edge, 2026 and 2027", () => {
+  const statute = {
+    2026: [[8_500, 332], [11_700, 473], [13_900, 586], [80_650, 4_191], [215_400, 12_141], [1_077_550, 71_198], [5_000_000, 449_714], [25_000_000, 2_509_714]],
+    2027: [[8_500, 323], [11_700, 461], [13_900, 572], [80_650, 4_110], [215_400, 11_926], [1_077_550, 70_983], [5_000_000, 449_499], [25_000_000, 2_509_499]],
+  };
+  for (const [y, list] of Object.entries(statute)) {
+    const ny = TT.taxTables(Number(y)).ny;
+    assert.equal(ny.basis, "published");
+    assert.equal(ny.standardDeduction, 8_000);
+    // The statute rounds each step to whole dollars, so the exact schedule is within $2 of its amounts.
+    for (const [edge, tax] of list) near(TT.bracketTax(edge, ny.single), tax, 2, `NY ${y} at $${edge}`);
+  }
+  assert.equal(TT.taxTables(2032).ny.single[4].rate, 5.8);
+  assert.equal(TT.taxTables(2033).ny.basis, "assumption", "after 2032 the statute changes the top rates");
+});
+
+test("New York recapture: worksheet amounts of IT-2105-I (2026) and each worksheet's rule", () => {
+  const ny = TT.taxTables(2026).ny;
+  // Worksheets 8, 9, 10 (single): recapture base and incremental benefit.
+  const published = [[5, 567, 2_047], [6, 2_614, 30_172], [7, 32_786, 32_500]];
+  for (const [k, rb, inc] of published) {
+    const a = TT.nyRecaptureAmounts(ny.single, k);
+    near(a.base, rb, 2, `worksheet base, bracket ${k}`);
+    near(a.incremental, inc, 2, `worksheet incremental, bracket ${k}`);
+  }
+  const sched = (ti) => TT.bracketTax(ti, ny.single);
+  // At or below $107,650 of NY AGI: the schedule.
+  assert.equal(TT.nyResidentTax(107_650, 99_650, ny), sched(99_650));
+  // Worksheet 7: NY AGI $157,650 or more and taxable income up to $215,400 = 5.90% of all of it.
+  near(TT.nyResidentTax(160_000, 152_000, ny), 152_000 * 0.059, 0.01, "worksheet 7, fully phased in");
+  // Halfway through the phase-in ($132,650 of NY AGI): half the benefit is taken back.
+  const ti = 124_650;
+  near(TT.nyResidentTax(132_650, ti, ny), sched(ti) + (ti * 0.059 - sched(ti)) * 0.5, 0.01, "worksheet 7, halfway");
+  // Worksheet 8 fully phased in = 6.85% of all taxable income; over $25,000,000 = 10.9% (worksheet 11).
+  near(TT.nyResidentTax(300_000, 292_000, ny), 292_000 * 0.0685, 0.01, "worksheet 8, fully phased in");
+  near(TT.nyResidentTax(30_000_000, 29_992_000, ny), 29_992_000 * 0.109, 0.01, "worksheet 11");
+  // The recapture never lowers the tax.
+  for (const agi of [110_000, 140_000, 200_000, 240_000, 1_100_000]) assert.ok(TT.nyResidentTax(agi, agi - 8_000, ny) >= sched(agi - 8_000) - 1e-9);
+});
+
+test("part-year allocation: the IT-203 income percentage and the IT-360.1 NYC months", () => {
+  // IT-203-I line 45 example: $12,000 / $36,000 = 0.3333.
+  assert.equal(TT.round4(12_000 / 36_000), 0.3333);
+  // IT-360.1-I examples: moved in April 1 = 9 months; September 4 = 4 months. Half a month or less does not count.
+  assert.equal(T.cityResidentMonths("2031-04-01", 2031), 9);
+  assert.equal(T.cityResidentMonths("2031-09-04", 2031), 4);
+  assert.equal(T.cityResidentMonths("2031-09-16", 2031), 3, "15 of 30 days is not more than half");
+  assert.equal(T.cityResidentMonths("2031-09-15", 2031), 4, "16 of 30 days");
+  assert.equal(T.cityResidentMonths("2030-07-01", 2031), 12);
+  assert.equal(T.cityResidentMonths("2032-01-10", 2031), 0);
+  assert.equal(T.cityResidentMonths(null, 2031), 0);
+  // NYC tax: resident-period income less the prorated standard deduction (9 months = $6,000 on the chart).
+  const p = { ...base, oneOffs: [], moveDate: "2031-04-01" };
+  const r = T.computeTaxYear(p, 2031, "2030-12-01");
+  const ny = r.jurisdictions.find((j) => j.jur === "NY");
+  const nyc = r.jurisdictions.find((j) => j.jur === "NYC");
+  const t = TT.taxTables(2031);
+  assert.equal(nyc.taxCents, Math.round(TT.bracketTax(ny.incomeCents / 100 - 6_000, t.nyc.single) * 100));
+  const nyFull = Math.round(TT.nyResidentTax(r.agiCents / 100, r.agiCents / 100 - 8_000, t.ny) * 100);
+  assert.equal(ny.taxCents, Math.round(nyFull * TT.round4(ny.incomeCents / r.agiCents)));
+});
+
+test("cash-payment timing: estimated tax due dates move like the official Form 1040-ES dates", () => {
+  // 2022 and 2023 Form 1040-ES (April 15 on a weekend + DC Emancipation Day; January 15 on a Sunday / on MLK Day).
+  assert.deepEqual(T.taxDueDates(2022), ["2022-04-18", "2022-06-15", "2022-09-15", "2023-01-17"]);
+  assert.deepEqual(T.taxDueDates(2023), ["2023-04-18", "2023-06-15", "2023-09-15", "2024-01-16"]);
+  // 2026 (IT-2105-I (2026) lists the same four dates).
+  assert.deepEqual(T.taxDueDates(2026), ["2026-04-15", "2026-06-15", "2026-09-15", "2027-01-15"]);
+  // January 15, 2028 is a Saturday and the Monday is MLK Day.
+  assert.deepEqual(T.taxDueDates(2027), ["2027-04-15", "2027-06-15", "2027-09-15", "2028-01-18"]);
+  assert.equal(T.taxDueDate("2028-04-15"), "2028-04-18", "Saturday, then Emancipation Day observed on Monday");
+  // The cash lines use the moved dates, including "due with the return" once no estimate date is left.
+  const p = { ...base, employmentStart: "2027-01-01", oneOffs: [] };
+  const r = T.computeTaxYear(p, 2027, "2027-03-01");
+  assert.deepEqual(r.payments.filter((x) => x.jur === "GA").map((x) => x.date), ["2027-04-15", "2027-06-15", "2027-09-15", "2028-01-18"]);
+  const after = T.computeTaxYear(p, 2027, "2028-01-20").payments.find((x) => x.jur === "GA");
+  assert.equal(after.date, "2028-04-18");
+  assert.ok(T.taxCashItems(p, [r], "2027-03-01").some((i) => i.id === "tax:2027:GA:2028-01-18"));
+});
+
+test("the result names its tables, what is stale and what is left out", () => {
+  const r = T.computeTaxYear({ ...base, moveDate: "2031-03-01" }, 2031, "2030-12-01");
+  assert.deepEqual(r.rules.map((x) => x.jur), r.jurisdictions.map((j) => j.jur));
+  assert.ok(r.rules.every((x) => ["published", "assumption", "override"].includes(x.basis) && x.figures.length > 0));
+  assert.ok(r.limitations.length > 0 && r.limitations.some((l) => /recapture/.test(l)));
+  assert.equal(r.tablesChecked, TT.TABLES_CHECKED);
+  // A year after the last check, the plan asks for the tables to be checked again.
+  assert.equal(T.tablesReviewMessage("2027-11-16", "2026-11-16"), null);
+  assert.match(T.tablesReviewMessage("2027-11-17", "2026-11-16"), /last checked/);
+  assert.ok(T.computeTaxYear(base, 2030, "2030-03-01").stale.some((s) => /last checked/.test(s)));
 });
