@@ -11,6 +11,13 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * intake_date defaults to the behavioral-today (pds.behavioral_today_now RPC,
  * TZ- + awake-tail-aware) with an ET-clock fallback — matching the existing
  * log-intake route so the awake-tail convention is honored everywhere.
+ *
+ * Event identity (SEC-04, sql/chat_operations.sql): with `event_key` (a UUID,
+ * the chat operation id) every row of this log carries the key and its place
+ * (client_event_key / client_event_line) and all rows go in ONE insert. A
+ * second call with the same key returns the rows already written instead of
+ * writing the stack again, also when two calls race (the unique index fails the
+ * whole second insert). Without a key nothing changes.
  */
 export interface LogStackResult {
   ok: boolean;
@@ -21,14 +28,64 @@ export interface LogStackResult {
   intake_ids?: number[];
   count?: number;
   total_doses?: number;
+  /** The rows of an earlier call with the same event_key; nothing was written now. */
+  replayed?: boolean;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Pds = SupabaseClient<any, any, any>;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The key columns are new: until sql/chat_operations.sql is applied the key is ignored (codes only, never a 23505). */
+const missingColumn = (error: { code?: string } | null | undefined) => !!error && (error.code === "42703" || error.code === "PGRST204");
+
+export const eventKeyOf = (value: unknown): string | null =>
+  typeof value === "string" && UUID_RE.test(value) ? value.toLowerCase() : null;
+
+interface EventRow {
+  intake_id: number;
+  doses: number | string;
+  intake_date: string;
+}
+
+/** The rows an earlier call with this key wrote (empty when none, or when the column is not there yet). */
+async function rowsForEvent(supabase: Pds, key: string): Promise<EventRow[]> {
+  const { data, error } = await supabase
+    .from("supplement_intake")
+    .select("intake_id,doses,intake_date")
+    .eq("client_event_key", key)
+    .order("client_event_line", { ascending: true });
+  if (error) return [];
+  return (data ?? []) as EventRow[];
+}
+
+async function replayStack(supabase: Pds, stack_id: number, rows: EventRow[]): Promise<LogStackResult> {
+  // The stack may have been renamed or archived since; its rows still stand.
+  const { data: stack } = await supabase.from("supplement_stack").select("name").eq("stack_id", stack_id).maybeSingle();
+  return {
+    ok: true,
+    stack_id,
+    stack_name: (stack as { name?: string } | null)?.name ?? undefined,
+    intake_date: rows[0].intake_date,
+    intake_ids: rows.map((r) => r.intake_id),
+    count: rows.length,
+    total_doses: rows.reduce((s, r) => s + Number(r.doses), 0),
+    replayed: true,
+  };
 }
 
 export async function logStackIntake(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  supabase: SupabaseClient<any, any, any>,
+  supabase: Pds,
   stack_id: number,
-  opts: { intake_date?: string | null; intake_time?: string | null } = {},
+  opts: { intake_date?: string | null; intake_time?: string | null; event_key?: string | null } = {},
 ): Promise<LogStackResult> {
+  const key = eventKeyOf(opts.event_key);
+  if (key) {
+    const prior = await rowsForEvent(supabase, key);
+    if (prior.length > 0) return replayStack(supabase, stack_id, prior);
+  }
+
   // Resolve the stack (must be active) + its items.
   const { data: stack, error: stackErr } = await supabase
     .from("supplement_stack")
@@ -76,10 +133,19 @@ export async function logStackIntake(
     notes: `Logged from stack: ${stack.name}`,
   }));
 
-  const { data: inserted, error: insErr } = await supabase
+  const keyed = key ? rows.map((r, i) => ({ ...r, client_event_key: key, client_event_line: i })) : rows;
+  let { data: inserted, error: insErr } = await supabase
     .from("supplement_intake")
-    .insert(rows)
+    .insert(keyed)
     .select("intake_id");
+  if (insErr && key && insErr.code === "23505") {
+    // The same event arrived twice at once: the other call wrote the whole set.
+    const prior = await rowsForEvent(supabase, key);
+    if (prior.length > 0) return replayStack(supabase, stack_id, prior);
+  }
+  if (insErr && key && missingColumn(insErr)) {
+    ({ data: inserted, error: insErr } = await supabase.from("supplement_intake").insert(rows).select("intake_id"));
+  }
   if (insErr) return { ok: false, error: insErr.message };
 
   return {
@@ -87,7 +153,7 @@ export async function logStackIntake(
     stack_id,
     stack_name: stack.name,
     intake_date,
-    intake_ids: (inserted ?? []).map((r) => r.intake_id),
+    intake_ids: (inserted ?? []).map((r: { intake_id: number }) => r.intake_id),
     count: rows.length,
     total_doses: rows.reduce((s, r) => s + Number(r.doses), 0),
   };

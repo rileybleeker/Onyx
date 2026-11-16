@@ -48,6 +48,12 @@ export interface LogIntakeInput {
   times?: string[] | null;
   date?: string | null;
   notes?: string | null;
+  /**
+   * Event identity (SEC-04, sql/chat_operations.sql): a UUID (the chat operation id). Every row of this log carries it
+   * and its place, all in ONE insert, so a repeated call with the same key returns the rows already written instead
+   * of logging again (also an untimed "now" log, which the duplicate check below cannot recognise).
+   */
+  event_key?: string | null;
 }
 
 export interface LogIntakeResult {
@@ -63,6 +69,8 @@ export interface LogIntakeResult {
   amount_each?: string;
   logged?: Array<{ intake_id: number; time: string | null }>;
   skipped_duplicates?: string[];
+  /** The rows of an earlier call with the same event_key; nothing was written now. */
+  replayed?: boolean;
 }
 
 const norm = (s: string | null | undefined) =>
@@ -246,7 +254,61 @@ export async function behavioralToday(supabase: Pds): Promise<string> {
 
 // ---------- the write ----------
 
+const EVENT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The key columns are new: until sql/chat_operations.sql is applied the key is ignored (codes only, never a 23505). */
+const missingColumn = (error: { code?: string } | null | undefined) => !!error && (error.code === "42703" || error.code === "PGRST204");
+
+interface EventRow {
+  intake_id: number;
+  product_id: string;
+  doses: number | string;
+  intake_date: string;
+  intake_time: string | null;
+}
+
+/** The rows an earlier call with this key wrote (empty when none, or when the column is not there yet). */
+async function rowsForEvent(supabase: Pds, key: string): Promise<EventRow[]> {
+  const { data, error } = await supabase
+    .from("supplement_intake")
+    .select("intake_id,product_id,doses,intake_date,intake_time")
+    .eq("client_event_key", key)
+    .order("client_event_line", { ascending: true });
+  if (error) return [];
+  return (data ?? []) as EventRow[];
+}
+
+/** The result of the call that wrote these rows, rebuilt from what is stored (the product may be inactive by now). */
+async function replayIntake(supabase: Pds, rows: EventRow[]): Promise<LogIntakeResult> {
+  const first = rows[0];
+  const { data: product } = await supabase
+    .from("supplement_products")
+    .select("product_id,brand_name,full_name")
+    .eq("product_id", first.product_id)
+    .maybeSingle();
+  const tz = await currentTimeZone(supabase, wallClockToUtc(first.intake_date, 12, 0, "America/New_York"));
+  const local = (iso: string | null) =>
+    iso ? new Date(iso).toLocaleTimeString("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }) : null;
+  const name = product ? [product.brand_name, product.full_name].filter(Boolean).join(" ") : "";
+  return {
+    ok: true,
+    product: name || first.product_id,
+    product_id: first.product_id,
+    intake_date: first.intake_date,
+    timezone: tz,
+    doses_each: Number(first.doses),
+    logged: rows.map((r) => ({ intake_id: r.intake_id, time: local(r.intake_time) })),
+    replayed: true,
+  };
+}
+
 export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput): Promise<LogIntakeResult> {
+  const key = typeof input.event_key === "string" && EVENT_UUID.test(input.event_key) ? input.event_key.toLowerCase() : null;
+  if (key) {
+    const prior = await rowsForEvent(supabase, key);
+    if (prior.length > 0) return replayIntake(supabase, prior);
+  }
+
   const byId = (input.product_id ?? "").trim();
   let query = (input.product ?? "").trim();
   if (!query && !byId) return { ok: false, error: "product is required" };
@@ -327,12 +389,21 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       intake_time,
       notes: input.notes ?? "Logged from chat",
     }));
-    const { data: inserted, error: insErr } = await supabase
+    const keyed = key ? rows.map((r, i) => ({ ...r, client_event_key: key, client_event_line: i })) : rows;
+    let { data: inserted, error: insErr } = await supabase
       .from("supplement_intake")
-      .insert(rows)
+      .insert(keyed)
       .select("intake_id,intake_time");
+    if (insErr && key && insErr.code === "23505") {
+      // The same event arrived twice at once: the other call wrote the whole set.
+      const prior = await rowsForEvent(supabase, key);
+      if (prior.length > 0) return replayIntake(supabase, prior);
+    }
+    if (insErr && key && missingColumn(insErr)) {
+      ({ data: inserted, error: insErr } = await supabase.from("supplement_intake").insert(rows).select("intake_id,intake_time"));
+    }
     if (insErr) return { ok: false, error: insErr.message };
-    logged = (inserted ?? []).map((r) => ({ intake_id: r.intake_id, time: local(r.intake_time) }));
+    logged = (inserted ?? []).map((r: { intake_id: number; intake_time: string | null }) => ({ intake_id: r.intake_id, time: local(r.intake_time) }));
   }
 
   return {

@@ -1,7 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
-import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, validateChatMessages } from "@/lib/chat-contract";
+import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
+import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
+import { createSupabaseServer } from "@/lib/supabase-server";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
@@ -502,7 +504,18 @@ async function describeStackIntakes(intakeIds: number[]): Promise<Record<string,
   }
 }
 
-async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
+/** createPlaylist errors raised before the create call reached Spotify, or a 4xx answer to it: nothing was created. */
+const PLAYLIST_NOT_CREATED =
+  /^(Playlist name is required|track_ids must be a non-empty array|Spotify is not configured|Spotify tokens not found|Spotify refresh token rejected|Spotify token refresh failed|Spotify playlist create failed \(4\d\d\))/;
+const PLAYLIST_MAYBE_CREATED =
+  "Spotify may have created the playlist before this failed, possibly without all its tracks. Do not create it again: tell the user to check Spotify first.";
+
+/**
+ * `opId` is the chat operation id (lib/chat-operations.ts) when the request carries a request_id: the supplement,
+ * stack and reading writes use it as their own idempotency key, so a retry that re-runs the tool finds what an earlier
+ * try already wrote.
+ */
+async function executeTool(name: string, input: Record<string, unknown>, opId?: string): Promise<string> {
   const days = (input.days as number) || 7;
   const since = new Date();
   since.setDate(since.getDate() - days);
@@ -671,7 +684,12 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       });
       return JSON.stringify({ success: true, ...result });
     } catch (e) {
-      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+      const message = e instanceof Error ? e.message : String(e);
+      // Only a failure from before Spotify was asked to create the playlist (bad arguments, no token, a 4xx on the
+      // create call) is a clean "not created". Anything later, or a network error on the create call itself, may have
+      // left a playlist on Spotify: report it as possibly done, so neither the model nor a retry creates a second one.
+      if (PLAYLIST_NOT_CREATED.test(message)) return JSON.stringify({ error: message });
+      return JSON.stringify({ error: PLAYLIST_MAYBE_CREATED, incomplete: true });
     }
   }
 
@@ -918,13 +936,17 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       recall: (input.recall as string) || null,
       question: (input.question as string) || null,
       source: "chat",
+      // The library's own idempotency key (sql/reading_sessions_client_key.sql): a retry gets the stored session back.
+      ...(opId ? { client_key: opId } : {}),
     });
     if (!result.ok) return JSON.stringify({ error: result.error });
-    // Mirror inline (the chat loop has no after() boundary worth protecting).
-    const blockId = await mirrorSession(result.book, result.session);
-    if (blockId) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    // A replay (same client_key) wrote nothing: no second Notion entry or progress update. Mirror inline otherwise
+    // (the chat loop has no after() boundary worth protecting).
+    const replayed = result.replayed === true;
+    const blockId = replayed ? result.session.notion_block_id : await mirrorSession(result.book, result.session);
+    if (blockId && !replayed) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
     const o = await getOverview(supabase, result.book.slug).catch(() => null);
-    await mirrorProgress(result.book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    if (!replayed) await mirrorProgress(result.book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
     return JSON.stringify({
       success: true,
       book: result.book.title,
@@ -944,6 +966,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       streak: o?.streak,
       level: o?.level,
       notion_mirrored: !!blockId,
+      ...(replayed ? { replayed: true } : {}),
     });
   }
 
@@ -1002,6 +1025,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       unit: (input.unit as string) || null,
       times: Array.isArray(input.times) ? (input.times as string[]) : null,
       date: (input.date as string) || null,
+      ...(opId ? { event_key: opId } : {}),
     });
     const { ok, ...rest } = result;
     return JSON.stringify(ok ? { success: true, ...rest } : rest);
@@ -1034,7 +1058,8 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
     // /supplements and log_supplement_intake): stamping "now" on a past day
     // gives it a next-day timestamp the caffeine timing layer has to quarantine.
     const backdated = !!date && date !== (await behavioralToday(supabase));
-    const result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null } : { intake_date: date });
+    const event = opId ? { event_key: opId } : {};
+    const result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...event });
     if (!result.ok) return JSON.stringify({ error: result.error });
     const written = await describeStackIntakes(result.intake_ids ?? []);
     return JSON.stringify({
@@ -1044,6 +1069,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       total_doses: result.total_doses,
       date: result.intake_date,
       ...written,
+      ...(result.replayed ? { replayed: true } : {}),
     });
   }
 
@@ -1080,12 +1106,81 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   return JSON.stringify(tagCalorieSources(table, stripRawFields(data ?? [])));
 }
 
+/** Run one tool; a throw becomes an "incomplete" result (write) or "unavailable" (lookup), never a failed request. */
+async function runTool(name: string, input: Record<string, unknown>, opId?: string): Promise<{ result: string; failed: boolean }> {
+  try {
+    return { result: await executeTool(name, input, opId), failed: false };
+  } catch (toolError) {
+    // A tool that throws may have written part of its work. Tell the
+    // model (and the receipt) so, instead of failing the whole request
+    // with nothing on screen. Tool name and error class only: never the
+    // message, which can echo user text.
+    const { name: errorName } = (toolError ?? {}) as { name?: unknown };
+    console.error("Chat tool failed", { tool: name, name: typeof errorName === "string" ? errorName : typeof toolError });
+    return {
+      failed: true,
+      result: JSON.stringify(isWriteTool(name)
+        ? { error: "This tool failed unexpectedly and may have completed only part of its work. Do not retry it; tell the user to check the relevant page.", incomplete: true }
+        : { error: "This lookup failed unexpectedly. Say that this data is unavailable right now; do not guess its contents." }),
+    };
+  }
+}
+
+/** The signed-in owner's user id from the session (middleware already admits the owner only). */
+async function sessionOwnerId(): Promise<string | null> {
+  try {
+    const client = await createSupabaseServer();
+    const { data } = await client.auth.getClaims();
+    const sub = data?.claims?.sub;
+    return typeof sub === "string" && REQUEST_ID_RE.test(sub) ? sub.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record this request (first try or retry) in the replay ledger for the signed-in owner. Never throws. */
+async function openRequestLedger(
+  requestId: string,
+  messages: ReadonlyArray<{ role: string; content: string }>,
+): Promise<OpenedLedger | { kind: "no_owner" }> {
+  const ownerId = await sessionOwnerId();
+  if (!ownerId) return { kind: "no_owner" };
+  return openLedger(supabaseLedgerStore(supabase), {
+    ownerId,
+    requestId,
+    conversationSha: conversationSha(messages),
+    buildReceipt: buildWriteReceipt,
+    reconcilers: supabaseReconcilers(supabase),
+    onError: logLedger,
+  });
+}
+
+/** Ledger problems are logged by stage and database code only. */
+const logLedger = (stage: string, code: string) => console.error("Chat ledger", { stage, code });
+
+const WRITES_PAUSED =
+  "Onyx could not set up safe logging for this message, so this action was not done and nothing was written. Answer the rest normally and tell the user to try the action again in a moment.";
+
 export async function POST(req: NextRequest) {
   // One receipt per executed write tool, built from the tool's own result (see
   // lib/chat-receipts.ts). Returned with every response after a write ran,
   // error responses included, so the page can show exactly what was saved.
   const receipts: WriteReceipt[] = [];
-  const withReceipts = <T extends object>(body: T) => (receipts.length > 0 ? { ...body, receipts } : body);
+  // Replay ledger (SEC-04, lib/chat-operations.ts): set when the page sent a request_id and the ledger is there.
+  let ledger: ChatLedger | null = null;
+  // The ledger is there but could not record this request: write tools are refused, lookups still answer.
+  let writesPaused = false;
+  const withReceipts = <T extends object>(body: T): T | (T & { receipts?: WriteReceipt[]; replay_safe?: true }) => {
+    if (receipts.length === 0 && !ledger) return body;
+    return { ...body, ...(receipts.length > 0 ? { receipts } : {}), ...(ledger ? { replay_safe: true as const } : {}) };
+  };
+  // On a retry, the receipts of what an earlier try saved that this try did not repeat, listed first.
+  let earlierAdded = false;
+  const addEarlierReceipts = async () => {
+    if (earlierAdded || !ledger?.retry) return;
+    earlierAdded = true;
+    receipts.unshift(...(await ledger.earlierReceipts()));
+  };
   try {
     let body: unknown;
     try { body = await req.json(); } catch {
@@ -1096,6 +1191,8 @@ export async function POST(req: NextRequest) {
     if (!validateChatMessages(rawMessages)) {
       return Response.json({ error: "Use a nonempty, alternating text conversation of at most 60 messages and 60,000 characters." }, { status: 400 });
     }
+    const requestId = parseRequestId(body && typeof body === "object" && "request_id" in body ? body.request_id : undefined);
+    if (requestId === false) return Response.json({ error: "request_id must be a UUID." }, { status: 400 });
     // Only role + text reach the model; any other field a client attaches is dropped.
     const messages = rawMessages.map(({ role, content }) => ({ role, content }));
 
@@ -1103,8 +1200,24 @@ export async function POST(req: NextRequest) {
 
     // The model has no clock of its own: tell it the local time and the
     // behavioral day so "today", "yesterday" and "this morning" resolve.
+    // The request is recorded in the replay ledger at the same time (one insert; nothing is added to the wait).
     const now = new Date();
-    const [tz, bday] = await Promise.all([currentTimeZone(supabase, now), behavioralToday(supabase)]);
+    const [opened, tz, bday] = await Promise.all([
+      requestId ? openRequestLedger(requestId, messages) : Promise.resolve(null),
+      currentTimeZone(supabase, now),
+      behavioralToday(supabase),
+    ]);
+    if (opened?.kind === "no_owner") return Response.json({ error: "Your session may have expired. Sign in again." }, { status: 401 });
+    if (opened?.kind === "conflict") {
+      return Response.json({ error: "This retry does not match the message it was first sent with, so nothing was run. Send your message again.", code: "request_conflict" }, { status: 409 });
+    }
+    if (opened?.kind === "ledger") ledger = opened.ledger;
+    else if (opened) {
+      logLedger("open", opened.code);
+      // Tables not there yet (sql/chat_operations.sql not applied): run as before. Any other failure: no write runs
+      // without a record of it.
+      if (opened.kind === "failed") writesPaused = true;
+    }
     const localNow = now.toLocaleString("en-US", {
       timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",
     });
@@ -1133,12 +1246,14 @@ export async function POST(req: NextRequest) {
 
     while (response.stop_reason === "tool_use") {
       if (toolRounds++ >= MAX_TOOL_ROUNDS) {
+        await addEarlierReceipts();
         return Response.json(withReceipts({ error: "This request reached the tool limit. Some actions may already have completed; check the relevant page before retrying any logging request." }), { status: 422 });
       }
       if (req.signal.aborted) return cancelled();
       const assistantContent = response.content;
       const batchSize = assistantContent.filter((b) => b.type === "tool_use").length;
       if (toolCalls + batchSize > MAX_TOOL_CALLS) {
+        await addEarlierReceipts();
         return Response.json(withReceipts({ error: "This request reached the tool-call limit. Some actions may already have completed; check the relevant page before repeating an action." }), { status: 422 });
       }
       toolCalls += batchSize;
@@ -1147,29 +1262,24 @@ export async function POST(req: NextRequest) {
       const toolResults = [];
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
-          let result: string;
-          let failed = false;
-          try {
-            result = await executeTool(block.name, block.input as Record<string, unknown>);
-          } catch (toolError) {
-            // A tool that throws may have written part of its work. Tell the
-            // model (and the receipt) so, instead of failing the whole request
-            // with nothing on screen. Tool name and error class only: never the
-            // message, which can echo user text.
-            failed = true;
-            const { name: errorName } = (toolError ?? {}) as { name?: unknown };
-            console.error("Chat tool failed", { tool: block.name, name: typeof errorName === "string" ? errorName : typeof toolError });
-            result = JSON.stringify(isWriteTool(block.name)
-              ? { error: "This tool failed unexpectedly and may have completed only part of its work. Do not retry it; tell the user to check the relevant page.", incomplete: true }
-              : { error: "This lookup failed unexpectedly. Say that this data is unavailable right now; do not guess its contents." });
+          const input = block.input as Record<string, unknown>;
+          let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
+          if (isWriteTool(block.name) && ledger) {
+            // Through the ledger: a retry of this message gets the stored result instead of writing again.
+            outcome = await ledger.run(block.name, input, (opId) => runTool(block.name, input, opId));
+          } else if (isWriteTool(block.name) && writesPaused) {
+            const result = JSON.stringify({ error: WRITES_PAUSED });
+            outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };
+          } else {
+            const ran = await runTool(block.name, input);
+            outcome = { ...ran, receipt: buildWriteReceipt(block.name, block.input, ran.result) };
           }
-          const receipt = buildWriteReceipt(block.name, block.input, result);
-          if (receipt) receipts.push(receipt);
+          if (outcome.receipt) receipts.push(outcome.receipt);
           toolResults.push({
             type: "tool_result" as const,
             tool_use_id: block.id,
-            content: result,
-            ...(failed ? { is_error: true } : {}),
+            content: outcome.result,
+            ...(outcome.failed ? { is_error: true } : {}),
           });
         }
       }
@@ -1197,6 +1307,7 @@ export async function POST(req: NextRequest) {
       ? "No final summary was produced. Tool requests were processed, but that does not confirm every action succeeded. Check the relevant page before repeating an action."
       : "No answer was produced. Please try rephrasing your question.");
     const suffix = response.stop_reason === "max_tokens" ? "\n\nThis response reached its length limit. Ask me to continue if needed; do not repeat an action without checking its result." : "";
+    await addEarlierReceipts();
     return Response.json(withReceipts({ response: summary + suffix }));
   } catch (err) {
     // The client is gone (the SDK throws when the abort signal fires).
@@ -1211,6 +1322,7 @@ export async function POST(req: NextRequest) {
       name: typeof name === "string" ? name : typeof err,
       status: typeof status === "number" ? status : undefined,
     });
+    await addEarlierReceipts().catch(() => {});
     return Response.json(
       withReceipts({ error: "Unable to finish this request. If you asked to log or create something, check the relevant page before retrying." }),
       { status: 500 }

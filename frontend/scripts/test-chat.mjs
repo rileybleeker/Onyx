@@ -5,13 +5,23 @@ import vm from "node:vm";
 import test from "node:test";
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
-// lib/checkin.ts is pure date / question rules with no imports: the chat route gets the real module.
-let checkinLib;
+// lib/checkin.ts is pure date / question rules with no imports: the chat route gets the real module. So does the
+// replay ledger (lib/chat-operations.ts, node:crypto only); the session is a stub signed in as a synthetic owner.
+let checkinLib, operationsLib;
+const OWNER = "00000000-0000-4000-8000-0000000000a1";
+const signedIn = { createSupabaseServer: async () => ({ auth: { getClaims: async () => ({ data: { claims: { sub: OWNER } } }) } }) };
 function compile(path, imports = {}, sandboxConsole = { error() {} }) {
   const source = readFileSync(new URL(path, import.meta.url), "utf8");
   const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true } }).outputText;
   const exports = {};
-  vm.runInNewContext(js, { exports, require: name => { if (name in imports) return imports[name]; if (name === "@/lib/checkin") return (checkinLib ??= compile("../src/lib/checkin.ts")); throw new Error(`Unexpected import: ${name}`); }, Response, console: sandboxConsole, process: { env: {} } });
+  vm.runInNewContext(js, { exports, require: name => {
+    if (name in imports) return imports[name];
+    if (name === "@/lib/checkin") return (checkinLib ??= compile("../src/lib/checkin.ts"));
+    if (name === "@/lib/chat-operations") return (operationsLib ??= compile("../src/lib/chat-operations.ts"));
+    if (name === "@/lib/supabase-server") return signedIn;
+    if (name === "node:crypto") return require("node:crypto");
+    throw new Error(`Unexpected import: ${name}`);
+  }, Response, console: sandboxConsole, process: { env: {} } });
   return exports;
 }
 const contract = compile("../src/lib/chat-contract.ts");
@@ -26,7 +36,7 @@ test("accepts ordinary text conversation and rejects malformed/tool-injected his
     assert.equal(contract.validateChatMessages(input), false);
   }
 });
-function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite = () => {}, intake = { ok: true }, stacks = {}, reading = {}, readingNotion = {}, spotify = {}, today = "2026-11-11", sandboxConsole } = {}) {
+function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite = () => {}, intake = { ok: true }, stacks = {}, reading = {}, readingNotion = {}, spotify = {}, today = "2026-11-11", sandboxConsole, session = signedIn } = {}) {
   let calls = 0, writes = 0; const requests = [];
   class Anthropic { messages = { create: async (body) => { calls++; requests.push(JSON.parse(JSON.stringify(body))); onModelCall(calls); return responses[Math.min(calls-1,responses.length-1)] ?? { stop_reason:"end_turn",content:[{type:"text",text:"A general answer"}] }; } }; }
   const exports = compile("../src/app/api/chat/route.ts", {
@@ -39,6 +49,7 @@ function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite 
     "@/lib/supplement-stacks": stacks,
     "@/lib/supplement-intake": {currentTimeZone: async()=>"UTC", behavioralToday: async()=>today, logSupplementIntake: async(_client, input)=>{writes++; onWrite(writes); return typeof intake === "function" ? intake(input) : intake;}},
     "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-practice": readingPractice,
+    "@/lib/supabase-server": session,
   }, sandboxConsole);
   return {post: body => exports.POST({json:async()=>body,signal:new AbortController().signal}), raw:exports.POST, calls:()=>calls,writes:()=>writes,requests:()=>requests};
 }
@@ -507,4 +518,206 @@ test("the chat page sends role + text only and shows receipts from the API, also
   assert.match(page, /<ChatReceipts receipts=\{msg\.receipts\} \/>/);
   assert.match(page, /setErrorReceipts\(written\)/);
   assert.match(page, /<ChatReceipts receipts=\{errorReceipts\}/);
+});
+
+// ---------------------------------------------------------------------------
+// Replay safety (SEC-04): the page sends one request_id per message and the same id on a retry. A response that is
+// lost after the write is simulated by ignoring the first answer and sending the same body again. Synthetic ids,
+// names and rows only; the ledger runs on an in-memory PostgREST stand-in.
+// ---------------------------------------------------------------------------
+const { randomUUID } = require("node:crypto");
+const { createFakePostgrest, chatLedgerTables } = require("../tests/helpers/fake-postgrest.cjs");
+const operations = compile("../src/lib/chat-operations.ts");
+const RID = "11111111-1111-4111-8111-111111111111";
+const ledgerDb = (extra = {}) => createFakePostgrest({ ...chatLedgerTables(randomUUID), rpc: { behavioral_today_now: "2026-11-11" }, ...extra });
+/** A supplement write that honours its event key, like lib/supplement-intake.ts: one effect per key. */
+function keyedIntake() {
+  const effects = new Map();
+  const keys = [];
+  const intake = (input) => {
+    keys.push(input.event_key);
+    if (input.event_key && effects.has(input.event_key)) return { ...effects.get(input.event_key), replayed: true };
+    const result = { ok: true, product: "Acme Synthetic Focus", product_id: "custom_synthetic", intake_date: "2026-11-11", timezone: "UTC", doses_each: 1, logged: [{ intake_id: effects.size + 1, time: "9:00 AM" }] };
+    effects.set(input.event_key ?? `unkeyed-${effects.size}`, result);
+    return result;
+  };
+  return { effects, keys, intake };
+}
+const logFocus = afterTool("log_supplement_intake", { product: "Synthetic Focus" }, "Logged Synthetic Focus.");
+
+test("a retried message returns the first try's receipt and writes nothing again", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  const first = route(logFocus, { supabase: db, intake: w.intake });
+  const firstBody = await (await first.post(body)).json(); // the page never sees this answer
+  assert.equal(firstBody.replay_safe, true);
+  assert.equal(w.effects.size, 1);
+
+  const retry = route(logFocus, { supabase: db, intake: w.intake });
+  const response = await retry.post(body);
+  assert.equal(response.status, 200);
+  const retryBody = await response.json();
+  assert.equal(retry.writes(), 0, "the ledger answered: the tool did not run again");
+  assert.equal(w.effects.size, 1);
+  assert.equal(retryBody.receipts.length, 1);
+  assert.deepEqual(retryBody.receipts[0].details, [...firstBody.receipts[0].details, operations.REPLAY_DETAIL]);
+  const toolResult = JSON.parse(retry.requests()[1].messages.at(-1).content[0].content);
+  assert.equal(toolResult.replayed, true);
+  assert.equal(toolResult.note, operations.REPLAY_NOTE);
+  const ops = db.rows("chat_operations");
+  assert.equal(ops.length, 1);
+  assert.equal(ops[0].status, "done");
+  assert.equal(ops[0].owner_id, OWNER);
+  assert.equal(w.keys[0], ops[0].op_id, "the write was keyed by the operation id");
+});
+
+test("a response lost after the write but before the ledger recorded it: the retry finds the write by its key", async () => {
+  let failFinish = true;
+  const db = ledgerDb({ fail: ({ table, op, payload }) => (failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null) });
+  const w = keyedIntake();
+  const logged = [];
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake, sandboxConsole: { error: (...args) => logged.push(args) } }).post(body);
+  assert.equal(db.rows("chat_operations")[0].status, "pending");
+  assert.deepEqual(JSON.parse(JSON.stringify(logged)), [["Chat ledger", { stage: "finish", code: "08006" }]]);
+  failFinish = false;
+  const retry = route(logFocus, { supabase: db, intake: w.intake });
+  const retryBody = await (await retry.post(body)).json();
+  assert.equal(retry.writes(), 1, "re-run, with the same key");
+  assert.equal(w.keys[0], w.keys[1]);
+  assert.equal(w.effects.size, 1, "one intake");
+  assert.equal(retryBody.receipts[0].status, "saved");
+  assert.equal(retryBody.receipts[0].details.at(-1), operations.REPLAY_DETAIL);
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+});
+
+test("a retry whose model asks for something else is refused; a new message still writes", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  const changed = route(afterTool("log_supplement_intake", { product: "Synthetic Calm" }), { supabase: db, intake: w.intake });
+  const changedBody = await (await changed.post(body)).json();
+  assert.equal(changed.writes(), 0);
+  assert.equal(w.effects.size, 1);
+  assert.equal(changedBody.receipts[0].details.at(-1), operations.CONFLICT_DETAIL);
+  assert.equal(JSON.parse(changed.requests()[1].messages.at(-1).content[0].content).conflict, true);
+
+  const next = route(logFocus, { supabase: db, intake: w.intake });
+  await next.post({ request_id: "22222222-2222-4222-8222-222222222222", messages: [user("Log Synthetic Focus")] });
+  assert.equal(next.writes(), 1);
+  assert.equal(w.effects.size, 2, "an intentional second message is a second intake");
+});
+
+test("the same request id with another conversation is a 409 and runs nothing", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  await route(logFocus, { supabase: db, intake: w.intake }).post({ request_id: RID, messages: [user("Log Synthetic Focus")] });
+  const other = route(logFocus, { supabase: db, intake: w.intake });
+  const response = await other.post({ request_id: RID, messages: [user("Log Synthetic Calm")] });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "request_conflict");
+  assert.equal(other.calls(), 0);
+  assert.equal(other.writes(), 0);
+});
+
+test("a retry where the model does not repeat the write still shows what the first try saved", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  const firstBody = await (await route(logFocus, { supabase: db, intake: w.intake }).post(body)).json();
+  const quiet = route([{ stop_reason: "end_turn", content: [{ type: "text", text: "Which product did you mean?" }] }], { supabase: db, intake: w.intake });
+  const quietBody = await (await quiet.post(body)).json();
+  assert.equal(quiet.writes(), 0);
+  assert.deepEqual(quietBody.receipts, [{ ...firstBody.receipts[0], details: [...firstBody.receipts[0].details, operations.EARLIER_DETAIL] }]);
+});
+
+test("stack and reading writes get the operation id as their own key; a reading replay mirrors nothing", async () => {
+  const db = ledgerDb({ tables: { supplement_stack: [{ stack_id: 7, name: "Synthetic Morning", is_active: true }] } });
+  const seen = [];
+  const stacks = { logStackIntake: async (_client, stackId, opts) => { seen.push(opts.event_key); return { ok: true, stack_id: stackId, stack_name: "Synthetic Morning", intake_date: "2026-11-11", intake_ids: [], count: 2, total_doses: 3 }; } };
+  await route(afterTool("log_supplement_stack", { stack: "synthetic morning" }), { supabase: db, stacks }).post({ request_id: RID, messages: [user("Log my synthetic morning stack")] });
+  const stackOp = db.rows("chat_operations").find((r) => r.tool === "log_supplement_stack");
+  assert.deepEqual(seen, [stackOp.op_id]);
+
+  const book = { slug: "synthetic-book", title: "Synthetic Book", habit_name: null };
+  const keys = [];
+  let mirrors = 0;
+  const reading = {
+    logSession: async (_client, input) => {
+      keys.push(input.client_key);
+      const replayed = keys.filter((k) => k === input.client_key).length > 1;
+      return { ok: true, book, session: { session_id: 1, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: null }, xpGained: 20, finished: false, habitMarked: false, habitCreated: replayed ? null : false, replayed };
+    },
+    getOverview: async () => null,
+  };
+  const readingNotion = { mirrorSession: async () => { mirrors++; return null; }, mirrorProgress: async () => { mirrors++; } };
+  const readingBody = { request_id: "33333333-3333-4333-8333-333333333333", messages: [user("I read chapters 1 and 2 on paper")] };
+  // The first try stops before the ledger records the session (its record update fails).
+  db.setFailure(({ table, op, payload }) => (table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null));
+  await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
+  db.setFailure(null);
+  const readingOp = db.rows("chat_operations").find((r) => r.tool === "log_reading_session");
+  assert.equal(readingOp.status, "pending");
+  assert.equal(mirrors, 2, "the first try mirrored the session and its progress once");
+  await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
+  assert.deepEqual(keys, [readingOp.op_id, readingOp.op_id], "the library client_key is the operation id on both tries");
+  assert.equal(mirrors, 2, "the replayed session made no second Notion entry");
+});
+
+test("a page without request_id runs as before: no ledger, no replay_safe flag", async () => {
+  const db = ledgerDb();
+  const w = keyedIntake();
+  const body = await (await route(logFocus, { supabase: db, intake: w.intake }).post({ messages: [user("Log Synthetic Focus")] })).json();
+  assert.equal("replay_safe" in body, false);
+  assert.equal(db.log.some((c) => c.table.startsWith("chat_")), false);
+  assert.deepEqual(w.keys, [undefined]);
+});
+
+test("missing ledger tables: writes run as before and only the code is logged; other ledger failures pause writes", async () => {
+  const logged = [];
+  const w = keyedIntake();
+  const missing = ledgerDb({ fail: ({ table }) => (table === "chat_requests" ? { code: "PGRST205", message: "synthetic detail" } : null) });
+  const asBefore = route(logFocus, { supabase: missing, intake: w.intake, sandboxConsole: { error: (...args) => logged.push(args) } });
+  const asBeforeBody = await (await asBefore.post({ request_id: RID, messages: [user("Log Synthetic Focus")] })).json();
+  assert.equal(asBefore.writes(), 1);
+  assert.equal("replay_safe" in asBeforeBody, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(logged)), [["Chat ledger", { stage: "open", code: "PGRST205" }]]);
+
+  const broken = ledgerDb({ fail: ({ table }) => (table === "chat_requests" ? { code: "53300" } : null) });
+  const paused = route(logFocus, { supabase: broken, intake: w.intake });
+  const pausedBody = await (await paused.post({ request_id: RID, messages: [user("Log Synthetic Focus")] })).json();
+  assert.equal(paused.writes(), 0, "no write runs without a record of it");
+  assert.equal(pausedBody.receipts[0].status, "not_saved");
+});
+
+test("a malformed request_id is a 400, and a request with one but no session is a 401, both before the model runs", async () => {
+  const r = route();
+  assert.equal((await r.post({ request_id: "not-a-uuid", messages: [user("Hi")] })).status, 400);
+  assert.equal((await r.post({ request_id: 5, messages: [user("Hi")] })).status, 400);
+  const signedOut = route([], { supabase: ledgerDb(), session: { createSupabaseServer: async () => ({ auth: { getClaims: async () => ({ data: null }) } }) } });
+  assert.equal((await signedOut.post({ request_id: RID, messages: [user("Hi")] })).status, 401);
+  assert.equal(r.calls() + signedOut.calls(), 0);
+});
+
+test("a playlist call that may have reached Spotify is reported as possibly done, not as a clean failure", async () => {
+  const spotify = { createPlaylist: async () => { throw new TypeError("fetch failed: synthetic network detail"); } };
+  const r = route(afterTool("create_spotify_playlist", { name: "Synthetic mix", track_ids: ["a"] }), { spotify });
+  const body = await (await r.post({ messages: [user("Create a synthetic playlist")] })).json();
+  assert.equal(body.receipts[0].status, "unknown");
+  assert.doesNotMatch(JSON.stringify(body), /synthetic network detail/);
+  const refused = route(afterTool("create_spotify_playlist", { name: "Synthetic mix", track_ids: ["a"] }), { spotify: { createPlaylist: async () => { throw new Error("Spotify refresh token rejected. Reconnect."); } } });
+  assert.equal((await (await refused.post({ messages: [user("Create a synthetic playlist")] })).json()).receipts[0].status, "not_saved");
+});
+
+test("the chat page sends a request id and reuses it only for the same text at the same point", () => {
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /body: JSON\.stringify\(\{ request_id: requestId, messages: updated\.map/);
+  assert.match(page, /previous && previous\.text === text && previous\.at === messages\.length \? previous\.requestId : newRequestId\(\)/);
+  assert.match(page, /failedSend\.current = \{ text, requestId, at: messages\.length \}/);
+  assert.match(page, /Send the same message again/);
+  assert.equal(contract.parseRequestId(undefined), null);
+  assert.equal(contract.parseRequestId("not-a-uuid"), false);
+  assert.equal(contract.parseRequestId(RID.toUpperCase()), RID);
 });

@@ -2,13 +2,21 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, type ChatMessage } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, newRequestId, type ChatMessage } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
 
 /** A message as shown on the page. Receipts are display-only: the API gets role + text. */
 type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
+
+/**
+ * The send that failed: its text, its request id and where in the conversation it was sent. Sending the same text
+ * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
+ * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. Memory only:
+ * a reload starts over.
+ */
+interface FailedSend { text: string; requestId: string; at: number }
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<ShownMessage[]>([]);
@@ -18,6 +26,11 @@ export default function ChatPage() {
   // What a failed request had already written before it stopped.
   const [errorReceipts, setErrorReceipts] = useState<WriteReceipt[]>([]);
   const sending = useRef(false);
+  const failedSend = useRef<FailedSend | null>(null);
+  // The text of the failed send, for the "Send the same message again" button.
+  const [resendText, setResendText] = useState<string | null>(null);
+  // The server said it keeps a replay ledger for this chat (replay_safe), so a retry cannot log anything twice.
+  const [replaySafe, setReplaySafe] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const loading = pending !== null;
@@ -32,29 +45,40 @@ export default function ChatPage() {
     }
   }, [loading, messages.length]);
 
-  async function send() {
-    const text = input.trim();
+  async function send(again?: string) {
+    const text = (again ?? input).trim();
     if (!text || sending.current) return;
     const updated: ShownMessage[] = [...messages, { role: "user", content: text }];
     if (updated.length > MAX_CHAT_MESSAGES || updated.reduce((n, m) => n + m.content.length, 0) > MAX_CHAT_CHARACTERS) {
       setError("This conversation is full. Start a new chat to continue.");
       return;
     }
+    const previous = failedSend.current;
+    const requestId = previous && previous.text === text && previous.at === messages.length ? previous.requestId : newRequestId();
+    failedSend.current = null;
+    setResendText(null);
     sending.current = true;
     setPending(text);
     setInput("");
     setError(null);
     setErrorReceipts([]);
     let written: WriteReceipt[] = [];
+    let safe = replaySafe;
+    let staleId = false;
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: updated.map(({ role, content }) => ({ role, content })) }),
+        body: JSON.stringify({ request_id: requestId, messages: updated.map(({ role, content }) => ({ role, content })) }),
       });
       const data = await res.json().catch(() => null);
       written = parseReceipts(data?.receipts);
+      if (data?.replay_safe === true) safe = true;
+      else if (res.ok) safe = false;
+      setReplaySafe(safe);
       if (res.redirected || res.status === 401) throw new Error("Your session may have expired. Sign in again.");
+      // The server no longer accepts this id for this message: the next send starts a new request.
+      if (res.status === 409 && data?.code === "request_conflict") staleId = true;
       if (!res.ok || typeof data?.response !== "string" || !data?.response.trim()) {
         throw new Error(typeof data?.error === "string" ? data.error : "Onyx could not finish this response.");
       }
@@ -62,7 +86,16 @@ export default function ChatPage() {
     } catch (err) {
       setInput(text);
       setErrorReceipts(written);
-      setError(`${err instanceof Error ? err.message : "Unable to connect to Onyx."} Your message is back in the composer. If it requested an action, check the relevant page before sending again.`);
+      if (!staleId) {
+        failedSend.current = { text, requestId, at: messages.length };
+        setResendText(text);
+      }
+      const next = staleId
+        ? "Your message is back in the composer."
+        : safe
+          ? "Your message is back in the composer. Sending it again unchanged is safe: anything this try already saved is shown, not saved twice. An edited message counts as a new request."
+          : "Your message is back in the composer. If it requested an action, check the relevant page before sending again.";
+      setError(`${err instanceof Error ? err.message : "Unable to connect to Onyx."} ${next}`);
     } finally {
       sending.current = false;
       setPending(null);
@@ -71,6 +104,8 @@ export default function ChatPage() {
 
   function newChat() {
     if (sending.current) return;
+    failedSend.current = null;
+    setResendText(null);
     setMessages([]);
     setInput("");
     setError(null);
@@ -128,6 +163,11 @@ export default function ChatPage() {
       {error && (
         <div role="alert" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3 max-h-[40dvh] overflow-y-auto">
           <p>{error}</p>
+          {resendText !== null && (
+            <button type="button" onClick={() => void send(resendText)} disabled={loading} className="mt-2 text-sm text-accent border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
+              Send the same message again
+            </button>
+          )}
           <ChatReceipts receipts={errorReceipts} heading="Before it stopped, this request had already done the following" />
         </div>
       )}

@@ -47,3 +47,31 @@ export function validateChatMessages(value: unknown): value is ChatMessage[] {
   }
   return value[value.length - 1].role === "user" && characters <= MAX_CHAT_CHARACTERS;
 }
+
+/**
+ * Replay safety (SEC-04). The page sends one `request_id` (a UUID) per user message and sends the SAME id again when
+ * Riley retries that message unchanged after a lost or failed response; an edited message gets a new id. The server
+ * keys its operation ledger (lib/chat-operations.ts, sql/chat_operations.sql) on (signed-in owner, request_id), so a
+ * retry returns the receipts of what the first try already wrote instead of writing it again. A request without an id
+ * (an older page) runs as before, with no ledger.
+ */
+export const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** undefined / null = no id sent (legacy page); false = present but not a UUID (a 400); otherwise the lower-case id. */
+export function parseRequestId(value: unknown): string | null | false {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" && REQUEST_ID_RE.test(value) ? value.toLowerCase() : false;
+}
+
+/** A random v4 UUID for a new message (browser). */
+export function newRequestId(): string {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === "function") c.getRandomValues(bytes);
+  else for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
