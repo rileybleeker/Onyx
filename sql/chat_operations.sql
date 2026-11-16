@@ -18,16 +18,19 @@
 --                         (owner, request_id, tool, n-th call of that tool):
 --                         the call's canonical input and its hash, a status
 --                         (pending -> done | refused | unknown), the result
---                         the model got and the receipt Riley saw. A retry
---                         that makes the same call gets the stored result and
---                         receipt back; a different call in the same place is
---                         refused; a refused call (nothing written) can run
---                         again. A call left pending or unknown is re-run only
---                         when the write itself is keyed by the operation id
---                         (below) or naturally idempotent; a Spotify playlist
---                         or quiz result is first looked up (read-only) in
---                         pds.spotify_playlists / pds.reading_quizzes and is
---                         never created again by the retry.
+--                         the model got, the receipt Riley saw and the context
+--                         it first ran with (the behavioral day, so a re-run
+--                         after the day rolled over keeps the first day). A
+--                         retry's calls are matched to the stored rows by
+--                         content: a match gets the stored result back (or is
+--                         re-run when nothing was written, or when the write
+--                         is keyed / idempotent); a call that matches nothing
+--                         is refused while an earlier write is unmatched, and
+--                         runs only past every earlier write. A Spotify
+--                         playlist or quiz result is never re-run: it is
+--                         looked up read-only (pds.spotify_playlists by its
+--                         client_key, pds.reading_quizzes by book, checkpoint
+--                         and score) and never created again by the retry.
 --
 -- The operation id (op_id) is also passed into the write itself, so a write
 -- that happened before the ledger could record it is found again:
@@ -37,12 +40,16 @@
 --       none of it (lib/supplement-stacks.ts, lib/supplement-intake.ts).
 --   pds.reading_sessions.client_key (sql/reading_sessions_client_key.sql,
 --       repeated below so this file alone is enough; both are IF NOT EXISTS).
+--   pds.spotify_playlists.client_key: the audit row of a playlist created
+--       from chat (lib/spotify-server.ts createPlaylist).
 --
 -- Access: service-role only (RLS on, no policy for anon / authenticated, no
 -- grants to them). Only the /api/chat route reads or writes these tables.
 -- What is stored: tool inputs, results and receipts of Riley's own chat
--- writes, i.e. the same facts the target tables already hold. No message
--- text, no model reply, no credentials.
+-- writes, i.e. the same facts the target tables already hold (a refused or
+-- unfinished call keeps only its error line, never the lists it carried).
+-- No message text, no model reply, no credentials. There is no retention
+-- window yet (a scheduled clean-up needs Riley's approval; roadmap follow-up).
 --
 -- Additive and safe to re-run (IF NOT EXISTS everywhere). Until it is applied
 -- the route detects the missing table and runs as before (no ledger); the new
@@ -70,12 +77,16 @@ CREATE TABLE IF NOT EXISTS pds.chat_operations (
                              CHECK (status IN ('pending', 'done', 'refused', 'unknown')),
     result       JSONB,
     receipt      JSONB,
+    context      JSONB,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT chat_operations_call_key UNIQUE (owner_id, request_id, tool, ordinal),
     CONSTRAINT chat_operations_request_fk FOREIGN KEY (owner_id, request_id)
         REFERENCES pds.chat_requests (owner_id, request_id) ON DELETE CASCADE
 );
+
+-- For a database where an earlier draft of this file was applied.
+ALTER TABLE pds.chat_operations ADD COLUMN IF NOT EXISTS context JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_chat_operations_request
     ON pds.chat_operations (owner_id, request_id, created_at);
@@ -148,6 +159,18 @@ ALTER TABLE pds.reading_sessions ADD COLUMN IF NOT EXISTS client_key UUID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_reading_sessions_client_key
   ON pds.reading_sessions (client_key)
+  WHERE client_key IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Spotify playlists created from chat: the audit row carries the operation id,
+-- so a retry whose first try may have created the playlist finds it here
+-- (read-only) instead of creating a second one. Rows from /spotify and older
+-- rows keep it NULL.
+-- ---------------------------------------------------------------------------
+ALTER TABLE pds.spotify_playlists ADD COLUMN IF NOT EXISTS client_key UUID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spotify_playlists_client_key
+  ON pds.spotify_playlists (client_key)
   WHERE client_key IS NOT NULL;
 
 -- Make PostgREST pick up the new tables and columns without waiting for a restart.

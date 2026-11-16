@@ -135,3 +135,22 @@ test("a timed single-product log with a key stores every time under the one even
   assert.equal(again.logged.length, 2);
   assert.equal(d.rows("supplement_intake").length, 2);
 });
+
+test("a stack event is found by its key alone, for the stack its rows belong to, before any name is resolved", async () => {
+  const d = db();
+  assert.equal(await stacks.stackEventReplay(d, KEY), null, "nothing written under the key yet");
+  assert.equal(await stacks.stackEventReplay(d, "not-a-uuid"), null);
+  const first = await stacks.logStackIntake(d, 7, { event_key: KEY });
+  // Renamed and archived since, and another stack now has the old name: the replay still names stack 7.
+  await d.from("supplement_stack").update({ name: "Synthetic Dawn", is_active: false }).eq("stack_id", 7);
+  d.seed("supplement_stack", [{ stack_id: 8, name: "Synthetic Morning", is_active: true }]);
+  const replay = await stacks.stackEventReplay(d, KEY);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.stack_id, 7);
+  assert.equal(replay.stack_name, "Synthetic Dawn");
+  assert.deepEqual(replay.intake_ids, first.intake_ids);
+  // logStackIntake called with another stack id still reports the stack that was logged.
+  const again = await stacks.logStackIntake(d, 8, { event_key: KEY });
+  assert.equal(again.stack_id, 7);
+  assert.equal(d.rows("supplement_intake").length, 2);
+});

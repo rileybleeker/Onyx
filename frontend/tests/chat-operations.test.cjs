@@ -137,19 +137,23 @@ test("two tries of one message at the same moment still write once", async () =>
   assert.ok(results.every((r) => r.receipt.status === "saved"));
 });
 
-test("a retry that asks for different details in the same place is refused and shows what the first try saved", async () => {
+test("a retry that asks for different details is refused; what the first try saved is still listed once", async () => {
   const { open } = setup();
   const write = keyedWrite();
   const first = await (await open()).run(STACK, input("synthetic morning"), write.execute("Synthetic Morning"));
   let ran = 0;
-  const conflict = await (await open()).run(STACK, input("synthetic evening"), async () => { ran++; return { failed: false, result: "{}" }; });
+  const retry = await open();
+  const conflict = await retry.run(STACK, input("synthetic evening"), async () => { ran++; return { failed: false, result: "{}" }; });
   assert.equal(ran, 0);
   assert.equal(write.effects.size, 1);
   const forModel = JSON.parse(conflict.result);
   assert.equal(forModel.conflict, true);
   assert.equal(forModel.error, ops.CONFLICT_ERROR);
   assert.equal(forModel.earlier_result.stack, "Synthetic Morning");
-  assert.deepEqual(plain(conflict.receipt.details), [...plain(first.receipt.details), ops.CONFLICT_DETAIL]);
+  assert.equal(conflict.receipt.status, "not_saved", "the refused call wrote nothing");
+  const earlier = plain(await retry.earlierReceipts());
+  assert.equal(earlier.length, 1);
+  assert.deepEqual(earlier[0].details, [...plain(first.receipt.details), ops.EARLIER_DETAIL]);
 });
 
 test("the same calls in another order on the retry are matched by content", async () => {
@@ -169,18 +173,31 @@ test("the same calls in another order on the retry are matched by content", asyn
   assert.equal(write.effects.size, 2);
 });
 
-test("a call the first try refused (nothing written) runs again on the retry", async () => {
+test("a call the first try refused (nothing written) does not block the retry: the same call or another one runs", async () => {
   const { db, open } = setup();
-  const refused = await (await open()).run(STACK, input("synthetic evening"), async () => ({ failed: false, result: JSON.stringify({ error: 'No stack named "synthetic evening".' }) }));
+  const refuse = async () => ({ failed: false, result: JSON.stringify({ error: 'No stack named "synthetic evening".', available: ["Synthetic Morning", "Synthetic Night"] }) });
+  const refused = await (await open()).run(STACK, input("synthetic evening"), refuse);
   assert.equal(refused.receipt.status, "not_saved");
-  assert.equal(db.rows("chat_operations")[0].status, "refused");
+  const stored = db.rows("chat_operations")[0];
+  assert.equal(stored.status, "refused");
+  assert.deepEqual(stored.result, { error: 'No stack named "synthetic evening".' }, "a refusal keeps its error line, not the lists it carried");
   const write = keyedWrite();
-  // The model picks the right stack this time: the refused place is free for it.
+  // The model picks the right stack this time: nothing earlier was written, so the call runs.
   const again = await (await open()).run(STACK, input("synthetic morning"), write.execute());
   assert.equal(write.effects.size, 1);
   assert.equal(again.receipt.status, "saved");
-  assert.equal(db.rows("chat_operations").length, 1);
-  assert.equal(db.rows("chat_operations")[0].status, "done");
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.status), ["refused", "done"]);
+
+  // The same refused call made again re-runs in its own place, under its own operation id.
+  const { db: db2, open: open2 } = setup();
+  await (await open2()).run(STACK, input("synthetic morning"), refuse);
+  const opId = db2.rows("chat_operations")[0].op_id;
+  const write2 = keyedWrite();
+  const rerun = await (await open2()).run(STACK, input("synthetic morning"), write2.execute());
+  assert.equal(rerun.receipt.status, "saved");
+  assert.deepEqual(write2.keys, [opId]);
+  assert.equal(db2.rows("chat_operations").length, 1);
+  assert.equal(db2.rows("chat_operations")[0].status, "done");
 });
 
 test("a new message is a new request: an intentional second log writes again", async () => {
@@ -246,17 +263,22 @@ test("a playlist left unconfirmed is looked up read-only and never created again
   assert.equal(unsure.receipt.status, "unknown");
   assert.equal(JSON.parse(unsure.result).uncertain, true);
 
-  // The audit row exists (the first try did create it): the retry confirms it from there.
+  // An audit row with the same name but another operation's key is not taken for it.
   const opRow = db.rows("chat_operations")[0];
   db.seed("spotify_playlists", [
-    { playlist_id: "old", name: call.name, created_via: "chat", spotify_url: "https://open.spotify.com/playlist/old", track_count: 2, created_at: "2029-12-01T00:00:00.000Z" },
-    { playlist_id: "pl1", name: call.name, created_via: "chat", spotify_url: "https://open.spotify.com/playlist/pl1", track_count: 2, created_at: opRow.created_at },
+    { playlist_id: "other", name: call.name, created_via: "chat", spotify_url: "https://open.spotify.com/playlist/other", track_count: 2, client_key: randomUUID(), created_at: opRow.created_at },
+  ]);
+  const stillUnsure = await (await open({ reconcilers })).run(PLAYLIST, call, create);
+  assert.equal(stillUnsure.receipt.status, "unknown");
+  // The audit row carries this operation's key (the first try did create it): the retry confirms it from there.
+  db.seed("spotify_playlists", [
+    { playlist_id: "pl1", name: call.name, created_via: "chat", spotify_url: "https://open.spotify.com/playlist/pl1", track_count: 2, client_key: opRow.op_id, created_at: opRow.created_at },
   ]);
   const found = await (await open({ reconcilers })).run(PLAYLIST, call, create);
   assert.equal(creates, 1, "still one create call in total");
   assert.equal(found.replayed, true);
   assert.equal(found.receipt.status, "saved");
-  assert.equal(found.receipt.link.href, "https://open.spotify.com/playlist/pl1", "the older playlist with the same name is not taken for it");
+  assert.equal(found.receipt.link.href, "https://open.spotify.com/playlist/pl1", "found by its key, not by its name");
   assert.equal(db.rows("chat_operations")[0].status, "done");
 
   // From now on it is a plain replay.
@@ -266,7 +288,14 @@ test("a playlist left unconfirmed is looked up read-only and never created again
 });
 
 test("a quiz result left pending is confirmed from pds.reading_quizzes, never recorded twice", async () => {
-  const { db, store, open } = setup();
+  const { db, store, open } = setup({
+    tables: {
+      books: [
+        { book_id: 3, slug: "synthetic-book", status: "reading", created_at: "2029-06-01T00:00:00.000Z" },
+        { book_id: 4, slug: "other-synthetic-book", status: "finished", created_at: "2029-01-01T00:00:00.000Z" },
+      ],
+    },
+  });
   const QUIZ = "record_reading_quiz";
   const call = { checkpoint: "ch12", score: 4, total: 5 };
   await store.claimRequest(OWNER, REQUEST, CONVERSATION);
@@ -277,7 +306,10 @@ test("a quiz result left pending is confirmed from pds.reading_quizzes, never re
   const unsure = await (await open({ reconcilers })).run(QUIZ, call, record);
   assert.equal(records, 0);
   assert.equal(unsure.receipt.status, "unknown");
-  db.seed("reading_quizzes", [{ quiz_id: 9, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
+  // The same checkpoint and score for another book is not this quiz.
+  db.seed("reading_quizzes", [{ quiz_id: 8, book_id: 4, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
+  assert.equal((await (await open({ reconcilers })).run(QUIZ, call, record)).receipt.status, "unknown");
+  db.seed("reading_quizzes", [{ quiz_id: 9, book_id: 3, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
   const found = await (await open({ reconcilers })).run(QUIZ, call, record);
   assert.equal(records, 0);
   assert.equal(found.receipt.status, "saved");
@@ -313,5 +345,100 @@ test("only the keyed and naturally idempotent write tools are re-run; every othe
 
 test("uncertain-outcome texts fit the receipt without being cut", () => {
   for (const tool of receipts.WRITE_TOOLS) assert.ok(ops.uncertainText(tool).length <= 240, tool);
-  for (const text of [ops.CONFLICT_ERROR, ops.LEDGER_ERROR]) assert.ok(text.length <= 240);
+  for (const text of [ops.CONFLICT_ERROR, ops.REPEAT_ERROR, ops.LEDGER_ERROR]) assert.ok(text.length <= 240);
+});
+
+// ---------------------------------------------------------------------------
+// Retries whose model makes the calls differently (review round 1). A retry never creates a new write while an
+// earlier write is still unmatched, so a reordered, reworded or repeated call cannot write a second time.
+// ---------------------------------------------------------------------------
+const INTAKE = "log_supplement_intake";
+
+test("first try saved A and stopped before B; the retry calls B then A: A is not written again", async () => {
+  const { db, open } = setup();
+  const write = keyedWrite();
+  await (await open()).run(INTAKE, { product: "synthetic a" }, write.execute("A"));
+  const retry = await open();
+  let ranA = 0;
+  const b = await retry.run(INTAKE, { product: "synthetic b" }, write.execute("B"));
+  const a = await retry.run(INTAKE, { product: "synthetic a" }, async (opId) => { ranA++; return write.execute("A")(opId); });
+  assert.equal(ranA, 0, "A was answered from the ledger");
+  assert.equal(a.replayed, true);
+  assert.equal(JSON.parse(b.result).conflict, true, "B could have been A asked differently: refused while A is unmatched");
+  assert.equal(b.receipt.status, "not_saved");
+  assert.equal(write.effects.size, 1, "one domain effect");
+  assert.equal(db.rows("chat_operations").length, 1, "the refused call made no row");
+  assert.deepEqual(plain(await retry.earlierReceipts()), [], "A was answered in this try, so it is not listed again");
+});
+
+test("a changed call the retry refused is refused again when the model repeats it, also after the earlier write matched", async () => {
+  const { open } = setup();
+  const write = keyedWrite();
+  await (await open()).run(INTAKE, { product: "synthetic a" }, write.execute("A"));
+  const retry = await open();
+  const changed = { product: "synthetic a", amount: 2 };
+  assert.equal(JSON.parse((await retry.run(INTAKE, changed, write.execute("A2"))).result).conflict, true);
+  assert.equal(JSON.parse((await retry.run(INTAKE, changed, write.execute("A2"))).result).conflict, true);
+  assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).replayed, true);
+  assert.equal(JSON.parse((await retry.run(INTAKE, changed, write.execute("A2"))).result).conflict, true);
+  assert.equal(write.effects.size, 1);
+});
+
+test("a stack the first try logged, asked for as single products on the retry, is not logged a second time", async () => {
+  const { open } = setup();
+  const write = keyedWrite();
+  await (await open()).run(STACK, input(), write.execute());
+  const retry = await open();
+  const x = await retry.run(INTAKE, { product: "synthetic x" }, write.execute("X"));
+  const y = await retry.run(INTAKE, { product: "synthetic y" }, write.execute("Y"));
+  assert.equal(JSON.parse(x.result).conflict, true);
+  assert.equal(JSON.parse(x.result).earlier_tool, STACK);
+  assert.equal(JSON.parse(y.result).conflict, true);
+  assert.equal(write.effects.size, 1);
+  assert.equal((await retry.earlierReceipts()).length, 1, "the stack the first try saved is still shown");
+});
+
+test("one more copy of a call than the first try made is refused; a new call past every earlier write runs", async () => {
+  const { db, open } = setup();
+  const write = keyedWrite();
+  await (await open()).run(INTAKE, { product: "synthetic a" }, write.execute("A"));
+  const retry = await open();
+  assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).replayed, true);
+  const extra = await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"));
+  assert.equal(JSON.parse(extra.result).error, ops.REPEAT_ERROR);
+  assert.equal(write.effects.size, 1);
+  // The first try stopped before B; with A accounted for, B is the rest of the message and runs once.
+  const b = await retry.run(INTAKE, { product: "synthetic b" }, write.execute("B"));
+  assert.equal(JSON.parse(b.result).success, true);
+  assert.equal(b.replayed, false);
+  assert.equal(write.effects.size, 2);
+  assert.deepEqual(db.rows("chat_operations").map((r) => r.ordinal).sort(), [1, 2]);
+  // A later retry answers both from the ledger.
+  const later = await open();
+  assert.equal((await later.run(INTAKE, { product: "synthetic b" }, write.execute("B"))).replayed, true);
+  assert.equal((await later.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).replayed, true);
+  assert.equal(write.effects.size, 2);
+});
+
+test("a re-run gets the context the operation first ran with (its behavioral day), not the retry's", async () => {
+  let failFinish = true;
+  const { open } = setup({
+    fail: ({ table, op, payload }) => (failFinish && table === "chat_operations" && op === "update" && payload && payload.status ? { code: "08006" } : null),
+  });
+  const seen = [];
+  const execute = async (opId, context) => {
+    seen.push(context.behavioral_today);
+    return { failed: false, result: JSON.stringify({ success: true, entry: { question: "Synthetic habit", answer: "Yes", cycle_date: context.behavioral_today } }) };
+  };
+  await (await open()).run("mark_habit_complete", { habit: "Synthetic habit" }, execute, { behavioral_today: "2030-01-01" });
+  failFinish = false;
+  const again = await (await open()).run("mark_habit_complete", { habit: "Synthetic habit" }, execute, { behavioral_today: "2030-01-02" });
+  assert.deepEqual(seen, ["2030-01-01", "2030-01-01"], "the re-run after the day rolled over keeps the first day");
+  assert.match(again.receipt.details.join(" "), /2030-01-01/);
+});
+
+test("an unfinished call keeps only its error line in the ledger", () => {
+  assert.deepEqual(plain(ops.storedResult("refused", { error: "x", candidates: ["a", "b"] })), { error: "x" });
+  assert.deepEqual(plain(ops.storedResult("unknown", { error: "x", incomplete: true, available: ["a"] })), { error: "x", incomplete: true });
+  assert.deepEqual(plain(ops.storedResult("done", { success: true, items: [1] })), { success: true, items: [1] });
 });

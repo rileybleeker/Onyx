@@ -7,7 +7,7 @@ import { createSupabaseServer } from "@/lib/supabase-server";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist } from "@/lib/spotify-server";
-import { logStackIntake } from "@/lib/supplement-stacks";
+import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/supplement-stacks";
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, logSupplementIntake } from "@/lib/supplement-intake";
 import { addHighlight, getOverview, logSession, recordQuiz, summarizeForChat, type HighlightSource, type Medium } from "@/lib/reading";
@@ -511,11 +511,26 @@ const PLAYLIST_MAYBE_CREATED =
   "Spotify may have created the playlist before this failed, possibly without all its tracks. Do not create it again: tell the user to check Spotify first.";
 
 /**
- * `opId` is the chat operation id (lib/chat-operations.ts) when the request carries a request_id: the supplement,
- * stack and reading writes use it as their own idempotency key, so a retry that re-runs the tool finds what an earlier
- * try already wrote.
+ * recordQuiz refusals from before anything was written. Any other error came from the insert, whose answer may have
+ * been lost after it committed (supabase-js reports a network failure as an error, not a throw).
  */
-async function executeTool(name: string, input: Record<string, unknown>, opId?: string): Promise<string> {
+const QUIZ_NOT_RECORDED = /^(No active book found|score must be between 0 and total|checkpoint is required)/;
+const QUIZ_MAYBE_RECORDED =
+  "The database did not confirm this quiz result, and it may have been recorded anyway. Do not record it again: tell the user to check /reading first.";
+
+/**
+ * A write-tool call that runs through the replay ledger (lib/chat-operations.ts), when the request carries a
+ * request_id. `id` = the operation id: the supplement, stack, reading and playlist writes use it as their own key, so
+ * a retry that re-runs the tool finds what an earlier try already wrote. `day` = the behavioral day the operation
+ * first ran on, `today` = this request's: a re-run on a later day keeps an omitted date on the first day.
+ */
+interface OpContext { id: string; day: string; today: string }
+
+/** The date to use when the model gave none: the operation's first day, when that is not today (a re-run). */
+const pinnedDate = (op?: OpContext): string | null => (op && op.day !== op.today ? op.day : null);
+
+async function executeTool(name: string, input: Record<string, unknown>, op?: OpContext): Promise<string> {
+  const opId = op?.id;
   const days = (input.days as number) || 7;
   const since = new Date();
   since.setDate(since.getDate() - days);
@@ -681,6 +696,8 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
         trackIds,
         isPublic: false,
         createdVia: "chat",
+        // The audit row carries the operation id, so a retry can look the playlist up instead of creating another.
+        ...(opId ? { clientKey: opId } : {}),
       });
       return JSON.stringify({ success: true, ...result });
     } catch (e) {
@@ -816,11 +833,18 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
     let storedFor: string | undefined;
     if (!date || SLEEP_QUESTIONS.has(habit)) {
       let today: string;
-      try {
-        const { data: bday } = await supabase.rpc("behavioral_today_now");
-        today = (bday as string) || fallbackBehavioralToday(new Date());
-      } catch {
-        today = fallbackBehavioralToday(new Date());
+      const pinned = pinnedDate(op);
+      if (pinned) {
+        // A re-run of an operation that first ran on an earlier day: resolve against THAT day, so the answer lands on
+        // the same day (and the same night) as the first try, never on a second one.
+        today = pinned;
+      } else {
+        try {
+          const { data: bday } = await supabase.rpc("behavioral_today_now");
+          today = (bday as string) || fallbackBehavioralToday(new Date());
+        } catch {
+          today = fallbackBehavioralToday(new Date());
+        }
       }
       if (SLEEP_QUESTIONS.has(habit)) {
         // A sleep question (mouth tape, same bed, ...) describes a finished night, and a night's answers live on
@@ -926,9 +950,18 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
   }
 
   if (name === "log_reading_session") {
+    // A re-run of an operation that already wrote its session: name that session's book, so logSession finds it by
+    // its key even when the book is no longer the one being read (it resolves the book before it checks the key).
+    let priorBook: number | null = null;
+    if (opId) {
+      const { data: prior } = await supabase.from("reading_sessions").select("book_id").eq("client_key", opId).maybeSingle();
+      const id = (prior as { book_id?: unknown } | null)?.book_id;
+      if (typeof id === "number") priorBook = id;
+    }
     const result = await logSession(supabase, {
+      ...(priorBook !== null ? { book_id: priorBook } : {}),
       slug: (input.book as string) || null,
-      date: (input.date as string) || null,
+      date: (input.date as string) || pinnedDate(op),
       chapter_through: Number(input.chapter_through),
       chapter_from: input.chapter_from != null ? Number(input.chapter_from) : null,
       minutes: input.minutes != null ? Number(input.minutes) : null,
@@ -978,6 +1011,8 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
       chapter: input.chapter != null ? Number(input.chapter) : null,
       concept: (input.concept as string) || null,
       source: (input.source as HighlightSource) || null,
+      // A re-run on a later day schedules the first review from the day the highlight was first sent.
+      ...(pinnedDate(op) ? { date: pinnedDate(op) } : {}),
     });
     if (!result.ok) return JSON.stringify({ error: result.error });
     let mirrored = false;
@@ -1015,7 +1050,7 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
         ? { error: "Onyx could not confirm this quiz result and it may have been recorded. Do not record it again: tell the user to check /reading first.", incomplete: true }
         : { error: result.error });
     }
-    return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint, quiz_date: result.quiz.quiz_date });
+    return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint, quiz_date: result.quiz.quiz_date, quiz_id: result.quiz.quiz_id });
   }
 
   if (name === "log_supplement_intake") {
@@ -1024,7 +1059,7 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
       amount: input.amount != null ? Number(input.amount) : null,
       unit: (input.unit as string) || null,
       times: Array.isArray(input.times) ? (input.times as string[]) : null,
-      date: (input.date as string) || null,
+      date: (input.date as string) || pinnedDate(op),
       ...(opId ? { event_key: opId } : {}),
     });
     const { ok, ...rest } = result;
@@ -1034,32 +1069,37 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
   if (name === "log_supplement_stack") {
     const wanted = (input.stack as string)?.trim();
     if (!wanted) return JSON.stringify({ error: "stack name is required" });
-    const date = (input.date as string) || undefined;
+    const date = (input.date as string) || pinnedDate(op) || undefined;
 
-    // Resolve the stack by case-insensitive name among active stacks.
-    const { data: candidates, error: lookupErr } = await supabase
-      .from("supplement_stack")
-      .select("stack_id,name")
-      .eq("is_active", true);
-    if (lookupErr) return JSON.stringify({ error: lookupErr.message });
+    // A re-run of an operation that already logged its stack: answer from those rows before resolving the name (the
+    // stack may have been renamed or archived since, which would otherwise read as "not logged").
+    let result: LogStackResult | null = opId ? await stackEventReplay(supabase, opId) : null;
+    if (!result) {
+      // Resolve the stack by case-insensitive name among active stacks.
+      const { data: candidates, error: lookupErr } = await supabase
+        .from("supplement_stack")
+        .select("stack_id,name")
+        .eq("is_active", true);
+      if (lookupErr) return JSON.stringify({ error: lookupErr.message });
 
-    const lc = wanted.toLowerCase();
-    const match =
-      (candidates ?? []).find((s) => s.name.toLowerCase() === lc) ??
-      (candidates ?? []).find((s) => s.name.toLowerCase().includes(lc));
-    if (!match) {
-      return JSON.stringify({
-        error: `No stack named "${wanted}".`,
-        available: (candidates ?? []).map((s) => s.name),
-      });
+      const lc = wanted.toLowerCase();
+      const match =
+        (candidates ?? []).find((s) => s.name.toLowerCase() === lc) ??
+        (candidates ?? []).find((s) => s.name.toLowerCase().includes(lc));
+      if (!match) {
+        return JSON.stringify({
+          error: `No stack named "${wanted}".`,
+          available: (candidates ?? []).map((s) => s.name),
+        });
+      }
+
+      // A stack logged for an earlier day carries no clock time (same rule as
+      // /supplements and log_supplement_intake): stamping "now" on a past day
+      // gives it a next-day timestamp the caffeine timing layer has to quarantine.
+      const backdated = !!date && date !== (await behavioralToday(supabase));
+      const event = opId ? { event_key: opId } : {};
+      result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...event });
     }
-
-    // A stack logged for an earlier day carries no clock time (same rule as
-    // /supplements and log_supplement_intake): stamping "now" on a past day
-    // gives it a next-day timestamp the caffeine timing layer has to quarantine.
-    const backdated = !!date && date !== (await behavioralToday(supabase));
-    const event = opId ? { event_key: opId } : {};
-    const result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...event });
     if (!result.ok) return JSON.stringify({ error: result.error });
     const written = await describeStackIntakes(result.intake_ids ?? []);
     return JSON.stringify({
@@ -1107,9 +1147,9 @@ async function executeTool(name: string, input: Record<string, unknown>, opId?: 
 }
 
 /** Run one tool; a throw becomes an "incomplete" result (write) or "unavailable" (lookup), never a failed request. */
-async function runTool(name: string, input: Record<string, unknown>, opId?: string): Promise<{ result: string; failed: boolean }> {
+async function runTool(name: string, input: Record<string, unknown>, op?: OpContext): Promise<{ result: string; failed: boolean }> {
   try {
-    return { result: await executeTool(name, input, opId), failed: false };
+    return { result: await executeTool(name, input, op), failed: false };
   } catch (toolError) {
     // A tool that throws may have written part of its work. Tell the
     // model (and the receipt) so, instead of failing the whole request
@@ -1138,13 +1178,17 @@ async function sessionOwnerId(): Promise<string | null> {
   }
 }
 
-/** Record this request (first try or retry) in the replay ledger for the signed-in owner. Never throws. */
+/**
+ * Record this request (first try or retry) in the replay ledger for the signed-in owner. Never throws. The middleware
+ * has already admitted the owner's session, so a missing owner id here is a failed check (e.g. the signing keys could
+ * not be fetched), not a signed-out user: writes pause and read-only answers go on.
+ */
 async function openRequestLedger(
   requestId: string,
   messages: ReadonlyArray<{ role: string; content: string }>,
-): Promise<OpenedLedger | { kind: "no_owner" }> {
+): Promise<OpenedLedger> {
   const ownerId = await sessionOwnerId();
-  if (!ownerId) return { kind: "no_owner" };
+  if (!ownerId) return { kind: "failed", code: "no_owner" };
   return openLedger(supabaseLedgerStore(supabase), {
     ownerId,
     requestId,
@@ -1207,7 +1251,6 @@ export async function POST(req: NextRequest) {
       currentTimeZone(supabase, now),
       behavioralToday(supabase),
     ]);
-    if (opened?.kind === "no_owner") return Response.json({ error: "Your session may have expired. Sign in again." }, { status: 401 });
     if (opened?.kind === "conflict") {
       return Response.json({ error: "This retry does not match the message it was first sent with, so nothing was run. Send your message again.", code: "request_conflict" }, { status: 409 });
     }
@@ -1265,8 +1308,14 @@ export async function POST(req: NextRequest) {
           const input = block.input as Record<string, unknown>;
           let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
           if (isWriteTool(block.name) && ledger) {
-            // Through the ledger: a retry of this message gets the stored result instead of writing again.
-            outcome = await ledger.run(block.name, input, (opId) => runTool(block.name, input, opId));
+            // Through the ledger: a retry of this message gets the stored result instead of writing again. A re-run
+            // of a stored call gets the day that call first ran on (its context), not today.
+            outcome = await ledger.run(
+              block.name,
+              input,
+              (id, context) => runTool(block.name, input, { id, day: typeof context.behavioral_today === "string" ? context.behavioral_today : bday, today: bday }),
+              { behavioral_today: bday },
+            );
           } else if (isWriteTool(block.name) && writesPaused) {
             const result = JSON.stringify({ error: WRITES_PAUSED });
             outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };

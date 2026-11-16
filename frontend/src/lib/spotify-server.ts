@@ -279,6 +279,11 @@ export interface CreatePlaylistArgs {
   isPublic?: boolean;
   createdVia: "chat" | "button" | "builder";
   prompt?: string;
+  /**
+   * The Onyx Chat operation id (SEC-04, sql/chat_operations.sql): stored on the audit row as client_key, so a retried
+   * chat message can find the playlist it already created instead of making a second one.
+   */
+  clientKey?: string;
 }
 
 export interface CreatePlaylistResult {
@@ -294,14 +299,22 @@ export interface CreatePlaylistResult {
  * pds.spotify_playlists for audit/history.
  */
 export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePlaylistResult> {
-  const { name, description, trackIds, isPublic = false, createdVia, prompt } = args;
+  const { name, description, trackIds, isPublic = false, createdVia, prompt, clientKey } = args;
 
   if (!name?.trim()) throw new Error("Playlist name is required");
   if (!Array.isArray(trackIds) || trackIds.length === 0) {
     throw new Error("track_ids must be a non-empty array");
   }
 
-  const accessToken = await getSpotifyAccessToken();
+  // Nothing has been asked of Spotify's API yet: a failure here (a network error included) means nothing was created.
+  // Callers read that from the "Spotify token refresh failed" prefix (the chat route's PLAYLIST_NOT_CREATED).
+  let accessToken: string;
+  try {
+    accessToken = await getSpotifyAccessToken();
+  } catch (e) {
+    if (e instanceof Error && /^Spotify /.test(e.message)) throw e;
+    throw new Error("Spotify token refresh failed (network)");
+  }
 
   // 1. Create the playlist for the current user.
   //    Spotify's Feb 2026 migration removed POST /users/{user_id}/playlists;
@@ -403,7 +416,7 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
 
   // 4. Persist to Supabase audit table
   const sb = supabaseAdmin();
-  const { error: insertErr } = await sb.from("spotify_playlists").insert({
+  const audit = {
     playlist_id: playlistId,
     name,
     description: description ?? null,
@@ -414,7 +427,12 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
     created_via: createdVia,
     prompt: prompt ?? null,
     raw_json: playlist,
-  });
+  };
+  let { error: insertErr } = await sb.from("spotify_playlists").insert(clientKey ? { ...audit, client_key: clientKey } : audit);
+  // The client_key column comes with sql/chat_operations.sql; until it is applied the row is written without it.
+  if (insertErr && clientKey && (insertErr.code === "42703" || insertErr.code === "PGRST204")) {
+    ({ error: insertErr } = await sb.from("spotify_playlists").insert(audit));
+  }
   if (insertErr) {
     console.error("Failed to log playlist to pds.spotify_playlists:", insertErr);
     // Non-fatal: the playlist exists in Spotify; logging is for our records.

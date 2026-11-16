@@ -2,18 +2,29 @@
  * Replay-safe chat writes (SEC-04, sql/chat_operations.sql).
  *
  * /chat sends one request_id per user message and the SAME id when Riley retries that message unchanged after a
- * lost or failed answer. Each write-tool call of a request becomes one row in pds.chat_operations, keyed by
- * (owner, request_id, tool, n-th call of that tool in the try). On a retry the model is run again, and:
+ * lost or failed answer. Each write-tool call of a request becomes one row in pds.chat_operations (its canonical
+ * input, a status, the result the model got and the receipt Riley saw). On a retry the model is run again and its
+ * write calls are matched to the stored rows BY CONTENT (same tool, same canonical input), in any order:
  *
- *   - the same call (same tool, same canonical input) returns the stored result and receipt: nothing is written again;
- *   - a different call in the same place (the model changed its mind) is refused: nothing new is written;
- *   - a call the first try refused (it wrote nothing) runs again;
- *   - a call the first try left pending or unknown (it stopped mid-way) runs again only when the write itself is keyed
- *     by the operation id or naturally idempotent (RERUN_SAFE); a Spotify playlist or a quiz result is looked up
- *     read-only first (reconcilers) and never created again by the retry.
+ *   - a call that matches a stored row is answered from it: done = the stored result and receipt, nothing written;
+ *     refused (nothing was written) = run again; pending / unknown (the try stopped mid-way) = run again only when
+ *     the write itself is keyed by the operation id or naturally idempotent (RERUN_SAFE), otherwise looked up
+ *     read-only (reconcilers) and never created again;
+ *   - a call that matches nothing is refused while any write of an earlier try is still unmatched (it may be the
+ *     same thing asked differently: a stack logged as single products, another wording); it is refused again if
+ *     the model repeats it; an extra copy of a call already answered from a stored row is refused too;
+ *   - only once every earlier write is matched does a new call run (the earlier try stopped before reaching it).
  *
- * The operation id is passed into the write (supplement event key, reading client_key), so a write that happened
- * before the ledger could record it is found again rather than repeated.
+ * The operation id is passed into the write (supplement event key, reading client_key, playlist audit key), so a
+ * write that happened before the ledger could record it is found again rather than repeated. The behavioral day the
+ * operation first ran on is stored with it (`context`) and a re-run uses that day, so a retry after midnight / 06:00
+ * never moves an omitted "today" to the next day.
+ *
+ * Known gaps (follow-ups): a playlist that exists on Spotify but never reached pds.spotify_playlists stays "unknown"
+ * (no read-only Spotify lookup yet); a reading session or highlight replay does not redo the Notion mirror, habit
+ * stamp or book finish the first try never reached (lib/reading.ts); a quiz result has no operation key and is
+ * matched by book, checkpoint, score and time; a highlight re-run resolves "the book being read" again; the ledger
+ * keeps tool inputs and results with no retention window yet.
  *
  * Errors are reported by code only (never a message, which can echo user text). No personal data in this file.
  */
@@ -30,6 +41,9 @@ export interface OperationKey {
   ordinal: number;
 }
 
+/** What the call depended on when it first ran, reused by a re-run (e.g. behavioral_today). Plain JSON. */
+export type OperationContext = Record<string, unknown>;
+
 export interface OperationRow extends OperationKey {
   op_id: string;
   intent_sha: string;
@@ -37,6 +51,7 @@ export interface OperationRow extends OperationKey {
   status: OperationStatus;
   result: unknown;
   receipt: WriteReceipt | null;
+  context: OperationContext | null;
   created_at: string;
 }
 
@@ -47,10 +62,10 @@ export interface LedgerStore {
   /** "new" = first time this id is seen; "retry" = seen with the same conversation; "conflict" = seen with another one. */
   claimRequest(owner_id: string, request_id: string, conversation_sha: string): Promise<RequestClaim>;
   /** Insert a pending row for this call, or return the row already in that place (created = false). Atomic. */
-  claim(key: OperationKey, intent_sha: string, intent: unknown): Promise<{ row: OperationRow; created: boolean }>;
+  claim(key: OperationKey, intent_sha: string, intent: unknown, context?: OperationContext | null): Promise<{ row: OperationRow; created: boolean }>;
   listForRequest(owner_id: string, request_id: string): Promise<OperationRow[]>;
-  /** Take a REFUSED row back to pending with new details; null when it is no longer refused (another try took it). */
-  reclaim(row: OperationRow, intent_sha: string, intent: unknown): Promise<OperationRow | null>;
+  /** Take a REFUSED row back to pending (same call, run again); null when it is no longer refused (another try took it). */
+  reclaim(row: OperationRow): Promise<OperationRow | null>;
   /** Record the outcome; false when the row had already moved on (a concurrent try finished it). */
   finish(row: OperationRow, status: OperationStatus, result: unknown, receipt: WriteReceipt | null): Promise<boolean>;
 }
@@ -123,7 +138,8 @@ export const REPLAY_DETAIL = "Saved by an earlier try of this message, not writt
 export const EARLIER_DETAIL = "Saved by an earlier try of this message.";
 export const CONFLICT_ERROR =
   "An earlier try of this same message already did this with different details, so nothing new was written. To log something different, the user should send it as a new message.";
-export const CONFLICT_DETAIL = "From an earlier try of this message. The retry asked for different details, so nothing new was written.";
+export const REPEAT_ERROR =
+  "An earlier try of this same message did this once and that was already reported in this answer, so nothing more was written. To do it again, the user should send it as a new message.";
 export const LEDGER_ERROR =
   "Onyx could not record this action safely, so it was not done and nothing was written. Tell the user to try again in a moment.";
 const UNCERTAIN: Record<string, string> = {
@@ -192,18 +208,35 @@ export function classifyOutcome(outcome: ToolOutcome): OperationStatus {
   return "refused";
 }
 
+/**
+ * What is kept of a result that wrote nothing (or may have): the error line and the incomplete flag only. A refusal
+ * can carry long lists (every active product, every stack) that the ledger has no use for; it never replays them.
+ */
+export function storedResult(status: OperationStatus, parsed: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (status === "done" || !parsed) return parsed;
+  return {
+    ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
+    ...(parsed.incomplete === true ? { incomplete: true } : {}),
+  };
+}
+
 function errorCode(e: unknown): string {
   if (e instanceof LedgerFailure || e instanceof LedgerUnavailable) return e.code;
   const name = (e as { name?: unknown } | null)?.name;
   return typeof name === "string" ? name : typeof e;
 }
 
+export type Execute = (opId: string, context: OperationContext) => Promise<ToolOutcome>;
+
 export class ChatLedger {
   readonly retry: boolean;
   private readonly opts: LedgerOptions;
+  /** First try: the n-th call of each tool, the place its row takes. */
   private readonly ordinals = new Map<string, number>();
-  /** Rows this try has already matched, so one stored call answers one call of this try. */
+  /** Rows this try has already matched to one of its calls, so one stored call answers one call of this try. */
   private readonly used = new Set<string>();
+  /** Calls (by intent hash) this retry refused as a possible change of an earlier write: refused again if repeated. */
+  private readonly conflicted = new Set<string>();
 
   constructor(opts: LedgerOptions) {
     this.opts = opts;
@@ -216,39 +249,79 @@ export class ChatLedger {
 
   /**
    * Run one write-tool call through the ledger. `execute` gets the operation id to pass into the write as its key and
-   * must not throw (the route turns a throw into an "incomplete" result); a throw is still treated as unknown here.
+   * the context the operation first ran with (`context` for a new one); it must not throw (the route turns a throw
+   * into an "incomplete" result), but a throw is still treated as unknown here.
    */
-  async run(tool: string, input: unknown, execute: (opId: string) => Promise<ToolOutcome>): Promise<LedgerOutcome> {
-    const ordinal = (this.ordinals.get(tool) ?? 0) + 1;
-    this.ordinals.set(tool, ordinal);
+  async run(tool: string, input: unknown, execute: Execute, context: OperationContext = {}): Promise<LedgerOutcome> {
     const canonical = canonicalJson(input ?? {});
     const intent: unknown = JSON.parse(canonical);
     const sha = sha256Hex(`${tool}\n${canonical}`);
-    const key: OperationKey = { owner_id: this.opts.ownerId, request_id: this.opts.requestId, tool, ordinal };
+    return this.retry
+      ? this.runRetry(tool, input, sha, intent, execute, context)
+      : this.runFirst(tool, input, sha, intent, execute, context);
+  }
 
+  /** A first try: every call takes the next place of its tool. */
+  private async runFirst(
+    tool: string, input: unknown, sha: string, intent: unknown, execute: Execute, context: OperationContext,
+  ): Promise<LedgerOutcome> {
+    const ordinal = (this.ordinals.get(tool) ?? 0) + 1;
+    this.ordinals.set(tool, ordinal);
+    return this.claimAndRun(tool, input, sha, intent, ordinal, execute, context);
+  }
+
+  /** A retry: match the call to a stored row by content; a call that matches nothing runs only past every earlier write. */
+  private async runRetry(
+    tool: string, input: unknown, sha: string, intent: unknown, execute: Execute, context: OperationContext,
+  ): Promise<LedgerOutcome> {
+    let rows: OperationRow[];
+    try {
+      rows = await this.opts.store.listForRequest(this.opts.ownerId, this.opts.requestId);
+    } catch (e) {
+      this.report("list", e);
+      return this.refuse(tool, input);
+    }
+    const same = rows
+      .filter((r) => r.tool === tool && r.intent_sha === sha && !this.used.has(r.op_id))
+      .sort((a, b) => a.ordinal - b.ordinal)[0];
+    if (same) return this.resume(same, tool, input, execute);
+    // One more copy of a call already answered from a stored row: the earlier try made it fewer times.
+    if (rows.some((r) => r.tool === tool && r.intent_sha === sha)) return this.conflict(tool, input, null, REPEAT_ERROR);
+    // The model asks again for a change this retry already refused.
+    if (this.conflicted.has(sha)) return this.conflict(tool, input, null);
+    // An earlier write not matched yet may be this same thing asked differently: refuse rather than risk a second one.
+    const outstanding = rows.filter((r) => !this.used.has(r.op_id) && r.status !== "refused");
+    if (outstanding.length > 0) {
+      this.conflicted.add(sha);
+      return this.conflict(tool, input, outstanding.find((r) => r.tool === tool) ?? outstanding[0]);
+    }
+    // Every write the earlier tries made is accounted for: this call goes past where they stopped.
+    const ordinal = rows.filter((r) => r.tool === tool).reduce((n, r) => Math.max(n, r.ordinal), 0) + 1;
+    return this.claimAndRun(tool, input, sha, intent, ordinal, execute, context);
+  }
+
+  private async claimAndRun(
+    tool: string, input: unknown, sha: string, intent: unknown, ordinal: number, execute: Execute, context: OperationContext,
+  ): Promise<LedgerOutcome> {
+    const key: OperationKey = { owner_id: this.opts.ownerId, request_id: this.opts.requestId, tool, ordinal };
     let claimed: { row: OperationRow; created: boolean };
     try {
-      claimed = await this.opts.store.claim(key, sha, intent);
+      claimed = await this.opts.store.claim(key, sha, intent, context);
     } catch (e) {
       this.report("claim", e);
       return this.refuse(tool, input);
     }
-    if (claimed.created) return this.execute(claimed.row, tool, input, execute);
-
-    let row = claimed.row;
-    if (row.intent_sha !== sha || this.used.has(row.op_id)) {
-      // This try may make the same calls in another order: match by content before calling it a conflict.
-      const same = await this.findUnused(tool, sha);
-      if (same) row = same;
-      else if (row.status === "refused" && !this.used.has(row.op_id)) return this.reclaimAndRun(row, tool, input, sha, intent, execute);
-      else return this.conflict(row, tool, input);
-    }
-    return this.resume(row, tool, input, sha, intent, execute);
+    if (claimed.created) return this.execute(claimed.row, tool, input, execute, context);
+    // Another try of this message took the place at the same moment: the same call joins it, anything else is refused.
+    const row = claimed.row;
+    if (row.intent_sha === sha && !this.used.has(row.op_id)) return this.resume(row, tool, input, execute);
+    this.conflicted.add(sha);
+    return this.conflict(tool, input, row);
   }
 
   /**
-   * Receipts of calls an earlier try made that this try did not repeat (the model answered differently this time), so
-   * Riley still sees what was already saved. Empty on a first try.
+   * Receipts of calls an earlier try made that this try did not repeat (the model answered differently this time, or
+   * asked for something else), so Riley still sees what was already saved. Empty on a first try.
    */
   async earlierReceipts(): Promise<WriteReceipt[]> {
     if (!this.retry) return [];
@@ -273,57 +346,40 @@ export class ChatLedger {
     return out;
   }
 
-  private async findUnused(tool: string, sha: string): Promise<OperationRow | null> {
-    try {
-      const rows = await this.opts.store.listForRequest(this.opts.ownerId, this.opts.requestId);
-      return (
-        rows
-          .filter((r) => r.tool === tool && r.intent_sha === sha && !this.used.has(r.op_id))
-          .sort((a, b) => a.ordinal - b.ordinal)[0] ?? null
-      );
-    } catch (e) {
-      this.report("list", e);
-      return null;
-    }
-  }
-
-  private async resume(
-    row: OperationRow, tool: string, input: unknown, sha: string, intent: unknown,
-    execute: (opId: string) => Promise<ToolOutcome>,
-  ): Promise<LedgerOutcome> {
+  /** A stored row matched by content. */
+  private async resume(row: OperationRow, tool: string, input: unknown, execute: Execute): Promise<LedgerOutcome> {
     this.used.add(row.op_id);
+    const context = asObject(row.context) ?? {};
     if (row.status === "done") return this.replay(row, tool);
-    if (row.status === "refused") return this.reclaimAndRun(row, tool, input, sha, intent, execute);
+    if (row.status === "refused") return this.reclaimAndRun(row, tool, input, execute, context);
     // pending (a try still running, or one that stopped mid-way) or unknown (one that failed part-way).
-    if (RERUN_SAFE.has(tool)) return this.execute(row, tool, input, execute);
+    if (RERUN_SAFE.has(tool)) return this.execute(row, tool, input, execute, context);
     return this.reconcile(row, tool, input);
   }
 
+  /** The earlier try's call was refused (nothing written): run the same call again under the same operation id. */
   private async reclaimAndRun(
-    row: OperationRow, tool: string, input: unknown, sha: string, intent: unknown,
-    execute: (opId: string) => Promise<ToolOutcome>,
+    row: OperationRow, tool: string, input: unknown, execute: Execute, context: OperationContext,
   ): Promise<LedgerOutcome> {
-    this.used.add(row.op_id);
     let fresh: OperationRow | null;
     try {
-      fresh = await this.opts.store.reclaim(row, sha, intent);
+      fresh = await this.opts.store.reclaim(row);
     } catch (e) {
       this.report("reclaim", e);
       return this.refuse(tool, input);
     }
     // Another try took this place at the same moment and is running it.
     if (!fresh) return this.uncertain(row, tool, input);
-    return this.execute(fresh, tool, input, execute);
+    return this.execute(fresh, tool, input, execute, context);
   }
 
   private async execute(
-    row: OperationRow, tool: string, input: unknown,
-    execute: (opId: string) => Promise<ToolOutcome>,
+    row: OperationRow, tool: string, input: unknown, execute: Execute, context: OperationContext,
   ): Promise<LedgerOutcome> {
     this.used.add(row.op_id);
     let outcome: ToolOutcome;
     try {
-      outcome = await execute(row.op_id);
+      outcome = await execute(row.op_id, context);
     } catch (e) {
       this.report("execute", e);
       outcome = {
@@ -332,10 +388,11 @@ export class ChatLedger {
       };
     }
     const parsed = parseResult(outcome.result);
+    const status = classifyOutcome(outcome);
     const receipt = this.opts.buildReceipt(tool, input, outcome.result);
     try {
       // A failed record leaves the row pending: a retry then re-runs (keyed, so no second write) or looks it up.
-      await this.opts.store.finish(row, classifyOutcome(outcome), parsed, receipt);
+      await this.opts.store.finish(row, status, storedResult(status, parsed), receipt);
     } catch (e) {
       this.report("finish", e);
     }
@@ -388,22 +445,19 @@ export class ChatLedger {
     return { result, failed: false, receipt: this.opts.buildReceipt(tool, row.intent ?? input, result), replayed: false };
   }
 
-  private conflict(row: OperationRow, tool: string, input: unknown): LedgerOutcome {
-    this.used.add(row.op_id);
-    if (row.status === "done") {
-      const earlier = asObject(row.result) ?? {};
-      const base = row.receipt ?? this.opts.buildReceipt(tool, row.intent, JSON.stringify(earlier));
-      return {
-        result: JSON.stringify({ error: CONFLICT_ERROR, conflict: true, earlier_result: earlier }),
-        failed: false,
-        receipt: base ? withDetail(base, CONFLICT_DETAIL) : null,
-        replayed: false,
-      };
-    }
-    // The earlier call in this place wrote nothing (refused) or may have (pending / unknown): show what it was for.
-    const uncertainEarlier = row.status !== "refused";
-    const result = JSON.stringify({ error: CONFLICT_ERROR, conflict: true, ...(uncertainEarlier ? { incomplete: true, earlier_outcome: "unknown" } : { earlier_outcome: "not saved" }) });
-    return { result, failed: false, receipt: this.opts.buildReceipt(tool, uncertainEarlier ? row.intent : input, result), replayed: false };
+  /**
+   * This call was refused because of an earlier try: nothing was written for it, and its receipt says so. The earlier
+   * write itself is shown once, by earlierReceipts() (or by the call that matches it later in this try).
+   */
+  private conflict(tool: string, input: unknown, earlier: OperationRow | null, error = CONFLICT_ERROR): LedgerOutcome {
+    const earlierResult = earlier?.status === "done" ? asObject(earlier.result) ?? {} : null;
+    const result = JSON.stringify({
+      error,
+      conflict: true,
+      ...(earlier ? { earlier_tool: earlier.tool, earlier_outcome: earlier.status === "done" ? "saved" : "unknown" } : {}),
+      ...(earlierResult ? { earlier_result: earlierResult } : {}),
+    });
+    return { result, failed: false, receipt: this.opts.buildReceipt(tool, input, result), replayed: false };
   }
 
   private refuse(tool: string, input: unknown): LedgerOutcome {
@@ -440,7 +494,7 @@ export async function openLedger(
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Pds = SupabaseClient<any, any, any>;
 
-const OP_COLS = "op_id,owner_id,request_id,tool,ordinal,intent_sha,intent,status,result,receipt,created_at";
+const OP_COLS = "op_id,owner_id,request_id,tool,ordinal,intent_sha,intent,status,result,receipt,context,created_at";
 /** Missing table / column (the SQL file is not applied yet). */
 const MISSING_CODES = new Set(["42P01", "PGRST205", "42703", "PGRST204"]);
 
@@ -471,8 +525,8 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
       return "retry";
     },
 
-    async claim(key, intent_sha, intent) {
-      const { data, error } = await ops().insert({ ...key, intent_sha, intent, status: "pending" }).select(OP_COLS).single();
+    async claim(key, intent_sha, intent, context) {
+      const { data, error } = await ops().insert({ ...key, intent_sha, intent, context: context ?? null, status: "pending" }).select(OP_COLS).single();
       if (!error && data) return { row: data as OperationRow, created: true };
       if (error && error.code !== "23505") fail(error);
       const { data: existing, error: readError } = await ops()
@@ -499,9 +553,10 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
       return (data ?? []) as OperationRow[];
     },
 
-    async reclaim(row, intent_sha, intent) {
+    async reclaim(row) {
+      // Same call, same operation id: only the status moves (a refused row has nothing worth keeping).
       const { data, error } = await ops()
-        .update({ status: "pending", intent_sha, intent, result: null, receipt: null, updated_at: new Date().toISOString() })
+        .update({ status: "pending", result: null, receipt: null, updated_at: new Date().toISOString() })
         .eq("op_id", row.op_id)
         .eq("owner_id", row.owner_id)
         .eq("status", "refused")
@@ -529,12 +584,16 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
 }
 
 /**
- * Both target rows get their timestamp from the database clock after the operation row was inserted, so a small
- * margin is enough; it keeps an older row with the same details from being taken for this one.
+ * The quiz row gets its timestamp from the database clock after the operation row was inserted, so a small margin is
+ * enough; it keeps an older row with the same details from being taken for this one.
  */
 const RECONCILE_MARGIN_MS = 5_000;
 
-/** Read-only lookups for the write tools that are never re-run. Exactly one matching row counts; two is ambiguous. */
+/**
+ * Read-only lookups for the write tools that are never re-run. Exactly one matching row counts; two is ambiguous.
+ * A playlist is found by its audit key (pds.spotify_playlists.client_key = the operation id, set by createPlaylist);
+ * a quiz result, which has no key, by its book, checkpoint, score and total, taken after the operation began.
+ */
 export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Reconciler>> {
   const since = (row: OperationRow) => {
     const t = Date.parse(row.created_at);
@@ -542,15 +601,10 @@ export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Recon
   };
   return {
     create_spotify_playlist: async (row) => {
-      const intent = asObject(row.intent) ?? {};
-      const name = typeof intent.name === "string" ? intent.name : "";
-      if (!name.trim()) return null;
       const { data, error } = await supabase
         .from("spotify_playlists")
         .select("playlist_id,name,spotify_url,track_count")
-        .eq("created_via", "chat")
-        .eq("name", name)
-        .gte("created_at", since(row))
+        .eq("client_key", row.op_id)
         .limit(2);
       if (error || !Array.isArray(data) || data.length !== 1) return null;
       const p = data[0] as { playlist_id: string; name: string; spotify_url: string | null; track_count: number | null };
@@ -563,17 +617,25 @@ export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Recon
       const score = Math.round(Number(intent.score));
       const total = Math.round(Number(intent.total));
       if (!checkpoint || !Number.isFinite(score) || !Number.isFinite(total) || total <= 0) return null;
+      // The book the tool would have used: the named one, else the book being read (lib/reading.ts getBook).
+      const slug = typeof intent.book === "string" && intent.book.trim() ? intent.book.trim() : null;
+      let books = supabase.from("books").select("book_id");
+      books = slug ? books.eq("slug", slug) : books.eq("status", "reading");
+      const { data: book, error: bookError } = await books.order("created_at", { ascending: false }).limit(1);
+      const bookId = !bookError && Array.isArray(book) ? (book[0] as { book_id?: unknown } | undefined)?.book_id : undefined;
+      if (typeof bookId !== "number") return null;
       const { data, error } = await supabase
         .from("reading_quizzes")
         .select("quiz_id,checkpoint,score,total,quiz_date")
+        .eq("book_id", bookId)
         .eq("checkpoint", checkpoint)
         .eq("score", score)
         .eq("total", total)
         .gte("taken_at", since(row))
         .limit(2);
       if (error || !Array.isArray(data) || data.length !== 1) return null;
-      const q = data[0] as { checkpoint: string; score: number; total: number; quiz_date: string };
-      return { success: true, passed: q.score / q.total >= 0.8, score: `${q.score}/${q.total}`, checkpoint: q.checkpoint, quiz_date: q.quiz_date, reconciled: true };
+      const q = data[0] as { quiz_id: number; checkpoint: string; score: number; total: number; quiz_date: string };
+      return { success: true, passed: q.score / q.total >= 0.8, score: `${q.score}/${q.total}`, checkpoint: q.checkpoint, quiz_date: q.quiz_date, quiz_id: q.quiz_id, reconciled: true };
     },
   };
 }

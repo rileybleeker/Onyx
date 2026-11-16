@@ -21,7 +21,7 @@ function compile(path, imports = {}, sandboxConsole = { error() {} }) {
     if (name === "@/lib/supabase-server") return signedIn;
     if (name === "node:crypto") return require("node:crypto");
     throw new Error(`Unexpected import: ${name}`);
-  }, Response, console: sandboxConsole, process: { env: {} } });
+  }, Response, console: sandboxConsole, process: { env: {} }, crypto: globalThis.crypto, TextEncoder });
   return exports;
 }
 const contract = compile("../src/lib/chat-contract.ts");
@@ -596,12 +596,14 @@ test("a retry whose model asks for something else is refused; a new message stil
   const db = ledgerDb();
   const w = keyedIntake();
   const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
-  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  const firstBody = await (await route(logFocus, { supabase: db, intake: w.intake }).post(body)).json();
   const changed = route(afterTool("log_supplement_intake", { product: "Synthetic Calm" }), { supabase: db, intake: w.intake });
   const changedBody = await (await changed.post(body)).json();
   assert.equal(changed.writes(), 0);
   assert.equal(w.effects.size, 1);
-  assert.equal(changedBody.receipts[0].details.at(-1), operations.CONFLICT_DETAIL);
+  // What the first try saved is listed first, then the refused call, which wrote nothing.
+  assert.deepEqual(changedBody.receipts.map((r) => r.status), ["saved", "not_saved"]);
+  assert.deepEqual(changedBody.receipts[0].details, [...firstBody.receipts[0].details, operations.EARLIER_DETAIL]);
   assert.equal(JSON.parse(changed.requests()[1].messages.at(-1).content[0].content).conflict, true);
 
   const next = route(logFocus, { supabase: db, intake: w.intake });
@@ -636,10 +638,15 @@ test("a retry where the model does not repeat the write still shows what the fir
 test("stack and reading writes get the operation id as their own key; a reading replay mirrors nothing", async () => {
   const db = ledgerDb({ tables: { supplement_stack: [{ stack_id: 7, name: "Synthetic Morning", is_active: true }] } });
   const seen = [];
-  const stacks = { logStackIntake: async (_client, stackId, opts) => { seen.push(opts.event_key); return { ok: true, stack_id: stackId, stack_name: "Synthetic Morning", intake_date: "2026-11-11", intake_ids: [], count: 2, total_doses: 3 }; } };
+  const replays = [];
+  const stacks = {
+    stackEventReplay: async (_client, key) => { replays.push(key); return null; },
+    logStackIntake: async (_client, stackId, opts) => { seen.push(opts.event_key); return { ok: true, stack_id: stackId, stack_name: "Synthetic Morning", intake_date: "2026-11-11", intake_ids: [], count: 2, total_doses: 3 }; },
+  };
   await route(afterTool("log_supplement_stack", { stack: "synthetic morning" }), { supabase: db, stacks }).post({ request_id: RID, messages: [user("Log my synthetic morning stack")] });
   const stackOp = db.rows("chat_operations").find((r) => r.tool === "log_supplement_stack");
   assert.deepEqual(seen, [stackOp.op_id]);
+  assert.deepEqual(replays, [stackOp.op_id], "the key is looked up before the stack name is resolved");
 
   const book = { slug: "synthetic-book", title: "Synthetic Book", habit_name: null };
   const keys = [];
@@ -692,13 +699,38 @@ test("missing ledger tables: writes run as before and only the code is logged; o
   assert.equal(pausedBody.receipts[0].status, "not_saved");
 });
 
-test("a malformed request_id is a 400, and a request with one but no session is a 401, both before the model runs", async () => {
+test("a malformed request_id is a 400 before the model runs; a failed owner check pauses writes, not the chat", async () => {
   const r = route();
   assert.equal((await r.post({ request_id: "not-a-uuid", messages: [user("Hi")] })).status, 400);
   assert.equal((await r.post({ request_id: 5, messages: [user("Hi")] })).status, 400);
-  const signedOut = route([], { supabase: ledgerDb(), session: { createSupabaseServer: async () => ({ auth: { getClaims: async () => ({ data: null }) } }) } });
-  assert.equal((await signedOut.post({ request_id: RID, messages: [user("Hi")] })).status, 401);
-  assert.equal(r.calls() + signedOut.calls(), 0);
+  assert.equal(r.calls(), 0);
+  // The middleware already admitted the session, so no owner id here is a failed check (e.g. the signing keys could
+  // not be fetched): lookups and answers go on, a write is refused rather than run without a record.
+  const logged = [];
+  const w = keyedIntake();
+  const noClaims = route(logFocus, {
+    supabase: ledgerDb(),
+    intake: w.intake,
+    session: { createSupabaseServer: async () => ({ auth: { getClaims: async () => ({ data: null }) } }) },
+    sandboxConsole: { error: (...args) => logged.push(args) },
+  });
+  const response = await noClaims.post({ request_id: RID, messages: [user("Log Synthetic Focus")] });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(noClaims.writes(), 0);
+  assert.equal(body.receipts[0].status, "not_saved");
+  assert.equal("replay_safe" in body, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(logged)), [["Chat ledger", { stage: "open", code: "no_owner" }]]);
+});
+
+test("a quiz insert whose answer was lost is reported as possibly recorded; a refusal stays not recorded", async () => {
+  const quiz = afterTool("record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 });
+  const lost = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) } });
+  const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz")] })).json();
+  assert.equal(lostBody.receipts[0].status, "unknown");
+  assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/, "the database text is not passed on");
+  const refused = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, error: "score must be between 0 and total" }) } });
+  assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz")] })).json()).receipts[0].status, "not_saved");
 });
 
 test("a playlist call that may have reached Spotify is reported as possibly done, not as a clean failure", async () => {
@@ -714,10 +746,35 @@ test("a playlist call that may have reached Spotify is reported as possibly done
 test("the chat page sends a request id and reuses it only for the same text at the same point", () => {
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   assert.match(page, /body: JSON\.stringify\(\{ request_id: requestId, messages: updated\.map/);
-  assert.match(page, /previous && previous\.text === text && previous\.at === messages\.length \? previous\.requestId : newRequestId\(\)/);
+  assert.match(page, /previous && previous\.text === text && previous\.at === messages\.length \? previous\.requestId : null/);
   assert.match(page, /failedSend\.current = \{ text, requestId, at: messages\.length \}/);
   assert.match(page, /Send the same message again/);
   assert.equal(contract.parseRequestId(undefined), null);
   assert.equal(contract.parseRequestId("not-a-uuid"), false);
   assert.equal(contract.parseRequestId(RID.toUpperCase()), RID);
+});
+
+test("a send whose answer never arrived is remembered by hash + id only, for a while, and cleared once answered", async () => {
+  const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
+  // Stored before the request goes out, reused for the same conversation, settled on an answer or a 409.
+  assert.match(page, /if \(conv\) writePendingSend\(\{ conv, id: requestId, at: Date\.now\(\) \}\)/);
+  assert.match(page, /if \(stored\?\.conv === conv\) requestId = stored\.id/);
+  assert.equal((page.match(/settlePendingSend\(requestId\)/g) ?? []).length, 2);
+  assert.match(contract.PENDING_SEND_KEY, /^onyx/, "an onyx key, so signing out wipes it");
+
+  const now = Date.parse("2030-01-01T12:00:00Z");
+  const conv = "a".repeat(64);
+  const ok = JSON.stringify({ conv, id: RID.toUpperCase(), at: now - 60_000 });
+  assert.deepEqual(JSON.parse(JSON.stringify(contract.parsePendingSend(ok, now))), { conv, id: RID, at: now - 60_000 });
+  assert.equal(contract.parsePendingSend(JSON.stringify({ conv, id: RID, at: now - contract.PENDING_SEND_TTL_MS }), now), null, "expired");
+  assert.equal(contract.parsePendingSend(JSON.stringify({ conv, id: RID, at: now + 1 }), now), null, "from the future");
+  assert.equal(contract.parsePendingSend(JSON.stringify({ conv: "not-a-hash", id: RID, at: now }), now), null);
+  assert.equal(contract.parsePendingSend(JSON.stringify({ conv, id: "not-a-uuid", at: now }), now), null);
+  assert.equal(contract.parsePendingSend("{not json", now), null);
+  assert.equal(contract.parsePendingSend(null, now), null);
+  // The stored value never holds the text: only the hash of the conversation.
+  const key = await contract.conversationKey([user("Log Synthetic Focus")]);
+  assert.match(key ?? "", /^[0-9a-f]{64}$/);
+  assert.equal(key, await contract.conversationKey([{ ...user("Log Synthetic Focus"), extra: "ignored" }]));
+  assert.notEqual(key, await contract.conversationKey([user("Log Synthetic Calm")]));
 });

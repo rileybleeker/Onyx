@@ -144,7 +144,7 @@ function chatLedgerTables(randomUUID) {
       chat_requests: (now) => ({ created_at: now(), last_attempt_at: now() }),
       chat_operations: (now) => {
         const at = now();
-        return { op_id: randomUUID(), status: "pending", result: null, receipt: null, created_at: at, updated_at: at };
+        return { op_id: randomUUID(), status: "pending", result: null, receipt: null, context: null, created_at: at, updated_at: at };
       },
     },
   };

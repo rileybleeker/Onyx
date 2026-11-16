@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, newRequestId, type ChatMessage } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSend, type ChatMessage, type PendingSend } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
@@ -13,10 +13,36 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
 /**
  * The send that failed: its text, its request id and where in the conversation it was sent. Sending the same text
  * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
- * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. Memory only:
- * a reload starts over.
+ * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. A send whose
+ * answer never arrived is also remembered on this device for a while (hash + id only, PENDING_SEND_KEY), so the same
+ * conversation sent again after a reload or a closed tab is still recognised.
  */
 interface FailedSend { text: string; requestId: string; at: number }
+
+function readPendingSend(): PendingSend | null {
+  try {
+    const raw = window.localStorage.getItem(PENDING_SEND_KEY);
+    const pending = parsePendingSend(raw, Date.now());
+    if (raw && !pending) window.localStorage.removeItem(PENDING_SEND_KEY);
+    return pending;
+  } catch {
+    return null;
+  }
+}
+
+function writePendingSend(pending: PendingSend | null) {
+  try {
+    if (pending) window.localStorage.setItem(PENDING_SEND_KEY, JSON.stringify(pending));
+    else window.localStorage.removeItem(PENDING_SEND_KEY);
+  } catch {
+    /* storage full or blocked: the in-memory retry still works */
+  }
+}
+
+/** An answer (or a definite refusal) arrived for this request: forget it, unless a newer send replaced it. */
+function settlePendingSend(requestId: string) {
+  if (readPendingSend()?.id === requestId) writePendingSend(null);
+}
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<ShownMessage[]>([]);
@@ -54,7 +80,7 @@ export default function ChatPage() {
       return;
     }
     const previous = failedSend.current;
-    const requestId = previous && previous.text === text && previous.at === messages.length ? previous.requestId : newRequestId();
+    let requestId: string | null = previous && previous.text === text && previous.at === messages.length ? previous.requestId : null;
     failedSend.current = null;
     setResendText(null);
     sending.current = true;
@@ -66,6 +92,14 @@ export default function ChatPage() {
     let safe = replaySafe;
     let staleId = false;
     try {
+      // The same conversation as a send whose answer never arrived (before a reload or a closed tab): the same request.
+      const conv = await conversationKey(updated);
+      if (!requestId && conv) {
+        const stored = readPendingSend();
+        if (stored?.conv === conv) requestId = stored.id;
+      }
+      if (!requestId) requestId = newRequestId();
+      if (conv) writePendingSend({ conv, id: requestId, at: Date.now() });
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -78,15 +112,19 @@ export default function ChatPage() {
       setReplaySafe(safe);
       if (res.redirected || res.status === 401) throw new Error("Your session may have expired. Sign in again.");
       // The server no longer accepts this id for this message: the next send starts a new request.
-      if (res.status === 409 && data?.code === "request_conflict") staleId = true;
+      if (res.status === 409 && data?.code === "request_conflict") {
+        staleId = true;
+        settlePendingSend(requestId);
+      }
       if (!res.ok || typeof data?.response !== "string" || !data?.response.trim()) {
         throw new Error(typeof data?.error === "string" ? data.error : "Onyx could not finish this response.");
       }
+      settlePendingSend(requestId);
       setMessages([...updated, { role: "assistant", content: data.response, ...(written.length > 0 ? { receipts: written } : {}) }]);
     } catch (err) {
       setInput(text);
       setErrorReceipts(written);
-      if (!staleId) {
+      if (!staleId && requestId) {
         failedSend.current = { text, requestId, at: messages.length };
         setResendText(text);
       }

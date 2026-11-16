@@ -75,3 +75,49 @@ export function newRequestId(): string {
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+
+/**
+ * A send whose answer never arrived (the tab was closed or reloaded, the phone suspended the app) is remembered on
+ * this device for a short while under this key: a SHA-256 of the conversation as sent and its request id, never the
+ * text. Sending exactly that conversation again (e.g. the same first message in a fresh chat after a reload) reuses
+ * the id, so the server answers from its ledger instead of logging again. Cleared once an answer arrives. An "onyx"
+ * key, so signing out wipes it.
+ */
+export const PENDING_SEND_KEY = "onyx.chat.pending";
+export const PENDING_SEND_TTL_MS = 30 * 60 * 1000;
+
+export interface PendingSend {
+  /** SHA-256 (hex) of the conversation as sent. */
+  conv: string;
+  /** Its request id. */
+  id: string;
+  /** When it was sent (epoch ms). */
+  at: number;
+}
+
+/** The stored pending send, or null when there is none, it is malformed or it is older than PENDING_SEND_TTL_MS. */
+export function parsePendingSend(raw: string | null, now: number): PendingSend | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<PendingSend> | null;
+    if (!v || typeof v.conv !== "string" || !/^[0-9a-f]{64}$/.test(v.conv)) return null;
+    if (typeof v.id !== "string" || !REQUEST_ID_RE.test(v.id)) return null;
+    if (typeof v.at !== "number" || !Number.isFinite(v.at) || v.at > now || now - v.at >= PENDING_SEND_TTL_MS) return null;
+    return { conv: v.conv, id: v.id.toLowerCase(), at: v.at };
+  } catch {
+    return null;
+  }
+}
+
+/** SHA-256 (hex) of the conversation as the page sends it (role + text only); null when the browser has no Web Crypto. */
+export async function conversationKey(messages: ReadonlyArray<{ role: string; content: string }>): Promise<string | null> {
+  try {
+    const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
+    if (!subtle) return null;
+    const bytes = new TextEncoder().encode(JSON.stringify(messages.map(({ role, content }) => ({ role, content }))));
+    const digest = await subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}

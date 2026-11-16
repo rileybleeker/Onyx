@@ -45,6 +45,7 @@ export const eventKeyOf = (value: unknown): string | null =>
 
 interface EventRow {
   intake_id: number;
+  stack_id: number | null;
   doses: number | string;
   intake_date: string;
 }
@@ -53,19 +54,23 @@ interface EventRow {
 async function rowsForEvent(supabase: Pds, key: string): Promise<EventRow[]> {
   const { data, error } = await supabase
     .from("supplement_intake")
-    .select("intake_id,doses,intake_date")
+    .select("intake_id,stack_id,doses,intake_date")
     .eq("client_event_key", key)
     .order("client_event_line", { ascending: true });
   if (error) return [];
   return (data ?? []) as EventRow[];
 }
 
-async function replayStack(supabase: Pds, stack_id: number, rows: EventRow[]): Promise<LogStackResult> {
+/** The result of the log that wrote these rows, for the stack the rows belong to (not the one a name resolves to now). */
+async function replayStack(supabase: Pds, rows: EventRow[], fallbackStackId?: number): Promise<LogStackResult> {
+  const stack_id = rows[0].stack_id ?? fallbackStackId;
   // The stack may have been renamed or archived since; its rows still stand.
-  const { data: stack } = await supabase.from("supplement_stack").select("name").eq("stack_id", stack_id).maybeSingle();
+  const { data: stack } = stack_id != null
+    ? await supabase.from("supplement_stack").select("name").eq("stack_id", stack_id).maybeSingle()
+    : { data: null };
   return {
     ok: true,
-    stack_id,
+    stack_id: stack_id ?? undefined,
     stack_name: (stack as { name?: string } | null)?.name ?? undefined,
     intake_date: rows[0].intake_date,
     intake_ids: rows.map((r) => r.intake_id),
@@ -73,6 +78,18 @@ async function replayStack(supabase: Pds, stack_id: number, rows: EventRow[]): P
     total_doses: rows.reduce((s, r) => s + Number(r.doses), 0),
     replayed: true,
   };
+}
+
+/**
+ * The stored result of an earlier stack log with this event key, or null (no key, nothing written under it, or the
+ * column is not there yet). Read-only: the chat route asks this before it resolves a stack name, so a re-run finds
+ * its rows even after the stack was renamed or archived.
+ */
+export async function stackEventReplay(supabase: Pds, event_key: unknown): Promise<LogStackResult | null> {
+  const key = eventKeyOf(event_key);
+  if (!key) return null;
+  const prior = await rowsForEvent(supabase, key);
+  return prior.length > 0 ? replayStack(supabase, prior) : null;
 }
 
 export async function logStackIntake(
@@ -83,7 +100,7 @@ export async function logStackIntake(
   const key = eventKeyOf(opts.event_key);
   if (key) {
     const prior = await rowsForEvent(supabase, key);
-    if (prior.length > 0) return replayStack(supabase, stack_id, prior);
+    if (prior.length > 0) return replayStack(supabase, prior, stack_id);
   }
 
   // Resolve the stack (must be active) + its items.
@@ -141,7 +158,7 @@ export async function logStackIntake(
   if (insErr && key && insErr.code === "23505") {
     // The same event arrived twice at once: the other call wrote the whole set.
     const prior = await rowsForEvent(supabase, key);
-    if (prior.length > 0) return replayStack(supabase, stack_id, prior);
+    if (prior.length > 0) return replayStack(supabase, prior, stack_id);
   }
   if (insErr && key && missingColumn(insErr)) {
     ({ data: inserted, error: insErr } = await supabase.from("supplement_intake").insert(rows).select("intake_id"));
