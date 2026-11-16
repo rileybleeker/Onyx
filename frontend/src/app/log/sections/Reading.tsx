@@ -11,6 +11,7 @@ import { LOG_READING_URL, logEarlyGet } from "@/lib/log-early";
 import type { Book, Medium, ReadingOverview, ReadingSession } from "@/lib/reading";
 import { deviceBehavioralDay, fallbackBehavioralToday } from "@/lib/checkin";
 import { isBlankSession, newClientKey, readingSaveTarget, sameReadingValue, sessionValue, type SessionValue } from "@/lib/reading-autosave";
+import type { RetainedSaveContext } from "@/lib/autosave-retain";
 import { useRetainedAutosave } from "@/lib/use-autosave";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
@@ -29,7 +30,9 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * it made and its client_key stay with its autosaver until it is saved (useRetainedAutosave, PROD-T01). It keeps the
  * day it was started on (also when finished after 06:00 with no new answer from the server), and it stays on screen
  * with its reason and Retry when its book is no longer in progress (or the overview cannot be read), with Discard
- * (which drops the Say it words the entry was made from too).
+ * (which drops the Say it words the entry was made from too). A failed save that may have been stored anyway (every
+ * failure but a refusal: mayHaveStored) reads "Not confirmed", and until a save is answered changing the form back to
+ * the last confirmed values is sent, never shown as "Saved" while the server may hold the lost edit.
  */
 
 const READING_URL = LOG_READING_URL;
@@ -134,6 +137,8 @@ type ReadingFormData = {
   pendingDraft: number | null;
   /** The behavioral day rolled while this entry was not saved: it keeps the day it was made for (sent explicitly). */
   keptDay: boolean;
+  /** The last failed save may have been stored anyway (mayHaveStored): its status line says "Not confirmed". */
+  unconfirmed: boolean;
   /**
    * The book on screen when this entry was started (when the form has no book of its own). A restored entry, or a
    * later edit of the session it made, stays with that book even if the current book changes meanwhile.
@@ -189,6 +194,16 @@ function isClockDay(day: string, now = new Date()): boolean {
   return day === fallbackBehavioralToday(now) || day === deviceBehavioralDay(now);
 }
 
+/**
+ * The form's `unknownOutcome` (lib/autosave.ts): every failed save that is not a refusal may have been stored anyway.
+ * The request can reach the server and commit while its answer is lost (the connection drops, a gateway error page, a
+ * 5xx after the write), and the browser cannot tell that from a request that never arrived. Until a save is answered,
+ * no value then counts as already saved: an edit that failed this way and was changed back to the last confirmed
+ * values is sent (to the same session), instead of the retry being dropped and "Saved" shown while the server may hold
+ * the edit (Codex T01-R3). Resending is safe: a create carries its client_key, an edit writes the same values again.
+ */
+const mayHaveStored = (e: unknown) => !(e instanceof AutosaveRefused);
+
 const newReadingData = (): ReadingFormData => ({
   form: blankForm(""),
   touched: { ...EMPTY_FIELDS },
@@ -201,6 +216,7 @@ const newReadingData = (): ReadingFormData => ({
   seenDraft: null,
   pendingDraft: null,
   keptDay: false,
+  unconfirmed: false,
   entryBook: null,
   entryStarted: false,
   entrySent: false,
@@ -227,76 +243,93 @@ export default function ReadingSection() {
 
   // The saver and the form's state (`kept`) outlive this component while the entry is not saved. Its save may run
   // after an unmount (a retry): it reads and writes `kept` only, and touches React state only while mounted.
+  // saveSession is one save of the session form (the create, or an edit of the session it made); the autosaver's save
+  // below wraps it to remember whether a failure may have been stored anyway.
+  const saveSession = async (v: SessionValue, { keepalive, cancelled }: RetainedSaveContext): Promise<void> => {
+    // ready() keeps an incomplete value from getting here; never report "Saved" without a request.
+    // cancelled(): the session ended while this save was under way (sign-out, a 401): it stops after the request
+    // that is out, before any further request (a replay's PATCH), any write to `kept` and any refetch.
+    if (!v.body) throw new AutosaveRefused(v.reason ?? "Enter the chapter you read through to save.");
+    const id = kept.sessionId;
+    const target = readingSaveTarget("sessions", id);
+    const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
+    let json: Record<string, unknown>;
+    try {
+      if (id === null) {
+        if (!kept.clientKey) kept.clientKey = newClientKey();
+        const body: Record<string, unknown> = { ...v.body, client_key: kept.clientKey };
+        if (v.body.date === null) {
+          // No day chosen: the entry is for its own day (entryDay). The first send lets the server's behavioral
+          // today apply while that is still the entry's day; a first send after the day rolled (the entry was
+          // started before 06:00 and finished after, with no new answer from the server in between) and every
+          // later send of this create carry that day, whether or not this copy is still mounted.
+          const first = !kept.entrySent;
+          if (first && kept.entryDay === null && shownDayIsCurrent()) kept.entryDay = kept.form.date || overviewRef.current?.today || null;
+          kept.entrySent = true;
+          if (kept.entryDay && !(first && isCurrentDay(kept.entryDay))) body.date = kept.entryDay;
+        }
+        json = await send(target.url, "POST", body);
+      } else {
+        json = await send(target.url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+      }
+    } catch (e) {
+      if (cancelled()) return;
+      if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+        // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
+        if (kept.sessionId === id) {
+          setSessionId(null);
+          kept.clientKey = newClientKey();
+          kept.habitCreatedOn = null;
+        }
+        throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
+      }
+      throw e;
+    }
+    if (cancelled()) return;
+    const session = json.session as ReadingSession | undefined;
+    if (id === null && session?.session_id && kept.sessionId === null) {
+      setSessionId(session.session_id);
+      // The server chose the day (the day on screen was not known to be current): show the day it stored.
+      const stored = typeof session.session_date === "string" && isYmd(session.session_date) ? session.session_date : null;
+      if (v.body.date === null && stored && !kept.touched.date && kept.form.date !== stored) {
+        kept.entryDay = stored;
+        setForm({ ...kept.form, date: stored });
+      }
+      if (json.replayed) {
+        // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
+        // values on screen now are written onto it.
+        json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+        if (cancelled()) return;
+      }
+    }
+    if (typeof json.habit_created_on === "string" || json.habit_created_on === null) kept.habitCreatedOn = (json.habit_created_on as string | null) ?? null;
+    setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
+    showOverview(json.overview as ReadingOverview | null | undefined);
+    const savedDraft = kept.pendingDraft;
+    if (savedDraft !== null) {
+      kept.pendingDraft = null; // first: dropping it from the store must not read as "dismissed before saving"
+      clear(savedDraft);
+    }
+  };
   const autosave = useRetainedAutosave<SessionValue, ReadingFormData>(
     "log-reading",
     {
       delayMs: 1500,
       ready: (v) => v.reason,
       same: sameReadingValue,
-      save: async (v, { keepalive, cancelled }) => {
-        // ready() keeps an incomplete value from getting here; never report "Saved" without a request.
-        // cancelled(): the session ended while this save was under way (sign-out, a 401): it stops after the request
-        // that is out, before any further request (a replay's PATCH), any write to `kept` and any refetch.
-        if (!v.body) throw new AutosaveRefused(v.reason ?? "Enter the chapter you read through to save.");
-        const id = kept.sessionId;
-        const target = readingSaveTarget("sessions", id);
-        const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
-        let json: Record<string, unknown>;
+      // A failure that may have been stored anyway leaves no value counted as saved until a save is answered.
+      unknownOutcome: mayHaveStored,
+      save: async (v, ctx) => {
+        let unconfirmed = false;
         try {
-          if (id === null) {
-            if (!kept.clientKey) kept.clientKey = newClientKey();
-            const body: Record<string, unknown> = { ...v.body, client_key: kept.clientKey };
-            if (v.body.date === null) {
-              // No day chosen: the entry is for its own day (entryDay). The first send lets the server's behavioral
-              // today apply while that is still the entry's day; a first send after the day rolled (the entry was
-              // started before 06:00 and finished after, with no new answer from the server in between) and every
-              // later send of this create carry that day, whether or not this copy is still mounted.
-              const first = !kept.entrySent;
-              if (first && kept.entryDay === null && shownDayIsCurrent()) kept.entryDay = kept.form.date || overviewRef.current?.today || null;
-              kept.entrySent = true;
-              if (kept.entryDay && !(first && isCurrentDay(kept.entryDay))) body.date = kept.entryDay;
-            }
-            json = await send(target.url, "POST", body);
-          } else {
-            json = await send(target.url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
-          }
+          await saveSession(v, ctx);
         } catch (e) {
-          if (cancelled()) return;
-          if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
-            // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
-            if (kept.sessionId === id) {
-              setSessionId(null);
-              kept.clientKey = newClientKey();
-              kept.habitCreatedOn = null;
-            }
-            throw new AutosaveRefused("That session was removed elsewhere. Retry logs it again.");
-          }
+          unconfirmed = mayHaveStored(e);
           throw e;
-        }
-        if (cancelled()) return;
-        const session = json.session as ReadingSession | undefined;
-        if (id === null && session?.session_id && kept.sessionId === null) {
-          setSessionId(session.session_id);
-          // The server chose the day (the day on screen was not known to be current): show the day it stored.
-          const stored = typeof session.session_date === "string" && isYmd(session.session_date) ? session.session_date : null;
-          if (v.body.date === null && stored && !kept.touched.date && kept.form.date !== stored) {
-            kept.entryDay = stored;
-            setForm({ ...kept.form, date: stored });
-          }
-          if (json.replayed) {
-            // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
-            // values on screen now are written onto it.
-            json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
-            if (cancelled()) return;
-          }
-        }
-        if (typeof json.habit_created_on === "string" || json.habit_created_on === null) kept.habitCreatedOn = (json.habit_created_on as string | null) ?? null;
-        setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
-        showOverview(json.overview as ReadingOverview | null | undefined);
-        const savedDraft = kept.pendingDraft;
-        if (savedDraft !== null) {
-          kept.pendingDraft = null; // first: dropping it from the store must not read as "dismissed before saving"
-          clear(savedDraft);
+        } finally {
+          // The status line says "Not confirmed" for such a failure, also on the next mount. A session that ended
+          // while this save ran writes nothing to `kept`.
+          if (!ctx.cancelled()) kept.unconfirmed = unconfirmed;
         }
       },
     },
@@ -483,6 +516,7 @@ export default function ReadingSection() {
     setHeldDraft(false);
     kept.touched = { ...EMPTY_FIELDS };
     kept.keptDay = false;
+    kept.unconfirmed = false;
     kept.entryBook = null;
     kept.entryStarted = false;
     kept.entrySent = false;
@@ -828,7 +862,14 @@ export default function ReadingSection() {
           <span className="text-[12px] text-text-tertiary">
             {day && day !== today ? `For ${fmtDate(day)}` : "For today"}
             {" · "}
-            <AutosaveStatus id={statusId} state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyTouched} />
+            <AutosaveStatus
+              id={statusId}
+              state={autosave.state}
+              onRetry={() => void autosave.retry()}
+              savedText={savedText}
+              showIncomplete={anyTouched}
+              errorLabel={st === "error" && kept.unconfirmed ? "Not confirmed:" : undefined}
+            />
           </span>
           {sessionId === null && !o && (
             <button

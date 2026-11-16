@@ -8,7 +8,9 @@
 // touch press that still blurs the field is remembered, a touch that became a scroll is not); a session end stops a
 // save under way (no replay PATCH, no refetch); a copy mounted while the previous copy's create was out shows the day
 // the server stored; a background retry landing between a render and its effects leaves the form live; Discard drops
-// the Say it words the entry was made from.
+// the Say it words the entry was made from; an edit the server stored but whose answer was lost reads "Not confirmed",
+// and changing it back to the last confirmed values is sent to the same session (before the retry and after a
+// remount), never shown as "Saved" while the server holds the lost edit (Codex T01-R3).
 // Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
 // tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
 // "server" is the in-memory fetch below.
@@ -23,6 +25,8 @@ const unsavedLib = loadTs("lib/unsaved-work.ts");
 const retainLib = loadTs("lib/autosave-retain.ts", { "./autosave": autosaveLib, "./unsaved-work": unsavedLib });
 
 const D1 = "2031-04-10";
+/** The values a session edit (PATCH /api/reading/sessions/[id]) writes onto the stored row. */
+const SESSION_VALUE_KEYS = ["book", "chapter_from", "chapter_through", "minutes", "medium", "recall"];
 const D2 = "2031-04-11";
 const answer = (today = D1) => ({
   overview: {
@@ -117,6 +121,8 @@ function setup(t) {
   const rows = new Map();
   /** "up", "offline", or "lost": the server stores the create, but its answer never arrives (a network failure). */
   let mode = "up";
+  /** "up", "lost" (the server stores an edit of a session, but its answer never arrives) or "gone" (404: removed). */
+  let patchMode = "up";
   let readMode = "up";
   /** Reads of the reading overview through cachedJson (the mount's load, and the refetch after every save). */
   let reads = 0;
@@ -155,7 +161,15 @@ function setup(t) {
         const row = rows.get(body.client_key);
         return reply({ session: row, replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: row.session_date, overview: null });
       }
-      if (init.method === "PATCH") return reply({ session: { session_id: Number(url.split("/").pop()) }, xp_gained: 0, finished: false, overview: null });
+      if (init.method === "PATCH") {
+        // An edit writes its values onto the stored row (the session keeps its day here), then answers, or not.
+        if (patchMode === "gone") return reply({ error: "That session no longer exists." }, 404);
+        const sid = Number(url.split("/").pop());
+        const row = [...rows.values()].find((r) => r.session_id === sid);
+        if (row) for (const k of SESSION_VALUE_KEYS) if (k in body) row[k] = body[k];
+        if (patchMode === "lost") throw new TypeError("Failed to fetch");
+        return reply({ session: { session_id: sid }, xp_gained: 0, finished: false, overview: null });
+      }
       if (init.method === "DELETE" && url.startsWith("/api/reading/sessions/")) return reply({ overview: null });
       throw new Error(`unexpected request ${init.method} ${url}`);
     },
@@ -269,6 +283,9 @@ function setup(t) {
     timers, work, retainer, calls, rows,
     get reads() { return reads; },
     set mode(m) { mode = m; },
+    /** "lost": the next edits are stored on the server, but their answers never arrive. */
+    set patchMode(m) { patchMode = m; },
+    patches: () => calls.filter((c) => c.method === "PATCH"),
     /** The overview read fails (offline): the section keeps what the cache showed it. */
     set readMode(m) { readMode = m; },
     set serverToday(d) { serverToday = d; },
@@ -427,7 +444,7 @@ test("offline: a failed create keeps its client_key through an unmount, and Retr
   await h.mount();
   await h.type("Through ch.", "3");
   await h.tick(1500);
-  assert.match(h.text(), /Not saved: Couldn't reach Onyx\. Trying again…/);
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\. Trying again…/, "no answer: the create may have been stored");
   assert.ok(h.hasButton("Retry"), "a clear retry next to the form");
   await h.unmount(); // sends once more on the way out: still offline
   assert.equal(h.posts().length, 2);
@@ -436,7 +453,7 @@ test("offline: a failed create keeps its client_key through an unmount, and Retr
 
   await h.mount();
   assert.equal(h.value("Through ch."), "3", "the entry is back");
-  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./, "and so is its failure");
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./, "and so is its failure");
   h.mode = "up";
   await h.click("Retry");
   assert.match(h.text(), /Saved · \+10 XP/, "confirmed only after the server answered");
@@ -706,7 +723,7 @@ test("no book in progress any more: a failed create keeps its Retry, and Discard
   await h.unmount();
   await h.serve(noBookAnswer());
   await h.mount();
-  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./);
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
   assert.ok(h.hasButton("Retry"), "Retry is still offered");
   assert.equal(h.value("Through ch."), "5");
   await h.click("Discard this entry");
@@ -842,7 +859,7 @@ test("session end during a background retry whose create had landed: the replaye
   h.mode = "lost"; // the server stores the session; the answer never arrives
   await h.tick(1500);
   assert.equal(h.rows.size, 1, "stored on the server");
-  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./);
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
   await h.unmount(); // sends once more on the way out; that answer is lost too
   assert.equal(h.retainer.size, 1, "kept, retrying on its own");
 
@@ -926,7 +943,7 @@ test("Discard drops the Say it words the entry was made from: the next mount nei
   await h.say({ chapter_through: 5, minutes: 20 });
   assert.equal(h.value("Through ch."), "5", "the words filled the form");
   await h.tick(1500); // the create fails offline
-  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./);
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
   await h.unmount();
   await h.serve(noBookAnswer()); // the book was finished elsewhere meanwhile
   await h.mount();
@@ -959,4 +976,103 @@ test("a touch on Discard that turns into a scroll is no press: the next blur out
   await h.blurTo(null); // later, focus leaves the form
   assert.equal(h.posts().length, 1, "saved at once, not skipped as if Discard had been pressed");
   assert.equal(h.posts()[0].body.chapter_through, 5);
+});
+
+/** A saved session (A: through ch. 3, no minutes), then an edit (B: 40 minutes) the server stores but never answers. */
+async function lostEditOfSavedSession(h) {
+  await h.mount();
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.match(h.text(), /Saved · \+10 XP/, "A is confirmed");
+  assert.equal(h.rows.size, 1);
+  const row = [...h.rows.values()][0];
+  assert.equal(row.minutes, null);
+  h.patchMode = "lost";
+  await h.type("Minutes", "40");
+  await h.tick(1500);
+  assert.equal(h.patches().length, 1);
+  assert.equal(row.minutes, 40, "the server holds B");
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\. Trying again…/, "a failure that may have been stored is never \"Not saved\"");
+  assert.doesNotMatch(h.text(), /Saved/);
+  return { row, url: `/api/reading/sessions/${row.session_id}` };
+}
+
+test("lost edit answer, then the form changed back to the confirmed values before the retry: the change-back is sent, Saved only once the server holds it (T01-R3)", async (t) => {
+  const h = setup(t);
+  const { row, url } = await lostEditOfSavedSession(h);
+  const patches = h.patches().length;
+
+  h.patchMode = "up";
+  await h.type("Minutes", ""); // back to A, before the lost edit's retry (2 s) fires
+  assert.match(h.text(), /Not saved yet/, "waiting to send A: the server may still hold B");
+  assert.doesNotMatch(h.text(), /Saved/, "never \"Saved\" without an answer");
+  assert.equal(h.work.has(), true, "still unsaved work");
+  await h.tick(1500);
+  const sent = h.patches();
+  assert.equal(sent.length, patches + 1, "the change back to A is sent, not dropped as unchanged");
+  assert.equal(sent[sent.length - 1].url, url, "to the same session");
+  assert.equal(sent[sent.length - 1].body.minutes, null);
+  assert.equal(row.minutes, null, "the server holds A again");
+  assert.equal(row.chapter_through, 3);
+  assert.match(h.text(), /Saved/, "confirmed once the server answered");
+  assert.doesNotMatch(h.text(), /Not confirmed/);
+  assert.equal(h.posts().length, 1, "one create");
+  assert.equal(h.rows.size, 1, "one session, never two");
+  await h.tick(120_000);
+  assert.equal(h.patches().length, patches + 1, "nothing more is sent: the lost edit's retry is not sent after A");
+  assert.equal(row.minutes, null);
+  await h.unmount();
+  assert.equal(h.retainer.size, 0, "all confirmed: nothing kept");
+  assert.equal(h.work.has(), false);
+});
+
+test("lost edit answer, then an unmount: the same entry is kept unconfirmed, and changing back on the next mount is sent to the same session (T01-R3)", async (t) => {
+  const h = setup(t);
+  const { row, url } = await lostEditOfSavedSession(h);
+  await h.unmount(); // sends B once more on the way out; that answer is lost too
+  assert.equal(row.minutes, 40);
+  assert.equal(h.retainer.size, 1, "kept: the server may hold B");
+  assert.equal(h.work.has(), true, "still unsaved work: the updater never reloads over it");
+  const kept = h.retainer.find("log-reading");
+  assert.ok(kept, "the kept entry");
+  const sessionId = kept.data.sessionId;
+  assert.equal(sessionId, row.session_id);
+
+  h.patchMode = "up";
+  const before = h.calls.length;
+  await h.mount();
+  assert.equal(h.calls.length, before, "taking the entry over sends nothing");
+  assert.strictEqual(h.retainer.find("log-reading"), kept, "the same kept entry, not a new form");
+  assert.equal(kept.data.sessionId, sessionId, "with the session it made");
+  assert.equal(h.value("Minutes"), "40", "B is back on screen");
+  assert.match(h.text(), /This session/);
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./, "and so is its unconfirmed failure");
+
+  await h.type("Minutes", ""); // back to A
+  assert.match(h.text(), /Not saved yet/);
+  assert.doesNotMatch(h.text(), /Saved/);
+  await h.tick(1500);
+  const last = h.calls[h.calls.length - 1];
+  assert.equal(last.method, "PATCH");
+  assert.equal(last.url, url, "to the same session");
+  assert.equal(last.body.minutes, null);
+  assert.equal(row.minutes, null, "the server holds A again");
+  assert.match(h.text(), /Saved/);
+  assert.equal(h.posts().length, 1, "one create");
+  assert.equal(h.rows.size, 1);
+  const patches = h.patches().length;
+  await h.tick(120_000);
+  assert.equal(h.patches().length, patches, "nothing more is sent");
+  await h.unmount();
+  assert.equal(h.retainer.size, 0, "all confirmed: nothing kept");
+  assert.equal(h.work.has(), false);
+});
+
+test("a refusal after an unconfirmed edit reads Not saved: the server answered this time", async (t) => {
+  const h = setup(t);
+  await lostEditOfSavedSession(h);
+  h.patchMode = "gone"; // removed elsewhere meanwhile: the next edit is answered 404 "no longer exists"
+  await h.click("Retry");
+  assert.match(h.text(), /Not saved: That session was removed elsewhere\. Retry logs it again\./);
+  assert.doesNotMatch(h.text(), /Not confirmed/);
 });

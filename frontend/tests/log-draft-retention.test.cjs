@@ -34,7 +34,10 @@ test("/log Reading keeps its entry, the session it made and its client_key with 
   assert.match(reading, /client_key: kept\.clientKey/, "the create's operation key lives with the kept entry");
   assert.doesNotMatch(reading, /sessionRef|clientKey = useRef|const touched = useRef/, "no component-local copy of the entry's identity");
   assert.match(reading, /if \(!v\.body\) throw new AutosaveRefused/, "never \"Saved\" without a request");
-  assert.match(reading, /<AutosaveStatus id=\{statusId\}/);
+  assert.match(reading, /<AutosaveStatus\s+id=\{statusId\}/);
+  assert.match(reading, /unknownOutcome: mayHaveStored,/, "a failure that may have been stored leaves nothing counted as saved (T01-R3)");
+  assert.match(reading, /const mayHaveStored = \(e: unknown\) => !\(e instanceof AutosaveRefused\);/);
+  assert.match(reading, /errorLabel=\{st === "error" && kept\.unconfirmed \? "Not confirmed:" : undefined\}/, "and reads Not confirmed");
   assert.match(reading, /aria-describedby=\{describedBy\}/, "fields point at the status line while it says why");
 });
 
