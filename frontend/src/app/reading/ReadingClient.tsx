@@ -6,7 +6,7 @@ import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CHECKPOINT_SIZE, CONCEPTS, checkpointOffer, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { CHECKPOINT_SIZE, checkpointOffer, conceptOptions, parseIdeaTitles, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
@@ -29,6 +29,41 @@ import CheckpointQuiz from "./CheckpointQuiz";
  */
 const UNRECORDED_TTL_MS = 120_000;
 const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
+
+/**
+ * The titles of the question-bank ideas the book's highlights are linked to (GET /api/reading/idea-titles), kept for
+ * the session per book so the highlight form coming back into view (the continuous scroll mounts and unmounts it)
+ * does not ask again. Memory only.
+ */
+const IDEA_TITLES_TTL_MS = 300_000;
+const ideaTitlesMemo = new Map<string, { at: number; titles: string[] }>();
+const NO_TITLES: string[] = [];
+const ideaTitlesUrl = (slug: string) => `/api/reading/idea-titles?book=${encodeURIComponent(slug)}`;
+const freshIdeaTitles = (slug: string) => {
+  const hit = ideaTitlesMemo.get(slug);
+  return hit && Date.now() - hit.at < IDEA_TITLES_TTL_MS ? hit : null;
+};
+
+/**
+ * The linked idea titles for the concept picker. A plain GET with no side effect, made only while the book's
+ * questions are on (nothing to read otherwise); any failure is no titles. The database applies the spoiler gate.
+ */
+function useLinkedIdeaTitles(slug: string, on: boolean): string[] {
+  const [titles, setTitles] = useState<string[]>(() => (on ? ideaTitlesMemo.get(slug)?.titles ?? NO_TITLES : NO_TITLES));
+  useEffect(() => {
+    if (!on || freshIdeaTitles(slug)) return;
+    let live = true;
+    void getJson(ideaTitlesUrl(slug)).then((r) => {
+      const next = r.status === 200 && r.body && typeof r.body === "object" ? parseIdeaTitles((r.body as { titles?: unknown }).titles) : NO_TITLES;
+      ideaTitlesMemo.set(slug, { at: Date.now(), titles: next });
+      if (live) setTitles((prev) => (sameJson(prev, next) ? prev : next));
+    });
+    return () => {
+      live = false;
+    };
+  }, [slug, on]);
+  return on ? titles : NO_TITLES;
+}
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -525,6 +560,9 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
   const [chapter, setChapter] = useState<string>("");
   const [concept, setConcept] = useState<string>("");
   const [customConcept, setCustomConcept] = useState("");
+  // The concept tags offered: the book's own (pds.books.theme, generic when none) plus the titles of its linked ideas.
+  const ideaTitles = useLinkedIdeaTitles(o.book.slug, o.practice?.enabled === true);
+  const concepts = useMemo(() => conceptOptions(o.theme?.concepts, ideaTitles), [o.theme, ideaTitles]);
   const [source, setSource] = useState<HighlightSource>("kindle");
   const [importText, setImportText] = useState("");
   const [preview, setPreview] = useState<{ format: string; count: number } | null>(null);
@@ -734,7 +772,7 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
               className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
             >
               <option value="">Concept (optional)</option>
-              {CONCEPTS.map((c) => (
+              {concepts.map((c) => (
                 <option key={c} value={c}>
                   {c}
                 </option>
