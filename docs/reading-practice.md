@@ -31,6 +31,27 @@ Spaced-repetition review grades (`/reading` Review card) and checkpoint quiz res
 Routes: owner session only (never in `isCiRoute()`), same-origin, JSON only, 8 KB cap, unknown fields refused,
 errors are short codes.
 
+## The Review card (PROD-T03)
+
+`frontend/src/app/reading/ReviewCard.tsx`, pure rules in `lib/reading-practice.ts`.
+
+- Each grade button shows its label and the interval the server will store, computed with `reviewPreview` (the
+  same `scheduleAfterGrade` the commit uses). The first Good is 1 day, the second 3 days.
+- One request at a time. While a grade is saving, the buttons are `aria-disabled` (a pressed button keeps focus) and
+  a status line says the buttons wait for Onyx's answer. The card and the revealed note stay on screen.
+- No answer or a server error: an inline "Not saved" alert (a word and an icon, not color alone) with Retry. The
+  card keeps ONE operation key until it hears a definite answer, so Retry, or a different grade, reuses it: a
+  grade that did land is answered from its receipt, and `key_reused` (another grade was stored first under that
+  key) counts as graded.
+- A refusal (4xx) wrote nothing: no Retry, any grade can be picked, the next try gets a new key. Graded on another
+  screen, archived or gone (409 / 404): grades are blocked and Refresh re-reads the overview.
+- Success advances exactly once: the card's graded highlight ids are kept for the day, so a reload that raced the
+  grade cannot bring a card back. Focus moves to the next card's reveal button or to the "Nothing due" line; the
+  reveal moves focus to the note. Each failure is announced once (the alert is removed while a retry is saving).
+- Controls are at least 44 px high with 12 px between grade buttons, on desktop and at 390 px.
+
+Tests: `frontend/tests/reading-review-card.test.cjs` (the real component under the hook harness, synthetic cards).
+
 ## Rollback
 
 Revert the route and card code. The additive columns, the receipt table and the functions can stay (read-only for
