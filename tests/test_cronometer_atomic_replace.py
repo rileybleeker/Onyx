@@ -111,7 +111,7 @@ class _Rpc:
                 db.daily[r["calendar_date"]] = dict(r)
             if db.reply is not _UNSET:
                 return _Result(db.reply)
-            return _Result({**out, "daily_upserted": len(drows)})
+            return _Result({**out, "daily_upserted": len(drows), "daily_kept": 0})
         assert self.fn == "replace_cronometer_servings", self.fn
         if db.reply is not _UNSET:
             self._replace()
