@@ -1,8 +1,10 @@
 # Medical records: backup and recovery (SEC-06, 2026-11-16)
 
-Plan and check only. Nothing in this document is scheduled, paid for or restored. Every step that
-costs money, copies a real record out of Supabase or restores anything waits for Riley's decision
-(the list is at the end). The read-only check `tools/medical_recovery/recovery_check.py` exists now.
+Plan and check only. Nothing in this document is scheduled, paid for or restored. The decisions are
+recorded in section 8 (2026-11-16): off-site option A, PITR off, and a count-free heartbeat for the
+future backup job. Building that job, creating the encryption key and running the drill is separate
+follow-up work; nothing here copies a real record out of Supabase or restores anything. The read-only
+check `tools/medical_recovery/recovery_check.py` exists now.
 
 `/health/records` stores two kinds of things (see `docs/medical-records.md`): rows in
 `pds.medical_documents` and `pds.lab_results`, and the original files in the private storage bucket
@@ -78,7 +80,7 @@ RPO = how much recent work can be lost. RTO = how long until it is back and chec
 | Today, from Supabase's daily backups (unverified until section 2's ask is done) | up to 24 h; restore points go back 7 days | under 1 h for a whole-project restore at this database size | A whole-project restore rolls **every** Onyx table back to that day, not just these two, and the project is offline while it runs |
 | Today, medical tables only, via "Restore to a new project" | up to 24 h | 2 to 4 h | A temporary second project (billed while it exists) is restored from the backup, the two tables are copied back by id, then the temporary project is removed |
 | With the off-site plan (section 4) | up to 24 h; snapshots kept 30 days plus 12 monthly | about 1 h | Decrypt the newest snapshot and upsert by id (idempotent): documents first, then lab results |
-| With the PITR add-on | 2 minutes (Supabase docs) | under 1 h | About $100 per month for 7 days of recovery, plus at least the Small compute add-on. Not recommended: entries are typed by hand, rarely, so a day is easy to re-enter |
+| With the PITR add-on | 2 minutes (Supabase docs) | under 1 h | About $100 per month for 7 days of recovery, plus at least the Small compute add-on. **Stays off** (decision 6): entries are typed by hand, rarely, so a day is easy to re-enter |
 
 ### Original files
 
@@ -90,7 +92,7 @@ RPO = how much recent work can be lost. RTO = how long until it is back and chec
 **Proposed targets:** rows RPO 24 h / RTO 4 h; files RPO 24 h / RTO 4 h. A lost day of typing can be
 redone; a lost original usually cannot, which is why the files are the priority.
 
-## 4. Off-site copy: encrypted, with retention (needs approval before it is built)
+## 4. Off-site copy: encrypted, with retention (option A chosen; not built yet)
 
 ### The same for every option
 
@@ -118,9 +120,11 @@ redone; a lost original usually cannot, which is why the files are the priority.
   for 30 days, plus the first of each month for 12 months.
 - **Deletion protection** on the storage side (per option below), so a mistake or a leaked credential
   cannot erase the recent copies.
-- **Output**: counts only, never names or content. The medical-records rule today is "no heartbeat,
-  no `/status` card"; whether the backup job may write a heartbeat that carries no counts (only
-  success / failure and time), so a stale backup shows on `/status`, is one of Riley's decisions.
+- **Output**: counts only, never names or content. **Monitoring (decision 5):** the backup job may
+  write a heartbeat that carries no counts (only success / failure, a short error code and the
+  time) and gets a `/status` card, so a stale backup shows there. This is the one exception to the
+  medical-records "no heartbeat" rule, and it applies to the backup job only. The check below stays
+  manual and writes nothing.
 
 ### Options (prices as published at the time of writing; confirm on the pricing page before approving)
 
@@ -131,9 +135,10 @@ redone; a lost original usually cannot, which is why the files are the priority.
 | **C. Backblaze B2 with Object Lock** | first 10 GB free, then about $6 to $7 per TB-month (well under $1 at 50 GB) | Object Lock | One B2 application key | **Yes** (needs approval) | Same as B, on a provider Onyx does not use yet |
 | **D. Encrypted USB drive** (BitLocker), swapped off-site by hand | $0 (about $60 once for a drive) | Physical | None | No | Not automatic: a recurring chore, which Riley prefers to avoid |
 
-**Recommendation: A.** It costs nothing, adds no credential and no provider, keeps the plaintext on
-machines Onyx already trusts, and at this data size a daily run on a PC that is used most days meets
-the 24 h target. Choose B instead if the PC is often off for days at a time.
+**Chosen: A** (decision 2). It costs nothing, adds no credential and no provider, keeps the plaintext
+on machines Onyx already trusts, and at this data size a daily run on a PC that is used most days
+meets the 24 h target. Revisit B only if the PC turns out to be off for days at a time (the job's
+heartbeat will show that).
 
 ## 5. Recovering for real (outline, used only with Riley's go-ahead)
 
@@ -199,16 +204,17 @@ $schema = (Resolve-Path sql\medical_records_schema.sql).Path
    $lab = @{ id = [guid]::NewGuid().ToString(); test_name = "Synthetic drill test"; value_num = 1.5; collected_on = "2026-01-01"; document_id = $rows[0].id }
    Invoke-RestMethod -Method Post "$api/rest/v1/lab_results" -Headers $pdb -ContentType "application/json" -Body (ConvertTo-Json @($lab))
    ```
-5. **A made-up signed-in user, then the baseline.** Set `$env:SUPABASE_SERVICE_ROLE_KEY` and
-   `$env:SUPABASE_ANON_KEY` to the local `SERVICE_ROLE_KEY` and `ANON_KEY`, in this window only (for
-   a drill target the check reads only these variables or a `--key-file` you name, never the
-   production key file), and give the check a made-up user's token for the signed-in-user probe
-   (the local stack confirms sign-ups by itself; the token lasts an hour):
+5. **A made-up signed-in user, then the baseline.** Set `$env:RECOVERY_DRILL_SERVICE_KEY` and
+   `$env:RECOVERY_DRILL_ANON_KEY` to the local `SERVICE_ROLE_KEY` and `ANON_KEY`, in this window only.
+   A drill target gets only these drill variables or a `--key-file` you name: never
+   `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_USER_ACCESS_TOKEN` or the production key file, which may
+   hold production credentials in this shell. Give the check a made-up user's token for the
+   signed-in-user probe (the local stack confirms sign-ups by itself; the token lasts an hour):
    ```powershell
-   $anon = $env:SUPABASE_ANON_KEY
+   $anon = $env:RECOVERY_DRILL_ANON_KEY
    $s = Invoke-RestMethod -Method Post "$api/auth/v1/signup" -Headers @{ apikey = $anon } -ContentType "application/json" `
         -Body (ConvertTo-Json @{ email = "drill-user@example.com"; password = [guid]::NewGuid().ToString() })
-   $env:SUPABASE_USER_ACCESS_TOKEN = $s.access_token
+   $env:RECOVERY_DRILL_USER_TOKEN = $s.access_token
    ```
    Then `python $check --url http://127.0.0.1:54321 --skip-backups --write-manifest "$d\manifest.json"`
    must print PASS (it opens every file; the manifest is written only from a PASS, so a broken seed
@@ -249,9 +255,11 @@ $schema = (Resolve-Path sql\medical_records_schema.sql).Path
     every lab result's document link and removed flag match the manifest (a link that was cleared or
     now points at another document fails); a 60-second signed link (the app's own viewing path)
     serves the same bytes; the bucket is private with the right cap and types; the anon key and the
-    made-up user's token each reach neither table, list no file and cannot reach a file directly (a
-    refusal counts only after the key itself was accepted); and the public URL is refused. Then
-    **open one restored file by hand**:
+    made-up user's token each reach neither table, list no file and cannot download a file directly
+    (a real GET of a made-up file, because Storage checks a download and a HEAD separately; a refusal
+    counts only after the key itself was accepted); and the public URL refuses a download too. The
+    file check is a structural parse, so the report lists `file_opened_in_viewer` under "not
+    checked". That is covered by the next step: **open one restored file by hand**:
     ```powershell
     $l = Invoke-RestMethod -Method Post "$api/storage/v1/object/sign/medical-records/documents/$($rows[0].id)" -Headers $h -ContentType "application/json" -Body '{"expiresIn":60}'
     Start-Process "$api/storage/v1$($l.signedURL)"
@@ -266,26 +274,40 @@ $schema = (Resolve-Path sql\medical_records_schema.sql).Path
     file opened, and the production backup dates from section 2. Then `npx supabase stop --no-backup`
     and move `$d` to the Recycle Bin.
 
-**SEC-06 closes only when** the production backup dates have been read (section 2), an off-site
-option is chosen and running, a drill has passed against its copy, and the receipt is saved. A merge
-of this document does not close it.
+**SEC-06 closes only when** the production backup dates have been read (section 2), the option A
+job is running, a drill has passed against its copy (including a person opening a restored file),
+and the receipt is saved. A merge of this document does not close it.
 
 ## 7. The check: `tools/medical_recovery/recovery_check.py`
 
-Read-only, standard-library Python, run by hand on the PC (no schedule, no heartbeat, no `/status`
-card: the medical-records rule keeps counts out of `sync_log`, and a card is a decision in section 8).
+Read-only, standard-library Python, run by hand on the PC. It has no schedule, no heartbeat and no
+`/status` card: the medical-records rule keeps counts out of `sync_log`, and the heartbeat allowed
+in decision 5 belongs to the backup job, not to this check. It is a standalone command-line tool, a
+scope accepted in decision 8.
 
 ```powershell
 python tools\medical_recovery\recovery_check.py              # production: relationships, privacy, backup dates (INCOMPLETE at best: see Files)
 python tools\medical_recovery\recovery_check.py --json       # the same as JSON (keep it private)
 ```
 
-- Keys: `SUPABASE_SERVICE_ROLE_KEY` or `~/.onyx_supabase_secret` (that file holds the production
-  key, so it is read for production only: a drill target gets the variable or a `--key-file` named
-  explicitly, never that file); `SUPABASE_ANON_KEY` (the public key the site ships);
-  `SUPABASE_USER_ACCESS_TOKEN` (a signed-in user's access token, which expires within an hour, for
-  the signed-in-user probe); `SUPABASE_ACCESS_TOKEN` for the backup list (account-wide admin: the
-  rules in section 2, one shell only, revoked after the run). Keys are never printed.
+- Where it may send anything: the target is decided from the exact origin **before any key is
+  read**. Production is exactly `https://<production ref>.supabase.co`. A drill target is a local
+  stack (`localhost`, `127.0.0.1`, `::1`) or the hosted project named with `--drill-project`, and is
+  never production. Any other `--url` or `SUPABASE_URL` is refused, and nothing is read or sent: no
+  other host, no `http`, no other port, no path, no user name in the URL, and no hosted project that
+  was not named. Every request is checked against that one origin before it is sent; the personal
+  access token is checked against the Management API's origin. Redirects are never followed (a 3xx
+  is reported as unreadable), no proxy from the environment is used, and a signed download link is
+  fetched only when it is the target's own signed route for that very file.
+- Keys on production: `SUPABASE_SERVICE_ROLE_KEY` or `~/.onyx_supabase_secret`;
+  `SUPABASE_ANON_KEY` (the public key the site ships); `SUPABASE_USER_ACCESS_TOKEN` (a signed-in
+  user's access token, which expires within an hour, for the signed-in-user probe). Keys on a drill
+  target come only from their own variables (`RECOVERY_DRILL_SERVICE_KEY` or a `--key-file` named
+  explicitly that is not the production key file, `RECOVERY_DRILL_ANON_KEY`,
+  `RECOVERY_DRILL_USER_TOKEN`), so production credentials sitting in the shell are never sent to a
+  drill target. A drill key or token whose JWT names the production project is refused.
+  `SUPABASE_ACCESS_TOKEN` is used for the backup list (account-wide admin: the rules in section 2,
+  one shell only, revoked after the run). Keys are never printed.
 - It reads only id, path, size, type and state columns, never a title, note, test name or value, and
   prints counts and pass / fail / warn per check, never an id or path.
 - Files: each confirmed document must be in the bucket listing with its declared size and type
@@ -294,45 +316,70 @@ python tools\medical_recovery\recovery_check.py --json       # the same as JSON 
   brings back even when the bytes are gone (Storage answers HEAD from that row and never asks the
   file store). So the bytes are proven only by downloading them: `files_stored` and
   `stored_sizes_match` pass only with `--open-files` on a drill target, and on production they are
-  reported as unknown. **A production run therefore ends INCOMPLETE at best**, with those two checks
-  the only unknowns; every other line is read normally, and any FAIL is a finding. Byte evidence
-  comes from the drill and, once it runs, from the off-site job, which reads every file when it
-  copies it.
+  reported as unknown. Byte evidence comes from the drill and, once it runs, from the off-site job,
+  which reads every file when it copies it.
+- `files_parse_as_declared_type` (drill only) is a **structural parse**: the PDF cross-reference
+  table, PNG chunks and pixel data, JPEG segments, WebP chunks and HEIF boxes. It catches a
+  truncated, swapped or look-alike file, but no decoder renders a page, and a JPEG's scan data is
+  not decoded. So every report lists `file_opened_in_viewer` under "not checked", and a PASS of
+  this tool is not recovery acceptance on its own. A person opening a restored file (section 6
+  step 10) covers that.
 - Privacy: the anon key and a signed-in user's token must each be accepted by a harmless read first
   (`/auth/v1/settings`, `/auth/v1/user`). After that, a table counts as refused only on PostgREST's
-  permission answer (`42501` or `PGRST106`), and a listing only when it answers a list (with no
-  policy Storage answers an empty one) or "bucket not found". Listing and download are separate
-  permissions in Storage, so each role also gets a HEAD request on one file's download route (the
-  same row-level check a download makes, no bytes sent), and the public URL is probed with HEAD as
-  well. A stale or rotated key, any other answer (for example "Invalid Compact JWS") and a
-  malformed listing are incomplete, never a privacy pass. Without a user token the signed-in-user
-  checks are incomplete: on production that token is Riley's own sign-in (decision 7 below); the
-  catalog query in section 6 step 10 is the manual alternative.
+  permission answer (`42501` or `PGRST106`). A listing counts as refused only when it answers a
+  list of well-formed entries (with no policy Storage answers an empty one) or "bucket not found";
+  any entry at all, file or folder, means the role sees the bucket. Listing and download are
+  separate permissions in Storage, and so are a HEAD (object info) and a download (GET). So each
+  role also probes one file's download route, and the public URL is probed too:
+  - on a drill target with a **real GET** of a made-up file, so a refusal there proves a download
+    is refused;
+  - on production with a **HEAD**, so no byte of a real record is ever sent. A HEAD that succeeds
+    is a FAIL. A refused HEAD proves nothing about a download, so `anon_file_refused`,
+    `authenticated_file_refused` and `public_url_refused` are reported as unknown. For production
+    the evidence that downloads are refused is the catalog read in section 2 (no policy on any
+    storage table, private bucket).
+
+  A stale or rotated key, any other answer (for example "Invalid Compact JWS"), a malformed listing
+  and a listing with a malformed entry (`[null]`, `["x"]`, an entry without a name) are incomplete,
+  never a privacy pass. Without a user token the signed-in-user checks are incomplete. On
+  production that token is Riley's own sign-in (decision 7); the catalog query in section 6 step 10
+  is the manual alternative.
+- **A production run therefore ends INCOMPLETE at best.** Its only unknowns are then the two byte
+  checks and the three download-refusal checks; every other line is read normally, and any FAIL is
+  a finding.
 - On production it never downloads a file: `--open-files`, `--write-manifest` and `--skip-backups`
-  run only on a local stack or a project named with `--drill-project` that is not production, and
-  are refused before any request otherwise (so a production report never reads PASS without backup
-  evidence). A manifest is written only from a PASS.
+  run only on a drill target and are refused before any request otherwise (so a production report
+  never reads PASS without backup evidence). A manifest is written only from a PASS.
 - Network errors, 429 and 5xx are retried twice (1 s, 2 s). A read that keeps failing, a refused
   read (401 / 403, with the exact access to ask for), a missing key or token is **incomplete**
-  (exit 2), never a pass. A failed check exits 1; a pass exits 0.
+  (exit 2), never a pass. A refused target also exits 2. A failed check exits 1; a pass exits 0.
 - Tests: `tests/test_medical_recovery_check.py` (synthetic rows and files, a fake Supabase, no network).
 
-## 8. Decisions for Riley
+## 8. Decisions (2026-11-16)
 
-1. **Backup dates**: read them on Dashboard > Database > Backups (recommended), or create a
-   personal access token for one run of the check. That token is account-wide admin (it can pause,
-   restore or delete projects), so section 2's rules apply: shortest expiry, one shell only, never a
-   saved variable, revoked right after the run.
-2. **Off-site option**: A (recommended, $0), B (about $0 to $0.60 per month, one R2 token), C (new
-   provider) or D (manual). Nothing is built until one is chosen.
-3. **Encryption key**: approve creating the age key pair and where the private key is kept
-   (password manager plus one printed copy).
-4. **Drill**: authorize the drill in section 6 on a local stack (Docker Desktop if it is not
-   installed) or on a throwaway hosted project (billed by the hour).
-5. **Monitoring**: whether the backup job may write a count-free heartbeat and get a `/status` card
-   (today's rule: no heartbeat for medical records).
-6. **PITR**: not recommended (about $100 per month plus compute) for hand-typed, infrequent entries.
-7. **Signed-in-user probe on production**: whether a production run should include it, which needs
-   a short-lived access token from Riley's own sign-in set in `SUPABASE_USER_ACCESS_TOKEN` for that
-   run (never saved). Without it, those two checks stay incomplete and the catalog query is the
-   evidence instead.
+Recorded 2026-11-16, under Riley's delegation that day of the remaining SEC-06 product and ops
+decisions; Riley's merge of this change confirms them.
+
+1. **Backup dates**: still to be read, in the follow-up work. Route 1 (Dashboard > Database >
+   Backups) is the default. A personal access token for one run of the check is the alternative,
+   under section 2's rules: shortest expiry, one shell only, never a saved variable, revoked right
+   after the run.
+2. **Off-site option: A**, the PC job to OneDrive ($0, no new credential, no new provider). It is
+   built in the follow-up work, not in this document's change.
+3. **Encryption key**: an age key pair, with the private key in Riley's password manager plus one
+   printed copy, created with the backup job in the follow-up work.
+4. **Drill**: section 6 on an isolated target with made-up files only, run in the follow-up work
+   once the job exists.
+5. **Monitoring: yes.** The backup job may write a heartbeat with no counts (success / failure, a
+   short error code and the time) and gets a `/status` card. Only the backup job; the check stays
+   silent.
+6. **PITR: stays off** (about $100 per month plus compute) for hand-typed, infrequent entries.
+7. **Signed-in-user probe on production: included.** Every request it makes is read-only (the token
+   check, a one-row table read, a one-entry listing and a HEAD on one file, so no byte of a record
+   is sent). It needs a short-lived access token from Riley's own sign-in in
+   `SUPABASE_USER_ACCESS_TOKEN` for that run (never saved). Without it, those checks stay incomplete
+   and the catalog query is the evidence instead.
+8. **Scope: accepted.** The check is a standalone, manual, read-only command-line tool rather than a
+   small inline check, because criterion 3 needs the evidence it reports. The audit's two-week
+   benefit check still applies: if it adds burden without a safety benefit, simplify it while
+   keeping the privacy and integrity rules.

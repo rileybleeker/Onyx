@@ -8,26 +8,37 @@ docs/medical-records-recovery.md:
      removal is soft and keeps the file for Undo) has its file in the bucket listing with the size and
      type its row declares; every lab result's document_id resolves; no file sits outside documents/.
      The listing (and a HEAD request) read the storage.objects ROW only, which comes back with a
-     database restore even when the bytes did not, so the bytes themselves are proven only by opening
-     the files on a drill target (below). On production that check is reported as unknown, never as
-     a pass: this tool does not download real records.
+     database restore even when the bytes did not, so the bytes themselves are proven only by
+     downloading the files on a drill target (below). On production that check is reported as unknown,
+     never as a pass: this tool does not download real records.
   2. Is it still private?  The bucket is private with the 25 MB cap and the type list; the anon key
      and a signed-in user's token each reach neither table, list no file and cannot reach one file
-     directly (a HEAD request: the same row-level check a download makes, no bytes sent), and the
-     public URL of a file is refused (HEAD as well). A refusal counts only after the key itself was
+     directly, and the public URL of a file is refused. A refusal counts only after the key itself was
      accepted: a table refusal must be PostgREST's permission answer (42501 or PGRST106), a listing
-     must answer a list (or "bucket not found"); a stale or invalid key is "incomplete", never a pass.
+     must answer a list of well-formed entries (or "bucket not found"); a stale or invalid key or a
+     malformed listing is "incomplete", never a pass. Storage checks a download (GET) and a HEAD / info
+     request as separate operations, so the direct-file probes are a real GET on a drill target (made-up
+     files) and a HEAD on production (no byte of a real record is sent): there a HEAD that succeeds is a
+     FAIL, and a refused HEAD leaves the download refusal unknown, never a pass.
   3. Is there a recent database backup?  Supabase's Management API backup list (needs a personal
      access token in SUPABASE_ACCESS_TOKEN; the Supabase MCP has no backup tool). Storage files are
      NOT in those backups (Supabase docs), which is why the doc's off-site plan exists.
 
-On a DRILL target only (a local Supabase stack on localhost / 127.0.0.1, or a throwaway hosted
-project named with --drill-project, never the production project) it can also open every file
-(download into memory: are the bytes served at their declared size, SHA-256, "does it parse as its
-declared type", and one file fetched through a 60-second signed link, the app's own viewing path) and
-write or compare a manifest of every file's size and hash, every document's path / size / type /
-state and every lab result's document link.
-On production those options are refused: real records are never downloaded by this tool.
+Where requests go: the target is decided from the exact origin before any key is read. Production is
+exactly https://<production ref>.supabase.co; a drill target is a local Supabase stack (localhost /
+127.0.0.1 / ::1) or a throwaway hosted project named with --drill-project, never production. Any other
+URL is refused with nothing read or sent. Every request is checked against that one origin before it
+is sent (the personal access token against the Management API's), redirects are never followed (a 3xx
+is unreadable), no proxy from the environment is used, and a signed download link is fetched only when
+it is the target's own signed route for that very file.
+
+On a DRILL target only it can also download every file into memory (are the bytes served at their
+declared size, SHA-256, does each parse as its declared type, and one file fetched through a 60-second
+signed link, the app's own viewing path) and write or compare a manifest of every file's size and
+hash, every document's path / size / type / state and every lab result's document link. The parse is
+structural (no decoder renders a page), so "a restored file opens" is reported as not checked: a
+person opens one in a viewer during the drill. On production those options are refused: real records
+are never downloaded by this tool.
 A missing key, a refused read (401 / 403) or a read that keeps failing is reported as "incomplete"
 with the exact access to ask for, never as a pass.
 
@@ -36,18 +47,20 @@ Usage (from the repo root):
   python tools/medical_recovery/recovery_check.py --write-synthetic DIR   # made-up drill files
   python tools/medical_recovery/recovery_check.py --skip-backups --url http://127.0.0.1:54321 \
       --open-files --manifest drill-manifest.json                    # the recovery drill
-Keys: SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret (production only: a drill target reads
-the environment variable or an explicit --key-file, never the production key file); SUPABASE_ANON_KEY
-(or NEXT_PUBLIC_SUPABASE_ANON_KEY); SUPABASE_USER_ACCESS_TOKEN (a signed-in user's short-lived access
-token) for the signed-in-user probe; SUPABASE_ACCESS_TOKEN (a personal access token: account-wide
-admin, so set it for one shell only and revoke it after the run) for the backup list. Keys are never
-printed.
-Exit status: 0 pass, 1 a check failed, 2 incomplete (something could not be checked).
+Keys on production: SUPABASE_SERVICE_ROLE_KEY or ~/.onyx_supabase_secret; SUPABASE_ANON_KEY (or
+NEXT_PUBLIC_SUPABASE_ANON_KEY); SUPABASE_USER_ACCESS_TOKEN (a signed-in user's short-lived access token)
+for the signed-in-user probe. Keys on a drill target, its own names only (a shell may hold the
+production ones): RECOVERY_DRILL_SERVICE_KEY or an explicit --key-file that is not the production key
+file; RECOVERY_DRILL_ANON_KEY; RECOVERY_DRILL_USER_TOKEN; a drill key or token whose JWT names the
+production project is refused. SUPABASE_ACCESS_TOKEN (a personal access token: account-wide admin, so
+set it for one shell only and revoke it after the run) for the backup list. Keys are never printed.
+Exit status: 0 pass, 1 a check failed, 2 incomplete (something could not be checked) or refused.
 Standard library only. Tests: tests/test_medical_recovery_check.py (synthetic, no network).
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.client
 import json
@@ -84,10 +97,25 @@ DEFAULT_URL = "https://fewweioupmsnbccqtxdl.supabase.co"
 PRODUCTION_REF = "fewweioupmsnbccqtxdl"
 DEFAULT_KEY_FILE = Path.home() / ".onyx_supabase_secret"
 MANAGEMENT_API = "https://api.supabase.com"
+# (scheme, host, port): the only origin that may receive the production keys, and the only origin the
+# personal access token is ever sent to
+PRODUCTION_ORIGIN = ("https", f"{PRODUCTION_REF}.supabase.co", 443)
+MANAGEMENT_ORIGIN = ("https", "api.supabase.com", 443)
+# A drill target's credentials have their own names, so a shell that holds the production keys (from
+# .env, say) never sends them to a drill stack or a throwaway project.
+DRILL_ENV = {"service": "RECOVERY_DRILL_SERVICE_KEY", "anon": "RECOVERY_DRILL_ANON_KEY",
+             "user": "RECOVERY_DRILL_USER_TOKEN"}
 MANIFEST_VERSION = 1
 # PostgREST's answers that mean "this role may not read it" (permission denied; schema not exposed
 # to the request). Anything else (an invalid JWT, a missing table, a gateway error) proves nothing.
 REFUSAL_CODES = frozenset({"42501", "PGRST106"})
+
+# What a PASS of this tool does not cover. Its file check parses structure (no decoder renders a page),
+# so "a restored file opens" stays a person's observation in the drill (section 6 step 10).
+NOT_CHECKED = {"name": "file_opened_in_viewer", "result": "unknown",
+               "how": "a person opens one restored drill file in a viewer and notes it in the private receipt "
+                      "(docs/medical-records-recovery.md, section 6 step 10); files_parse_as_declared_type is "
+                      "a structural parse, not an opening"}
 
 # What to ask for when a read is refused or a key is missing, per stage.
 ACCESS_ASK = {
@@ -95,9 +123,11 @@ ACCESS_ASK = {
     "labs": "service-role key able to read pds.lab_results",
     "bucket": "service-role key able to read the storage bucket settings of medical-records",
     "objects": "service-role key able to list the medical-records bucket",
-    "anon": "the project's current anon / publishable key in SUPABASE_ANON_KEY (public; it ships in the site's JS)",
+    "anon": "the project's current anon / publishable key in SUPABASE_ANON_KEY (public; it ships in the site's JS; "
+            "on a drill target the drill stack's in RECOVERY_DRILL_ANON_KEY)",
     "authenticated": "a signed-in user's access token in SUPABASE_USER_ACCESS_TOKEN (it expires within an hour; "
-                     "on production Riley's own sign-in, on the drill stack a made-up user's), with the anon key set",
+                     "on production Riley's own sign-in; on a drill target a made-up user's, in "
+                     "RECOVERY_DRILL_USER_TOKEN), with the anon key set",
     "backups": "the dates on Dashboard > Database > Backups, or a Supabase personal access token in "
                "SUPABASE_ACCESS_TOKEN for this one shell (dashboard > Account > Access Tokens; it is account-wide "
                "admin: shortest expiry, never a saved environment variable, revoke it after the run)",
@@ -122,19 +152,36 @@ class TransportError(Exception):
 Transport = Callable[[str, str, dict, Optional[bytes], bool], tuple]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the 3xx comes back as the answer (an HTTPError), so a key or a token is
+    never sent on to wherever a server points. request() then reports it as unreadable."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401 - urllib's signature
+        return None
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """No redirects and no proxy from the environment: every header goes to the origin it was checked
+    against. (Passing a subclass of the default redirect handler replaces it.)"""
+    return urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+
+
+_OPENER = _build_opener()
+
+
 def urllib_transport(method: str, url: str, headers: dict, body: Optional[bytes],
                      read_body: bool = True) -> tuple[int, bytes, dict]:
     # A generic client name: some API front ends refuse urllib's default User-Agent.
     try:
         req = urllib.request.Request(url, data=body, method=method,
                                      headers={"User-Agent": "onyx-recovery-check/1", **headers})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _OPENER.open(req, timeout=60) as resp:
             data = resp.read() if read_body and method != "HEAD" else b""
             return resp.status, data, {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as e:
         try:
             data = e.read() if read_body and method != "HEAD" else b""
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException, ValueError):  # a closed or truncated error body
             data = b""
         return e.code, data, {k.lower(): v for k, v in (e.headers or {}).items()}
     except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
@@ -142,11 +189,56 @@ def urllib_transport(method: str, url: str, headers: dict, body: Optional[bytes]
         raise TransportError(type(getattr(e, "reason", e)).__name__) from None
 
 
+def origin_of(url: str) -> Optional[tuple[str, str, int]]:
+    """(scheme, host, port) of a plain http(s) URL, or None for anything else: another scheme, no host,
+    a user name or password in it, a malformed port."""
+    try:
+        p = urllib.parse.urlsplit(url)
+        port = p.port
+    except ValueError:
+        return None
+    if p.scheme not in ("http", "https") or not p.hostname or p.username is not None or p.password is not None:
+        return None
+    return p.scheme, p.hostname.lower(), port or (443 if p.scheme == "https" else 80)
+
+
+def base_url(origin: tuple[str, str, int]) -> str:
+    scheme, host, port = origin
+    netloc = f"[{host}]" if ":" in host else host
+    if port != (443 if scheme == "https" else 80):
+        netloc += f":{port}"
+    return f"{scheme}://{netloc}"
+
+
+def classify(url: str, drill_project: Optional[str]) -> Optional[str]:
+    """'production' for exactly the production origin, 'drill' for a local stack or the hosted project
+    named with --drill-project (never production), None for anything else. Judged on the whole URL as
+    given: it must be the bare origin (no path, query or fragment), so nothing a parser could read two
+    ways reaches a credential."""
+    origin = origin_of(url)
+    if origin is None or str(url).rstrip("/").lower() != base_url(origin).lower():
+        return None
+    scheme, host, port = origin
+    if origin == PRODUCTION_ORIGIN:
+        return "production"
+    if host in LOCAL_HOSTS:
+        return "drill"
+    m = re.fullmatch(r"([a-z0-9]{20})\.supabase\.co", host)
+    if (m and scheme == "https" and port == 443 and drill_project and m.group(1) == drill_project
+            and m.group(1) != PRODUCTION_REF):
+        return "drill"
+    return None
+
+
 def request(transport: Transport, stage: str, method: str, url: str, headers: dict,
-            body: Optional[bytes] = None, *, read_body: bool = True, attempts: int = 3,
-            sleep: Callable[[float], None] = time.sleep) -> tuple:
+            body: Optional[bytes] = None, *, origin: tuple[str, str, int], read_body: bool = True,
+            attempts: int = 3, sleep: Callable[[float], None] = time.sleep) -> tuple:
     """One HTTP call with retries for network errors, 429 and 5xx (1 s, 2 s backoff). Answers the last
-    (status, body); raises Unreadable when every attempt hit a network error or a 5xx / 429."""
+    (status, body); raises Unreadable when every attempt hit a network error or a 5xx / 429. `origin` is
+    the only origin this call may go to (checked before anything is sent), and a redirect is never
+    followed and never an answer: a 3xx is unreadable."""
+    if origin_of(url) != origin:
+        raise Unreadable(stage, "refused: a request to another origin (nothing was sent)")
     last = "network"
     for attempt in range(1, attempts + 1):
         try:
@@ -155,6 +247,8 @@ def request(transport: Transport, stage: str, method: str, url: str, headers: di
             last = "network"
         else:
             status, data = answer[0], answer[1]
+            if 300 <= status < 400:
+                raise Unreadable(stage, f"HTTP {status} redirect, not followed")
             if status != 429 and status < 500:
                 return status, data
             last = f"HTTP {status}"
@@ -206,23 +300,30 @@ def _ok(stage: str, status: int) -> None:
         raise Unreadable(stage, f"HTTP {status}")
 
 
-def is_local(url: str) -> bool:
-    return (urllib.parse.urlsplit(url).hostname or "") in LOCAL_HOSTS
-
-
 def project_ref(url: str) -> Optional[str]:
-    host = urllib.parse.urlsplit(url).hostname or ""
-    m = re.fullmatch(r"([a-z0-9]{20})\.supabase\.co", host)
+    origin = origin_of(url)
+    m = re.fullmatch(r"([a-z0-9]{20})\.supabase\.co", origin[1]) if origin else None
     return m.group(1) if m else None
 
 
 def drill_allowed(url: str, drill_project: Optional[str]) -> bool:
     """Files may be opened only on a local stack, or on a hosted project explicitly named as the drill
     target that is not the production project."""
-    if is_local(url):
-        return True
-    ref = project_ref(url)
-    return bool(ref and drill_project and ref == drill_project and ref != PRODUCTION_REF)
+    return classify(url, drill_project) == "drill"
+
+
+def _listing(stage: str, got) -> list[dict]:
+    """A Storage listing, every entry checked: a file (a non-empty string id, metadata an object or
+    absent) or a folder (id null). Anything else (null, a string, a nameless entry) makes the listing
+    unreadable: it is never filtered down to an empty, "private" listing."""
+    if not isinstance(got, list):
+        raise Unreadable(stage, "answer was not a list")
+    for o in got:
+        if not (isinstance(o, dict) and isinstance(o.get("name"), str) and o["name"]
+                and (o.get("id") is None or (isinstance(o.get("id"), str) and o["id"]))
+                and (o.get("metadata") is None or isinstance(o.get("metadata"), dict))):
+            raise Unreadable(stage, "a listing entry was neither a file nor a folder")
+    return got
 
 
 @dataclass
@@ -231,12 +332,22 @@ class Target:
     service_key: str
     transport: Transport = urllib_transport
     sleep: Callable[[float], None] = time.sleep
-    drill: bool = False  # True only on a drill target: enables download() and signed_fetch()
+    # True only on a drill target: enables download(), signed_fetch() and the GET file probes
+    drill: bool = False
 
     def __post_init__(self) -> None:
-        self.url = self.url.rstrip("/")
-        if self.drill and not drill_allowed(self.url, project_ref(self.url)):
-            raise PermissionError("the production project is never a drill target")
+        origin = origin_of(self.url)
+        if origin is None:
+            raise ValueError("not an http(s) origin")
+        if self.drill and (origin == PRODUCTION_ORIGIN or not drill_allowed(base_url(origin), project_ref(self.url))):
+            raise PermissionError("a drill target is a local stack or a named project that is not production")
+        # every request this target makes goes to exactly this origin (request() checks it)
+        self.origin, self.url = origin, base_url(origin)
+
+    def _get(self, stage: str, method: str, url: str, headers: dict, body: Optional[bytes] = None,
+             read_body: bool = True) -> tuple:
+        return request(self.transport, stage, method, url, headers, body, origin=self.origin,
+                       read_body=read_body, sleep=self.sleep)
 
     def _h(self, key: Optional[str] = None, **extra: str) -> dict:
         k = self.service_key if key is None else key
@@ -246,12 +357,14 @@ class Target:
         out: list[dict] = []
         while True:
             q = urllib.parse.urlencode({"select": select, "order": "id.asc", "limit": PAGE, "offset": len(out)})
-            status, data = request(self.transport, stage, "GET", f"{self.url}/rest/v1/{table}?{q}",
-                                   self._h(**{"Accept-Profile": "pds"}), sleep=self.sleep)
+            status, data = self._get(stage, "GET", f"{self.url}/rest/v1/{table}?{q}",
+                                     self._h(**{"Accept-Profile": "pds"}))
             _ok(stage, status)
             page = _json(stage, data)
             if not isinstance(page, list):
                 raise Unreadable(stage, "answer was not a list")
+            if not all(isinstance(r, dict) for r in page):
+                raise Unreadable(stage, "a row was not an object")
             out.extend(page)
             if len(page) < PAGE:
                 return out
@@ -259,8 +372,7 @@ class Target:
                 raise Unreadable(stage, f"more than {MAX_ROWS} rows")
 
     def bucket(self) -> dict:
-        status, data = request(self.transport, "bucket", "GET", f"{self.url}/storage/v1/bucket/{BUCKET}",
-                               self._h(), sleep=self.sleep)
+        status, data = self._get("bucket", "GET", f"{self.url}/storage/v1/bucket/{BUCKET}", self._h())
         _ok("bucket", status)
         got = _json("bucket", data)
         if not isinstance(got, dict):
@@ -272,12 +384,10 @@ class Target:
         while True:
             body = json.dumps({"prefix": prefix, "limit": PAGE, "offset": len(out),
                                "sortBy": {"column": "name", "order": "asc"}}).encode("utf-8")
-            status, data = request(self.transport, "objects", "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
-                                   self._h(**{"Content-Type": "application/json"}), body, sleep=self.sleep)
+            status, data = self._get("objects", "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
+                                     self._h(**{"Content-Type": "application/json"}), body)
             _ok("objects", status)
-            page = _json("objects", data)
-            if not isinstance(page, list):
-                raise Unreadable("objects", "answer was not a list")
+            page = _listing("objects", _json("objects", data))
             out.extend(page)
             if len(page) < PAGE:
                 return out
@@ -289,17 +399,15 @@ class Target:
         """A positive control before any refusal is believed: the key (or the user's token) must be
         accepted by a read that every valid key may make. A stale, rotated or disabled key is refused
         here, so its later refusals are never counted as privacy."""
-        status, _ = request(self.transport, stage, "GET", f"{self.url}{check_path}",
-                            {"apikey": apikey, "Authorization": f"Bearer {bearer}"}, read_body=False,
-                            sleep=self.sleep)
+        status, _ = self._get(stage, "GET", f"{self.url}{check_path}",
+                              {"apikey": apikey, "Authorization": f"Bearer {bearer}"}, read_body=False)
         if not 200 <= status < 300:
             raise Unreadable(stage, f"HTTP {status} from the key check (the key was not accepted)",
                              denied=status in (401, 403))
 
     def role_reaches_table(self, stage: str, apikey: str, bearer: str, table: str) -> bool:
-        status, data = request(self.transport, stage, "GET", f"{self.url}/rest/v1/{table}?select=id&limit=1",
-                               {"apikey": apikey, "Authorization": f"Bearer {bearer}", "Accept-Profile": "pds"},
-                               sleep=self.sleep)
+        status, data = self._get(stage, "GET", f"{self.url}/rest/v1/{table}?select=id&limit=1",
+                                 {"apikey": apikey, "Authorization": f"Bearer {bearer}", "Accept-Profile": "pds"})
         if 200 <= status < 300:
             return True
         if status in (401, 403, 404, 406) and str(_error_body(data).get("code")) in REFUSAL_CODES:
@@ -307,59 +415,72 @@ class Target:
         raise Unreadable(stage, f"table probe answered HTTP {status} without a permission refusal")
 
     def role_list_count(self, stage: str, apikey: str, bearer: str) -> int:
+        """How many entries (files or folders) the role's listing shows: any entry at all means the role
+        sees what is in the bucket."""
         body = json.dumps({"prefix": "documents", "limit": 1, "offset": 0}).encode("utf-8")
-        status, data = request(self.transport, stage, "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
-                               {"apikey": apikey, "Authorization": f"Bearer {bearer}",
-                                "Content-Type": "application/json"}, body, sleep=self.sleep)
+        status, data = self._get(stage, "POST", f"{self.url}/storage/v1/object/list/{BUCKET}",
+                                 {"apikey": apikey, "Authorization": f"Bearer {bearer}",
+                                  "Content-Type": "application/json"}, body)
         if 200 <= status < 300:
-            got = _json(stage, data)
-            if not isinstance(got, list):
-                raise Unreadable(stage, "file listing answer was not a list")
-            return len([o for o in got if isinstance(o, dict) and o.get("id")])
+            return len(_listing(stage, _json(stage, data)))
         if status in (400, 404) and "bucket not found" in _said(data):
             return 0  # the bucket itself is hidden from this role (answered after the credential was accepted)
         # Without a storage policy a role's listing answers 200 []: any other answer (a credential error
         # such as "Invalid Compact JWS", a gateway error) proves nothing about privacy.
         raise Unreadable(stage, f"file listing answered HTTP {status} without a listing")
 
-    def role_file_served(self, stage: str, apikey: str, bearer: str, path: str) -> bool:
-        """Whether this role reaches one file directly: a HEAD request on the download route runs the
-        same row-level check a download makes, and sends no bytes. Asked only after the role's own
-        listing answered (proof that Storage accepted the credential), so a refusal here is the access
-        decision, not a credential problem. Listing and download are separate permissions in Storage, so
-        an empty listing alone does not prove a file is out of reach."""
-        quoted = urllib.parse.quote(path)
-        status, _ = request(self.transport, stage, "HEAD", f"{self.url}/storage/v1/object/{BUCKET}/{quoted}",
-                            {"apikey": apikey, "Authorization": f"Bearer {bearer}"}, read_body=False,
-                            sleep=self.sleep)
+    @property
+    def file_probe(self) -> str:
+        """How a role's reach to one file is probed. On a drill target: a real GET of a made-up file,
+        because Storage checks a download (GET) and a HEAD / info request as separate operations, so only
+        a refused GET proves a download is refused. On production: a HEAD, so no byte of a real record is
+        ever sent; a HEAD that succeeds proves the file is reachable, a refused HEAD proves nothing about
+        GET (reported as unknown)."""
+        return "get" if self.drill else "head"
+
+    def _file_reached(self, stage: str, url: str, headers: dict, what: str) -> bool:
+        if self.drill:
+            status, data = self._get(stage, "GET", url, headers)
+            if 200 <= status < 300:
+                return True
+            # Storage hides an object the role may not read ("not found"); 401 / 403 refuse it outright.
+            # Any other answer (another 400) proves nothing about the download.
+            if status in (401, 403) or _not_found(status, data):
+                return False
+            raise Unreadable(stage, f"{what} answered HTTP {status} without a refusal")
+        status, _ = self._get(stage, "HEAD", url, headers, read_body=False)
         if 200 <= status < 300:
             return True
         if status in (400, 401, 403, 404):
-            return False
-        raise Unreadable(stage, f"file probe answered HTTP {status}")
+            return False  # a refused HEAD: evaluate() reports the download refusal as unknown
+        raise Unreadable(stage, f"{what} answered HTTP {status}")
+
+    def role_file_served(self, stage: str, apikey: str, bearer: str, path: str) -> bool:
+        """Whether this role reaches one file directly on the download route (see file_probe). Asked only
+        after the role's own listing answered (proof that Storage accepted the credential), so a refusal
+        here is the access decision, not a credential problem. Listing and download are separate
+        permissions in Storage, so an empty listing alone does not prove a file is out of reach."""
+        quoted = urllib.parse.quote(path)
+        return self._file_reached(stage, f"{self.url}/storage/v1/object/{BUCKET}/{quoted}",
+                                  {"apikey": apikey, "Authorization": f"Bearer {bearer}"}, "file probe")
 
     def public_url_served(self, path: str) -> bool:
-        # HEAD: even if the bucket were ever made public, no bytes of a real record are sent
+        """Whether the file's public URL serves it (see file_probe: GET on a drill target, HEAD on
+        production)."""
         quoted = urllib.parse.quote(path)
-        status, _ = request(self.transport, "anon", "HEAD", f"{self.url}/storage/v1/object/public/{BUCKET}/{quoted}",
-                            {}, read_body=False, sleep=self.sleep)
-        if 200 <= status < 300:
-            return True
-        if status in (400, 401, 403, 404):
-            return False
-        raise Unreadable("anon", f"public URL probe answered HTTP {status}")
+        return self._file_reached("anon", f"{self.url}/storage/v1/object/public/{BUCKET}/{quoted}", {},
+                                  "public URL probe")
 
     def download(self, path: str) -> Optional[bytes]:
         """The file's bytes (drill target only), or None when Storage does not serve them: a not-found
         answer (the hosted S3 backend), or a 5xx that persisted through the retries (the local file
-        backend answers 500 for a row whose file is gone). A refused read, any other answer or a
-        network failure raises Unreadable."""
+        backend answers 500 for a row whose file is gone). A refused read, a redirect, any other answer
+        or a network failure raises Unreadable."""
         if not self.drill:
             raise PermissionError("files are opened on a drill target only")
         quoted = urllib.parse.quote(path)
         try:
-            status, data = request(self.transport, "download", "GET",
-                                   f"{self.url}/storage/v1/object/{BUCKET}/{quoted}", self._h(), sleep=self.sleep)
+            status, data = self._get("download", "GET", f"{self.url}/storage/v1/object/{BUCKET}/{quoted}", self._h())
         except Unreadable as e:
             if e.reason.startswith("HTTP 5"):
                 return None
@@ -369,21 +490,37 @@ class Target:
         _ok("download", status)  # a refusal (401 / 403) or any other non-2xx answer raises
         return data
 
+    def signed_link(self, path: str, link) -> str:
+        """The URL a signed link answer points at, accepted only when it is this target's own signed
+        download route for this very file: Storage's relative form (/object/sign/<bucket>/<path>?token=)
+        or the same as an absolute URL on this origin. Anything else (another host, a protocol-relative
+        //host, another path) is refused before it is fetched."""
+        if not isinstance(link, str) or not link:
+            raise Unreadable("signed", "no signed link in the answer")
+        if link.startswith("/object/sign/"):
+            full = f"{self.url}/storage/v1{link}"
+        elif link.startswith("/"):
+            raise Unreadable("signed", "the signed link is not a signed download route")
+        else:
+            full = link
+        parts = urllib.parse.urlsplit(full)
+        if (origin_of(full) != self.origin or parts.username is not None
+                or urllib.parse.unquote(parts.path) != f"/storage/v1/object/sign/{BUCKET}/{path}" or not parts.query):
+            raise Unreadable("signed", "the signed link points somewhere else (not fetched)")
+        return full
+
     def signed_fetch(self, path: str) -> bytes:
         """The file through a 60-second signed link, fetched with no key: how /health/records serves it."""
         if not self.drill:
             raise PermissionError("files are opened on a drill target only")
         quoted = urllib.parse.quote(path)
-        status, data = request(self.transport, "signed", "POST", f"{self.url}/storage/v1/object/sign/{BUCKET}/{quoted}",
-                               self._h(**{"Content-Type": "application/json"}),
-                               json.dumps({"expiresIn": 60}).encode("utf-8"), sleep=self.sleep)
+        status, data = self._get("signed", "POST", f"{self.url}/storage/v1/object/sign/{BUCKET}/{quoted}",
+                                 self._h(**{"Content-Type": "application/json"}),
+                                 json.dumps({"expiresIn": 60}).encode("utf-8"))
         _ok("signed", status)
         link = _json("signed", data)
-        rel = (link.get("signedURL") or link.get("signedUrl")) if isinstance(link, dict) else None
-        if not rel:
-            raise Unreadable("signed", "no signed link in the answer")
-        full = rel if rel.startswith("http") else f"{self.url}/storage/v1{rel if rel.startswith('/') else '/' + rel}"
-        status, body = request(self.transport, "signed", "GET", full, {}, sleep=self.sleep)
+        full = self.signed_link(path, (link.get("signedURL") or link.get("signedUrl")) if isinstance(link, dict) else None)
+        status, body = self._get("signed", "GET", full, {})
         _ok("signed", status)
         return body
 
@@ -579,11 +716,13 @@ def _heif_ok(data: bytes) -> bool:
     return bool(brands & _HEIF_BRANDS) and meta
 
 
-def opens_as(mime: str, data: bytes) -> bool:
+def parses_as(mime: str, data: bytes) -> bool:
     """Whether the bytes parse as a whole file of the declared type: the format's structure from start
     to end (PDF cross-reference table, PNG chunks and pixel data, JPEG segments, WebP chunks, HEIF
-    boxes), so a truncated, swapped or merely look-alike file is caught. Not a rendering: the drill
-    adds a human opening one restored file (docs/medical-records-recovery.md, section 6)."""
+    boxes), so a truncated, swapped or merely look-alike file is caught. A structural parse, NOT an
+    opening: a JPEG's scan data, for one, is never decoded. That a restored file opens is a separate
+    observation (a person opens one in a viewer, docs/medical-records-recovery.md section 6 step 10),
+    which this tool reports as not checked."""
     if not data:
         return False
     checker = {"application/pdf": _pdf_ok, "image/png": _png_ok, "image/jpeg": _jpeg_ok,
@@ -599,10 +738,12 @@ class Inventory:
     objects: dict[str, dict] = field(default_factory=dict)  # "documents/<id>" -> {"size", "type"}
     unexpected_paths: int = 0                              # files or folders outside documents/<id>
     bucket: Optional[dict] = None
-    # {"tables_reached": n, "files_listed": n, "file_served": bool|None, "public_url_served": bool|None}
+    # {"tables_reached": n, "files_listed": n, "file_served": bool|None, "public_url_served": bool|None,
+    #  "file_probe": "get" (drill: a refusal proves a download is refused) | "head" (production: it does not)}
     anon: Optional[dict] = None
-    authenticated: Optional[dict] = None  # {"tables_reached", "files_listed", "file_served"} for a signed-in user
-    # drill target only: path -> {"served": False} or {"served": True, "size", "sha256", "opens"}, for every
+    # {"tables_reached", "files_listed", "file_served", "file_probe"} for a signed-in user
+    authenticated: Optional[dict] = None
+    # drill target only: path -> {"served": False} or {"served": True, "size", "sha256", "parses"}, for every
     # listed file and every ready document's path
     opened: Optional[dict] = None
     signed_ok: Optional[bool] = None  # one file fetched through a signed link matched its download
@@ -650,8 +791,15 @@ def evaluate(inv: Inventory) -> dict:
         types = b.get("allowed_mime_types")
         checks.append(_check("bucket_types", "pass" if isinstance(types, list) and set(types) == EXPECTED_TYPES else "fail"))
 
-    def refused(name: str, served) -> None:
-        checks.append(_check(name, "skip" if served is None else ("fail" if served else "pass")))
+    def refused(name: str, served, probe) -> None:
+        # reached = fail; refused = pass only when the probe was a GET (a download), because Storage checks
+        # HEAD / info and GET as separate operations: a refused HEAD leaves the download unknown
+        if served is None:
+            checks.append(_check(name, "skip"))
+        elif served:
+            checks.append(_check(name, "fail"))
+        else:
+            checks.append(_check(name, "pass" if probe == "get" else "unknown"))
 
     if inv.anon is None:
         checks += [_check(n, "unknown") for n in ("anon_tables_refused", "anon_files_hidden", "anon_file_refused",
@@ -659,15 +807,16 @@ def evaluate(inv: Inventory) -> dict:
     else:
         add("anon_tables_refused", int(inv.anon.get("tables_reached", 0)))
         add("anon_files_hidden", int(inv.anon.get("files_listed", 0)))
-        refused("anon_file_refused", inv.anon.get("file_served"))
-        refused("public_url_refused", inv.anon.get("public_url_served"))
+        refused("anon_file_refused", inv.anon.get("file_served"), inv.anon.get("file_probe"))
+        refused("public_url_refused", inv.anon.get("public_url_served"), inv.anon.get("file_probe"))
     if inv.authenticated is None:
         checks += [_check(n, "unknown") for n in ("authenticated_tables_refused", "authenticated_files_hidden",
                                                    "authenticated_file_refused")]
     else:
         add("authenticated_tables_refused", int(inv.authenticated.get("tables_reached", 0)))
         add("authenticated_files_hidden", int(inv.authenticated.get("files_listed", 0)))
-        refused("authenticated_file_refused", inv.authenticated.get("file_served"))
+        refused("authenticated_file_refused", inv.authenticated.get("file_served"),
+                inv.authenticated.get("file_probe"))
 
     # metadata relationships
     docs_ok = "documents" not in unread
@@ -714,9 +863,10 @@ def evaluate(inv: Inventory) -> dict:
     add("uploads_confirmed", pending_with_file, warn=True, stage=both)
     add("no_unexpected_paths", inv.unexpected_paths, warn=True, stage="objects" if not objs_ok else None)
 
-    # opened files (drill target only)
+    # downloaded files (drill target only): their structure, which is not the same as opening them
     if inv.opened is not None:
-        add("files_open", sum(1 for v in inv.opened.values() if v.get("served") and not v.get("opens")),
+        add("files_parse_as_declared_type",
+            sum(1 for v in inv.opened.values() if v.get("served") and not v.get("parses")),
             stage="download" if "download" in unread else None)
         if "signed" in unread:
             checks.append(_check("signed_link_serves_file", "unknown"))
@@ -774,6 +924,9 @@ def evaluate(inv: Inventory) -> dict:
         report["backups"] = dict(inv.backups)
     if inv.unreadable:
         report["incomplete"] = inv.unreadable
+    # Never a check of this tool, so never part of its PASS: recovery acceptance also needs it, recorded in
+    # the private drill receipt.
+    report["not_checked"] = [dict(NOT_CHECKED)]
     return report
 
 
@@ -824,6 +977,7 @@ def _probe_role(target: Target, stage: str, apikey: str, bearer: str, check_path
            "files_listed": target.role_list_count(stage, apikey, bearer)}
     # after the listing answered (the credential is accepted): can the role reach one file directly?
     out["file_served"] = target.role_file_served(stage, apikey, bearer, sample) if sample else None
+    out["file_probe"] = target.file_probe
     return out
 
 
@@ -891,6 +1045,13 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
             inv.authenticated = _probe_role(target, "authenticated", anon_key, user_token, "/auth/v1/user", sample)
         except Unreadable as e:
             note(e)
+    if target.file_probe == "head" and any(p and False in (p.get("file_served"), p.get("public_url_served"))
+                                           for p in (inv.anon, inv.authenticated)):
+        inv.unreadable.append({"stage": "download_privacy", "reason": (
+            "the file and public-URL probes are HEAD requests here (no byte of a real record is sent), and "
+            "Storage checks a HEAD and a download as separate operations, so a refused HEAD does not prove a "
+            "download is refused; that is proven on a drill target (a GET of made-up files), and for "
+            "production by the catalog read (no policy on any storage table)")})
 
     if open_files:
         inv.opened = {}
@@ -906,7 +1067,7 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
                     continue
                 mime = norm_type(types.get(path) or (inv.objects.get(path) or {}).get("type"))
                 inv.opened[path] = {"served": True, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                                    "opens": opens_as(mime, data)}
+                                    "parses": parses_as(mime, data)}
         except Unreadable as e:
             note(e)
         first = next((p for p in sorted(inv.opened) if inv.opened[p].get("served")), None)
@@ -916,9 +1077,9 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
             except Unreadable as e:
                 note(e)
     else:
-        inv.unreadable.append({"stage": "bytes", "reason": "file bytes are not checked without opening the files: "
-                               "the listing and HEAD read the database row only, and files are opened on a "
-                               "drill target only (--open-files), never on production"})
+        inv.unreadable.append({"stage": "bytes", "reason": "file bytes are not checked without downloading the "
+                               "files: the listing and HEAD read the database row only, and files are downloaded "
+                               "on a drill target only (--open-files), never on production"})
 
     if skip_backups:
         inv.backups = {"state": "skipped"}
@@ -932,9 +1093,11 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
             inv.unreadable.append({"stage": "backups", "reason": "no access token", "ask": ACCESS_ASK["backups"]})
         else:
             try:
+                # the personal access token goes to the Management API's own origin and nowhere else
                 status, data = request(target.transport, "backups", "GET",
                                        f"{MANAGEMENT_API}/v1/projects/{ref}/database/backups",
-                                       {"Authorization": f"Bearer {access_token}"}, sleep=target.sleep)
+                                       {"Authorization": f"Bearer {access_token}"}, origin=MANAGEMENT_ORIGIN,
+                                       sleep=target.sleep)
                 _ok("backups", status)
                 inv.backups = summarize_backups(_json("backups", data), now)
                 if inv.backups.get("state") != "read":
@@ -983,6 +1146,8 @@ def format_report(report: dict) -> str:
                      f"oldest {bk.get('oldest')}, newest {bk.get('newest')} ({bk.get('newest_age_hours')} h ago)")
     for u in report.get("incomplete", []):
         lines.append(f"incomplete: {u['stage']}: {u['reason']}" + (f"; ask for: {u['ask']}" if u.get("ask") else ""))
+    for n in report.get("not_checked", []):
+        lines.append(f"not checked by this tool: {n['name']}: {n['how']}")
     return "\n".join(lines)
 
 
@@ -1000,6 +1165,20 @@ def _same_file(a: Path, b: Path) -> bool:
         return a.expanduser().resolve() == b.expanduser().resolve()
     except OSError:
         return True  # cannot tell: treat it as the production key file
+
+
+def _names_production(token: str) -> bool:
+    """Whether a JWT-style key or token says it belongs to the production project (its payload's "ref",
+    or the issuer URL). Decoded without verification and never printed; anything else answers False."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except ValueError:  # bad base64, bytes that are not UTF-8, not JSON
+        return False
+    return isinstance(payload, dict) and (payload.get("ref") == PRODUCTION_REF
+                                          or PRODUCTION_REF in str(payload.get("iss") or ""))
 
 
 def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transport,
@@ -1026,32 +1205,50 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
             (args.write_synthetic / name).write_bytes(data)
         print(f"wrote {len(files)} synthetic drill files", file=out)
         return 0
-    drill = bool(args.open_files or args.write_manifest)
-    if drill and not drill_allowed(args.url, args.drill_project):
+    # Which target this is, decided from the exact origin before any key is read: production is exactly
+    # PRODUCTION_ORIGIN; a drill target is a local stack or the project named with --drill-project. Anything
+    # else (another host, http, another port, a path, a user name in the URL) is refused, so no key, token or
+    # header can reach a server nobody chose.
+    kind = classify(args.url, args.drill_project)
+    if kind is None:
+        print(f"refused: the target must be exactly the production project ({base_url(PRODUCTION_ORIGIN)}) or a "
+              "drill target (a local stack, or a throwaway project named with --drill-project), given as a bare "
+              "origin; no key was read and nothing was sent", file=out)
+        return 2
+    opening = bool(args.open_files or args.write_manifest)
+    if opening and kind != "drill":
         print("refused: --open-files and --write-manifest run on a drill target only (a local stack, or a "
               "throwaway project named with --drill-project); real records are never downloaded by this check",
               file=out)
         return 2
-    if args.skip_backups and not drill_allowed(args.url, args.drill_project):
+    if args.skip_backups and kind != "drill":
         print("refused: --skip-backups is for a drill target only; on production the backup list is part of the "
               f"check (without SUPABASE_ACCESS_TOKEN it is reported as incomplete; ask for: {ACCESS_ASK['backups']})",
               file=out)
         return 2
-    on_drill = drill_allowed(args.url, args.drill_project)
-    if on_drill:
-        # The default key file holds the PRODUCTION key; a drill target (whose logs may record headers) only
-        # ever gets SUPABASE_SERVICE_ROLE_KEY or a key file named explicitly that is not that file.
+    if kind == "drill":
+        # A drill target (whose logs may record headers) gets its own credentials only: the RECOVERY_DRILL_*
+        # variables or a key file named explicitly, never SUPABASE_SERVICE_ROLE_KEY / SUPABASE_USER_ACCESS_TOKEN
+        # (a shell may hold the production ones) and never the default key file (it holds the production key).
         key_file = args.key_file if args.key_file and not _same_file(args.key_file, DEFAULT_KEY_FILE) else None
+        key = _read_key((DRILL_ENV["service"],), key_file)
+        anon_key = _read_key((DRILL_ENV["anon"],), None)
+        user_token = os.environ.get(DRILL_ENV["user"]) or None
+        if not key:
+            print(f"incomplete: set the drill stack's service key in {DRILL_ENV['service']}, or name a key file with "
+                  "--key-file (SUPABASE_SERVICE_ROLE_KEY and the production key file are never used for a drill "
+                  "target)", file=out)
+            return 2
+        if any(_names_production(t) for t in (key, user_token) if t):
+            print("refused: a drill credential belongs to the production project; nothing was sent", file=out)
+            return 2
     else:
-        key_file = args.key_file or DEFAULT_KEY_FILE
-    key = _read_key(("SUPABASE_SERVICE_ROLE_KEY",), key_file)
-    if not key:
-        if on_drill:
-            print("incomplete: set the drill stack's service key in SUPABASE_SERVICE_ROLE_KEY (the production key "
-                  "file is never read for a drill target)", file=out)
-        else:
+        key = _read_key(("SUPABASE_SERVICE_ROLE_KEY",), args.key_file or DEFAULT_KEY_FILE)
+        anon_key = _read_key(("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"), None)
+        user_token = os.environ.get("SUPABASE_USER_ACCESS_TOKEN") or None
+        if not key:
             print(f"incomplete: no service-role key; ask for: {ACCESS_ASK['documents']}", file=out)
-        return 2
+            return 2
     manifest = None
     if args.manifest:
         try:
@@ -1060,11 +1257,10 @@ def main(argv: Optional[list[str]] = None, transport: Transport = urllib_transpo
             print(f"incomplete: manifest could not be read ({type(e).__name__})", file=out)
             return 2
     now = datetime.now(timezone.utc)
-    target = Target(args.url, key, transport=transport, sleep=sleep, drill=drill)
-    inv = collect(target, anon_key=_read_key(("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"), None),
-                  access_token=os.environ.get("SUPABASE_ACCESS_TOKEN") or None, skip_backups=args.skip_backups,
-                  open_files=drill, manifest=manifest, now=now,
-                  user_token=os.environ.get("SUPABASE_USER_ACCESS_TOKEN") or None)
+    target = Target(args.url, key, transport=transport, sleep=sleep, drill=kind == "drill")
+    inv = collect(target, anon_key=anon_key, access_token=os.environ.get("SUPABASE_ACCESS_TOKEN") or None,
+                  skip_backups=args.skip_backups, open_files=opening, manifest=manifest, now=now,
+                  user_token=user_token)
     report = evaluate(inv)
     print(json.dumps(report, indent=2) if args.json else format_report(report), file=out)
     code = {"pass": 0, "fail": 1}.get(report["status"], 2)

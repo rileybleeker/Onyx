@@ -13,10 +13,20 @@ and files:
     is compared the way the app's complete route compares it;
   * privacy / cross-user: a public bucket, a changed size cap or type list, the anon key or a
     signed-in user's token reaching a table, listing a file or reaching one file directly (with the
-    listing still empty), or the public URL serving a file are each a FAIL; every file probe on
-    production is a HEAD (no bytes); a stale / invalid key, a table probe answered without a
+    listing still empty), or the public URL serving a file are each a FAIL; on the drill the file
+    probes are real GETs of made-up files, so a GET-only exposure (HEAD refused, download served)
+    fails; on production every file probe is a HEAD (no bytes), and a refused HEAD leaves the
+    download refusal UNKNOWN, never a pass; a stale / invalid key, a table probe answered without a
     permission code, a listing answered with anything but a list or "bucket not found" (e.g.
-    "Invalid Compact JWS") and a malformed listing are INCOMPLETE, never a pass;
+    "Invalid Compact JWS"), a malformed listing and a listing with a malformed entry ([null],
+    ["x"], a nameless entry) are INCOMPLETE, never a pass;
+  * origins: only the exact production origin may receive the production keys; any other URL
+    (another host, http, another port, a path, a user name, a look-alike host, a hosted project not
+    named with --drill-project) is refused before any key is read; a drill target never gets
+    SUPABASE_SERVICE_ROLE_KEY, SUPABASE_USER_ACCESS_TOKEN or the default key file, and a drill key or
+    token whose JWT names production is refused; a redirect is never followed (a 3xx is unreadable,
+    proven against urllib's own opener), a request to another origin is refused before it is sent,
+    and a signed link to another origin or another file is never fetched;
   * retry: network errors and 5xx are retried with backoff and then pass; a read that keeps failing
     is INCOMPLETE (exit 2), never a pass; a 401 / 403 is not retried and becomes the exact access ask;
   * backups: no access token = incomplete with the access ask; a backup older than 36 h = fail;
@@ -25,19 +35,24 @@ and files:
   * the drill: files are opened, backups skipped and a manifest written only on a local stack or a
     named throwaway project, never on production (refused before any request); the manifest is
     written only from a PASS; a wipe is detected against the manifest and a full restore passes,
-    including the signed-link fetch; a drill target never reads the production key file;
+    including the signed-link fetch; a drill target never reads the production key file; the file
+    check is reported as a structural parse, and "a restored file opens" as not checked;
   * paging past PostgREST's 1000-row cap; placeholder files and orphans warn instead of failing.
 
 Synthetic data only. No network, no credentials.
 
 Run: python tests/test_medical_recovery_check.py
 """
+import base64
+import email.message
 import io
 import json
 import os
 import sys
 import tempfile
 import urllib.parse
+import urllib.request
+import urllib.response
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -70,6 +85,8 @@ NOT_FOUND = b'{"statusCode":"404","error":"not_found","message":"Object not foun
 BAD_JWS = b'{"statusCode":"403","error":"Unauthorized","message":"Invalid Compact JWS"}'
 INTERNAL = (500, b'{"statusCode":"500","error":"Internal","message":"Internal Server Error"}')
 BYTE_CHECKS = ("files_stored", "stored_sizes_match")
+# on production the file probes are HEADs: a refusal there proves nothing about a download
+DOWNLOAD_CHECKS = ("anon_file_refused", "public_url_refused", "authenticated_file_refused")
 
 
 def uid(n: int) -> str:
@@ -110,7 +127,8 @@ class FakeServer:
     def __init__(self, docs, labs, files, *, public=False, limit=rc.EXPECTED_LIMIT, types=rc.EXPECTED_TYPES,
                  anon_table=False, anon_list=False, user_table=False, user_list=False, anon_table_answer=None,
                  anon_list_answer=None, lost_bytes=(), fail=None, backups=None, extra_top=(), extra_docs=(),
-                 signed_bytes=None, anon_file=False, user_file=False, lost_answer=None):
+                 signed_bytes=None, anon_file=False, user_file=False, lost_answer=None, get_only=False,
+                 signed_link=None):
         self.tables = {"medical_documents": docs, "lab_results": labs}
         self.files = dict(files)
         self.public, self.limit, self.types = public, limit, sorted(types)
@@ -120,16 +138,20 @@ class FakeServer:
         self.lost_bytes = set(lost_bytes)  # listed (storage.objects row) but the bytes are gone
         self.lost_answer = lost_answer or INTERNAL  # the local file backend answers 500 for a missing file
         self.anon_file, self.user_file = anon_file, user_file  # a policy letting the role read one file
+        # a policy on the download (GET) operation only: HEAD / info stays refused (Storage checks them apart)
+        self.get_only = get_only
+        self.signed_link = signed_link  # obj -> the signed link the sign route answers (default: Storage's)
         self.fail = {k: list(v) for k, v in (fail or {}).items()}
         self.backups = backups if backups is not None else recent_backups()
         self.extra_top, self.extra_docs = list(extra_top), list(extra_docs)
         self.signed_bytes = signed_bytes
-        self.calls, self.selects, self.heads = [], [], []
+        self.calls, self.selects, self.heads, self.bearers = [], [], [], []
 
     def __call__(self, method, url, headers, body, read_body=True):
         parts = urllib.parse.urlsplit(url)
         path, q = parts.path, urllib.parse.parse_qs(parts.query)
         self.calls.append((method, parts.hostname, path))
+        self.bearers.append(headers.get("Authorization"))
         for prefix, seq in self.fail.items():
             if path.startswith(prefix) and seq:
                 v = seq.pop(0)
@@ -185,7 +207,8 @@ class FakeServer:
             if method == "POST":
                 if key != SERVICE or obj not in self.files:
                     return 400, b"{}"
-                return 200, json.dumps({"signedURL": f"/object/sign/{rc.BUCKET}/{obj}?token=synthetic"}).encode()
+                link = self.signed_link(obj) if self.signed_link else f"/object/sign/{rc.BUCKET}/{obj}?token=synthetic"
+                return 200, json.dumps({"signedURL": link}).encode()
             if q.get("token") != ["synthetic"] or obj not in self.files:
                 return 400, b"{}"
             return 200, self.signed_bytes if self.signed_bytes is not None else self.files[obj][1]
@@ -198,6 +221,8 @@ class FakeServer:
                 # row-level security on storage.objects: with no policy the row is invisible to the role
                 if (self.user_file if who == "user" else self.anon_file) and obj in self.files:
                     return 200, b"" if method == "HEAD" else self.files[obj][1], {}
+                if self.get_only and method == "GET" and obj in self.files:
+                    return 200, self.files[obj][1], {}
                 return 400, b"" if method == "HEAD" else NOT_FOUND, {}
             if who != "service":
                 return 400, BAD_JWS, {}
@@ -222,11 +247,16 @@ class FakeServer:
 
 
 class Env:
-    """Set the anon key / user token / access token for one main() call (offline runs strip SUPABASE_* vars)."""
+    """Set the anon key / user token / access token for one main() call (offline runs strip SUPABASE_* vars).
+    The same synthetic anon key and user token go under the production names and the drill names
+    (RECOVERY_DRILL_*), so a test runs the same on either target; `extra` overrides any variable."""
 
-    def __init__(self, anon=ANON, token=TOKEN, user=USER):
+    def __init__(self, anon=ANON, token=TOKEN, user=USER, **extra):
         self.values = {"SUPABASE_ANON_KEY": anon, "SUPABASE_ACCESS_TOKEN": token, "SUPABASE_USER_ACCESS_TOKEN": user,
-                       "SUPABASE_SERVICE_ROLE_KEY": None, "NEXT_PUBLIC_SUPABASE_ANON_KEY": None, "SUPABASE_URL": None}
+                       "SUPABASE_SERVICE_ROLE_KEY": None, "NEXT_PUBLIC_SUPABASE_ANON_KEY": None, "SUPABASE_URL": None,
+                       "RECOVERY_DRILL_SERVICE_KEY": None, "RECOVERY_DRILL_ANON_KEY": anon,
+                       "RECOVERY_DRILL_USER_TOKEN": user}
+        self.values.update(extra)
 
     def __enter__(self):
         self.saved = {k: os.environ.get(k) for k in self.values}
@@ -268,15 +298,23 @@ def result(report, name):
 
 
 def only_bytes_unknown(report):
-    """Production's best result: everything read, only the bytes unknown (real records are never downloaded)."""
+    """Production's best result: everything read; unknown are only the bytes (real records are never
+    downloaded) and the download refusals (the file probes are HEADs, which prove nothing about a GET)."""
     unknown = {c["name"] for c in report["checks"] if c["result"] == "unknown"}
-    return (report["status"] == "incomplete" and unknown == set(BYTE_CHECKS)
-            and [u["stage"] for u in report.get("incomplete", [])] == ["bytes"])
+    return (report["status"] == "incomplete" and unknown == set(BYTE_CHECKS) | set(DOWNLOAD_CHECKS)
+            and sorted(u["stage"] for u in report.get("incomplete", [])) == ["bytes", "download_privacy"])
 
 
 def assert_private_output(text):
     for secret in (SERVICE, ANON, TOKEN, USER, "Synthetic title", "synthetic note", "Synthetic test", "documents/", uid(1)):
         assert secret not in text, secret
+
+
+def jwt(payload: dict) -> str:
+    """A made-up, unsigned JWT-shaped string carrying `payload` (never a real key)."""
+    def part(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{part({'alg': 'none'})}.{part(payload)}.SYNTHETIC"
 
 
 def seed_manifest(tmp, docs, labs, files):
@@ -297,10 +335,13 @@ def test_healthy_store_on_production_reads_everything_but_the_bytes():
     assert report["counts"]["documents"] == 4 and report["counts"]["documents_ready"] == 3
     assert report["counts"]["files"] == 3 and report["counts"]["lab_results_linked"] == 1
     assert report["backups"]["state"] == "read" and report["backups"]["completed_backups"] == 7
-    for name in ("public_url_refused", "anon_tables_refused", "anon_files_hidden", "anon_file_refused",
-                 "authenticated_tables_refused", "authenticated_files_hidden", "authenticated_file_refused",
-                 "ready_documents_have_file", "file_sizes_match", "lab_links_resolve", "database_backup_recent"):
+    for name in ("anon_tables_refused", "anon_files_hidden", "authenticated_tables_refused",
+                 "authenticated_files_hidden", "ready_documents_have_file", "file_sizes_match", "lab_links_resolve",
+                 "database_backup_recent"):
         assert result(report, name)["result"] == "pass", name
+    for name in DOWNLOAD_CHECKS:  # a refused HEAD is not a refused download: never a pass on production
+        assert result(report, name)["result"] == "unknown", name
+    assert result(report, "public_url_refused")["result"] == "unknown"
     assert_private_output(text)
     # only ids, paths, sizes, types and states are ever requested
     assert server.selects and all(not any(c in sel.split(",") for c in TEXT_COLUMNS) for _, sel in server.selects)
@@ -315,11 +356,15 @@ def test_healthy_store_on_production_reads_everything_but_the_bytes():
 
 def test_healthy_drill_target_passes_with_the_bytes_proven():
     docs, labs, files = healthy()
-    code, text, report, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--open-files", url=LOCAL)
+    server = FakeServer(docs, labs, files)
+    code, text, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
     assert code == 0 and report["status"] == "pass", text
-    for name in BYTE_CHECKS + ("files_open", "signed_link_serves_file", "anon_file_refused",
-                               "authenticated_file_refused"):
+    for name in BYTE_CHECKS + DOWNLOAD_CHECKS + ("files_parse_as_declared_type", "signed_link_serves_file"):
         assert result(report, name)["result"] == "pass", name
+    # the drill's file probes are real downloads (GET) of made-up files, never a HEAD
+    assert server.heads == [] and not any(c["name"] == "files_open" for c in report["checks"])
+    # the structural parse is not an opening: that stays a person's observation, outside the PASS
+    assert report["not_checked"] == [rc.NOT_CHECKED] and report["not_checked"][0]["result"] == "unknown"
     assert_private_output(text)
 
 
@@ -333,7 +378,8 @@ def test_human_output_is_counts_only_too():
                        sleep=lambda s: None, out=out)
     assert code == 2
     assert out.getvalue().startswith("medical records recovery check: INCOMPLETE")
-    assert "incomplete: bytes:" in out.getvalue()
+    assert "incomplete: bytes:" in out.getvalue() and "incomplete: download_privacy:" in out.getvalue()
+    assert "not checked by this tool: file_opened_in_viewer" in out.getvalue()
     assert_private_output(out.getvalue())
 
 
@@ -468,6 +514,24 @@ def test_file_reachable_directly_while_the_listing_is_empty_fails():
     assert not any(m == "GET" and p.startswith("/storage/v1/object/") for m, _, p in server.calls)
 
 
+def test_download_only_exposure_fails_on_the_drill_and_is_never_a_pass_on_production():
+    # a policy on the download (GET) operation alone: HEAD / info is refused while the file is served
+    docs, labs, files = healthy()
+    server = FakeServer(docs, labs, files, get_only=True)
+    code, text, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 1 and report["status"] == "fail", text
+    for name in ("anon_file_refused", "authenticated_file_refused"):
+        assert result(report, name)["result"] == "fail", name
+    assert result(report, "anon_files_hidden")["result"] == "pass"  # the listing alone looked private
+    assert result(report, "public_url_refused")["result"] == "pass"  # the bucket itself is still private
+    # on production the probe stays a HEAD (no bytes of a real record): refused, so the download is unknown
+    server = FakeServer(docs, labs, files, get_only=True)
+    code, text, report, _ = run(server)
+    assert code == 2 and only_bytes_unknown(report), text
+    assert not any(m == "GET" and p.startswith("/storage/v1/object/") for m, _, p in server.calls)
+    assert_private_output(text)
+
+
 def test_missing_anon_key_is_incomplete_not_pass():
     docs, labs, files = healthy()
     code, _, report, _ = run(FakeServer(docs, labs, files), anon=None)
@@ -505,6 +569,34 @@ def test_probe_without_a_permission_refusal_is_unknown():
     hidden = (400, b'{"statusCode":"404","error":"Bucket not found","message":"Bucket not found"}')
     code, _, report, _ = run(FakeServer(docs, labs, files, anon_list_answer=hidden))
     assert result(report, "anon_files_hidden")["result"] == "pass" and only_bytes_unknown(report)
+
+
+def test_listing_with_a_malformed_entry_is_unknown_not_an_empty_listing():
+    # a 200 list whose entries are not files or folders is unreadable: never filtered down to "nothing listed"
+    docs, labs, files = healthy()
+    for body in (b"[null]", b'["invalid"]', b"[1]", b'[{"id": "x"}]', b'[{"name": "", "id": null}]',
+                 b'[{"name": "a", "id": 5}]', b'[{"name": "a", "id": "x", "metadata": "text"}]', b"[[]]"):
+        code, text, report, _ = run(FakeServer(docs, labs, files, anon_list_answer=(200, body)))
+        assert code == 2 and result(report, "anon_files_hidden")["result"] == "unknown", body
+        assert any(u["stage"] == "anon" and "listing entry" in u["reason"] for u in report["incomplete"]), body
+        assert_private_output(text)
+    # a folder the role can see is a listed entry too: the role sees what is in the bucket
+    code, _, report, _ = run(FakeServer(docs, labs, files, anon_list_answer=(200, b'[{"name": "x", "id": null}]')))
+    assert code == 1 and result(report, "anon_files_hidden") == {"name": "anon_files_hidden", "result": "fail",
+                                                                 "count": 1}
+    # the service listing: a malformed entry makes every file check unknown, never a crash or a pass
+    code, _, report, _ = run(FakeServer(docs, labs, files, extra_docs=[None]))
+    assert code == 2 and result(report, "ready_documents_have_file")["result"] == "unknown"
+    assert any(u["stage"] == "objects" for u in report["incomplete"])
+
+
+def test_rows_that_are_not_objects_are_unreadable():
+    target = rc.Target(PROD, SERVICE, transport=lambda *a: (200, b"[null]"), sleep=lambda s: None)
+    try:
+        target.rows("documents", "medical_documents", rc.DOC_SELECT)
+        raise AssertionError("a row that is not an object must be unreadable")
+    except rc.Unreadable as e:
+        assert e.stage == "documents" and "not an object" in e.reason
 
 
 def test_missing_or_invalid_user_token_is_an_access_ask():
@@ -654,6 +746,170 @@ def test_production_is_never_a_drill_target():
             pass
 
 
+# ---------------------------------------------------------------- origins, redirects and signed links
+
+UNKNOWN_ORIGINS = (
+    "https://evil.example", "http://fewweioupmsnbccqtxdl.supabase.co", "https://fewweioupmsnbccqtxdl.supabase.co:8443",
+    "https://fewweioupmsnbccqtxdl.supabase.co.evil.example", "https://user@fewweioupmsnbccqtxdl.supabase.co",
+    "https://user:pw@fewweioupmsnbccqtxdl.supabase.co", "https://evil.example\\@fewweioupmsnbccqtxdl.supabase.co",
+    "https://fewweioupmsnbccqtxdl.supabase.co/rest/v1", "https://fewweioupmsnbccqtxdl.supabase.co?x=1",
+    "https://fewweioupmsnbccqtxdl.supabase.co#x", DRILL, "ftp://127.0.0.1", "http://127.0.0.1.evil.example:54321",
+    "https://fewweioupmsnbccqtxdl.supabase.co:443", "not a url", "",
+)
+
+
+def test_unknown_origin_is_refused_before_any_key_is_read():
+    # not a drill target is not proof of production: only the exact production origin gets its keys
+    reads = []
+    saved = rc._read_key
+    rc._read_key = lambda *a, **k: reads.append(a) or SERVICE
+    try:
+        for url in UNKNOWN_ORIGINS:
+            server = FakeServer(*healthy())
+            for extra in ([], ["--skip-backups"], ["--open-files"]):
+                out = io.StringIO()
+                with Env(SUPABASE_SERVICE_ROLE_KEY=SERVICE):  # a production key sitting in the shell
+                    code = rc.main(["--url", url, *extra], transport=server, sleep=lambda s: None, out=out)
+                assert code == 2 and out.getvalue().startswith("refused:"), (url, extra, out.getvalue())
+                assert SERVICE not in out.getvalue()
+            assert server.calls == [], url
+        assert reads == [], "no key was read for an unknown origin"
+    finally:
+        rc._read_key = saved
+    assert rc.classify(PROD, None) == "production" and rc.classify(PROD + "/", None) == "production"
+    assert rc.classify(PROD.upper().replace("HTTPS", "https"), None) == "production"
+    assert rc.classify(LOCAL, None) == "drill" and rc.classify("http://localhost:54321", None) == "drill"
+    assert rc.classify("http://[::1]:54321", None) == "drill" and rc.classify(DRILL, DRILL_REF) == "drill"
+    assert rc.classify(DRILL, None) is None and rc.classify(PROD, rc.PRODUCTION_REF) == "production"
+    for url in UNKNOWN_ORIGINS:
+        assert rc.classify(url, None) is None, url
+
+
+def test_drill_target_never_gets_production_credentials():
+    docs, labs, files = healthy()
+    # the production variables in the shell are not read for a drill target: no drill key = stop, nothing sent
+    server = FakeServer(docs, labs, files)
+    out = io.StringIO()
+    with Env(SUPABASE_SERVICE_ROLE_KEY=SERVICE, RECOVERY_DRILL_ANON_KEY=None, RECOVERY_DRILL_USER_TOKEN=None):
+        code = rc.main(["--url", LOCAL, "--skip-backups", "--open-files"], transport=server, sleep=lambda s: None,
+                       out=out)
+    assert code == 2 and "RECOVERY_DRILL_SERVICE_KEY" in out.getvalue() and server.calls == []
+    # with a drill key but no drill user token, the production user token is never sent to the drill target
+    server = FakeServer(docs, labs, files)
+    out = io.StringIO()
+    with Env(RECOVERY_DRILL_SERVICE_KEY=SERVICE, RECOVERY_DRILL_USER_TOKEN=None):
+        code = rc.main(["--url", LOCAL, "--skip-backups", "--open-files", "--json"], transport=server,
+                       sleep=lambda s: None, out=out)
+    report = json.loads(out.getvalue())
+    assert code == 2 and result(report, "authenticated_tables_refused")["result"] == "unknown"
+    assert f"Bearer {USER}" not in server.bearers and server.calls
+    # a drill key or user token that names the production project is refused before any request
+    for extra in ({"RECOVERY_DRILL_SERVICE_KEY": jwt({"ref": rc.PRODUCTION_REF, "role": "service_role"})},
+                  {"RECOVERY_DRILL_SERVICE_KEY": SERVICE,
+                   "RECOVERY_DRILL_USER_TOKEN": jwt({"iss": f"https://{rc.PRODUCTION_REF}.supabase.co/auth/v1"})}):
+        server = FakeServer(docs, labs, files)
+        out = io.StringIO()
+        with Env(**extra):
+            code = rc.main(["--url", LOCAL, "--skip-backups", "--open-files"], transport=server, sleep=lambda s: None,
+                           out=out)
+        assert code == 2 and out.getvalue().startswith("refused:") and server.calls == [], extra
+    assert not rc._names_production(jwt({"ref": DRILL_REF})) and not rc._names_production(SERVICE)
+
+
+def test_a_request_to_another_origin_is_never_sent():
+    sent = []
+
+    def transport(*a):
+        sent.append(a)
+        return 200, b"{}"
+
+    for url, origin in (("https://elsewhere.example/v1/projects", rc.MANAGEMENT_ORIGIN),
+                        ("https://api.supabase.com.evil.example/v1", rc.MANAGEMENT_ORIGIN),
+                        (f"{LOCAL}/rest/v1/x", rc.PRODUCTION_ORIGIN), ("http://api.supabase.com/v1", rc.MANAGEMENT_ORIGIN)):
+        try:
+            rc.request(transport, "backups", "GET", url, {"Authorization": f"Bearer {TOKEN}"}, origin=origin)
+            raise AssertionError(url)
+        except rc.Unreadable as e:
+            assert "another origin" in e.reason
+    assert sent == []
+
+
+def test_redirects_are_never_followed():
+    docs, labs, files = healthy()
+    # a 3xx is unreadable, not retried and not followed (production rows; the drill's file probes and downloads)
+    server = FakeServer(docs, labs, files, fail={"/rest/v1/medical_documents": [307]})
+    code, _, report, sleeps = run(server)
+    assert code == 2 and result(report, "ready_documents_have_file")["result"] == "unknown"
+    assert any(u["stage"] == "documents" and "redirect, not followed" in u["reason"] for u in report["incomplete"])
+    assert sleeps == []  # not retried
+    server = FakeServer(docs, labs, files, fail={f"/storage/v1/object/{rc.BUCKET}/": [302] * 10})
+    code, _, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 2 and report["status"] == "incomplete"
+    for name in ("anon_file_refused", "authenticated_file_refused", "files_stored"):
+        assert result(report, name)["result"] == "unknown", name
+    # urllib's own opener: the one this tool uses never follows a Location header; the default one would
+    class Redirecting(urllib.request.BaseHandler):
+        handler_order = 100  # ahead of the real HTTP handler: no network
+
+        def __init__(self):
+            self.opened = []
+
+        def http_open(self, req):
+            self.opened.append((req.host, req.get_header("Authorization")))
+            hdrs = email.message.Message()
+            hdrs["Location"] = "http://elsewhere.invalid/collect"
+            resp = urllib.response.addinfourl(io.BytesIO(b""), hdrs, req.full_url, 302)
+            resp.msg = "Found"
+            return resp
+
+    saved = rc._OPENER
+    try:
+        # the control keeps urllib's default redirect handling (only the environment's proxies are left out)
+        control = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for opener, followed in ((rc._build_opener(), False), (control, True)):
+            fake = Redirecting()
+            opener.add_handler(fake)
+            rc._OPENER = opener
+            try:
+                status = rc.urllib_transport("GET", "http://origin.invalid/x", {"Authorization": f"Bearer {SERVICE}"},
+                                             None)[0]
+            except rc.TransportError:
+                status = None  # the default opener gave up after following the loop
+            hosts = [h for h, _ in fake.opened]
+            if followed:
+                assert "elsewhere.invalid" in hosts  # the control: urllib's default does follow it
+            else:
+                assert status == 302 and hosts == ["origin.invalid"], hosts
+    finally:
+        rc._OPENER = saved
+    assert any(isinstance(h, rc._NoRedirect) for h in rc._OPENER.handlers)
+    assert not any(type(h) is urllib.request.HTTPRedirectHandler for h in rc._OPENER.handlers)
+    assert all(h.proxies == {} for h in rc._OPENER.handlers if isinstance(h, urllib.request.ProxyHandler))
+
+
+def test_signed_link_to_another_origin_or_file_is_never_fetched():
+    docs, labs, files = healthy()
+    other = f"documents/{uid(2)}"
+    for link in (lambda o: f"https://elsewhere.example/storage/v1/object/sign/{rc.BUCKET}/{o}?token=synthetic",
+                 lambda o: f"//elsewhere.example/storage/v1/object/sign/{rc.BUCKET}/{o}?token=synthetic",
+                 lambda o: f"http://127.0.0.1:9999/storage/v1/object/sign/{rc.BUCKET}/{o}?token=synthetic",
+                 lambda o: f"/object/sign/{rc.BUCKET}/{other}?token=synthetic",
+                 lambda o: f"/object/sign/{rc.BUCKET}/{o}/../../../../rest/v1/medical_documents?token=synthetic",
+                 lambda o: f"/object/sign/{rc.BUCKET}/{o}",
+                 lambda o: "/../rest/v1/medical_documents?token=synthetic",
+                 lambda o: None):
+        server = FakeServer(docs, labs, files, signed_link=link)
+        code, _, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+        assert code == 2 and result(report, "signed_link_serves_file")["result"] == "unknown"
+        assert all(h == "127.0.0.1" for _, h, _ in server.calls), server.calls  # nothing left the drill origin
+        assert not any(m == "GET" and "/object/sign/" in p for m, _, p in server.calls)  # the link was not fetched
+    # the same route as an absolute URL on the target's own origin is accepted
+    server = FakeServer(docs, labs, files,
+                        signed_link=lambda o: f"{LOCAL}/storage/v1/object/sign/{rc.BUCKET}/{o}?token=synthetic")
+    code, text, report, _ = run(server, "--skip-backups", "--open-files", url=LOCAL)
+    assert code == 0 and result(report, "signed_link_serves_file")["result"] == "pass", text
+
+
 def test_drill_target_never_reads_the_production_key_file():
     # the default key file holds the production key: a drill stack (whose logs may keep headers) never gets it
     server = FakeServer(*healthy())
@@ -700,7 +956,8 @@ def test_drill_wipe_is_detected_and_full_restore_passes():
         code, text, report, _ = run(FakeServer(docs, labs, files), "--skip-backups", "--manifest", str(manifest),
                                     "--open-files", url=LOCAL)
         assert code == 0, text
-        for name in ("files_open", "manifest_hashes_match", "manifest_sizes_match", "signed_link_serves_file",
+        for name in ("files_parse_as_declared_type", "manifest_hashes_match", "manifest_sizes_match",
+                     "signed_link_serves_file",
                      "bucket_private", "anon_tables_refused", "authenticated_tables_refused", "files_stored",
                      "anon_file_refused", "authenticated_file_refused", "stored_sizes_match",
                      "lab_links_resolve", "manifest_document_state_match", "manifest_lab_links_match"):
@@ -746,12 +1003,12 @@ def test_drill_catches_corrupted_and_truncated_restores():
         bad[f"documents/{uid(1)}"] = ("application/pdf", bytes(flipped))
         _, _, report, _ = run(FakeServer(docs, labs, bad), "--skip-backups", "--manifest", str(manifest), "--open-files", url=LOCAL)
         assert result(report, "manifest_hashes_match")["result"] == "fail"
-        assert result(report, "files_open")["result"] == "pass"
+        assert result(report, "files_parse_as_declared_type")["result"] == "pass"
         truncated = dict(files)
         truncated[f"documents/{uid(2)}"] = ("image/png", PNG[:-12])
         _, _, report, _ = run(FakeServer(docs, labs, truncated), "--skip-backups", "--manifest", str(manifest),
                               "--open-files", url=LOCAL)
-        assert result(report, "files_open")["result"] == "fail"
+        assert result(report, "files_parse_as_declared_type")["result"] == "fail"
         assert result(report, "manifest_sizes_match")["result"] == "fail"
 
 
@@ -786,31 +1043,31 @@ def test_manifest_is_not_written_from_a_failing_baseline():
 
 # ---------------------------------------------------------------- files and paging
 
-def test_opens_as_checks_the_structure_not_just_the_ends():
-    assert rc.opens_as("application/pdf", PDF) and rc.opens_as("image/png", PNG) and rc.opens_as("image/jpeg", JPEG)
+def test_parses_as_checks_the_structure_not_just_the_ends():
+    assert rc.parses_as("application/pdf", PDF) and rc.parses_as("image/png", PNG) and rc.parses_as("image/jpeg", JPEG)
     # truncated, swapped, or only the start and end markers of the format
-    assert not rc.opens_as("application/pdf", PDF[: len(PDF) // 2])
-    assert not rc.opens_as("application/pdf", PNG) and not rc.opens_as("image/png", PDF)
-    assert not rc.opens_as("application/pdf", b"%PDF-junk%%EOF")
-    assert not rc.opens_as("application/pdf", b"%PDF-1.4\nstartxref\n9\n%%EOF\n")
-    assert not rc.opens_as("application/pdf", PDF[:9] + b" " + PDF[9:])  # every offset now points one byte early
-    assert not rc.opens_as("image/png", PNG[:-12])  # no IEND chunk
+    assert not rc.parses_as("application/pdf", PDF[: len(PDF) // 2])
+    assert not rc.parses_as("application/pdf", PNG) and not rc.parses_as("image/png", PDF)
+    assert not rc.parses_as("application/pdf", b"%PDF-junk%%EOF")
+    assert not rc.parses_as("application/pdf", b"%PDF-1.4\nstartxref\n9\n%%EOF\n")
+    assert not rc.parses_as("application/pdf", PDF[:9] + b" " + PDF[9:])  # every offset now points one byte early
+    assert not rc.parses_as("image/png", PNG[:-12])  # no IEND chunk
     bad_crc = bytearray(PNG)
     bad_crc[-20] ^= 0x01  # inside the pixel data: its chunk CRC no longer matches
-    assert not rc.opens_as("image/png", bytes(bad_crc))
-    assert not rc.opens_as("image/png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 20 + b"IEND\xaeB`\x82")
-    assert not rc.opens_as("image/jpeg", JPEG[:-2])  # no end-of-image marker
-    assert not rc.opens_as("image/jpeg", b"\xff\xd8\xff\xe0" + b"\x00" * 40 + b"\xff\xd9")
+    assert not rc.parses_as("image/png", bytes(bad_crc))
+    assert not rc.parses_as("image/png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 20 + b"IEND\xaeB`\x82")
+    assert not rc.parses_as("image/jpeg", JPEG[:-2])  # no end-of-image marker
+    assert not rc.parses_as("image/jpeg", b"\xff\xd8\xff\xe0" + b"\x00" * 40 + b"\xff\xd9")
     chunk = b"VP8L" + (5).to_bytes(4, "little") + b"\x2f\x00\x00\x00\x00" + b"\x00"  # odd size: one pad byte
     payload = b"WEBP" + chunk
     webp = b"RIFF" + len(payload).to_bytes(4, "little") + payload
-    assert rc.opens_as("image/webp", webp) and not rc.opens_as("image/webp", webp + b"extra")
-    assert not rc.opens_as("image/webp", b"RIFF" + (8).to_bytes(4, "little") + b"WEBPVP8 ")  # a chunk with no size
+    assert rc.parses_as("image/webp", webp) and not rc.parses_as("image/webp", webp + b"extra")
+    assert not rc.parses_as("image/webp", b"RIFF" + (8).to_bytes(4, "little") + b"WEBPVP8 ")  # a chunk with no size
     meta = b"\x00\x00\x00\x0cmeta" + b"\x00" * 4
-    assert rc.opens_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12 + meta)
-    assert not rc.opens_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12)  # no meta box
-    assert not rc.opens_as("image/heif", b"\x00\x00\x00\x18ftypisom" + b"\x00" * 12 + meta)
-    assert not rc.opens_as("application/pdf", b"") and not rc.opens_as("text/html", b"<html>")
+    assert rc.parses_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12 + meta)
+    assert not rc.parses_as("image/heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12)  # no meta box
+    assert not rc.parses_as("image/heif", b"\x00\x00\x00\x18ftypisom" + b"\x00" * 12 + meta)
+    assert not rc.parses_as("application/pdf", b"") and not rc.parses_as("text/html", b"<html>")
 
 
 def test_every_row_is_read_past_the_1000_row_cap():
@@ -831,7 +1088,7 @@ def test_write_synthetic_files_are_valid_and_made_up():
         assert written == sorted(FILES)
         for name, (mime, _) in FILES.items():
             data = (Path(tmp) / name).read_bytes()
-            assert rc.opens_as(mime, data), name
+            assert rc.parses_as(mime, data), name
         assert b"SYNTHETIC" in (Path(tmp) / "synthetic-drill-document.pdf").read_bytes()
 
 
