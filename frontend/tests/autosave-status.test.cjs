@@ -40,29 +40,79 @@ test("idle shows nothing; an incomplete entry shows its reason only when asked t
 test("one polite live region, without the Retry button; no alert role that would read it twice", () => {
   const html = render({ state: state({ status: "error", error: "Synthetic outage" }), id: "synthetic-status" });
   assert.equal((html.match(/role="status"/g) || []).length, 1);
-  assert.match(html, /<span role="status" aria-live="polite" aria-atomic="true" class="sr-only">[^<]*<\/span>/, "the region holds text only");
+  assert.match(html, /<span role="status" aria-live="polite" aria-atomic="true" class="sr-only"><span>[^<]*<\/span><\/span>/, "the region holds text only");
   assert.doesNotMatch(html, /role="alert"/);
-  assert.match(html, /^<span id="synthetic-status" tabindex="-1"/, "fields can point at the line; Retry's focus can land on it");
+  assert.match(html, /^<span tabindex="-1"/, "Retry's focus can land on the line");
+  // aria-describedby names the visible text only: never the live region, which can hold an earlier result.
+  assert.match(html, /<span id="synthetic-status"><span[^>]*><span>Not saved: Synthetic outage<\/span>/);
+  const idPart = html.slice(html.indexOf('<span id="synthetic-status">'), html.indexOf('<span role="status"'));
+  assert.doesNotMatch(idPart, /role="status"/);
 });
 
-test("announcement: each result once; a retry failing the same way is not read again; a reset starts over", () => {
-  const a = S.announcement;
-  let text = "";
-  text = a(text, state({ status: "waiting" }), "Saved");
-  assert.equal(text, "", "waiting is not announced");
-  text = a(text, state({ status: "saving" }), "Saved");
-  assert.equal(text, "", "saving is not announced");
-  text = a(text, state({ status: "error", error: "Synthetic outage", retrying: true }), "Saved");
-  assert.equal(text, "Not saved: Synthetic outage");
-  const failed = text;
-  text = a(text, state({ status: "saving" }), "Saved");
-  text = a(text, state({ status: "error", error: "Synthetic outage", retrying: true }), "Saved");
-  assert.equal(text, failed, "the same failure again: same text, nothing new to read");
-  text = a(text, state({ status: "saved", savedAt: 5 }), "Saved");
-  assert.equal(text, "Saved", "recovered: announced");
-  text = a(text, state({ status: "waiting", savedAt: 5 }), "Saved");
-  assert.equal(text, "Saved", "a new edit keeps the last result until the next one");
-  text = a(text, state({ status: "idle", savedAt: null }), "Saved");
-  assert.equal(text, "", "reset (a new entry): the next result is read again");
+test("nextAnnouncement: each result once; a retry failing the same way is not read again; anything else empties it", () => {
+  const next = (prev, over, savedText = "Saved") => S.nextAnnouncement(prev, state(over), savedText);
+  let a = S.NO_ANNOUNCEMENT;
+  a = next(a, { status: "waiting" });
+  assert.equal(a.text, "", "waiting is not announced");
+  a = next(a, { status: "saving" });
+  assert.equal(a.text, "", "saving is not announced");
+  a = next(a, { status: "error", error: "Synthetic outage", retrying: true });
+  assert.equal(a.text, "Not saved: Synthetic outage");
+  const failed = a;
+  a = next(a, { status: "saving" });
+  assert.equal(a, failed, "a retry under way keeps its failure");
+  a = next(a, { status: "error", error: "Synthetic outage", retrying: true });
+  assert.equal(a, failed, "the same failure again: nothing new to read");
+  a = next(a, { status: "saved", savedAt: 5 });
+  assert.equal(a.text, "Saved", "recovered: announced");
+  assert.notEqual(a.seq, failed.seq);
+  const first = a;
+  a = next(a, { status: "saved", savedAt: 5 });
+  assert.equal(a, first, "the same state rendered again: not read again");
+  a = next(a, { status: "saved", savedAt: 9 });
+  assert.equal(a.text, "Saved");
+  assert.notEqual(a.seq, first.seq, "a second confirmed save with the same words is a new result (new text node)");
+  const second = a;
+  a = next(a, { status: "incomplete", error: "Enter the chapter you read through to save.", savedAt: 9 });
+  assert.equal(a.text, "", "an incomplete entry: no stale Saved left in the region");
+  a = next(a, { status: "saved", savedAt: 9 }, "Saved");
+  a = next(a, { status: "idle", savedAt: 9 });
+  assert.equal(a.text, "", "a reset that kept savedAt still empties the region");
+  a = next(a, { status: "saved", savedAt: 12 });
+  assert.equal(a.text, "Saved", "the new entry's first save is announced");
+  assert.ok(a.seq > second.seq);
   assert.equal(S.failureText({ error: null }), "Not saved: save failed.");
+});
+
+test("a real Autosaver: a reset clears the announcement and successive saves are each a new result", async () => {
+  const autosave = loadTs("lib/autosave.ts");
+  let now = 100;
+  const pending = [];
+  const timers = { set: (fn) => { pending.push(fn); return pending.length; }, clear: () => {} };
+  const saver = new autosave.Autosaver({ save: async () => {}, delayMs: 10, timers, now: () => (now += 1) });
+  let a = S.NO_ANNOUNCEMENT;
+  const seen = () => { a = S.nextAnnouncement(a, saver.state, "Saved"); return a; };
+
+  saver.change({ v: 1 });
+  seen();
+  await saver.flush();
+  const one = seen();
+  assert.equal(one.text, "Saved");
+
+  saver.change({ v: 2 });
+  await saver.flush(); // waiting and saved may land in one render: only the final state is seen
+  const two = seen();
+  assert.equal(two.text, "Saved");
+  assert.notEqual(two.seq, one.seq, "the second save is read too");
+
+  saver.reset();
+  assert.notEqual(saver.state.savedAt, null, "Autosaver.reset keeps savedAt");
+  assert.equal(seen().text, "", "yet the region is emptied for the new entry");
+  saver.change({ v: 3 });
+  assert.equal(seen().text, "");
+  await saver.flush();
+  const three = seen();
+  assert.equal(three.text, "Saved");
+  assert.ok(three.seq > two.seq);
+  saver.dispose();
 });

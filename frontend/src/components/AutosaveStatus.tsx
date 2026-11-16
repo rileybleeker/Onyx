@@ -11,11 +11,13 @@ import type { AutosaveState } from "@/lib/autosave";
  * (a failure). `incomplete` shows the form's own reason only when `showIncomplete` (a blank field is not worth a
  * message). Nothing at all while idle.
  *
- * Screen readers (PROD-T01): the result is announced once, from its own polite live region that holds only "Saved"
- * or "Not saved: <why>" (a background retry failing the same way again is not announced again; "Saving…" never is),
- * and Retry sits outside that region. Pressing Retry takes the button away while the save runs, so focus moves to
- * this line (tabIndex -1) instead of falling to the page, and Retry is the next stop if it fails again. `id` lets a
- * field point at the line with aria-describedby, so its reason is read with the field.
+ * Screen readers (PROD-T01): each result is announced once, from its own polite live region that holds only "Saved"
+ * or "Not saved: <why>" (every save the server confirms is read, also a second "Saved" in a row; a background retry
+ * failing the same way again is not; "Saving…" never is), and Retry sits outside that region. The region is emptied
+ * as soon as it holds no current result (a new edit, an incomplete entry, a reset). Pressing Retry takes the button
+ * away while the save runs, so focus moves to this line (tabIndex -1) instead of falling to the page, and Retry is
+ * the next stop if it fails again. `id` names the visible text only (never the live region), so a field pointing at
+ * it with aria-describedby reads the current reason, never an old "Saved".
  */
 /** "Not saved: <why>": the failure text, shown and announced. */
 export function failureText(state: Pick<AutosaveState, "error">): string {
@@ -23,15 +25,31 @@ export function failureText(state: Pick<AutosaveState, "error">): string {
 }
 
 /**
- * The live region's next text: the result ("Saved" / the failure), changed only when the result changes, so each
- * result is announced once (a background retry failing the same way again keeps the same text: nothing is read
- * again). Emptied when the form is reset (a new entry), so its first result is announced too.
+ * What the live region holds: the current result and a counter that changes with every new result. The text is
+ * drawn in a child keyed by the counter, so a new result replaces the text node even when its words are the same
+ * as before (two saves in a row are both read).
  */
-export function announcement(prev: string, state: Pick<AutosaveState, "status" | "error" | "savedAt">, savedText: string): string {
-  if (state.status === "saved") return savedText;
-  if (state.status === "error") return failureText(state);
-  if (state.status === "idle" && state.savedAt === null) return "";
-  return prev;
+export type Announcement = { text: string; kind: "" | "saved" | "error"; savedAt: number | null; seq: number };
+export const NO_ANNOUNCEMENT: Announcement = { text: "", kind: "", savedAt: null, seq: 0 };
+
+/**
+ * The live region after a state change. A confirmed save (a new savedAt, or new words) and a new failure text are
+ * new results; the same failure again (a background retry) is not. A retry under way keeps its failure; anything
+ * else that is not a result (a new edit waiting, a save of a new edit, an incomplete entry, a reset to idle, also
+ * when Autosaver.reset kept savedAt) empties the region.
+ */
+export function nextAnnouncement(prev: Announcement, state: Pick<AutosaveState, "status" | "error" | "savedAt">, savedText: string): Announcement {
+  if (state.status === "saved") {
+    if (prev.kind === "saved" && prev.text === savedText && prev.savedAt === state.savedAt) return prev;
+    return { text: savedText, kind: "saved", savedAt: state.savedAt, seq: prev.seq + 1 };
+  }
+  if (state.status === "error") {
+    const text = failureText(state);
+    if (prev.kind === "error" && prev.text === text) return prev;
+    return { text, kind: "error", savedAt: prev.savedAt, seq: prev.seq + 1 };
+  }
+  if (state.status === "saving" && prev.kind === "error") return prev;
+  return prev.kind === "" ? prev : { text: "", kind: "", savedAt: prev.savedAt, seq: prev.seq };
 }
 
 export function AutosaveStatus({
@@ -56,10 +74,10 @@ export function AutosaveStatus({
   const focusAfterRetry = useRef(false);
   const failure = failureText(state);
 
-  // The live region's text: changes only when the result does (see announcement()).
-  const [announced, setAnnounced] = useState("");
+  // The live region: changes only when the result does (see nextAnnouncement()).
+  const [announced, setAnnounced] = useState<Announcement>(NO_ANNOUNCEMENT);
   useEffect(() => {
-    setAnnounced((prev) => announcement(prev, { status, error, savedAt }, savedText));
+    setAnnounced((prev) => nextAnnouncement(prev, { status, error, savedAt }, savedText));
   }, [status, error, savedAt, savedText]);
 
   // Retry pressed: its button leaves while the save runs; keep keyboard focus on this line, not on the page.
@@ -112,10 +130,10 @@ export function AutosaveStatus({
     body = <span className="text-text-tertiary">{error}</span>;
   }
   return (
-    <span ref={wrap} id={id} tabIndex={-1} data-autosave={status} className={`text-[12px] ${className}`}>
-      {body}
+    <span ref={wrap} tabIndex={-1} data-autosave={status} className={`text-[12px] ${className}`}>
+      <span id={id}>{body}</span>
       <span role="status" aria-live="polite" aria-atomic="true" className="sr-only">
-        {announced}
+        <span key={announced.seq}>{announced.text}</span>
       </span>
     </span>
   );

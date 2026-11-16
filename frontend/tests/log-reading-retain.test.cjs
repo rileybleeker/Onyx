@@ -32,6 +32,11 @@ const answer = (today = D1) => ({
   },
   books: [],
 });
+/** No book in progress any more (the current one was finished or set aside elsewhere); the list still has it. */
+const noBookAnswer = () => ({
+  overview: null,
+  books: [{ slug: "synthetic-book", title: "A Synthetic Book", total_chapters: 12, status: "finished" }],
+});
 /** The same day with another current book (the first one finished, or a Kindle harvest moved on). */
 const otherBookAnswer = (today = D1) => {
   const a = answer(today);
@@ -105,6 +110,11 @@ function setup(t) {
   const calls = [];
   const rows = new Map();
   let mode = "up";
+  let readMode = "up";
+  // The server's behavioral today (a create without a date is stored on it) and the clock's guess of the same day:
+  // D1 until rollDay(), then D2 for every instant from then on.
+  let serverToday = D1;
+  let rollAt = Infinity;
   const reply = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
   const replacements = {
     document: { visibilityState: "visible", activeElement: null, body: {}, addEventListener() {}, removeEventListener() {} },
@@ -115,8 +125,9 @@ function setup(t) {
       if (mode === "offline") throw new TypeError("Failed to fetch");
       if (init.method === "POST" && url === "/api/reading/sessions") {
         const replayed = rows.has(body.client_key);
-        if (!replayed) rows.set(body.client_key, { session_id: 500 + rows.size + 1, ...body });
-        return reply({ session: rows.get(body.client_key), replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: body.date ?? D1, overview: null });
+        if (!replayed) rows.set(body.client_key, { session_id: 500 + rows.size + 1, session_date: body.date ?? serverToday, ...body });
+        const row = rows.get(body.client_key);
+        return reply({ session: row, replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: row.session_date, overview: null });
       }
       if (init.method === "PATCH") return reply({ session: { session_id: Number(url.split("/").pop()) }, xp_gained: 0, finished: false, overview: null });
       throw new Error(`unexpected request ${init.method} ${url}`);
@@ -135,8 +146,12 @@ function setup(t) {
     "@/lib/autosave": autosaveLib,
     "@/lib/unsaved-work": { ...unsavedLib, unsavedWork: work },
     "@/lib/autosave-retain": { ...retainLib, formRetainer: retainer },
+    "@/lib/checkin": { fallbackBehavioralToday: (d) => (d.getTime() >= rollAt ? D2 : D1) },
     "@/lib/client-cache": {
-      cachedJson: async () => structuredClone(current),
+      cachedJson: async () => {
+        if (readMode === "offline") throw new TypeError("Failed to fetch");
+        return structuredClone(current);
+      },
       clientCache: {
         peek: () => structuredClone(current),
         read: async () => structuredClone(current),
@@ -191,6 +206,15 @@ function setup(t) {
   const h = {
     timers, work, retainer, calls, rows,
     set mode(m) { mode = m; },
+    /** The overview read fails (offline): the section keeps what the cache showed it. */
+    set readMode(m) { readMode = m; },
+    set serverToday(d) { serverToday = d; },
+    /** The behavioral day rolls now (06:00): the clock says D2 from here on; nothing is re-read. */
+    async rollDay() {
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      rollAt = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 3));
+    },
     posts: () => calls.filter((c) => c.method === "POST"),
     text: () => text(),
     value: (label) => field(label).props.value,
@@ -413,4 +437,106 @@ test("a restored entry and the session it made keep their book when the current 
   const last = h.calls[h.calls.length - 1];
   assert.equal(last.method, "PATCH");
   assert.equal(last.body.book, "synthetic-book", "a later edit never moves the session to another book");
+});
+
+test("day boundary with no new answer: an entry started before the day rolls and finished after is created for its own day", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Minutes", "25"); // started on D1: incomplete, nothing sent
+  assert.equal(h.calls.length, 0);
+  await h.rollDay(); // 06:00 passes; the overview is not read again
+  h.serverToday = D2;
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, D1, "sent for the day it was started on, which the form still shows");
+  assert.equal(h.value("Day"), D1);
+  const row = [...h.rows.values()][0];
+  assert.equal(row.session_date, D1, "never the new day");
+});
+
+test("an entry started on its own day, before the roll, still lets the server's today apply when sent the same day", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Minutes", "25");
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts()[0].body.date, null);
+  assert.equal([...h.rows.values()][0].session_date, D1);
+});
+
+test("a stale day on screen (cached answer, read failing, clock already on the next day): the server decides and the form shows that day", async (t) => {
+  const h = setup(t);
+  await h.rollDay(); // the clock is on D2 before the section opens; the cache still says D1
+  h.serverToday = D2;
+  h.readMode = "offline";
+  await h.mount();
+  assert.match(h.text(), /A Synthetic Book/, "drawn from the cached answer");
+  await h.type("Through ch.", "4");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, null, "the day on screen could be stale: the server's behavioral today applies");
+  assert.equal([...h.rows.values()][0].session_date, D2);
+  assert.equal(h.value("Day"), D2, "the form then shows the day the session was stored on");
+  assert.match(h.text(), /For Apr 11/);
+  await h.type("Minutes", "30");
+  await h.tick(1500);
+  const last = h.calls[h.calls.length - 1];
+  assert.equal(last.method, "PATCH");
+  assert.equal(last.body.date, null, "an edit keeps the session's own day");
+});
+
+test("no book in progress any more: a kept incomplete entry stays on screen with its fields and reason, and saves for its book", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Minutes", "20");
+  await h.unmount();
+  await h.serve(noBookAnswer()); // the book was finished elsewhere while the section was away
+  await h.mount();
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.value("Minutes"), "20", "the entry is still reachable");
+  assert.match(h.text(), /Book: A Synthetic Book/, "named from the book list");
+  assert.match(h.text(), /Enter the chapter you read through to save\./);
+  assert.equal(h.calls.length, 0, "showing it sends nothing");
+  await h.type("Through ch.", "12");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.book, "synthetic-book");
+  assert.match(h.text(), /Saved · \+10 XP/);
+  assert.match(h.text(), /This session/);
+  await h.click("New session");
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.hasButton("New session"), false, "nothing left: the empty form is not drawn without a book");
+});
+
+test("no book in progress any more: a failed create keeps its Retry, and Discard drops the entry", async (t) => {
+  const h = setup(t);
+  h.mode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  await h.unmount();
+  await h.serve(noBookAnswer());
+  await h.mount();
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./);
+  assert.ok(h.hasButton("Retry"), "Retry is still offered");
+  assert.equal(h.value("Through ch."), "5");
+  await h.click("Discard this entry");
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.hasButton("Retry"), false);
+  assert.equal(h.work.has(), false, "a discarded entry is not unsaved work");
+  const sent = h.calls.length;
+  await h.tick(60_000);
+  assert.equal(h.calls.length, sent, "and nothing more is sent");
+  await h.unmount();
+  assert.equal(h.retainer.size, 0);
+});
+
+test("no book in progress and nothing kept: only the line, no form", async (t) => {
+  const h = setup(t);
+  await h.serve(noBookAnswer());
+  await h.mount();
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.hasButton("Audio"), false);
+  assert.equal(h.calls.length, 0);
 });

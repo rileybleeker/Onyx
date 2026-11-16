@@ -116,6 +116,16 @@ test('only text-like fields count', () => {
   assert.equal(isTextField({ tagName: 'SELECT', dataset: {} }), false);
   assert.equal(isTextField({ tagName: 'DIV', isContentEditable: true, dataset: {} }), true);
   assert.equal(isTextField({ tagName: 'TEXTAREA', dataset: { unsavedIgnore: '' } }), false);
+  // A filter or search box is not an entry: typing in it never pins its page of the scroll or blocks an update.
+  // closest() stand-in: the field's ancestors match these simple selectors (one per ancestor).
+  const within = (...ancestors) => ({
+    tagName: 'INPUT', type: 'text', dataset: {},
+    closest: (sel) => (sel.split(',').some((part) => ancestors.includes(part.trim())) ? {} : null),
+  });
+  assert.equal(isTextField(within('[role="search"]')), false, 'inside a role="search" box');
+  assert.equal(isTextField(within('[data-unsaved-ignore]')), false, 'inside an ignored container');
+  assert.equal(isTextField(within('[data-feed-route]')), true, 'an entry field in a page of the scroll still counts');
+  assert.equal(isTextField({ tagName: 'INPUT', type: 'text', dataset: {}, closest: () => { throw new Error('detached'); } }), true);
 });
 
 // ---- per page of the continuous scroll (PROD-T01, 2026-11-16) ----------------------------------------------------

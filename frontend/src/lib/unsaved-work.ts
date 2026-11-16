@@ -129,11 +129,26 @@ export class UnsavedWork {
 
 export const unsavedWork = new UnsavedWork();
 
-/** Text-like fields only: checkboxes, selects and sliders save on change and lose nothing worth a prompt. */
+/**
+ * Text-like fields only: checkboxes, selects and sliders save on change and lose nothing worth a prompt. A field that
+ * is not an entry (data-unsaved-ignore on it or an ancestor, or inside a role="search" box) never counts, so typing a
+ * search on a page of the scroll does not keep that page mounted.
+ */
 export function isTextField(el: unknown): el is Field {
-  const e = el as { tagName?: string; type?: string; isContentEditable?: boolean; dataset?: Record<string, string | undefined> } | null;
+  const e = el as {
+    tagName?: string;
+    type?: string;
+    isContentEditable?: boolean;
+    dataset?: Record<string, string | undefined>;
+    closest?: (selector: string) => unknown;
+  } | null;
   if (!e || typeof e.tagName !== "string") return false;
   if (e.dataset && e.dataset.unsavedIgnore !== undefined) return false;
+  try {
+    if (typeof e.closest === "function" && e.closest('[data-unsaved-ignore], [role="search"]')) return false;
+  } catch {
+    /* an element that cannot be queried counts by its own type below */
+  }
   const tag = e.tagName.toLowerCase();
   if (tag === "textarea") return true;
   if (tag === "input") {

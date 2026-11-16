@@ -26,7 +26,9 @@ import { DraftMark, LogCard, SectionSkeleton } from "./ui";
  * (ReadingLogDraft) fills the fields Riley has not changed and is saved like his own entry, marked "from what you
  * said"; a new draft after a session was saved starts a new session. Nothing is written on open or on scroll.
  * An entry not saved yet (incomplete, failed or waiting) survives the section being unmounted: its fields, the session
- * it made and its client_key stay with its autosaver until it is saved (useRetainedAutosave, PROD-T01).
+ * it made and its client_key stay with its autosaver until it is saved (useRetainedAutosave, PROD-T01). It keeps the
+ * day it was started on (also when finished after 06:00 with no new answer from the server), and it stays on screen
+ * with its reason and Retry when its book is no longer in progress (or the overview cannot be read), with Discard.
  */
 
 const READING_URL = LOG_READING_URL;
@@ -136,13 +138,18 @@ type ReadingFormData = {
    * later edit of the session it made, stays with that book even if the current book changes meanwhile.
    */
   entryBook: string | null;
-  /** The first send of this create went out (with no day chosen: the server's behavioral today applied to it). */
+  /** Something was entered: entryBook and entryDay were taken then (cleared when the form is emptied or reset). */
+  entryStarted: boolean;
+  /** The first send of this create went out. */
   entrySent: boolean;
   /**
-   * The day that first send was for: the day on screen, when the server had confirmed it as today and the day had
-   * not rolled since. Every later send of the same create (a retry, also one after the day rolled, also one running
-   * while the section is away) carries it, so the session never moves to the next day. Null when the day on screen
-   * could be stale (an offline first paint from the cache): a retry then lets the server decide again.
+   * The day this entry is for when no day was chosen: the day on screen when it was started, if that day was current
+   * then (the server's last answer said so and the day has not rolled since, or it is the clock's day); else the day
+   * on screen at the first send, if the server had confirmed it by then. The first send lets the server's behavioral
+   * today apply while that is still this day; every later send of the same create (a retry, also one running while
+   * the section is away) and a first send after the day rolled carry it, so the session never moves to the next day.
+   * Null = unknown (the day on screen could be stale, e.g. an offline first paint from the cache): the server decides,
+   * and the form then shows the day it stored.
    */
   entryDay: string | null;
 };
@@ -160,6 +167,7 @@ const newReadingData = (): ReadingFormData => ({
   pendingDraft: null,
   keptDay: false,
   entryBook: null,
+  entryStarted: false,
   entrySent: false,
   entryDay: null,
 });
@@ -179,6 +187,8 @@ export default function ReadingSection() {
     const at = confirmedAt.current;
     return at !== null && fallbackBehavioralToday(new Date(at)) === fallbackBehavioralToday(new Date());
   };
+  /** `day` is the server's behavioral today now: the overview on screen says so, and that is still current. */
+  const isCurrentDay = (day: string) => shownDayIsCurrent() && overviewRef.current?.today === day;
 
   // The saver and the form's state (`kept`) outlive this component while the entry is not saved. Its save may run
   // after an unmount (a retry): it reads and writes `kept` only, and touches React state only while mounted.
@@ -200,14 +210,14 @@ export default function ReadingSection() {
             if (!kept.clientKey) kept.clientKey = newClientKey();
             const body: Record<string, unknown> = { ...v.body, client_key: kept.clientKey };
             if (v.body.date === null) {
-              // No day chosen: the first send takes the server's behavioral today; a later send of this create keeps
-              // the day that first send was for (entryDay), whether or not this copy is still mounted.
-              if (!kept.entrySent) {
-                kept.entrySent = true;
-                kept.entryDay = shownDayIsCurrent() ? kept.form.date || overviewRef.current?.today || null : null;
-              } else if (kept.entryDay) {
-                body.date = kept.entryDay;
-              }
+              // No day chosen: the entry is for its own day (entryDay). The first send lets the server's behavioral
+              // today apply while that is still the entry's day; a first send after the day rolled (the entry was
+              // started before 06:00 and finished after, with no new answer from the server in between) and every
+              // later send of this create carry that day, whether or not this copy is still mounted.
+              const first = !kept.entrySent;
+              if (first && kept.entryDay === null && shownDayIsCurrent()) kept.entryDay = kept.form.date || overviewRef.current?.today || null;
+              kept.entrySent = true;
+              if (kept.entryDay && !(first && isCurrentDay(kept.entryDay))) body.date = kept.entryDay;
             }
             json = await send(target.url, "POST", body);
           } else {
@@ -228,6 +238,12 @@ export default function ReadingSection() {
         const session = json.session as ReadingSession | undefined;
         if (id === null && session?.session_id && kept.sessionId === null) {
           setSessionId(session.session_id);
+          // The server chose the day (the day on screen was not known to be current): show the day it stored.
+          const stored = typeof session.session_date === "string" && isYmd(session.session_date) ? session.session_date : null;
+          if (v.body.date === null && stored && !kept.touched.date && kept.form.date !== stored) {
+            kept.entryDay = stored;
+            setForm({ ...kept.form, date: stored });
+          }
           if (json.replayed) {
             // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
             // values on screen now are written onto it.
@@ -327,6 +343,7 @@ export default function ReadingSection() {
     const cur = overviewRef.current;
     const marks = kept.fromDraft?.fields;
     const book = f.book || kept.entryBook || cur?.book.slug || "";
+    if (!book) return { body: null, reason: "No book in progress to log this session for." };
     const otherBook = cur && book && book !== cur.book.slug ? book : null;
     const day = f.date || cur?.today || "";
     const chosenDay = kept.touched.date || kept.keptDay || marks?.date ? day : null;
@@ -342,6 +359,7 @@ export default function ReadingSection() {
     if (kept.sessionId === null && !anyBook && !kept.touched.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
       autosave.reset(); // back to nothing typed: nothing to save, nothing unsaved
       kept.entryBook = null;
+      kept.entryStarted = false;
       kept.entrySent = false;
       kept.entryDay = null;
       if (kept.keptDay) {
@@ -352,8 +370,14 @@ export default function ReadingSection() {
       }
       return;
     }
-    // The entry belongs to the book on screen now, also if the current book changes before it is saved.
+    // The entry belongs to the book on screen now, also if the current book changes before it is saved, and to the
+    // day on screen when that day is current (an entry started before 06:00 keeps its day when finished after).
     if (!kept.entryBook && cur) kept.entryBook = cur.book.slug;
+    if (!kept.entryStarted && kept.sessionId === null) {
+      kept.entryStarted = true;
+      const shown = next.date || cur?.today || "";
+      kept.entryDay = shown && (isCurrentDay(shown) || shown === fallbackBehavioralToday(new Date())) ? shown : null;
+    }
     autosave.change(valueOf(next));
   };
 
@@ -366,8 +390,8 @@ export default function ReadingSection() {
     const f = kept.form;
     if (f.date === today) return;
     if (kept.sessionId !== null && f.date) return; // a session already made stays on its own day, also on screen
-    // A first send whose day could have been stale (entryDay null) leaves the day to the server: the form follows.
-    if (f.date && f.date < today && kept.sessionId === null && autosave.dirty && (!kept.entrySent || kept.entryDay === f.date)) {
+    // An entry whose day on screen could have been stale (entryDay null) leaves the day to the server: the form follows.
+    if (f.date && f.date < today && kept.sessionId === null && autosave.dirty && kept.entryDay === f.date) {
       kept.keptDay = true;
       commit(f);
       return;
@@ -392,6 +416,7 @@ export default function ReadingSection() {
     kept.touched = { ...EMPTY_FIELDS };
     kept.keptDay = false;
     kept.entryBook = null;
+    kept.entryStarted = false;
     kept.entrySent = false;
     kept.entryDay = null;
     setFromDraft(null);
@@ -492,46 +517,49 @@ export default function ReadingSection() {
   const st = autosave.state.status;
   const busy = st === "saving" || removing;
 
+  // An entry this form still holds (not saved yet, or the session it made) stays on screen with its fields, reason
+  // and Retry also when there is no book in progress any more (the book was finished or set aside elsewhere) or the
+  // overview cannot be read: it is drawn for its own book, from the book list.
+  const keptEntry = !o && (sessionId !== null || autosave.dirty);
   if (!data && !loadFailed) return <SectionSkeleton section="reading" />;
-  if (!data) {
+  const loadError = (
+    <div className="flex items-center gap-3">
+      <p className="text-[13px] text-down">Couldn&apos;t load reading.</p>
+      <button type="button" onClick={load} className="min-h-11 px-3 text-[13px] text-text-secondary hover:text-text-primary underline underline-offset-2">
+        Retry
+      </button>
+    </div>
+  );
+  const noBook = <p className="text-[13px] text-text-tertiary">No book in progress.</p>;
+  if (!o && !keptEntry) {
     return (
       <LogCard title="Reading" id="log-section-reading">
-        <div className="flex items-center gap-3">
-          <p className="text-[13px] text-down">Couldn&apos;t load reading.</p>
-          <button type="button" onClick={load} className="min-h-11 px-3 text-[13px] text-text-secondary hover:text-text-primary underline underline-offset-2">
-            Retry
-          </button>
-        </div>
-      </LogCard>
-    );
-  }
-  if (!o) {
-    return (
-      <LogCard title="Reading" id="log-section-reading">
-        <p className="text-[13px] text-text-tertiary">No book in progress.</p>
+        {data ? noBook : loadError}
       </LogCard>
     );
   }
 
   const entryBook = form.book || kept.entryBook;
-  const otherBook = entryBook && entryBook !== o.book.slug ? entryBook : null;
-  const otherBookTitle = otherBook ? data.books?.find((b) => b.slug === otherBook)?.title ?? otherBook : null;
-  const total = o.totalChapters || 0;
-  const next = total ? Math.min(total, o.chaptersDone + 1) : o.chaptersDone + 1;
-  const chips = [next, next + 1].filter((n, i, all) => n >= 0 && (!total || n <= total) && all.indexOf(n) === i);
-  const todaySessions = o.sessions.filter((s) => s.session_date === o.today);
-  const pace = o.pace;
-  const paceText =
-    o.book.status === "finished"
+  const otherBook = entryBook && (!o || entryBook !== o.book.slug) ? entryBook : null;
+  const otherBookTitle = otherBook ? data?.books?.find((b) => b.slug === otherBook)?.title ?? otherBook : null;
+  const total = o?.totalChapters || 0;
+  const done = o?.chaptersDone ?? 0;
+  const next = total ? Math.min(total, done + 1) : done + 1;
+  const chips = o ? [next, next + 1].filter((n, i, all) => n >= 0 && (!total || n <= total) && all.indexOf(n) === i) : [];
+  const todaySessions = o ? o.sessions.filter((s) => s.session_date === o.today) : [];
+  const pace = o?.pace;
+  const paceText = !o || !pace
+    ? ""
+    : o.book.status === "finished"
       ? "finished"
       : pace.aheadBy === 0
         ? "on pace"
         : pace.aheadBy > 0
           ? `${pace.aheadBy} ahead`
           : `${-pace.aheadBy} behind`;
-  const paceClass = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-down";
+  const paceClass = !o || !pace || o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-down";
   const mediaOptions = form.medium === "kindle" ? [...MEDIA, { key: "kindle" as Medium, label: "Kindle" }] : MEDIA;
-  const day = form.date || o.today;
+  const day = form.date || today;
   const anyTouched = Object.values(kept.touched).some(Boolean) || anyMarked;
   const describedBy = (st === "incomplete" && anyTouched) || st === "error" ? statusId : undefined;
   const savedText = `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
@@ -544,8 +572,10 @@ export default function ReadingSection() {
     <LogCard
       title="Reading"
       id="log-section-reading"
-      action={<span className="font-mono text-[12px] tabular-nums text-text-secondary">ch {o.chaptersDone} / {total || "?"}</span>}
+      action={o ? <span className="font-mono text-[12px] tabular-nums text-text-secondary">ch {o.chaptersDone} / {total || "?"}</span> : undefined}
     >
+      {!o ? (data ? noBook : loadError) : (
+      <>
       <div>
         <p className="text-[14px] text-text-primary truncate">{o.book.title}</p>
         <div className="mt-1.5 h-1.5 rounded-full bg-white/[0.06] overflow-hidden" aria-hidden="true">
@@ -574,6 +604,8 @@ export default function ReadingSection() {
           <p className="mt-1 text-[13px] text-text-tertiary">Nothing logged today.</p>
         )}
       </div>
+      </>
+      )}
 
       <form
         noValidate
@@ -650,7 +682,7 @@ export default function ReadingSection() {
               value={form.through}
               aria-describedby={describedBy}
               onChange={(e) => set("through", { through: e.target.value })}
-              placeholder={String(next)}
+              placeholder={o ? String(next) : undefined}
               className={inputCls}
             />
           </label>
@@ -689,9 +721,9 @@ export default function ReadingSection() {
             <input
               type="date"
               value={day}
-              max={o.today}
+              max={today || undefined}
               aria-describedby={describedBy}
-              onChange={(e) => set("date", { date: e.target.value || o.today })}
+              onChange={(e) => set("date", { date: e.target.value || today })}
               className={inputCls}
             />
           </label>
@@ -711,10 +743,20 @@ export default function ReadingSection() {
 
         <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
           <span className="text-[12px] text-text-tertiary">
-            {day !== o.today ? `For ${fmtDate(day)}` : "For today"}
+            {day && day !== today ? `For ${fmtDate(day)}` : "For today"}
             {" · "}
             <AutosaveStatus id={statusId} state={autosave.state} onRetry={() => void autosave.retry()} savedText={savedText} showIncomplete={anyTouched} />
           </span>
+          {sessionId === null && !o && (
+            <button
+              type="button"
+              onClick={startNew}
+              disabled={busy}
+              className="min-h-11 px-2 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
+            >
+              Discard this entry
+            </button>
+          )}
           {sessionId !== null && (
             <span className="flex items-center gap-1">
               <button
