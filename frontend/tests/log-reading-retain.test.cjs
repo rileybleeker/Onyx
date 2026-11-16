@@ -2,7 +2,8 @@
 // (app/log/sections/Reading.tsx) keeps an entry that is not saved yet when the section is unmounted (the continuous
 // scroll dropping the Log page, a navigation, a hidden part) and shows it again on the next mount; a create that
 // failed offline keeps its client_key, so Retry creates the session once; opening the section never sends anything;
-// an entry made before the behavioral day rolls keeps its own day.
+// an entry made before the behavioral day rolls keeps its own day; Discard / Remove / New session pressed while a
+// field has focus are never pre-empted by the form's blur save (the press keeps focus, Tab to them skips the save).
 // Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
 // tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
 // "server" is the in-memory fetch below.
@@ -111,6 +112,8 @@ function setup(t) {
   const rows = new Map();
   let mode = "up";
   let readMode = "up";
+  /** While set, every save request waits for it (the request is in flight, as between a press and its click). */
+  let hold = null;
   // The server's behavioral today (a create without a date is stored on it) and the clock's guess of the same day:
   // D1 until rollDay(), then D2 for every instant from then on.
   let serverToday = D1;
@@ -122,6 +125,7 @@ function setup(t) {
     fetch: async (url, init = {}) => {
       const body = init.body ? JSON.parse(init.body) : null;
       calls.push({ url, method: init.method, body });
+      if (hold && (init.method === "POST" || init.method === "PATCH")) await hold.promise;
       if (mode === "offline") throw new TypeError("Failed to fetch");
       if (init.method === "POST" && url === "/api/reading/sessions") {
         const replayed = rows.has(body.client_key);
@@ -130,6 +134,7 @@ function setup(t) {
         return reply({ session: row, replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: row.session_date, overview: null });
       }
       if (init.method === "PATCH") return reply({ session: { session_id: Number(url.split("/").pop()) }, xp_gained: 0, finished: false, overview: null });
+      if (init.method === "DELETE" && url.startsWith("/api/reading/sessions/")) return reply({ overview: null });
       throw new Error(`unexpected request ${init.method} ${url}`);
     },
   };
@@ -203,6 +208,20 @@ function setup(t) {
     assert.ok(b, `button exists: ${label}`);
     return b;
   };
+  /** The element focus moves to, as a blur event's relatedTarget: answers closest("[attr]") from its props. */
+  const asTarget = (node) => ({
+    closest: (selector) => {
+      const m = /^\[([^\]=]+)\]$/.exec(selector);
+      return m && node && m[1] in node.props ? {} : null;
+    },
+  });
+  /** Focus leaves a field of the session form for `label`'s button (null = out of the form): the form's onBlur. */
+  const blurTo = async (label) => {
+    const form = nodes().find((n) => n.type === "form");
+    assert.ok(form, "the session form is drawn");
+    form.props.onBlur({ relatedTarget: label === null ? null : asTarget(button(label)) });
+    await flush();
+  };
   const h = {
     timers, work, retainer, calls, rows,
     set mode(m) { mode = m; },
@@ -221,6 +240,26 @@ function setup(t) {
     hasButton: (label) => nodes().some((n) => n.type === "button" && text(n) === label),
     type: async (label, value) => { field(label).props.onChange({ target: { value } }); await flush(); },
     click: async (label) => { await button(label).props.onClick(); await flush(); },
+    blurTo,
+    /**
+     * A pointer press on a button while a field of the form has focus, in a browser's order: mousedown, whose default
+     * action moves focus to the button (so the field blurs) unless it is prevented; then the click, which a browser
+     * never delivers to a button that became disabled or left the page in between.
+     */
+    async press(label) {
+      const down = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+      button(label).props.onMouseDown?.(down);
+      if (!down.defaultPrevented) await blurTo(label);
+      const b = nodes().find((n) => n.type === "button" && text(n) === label);
+      if (b && !b.props.disabled) await b.props.onClick();
+      await flush();
+    },
+    /** Hold every save request in flight until the returned release() is called. */
+    holdSaves() {
+      let release;
+      hold = { promise: new Promise((resolve) => { release = resolve; }) };
+      return async () => { const h0 = hold; hold = null; release(); await h0.promise; await flush(); };
+    },
     async mount() { R.gen += 1; R.frames = new Map(); R.mounted = true; R.dirty = true; await flush(); },
     async unmount() {
       const cells = [...R.frames.values()].flatMap((f) => f.slots.filter((s) => s && typeof s === "object" && "cleanup" in s));
@@ -539,4 +578,78 @@ test("no book in progress and nothing kept: only the line, no form", async (t) =
   assert.match(h.text(), /No book in progress\./);
   assert.equal(h.hasButton("Audio"), false);
   assert.equal(h.calls.length, 0);
+});
+
+/** No book in progress any more, and a kept entry that is complete and waiting for its pause (would be saved on blur). */
+async function keptCompleteEntryWithoutBook(h) {
+  await h.mount();
+  await h.type("Minutes", "20");
+  await h.unmount();
+  await h.serve(noBookAnswer());
+  await h.mount();
+  await h.type("Through ch.", "5"); // the field keeps focus; the entry is complete now
+  assert.match(h.text(), /Not saved yet/);
+  assert.ok(h.hasButton("Discard this entry"));
+  assert.equal(h.calls.length, 0);
+}
+
+test("Discard pressed while a field has focus drops the entry: the field's blur never saves it first", async (t) => {
+  const h = setup(t);
+  await keptCompleteEntryWithoutBook(h);
+  await h.press("Discard this entry");
+  assert.equal(h.posts().length, 0, "nothing was created on the way to the button");
+  assert.equal(h.rows.size, 0);
+  assert.match(h.text(), /No book in progress\./, "the click landed: the entry is gone");
+  assert.equal(h.hasButton("Audio"), false, "no form without a book once nothing is kept");
+  assert.equal(h.work.has(), false, "a discarded entry is not unsaved work");
+  await h.tick(60_000);
+  assert.equal(h.calls.length, 0, "and nothing is sent later (its pause timer went with it)");
+  await h.unmount();
+  assert.equal(h.retainer.size, 0);
+});
+
+test("Discard reached with the keyboard: Tab to it does not save, Enter discards, nothing is sent", async (t) => {
+  const h = setup(t);
+  await keptCompleteEntryWithoutBook(h);
+  await h.blurTo("Discard this entry"); // Tab from the field to the button
+  assert.equal(h.calls.length, 0, "moving focus to Discard is not a reason to save");
+  await h.click("Discard this entry");
+  assert.equal(h.calls.length, 0);
+  assert.match(h.text(), /No book in progress\./);
+  assert.equal(h.work.has(), false);
+});
+
+test("leaving the form from a field still saves at once; Remove pressed with an edit waiting deletes without sending it", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Through ch.", "3");
+  await h.blurTo(null); // focus leaves the form
+  assert.equal(h.posts().length, 1, "blur out of the form saves without waiting for the pause");
+  assert.match(h.text(), /This session/);
+
+  await h.type("Minutes", "40"); // an edit of that session, waiting; the field keeps focus
+  const before = h.calls.length;
+  await h.press("Remove this session");
+  const after = h.calls.slice(before);
+  assert.deepEqual(after.map((c) => c.method), ["DELETE"], "the waiting edit belongs to the removed session: never sent");
+  assert.match(h.text(), /Audio or paper session/, "the removal landed: a new, empty form");
+  assert.equal(h.value("Through ch."), "");
+});
+
+test("New session pressed while a field has focus and a save would be in flight: the click lands, the edit is saved once, then a new form", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.match(h.text(), /This session/);
+  await h.type("Minutes", "40");
+  const before = h.calls.length;
+  const release = h.holdSaves(); // the request stays in flight, as it would between the press and the click
+  await h.press("New session");
+  await release();
+  const after = h.calls.slice(before);
+  assert.deepEqual(after.map((c) => c.method), ["PATCH"], "the waiting edit is sent once");
+  assert.equal(after[0].body.minutes, 40);
+  assert.match(h.text(), /Audio or paper session/, "and the click was not lost to a disabled button");
+  assert.equal(h.value("Minutes"), "");
 });

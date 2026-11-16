@@ -154,6 +154,23 @@ type ReadingFormData = {
   entryDay: string | null;
 };
 
+/**
+ * The form's action buttons (Discard, Remove, New session, the removal's Retry) decide themselves what happens to
+ * the entry, so reaching one never saves it first. The form saves on blur; without this, pressing Discard while a field
+ * has focus moved focus to the button, the field's blur created the session, and the button was disabled (busy) or
+ * gone before the click landed (PROD-T01). A pointer press keeps focus where it is (no blur at all); focus moving to one
+ * of them (Tab) skips the blur save, and leaving the form from one still saves.
+ */
+const BLUR_SKIP_ATTR = "data-autosave-blur-skip";
+const keepsFocus = {
+  [BLUR_SKIP_ATTR]: "",
+  onMouseDown: (e: { preventDefault(): void }) => e.preventDefault(),
+} as const;
+function skipsBlurSave(next: EventTarget | null): boolean {
+  const el = next as { closest?: (selector: string) => unknown } | null;
+  return !!el && typeof el.closest === "function" && !!el.closest(`[${BLUR_SKIP_ATTR}]`);
+}
+
 const newReadingData = (): ReadingFormData => ({
   form: blankForm(""),
   touched: { ...EMPTY_FIELDS },
@@ -610,7 +627,7 @@ export default function ReadingSection() {
       <form
         noValidate
         onSubmit={(e) => { e.preventDefault(); void autosave.flush(); }}
-        onBlur={() => void autosave.flush()}
+        onBlur={(e) => { if (!skipsBlurSave(e.relatedTarget)) void autosave.flush(); }}
         className="mt-4 border-t border-border-subtle pt-3"
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -750,6 +767,7 @@ export default function ReadingSection() {
           {sessionId === null && !o && (
             <button
               type="button"
+              {...keepsFocus}
               onClick={startNew}
               disabled={busy}
               className="min-h-11 px-2 text-[12px] text-text-tertiary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
@@ -761,6 +779,7 @@ export default function ReadingSection() {
             <span className="flex items-center gap-1">
               <button
                 type="button"
+                {...keepsFocus}
                 onClick={() => void removeSession()}
                 disabled={busy}
                 className="min-h-11 px-2 text-[12px] text-text-tertiary hover:text-down underline underline-offset-2 disabled:opacity-40"
@@ -769,6 +788,7 @@ export default function ReadingSection() {
               </button>
               <button
                 type="button"
+                {...keepsFocus}
                 onClick={() => void autosave.flush().then((ok) => { if (ok && alive.current) startNew(); })}
                 disabled={busy || st === "error"}
                 className="min-h-11 px-4 rounded-full text-[13px] font-medium border border-border-subtle text-text-secondary hover:text-text-primary disabled:opacity-40"
@@ -783,6 +803,7 @@ export default function ReadingSection() {
             <p role="alert">{removeError}</p>
             <button
               type="button"
+              {...keepsFocus}
               onClick={() => void removeSession()}
               disabled={busy}
               className="min-h-11 px-1 text-text-secondary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
