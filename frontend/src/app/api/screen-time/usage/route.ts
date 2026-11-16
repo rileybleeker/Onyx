@@ -39,8 +39,12 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * builds from 2026-11-16 also send `run` (lib/screen-time-upload.ts) with every
  * chunk. The hours are written first, then the chunk is recorded in
  * pds.phone_usage_sync_chunks and pds.finalize_phone_usage_run marks the run's
- * hours verified once every chunk arrived and Apple's stream ended on its own;
- * the answer then carries `completeness` (the run's status). A watchdog stop, a
+ * hours verified once every chunk arrived and Apple's stream ended on its own,
+ * for hours that ended at or before the run's coverage end (the earlier of the
+ * export time and `source_updated_at`, Apple's own last update: a clean stream
+ * from a stale cache is current only that far, and hours after it are unknown,
+ * never "no usage"); the answer carries `completeness` (the run's status) and
+ * `covered_through`. A run without `source_updated_at` is refused. A watchdog stop, a
  * missing chunk or an app stopped halfway leaves the hours unverified. A body
  * without `run` (older builds) is stored exactly as before and stays
  * unverified: completeness unknown, never complete. A malformed `run` is a
@@ -219,7 +223,9 @@ export async function POST(req: NextRequest) {
       // Provenance, always sent so an older build's upload clears a run's claim on the hour.
       last_run_id: run?.runId ?? null,
       last_run_item_count: null as number | null,
-      last_export_at: run?.windowEnd ?? null,
+      // The instant Apple's data is known current through (the earlier of the export time and Apple's own
+      // last update): it orders exports against each other and is what the database verifies hours up to.
+      last_export_at: run?.coverageEnd ?? null,
     });
 
     for (const it of Array.isArray(raw.items) ? (raw.items as ItemInput[]) : []) {
@@ -257,14 +263,21 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const segRows = [...segments.values()];
+    // Rows go to the database in hour order, the order the finalization locks hours in, so a concurrent
+    // finalization and this upload never wait for each other crosswise (ISO instants sort as text).
+    const byHour = (a: Record<string, unknown>, b: Record<string, unknown>) => {
+      const x = String(a.segment_start);
+      const y = String(b.segment_start);
+      return x < y ? -1 : x > y ? 1 : 0;
+    };
+    const segRows = [...segments.values()].sort(byHour);
     for (let i = 0; i < segRows.length; i += CHUNK) {
       const { error } = await supabase
         .from("phone_usage_segments")
         .upsert(segRows.slice(i, i + CHUNK), { onConflict: "device,segment_start" });
       if (error) throw new Error(`segments: ${error.message}`);
     }
-    const itemRows = [...items.values()];
+    const itemRows = [...items.values()].sort(byHour);
     for (let i = 0; i < itemRows.length; i += CHUNK) {
       const { error } = await supabase
         .from("phone_usage_items")
@@ -295,6 +308,8 @@ export async function POST(req: NextRequest) {
       items: itemRows.length,
       completeness,
       hours_verified: Number.isFinite(verified) ? verified : 0,
+      // What the run is current through (Apple's own last update may be older than the export time).
+      covered_through: run.coverageEnd,
       chunk: { index: run.chunkIndex, count: run.chunkCount },
     });
   } catch (e) {

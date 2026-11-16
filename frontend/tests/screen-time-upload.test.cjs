@@ -20,6 +20,7 @@ function runMeta(over = {}) {
     run_id: RUN_ID,
     window_start: "2030-03-08T05:00:00Z",
     window_end: "2030-03-10T14:30:00Z",
+    source_updated_at: "2030-03-10T14:20:00Z", // Apple's own last update: ten minutes before the export was read
     stream_ended: true,
     segment_count: 2,
     chunk_index: 0,
@@ -39,10 +40,30 @@ test("a good run parses, the id is lower-cased and times normalised", () => {
   assert.equal(p.run.runId, RUN_ID.toLowerCase());
   assert.equal(p.run.windowStart, "2030-03-08T05:00:00.000Z");
   assert.equal(p.run.windowEnd, "2030-03-10T14:30:00.000Z");
+  assert.equal(p.run.sourceUpdated, "2030-03-10T14:20:00.000Z");
+  assert.equal(p.run.coverageEnd, "2030-03-10T14:20:00.000Z"); // the run is current only through Apple's last update
   assert.equal(p.run.streamEnded, true);
   assert.deepEqual([p.run.segmentCount, p.run.chunkIndex, p.run.chunkCount], [2, 0, 1]);
   // A watchdog stop is still a well-formed run: the database decides it is not complete.
   assert.equal(U.parseUploadRun(runMeta({ stream_ended: false }), NOW, LIMITS).run.streamEnded, false);
+});
+
+test("coverage is the earlier of the export time and Apple's last update", () => {
+  const cover = (over) => U.parseUploadRun(runMeta(over), NOW, LIMITS).run.coverageEnd;
+  // A source updated before the export was read limits the coverage (a clean stream from a stale cache).
+  assert.equal(cover({ source_updated_at: "2030-03-10T09:00:00Z" }), "2030-03-10T09:00:00.000Z");
+  // A source that claims to be newer than the export cannot extend it.
+  assert.equal(cover({ source_updated_at: "2030-03-10T14:45:00Z" }), "2030-03-10T14:30:00.000Z");
+  // A source older than the window covers nothing of it.
+  assert.equal(cover({ source_updated_at: "2030-03-07T00:00:00Z" }), "2030-03-07T00:00:00.000Z");
+});
+
+test("a run without Apple's freshness is refused, never certified through the export time", () => {
+  const { source_updated_at, ...without } = runMeta();
+  void source_updated_at;
+  const p = U.parseUploadRun(without, NOW, LIMITS);
+  assert.equal(p.kind, "bad");
+  assert.ok(p.reason.includes("source_updated_at"), p.reason);
 });
 
 test("every malformed field is refused with a reason that names the field and echoes no value", () => {
@@ -53,6 +74,9 @@ test("every malformed field is refused with a reason that names the field and ec
     ["run_id", { run_id: 7 }],
     ["window_start", { window_start: "yesterday" }],
     ["window_end is not after", { window_end: "2030-03-08T05:00:00Z" }],
+    ["source_updated_at", { source_updated_at: "yesterday" }],
+    ["source_updated_at", { source_updated_at: 12 }],
+    ["source_updated_at", { source_updated_at: "2030-03-10T20:00:00Z" }],
     ["longer than 40 days", { window_start: "2030-01-01T00:00:00Z" }],
     ["outside the accepted time range", { window_end: "2030-03-10T20:00:00Z" }],
     ["stream_ended", { stream_ended: "true" }],
@@ -175,8 +199,8 @@ test("a run chunk: hours, then items, then the chunk ack, then finalization; the
   const seg = log.find((c) => c.table === "phone_usage_segments").rows;
   const runId = RUN_ID.toLowerCase();
   assert.deepEqual(seg.map((r) => [r.last_run_id, r.last_run_item_count, r.last_export_at]), [
-    [runId, 2, "2030-03-10T14:30:00.000Z"],
-    [runId, 0, "2030-03-10T14:30:00.000Z"], // an hour with no items claims zero
+    [runId, 2, "2030-03-10T14:20:00.000Z"], // last_export_at = how far the export is known current
+    [runId, 0, "2030-03-10T14:20:00.000Z"], // an hour with no items claims zero
   ]);
   for (const row of log.find((c) => c.table === "phone_usage_items").rows) assert.equal(row.last_run_id, runId);
   const chunk = log.find((c) => c.table === "phone_usage_sync_chunks");
@@ -185,10 +209,38 @@ test("a run chunk: hours, then items, then the chunk ack, then finalization; the
     [chunk.rows.run_id, chunk.rows.chunk_index, chunk.rows.chunk_count, chunk.rows.stream_ended, chunk.rows.run_segment_count, chunk.rows.segment_count],
     [runId, 0, 1, true, 2, 2],
   );
+  assert.equal(chunk.rows.window_end, "2030-03-10T14:30:00.000Z");
+  assert.equal(chunk.rows.source_updated_at, "2030-03-10T14:20:00.000Z"); // Apple's freshness reaches the database
+  assert.equal(res.body.covered_through, "2030-03-10T14:20:00.000Z");
   assert.equal(chunk.rows.first_segment_start, "2030-03-10T12:00:00.000Z");
   assert.equal(chunk.rows.last_segment_end, "2030-03-10T14:00:00.000Z");
   assert.equal(chunk.rows.app_version, "0.2.0 (9)");
   assert.deepEqual(log.find((c) => c.op === "rpc").args, { p_device: "iphone", p_run_id: runId });
+});
+
+test("a clean stream from a stale source is covered only through Apple's last update", async () => {
+  const stale = "2030-03-10T12:30:00Z";
+  const { res, log } = await post({ segments: SEGMENTS, run: runMeta({ source_updated_at: stale }) });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.covered_through, "2030-03-10T12:30:00.000Z");
+  // The export time still travels (it orders exports and bounds the window), the freshness limits coverage.
+  const chunk = log.find((c) => c.table === "phone_usage_sync_chunks").rows;
+  assert.equal(chunk.window_end, "2030-03-10T14:30:00.000Z");
+  assert.equal(chunk.source_updated_at, "2030-03-10T12:30:00.000Z");
+  for (const row of log.find((c) => c.table === "phone_usage_segments").rows) {
+    assert.equal(row.last_export_at, "2030-03-10T12:30:00.000Z");
+  }
+});
+
+test("hours and items are written in hour order, the order the finalization locks them in", async () => {
+  const reversed = [hourSeg("2030-03-10T13:00:00Z", ITEMS), hourSeg("2030-03-10T12:00:00Z", ITEMS)];
+  const { log } = await post({ segments: reversed, run: runMeta() });
+  const seg = log.find((c) => c.table === "phone_usage_segments").rows;
+  assert.deepEqual(seg.map((r) => r.segment_start), ["2030-03-10T12:00:00.000Z", "2030-03-10T13:00:00.000Z"]);
+  const items = log.find((c) => c.table === "phone_usage_items").rows;
+  assert.deepEqual(items.map((r) => r.segment_start), [
+    "2030-03-10T12:00:00.000Z", "2030-03-10T12:00:00.000Z", "2030-03-10T13:00:00.000Z", "2030-03-10T13:00:00.000Z",
+  ]);
 });
 
 test("a watchdog stop is recorded as such, and the database's 'not complete' answer is passed back", async () => {
@@ -236,6 +288,7 @@ test("malformed run metadata and chunks that contradict their run are rejected u
   const cases = [
     [{ segments: SEGMENTS, run: runMeta({ stream_ended: "yes" }) }, "completeness metadata invalid"],
     [{ segments: SEGMENTS, run: "run" }, "completeness metadata invalid"],
+    [{ segments: SEGMENTS, run: (({ source_updated_at, ...r }) => r)(runMeta()) }, "source_updated_at is not a time"],
     [{ segments: [], run: runMeta() }, "a run chunk carried no segments"],
     [{ segments: [hourSeg("2030-03-07T12:00:00Z")], run: runMeta() }, "outside its run's window"],
     [{ segments: SEGMENTS, run: runMeta({ segment_count: 1 }) }, "more hours than its run"],
@@ -259,9 +312,21 @@ test("the route is still the only CI-token Screen Time path and the app sends `r
   assert.match(swift, /payload\(for: result, segments: chunk, run: run\)/);
   assert.match(swift, /UUID\(\)\.uuidString\.lowercased\(\)/);
   const models = fs.readFileSync(path.join(SRC, "..", "..", "tools", "screentime_ios", "OnyxScreenTime", "Models.swift"), "utf8");
-  for (const key of ["run_id", "window_start", "window_end", "stream_ended", "segment_count", "chunk_index", "chunk_count"]) {
+  for (const key of ["run_id", "window_start", "window_end", "source_updated_at", "stream_ended", "segment_count", "chunk_index", "chunk_count"]) {
     assert.match(models, new RegExp(`let ${key}:`), key);
   }
+});
+
+test("the app sends Apple's own last-update time, never claiming the export time as coverage", () => {
+  const dir = path.join(SRC, "..", "..", "tools", "screentime_ios", "OnyxScreenTime");
+  const exporter = fs.readFileSync(path.join(dir, "ScreenTimeExporter.swift"), "utf8");
+  const sync = fs.readFileSync(path.join(dir, "SyncService.swift"), "utf8");
+  // The stream's freshness is read from every emission and the EARLIEST one is kept (hours of an older
+  // emission that a later one did not re-send are only as fresh as that emission).
+  assert.match(exporter, /noteSource\(updatedAt: data\.lastUpdatedDate\)/);
+  assert.match(exporter, /sourceUpdatedAt\.map \{ min\(\$0, updatedAt\) \}/);
+  assert.match(exporter, /sourceUpdatedAt: await store\.sourceUpdatedAt \?\? firstDay/);
+  assert.match(sync, /source_updated_at: result\.sourceUpdatedAt/);
 });
 
 test("the app reports stream_ended only for a stream that ended by itself with no error", () => {

@@ -10,8 +10,12 @@ applied. This file keeps a later edit from quietly undoing the rules that check 
   * the new tables are service-role only (RLS on, nothing granted to anon / authenticated),
   * the finalization refuses a watchdog stop, a missing chunk and disagreeing chunks before it
     verifies anything, locks the hours it may change before it decides, verifies only closed whole
-    hours the run still owns, and removes only items of an hour it verifies or replaces and the
-    staged copies of settled or old runs,
+    hours the run still owns that ended by the run's coverage end (the earlier of the export time and
+    Apple's own last update: a clean stream from a stale cache never certifies the hours after it),
+    and removes only items of an hour it verifies or replaces and the staged copies of settled or
+    old runs,
+  * the item guard locks the hour (FOR SHARE) before it reads whether it is verified or who owns it,
+    so an item write and a finalization are one after the other,
   * a verified hour is a snapshot an ordinary upload cannot change; a newer run's upload is staged and
     replaces the snapshot only when that run finalizes complete,
   * the view keeps every existing column, in order, and appends the five completeness columns,
@@ -79,6 +83,8 @@ def test_additive_and_sendable():
     for col in ("last_run_id", "last_run_item_count", "last_export_at", "verified_at", "verified_run_id",
                 "verified_export_at"):
         assert re.search(rf"ADD COLUMN IF NOT EXISTS {col}\s+\w+[,;]\n", sql), col
+    for col in ("source_updated_at", "coverage_end"):
+        assert re.search(rf"ADD COLUMN IF NOT EXISTS {col}\s+TIMESTAMPTZ[,;]\n", sql), col
     assert not re.search(r"ADD COLUMN[^\n]*NOT NULL", sql), "new columns on existing tables stay nullable"
     for table in ("phone_usage_sync_chunks", "phone_usage_sync_runs", "phone_usage_pending_hours"):
         assert f"CREATE TABLE IF NOT EXISTS pds.{table}" in sql, table
@@ -114,8 +120,13 @@ def test_finalization_refuses_unsupported_runs_before_verifying():
     assert "ELSIF NOT c.ended_all THEN" in fn, "a watchdog stop is never complete"
     assert "ELSIF c.chunks < c.chunk_count THEN" in fn, "a missing chunk is never complete"
     assert "c.segments_received <> c.segment_total" in fn
+    # Coverage: the earlier of the export time and Apple's own last update; no source time covers nothing,
+    # and chunks that disagree on it are one inconsistent run.
+    assert "v_cover := LEAST(c.window_end, COALESCE(c.source_updated, c.window_start));" in fn
+    assert "c.source_updated IS DISTINCT FROM c.source_updated_max" in fn
+    assert "c.source_known NOT IN (0, c.n)" in fn
     verify = fn[fn.index("IF v_status = 'complete' THEN"):fn.index("INSERT INTO pds.phone_usage_sync_runs")]
-    for rule in ("s.last_run_id = p_run_id", "s.verified_at IS NULL", "s.segment_end <= c.window_end",
+    for rule in ("s.last_run_id = p_run_id", "s.verified_at IS NULL", "s.segment_end <= v_cover",
                  "s.segment_end - s.segment_start >= INTERVAL '1 hour'", "s.last_run_item_count IS NOT NULL",
                  "i.last_run_id IS DISTINCT FROM p_run_id"):
         assert rule in verify, rule
@@ -127,8 +138,8 @@ def test_finalization_refuses_unsupported_runs_before_verifying():
     assert "AND s.last_run_id = p_run_id AND s.verified_at IS NULL\n            RETURNING 1" in verify, "the marking rechecks ownership"
     # A later complete export replaces the snapshot of an hour an earlier run verified, only from its own staged copy.
     fix = verify[verify.index("SELECT COALESCE(array_agg"):verify.index("DELETE FROM pds.phone_usage_pending_hours h WHERE h.device")]
-    for rule in ("h.run_id = p_run_id", "s.verified_at IS NOT NULL", "s.verified_export_at < c.window_end",
-                 "(h.segment ->> 'segment_end')::timestamptz <= c.window_end", ">= INTERVAL '1 hour'",
+    for rule in ("h.run_id = p_run_id", "s.verified_at IS NOT NULL", "s.verified_export_at < v_cover",
+                 "(h.segment ->> 'segment_end')::timestamptz <= v_cover", ">= INTERVAL '1 hour'",
                  "(h.segment ->> 'last_run_item_count')::int = (SELECT count(*) FROM jsonb_object_keys(h.items))",
                  "verified_run_id        = p_run_id"):
         assert rule in fix, rule
@@ -155,7 +166,14 @@ def test_guards_keep_the_snapshot_and_the_ownership():
     assert "NEW.last_run_id IS DISTINCT FROM parent_verified_run" in verified_items
     assert "UPDATE pds.phone_usage_pending_hours" in verified_items
     assert "RETURN NULL;" in verified_items and "RETURN NEW" not in verified_items, "a verified hour's items never change directly"
-    assert "NEW.last_run_id IS NOT NULL AND parent_run IS DISTINCT FROM NEW.last_run_id" in items
+    # An item applies only while the upload that wrote it owns the hour: a run's item while that run owns it,
+    # an item without a run id only while no run does.
+    assert "IF parent_run IS DISTINCT FROM NEW.last_run_id THEN\n        RETURN NULL;" in items
+    # The hour is locked BEFORE it is read and the lock lasts to the end of the transaction (past the item
+    # write), so a finalization that verifies the hour cannot slip in between the check and the write.
+    locked_read = items[items.index("SELECT s.verified_at, s.last_run_id, s.verified_run_id"):items.index("IF NOT FOUND THEN")]
+    assert "FOR SHARE OF s" in locked_read, "the item guard must lock its hour while it reads it"
+    assert items.index("FOR SHARE OF s") < items.index("IF parent_verified IS NOT NULL THEN")
     assert "BEFORE INSERT OR UPDATE ON pds.phone_usage_segments" in sql
     assert "BEFORE INSERT OR UPDATE ON pds.phone_usage_items" in sql
     # Postgres fires BEFORE triggers in name order: the guard must come before the date trigger so a
@@ -182,7 +200,7 @@ def test_view_keeps_its_columns_and_appends_completeness():
 def test_window_check_needs_a_complete_run_and_no_unverified_hour():
     fn = _no_comments(_function(_sql(MIGRATION), "phone_usage_window_complete"))
     assert "COALESCE(p_from < p_to, false)" in fn, "a missing bound is never complete"
-    assert "r.status = 'complete' AND r.window_start <= p_from AND r.window_end >= p_to" in fn
+    assert "r.status = 'complete' AND r.window_start <= p_from AND r.coverage_end >= p_to" in fn
     assert "s.verified_at IS NULL AND s.segment_start < p_to AND s.segment_end > p_from" in fn
 
 
@@ -227,7 +245,8 @@ def test_branch_check_is_rolled_back_and_refuses_real_data():
     for case in ("'stream_open'", "'receiving'", "'inconsistent'", "'complete'", "'unknown'", "'partial'",
                  "items_removed", "'already'", "hours_replaced", "pds.phone_usage_pending_hours",
                  "later_complete_export_replaces_snapshot", "later_incomplete_export_keeps_snapshot",
-                 "older_export_not_staged"):
+                 "older_export_not_staged", "stale_source_limits_coverage", "legacy_item_refused",
+                 "source_updated_at", "coverage_end"):
         assert case in body, case
 
 

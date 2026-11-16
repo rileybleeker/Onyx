@@ -106,14 +106,19 @@ Onyx refuses (401) cannot be reported; the card catches those when the last
 heartbeat is more than 36 h old. Builds before this one report nothing.
 
 Export completeness (from the build after 2026-11-16, PIPE-11): every chunk
-carries a `run` object (one id per sync, the requested window, whether Apple's
-stream ended on its own, the hour count and the chunk's index / count). Onyx
-counts the hours as verified only when every chunk of the run arrived and the
-stream ended by itself with no error; a sync the watchdog stopped ("[stream
-stopped by watchdog]" in the summary), a stream that threw part-way ("[stream
-failed before it ended]"), a chunk that failed or an app stopped halfway leaves
-them unverified, and the summary ends with what Onyx made of the run ("verified
-complete" or "not verified: ..."). An hour Onyx already verified keeps that
+carries a `run` object (one id per sync, the requested window, Apple's own
+last-update time for the data (`source_updated_at`, the earliest the stream
+reported: `DeviceActivityData.lastUpdatedDate`), whether Apple's stream ended on
+its own, the hour count and the chunk's index / count). Onyx counts the hours as
+verified only when every chunk of the run arrived and the stream ended by itself
+with no error, and only the hours that ended by the run's coverage end (the
+earlier of the export time and `source_updated_at`: a stream that ends cleanly
+from a stale cache is current only that far, and the hours after it are unknown,
+not "no usage"). A sync the watchdog stopped ("[stream stopped by watchdog]" in
+the summary), a stream that threw part-way ("[stream failed before it ended]"),
+a chunk that failed or an app stopped halfway leaves them unverified, and the
+summary ends with what Onyx made of the run ("verified complete through <time>"
+or "not verified: ..."). An hour Onyx already verified keeps that
 snapshot until a LATER run completes, which then replaces it (a later run that
 does not complete changes nothing). Uploads from older builds are still accepted
 but never verified, so Screen Time days read as unverified until this build

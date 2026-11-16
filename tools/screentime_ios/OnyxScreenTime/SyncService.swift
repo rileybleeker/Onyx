@@ -69,6 +69,7 @@ enum SyncService {
             run_id: runID,
             window_start: result.windowStart,
             window_end: result.windowEnd,
+            source_updated_at: result.sourceUpdatedAt,
             stream_ended: result.streamEnded,
             segment_count: result.segments.count,
             chunk_index: chunkIndex,
@@ -80,6 +81,15 @@ enum SyncService {
     static func completeness(_ data: Data) -> String? {
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         return object["completeness"] as? String
+    }
+
+    /// How far Onyx says the run is current (Apple's own last update can be older than the export time).
+    static func coveredThrough(_ data: Data) -> Date? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let text = object["covered_through"] as? String else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return withFraction.date(from: text) ?? ISO8601DateFormatter().date(from: text)
     }
 
     /// Reads the last `days` days from Screen Time and sends them to Onyx.
@@ -110,6 +120,7 @@ enum SyncService {
         let chunks = chunkCount(for: result.segments.count)
         var chunkIndex = 0
         var lastCompleteness: String?
+        var lastCoveredThrough: Date?
         var sent = 0
         var index = 0
         while index < result.segments.count {
@@ -147,12 +158,13 @@ enum SyncService {
                 throw SyncError.server(code, body)
             }
             lastCompleteness = completeness(data)
+            lastCoveredThrough = coveredThrough(data)
             sent += chunk.count
             index += chunkSize
             chunkIndex += 1
         }
 
-        let summary = describe(result, sent: sent, completeness: lastCompleteness)
+        let summary = describe(result, sent: sent, completeness: lastCompleteness, coveredThrough: lastCoveredThrough)
         Settings.lastSync = Date()
         Settings.lastSummary = summary
         return summary
@@ -182,7 +194,7 @@ enum SyncService {
         return (object["logged"] as? Bool) == true
     }
 
-    static func describe(_ result: ExportResult, sent: Int?, completeness: String? = nil) -> String {
+    static func describe(_ result: ExportResult, sent: Int?, completeness: String? = nil, coveredThrough: Date? = nil) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d HH:mm"
         let from = result.firstStart.map(formatter.string) ?? "?"
@@ -191,13 +203,17 @@ enum SyncService {
         let head = sent.map { "Sent \($0) hours" } ?? "Read \(result.segments.count) hours"
         return "\(head) (\(from) → \(to)), \(hours) h of screen time"
             + (result.streamEnded ? "" : (result.streamFailed ? " [stream failed before it ended]" : " [stream stopped by watchdog]"))
-            + completenessNote(completeness)
+            + completenessNote(completeness, coveredThrough: coveredThrough)
     }
 
     /// What Onyx made of the run, in words (nil: not sent, or an Onyx version that does not answer it).
-    static func completenessNote(_ status: String?) -> String {
+    static func completenessNote(_ status: String?, coveredThrough: Date? = nil) -> String {
         switch status {
-        case "complete"?: return " · verified complete"
+        case "complete"?:
+            guard let through = coveredThrough else { return " · verified complete" }
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MMM d HH:mm"
+            return " · verified complete through \(formatter.string(from: through))"
         case "stream_open"?: return " · not verified: the stream did not end"
         case "receiving"?: return " · not verified: a chunk is missing"
         case "inconsistent"?: return " · not verified: the chunks disagree"

@@ -7,6 +7,10 @@
  *   run_id         one UUID per sync run (every chunk of the run carries the same one)
  *   window_start   the start of the window the app asked Apple for (local midnight, days back)
  *   window_end     when the export was read (the window's end)
+ *   source_updated_at  when Apple's own data was last updated (DeviceActivityData.lastUpdatedDate; the
+ *                  earliest one the stream reported). A clean stream read from a stale cache is current only
+ *                  up to here, so the run covers [window_start, min(window_end, source_updated_at)] and no
+ *                  later: an hour after that is unknown, never "no usage".
  *   stream_ended   true when Apple's stream ended on its own; false when the app's watchdog stopped it
  *   segment_count  hours in the whole run
  *   chunk_index    this chunk, 0-based
@@ -14,7 +18,8 @@
  *
  * The route records the chunk only after its hours are written, and the database
  * (pds.finalize_phone_usage_run, sql/phone_usage_completeness.sql) marks hours verified only when every chunk
- * of the run arrived, the chunks agree and the stream ended. An upload without `run` (every app build before
+ * of the run arrived, the chunks agree and the stream ended, and only for hours that ended at or before the
+ * coverage end (the earlier of the export time and Apple's own last update). An upload without `run` (every app build before
  * this change) is accepted as before and its hours stay unverified: completeness unknown, never complete.
  */
 
@@ -24,6 +29,11 @@ export interface UploadRun {
   windowEnd: string;
   windowStartMs: number;
   windowEndMs: number;
+  /** When Apple's data was last updated, as the app reported it. */
+  sourceUpdated: string;
+  /** The instant the run is current through: the earlier of the export time and Apple's last update. */
+  coverageEnd: string;
+  coverageEndMs: number;
   streamEnded: boolean;
   segmentCount: number;
   chunkIndex: number;
@@ -75,6 +85,12 @@ export function parseUploadRun(
   if (endMs > nowMs + limits.maxFutureMs || startMs < nowMs - limits.maxAgeMs) {
     return { kind: "bad", reason: "the window is outside the accepted time range" };
   }
+  // Required: without Apple's own freshness the run's coverage is unknown, so a run without it is refused
+  // (a failed heartbeat) rather than certified through the export time.
+  const sourceMs = instantMs(r.source_updated_at);
+  if (sourceMs === null) return { kind: "bad", reason: "source_updated_at is not a time" };
+  if (sourceMs > nowMs + limits.maxFutureMs) return { kind: "bad", reason: "source_updated_at is in the future" };
+  const coverageMs = Math.min(endMs, sourceMs);
   const streamEnded = r.stream_ended;
   if (typeof streamEnded !== "boolean") return { kind: "bad", reason: "stream_ended is not true or false" };
   const segmentCount = wholeNumber(r.segment_count);
@@ -97,6 +113,9 @@ export function parseUploadRun(
       windowEnd: new Date(endMs).toISOString(),
       windowStartMs: startMs,
       windowEndMs: endMs,
+      sourceUpdated: new Date(sourceMs).toISOString(),
+      coverageEnd: new Date(coverageMs).toISOString(),
+      coverageEndMs: coverageMs,
       streamEnded,
       segmentCount,
       chunkIndex,
@@ -140,6 +159,7 @@ export function chunkRow(
     chunk_count: run.chunkCount,
     window_start: run.windowStart,
     window_end: run.windowEnd,
+    source_updated_at: run.sourceUpdated,
     stream_ended: run.streamEnded,
     run_segment_count: run.segmentCount,
     segment_count: segments.length,

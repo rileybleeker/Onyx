@@ -17,9 +17,16 @@
 --     pds.phone_usage_sync_chunks and calls pds.finalize_phone_usage_run.
 --   * A run is complete only when every chunk arrived, the chunks agree on the
 --     run's metadata, the hour counts add up and the stream ended. Then, and
---     only then, the hours the run still owns that had ended at export time
+--     only then, the hours the run still owns that had ended by its COVERAGE END
 --     are marked verified, and items such an hour no longer lists are removed
 --     (a completed hour cannot keep stale usage).
+--   * The coverage end is the earlier of the export time and `source_updated_at`,
+--     the last update Apple itself reports for the data (DeviceActivityData
+--     .lastUpdatedDate; the earliest the stream reported). A stream that ends
+--     cleanly can still be served from a stale cache, and the hours after the
+--     cache's last update are then missing, not empty: they are never verified,
+--     and a window reaching past the coverage end is never complete. A run with
+--     no `source_updated_at` covers nothing (the route refuses such a run).
 --   * A verified hour is a snapshot: an ordinary upload never changes it, and an
 --     upload that carries a newer run is STAGED in pds.phone_usage_pending_hours
 --     instead. Only the finalization of that later run, and only when it is
@@ -56,7 +63,8 @@
 --   last_run_id          the run of the upload that last wrote the hour (NULL: an app build
 --                        without completeness metadata)
 --   last_run_item_count  how many items that upload listed for the hour
---   last_export_at       when that upload's export was read on the phone (its window end)
+--   last_export_at       how far that upload's export is known current: the earlier of when it was read
+--                        on the phone and Apple's own last update (its coverage end)
 --   verified_*           set only by pds.finalize_phone_usage_run
 -- ----------------------------------------------------------------------------
 ALTER TABLE pds.phone_usage_segments
@@ -87,6 +95,7 @@ CREATE TABLE IF NOT EXISTS pds.phone_usage_sync_chunks (
     chunk_count          INTEGER NOT NULL CHECK (chunk_count BETWEEN 1 AND 100),
     window_start         TIMESTAMPTZ NOT NULL,
     window_end           TIMESTAMPTZ NOT NULL,
+    source_updated_at    TIMESTAMPTZ,
     stream_ended         BOOLEAN NOT NULL,
     run_segment_count    INTEGER NOT NULL CHECK (run_segment_count >= 1),
     segment_count        INTEGER NOT NULL CHECK (segment_count >= 1),
@@ -107,6 +116,8 @@ CREATE TABLE IF NOT EXISTS pds.phone_usage_sync_runs (
     status             TEXT NOT NULL CHECK (status IN ('receiving', 'stream_open', 'inconsistent', 'complete')),
     window_start       TIMESTAMPTZ NOT NULL,
     window_end         TIMESTAMPTZ NOT NULL,
+    source_updated_at  TIMESTAMPTZ,
+    coverage_end       TIMESTAMPTZ,
     stream_ended       BOOLEAN NOT NULL,
     chunk_count        INTEGER NOT NULL,
     chunks_received    INTEGER NOT NULL,
@@ -121,8 +132,15 @@ CREATE TABLE IF NOT EXISTS pds.phone_usage_sync_runs (
     CHECK ((status = 'complete') = (completed_at IS NOT NULL))
 );
 
-CREATE INDEX IF NOT EXISTS phone_usage_sync_runs_complete_idx
-    ON pds.phone_usage_sync_runs (window_start, window_end) WHERE status = 'complete';
+-- Tables created by an earlier version of this file get the freshness columns here (nullable).
+ALTER TABLE pds.phone_usage_sync_chunks
+    ADD COLUMN IF NOT EXISTS source_updated_at TIMESTAMPTZ;
+ALTER TABLE pds.phone_usage_sync_runs
+    ADD COLUMN IF NOT EXISTS source_updated_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS coverage_end      TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS phone_usage_sync_runs_cover_idx
+    ON pds.phone_usage_sync_runs (window_start, coverage_end) WHERE status = 'complete';
 
 -- Staged copy of an hour a NEWER run uploaded over an already verified hour (written only by the
 -- guard triggers below, one row per run and hour; `segment` is the uploaded hour row and `items` its
@@ -160,6 +178,10 @@ GRANT ALL  ON pds.phone_usage_sync_chunks, pds.phone_usage_sync_runs, pds.phone_
 --    setting onyx.phone_usage_verified_write) may write a verified hour, its
 --    items, or the verified_* columns. An integrity rule, not an access rule:
 --    the service role is the only writer either way.
+--    The items guard locks the hour it reads (FOR SHARE) before it decides, and
+--    keeps the lock through the item write, so it and the finalization (which
+--    locks the hours it may verify FOR UPDATE before it decides) run one after
+--    the other: no item can be written into an hour after its verification.
 --    An upload that carries a NEWER run for a verified hour is not lost: it is
 --    staged in pds.phone_usage_pending_hours (the hour row here, its items in the
 --    items guard) and the finalization of that run replaces the snapshot only
@@ -218,10 +240,20 @@ BEGIN
     IF current_setting('onyx.phone_usage_verified_write', true) = 'on' THEN
         RETURN NEW;
     END IF;
+    -- Lock the hour BEFORE reading whether it is verified or who owns it, and keep the lock until this
+    -- transaction ends (past the item write). The finalization locks every hour it may verify FOR UPDATE
+    -- first and decides second, so with this share lock an item write and a finalization are one after the
+    -- other: either the item is written and committed before the finalization looks at the hour (it then
+    -- counts it and removes it when it is not the run's), or the finalization has already verified the hour
+    -- and this read waits for it and sees the verified hour. Without the lock this read could see an
+    -- unverified hour, the finalization could verify it, and the item would still be written afterwards
+    -- into the verified snapshot. Hours are locked in hour order by the route and by the finalization, so
+    -- the two do not wait for each other crosswise.
     SELECT s.verified_at, s.last_run_id, s.verified_run_id
       INTO parent_verified, parent_run, parent_verified_run
       FROM pds.phone_usage_segments s
-     WHERE s.device = NEW.device AND s.segment_start = NEW.segment_start;
+     WHERE s.device = NEW.device AND s.segment_start = NEW.segment_start
+       FOR SHARE OF s;
     IF NOT FOUND THEN
         RETURN NEW;          -- the foreign key answers for a missing hour
     END IF;
@@ -235,9 +267,10 @@ BEGIN
         END IF;
         RETURN NULL;
     END IF;
-    -- An item from a run applies only while that run owns the hour: when another upload's run
-    -- took the hour over (or this run's hour write was refused), the item is not mixed in.
-    IF NEW.last_run_id IS NOT NULL AND parent_run IS DISTINCT FROM NEW.last_run_id THEN
+    -- An item applies only while the upload that wrote it still owns the hour: a run's item while that run
+    -- owns the hour, an item from an app build without run metadata (no run id) only while no run owns it.
+    -- When another upload took the hour over (or this upload's hour write was refused), the item is not mixed in.
+    IF parent_run IS DISTINCT FROM NEW.last_run_id THEN
         RETURN NULL;
     END IF;
     RETURN NEW;
@@ -256,12 +289,14 @@ CREATE OR REPLACE TRIGGER phone_usage_items_guard
 --    chunks_received, chunk_count, already}; status is one of 'unknown_run',
 --    'inconsistent', 'stream_open', 'receiving', 'complete'.
 --    An hour is verified when this run still owns it (last_run_id), it had ended
---    at export time (segment_end <= window_end) and is a whole hour (an in-progress
---    hour that Apple clips to the export time is shorter), and every item the run
---    sent for it is still the run's (last_run_item_count).
+--    by the run's coverage end (segment_end <= coverage_end: the earlier of the
+--    export time and Apple's own last update, so an hour the stale source never
+--    saw is not verified) and is a whole hour (an in-progress hour that Apple
+--    clips to the export time is shorter), and every item the run sent for it is
+--    still the run's (last_run_item_count).
 --    A complete run also REPLACES the snapshot of an hour an earlier run verified
 --    when it staged its own copy of that hour (same whole-hour and item-count
---    rules, and its export must have been read later than the snapshot's): the
+--    rules, and its coverage must reach later than the snapshot's): the
 --    hour row and all its items become the later export's, so totals are
 --    corrected and items the old snapshot listed but this export does not are
 --    gone. hours_verified counts both; hours_replaced only the second kind.
@@ -284,6 +319,7 @@ DECLARE
     v_removed  INTEGER := 0;
     v_fix      TIMESTAMPTZ[] := ARRAY[]::timestamptz[];
     v_fixed    INTEGER := 0;
+    v_cover    TIMESTAMPTZ;
 BEGIN
     IF p_device IS NULL OR p_run_id IS NULL THEN
         RAISE EXCEPTION 'finalize_phone_usage_run: device and run id are required' USING ERRCODE = '22023';
@@ -294,7 +330,8 @@ BEGIN
     IF FOUND AND v_prior.status = 'complete' THEN
         RETURN jsonb_build_object('status', 'complete', 'hours_verified', v_prior.hours_verified, 'hours_replaced', 0,
                                   'items_removed', 0, 'chunks_received', v_prior.chunks_received,
-                                  'chunk_count', v_prior.chunk_count, 'already', true);
+                                  'chunk_count', v_prior.chunk_count, 'coverage_end', v_prior.coverage_end,
+                                  'already', true);
     END IF;
 
     SELECT count(*)                       AS n,
@@ -305,6 +342,9 @@ BEGIN
            max(k.window_start)            AS window_start_max,
            min(k.window_end)              AS window_end,
            max(k.window_end)              AS window_end_max,
+           min(k.source_updated_at)       AS source_updated,
+           max(k.source_updated_at)       AS source_updated_max,
+           count(k.source_updated_at)     AS source_known,
            bool_and(k.stream_ended)       AS ended_all,
            bool_or(k.stream_ended)        AS ended_any,
            min(k.run_segment_count)       AS segment_total,
@@ -318,11 +358,17 @@ BEGIN
 
     IF c.n = 0 THEN
         RETURN jsonb_build_object('status', 'unknown_run', 'hours_verified', 0, 'hours_replaced', 0, 'items_removed', 0,
-                                  'chunks_received', 0, 'chunk_count', NULL, 'already', false);
+                                  'chunks_received', 0, 'chunk_count', NULL, 'coverage_end', NULL, 'already', false);
     END IF;
+
+    -- How far the export is known current: the earlier of the export time and Apple's own last update. No
+    -- source time (an app that did not report it) covers nothing, never "through the export time".
+    v_cover := LEAST(c.window_end, COALESCE(c.source_updated, c.window_start));
 
     IF c.chunk_count <> c.chunk_count_max OR c.window_start <> c.window_start_max
        OR c.window_end <> c.window_end_max OR c.ended_all <> c.ended_any
+       OR c.source_updated IS DISTINCT FROM c.source_updated_max
+       OR c.source_known NOT IN (0, c.n)
        OR c.segment_total <> c.segment_total_max THEN
         v_status := 'inconsistent';           -- the chunks describe different runs
     ELSIF NOT c.ended_all THEN
@@ -355,7 +401,7 @@ BEGIN
              WHERE s.device = p_device
                AND s.last_run_id = p_run_id
                AND s.verified_at IS NULL
-               AND s.segment_end <= c.window_end
+               AND s.segment_end <= v_cover
                AND s.segment_end - s.segment_start >= INTERVAL '1 hour'
                AND s.last_run_item_count IS NOT NULL
                AND s.last_run_item_count = (
@@ -370,7 +416,7 @@ BEGIN
             RETURNING 1
         ), marked AS (
             UPDATE pds.phone_usage_segments s
-               SET verified_at = now(), verified_run_id = p_run_id, verified_export_at = c.window_end
+               SET verified_at = now(), verified_run_id = p_run_id, verified_export_at = v_cover
               FROM owned o
              WHERE s.device = o.device AND s.segment_start = o.segment_start
                AND s.last_run_id = p_run_id AND s.verified_at IS NULL
@@ -387,8 +433,8 @@ BEGIN
                 JOIN pds.phone_usage_segments s ON s.device = h.device AND s.segment_start = h.segment_start
                WHERE h.device = p_device AND h.run_id = p_run_id
                  AND s.verified_at IS NOT NULL
-                 AND s.verified_export_at < c.window_end
-                 AND (h.segment ->> 'segment_end')::timestamptz <= c.window_end
+                 AND s.verified_export_at < v_cover
+                 AND (h.segment ->> 'segment_end')::timestamptz <= v_cover
                  AND (h.segment ->> 'segment_end')::timestamptz - h.segment_start >= INTERVAL '1 hour'
                  AND (h.segment ->> 'last_run_item_count')::int = (SELECT count(*) FROM jsonb_object_keys(h.items))
           ) x;
@@ -409,10 +455,10 @@ BEGIN
                    synced_at              = (h.segment ->> 'synced_at')::timestamptz,
                    last_run_id            = p_run_id,
                    last_run_item_count    = (h.segment ->> 'last_run_item_count')::int,
-                   last_export_at         = c.window_end,
+                   last_export_at         = v_cover,
                    verified_at            = now(),
                    verified_run_id        = p_run_id,
-                   verified_export_at     = c.window_end
+                   verified_export_at     = v_cover
               FROM pds.phone_usage_pending_hours h
              WHERE h.device = p_device AND h.run_id = p_run_id AND h.segment_start = ANY (v_fix)
                AND s.device = h.device AND s.segment_start = h.segment_start;
@@ -438,15 +484,18 @@ BEGIN
     END IF;
 
     INSERT INTO pds.phone_usage_sync_runs AS r
-           (device, run_id, status, window_start, window_end, stream_ended, chunk_count, chunks_received,
-            segment_count, segments_received, hours_verified, app_version, first_received_at, checked_at, completed_at)
-    VALUES (p_device, p_run_id, v_status, c.window_start, c.window_end, c.ended_all, c.chunk_count_max, c.chunks,
-            c.segment_total_max, c.segments_received, v_verified, c.app_version, c.first_received_at, now(),
-            CASE WHEN v_status = 'complete' THEN now() END)
+           (device, run_id, status, window_start, window_end, source_updated_at, coverage_end, stream_ended,
+            chunk_count, chunks_received, segment_count, segments_received, hours_verified, app_version,
+            first_received_at, checked_at, completed_at)
+    VALUES (p_device, p_run_id, v_status, c.window_start, c.window_end, c.source_updated, v_cover, c.ended_all,
+            c.chunk_count_max, c.chunks, c.segment_total_max, c.segments_received, v_verified, c.app_version,
+            c.first_received_at, now(), CASE WHEN v_status = 'complete' THEN now() END)
     ON CONFLICT (device, run_id) DO UPDATE SET
         status            = EXCLUDED.status,
         window_start      = EXCLUDED.window_start,
         window_end        = EXCLUDED.window_end,
+        source_updated_at = EXCLUDED.source_updated_at,
+        coverage_end      = EXCLUDED.coverage_end,
         stream_ended      = EXCLUDED.stream_ended,
         chunk_count       = EXCLUDED.chunk_count,
         chunks_received   = EXCLUDED.chunks_received,
@@ -459,16 +508,17 @@ BEGIN
 
     RETURN jsonb_build_object('status', v_status, 'hours_verified', v_verified, 'hours_replaced', v_fixed,
                               'items_removed', v_removed, 'chunks_received', c.chunks,
-                              'chunk_count', c.chunk_count_max, 'already', false);
+                              'chunk_count', c.chunk_count_max, 'coverage_end', v_cover, 'already', false);
 END;
 $$;
 
 -- ----------------------------------------------------------------------------
 -- 5. Is [p_from, p_to) backed by a complete export? True only when one complete
---    run's window covers it AND no stored hour overlapping it is unverified (an
+--    run's coverage (its window up to the coverage end: the earlier of the export
+--    time and Apple's own last update) holds it AND no stored hour overlapping it is unverified (an
 --    hour from an older app build, from a run that did not complete, or one a
 --    complete run could not claim). An hour with no row inside a complete run's
---    window had no usage. Device-agnostic on purpose: an unverified hour from any
+--    coverage had no usage; one after its coverage end is unknown. Device-agnostic on purpose: an unverified hour from any
 --    device makes the window incomplete.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.phone_usage_window_complete(p_from TIMESTAMPTZ, p_to TIMESTAMPTZ)
@@ -479,7 +529,7 @@ SET search_path = pds, pg_temp
 AS $$
     SELECT COALESCE(p_from < p_to, false)
        AND EXISTS (SELECT 1 FROM pds.phone_usage_sync_runs r
-                    WHERE r.status = 'complete' AND r.window_start <= p_from AND r.window_end >= p_to)
+                    WHERE r.status = 'complete' AND r.window_start <= p_from AND r.coverage_end >= p_to)
        AND NOT EXISTS (SELECT 1 FROM pds.phone_usage_segments s
                         WHERE s.verified_at IS NULL AND s.segment_start < p_to AND s.segment_end > p_from)
 $$;
