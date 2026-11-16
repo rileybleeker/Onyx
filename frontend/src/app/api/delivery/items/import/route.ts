@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildOrderItemRows, customizationsText, type HarvestOrder, type ItemCustomization } from "@/lib/delivery";
+import { chooseModel, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
 
 // Uber Eats item harvester endpoint (tools/ubereats_harvest/harvest.mjs on Riley's PC).
 // Auth: the middleware CI carve-out (x-onyx-ci-token) or a Supabase session.
@@ -22,8 +23,7 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
 });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-// A per-dish calorie guess does not need Opus (model routing policy, 2026-11-16).
-const MODEL = "claude-sonnet-5-5";
+// Model + effort come from lib/model-routing.ts (baseline, or the bounded pilot when it is on).
 const BATCH = 25;
 
 interface Body {
@@ -173,19 +173,41 @@ async function estimateBatch(limit?: number, offset?: number) {
     price: r.price != null ? `${r.price} ${r.currency ?? ""}`.trim() : undefined,
   }));
 
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 16000,
-    system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
-    output_config: { effort: "low", format: { type: "json_schema", schema: SCHEMA } },
-    messages: [{ role: "user", content: JSON.stringify({ items: input }) }],
-  });
-  if (res.stop_reason !== "end_turn") {
-    throw new Error(`estimator stopped with ${res.stop_reason}`);
+  // One model per call; the arm is fixed by the batch's first dish, so a dish retried on its own
+  // (limit 1) lands in its own arm every time.
+  const now = Date.now();
+  const pilot = pilotFromEnv(now);
+  const choice = chooseModel("delivery_estimate", String(todo[0].est_key), pilot, now);
+  const started = Date.now();
+  let res: Anthropic.Message | null = null;
+  let parsed: { items: Estimate[] };
+  try {
+    res = await anthropic.messages.create({
+      model: choice.model,
+      max_tokens: 16000,
+      system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+      output_config: { effort: choice.effort ?? "low", format: { type: "json_schema", schema: SCHEMA } },
+      messages: [{ role: "user", content: JSON.stringify({ items: input }) }],
+    });
+    if (res.stop_reason !== "end_turn") {
+      throw new Error(`estimator stopped with ${res.stop_reason}`);
+    }
+    const text = res.content.find((b): b is Anthropic.TextBlock => b.type === "text")?.text;
+    if (!text) throw new Error("estimator returned no text block");
+    parsed = JSON.parse(text) as { items: Estimate[] };
+  } catch (e) {
+    logPilotObservation(
+      pilotObservation("delivery_estimate", choice, pilot, {
+        usage: res ? [res.usage] : [],
+        latencyMs: Date.now() - started,
+        ok: false,
+        units: todo.length,
+        accepted: 0,
+        calls: 1,
+      }),
+    );
+    throw e;
   }
-  const text = res.content.find((b): b is Anthropic.TextBlock => b.type === "text")?.text;
-  if (!text) throw new Error("estimator returned no text block");
-  const parsed = JSON.parse(text) as { items: Estimate[] };
 
   const rows = [];
   const used = new Set<number>();
@@ -207,9 +229,19 @@ async function estimateBatch(limit?: number, offset?: number) {
       alcohol_g: zero ? 0 : Math.max(0, e.alcohol_g),
       confidence: e.confidence,
       basis: e.basis,
-      model: MODEL,
+      model: choice.model,
     });
   }
+  logPilotObservation(
+    pilotObservation("delivery_estimate", choice, pilot, {
+      usage: [res.usage],
+      latencyMs: Date.now() - started,
+      ok: rows.length === todo.length,
+      units: todo.length,
+      accepted: rows.length,
+      calls: 1,
+    }),
+  );
   if (rows.length) {
     // ignoreDuplicates: a row someone hand-corrected is never overwritten by a re-estimate
     const { error: upErr } = await supabase

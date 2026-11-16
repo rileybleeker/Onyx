@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import type { NormalizedIngredient, NormalizedProduct } from "@/lib/dsld";
+import { chooseModel, effortConfig, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -11,7 +12,7 @@ const supabase = createClient(
   { db: { schema: "pds" } },
 );
 
-const MODEL = "claude-sonnet-5-5";
+// Model + effort come from lib/model-routing.ts (baseline, or the bounded pilot when it is on).
 
 // Cap reference list at ~120 entries so the prompt stays small. The full DSLD
 // universe is larger but the user's library is the realistic intersection.
@@ -260,14 +261,28 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const now = Date.now();
+  const pilot = pilotFromEnv(now);
+  const choice = chooseModel("supplement_photo", crypto.randomUUID(), pilot, now);
+  const started = Date.now();
+  let usage: Anthropic.Usage | null = null;
+  const observe = (ok: boolean) =>
+    logPilotObservation(
+      pilotObservation("supplement_photo", choice, pilot, {
+        usage: usage ? [usage] : [],
+        latencyMs: Date.now() - started,
+        ok,
+      }),
+    );
+
   try {
     const reference = await buildReferenceTable();
     const prompt = buildPrompt(reference);
 
     const resp = await anthropic.messages.create({
-      model: MODEL,
+      model: choice.model,
       max_tokens: 4096,
-      output_config: { effort: "low" },
+      ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
       messages: [
         {
           role: "user",
@@ -285,9 +300,11 @@ export async function POST(req: NextRequest) {
         },
       ],
     });
+    usage = resp.usage;
 
     const textBlock = resp.content.find((b) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") {
+      observe(false);
       return NextResponse.json(
         { error: "Claude returned no text content" },
         { status: 502 },
@@ -298,6 +315,7 @@ export async function POST(req: NextRequest) {
     try {
       parsed = extractJson(textBlock.text) as ExtractedShape;
     } catch (e) {
+      observe(false);
       return NextResponse.json(
         {
           error: "Could not parse Claude response as JSON",
@@ -310,14 +328,19 @@ export async function POST(req: NextRequest) {
 
     const aligned = alignWithReference(parsed, reference);
     const product = toNormalizedShape(aligned);
+    observe(true);
 
     return NextResponse.json({
       product,
       reference_size: reference.length,
       stop_reason: resp.stop_reason,
       usage: resp.usage,
+      // Which model read the label (pilot arm or baseline); saved with the product's raw_json.
+      model: choice.model,
+      model_effort: choice.effort ?? "default",
     });
   } catch (e) {
+    observe(false);
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 502 },

@@ -21,6 +21,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest } from "next/server";
 import { searchTracks, createPlaylist, CreatePlaylistResult } from "@/lib/spotify-server";
+import { chooseModel, effortConfig, logPilotObservation, pilotFromEnv, pilotObservation } from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -30,7 +31,7 @@ const supabase = createClient(
   { db: { schema: "pds" } }
 );
 
-const MODEL = "claude-sonnet-5-5";
+// Model + effort come from lib/model-routing.ts (baseline, or the bounded pilot when it is on).
 const MAX_ITERATIONS = 8;
 
 interface GenerateRequest {
@@ -209,6 +210,12 @@ export async function POST(req: NextRequest) {
       : [SEARCH_TOOL, FEATURES_TOOL, CREATE_TOOL];
 
   const systemPrompt = buildSystemPrompt(body);
+  // One arm per request (every call of the tool loop uses it).
+  const now = Date.now();
+  const pilot = pilotFromEnv(now);
+  const choice = chooseModel("playlist", crypto.randomUUID(), pilot, now);
+  const usage: Anthropic.Usage[] = [];
+  const started = Date.now();
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -229,13 +236,14 @@ export async function POST(req: NextRequest) {
         ];
 
         let response = await anthropic.messages.create({
-          model: MODEL,
+          model: choice.model,
           max_tokens: 1024,
           system: systemPrompt,
           tools,
           messages,
-          output_config: { effort: "low" },
+          ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
         });
+        usage.push(response.usage);
 
         let iter = 0;
         let finalResult: CreatePlaylistResult | null = null;
@@ -309,13 +317,14 @@ export async function POST(req: NextRequest) {
           messages.push({ role: "user", content: toolResults });
 
           response = await anthropic.messages.create({
-            model: MODEL,
+            model: choice.model,
             max_tokens: 1024,
             system: systemPrompt,
             tools,
             messages,
-            output_config: { effort: "low" },
+            ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
           });
+          usage.push(response.usage);
         }
 
         const finalText = response.content
@@ -327,6 +336,13 @@ export async function POST(req: NextRequest) {
           send({ type: "message", text: finalText });
         }
 
+        logPilotObservation(
+          pilotObservation("playlist", choice, pilot, {
+            usage,
+            latencyMs: Date.now() - started,
+            ok: finalResult != null,
+          }),
+        );
         if (finalResult) {
           send({ type: "done", result: finalResult });
         } else {
@@ -339,6 +355,9 @@ export async function POST(req: NextRequest) {
           });
         }
       } catch (e) {
+        logPilotObservation(
+          pilotObservation("playlist", choice, pilot, { usage, latencyMs: Date.now() - started, ok: false }),
+        );
         send({
           type: "error",
           message: e instanceof Error ? e.message : String(e),
