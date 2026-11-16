@@ -15,19 +15,21 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      uniquely is skipped and reported, never guessed: a wrong match would mix two accounts' rows.
   2. Transactions (posted only; pending are not requested) -> rows with the ledger's sign (expense-positive).
      Investment accounts are balances-only, as they were under Rocket Money (trades and dividends are not spending).
-  3. Cutover from the Rocket Money history, per account: rows whose dates (transacted and posted) are all more than
-     OVERLAP_DAYS before the last Rocket Money row are dropped (that history already has them; a row posted later
-     is not, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence (PIPE-04;
-     the two feeds share no transaction id): same account, amount and currency, and either the same date and a
-     normalized description that names a merchant ('exact', paired one for one, payees not contradicting) or a
-     date within OVERLAP_DAYS and shared merchant words, including the word that names the business, where that
-     one SimpleFIN row and that one Rocket Money row have no other such candidate ('merchant'). Every SimpleFIN row
-     of the response takes part, so a Rocket Money row whose twin is before the window is taken by that twin, and
-     a Rocket Money row an earlier run matched stays taken (pds.finance_cutover_matches). An equal amount alone
-     never drops a row: a row with competing candidates ('ambiguous') or with a same-amount Rocket Money row
-     nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review. Every decision is recorded
-     in pds.finance_cutover_matches (keys only). Rows already stored by an earlier SimpleFIN run are always
-     rewritten in place.
+  3. Cutover from the Rocket Money history, per account: a row transacted more than OVERLAP_DAYS before the last
+     Rocket Money row and posted by that date is dropped (that history already has it; a row posted after it may
+     not be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence
+     (PIPE-04; the two feeds share no transaction id): same account, amount and currency, and either the same date
+     and a normalized description that names a merchant ('exact', paired one for one, payees not contradicting)
+     or a date within OVERLAP_DAYS and the same merchant name ('merchant': one side's distinctive words all on the
+     other side, including the word that names the business), where the pair's date gap is the smallest for both
+     rows and the group is one to one, or its rows cannot be told apart on either side (then paired one for one).
+     Every SimpleFIN row of the response takes part, so a Rocket Money row whose twin is before the window is
+     taken by that twin, and a Rocket Money row an earlier run matched stays taken (pds.finance_cutover_matches).
+     An equal amount alone never drops a row: a row with competing candidates ('ambiguous') or with a same-amount
+     Rocket Money row nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review. Every match
+     and every row kept for review is recorded in pds.finance_cutover_matches (keys only). When that record
+     cannot be read (other than not applied yet) the run fails before writing anything. Rows already stored by an
+     earlier SimpleFIN run are always rewritten in place.
   4. Category (SimpleFIN sends none; /financials needs one to keep card payments and transfers out of spending):
      a payment/transfer pair (same amount, opposite sign, two of Riley's accounts, within PAIR_DAYS, one side worded
      like a payment or transfer) -> "Credit Card Payment" or "Internal Transfers"; else the category Rocket Money
@@ -128,6 +130,7 @@ NOTE_CODES: dict[str, str] = {
     "window_too_long": "the requested window is longer than SimpleFIN's 90-day limit",
     "etl_error": "the SimpleFIN ETL failed unexpectedly (the Actions log names the error type)",
     "db_write_failed": "the SimpleFIN ETL could not write to Supabase; the next run retries",
+    "db_read_failed": "the SimpleFIN ETL could not read its cutover record from Supabase; nothing was written, the next run retries",
     "sf_reauth": "SimpleFIN: a bank connection needs signing in again: reconnect it on SimpleFIN's site",
     "sf_connection_error": "SimpleFIN: a bank connection reported an error: check it on SimpleFIN's site",
     "sf_account_failed": "SimpleFIN could not read an account this run; it retries",
@@ -643,13 +646,18 @@ def exact_key(row: dict) -> Optional[tuple]:
 
 
 def merchant_evidence(a: dict, b: dict) -> bool:
-    """The rows name the same merchant: more than half of the shorter side's distinctive words (description and
-    name) are shared, the shared words include the word that names the business on one side (so a shared city or
-    kind of business alone, 'DEMO ATLANTA' vs 'SHOP ATLANTA', 'STARBUCKS COFFEE' vs 'CARIBOU COFFEE', is not
-    evidence), and the payee names do not contradict each other."""
+    """The rows name the same merchant: more than half of the shorter side's merchant words (description and name)
+    are shared; the distinctive words of one side (its merchant words other than TRADE_WORDS) are ALL on the other
+    side, so a bank text and its cleaned name agree ('DEMO CAFE 0042 ATLANTA GA' vs 'Demo Cafe') but two shops that
+    share a first word, a city or a kind of business do not ('DEMO BOTTLE COFFEE' vs 'DEMO DONKEY COFFEE', 'DEMO
+    ATLANTA' vs 'SHOP ATLANTA', 'STARBUCKS COFFEE' vs 'CARIBOU COFFEE'); the shared words include the word that
+    names the business on one side; and the payee names do not contradict each other."""
     ta, tb = merchant_tokens(a), merchant_tokens(b)
     shared = ta & tb
     if not shared or 2 * len(shared) <= min(len(ta), len(tb)):
+        return False
+    da, db = ta - TRADE_WORDS, tb - TRADE_WORDS
+    if not (da and db) or not (da <= db or db <= da):
         return False
     if not (merchant_leads(a) & tb or merchant_leads(b) & ta):
         return False
@@ -675,6 +683,42 @@ def recorded_claims(saved: Optional[dict]) -> dict[str, set[str]]:
     return dict(claims)
 
 
+def in_cutover_window(row: dict, cutover: date) -> bool:
+    """Whether the cutover rule judges the row on evidence. A row transacted more than OVERLAP_DAYS before the
+    account's last Rocket Money date and posted by that date is in the Rocket Money history already (it was posted
+    while the harvester still read the account). A row posted after that date may not be: Rocket Money skipped
+    pending rows."""
+    if date.fromisoformat(row["txn_date"]) >= cutover - timedelta(days=OVERLAP_DAYS):
+        return True
+    posted = row.get("original_date")
+    return bool(posted) and date.fromisoformat(posted) > cutover
+
+
+def _signature(row: dict) -> tuple:
+    """What the merchant step can tell two same-amount rows apart by: their dates and normalized text."""
+    return (row["txn_date"], row.get("original_date") or "", norm_text(row.get("description")), norm_text(row.get("name")))
+
+
+def _components(edges: Iterable[tuple[str, str]]) -> list[tuple[list, list]]:
+    """(SimpleFIN key, Rocket Money key) edges -> connected groups, each (SimpleFIN keys, Rocket Money keys), sorted."""
+    parent: dict[tuple, tuple] = {}
+
+    def root(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for sk, hk in edges:
+        a, b = root(("s", sk)), root(("h", hk))
+        if a != b:
+            parent[b] = a
+    groups: dict[tuple, tuple] = {}
+    for node in sorted(parent):
+        groups.setdefault(root(node), ([], []))[0 if node[0] == "s" else 1].append(node[1])
+    return sorted((sorted(s), sorted(h)) for s, h in groups.values())
+
+
 @dataclass(frozen=True)
 class CutoverDecision:
     sf_txn_key: str
@@ -689,20 +733,20 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
                   claims: Optional[dict] = None) -> tuple[list[dict], Counter, list[CutoverDecision]]:
     """SimpleFIN rows -> (kept, dropped counts, decisions) against one account's Rocket Money history (module
     docstring, step 3). Deterministic and order-independent. A row is dropped only when it is matched on identity
-    evidence or when every date it carries (transacted and posted) is before the cutover window; a row stored by
-    an earlier run is always kept (a match then marks it 'stored_duplicate').
+    evidence or when it is before the cutover window (in_cutover_window); a row stored by an earlier run is always
+    kept (a match then marks it 'stored_duplicate').
 
     Every SimpleFIN row takes part in the matching, also the rows before the window: their Rocket Money twins are
-    taken by them, so a later purchase of the same amount cannot claim one. `claims` (recorded_claims of earlier
-    runs) keeps those decisions: a Rocket Money row claimed by a row missing from this response stays taken, and a
-    claim whose row is still here and still carries the evidence is kept as it was."""
+    taken by them, so a later purchase of the same amount cannot claim one, and their matches are recorded too.
+    `claims` (recorded_claims of earlier runs) keeps those decisions: a Rocket Money row claimed by a row missing
+    from this response stays taken, and a claim whose row is still here and still carries the evidence is kept as
+    it was."""
     kept: list[dict] = []
     dropped: Counter = Counter()
     if cutover is None:
         return list(sf_rows), dropped, []
-    floor = cutover - timedelta(days=OVERLAP_DAYS)
     rows = sorted(sf_rows, key=lambda r: (r["txn_date"], r["txn_key"]))
-    in_zone = {r["txn_key"]: max(_row_dates(r)) >= floor for r in rows}
+    in_zone = {r["txn_key"]: in_cutover_window(r, cutover) for r in rows}
     present = {r["txn_key"]: r for r in rows}
     pool = sorted(history, key=lambda h: (h["txn_date"], h["txn_key"]))
 
@@ -747,36 +791,41 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
                 used.add(h["txn_key"])
                 found[r["txn_key"]] = ("matched", "exact", (h["txn_key"],))
 
-    # 2. Merchant: same amount and currency, dates within OVERLAP_DAYS, shared merchant words. Only a one-to-one
-    #    group (one SimpleFIN row, one Rocket Money row, no other evidence either side) is a match; anything larger
-    #    is ambiguous and every SimpleFIN row in it is kept.
+    # 2. Merchant: same amount and currency, dates within OVERLAP_DAYS, the same merchant (merchant_evidence). A
+    #    candidate pair counts only at the smallest date gap of BOTH its rows, so a purchase repeated on the next
+    #    days pairs day by day (the next day's row is the next day's twin). A group of such pairs is a match when it
+    #    is one to one, or when its rows cannot be told apart on either side (same dates and text: paired one for
+    #    one in the order of step 1, like 'exact'). Rounds repeat on what is left until one matches nothing. A row
+    #    still holding candidates then is ambiguous (ties, or a group that is neither) and is kept.
     rest = [r for r in rows if r["txn_key"] not in found]
-    free = [h for h in pool if h["txn_key"] not in used]
-    near = {r["txn_key"]: [h for h in free if h["amount_cents"] == r["amount_cents"] and _currency(h) == _currency(r)
-                           and date_gap(r, h) <= OVERLAP_DAYS] for r in rest}
-    parent: dict[tuple, tuple] = {}
-
-    def root(x):
-        while parent.setdefault(x, x) != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
+    free = {h["txn_key"]: h for h in pool if h["txn_key"] not in used}
+    near = {r["txn_key"]: [h for h in free.values() if h["amount_cents"] == r["amount_cents"]
+                           and _currency(h) == _currency(r) and date_gap(r, h) <= OVERLAP_DAYS] for r in rest}
+    edge_gap = {(r["txn_key"], h["txn_key"]): date_gap(r, h)
+                for r in rest for h in near[r["txn_key"]] if merchant_evidence(r, h)}
+    while True:
+        live = {e: g for e, g in edge_gap.items() if e[0] not in found and e[1] not in used}
+        s_min: dict[str, int] = {}
+        h_min: dict[str, int] = {}
+        for (sk, hk), g in live.items():
+            s_min[sk] = min(g, s_min.get(sk, g))
+            h_min[hk] = min(g, h_min.get(hk, g))
+        nearest = sorted(e for e, g in live.items() if g == s_min[e[0]] == h_min[e[1]])
+        matched = 0
+        for ss, hs in _components(nearest):
+            if len({_signature(present[k]) for k in ss}) != 1 or len({_signature(free[k]) for k in hs}) != 1:
+                continue   # rows that can be told apart compete for the same twin: never guessed
+            for sk, hk in zip(sorted(ss, key=lambda k: (in_zone[k], k in stored_keys, k)), hs):
+                used.add(hk)
+                found[sk] = ("matched", "merchant", (hk,))
+                matched += 1
+        if not matched:
+            break
     for r in rest:
-        for h in near[r["txn_key"]]:
-            if merchant_evidence(r, h):
-                parent[root(("h", h["txn_key"]))] = root(("s", r["txn_key"]))
-    comps: dict[tuple, dict] = {}
-    for node in sorted(parent):
-        comps.setdefault(root(node), {"s": [], "h": []})[node[0]].append(node[1])
-    for comp in comps.values():
-        hs = tuple(sorted(comp["h"]))
-        if len(comp["s"]) == 1 and len(hs) == 1:
-            used.add(hs[0])
-            found[comp["s"][0]] = ("matched", "merchant", hs)
-        else:
-            for sk in comp["s"]:
-                found[sk] = ("ambiguous", None, hs[:MAX_CANDIDATES])
+        if r["txn_key"] not in found:
+            cands = tuple(sorted(hk for (sk, hk) in live if sk == r["txn_key"]))
+            if cands:
+                found[r["txn_key"]] = ("ambiguous", None, cands[:MAX_CANDIDATES])
 
     # 3. Unconfirmed: an unclaimed Rocket Money row with the same amount is near, but nothing says it is the same
     #    purchase (the case an amount-only rule used to drop). Kept.
@@ -789,22 +838,26 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
 
     decisions: list[CutoverDecision] = []
     for r in rows:
-        stored = r["txn_key"] in stored_keys
-        if not in_zone[r["txn_key"]]:
-            # Every date before the window: the Rocket Money history already has it (no decision is recorded).
+        sk = r["txn_key"]
+        stored = sk in stored_keys
+        decision, how, hkeys = found.get(sk, (None, None, ()))
+        if decision == "matched" and stored:
+            decision = "stored_duplicate"
+        if not in_zone[sk]:
+            # Before the window: the Rocket Money history already has it. Only a match is recorded, so the Rocket
+            # Money row it took stays taken on later runs (an ambiguous row here is dropped all the same).
             if stored:
                 kept.append(r)
             else:
                 dropped["before the Rocket Money cutover"] += 1
-            continue
-        decision, evidence, hkeys = found.get(r["txn_key"], (None, None, ()))
-        if decision == "matched" and not stored:
+            if decision not in CLAIM_DECISIONS:
+                continue
+        elif decision == "matched":
             dropped["already in the Rocket Money history"] += 1
         else:
             kept.append(r)
         if decision:
-            decision = "stored_duplicate" if decision == "matched" and stored else decision
-            decisions.append(CutoverDecision(r["txn_key"], r["account_key"], decision, evidence, hkeys, cutover.isoformat()))
+            decisions.append(CutoverDecision(sk, r["account_key"], decision, how, hkeys, cutover.isoformat()))
     return kept, dropped, sorted(decisions, key=lambda d: d.sf_txn_key)
 
 
@@ -976,6 +1029,14 @@ def _t(supa, table):
     return supa.schema("pds").from_(table)
 
 
+MISSING_RELATION_CODES = ("PGRST205", "42P01")   # PostgREST / Postgres: the table does not exist (not applied yet)
+
+
+def is_missing_relation(e: BaseException) -> bool:
+    """A read error that only means the table is not there yet (postgrest APIError.code); never reads its text."""
+    return str(getattr(e, "code", "") or "") in MISSING_RELATION_CODES
+
+
 def read_all(build) -> list[dict]:
     rows: list[dict] = []
     while True:
@@ -1097,11 +1158,16 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     for p in pool:
         if p.get("source") != SOURCE:
             history_by_account[p["account_key"]].append(p)
-    # Earlier cutover decisions keep their Rocket Money rows taken (apply_cutover, step 0). Best-effort: without
-    # the record (table not applied yet, or a read error) the matching works on this response alone.
+    # Earlier cutover decisions keep their Rocket Money rows taken (apply_cutover, step 0). Before
+    # sql/finance_cutover_matches.sql is applied the table is missing: each run then matches on its own response
+    # and saves nothing (saved = None). Any OTHER read error fails the run here, before anything is written:
+    # matching without the record would free Rocket Money rows earlier runs matched, and saving that result would
+    # overwrite the record.
     try:
         saved = store.cutover_decisions()
-    except Exception:
+    except Exception as e:
+        if not is_missing_relation(e):
+            raise SimpleFinError("db_read_failed") from None
         saved = None
     claims = recorded_claims(saved)
 
@@ -1194,6 +1260,10 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
             # Reconciliation preview of the cutover window, counts only (pds.finance_cutover_matches has the keys).
             out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}; new for review: "
                 f"{new_review_count(plan.cutover, plan.saved)}" + ("" if plan.saved is not None else " (no decision record yet)"))
+        recorded = Counter(rec.get("decision") for rec in (plan.saved or {}).values() if rec.get("decision") in REVIEW_DECISIONS)
+        if recorded:
+            # Every row kept for review so far (all runs), still to check by hand (docs/financials-simplefin.md).
+            out(f"  recorded for review (all runs): {dict(sorted(recorded.items()))}")
         if plan.notes:
             out(f"  heartbeat note: {format_notes(plan.notes)}")
         return 0
@@ -1213,17 +1283,22 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         return 1
 
     if plan.cutover:
-        # Provenance of every cutover decision; best-effort (the ledger writes above are done). A kept-for-review
-        # row is reported in the heartbeat once, by the run that records it: while the record cannot be saved only
-        # cutover_provenance_unsaved is reported, and the first run that saves it reports the review rows.
-        try:
-            store.save_cutover_decisions(decision_rows(plan.cutover, now or datetime.now(timezone.utc)))
-        except Exception:
+        # Provenance of every cutover decision; best-effort (the ledger writes above are done). Saved only by a run
+        # that read the record (saved is None only while the table is not applied), so the record is never
+        # rewritten from decisions made without it. A kept-for-review row is reported in the heartbeat once, by the
+        # run that records it: while the record cannot be saved only cutover_provenance_unsaved is reported, and the
+        # first run that saves it reports the review rows.
+        if plan.saved is None:
             plan.notes["cutover_provenance_unsaved"] += 1
         else:
-            review = new_review_count(plan.cutover, plan.saved)
-            if review:
-                plan.notes["cutover_review"] += review
+            try:
+                store.save_cutover_decisions(decision_rows(plan.cutover, now or datetime.now(timezone.utc)))
+            except Exception:
+                plan.notes["cutover_provenance_unsaved"] += 1
+            else:
+                review = new_review_count(plan.cutover, plan.saved)
+                if review:
+                    plan.notes["cutover_review"] += review
 
     note = format_notes(plan.notes)
     status = "partial" if note else "success"

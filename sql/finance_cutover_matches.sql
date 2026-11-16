@@ -2,8 +2,9 @@
 -- only like the other finance tables (RLS on, no policies, nothing granted to anon or authenticated).
 --
 -- simplefin_etl.py decides, per SimpleFIN transaction dated near an account's last Rocket Money row, whether the
--- Rocket Money history already holds it (see the cutover rule in its docstring). Every decision is recorded here
--- by key only, so a later reconciliation can find the rows kept for review and the Rocket Money rows they might
+-- Rocket Money history already holds it (see the cutover rule in its docstring). Every such decision, and every
+-- match of a row dated before that window (so the Rocket Money row it took stays taken), is recorded here by key
+-- only, so a later reconciliation can find the rows kept for review and the Rocket Money rows they might
 -- duplicate. No amount, date, merchant or description is stored here.
 --
 -- decision:
@@ -13,9 +14,11 @@
 --   unconfirmed       a same-amount Rocket Money row is near but no merchant evidence; kept
 -- evidence: 'exact' (same date, amount, currency, description) or 'merchant' (shared merchant words, one to one).
 -- The ETL reads the table back each run: a Rocket Money row a recorded decision matched stays taken, also when a
--- later SimpleFIN answer no longer has the row that matched it. The ETL works without this table (each run then
--- matches on its own response and the SimpleFIN card reads partial with cutover_provenance_unsaved).
--- Not applied yet: Riley applies it before or with the merge of the change that added it.
+-- later SimpleFIN answer no longer has the row that matched it. While the table does not exist the ETL matches each
+-- response on its own, saves nothing and the SimpleFIN card reads partial with cutover_provenance_unsaved; any
+-- other error reading it fails the run before anything is written (db_read_failed), so the record is never
+-- rewritten from decisions made without it.
+-- Not applied yet: Riley applies it BEFORE merging the change that added it.
 
 create table if not exists pds.finance_cutover_matches (
   sf_txn_key        text primary key,          -- the SimpleFIN row's txn_key (= finance_transactions.txn_key when kept)

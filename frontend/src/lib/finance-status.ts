@@ -43,6 +43,7 @@ export const SIMPLEFIN_NOTES: Readonly<Record<string, string>> = {
   window_too_long: "the requested window is longer than SimpleFIN's 90-day limit",
   etl_error: "the SimpleFIN ETL failed unexpectedly (the Actions log names the error type)",
   db_write_failed: "the SimpleFIN ETL could not write to Supabase; the next run retries",
+  db_read_failed: "the SimpleFIN ETL could not read its cutover record from Supabase; nothing was written, the next run retries",
   sf_reauth: "SimpleFIN: a bank connection needs signing in again: reconnect it on SimpleFIN's site",
   sf_connection_error: "SimpleFIN: a bank connection reported an error: check it on SimpleFIN's site",
   sf_account_failed: "SimpleFIN could not read an account this run; it retries",

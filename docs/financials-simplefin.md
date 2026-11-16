@@ -45,6 +45,7 @@ Every message ends with its code in brackets (`[sf_reauth]`, `[account_unmatched
 | `a new account is balances-only ... [account_type_unset]` | Set `finance_accounts.account_type` (Cash or Credit Card) if its transactions should count. |
 | `rows near the Rocket Money cutover were kept ... [cutover_review xN]` (amber, once) | Possible duplicates were kept rather than guessed; see "The cutover from Rocket Money" below. |
 | `the cutover match record was not saved ... [cutover_provenance_unsaved]` | Apply `sql/finance_cutover_matches.sql`; the ledger itself was written. Rows kept for review are reported (`cutover_review`) by the first run that saves the record. |
+| `the SimpleFIN ETL could not read its cutover record ... [db_read_failed]` (red) | Nothing was written that run; the next run retries. If it repeats, check that Supabase is up and the table is readable. |
 | `SimpleFIN reported a problem; its details are not shown here` | An older heartbeat (or an unexpected one) without a code. Wait for the next run, or run `--dry-run` locally. |
 
 ## What is never stored or printed
@@ -61,9 +62,10 @@ row or a rolled-back ETL still cannot show free text there.
 
 ## The cutover from Rocket Money
 
-Rocket Money rows (up to 2026-11-11) stay as they are. For each account, SimpleFIN rows whose dates (transaction and
-posting) are all more than 3 days before the last Rocket Money row are dropped. A row transacted earlier but posted
-later is not dropped on its date: Rocket Money skipped pending rows, so it is matched on evidence like the others.
+Rocket Money rows (up to 2026-11-11) stay as they are. For each account, a SimpleFIN row transacted more than 3 days
+before the last Rocket Money row and posted by that date is dropped: it was posted while Rocket Money still read the
+account, so its history has it. A row transacted earlier but posted after that date is not dropped on its date:
+Rocket Money skipped pending rows, so it is matched on evidence like the others.
 
 A nearer row is dropped only on identity evidence (2026-11-16). The two feeds share no transaction id, so the
 evidence is the account, the amount and the currency plus either:
@@ -72,35 +74,56 @@ evidence is the account, the amount and the currency plus either:
   names a merchant (`POS PURCHASE` or `COFFEE SHOP` alone does not) and the payee names do not contradict each
   other. Such rows cannot be told apart, so they are paired one for one (two identical coffees on both sides: both
   match).
-- **merchant**: dates within 3 days (either feed's original or posted date counts), more than half of the shorter
-  side's description and merchant name words in common, including the word that names the business (its first
-  word, unless that is a kind of business such as `COFFEE` or `DELI`), and payee names that do not contradict each
-  other, where that one SimpleFIN row and that one Rocket Money row have no other such candidate. A shared city or
-  kind of business alone is not enough (`DEMO COFFEE ATLANTA` and `OTHER COFFEE ATLANTA` are two merchants).
+- **merchant**: dates within 3 days (either feed's original or posted date counts) and the same merchant: more than
+  half of the shorter side's description and merchant name words in common, the distinctive words of one side
+  (all but kinds of business such as `COFFEE` or `DELI`) all present on the other, including the word that names
+  the business, and payee names that do not contradict each other. A shared city, kind of business or first word
+  is not enough (`DEMO COFFEE ATLANTA` and `OTHER COFFEE ATLANTA`, or `DEMO BOTTLE COFFEE` and `DEMO DONKEY
+  COFFEE`, are two merchants), while a bank text and its cleaned name agree (`DEMO CAFE 0042 ATLANTA GA` and
+  `Demo Cafe`). A candidate pair counts only at the smallest date gap of both its rows, so the same purchase on
+  consecutive days pairs day by day. A match is a group of such pairs that is one to one, or whose rows cannot be
+  told apart on either side (same dates and text: paired one for one, like exact). A day Rocket Money lacks is
+  kept, since its neighbours are the nearer twins.
 
 Every SimpleFIN row of the response takes part, also the rows before the window, so a Rocket Money row whose twin is
-before the window is taken by that twin and a later purchase of the same amount is not matched to it. A Rocket Money
-row a recorded decision matched stays taken on later runs, also when SimpleFIN's answer no longer has that row (a
-narrower or incomplete answer), and a settled match is not reopened by a new row of the same merchant.
+before the window is taken by that twin and a later purchase of the same amount is not matched to it. That match is
+recorded too. A Rocket Money row a recorded decision matched stays taken on later runs, also when SimpleFIN's answer
+no longer has that row (a narrower or incomplete answer), and a settled match is not reopened by a new row of the
+same merchant.
 
-An equal amount alone never drops a row. A row with competing candidates (**ambiguous**) or with a same-amount
-Rocket Money row nearby but no merchant evidence (**unconfirmed**) is kept, and so is a row an earlier run already
-stored that turns out to match (**stored_duplicate**). The SimpleFIN card turns amber once, with
-`[cutover_review xN]`, by the run that records such rows; they may be duplicates to fix by hand.
-
-Every decision is recorded in `pds.finance_cutover_matches` (`sql/finance_cutover_matches.sql`, service-role only):
-the SimpleFIN row's key, the decision, its evidence and the Rocket Money key(s), no amounts or text. **That file is
-not applied yet: Riley applies it before or with the merge of the change that added it.** Until then every run
-works without the record (each response matched on its own) and the card reads amber with
-`[cutover_provenance_unsaved]`. To review: `python simplefin_etl.py --dry-run` prints the decisions per account (counts only), and
+An equal amount alone never drops a row. A row with competing candidates (**ambiguous**: a tie on dates, or rows
+that can be told apart competing for one twin) or with a same-amount Rocket Money row nearby but no merchant evidence
+(**unconfirmed**) is kept, and so is a row an earlier run already stored that turns out to match
+(**stored_duplicate**). The SimpleFIN card turns amber once, with `[cutover_review xN]`, by the run that records such
+rows; they may be duplicates to fix by hand, so check them (for example in the weekly review) until each is settled:
 
 ```sql
-select decision, account_key, sf_txn_key, history_txn_keys from pds.finance_cutover_matches
-where decision <> 'matched' order by account_key;
+select m.decision, m.account_key, m.sf_txn_key, m.history_txn_keys
+from pds.finance_cutover_matches m
+join pds.finance_transactions t on t.txn_key = m.sf_txn_key
+where m.decision <> 'matched' and coalesce(t.ignored_from, '') = ''
+order by m.account_key;
 ```
 
-lists the kept rows next to the Rocket Money rows they might duplicate (join `finance_transactions` on `txn_key`).
-Nothing is ever removed automatically: a duplicate is resolved by hand, e.g. by setting its `ignored_from`.
+lists the kept rows still counted next to the Rocket Money rows they might duplicate (join `finance_transactions`
+on `txn_key` again for the details). A kept row that is a real purchase needs no change; a duplicate is resolved by
+hand, e.g. by setting its `ignored_from`. Nothing is ever removed automatically. `python simplefin_etl.py --dry-run`
+prints the decisions per account and the rows recorded for review so far (counts only).
+
+The matches and the kept rows are recorded in `pds.finance_cutover_matches` (`sql/finance_cutover_matches.sql`,
+service-role only): the SimpleFIN row's key, the decision, its evidence and the Rocket Money key(s), no amounts or
+text. While the table does not exist every run matches its response on its own, saves nothing and the card reads
+amber with `[cutover_provenance_unsaved]`. Any other error reading it fails the run before anything is written
+(`[db_read_failed]`, red; the next run retries), so a run never matches without the record and then saves over it.
+
+**Before merging the change that added this (2026-11-16), Riley:**
+
+1. applies `sql/finance_cutover_matches.sql` (before the merge, not with it);
+2. runs `python simplefin_etl.py --dry-run` locally from that branch (it writes nothing) and checks the counts-only
+   `cutover decisions`, `new for review` and per-account `kept for review` lines. The first scheduled run after the
+   merge decides the cutover window again: rows the earlier equal-amount rule dropped without recording them are
+   still in SimpleFIN's 45-day answer until about late December, and every one of them without identity evidence
+   is written (and reported as `cutover_review`). Merge once those counts are acceptable.
 
 ## Categories
 
