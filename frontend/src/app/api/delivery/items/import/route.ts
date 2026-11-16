@@ -210,7 +210,8 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
   // Rows to read: with a pilot (or a retry inside one arm) the arms interleave, so a long queue is
   // read to find n dishes of one arm; without one every dish is baseline and the read stops at the
   // dishes stepped past plus one batch. The batch itself is always at most n (selectEstimateBatch).
-  const readN = only || pilot?.tasks.has("delivery_estimate") ? 1000 : from + skipN.baseline + skipN.pilot + n;
+  // Capped at 1000 rows, PostgREST's default max-rows (a larger read would be cut there anyway).
+  const readN = only || pilot?.tasks.has("delivery_estimate") ? 1000 : Math.min(1000, from + skipN.baseline + skipN.pilot + n);
   const { data, error, count } = await supabase
     .from("delivery_items_unestimated")
     .select("est_key,store_name,merchant_kind,title,customizations,price,currency", { count: "exact" })

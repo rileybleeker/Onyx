@@ -229,6 +229,25 @@ export const PLAYLIST_CALL_TIMEOUT_MS = 60_000;
  * stays under the platform's default function limit; past it, no retry is started.
  */
 export const PLAYLIST_REQUEST_BUDGET_MS = 280_000;
+/**
+ * How long past the request budget a playlist creation already started on Spotify is waited for.
+ * A creation is a write, so it is never abandoned: its outcome is waited for (up to this grace,
+ * still under the platform's default limit) and, when it is still running then, observed once it
+ * settles, never logged as not created while it may still land.
+ */
+export const PLAYLIST_CREATE_GRACE_MS = 10_000;
+
+/**
+ * Thrown when one model attempt ran past its own deadline (the response body included: the SDK's
+ * `timeout` stops only at the response headers). Retryable like the SDK's own timeout, unlike an
+ * abort by the request budget or a disconnect.
+ */
+export class AttemptTimeoutError extends Error {
+  constructor() {
+    super("Model call timed out.");
+    this.name = "AttemptTimeoutError";
+  }
+}
 
 /** HTTP statuses the SDK itself retries (request timeout, conflict, rate limit, server errors). */
 export function isRetryableStatus(status: unknown): boolean {

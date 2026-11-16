@@ -165,7 +165,7 @@ test("playlist and label requests count attempted calls before each create, obse
   const pl = read("app/api/spotify/generate-playlist/route.ts");
   // One create, inside callWithCountedRetries, which counts every attempt (retries included).
   assert.equal(createCalls(pl).length, 1);
-  assert.match(pl, /callWithCountedRetries\(\s*\(\) =>\s*anthropic\.messages\.create\(/);
+  assert.match(pl, /callWithCountedRetries\(\s*async \(\) => \{[\s\S]{0,400}?return await anthropic\.messages\.create\(/);
   assert.match(pl, /onAttempt: \(\) => \{\s*attempts\+\+;/);
   assert.match(pl, /if \(observed\) return;/);
   // The label and dish routes: one create each, inside callWithCountedRetries (their attempt
@@ -311,10 +311,13 @@ test("route deadlines count from the handler's entry and end the model call befo
   assert.ok(dish.indexOf("routeDeadline(startedAt.getTime()") < dish.indexOf("await req.json()"));
   // The playlist route has no function limit: 60 s per attempt, a whole-request budget, SDK retries off.
   const pl = read("app/api/spotify/generate-playlist/route.ts");
-  assert.match(pl, /timeout: Math\.min\(PLAYLIST_CALL_TIMEOUT_MS, attemptTimeoutMs\(requestAt, Date\.now\(\)\)\)/);
-  assert.match(pl, /maxRetries: 0,\s*signal: stop\.signal/);
+  assert.match(pl, /const attemptMs = Math\.min\(PLAYLIST_CALL_TIMEOUT_MS, attemptTimeoutMs\(requestAt, Date\.now\(\)\)\)/);
+  // Each attempt's own deadline also ends a stalled body read; it is retryable, the budget is not.
+  assert.match(pl, /timeout: attemptMs,\s*maxRetries: 0,\s*signal: AbortSignal\.any\(\[stop\.signal, attempt\]\)/);
+  assert.match(pl, /if \(attempt\.aborted && !stop\.signal\.aborted\) throw new AttemptTimeoutError\(\);/);
+  assert.match(pl, /e instanceof AttemptTimeoutError \|\|/);
   // Every request is observed, also one whose client disconnected mid-loop.
-  assert.match(pl, /\} finally \{[\s\S]{0,240}?observe\(\);/);
+  assert.match(pl, /\} finally \{[\s\S]{0,700}?observe\(\);/);
 });
 
 test("a failed estimate batch answers with its arm first, so the harvester can read it", () => {
@@ -502,6 +505,12 @@ function stubSdk(script, seenOptions) {
           seenOptions.push(options);
           const step = script.shift();
           if (step === "timeout") throw new StubTimeoutError();
+          // Headers arrived but the body never does: ends only when the call's signal aborts.
+          if (step === "stall") {
+            return new Promise((_, reject) => {
+              options.signal.addEventListener("abort", () => reject(new Error("Request was aborted.")), { once: true });
+            });
+          }
           if (step === "http_529") throw new StubAPIError(529, "Overloaded");
           if (step === "http_400") throw new StubAPIError(400, "Bad request");
           if (step === "answer_tool") {
@@ -529,7 +538,7 @@ function stubSdk(script, seenOptions) {
   return FakeAnthropic;
 }
 
-async function runPlaylistCase(attempts) {
+async function runPlaylistCase(attempts, opts = {}) {
   const until = new Date(Date.now() + 3 * DAY).toISOString().slice(0, 10);
   const saved = { p: process.env.ONYX_MODEL_PILOT, u: process.env.ONYX_MODEL_PILOT_UNTIL, s: process.env.ONYX_MODEL_PILOT_SHARE };
   process.env.ONYX_MODEL_PILOT = "playlist";
@@ -542,28 +551,77 @@ async function runPlaylistCase(attempts) {
   console.info = (msg) => lines.push(JSON.parse(msg));
   // The route's retry wait goes through setTimeout; run it at once so the test does not sleep.
   global.setTimeout = (fn) => origSetTimeout(fn, 0);
+  // Optionally shorten the per-attempt deadline (a real AbortSignal.timeout, not setTimeout).
+  const origAbortTimeout = AbortSignal.timeout;
+  if (opts.attemptMs) {
+    AbortSignal.timeout = (ms) => origAbortTimeout.call(AbortSignal, ms === R.PLAYLIST_CALL_TIMEOUT_MS ? opts.attemptMs : ms);
+  }
+  const afterFns = [];
+  let text = "";
   try {
     const route = loadTs("app/api/spotify/generate-playlist/route.ts", {
       "@anthropic-ai/sdk": stubSdk([...attempts], seenOptions),
       "@supabase/supabase-js": { createClient: () => ({}) },
-      "next/server": { NextRequest: class {} },
+      "next/server": { NextRequest: class {}, after: (fn) => afterFns.push(fn) },
       "@/lib/spotify-server": {
         searchTracks: async () => [],
-        createPlaylist: async ({ name, trackIds }) => ({ playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length }),
+        createPlaylist:
+          opts.createPlaylist ||
+          (async ({ name, trackIds }) => ({ playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length })),
       },
     });
     const res = await route.POST({ json: async () => ({ prompt: "Upbeat songs for a morning run", source_pool: "discovery" }) });
-    await res.text();
+    text = await res.text();
+    // What `after` keeps alive (a creation still running when the response closed).
+    await Promise.all(afterFns.map((fn) => fn()));
   } finally {
     console.info = origInfo;
     global.setTimeout = origSetTimeout;
+    AbortSignal.timeout = origAbortTimeout;
     for (const [k, v] of [["ONYX_MODEL_PILOT", saved.p], ["ONYX_MODEL_PILOT_UNTIL", saved.u], ["ONYX_MODEL_PILOT_SHARE", saved.s]]) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
   }
-  return { lines, seenOptions };
+  return { lines, seenOptions, text };
 }
+
+test("a playlist attempt whose body stalls ends at its own deadline and is retried", async () => {
+  const { lines, seenOptions } = await runPlaylistCase(["stall", "answer_tool", "answer_end"], { attemptMs: 20 });
+  assert.equal(seenOptions.length, 3, "the stalled attempt was retried, not left to the request budget");
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].ok, true);
+  assert.equal(lines[0].calls, 3);
+  assert.equal(lines[0].answered, 2);
+});
+
+test("a second create in one playlist request reuses the first creation", async () => {
+  let writes = 0;
+  const createPlaylist = async ({ name, trackIds }) => {
+    writes++;
+    return { playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length };
+  };
+  const { lines, text } = await runPlaylistCase(["answer_tool", "answer_tool", "answer_end"], { createPlaylist });
+  assert.equal(writes, 1, "one Spotify write per request");
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].ok, true);
+  assert.match(text, /Already created/);
+  assert.match(text, /"type":"done"/);
+});
+
+test("a creation still running when the request gives up is observed with its real outcome", async () => {
+  // The grace timer runs at once in this test (setTimeout is shortened), so the route gives up on
+  // the creation while it is still running; it lands 30 ms later.
+  const realSetTimeout = setTimeout;
+  const createPlaylist = ({ name, trackIds }) =>
+    new Promise((resolve) => realSetTimeout(() => resolve({ playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length }), 30));
+  const { lines, text } = await runPlaylistCase(["answer_tool", "answer_end"], { createPlaylist });
+  assert.match(text, /may still appear in Spotify/);
+  assert.doesNotMatch(text, /"type":"done"/);
+  assert.equal(lines.length, 1, "observed once, after the creation settled");
+  assert.equal(lines[0].ok, true, "a playlist that landed late counts as accepted");
+  assert.equal(lines[0].accepted, 1);
+});
 
 for (const c of FX.playlist_measurement.cases) {
   test(`playlist route, ${c.id} (${c.attempts.join(" > ")}): every attempt logged, missing usage unpriced`, async () => {
@@ -848,6 +906,9 @@ test("harvester keeps failed dishes per arm, and the route and playlist loop hon
   const pl = read("app/api/spotify/generate-playlist/route.ts");
   assert.match(pl, /withinBudget\(searchTracks/);
   assert.match(pl, /withinBudget\(runFeatureQuery/);
-  assert.match(pl, /withinBudget\(createPlaylist/);
+  // Playlist creation is a write: never raced away by the budget, at most one per request.
+  assert.doesNotMatch(pl, /withinBudget\(createPlaylist/);
+  assert.match(pl, /await createOnce\(\{/);
+  assert.ok(R.PLAYLIST_REQUEST_BUDGET_MS + R.PLAYLIST_CREATE_GRACE_MS < 300_000, "grace stays under the default function limit");
   assert.match(pl, /if \(stop\.signal\.aborted\) throw/);
 });

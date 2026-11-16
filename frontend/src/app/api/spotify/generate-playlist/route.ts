@@ -19,9 +19,10 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
-import { NextRequest } from "next/server";
+import { after, NextRequest } from "next/server";
 import { searchTracks, createPlaylist, CreatePlaylistResult } from "@/lib/spotify-server";
 import {
+  AttemptTimeoutError,
   attemptTimeoutMs,
   callWithCountedRetries,
   chooseModel,
@@ -32,6 +33,7 @@ import {
   pilotFromEnv,
   pilotObservation,
   PLAYLIST_CALL_TIMEOUT_MS,
+  PLAYLIST_CREATE_GRACE_MS,
   PLAYLIST_REQUEST_BUDGET_MS,
   retryAfterMs,
 } from "@/lib/model-routing";
@@ -260,28 +262,41 @@ export async function POST(req: NextRequest) {
   // Every model call of the tool loop. The SDK's own retries are off (they would hide attempts
   // from the count) and the route retries the same errors the SDK would, at most
   // MODEL_CALL_RETRIES times, counting each attempt and waiting as long as the provider's
-  // Retry-After asks, but never past the request budget; a hung call ends at its deadline.
+  // Retry-After asks, but never past the request budget. Each attempt has its own deadline that
+  // also covers reading the response body (the SDK's `timeout` stops at the headers): a stalled
+  // attempt ends there and is retried like the SDK's own timeout, while an abort by the request
+  // budget is not.
   const callModel = (messages: Anthropic.MessageParam[]) =>
     callWithCountedRetries(
-      () =>
-        anthropic.messages.create(
-          {
-            model: choice.model,
-            max_tokens: 1024,
-            system: systemPrompt,
-            tools,
-            messages,
-            ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
-          },
-          {
-            timeout: Math.min(PLAYLIST_CALL_TIMEOUT_MS, attemptTimeoutMs(requestAt, Date.now())),
-            maxRetries: 0,
-            signal: stop.signal,
-          },
-        ),
+      async () => {
+        const attemptMs = Math.min(PLAYLIST_CALL_TIMEOUT_MS, attemptTimeoutMs(requestAt, Date.now()));
+        const attempt = AbortSignal.timeout(attemptMs);
+        try {
+          return await anthropic.messages.create(
+            {
+              model: choice.model,
+              max_tokens: 1024,
+              system: systemPrompt,
+              tools,
+              messages,
+              ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
+            },
+            {
+              timeout: attemptMs,
+              maxRetries: 0,
+              signal: AbortSignal.any([stop.signal, attempt]),
+            },
+          );
+        } catch (e) {
+          if (attempt.aborted && !stop.signal.aborted) throw new AttemptTimeoutError();
+          throw e;
+        }
+      },
       {
         retries: MODEL_CALL_RETRIES,
-        isRetryable: (e) => isRetryableModelError(e, (x) => x instanceof Anthropic.APIConnectionError),
+        isRetryable: (e) =>
+          e instanceof AttemptTimeoutError ||
+          isRetryableModelError(e, (x) => x instanceof Anthropic.APIConnectionError),
         retryAfterMs: (e) => retryAfterMs(e, Date.now()),
         deadlineMs: requestAt,
         signal: stop.signal,
@@ -291,8 +306,9 @@ export async function POST(req: NextRequest) {
       },
     );
 
-  // Tool operations (Spotify, database) race the same request budget, and no tool starts after it
-  // has run out, so a hung one cannot keep the request open past its terminal observation.
+  // Read-only tool operations (Spotify search, database) race the same request budget, and no tool
+  // starts after it has run out, so a hung one cannot keep the request open past its terminal
+  // observation. Playlist creation is a write and goes through `createOnce` below instead.
   const withinBudget = <T,>(work: Promise<T>): Promise<T> => {
     if (stop.signal.aborted) {
       work.catch(() => undefined);
@@ -305,6 +321,50 @@ export async function POST(req: NextRequest) {
     });
   };
 
+  // Playlist creation, at most one per request. A creation is never abandoned: once started on
+  // Spotify it is tracked, its result is recorded whenever it lands, and a second
+  // create_spotify_playlist call of the same request (the model retrying after an error) reuses it
+  // instead of writing a second playlist. It is waited for past the request budget, up to
+  // PLAYLIST_CREATE_GRACE_MS; when it is still running then, the outcome is unknown, the client is
+  // told so, and the request is observed once the creation settles (`after` keeps the function
+  // alive for it) instead of being logged as not created while it may still land.
+  let creation: Promise<CreatePlaylistResult> | null = null;
+  let creationPending = false;
+  const graceAt = requestAt + PLAYLIST_CREATE_GRACE_MS;
+  const createOnce = (args: Parameters<typeof createPlaylist>[0]): Promise<CreatePlaylistResult> => {
+    if (!creation) {
+      if (stop.signal.aborted) return Promise.reject(new Error("Request time budget exceeded"));
+      creationPending = true;
+      const write = createPlaylist(args);
+      creation = write;
+      write
+        .then(
+          (r) => {
+            finalResult = r;
+          },
+          () => undefined,
+        )
+        .finally(() => {
+          creationPending = false;
+        });
+    }
+    const work = creation;
+    return new Promise<CreatePlaylistResult>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Playlist creation is still running on Spotify")),
+        Math.max(0, graceAt - Date.now()),
+      );
+      work.then(resolve, reject).finally(() => clearTimeout(timer));
+    });
+  };
+  // Resolved when the request is fully done (its creation settled and the request observed), so
+  // the function stays alive for a creation still running after the response closed.
+  let finished: () => void = () => undefined;
+  const requestDone = new Promise<void>((resolve) => {
+    finished = resolve;
+  });
+  after(() => requestDone);
+
   const stream = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -313,6 +373,29 @@ export async function POST(req: NextRequest) {
           controller.enqueue(enc.encode(`data: ${JSON.stringify(evt)}\n\n`));
         } catch {
           // Controller closed early (client disconnected) — swallow.
+        }
+      };
+      const closeStream = () => {
+        try {
+          controller.close();
+        } catch {
+          // already closed
+        }
+      };
+      // The last event: the playlist when one was created (also after a later failure, so the
+      // client does not ask for it again), the unknown outcome when a creation is still running,
+      // else the failure.
+      const sendOutcome = (failure: string) => {
+        if (finalResult) {
+          send({ type: "done", result: finalResult });
+        } else if (creationPending) {
+          send({
+            type: "error",
+            message:
+              "Playlist creation did not finish in time and may still appear in Spotify. Check your playlists before generating again.",
+          });
+        } else {
+          send({ type: "error", message: failure });
         }
       };
 
@@ -366,16 +449,19 @@ export async function POST(req: NextRequest) {
                   type: "status",
                   message: `Creating "${inp.name}" with ${inp.track_ids.length} tracks…`,
                 });
-                const result = await withinBudget(createPlaylist({
+                const reused = creation != null;
+                const result = await createOnce({
                   name: inp.name,
                   description: inp.description,
                   trackIds: inp.track_ids,
                   isPublic: false,
                   createdVia: "builder",
                   prompt: body.prompt,
-                }));
+                });
                 resultStr = JSON.stringify(result);
-                summary = `Created "${result.name}" · ${result.track_count} tracks`;
+                summary = reused
+                  ? `Already created "${result.name}" · ${result.track_count} tracks`
+                  : `Created "${result.name}" · ${result.track_count} tracks`;
                 finalResult = result;
               } else {
                 resultStr = JSON.stringify({ error: `Unknown tool: ${block.name}` });
@@ -410,34 +496,26 @@ export async function POST(req: NextRequest) {
           send({ type: "message", text: finalText });
         }
 
-        observe();
-        if (finalResult) {
-          send({ type: "done", result: finalResult });
-        } else {
-          send({
-            type: "error",
-            message:
-              iter >= MAX_ITERATIONS
-                ? "Reached iteration cap without creating a playlist. Try a more specific prompt."
-                : "Agent ended without creating a playlist.",
-          });
-        }
+        sendOutcome(
+          iter >= MAX_ITERATIONS
+            ? "Reached iteration cap without creating a playlist. Try a more specific prompt."
+            : "Agent ended without creating a playlist.",
+        );
       } catch (e) {
         // A playlist already created counts as accepted even if a later call failed.
-        observe();
-        send({
-          type: "error",
-          message: e instanceof Error ? e.message : String(e),
-        });
+        sendOutcome(e instanceof Error ? e.message : String(e));
       } finally {
+        if (creationPending) {
+          // Outcome unknown: the response ends now and the creation is waited for (the function
+          // is kept alive by `after`), so the request is observed with its real outcome.
+          closeStream();
+          await creation?.catch(() => undefined);
+        }
         // Every path observes once (the flag makes repeats no-ops), including a request whose
         // client disconnected or whose last event could not be sent.
         observe();
-        try {
-          controller.close();
-        } catch {
-          // already closed
-        }
+        closeStream();
+        finished();
       }
     },
   });

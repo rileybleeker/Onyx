@@ -286,7 +286,11 @@ export async function POST(req: NextRequest) {
   // request failed before the model call (e.g. the reference table read), so those failures are
   // not charged to the model.
   let attempts = 0;
-  const observe = (ok: boolean) =>
+  // Observed once per request: a throw after the outcome was logged must not log a second one.
+  let observed = false;
+  const observe = (ok: boolean) => {
+    if (observed) return;
+    observed = true;
     logPilotObservation(
       pilotObservation("supplement_photo", choice, pilot, {
         usage: usage ? [usage] : [],
@@ -295,6 +299,7 @@ export async function POST(req: NextRequest) {
         calls: attempts,
       }),
     );
+  };
 
   try {
     const reference = await buildReferenceTable(deadline.signal);
