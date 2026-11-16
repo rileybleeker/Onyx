@@ -893,3 +893,66 @@ test("a removal and a keyed insert of the same operation take one lock, so a rem
   assert.ok(body("chat_operation_tombstone").includes(lock));
   assert.doesNotMatch(sql, /\bDROP\b/i, "applied through the Supabase MCP, which declines any DROP");
 });
+
+// ---------------------------------------------------------------------------
+// Review round 9 (SEC-04): every row of a request is read back, never the first 200. Synthetic ids and names only.
+// ---------------------------------------------------------------------------
+
+/** `refused` refused calls, then one confirmed stack log, as an earlier try (or earlier tries) left them. */
+function seedLongRequest(db, refused) {
+  const at = (i) => new Date(Date.parse("2029-12-01T00:00:00.000Z") + i * 1000).toISOString();
+  const row = (i, fields) => ({
+    op_id: randomUUID(), owner_id: OWNER, request_id: REQUEST, context: null, receipt: null, created_at: at(i), updated_at: at(i), ...fields,
+  });
+  const rows = [];
+  for (let i = 1; i <= refused; i++) {
+    const intent = { product: `synthetic ${i}` };
+    rows.push(row(i, { tool: INTAKE, ordinal: i, intent, intent_sha: ops.intentSha(INTAKE, intent), status: "refused", result: { error: "No product named that." } }));
+  }
+  rows.push(row(refused + 1, {
+    tool: STACK, ordinal: 1, intent: input(), intent_sha: ops.intentSha(STACK, input()), status: "done",
+    result: { success: true, stack: "Synthetic Morning", products: 2, total_doses: 3, date: "2030-01-01" },
+  }));
+  db.seed("chat_operations", rows);
+}
+
+test("a request with more than 200 operations is read back in full: a write after the 200th row still blocks new calls", async () => {
+  for (const maxRows of [undefined, 50]) {
+    // maxRows = a PostgREST max-rows cap smaller than one page: the listing advances by what came back, skipping nothing.
+    const { db, store, open } = setup(maxRows ? { maxRows } : {});
+    await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+    await expireLeases(db);
+    seedLongRequest(db, 250);
+    assert.equal((await store.listForRequest(OWNER, REQUEST)).length, 251);
+    const write = keyedWrite();
+    const retry = await open();
+    assert.equal(retry.retry, true);
+    const fresh = await retry.run(INTAKE, { product: "synthetic new" }, write.execute("New"));
+    const forModel = JSON.parse(fresh.result);
+    assert.equal(forModel.conflict, true, "the stack log past row 200 counts as written");
+    assert.equal(forModel.earlier_tool, STACK);
+    assert.equal(forModel.earlier_outcome, "saved");
+    assert.equal(fresh.receipt.status, "not_saved");
+    assert.equal(write.effects.size, 0, "nothing ran next to the earlier write");
+    const earlier = await retry.earlierReceipts();
+    assert.deepEqual(earlier.map((r) => r.status), ["unchanged"], "the earlier stack log is listed");
+    const outcome = plain(await ops.requestOutcome(store, OWNER, REQUEST, receipts.buildWriteReceipt));
+    assert.deepEqual(outcome.receipts.map((r) => r.status), ["saved"]);
+  }
+});
+
+test("a listing that cannot reach the row count fails closed: no new write, the earlier account is unknown", async () => {
+  const { db, store, open, errors } = setup({ maxRows: 0 });
+  await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  await expireLeases(db);
+  seedLongRequest(db, 3);
+  await assert.rejects(store.listForRequest(OWNER, REQUEST), (e) => e instanceof ops.LedgerFailure && e.code === "list_incomplete");
+  const write = keyedWrite();
+  const retry = await open();
+  const fresh = await retry.run(INTAKE, { product: "synthetic new" }, write.execute("New"));
+  assert.equal(JSON.parse(fresh.result).error, ops.LEDGER_ERROR);
+  assert.equal(write.effects.size, 0);
+  assert.equal(await retry.earlierReceipts(), null, "unknown, never 'nothing was saved'");
+  assert.deepEqual(errors.at(-1), ["list", "list_incomplete"]);
+  assert.equal((await ops.requestOutcome(store, OWNER, REQUEST, receipts.buildWriteReceipt)).status, "failed");
+});

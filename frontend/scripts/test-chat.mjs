@@ -683,6 +683,7 @@ test("a page without request_id runs as before: no ledger, no replay_safe flag",
   const w = keyedIntake();
   const body = await (await route(logFocus, { supabase: db, intake: w.intake }).post({ messages: [user("Log Synthetic Focus")] })).json();
   assert.equal("replay_safe" in body, false);
+  assert.equal("earlier_unconfirmed" in body, false, "no id, no ledger: nothing to flag");
   assert.equal(db.log.some((c) => c.table.startsWith("chat_")), false);
   assert.deepEqual(w.keys, [undefined]);
 });
@@ -698,6 +699,7 @@ test("missing ledger tables: write tools are refused (fail closed) and only the 
   assert.equal(closed.writes(), 0, "no write runs without a record of it, never an unkeyed fallback");
   assert.equal(closedBody.receipts[0].status, "not_saved");
   assert.equal("replay_safe" in closedBody, false);
+  assert.equal(closedBody.earlier_unconfirmed, true, "this try cannot tell whether an earlier try of the id wrote");
   assert.deepEqual(JSON.parse(JSON.stringify(logged)), [["Chat ledger", { stage: "open", code: "PGRST205" }]]);
   assert.doesNotMatch(JSON.stringify(logged), /synthetic detail/);
 
@@ -730,6 +732,7 @@ test("a malformed request_id is a 400 before the model runs; a failed owner chec
   assert.equal(noClaims.writes(), 0);
   assert.equal(body.receipts[0].status, "not_saved");
   assert.equal("replay_safe" in body, false);
+  assert.equal(body.earlier_unconfirmed, true);
   assert.deepEqual(JSON.parse(JSON.stringify(logged)), [["Chat ledger", { stage: "open", code: "no_owner" }]]);
 });
 
@@ -1492,8 +1495,40 @@ test("a retry whose earlier writes cannot be read back says so, and the page kee
   assert.equal("earlier_unconfirmed" in readable, false);
   assert.equal(readable.receipts.length, 1);
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /const earlierUnknown = data\?\.earlier_unconfirmed === true;/);
+  assert.match(page, /const reusedId = requestId !== null;/);
+  assert.match(page, /const earlierUnknown = earlierOutcomeUnknown\(reusedId, data\);/);
   assert.match(page, /if \(!earlierUnknown\) settlePendingSend\(requestId\);/);
+});
+
+test("a retry whose ledger cannot be opened keeps the earlier try's outcome unknown, so the page keeps the id (SEC-04)", async () => {
+  // The first try saves, its answer is lost; the retry (same id) finds the ledger down: writes pause, and what the
+  // first try saved cannot be read either. A 200 that let the page settle the id would make a later "log it" look new.
+  const state = { down: false };
+  const db = ledgerDb({ fail: ({ table }) => (state.down && table.startsWith("chat_") ? { code: "08006" } : null) });
+  const w = keyedIntake();
+  const body = { request_id: RID, messages: [user("Log Synthetic Focus")] };
+  await route(logFocus, { supabase: db, intake: w.intake }).post(body);
+  assert.equal(w.keys.length, 1);
+  state.down = true;
+  const retry = route(logFocus, { supabase: db, intake: w.intake });
+  const response = await retry.post(body);
+  assert.equal(response.status, 200, "the chat still answers");
+  const data = await response.json();
+  assert.equal(retry.writes(), 0, "no write runs without a record of it");
+  assert.equal(data.earlier_unconfirmed, true, "unknown, never 'nothing was saved'");
+  assert.equal("replay_safe" in data, false);
+  assert.equal(data.receipts[0].status, "not_saved");
+  assert.ok(data.receipts[0].details.every((d) => !d.endsWith("…")), "the paused text fits the receipt");
+  // The page keeps a remembered send whenever the answer leaves its earlier outcome unknown.
+  assert.equal(contract.earlierOutcomeUnknown(true, data), true);
+  assert.equal(contract.earlierOutcomeUnknown(false, data), true, "the server's flag is honoured for any id");
+  // A retry answered without the ledger (no replay_safe; e.g. an older server) is unknown too; through the ledger it is not.
+  assert.equal(contract.earlierOutcomeUnknown(true, { response: "ok" }), true);
+  assert.equal(contract.earlierOutcomeUnknown(true, { response: "ok", replay_safe: true }), false);
+  // A fresh id with no flag has no earlier try.
+  assert.equal(contract.earlierOutcomeUnknown(false, { response: "ok" }), false);
+  assert.equal(contract.earlierOutcomeUnknown(false, null), false);
+  assert.equal(contract.earlierOutcomeUnknown(true, null), true);
 });
 
 test("the chat page never reuses a remembered send silently: Riley picks retry or new, and a dismissed account is resolved", () => {

@@ -1597,8 +1597,9 @@ async function openRequestLedger(
 /** Ledger problems are logged by stage and database code only. */
 const logLedger = (stage: string, code: string) => console.error("Chat ledger", { stage, code });
 
+/** Shown on the receipt too, so at most 240 characters (the receipt's limit). */
 const WRITES_PAUSED =
-  "Onyx could not set up safe logging for this message, so this action was not done and nothing was written. Answer the rest normally and tell the user to try the action again in a moment.";
+  "Onyx could not set up safe logging for this message, so this action was not done now. An earlier send of this message may already have saved it. Answer the rest normally; tell the user to check the relevant page before trying again.";
 
 export async function POST(req: NextRequest) {
   // One receipt per executed write tool, built from the tool's own result (see
@@ -1610,11 +1611,13 @@ export async function POST(req: NextRequest) {
   // The page sent a request_id but the ledger could not record it (tables missing, or any other failure): write
   // tools are refused, lookups still answer.
   let writesPaused = false;
-  // On a retry, the ledger could not be read back for what an earlier try saved: that is unknown, not "nothing", so
-  // the answer says so (earlier_unconfirmed) and the page keeps the request remembered instead of settling it.
+  // What an earlier try of this request id saved could not be read back: unknown, not "nothing", so the answer says
+  // so (earlier_unconfirmed) and the page keeps the request remembered instead of settling it. Set on a retry whose
+  // ledger rows cannot be listed, and whenever a keyed request's ledger cannot be opened at all (that try cannot
+  // tell a first try from a retry, so an earlier try may have written).
   let earlierUnconfirmed = false;
   const withReceipts = <T extends object>(body: T): T | (T & { receipts?: WriteReceipt[]; replay_safe?: true; earlier_unconfirmed?: true }) => {
-    if (receipts.length === 0 && !ledger) return body;
+    if (receipts.length === 0 && !ledger && !earlierUnconfirmed) return body;
     return {
       ...body,
       ...(receipts.length > 0 ? { receipts } : {}),
@@ -1675,6 +1678,10 @@ export async function POST(req: NextRequest) {
       // missing, or any other failure). No write runs without a record of it; questions are still answered. Only a
       // request with no request_id (an older page) runs write tools without the ledger, and it is not called safe.
       writesPaused = true;
+      // Nor can it say what an earlier try of this id saved (this may be a retry of a send whose writes committed
+      // before its answer was lost): unknown, so the page keeps the id remembered until its account can be read back,
+      // and a later "log it" is not taken as the first time.
+      earlierUnconfirmed = true;
     }
     const localNow = now.toLocaleString("en-US", {
       timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",

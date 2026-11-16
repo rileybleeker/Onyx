@@ -119,6 +119,10 @@ export interface LedgerStore {
   abandonRequest(owner_id: string, request_id: string): Promise<"abandoned" | "exists">;
   /** Insert a pending row for this call, or return the row already in that place (created = false). Atomic. */
   claim(key: OperationKey, intent_sha: string, intent: unknown, context?: OperationContext | null): Promise<{ row: OperationRow; created: boolean }>;
+  /**
+   * EVERY row of the request, oldest first, or a Ledger* error: never part of them (a row left out could be the write
+   * that makes a retry refuse new calls).
+   */
   listForRequest(owner_id: string, request_id: string): Promise<OperationRow[]>;
   /** Take a REFUSED row back to pending (same call, run again); null when it is no longer refused (another try took it). */
   reclaim(row: OperationRow): Promise<OperationRow | null>;
@@ -839,6 +843,14 @@ export async function abandonRequest(
 type Pds = SupabaseClient<any, any, any>;
 
 const OP_COLS = "op_id,owner_id,request_id,tool,ordinal,intent_sha,intent,status,result,receipt,context,created_at";
+/** Rows read per round trip when a request's operations are listed (under Supabase's default max-rows of 1000). */
+const LIST_PAGE = 200;
+/**
+ * More operation rows than one request can reach in practice (a try adds at most MAX_TOOL_CALLS = 32, and a retry
+ * adds new ones only while every earlier call was refused). Past it the listing fails closed (a LedgerFailure: the
+ * retry writes nothing and its earlier account reads as unknown) instead of answering with part of the rows.
+ */
+const LIST_MAX = 5000;
 /** Missing table / column (the SQL file is not applied yet). */
 const MISSING_CODES = new Set(["42P01", "PGRST205", "42703", "PGRST204"]);
 
@@ -939,15 +951,36 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
     },
 
     async listForRequest(owner_id, request_id) {
-      const { data, error } = await ops()
-        .select(OP_COLS)
-        .eq("owner_id", owner_id)
-        .eq("request_id", request_id)
-        .order("created_at", { ascending: true })
-        .order("ordinal", { ascending: true })
-        .limit(200);
-      if (error) fail(error);
-      return (data ?? []) as OperationRow[];
+      // Every row of the request, never the first N: a row left out could be the one that wrote, and a retry that
+      // misses it would treat the request as "nothing written" and run new writes next to it. Read page by page in a
+      // total order (op_id breaks ties), advancing by the rows actually returned (a PostgREST max-rows cap smaller
+      // than the page cannot skip any), and checked against the exact count: short of it = fail closed.
+      const out: OperationRow[] = [];
+      const seen = new Set<string>();
+      for (let from = 0; ; ) {
+        const { data, error, count } = await ops()
+          .select(OP_COLS, { count: "exact" })
+          .eq("owner_id", owner_id)
+          .eq("request_id", request_id)
+          .order("created_at", { ascending: true })
+          .order("ordinal", { ascending: true })
+          .order("op_id", { ascending: true })
+          .range(from, from + LIST_PAGE - 1);
+        if (error) fail(error);
+        if (typeof count !== "number") fail({ code: "list_count_missing" });
+        const page = (data ?? []) as OperationRow[];
+        // A row inserted meanwhile ahead of this page shifts the rest: they are read twice (kept once), never skipped,
+        // and the new row itself is then short of the count, which fails closed.
+        for (const row of page) {
+          if (seen.has(row.op_id)) continue;
+          seen.add(row.op_id);
+          out.push(row);
+        }
+        if (out.length >= count) return out;
+        if (page.length === 0) fail({ code: "list_incomplete" });
+        from += page.length;
+        if (from >= LIST_MAX) fail({ code: "list_too_long" });
+      }
     },
 
     async reclaim(row) {

@@ -1,5 +1,6 @@
 // Test helper (not a test: CI only runs tests/*.test.cjs). A small in-memory stand-in for the supabase-js query
-// builder: insert / upsert (also ignoreDuplicates) / update / select with eq / neq / in / gte / lt / is / order / limit / single / maybeSingle,
+// builder: insert / upsert (also ignoreDuplicates) / update / select (also { count: "exact" }) with eq / neq / in / gte / lt / is / order /
+// limit / range / single / maybeSingle, a PostgREST-style max-rows cap (`maxRows`),
 // unique keys per table (all-or-nothing inserts, a 23505 on a clash, keys with a NULL column never clash, like a
 // partial unique index) and injectable failures: one that writes nothing (`fail`) and one that writes and then loses
 // the answer (`lose`, e.g. a network error after the commit). Enough to run code that writes through PostgREST
@@ -15,6 +16,7 @@ const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)
  * options.rpc      { name: value }                     rpc() answers
  * options.fail     ({ table, op, payload }) => error | null   an error object fails that call (nothing is written)
  * options.lose     ({ table, op, payload }) => error | null   the call is carried out, then answers with that error
+ * options.maxRows  number                              at most this many rows per list select (PostgREST max-rows)
  */
 function createFakePostgrest(options = {}) {
   const unique = options.unique ?? {};
@@ -32,7 +34,7 @@ function createFakePostgrest(options = {}) {
   };
 
   function query(table) {
-    const q = { op: "select", filters: [], orders: [], max: null, mode: "many", returning: false, payload: null, conflict: null, ignoreDuplicates: false };
+    const q = { op: "select", filters: [], orders: [], max: null, offset: 0, count: false, mode: "many", returning: false, payload: null, conflict: null, ignoreDuplicates: false };
     const shape = (list) => {
       if (q.mode === "single") return list.length === 1 ? { data: clone(list[0]), error: null } : { data: null, error: { code: "PGRST116" } };
       if (q.mode === "maybe") return list.length <= 1 ? { data: clone(list[0] ?? null), error: null } : { data: null, error: { code: "PGRST116" } };
@@ -95,12 +97,16 @@ function createFakePostgrest(options = {}) {
       for (const [col, asc] of [...q.orders].reverse()) {
         list = [...list].sort((a, b) => (a[col] < b[col] ? -1 : a[col] > b[col] ? 1 : 0) * (asc ? 1 : -1));
       }
+      const total = list.length;
+      list = list.slice(q.offset);
       if (q.max != null) list = list.slice(0, q.max);
-      return shape(list);
+      if (options.maxRows != null && q.mode === "many") list = list.slice(0, options.maxRows);
+      return q.count ? { ...shape(list), count: total } : shape(list);
     };
     const api = {
-      select() {
+      select(_cols, opts = {}) {
         if (q.op !== "select") q.returning = true;
+        if (opts.count === "exact") q.count = true;
         return api;
       },
       insert(payload) {
@@ -154,6 +160,11 @@ function createFakePostgrest(options = {}) {
       },
       limit(n) {
         q.max = n;
+        return api;
+      },
+      range(from, to) {
+        q.offset = from;
+        q.max = to - from + 1;
         return api;
       },
       single() {

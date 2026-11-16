@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, newRequestId, parsePendingSends, rememberPendingSend, requestIdForSend, settledPendingSends, unresolvedPendingSend, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, earlierOutcomeUnknown, newRequestId, parsePendingSends, rememberPendingSend, requestIdForSend, settledPendingSends, unresolvedPendingSend, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
@@ -193,6 +193,8 @@ export default function ChatPage() {
     }
     sending.current = true;
     let requestId: string | null = requestIdForSend(choice, failedSend.current, text, messages.length);
+    // A retry of a send that did not finish (its id again): an earlier try of it may have written.
+    const reusedId = requestId !== null;
     // The same conversation as a send whose answer never arrived (before a reload or a closed tab): never reused
     // silently, Riley chooses (retry that send, or send this as a new message). Seen and dismissed ones are gone.
     const conv = await conversationKey(updated);
@@ -229,9 +231,10 @@ export default function ChatPage() {
       });
       const data = await res.json().catch(() => null);
       written = parseReceipts(data?.receipts);
-      // What an earlier try of this message saved could not be read back: unknown, so it is said, and the send stays
-      // remembered (not settled below), so its account can still be read back after a reload.
-      const earlierUnknown = data?.earlier_unconfirmed === true;
+      // What an earlier try of this message saved could not be read back (the server says so, or a retry's answer did
+      // not come through the ledger): unknown, so it is said, and the send stays remembered (not settled below), so
+      // its account can still be read back after a reload.
+      const earlierUnknown = earlierOutcomeUnknown(reusedId, data);
       setEarlierUnconfirmed(earlierUnknown);
       // A busy answer comes from the ledger itself (another try of this message is still running).
       if (data?.replay_safe === true || (res.status === 409 && data?.code === "request_in_progress")) safe = true;
@@ -341,7 +344,7 @@ export default function ChatPage() {
       )}
       {earlierUnconfirmed && (
         <p role="status" className="text-sm text-text-secondary bg-surface-raised border border-border-subtle rounded-lg p-3 mb-3">
-          Onyx could not read back what an earlier try of this message saved, so it may not all be listed. Check the relevant page before logging any of it again.
+          Onyx could not read back what this message may already have saved, so it may not all be listed. Check the relevant page before logging any of it again.
         </p>
       )}
       {matched && input.trim() === matched.text && messages.length === matched.at && (

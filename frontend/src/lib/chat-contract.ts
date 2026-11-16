@@ -160,6 +160,20 @@ export function rememberPendingSend(list: ReadonlyArray<PendingSend>, send: Pend
   });
 }
 
+/**
+ * Whether an answer leaves what this request id may already have saved UNKNOWN, so the page keeps the send remembered
+ * (not settled) and says so, until its account can be read back (after a reload, GET /api/chat/operations). The
+ * server says so (`earlier_unconfirmed`: it could not list the ledger rows of a retry, or could not open the ledger at
+ * all, which also hides whether this is a retry). A reused id (a retry of a send that did not finish) is unknown too
+ * whenever the answer did not come through the ledger (no `replay_safe`): nothing then read back what the earlier try
+ * saved. A fresh id the server did not flag was never sent before, so it has no earlier try.
+ */
+export function earlierOutcomeUnknown(reusedId: boolean, data: unknown): boolean {
+  const d = data && typeof data === "object" ? (data as { earlier_unconfirmed?: unknown; replay_safe?: unknown }) : null;
+  if (d?.earlier_unconfirmed === true) return true;
+  return reusedId && d?.replay_safe !== true;
+}
+
 /** The list without this request (its answer arrived, or the server refused its id for good). */
 export const settledPendingSends = (list: ReadonlyArray<PendingSend>, id: string): PendingSend[] => list.filter((p) => p.id !== id);
 
