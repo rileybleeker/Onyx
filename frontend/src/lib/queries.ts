@@ -6,6 +6,7 @@ import { combineEstimateDays, isMissingRelation, type PhotoMealItem } from "./ph
 import { addDirectDrinks, DRINK_COLUMNS, toDrinkRecord, type DrinkDay, type DrinkRecord } from "./drink-capture";
 import { LEFTOVER_WINDOW_DAYS, type LeftoverRow } from "./delivery-leftovers";
 import type { UberEatsCheck } from "./log-ubereats";
+import { assertServerRead, derivedRead } from "./derived-reads";
 
 // Re-audit 2026-06-07 (units/deepseek/F-003): promoted the workout→sleep gap
 // window from a function-local literal to a named module-level const. The pairing
@@ -477,18 +478,9 @@ export async function getNutrition(days: number = 30) {
   // day (addDirectDrinks in lib/drink-capture.ts). A drink marked as already in the diary, or removed, is not in
   // that view. They never pass through the fallback-only estimate merge, which a diary day suppresses.
   // The four reads are independent, so they run in parallel.
+  // The matrix read goes through the owner-only facade in the browser (lib/derived-reads.ts).
   const [matrix, delivery, photo, drinks] = await Promise.all([
-    supabase
-      .from("daily_health_matrix_behavioral_mat")
-      .select(
-        "calendar_date, nutrition_source, " +
-          "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
-          "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
-          "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
-      )
-      .gte("calendar_date", sinceYmd)
-      .not("nutrition_calories", "is", null)
-      .order("calendar_date", { ascending: true }),
+    derivedRead("nutrition", sinceYmd, () => readNutritionMatrix(sinceYmd)),
     supabase
       .from("delivery_nutrition_daily")
       .select("behavioral_date, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
@@ -508,7 +500,6 @@ export async function getNutrition(days: number = 30) {
       .gte("behavioral_date", sinceYmd)
       .order("behavioral_date", { ascending: true }),
   ]);
-  if (matrix.error) throw matrix.error;
   if (delivery.error) throw delivery.error;
   // Photo meals are an add-on: until sql/photo_meals.sql is applied the view does not exist, and no other
   // failure there may take the macro charts down with it.
@@ -519,8 +510,29 @@ export async function getNutrition(days: number = 30) {
 
   type NutritionRow = Record<string, unknown> & { calendar_date: string };
   const estimates = combineEstimateDays(delivery.data ?? [], photo.error ? [] : (photo.data ?? []));
-  const merged = mergeDeliveryEstimates((matrix.data as unknown as NutritionRow[]) ?? [], estimates) as NutritionRow[];
+  const merged = mergeDeliveryEstimates(matrix as NutritionRow[], estimates) as NutritionRow[];
   return addDirectDrinks(merged, drinks.error ? [] : ((drinks.data ?? []) as DrinkDay[]));
+}
+
+/**
+ * Server only (service role): getNutrition's matrix rows, days with nutrition logged, macros aliased to the
+ * legacy keys. Behind GET /api/derived/nutrition for the browser. Throws on a PostgREST error.
+ */
+export async function readNutritionMatrix(sinceYmd: string): Promise<Array<Record<string, unknown> & { calendar_date: string }>> {
+  assertServerRead("nutrition");
+  const { data, error } = await supabase
+    .from("daily_health_matrix_behavioral_mat")
+    .select(
+      "calendar_date, nutrition_source, " +
+        "calories:nutrition_calories, protein_g:nutrition_protein_g, " +
+        "carbs_g:nutrition_carbs_g, fat_g:nutrition_fat_g, fiber_g:nutrition_fiber_g, " +
+        "sugar_g:nutrition_sugar_g, sodium_mg:nutrition_sodium_mg, water_ml:nutrition_water_ml"
+    )
+    .gte("calendar_date", sinceYmd)
+    .not("nutrition_calories", "is", null)
+    .order("calendar_date", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as unknown as Array<Record<string, unknown> & { calendar_date: string }>;
 }
 
 /**
@@ -986,7 +998,14 @@ export interface CaffeineHrvPair {
 export async function getCaffeineHrvPairs(days: number = 90): Promise<CaffeineHrvPair[]> {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  const sinceStr = since.toISOString().split("T")[0];
+  // Owner-only facade in the browser (lib/derived-reads.ts).
+  return derivedRead("caffeine-hrv", sinceStr, () => readCaffeineHrvPairs(sinceStr));
+}
 
+/** Server only (service role), behind GET /api/derived/caffeine-hrv. Throws on a PostgREST error. */
+export async function readCaffeineHrvPairs(sinceStr: string): Promise<CaffeineHrvPair[]> {
+  assertServerRead("caffeine-hrv");
   const { data, error } = await supabase
     // Matview read (15-min refresh): the whoop_hrv_rmssd NOT NULL filter
     // already excludes today's row until tomorrow's ETL scores the night, so
@@ -994,7 +1013,7 @@ export async function getCaffeineHrvPairs(days: number = 90): Promise<CaffeineHr
     // write-coupled. (The /caffeine KPI tiles read the LIVE caffeine views.)
     .from("daily_health_matrix_behavioral_mat")
     .select("calendar_date,caffeine_total_mg,caffeine_to_bedtime_min,whoop_hrv_rmssd")
-    .gte("onyx_behavioral_date", since.toISOString().split("T")[0])
+    .gte("onyx_behavioral_date", sinceStr)
     .not("caffeine_total_mg", "is", null)
     .not("whoop_hrv_rmssd", "is", null)
     .order("onyx_behavioral_date", { ascending: true });
@@ -1038,14 +1057,21 @@ export async function getCaffeineDataQuality(days: number = 45): Promise<Caffein
 export async function getRunningRecoveryContext(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
+  const sinceStr = since.toISOString().split("T")[0];
+  // Owner-only facade in the browser (lib/derived-reads.ts).
+  return derivedRead("running-recovery", sinceStr, () => readRunningRecoveryContext(sinceStr));
+}
 
+/** Server only (service role), behind GET /api/derived/running-recovery. Throws on a PostgREST error. */
+export async function readRunningRecoveryContext(sinceStr: string) {
+  assertServerRead("running-recovery");
   // Matview read (15-min refresh, 2026-06-11): is_excluded toggles reach this
   // recovery overlay at the next refresh (the activity list itself reads base
   // tables live, so exclusions disappear from the list immediately).
   const { data, error } = await supabase
     .from("recovery_vs_pace_mat")
     .select("activity_id, whoop_recovery, whoop_hrv_rmssd_ms, whoop_sleep_performance, pace_delta_pct, segment_targets, segment_target_count")
-    .gte("activity_date", since.toISOString().split("T")[0]);
+    .gte("activity_date", sinceStr);
 
   if (error) throw error;
   return data ?? [];
@@ -1083,7 +1109,13 @@ export async function getHealthMatrix(days: number = 30) {
   const since = new Date();
   since.setDate(since.getDate() - days);
   const sinceStr = since.toISOString().split("T")[0];
+  // Owner-only facade in the browser (lib/derived-reads.ts); the server pages through the matview.
+  return derivedRead("health-matrix", sinceStr, () => readHealthMatrix(sinceStr));
+}
 
+/** Server only (service role), behind GET /api/derived/health-matrix: every row since `sinceStr`. */
+export async function readHealthMatrix(sinceStr: string): Promise<Record<string, unknown>[]> {
+  assertServerRead("health-matrix");
   // ADR-0001 Phase 3: filter/order by onyx_behavioral_date so the window and
   // ordering use the bedtime-day attribution the HRV pipeline assumes.
   // Reads the 15-min-refreshed matview (perf migration 2026-06-11), not the
@@ -1455,11 +1487,18 @@ export async function getSpotifyKpis(range: SpotifyRange = "30d") {
 }
 
 export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promise<SpotifyDailySignatureRow[]> {
+  const since = sinceFor(range);
+  // Owner-only facade in the browser (lib/derived-reads.ts); null = all time.
+  return derivedRead("spotify-volume", since, () => readSpotifyDailyVolume(since));
+}
+
+/** Server only (service role), behind GET /api/derived/spotify-volume. Throws on a PostgREST error. */
+export async function readSpotifyDailyVolume(since: string | null): Promise<SpotifyDailySignatureRow[]> {
+  assertServerRead("spotify-volume");
   // Matview read (15-min refresh, 2026-06-11): plays only ingest hourly at :50, so staleness is invisible.
   let q = supabase
     .from("spotify_daily_signature_mat")
     .select("calendar_date,play_count,unique_tracks,unique_artists,total_minutes,featurized_plays");
-  const since = sinceFor(range);
   if (since) q = q.gte("calendar_date", since);
   const { data, error } = await q.order("calendar_date", { ascending: true });
   if (error) throw error;
@@ -1467,13 +1506,20 @@ export async function getSpotifyDailyVolume(range: SpotifyRange = "90d"): Promis
 }
 
 export async function getSpotifyAudioFeatureDrift(range: SpotifyRange = "60d"): Promise<SpotifyDailySignatureRow[]> {
+  const since = sinceFor(range);
+  // Owner-only facade in the browser (lib/derived-reads.ts); null = all time.
+  return derivedRead("spotify-drift", since, () => readSpotifyAudioFeatureDrift(since));
+}
+
+/** Server only (service role), behind GET /api/derived/spotify-drift. Throws on a PostgREST error. */
+export async function readSpotifyAudioFeatureDrift(since: string | null): Promise<SpotifyDailySignatureRow[]> {
+  assertServerRead("spotify-drift");
   // Matview read (15-min refresh, 2026-06-11): plays only ingest hourly at :50, so staleness is invisible.
   let q = supabase
     .from("spotify_daily_signature_mat")
     .select(
       "calendar_date,avg_valence,avg_energy,avg_danceability,avg_acousticness,avg_instrumentalness,avg_liveness,avg_speechiness,featurized_plays,play_count",
     );
-  const since = sinceFor(range);
   if (since) q = q.gte("calendar_date", since);
   const { data, error } = await q
     .gt("featurized_plays", 0)
