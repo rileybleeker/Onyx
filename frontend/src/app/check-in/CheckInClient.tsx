@@ -7,6 +7,7 @@ import { agentsApi } from "@/lib/agents-api";
 import { sayFromHash, VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { reportCheckinFill, setLogDraft, useLogDrafts } from "@/lib/log-drafts";
 import { addDays, fallbackBehavioralToday, kitSummary, nightLabel, Q_JOURNALED, type CheckinAnswer, type CheckinItem, type CheckinNight, type CheckinPayload } from "@/lib/checkin";
+import { WINDDOWN_SAVED_EVENT } from "@/lib/sleep-winddown";
 import { clientCache } from "@/lib/client-cache";
 import { earlyOr } from "@/lib/early-fetch";
 import { buildCells, dayComplete, savePlan, visibleNights, voicePatch, type Cell, type Cells, type Patch } from "@/lib/checkin-cells";
@@ -330,10 +331,14 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     };
     document.addEventListener("visibilitychange", back);
     window.addEventListener("pageshow", back);
+    // The wind-down button (/log, Today) writes the same habit row: show its answer here (unsaved taps stay drafts).
+    const answeredElsewhere = () => { if (!savingRef.current && !autosaveRef.current.dirty) load(requested); };
+    window.addEventListener(WINDDOWN_SAVED_EVENT, answeredElsewhere);
     return () => {
       alive = false;
       document.removeEventListener("visibilitychange", back);
       window.removeEventListener("pageshow", back);
+      window.removeEventListener(WINDDOWN_SAVED_EVENT, answeredElsewhere);
     };
   }, [load, requested, drafts, show]);
 

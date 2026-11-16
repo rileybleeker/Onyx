@@ -2,7 +2,7 @@
 // as /log#log-part-supplements (Today's quick links). Browser-only; no React, no request.
 
 /** The Log screen's parts (LogClient's <Part id>s), in their default order. */
-export const LOG_PART_IDS = ["say-it", "check-in", "journal", "supplements", "drinks", "uber-eats", "weight", "reading"] as const;
+export const LOG_PART_IDS = ["say-it", "check-in", "wind-down", "journal", "supplements", "drinks", "uber-eats", "weight", "reading"] as const;
 export type LogPartId = (typeof LOG_PART_IDS)[number];
 
 /** The id of the zero-height anchor LogClient puts at the top of each part; `/log#<this>` opens the screen there. */

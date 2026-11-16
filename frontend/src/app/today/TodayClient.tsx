@@ -34,6 +34,8 @@ import InfoHint from "@/components/InfoHint";
 // runs in CSS mode: the DOM keeps the default order and a saved order / hidden part is painted before React runs.
 // One container holds every panel and the three section headings, so a panel can be moved into another section.
 import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
+// The wind-down streak (PROD-SLEEP-01, set up on Log): the same panel as on Log, and one quiet-view source once set up.
+import WindDownPanel, { useWindDownToday } from "@/components/sleep/WindDownPanel";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -541,9 +543,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     checkLines.push(checkLine("money", "Money", "/financials/budgets", !!money, moneyStatus ? `No alerts to act on. ${moneyStatus.text}` : "No alerts to act on."));
   }
   const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
+  const windDown = useWindDownToday();
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
-  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, "reading", "check-in"]
+  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, "reading", "check-in"]
     .filter((id): id is string => id !== null);
   const renderedParts = TODAY_HEAD_PARTS.concat(experiment.state === "error" || trial ? ["experiment"] : [], TODAY_MID_PARTS, lifeParts);
   const lifeW = lifeLayout(usePartOrder("/today", renderedParts), lifeParts);
@@ -596,6 +599,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
     renewals: { probe: lifeProbe("renewals", !!renewals, renewals?.updating ? { checking: !renewals.refreshFailed, refreshFailed: lifeChecks.renewals.state === "failed" || renewals.refreshFailed, asOf: renewals.asOf } : {}), summary: renewals },
     packages: { probe: lifeProbe("orders", !!orders, { connected: orders?.status !== "not_connected", syncLate: ordersLate, syncAt: orders?.status === "ready" ? orders.lastSync?.at ?? null : null }), summary: orders },
     reading: { probe: probe(reading, "reading"), overview: book },
+    windDown: windDown.source ?? undefined,
   }) : null;
   const selection = attention ? selectQuiet(attention.obligations, attention.sources, { budget: quiet.budget, learning: quiet.learning, marks, nowMs }) : null;
   const listed = attention ? fullList(attention.obligations, marks, nowMs) : [];
@@ -997,6 +1001,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         {lifeFailed("renewals") && <p className="mt-3 text-sm text-mid">Couldn&apos;t refresh renewals. Showing {clock(lifeChecks.renewals.at) ? `the check at ${clock(lifeChecks.renewals.at)}` : "an earlier check"}; it may have changed.</p>}
         <Link href="/procurement" className={`${linkStyle} mt-4 inline-block`}>Open procurement</Link>
       </section>
+      </Part>}
+      {windDown.show && <Part id="wind-down" title="Wind-down" width={lifeWidth("wind-down")}>
+      <WindDownPanel surface="today" className={panelStyle} />
       </Part>}
       <Part id="reading" title="Keep reading" width={lifeWidth("reading")}>
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>

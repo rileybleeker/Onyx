@@ -15,8 +15,8 @@ import { SectionSkeleton } from "./sections/ui";
  * its own chunk and data (client cache first); the frame paints at once with each section's skeleton. Every section
  * saves Riley's input on its own (autosave, lib/autosave.ts). Nothing is written on open or on scroll.
  *
- * Section files (app/log/sections/*.tsx, one per section): SayIt, CheckIn, Journal, Supplements, Drinks, UberEats, Weight,
- * Reading.
+ * Section files (app/log/sections/*.tsx, one per section): SayIt, CheckIn, WindDown, Journal, Supplements, Drinks, UberEats,
+ * Weight, Reading.
  * The Say it box writes suggestions to lib/log-drafts.ts; each section reads its own with useLogDrafts(section).
  */
 
@@ -27,6 +27,7 @@ import { SectionSkeleton } from "./sections/ui";
 // the one frame before its lazy module resolves; a hidden part is still never mounted, so it reads and writes nothing.
 import "./sections/SayIt";
 import "./sections/CheckIn";
+import "./sections/WindDown";
 import "./sections/Journal";
 import "./sections/Supplements";
 import "./sections/Drinks";
@@ -36,6 +37,7 @@ import "./sections/Reading";
 
 const SayIt = dynamic(() => import("./sections/SayIt"), { ssr: false, loading: () => <SectionSkeleton section="sayit" /> });
 const CheckIn = dynamic(() => import("./sections/CheckIn"), { ssr: false, loading: () => <SectionSkeleton section="checkin" /> });
+const WindDown = dynamic(() => import("./sections/WindDown"), { ssr: false, loading: () => <SectionSkeleton section="winddown" /> });
 const Journal = dynamic(() => import("./sections/Journal"), { ssr: false, loading: () => <SectionSkeleton section="journal" /> });
 const Supplements = dynamic(() => import("./sections/Supplements"), { ssr: false, loading: () => <SectionSkeleton section="supplements" /> });
 const Drinks = dynamic(() => import("./sections/Drinks"), { ssr: false, loading: () => <SectionSkeleton section="drinks" /> });
@@ -81,6 +83,7 @@ export default function LogClient({ headingTestId = "page-heading" }: { headingT
       <PartGrid page="/log" title="Log">
         <Part id="say-it" title="Say it"><Anchor part="say-it" /><SayIt /></Part>
         <Part id="check-in" title="Check-in" nested><Anchor part="check-in" /><CheckIn /></Part>
+        <Part id="wind-down" title="Wind-down"><Anchor part="wind-down" /><WindDown /></Part>
         <Part id="journal" title="Journal"><Anchor part="journal" /><Journal /></Part>
         <Part id="supplements" title="Supplements"><Anchor part="supplements" /><Supplements /></Part>
         <Part id="drinks" title="Drinks"><Anchor part="drinks" /><Drinks /></Part>

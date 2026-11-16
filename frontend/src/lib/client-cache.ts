@@ -91,15 +91,17 @@ export function writeInvalidates(path: string): string[] {
   if (NO_INVALIDATE.includes(path)) return [];
   // A /habits tap: that page keeps its own cached journal in step (a 365-day re-read per tap would be waste);
   // the check-in screen and the habit list still re-read.
-  if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list"];
+  if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list", "/api/sleep/winddown"];
   // Chat write tools log habits, supplements, reading and playlists.
-  if (path === "/api/chat") return ["/api/habits", "habits:", "/api/supplements", "/api/reading", "/api/delivery"];
+  if (path === "/api/chat") return ["/api/habits", "habits:", "/api/supplements", "/api/reading", "/api/delivery", "/api/sleep/winddown"];
   const m = /^\/api\/([^/?#]+)/.exec(path);
   if (!m) return [];
   const area = m[1];
   const out = [`/api/${area}`, `${area}:`];
   // A check-in or habit write also changes what Today and the delivery portions show.
-  if (area === "habits") out.push("/api/delivery");
+  if (area === "habits") out.push("/api/delivery", "/api/sleep/winddown");
+  // A wind-down answer IS the chosen habit's answer (PROD-SLEEP-01): the check-in and /habits go stale too.
+  if (area === "sleep") out.push("/api/habits", "habits:");
   if (area === "delivery") out.push("/api/habits/checkin");
   // A drink capture (one row) counts in Nutrition AND Caffeine: both areas' entries (and feed seeds) go stale.
   if (path === "/api/nutrition/drinks" || path.startsWith("/api/nutrition/drinks/")) out.push("/api/caffeine", "caffeine:");

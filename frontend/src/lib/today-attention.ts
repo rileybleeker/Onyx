@@ -28,10 +28,11 @@ import type { EmailItemLike, TodayUrgentItem } from "./urgent-email";
 import type { MoneyAlert } from "./finance-alerts";
 import type { RenewalSummary } from "./procurement-renewals";
 import type { CalendarEvent } from "./calendar-events";
+import type { WindDownAttention } from "./sleep-winddown";
 
-export type AttentionSource = "urgent-email" | "agents" | "experiment" | "calendar" | "money" | "renewals" | "packages" | "reading";
+export type AttentionSource = "urgent-email" | "agents" | "experiment" | "calendar" | "money" | "renewals" | "packages" | "winddown" | "reading";
 /** Ties within a tier and a due time break in this order (then by id). */
-export const SOURCE_ORDER: readonly AttentionSource[] = ["urgent-email", "agents", "experiment", "calendar", "money", "renewals", "packages", "reading"];
+export const SOURCE_ORDER: readonly AttentionSource[] = ["urgent-email", "agents", "experiment", "calendar", "money", "renewals", "packages", "winddown", "reading"];
 export const SOURCE_LABEL: Readonly<Record<AttentionSource, string>> = {
   "urgent-email": "Urgent email",
   agents: "Agent requests",
@@ -40,6 +41,7 @@ export const SOURCE_LABEL: Readonly<Record<AttentionSource, string>> = {
   money: "Money",
   renewals: "Renewals",
   packages: "Packages",
+  winddown: "Wind-down",
   reading: "Reading",
 };
 
@@ -634,6 +636,30 @@ export function readingObligations(overview: ReadingLike | null): Obligation[] {
   }];
 }
 
+/**
+ * Tonight's wind-down (PROD-SLEEP-01, opt-in on Log): one ordinary item from `listFrom` (3 h before the target) while
+ * tonight is unanswered and not paused; none once it is answered (here, on the check-in or on /habits). Never
+ * urgent and never pinned: no forced reminder; a snooze or hide works as for any item. A new night is a new item.
+ */
+export function windDownObligations(a: WindDownAttention | null, now: Date): Obligation[] {
+  if (!a || !a.open || now.getTime() < a.listFrom) return [];
+  const left = a.dueAt - now.getTime();
+  return [{
+    id: `winddown:${a.today}`,
+    source: "winddown",
+    title: `Start winding down by ${a.targetLabel}`,
+    detail: a.streak > 0 ? `${a.streak}-night streak · ${a.wins} of ${a.needed} this week` : `${a.wins} of ${a.needed} this week`,
+    href: "/log#log-part-wind-down",
+    external: false,
+    urgency: "normal",
+    dueAt: a.dueAt,
+    resurfaceAt: null,
+    reason: left > 0 ? `Your wind-down target is in ${inWords(left)}` : "Your wind-down target has passed; tonight is still open",
+    version: `${a.today}|${a.targetTime}`,
+    learning: false,
+  }];
+}
+
 // ─── Fold, rank, budget ─────────────────────────────────────────────────────────────────────────────────────
 
 /** Every list in one; an id that appears twice is kept once (its more urgent copy). Wording never merges. */
@@ -908,6 +934,8 @@ export interface TodayAttentionInput {
   renewals: { probe: SourceProbe; summary: RenewalSummary | null };
   packages: { probe: SourceProbe; summary: PackagesLike | null };
   reading: { probe: SourceProbe; overview: ReadingLike | null };
+  /** Omitted until the wind-down goal is known to be set up (and not hidden): most days it is not a source. */
+  windDown?: { probe: SourceProbe; attention: WindDownAttention | null };
 }
 
 export function todayAttention(input: TodayAttentionInput): { obligations: Obligation[]; sources: SourceStatus[] } {
@@ -920,6 +948,7 @@ export function todayAttention(input: TodayAttentionInput): { obligations: Oblig
     sourceStatus("money", input.money.probe, now),
     sourceStatus("renewals", input.renewals.probe, now),
     sourceStatus("packages", input.packages.probe, now),
+    ...(input.windDown ? [sourceStatus("winddown", input.windDown.probe, now)] : []),
     sourceStatus("reading", input.reading.probe, now),
   ];
   const obligations = collectObligations([
@@ -930,6 +959,7 @@ export function todayAttention(input: TodayAttentionInput): { obligations: Oblig
     moneyObligations(input.money.alerts, input.money.period ?? "", now),
     renewalObligations(input.renewals.summary, now),
     packageObligations(input.packages.summary),
+    windDownObligations(input.windDown?.attention ?? null, now),
     readingObligations(input.reading.overview),
   ]);
   return { obligations, sources };
