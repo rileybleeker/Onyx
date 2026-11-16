@@ -34,7 +34,15 @@ Covers
     an accepted region (the stepped-out one on the rejected-gap re-draws) and passes the certified
     one; the calibration seeds its re-draws with the deployed rule (experiment_design.redraw_seed);
     the recorded METHOD_REVIEW holds the independent review but no calibration report, so the
-    decision stays withheld with a reason naming the missing report, and each half alone is named.
+    decision stays withheld with a reason naming the missing report, and each half alone is named;
+    the near_singular stress scenario (supported, review-ready at REVIEW_MIN_STRESS analysed);
+  * the method record is bound to the code (experiment_fingerprint): the inference fingerprint
+    ignores docstrings, comments, layout, the record itself and the output explanations, and
+    changes with any expression of the analysis or of the allocation / re-draw code; the recorded
+    review names the running code's fingerprint; a free-text record, fewer than two reviewers, a
+    verdict that is not sound, another fingerprint, an unreadable source, and a calibration record
+    without its revision, harness fingerprint, scheduled-suite run or review-ready flag all keep the
+    decision withheld; a report is review-ready only with a revision and a fingerprint.
 
 Synthetic data only. No network, no credentials, no database.
 
@@ -54,6 +62,7 @@ import numpy as np  # noqa: E402
 import experiment_analysis as ea  # noqa: E402
 import experiment_calibration as cal  # noqa: E402
 import experiment_design as ed  # noqa: E402
+import experiment_fingerprint as ef  # noqa: E402
 
 SUPPORTED = [s.name for s in cal.SCENARIOS if s.supported]
 UNSUPPORTED = [s.name for s in cal.SCENARIOS if not s.supported]
@@ -375,7 +384,13 @@ def test_recorded_method_review_still_withholds_until_the_calibration_report():
     # Doc 8.3: the independent review is recorded, the calibration report is not, so no trial's
     # decision is firm yet and the register step still refuses a treatment trial.
     assert ea.METHOD_REVIEW["method"] == ea.INFERENCE_METHOD
-    assert ea.METHOD_REVIEW["independent_review"] and "8.3" in ea.METHOD_REVIEW["independent_review"]
+    assert ea.METHOD_REVIEW["interval_method"] == ea.INTERVAL_METHOD
+    record = ea.METHOD_REVIEW["independent_review"]
+    assert isinstance(record, dict) and "8.3" in record["reference"] and len(record["reviewers"]) >= 2
+    assert all(v == "sound" for v in record["verdicts"]) and record["reviewed_revision"]
+    # The review names the code that is running: the analysis changes after the reviewed revision left
+    # the inference fingerprint unchanged (doc 8.3), and any later change withholds every decision.
+    assert record["inference_fingerprint"] == ef.inference_fingerprint()
     assert not ea.METHOD_REVIEW["calibration_report"]
     assert not ea.METHOD_REVIEW["n_redraws"] and not ea.METHOD_REVIEW["alpha"]
     problem = ea.method_review_problem(0.05, 10000)
@@ -393,6 +408,106 @@ def test_recorded_method_review_still_withholds_until_the_calibration_report():
         ea.METHOD_REVIEW.update(calibration_report=None, independent_review=None)
         neither = ea.method_review_problem(0.05, 10000)
         assert "calibration report and the independent statistical review" in neither
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
+def test_inference_fingerprint_covers_the_code_not_the_text():
+    analysis = (ROOT / "experiment_analysis.py").read_text(encoding="utf-8")
+    design_src = (ROOT / "experiment_design.py").read_text(encoding="utf-8")
+    base = ef.fingerprint_sources(analysis, design_src)
+    assert base == ef.inference_fingerprint() and len(base) == 64
+
+    def edited(old, new, in_design=False):
+        source = design_src if in_design else analysis
+        assert old in source, old
+        changed = source.replace(old, new, 1)
+        return ef.fingerprint_sources(analysis, changed) if in_design else ef.fingerprint_sources(changed, design_src)
+
+    # Text, layout and the record itself never count.
+    assert edited('"""The end-of-trial report. Raises', '"""The final report. Raises') == base
+    assert edited("REDRAW_CHUNK = 2000", "REDRAW_CHUNK = 2000  # a comment") == base
+    assert edited("Not read by the decision rule", "Never read by the decision rule") == base
+    assert edited('"calibration_report": None,', '"calibration_report": "synthetic",') == base
+    assert edited("def method_review_problem(alpha: float, n_redraws: int) -> str | None:",
+                  "def method_review_problem(alpha: float, n_redraws: int, _unused: int = 0) -> str | None:") == base
+    assert edited("def validate_protocol(", "def validate_protocol(_unused, ", in_design=True) == base
+    # Code does: an analysis constant, the decision rule, the re-draw seed and the uniform draws.
+    assert edited("TIE_TOL = 1e-12", "TIE_TOL = 1e-11") != base
+    assert edited("if p_value < alpha and estimate > 0:", "if p_value <= alpha and estimate > 0:") != base
+    assert edited("randomization-test", "randomization-test-2", in_design=True) != base
+    assert edited("excess = (1 << 64) % n_choices", "excess = 0", in_design=True) != base
+    # An import the re-draw code relies on is part of it; one nothing reaches is not.
+    assert edited("import hashlib", "import hashlib as hashlib", in_design=True) != base
+    assert edited("import re\n", "import re as re\n", in_design=True) == base
+    # Statement order counts: a later definition replaces an earlier one.
+    first_then_second = "\n".join(["x = 1", "x = 2", ""])
+    second_then_first = "\n".join(["x = 2", "x = 1", ""])
+    assert ef.fingerprint_sources(first_then_second, design_src) != ef.fingerprint_sources(second_then_first, design_src)
+    # A design name the analysis starts to read joins the closure, and so does the code it uses.
+    reads_new = analysis + "\nSYNTHETIC_READ = design.synthetic_new_name\n"
+    absent = ef.fingerprint_sources(reads_new, design_src)
+    defined = ef.fingerprint_sources(reads_new, design_src + "\ndef synthetic_new_name():\n    return _SYNTHETIC_HELPER\n"
+                                     "\n_SYNTHETIC_HELPER = 1\n")
+    helper_changed = ef.fingerprint_sources(reads_new, design_src + "\ndef synthetic_new_name():\n    return _SYNTHETIC_HELPER\n"
+                                            "\n_SYNTHETIC_HELPER = 2\n")
+    assert len({absent, defined, helper_changed}) == 3
+    unread = design_src + "\n_SYNTHETIC_UNREAD = 3\n"            # design code nothing reaches stays out
+    assert ef.fingerprint_sources(analysis, unread) == base
+    # The calibration harness has its own fingerprint, recorded by the report.
+    assert ef.harness_fingerprint() == ef.module_fingerprint((ROOT / "experiment_calibration.py").read_text(encoding="utf-8"))
+
+
+def test_method_review_records_are_bound_to_the_inference_code():
+    saved = dict(ea.METHOD_REVIEW)
+    live = ef.inference_fingerprint()
+    try:
+        ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
+        assert ea.method_review_problem(0.05, 10000) is None, "a complete record for this code covers the trial"
+
+        def problem_with(review_changes=None, report_changes=None, **top):
+            ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
+            if review_changes is not None:
+                ea.METHOD_REVIEW["independent_review"] = (review_changes if not isinstance(review_changes, dict)
+                                                          else {**ea.METHOD_REVIEW["independent_review"], **review_changes})
+            if report_changes is not None:
+                ea.METHOD_REVIEW["calibration_report"] = (report_changes if not isinstance(report_changes, dict)
+                                                          else {**ea.METHOD_REVIEW["calibration_report"], **report_changes})
+            ea.METHOD_REVIEW.update(top)
+            return ea.method_review_problem(0.05, 10000) or ""
+
+        # The reviewer's finding: a non-empty free text must not satisfy the gate.
+        assert "not a structured record" in problem_with(review_changes="synthetic free text review")
+        assert "two distinct reviewers" in problem_with({"reviewers": ("synthetic-reviewer-a",), "verdicts": ("sound",)})
+        assert "two distinct reviewers" in problem_with({"reviewers": ("synthetic-reviewer-a", "synthetic-reviewer-a")})
+        assert "sound verdict" in problem_with({"verdicts": ("sound", "concerns")})
+        assert "sound verdict" in problem_with({"verdicts": ("sound",)})
+        assert "reviewed revision" in problem_with({"reviewed_revision": " "})
+        other = "0" * 64
+        assert "covers other inference code" in problem_with({"inference_fingerprint": other})
+        assert "covers other inference code" in problem_with({"inference_fingerprint": None})
+        # The calibration half: structured, review-ready, its revision, harness and the suite run that
+        # passed the strip-bound proofs, for this code.
+        assert "not a structured record" in problem_with(report_changes="synthetic-report-ref")
+        for key in ("reference", "revision", "harness_fingerprint", "suite_run"):
+            assert "scheduled-suite run" in problem_with(report_changes={key: ""}), key
+        assert "not review-ready" in problem_with(report_changes={"review_ready": False})
+        assert "not review-ready" in problem_with(report_changes={"review_ready": "yes"})
+        assert "calibration report covers other inference code" in problem_with(report_changes={"inference_fingerprint": other})
+        assert "interval" in problem_with(interval_method="synthetic_other_interval_v9")
+        # A changed code base withholds every decision until both halves are recorded again.
+        ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,), fingerprint=other))
+        assert "covers other inference code" in (ea.method_review_problem(0.05, 10000) or "")
+        # An unreadable source cannot be checked, so the decision is withheld.
+        ea.METHOD_REVIEW.update(synthetic_method_review(n_redraws=(10000,)))
+        original = ef.inference_fingerprint
+        try:
+            ef.inference_fingerprint = lambda: None
+            assert "cannot be read" in (ea.method_review_problem(0.05, 10000) or "")
+        finally:
+            ef.inference_fingerprint = original
+        assert ea.method_review_problem(0.05, 10000) is None and ef.inference_fingerprint() == live
     finally:
         ea.METHOD_REVIEW.clear()
         ea.METHOD_REVIEW.update(saved)
@@ -418,8 +533,21 @@ def _spec_and_data(effect=25.0, n_blocks=40, missing_a_extra=0.0, seed=331, **sp
     return spec, ea.TrialData(arms=arms, outcome=y)
 
 
-REVIEWED = dict(method=ea.INFERENCE_METHOD, calibration_report="synthetic-report-ref",
-                independent_review="synthetic-review-ref", n_redraws=(999,), alpha=(0.05,))
+def synthetic_method_review(n_redraws=(999,), alpha=(0.05,), fingerprint=None):
+    """A complete synthetic METHOD_REVIEW for the running code (both halves structured)."""
+    fingerprint = ef.inference_fingerprint() if fingerprint is None else fingerprint
+    return dict(method=ea.INFERENCE_METHOD, interval_method=ea.INTERVAL_METHOD,
+                independent_review={"reference": "synthetic-review-ref", "date": "2030-01-01",
+                                    "reviewers": ("synthetic-reviewer-a", "synthetic-reviewer-b"),
+                                    "verdicts": ("sound", "sound"), "reviewed_revision": "synthetic-revision",
+                                    "inference_fingerprint": fingerprint},
+                calibration_report={"reference": "synthetic-report-ref", "revision": "synthetic-revision",
+                                    "inference_fingerprint": fingerprint, "harness_fingerprint": "synthetic-harness",
+                                    "review_ready": True, "suite_run": "synthetic-suite-run"},
+                n_redraws=n_redraws, alpha=alpha)
+
+
+REVIEWED = synthetic_method_review()
 
 
 def _without(report, *keys):
@@ -598,6 +726,10 @@ def test_tolerances_are_prespecified():
     assert len(names) == len(set(names))
     assert {"carryover_only", "carryover_only_serial", "missing_and_excluded", "short_trial"} <= set(SUPPORTED)
     assert set(UNSUPPORTED) == {"two_night_carryover", "arm_dependent_missing"}
+    # Doc 8.3 (method review): the near-singular stress scenario is supported and judged like the others.
+    stress = [s for s in cal.SCENARIOS if s.stress]
+    assert [s.name for s in stress] == ["near_singular"] and stress[0].supported and stress[0].direct == 0
+    assert cal.REVIEW_MIN_STRESS < cal.REVIEW_MIN_SIMS
     for s in cal.SCENARIOS:
         breaks = s.carryover2 != 0 or s.missing_a_extra != 0
         assert s.supported == (not breaks), f"{s.name}: supported must mean the working model holds"
@@ -652,16 +784,37 @@ def test_smoke_scenarios_meet_their_prespecified_tolerances():
     assert 0.0 <= by_name["effect_only"]["informational"]["direct_power"] <= 1.0
     assert "direct_power" not in by_name["carryover_only"]["informational"]
     # What the report may back: its own configuration, and a subset run never passes.
-    assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [SMOKE_REDRAWS], "alpha": [0.05]}
+    assert report["covers"] == {"method": ea.INFERENCE_METHOD, "n_redraws": [SMOKE_REDRAWS], "alpha": [0.05],
+                                "inference_fingerprint": ef.inference_fingerprint()}
+    assert report["harness_fingerprint"] == ef.harness_fingerprint() and report["revision"] is None
     assert report["all_supported_scenarios"] is False
     assert report["passed"] is False and report["review_ready"] is False
 
 
 def test_review_ready_counts_analysed_trials_and_shards_merge():
-    config = cal._config(alpha=0.05, beta=ea.nuisance_beta_for(10000), n_sims=1000, n_redraws=10000, seed=1)
+    config = cal._config(alpha=0.05, beta=ea.nuisance_beta_for(10000), n_sims=1000, n_redraws=10000, seed=1,
+                         revision="synthetic-revision")
     fake = [{"name": s.name, "supported": s.supported, "ok": True if s.supported else None, "n_analysed": 1000}
             for s in cal.SCENARIOS]
     assert cal._assemble(config, fake)["review_ready"] is True
+    # A stress scenario expects unfittable trials: REVIEW_MIN_STRESS analysed is enough there.
+    stressed = [{**x, "n_analysed": cal.REVIEW_MIN_STRESS} if x["name"] == "near_singular" else x for x in fake]
+    assert cal._assemble(config, stressed)["review_ready"] is True
+    stressed = [{**x, "n_analysed": cal.REVIEW_MIN_STRESS - 1} if x["name"] == "near_singular" else x for x in fake]
+    assert cal._assemble(config, stressed)["review_ready"] is False
+    # Skipped (unfittable) trials are bounded too: the rates hold only for the trials the model can fit.
+    stressed = [{**x, "n_analysed": 500, "n_skipped": 400} if x["name"] == "near_singular" else x for x in fake]
+    assert cal._assemble(config, stressed)["review_ready"] is True
+    stressed = [{**x, "n_analysed": 500, "n_skipped": 600} if x["name"] == "near_singular" else x for x in fake]
+    assert cal._assemble(config, stressed)["review_ready"] is False, "a stress scenario may skip at most half"
+    skipping = [{**x, "n_skipped": 20} if x["name"] == "no_effect" else x for x in fake]
+    assert cal._assemble(config, skipping)["review_ready"] is False, "an ordinary scenario may skip at most 1%"
+    skipping = [{**x, "n_skipped": 10} if x["name"] == "no_effect" else x for x in fake]
+    assert cal._assemble(config, skipping)["review_ready"] is True
+    # Without a revision, or without a fingerprint of the code it ran, a report cannot back the record.
+    assert cal._assemble({**config, "revision": None}, fake)["review_ready"] is False
+    assert cal._assemble({**config, "inference_fingerprint": None}, fake)["review_ready"] is False
+    assert config["inference_fingerprint"] == ef.inference_fingerprint() and config["revision"] == "synthetic-revision"
     fake[0] = {**fake[0], "n_analysed": 990}            # ten of the 1,000 trials could not be fitted
     short = cal._assemble(config, fake)
     assert short["passed"] is True and short["review_ready"] is False, "skipped trials do not count"
@@ -675,6 +828,8 @@ def test_review_ready_counts_analysed_trials_and_shards_merge():
     for bad, words in ((shards + [shards[0]], "more than one shard"),
                        ([shards[0], {**shards[1], "seed": 9}], "seed"),
                        ([shards[0], {**shards[1], "n_redraws": 999}], "n_redraws"),
+                       ([shards[0], {**shards[1], "inference_fingerprint": "0" * 64}], "inference_fingerprint"),
+                       ([shards[0], {**shards[1], "revision": "synthetic-other-revision"}], "revision"),
                        ([{**shards[0], "method": "synthetic_other_v9"}], "synthetic_other_v9"),
                        ([], "nothing to merge")):
         try:
@@ -709,6 +864,7 @@ def test_cli_writes_the_report():
         cal.main(["--merge", str(out), str(Path(tmp) / "b.json"), "--out", str(merged_out)])
         merged = json.loads(merged_out.read_text(encoding="utf-8"))
     assert saved["n_sims"] == 3 and saved["scenarios"][0]["name"] == "no_effect"
+    assert saved["inference_fingerprint"] == ef.inference_fingerprint()
     assert code == (0 if saved["passed"] else 1)
     assert [s["name"] for s in merged["scenarios"]] == ["no_effect", "carryover_only"]
 

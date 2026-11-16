@@ -59,7 +59,8 @@ decision rule's verdict as a firm decision only when every blocking check in ass
 passes: missing nights not tied to the arm, the registered protocol's declaration and
 justification of the untestable parts of M (one-night carryover, constant effects, pre-trial day
 as control), the registered inference method, and a METHOD_REVIEW (calibration report plus
-independent review) covering the trial's alpha and re-draw count. Otherwise the decision is
+independent review) covering the trial's alpha and re-draw count and recorded for the inference
+code that is running (its experiment_fingerprint fingerprint). Otherwise the decision is
 withheld ("inconclusive"), the reasons are in the report, and every output whose assumptions a
 failed check leaves unsupported is marked so.
 """
@@ -88,46 +89,124 @@ INFERENCE_METHOD = "joint_sharp_null_berger_boos_v1"
 INTERVAL_METHOD = "certified_enclosure_v1"
 # The method record a firm decision needs (docs/experiment-framework.md 8.1 and 8.3): the independent
 # statistical review of INFERENCE_METHOD and the seeded calibration report (experiment_calibration.py,
-# run in the scheduled validation phase), with the configuration the report calibrated. A trial's
-# decision is firm only when both are recorded and its alpha and re-draw count are among those;
-# until then it is withheld. The review is recorded (doc 8.3). The calibration report is not: the PR
-# that records a review-ready report fills in calibration_report, n_redraws and alpha.
+# run in the scheduled validation phase), with the configuration the report calibrated. Each half is a
+# structured record that names the code it covered by its inference fingerprint (experiment_fingerprint:
+# this module and the allocation / re-draw code of experiment_design, with docstrings, comments, this
+# record, its check and the explanation of the outputs left out). A trial's decision is firm only when
+# both halves are recorded, both fingerprints equal the fingerprint of the code that is running, and the
+# trial's alpha and re-draw count are among those calibrated; until then it is withheld. Any change to
+# the fingerprinted code therefore withholds every decision until both halves are recorded again for it.
+# The review is recorded (doc 8.3). The calibration report is not: the PR that records a review-ready
+# report fills in calibration_report, n_redraws and alpha, with calibration_report =
+#   {"reference": where the report is kept, "revision": the commit it ran at (the report's `revision`),
+#    "inference_fingerprint" and "harness_fingerprint": copied from the report, "review_ready": True,
+#    "suite_run": the scheduled-suite run, at that fingerprint, in which tests/test_experiment_calibration.py
+#    passed, its strip-bound proofs of the certified interval included}
+# This record and method_review_problem are outside the fingerprint (a record cannot cover itself).
 METHOD_REVIEW: dict[str, Any] = {
-    "method": INFERENCE_METHOD,   # the INFERENCE_METHOD the report and the review cover
-    "calibration_report": None,   # reference to the passing, review-ready seeded report (experiment_calibration.py)
-    # Reference to the independent statistical review (doc 8.3). It reviews the method; it is not an
-    # approval of any trial's outcome.
-    "independent_review": (
-        "docs/experiment-framework.md 8.3: independent statistical challenge of joint_sharp_null_berger_boos_v1 / "
-        "certified_enclosure_v1 by two non-Anthropic models (openai/gpt-5.2, google/gemini-2.5-pro) on "
-        "2026-11-16, of the analysis at ce76f720, the synthetic calibration design and the changes recorded in "
-        "doc 8.3; final verdicts SOUND (both). Adopted: the enclosure metric and the deployed re-draw seeding rule "
-        "in the calibration, the Monte Carlo qualification of every guarantee. Rejected with reasons: "
-        "float-tolerance snapping in _sets_moving / _piece (it would narrow the sets), a fresh random re-draw "
-        "seed at analysis time (once drawn it is as fixed as the public-hash seed)"),
-    "n_redraws": (),              # re-draw counts the report calibrated
-    "alpha": (),                  # alpha levels it calibrated
+    "method": INFERENCE_METHOD,            # the INFERENCE_METHOD the report and the review cover
+    "interval_method": INTERVAL_METHOD,    # and its INTERVAL_METHOD
+    "calibration_report": None,            # the passing, review-ready seeded report (fields above)
+    # The independent statistical review (doc 8.3). It reviews the method; it is not an approval of any
+    # trial's outcome. Its fingerprint is the one experiment_fingerprint gives the reviewed revision, which
+    # is also the fingerprint of every later revision until the inference code changes (doc 8.3 records
+    # that the analysis changes after ce76f720 left it unchanged).
+    "independent_review": {
+        "reference": "docs/experiment-framework.md 8.3",
+        "date": "2026-11-16",
+        "reviewers": ("openai/gpt-5.2", "google/gemini-2.5-pro"),
+        "verdicts": ("sound", "sound"),
+        "reviewed_revision": "ce76f720d8ff127cc90a012cc4ca7491ce2d9734",
+        "inference_fingerprint": "7a79a1a4cc2f89a1d5f9a8a5547e1e4ca63ad3b38de01cb9cc25783761969da0",
+        "summary": (
+            "independent statistical challenge of joint_sharp_null_berger_boos_v1 / certified_enclosure_v1 by two "
+            "non-Anthropic models on the analysis at ce76f720, the synthetic calibration design and the changes "
+            "recorded in doc 8.3; final verdicts sound (both). Adopted: the enclosure metric and the deployed re-draw "
+            "seeding rule in the calibration, the Monte Carlo qualification of every guarantee. Rejected with "
+            "reasons: float-tolerance snapping in _sets_moving / _piece (it would narrow the sets), a fresh random "
+            "re-draw seed at analysis time (once drawn it is as fixed as the public-hash seed)"),
+        # Doc 8.3 "Follow-up": the same two models reviewed every change after ce76f720 and this fingerprint
+        # binding; final verdicts sound (both), with source order, the narrowed claim and the skip bound in.
+        "follow_up": ("2026-11-16: binding to the code by experiment_fingerprint reviewed by both models, final "
+                      "verdicts sound; adopted: source-order hashing, imports in the design closure, the skip-share "
+                      "bound in review_ready, the near_singular stress scenario; the method-review check itself is "
+                      "outside the fingerprint by design (held by its tests)"),
+    },
+    "n_redraws": (),                       # re-draw counts the report calibrated
+    "alpha": (),                           # alpha levels it calibrated
 }
 
 
 def method_review_problem(alpha: float, n_redraws: int) -> str | None:
     """Why a trial with this alpha and re-draw count has no recorded review of INFERENCE_METHOD
-    that covers it, or None when it has one."""
+    that covers it, or None when it has one. Both halves of METHOD_REVIEW must be structured records
+    whose inference fingerprint is the running code's (experiment_fingerprint); anything else, an
+    unreadable source included, withholds the decision. Its helpers stay inside it, so they stay
+    outside the fingerprint with it."""
+    from experiment_fingerprint import inference_fingerprint
+
     review = METHOD_REVIEW
-    has_report, has_review = bool(review.get("calibration_report")), bool(review.get("independent_review"))
-    if not (has_report or has_review):
+    report, record = review.get("calibration_report"), review.get("independent_review")
+    if not (report or record):
         return (f"the calibration report and the independent statistical review of {INFERENCE_METHOD} are not "
                 "recorded yet (experiment_analysis.METHOD_REVIEW)")
-    if not has_report:
+    live = inference_fingerprint()
+
+    def filled(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def other_code(entry: dict[str, Any], what: str) -> str | None:
+        recorded = entry.get("inference_fingerprint")
+        if live is None:
+            return (f"the source of the running inference code cannot be read, so the recorded {what} cannot be "
+                    "checked against it (experiment_fingerprint)")
+        if recorded != live:
+            shown = recorded[:12] if filled(recorded) else "none"
+            return (f"the recorded {what} covers other inference code (fingerprint {shown}; the running code is "
+                    f"{live[:12]}): the code changed since, so the {what} must be recorded again for it")
+        return None
+
+    if record:
+        if not isinstance(record, dict):
+            return ("the recorded independent statistical review is not a structured record (reference, reviewers, "
+                    "verdicts, reviewed_revision, inference_fingerprint), so it cannot be checked against the code")
+        reviewers = record.get("reviewers")
+        verdicts = record.get("verdicts")
+        if not (filled(record.get("reference")) and filled(record.get("reviewed_revision"))):
+            return "the recorded independent statistical review has no reference or no reviewed revision"
+        if not (isinstance(reviewers, (list, tuple)) and len({r.strip() for r in reviewers if filled(r)}) >= 2
+                and len(reviewers) == len({r.strip() for r in reviewers if filled(r)})):
+            return "the recorded independent statistical review does not name at least two distinct reviewers"
+        if not (isinstance(verdicts, (list, tuple)) and len(verdicts) == len(reviewers)
+                and all(isinstance(v, str) and v.strip().lower() == "sound" for v in verdicts)):
+            return "the recorded independent statistical review does not record a sound verdict from every reviewer"
+        problem = other_code(record, "independent statistical review")
+        if problem:
+            return problem
+    if not report:
         return (f"the seeded calibration report of {INFERENCE_METHOD} is not recorded yet "
                 "(experiment_analysis.METHOD_REVIEW): the independent statistical review is recorded, and a firm "
                 "decision needs both")
-    if not has_review:
+    if not record:
         return (f"the independent statistical review of {INFERENCE_METHOD} is not recorded yet "
                 "(experiment_analysis.METHOD_REVIEW): the calibration report is recorded, and a firm decision "
                 "needs both")
+    if not isinstance(report, dict):
+        return ("the recorded calibration report is not a structured record (reference, revision, "
+                "inference_fingerprint, harness_fingerprint, review_ready, suite_run), so it cannot be checked "
+                "against the code")
+    if not all(filled(report.get(key)) for key in ("reference", "revision", "harness_fingerprint", "suite_run")):
+        return ("the recorded calibration report lacks its reference, revision, harness fingerprint or the "
+                "scheduled-suite run that passed tests/test_experiment_calibration.py (the strip-bound proofs)")
+    if report.get("review_ready") is not True:
+        return "the recorded calibration report is not review-ready (experiment_calibration.py, doc 8.2)"
+    problem = other_code(report, "calibration report")
+    if problem:
+        return problem
     if review.get("method") != INFERENCE_METHOD:
         return f"the recorded review covers {review.get('method')!r}, not {INFERENCE_METHOD}"
+    if review.get("interval_method") != INTERVAL_METHOD:
+        return f"the recorded review covers the interval {review.get('interval_method')!r}, not {INTERVAL_METHOD}"
     counts = sorted({int(x) for x in review.get("n_redraws") or ()})
     if int(n_redraws) not in counts:
         return f"the calibration report covers {counts or 'no'} re-draw counts, not this trial's {int(n_redraws)}"

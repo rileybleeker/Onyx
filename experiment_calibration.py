@@ -32,9 +32,13 @@ size and coverage of the deployed rule itself: the analysis's "at most alpha" fo
 pseudo-randomness assumption of doc 8.1 (the Monte Carlo randomization p-value (1 + count) / (R + 1)),
 and this report is the empirical evidence for it.
 
-The report records the configuration it calibrated (method, alpha, re-draw count): a
-METHOD_REVIEW entry covers exactly those, and a trial's decision is firm only when its alpha
-and re-draw count are among them (experiment_analysis.method_review_problem).
+The report records the configuration it calibrated (method, alpha, re-draw count) and the code
+it ran: the inference fingerprint (experiment_fingerprint) of the analysis it calibrated, the
+harness fingerprint of this file and the revision (--revision, else $GITHUB_SHA). A METHOD_REVIEW
+entry covers exactly that configuration and that inference code, and a trial's decision is firm
+only when its alpha and re-draw count are among them and the running code has the same inference
+fingerprint (experiment_analysis.method_review_problem). A report without a revision or whose
+inference code cannot be fingerprinted is never review-ready.
 
 Supported scenarios satisfy the working model of experiment_analysis (one-night carryover,
 constant additive effects, missing nights and excluded blocks independent of the arm) and must
@@ -42,7 +46,19 @@ meet every tolerance. Unsupported scenarios break one assumption on purpose; the
 without a tolerance, to show what the assumption protects and how often the report's own checks
 withhold the decision. Each scenario also carries informational rates for the previous method
 (Fisher's no-effect test and the interval that assumed no carryover), so the validation phase can
-see whether the old mechanism mattered.
+see whether the old mechanism mattered, and the share of re-draws that cannot separate the arm
+from the carryover (singular_redraw_share; they count as extreme).
+
+A stress scenario (stress=True: near_singular, from the method review, doc 8.3) is a supported
+scenario on a deliberately hard design: few nights per block, so many re-draws are singular and
+some trials cannot be fitted at all (skipped). It must meet every tolerance like the others; a
+report needs REVIEW_MIN_STRESS of its trials analysed, not REVIEW_MIN_SIMS, to be review-ready.
+
+Skipped trials are judged too (method review, doc 8.3): the rates are measured on the trials the
+model can fit, while a real trial that cannot be fitted gets a final report with no decision
+(experiment_report.py, not_analysable). So a report is review-ready only when no supported
+scenario skips more than REVIEW_MAX_SKIP of its trials (REVIEW_MAX_SKIP_STRESS in a stress
+scenario): a scenario where the model often cannot be fitted is not evidence for the method.
 
 Synthetic inputs only, declared in SCENARIOS (round planning values, no personal data). Nothing
 reads the database, the clock or a credential; the output holds rates and counts only.
@@ -53,8 +69,8 @@ than one Actions job allows, so it runs on the PC or as one job per scenario, me
 Scenario j's trial i always draws from default_rng([seed, j, i]) and calibration_redraw_seed(seed, j, i),
 so a shard holds exactly the rows a full run would; --merge refuses shards of different
 configurations or a scenario twice:
-    python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --out calibration.json
-    python experiment_calibration.py --sims 1000 --redraws 10000 --seed 20261116 --scenario no_effect --out s1.json
+    python experiment_calibration.py --sims 1000 --redraws 10000 --alpha 0.05 --seed 20261116 --revision <commit> --out calibration.json
+    python experiment_calibration.py --sims 1000 --redraws 10000 --seed 20261116 --revision <commit> --scenario no_effect --out s1.json
     python experiment_calibration.py --merge s1.json s2.json ... --out calibration.json
 The scheduled test (tests/test_experiment_calibration.py) runs a bounded smoke subset only.
 """
@@ -63,6 +79,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -72,11 +89,15 @@ import numpy as np
 
 import experiment_analysis as ea
 import experiment_design as design
+import experiment_fingerprint as fingerprint
 
 ALPHA = 0.05
 Z_MC = 3.0                  # Monte Carlo tolerance in binomial standard errors, fixed before any run
 DEFAULT_SIMS = 1000
 REVIEW_MIN_SIMS = 1000      # trials per scenario a report needs before it may back METHOD_REVIEW
+REVIEW_MIN_STRESS = 500     # the same for a stress scenario, where unfittable trials are expected
+REVIEW_MAX_SKIP = 0.01      # largest share of a supported scenario's trials the model may fail to fit
+REVIEW_MAX_SKIP_STRESS = 0.5  # the same for a stress scenario
 DEFAULT_REDRAWS = 10000     # the template's registered count; a trial is covered only at a calibrated count
 DEFAULT_SEED = 20261116
 BASELINE = 70.0             # synthetic outcome level (ms)
@@ -101,6 +122,7 @@ class Scenario:
     missing_a_extra: float = 0.0  # extra missing share on arm-A nights; non-zero breaks missing_not_caused_by_arm
     excluded_blocks: int = 0     # whole blocks left out, chosen at random before any outcome
     n_blocks: int = 58
+    stress: bool = False         # a deliberately hard design (unfittable trials expected; see the module doc)
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -121,6 +143,12 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("arm_dependent_missing", False,
              "no effect, nights after arm A are missing more often (breaks missing_not_caused_by_arm)",
              missing=0.1, missing_a_extra=0.25),
+    # Doc 8.3 (method review, gpt-5.2): near-singular designs and many singular re-draws. About two of
+    # four nights per block survive, so after the block and weekday terms little is left to separate the
+    # arm from the carryover: many re-draws are singular (counted as extreme) and some trials are skipped.
+    Scenario("near_singular", True,
+             "no same-night effect, a carryover, 10 blocks with half the nights missing (a near-singular design)",
+             carryover=6.0, missing=0.5, n_blocks=10, stress=True),
 )
 
 
@@ -198,6 +226,7 @@ def one_trial(s: Scenario, rng: np.random.Generator, *, n_redraws: int, alpha: f
         "enclosure_violation": (enclosure_violation(draws, 0, lo, hi, alpha, beta, (s.direct, 0.0))
                                 or enclosure_violation(draws, 1, clo, chi, alpha, beta, (s.carryover, 0.0))),
         "interval_unbounded": not all(math.isfinite(v) for v in (lo, hi, clo, chi)),
+        "singular_redraw_share": float(np.mean(np.isnan(draws.a[:, 0]))),
         "carryover_set_unbounded": not (math.isfinite(carry_set[0]) and math.isfinite(carry_set[1])),
         "missingness_withholds": bool(ea.missingness_check(t[in_scope], np.isnan(y[in_scope]))["threat"]),
     }
@@ -248,6 +277,9 @@ def summarize(s: Scenario, rows: list[dict[str, Any]], skipped: int, alpha: floa
         "carryover_set_unbounded": round(rate("carryover_set_unbounded"), 4),
         # An interval end left infinite: the nights cannot bound it, or its certification budget ran out.
         "interval_unbounded": round(rate("interval_unbounded"), 4),
+        # Mean share of re-draws that cannot separate the arm from the carryover (counted as extreme).
+        "singular_redraw_share": (round(float(np.mean([r["singular_redraw_share"] for r in rows])), 4)
+                                  if rows else float("nan")),
         "missingness_check_withholds": round(rate("missingness_withholds"), 4),
     }
     if s.direct != 0:
@@ -265,10 +297,11 @@ def summarize(s: Scenario, rows: list[dict[str, Any]], skipped: int, alpha: floa
 
 def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDRAWS, seed: int = DEFAULT_SEED,
                     names: list[str] | None = None, alpha: float = ALPHA,
-                    beta: float | None = None) -> dict[str, Any]:
+                    beta: float | None = None, revision: str | None = None) -> dict[str, Any]:
     """The calibration report. Deterministic in (seed, n_sims, n_redraws, names): trial i of scenario
     j draws its synthetic trial from numpy's default_rng([seed, j, i]) and its re-draws from
-    calibration_redraw_seed(seed, j, i). beta None = the registered level for n_redraws."""
+    calibration_redraw_seed(seed, j, i). beta None = the registered level for n_redraws. revision
+    names the commit the run used (recorded, never read: a report without one is not review-ready)."""
     beta = ea.nuisance_beta_for(n_redraws) if beta is None else beta
     chosen = [(j, s) for j, s in enumerate(SCENARIOS) if names is None or s.name in names]
     unknown = set(names or ()) - {s.name for s in SCENARIOS}
@@ -285,18 +318,38 @@ def run_calibration(*, n_sims: int = DEFAULT_SIMS, n_redraws: int = DEFAULT_REDR
             else:
                 rows.append(row)
         scenarios.append(summarize(s, rows, skipped, alpha))
-    return _assemble(_config(alpha=alpha, beta=beta, n_sims=n_sims, n_redraws=n_redraws, seed=seed), scenarios)
+    return _assemble(_config(alpha=alpha, beta=beta, n_sims=n_sims, n_redraws=n_redraws, seed=seed,
+                             revision=revision), scenarios)
 
 
 # The fields that must agree for shards to be merged into one report.
 CONFIG_KEYS = ("method", "interval_method", "alpha", "nuisance_beta", "z_mc", "n_sims", "n_redraws", "seed",
-               "generator")
+               "generator", "fingerprint_version", "inference_fingerprint", "harness_fingerprint", "revision")
 
 
-def _config(*, alpha: float, beta: float, n_sims: int, n_redraws: int, seed: int) -> dict[str, Any]:
+def _config(*, alpha: float, beta: float, n_sims: int, n_redraws: int, seed: int,
+            revision: str | None = None) -> dict[str, Any]:
     return {"method": ea.INFERENCE_METHOD, "interval_method": ea.INTERVAL_METHOD,
             "alpha": alpha, "nuisance_beta": beta, "z_mc": Z_MC,
-            "n_sims": n_sims, "n_redraws": n_redraws, "seed": seed, "generator": design.GENERATOR}
+            "n_sims": n_sims, "n_redraws": n_redraws, "seed": seed, "generator": design.GENERATOR,
+            # The code this report calibrated (METHOD_REVIEW's calibration_report copies these).
+            "fingerprint_version": fingerprint.FINGERPRINT_VERSION,
+            "inference_fingerprint": fingerprint.inference_fingerprint(),
+            "harness_fingerprint": fingerprint.harness_fingerprint(),
+            "revision": revision.strip() if isinstance(revision, str) and revision.strip() else None}
+
+
+def _review_limits(name: str) -> tuple[int, float]:
+    """(trials it needs analysed, largest share it may skip) before a supported scenario lets the
+    report back METHOD_REVIEW."""
+    stress = {s.name: s.stress for s in SCENARIOS}.get(name, False)
+    return (REVIEW_MIN_STRESS, REVIEW_MAX_SKIP_STRESS) if stress else (REVIEW_MIN_SIMS, REVIEW_MAX_SKIP)
+
+
+def _review_counts_ok(summary: dict[str, Any]) -> bool:
+    minimum, max_skip = _review_limits(summary["name"])
+    analysed, skipped = int(summary["n_analysed"]), int(summary.get("n_skipped", 0))
+    return analysed >= minimum and skipped <= max_skip * (analysed + skipped)
 
 
 def _assemble(config: dict[str, Any], scenarios: list[dict[str, Any]]) -> dict[str, Any]:
@@ -309,14 +362,18 @@ def _assemble(config: dict[str, Any], scenarios: list[dict[str, Any]]) -> dict[s
     return {
         **config,
         # What a METHOD_REVIEW entry may cover once this report passed with every supported scenario.
-        "covers": {"method": config["method"], "n_redraws": [config["n_redraws"]], "alpha": [config["alpha"]]},
+        "covers": {"method": config["method"], "n_redraws": [config["n_redraws"]], "alpha": [config["alpha"]],
+                   "inference_fingerprint": config.get("inference_fingerprint")},
         "all_supported_scenarios": every_supported,
         "scenarios": scenarios,
         "passed": passed,
         # Only a full run may back a METHOD_REVIEW entry: every supported scenario, at least
-        # REVIEW_MIN_SIMS trials ANALYSED in each (skipped, unfittable trials do not count; the
-        # tolerances widen as the count falls).
-        "review_ready": passed and min(x["n_analysed"] for x in supported) >= REVIEW_MIN_SIMS,
+        # REVIEW_MIN_SIMS trials ANALYSED in each (REVIEW_MIN_STRESS in a stress scenario; skipped,
+        # unfittable trials do not count; the tolerances widen as the count falls) and at most
+        # REVIEW_MAX_SKIP of them skipped (REVIEW_MAX_SKIP_STRESS), a recorded revision and an inference
+        # fingerprint, so the record can name the code it covers.
+        "review_ready": (passed and all(_review_counts_ok(x) for x in supported)
+                         and bool(config.get("revision")) and bool(config.get("inference_fingerprint"))),
     }
 
 
@@ -355,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", action="append", help="run only this scenario (repeatable)")
     parser.add_argument("--merge", nargs="+", metavar="SHARD", help="merge shard reports instead of running")
     parser.add_argument("--out", help="also write the JSON report to this file")
+    parser.add_argument("--revision", default=os.environ.get("GITHUB_SHA"),
+                        help="the commit this run uses (default $GITHUB_SHA); a report without one is not review-ready")
     args = parser.parse_args(argv)
     if args.merge:
         shards = []
@@ -364,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         report = merge_reports(shards)
     else:
         report = run_calibration(n_sims=args.sims, n_redraws=args.redraws, seed=args.seed, names=args.scenario,
-                                 alpha=args.alpha)
+                                 alpha=args.alpha, revision=args.revision)
     text = json.dumps(report, indent=2, sort_keys=False)
     print(text)
     if args.out:

@@ -38,6 +38,7 @@ import numpy as np  # noqa: E402
 import experiment_admin as admin  # noqa: E402
 import experiment_analysis as ea  # noqa: E402
 import experiment_design as ed  # noqa: E402
+import experiment_fingerprint as ef  # noqa: E402
 
 GOLDEN_SEED = hashlib.sha256(b"onyx experiment framework golden test seed (synthetic)").digest()
 GOLDEN_SCHEDULE = "ABBABABAABBAABABBAABABBABAABAABBABBAABBABAABBABA"
@@ -525,8 +526,16 @@ def _reviewed(**changes):
     """A synthetic METHOD_REVIEW covering the template's configuration, restored afterwards."""
     saved = dict(ea.METHOD_REVIEW)
     try:
-        ea.METHOD_REVIEW.update(method=ea.INFERENCE_METHOD, calibration_report="synthetic-report-ref",
-                                independent_review="synthetic-review-ref", n_redraws=(10000,), alpha=(0.05,))
+        fingerprint = ef.inference_fingerprint()
+        ea.METHOD_REVIEW.update(
+            method=ea.INFERENCE_METHOD, interval_method=ea.INTERVAL_METHOD,
+            independent_review={"reference": "synthetic-review-ref", "reviewers": ("synthetic-a", "synthetic-b"),
+                                "verdicts": ("sound", "sound"), "reviewed_revision": "synthetic-revision",
+                                "inference_fingerprint": fingerprint},
+            calibration_report={"reference": "synthetic-report-ref", "revision": "synthetic-revision",
+                                "inference_fingerprint": fingerprint, "harness_fingerprint": "synthetic-harness",
+                                "review_ready": True, "suite_run": "synthetic-suite-run"},
+            n_redraws=(10000,), alpha=(0.05,))
         ea.METHOD_REVIEW.update(changes)
         yield
     finally:
