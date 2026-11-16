@@ -82,6 +82,8 @@ export default function ReviewCard({
   const queue = useMemo(() => remainingQueue(o.dueReviews, new Set(graded)), [o.dueReviews, graded]);
   const cur: Highlight | undefined = queue[0];
   const cardKey = cur ? `${cur.highlight_id}:${cur.review_count}` : "";
+  const curRef = useRef<Highlight | undefined>(cur);
+  curRef.current = cur;
 
   // Another card on top (advanced, or a reload changed it): its own fresh state. Not while a request is out.
   useEffect(() => {
@@ -140,6 +142,11 @@ export default function ReviewCard({
     }
     // Refused or stale: nothing was written under this key, so it is not reused.
     if (out.kind !== "unknown") setPending(null);
+    // The card left the top while the request was out (the overview was re-read): its message would sit on another card.
+    if (curRef.current?.highlight_id !== attempt.highlight_id) {
+      setStatus({ kind: "idle" });
+      return;
+    }
     setStatus({ kind: out.kind, grade: g, message: out.message });
   };
 
