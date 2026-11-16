@@ -1,7 +1,7 @@
 -- =============================================================================
 -- ADR-0001 Phase 1, step 5 — onyx_is_transition_day flag on whoop_cycles
 -- NOTE 2026-11-14: pds.set_whoop_cycles_transition_flag, pds.refresh_next_transition_day
--- and its trigger are redefined in sql/tz_derivation_edge_cases.sql (pending Riley's
+-- and its trigger are redefined in sql/tz_derivation_whoop_followups.sql (pending
 -- apply; adds moved / removed cycles and pds.recompute_whoop_transition_flags()). Once
 -- applied, that file holds the current definitions; do not re-run the copies below.
 -- =============================================================================
