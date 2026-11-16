@@ -3,7 +3,9 @@
 // scroll dropping the Log page, a navigation, a hidden part) and shows it again on the next mount; a create that
 // failed offline keeps its client_key, so Retry creates the session once; opening the section never sends anything;
 // an entry made before the behavioral day rolls keeps its own day; Discard / Remove / New session pressed while a
-// field has focus are never pre-empted by the form's blur save (the press keeps focus, Tab to them skips the save).
+// field has focus are never pre-empted by the form's blur save (the press keeps focus, Tab to them skips the save, a
+// touch press that still blurs the field is remembered); a session end stops a save under way (no replay PATCH, no
+// refetch); a copy mounted while the previous copy's create was out shows the day the server stored.
 // Executes the real section, lib/use-autosave.ts, lib/autosave-retain.ts, lib/autosave.ts and AutosaveStatus with a
 // tiny hook scheduler and a manual autosave clock. SYNTHETIC DATA ONLY: invented book, chapters and dates; the only
 // "server" is the in-memory fetch below.
@@ -110,8 +112,11 @@ function setup(t) {
   const subscribers = new Set();
   const calls = [];
   const rows = new Map();
+  /** "up", "offline", or "lost": the server stores the create, but its answer never arrives (a network failure). */
   let mode = "up";
   let readMode = "up";
+  /** Reads of the reading overview through cachedJson (the mount's load, and the refetch after every save). */
+  let reads = 0;
   /** While set, every save request waits for it (the request is in flight, as between a press and its click). */
   let hold = null;
   // The server's behavioral today (a create without a date is stored on it) and the clock's guess of the same day:
@@ -130,6 +135,7 @@ function setup(t) {
       if (init.method === "POST" && url === "/api/reading/sessions") {
         const replayed = rows.has(body.client_key);
         if (!replayed) rows.set(body.client_key, { session_id: 500 + rows.size + 1, session_date: body.date ?? serverToday, ...body });
+        if (mode === "lost") throw new TypeError("Failed to fetch");
         const row = rows.get(body.client_key);
         return reply({ session: row, replayed, xp_gained: replayed ? 0 : 10, finished: false, habit_created_on: row.session_date, overview: null });
       }
@@ -154,6 +160,7 @@ function setup(t) {
     "@/lib/checkin": { fallbackBehavioralToday: (d) => (d.getTime() >= rollAt ? D2 : D1) },
     "@/lib/client-cache": {
       cachedJson: async () => {
+        reads += 1;
         if (readMode === "offline") throw new TypeError("Failed to fetch");
         return structuredClone(current);
       },
@@ -215,15 +222,28 @@ function setup(t) {
       return m && node && m[1] in node.props ? {} : null;
     },
   });
-  /** Focus leaves a field of the session form for `label`'s button (null = out of the form): the form's onBlur. */
-  const blurTo = async (label) => {
+  const formNode = () => {
     const form = nodes().find((n) => n.type === "form");
     assert.ok(form, "the session form is drawn");
-    form.props.onBlur({ relatedTarget: label === null ? null : asTarget(button(label)) });
+    return form;
+  };
+  /** Focus leaves a field of the session form for `label`'s button (null = out of the form): the form's onBlur. */
+  const blurTo = async (label) => {
+    formNode().props.onBlur({ relatedTarget: label === null ? null : asTarget(button(label)) });
+    await flush();
+  };
+  /** A click on `label`'s button, if it is still drawn and enabled, bubbling to the form (as a browser delivers it). */
+  const clickIfEnabled = async (label) => {
+    const b = nodes().find((n) => n.type === "button" && text(n) === label);
+    if (b && !b.props.disabled) {
+      await b.props.onClick();
+      nodes().find((n) => n.type === "form")?.props.onClick?.();
+    }
     await flush();
   };
   const h = {
     timers, work, retainer, calls, rows,
+    get reads() { return reads; },
     set mode(m) { mode = m; },
     /** The overview read fails (offline): the section keeps what the cache showed it. */
     set readMode(m) { readMode = m; },
@@ -247,12 +267,25 @@ function setup(t) {
      * never delivers to a button that became disabled or left the page in between.
      */
     async press(label) {
+      const b = button(label);
+      b.props.onPointerDown?.({});
       const down = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
-      button(label).props.onMouseDown?.(down);
+      b.props.onMouseDown?.(down);
       if (!down.defaultPrevented) await blurTo(label);
-      const b = nodes().find((n) => n.type === "button" && text(n) === label);
-      if (b && !b.props.disabled) await b.props.onClick();
-      await flush();
+      await clickIfEnabled(label);
+    },
+    /**
+     * A tap on a touch screen while a field of the form has focus, in the worst order a phone browser uses: pointerdown
+     * and touchstart, then the field blurs whatever mousedown did, with no relatedTarget (iOS Safari never focuses a
+     * tapped button), then the click.
+     */
+    async tap(label) {
+      const b = button(label);
+      b.props.onPointerDown?.({});
+      b.props.onTouchStart?.({});
+      b.props.onMouseDown?.({ preventDefault() {} });
+      await blurTo(null);
+      await clickIfEnabled(label);
     },
     /** Hold every save request in flight until the returned release() is called. */
     holdSaves() {
@@ -652,4 +685,91 @@ test("New session pressed while a field has focus and a save would be in flight:
   assert.equal(after[0].body.minutes, 40);
   assert.match(h.text(), /Audio or paper session/, "and the click was not lost to a disabled button");
   assert.equal(h.value("Minutes"), "");
+});
+
+test("Discard tapped on a touch screen: the field blurs with no target, the press is remembered, nothing is saved", async (t) => {
+  const h = setup(t);
+  await keptCompleteEntryWithoutBook(h);
+  await h.tap("Discard this entry");
+  assert.equal(h.posts().length, 0, "the blur the tap caused did not create the session");
+  assert.equal(h.rows.size, 0);
+  assert.match(h.text(), /No book in progress\./, "the click landed: the entry is gone");
+  assert.equal(h.work.has(), false);
+  await h.tick(60_000);
+  assert.equal(h.calls.length, 0, "and nothing is sent later");
+});
+
+test("a press does not linger: after Remove (mouse, then touch), leaving the form saves the next entry at once", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Through ch.", "3");
+  await h.tick(1500);
+  assert.equal(h.posts().length, 1);
+  await h.press("Remove this session"); // mouse: no blur at all, the click clears the press
+  assert.match(h.text(), /Audio or paper session/);
+
+  await h.type("Through ch.", "4");
+  await h.blurTo(null);
+  assert.equal(h.posts().length, 2, "a later blur out of the form saves without waiting for the pause");
+
+  await h.tap("Remove this session"); // touch: the blur it causes is skipped and uses the press up
+  assert.deepEqual(h.calls.slice(-1).map((c) => c.method), ["DELETE"]);
+  await h.type("Through ch.", "5");
+  await h.blurTo(null);
+  assert.equal(h.posts().length, 3, "and so does the next one after a tap");
+});
+
+test("session end during a background retry whose create had landed: the replayed answer sends no PATCH and reads nothing", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Through ch.", "3");
+  h.mode = "lost"; // the server stores the session; the answer never arrives
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1, "stored on the server");
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\./);
+  await h.unmount(); // sends once more on the way out; that answer is lost too
+  assert.equal(h.retainer.size, 1, "kept, retrying on its own");
+
+  h.mode = "up";
+  const release = h.holdSaves();
+  await h.tick(60_000); // the kept saver's retry goes out and is held in flight
+  const before = h.calls.length;
+  assert.equal(h.calls[before - 1].method, "POST", "the retry of the create is out");
+  const reads = h.reads;
+  h.retainer.clear(); // the session ends (wipeClientData fires CLIENT_WIPE_EVENT) while it is out
+  await release(); // its answer arrives: the row already existed (replayed)
+  assert.deepEqual(h.calls.slice(before).map((c) => c.method), [], "no PATCH writes the old session's values after the session ended");
+  assert.equal(h.reads, reads, "and nothing is read back into the wiped cache");
+  assert.equal(h.retainer.size, 0);
+  assert.equal(h.work.has(), false, "no unsaved work is left registered");
+  assert.equal(h.timers.count(), 0, "no retry is waiting");
+  await h.tick(120_000);
+  assert.equal(h.calls.length, before, "nothing more is ever sent");
+  assert.equal(h.rows.size, 1, "one row on the server, from before the session ended");
+
+  await h.mount();
+  assert.equal(h.value("Through ch."), "", "the next session starts with an empty form");
+  assert.equal(h.calls.length, before, "and opening it sends nothing");
+});
+
+test("remounted while the previous copy's create is out: the day the server stored is shown by the new copy", async (t) => {
+  const h = setup(t);
+  await h.rollDay(); // the clock is on D2 before the section opens; the cache still says D1
+  h.serverToday = D2;
+  h.readMode = "offline";
+  await h.mount();
+  await h.type("Through ch.", "4");
+  const release = h.holdSaves();
+  await h.tick(1500); // the create is out (the day on screen could be stale: the server decides)
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.date, null);
+  await h.unmount(); // its send is still pending
+  await h.mount(); // a new copy takes the entry over before the answer arrives
+  assert.equal(h.value("Day"), D1, "until the answer, the day on screen");
+  await release();
+  assert.equal([...h.rows.values()][0].session_date, D2);
+  assert.match(h.text(), /This session/, "the new copy shows the session the old copy's create made");
+  assert.equal(h.value("Day"), D2, "and the day it was stored on");
+  assert.match(h.text(), /For Apr 11/);
+  assert.equal(h.posts().length, 1, "created once");
 });

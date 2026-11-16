@@ -16,7 +16,9 @@
  *  - Taking a form over never sends anything (opening or scrolling never saves).
  *  - Memory only: nothing is written to storage, so a reload forgets it. A session end forgets it too, also without a
  *    reload: every wipe of the client's data (sign-out, a 401, a load without a session: wipeClientData in
- *    lib/client-cache.ts) fires CLIENT_WIPE_EVENT, and every kept form is dropped with its retry timer stopped.
+ *    lib/client-cache.ts) fires CLIENT_WIPE_EVENT, and every kept form (and every copy still on screen) is dropped
+ *    with its retry timer stopped; a save under way stops at its next step (RetainedSaveContext.cancelled), and an
+ *    unmount whose send was pending then registers nothing.
  *    Bounded: one form per name, at most MAX_RETAINED names; a copy beyond that, or a second copy shown at the same
  *    time as the first, is not kept past its component.
  * No React, no DOM; React side in lib/use-autosave.ts (useRetainedAutosave). Unit-tested in tests/autosave-retain.test.cjs.
@@ -26,10 +28,18 @@ import { unsavedWork as defaultWork, type UnsavedWork } from "./unsaved-work";
 
 export const MAX_RETAINED = 8;
 
-/** What the component showing the form supplies on every render (the latest closures are always used). */
-export type FormSource<T> = Pick<AutosaverOptions<T>, "save" | "ready" | "same">;
+/**
+ * What a retained form's save gets. `cancelled()` turns true once the form was let go while the save ran (the session
+ * ended: CLIENT_WIPE_EVENT). A save checks it after every await and stops there: no further request (a replay's
+ * follow-up PATCH), no write to the form's data, no refetch into a cache that was just wiped.
+ */
+export type RetainedSaveContext = { keepalive: boolean; cancelled: () => boolean };
+export type RetainedSave<T> = (value: T, ctx: RetainedSaveContext) => Promise<void>;
 
-export type RetainOptions<T> = Omit<AutosaverOptions<T>, "onState">;
+/** What the component showing the form supplies on every render (the latest closures are always used). */
+export type FormSource<T> = Pick<AutosaverOptions<T>, "ready" | "same"> & { save: RetainedSave<T> };
+
+export type RetainOptions<T> = Omit<AutosaverOptions<T>, "onState" | "save"> & { save: RetainedSave<T> };
 
 const jsonSame = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -39,6 +49,8 @@ export class RetainedForm<T, D> {
   source: () => FormSource<T>;
   readonly listeners = new Set<(s: AutosaveState) => void>();
   mounts = 0;
+  /** Let go (forgotten when clean, or dropped at session end): its saver is disposed and a save under way stops. */
+  released = false;
 
   constructor(
     readonly name: string,
@@ -51,7 +63,7 @@ export class RetainedForm<T, D> {
     this.source = () => opts;
     this.saver = new Autosaver<T>(
       {
-        save: (v, ctx) => this.source().save(v, ctx),
+        save: (v, ctx) => this.source().save(v, { keepalive: ctx.keepalive, cancelled: () => this.released }),
         ready: (v) => this.source().ready?.(v),
         same: (a, b) => (this.source().same ?? jsonSame)(a, b),
         delayMs: opts.delayMs,
@@ -67,6 +79,8 @@ export class RetainedForm<T, D> {
 
 export class FormRetainer {
   private forms = new Map<string, RetainedForm<unknown, unknown>>();
+  /** Every form a component shows now, kept or not (a copy beyond the bound): a session end stops these too. */
+  private shown = new Set<RetainedForm<unknown, unknown>>();
   private work: UnsavedWork;
   private max: number;
   private defaults: { timers?: Timers; now?: () => number };
@@ -96,13 +110,15 @@ export class FormRetainer {
   attach<T, D>(form: RetainedForm<T, D>, listener: (s: AutosaveState) => void): void {
     form.mounts += 1;
     form.listeners.add(listener);
+    this.shown.add(form as RetainedForm<unknown, unknown>);
     const cur = this.forms.get(form.name);
     if (this.owns(form)) {
       // Shown again: the component reports its own unsaved work while it is mounted.
       this.work.setDirty(FormRetainer.keyOf(form.name), false);
       return;
     }
-    if (!cur && this.forms.size < this.max) this.forms.set(form.name, form as RetainedForm<unknown, unknown>);
+    // A form already let go (the session ended while a copy still held it) is never kept again.
+    if (!cur && !form.released && this.forms.size < this.max) this.forms.set(form.name, form as RetainedForm<unknown, unknown>);
   }
 
   /**
@@ -113,10 +129,10 @@ export class FormRetainer {
     form.listeners.delete(listener);
     form.mounts = Math.max(0, form.mounts - 1);
     if (form.mounts > 0) return;
+    this.shown.delete(form as RetainedForm<unknown, unknown>);
     const key = FormRetainer.keyOf(form.name);
-    const owned = this.owns(form);
     // Registered before the send, so an update check landing meanwhile never reloads over the entry.
-    if (owned && form.saver.dirty) this.work.setDirty(key, true);
+    if (this.owns(form) && form.saver.dirty) this.work.setDirty(key, true);
     try {
       await form.saver.flush(true);
     } catch {
@@ -124,7 +140,11 @@ export class FormRetainer {
     }
     // Shown again before the send settled (React's development double mount, or Riley came straight back).
     if (form.mounts > 0) return;
-    if (!owned) {
+    // Ownership is read again AFTER the send: a session end (clear) while it was pending let the form go, cleared its
+    // key and disposed its saver, which then keeps its last "saving" or "error" state (still dirty). Such a form, a
+    // copy beyond the bound, and one whose name another form holds now, register nothing: no unsaved-work key that
+    // nothing could clear, and a replacement under the same name is left as it is.
+    if (!this.owns(form)) {
       form.saver.dispose();
       return;
     }
@@ -142,7 +162,7 @@ export class FormRetainer {
    * empty (session end, CLIENT_WIPE_EVENT below). A copy still on screen keeps its fields but sends nothing more.
    */
   clear(): void {
-    for (const form of [...this.forms.values()]) this.release(form);
+    for (const form of [...this.forms.values(), ...this.shown]) this.release(form);
   }
 
   /** The form is the copy kept under its name. */
@@ -157,8 +177,11 @@ export class FormRetainer {
   }
 
   private release<T, D>(form: RetainedForm<T, D>): void {
-    if (this.owns(form)) this.forms.delete(form.name);
-    this.work.setDirty(FormRetainer.keyOf(form.name), false);
+    const owned = this.owns(form);
+    if (owned) this.forms.delete(form.name);
+    form.released = true;
+    // The name's key belongs to the form kept under it: a copy that was never kept leaves it alone.
+    if (owned || !this.forms.has(form.name)) this.work.setDirty(FormRetainer.keyOf(form.name), false);
     form.saver.dispose();
   }
 }

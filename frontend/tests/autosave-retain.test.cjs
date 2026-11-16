@@ -310,3 +310,69 @@ test('session end: the wipe event of lib/client-cache.ts drops every kept form o
   assert.equal(api.rows.size, 0);
   assert.equal(retainer.find('synthetic-incomplete'), null, 'the next mount starts empty');
 });
+
+test('a session end while an unmount is still sending: nothing is registered after it settles, no retry, a replacement is left alone', async () => {
+  const timers = fakeTimers();
+  const work = new UnsavedWork();
+  const retainer = new FormRetainer({ work, timers });
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const seen = [];
+  const opts = {
+    delayMs: 800,
+    ready,
+    save: async (_v, ctx) => {
+      seen.push(ctx.cancelled());
+      await held; // the request is out
+      seen.push(ctx.cancelled());
+      throw new TypeError('Failed to fetch'); // a failure worth retrying, had the session not ended
+    },
+  };
+  const a = mount(retainer, 'log-reading', opts);
+  a.form.saver.change({ through: '3' }); // waiting for its pause
+  const pending = a.unmount(); // sends what is waiting; held in flight
+  await settle();
+  assert.equal(a.form.saver.state.status, 'saving');
+  assert.equal(work.has(), true, 'registered before the send');
+
+  retainer.clear(); // the session ends while that request is out
+  assert.equal(retainer.size, 0);
+  assert.equal(work.has(), false);
+  const b = mount(retainer, 'log-reading', { ready, save: async () => {} }); // the next session's copy, same name
+  assert.notEqual(b.form, a.form, 'a new form');
+  b.form.saver.change({ minutes: '5' }); // incomplete
+
+  release();
+  await pending;
+  await settle();
+  assert.deepEqual(seen, [false, true], 'the save saw the session end after its await');
+  assert.equal(retainer.size, 1, 'only the replacement is kept');
+  assert.equal(retainer.find('log-reading'), b.form);
+  assert.equal(work.has(), false, 'no retained: key left behind by the wiped form (the replacement is shown)');
+  assert.equal(timers.count(), 0, 'no retry timer');
+  assert.equal(b.form.saver.state.status, 'incomplete', 'the replacement is untouched');
+
+  await b.unmount();
+  assert.equal(retainer.find('log-reading'), b.form, 'and is kept as usual when it unmounts');
+  assert.equal(work.has(), true);
+  retainer.clear();
+  assert.equal(work.has(), false);
+});
+
+test('a session end also stops a copy on screen that was never kept (beyond the bound), and a let-go form is never kept again', async () => {
+  const { timers, retainer, show } = setup({ max: 1 });
+  const one = show('one');
+  const two = show('two');
+  assert.equal(retainer.size, 1, 'the second name is beyond the bound');
+  two.form.saver.change({ through: '2' }); // waiting: its pause timer is set
+  assert.ok(timers.count() > 0);
+  retainer.clear();
+  assert.equal(timers.count(), 0, 'its timer stopped too');
+  assert.equal(one.form.released, true);
+  assert.equal(two.form.released, true);
+  // React's development double mount of the copy that was on screen: the old form is not taken back in.
+  await one.unmount();
+  retainer.attach(one.form, () => {});
+  assert.equal(retainer.size, 0);
+  assert.equal(retainer.find('one'), null);
+});

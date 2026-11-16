@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Autosaver, type AutosaveState, type AutosaverOptions } from "@/lib/autosave";
-import { formRetainer } from "@/lib/autosave-retain";
+import { formRetainer, type RetainOptions } from "@/lib/autosave-retain";
 import { useUnsavedWork } from "@/lib/use-unsaved-work";
 
 export type UseAutosave<T> = {
@@ -95,11 +95,12 @@ export type UseRetainedAutosave<T, D> = UseAutosave<T> & {
  * useAutosave for a form whose entry must survive its component (lib/autosave-retain.ts): unmounting it (navigation,
  * a hidden or moved part, the scroll dropping the page) sends what is waiting once and, if anything is still not saved,
  * keeps the saver (retrying on its own) and `data` for the next mount, still counted as unsaved work. One form per
- * `name`: use a name only one form on the screen has. Taking a kept form over sends nothing.
+ * `name`: use a name only one form on the screen has. Taking a kept form over sends nothing. Its `save` also gets
+ * `cancelled()` (lib/autosave-retain.ts RetainedSaveContext): check it after every await, a session end stops the save.
  */
 export function useRetainedAutosave<T, D extends object>(
   name: string,
-  opts: Omit<AutosaverOptions<T>, "onState">,
+  opts: RetainOptions<T>,
   initData: () => D,
   baseline?: T,
 ): UseRetainedAutosave<T, D> {

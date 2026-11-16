@@ -158,14 +158,15 @@ type ReadingFormData = {
  * The form's action buttons (Discard, Remove, New session, the removal's Retry) decide themselves what happens to
  * the entry, so reaching one never saves it first. The form saves on blur; without this, pressing Discard while a field
  * has focus moved focus to the button, the field's blur created the session, and the button was disabled (busy) or
- * gone before the click landed (PROD-T01). A pointer press keeps focus where it is (no blur at all); focus moving to one
- * of them (Tab) skips the blur save, and leaving the form from one still saves.
+ * gone before the click landed (PROD-T01). A mouse press keeps focus where it is (mousedown prevented: no blur at all);
+ * focus moving to one of them (Tab) skips the blur save. A touch press can still blur the field, often with no
+ * relatedTarget (iOS Safari does not focus a tapped button), so the press itself is remembered (pointerdown and
+ * touchstart both come before that blur) and the next blur within PRESS_MS skips the save; the click, or that blur,
+ * clears it. Skipping only drops the immediate save: what is waiting still goes on its pause timer unless the button
+ * drops it. Leaving the form from anywhere else still saves at once.
  */
 const BLUR_SKIP_ATTR = "data-autosave-blur-skip";
-const keepsFocus = {
-  [BLUR_SKIP_ATTR]: "",
-  onMouseDown: (e: { preventDefault(): void }) => e.preventDefault(),
-} as const;
+const PRESS_MS = 1000;
 function skipsBlurSave(next: EventTarget | null): boolean {
   const el = next as { closest?: (selector: string) => unknown } | null;
   return !!el && typeof el.closest === "function" && !!el.closest(`[${BLUR_SKIP_ATTR}]`);
@@ -215,8 +216,10 @@ export default function ReadingSection() {
       delayMs: 1500,
       ready: (v) => v.reason,
       same: sameReadingValue,
-      save: async (v, { keepalive }) => {
+      save: async (v, { keepalive, cancelled }) => {
         // ready() keeps an incomplete value from getting here; never report "Saved" without a request.
+        // cancelled(): the session ended while this save was under way (sign-out, a 401): it stops after the request
+        // that is out, before any further request (a replay's PATCH), any write to `kept` and any refetch.
         if (!v.body) throw new AutosaveRefused(v.reason ?? "Enter the chapter you read through to save.");
         const id = kept.sessionId;
         const target = readingSaveTarget("sessions", id);
@@ -241,6 +244,7 @@ export default function ReadingSection() {
             json = await send(target.url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
           }
         } catch (e) {
+          if (cancelled()) return;
           if (id !== null && e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
             // Removed elsewhere: Retry logs it again as a new session (a new key: the old one named a removed row).
             if (kept.sessionId === id) {
@@ -252,6 +256,7 @@ export default function ReadingSection() {
           }
           throw e;
         }
+        if (cancelled()) return;
         const session = json.session as ReadingSession | undefined;
         if (id === null && session?.session_id && kept.sessionId === null) {
           setSessionId(session.session_id);
@@ -265,6 +270,7 @@ export default function ReadingSection() {
             // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
             // values on screen now are written onto it.
             json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+            if (cancelled()) return;
           }
         }
         if (typeof json.habit_created_on === "string" || json.habit_created_on === null) kept.habitCreatedOn = (json.habit_created_on as string | null) ?? null;
@@ -312,11 +318,15 @@ export default function ReadingSection() {
     kept.heldDraft = next;
     setHeldDraftState(next);
   };
-  // A save that was already under way when this copy mounted (a retry while the Log page was away) wrote `kept`
-  // only: show what it made.
+  // A save that was already under way when this copy mounted (a retry while the Log page was away, or the send of the
+  // copy that just unmounted) wrote `kept` only, through that copy's setters: show what it made, including the day
+  // the server stored the session on when it chose the day. Every setter here writes `kept` and the state together,
+  // so they differ only after such a save.
   useEffect(() => {
     setSessionIdState((prev) => (prev === kept.sessionId ? prev : kept.sessionId));
     setSavedState((prev) => (prev === kept.saved ? prev : kept.saved));
+    setFormState((prev) => (prev === kept.form ? prev : kept.form));
+    setFromDraftState((prev) => (prev === kept.fromDraft ? prev : kept.fromDraft));
   }, [autosave.state, kept]);
 
   const show = useCallback((raw: unknown) => {
@@ -328,6 +338,24 @@ export default function ReadingSection() {
     if (asReading(raw)) confirmedAt.current = Date.now();
     show(raw);
   }, [show]);
+
+  // A press on one of the form's action buttons is under way (see BLUR_SKIP_ATTR): when it started, else null.
+  const pressAt = useRef<number | null>(null);
+  const notePress = () => {
+    pressAt.current = Date.now();
+  };
+  const keepsFocus = {
+    [BLUR_SKIP_ATTR]: "",
+    onPointerDown: notePress,
+    onTouchStart: notePress,
+    onMouseDown: (e: { preventDefault(): void }) => e.preventDefault(),
+  };
+  const onFormBlur = (next: EventTarget | null) => {
+    const at = pressAt.current;
+    pressAt.current = null;
+    if ((at !== null && Date.now() - at < PRESS_MS) || skipsBlurSave(next)) return;
+    void autosave.flush();
+  };
 
   // The routed page's first read takes the GET its HTML already started (lib/log-early.ts), once.
   const routed = !useInFeed();
@@ -627,7 +655,8 @@ export default function ReadingSection() {
       <form
         noValidate
         onSubmit={(e) => { e.preventDefault(); void autosave.flush(); }}
-        onBlur={(e) => { if (!skipsBlurSave(e.relatedTarget)) void autosave.flush(); }}
+        onBlur={(e) => onFormBlur(e.relatedTarget)}
+        onClick={() => { pressAt.current = null; }}
         className="mt-4 border-t border-border-subtle pt-3"
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
