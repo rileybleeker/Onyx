@@ -71,6 +71,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
       json("/api/orders/summary"),
       json("/api/procurement/renewals/summary"),
       json("/api/finance/alerts"),
+      // The wind-down panel (components/sleep/WindDownPanel, opt-in): GET only, same key as its store.
+      json("/api/sleep/winddown"),
       // The overview cards under Today's panels (shown cards only; memory-only and Today's own keys excluded).
       ...overviewWarmers(),
     ];
@@ -85,6 +87,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
+    // Wind-down (app/log/sections/WindDown.tsx): GET only, same key as the store (lib/use-winddown.ts).
+    json("/api/sleep/winddown"),
     // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
     json("/api/nutrition/drinks"),
     // Uber Eats (app/log/sections/UberEats.tsx): behavioral today, today's dish window, the harvester heartbeat.

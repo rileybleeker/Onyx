@@ -186,7 +186,7 @@ function manualTimers() {
   return { timers: { set: (fn, ms) => { const h = { fn, ms }; queue.push(h); return h; }, clear: (h) => { const i = queue.indexOf(h); if (i >= 0) queue.splice(i, 1); } }, queue };
 }
 const flush = () => new Promise((r) => setImmediate(r));
-const intent = (over = {}) => ({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, ...over });
+const intent = (over = {}) => ({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, ruleId: 1, ...over });
 
 test("saver: a network failure is retried with backoff and saved once", async () => {
   const { timers, queue } = manualTimers();
@@ -239,12 +239,88 @@ test("saver: a tap made while one is in flight waits; the newest waiting tap win
   assert.deepEqual(sent, ["Yes", "No"]);
 });
 
+test("saver: a tap for another night never replaces an unsaved one; the same night merges into one tap", async () => {
+  const { timers, queue } = manualTimers();
+  const sent = [];
+  let fail = true;
+  const saver = new W.WindDownSaver({ timers, send: async (i) => { sent.push(i); if (fail) throw new TypeError("offline"); return {}; } });
+  assert.equal(saver.submit(intent({ night: day(-1), answer: "Yes", expect: "none" })), true);
+  await flush();
+  assert.equal(saver.current.status, "retrying");
+  assert.equal(saver.canAccept(TODAY), false, "last night's tap is still waiting to be saved");
+  assert.equal(saver.canAccept(day(-1)), true);
+  assert.equal(saver.submit(intent({ night: TODAY })), false, "refused: nothing is cancelled or overwritten");
+  assert.equal(queue.length, 1, "the retry of the first tap is still scheduled");
+  assert.deepEqual(saver.unsavedNights, [day(-1)]);
+  // The same night again while it waits: one tap from what the server last held (none) to the newest answer.
+  fail = false;
+  assert.equal(saver.submit(intent({ night: day(-1), answer: null, expect: "Yes" })), true);
+  await flush();
+  assert.equal(sent.length, 2);
+  assert.deepEqual({ answer: sent[1].answer, expect: sent[1].expect }, { answer: null, expect: "none" });
+  assert.equal(saver.unsaved, false);
+  assert.equal(saver.submit(intent({ night: TODAY })), true, "free again once the first is saved");
+});
+
+test("saver: a failed tap with a same-night tap behind it goes out as one tap from the server's answer", async () => {
+  let release;
+  const sent = [];
+  const saver = new W.WindDownSaver({ send: (i) => { sent.push(i); return sent.length === 1 ? new Promise((_, rej) => { release = rej; }) : Promise.resolve({}); } });
+  saver.submit(intent({ answer: "Yes", expect: "none" }));
+  saver.submit(intent({ answer: "No", expect: "Yes" }));
+  release(new TypeError("offline"));
+  await flush();
+  await flush();
+  assert.equal(sent.length, 2);
+  assert.deepEqual({ answer: sent[1].answer, expect: sent[1].expect }, { answer: "No", expect: "none" });
+});
+
+test("a goal change refuses an old tap, a kept tap is not offered under another goal, undo uses the screen's answer", () => {
+  const sql = fs.readFileSync(path.join(ROOT, "sql", "sleep_winddown.sql"), "utf8");
+  assert.match(sql, /p_rule_id bigint DEFAULT NULL/);
+  assert.match(sql, /IF p_rule_id IS NOT NULL AND r\.rule_id <> p_rule_id THEN\s+RAISE EXCEPTION [^;]*ERRCODE = 'OXW16'/);
+  assert.equal(W.WINDDOWN_DB_ERRORS.OXW16.status, 409);
+  const night = read("app/api/sleep/winddown/night/route.ts");
+  assert.match(night, /p_rule_id: b\.ruleId/);
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /ruleFor\(p\.rules, night\)/, "the tap carries the goal version the screen showed");
+  // Undo goes back to the answer the screen showed when the tap was made, not the server's "previous": a retry
+  // after a lost answer comes back from the server as an unchanged night.
+  assert.match(store, /previous: intent\.expect === "none" \? null : intent\.expect/);
+  const kept = W.parsePending(W.pendingRecord(intent(), Date.parse("2031-03-20T22:00:00Z")));
+  const now = Date.parse("2031-03-20T23:00:00Z");
+  assert.ok(W.pendingToOffer(kept, payload(), now));
+  const changed = payload({ rules: [rule(), rule({ id: 2, effectiveFrom: TODAY, habitPageId: ID_B, habitName: HABIT_2 })], habitNames: { [ID_A]: HABIT, [ID_B]: HABIT_2 } });
+  assert.equal(W.pendingToOffer(kept, changed, now), null, "the goal changed since the tap: not offered");
+  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, at: 1 })), null, "a kept tap without its goal is dropped");
+});
+
+test("one unsaved tap at a time: the answer buttons wait; every mount, the day rollover and the Habits page follow", () => {
+  const panel = read("components/sleep/WindDownPanel.tsx");
+  assert.match(panel, /const saving = s\.saver\.status === "saving" \|\| s\.saver\.status === "retrying" \|\| !!s\.recovery;/);
+  const store = read("lib/use-winddown.ts");
+  assert.match(store, /if \(snap\.recovery \|\| !saver\.canAccept\(night\)\) return false;/);
+  assert.match(store, /if \(!saver\.unsaved\) overlay = null;/, "a tap still waiting keeps its optimistic answer");
+  assert.match(store, /else if \(Date\.now\(\) - lastLoad > REMOUNT_RELOAD_MS && !saver\.unsaved\)/, "a later mount revalidates");
+  assert.match(store, /msUntilRollover\(new Date\(\)\)/);
+  const habits = read("app/habits/HabitsClient.tsx");
+  assert.match(habits, /addEventListener\(WINDDOWN_SAVED_EVENT/);
+  assert.match(habits, /togglingRef\.current\.size > 0\) return;/, "a tap of the Habits page still in flight is not overwritten");
+  assert.equal(W.msUntilRollover(new Date(2031, 2, 20, 5, 59, 0)), 65_000);
+  assert.ok(W.msUntilRollover(new Date(2031, 2, 20, 6, 0, 10)) > 23 * 3_600_000, "after 06:00 the next rollover is tomorrow");
+});
+
 test("replay: the server treats a repeated tap as a no-op, so a retry after a lost answer counts once", () => {
   const sql = fs.readFileSync(path.join(ROOT, "sql", "sleep_winddown.sql"), "utf8");
   assert.match(sql, /IF COALESCE\(v_current, 'none'\) IS DISTINCT FROM COALESCE\(p_answer, 'none'\) THEN/);
   assert.match(sql, /ON CONFLICT \(cycle_date, question\) DO UPDATE SET answer = EXCLUDED\.answer/);
   assert.match(sql, /ON CONFLICT \(night\) DO NOTHING/, "the first Started tap's time is kept on a replay");
   assert.match(sql, /pg_advisory_xact_lock/);
+  // No row yet: the insert never overwrites one a concurrent check-in or Habits write made (FOR UPDATE locks nothing then).
+  assert.match(sql, /ELSIF v_current IS NULL AND p_expect IS NOT NULL THEN[\s\S]*ON CONFLICT \(cycle_date, question\) DO NOTHING;[\s\S]*GET DIAGNOSTICS v_rows = ROW_COUNT;/);
+  assert.match(sql, /IF v_current IS DISTINCT FROM p_answer THEN\s+RAISE EXCEPTION [^;]*ERRCODE = 'OXW15'/);
+  // The start time is the moment of the tap that wrote the first answer, never a later report or a correction.
+  assert.match(sql, /IF p_answer = 'Yes' AND p_night = v_today AND v_changed AND v_prior IS NULL THEN/);
 });
 
 test("offline recovery: a kept tap is offered (never sent) only while it still applies", () => {
@@ -252,13 +328,13 @@ test("offline recovery: a kept tap is offered (never sent) only while it still a
   const kept = W.parsePending(W.pendingRecord(intent({ night: TODAY }), now - 3600_000));
   assert.equal(kept.night, TODAY);
   const tomorrow = payload({ today: day(1) });
-  assert.deepEqual(W.pendingToOffer(kept, tomorrow, now), { night: TODAY, answer: "Yes", expect: "none", today: day(1) }, "resent for the same night with the new day");
+  assert.deepEqual(W.pendingToOffer(kept, tomorrow, now), { night: TODAY, answer: "Yes", expect: "none", today: day(1), ruleId: 1 }, "resent for the same night with the new day");
   assert.equal(W.pendingToOffer(kept, payload({ today: day(1), answers: [yes(0)] }), now), null, "it landed: nothing to offer");
   assert.equal(W.pendingToOffer(kept, payload({ today: day(3) }), now), null, "the night is outside the answer window");
   assert.equal(W.pendingToOffer(kept, tomorrow, now + W.PENDING_MAX_AGE_MS + 1), null, "too old");
   assert.equal(W.pendingToOffer(kept, payload({ status: "not_set_up", rules: [] }), now), null);
   assert.equal(W.parsePending("{bad json"), null);
-  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Maybe", expect: "none", today: TODAY, at: 1 })), null);
+  assert.equal(W.parsePending(JSON.stringify({ night: TODAY, answer: "Maybe", expect: "none", today: TODAY, ruleId: 1, at: 1 })), null);
   assert.ok(W.WINDDOWN_PENDING_KEY.startsWith("onyx"), "wiped on sign-out with every onyx* key");
 });
 
@@ -314,10 +390,13 @@ test("Today: the wind-down is a source only once it is known to be set up", () =
 // ─── bodies, errors, SQL, boundary ──────────────────────────────────────────────────────────────────────────
 
 test("request bodies: exact fields, Riley's own values, no assumed bedtime", () => {
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY }).ok, true);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, extra: 1 }).ok, false);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: "Maybe", today: TODAY }).ok, false);
-  assert.equal(W.parseNightBody({ night: TODAY, answer: null, today: TODAY }).value.expect, null);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY, rule_id: 1 }).ok, true);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 1, extra: 1 }).ok, false);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Maybe", today: TODAY, rule_id: 1 }).ok, false);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: null, today: TODAY, rule_id: 1 }).value.expect, null);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", expect: "none", today: TODAY }).ok, false, "the goal the screen showed is required");
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 0 }).ok, false);
+  assert.equal(W.parseNightBody({ night: TODAY, answer: "Yes", today: TODAY, rule_id: 7 }).value.ruleId, 7);
   const goal = { habit_page_id: ID_A, target_time: "22:30", wins_needed: 5, window_nights: 7, tz: "America/New_York", today: TODAY };
   assert.equal(W.parseRuleBody(goal).ok, true);
   assert.equal(W.parseRuleBody({ ...goal, target_time: "" }).ok, false, "a target time must be chosen");
@@ -452,6 +531,18 @@ test("server read: the habit's own answers since the goal, the starts and WHOOP 
   const answerRead = db.calls.find((c) => c.table === "habit_journal");
   assert.ok(answerRead.ops.some(([op]) => op === "range"), "paged in a fixed order");
   assert.ok(!db.calls.some((c) => c.ops.some(([op]) => ["insert", "upsert", "update", "delete"].includes(op))), "the read writes nothing");
+});
+
+test("server read: after a rename in Notion the answers are read under the habit's current name", async () => {
+  const db = fakeDb({
+    sleep_winddown_rules: [RULE_ROW], sleep_winddown_pauses: [],
+    habit_name_map: [{ notion_page_id: ID_A, habit_name: "Renamed synthetic routine?" }],
+    habit_journal: [{ cycle_date: day(-1), question: "Renamed synthetic routine?", answer: "Yes" }, { cycle_date: day(-1), question: "Unrelated synthetic habit?", answer: "No" }],
+  });
+  const p = await S.readWindDown(db);
+  assert.deepEqual(p.answers.map((a) => a.question), ["Renamed synthetic routine?"]);
+  assert.equal(db.calls.filter((c) => c.table === "habit_journal").length, 2, "one read under the stored name, one under the new name");
+  assert.equal(W.windDownProgress(p).question, "Renamed synthetic routine?");
 });
 
 test("server read: a failed WHOOP read is shown as failed, never as zeros", async () => {

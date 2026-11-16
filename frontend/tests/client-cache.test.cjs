@@ -443,6 +443,8 @@ test('a successful write invalidates the entries it changed and refetches them i
   assert.deepEqual(writeInvalidates('/api/habits/checkin'), ['/api/habits', 'habits:', '/api/delivery', '/api/sleep/winddown']);
   // A wind-down answer is the chosen habit's own row (PROD-SLEEP-01): habits and wind-down go stale together.
   assert.deepEqual(writeInvalidates('/api/sleep/winddown/night'), ['/api/sleep', 'sleep:', '/api/habits', 'habits:']);
+  // A goal or pause change touches no habit row: only the wind-down entries go stale.
+  assert.deepEqual(writeInvalidates('/api/sleep/winddown/rule'), ['/api/sleep', 'sleep:']);
   assert.deepEqual(writeInvalidates('/api/reading/sessions'), ['/api/reading', 'reading:']);
   // A Want to read change refreshes the quest (/api/reading, the switcher's book list) and the list itself.
   assert.deepEqual(writeInvalidates('/api/reading/list'), ['/api/reading', 'reading:']);

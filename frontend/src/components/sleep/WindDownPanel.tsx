@@ -142,7 +142,16 @@ function Tonight({ p, saving }: { p: WindDownProgress; saving: boolean }) {
       </p>
     );
   }
-  if (t.status === "missed") return <p className="mt-3 inline-flex flex-wrap items-center gap-1.5 text-[14px] text-text-secondary">Tonight is recorded as not done.{clear}</p>;
+  if (t.status === "missed") {
+    // A "No" can be recorded before the evening happened (the check-in's "No for the other N"): it can be changed here.
+    return (
+      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-[14px] text-text-secondary">Tonight is recorded as not done.</span>
+        <button type="button" onClick={() => answerNight(t.date, "Yes")} disabled={saving} className={secondary}>I did wind down</button>
+        {clear}
+      </div>
+    );
+  }
   if (t.status !== "pending") return null;
   return (
     <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -221,7 +230,9 @@ export default function WindDownPanel({ surface, className = "" }: { surface: "t
   const now = Date.now();
   // Log's sections are h2 under its h1; Today's panels are h3 under its section headings.
   const Heading = surface === "log" ? "h2" : "h3";
-  const saving = s.saver.status === "saving";
+  // One unsaved tap at a time: while one is saving, waiting to retry or kept from an earlier visit, the answer
+  // buttons wait (the line below them says why; Retry now / Cancel / Save it / Discard resolve it).
+  const saving = s.saver.status === "saving" || s.saver.status === "retrying" || !!s.recovery;
   const checked = ago(s.at, now);
   const stopped = p.streak.current === 0 && p.streak.stoppedAt
     ? `Streak ended ${shortDate(p.streak.stoppedAt.date)}: ${p.streak.stoppedAt.status === "missed" ? "not done" : "not answered"}.`

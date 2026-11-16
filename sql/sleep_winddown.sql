@@ -38,6 +38,7 @@
 --   OXW10 the screen's day is over            OXW11 that night has not started
 --   OXW12 older than the answer window        OXW13 not set up for that night
 --   OXW14 the chosen habit is gone            OXW15 the answer changed elsewhere
+--   OXW16 the goal changed since the tap was made
 --   OXW20 pause starting on a past night      OXW21 pause ends before it starts
 --   OXW22 overlaps another pause              OXW23 no such pause
 --   OXW24 a past night's pause cannot change
@@ -188,11 +189,19 @@ END $$;
 -- p_answer  'Yes' | 'No' | NULL (NULL = clear: not answered)
 -- p_expect  the answer the screen showed ('Yes' | 'No' | 'none'), or NULL for
 --           no check. A different stored answer refuses (OXW15) unless it is
---           already the requested one: a repeated request is a no-op.
+--           already the requested one: a repeated request is a no-op. The check
+--           also holds when there was no row yet: a row the check-in or Habits
+--           inserted in the meantime is never overwritten.
 -- p_today   the behavioral today the screen was drawn with (OXW10 when over)
--- Writes the habit_journal row and, for a Yes on tonight, the start time (the
--- first tap wins: a replay keeps it). A clear or a No removes the start time.
-CREATE OR REPLACE FUNCTION pds.sleep_winddown_set_night(p_night date, p_answer text, p_expect text, p_today date)
+-- p_rule_id the goal version the screen showed for that night (NULL = no
+--           check). When another version applies to the night now (the goal was
+--           changed from another device or tab), the tap refuses (OXW16): an
+--           old tap can never complete a different habit than the one it showed.
+-- Writes the habit_journal row and, for a Yes this call wrote on tonight when
+-- there was no answer before, the start time (the first tap wins: a replay or a
+-- later correction keeps it, and records none). A clear or a No removes the
+-- start time.
+CREATE OR REPLACE FUNCTION pds.sleep_winddown_set_night(p_night date, p_answer text, p_expect text, p_today date, p_rule_id bigint DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql SET search_path = pds, pg_temp AS $$
 DECLARE
@@ -202,7 +211,9 @@ DECLARE
     v_channel  text;
     v_category text;
     v_current  text;
+    v_prior    text;
     v_changed  boolean := false;
+    v_rows     integer;
     v_tz       text;
     s          pds.sleep_winddown_starts%ROWTYPE;
 BEGIN
@@ -232,6 +243,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'the wind-down goal is not set up for that night' USING ERRCODE = 'OXW13';
     END IF;
+    IF p_rule_id IS NOT NULL AND r.rule_id <> p_rule_id THEN
+        RAISE EXCEPTION 'the wind-down goal changed since this screen loaded' USING ERRCODE = 'OXW16';
+    END IF;
     SELECT habit_name, channel INTO v_question, v_channel FROM pds.habit_name_map WHERE notion_page_id = r.habit_page_id;
     IF v_question IS NULL THEN
         RAISE EXCEPTION 'the chosen habit is no longer in Onyx' USING ERRCODE = 'OXW14';
@@ -241,9 +255,12 @@ BEGIN
      WHERE notion_page_id = r.habit_page_id AND valid_to IS NULL
      ORDER BY valid_from DESC LIMIT 1;
 
+    -- FOR UPDATE locks the row when there is one. When there is none it locks nothing, so the insert below is
+    -- made conflict-safe instead (a row the check-in or Habits inserts in between is never overwritten).
     SELECT answer INTO v_current FROM pds.habit_journal
      WHERE cycle_date = p_night AND question = v_question
      FOR UPDATE;
+    v_prior := v_current;
 
     IF COALESCE(v_current, 'none') IS DISTINCT FROM COALESCE(p_answer, 'none') THEN
         IF p_expect IS NOT NULL AND COALESCE(v_current, 'none') <> p_expect THEN
@@ -251,15 +268,34 @@ BEGIN
         END IF;
         IF p_answer IS NULL THEN
             DELETE FROM pds.habit_journal WHERE cycle_date = p_night AND question = v_question;
+            v_changed := true;
+        ELSIF v_current IS NULL AND p_expect IS NOT NULL THEN
+            -- No row was there and none was expected: write only if there is still none. A different answer that
+            -- landed since the read refuses; the same answer landing meanwhile is a no-op.
+            INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
+            VALUES (p_night, v_question, COALESCE(v_category, r.habit_category), p_answer)
+            ON CONFLICT (cycle_date, question) DO NOTHING;
+            GET DIAGNOSTICS v_rows = ROW_COUNT;
+            IF v_rows = 1 THEN
+                v_changed := true;
+            ELSE
+                SELECT answer INTO v_current FROM pds.habit_journal
+                 WHERE cycle_date = p_night AND question = v_question;
+                IF v_current IS DISTINCT FROM p_answer THEN
+                    RAISE EXCEPTION 'that night''s answer changed elsewhere' USING ERRCODE = 'OXW15';
+                END IF;
+            END IF;
         ELSE
             INSERT INTO pds.habit_journal (cycle_date, question, category, answer)
             VALUES (p_night, v_question, COALESCE(v_category, r.habit_category), p_answer)
             ON CONFLICT (cycle_date, question) DO UPDATE SET answer = EXCLUDED.answer;
+            v_changed := true;
         END IF;
-        v_changed := true;
     END IF;
 
-    IF p_answer = 'Yes' AND p_night = v_today THEN
+    -- The start time is the moment of THIS tap: only a Yes that this call wrote on a night that had no answer. A
+    -- replay of a tap that already landed, or a No corrected to Yes later, keeps what is there (never a made-up time).
+    IF p_answer = 'Yes' AND p_night = v_today AND v_changed AND v_prior IS NULL THEN
         v_tz := COALESCE(pds.tz_for_instant(now()), 'America/New_York');
         INSERT INTO pds.sleep_winddown_starts (night, started_at, local_time, tz, rule_id)
         VALUES (p_night, now(), to_char(now() AT TIME ZONE v_tz, 'HH24:MI'), v_tz, r.rule_id)
@@ -348,10 +384,10 @@ GRANT USAGE, SELECT ON SEQUENCE pds.sleep_winddown_rules_rule_id_seq   TO servic
 GRANT USAGE, SELECT ON SEQUENCE pds.sleep_winddown_pauses_pause_id_seq TO service_role;
 
 REVOKE ALL ON FUNCTION pds.sleep_winddown_add_rule(text, text, text, integer, integer, date) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date)                 FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date, bigint)       FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION pds.sleep_winddown_add_pause(date, date, date)                       FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION pds.sleep_winddown_end_pause(bigint)                                 FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION pds.sleep_winddown_add_rule(text, text, text, integer, integer, date) TO service_role;
-GRANT EXECUTE ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date)                 TO service_role;
+GRANT EXECUTE ON FUNCTION pds.sleep_winddown_set_night(date, text, text, date, bigint)       TO service_role;
 GRANT EXECUTE ON FUNCTION pds.sleep_winddown_add_pause(date, date, date)                       TO service_role;
 GRANT EXECUTE ON FUNCTION pds.sleep_winddown_end_pause(bigint)                                 TO service_role;

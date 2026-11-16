@@ -158,6 +158,13 @@ export function targetInstant(today: string, targetTime: string): number {
   return new Date(y, mo - 1, h < 6 ? d + 1 : d, h, m, 0, 0).getTime();
 }
 
+/** Milliseconds until the next 06:00 on this device (plus 5 s): when the behavioral day turns over. Always positive. */
+export function msUntilRollover(now: Date): number {
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 6, 0, 5, 0);
+  if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1);
+  return Math.max(1000, next.getTime() - now.getTime());
+}
+
 // ─── Rules over nights ──────────────────────────────────────────────────────────────────────────────────────
 
 function byVersion(a: WindDownRule, b: WindDownRule): number {
@@ -534,17 +541,22 @@ function exactKeys(body: unknown, required: readonly string[], optional: readonl
   return b;
 }
 
-export interface NightBody { night: string; answer: NightAnswer | null; expect: NightAnswer | "none" | null; today: string }
-/** POST /api/sleep/winddown/night: {night, answer: "Yes" | "No" | null, expect?: "Yes" | "No" | "none", today}. */
+export interface NightBody { night: string; answer: NightAnswer | null; expect: NightAnswer | "none" | null; today: string; ruleId: number }
+/**
+ * POST /api/sleep/winddown/night: {night, answer: "Yes" | "No" | null, expect?: "Yes" | "No" | "none", today, rule_id}.
+ * `rule_id` is the goal version the screen showed for that night: a tap made under an older goal refuses (OXW16)
+ * instead of completing whatever habit the goal names now.
+ */
 export function parseNightBody(body: unknown): Parsed<NightBody> {
-  const b = exactKeys(body, ["night", "answer", "today"], ["expect"]);
+  const b = exactKeys(body, ["night", "answer", "today", "rule_id"], ["expect"]);
   if (typeof b === "string") return { ok: false, error: b };
   if (!isDate(b.night)) return { ok: false, error: "night must be YYYY-MM-DD" };
   if (!isDate(b.today)) return { ok: false, error: "today must be YYYY-MM-DD" };
+  if (typeof b.rule_id !== "number" || !Number.isInteger(b.rule_id) || b.rule_id < 1) return { ok: false, error: "rule_id must be the goal's id" };
   if (b.answer !== null && b.answer !== "Yes" && b.answer !== "No") return { ok: false, error: "answer must be Yes, No or null" };
   const expect = b.expect === undefined ? null : b.expect;
   if (expect !== null && expect !== "Yes" && expect !== "No" && expect !== "none") return { ok: false, error: "expect must be Yes, No or none" };
-  return { ok: true, value: { night: b.night, answer: b.answer as NightAnswer | null, expect: expect as NightBody["expect"], today: b.today } };
+  return { ok: true, value: { night: b.night, answer: b.answer as NightAnswer | null, expect: expect as NightBody["expect"], today: b.today, ruleId: b.rule_id } };
 }
 
 export interface RuleBody { habitPageId: string; targetTime: string; winsNeeded: number; windowNights: number; tz: string; today: string }
@@ -591,6 +603,7 @@ export const WINDDOWN_DB_ERRORS: Readonly<Record<string, { status: number; code:
   OXW13: { status: 409, code: "not_set_up", error: "The wind-down goal isn't set up for that night." },
   OXW14: { status: 409, code: "habit_gone", error: "The chosen habit is no longer in Onyx. Choose another one." },
   OXW15: { status: 409, code: "changed", error: "That night's answer changed somewhere else (check-in or Habits). It has been refreshed." },
+  OXW16: { status: 409, code: "goal_changed", error: "The wind-down goal changed since this screen loaded. It has been refreshed; tap again if you still mean it." },
   OXW20: { status: 409, code: "pause_past", error: "A pause can start tonight or later, not on a night that already passed." },
   OXW21: { status: 400, code: "pause_range", error: "The pause ends before it starts." },
   OXW22: { status: 409, code: "pause_overlap", error: "That overlaps a pause you already planned." },
@@ -610,7 +623,12 @@ export function isMissingStorage(e: { code?: unknown } | null | undefined): bool
 
 // ─── Saving one tap: retry, refusal, replay, recovery ──────────────────────────────────────────────────────
 
-export interface NightIntent { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string }
+/** `ruleId` = the goal version the screen showed for that night; `expect` = the answer it showed. */
+export interface NightIntent { night: string; answer: NightAnswer | null; expect: NightAnswer | "none"; today: string; ruleId: number }
+/** Two taps for one night that were never both sent: one tap going from the OLDER one's `expect` to the newer answer. */
+export function coalesceIntents(older: NightIntent | null, newer: NightIntent): NightIntent {
+  return older && older.night === newer.night ? { ...newer, expect: older.expect, ruleId: older.ruleId } : newer;
+}
 /** The server refused the tap (4xx): shown with its code, never retried on its own. */
 export class WindDownRefused extends Error {
   constructor(message: string, readonly code: string) {
@@ -638,7 +656,12 @@ export interface SaverOptions {
 /**
  * One wind-down tap at a time. A failure that is not a refusal is retried with backoff (and at once by retryNow(),
  * e.g. when the device comes back online); the server treats a repeated tap as a no-op, so a retry after a lost
- * answer cannot count twice. A tap made while one is in flight waits and is sent next (the newest waiting tap wins).
+ * answer cannot count twice.
+ *
+ * Nothing unsaved is ever replaced by a tap for ANOTHER night: submit() refuses it (returns false, canAccept() says
+ * so beforehand) until the first one is saved, refused or dismissed, so a night's retry is never cancelled and its
+ * kept copy is never overwritten. A second tap for the SAME night merges with the first (one tap from the answer the
+ * server last held to the newest answer): a tap made while one is in flight waits and is sent next.
  */
 export class WindDownSaver {
   private state: SaverState = { status: "idle" };
@@ -654,11 +677,25 @@ export class WindDownSaver {
   get current(): SaverState { return this.state; }
   /** Something tapped is not saved yet (saving, waiting to retry, or waiting behind another tap). */
   get unsaved(): boolean { return this.inflight || this.queued !== null || this.state.status === "retrying"; }
+  /** The nights with a tap that is not saved yet. */
+  get unsavedNights(): string[] {
+    const s = this.state;
+    const nights = new Set<string>();
+    if (this.queued) nights.add(this.queued.night);
+    if (s.status === "saving" || s.status === "retrying") nights.add(s.intent.night);
+    return Array.from(nights);
+  }
+  /** A tap for this night can be taken now: nothing is unsaved, or what is unsaved is for this same night. */
+  canAccept(night: string): boolean { return this.unsavedNights.every((n) => n === night); }
   private set(s: SaverState) { this.state = s; this.opts.onState?.(s); }
-  submit(intent: NightIntent) {
-    if (this.inflight) { this.queued = intent; return; }
+  /** Returns false (and does nothing) when another night's tap is still unsaved. */
+  submit(intent: NightIntent): boolean {
+    if (!this.canAccept(intent.night)) return false;
+    if (this.inflight) { this.queued = coalesceIntents(this.queued, intent); return true; }
+    const waiting = this.state.status === "retrying" ? this.state.intent : null;
     this.clearTimer();
-    void this.run(intent, 0);
+    void this.run(coalesceIntents(waiting, intent), 0);
+    return true;
   }
   /** Retry a tap that is waiting to retry, now (Retry, or the device came back online). A refusal is not retried. */
   retryNow() {
@@ -689,7 +726,11 @@ export class WindDownSaver {
       if (e instanceof WindDownRefused) {
         this.set({ status: "refused", intent, error: e.message, code: e.code });
         this.opts.onRefused?.(intent, e);
-      } else if (!this.queued) {
+      } else if (this.queued) {
+        // The tap behind it is for the same night and starts from where the failed one would have left it: it
+        // goes out as one tap from the answer the server last held.
+        this.queued = coalesceIntents(intent, this.queued);
+      } else {
         const error = e instanceof TypeError ? "Couldn't reach Onyx." : e instanceof Error && e.message ? e.message : "Not saved.";
         const n = attempt + 1;
         this.set({ status: "retrying", intent, error, attempt: n });
@@ -715,18 +756,21 @@ export function parsePending(raw: string | null | undefined): PendingTap | null 
   if (!r || !isDate(r.night) || !isDate(r.today) || typeof r.at !== "number" || !Number.isFinite(r.at)) return null;
   if (r.answer !== null && r.answer !== "Yes" && r.answer !== "No") return null;
   if (r.expect !== "Yes" && r.expect !== "No" && r.expect !== "none") return null;
-  return { night: r.night, answer: r.answer as NightAnswer | null, expect: r.expect, today: r.today, at: r.at };
+  if (typeof r.ruleId !== "number" || !Number.isInteger(r.ruleId) || r.ruleId < 1) return null;
+  return { night: r.night, answer: r.answer as NightAnswer | null, expect: r.expect, today: r.today, ruleId: r.ruleId, at: r.at };
 }
 /**
  * The kept tap worth offering again on this payload, or null: it must be under PENDING_MAX_AGE_MS old, for a night
  * still answerable here, and not already what the server holds (then it did land and the answer was lost). It is
  * OFFERED, never sent on its own: opening a page writes nothing. Sent with the payload's `today` (the night stays
- * the one tapped); a stored answer that moved meanwhile refuses it (OXW15) instead of overwriting it.
+ * the one tapped); a stored answer that moved meanwhile refuses it (OXW15) instead of overwriting it. A tap made
+ * under a goal that has since changed is not offered at all (the server would refuse it, OXW16).
  */
 export function pendingToOffer(tap: PendingTap | null, p: WindDownPayload | null, nowMs: number): NightIntent | null {
   if (!tap || !p || p.status !== "ready") return null;
   if (nowMs - tap.at > PENDING_MAX_AGE_MS || nowMs < tap.at - 60_000) return null;
   if (tap.night > p.today || tap.night < addDays(p.today, -WINDDOWN_ANSWER_DAYS_BACK)) return null;
+  if (ruleFor(p.rules, tap.night)?.id !== tap.ruleId) return null;
   if (answerOn(p, tap.night) === (tap.answer ?? "none")) return null;
-  return { night: tap.night, answer: tap.answer, expect: tap.expect, today: p.today };
+  return { night: tap.night, answer: tap.answer, expect: tap.expect, today: p.today, ruleId: tap.ruleId };
 }

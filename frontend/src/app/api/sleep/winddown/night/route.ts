@@ -8,12 +8,14 @@ export const dynamic = "force-dynamic";
 
 /**
  * POST /api/sleep/winddown/night (PROD-SLEEP-01): one explicit answer for one night, from the wind-down button or
- * the "Did it / Didn't" rows. Body {night, answer: "Yes" | "No" | null, expect: "Yes" | "No" | "none", today}.
+ * the "Did it / Didn't" rows. Body {night, answer: "Yes" | "No" | null, expect: "Yes" | "No" | "none", today, rule_id}.
  * pds.sleep_winddown_set_night writes the chosen habit's pds.habit_journal row (the same row the check-in and
  * /habits write) in one locked transaction: a repeated request is a no-op (no double credit), a stored answer that
  * is not the `expect`ed one refuses (409 changed), a screen from an earlier day refuses (409 stale), and only
  * tonight and the two nights before can be answered here. Owner session only (never in isCiRoute()), same-origin
- * JSON, at most 1 KB. Notion "Last Completed" follows after the response, best effort.
+ * JSON, at most 1 KB. Notion "Last Completed" follows after the response, best effort. `rule_id` is the goal version
+ * the screen showed for the night: a tap made under an older goal refuses (409 goal_changed) instead of completing
+ * whatever habit the goal names now.
  */
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -32,7 +34,7 @@ export async function POST(req: NextRequest) {
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400, headers: NO_STORE });
   const b = parsed.value;
 
-  const { data, error } = await supabase.rpc("sleep_winddown_set_night", { p_night: b.night, p_answer: b.answer, p_expect: b.expect, p_today: b.today });
+  const { data, error } = await supabase.rpc("sleep_winddown_set_night", { p_night: b.night, p_answer: b.answer, p_expect: b.expect, p_today: b.today, p_rule_id: b.ruleId });
   if (error) {
     const known = windDownRefusal(error);
     if (known) return NextResponse.json({ error: known.error, code: known.code }, { status: known.status, headers: NO_STORE });

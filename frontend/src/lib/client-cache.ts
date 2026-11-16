@@ -100,8 +100,9 @@ export function writeInvalidates(path: string): string[] {
   const out = [`/api/${area}`, `${area}:`];
   // A check-in or habit write also changes what Today and the delivery portions show.
   if (area === "habits") out.push("/api/delivery", "/api/sleep/winddown");
-  // A wind-down answer IS the chosen habit's answer (PROD-SLEEP-01): the check-in and /habits go stale too.
-  if (area === "sleep") out.push("/api/habits", "habits:");
+  // A wind-down NIGHT answer IS the chosen habit's answer (PROD-SLEEP-01): the check-in and /habits go stale too
+  // (a goal or pause change touches no habit row).
+  if (path === "/api/sleep/winddown/night") out.push("/api/habits", "habits:");
   if (area === "delivery") out.push("/api/habits/checkin");
   // A drink capture (one row) counts in Nutrition AND Caffeine: both areas' entries (and feed seeds) go stale.
   if (path === "/api/nutrition/drinks" || path.startsWith("/api/nutrition/drinks/")) out.push("/api/caffeine", "caffeine:");

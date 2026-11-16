@@ -52,14 +52,28 @@ tool and not an experiment: it never claims that winding down improved sleep.
 - Opening, scrolling, inspecting progress or new wearable data never writes. Only a tap does.
 - One night at a time (`lib/use-winddown.ts`, `WindDownSaver` in `lib/sleep-winddown.ts`): shown at once; a network
   failure is retried with backoff and at once when the device comes back online (Retry now / Cancel on screen); a
-  refusal is shown and the screen reloads. The tap is kept on the device until the server confirmed it; a tap from a
-  closed tab is offered on the next visit (**Save it** / **Discard**), never sent on its own.
-- `pds.sleep_winddown_set_night` (one locked transaction) refuses a screen from an earlier day (409 stale), a night
-  outside the window, and an answer that changed elsewhere since the screen showed it (409 changed); a repeated
-  request is a no-op, so a retry after a lost answer cannot count twice. **Undo** puts the night back to the answer
-  it had.
-- A wind-down save tells a check-in on the same screen to reload; a check-in or `/habits` save refetches the panel
-  (`writeInvalidates`).
+  refusal is shown and the screen reloads. **Nothing unsaved is replaced:** while a tap is saving, waiting to retry
+  or kept from an earlier visit, the answer buttons for the other nights wait (the line under them says why;
+  Retry now / Cancel / Save it / Discard resolve it). A second tap for the same night merges into one tap from the
+  answer the server last held.
+- The tap is kept on the device until the server confirmed it; a tap from a closed tab is offered on the next visit
+  (**Save it** / **Discard**), never sent on its own, and not offered at all when the goal changed since.
+- Every tap carries the answer the screen showed (`expect`) and the goal version it showed (`rule_id`).
+  `pds.sleep_winddown_set_night` (one locked transaction) refuses a screen from an earlier day (409 stale), a night
+  outside the window, an answer that changed elsewhere since the screen showed it (409 changed; also when the check-in
+  or Habits inserted that night's row in the meantime) and a goal that changed since the screen loaded (409
+  goal_changed: an old tap can never complete a different habit). A repeated request is a no-op, so a retry after a
+  lost answer cannot count twice.
+- **Undo** puts the night back to the answer the screen showed when the tap was made, also after a retry that
+  followed a lost answer.
+- The start time is the moment of the tap that wrote the first answer for tonight. A replay, or a No corrected to
+  Yes later ("I did wind down" on a night the check-in recorded as not done), keeps what is there and records no time.
+- A wind-down save tells a check-in and the Habits page on the same screen to reload that answer; a check-in or
+  `/habits` save refetches the panel (`writeInvalidates`). The panel is checked again whenever a page that shows it
+  mounts, when the app comes back after a minute, and when the behavioral day turns over (06:00 on the device).
+- The check-in's "No for the other N" can record tonight's wind-down as not done before the evening happened; the
+  panel then offers **I did wind down** and Clear. Excluding the habit from that button would stop the day from
+  counting as answered (it would hold the 21:30 card open), so it is left as it is.
 
 ## Storage and access
 
