@@ -17,28 +17,32 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      Investment accounts are balances-only, as they were under Rocket Money (trades and dividends are not spending).
   3. Cutover from the Rocket Money history, per account: a row transacted more than OVERLAP_DAYS before the last
      Rocket Money row and posted by that date is dropped (that history already has it; a row posted after it may not
-     be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence (PIPE-04;
-     the two feeds share no transaction id): same account, amount and currency, and either the same date and
-     description text (store numbers included) that names a merchant ('exact') or a date within OVERLAP_DAYS and the
-     same merchant name ('merchant': one side's distinctive words all on the other side, including the word that
-     names the business, at the smallest date gap of both rows); payee names whose distinctive words contradict, or
-     store numbers that contradict ('DEMO DELI 0042' and 'DEMO DELI 0099'), are never a match (a shared STORE or
-     COFFEE is no evidence). A group of candidate pairs is a match only when it is one to one, or when it has as many
-     SimpleFIN rows as Rocket Money rows and its rows cannot be told apart on either side; a group of unequal size is
-     never guessed (key order is not identity evidence). The smallest date gap is found over every contender, held
-     and ambiguous rows included, so a row whose nearest candidate is held is never paired with a farther one. Every
-     SimpleFIN row of the response takes part, so a Rocket Money row whose twin is before the window is taken by that
-     twin, and a Rocket Money row an earlier run matched stays taken (pds.finance_cutover_matches); the candidates of
-     a row recorded as ambiguous stay held while that row is missing from a later answer, and a recorded claim or
-     hold the run no longer makes is recorded again as 'unconfirmed' (kept for review), never left behind. An equal
-     amount alone never drops a row: a row with competing candidates ('ambiguous') or with a same-amount Rocket Money
-     row nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review. Every match and every row
-     kept for review is recorded (also the decisions on rows dropped before the window, which hold or take a Rocket
-     Money row) in pds.finance_cutover_matches (keys only; the run's whole set in one statement, so it is never on
-     record in part) BEFORE the ledger is written: when that record cannot be read (other than not applied yet),
-     cannot be written, or is missing while there are decisions to record, the run fails before writing anything, so
-     a row is never left out on a match that is not on record. Rows already stored by an earlier SimpleFIN run are
-     always rewritten in place.
+     be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence
+     (PIPE-04; the two feeds share no transaction id): same account, amount and currency, and either the same date
+     and description text (store numbers included) that names a merchant ('exact') or a date within OVERLAP_DAYS and
+     the same merchant name ('merchant': one side's distinctive words all on the other side, including the word that
+     names the business, at the smallest date gap of both rows); payee names whose distinctive words contradict,
+     store numbers that contradict ('DEMO DELI 0042' and 'DEMO DELI 0099') or two different kinds of business ('DEMO
+     CAFE' and 'DEMO HOTEL') are never a match (a shared STORE or COFFEE is no evidence). A group of candidate pairs
+     is a match only when it is one to one, or when it has as many SimpleFIN rows as Rocket Money rows and its rows
+     cannot be told apart on either side; a group of unequal size is never guessed (key order is not identity
+     evidence). The smallest date gap is found over every contender, held and ambiguous rows included, so a row
+     whose nearest candidate is held is never paired with a farther one. Every SimpleFIN row of the response takes
+     part, so a Rocket Money row whose twin is before the window is taken by that twin, and a Rocket Money row an
+     earlier run matched stays taken (pds.finance_cutover_matches; the ledger is read from before the earliest date
+     in the answer, and every Rocket Money row the record names is read by key, so the record is replayed whatever
+     the date window, and a named row gone from the ledger leaves its claimant kept for review); the candidates of a
+     row recorded as ambiguous stay held while that row is missing from a later answer, and a recorded claim or hold
+     the run no longer makes is recorded again as 'unconfirmed' (kept for review), never left behind. An equal
+     amount alone never drops a row: a row with competing candidates ('ambiguous') or with a same-amount Rocket
+     Money row nearby but no merchant evidence ('unconfirmed') is KEPT and counted for review, on every run until a
+     heartbeat carrying it is written (review_state 'pending' -> 'reported'). Every match and every row kept for
+     review is recorded (also the decisions on rows dropped before the window, which hold or take a Rocket Money
+     row) in pds.finance_cutover_matches (keys only; the run's whole set in one statement, so it is never on record
+     in part) BEFORE the ledger is written: when that record cannot be read (other than not applied yet), cannot be
+     written, or is missing while there are decisions to record, the run fails before writing anything, so a row is
+     never left out on a match that is not on record. Rows already stored by an earlier SimpleFIN run are always
+     rewritten in place.
   4. Category (SimpleFIN sends none; /financials needs one to keep card payments and transfers out of spending):
      a payment/transfer pair (same amount, opposite sign, two of Riley's accounts, within PAIR_DAYS, one side worded
      like a payment or transfer) -> "Credit Card Payment" or "Internal Transfers"; else the category Rocket Money
@@ -153,7 +157,7 @@ NOTE_CODES: dict[str, str] = {
     "account_unmatched": "an account was not imported: it could not be matched uniquely to a ledger account (run simplefin_etl.py --dry-run locally)",
     "account_type_unset": "a new account is balances-only until its finance_accounts.account_type is set",
     "cutover_review": "rows near the Rocket Money cutover were kept though a same-amount Rocket Money row is near: check for duplicates (simplefin_etl.py --dry-run locally)",
-    "cutover_provenance_unsaved": "the cutover match record table is missing (apply sql/finance_cutover_matches.sql); nothing was written, the next run retries",
+    "cutover_provenance_unsaved": "the cutover match record table is missing or out of date (apply sql/finance_cutover_matches.sql); nothing was written, the next run retries",
 }
 NOTE_LIMIT = 300      # past this the later codes keep only their token (format_notes); lib/finance-status.ts agrees
 NOTE_MAX_COUNT = 9999
@@ -318,6 +322,22 @@ def utc_date(ts: Any) -> Optional[date]:
     if n <= 0:
         return None
     return datetime.fromtimestamp(n, tz=timezone.utc).date()
+
+
+def response_dates(accounts: Iterable["SfAccount"]) -> list[date]:
+    """Every transacted and posted date in SimpleFIN's answer (build_plan reads the ledger from before the earliest).
+    A timestamp too large for a date is left out here (normalize_transactions judges the row itself)."""
+    out: list[date] = []
+    for a in accounts:
+        for t in a.transactions:
+            for ts in (t.get("transacted_at"), t.get("posted")):
+                try:
+                    d = utc_date(ts)
+                except (OverflowError, OSError, ValueError):
+                    d = None
+                if d:
+                    out.append(d)
+    return out
 
 
 def clean(s: Any, limit: int = 300) -> Optional[str]:
@@ -588,7 +608,8 @@ GENERIC_WORDS = frozenset({
 })
 # Words that name a kind of business, not which one. They count toward the shared words, but never as the word that
 # identifies the merchant: "DEMOBREW COFFEE ATLANTA" and "OTHERBREW COFFEE ATLANTA" share two of three words and are
-# still two merchants.
+# still two merchants. Two DIFFERENT kinds are evidence against a match (trades_conflict): "DEMO CAFE ATLANTA" and
+# "DEMO HOTEL ATLANTA" are two businesses.
 TRADE_WORDS = frozenset({
     "COFFEE", "CAFE", "ESPRESSO", "TEA", "DELI", "BAKERY", "BAGEL", "DONUT", "DONUTS", "GROCER", "GROCERY", "GROCERIES",
     "MARKET", "SUPERMARKET", "FOODS", "FOOD", "PHARMACY", "DRUG", "DRUGS", "STORE", "STORES", "SHOP", "SHOPS", "MART",
@@ -686,15 +707,27 @@ def numbers_conflict(a: dict, b: dict) -> bool:
     return bool(na and nb) and not (na <= nb or nb <= na)
 
 
+def trades_conflict(a: dict, b: dict) -> bool:
+    """Both rows name a kind of business and neither row's kinds are all on the other: a cafe and a hotel ('DEMO
+    CAFE ATLANTA' vs 'DEMO HOTEL ATLANTA'; Codex review), even when every other word agrees. A TRADE_WORD never says
+    WHICH business it is, so it is no evidence for a match, but two different kinds are two businesses: evidence
+    against one. Compared on each row's merchant words (description and name together), like the distinctive words
+    in merchant_evidence, so a kind on one side only, or one side's kinds all on the other ('DEMO COFFEE BAR' vs
+    'Demo Coffee'), is no conflict."""
+    ka, kb = merchant_tokens(a) & TRADE_WORDS, merchant_tokens(b) & TRADE_WORDS
+    return bool(ka and kb) and not (ka <= kb or kb <= ka)
+
+
 def identity_conflict(a: dict, b: dict) -> bool:
-    """The rows name two different payees or two different store numbers: never the same purchase."""
-    return names_conflict(a, b) or numbers_conflict(a, b)
+    """The rows name two different payees, two different store numbers or two different kinds of business: never the
+    same purchase."""
+    return names_conflict(a, b) or numbers_conflict(a, b) or trades_conflict(a, b)
 
 
 def exact_key(row: dict) -> Optional[tuple]:
     """Same account (callers compare one account), date, amount, currency and description text, store numbers
     included (ident_text). Only a description that names a merchant counts ('POS PURCHASE', '#1234' or 'COFFEE
-    SHOP' alone say nothing)."""
+    SHOP' alone say nothing). The payee names can still tell two such rows apart (identity_conflict)."""
     words = _merchant_words(row.get("description"))
     if not words or words[0] in TRADE_WORDS:
         return None
@@ -707,9 +740,10 @@ def merchant_evidence(a: dict, b: dict) -> bool:
     side, so a bank text and its cleaned name agree ('DEMO CAFE 0042 ATLANTA GA' vs 'Demo Cafe') but two shops that
     share a first word, a city or a kind of business do not ('DEMO BOTTLE COFFEE' vs 'DEMO DONKEY COFFEE', 'DEMO
     ATLANTA' vs 'SHOP ATLANTA', 'DEMOBREW COFFEE' vs 'OTHERBREW COFFEE'); the shared words include the word that
-    names the business on one side; and neither the payee names nor the store numbers contradict each other
-    (identity_conflict: merchant_tokens drop the digits, so 'DEMO DELI 0042' and 'DEMO DELI 0099' share every word
-    and are still two shops)."""
+    names the business on one side; and neither the payee names, the store numbers nor the kinds of business
+    contradict each other (identity_conflict: merchant_tokens drop the digits, so 'DEMO DELI 0042' and 'DEMO DELI
+    0099' share every word and are still two shops, and the distinctive words leave the TRADE_WORDS out, so 'DEMO
+    CAFE ATLANTA' and 'DEMO HOTEL ATLANTA' agree on them and are still two businesses)."""
     ta, tb = merchant_tokens(a), merchant_tokens(b)
     shared = ta & tb
     if not shared or 2 * len(shared) <= min(len(ta), len(tb)):
@@ -854,17 +888,20 @@ def apply_cutover(sf_rows: list[dict], history: list[dict], cutover: Optional[da
     #    Claims: a Rocket Money row claimed by a SimpleFIN row absent from this response stays taken (a narrower or
     #    incomplete answer must not free it for another purchase); a claim still present and still evidenced is
     #    kept, so a new same-merchant row cannot turn a settled match into a new ambiguity. A present claimant whose
-    #    evidence is gone (its amount or text changed) no longer holds the row: it is decided again (step 4).
-    for h in pool:
-        hk = h["txn_key"]
-        claimants = claims.get(hk)
-        if not claimants:
-            continue
+    #    evidence is gone (its amount or text changed) no longer holds the row: it is decided again (step 4). A
+    #    present claimant's record is carried whether or not its Rocket Money row is in `history` (Codex review):
+    #    build_plan reads every Rocket Money row a record names, whatever its date, so a row missing here is not in
+    #    the ledger at all, and the claimant is then decided again and kept for review, never written unremarked.
+    for hk in sorted(claims):
+        claimants = claims[hk]
         here = sorted(claimants & present.keys())
-        evidenced = [(sk, same_purchase(present[sk], h)) for sk in here]
-        evidenced = [(sk, how) for sk, how in evidenced if how and sk not in found]
         for sk in here:
             carried[sk].add(hk)
+        h = hist.get(hk)
+        if h is None:
+            continue   # not this account's, or no longer in the ledger: nothing to take or hold
+        evidenced = [(sk, same_purchase(present[sk], h)) for sk in here]
+        evidenced = [(sk, how) for sk, how in evidenced if how and sk not in found]
         if len(evidenced) == 1:
             used.add(hk)
             found[evidenced[0][0]] = ("matched", evidenced[0][1], (hk,))
@@ -1009,21 +1046,46 @@ def cutover_counts(decisions: Iterable[CutoverDecision]) -> Counter:
     return Counter(label(d) for d in decisions)
 
 
-def decision_rows(decisions: Iterable[CutoverDecision], now: datetime) -> list[dict]:
-    """pds.finance_cutover_matches rows: keys, the decision and its evidence only (no amount, date or text)."""
+def review_state(d: CutoverDecision, rec: Optional[dict]) -> Optional[str]:
+    """The record's review_state for this decision (Codex review: reporting is tracked apart from the decision).
+    'pending' = a row kept for review that no written heartbeat has carried yet; 'reported' = one has; None = nothing
+    to report (a match, or a row not in the ledger: a decision before the window is recorded for its hold only). A
+    reported decision stays reported while it is unchanged; a new or changed review decision is pending; and a
+    pending report is never dropped, so it is carried until a heartbeat with it is written (run: mark_reported).
+    `rec` is the recorded decision of this row, if any ({'decision', 'review_state', ...})."""
+    rec = rec or {}
+    prev = rec.get("review_state")
+    if d.kept and d.decision in REVIEW_DECISIONS:
+        return "reported" if prev == "reported" and rec.get("decision") == d.decision else "pending"
+    return "pending" if prev == "pending" else None
+
+
+def decision_rows(decisions: Iterable[CutoverDecision], now: datetime, saved: Optional[dict] = None) -> list[dict]:
+    """pds.finance_cutover_matches rows: keys, the decision, its evidence and its review_state only (no amount, date
+    or text). Every row carries the same columns (one upsert must carry one key set). `saved` = the recorded
+    decisions the run read ({sf_txn_key: {'decision', 'review_state', ...}})."""
+    saved = saved or {}
     return [{
         "sf_txn_key": d.sf_txn_key, "account_key": d.account_key, "decision": d.decision, "evidence": d.evidence,
         "history_txn_keys": list(d.history_txn_keys), "cutover_date": d.cutover_date, "decided_at": now.isoformat(),
+        "review_state": review_state(d, saved.get(d.sf_txn_key)),
     } for d in decisions]
 
 
+def review_pending(saved: Optional[dict], rows: Iterable[dict] = ()) -> list[str]:
+    """The keys of every row kept for review that is still to report once these decision rows are on record: this
+    run's new or changed review decisions, and those of earlier runs that no written heartbeat has carried yet (a
+    lost heartbeat, or a run stopped after it saved the record), also when the row is not in this answer."""
+    merged = {k: rec.get("review_state") for k, rec in (saved or {}).items()}
+    merged.update({r["sf_txn_key"]: r.get("review_state") for r in rows})
+    return sorted(k for k, state in merged.items() if state == "pending")
+
+
 def new_review_count(decisions: Iterable[CutoverDecision], saved: Optional[dict]) -> int:
-    """Rows kept for review whose decision is not recorded yet (each one is reported once, the run that records it).
-    Only rows in the ledger count: a decision on a row dropped before the window is recorded for its hold only.
-    `saved` ={sf_txn_key: {'decision': ..., 'history_txn_keys': [...]}} or None when the record could not be read."""
-    return sum(1 for d in decisions
-               if d.kept and d.decision in REVIEW_DECISIONS
-               and (saved is None or (saved.get(d.sf_txn_key) or {}).get("decision") != d.decision))
+    """How many rows kept for review a run with these decisions reports (review_pending; the --dry-run preview).
+    `saved` = the recorded decisions ({sf_txn_key: {'decision', 'review_state', 'history_txn_keys'}}), or None when
+    the record table is missing (then every review decision is new)."""
+    return len(review_pending(saved, decision_rows(decisions, datetime.now(timezone.utc), saved)))
 
 
 def learn_categories(history: Iterable[dict]) -> dict[str, dict[str, str]]:
@@ -1174,11 +1236,18 @@ def _t(supa, table):
 
 
 MISSING_RELATION_CODES = ("PGRST205", "42P01")   # PostgREST / Postgres: the table does not exist (not applied yet)
+MISSING_COLUMN_CODES = ("42703", "PGRST204")      # Postgres / PostgREST: a column does not exist (not applied yet)
 
 
 def is_missing_relation(e: BaseException) -> bool:
     """A read error that only means the table is not there yet (postgrest APIError.code); never reads its text."""
     return str(getattr(e, "code", "") or "") in MISSING_RELATION_CODES
+
+
+def is_missing_column(e: BaseException) -> bool:
+    """A read error that only means a column is not there yet (the review_state statement of
+    sql/finance_cutover_matches.sql not applied); never reads its text."""
+    return str(getattr(e, "code", "") or "") in MISSING_COLUMN_CODES
 
 
 def read_all(build) -> list[dict]:
@@ -1237,12 +1306,31 @@ class Store:
             _t(self.supa, "finance_balance_snapshots").upsert(rows, on_conflict="account_key,captured_at").execute()
 
     def cutover_decisions(self) -> dict[str, dict]:
-        """The recorded cutover decisions, sf_txn_key -> {decision, history_txn_keys}; a small table (cutover-window
-        rows only). Keys only: no amount, date or text is stored there."""
+        """The recorded cutover decisions, sf_txn_key -> {decision, history_txn_keys, review_state}; a small table
+        (cutover-window rows only). Keys only: no amount, date or text is stored there."""
         rows = read_all(lambda: _t(self.supa, "finance_cutover_matches")
-                        .select("sf_txn_key,decision,history_txn_keys").order("sf_txn_key"))
-        return {r["sf_txn_key"]: {"decision": r.get("decision"), "history_txn_keys": list(r.get("history_txn_keys") or [])}
+                        .select("sf_txn_key,decision,history_txn_keys,review_state").order("sf_txn_key"))
+        return {r["sf_txn_key"]: {"decision": r.get("decision"),
+                                  "history_txn_keys": list(r.get("history_txn_keys") or []),
+                                  "review_state": r.get("review_state")}
                 for r in rows}
+
+    def history_rows(self, keys: Iterable[str]) -> list[dict]:
+        """Rocket Money rows by txn_key, whatever their date: the rows recorded decisions name (build_plan), so a
+        recorded match is replayed even when its Rocket Money row is outside the run's date window."""
+        cols = "txn_key,account_key,txn_date,original_date,amount_cents,currency,name,description,source"
+        keys, out = sorted(set(keys)), []
+        for i in range(0, len(keys), 100):
+            out.extend(_t(self.supa, "finance_transactions").select(cols).in_("txn_key", keys[i:i + 100])
+                       .neq("source", SOURCE).execute().data or [])
+        return out
+
+    def mark_reported(self, keys: Iterable[str]) -> None:
+        """review_state 'pending' -> 'reported' for these keys: a written heartbeat has carried them (run())."""
+        keys = sorted(set(keys))
+        for i in range(0, len(keys), 100):
+            (_t(self.supa, "finance_cutover_matches").update({"review_state": "reported"})
+             .in_("sf_txn_key", keys[i:i + 100]).eq("review_state", "pending").execute())
 
     def ledger_keys(self, keys: Iterable[str]) -> set[str]:
         """Which of these txn_keys are in the ledger (--dry-run only: the recorded rows still to review)."""
@@ -1266,11 +1354,12 @@ class Store:
             _t(self.supa, "finance_cutover_matches").upsert(unique, on_conflict="sf_txn_key").execute()
 
     def heartbeat(self, data_type: str, status: str, records: int, started: float, error: Optional[str],
-                  start: Optional[date] = None, end: Optional[date] = None) -> None:
-        from sync_log_helper import log_sync
+                  start: Optional[date] = None, end: Optional[date] = None) -> bool:
+        """Writes the heartbeat; True when it was written (a failed write is logged as a code, never raised)."""
+        from sync_log_helper import write_sync
 
-        log_sync(self.supa, SOURCE, data_type, status, records=records, started_at=started, error=error,
-                 date_range_start=start, date_range_end=end)
+        return write_sync(self.supa, SOURCE, data_type, status, records=records, started_at=started, error=error,
+                          date_range_start=start, date_range_end=end)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1313,7 +1402,11 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     skipped: Counter = Counter()
     decisions: list[CutoverDecision] = []
     window_start = today - timedelta(days=days)
-    pool = store.window_rows(window_start - timedelta(days=PAIR_DAYS + OVERLAP_DAYS * 2))
+    # The ledger rows read for matching start before EVERY date in SimpleFIN's answer (Codex review): SimpleFIN
+    # returns rows by posted date, and a row posted late can be transacted weeks before the window, with its Rocket
+    # Money twin (and its own stored copy) dated alike.
+    earliest = min([window_start] + response_dates(sf_accounts))
+    pool = store.window_rows(earliest - timedelta(days=PAIR_DAYS + OVERLAP_DAYS * 2))
     stored_sf = {p["txn_key"] for p in pool if p.get("source") == SOURCE}
     history_by_account: dict[str, list] = defaultdict(list)
     for p in pool:
@@ -1321,17 +1414,33 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
             history_by_account[p["account_key"]].append(p)
     # Earlier cutover decisions keep their Rocket Money rows taken or held (apply_cutover, step 0). Before
     # sql/finance_cutover_matches.sql is applied the table is missing (saved = None): the plan matches on its own
-    # response, and run() stops before writing if any decision would need recording. Any OTHER read error fails
-    # the run here, before anything is written:
-    # matching without the record would free Rocket Money rows earlier runs matched, and saving that result would
-    # overwrite the record.
+    # response, and run() stops before writing if any decision would need recording. The table without its
+    # review_state column fails the run here (cutover_provenance_unsaved: apply the file), and so does any OTHER
+    # read error (db_read_failed), before anything is written: matching without the record would free Rocket Money
+    # rows earlier runs matched, and saving that result would overwrite the record.
     try:
         saved = store.cutover_decisions()
     except Exception as e:
+        if is_missing_column(e):
+            raise SimpleFinError("cutover_provenance_unsaved") from None
         if not is_missing_relation(e):
             raise SimpleFinError("db_read_failed") from None
         saved = None
     claims = recorded_claims(saved)   # computed once; holds and replaced claims come from `saved` itself
+    # Every Rocket Money row a recorded match or ambiguity names is read by key when the date window missed it
+    # (Codex review), so the record is replayed whatever the window: a claimant still in the answer stays matched,
+    # never written again unreviewed. A failed read stops the run like a failed read of the record.
+    in_pool = {p["txn_key"] for p in pool}
+    named = {k for rec in (saved or {}).values() if rec.get("decision") in CLAIM_DECISIONS + ("ambiguous",)
+             for k in rec.get("history_txn_keys") or ()} - in_pool
+    if named:
+        try:
+            extra = store.history_rows(named)
+        except Exception:
+            raise SimpleFinError("db_read_failed") from None
+        for k, p in sorted({p["txn_key"]: p for p in extra}.items()):
+            if p.get("source") != SOURCE and k in named:
+                history_by_account[p["account_key"]].append(p)
 
     for a in sf_accounts:
         m = matches[a.id]
@@ -1418,10 +1527,13 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
             out(f"  {line['institution']} | {line['name']} | last4 {line.get('mask') or '-'} | {line['action']}{why} | {what}{flag}")
         out(f"  transactions to write: {len(plan.transactions)}; balances: {len(plan.balances)}; new accounts: {len(plan.new_accounts)}")
         out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
+        to_report = new_review_count(plan.cutover, plan.saved) if plan.cutover else len(review_pending(plan.saved))
         if plan.cutover:
             # Reconciliation preview of the cutover window, counts only (pds.finance_cutover_matches has the keys).
-            out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}; new for review: "
-                f"{new_review_count(plan.cutover, plan.saved)}" + ("" if plan.saved is not None else " (no decision record yet)"))
+            out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}; to report: {to_report}"
+                + ("" if plan.saved is not None else " (no decision record yet)"))
+        elif to_report:
+            out(f"  cutover review to report (no written heartbeat has carried it yet): {to_report}")
         review_keys = {k for k, rec in (plan.saved or {}).items() if rec.get("decision") in REVIEW_DECISIONS}
         if review_keys:
             # Every row kept for review so far (all runs), still to check by hand (docs/financials-simplefin.md). Only
@@ -1440,11 +1552,16 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
             out(f"  heartbeat note: {format_notes(plan.notes)}")
         return 0
 
-    def fail(code: str, detail: Optional[str], also: Optional[Counter] = None) -> int:
-        msg = format_notes(Counter({code: 1}) + (also or Counter()))
+    def fail(code: str, detail: Optional[str], review_keys: Iterable[str] = ()) -> int:
+        review_keys = list(review_keys)
+        counts = Counter({code: 1})
+        if review_keys:
+            counts["cutover_review"] = len(review_keys)
+        msg = format_notes(counts)
         out(f"FAILED: {msg}" + (f" ({detail})" if detail else ""))
-        store.heartbeat("transactions", "failed", 0, started, msg)
-        store.heartbeat("balances", "failed", 0, started, msg)
+        written = [store.heartbeat("transactions", "failed", 0, started, msg),
+                   store.heartbeat("balances", "failed", 0, started, msg)]
+        mark_reported(store, review_keys, any(written), out)
         return 1
 
     # The cutover decisions are recorded BEFORE the ledger is written, and a run that cannot record them writes
@@ -1455,19 +1572,22 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     # (Codex review R5): a contender left off the record could not hold its candidate. Recorded only by a run
     # that read the record (saved is None only while the table is missing), so it is never rewritten from
     # decisions made without it; the table missing is then a failed run too (cutover_provenance_unsaved). The
-    # workflow's concurrency group keeps two runs from deciding at once. A kept-for-review row is reported by the run
-    # that records it (also when that run then fails to write the ledger, or fails while saving the record itself).
-    review = Counter()
+    # workflow's concurrency group keeps two runs from deciding at once.
+    # Reporting is tracked apart from the decision (review_state, Codex review): a row kept for review is 'pending'
+    # on record until a heartbeat that carries it is WRITTEN, then it is marked 'reported' (mark_reported). Every run
+    # reports every pending row, this run's and earlier runs', also when the row is not in this answer, so a lost
+    # heartbeat, a failed run or a run stopped after it saved the record never hides one. A row may be reported a
+    # second time (the heartbeat was written but the mark was not), never not at all.
+    if plan.cutover and plan.saved is None:
+        return fail("cutover_provenance_unsaved", None)
+    review_keys = review_pending(plan.saved)
     if plan.cutover:
-        if plan.saved is None:
-            return fail("cutover_provenance_unsaved", None)
-        n = new_review_count(plan.cutover, plan.saved)
+        rows = decision_rows(plan.cutover, now or datetime.now(timezone.utc), plan.saved)
         try:
-            store.save_cutover_decisions(decision_rows(plan.cutover, now or datetime.now(timezone.utc)))
+            store.save_cutover_decisions(rows)
         except Exception as e:
-            return fail("db_write_failed", safe_type_name(e), Counter(cutover_review=review_on_record(store, plan, n)))
-        if n:
-            review["cutover_review"] = n
+            return fail("db_write_failed", safe_type_name(e), review_on_record(store, plan, rows))
+        review_keys = review_pending(plan.saved, rows)
 
     try:
         for row in plan.new_accounts:
@@ -1477,13 +1597,14 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         store.upsert_transactions(plan.transactions)
         store.upsert_balances(plan.balances)
     except Exception as e:
-        return fail("db_write_failed", safe_type_name(e), review)
+        return fail("db_write_failed", safe_type_name(e), review_keys)
 
-    plan.notes.update(review)
+    if review_keys:
+        plan.notes["cutover_review"] = len(review_keys)
     note = format_notes(plan.notes)
     status = "partial" if note else "success"
-    store.heartbeat("transactions", status, len(plan.transactions), started, note, start, today)
-    store.heartbeat("balances", status, len(plan.balances), started, note)
+    written = [store.heartbeat("transactions", status, len(plan.transactions), started, note, start, today),
+               store.heartbeat("balances", status, len(plan.balances), started, note)]
     out(f"{status}: {len(plan.accounts)} account(s), {len(plan.transactions)} transaction(s), "
         f"{len(plan.balances)} balance(s), {len(plan.new_accounts)} new account(s), {len(plan.links)} linked")
     out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
@@ -1491,23 +1612,38 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         out(f"  cutover decisions: {dict(cutover_counts(plan.cutover))}")
     if note:
         out(f"  heartbeat codes: {note_codes_summary(plan.notes)}")
+    mark_reported(store, review_keys, any(written), out)
     return 0
 
 
-def review_on_record(store, plan: Plan, n: int) -> int:
-    """After a failed save of the cutover record: how many of the n rows newly kept for review are on record all the
-    same (Codex review: the save is one statement, so that is all of them when the write went through and its answer
-    was lost, and none when it did not). Those are reported on the failed heartbeat, because the retry reads them as
-    recorded and does not report them again; the rest are reported by the run that records them. When the record
-    cannot be read back, all n are reported here: some may then be reported a second time by the retry, but none is
-    never reported."""
-    if not n:
-        return 0
+def mark_reported(store, keys: list[str], written: bool, out=print) -> None:
+    """After a run's heartbeats: the rows kept for review that they carried are marked 'reported' on record, but only
+    when at least one of the two was written (the SimpleFIN card shows the worse of the two). Otherwise, and when the
+    mark itself fails, the rows stay 'pending' and the next run reports them again. Never fails the run; the log
+    gets counts and a type name only."""
+    if not keys:
+        return
+    if not written:
+        out(f"  cutover review: no heartbeat was written; {len(keys)} row(s) stay pending for the next run")
+        return
+    try:
+        store.mark_reported(keys)
+    except Exception as e:
+        out(f"  cutover review: {len(keys)} row(s) could not be marked reported ({safe_type_name(e)}); "
+            "the next run reports them again")
+
+
+def review_on_record(store, plan: Plan, rows: list[dict]) -> list[str]:
+    """After a failed save of the cutover record: the rows kept for review that are pending on record all the same.
+    The save is one statement, so this run's rows are all there when the write went through and its answer was lost
+    (Codex review R5), and none of them when it did not; earlier runs' pending rows are there either way. The failed
+    heartbeat reports them and, once written, marks them reported. When the record cannot be read back, every row
+    this run would report is reported there (the retry may report some again; none is left unreported)."""
     try:
         after = store.cutover_decisions()
     except Exception:
-        return n
-    return n - new_review_count(plan.cutover, after)
+        return review_pending(plan.saved, rows)
+    return review_pending(after)
 
 
 def safe_type_name(e: BaseException) -> str:

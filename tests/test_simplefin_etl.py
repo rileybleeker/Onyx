@@ -358,15 +358,21 @@ def test_cutover_ambiguous_overlap_is_kept_and_visible():
     assert sorted(r["txn_key"] for r in kept) == ["c", "d", "e"] and not dropped
     assert sf.cutover_counts(decisions) == {"ambiguous": 3}
     assert sf.apply_cutover(list(reversed(sf_rows)), list(reversed(hist)), CUT, set())[2] == decisions, "order-independent"
-    # Each review row is reported once: not again when the same decision is already recorded.
+    # Each review row is reported until a written heartbeat carried it (review_state 'reported'), then not again
+    # while its decision is unchanged; a changed decision, or one still 'pending', is reported (again).
     assert sf.new_review_count(decisions, None) == 3
-    same = {k: {"decision": "ambiguous"} for k in ("c", "d", "e")}
+    same = {k: {"decision": "ambiguous", "review_state": "reported"} for k in ("c", "d", "e")}
     assert sf.new_review_count(decisions, same) == 0
-    assert sf.new_review_count(decisions, {"d": {"decision": "ambiguous"}, "e": {"decision": "unconfirmed"}}) == 2
+    assert sf.new_review_count(decisions, {"d": {"decision": "ambiguous", "review_state": "reported"},
+                                           "e": {"decision": "unconfirmed", "review_state": "reported"}}) == 2
+    assert sf.new_review_count(decisions, dict(same, d={"decision": "ambiguous", "review_state": "pending"})) == 1
+    assert sf.new_review_count(decisions, {k: {"decision": "ambiguous"} for k in ("c", "d", "e")}) == 3
     # Recoverable: the record names the candidates, by key only.
     rows = sf.decision_rows(decisions, NOW)
     assert {tuple(sorted(r)) for r in rows} == {tuple(sorted(
-        ["sf_txn_key", "account_key", "decision", "evidence", "history_txn_keys", "cutover_date", "decided_at"]))}
+        ["sf_txn_key", "account_key", "decision", "evidence", "history_txn_keys", "cutover_date", "decided_at",
+         "review_state"]))}
+    assert {r["review_state"] for r in rows} == {"pending"}
     assert next(r for r in rows if r["sf_txn_key"] == "d")["history_txn_keys"] == ["h1", "h2"]
     assert not any("DEMO" in str(v) or v == 700 for r in rows for v in r.values())
 
@@ -607,6 +613,49 @@ def test_cutover_store_numbers_are_identity():
     assert decided(sf.apply_cutover([p1], [p2], CUT, set())[2]) == {"p": ("unconfirmed", None, ("h6",))}
 
 
+def test_cutover_different_kinds_of_business_are_not_identity():
+    """Codex review (round 7): a word that names a kind of business is no evidence FOR a match, but two different
+    kinds are evidence AGAINST one. 'DEMO CAFE ATLANTA' and 'DEMO HOTEL ATLANTA' agree on every other word and are
+    two businesses: the row is kept and listed for review, in the merchant step and in the exact step (one bank text,
+    payees of two kinds). A kind on one side only, or one side's kinds all on the other, still agrees."""
+    cafe = row("a", "2026-11-11", 1250, desc="DEMO CAFE ATLANTA")
+    hotel = hrow("h1", "2026-11-11", 1250, "DEMO HOTEL ATLANTA")
+    assert sf.trades_conflict(cafe, hotel) and sf.identity_conflict(cafe, hotel)
+    assert not sf.merchant_evidence(cafe, hotel) and sf.same_purchase(cafe, hotel) is None
+    kept, dropped, decisions = sf.apply_cutover([cafe], [hotel], CUT, set())
+    assert kept == [cafe] and not dropped and decided(decisions) == {"a": ("unconfirmed", None, ("h1",))}
+    assert sf.new_review_count(decisions, {}) == 1
+    assert sf.same_purchase(dict(cafe, txn_date="2026-11-10"), hotel) is None, "a day apart: the merchant step"
+    # The exact step: the same bank text, payees naming two kinds of business.
+    p1 = row("p", "2026-11-11", 1250, desc="SQ *DEMO ATLANTA", name="Demo Cafe")
+    p2 = hrow("h2", "2026-11-11", 1250, "SQ *DEMO ATLANTA", name="Demo Hotel")
+    assert sf.exact_key(p1) == sf.exact_key(p2) and not sf.names_conflict(p1, p2) and sf.trades_conflict(p1, p2)
+    kept, dropped, decisions = sf.apply_cutover([p1], [p2], CUT, set())
+    assert kept == [p1] and decided(decisions) == {"p": ("unconfirmed", None, ("h2",))}
+    # Still one business: a kind on one side only, or one side's kinds all on the other.
+    bar = row("b", "2026-11-11", 900, desc="DEMO COFFEE BAR ATLANTA")
+    assert sf.merchant_evidence(bar, hrow("h3", "2026-11-11", 900, None, name="Demo Coffee"))
+    assert sf.merchant_evidence(cafe, hrow("h4", "2026-11-10", 1250, None, name="Demo"))
+    assert not sf.trades_conflict(cafe, hrow("h5", "2026-11-11", 1250, "DEMO CAFE BAKERY ATLANTA"))
+
+
+def test_cutover_claim_whose_twin_is_not_in_the_history():
+    """Codex review (round 7): a recorded claim is carried for its row whether or not the Rocket Money row it names is
+    in this run's history. build_plan reads every named row by key, so one missing here is not in the ledger any
+    more: the row is decided again and kept for review ('unconfirmed', naming the recorded key), never written
+    unremarked while the record still says 'matched'."""
+    s1 = row("s1", "2026-11-11", 800, desc="DEMO BAKERY 0042 ATLANTA GA")
+    for decision in ("matched", "stored_duplicate"):
+        rec = {"s1": {"decision": decision, "history_txn_keys": ["gone"], "review_state": None}}
+        stored = {"s1"} if decision == "stored_duplicate" else set()
+        kept, dropped, decisions = sf.apply_cutover([s1], [], CUT, stored, records=rec)
+        assert kept == [s1] and not dropped and decided(decisions) == {"s1": ("unconfirmed", None, ("gone",))}, decision
+        assert sf.new_review_count(decisions, rec) == 1
+    # A claim of another account's Rocket Money row (not this account's history, its claimant not here) is left alone.
+    other = {"x9": {"decision": "matched", "history_txn_keys": ["elsewhere"]}}
+    assert sf.apply_cutover([s1], [], CUT, set(), records=other)[2] == []
+
+
 def test_cutover_every_candidate_is_recorded_and_held():
     """Codex review: the record names every candidate of an ambiguous row, never a first few. Twelve identical
     purchases competing for eleven identical Rocket Money rows record all eleven, so when a later answer lacks them
@@ -721,7 +770,7 @@ def test_cutover_ambiguous_rows_hold_their_twin_across_runs():
     saved = {r["sf_txn_key"]: r for r in sf.decision_rows(first, NOW)}
     assert sf.recorded_holds(saved) == {"s1": ("h1",), "s2": ("h1",)} and sf.recorded_claims(saved) == {}
     assert "kept" not in sf.decision_rows(first, NOW)[0], "the record has no such column"
-    # The later answer has only s3: h1 is held, so s3 is kept and reported once.
+    # The later answer has only s3: h1 is held, so s3 is kept and reported (until a written heartbeat carries it).
     kept, dropped, decisions = sf.apply_cutover([s3], hist, CUT, set(), records=saved)
     assert kept == [s3] and not dropped
     assert decided(decisions) == {"s3": ("ambiguous", None, ("h1",))} and sf.new_review_count(decisions, saved) == 1
@@ -857,6 +906,8 @@ class FakeStore:
         self.created, self.links, self.txns, self.balances, self.beats = [], [], [], [], []
         self.saved, self.saved_rows = {}, []
         self.read_error = None   # raised by cutover_decisions when set
+        self.beat_ok = True      # what heartbeat() answers: False = the sync_log write was lost
+        self.marked = []         # keys passed to mark_reported, per call
 
     def accounts(self):
         return [dict(a) for a in self._accounts]
@@ -879,10 +930,21 @@ class FakeStore:
     def ledger_keys(self, keys):
         return set(keys) & {t["txn_key"] for t in self.window_rows(None)}
 
+    def history_rows(self, keys):
+        return [dict(r) for r in self._window if r["txn_key"] in set(keys) and r.get("source") != "simplefin"]
+
     def save_cutover_decisions(self, rows):
+        assert len({tuple(sorted(r)) for r in rows}) <= 1, "one upsert carries one key set"
         self.saved_rows.extend(rows)
-        self.saved.update({r["sf_txn_key"]: {"decision": r["decision"], "history_txn_keys": list(r["history_txn_keys"])}
+        self.saved.update({r["sf_txn_key"]: {"decision": r["decision"], "history_txn_keys": list(r["history_txn_keys"]),
+                                             "review_state": r["review_state"]}
                            for r in rows})
+
+    def mark_reported(self, keys):
+        self.marked.append(sorted(keys))
+        for k in keys:
+            if k in self.saved and self.saved[k].get("review_state") == "pending":
+                self.saved[k] = dict(self.saved[k], review_state="reported")
 
     def history_for_learning(self, since):
         return list(self._history)
@@ -901,6 +963,7 @@ class FakeStore:
 
     def heartbeat(self, data_type, status, records, started, error, start=None, end=None):
         self.beats.append((data_type, status, records, error))
+        return self.beat_ok
 
 
 def body(errlist=()):
@@ -1117,7 +1180,7 @@ def test_run_cutover_review_reported_once_and_recorded():
     assert sf.run(dry, Http(get=Res(200, cutover_body())), ACCESS, 60, True, now=NOW, out=lines3.append) == 0
     assert not (dry.txns or dry.saved_rows or dry.beats)
     preview = "\n".join(lines3)
-    assert "kept for review {'unconfirmed': 1}" in preview and "new for review: 1" in preview
+    assert "kept for review {'unconfirmed': 1}" in preview and "to report: 1" in preview
     assert "PHARMACY" not in preview and "GROCER" not in preview
 
 
@@ -1163,7 +1226,8 @@ def test_run_cutover_record_is_saved_before_the_ledger():
     assert not (store.txns or store.balances or store.saved_rows) and store.saved == {}
     assert store.beats[0][3] == sf.format_notes({"db_write_failed": 1})
     assert_no_pii("\n".join(lines) + store.beats[0][3])
-    # Retry: the record is saved, then the ledger; the matched row stays out and the kept one is reported once.
+    # Retry: the record is saved, then the ledger; the matched row stays out and the kept one is reported (once its
+    # heartbeat is written it is marked reported).
     store.failing = False
     assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
     assert {r["sf_txn_key"]: r["decision"] for r in store.saved_rows} == {
@@ -1204,9 +1268,9 @@ def test_run_cutover_record_is_saved_before_the_ledger():
 def test_run_partly_saved_record_reports_review():
     """Codex review: a failed save of the record may have written it all the same (the write went through and its
     answer was lost; the save is one statement, so it is all of the set or none of it: R5). The rows kept for review
-    that are on record are reported on that failed heartbeat, since the retry reads them as recorded; nothing is
-    written to the ledger. When the record cannot be read back, every such row is reported there (the retry may
-    report it again, but it is never left unreported)."""
+    that are pending on record are reported on that failed heartbeat and marked reported once it is written, so the
+    retry does not report them again; nothing is written to the ledger. When the record cannot be read back, every
+    such row is reported there (the retry may report it again, but it is never left unreported)."""
     class PartSave(FakeStore):
         mode = "all"              # what the failing save writes before it raises; "ok" = a normal save
         readback_fails = False
@@ -1339,11 +1403,17 @@ def test_run_failed_record_save_never_leaves_part_of_the_set():
             self.db = db
 
         def cutover_decisions(self):
-            return {k: {"decision": r["decision"], "history_txn_keys": list(r["history_txn_keys"])}
+            return {k: {"decision": r["decision"], "history_txn_keys": list(r["history_txn_keys"]),
+                        "review_state": r["review_state"]}
                     for k, r in self.db.rows.items()}
 
         def save_cutover_decisions(self, rows):
             sf.Store(self.db).save_cutover_decisions(rows)
+
+        def mark_reported(self, keys):
+            for k in keys:
+                if self.db.rows.get(k, {}).get("review_state") == "pending":
+                    self.db.rows[k]["review_state"] = "reported"
 
     quiet = lambda *_: None  # noqa: E731
     x1, x2 = sf.txn_key("S-WF", "x1"), sf.txn_key("S-WF", "x2")
@@ -1352,18 +1422,19 @@ def test_run_failed_record_save_never_leaves_part_of_the_set():
     assert sf.run(store, Http(get=Res(200, answer("x1", "x2"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
     assert [r[1] for r in store.db.requests] == [n + 2]
     rec = store.cutover_decisions()
-    assert rec[x1] == rec[x2] == {"decision": "ambiguous", "history_txn_keys": ["rm-x"]}
+    assert rec[x1] == rec[x2] == {"decision": "ambiguous", "history_txn_keys": ["rm-x"], "review_state": "reported"}
     assert sum(1 for r in rec.values() if r["decision"] == "matched") == n
     assert {sf.txn_key("S-WF", "x1"), sf.txn_key("S-WF", "x2")} <= {t["txn_key"] for t in store.txns}
     # The next answer lacks x2: rm-x stays held, so x1 stays ambiguous (never matched to it) and in the ledger.
     store.db.fail = set()
     assert sf.run(store, Http(get=Res(200, answer("x1"))), ACCESS, 60, False, now=NOW, out=quiet) == 0
-    assert store.cutover_decisions()[x1] == {"decision": "ambiguous", "history_txn_keys": ["rm-x"]}
+    assert store.cutover_decisions()[x1] == {"decision": "ambiguous", "history_txn_keys": ["rm-x"],
+                                             "review_state": "reported"}
     # The one request fails: nothing on record, nothing written, the run fails.
     store = RealSave(OneStatementDb(fail={0}))
     assert sf.run(store, Http(get=Res(200, answer("x1", "x2"))), ACCESS, 60, False, now=NOW, out=quiet) == 1
     assert store.db.rows == {} and not (store.txns or store.balances or store.created or store.links)
-    # Nothing is on record, so the review rows are reported by the run that records them, not here.
+    # Nothing is on record, so the review rows are reported by the run that records them (pending), not here.
     assert store.beats[0][1] == "failed" and store.beats[0][3] == sf.format_notes({"db_write_failed": 1})
     # The answer after it lacks x2 and is decided exactly as on a store that never saw the failed run.
     store.db.fail = set()
@@ -1419,7 +1490,8 @@ def test_run_ambiguous_rows_hold_their_twin_across_responses():
     second = wf_answer(txn("x3", "2026-11-09", "-5.25", "SQ *DEMO CAFE"))
     assert sf.run(store, Http(get=Res(200, second)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
     assert any(t["source_txn_id"] == "sf:S-WF:x3" for t in store.txns), "the new purchase is written"
-    assert store.saved[sf.txn_key("S-WF", "x3")] == {"decision": "ambiguous", "history_txn_keys": ["rm-7"]}
+    assert store.saved[sf.txn_key("S-WF", "x3")] == {"decision": "ambiguous", "history_txn_keys": ["rm-7"],
+                                                     "review_state": "reported"}
     assert store.beats[-2][3] == sf.format_notes({"cutover_review": 1})
 
 
@@ -1450,13 +1522,13 @@ def test_run_replaced_claim_is_saved_before_the_ledger():
     store.events.clear()
     run2 = wf_answer(txn("b1", "2026-11-11", "-8.50", "DEMO BAKERY 0042 ATLANTA GA"))
     assert sf.run(store, Http(get=Res(200, run2)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
-    assert store.saved[b1] == {"decision": "unconfirmed", "history_txn_keys": ["rm-6"]}
+    assert store.saved[b1] == {"decision": "unconfirmed", "history_txn_keys": ["rm-6"], "review_state": "reported"}
     assert any(t["txn_key"] == b1 for t in store.txns), "no longer evidenced: written"
     assert store.events == ["record", "ledger"], "the replaced claim is on record before the ledger is written"
     assert store.beats[-2][3] == sf.format_notes({"cutover_review": 1})
     run3 = wf_answer(txn("b2", "2026-11-10", "-8.00", "DEMO BAKERY 0042 ATLANTA GA"))
     assert sf.run(store, Http(get=Res(200, run3)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
-    assert store.saved[b2] == {"decision": "matched", "history_txn_keys": ["rm-6"]}
+    assert store.saved[b2] == {"decision": "matched", "history_txn_keys": ["rm-6"], "review_state": None}
     assert not any(t["txn_key"] == b2 for t in store.txns), "the real twin is not written twice"
 
     class SaveFails(Ordered):
@@ -1497,6 +1569,214 @@ def test_run_cutover_record_read_error_fails_before_writing():
     assert sf.run(store, Http(get=Res(200, second)), ACCESS, 60, False, now=NOW, out=lambda *_: None) == 0
     assert any(t["source_txn_id"] == "sf:S-WF:b2" for t in store.txns)
     assert store.beats[-1][1] == "success" and store.saved == recorded
+
+
+class DatedStore(FakeStore):
+    """window_rows honours `since` like the real read (txn_date >= since). `floor` narrows it further, standing in
+    for a window that misses a row whatever was asked; `by_key` records the history_rows calls."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.floor, self.since, self.by_key = None, [], []
+
+    def window_rows(self, since):
+        rows = super().window_rows(since)
+        if since is None:
+            return rows
+        self.since.append(since)
+        lo = max(since, self.floor) if self.floor else since
+        return [r for r in rows if r["txn_date"] >= lo.isoformat()]
+
+    def history_rows(self, keys):
+        self.by_key.append(sorted(keys))
+        return super().history_rows(keys)
+
+
+def test_run_recorded_twin_outside_the_date_window():
+    """Codex review (round 7): a row posted late, transacted long before the window, whose Rocket Money twin is dated
+    alike. (1) The ledger is read from before EVERY date in SimpleFIN's answer, so the first run matches it. (2) A
+    later run whose date read misses the twin reads it by key (the record names it), so the match is replayed and
+    the row is not written again. (3) With the twin gone from the ledger, the row is written and reported for
+    review, never written unremarked. (4) A failed read of the named rows stops the run before anything is written."""
+    window = [hrow("rm-t", "2026-08-14", 6400, "DEMO TAILOR ATLANTA")]
+    store = DatedStore(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+    late = sf.txn_key("S-WF", "t1")
+    answer = wf_answer(txn("t1", "2026-08-14", "-64.00", "DEMO TAILOR ATLANTA", posted=ts("2026-11-12", 12)))
+    quiet = lambda *_: None  # noqa: E731
+    assert sf.run(store, Http(get=Res(200, answer)), ACCESS, 45, False, now=NOW, out=quiet) == 0
+    assert store.since == [date(2026, 8, 3)], "read from the earliest date in the answer, less the margins"
+    assert store.saved[late]["decision"] == "matched" and not any(t["txn_key"] == late for t in store.txns)
+    assert store.by_key == [] and store.beats[-2][1] == "success"
+    # (2) The date read misses the twin: it is read by key and the recorded match holds.
+    store.floor = date(2026, 11, 1)
+    assert sf.run(store, Http(get=Res(200, answer)), ACCESS, 45, False, now=NOW, out=quiet) == 0
+    assert store.by_key == [["rm-t"]]
+    assert store.saved[late]["decision"] == "matched" and not any(t["txn_key"] == late for t in store.txns)
+    assert store.beats[-2][:2] == ("transactions", "success")
+    # (3) The twin is gone from the ledger: the row is written and reported for review.
+    store._window = []
+    assert sf.run(store, Http(get=Res(200, answer)), ACCESS, 45, False, now=NOW, out=quiet) == 0
+    assert store.saved[late]["decision"] == "unconfirmed" and any(t["txn_key"] == late for t in store.txns)
+    assert store.beats[-2][3] == sf.format_notes({"cutover_review": 1})
+
+    # (4) A failed read of the named rows: nothing written, the run fails like a failed read of the record.
+    class ByKeyFails(DatedStore):
+        def history_rows(self, keys):
+            raise FakeApiError("57014", pii_msg())
+
+    failing = ByKeyFails(ledger_with_fidelity(), kinds={"wf1": "asset"}, cutovers={"wf1": CUT}, window=window)
+    failing.floor = date(2026, 11, 1)
+    failing.saved = {late: {"decision": "matched", "history_txn_keys": ["rm-t"], "review_state": None}}
+    lines = []
+    assert sf.run(failing, Http(get=Res(200, answer)), ACCESS, 45, False, now=NOW, out=lines.append) == 1
+    assert not (failing.txns or failing.balances or failing.saved_rows or failing.created or failing.links)
+    assert [b[3] for b in failing.beats] == [sf.format_notes({"db_read_failed": 1})] * 2
+    assert_no_pii("\n".join(lines))
+
+
+def test_run_review_is_reported_until_a_heartbeat_carries_it():
+    """Codex review (round 7): reporting is tracked apart from the decision (review_state). A row kept for review is
+    'pending' on record until a heartbeat carrying it is WRITTEN, then 'reported'. When both heartbeat writes are
+    lost, the run stops after it saved the record, or the mark fails, the next run reports it again, also when the
+    row is no longer in SimpleFIN's answer; once a written heartbeat carried it, it is not reported again."""
+    w1 = sf.txn_key("S-WF", "w1")
+    review = sf.format_notes({"cutover_review": 1})
+    quiet = lambda *_: None  # noqa: E731
+    # Both heartbeat writes lost: the row stays pending; the next run reports it and marks it; then nothing more.
+    store, lines = cutover_store(), []
+    store.beat_ok = False
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+    assert store.beats[0][3] == review and store.saved[w1]["review_state"] == "pending" and store.marked == []
+    assert any("stay pending for the next run" in line for line in lines)
+    store.beat_ok = True
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+    assert [b[3] for b in store.beats[-2:]] == [review] * 2
+    assert store.marked == [[w1]] and store.saved[w1]["review_state"] == "reported"
+    assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+    assert [(b[1], b[3]) for b in store.beats[-2:]] == [("success", None), ("success", None)]
+    out = "\n".join(lines)
+    assert w1 not in out and "rm-1" not in out, "counts only"
+
+    # The process stops after the record was saved, before any heartbeat: the next run reports the row.
+    class Stops(FakeStore):
+        stopping = True
+
+        def upsert_transactions(self, rows):
+            if self.stopping:
+                raise SystemExit(1)
+            super().upsert_transactions(rows)
+
+    st = cutover_store(Stops)
+    try:
+        sf.run(st, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=quiet)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("the stand-in for a stopped process must stop the run")
+    assert st.beats == [] and st.saved[w1]["review_state"] == "pending"
+    st.stopping = False
+    assert sf.run(st, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert st.beats[-2][3] == review and st.saved[w1]["review_state"] == "reported"
+
+    # A pending row is reported also when it is no longer in SimpleFIN's answer (no cutover decision this run).
+    gone = cutover_store()
+    gone.beat_ok = False
+    assert sf.run(gone, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    gone.beat_ok = True
+    assert sf.run(gone, Http(get=Res(200, wf_answer())), ACCESS, 60, False, now=NOW, out=quiet) == 0
+    assert gone.beats[-2][3] == review and gone.marked == [[w1]]
+    # The dry run counts it among the rows to report, and writes nothing.
+    dry = cutover_store()
+    dry.saved = {w1: {"decision": "unconfirmed", "history_txn_keys": ["rm-1"], "review_state": "pending"}}
+    preview = []
+    assert sf.run(dry, Http(get=Res(200, wf_answer())), ACCESS, 60, True, now=NOW, out=preview.append) == 0
+    assert any("cutover review to report" in line and line.endswith(": 1") for line in preview), preview
+    assert not (dry.beats or dry.marked or dry.saved_rows)
+
+    # The mark fails: the row stays pending and the next run reports it again (twice at worst, never not at all).
+    class MarkFails(FakeStore):
+        def mark_reported(self, keys):
+            raise FakeApiError("57014", pii_msg())
+
+    mf, lines = cutover_store(MarkFails), []
+    for _ in range(2):
+        assert sf.run(mf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 0
+        assert mf.beats[-2][3] == review and mf.saved[w1]["review_state"] == "pending"
+    assert any("could not be marked reported (FakeApiError)" in line for line in lines)
+    assert_no_pii("\n".join(lines))
+
+    # A failed run reports the pending rows on its red heartbeat and marks them once that heartbeat is written.
+    class LedgerFails(FakeStore):
+        def upsert_transactions(self, rows):
+            raise RuntimeError(pii_msg())
+
+    lf = cutover_store(LedgerFails)
+    lf.beat_ok = False
+    assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=quiet) == 1
+    assert lf.beats[0][3] == sf.format_notes({"db_write_failed": 1, "cutover_review": 1}) and lf.marked == []
+    lf.beat_ok = True
+    assert sf.run(lf, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=quiet) == 1
+    assert lf.beats[-1][3] == sf.format_notes({"db_write_failed": 1, "cutover_review": 1}) and lf.marked == [[w1]]
+
+
+def test_run_record_without_review_state_fails_before_writing():
+    """The table without its review_state column (that statement of sql/finance_cutover_matches.sql not applied):
+    the run fails before anything is written, with the code that says to apply the file; the error text is never
+    shown."""
+    for code in ("42703", "PGRST204"):
+        store = cutover_store()
+        store.read_error = FakeApiError(code, "column finance_cutover_matches.review_state does not exist")
+        lines = []
+        assert sf.run(store, Http(get=Res(200, cutover_body())), ACCESS, 60, False, now=NOW, out=lines.append) == 1
+        assert not (store.txns or store.balances or store.saved_rows or store.created or store.links)
+        assert [b[3] for b in store.beats] == [sf.format_notes({"cutover_provenance_unsaved": 1})] * 2
+        assert "does not exist" not in "\n".join(lines)
+
+
+class ChainDb:
+    """A fake Supabase client that records each request's calls ([('from', table), (method, args), ...])."""
+
+    def __init__(self, answer=()):
+        self.calls, self.answer, self.cur = [], list(answer), None
+
+    def schema(self, name):
+        assert name == "pds"
+        return self
+
+    def from_(self, table):
+        self.cur = [("from", table)]
+        return self
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def call(*args, **kw):
+            self.cur.append((name, args))
+            return self
+        return call
+
+    def execute(self):
+        self.calls.append(self.cur)
+        return type("Answer", (), {"data": list(self.answer)})()
+
+
+def test_store_marks_reported_and_reads_named_rows_by_key():
+    """Store.mark_reported moves only 'pending' rows to 'reported', in batches; Store.history_rows reads Rocket Money
+    rows by key (never SimpleFIN rows), whatever their date."""
+    keys = [f"k{i:03d}" for i in range(150)]
+    db = ChainDb()
+    sf.Store(db).mark_reported(keys + ["k000"])
+    assert db.calls == [[("from", "finance_cutover_matches"), ("update", ({"review_state": "reported"},)),
+                         ("in_", ("sf_txn_key", part)), ("eq", ("review_state", "pending"))]
+                        for part in (keys[:100], keys[100:])]
+    db = ChainDb(answer=[{"txn_key": "h1", "source": "rocketmoney"}])
+    assert sf.Store(db).history_rows({"h1"}) == [{"txn_key": "h1", "source": "rocketmoney"}]
+    [call] = db.calls
+    assert call[0] == ("from", "finance_transactions")
+    assert ("in_", ("txn_key", ["h1"])) in call and ("neq", ("source", "simplefin")) in call
+    db = ChainDb()
+    assert sf.Store(db).history_rows(set()) == [] and db.calls == []
 
 
 if __name__ == "__main__":

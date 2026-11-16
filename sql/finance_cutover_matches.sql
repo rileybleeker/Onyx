@@ -24,9 +24,13 @@
 -- and a run that cannot (a failed write, or this table missing while there are decisions to record:
 -- cutover_provenance_unsaved) writes nothing, so a row is never left out on a match that is not recorded. Any
 -- other error reading it fails the run before anything is written (db_read_failed), so the record is never
--- rewritten from decisions made without it. (These comments were revised after the table was applied; the
--- statements below are unchanged.)
--- Applied 2026-11-16 (Supabase MCP, before the merge of the change that added it).
+-- rewritten from decisions made without it. Every Rocket Money row a recorded match or ambiguity names is read
+-- back by key, whatever its date, so the record is replayed whatever the run's date window.
+-- review_state tracks the REPORTING of a row kept for review apart from its decision (see the statement at the end).
+-- (These comments were revised after the table was applied; the statements down to the review_state section are
+-- unchanged.)
+-- Applied 2026-11-16 (Supabase MCP, before the merge of the change that added it), except the review_state
+-- statement at the end.
 
 create table if not exists pds.finance_cutover_matches (
   sf_txn_key        text primary key,          -- the SimpleFIN row's txn_key (= finance_transactions.txn_key when kept)
@@ -46,3 +50,18 @@ create index if not exists finance_cutover_matches_review_idx
 alter table pds.finance_cutover_matches enable row level security;
 
 revoke all on pds.finance_cutover_matches from anon, authenticated;
+
+-- review_state (added 2026-11-16 after the review of round 6; NOT APPLIED YET: apply it before the merge). Every
+-- statement in this file is idempotent, so applying the whole file again is safe.
+--   pending   a row kept for review (ambiguous / unconfirmed / stored_duplicate, in the ledger) that no WRITTEN
+--             heartbeat has carried yet
+--   reported  a written heartbeat carried it as cutover_review
+--   null      nothing to report (a match, or a decision on a row before the window, recorded for its hold only)
+-- Each run reports every pending row, its own and earlier runs', and marks them reported only once one of its
+-- heartbeats was written (sync_log_helper.write_sync), so a lost heartbeat, a failed run or a run stopped after
+-- the record was saved never hides a row kept for review; at worst one is reported twice. A decision that changes
+-- is pending again. A row recorded before this column existed keeps review_state null and is not reported again
+-- (none is expected: only this version of the ETL writes the table). Until this statement is applied, every run of
+-- this version fails before writing anything (cutover_provenance_unsaved).
+alter table pds.finance_cutover_matches
+  add column if not exists review_state text check (review_state in ('pending', 'reported'));
