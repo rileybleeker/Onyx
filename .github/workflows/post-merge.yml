@@ -5,6 +5,20 @@ name: Post-merge verify
 # deployment history cannot name that commit (result=halt) the train halts with an issue and nothing is reverted.
 # The offline suite below is reported, never a rollback or halt condition: a red offline-tests job (or a red
 # scheduled-tests run) is raised by the cloud watchdog and fixed forward with a normal PR (docs/ci-cd.md).
+# Smoke provenance (DEL-02): verify hands the smoke test the commit AND its immutable deployment URL; the smoke run
+# counts only when production served exactly that before and after the tests. `receipt` records the result as the
+# commit status post-merge/smoke (pass / fail / pending verification) and reverts only a commit that failed twice on
+# its own deployment while its parent passed on its own within the last 3 h; anything less certain halts without a
+# revert, and so does a failed smoke test whose receipt could not be written. A halt is dropped, and a revert never
+# opened, once a newer master commit containing the change (or a later run of the commit itself) passed on its own
+# deployment in a run that STARTED after the failing attempt ENDED (the receipt's observed_at; no time = the halt goes
+# ahead). Those times are the attempts' own (smoke job outputs started_at / ended_at, kept in each receipt's
+# description with the attempt's identity), never when the receipt job ran, so a late or re-run receipt decides the
+# same way.
+# post-merge/smoke is a smoke receipt, not the deploy signal, and a pending or failed receipt changes master's
+# combined commit status. So it is written only while the repository variable SMOKE_RECEIPT_STATUS is "on", which is
+# set once every reader of that combined status reads the `Vercel` context instead (docs/ci-cd.md). Until then the
+# job summary is the receipt and every smoke failure halts without a revert (a revert needs a recorded receipt).
 # `drill: true` injects a failure so the rollback path can be exercised on a harmless commit.
 on:
   push:
@@ -35,6 +49,7 @@ jobs:
       result: ${{ steps.v.outputs.result }}
       sha: ${{ steps.v.outputs.sha }}
       detail: ${{ steps.v.outputs.detail }}
+      deployment_url: ${{ steps.v.outputs.deployment_url }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -51,34 +66,115 @@ jobs:
     uses: ./.github/workflows/scheduled-tests.yml
     with:
       sha: ${{ needs.verify.outputs.sha }}
+  # Only the three smoke secrets reach the smoke test, never every repo secret. post_merge: true binds each attempt
+  # to this commit + deployment (a scheduled run instead tests whatever master commit production serves).
   smoke:
     needs: verify
     if: needs.verify.outputs.result == 'ok'
     uses: ./.github/workflows/smoke-test.yml
-    secrets: inherit
+    with:
+      expected_sha: ${{ needs.verify.outputs.sha }}
+      deployment_url: ${{ needs.verify.outputs.deployment_url }}
+      post_merge: true
+      attempt: first
+    secrets:
+      SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
+      SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
+      SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
+  # failure() is required: without a status function GitHub adds success(), which is false once smoke failed, so the
+  # retry would never run and the receipt would see a skipped retry (read as unverified: a halt, never a pass).
   smoke-retry:
     needs: [verify, smoke]
-    if: needs.smoke.result == 'failure'
+    if: failure() && needs.smoke.result == 'failure'
     uses: ./.github/workflows/smoke-test.yml
-    secrets: inherit
-  rollback:
+    with:
+      expected_sha: ${{ needs.verify.outputs.sha }}
+      deployment_url: ${{ needs.verify.outputs.deployment_url }}
+      post_merge: true
+      attempt: retry
+    secrets:
+      SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
+      SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
+      SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
+  # The durable smoke receipt + the decision. No smoke secrets here; the token can only post a commit status, and
+  # only does while vars.SMOKE_RECEIPT_STATUS is "on". The decision is published only after the status is written
+  # (or an earlier exact receipt stands, or recording is off); otherwise this job fails with no decision and the
+  # rollback job below halts without a revert when the smoke test failed.
+  receipt:
     needs: [verify, smoke, smoke-retry]
-    if: always() && (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt' || needs.smoke-retry.result == 'failure')
+    if: always() && (needs.verify.outputs.result == 'ok' || needs.verify.outputs.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      action: ${{ steps.r.outputs.action }}
+      culprit: ${{ steps.r.outputs.culprit }}
+      reason: ${{ steps.r.outputs.reason }}
+      observed_at: ${{ steps.r.outputs.observed_at }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - id: r
+        name: Record the smoke receipt and decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.verify.outputs.sha }}
+          DEPLOYMENT_URL: ${{ needs.verify.outputs.deployment_url }}
+          VERIFY: ${{ needs.verify.outputs.result }}
+          VERIFY_DETAIL: ${{ needs.verify.outputs.detail }}
+          FIRST: ${{ needs.smoke.outputs.verdict }}
+          FIRST_RESULT: ${{ needs.smoke.result }}
+          FIRST_DETAIL: ${{ needs.smoke.outputs.detail }}
+          FIRST_STARTED_AT: ${{ needs.smoke.outputs.started_at }}
+          FIRST_ENDED_AT: ${{ needs.smoke.outputs.ended_at }}
+          FIRST_ATTEMPT_ID: ${{ needs.smoke.outputs.attempt_id }}
+          RETRY: ${{ needs.smoke-retry.outputs.verdict }}
+          RETRY_RESULT: ${{ needs.smoke-retry.result }}
+          RETRY_DETAIL: ${{ needs.smoke-retry.outputs.detail }}
+          RETRY_STARTED_AT: ${{ needs.smoke-retry.outputs.started_at }}
+          RETRY_ENDED_AT: ${{ needs.smoke-retry.outputs.ended_at }}
+          RETRY_ATTEMPT_ID: ${{ needs.smoke-retry.outputs.attempt_id }}
+          RECORD_STATUS: ${{ vars.SMOKE_RECEIPT_STATUS }}
+        run: >-
+          python3 tools/merge_train.py smoke-receipt --sha "$SHA" --deployment-url "$DEPLOYMENT_URL"
+          --verify "$VERIFY" --verify-detail "$VERIFY_DETAIL"
+          --first "$FIRST" --first-result "$FIRST_RESULT" --first-detail "$FIRST_DETAIL"
+          --first-started-at "$FIRST_STARTED_AT" --first-ended-at "$FIRST_ENDED_AT" --first-attempt-id "$FIRST_ATTEMPT_ID"
+          --retry "$RETRY" --retry-result "$RETRY_RESULT" --retry-detail "$RETRY_DETAIL"
+          --retry-started-at "$RETRY_STARTED_AT" --retry-ended-at "$RETRY_ENDED_AT" --retry-attempt-id "$RETRY_ATTEMPT_ID"
+          --record-status "$RECORD_STATUS"
+  # A build failure (verify fail / halt) or a smoke decision. A smoke test that failed (and whose retry failed too or
+  # never ran) while the receipt could not be written halts without a revert. A cancelled retry (superseded by a
+  # newer run for the same commit) does nothing: that run decides.
+  rollback:
+    needs: [verify, smoke, smoke-retry, receipt]
+    if: always() && (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt' || needs.receipt.outputs.action == 'revert' || needs.receipt.outputs.action == 'halt' || (needs.receipt.result == 'failure' && needs.smoke.result == 'failure' && (needs.smoke-retry.result == 'failure' || needs.smoke-retry.result == 'skipped')))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Job permissions replace the workflow's, so the reads rollback() makes (deployments for a fixed build, commit
+    # statuses for the smoke receipts) are listed here too.
     permissions:
       contents: write
       pull-requests: write
       issues: write
       actions: write
+      statuses: read
+      deployments: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
       - name: Halt the train and open the revert
-        run: python3 tools/merge_train.py rollback --sha "$SHA" --reason "$REASON" $HALT_ONLY
+        run: python3 tools/merge_train.py rollback --sha "$SHA" --reason "$REASON" --failed-at "$FAILED_AT" $HALT_ONLY
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ needs.verify.outputs.sha || github.event.inputs.sha || github.sha }}
-          REASON: ${{ (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt') && needs.verify.outputs.detail || 'production smoke test failed twice' }}
-          HALT_ONLY: ${{ needs.verify.outputs.result == 'halt' && '--halt-only' || '' }}
+          SHA: ${{ needs.receipt.outputs.culprit || needs.verify.outputs.sha || github.event.inputs.sha || github.sha }}
+          REASON: ${{ (needs.verify.outputs.result == 'fail' || needs.verify.outputs.result == 'halt') && needs.verify.outputs.detail || needs.receipt.outputs.reason || 'production smoke test failed and its receipt could not be written, so the failure is not attributed' }}
+          HALT_ONLY: ${{ (needs.verify.outputs.result == 'halt' || (needs.verify.outputs.result == 'ok' && needs.receipt.outputs.action != 'revert')) && '--halt-only' || '' }}
+          # When the failing smoke attempt ended (its own clock, kept across a late or re-run receipt); only a smoke
+          # pass whose run started after it cancels the revert or the halt. Empty when the receipt was not written (or
+          # for a build failure): then no smoke pass can cancel a halt.
+          FAILED_AT: ${{ needs.receipt.outputs.observed_at }}
