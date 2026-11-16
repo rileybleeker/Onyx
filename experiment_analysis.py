@@ -118,17 +118,18 @@ METHOD_REVIEW: dict[str, Any] = {
     # The independent statistical review (doc 8.3). It reviews the method; it is not an approval of any
     # trial's outcome. Its fingerprint is the one experiment_fingerprint gives the reviewed revision, which
     # is also the fingerprint of every later revision until the inference code changes. The method was
-    # reviewed at ce76f720 (fingerprint 7a79a1a4...); review round 5 changed the review gate and the
-    # missing-night checks inside the fingerprint, the same two models reviewed that change (doc 8.3,
-    # "Follow-up: design scope and fail-closed missing-night checks"), and the record names the revision
-    # and fingerprint of that review.
+    # reviewed at ce76f720 (the head of #375, squash-merged as ef17db5e with the same fingerprint 7a79a1a4...);
+    # review round 5 changed the review gate and the missing-night checks inside the fingerprint, and review
+    # round 6 added the early-stop check (stopping_not_outcome_dependent); the same two models reviewed each
+    # change (doc 8.3, the "Follow-up" sections), and the record names the revision and fingerprint of the
+    # last review.
     "independent_review": {
         "reference": "docs/experiment-framework.md 8.3",
         "date": "2026-11-16",
         "reviewers": ("openai/gpt-5.2", "google/gemini-2.5-pro"),
         "verdicts": ("sound", "sound"),
-        "reviewed_revision": "29161919dac63e11e6110d545e50cbec0d76e954",
-        "inference_fingerprint": "02808939ca0a678be6c597d9929274810a585a85034d8b9679e251b9f74ef671",
+        "reviewed_revision": "7ac3cf32458b7f4ce854314688405b579be70411",
+        "inference_fingerprint": "25ea4dad9d45b77197af2e8bb909d70fb7a3d7f2ab2489f7cd1c4a31b0be2a7c",
         "method_reviewed_revision": "ce76f720d8ff127cc90a012cc4ca7491ce2d9734",
         "method_reviewed_fingerprint": "7a79a1a4cc2f89a1d5f9a8a5547e1e4ca63ad3b38de01cb9cc25783761969da0",
         "summary": (
@@ -139,7 +140,8 @@ METHOD_REVIEW: dict[str, Any] = {
             "reasons: float-tolerance snapping in _sets_moving / _piece (it would narrow the sets), a fresh random "
             "re-draw seed at analysis time (once drawn it is as fixed as the public-hash seed)"),
         # Doc 8.3 "Follow-up" sections: the same two models reviewed every change after ce76f720, the
-        # fingerprint binding and the round-5 gate changes; final verdicts sound (both) each time.
+        # fingerprint binding, the round-5 gate changes and the round-6 early-stop check; final verdicts
+        # sound (both) each time.
         "follow_up": (
             "2026-11-16: binding to the code by experiment_fingerprint reviewed by both models, final verdicts sound; "
             "adopted: source-order hashing, imports in the design closure, the skip-share bound in review_ready, the "
@@ -148,7 +150,12 @@ METHOD_REVIEW: dict[str, Any] = {
             "2026-11-16: review round 5 (the gate covers the calibrated block designs and the blocks a trial "
             "analyses; missing-night checks fail closed) reviewed by both models, final verdicts sound; adopted: "
             "numpy scalar p-values read, a Fisher p outside [0, 1] fails closed, the analysed-block lower bound; no "
-            "estimator, p-value, interval or re-draw code changed"),
+            "estimator, p-value, interval or re-draw code changed",
+            "2026-11-16: review round 6 (an early stop withholds the decision and marks the model and Fisher outputs "
+            "unsupported, stopping_not_outcome_dependent; calibration shards merge only under the harness and the "
+            "inference code that ran them) reviewed by both models at 0a3d3712, final verdicts sound; adopted: the "
+            "merge-time inference fingerprint check (7ac3cf32, harness only); no estimator, p-value, interval or "
+            "re-draw code changed"),
     },
     "n_redraws": (),                       # re-draw counts the report calibrated
     "alpha": (),                           # alpha levels it calibrated
