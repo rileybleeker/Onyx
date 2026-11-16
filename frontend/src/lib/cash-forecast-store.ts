@@ -98,7 +98,13 @@ export function itemRowToPlanned(r: ItemRow): PlannedItem {
   };
 }
 
-/** Body {key, value}: key 'settings' | 'card:<account_key>' | 'growth:<account_key>'; value null removes the driver. */
+/** The most pool accounts the "safe-to-move" driver can leave out of the amount. */
+export const MAX_LEAVE_OUT = 20;
+
+/**
+ * Body {key, value}: key 'settings' | 'card:<account_key>' | 'growth:<account_key>' | 'safe-to-move' (value
+ * {leaveOut: account keys}: pool accounts left out of the safe-to-move amount); value null removes the driver.
+ */
 export function parseDriverBody(
   body: unknown,
   knownAccounts: ReadonlySet<string>,
@@ -111,6 +117,20 @@ export function parseDriverBody(
     if (b.value === null) return { ok: true, key, value: null };
     const profile = parseTaxProfile(b.value);
     return profile ? { ok: true, key, value: profile as unknown as Record<string, unknown> } : { ok: false, error: "tax profile needs salaryAnnualCents and employmentStart" };
+  }
+  if (key === "safe-to-move") {
+    if (b.value === null) return { ok: true, key, value: null };
+    const v = b.value as Record<string, unknown> | undefined;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return { ok: false, error: "value must be an object or null" };
+    for (const k of Object.keys(v)) if (k !== "leaveOut") return { ok: false, error: `unknown value field ${k}` };
+    const list = v.leaveOut;
+    if (!Array.isArray(list) || list.length > MAX_LEAVE_OUT) return { ok: false, error: `leaveOut must be a list of at most ${MAX_LEAVE_OUT} accounts` };
+    const keys: string[] = [];
+    for (const a of list) {
+      if (typeof a !== "string" || !knownAccounts.has(a)) return { ok: false, error: "unknown account" };
+      if (!keys.includes(a)) keys.push(a);
+    }
+    return { ok: true, key, value: keys.length ? { leaveOut: keys } : null };
   }
   if (key === "move") {
     if (b.value === null) return { ok: true, key, value: null };
@@ -202,6 +222,9 @@ export function driversToInputs(rows: readonly DriverRow[]): { settings: Forecas
       if (cm && cm >= 1) settings.cardMonths = Math.round(cm);
       const lp = n(v.lowPercentile);
       if (lp && lp >= 5) settings.lowPercentile = lp / 100;
+    } else if (r.key === "safe-to-move") {
+      const list = Array.isArray(v.leaveOut) ? v.leaveOut.filter((a): a is string => typeof a === "string") : [];
+      if (list.length) settings.safeToMoveLeaveOut = list.slice(0, MAX_LEAVE_OUT);
     } else if (r.key.startsWith("card:")) {
       cardTerms.push({
         account_key: r.key.slice(5),

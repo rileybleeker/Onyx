@@ -50,6 +50,22 @@ test("driver bodies: keys, accounts and value fields are checked", () => {
   assert.equal(S.parseDriverBody({ key: "growth:acct1", value: { returnPct: 6, contributionStarts: "2031-01-01" } }, known).ok, true);
 });
 
+test("the safe-to-move driver: known accounts only, deduplicated, empty removes it, mapped to the engine", () => {
+  const known = new Set(["acct1", "acct2"]);
+  assert.deepEqual(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: ["acct1", "acct2", "acct1"] } }, known), { ok: true, key: "safe-to-move", value: { leaveOut: ["acct1", "acct2"] } });
+  assert.deepEqual(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: [] } }, known), { ok: true, key: "safe-to-move", value: null }, "an empty list removes the driver");
+  assert.deepEqual(S.parseDriverBody({ key: "safe-to-move", value: null }, known), { ok: true, key: "safe-to-move", value: null });
+  assert.equal(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: ["other"] } }, known).ok, false, "an unknown account");
+  assert.equal(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: [7] } }, known).ok, false);
+  assert.equal(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: "acct1" } }, known).ok, false);
+  assert.equal(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: ["acct1"], extra: 1 } }, known).ok, false);
+  assert.equal(S.parseDriverBody({ key: "safe-to-move", value: { leaveOut: Array.from({ length: S.MAX_LEAVE_OUT + 1 }, () => "acct1") } }, known).ok, false);
+  const d = S.driversToInputs([{ key: "settings", value: { bufferCents: 1000 } }, { key: "safe-to-move", value: { leaveOut: ["acct1", 5, "acct2"] } }]);
+  assert.deepEqual(d.settings.safeToMoveLeaveOut, ["acct1", "acct2"]);
+  assert.equal(d.settings.bufferCents, 1000, "the settings driver is untouched");
+  assert.equal("safeToMoveLeaveOut" in S.driversToInputs([{ key: "safe-to-move", value: { leaveOut: [] } }]).settings, false);
+});
+
 test("rows map to engine inputs", () => {
   const p = S.itemRowToPlanned({ id: "i1", label: "Demo", item_date: "2031-01-29", amount_cents: "5000", certainty: "likely", repeat_unit: "month", repeat_every: 2, repeat_count: 3, note: null });
   assert.deepEqual(p, { id: "i1", label: "Demo", date: "2031-01-29", amountCents: 5000, certainty: "likely", repeat: { unit: "month", every: 2, count: 3 }, account: undefined });

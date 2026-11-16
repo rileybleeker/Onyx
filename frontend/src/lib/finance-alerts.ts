@@ -3,7 +3,7 @@
  * over, a 0% promo ending soon, a tax payment due soon. PURE: no I/O. Shown on Today and on the finance pages.
  */
 import type { ForecastResult } from "./cash-forecast";
-import { eligibilityOf } from "./cash-forecast-eligibility";
+import { EXPIRED_REASON, eligibilityOf } from "./cash-forecast-eligibility";
 import type { BudgetsResult } from "./finance-budgets";
 
 export interface MoneyAlert {
@@ -35,11 +35,23 @@ export interface MoneyAlert {
 export interface CashForecastCheck {
   eligible: boolean;
   reasons: string[];
+  /** Stored copy only: when the check stops holding (ISO). cashCheckAt applies it when the answer is served. */
+  validUntil?: string;
 }
 export function cashForecastCheck(forecast: ForecastResult | null): CashForecastCheck | null {
   if (!forecast) return null;
   const e = eligibilityOf(forecast);
-  return { eligible: e.eligible, reasons: e.reasons.slice(0, 3).map((r) => r.text) };
+  return { eligible: e.eligible, reasons: e.reasons.slice(0, 3).map((r) => r.text), ...(e.validUntil ? { validUntil: e.validUntil } : {}) };
+}
+/**
+ * A stored check as Today is told it at `now`: once a balance it counted has turned 48 hours old (validUntil, or a
+ * validUntil that does not parse), it is not eligible. The answer never carries validUntil itself.
+ */
+export function cashCheckAt(check: CashForecastCheck, now: Date): CashForecastCheck {
+  const until = check.validUntil === undefined ? null : Date.parse(check.validUntil);
+  const expired = until !== null && !(Number.isFinite(until) && until > now.getTime());
+  const reasons = expired ? [EXPIRED_REASON.text, ...check.reasons.filter((t) => t !== EXPIRED_REASON.text)].slice(0, 3) : check.reasons;
+  return { eligible: check.eligible && !expired && reasons.length === 0, reasons };
 }
 
 const usd = (cents: number) => `$${Math.round(Math.abs(cents) / 100).toLocaleString("en-US")}`;

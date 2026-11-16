@@ -5,11 +5,12 @@ import { fetchPaged, loadCategoryFixes, serviceClient } from "@/lib/finance-ledg
 import { fixedCategory } from "@/lib/finance-categories";
 import { computeGoals, type GoalRow, type GoalView } from "@/lib/finance-goals";
 import { moveItems, parseMovePlan, type MovePlan } from "@/lib/finance-plan";
-import { forecastCash, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
+import { forecastCash, poolAccountKeys, poolBalanceAt, type ForecastAccount, type ForecastBalance, type ForecastResult, type ForecastTxn } from "@/lib/cash-forecast";
 import { driversToInputs, itemRowToPlanned, type DriverRow, type ItemInput, type ItemRow } from "@/lib/cash-forecast-store";
 import { applyToProfile, hasLevers, scenarioCardPayments, scenarioItems, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import { computeTaxYear, federalMarginalRate, parseTaxProfile, salaryFor, taxCashItems, taxYearsFor, type TaxProfile, type TaxYearResult } from "@/lib/tax-plan";
 import { addDays } from "@/lib/procurement-recurring";
+import { FORECAST } from "@/lib/cash-forecast-config";
 
 /**
  * Server-side reads and writes for the cash forecast (/financials/forecast). SERVICE ROLE ONLY: the finance
@@ -18,6 +19,7 @@ import { addDays } from "@/lib/procurement-recurring";
  */
 
 const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
+const BAL_COLS = "account_key,captured_at,balance_cents,currency,kind";
 const HISTORY_DAYS = 450;
 /** The forecast runs two years ahead; the tax years are picked from the same window. */
 const HORIZON_DAYS = 730;
@@ -101,7 +103,7 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const goalsRead = started(db.from("finance_goals").select("id,name,target_cents,target_date,account_key").is("removed_at", null).order("target_date", { ascending: true }));
     const [acc, bal, txn] = await Promise.all([
       db.from("finance_accounts").select("account_key,institution,account_name,account_type,mask"),
-      fetchPaged((f, t, c) => db.from("finance_balance_snapshots").select("account_key,captured_at,balance_cents,currency,kind", c ? { count: "exact" } : undefined).gte("captured_at", balSince).order("captured_at", { ascending: true }).order("account_key", { ascending: true }).range(f, t), MAX_PAGES),
+      fetchPaged((f, t, c) => db.from("finance_balance_snapshots").select(BAL_COLS, c ? { count: "exact" } : undefined).gte("captured_at", balSince).order("captured_at", { ascending: true }).order("account_key", { ascending: true }).range(f, t), MAX_PAGES),
       fetchPaged((f, t, c) => db.from("finance_transactions").select(TXN_COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), MAX_PAGES),
     ]);
     if (acc.error) return { kind: "error", code: acc.error.code ?? "accounts" };
@@ -109,6 +111,29 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     if (!parsedAccounts.length) return { kind: "empty" };
     const accounts: ForecastAccount[] = parsedAccounts.map((a) => ({ account_key: a.account_key, account_type: a.account_type, label: accountLabel(a) }));
     const balances: ForecastBalance[] = bal.rows.map(parseBalance).filter((b): b is NonNullable<typeof b> => !!b);
+    // A cash account with no balance in the 60-day read (one the feed no longer refreshes, or a closed one): its
+    // newest snapshot when it is SMALL, so the engine leaves it out of safe to move and names it instead of
+    // withholding the amount for good (a small account that rarely updates). A larger one stays missing: the
+    // projection keeps counting it as $0 (as before) and the amount stays withheld until Riley leaves it out. One
+    // limit-1 read per such account, only when there is one; a failed read leaves it missing. Forecast only: goals
+    // keep the 60-day balances.
+    const seen = new Set(bal.rows.map((r) => (r as { account_key?: unknown }).account_key));
+    const unseen = poolAccountKeys(accounts).filter((k) => !seen.has(k));
+    const older: ForecastBalance[] = [];
+    if (unseen.length) {
+      const reads = await Promise.all(
+        unseen.map((k) =>
+          Promise.resolve(db.from("finance_balance_snapshots").select(BAL_COLS).eq("account_key", k).order("captured_at", { ascending: false }).limit(1)).catch(() => null),
+        ),
+      );
+      for (const res of reads) {
+        if (!res || res.error) continue;
+        for (const raw of res.data ?? []) {
+          const b = parseBalance(raw);
+          if (b && Number.isFinite(b.balance_cents) && Math.abs(b.balance_cents) < FORECAST.smallBalanceCents) older.push(b);
+        }
+      }
+    }
     const fixes = await fixesRead;
     const txns: ForecastTxn[] = [];
     for (const raw of txn.rows) {
@@ -151,8 +176,8 @@ export async function loadForecast(now: Date = new Date(), levers: ScenarioParam
     const manual = itemRows.map(itemRowToPlanned);
     // What the reads could not deliver: each withholds the safe-to-move amount in the base plan AND the what-if,
     // because both are computed from this one input (result.eligibility, lib/cash-forecast.ts).
-    const quality = { historyTruncated: bal.truncated || txn.truncated, planUnavailable: setupPending };
-    const baseInput = { today, now, accounts, txns, balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS }, quality };
+    const quality = { historyTruncated: bal.truncated || txn.truncated, planUnavailable: setupPending, categoriesUnavailable: fixes.failed === true };
+    const baseInput = { today, now, accounts, txns, balances: older.length ? [...balances, ...older] : balances, cardTerms, growth, settings: { ...settings, horizonDays: HORIZON_DAYS }, quality };
     const basePlanned = [...manual, ...(move ? moveItems(move) : []), ...(profile ? taxCashItems(profile, tax, today) : [])];
     let result = forecastCash({ ...baseInput, planned: basePlanned, adjustments: savedAdjust });
     // Annual raise: the paycheck stream grows each January (net pay scaled with gross; a planning approximation).

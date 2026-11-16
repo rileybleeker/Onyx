@@ -21,15 +21,16 @@ const PROFILE = {
   estimatesPaid: [],
 };
 
-// Every table the loader reads; each query resolves to the table's rows (filters are not needed here). A table in
+// Every table the loader reads; each query resolves to the table's rows (filters are not needed here, except on the
+// balance snapshots: gte / eq / order / limit, so the 60-day read and the newest-snapshot read differ). A table in
 // `failing` answers a database error instead.
-function fakeDb(now, { profile = PROFILE, txns = [], failing = [] } = {}) {
+function fakeDb(now, { profile = PROFILE, txns = [], failing = [], accounts = [], balances = [], drivers = [] } = {}) {
   const tables = {
-    finance_accounts: [{ account_key: "demo-checking", institution: "Demo Bank", account_name: "Checking", account_type: "Cash", mask: "0001" }],
-    finance_balance_snapshots: [{ account_key: "demo-checking", captured_at: new Date(now.getTime() - 3_600_000).toISOString(), balance_cents: 5_000_000, currency: "USD", kind: "asset" }],
+    finance_accounts: [{ account_key: "demo-checking", institution: "Demo Bank", account_name: "Checking", account_type: "Cash", mask: "0001" }, ...accounts],
+    finance_balance_snapshots: [{ account_key: "demo-checking", captured_at: new Date(now.getTime() - 3_600_000).toISOString(), balance_cents: 5_000_000, currency: "USD", kind: "asset" }, ...balances],
     finance_transactions: txns,
     finance_plan_items: [],
-    finance_plan_drivers: profile ? [{ key: "tax", value: profile }] : [],
+    finance_plan_drivers: [...(profile ? [{ key: "tax", value: profile }] : []), ...drivers],
     finance_forecast_snapshots: [],
     finance_goals: [],
     finance_category_rules: [],
@@ -38,10 +39,25 @@ function fakeDb(now, { profile = PROFILE, txns = [], failing = [] } = {}) {
   return {
     from(table) {
       assert.ok(table in tables, `unexpected table ${table}`);
-      const rows = tables[table];
-      const answer = failing.includes(table) ? { data: null, error: { code: "57014", message: "synthetic failure" }, count: null } : { data: rows, error: null, count: rows.length };
+      const calls = [];
+      const rowsNow = () => {
+        let rows = tables[table];
+        if (table !== "finance_balance_snapshots") return rows;
+        for (const [k, a] of calls) {
+          if (k === "gte") rows = rows.filter((r) => r[a[0]] >= a[1]);
+          else if (k === "eq") rows = rows.filter((r) => r[a[0]] === a[1]);
+          else if (k === "order") rows = [...rows].sort((x, y) => (x[a[0]] < y[a[0]] ? -1 : x[a[0]] > y[a[0]] ? 1 : 0) * (a[1]?.ascending === false ? -1 : 1));
+          else if (k === "limit") rows = rows.slice(0, a[0]);
+        }
+        return rows;
+      };
+      const answer = () => {
+        if (failing.includes(table)) return { data: null, error: { code: "57014", message: "synthetic failure" }, count: null };
+        const rows = rowsNow();
+        return { data: rows, error: null, count: rows.length };
+      };
       const b = new Proxy({}, {
-        get: (_, k) => (k === "then" ? (res, rej) => Promise.resolve(answer).then(res, rej) : () => b),
+        get: (_, k) => (k === "then" ? (res, rej) => Promise.resolve(answer()).then(res, rej) : (...a) => (calls.push([k, a]), b)),
       });
       return b;
     },
@@ -57,7 +73,7 @@ function loader(opts) {
         const r = await build(0, 999, true);
         return { rows: r.data ?? [], truncated: !!opts?.truncated };
       },
-      loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map() }),
+      loadCategoryFixes: async () => ({ rules: new Map(), overrides: new Map(), ...(opts?.fixesFailed ? { failed: true } : {}) }),
     },
   });
   return async (iso, levers) => {
@@ -158,7 +174,8 @@ const AT = "2026-11-14T17:00:00Z";
 test("complete, fresh reads: the base plan and the what-if both carry an amount, from the same gate", async () => {
   const load = await loader({ txns: everyday(AT) })(AT, { otherIncome: 6_000 });
   assert.equal(load.setupPending, false);
-  assert.deepEqual(load.result.eligibility, { eligible: true, reasons: [] });
+  assert.equal(load.result.eligibility.eligible, true);
+  assert.deepEqual(load.result.eligibility.reasons, []);
   assert.equal(typeof load.result.headlines.safeToMoveCents, "number");
   assert.deepEqual(load.scenario.result.eligibility, load.result.eligibility, "the what-if reads the same inputs");
   assert.equal(typeof load.scenario.result.headlines.safeToMoveCents, "number");
@@ -203,4 +220,32 @@ test("a balance older than 48 hours at load time: no amount until the next sync"
   assert.equal(stale.kind, "ok");
   assert.deepEqual(stale.result.eligibility.reasons.map((r) => r.code), ["stale-balance"]);
   assert.equal(stale.result.headlines.safeToMoveCents, null);
+});
+
+test("category fixes that could not be read: no amount in the base plan or the what-if", async () => {
+  const load = await loader({ txns: everyday(AT), fixesFailed: true })(AT, { otherIncome: 6_000 });
+  assert.deepEqual(load.result.eligibility.reasons.map((r) => r.code), ["categories-unavailable"]);
+  assert.equal(load.result.headlines.safeToMoveCents, null);
+  assert.deepEqual(load.scenario.result.eligibility.reasons.map((r) => r.code), ["categories-unavailable"]);
+});
+
+test("a cash account the feed stopped refreshing: a small one is left out and named, a larger one waits for Riley", async () => {
+  const wallet = { account_key: "demo-wallet", institution: "Demo Pay", account_name: "Wallet", account_type: "Cash", mask: "0002" };
+  const old = (cents) => ({ account_key: "demo-wallet", captured_at: new Date(Date.parse(AT) - 90 * 86_400_000).toISOString(), balance_cents: cents, currency: "USD", kind: "asset" });
+  // Small: its newest snapshot (outside the 60-day read) is read on its own; the amount leaves it out and names it.
+  const small = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(4_000)] })(AT);
+  assert.equal(small.result.eligibility.eligible, true);
+  assert.deepEqual(small.result.eligibility.leftOut.map((l) => [l.account, l.why]), [["demo-wallet", "small"]]);
+  assert.equal(small.result.opening.cents, 5_004_000, "the projection counts its last balance");
+  assert.equal(typeof small.result.headlines.safeToMoveCents, "number");
+  // Larger: it stays missing (the projection counts it as $0) and withholds the amount, naming the account.
+  const large = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(400_000)] })(AT);
+  assert.deepEqual(large.result.eligibility.reasons.map((r) => [r.code, r.account]), [["missing-balance", "demo-wallet"]]);
+  assert.equal(large.result.opening.cents, 5_000_000);
+  assert.equal(large.result.headlines.safeToMoveCents, null);
+  // Riley leaves it out (driver "safe-to-move"): the amount comes back, the account is named as left out.
+  const chosen = await loader({ txns: everyday(AT), accounts: [wallet], balances: [old(400_000)], drivers: [{ key: "safe-to-move", value: { leaveOut: ["demo-wallet"] } }] })(AT);
+  assert.equal(chosen.result.eligibility.eligible, true);
+  assert.deepEqual(chosen.result.eligibility.leftOut.map((l) => [l.account, l.why, l.asOf]), [["demo-wallet", "chosen", null]]);
+  assert.equal(typeof chosen.result.headlines.safeToMoveCents, "number");
 });

@@ -146,9 +146,10 @@ async function heartbeat(db: Db, dataType: string): Promise<Record<string, unkno
 
 /**
  * Category fixes Riley made (merchant rules, one-off overrides). Fail-open: a missing table or a failed read
- * shows the source categories, never an error page.
+ * shows the source categories, never an error page. `failed` (optional, so other callers are unaffected) says a
+ * read failed for another reason than a missing table: the cash forecast withholds its safe-to-move amount then.
  */
-export async function loadCategoryFixes(db: Db): Promise<CategoryFixes> {
+export async function loadCategoryFixes(db: Db): Promise<CategoryFixes & { failed?: boolean }> {
   let rules: { data: unknown[] | null; error: unknown };
   let overrides: { data: unknown[] | null; error: unknown };
   try {
@@ -157,13 +158,17 @@ export async function loadCategoryFixes(db: Db): Promise<CategoryFixes> {
       db.from("finance_txn_categories").select("txn_key,category"),
     ]);
   } catch {
-    return NO_FIXES;
+    return { ...NO_FIXES, failed: true };
   }
-  if (rules.error && overrides.error) return NO_FIXES;
-  return {
+  // A missing table (migration not applied) means no fixes were ever saved: the source categories are right.
+  const realError = (e: unknown) => !!e && !["42P01", "PGRST205"].includes(String((e as { code?: unknown }).code ?? ""));
+  const failed = realError(rules.error) || realError(overrides.error);
+  if (rules.error && overrides.error) return failed ? { ...NO_FIXES, failed } : NO_FIXES;
+  const fixes: CategoryFixes = {
     rules: new Map(((rules.data ?? []) as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
     overrides: new Map(((overrides.data ?? []) as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
   };
+  return failed ? { ...fixes, failed } : fixes;
 }
 
 export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Promise<LedgerLoad> {

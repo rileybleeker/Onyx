@@ -25,8 +25,10 @@ test("parse: the route's answer, older answers without metadata, junk rejected",
 });
 
 test("panel: alerts, or an unverified 'nothing to act on'; a current empty answer shows nothing", () => {
-  const v = (over) => ({ alerts: [], asOf: hoursAgo(5), updating: false, partial: null, refreshFailed: false, ...over });
+  const v = (over) => ({ alerts: [], asOf: hoursAgo(5), updating: false, partial: null, refreshFailed: false, cash: null, ...over });
   assert.equal(V.showMoneyPanel(null), false);
+  // A view built before the cash check existed (no `cash` field at all) is read the same as cash: null.
+  assert.equal(V.showMoneyPanel({ alerts: [], asOf: hoursAgo(5), updating: false, partial: null, refreshFailed: false }), false);
   assert.equal(V.showMoneyPanel(v({})), false);
   assert.equal(V.showMoneyPanel(v({ updating: true })), false, "the follow-up lands in seconds");
   assert.equal(V.showMoneyPanel(v({ updating: true, refreshFailed: true })), true, "an older empty answer that could not be updated");
@@ -36,7 +38,7 @@ test("panel: alerts, or an unverified 'nothing to act on'; a current empty answe
 });
 
 test("note: says how old an answer is, and when it could not be brought up to date", () => {
-  const v = (over) => ({ alerts: [alert], asOf: hoursAgo(5), updating: false, partial: null, refreshFailed: false, ...over });
+  const v = (over) => ({ alerts: [alert], asOf: hoursAgo(5), updating: false, partial: null, refreshFailed: false, cash: null, ...over });
   assert.equal(V.moneyNote(v({}), NOW), null, "current and complete");
   assert.deepEqual(V.moneyNote(v({ updating: true }), NOW), { text: "From the check 5 h ago. Updating...", tone: "muted" });
   assert.deepEqual(V.moneyNote(v({ updating: true, refreshFailed: true }), NOW), { text: "Couldn't refresh: these are from the check 5 h ago and may have changed.", tone: "warn" });

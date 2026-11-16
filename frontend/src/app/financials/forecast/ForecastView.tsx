@@ -85,6 +85,26 @@ export default function ForecastView({
   const buffer = Number((drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0);
   // Safe to move: an amount only when the inputs were complete and fresh (result.eligibility), else the reasons.
   const safe = safeToMoveTile(result, buffer);
+  // Pool accounts Riley left out of the amount (driver "safe-to-move"): an account the feed no longer refreshes would
+  // otherwise withhold it for good. Leaving one out takes its balance out of the amount; the projection keeps it.
+  const leaveOut = (() => {
+    const v = (drivers.find((d) => d.key === "safe-to-move")?.value as { leaveOut?: unknown } | undefined)?.leaveOut;
+    return Array.isArray(v) ? v.filter((a): a is string => typeof a === "string") : [];
+  })();
+  const setLeftOut = (account: string, out: boolean) => {
+    const next = out ? [...leaveOut.filter((a) => a !== account), account] : leaveOut.filter((a) => a !== account);
+    return run(() => send("/api/finance/forecast/drivers", "PUT", { key: "safe-to-move", value: next.length ? { leaveOut: next } : null }));
+  };
+  const reasonItem = (r: { text: string; account?: string }) => (
+    <li key={r.text}>
+      {r.text}
+      {r.account && (
+        <button type="button" className="ml-1 underline disabled:opacity-50" disabled={busy} onClick={() => void setLeftOut(r.account as string, true)}>
+          Leave it out
+        </button>
+      )}
+    </li>
+  );
 
   const run = async (fn: () => Promise<string | null>) => {
     setBusy(true);
@@ -151,13 +171,32 @@ export default function ForecastView({
                 <>
                   <p className="text-xl font-semibold text-mid">Not available</p>
                   <ul className="mt-1 space-y-0.5 text-[12px] text-mid" aria-label="Why there is no amount">
-                    {safe.reasons.map((r) => (
-                      <li key={r}>{r}</li>
-                    ))}
-                    {safe.more > 0 && <li>{`and ${safe.more} more (see the warnings)`}</li>}
+                    {safe.reasons.map(reasonItem)}
+                    {safe.more.length > 0 && (
+                      <li>
+                        <details>
+                          <summary className="cursor-pointer">{`${safe.more.length} more`}</summary>
+                          <ul className="mt-0.5 space-y-0.5">{safe.more.map(reasonItem)}</ul>
+                        </details>
+                      </li>
+                    )}
                   </ul>
                   <p className="mt-1 text-[12px] text-text-secondary">The projection below is an estimate.</p>
                 </>
+              )}
+              {safe.leftOut.length > 0 && (
+                <ul className="mt-1 space-y-0.5 text-[12px] text-text-secondary" aria-label="Accounts not counted in this amount">
+                  {safe.leftOut.map((l) => (
+                    <li key={l.account}>
+                      {l.text}
+                      {l.chosen && (
+                        <button type="button" className="ml-1 underline disabled:opacity-50" disabled={busy} onClick={() => void setLeftOut(l.account, false)}>
+                          Count it again
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
               )}
               {safe.asOf && <p className="mt-1 text-[12px] text-text-tertiary">Cash as of {safe.asOf}</p>}
             </div>

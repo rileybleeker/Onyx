@@ -58,7 +58,7 @@ export function parseMoneyAnswer(data: unknown): MoneyView {
 /** The panel is shown when there is something to act on, or when "nothing to act on" is not verified. */
 export function showMoneyPanel(v: MoneyView | null): boolean {
   if (!v) return false;
-  return v.alerts.length > 0 || v.partial !== null || (v.updating && v.refreshFailed) || (v.cash !== null && !v.cash.eligible);
+  return v.alerts.length > 0 || v.partial !== null || (v.updating && v.refreshFailed) || (!!v.cash && !v.cash.eligible);
 }
 
 function age(iso: string | null, now: Date): string {

@@ -287,3 +287,22 @@ test("every read lists its columns - none selects everything", async () => {
     assert.ok(c.cols && c.cols !== "*" && !c.cols.includes("*"), `${c.table}: ${c.cols}`);
   }
 });
+
+test("category fixes: a missing table means no fixes; any other failed read is reported (the forecast withholds its amount)", async () => {
+  const S = load(makeDb(base));
+  const fake = (answers) => ({ from: (t) => ({ select: () => (answers[t] instanceof Error ? Promise.reject(answers[t]) : Promise.resolve(answers[t])) }) });
+  const ok = (rows) => ({ data: rows, error: null });
+  const err = (code) => ({ data: null, error: { code, message: "synthetic" } });
+  const both = await S.loadCategoryFixes(fake({ finance_category_rules: ok([{ merchant_key: "demo", category: "Fun" }]), finance_txn_categories: ok([{ txn_key: "t1", category: "Groceries" }]) }));
+  assert.equal(both.rules.get("demo"), "Fun");
+  assert.equal(both.overrides.get("t1"), "Groceries");
+  assert.equal(both.failed, undefined);
+  const missing = await S.loadCategoryFixes(fake({ finance_category_rules: err("42P01"), finance_txn_categories: err("PGRST205") }));
+  assert.equal(missing.failed, undefined, "a migration not applied yet is not a failure");
+  assert.equal(missing.rules.size + missing.overrides.size, 0);
+  const oneFailed = await S.loadCategoryFixes(fake({ finance_category_rules: err("57014"), finance_txn_categories: ok([{ txn_key: "t1", category: "Groceries" }]) }));
+  assert.equal(oneFailed.failed, true, "half the fixes is not all of them");
+  assert.equal(oneFailed.overrides.get("t1"), "Groceries", "what was read is still used");
+  assert.equal((await S.loadCategoryFixes(fake({ finance_category_rules: err("42P01"), finance_txn_categories: err("57014") }))).failed, true);
+  assert.equal((await S.loadCategoryFixes(fake({ finance_category_rules: new Error("network"), finance_txn_categories: ok([]) }))).failed, true);
+});

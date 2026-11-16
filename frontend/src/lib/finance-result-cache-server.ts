@@ -4,7 +4,8 @@ import { etDate } from "@/lib/format";
 import { serviceClient } from "@/lib/finance-ledger-server";
 import { loadForecast, type ForecastLoad } from "@/lib/cash-forecast-server";
 import { loadBudgets, type BudgetsLoad } from "@/lib/finance-budgets-server";
-import { cashForecastCheck, moneyAlerts, type CashForecastCheck, type MoneyAlert } from "@/lib/finance-alerts";
+import { cashCheckAt, cashForecastCheck, moneyAlerts, type CashForecastCheck, type MoneyAlert } from "@/lib/finance-alerts";
+import { asOfNow } from "@/lib/cash-forecast-eligibility";
 import { loadDetectedSubscriptions } from "@/lib/procurement-recurring-server";
 import { parseRenewalsAhead, renewalsAhead, type RenewalsAhead } from "@/lib/procurement-renewals";
 import { INPUTS_KEY, cacheBuild, decide, jsonSafe, parseAlertsBody, parseLoadBody, parseRow, type ResultKey, type StoredRow } from "@/lib/finance-result-cache";
@@ -209,7 +210,10 @@ export async function cachedMoneyAlerts(now: Date, mode: ServeMode = "stale-ok")
     mode,
   );
   if (!served) return null;
-  const { status, alerts, partial, cash } = served.value;
+  const { status, alerts, partial } = served.value;
+  // The stored check as of this request: a balance that turned 48 hours old since it was computed (up to an hour
+  // in the fresh window, longer when a refresh failed) makes it not eligible.
+  const cash = served.value.cash ? cashCheckAt(served.value.cash, now) : null;
   return { status, alerts, ...(cash ? { cash } : {}), asOf: served.computedAt, ...(served.stale ? { updating: true as const } : {}), ...(partial ? { partial } : {}) };
 }
 
@@ -239,6 +243,17 @@ export async function cachedRenewalsAheadWithAge(now: Date, mode: ServeMode = "s
   );
 }
 
+/**
+ * A forecast load as of `now`: a stored one keeps its safe-to-move amount only while every balance it counted is
+ * still under 48 hours old (eligibility.validUntil); past that, the base plan and the what-if both withhold it.
+ */
+export function forecastLoadAt(load: ForecastLoad, now: Date): ForecastLoad {
+  if (load.kind !== "ok") return load;
+  const result = asOfNow(load.result, now);
+  const scenario = load.scenario ? { ...load.scenario, result: asOfNow(load.scenario.result, now) } : null;
+  return result === load.result && scenario?.result === load.scenario?.result ? load : { ...load, result, scenario };
+}
+
 /** /financials/forecast without what-if levers. */
 export async function cachedForecast(now: Date): Promise<ForecastLoad> {
   const load = await serveStored<ForecastLoad>(
@@ -251,7 +266,7 @@ export async function cachedForecast(now: Date): Promise<ForecastLoad> {
     parseLoadBody<ForecastLoad>,
     "fresh-only",
   );
-  return load ?? { kind: "error", code: "unknown" };
+  return load ? forecastLoadAt(load, now) : { kind: "error", code: "unknown" };
 }
 
 /** /financials/budgets. */

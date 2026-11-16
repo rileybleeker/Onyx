@@ -327,7 +327,7 @@ test("the alerts answer carries the cash forecast's input check, and the stored 
   const first = await h.S.cachedMoneyAlerts(NOW);
   assert.deepEqual(first.cash, { eligible: true, reasons: [] });
   await h.drain();
-  assert.deepEqual(h.db.rows.get("alerts").body.cash, { eligible: true, reasons: [] }, "stored with the alerts");
+  assert.deepEqual(h.db.rows.get("alerts").body.cash, { eligible: true, reasons: [], validUntil: fresh.eligibility.validUntil }, "stored with the alerts, and when it stops holding");
   assert.deepEqual(await h.S.cachedMoneyAlerts(addMs(NOW, 60_000)), first, "served from the stored row, same check");
 
   // The same ledger read three days later with no new balance: Today is told the forecast is incomplete.
@@ -346,6 +346,40 @@ test("the alerts answer carries the cash forecast's input check, and the stored 
   // A failed forecast is `partial`, not a cash check.
   const failed = await harness({ forecast: { kind: "error", code: "57014" }, budgets: { kind: "empty" } }).S.cachedMoneyAlerts(NOW);
   assert.deepEqual([failed.partial, "cash" in failed], ["forecast", false]);
+});
+
+test("a stored forecast and Today's check stop offering an amount once a counted balance turns 48 hours old", async () => {
+  const HOUR = 3_600_000;
+  const forecastLoad = (result) => ({ kind: "ok", result, items: [], drivers: [], accounts: [], setupPending: false, profile: null, tax: [], scenario: { params: {}, result, tax: [] }, saved: [], accuracy: [], goals: [], move: null });
+  // Computed 47.5 hours after the synthetic balance: the check holds 30 more minutes, inside the fresh window.
+  const at = new Date(Date.parse("2030-06-15T06:00:00Z") + 47.5 * HOUR);
+  const result = synthForecast(at);
+  assert.equal(result.eligibility.eligible, true);
+  assert.equal(result.eligibility.validUntil, "2030-06-17T06:00:00.000Z");
+  const h = harness({ forecast: forecastLoad(result), budgets: { kind: "empty" } });
+  const first = await h.S.cachedForecast(at);
+  assert.equal(typeof first.result.headlines.safeToMoveCents, "number");
+  await h.drain();
+  // 45 minutes on: the stored load is still fresh (not recomputed), but its check no longer holds.
+  const later = addMs(at, 45 * 60_000);
+  const served = await h.S.cachedForecast(later);
+  assert.equal(h.calls.forecast, 1, "served from the stored row");
+  assert.equal(served.result.headlines.safeToMoveCents, null);
+  assert.equal(served.result.eligibility.eligible, false);
+  assert.equal(served.result.eligibility.reasons[0].code, "stale-balance");
+  assert.equal(served.scenario.result.headlines.safeToMoveCents, null, "the what-if agrees");
+  assert.equal(typeof h.db.rows.get("forecast").body.result.headlines.safeToMoveCents, "number", "the stored row itself is not rewritten");
+  // Today at the same two moments.
+  assert.deepEqual((await h.S.cachedMoneyAlerts(at)).cash, { eligible: true, reasons: [] });
+  await h.drain();
+  const laterAlerts = await h.S.cachedMoneyAlerts(later);
+  assert.equal(laterAlerts.cash.eligible, false);
+  assert.match(laterAlerts.cash.reasons[0], /gone stale/);
+  assert.equal("validUntil" in laterAlerts.cash, false, "the answer carries only the verdict");
+  // An older answer served while its refresh is pending (or after a refresh failed) is not eligible either.
+  const dayLater = await h.S.cachedMoneyAlerts(addMs(at, 26 * HOUR));
+  assert.equal(dayLater.updating, true);
+  assert.equal(dayLater.cash.eligible, false);
 });
 
 test("an older stored answer is marked updating with the time it was computed; fresh-only computes before answering", async () => {
