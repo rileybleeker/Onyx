@@ -899,7 +899,7 @@ test.describe("Capture carryovers — read-only opening", () => {
             // Compare private data inside the browser; only the boolean leaves this evaluation.
             listMatchesApi = await page.evaluate(async () => {
               const response = await fetch("/api/reading/list", { cache: "no-store" });
-              if (!response.ok()) return false;
+              if (!response.ok) return false;
               const value = await response.json();
               if (!Array.isArray(value.items)) return false;
               const rows = Array.from(document.querySelectorAll('[data-testid="reading-want-list"] [data-testid="want-to-read-item"]'));
