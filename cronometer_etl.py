@@ -13,11 +13,12 @@ unchanged. A rolling re-fetch self-heals edits/deletes made in the app.
 This is the one caller that passes run_import the window it requested: a day
 inside it that has no food any more (its last entry removed in Cronometer) is
 emptied in Onyx too, but only when the export passes the importer's
-completeness check, a second such export at least 6 h after the first that
-showed the day empty still does (the twice-daily runs are 10.5 and 13.5 h
-apart), and at most --max-empty-days stored days per run (a bigger change is
-refused with a partial heartbeat). A failed login or export never reaches the
-importer, so it changes nothing. --no-empty-days (or the env var
+completeness check, the day lies between two days that still have food in the
+same export (so the export shows it covered that date), a second such export at
+least 6 h after the first that showed the day empty still does (the twice-daily
+runs are 10.5 and 13.5 h apart), and at most --max-empty-days stored days per run
+(a bigger change is refused with a partial heartbeat). A failed login or export
+never reaches the importer, so it changes nothing. --no-empty-days (or the env var
 CRONOMETER_EMPTY_DAYS=off) turns this off: the run then imports exactly as a
 manual export does (nothing emptied, no completeness check).
 

@@ -4,12 +4,14 @@ The date-set replace (pds.replace_cronometer_servings) only touches dates that
 have rows in an export, so a day whose last food was removed in Cronometer kept
 its old servings and daily total in Onyx. The automated export now passes the
 window it requested; run_import checks the export is the whole window
-(check_trusted_export: well formed, inside the window, per-day sums equal the
-daily totals) and pds.replace_cronometer_servings_window writes the servings and
-daily totals in one transaction and empties the window's inner days that have no
-food, on a second look at least 6 h after the first, with a backup copy and a
-per-run limit. Manual imports write servings and daily totals in one call too
-(pds.replace_cronometer_servings_and_daily) and never empty a day.
+(check_trusted_export: well formed, inside the window, every nutrient cell blank
+or a number, per-day sums equal the daily totals) and
+pds.replace_cronometer_servings_window writes the servings and daily totals in one
+transaction and empties the days without food that lie between two days with food
+in the same export, on a second look at least 6 h after the first, with a backup
+copy and a per-run limit. Manual imports write servings and daily totals in one
+call too (pds.replace_cronometer_servings_and_daily), never empty a day, and start
+the empty-day count of every day they write over.
 
 Everything is faked: no network, no database, no credentials, synthetic rows
 only. FakeDB applies the SQL functions' contracts the way Postgres does
@@ -158,6 +160,9 @@ class FakeDB:
             raise bad("date(s) but no rows; this function never empties a day")
         if not rows and not drows:
             raise bad("no rows; nothing to do")
+        # every date this import writes starts its empty-day count over
+        for d in set(dates) | {r.get("calendar_date") for r in drows}:
+            self.candidates.pop(d, None)
         out = {"dates": 0, "deleted": 0, "inserted": 0}
         if rows:
             out = self._legacy({"p_dates": dates, "p_rows": rows})
@@ -189,6 +194,10 @@ class FakeDB:
             raise bad("a date in p_empty_dates has a row in p_daily_rows")
         if not s_empty <= set(ddates):
             raise bad("a date in p_servings_empty_dates has no row in p_daily_rows")
+        # coverage: food on both sides of every empty date, in this export
+        first, last = (min(dates), max(dates)) if dates else (None, None)
+        if any(first is None or not (first < d < last) for d in empty | s_empty):
+            raise bad("an empty date does not lie strictly between the first and last date of p_dates")
         # 5. a day with food in this export starts its count over
         for d in (set(dates) | set(ddates)) - s_empty:
             self.candidates.pop(d, None)
@@ -466,15 +475,15 @@ def test_authoritative_empty_day_removes_that_day_only() -> None:
     assert backed == [("cronometer_nutrition_daily", "2030-01-05"), ("cronometer_servings", "2030-01-05")]
     assert all(c["window_start"] == "2030-01-01" and c["window_end"] == "2030-01-10" for c in db.cleared)
     assert db.cleared[0]["row_data"]["calendar_date"] == "2030-01-05"
-    # One call per run, one transaction, daily totals included; the inner food-less
-    # days were passed but held nothing; the first and last day are never passed.
+    # One call per run, one transaction, daily totals included. Only the food-less
+    # days between the first and last day with food (01-02, 01-07) were passed (the
+    # others held nothing); the days after the newest day with food never are.
     calls = _calls(db, WINDOW_FN)
     assert len(db.rpc_calls) == 2 and len(calls) == 2 and db.direct_daily_upserts == 0
     p = calls[1]
     assert p["p_dates"] == ["2030-01-02", "2030-01-07"]
     assert [r["calendar_date"] for r in p["p_daily_rows"]] == ["2030-01-02", "2030-01-07"]
-    assert p["p_empty_dates"] == ["2030-01-03", "2030-01-04", "2030-01-05", "2030-01-06",
-                                  "2030-01-08", "2030-01-09"], p["p_empty_dates"]
+    assert p["p_empty_dates"] == ["2030-01-03", "2030-01-04", "2030-01-05", "2030-01-06"], p["p_empty_dates"]
     assert p["p_servings_empty_dates"] == [] and p["p_max_cleared_days"] == ci.DEFAULT_MAX_EMPTY_DAYS
     # The removal leaves a counts-only note on the servings heartbeat, which /status does
     # not show; the daily heartbeat (the Cronometer card) stays a clean success.
@@ -520,15 +529,17 @@ def test_one_run_is_one_look_even_when_both_files_miss_the_same_day() -> None:
 
 
 def test_moving_the_last_serving_to_another_day_converges_and_a_retry_is_a_no_op() -> None:
-    db = FakeDB([_srow("2030-01-03", "test bar")], [_drow("2030-01-03", 100.0)])
+    around = [("2030-01-02", "test oats", 100.0), ("2030-01-06", "test soup", 100.0)]
+    db = FakeDB([_srow("2030-01-02", "test oats"), _srow("2030-01-03", "test bar"), _srow("2030-01-06", "test soup")],
+                [_drow("2030-01-02", 100.0), _drow("2030-01-03", 100.0), _drow("2030-01-06", 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
-        paths = _export(tmp, [("2030-01-04", "test bar", 100.0)])      # moved one day later
+        paths = _export(tmp, around + [("2030-01-04", "test bar", 100.0)])      # moved one day later
         _run(db, paths, window=WINDOW)
         assert _names(db, "2030-01-04") == ["test bar"] and _names(db, "2030-01-03") == ["test bar"]
         db.advance(LATER)
         _run(db, paths, window=WINDOW)
         state = (_names(db, "2030-01-03"), _names(db, "2030-01-04"), sorted(db.daily))
-        assert state == ([], ["test bar"], ["2030-01-04"]), state
+        assert state == ([], ["test bar"], ["2030-01-02", "2030-01-04", "2030-01-06"]), state
         n_backup = len(db.cleared)
         # A retry (same export, e.g. the next scheduled run) changes nothing more.
         db.advance(LATER)
@@ -567,8 +578,9 @@ def test_daily_totals_ride_in_the_same_transaction_as_the_servings() -> None:
     daily total back after a newer import emptied it. Each automated import is ONE
     call, so whatever order imports land in, a day's servings and its daily row
     always come from the same import."""
-    older = [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0)]
-    newer = [("2030-01-02", "test oats", 100.0)]                    # 2030-01-05 emptied upstream
+    older = [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0),
+             ("2030-01-07", "test soup", 100.0)]
+    newer = [("2030-01-02", "test oats", 100.0), ("2030-01-07", "test soup", 100.0)]   # 01-05 emptied upstream
     for sequence in ((newer, "later", newer, older), (older, newer, "later", newer, older),
                      (newer, "later", older, newer)):
         servings, daily = _stored()
@@ -587,11 +599,11 @@ def test_listed_day_with_no_food_loses_its_servings_and_keeps_the_exported_daily
     # Cronometer can still list an emptied day in the daily summary (a non-food entry,
     # a day marked completed) with every nutrient at zero. Its servings go; its daily
     # row is rewritten from the export in the same transaction.
-    db = FakeDB([_srow("2030-01-02", "test oats"), _srow("2030-01-05", "test rice")],
-                [_drow("2030-01-02", 100.0), _drow("2030-01-05", 100.0)])
+    db = FakeDB([_srow("2030-01-02", "test oats"), _srow("2030-01-05", "test rice"), _srow("2030-01-07", "test soup")],
+                [_drow("2030-01-02", 100.0), _drow("2030-01-05", 100.0), _drow("2030-01-07", 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
-        paths = _export(tmp, [("2030-01-02", "test oats", 100.0)],
-                        daily=[("2030-01-02", 100.0), ("2030-01-05", 0.0)])
+        paths = _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-07", "test soup", 100.0)],
+                        daily=[("2030-01-02", 100.0), ("2030-01-05", 0.0), ("2030-01-07", 100.0)])
         _two_looks(db, paths, window=WINDOW)
         p = _calls(db, WINDOW_FN)[-1]
         assert p["p_servings_empty_dates"] == ["2030-01-05"] and "2030-01-05" not in p["p_empty_dates"]
@@ -626,26 +638,31 @@ def test_zero_calorie_day_with_water_or_caffeine_is_not_empty() -> None:
             _two_looks(db, [spath, dpath], window=WINDOW)
         assert _names(db, "2030-01-05") == ["test drink"] and db.cleared == [], drink
         assert db.candidates == {} and _hb(db)["servings"]["status"] == "partial"
-    # A day whose every nutrient is zero is still a day with no food.
+    # A day whose every nutrient is zero is still a day with no food (food on both sides).
     with tempfile.TemporaryDirectory() as tmp:
-        spath = _write(tmp, "servings.csv", [header_s, "2030-01-02,8:00 AM,Breakfast,test oats,1.00 g,100,1,0,0"])
+        spath = _write(tmp, "servings.csv", [header_s, "2030-01-02,8:00 AM,Breakfast,test oats,1.00 g,100,1,0,0",
+                                             "2030-01-07,8:00 AM,Breakfast,test soup,1.00 g,100,1,0,0"])
         dpath = _write(tmp, "dailysummary.csv", [header_d, "2030-01-02,Total,100,1,0,0,false",
-                                                 "2030-01-05,Total,0,0,0,0,true"])
+                                                 "2030-01-05,Total,0,0,0,0,true",
+                                                 "2030-01-07,Total,100,1,0,0,false"])
         assert ci.check_trusted_export(WINDOW, spath, dpath).servings_empty_dates == ("2030-01-05",)
 
 
 def test_first_and_last_day_of_the_window_are_never_emptied() -> None:
     # Nothing has checked that Cronometer's start and end are inclusive; an edge day
     # missing from the export proves nothing (it is an inner day of a neighbouring run).
+    # An edge day can never have food on both sides inside the window, so it is never offered.
     db = FakeDB([_srow("2030-01-01", "test first"), _srow("2030-01-10", "test last"),
-                 _srow("2030-01-05", "test rice")],
-                [_drow("2030-01-01", 100.0), _drow("2030-01-10", 100.0), _drow("2030-01-05", 100.0)])
+                 _srow("2030-01-05", "test rice"), _srow("2030-01-07", "test soup")],
+                [_drow("2030-01-01", 100.0), _drow("2030-01-10", 100.0), _drow("2030-01-05", 100.0),
+                 _drow("2030-01-07", 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
-        _two_looks(db, _export(tmp, [("2030-01-05", "test rice", 100.0)],
-                               daily=[("2030-01-05", 100.0), ("2030-01-10", 0.0)]), window=WINDOW)
+        _two_looks(db, _export(tmp, [("2030-01-05", "test rice", 100.0), ("2030-01-07", "test soup", 100.0)],
+                               daily=[("2030-01-05", 100.0), ("2030-01-07", 100.0), ("2030-01-10", 0.0)]),
+                   window=WINDOW)
     for p in _calls(db, WINDOW_FN):
         assert "2030-01-01" not in p["p_empty_dates"] and "2030-01-10" not in p["p_empty_dates"]
-        assert p["p_servings_empty_dates"] == []
+        assert p["p_empty_dates"] == ["2030-01-06"] and p["p_servings_empty_dates"] == []
     assert _names(db, "2030-01-01") == ["test first"] and "2030-01-01" in db.daily
     assert _names(db, "2030-01-10") == ["test last"] and db.cleared == [] and db.candidates == {}
 
@@ -679,7 +696,9 @@ def test_manual_import_writes_servings_and_daily_together_around_an_emptied_day(
     "manual servings, then the automated export empties the day, then the manual
     daily row" left an old daily total with no servings under it, and the
     behavioural view shows that fallback row. Now each import is ONE call under the
-    shared lock, so whichever order they land in, servings and daily row agree."""
+    shared lock, so whichever order they land in, servings and daily row agree.
+    The manual import also starts the day's empty-day count over (Codex review), so
+    an automated export right after it is a first look again."""
     stale = [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0)]
     days = ("2030-01-02", "2030-01-05", "2030-01-07")
     for manual_after in (True, False):
@@ -694,10 +713,57 @@ def test_manual_import_writes_servings_and_daily_together_around_an_emptied_day(
             for kind, paths in steps:
                 _run(db, paths, window=WINDOW) if kind == "auto" else _run(db, paths)
                 _consistent(db, days)
+            # Either way the day has food now: the manual import wrote it last, or it
+            # wrote it before the automated export, which then only looked once.
+            assert _names(db, "2030-01-05") == ["test rice"], manual_after
+            assert ("2030-01-05" in db.candidates) == (not manual_after), "the first look after the manual write"
+            if not manual_after:
+                db.advance(LATER)                            # the second look after it
+                _run(db, auto, window=WINDOW)
+                _consistent(db, days)
+                assert _names(db, "2030-01-05") == [] and "2030-01-05" not in db.daily
         assert db.direct_daily_upserts == 0
         manual_calls = _calls(db, COMBINED_FN)
         assert len(manual_calls) == 1 and manual_calls[0]["p_daily_rows"], "one call, daily rows included"
-        assert bool(_names(db, "2030-01-05")) == manual_after, "the newest import's view of the day wins"
+
+
+def test_any_write_of_a_day_starts_its_empty_day_count_over() -> None:
+    """Codex review (round 3): only the window function forgot a first look when food came
+    back. After a manual import (or a run with emptying off, which imports the same
+    way) or an automated daily-only write showed food on the day, the old first look
+    survived, so the next automated export that missed the day emptied it on ONE
+    look. Every writer now forgets the record of each day it writes, in the same
+    transaction and under the same lock."""
+    restored = UPSTREAM + [("2030-01-05", "test rice", 100.0)]
+
+    def manual(db, folder):
+        _run(db, _export(folder, restored))
+
+    def daily_only(db, folder):
+        # An automated export whose servings are unusable: only its daily rows are
+        # written, and they show food on 2030-01-05 again.
+        spath, dpath = _export(folder, restored)
+        with open(spath, "a", encoding="utf-8") as f:
+            f.write("2030-01-07,8:00 AM,Breakfast,test cut\n")
+        _run(db, [spath, dpath], window=WINDOW)
+
+    for name, writer in (("manual import", manual), ("daily-only write", daily_only)):
+        servings, daily = _stored()
+        db = FakeDB(servings, daily)
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as tmp2:
+            missed = _export(tmp, UPSTREAM)
+            _run(db, missed, window=WINDOW)                          # first look at 2030-01-05
+            assert "2030-01-05" in db.candidates, name
+            db.advance(LATER)
+            writer(db, tmp2)                                         # food on the day again
+            assert db.candidates == {}, f"{name} left the old first look behind"
+            _run(db, missed, window=WINDOW)                          # missed again: a first look only
+            assert _names(db, "2030-01-05") == ["test rice"] and "2030-01-05" in db.daily, name
+            assert db.candidates["2030-01-05"]["first_seen_at"] == db.now, name
+            db.advance(LATER)
+            _run(db, missed, window=WINDOW)                          # the second look
+        assert _names(db, "2030-01-05") == [] and "2030-01-05" not in db.daily, name
+        assert {c["calendar_date"] for c in db.cleared} == {"2030-01-05"}, name
 
 
 def test_window_longer_than_the_bound_is_treated_as_manual() -> None:
@@ -764,7 +830,7 @@ def test_dry_run_reports_a_refusal_and_an_unreadable_database() -> None:
     servings, daily = _stored()
     servings += [_srow("2030-01-08", "test extra"), _srow("2030-01-09", "test extra 2")]
     with tempfile.TemporaryDirectory() as tmp:
-        paths = _export(tmp, [("2030-01-02", "test oats", 100.0)])
+        paths = _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-10", "test late", 100.0)])
         _result, out = _dry(FakeDB(servings, daily), paths)
         assert "4 stored day(s) have no food any more, more than the limit of 3" in out, out
         _result, out = _dry(FakeDB(servings, daily, read_error=FakeAPIError("08006", "offline")), paths)
@@ -780,8 +846,9 @@ def test_more_stored_empty_days_than_the_limit_are_refused_and_say_so() -> None:
     servings += [_srow("2030-01-08", "test extra"), _srow("2030-01-09", "test extra 2")]
     db = FakeDB(servings, daily)
     with tempfile.TemporaryDirectory() as tmp:
-        paths = _export(tmp, [("2030-01-02", "test oats", 100.0)])
-        assert _two_looks(db, paths, window=WINDOW) == (1, 1)
+        # Food on the first and the last day of the export brackets every stored day.
+        paths = _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-10", "test late", 100.0)])
+        assert _two_looks(db, paths, window=WINDOW) == (2, 2)
         assert _names(db, "2030-01-05") == ["test rice"] and _names(db, "2030-01-09") == ["test extra 2"]
         assert db.cleared == [], "a refused run emptied something"
         assert _names(db, "2030-01-02") == ["test oats"], "the days with food are still written"
@@ -799,53 +866,90 @@ def test_more_stored_empty_days_than_the_limit_are_refused_and_say_so() -> None:
         # empties the days two looks have confirmed.
         assert sorted(db.candidates) == ["2030-01-05", "2030-01-07", "2030-01-08", "2030-01-09"]
         _run(db, paths, window=WINDOW, max_empty_days=4)
-    assert _names(db) == ["test oats", "test outside"] and sorted(db.daily) == [OUTSIDE, "2030-01-02"]
+    assert _names(db) == ["test late", "test oats", "test outside"]
+    assert sorted(db.daily) == [OUTSIDE, "2030-01-02", "2030-01-10"]
     assert _hb(db)["servings"]["status"] == "success"
 
 
-def test_a_blank_export_empties_the_only_serving_on_the_second_look() -> None:
-    """Codex review: an export with no food anywhere used to force the limit to 0, so
-    removing the only serving in the window never reached Onyx. A blank export is
-    what the real account returns through a logging pause; it is trusted like any
-    other, on the second look and within the limit."""
+def test_a_blank_export_empties_nothing() -> None:
+    """Codex review (round 3): two looks hours apart are not coverage. A blank export
+    (no food anywhere in the window, which is also what a logging pause returns)
+    shows no date it covered, so it never offers a day for emptying, however many
+    looks, and makes no call at all."""
     db = FakeDB([_srow("2030-01-05", "test rice"), _srow(OUTSIDE, "test outside")],
                 [_drow("2030-01-05", 100.0), _drow(OUTSIDE, 100.0)])
     with tempfile.TemporaryDirectory() as tmp:
         blank = _export(tmp, [])
-        assert _run(db, blank, window=WINDOW, max_empty_days=10) == (0, 0)
-        assert _names(db, "2030-01-05") == ["test rice"], "one look is not enough"
-        assert _calls(db, WINDOW_FN)[0]["p_max_cleared_days"] == 10
-        assert _hb(db)["servings"]["status"] == "success"
+        for _look in range(3):
+            assert _run(db, blank, window=WINDOW, max_empty_days=10) == (0, 0)
+            db.advance(LATER)
+    assert _names(db) == ["test outside", "test rice"] and sorted(db.daily) == [OUTSIDE, "2030-01-05"]
+    assert db.rpc_calls == [] and db.cleared == [] and db.candidates == {}
+    hb = _hb(db)
+    assert hb["servings"]["status"] == "success" and hb["servings"]["error_message"] is None
+    assert hb["daily"]["status"] == "success", "a quiet window is a healthy run"
+
+
+def test_a_day_without_food_on_both_sides_waits_for_a_later_day_with_food() -> None:
+    """Codex review (round 3): an export cut short after its newest day with food, in
+    both files, passes every file check and looks the same on two looks. A day past
+    the newest day with food is therefore never emptied; once a later day has food,
+    the export shows it covered the day, and two such looks empty it."""
+    db = FakeDB([_srow("2030-01-02", "test oats"), _srow("2030-01-05", "test rice"), _srow("2030-01-07", "test soup")],
+                [_drow("2030-01-02", 100.0), _drow("2030-01-05", 100.0), _drow("2030-01-07", 100.0)])
+    with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as tmp2:
+        cut = _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0)])
+        check = ci.check_trusted_export(WINDOW, *cut)
+        assert check.complete and "2030-01-07" not in check.empty_dates, check.empty_dates
+        assert check.empty_dates == ("2030-01-03", "2030-01-04"), "only days between days with food"
+        for _look in range(3):
+            _run(db, cut, window=WINDOW)
+            db.advance(LATER)
+        assert _names(db, "2030-01-07") == ["test soup"] and "2030-01-07" in db.daily and db.cleared == []
+        assert db.candidates == {}
+        # Food on a later day: 01-07 is now between two days with food.
+        later = _export(tmp2, [("2030-01-02", "test oats", 100.0), ("2030-01-05", "test rice", 100.0),
+                               ("2030-01-09", "test new", 100.0)])
+        _run(db, later, window=WINDOW)
+        assert _names(db, "2030-01-07") == ["test soup"] and "2030-01-07" in db.candidates, "first look"
         db.advance(LATER)
-        _run(db, blank, window=WINDOW, max_empty_days=10)
-    assert _names(db) == ["test outside"] and sorted(db.daily) == [OUTSIDE]
-    assert _hb(db)["servings"]["error_message"].startswith("emptied 1 day(s)")
-    # A blank export over more stored days than the limit (5 > 3) is refused, look after look.
-    servings, daily = _stored()
-    servings += [_srow("2030-01-08", "test extra"), _srow("2030-01-09", "test extra 2")]
-    db = FakeDB(servings, daily)
-    with tempfile.TemporaryDirectory() as tmp:
-        _two_looks(db, _export(tmp, []), window=WINDOW)
-    assert _names(db) == _names(FakeDB(servings)) and db.cleared == []
-    msg = _hb(db)["servings"]["error_message"]
-    assert _hb(db)["servings"]["status"] == "partial" and "5 stored day(s)" in msg and "limit of 3" in msg, msg
-    # With nothing stored in the window, a blank export is simply a quiet window.
-    quiet = FakeDB([_srow(OUTSIDE, "test outside")], [_drow(OUTSIDE, 100.0)])
-    with tempfile.TemporaryDirectory() as tmp:
-        _two_looks(quiet, _export(tmp, []), window=WINDOW)
-    assert _hb(quiet)["servings"]["status"] == "success" and _hb(quiet)["servings"]["error_message"] is None
-    assert _names(quiet) == ["test outside"] and quiet.candidates == {}
+        _run(db, later, window=WINDOW)
+    assert _names(db, "2030-01-07") == [] and "2030-01-07" not in db.daily
+    assert {c["calendar_date"] for c in db.cleared} == {"2030-01-07"}
+
+
+def test_function_refuses_an_empty_date_without_food_on_both_sides() -> None:
+    """The coverage rule is enforced by the database function too (FakeDB mirrors it):
+    a caller cannot empty a day past its newest day with food, or with no food."""
+    for rows, empty in (([], ["2030-01-05"]),
+                        ([_srow("2030-01-02", "a")], ["2030-01-05"]),
+                        ([_srow("2030-01-02", "a"), _srow("2030-01-05", "b")], ["2030-01-07"]),
+                        ([_srow("2030-01-02", "a"), _srow("2030-01-05", "b")], ["2030-01-02"])):
+        db = FakeDB([_srow("2030-01-07", "test soup")], [_drow("2030-01-07", 100.0)])
+        db.candidates["2030-01-07"] = {"first_seen_at": db.now - timedelta(hours=LATER),
+                                       "last_seen_at": db.now - timedelta(hours=LATER), "times_seen": 1}
+        before = (_names(db), copy.deepcopy(db.daily), copy.deepcopy(db.candidates))
+        try:
+            ci.import_servings_window(rows, [], WINDOW, empty, [], 3, dry_run=False, sb=db)
+        except FakeAPIError as e:
+            assert "strictly between" in str(e) or "more than one" in str(e), str(e)
+        else:
+            raise AssertionError(f"rows {[r['calendar_date'] for r in rows]} with empty {empty} must be refused")
+        assert (_names(db), db.daily, db.candidates) == before and db.cleared == []
 
 
 def test_limit_is_inclusive_and_zero_empties_nothing() -> None:
     servings, daily = _stored()
     with tempfile.TemporaryDirectory() as tmp:
         db = FakeDB(servings, daily)
-        # Food only on a new day: the three stored days are exactly the limit.
-        _two_looks(db, _export(tmp, [("2030-01-08", "test new", 100.0)]), window=WINDOW, max_empty_days=3)
-        assert _names(db) == ["test new", "test outside"] and sorted(db.daily) == [OUTSIDE, "2030-01-08"]
+        # Food only on two new days around them: the three stored days are exactly the limit.
+        _two_looks(db, _export(tmp, [("2030-01-01", "test first", 100.0), ("2030-01-08", "test new", 100.0)]),
+                   window=WINDOW, max_empty_days=3)
+        assert _names(db) == ["test first", "test new", "test outside"]
+        assert sorted(db.daily) == [OUTSIDE, "2030-01-01", "2030-01-08"]
         db0 = FakeDB([_srow("2030-01-05", "test rice")])
-        _two_looks(db0, _export(tmp, [("2030-01-02", "test oats", 100.0)]), window=WINDOW, max_empty_days=0)
+        _two_looks(db0, _export(tmp, [("2030-01-02", "test oats", 100.0), ("2030-01-07", "test soup", 100.0)]),
+                   window=WINDOW, max_empty_days=0)
         assert _names(db0, "2030-01-05") == ["test rice"] and _hb(db0)["servings"]["status"] == "partial"
     for bad in (-1, 1.5, True, None):
         try:
@@ -967,6 +1071,92 @@ def test_sums_within_rounding_agree() -> None:
     assert check.complete and check.skip_dates == (), check.reason
 
 
+def test_unreadable_or_missing_values_are_never_zero_and_clear_nothing() -> None:
+    """Codex review (round 3): `to_num(...) or 0.0` turned an unreadable cell into 0, so
+    a garbled daily row could read as "no food" and later empty a day. An unreadable
+    or non-finite nutrient cell, or a daily Total row with no Energy value, now puts
+    that day in doubt: its servings and (when the doubt is in the daily summary) that
+    daily row are not written, and nothing is emptied."""
+    for bad in ("SyntheticMarker", "nan", "inf", "-inf", "1e999"):
+        assert ci.to_num(bad) is None, bad
+        assert ci.strict_num(bad) == (False, None), bad
+    assert ci.strict_num("") == (True, None) and ci.strict_num("0") == (True, 0.0)
+    cases = [
+        # (line appended to dailysummary.csv, line appended to servings.csv, reason,
+        #  days whose daily row must not be written)
+        ("2030-01-05,Total,SyntheticMarker,0,true", None, "not a number", ("2030-01-05",)),
+        ("2030-01-05,Total,nan,0,true", None, "not a number", ("2030-01-05",)),
+        ("2030-01-05,Total,inf,0,true", None, "not a number", ("2030-01-05",)),
+        ("2030-01-05,Total,,0,true", None, "no Energy value", ("2030-01-05",)),
+        # A serving cell nobody can read: that day keeps its stored servings.
+        (None, "2030-01-07,9:00 AM,Lunch,test extra,1.00 g,0,SyntheticMarker", "not a number", ()),
+    ]
+    for daily_line, serving_line, reason, daily_skip in cases:
+        servings, daily = _stored()
+        db = FakeDB(servings, daily)
+        with tempfile.TemporaryDirectory() as tmp:
+            spath, dpath = _export(tmp, UPSTREAM)
+            for path, line in ((dpath, daily_line), (spath, serving_line)):
+                if line:
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+            check = ci.check_trusted_export(WINDOW, spath, dpath)
+            assert check.usable and not check.complete, reason
+            assert reason in check.reason and "SyntheticMarker" not in check.reason, check.reason
+            assert check.daily_skip_dates == daily_skip, check.daily_skip_dates
+            assert check.empty_dates == () and check.servings_empty_dates == ()
+            _two_looks(db, [spath, dpath], window=WINDOW)
+        assert _names(db, "2030-01-05") == ["test rice"] and db.daily["2030-01-05"]["calories"] == 100.0, reason
+        assert _names(db, "2030-01-07") == ["test soup"], "a day with an unreadable serving was replaced"
+        assert db.cleared == [] and db.candidates == {}, reason
+        for p in _calls(db, WINDOW_FN):
+            sent = [r["calendar_date"] for r in p["p_daily_rows"]]
+            assert not set(sent) & set(daily_skip), "a daily row with an unreadable value was written"
+            assert p["p_empty_dates"] == [] and p["p_servings_empty_dates"] == []
+        hb = _hb(db)
+        assert hb["servings"]["status"] == "partial" and hb["daily"]["status"] == "partial", reason
+
+
+def test_unreadable_daily_value_keeps_the_stored_row_when_the_servings_are_unusable() -> None:
+    # The daily-only write of an unusable export leaves out the same rows.
+    servings, daily = _stored()
+    db = FakeDB(servings, daily)
+    with tempfile.TemporaryDirectory() as tmp:
+        spath, dpath = _export(tmp, UPSTREAM)
+        with open(dpath, "a", encoding="utf-8") as f:
+            f.write("2030-01-05,Total,SyntheticMarker,0,true\n")
+        with open(spath, "a", encoding="utf-8") as f:
+            f.write("2030-01-07,8:00 AM,Breakfast,test cut\n")        # cut off mid-row
+        _run(db, [spath, dpath], window=WINDOW)
+    (p,) = _calls(db, COMBINED_FN)
+    assert p["p_rows"] == [] and [r["calendar_date"] for r in p["p_daily_rows"]] == ["2030-01-02", "2030-01-07"]
+    assert db.daily["2030-01-05"]["calories"] == 100.0 and _names(db, "2030-01-05") == ["test rice"]
+
+
+def test_a_file_without_an_energy_column_is_not_usable() -> None:
+    """Codex review (round 3): the per-day comparison used only the nutrients both files
+    share, so a servings file without nutrient columns compared nothing and passed.
+    Both files must carry Energy; without it no servings are written and nothing is
+    emptied."""
+    servings, daily = _stored()
+    db = FakeDB(servings, daily)
+    before = _names(db)
+    with tempfile.TemporaryDirectory() as tmp:
+        spath = _write(tmp, "servings.csv", ["Day,Time,Group,Food Name,Amount",
+                                             "2030-01-02,8:00 AM,Breakfast,test oats,1.00 g",
+                                             "2030-01-07,8:00 AM,Breakfast,test soup,1.00 g"])
+        dpath = _write(tmp, "dailysummary.csv", [D_HEADER, "2030-01-02,Total,200.0,2.0,false",
+                                                 "2030-01-07,Total,100.0,1.0,false"])
+        assert ci.scan_export_file(spath, "servings").reason == "servings.csv has no Energy column"
+        check = ci.check_trusted_export(WINDOW, spath, dpath)
+        assert not check.usable and not check.complete and check.daily_ok
+        _two_looks(db, [spath, dpath], window=WINDOW)
+        nodaily = _write(tmp, "d2.csv", ["Date,Group,Protein (g),Completed", "2030-01-02,Total,2.0,false"])
+        assert ci.scan_export_file(nodaily, "daily").reason == "dailysummary.csv has no Energy column"
+    _assert_nothing_written(db, before, "has no Energy column")
+    assert db.daily["2030-01-05"]["calories"] == 100.0
+
+
 # The shape of a real Cronometer web export (Claude review): a BOM, a wide servings
 # header ending in Category, quoted cells with commas, units in parentheses with µ,
 # and a daily summary with one row per day and NO Group column. Values are synthetic.
@@ -1012,11 +1202,13 @@ def test_real_export_shape_is_complete_and_empties_the_right_day() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         paths = _real_export(tmp, [("2030-01-03", "test bar, chocolate", 210.0),
                                    ("2030-01-03", "test bar, chocolate", 210.0),
-                                   ("2030-01-04", 'test "quoted", food', 55.5)])
+                                   ("2030-01-04", 'test "quoted", food', 55.5),
+                                   ("2030-01-08", "test late", 80.0)])
         with open(paths[0], "rb") as f:
             assert f.read(3) == b"\xef\xbb\xbf", "fixture must carry the BOM"
         scan = ci.scan_export_file(paths[0], "servings")
-        assert scan.ok and scan.by_date == {"2030-01-03": 2, "2030-01-04": 1}, scan
+        assert scan.ok and scan.by_date == {"2030-01-03": 2, "2030-01-04": 1, "2030-01-08": 1}, scan
+        assert scan.invalid_dates == frozenset(), "every nutrient cell of the fixture is a number"
         check = ci.check_trusted_export(WINDOW, *paths)
         assert check.complete and check.skip_dates == (), check.reason
         assert "2030-01-06" in check.empty_dates and check.servings_empty_dates == ()
@@ -1025,7 +1217,7 @@ def test_real_export_shape_is_complete_and_empties_the_right_day() -> None:
     assert _names(db, "2030-01-03") == ["test bar, chocolate", "test bar, chocolate"]
     assert _names(db, "2030-01-04") == ['test "quoted", food']
     p = _calls(db, WINDOW_FN)[-1]
-    assert sorted(r["calendar_date"] for r in p["p_daily_rows"]) == ["2030-01-03", "2030-01-04"]
+    assert sorted(r["calendar_date"] for r in p["p_daily_rows"]) == ["2030-01-03", "2030-01-04", "2030-01-08"]
     assert p["p_rows"][0]["food_category"] == "Snacks, Sweets"
 
 
@@ -1088,7 +1280,8 @@ def test_function_raising_mid_transaction_rolls_everything_back() -> None:
     assert (_names(db), db.daily, db.candidates) == before and db.cleared == []
     # A key the table does not have fails AFTER the empty day was removed: still nothing changes.
     try:
-        ci.import_servings_window([{**_srow("2030-01-02", "test oats"), "serving_id": 1}],
+        ci.import_servings_window([{**_srow("2030-01-02", "test oats"), "serving_id": 1},
+                                   _srow("2030-01-07", "test soup")],
                                   [_drow("2030-01-02", 100.0)], WINDOW, ["2030-01-05"], [], 3,
                                   dry_run=False, sb=db)
     except FakeAPIError as e:
@@ -1280,28 +1473,29 @@ def test_etl_auth_or_export_failure_never_reaches_the_importer() -> None:
 def test_etl_end_to_end_empties_a_day_removed_in_cronometer() -> None:
     etl = _etl()
     today = date.today()
-    d_kept, d_gone = (today - timedelta(days=3)).isoformat(), (today - timedelta(days=2)).isoformat()
-    db = FakeDB([_srow(d_kept, "test oats"), _srow(d_gone, "test rice")],
-                [_drow(d_kept, 100.0), _drow(d_gone, 100.0)])
+    d_kept, d_gone, d_after = ((today - timedelta(days=n)).isoformat() for n in (3, 2, 1))
+    db = FakeDB([_srow(d_kept, "test oats"), _srow(d_gone, "test rice"), _srow(d_after, "test soup")],
+                [_drow(d_kept, 100.0), _drow(d_gone, 100.0), _drow(d_after, 100.0)])
 
     def fake_export(_client, _token, generate, _start, _end):
         if generate == "servings":
-            return "﻿" + S_HEADER + f"\n{d_kept},8:00 AM,Breakfast,test oats,1.00 g,100.0,1.0\n"
-        return "﻿" + D_HEADER + f"\n{d_kept},Total,100.0,1.0,false\n"
+            return ("﻿" + S_HEADER + f"\n{d_kept},8:00 AM,Breakfast,test oats,1.00 g,100.0,1.0"
+                    f"\n{d_after},8:00 AM,Breakfast,test soup,1.00 g,100.0,1.0\n")
+        return "﻿" + D_HEADER + f"\n{d_kept},Total,100.0,1.0,false\n{d_after},Total,100.0,1.0,false\n"
 
     saved = ci.create_client
     ci.create_client = lambda *_a, **_k: db
     try:
         with _Patch(etl, authenticate_session=_fake_auth, mint_token=lambda *a, **k: "TOKEN",
                     export_csv=fake_export, _save_session=lambda *a, **k: None):
-            assert etl.fetch_and_import(days=30, dry_run=False) == (1, 1)
+            assert etl.fetch_and_import(days=30, dry_run=False) == (2, 2)
             assert _names(db, d_gone) == ["test rice"], "the first scheduled run only records the day"
             db.advance(LATER)                                  # the next scheduled run
-            assert etl.fetch_and_import(days=30, dry_run=False) == (1, 1)
+            assert etl.fetch_and_import(days=30, dry_run=False) == (2, 2)
     finally:
         ci.create_client = saved
     assert _names(db, d_kept) == ["test oats"] and _names(db, d_gone) == []
-    assert sorted(db.daily) == [d_kept]
+    assert _names(db, d_after) == ["test soup"] and sorted(db.daily) == [d_kept, d_after]
     assert {c["calendar_date"] for c in db.cleared} == {d_gone}
 
 
@@ -1334,8 +1528,8 @@ def test_window_sql_contract() -> None:
 
     # The argument names are the keys the importer sends (PostgREST matches by name).
     db = FakeDB()
-    ci.import_servings_window([_srow("2030-01-02", "a")], [_drow("2030-01-02", 100.0)], WINDOW,
-                              ["2030-01-03"], [], 3, dry_run=False, sb=db)
+    ci.import_servings_window([_srow("2030-01-02", "a"), _srow("2030-01-04", "c")], [_drow("2030-01-02", 100.0)],
+                              WINDOW, ["2030-01-03"], [], 3, dry_run=False, sb=db)
     ci.import_servings_and_daily([_srow("2030-01-04", "b")], [_drow("2030-01-04", 1.0)], False, sb=db)
     assert _args(flat, WINDOW_FN) == sorted(db.rpc_calls[0][1]), db.rpc_calls[0][1].keys()
     assert _args(flat, COMBINED_FN) == sorted(db.rpc_calls[1][1]), db.rpc_calls[1][1].keys()
@@ -1355,9 +1549,9 @@ def test_window_sql_contract() -> None:
     assert "INSERT INTO pds.cronometer_servings" not in flat
     assert flat.count("pds.replace_cronometer_servings(") == 2
 
-    # Exactly four deletes, each scoped to the dates it may touch.
+    # Exactly five deletes, each scoped to the dates it may touch.
     deletes = re.findall(r"DELETE FROM [^;]*?(?:;|RETURNING)", flat)
-    assert len(deletes) == 4 and upper.count("DELETE ") == 4, deletes
+    assert len(deletes) == 5 and upper.count("DELETE ") == 5, deletes
     assert "DELETE FROM pds.cronometer_servings s WHERE s.calendar_date = ANY (v_confirmed) RETURNING" in flat
     assert ("DELETE FROM pds.cronometer_nutrition_daily n WHERE n.calendar_date = ANY (v_confirmed) "
             "AND n.calendar_date = ANY (v_empty) RETURNING") in flat
@@ -1365,6 +1559,8 @@ def test_window_sql_contract() -> None:
             "(v_arg_dates || v_daily_dates) AND NOT (c.calendar_date = ANY (v_sempty));") in flat
     assert ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
             "(v_empty || v_sempty) AND NOT (c.calendar_date = ANY (v_kept));") in flat
+    assert ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
+            "(p_dates || v_daily_dates);") in flat
     # Every empty-day delete feeds the backup table in the same statement.
     assert flat.count("INSERT INTO pds.cronometer_cleared_rows") == 2
     assert flat.count("RETURNING s.* ) INSERT INTO pds.cronometer_cleared_rows") == 1
@@ -1393,12 +1589,24 @@ def test_window_sql_contract() -> None:
     positions = [w.index(s) for s in order]
     assert positions == sorted(positions), list(zip(order, positions))
 
-    # The manual writer: same lock, the date-set function, the daily upsert, no delete.
+    # The manual writer: same lock, the date-set function, the daily upsert, and its one
+    # delete forgets the empty-day record of every date it writes (Codex review),
+    # under the lock; it never deletes a serving or a daily row.
     m = _body(flat, COMBINED_FN)
     assert lock in m and "pds.replace_cronometer_servings(p_dates, p_rows)" in m
-    assert "pds.cronometer_upsert_daily(p_daily_rows)" in m and "DELETE" not in m.upper()
-    assert "this function never empties a day" in m
-    assert m.index(lock) < m.index("pds.replace_cronometer_servings(p_dates, p_rows)")
+    assert "pds.cronometer_upsert_daily(p_daily_rows)" in m and "this function never empties a day" in m
+    reset = "DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY (p_dates || v_daily_dates);"
+    assert m.upper().count("DELETE ") == 1 and reset in m
+    assert "pds.cronometer_servings" not in m and "pds.cronometer_nutrition_daily" not in m, \
+        "only the candidates are deleted; servings and daily rows only through the two functions"
+    assert m.index(lock) < m.index(reset) < m.index("pds.replace_cronometer_servings(p_dates, p_rows)")
+
+    # Coverage comes from dates: every empty date lies strictly between the first and
+    # last date with servings in the same call, checked before anything is written.
+    cover = ("SELECT min(u.d), max(u.d) INTO v_first, v_last FROM unnest(v_arg_dates) AS u(d); "
+             "IF EXISTS (SELECT 1 FROM unnest(v_empty || v_sempty) AS u(d) "
+             "WHERE v_first IS NULL OR u.d <= v_first OR u.d >= v_last) THEN")
+    assert cover in w and w.index(cover) < w.index(lock), "the coverage rule must run before the lock"
 
     # The daily upsert: one row per day, same keys, writable columns from pg_attribute.
     u = _body(flat, "cronometer_upsert_daily")
