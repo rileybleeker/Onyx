@@ -543,12 +543,12 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         let quietPanel = quietOf(page);
         assert.equal(await quietPanel.count(), 0, 'off by default');
         assert(await page.locator('section[aria-labelledby="requests-heading"]').isVisible(), 'the full page is unchanged while off');
-        assert.equal(await page.getByRole('button', { name: 'Quiet view' }).getAttribute('aria-pressed'), 'false');
+        assert.equal(await page.getByRole('button', { name: 'Quiet view', exact: true }).getAttribute('aria-pressed'), 'false');
         await page.waitForFunction(() => window.quietGets === 1, null, { timeout: 10000 });
         assert.deepEqual(await page.evaluate(() => window.quietPuts), [], 'opening Today writes no setting');
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.waitFor();
-        assert.equal(await page.getByRole('button', { name: 'Quiet view' }).getAttribute('aria-pressed'), 'true');
+        assert.equal(await page.getByRole('button', { name: 'Quiet view', exact: true }).getAttribute('aria-pressed'), 'true');
         assert.deepEqual(await page.evaluate(() => window.quietPuts), [{ key: 'today.quiet', value: { v: 1, on: true, budget: 3, learning: true } }], 'the change is stored under its own UI preference');
         assert(await page.locator('#today-full').isHidden(), 'the full page is hidden, not removed');
         const quietLog = quietPanel.getByRole('link', { name: 'Start your check-in' });
@@ -606,7 +606,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await page.setViewportSize({ width: 1440, height: 1000 });
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         // Off again: the full page as before.
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.waitFor({ state: 'detached' });
         assert(await page.locator('#today-full').isVisible());
         assert.deepEqual(await page.evaluate(() => window.quietPuts[window.quietPuts.length - 1].value), { v: 1, on: false, budget: 1, learning: true });
@@ -628,14 +628,14 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
             return result;
         }, quietBootJs);
         assert.deepEqual(boot, { before: 'none', shown: 'block', full: 'none' }, 'the quiet slot is painted before React, the full page is not');
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.waitFor();
         assert(await quietPanel.getByText('Nothing needs you right now. Every source answered.').isVisible());
         await close(page);
         page = await setup('empty', 390, false, 'error');
         quietPanel = quietOf(page);
         await settled(page);
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.waitFor();
         assert(await quietPanel.getByText('Nothing to show yet, but not every source could be checked, so this is not an all-clear.').isVisible());
         assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(couldn't check\)/).isVisible());
@@ -645,7 +645,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         page = await setup('empty', 390, false, 'never_synced');
         quietPanel = quietOf(page);
         await settled(page);
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.waitFor();
         assert(await quietPanel.getByText('Nothing to show yet, but not every source could be checked, so this is not an all-clear.').isVisible());
         assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(its sync hasn't reported a run/).isVisible());
@@ -656,7 +656,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         quietPanel = quietOf(page);
         await settled(page);
         await page.evaluate(() => { window.quietPutMode = 'error'; });
-        await page.getByRole('button', { name: 'Quiet view' }).click();
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
         await quietPanel.getByText(/Couldn't save the quiet view settings to your account/).waitFor();
         assert(await quietPanel.isVisible(), 'the change still applies on this screen');
         await page.evaluate(() => { window.quietPutMode = 'ok'; });
