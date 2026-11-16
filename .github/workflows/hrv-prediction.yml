@@ -79,6 +79,9 @@ jobs:
         # pds.hrv_model_artifacts that this code and these packages can serve, ordered by its
         # provenance. This job never saves or publishes a model it restored; only a training run
         # (hrv-retrain-on-backfill.yml, or the missing-model step below) adds one.
+        # registry=ok | not_applied (table missing: the legacy restore below) | error (unreadable:
+        # nothing is restored or trained and hrv_predict.py refuses to forecast, so a retired or
+        # unpinned model can never come back during an outage).
         id: select
         run: python hrv_model_artifact.py select
 
@@ -93,26 +96,26 @@ jobs:
             analysis_output/xgboost_hrv_model.manifest.json
           key: ${{ steps.select.outputs.key }}
 
-      - name: Restore the newest cached training (registry unreadable)
-        # Degraded mode only (registry table missing, Supabase down): the most recently saved
-        # TRAINING artifact. hrv_predict.py checks it against its manifest and writes a partial
-        # hrv_predict|model_artifact heartbeat.
-        if: steps.select.outputs.registry == 'unavailable'
+      - name: Restore the newest cached training (registry not applied yet)
+        # Rollout window only (sql/hrv_model_artifacts.sql not applied yet, so nothing can be
+        # pinned or retired): the most recently saved TRAINING artifact. hrv_predict.py checks it
+        # against its manifest and writes a partial hrv_predict|model_artifact heartbeat.
+        if: steps.select.outputs.registry == 'not_applied'
         uses: actions/cache/restore@v5
         with:
           path: |
             analysis_output/xgboost_hrv_model.pkl
             analysis_output/xgboost_hrv_model.manifest.json
-          key: hrv-model-${{ runner.os }}-v2-registry-unavailable
+          key: hrv-model-${{ runner.os }}-v2-registry-not-applied
           restore-keys: |
             hrv-model-${{ runner.os }}-v2-
 
-      - name: Restore a pre-provenance model (registry unreadable, nothing newer)
-        if: steps.select.outputs.registry == 'unavailable' && hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
+      - name: Restore a pre-provenance model (registry not applied yet, nothing newer)
+        if: steps.select.outputs.registry == 'not_applied' && hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
         uses: actions/cache/restore@v5
         with:
           path: analysis_output/xgboost_hrv_model.pkl
-          key: hrv-model-${{ runner.os }}-v1-registry-unavailable
+          key: hrv-model-${{ runner.os }}-v1-registry-not-applied
           restore-keys: |
             hrv-model-${{ runner.os }}-v1-
             hrv-model-${{ runner.os }}-
@@ -120,9 +123,11 @@ jobs:
       - name: Train model if missing
         # The one training path in this workflow: nothing servable was published, or the selected
         # artifact is no longer in the cache. The model trained here is saved and published below
-        # exactly like the retrain workflow's.
+        # exactly like the retrain workflow's. Never when the registry could not be read, and
+        # never in place of a PINNED artifact that is gone from the cache: a pin is an explicit
+        # rollback, so hrv_predict.py skips the forecast with a failed heartbeat instead.
         id: self-train
-        if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''
+        if: hashFiles('analysis_output/xgboost_hrv_model.pkl') == '' && steps.select.outputs.registry != 'error' && steps.select.outputs.pinned != 'true'
         run: |
           echo "Model pickle missing - running hrv_analysis.py to retrain"
           python hrv_analysis.py --skip-analysis
@@ -160,11 +165,13 @@ jobs:
         run: python hrv_model_artifact.py publish --saved "${{ steps.saved.outputs.cache-hit }}"
 
       - name: Backfill actuals & predict tomorrow
-        # Never with a model from a training that failed; otherwise also after a failed key or
-        # publish step, so the artifact check below reports it.
-        if: ${{ !cancelled() && steps.self-train.outcome != 'failure' }}
+        # Never with a model from a training that failed, and never after a setup step (checkout,
+        # install) failed; otherwise also after a failed key or publish step, so the artifact
+        # check reports it.
+        if: ${{ !cancelled() && steps.select.outcome == 'success' && steps.self-train.outcome != 'failure' }}
         env:
           HRV_MODEL_REGISTRY: ${{ steps.select.outputs.registry }}
           HRV_MODEL_SELECTED_SHA256: ${{ steps.select.outputs.sha }}
+          HRV_MODEL_PINNED: ${{ steps.select.outputs.pinned }}
           HRV_MODEL_RESTORED: ${{ steps.model-cache.outputs.cache-hit }}
         run: python hrv_predict.py --predict

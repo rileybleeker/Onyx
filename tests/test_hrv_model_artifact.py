@@ -10,8 +10,12 @@ These tests pin:
      preprocessing versions, package fingerprint) and the SHA-256 of its exact bytes;
   2. every check that can refuse an artifact runs BEFORE the bytes are unpickled (a tripwire
      object proves nothing was unpickled): wrong checksum, pickle/manifest mismatch, another
-     alignment rule, an unknown preprocessing version, an incompatible package major;
+     alignment rule, an unknown preprocessing version, another xgboost / scikit-learn release
+     (exact match: not even a patch release), another numpy major or Python minor;
   3. selection is by provenance, never by save or publish time; pinned wins, retired never;
+     the forecast fails closed when the registry cannot be read (anything but "table not applied
+     yet") and when a pinned artifact is gone from the cache (no other model is served or
+     trained in its place);
   4. a synthetic interleaving of an old forecast run and a new training cannot put the old
      model back as the served one (the forecast workflow has no save step for a restored model,
      and the publish command refuses an artifact another run trained);
@@ -59,7 +63,8 @@ DEPS = {"python": "3.12.7", "numpy": "2.1.3", "pandas": "2.2.3",
 T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 ENV_KEYS = ("GITHUB_ACTIONS", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REF", "GITHUB_SHA",
             "GITHUB_WORKFLOW", "GITHUB_JOB", "GITHUB_OUTPUT", "RUNNER_OS",
-            "HRV_MODEL_REGISTRY", "HRV_MODEL_SELECTED_SHA256", "HRV_MODEL_RESTORED")
+            "HRV_MODEL_REGISTRY", "HRV_MODEL_SELECTED_SHA256", "HRV_MODEL_PINNED",
+            "HRV_MODEL_RESTORED")
 
 
 # ── synthetic pieces ─────────────────────────────────────────────────────────────────────────
@@ -164,6 +169,13 @@ class _Resp:
         self.data = data
 
 
+class _MissingTable(Exception):
+    """What PostgREST raises while sql/hrv_model_artifacts.sql has not been applied."""
+
+    code = "PGRST205"
+    message = f"Could not find the table 'pds.{ma.REGISTRY_TABLE}' in the schema cache"
+
+
 class _Query:
     def __init__(self, db, table):
         self.db, self.table = db, table
@@ -204,6 +216,8 @@ class _Query:
     def execute(self):
         rows = self.db.tables.setdefault(self.table, [])
         if self.op[0] == "select":
+            if self.table in self.db.missing_tables:
+                raise _MissingTable(_MissingTable.message)
             if self.table in self.db.fail_reads:
                 raise RuntimeError("synthetic read failure SECRET-MARKER")
             out = [r for r in rows if all(r.get(c) == v for c, v in self.filters)]
@@ -235,6 +249,7 @@ class _FakeDb:
         self.tables: dict[str, list[dict]] = {}
         self.fail_reads: set[str] = set()
         self.fail_writes: set[str] = set()
+        self.missing_tables: set[str] = set()
 
     def schema(self, _name):
         return self
@@ -332,6 +347,12 @@ def test_every_refusal_happens_before_unpickling():
         _refused(lambda: _load(path, expected=sha, deps={**DEPS, "numpy": "3.0.1"}), "numpy")
         _refused(lambda: _load(path, expected=sha, deps={**DEPS, "python": "3.13.0"}), "python")
         _refused(lambda: _load(path, expected=sha, deps={**DEPS, "xgboost": "3.0.0"}), "xgboost")
+        # XGBoost promises no pickle compatibility between releases, not even a minor or a patch
+        # one, and its wrapper pickles the scikit-learn estimator state: both must match exactly
+        _refused(lambda: _load(path, expected=sha, deps={**DEPS, "xgboost": "2.2.0"}), "xgboost")
+        _refused(lambda: _load(path, expected=sha, deps={**DEPS, "xgboost": "2.1.3"}), "xgboost")
+        _refused(lambda: _load(path, expected=sha, deps={**DEPS, "scikit-learn": "1.6.0"}), "scikit-learn")
+        _refused(lambda: _load(path, expected=sha, deps={**DEPS, "scikit-learn": "1.5.3"}), "scikit-learn")
         assert _TRIPPED == [], "an incompatible artifact was unpickled"
 
         # an unknown preprocessing version (a newer pickle after a code rollback)
@@ -364,12 +385,12 @@ def test_every_refusal_happens_before_unpickling():
         # a compatible artifact is unpickled (the tripwire itself works)
         path4 = Path(tmp) / "ok" / "xgboost_hrv_model.pkl"
         m4 = _write(path4, model=_Tripwire())
-        _load(path4, expected=m4["artifact_sha256"], deps={**DEPS, "numpy": "2.3.0"})
+        _load(path4, expected=m4["artifact_sha256"], deps={**DEPS, "numpy": "2.3.0", "pandas": "2.3.1"})
         assert _TRIPPED == [1]
 
         missing = Path(tmp) / "none" / "xgboost_hrv_model.pkl"
         _refused(lambda: _load(missing), "No model to serve")
-    print("PASS: every refusal (checksum, manifest, alignment, preprocessing, packages) runs before unpickling")
+    print("PASS: every refusal (checksum, manifest, alignment, preprocessing, exact packages) runs before unpickling")
 
 
 def test_pre_pipe08_pickle_is_served_with_a_partial_report():
@@ -380,8 +401,8 @@ def test_pre_pipe08_pickle_is_served_with_a_partial_report():
         assert loaded.manifest is None
         status, message = ma.serving_report(loaded, env={})
         assert status == "partial" and "no training provenance" in message
-        status, message = ma.serving_report(loaded, env={"HRV_MODEL_REGISTRY": "unavailable"})
-        assert status == "partial" and "could not be read" in message
+        status, message = ma.serving_report(loaded, env={"HRV_MODEL_REGISTRY": "not_applied"})
+        assert status == "partial" and "not set up yet" in message
     print("PASS: a pickle from before provenance is served, reported partial until the next retrain")
 
 
@@ -399,7 +420,7 @@ def test_serving_report_names_every_unchecked_path():
               "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1"}, "partial", "not in the Actions cache"),
             ({**ok, "HRV_MODEL_SELECTED_SHA256": "e" * 64, "HRV_MODEL_RESTORED": "false",
               "GITHUB_RUN_ID": "501", "GITHUB_RUN_ATTEMPT": "1"}, "partial", "not the selected"),
-            ({"HRV_MODEL_REGISTRY": "unavailable"}, "partial", "could not be read"),
+            ({"HRV_MODEL_REGISTRY": "not_applied"}, "partial", "not set up yet"),
             # nothing published yet: the missing-model training of this run
             ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1"}, "success", None),
             ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "2"}, "partial", "did not select"),
@@ -469,9 +490,11 @@ def test_pinned_retired_and_incompatible_rows():
         _row("6", commit_h=31, dependencies={**DEPS, "numpy": "3.0.0"}),
         _row("7", commit_h=32, cache_key=ma.cache_key("7" * 64, "Windows")),
         _row("8", commit_h=33, artifact_sha256="not-a-checksum"),
+        _row("9", commit_h=34, dependencies={**DEPS, "xgboost": "2.1.3"}),
+        _row("a", commit_h=35, dependencies={**DEPS, "scikit-learn": "1.5.3"}),
     ]
     chosen, skipped = _select([newest, *incompatible])
-    assert chosen["artifact_sha256"] == "1" * 64 and len(skipped) == 4
+    assert chosen["artifact_sha256"] == "1" * 64 and len(skipped) == 6
     assert _select(incompatible)[0] is None
     assert _select([])[0] is None
     print("PASS: pinned beats newer, retired and incompatible rows are never served")
@@ -505,7 +528,7 @@ def test_old_forecast_run_cannot_shadow_a_newer_training():
         out = dict(line.split("=", 1) for line in
                    Path(os.environ["GITHUB_OUTPUT"]).read_text().splitlines())
         assert out == {"found": "true", "key": a["cache_key"], "sha": a["artifact_sha256"],
-                       "registry": "ok"}
+                       "pinned": "false", "registry": "ok"}
         assert cache.restore(out["key"], ws_forecast)
 
         # ... a retrain finishes meanwhile: artifact B (newer code and data), published
@@ -625,20 +648,80 @@ def test_publishing_again_changes_nothing():
     print("PASS: publishing the same artifact again is a no-op")
 
 
-def test_select_never_fails_the_forecast():
-    db = _FakeDb()
+def _select_output(db) -> dict:
     with _workspace() as ws, _environ(RUNNER_OS=OS):
         out_file = ws / "out"
         os.environ["GITHUB_OUTPUT"] = str(out_file)
-        assert ma.cmd_select(None, db=db) == 0          # empty registry: the missing-model path
-        assert "found=false" in out_file.read_text() and "registry=ok" in out_file.read_text()
-        out_file.unlink()
-        db.fail_reads.add(ma.REGISTRY_TABLE)
-        assert ma.cmd_select(None, db=db) == 0          # unreadable: degraded restore
+        assert ma.cmd_select(None, db=db) == 0, "select reports through its outputs, never by failing"
         text = out_file.read_text()
-        assert "found=false" in text and "registry=unavailable" in text
         assert "SECRET-MARKER" not in text
-    print("PASS: an empty or unreadable registry never fails the forecast job")
+        return dict(line.split("=", 1) for line in text.splitlines())
+
+
+def test_select_reports_the_registry_state_and_never_fails():
+    db = _FakeDb()
+    out = _select_output(db)                                    # empty registry: train one
+    assert out == {"found": "false", "key": "", "sha": "", "pinned": "false", "registry": "ok"}
+
+    db.missing_tables.add(ma.REGISTRY_TABLE)                    # SQL not applied: legacy restore
+    out = _select_output(db)
+    assert out["registry"] == "not_applied" and out["found"] == "false"
+    db.missing_tables.clear()
+
+    db.fail_reads.add(ma.REGISTRY_TABLE)                        # unreadable: fail closed
+    out = _select_output(db)
+    assert out["registry"] == "error" and out["found"] == "false" and out["pinned"] == "false"
+    db.fail_reads.clear()
+
+    # a pin is reported, so the workflow never trains a replacement for it
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = _write(Path(tmp) / "xgboost_hrv_model.pkl", run_id="1100",
+                          deps=ma.dependency_versions())
+        assert ma.publish(db, manifest) == "published"
+    out = _select_output(db)
+    assert out["found"] == "true" and out["pinned"] == "false" and out["registry"] == "ok"
+    db.registry()[0]["pinned"] = True
+    out = _select_output(db)
+    assert out["found"] == "true" and out["pinned"] == "true"
+    print("PASS: select says ok / not_applied / error and pinned, and never fails the job")
+
+
+def test_registry_not_applied_is_only_the_missing_table():
+    class E(Exception):
+        def __init__(self, code, message):
+            super().__init__(message)
+            self.code, self.message = code, message
+
+    t = ma.REGISTRY_TABLE
+    assert ma.registry_not_applied(E("PGRST205", f"Could not find the table 'pds.{t}' in the schema cache"))
+    assert ma.registry_not_applied(E("42P01", f'relation "pds.{t}" does not exist'))
+    assert not ma.registry_not_applied(E("PGRST205", "Could not find the table 'pds.other' in the schema cache"))
+    assert not ma.registry_not_applied(E("PGRST301", "JWT expired"))
+    assert not ma.registry_not_applied(E("57014", "canceling statement due to statement timeout"))
+    assert not ma.registry_not_applied(RuntimeError("connection reset"))
+    print("PASS: only a missing registry table counts as not applied; every other failure is an error")
+
+
+def test_forecast_fails_closed_without_a_checked_registry_or_a_pinned_artifact():
+    ok = {"HRV_MODEL_REGISTRY": "ok"}
+    cases = [
+        ({"HRV_MODEL_REGISTRY": "error"}, "registry"),
+        ({"HRV_MODEL_REGISTRY": "error", "HRV_MODEL_RESTORED": "true"}, "registry"),
+        ({**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "true",
+          "HRV_MODEL_RESTORED": "false"}, "pinned artifact " + "a" * 12),
+        ({**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "true"}, "pinned artifact"),
+    ]
+    for env, fragment in cases:
+        why = ma.serving_refusal(env)
+        assert why and why.startswith("GUARD model_artifact:") and fragment in why, (env, why)
+    for env in (
+        {}, ok, {"HRV_MODEL_REGISTRY": "not_applied"},
+        {**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "true", "HRV_MODEL_RESTORED": "true"},
+        # an unpinned selected artifact that was evicted is replaced by this run's own training
+        {**ok, "HRV_MODEL_SELECTED_SHA256": "a" * 64, "HRV_MODEL_PINNED": "false", "HRV_MODEL_RESTORED": "false"},
+    ):
+        assert ma.serving_refusal(env) is None, env
+    print("PASS: an unreadable registry or a lost pinned artifact refuses the forecast outright")
 
 
 # ── 6: forecasts name their artifact ─────────────────────────────────────────────────────────
@@ -761,21 +844,42 @@ def test_each_forecast_names_the_artifact_that_made_it():
         assert beats()[-1]["status"] == "failed"
         assert beats()[-1]["error_message"].startswith("GUARD model_artifact:")
 
-        # (e) the registry could not be read: forecast made, reported partial
-        with _environ(HRV_MODEL_REGISTRY="unavailable", RUNNER_OS=OS):
+        # (e) the registry table is not applied yet: forecast made, reported partial
+        with _environ(HRV_MODEL_REGISTRY="not_applied", RUNNER_OS=OS):
             assert _run_main(hp) == 0
         assert stored and stored[-1][0][ma.LINK_COLUMN] == sha
-        assert beats()[-1]["status"] == "partial" and "could not be read" in beats()[-1]["error_message"]
+        assert beats()[-1]["status"] == "partial" and "not set up yet" in beats()[-1]["error_message"]
+
+        # (e2) the registry could not be read: no forecast, however good the file on disk is
+        stored.clear()
+        with _environ(HRV_MODEL_REGISTRY="error", RUNNER_OS=OS):
+            assert _run_main(hp) == 1
+        assert stored == []
+        assert beats()[-1]["status"] == "failed"
+        assert beats()[-1]["error_message"].startswith("GUARD model_artifact:")
+        assert "registry" in beats()[-1]["error_message"]
+
+        # (e3) a pinned artifact that is no longer in the cache: no forecast, no other model
+        with _environ(**{**selected, "HRV_MODEL_PINNED": "true", "HRV_MODEL_RESTORED": "false"}):
+            assert _run_main(hp) == 1
+        assert stored == []
+        assert beats()[-1]["status"] == "failed" and "pinned artifact" in beats()[-1]["error_message"]
+        assert "never replaced" in beats()[-1]["error_message"]
+        # the same pin, restored: served as selected, the heartbeat clears
+        with _environ(**{**selected, "HRV_MODEL_PINNED": "true"}):
+            assert _run_main(hp) == 0
+        assert stored and stored[-1][0][ma.LINK_COLUMN] == sha
+        assert beats()[-1]["status"] == "success"
 
         # (f) the heartbeat writer failing never stops the forecast
         def broken(*_a, **_k):
             raise RuntimeError("synthetic write failure")
         hp._shared_log_sync = broken
         stored.clear()
-        with _environ(**{**selected, "HRV_MODEL_REGISTRY": "unavailable"}):
+        with _environ(**{**selected, "HRV_MODEL_REGISTRY": "not_applied"}):
             assert _run_main(hp) == 0
         assert stored
-    print("PASS: every forecast row names its artifact; every unchecked path is a partial heartbeat")
+    print("PASS: every forecast row names its artifact; every unchecked path is a partial or failed heartbeat")
 
 
 def test_the_retrain_links_its_own_live_row():
@@ -841,6 +945,10 @@ def test_forecast_workflow_never_saves_a_restored_model():
     predict = _index(steps, "hrv_predict.py --predict")
     assert select < min(i for i, _ in model) and select < train < key < publish < predict
     assert "hashFiles('analysis_output/xgboost_hrv_model.pkl') == ''" in steps[train]["if"]
+    # no replacement training when the registry could not be read, or for a pinned artifact that
+    # is gone from the cache (hrv_predict.py then refuses the forecast, see serving_refusal)
+    assert "steps.select.outputs.registry != 'error'" in steps[train]["if"]
+    assert "steps.select.outputs.pinned != 'true'" in steps[train]["if"]
     assert steps[key]["if"] == "steps.self-train.outcome == 'success'"
     saves = [(i, s) for i, s in model if s["uses"].startswith("actions/cache/save@")]
     assert len(saves) == 1, "one save: the model trained in this run"
@@ -857,10 +965,17 @@ def test_forecast_workflow_never_saves_a_restored_model():
                 s["uses"].startswith("actions/cache/save@"):
             assert _paths(s) == MODEL_PATHS, f"same paths = same cache version: {s.get('name')}"
     env = steps[predict]["env"]
+    assert env["HRV_MODEL_PINNED"] == "${{ steps.select.outputs.pinned }}"
     assert env["HRV_MODEL_SELECTED_SHA256"] == "${{ steps.select.outputs.sha }}"
     assert env["HRV_MODEL_RESTORED"] == "${{ steps.model-cache.outputs.cache-hit }}"
     assert env["HRV_MODEL_REGISTRY"] == "${{ steps.select.outputs.registry }}"
     assert "steps.self-train.outcome != 'failure'" in steps[predict]["if"]
+    assert "steps.select.outcome == 'success'" in steps[predict]["if"], "not after a failed setup step"
+    # the legacy restore is for the table-not-applied window only; nothing is restored on an error
+    for _i, step in model:
+        cond = str(step.get("if", ""))
+        if "registry" in cond:
+            assert "registry == 'not_applied'" in cond and "'error'" not in cond, step.get("name")
     assert all(i < predict for i, s in saves), "nothing is saved after the forecast"
     print("PASS: the forecast workflow saves and publishes only a model it trained itself")
 

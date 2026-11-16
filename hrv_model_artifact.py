@@ -20,7 +20,10 @@ Now:
     checksum (sql/hrv_model_artifacts.sql), so publishing again changes nothing;
   * a forecast run reads the registry and never writes it. It serves the newest COMPATIBLE
     published artifact by provenance (training commit time, then data cutoff, then training
-    time), never by when an entry was saved; pinned rows win, retired rows are never served;
+    time), never by when an entry was saved; pinned rows win, retired rows are never served.
+    It fails closed: a registry that cannot be read (anything but "table not applied yet"), or
+    a pinned artifact that is no longer in the Actions cache, skips the forecast with a failed
+    heartbeat instead of serving or training some other model;
   * before unpickling, hrv_predict.py checks the file against the selected checksum and against
     its manifest (checksum, alignment, preprocessing, packages), and every forecast row records the
     checksum of the artifact that produced it (pds.hrv_predictions.model_artifact_sha256).
@@ -64,11 +67,17 @@ DEFAULT_BRANCH_REF = "refs/heads/master"
 REGISTRY_READ_LIMIT = 500
 
 # Package versions recorded with every artifact (the fingerprint covers all of them). An artifact
-# is served only where the leading version parts below agree with the packages installed here:
-# a pickle from another Python minor, numpy major or xgboost major may not load or may predict
-# differently. A package missing on either side is not compared.
+# is served only where the packages installed here agree with the ones it was trained with:
+#   * EXACT_PACKAGES must be identical. XGBoost does not promise that a pickle written by one
+#     release loads, or predicts the same, in another (not even a patch release), and its
+#     scikit-learn wrapper pickles the estimator state of the scikit-learn it ran with. Both
+#     workflows install unpinned packages, so a new release makes older artifacts unservable;
+#     the missing-model training then publishes a replacement built with the new packages.
+#   * COMPATIBLE_PARTS must agree on their leading parts (Python minor, numpy major).
+# A package missing on either side is not compared.
 DEPENDENCY_PACKAGES = ("numpy", "pandas", "scikit-learn", "xgboost")
-COMPATIBLE_PARTS = {"python": 2, "numpy": 1, "xgboost": 1}
+EXACT_PACKAGES = ("xgboost", "scikit-learn")
+COMPATIBLE_PARTS = {"python": 2, "numpy": 1}
 
 # A training that is not published reports on the HRV Retrain card (/status reads the newest row
 # of this pair), because the hourly forecast then keeps serving the previous model.
@@ -184,6 +193,11 @@ def _version_head(version: str, parts: int) -> tuple:
 
 def dependency_mismatch(recorded: Mapping | None, runtime: Mapping | None) -> str | None:
     """None when the recorded packages can be served by the runtime ones, else what differs."""
+    for name in EXACT_PACKAGES:
+        a = str((recorded or {}).get(name) or "").strip()
+        b = str((runtime or {}).get(name) or "").strip()
+        if a and b and a != b:
+            return f"{name} {a} at training, {b} here"
     for name, parts in COMPATIBLE_PARTS.items():
         a = (recorded or {}).get(name)
         b = (runtime or {}).get(name)
@@ -355,25 +369,51 @@ def _trained_in_this_run(manifest: Mapping | None, env: Mapping[str, str]) -> bo
             and run.get("run_attempt") == env.get("GITHUB_RUN_ATTEMPT"))
 
 
+def serving_refusal(env: Mapping[str, str] | None = None) -> str | None:
+    """Why no forecast may be made at all, whatever model file is on disk (None = go on).
+
+    Fail closed, never serve or train another model in its place:
+      * registry "error": the registry could not be read, so the model cannot be checked against
+        publication, retirement or a pin (a retired model must not come back during an outage);
+      * a pinned artifact that the exact-key restore did not bring back (GitHub evicts a cache
+        entry after seven days without a restore): the pin is an explicit rollback, so a model
+        trained in its place would defeat it, and would be trained again on every run."""
+    env = os.environ if env is None else env
+    if env.get("HRV_MODEL_REGISTRY", "") == "error":
+        return (f"GUARD model_artifact: the model registry pds.{REGISTRY_TABLE} could not be read, so "
+                "the model cannot be checked against publication, retirement or a pin. Forecast "
+                "skipped (no model is served or trained in its place).")
+    if env.get("HRV_MODEL_PINNED", "") == "true" and env.get("HRV_MODEL_RESTORED", "") != "true":
+        selected = (env.get("HRV_MODEL_SELECTED_SHA256") or "")[:12]
+        return (f"GUARD model_artifact: pinned artifact {selected} is no longer in the Actions cache. "
+                "Forecast skipped (a pin is never replaced by another model). Unpin or retire it "
+                f"(UPDATE pds.{REGISTRY_TABLE} ...), then retrain "
+                "(gh workflow run hrv-retrain-on-backfill.yml).")
+    return None
+
+
 def serving_report(loaded: LoadedArtifact, env: Mapping[str, str] | None = None) -> tuple[str, str | None]:
     """Heartbeat status + message for the artifact a forecast is made with.
 
-    The workflow passes HRV_MODEL_REGISTRY (ok | unavailable), HRV_MODEL_SELECTED_SHA256 and
-    HRV_MODEL_RESTORED (the exact-key restore hit). Outside the workflow none is set."""
+    The workflow passes HRV_MODEL_REGISTRY (ok | not_applied | error), HRV_MODEL_SELECTED_SHA256,
+    HRV_MODEL_PINNED and HRV_MODEL_RESTORED (the exact-key restore hit). Outside the workflow
+    none is set. Registry "error" and a lost pinned artifact never get this far
+    (serving_refusal)."""
     env = os.environ if env is None else env
     sha = loaded.sha256[:12]
     registry = env.get("HRV_MODEL_REGISTRY", "")
     selected = env.get("HRV_MODEL_SELECTED_SHA256", "")
     restored = env.get("HRV_MODEL_RESTORED", "") == "true"
     if loaded.manifest is None:
-        unread = (f" The model registry pds.{REGISTRY_TABLE} could not be read."
-                  if registry == "unavailable" else "")
+        unread = (f" The model registry pds.{REGISTRY_TABLE} is not set up yet."
+                  if registry == "not_applied" else "")
         return "partial", (f"Model artifact {sha} has no training provenance (cached before audit "
                            f"PIPE-08); the next retrain publishes one.{unread}")
     trained_here = _trained_in_this_run(loaded.manifest, env)
-    if registry == "unavailable":
-        return "partial", (f"Model registry pds.{REGISTRY_TABLE} could not be read; forecast made with "
-                           f"the newest cached training artifact {sha} without a registry check.")
+    if registry == "not_applied":
+        return "partial", (f"Model registry pds.{REGISTRY_TABLE} is not set up yet (apply "
+                           "sql/hrv_model_artifacts.sql); forecast made with the newest cached "
+                           f"training artifact {sha} without a registry check.")
     if selected:
         if restored and loaded.sha256 == selected:
             return "success", None
@@ -594,9 +634,21 @@ def read_registry(db) -> list[dict]:
     return list(rows.values())
 
 
+def registry_not_applied(exc: BaseException) -> bool:
+    """True when the registry read failed because sql/hrv_model_artifacts.sql was never applied
+    (the table is missing). Nothing can be retired or pinned then, so the forecast may still use
+    the newest cached training; every other read failure is an error (fail closed)."""
+    code = str(getattr(exc, "code", "") or "")
+    text = str(getattr(exc, "message", "") or exc)
+    return code in ("PGRST205", "42P01") and REGISTRY_TABLE in text
+
+
 def cmd_select(_args, db=None) -> int:
-    """Never fails the job: an unreadable registry is reported as registry=unavailable."""
-    out = {"found": "false", "key": "", "sha": "", "registry": "unavailable"}
+    """Picks the artifact to restore. Never fails the job itself: registry=ok (a normal answer,
+    found or not), registry=not_applied (table missing: legacy restore) or registry=error (the
+    registry could not be read: the workflow restores and trains nothing, and hrv_predict.py
+    refuses to forecast, see serving_refusal)."""
+    out = {"found": "false", "key": "", "sha": "", "pinned": "false", "registry": "error"}
     try:
         import hrv_alignment as al
         from hrv_analysis import SPARSE_FILL_VERSIONS
@@ -606,16 +658,25 @@ def cmd_select(_args, db=None) -> int:
             rows, alignment_version=al.ALIGNMENT_VERSION, preprocessing_versions=SPARSE_FILL_VERSIONS,
             runtime_deps=dependency_versions(), os_name=runner_os())
         if chosen:
-            out.update(found="true", key=chosen["cache_key"], sha=chosen["artifact_sha256"])
+            pinned = chosen.get("pinned") is True
+            out.update(found="true", key=chosen["cache_key"], sha=chosen["artifact_sha256"],
+                       pinned="true" if pinned else "false")
             log.info(f"Selected model artifact {chosen['artifact_sha256'][:12]} (trained "
                      f"{chosen.get('trained_at')}, data through {chosen.get('data_cutoff')}"
-                     f"{', pinned' if chosen.get('pinned') else ''}).")
+                     f"{', pinned' if pinned else ''}).")
         else:
             log.warning(f"No published model this code can serve ({len(rows)} published, "
                         f"{len(skipped)} not compatible); the missing-model training step trains one.")
     except Exception as e:  # noqa: BLE001
-        log.warning(f"Model registry unreadable ({_error_code(e)}); the newest cached training "
-                    "artifact is restored instead, with a partial forecast heartbeat.")
+        if registry_not_applied(e):
+            out["registry"] = "not_applied"
+            log.warning("Model registry is not set up yet (apply sql/hrv_model_artifacts.sql); the "
+                        "newest cached training artifact is restored instead, with a partial "
+                        "forecast heartbeat.")
+        else:
+            out["registry"] = "error"
+            log.error(f"Model registry unreadable ({_error_code(e)}): no model is restored or "
+                      "trained, and the forecast is skipped with a failed heartbeat.")
     _github_output(out)
     return 0
 

@@ -16,9 +16,10 @@
 -- Rollback / recovery (service role, e.g. the Supabase SQL editor):
 --   * serve a known-good artifact:  UPDATE pds.hrv_model_artifacts SET pinned = true, note = '...'
 --                                   WHERE artifact_sha256 = '<checksum>';
---     (its cache entry must still exist: GitHub keeps an entry 7 days after its last use; a pinned
---     artifact that is gone makes every forecast run train a model of its own, so clear the pin
---     once the problem is fixed: SET pinned = false)
+--     (its cache entry must still exist: GitHub removes an entry 7 days after its last restore, and
+--     a pinned artifact that is gone STOPS the forecast with a failed hrv_predict|model_artifact
+--     heartbeat; no other model is trained or served in its place, so the rollback is never
+--     silently replaced. Clear the pin, SET pinned = false, or retire it, then retrain)
 --   * stop serving a bad one:       UPDATE ... SET retired_at = now(), note = '...' WHERE ...;
 -- Only pinned, retired_at and note can change; every provenance column is fixed once published
 -- (trigger below). Rows are never removed by any job.
@@ -31,9 +32,13 @@
 -- Access: the table is service-role only (the browser never reads it). hrv_predictions keeps its
 -- existing policies; the new column is covered by them.
 --
--- Additive and safe to re-run. Apply BEFORE merging the PIPE-08 workflow change: until then the
--- forecast falls back to the newest cached training with a partial heartbeat, and the retrain's
--- publish step fails (the model trains, but the registry cannot record it).
+-- The forecast fails closed: a registry read that fails for any reason other than this table
+-- missing skips the forecast with a failed heartbeat (a retired or unpinned model is never
+-- served unchecked during an outage).
+--
+-- Additive and safe to re-run. Apply BEFORE merging the PIPE-08 workflow change: until then (table
+-- missing) the forecast falls back to the newest cached training with a partial heartbeat, and the
+-- retrain's publish step fails (the model trains, but the registry cannot record it).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS pds.hrv_model_artifacts (

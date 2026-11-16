@@ -96,9 +96,10 @@ PREPROCESSING_HEARTBEAT = ("hrv_predict", "preprocessing")
 PREPROCESSING_REPORT_EVERY_HOURS = 12
 # Heartbeat for the model artifact a forecast is made with (audit PIPE-08, hrv_model_artifact.py):
 # success = exactly the artifact the registry selected; partial = served without that check
-# (registry unreadable, a pre-PIPE-08 pickle, the selected one missing from the cache, or the
-# forecast stored without its artifact column); failed = refused before unpickling. Same
-# repeat rule as the preprocessing heartbeat.
+# (registry table not applied yet, a pre-PIPE-08 pickle, the selected one missing from the cache,
+# or the forecast stored without its artifact column); failed = refused before unpickling, or no
+# forecast at all (registry unreadable, pinned artifact gone from the cache). Same repeat rule as
+# the preprocessing heartbeat.
 MODEL_ARTIFACT_HEARTBEAT = ("hrv_predict", "model_artifact")
 
 
@@ -283,10 +284,15 @@ def load_model() -> tuple[dict | None, dict]:
     The workflow restores the artifact the registry selected and passes its checksum
     (HRV_MODEL_SELECTED_SHA256, HRV_MODEL_RESTORED = exact-key hit): the file must be exactly that
     artifact, and its manifest must match the pickle and this code, before anything is unpickled.
+    An unreadable registry, or a pinned artifact that is gone from the cache, refuses outright.
     report = {"sha256", "status", "message"}; the bundle is None when it must not be served."""
     from hrv_analysis import SPARSE_FILL_VERSIONS
     import hrv_alignment as al
 
+    refusal = model_artifact.serving_refusal(os.environ)     # registry unreadable / pin lost
+    if refusal:
+        log.error(refusal)
+        return None, {"sha256": None, "status": "failed", "message": refusal}
     selected = os.environ.get("HRV_MODEL_SELECTED_SHA256", "")
     restored = os.environ.get("HRV_MODEL_RESTORED", "") == "true"
     try:
