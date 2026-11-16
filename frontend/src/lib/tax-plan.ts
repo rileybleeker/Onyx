@@ -71,9 +71,10 @@ export interface TaxProfile {
 export const DEFAULT_BRACKET_INDEX_PCT = 2.7;
 /**
  * Tax tables for a year with the profile's entries applied. Published figures are used as they are; a year whose
- * federal figures are not published yet indexes the last published year's by `bracketIndexPct` (an assumption, or
- * "override" when Riley entered the percentage); an entered Georgia or North Carolina rate replaces the table's for
- * every year ("override", the table's own figure named in the note).
+ * federal figures are not published yet indexes the last published year's by `bracketIndexPct` and stays an
+ * "assumption" either way (the note says whether the percentage is the plan's default or Riley's entry, since an
+ * entered index does not make an unpublished year's figures any less of an estimate); an entered Georgia or North
+ * Carolina rate replaces the table's for every year ("override", the table's own figure named in the note).
  */
 export function tablesFor(profile: TaxProfile, year: number): YearTables {
   const t = taxTables(year);
@@ -94,8 +95,8 @@ export function tablesFor(profile: TaxProfile, year: number): YearTables {
         single: t.federal.single.map((b) => ({ ...b, upTo: b.upTo === null ? null : down(b.upTo, 25) })),
         standardDeduction: down(t.federal.standardDeduction, 50),
         ssWageBase: Math.round((t.federal.ssWageBase * f) / 300) * 300,
-        basis: entered ? "override" : "assumption",
-        note: `${year} federal brackets, standard deduction and wage base are not published yet: ${from}'s indexed ${pct.toFixed(1)}% a year (${entered ? "your entry in the tax profile" : "the plan's default; edit it in the tax profile"}).`,
+        basis: "assumption",
+        note: `${year} federal brackets, standard deduction and wage base are not published yet: estimated as ${from}'s indexed ${pct.toFixed(1)}% a year (${entered ? "the index is your entry in the tax profile" : "the plan's default index; edit it in the tax profile"}).`,
       },
     };
   }
@@ -137,24 +138,27 @@ export function taxRuleStatus(t: YearTables, jur: Jur, today: string): TaxRuleSt
         : jur === "NC"
           ? `${t.nc.rate}% flat, standard deduction ${dollarsText(t.nc.standardDeduction)}, withholding ${t.nc.supplementalRate}%`
           : jur === "NY"
-            ? `brackets ${rangeText(t.ny.single)}, standard deduction ${dollarsText(t.ny.standardDeduction)}${t.ny.recapture ? `, recapture above ${dollarsText(t.ny.recapture.startAgi)} of NY income` : ""}`
+            ? `brackets ${rangeText(t.ny.single)}, standard deduction ${dollarsText(t.ny.standardDeduction)}${t.ny.recapture ? `, recapture above ${dollarsText(t.ny.recapture.startAgi)} of NY AGI` : ""}`
             : `brackets ${rangeText(t.nyc.single)}`;
   const stale = part.staleAfter && today > part.staleAfter
-    ? `${JUR_LABEL[jur]} ${t.year}: the official figures are normally published by ${part.staleAfter}, and the built-in table still has an assumption. Update lib/tax-tables.ts.`
+    ? `${JUR_LABEL[jur]} ${t.year}: the official figures are normally published by ${part.staleAfter}, and the built-in table still has an assumption. Ask an agent to update the built-in tax tables.`
     : null;
   return { jur, label: JUR_LABEL[jur], basis: part.basis, figures, note: part.note, sources: part.sources, stale };
 }
-/** The built-in tables are re-checked every year (each November to January); past a year since the check, say so. */
+/**
+ * The built-in tables are re-checked every year (each November to January); past a year since the check, say so.
+ * One message for the whole page (TaxYearResult.tablesReview, shown once above the years), not one per year.
+ */
 export function tablesReviewMessage(today: string, checked: string = TABLES_CHECKED): string | null {
   const due = `${Number(checked.slice(0, 4)) + 1}${checked.slice(4)}`;
-  return today > due ? `The built-in tax tables were last checked against their sources on ${checked}; check every year's figures again (due ${due}).` : null;
+  return today > due ? `The built-in tax tables were last checked against their sources on ${checked} (a new check was due ${due}): ask an agent to check every year's figures again.` : null;
 }
 
 /** What the estimate leaves out, shown beside it on the page. */
 export const TAX_LIMITATIONS: readonly string[] = [
   "One single filer with the standard deduction: no itemizing, credits, AMT or equity compensation; FICA is assumed to be withheld exactly.",
   "Not modeled: the federal deductions for tips, overtime and car-loan interest, Georgia's tips and overtime exclusions and retirement exclusion, half of self-employment tax as a deduction, NYC credits, the MCTMT and Yonkers.",
-  "Part-year rules: Georgia prorates its standard deduction by the Georgia share of income (Form 500 Schedule 3); New York taxes the income percentage of the full-year tax, rounded to four decimals (IT-203); NYC prorates the standard deduction by full months of residence (IT-360.1). No special accruals.",
+  "Part-year rules: Georgia prorates its standard deduction by the Georgia share of income (Form 500 Schedule 3); New York taxes the income percentage of the full-year tax, rounded to four decimals (IT-203); NYC prorates the standard deduction by full months of residence (IT-360.1). Wages and other income are split at the move date by when they are received (other income counted as one twelfth at each month end). No special accruals.",
   "New York's tax benefit recapture is included (worksheets 7-11, single), derived from the brackets: within about $2 of the published worksheet amounts.",
   "North Carolina: nonresident tax on the share of days worked there, credited by Georgia or New York up to their own tax on that income.",
   "Payment dates move past weekends, federal holidays and DC Emancipation Day like IRS due dates (IRC 7503); the states are assumed to use the same dates. A refund is assumed on April 30.",
@@ -223,6 +227,30 @@ export function otherIncomeFor(profile: TaxProfile, year: number): number {
   const extra = ch && ch.annualCents ? otherIncomeReceiptCents(ch.annualCents) * otherIncomeReceiptDates(ch.from, year).length : 0;
   return Math.max(0, profile.otherIncomeAnnualCents + extra);
 }
+/**
+ * The part of a year's other income (`otherCents` = otherIncomeFor) received as a New York resident, split by receipt
+ * date like wages: the profile's yearly figure as one twelfth at each month end, a what-if change on its own receipt
+ * dates, and every receipt on or after the move date is New York's. Deliberately not the NYC resident months
+ * (cityResidentMonths), which round a part month and only prorate the NYC standard deduction: a move on December 20
+ * still receives December's income in New York.
+ */
+export function nyOtherIncomeCents(profile: TaxProfile, year: number, otherCents: number): number {
+  const move = profile.moveDate;
+  if (!move || otherCents <= 0) return 0;
+  const ch = profile.otherIncomeChange;
+  const changeDates = ch && ch.annualCents ? otherIncomeReceiptDates(ch.from, year) : [];
+  const changeEach = ch && ch.annualCents ? otherIncomeReceiptCents(ch.annualCents) : 0;
+  let total = 0;
+  let ny = 0;
+  for (let m = 1; m <= 12; m++) {
+    const date = lastBusinessDayOfMonth(year, m);
+    const cents = profile.otherIncomeAnnualCents / 12 + (changeDates.includes(date) ? changeEach : 0);
+    total += cents;
+    if (date >= move) ny += cents;
+  }
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(otherCents, Math.round(otherCents * (ny / total))));
+}
 /** Salary for a calendar year, with the annual raise from the start year on. */
 export function salaryFor(profile: TaxProfile, year: number): number {
   const startYear = Number(profile.employmentStart.slice(0, 4));
@@ -278,8 +306,10 @@ export interface TaxYearResult {
   assumptions: string[];
   /** Where each jurisdiction's figures come from (published / assumption / your entry), with sources. */
   rules: TaxRuleStatus[];
-  /** Built-in figures that should have been updated by now (an assumption past its publication date, an old check). */
+  /** Built-in figures of this year that should have been updated by now (an assumption past its publication date). */
   stale: string[];
+  /** Set when the built-in tables were last checked more than a year ago (the same on every year: show it once). */
+  tablesReview: string | null;
   limitations: readonly string[];
   /** The day the built-in tables were last checked against their sources. */
   tablesChecked: string;
@@ -368,11 +398,12 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
   }
   assumptions.push(ytd ? `Withholding: pay stub to ${ytd.asOf}, then projected.` : "Withholding is estimated from the salary (no pay stub entered yet).");
 
-  // State incomes.
+  // State incomes: wages and other income by the date they are received (before the move = Georgia's).
   const gaWages = wages.filter((w) => !isNY(w.date)).reduce((s, w) => s + w.cents, 0);
   const nyWages = W - gaWages;
-  const gaIncome = Math.round(gaWages * (1 - preTaxShare) + (other * (12 - nyMonths)) / 12);
-  const nyIncome = Math.round(nyWages * (1 - preTaxShare) + (other * nyMonths) / 12);
+  const nyOther = nyOtherIncomeCents(profile, year, other);
+  const gaIncome = Math.round(gaWages * (1 - preTaxShare) + (other - nyOther));
+  const nyIncome = Math.round(nyWages * (1 - preTaxShare) + nyOther);
   const ncShare = Math.max(0, Math.min(100, profile.ncWorkSharePct)) / 100;
   const ncSource = Math.round(W * (1 - preTaxShare) * ncShare);
   const ncTax = ncSource > 0 && agi > 0 ? Math.round(c((Math.max(0, d(agi) - t.nc.standardDeduction) * t.nc.rate) / 100) * (ncSource / agi)) : 0;
@@ -456,8 +487,6 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
 
   const rules = jurisdictions.map((j) => taxRuleStatus(t, j.jur, today));
   const stale = rules.filter((r) => r.stale).map((r) => r.stale as string);
-  const review = tablesReviewMessage(today);
-  if (review) stale.push(review);
 
   return {
     year,
@@ -470,6 +499,7 @@ export function computeTaxYear(profile: TaxProfile, year: number, today: string)
     assumptions,
     rules,
     stale,
+    tablesReview: tablesReviewMessage(today),
     limitations: TAX_LIMITATIONS,
     tablesChecked: TABLES_CHECKED,
   };

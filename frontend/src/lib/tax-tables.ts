@@ -7,7 +7,8 @@
  *  - basis "assumption": not published yet; a planning figure (carried forward, or indexed in lib/tax-plan.ts), with
  *    the reason in `note` and `staleAfter` = the date by which the official figures are normally out. Past that date
  *    the plan says the built-in table needs updating (taxRuleStatus in lib/tax-plan.ts).
- * A rate Riley enters in the tax profile is a third basis, "override", applied by lib/tax-plan.ts (tablesFor).
+ * A rate Riley enters in the tax profile is a third basis, "override", applied by lib/tax-plan.ts (tablesFor). An
+ * entered federal index does not make an unpublished year "override": its figures stay an assumption.
  *
  * Yearly refresh (who and when: docs/cash-flow-forecast.md, Section 7.2): federal figures after the IRS revenue
  * procedure (October / November) and the SSA wage base (October), Georgia after the Office of Planning and Budget's
@@ -80,7 +81,10 @@ export interface NycTable extends Provenance {
 }
 export interface YearTables {
   year: number;
-  /** The notes of every jurisdiction that is an assumption, joined; null = every figure is published. */
+  /**
+   * The notes of every jurisdiction that is not published (an assumption here; also an override once lib/tax-plan.ts
+   * applies Riley's entries), joined; null = every figure is published.
+   */
   estimated: string | null;
   federal: FederalTable;
   ga: GaTable;
@@ -98,7 +102,7 @@ const SRC = {
   ssa: { title: "SSA contribution and benefit base ($184,500 for 2026, $192,300 for 2027)", url: "https://www.ssa.gov/oact/cola/cbb.html", retrieved: R, effective: "wages paid in the calendar year" },
   fica: { title: "IRC 3101 (6.2% Social Security, 1.45% Medicare, 0.9% above $200,000) and the 22% optional flat rate for supplemental wages (Treas. Reg. 31.3402(g)-1)", url: "https://www.irs.gov/publications/p15", retrieved: R, effective: "wages paid in the calendar year (statutory, not indexed)" },
   ga2026: { title: "Georgia DOR, Important tax updates: 2026 flat rate 4.99%, standard deduction $15,000 single", url: "https://dor.georgia.gov/taxes/important-tax-updates", retrieved: R, effective: "tax year 2026" },
-  gaHb463: { title: "Georgia HB 463 (2026), as passed: O.C.G.A. 48-7-20(a.1) and 48-7-27(a)(1); signed May 11, 2026", url: "https://www.legis.ga.gov/api/legislation/document/20252026/249080", retrieved: R, effective: "taxable years beginning on or after January 1, 2026; later steps from January 1, 2027, each subject to the December 1 revenue conditions" },
+  gaHb463: { title: "Georgia HB 463 (2026), as passed: O.C.G.A. 48-7-20(a.1) (rate, 0.125-point steps delayed with the standard deduction's) and 48-7-27(a)(1), (a)(1.1) (standard deduction, $375 steps; delayed a year when any revenue condition fails as of December 1, determined and reported by the Office of Planning and Budget by December 1); signed May 11, 2026", url: "https://www.legis.ga.gov/api/legislation/document/20252026/249080", retrieved: R, effective: "taxable years beginning on or after January 1, 2026 (Section 5-1); later steps from January 1, 2027, each subject to the December 1 revenue conditions" },
   ncRates: { title: "NCDOR tax rate schedules: 3.99% for taxable years after 2025", url: "https://www.ncdor.gov/taxes-forms/tax-rate-schedules", retrieved: R, effective: "taxable years beginning in 2026" },
   ncSl202641: { title: "N.C. S.L. 2026-41 (S.B. 257), section 44.1: G.S. 105-153.7 rates 3.49% (2027-2029), 3.24% (2030-2032), 2.99% (after 2032)", url: "https://www.ncleg.gov/Sessions/2025/Bills/Senate/PDF/S257v8.pdf", retrieved: R, effective: "taxable years beginning in 2027 and later" },
   ncStd: { title: "NCDOR standard deduction: $12,750 single (G.S. 105-153.5(a)(1), not indexed)", url: "https://www.ncdor.gov/taxes-forms/individual-income-tax/north-carolina-standard-deduction-or-north-carolina-itemized-deductions", retrieved: R, effective: "every year until the statute changes" },
@@ -178,7 +182,7 @@ function gaFor(year: number): GaTable {
     basis: "assumption",
     note:
       `HB 463 schedules a 0.125-point rate cut and a $375 larger standard deduction each year from 2027 (down to 3.99% and up to $18,000), ` +
-      `each step delayed a year unless the Office of Planning and Budget's December 1 report finds the revenue conditions met. ` +
+      `each step delayed a year when any of its three revenue conditions fails as of December 1 (O.C.G.A. 48-7-27(a)(1.1); the Office of Planning and Budget reports by December 1). ` +
       `Until the report for ${year} is entered here, ${year} uses 2026's 4.99% and $15,000 (the higher tax).`,
     staleAfter: `${year - 1}-12-15`,
   };
@@ -194,10 +198,18 @@ const NC_RATES: { from: number; to: number; rate: number; source: TableSource }[
   { from: 2033, to: 2034, rate: 2.99, source: SRC.ncSl202641 },
 ];
 const ncWithholding = (rate: number): number => Math.round((rate + 0.1) * 100) / 100;
+/** The latest year whose NC-30 (withholding tables) is issued. */
+const NC_LAST_NC30 = 2026;
 
 function ncFor(year: number): NcTable {
   const hit = NC_RATES.find((r) => year >= r.from && year <= r.to);
-  if (hit) return { rate: hit.rate, standardDeduction: NC_STD, supplementalRate: ncWithholding(hit.rate), basis: "published", note: null, sources: [hit.source, SRC.ncStd, SRC.ncWh], staleAfter: null };
+  if (hit) {
+    // The rate is enacted; the withholding rate is published only in that year's NC-30, so after the latest NC-30
+    // (2026) it is derived with the NC-30 rule (rate + 0.10) and says so.
+    const wh = ncWithholding(hit.rate);
+    const note = year > NC_LAST_NC30 ? `Withholding ${wh}% is derived as the rate + 0.10 (the NC-30 rule) until the NC-30 for ${year} is issued.` : null;
+    return { rate: hit.rate, standardDeduction: NC_STD, supplementalRate: wh, basis: "published", note, sources: [hit.source, SRC.ncStd, SRC.ncWh], staleAfter: null };
+  }
   const edge = year < NC_RATES[0].from ? NC_RATES[0] : NC_RATES[NC_RATES.length - 1];
   return {
     rate: edge.rate,

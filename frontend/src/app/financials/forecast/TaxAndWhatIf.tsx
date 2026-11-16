@@ -217,6 +217,8 @@ export function CompareTable({ base, baseTax, scen, scenTax }: { base: ForecastR
 // ─── Taxes ────────────────────────────────────────────────────────────────────────────────────
 
 export function TaxSection({ tax, profile, busy, run }: { tax: TaxYearResult[]; profile: TaxProfile | null; busy: boolean; run: Run }) {
+  // The "tables last checked over a year ago" line is the same for every year: shown once, above the years.
+  const review = tax.find((t) => t.tablesReview)?.tablesReview ?? null;
   return (
     <section className={card} aria-labelledby="fc-tax">
       <div className="flex items-center gap-2">
@@ -226,6 +228,7 @@ export function TaxSection({ tax, profile, busy, run }: { tax: TaxYearResult[]; 
         </InfoHint>
       </div>
       {!profile && <p className="mt-2 text-[13px] text-mid">No tax profile yet: fill in the form below.</p>}
+      {review && <p className="mt-2 text-[12px] text-mid">{review}</p>}
       {tax.map((t) => (
         <div key={t.year} className="mt-4">
           <h3 className="font-semibold">{t.year}</h3>

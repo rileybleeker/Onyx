@@ -257,16 +257,18 @@ balance on April 15, a refund about 3 weeks after the planned filing date (drive
 
 | Basis | Meaning | Today (checked 2026-11-16) |
 |---|---|---|
-| published | an official table or an enacted law for that year | federal 2026 (Rev. Proc. 2025-32) and 2027 (Rev. Proc. 2026-35, SSA $192,300); Georgia 2026 4.99% / $15,000 (HB 463); North Carolina 3.99% (2026), 3.49% (2027-2029), 3.24%, 2.99% (S.L. 2026-41), $12,750, withholding = rate + 0.10; New York 2026 and 2027-2032 (Tax Law 601(c)(1)(vii), (viii)), $8,000, the 601(d-1) recapture; NYC current rates |
-| assumption | not published yet: a planning figure with the reason, and `staleAfter` = when the official figures are normally out | federal 2028+ = 2027 indexed `bracketIndexPct` a year (default 2.7%, IRS rounding); Georgia 2027+ = 2026's 4.99% / $15,000 until the Office of Planning and Budget's December 1 report says whether HB 463's next step (-0.125 points, +$375) happens |
-| override | a figure Riley entered in the tax profile (Georgia or NC rate, the federal index) | shown as "your entry", with the table's own figure in the note |
+| published | an official table or an enacted law for that year | federal 2026 (Rev. Proc. 2025-32) and 2027 (Rev. Proc. 2026-35, SSA $192,300); Georgia 2026 4.99% / $15,000 (HB 463); North Carolina 3.99% (2026), 3.49% (2027-2029), 3.24%, 2.99% (S.L. 2026-41), $12,750, withholding = rate + 0.10 (the 2026 NC-30; later years are derived with that rule and say so until their NC-30 is issued); New York 2026 and 2027-2032 (Tax Law 601(c)(1)(vii), (viii)), $8,000, the 601(d-1) recapture; NYC current rates |
+| assumption | not published yet: a planning figure with the reason, and `staleAfter` = when the official figures are normally out | federal 2028+ = 2027 indexed `bracketIndexPct` a year (default 2.7%, IRS rounding; an index Riley entered keeps the year an assumption, the note says the index is his); Georgia 2027+ = 2026's 4.99% / $15,000 until the Office of Planning and Budget's December 1 report says whether HB 463's next step (-0.125 points, +$375) happens (O.C.G.A. 48-7-27(a)(1.1): a step is delayed a year when any of three revenue conditions fails as of December 1) |
+| override | a rate Riley entered in the tax profile (Georgia or NC) | shown as "your entry", with the table's own figure in the note |
 
-The page shows the basis per jurisdiction for each year, a visible line when an assumption is past its `staleAfter`
-date (federal: November 30 of the year before; Georgia: December 15) or when the tables were last checked more than a
-year ago (`TABLES_CHECKED`), and the sources and limits behind "Tax tables and limits". **Refresh ownership:** whoever
-works the finance area refreshes the tables each November to January (IRS revenue procedure in October / November,
-SSA wage base in October, Georgia OPB report December 1; NC and NY after their sessions) and moves `TABLES_CHECKED`;
-the stale line is the reminder. Tests (`tests/tax-plan.test.cjs`, synthetic) check the bracket edges against the
+The page shows the basis per jurisdiction for each year, a visible line per year when an assumption is past its
+`staleAfter` date (federal: November 30 of the year before; Georgia: December 15), one line above the years when the
+tables were last checked more than a year ago (`TABLES_CHECKED`), and the sources and limits behind "Tax tables and
+limits". **Refresh ownership:** the Onyx Roadmap row "[TAX-REFRESH] Refresh built-in tax tables" (Not Started, due
+each December 15; its Notes list the steps and the `staleAfter` dates) is the owner, so the refresh is tracked in the
+backlog instead of waiting for the page's stale line: IRS revenue procedure in October / November, SSA wage base in
+October, the Georgia OPB report by December 1, the next NC-30 and NY IT-2105-I; then move `TABLES_CHECKED` and the
+row's due date to the next December 15. Tests (`tests/tax-plan.test.cjs`, synthetic) check the bracket edges against the
 amounts printed in the revenue procedures and the NY statute, the recapture against the IT-2105-I (2026) worksheet
 amounts, the part-year rules against the IT-203 and IT-360.1 examples, and the due dates against Form 1040-ES.
 
@@ -292,6 +294,9 @@ preparer files the return (D6). The list shown on the page is `TAX_LIMITATIONS` 
 2026-11-16: New York's tax benefit recapture (worksheets 7-11, derived from the brackets, within about $2 of the
 published amounts), the IT-203 income percentage rounded to four decimals, NYC's standard deduction prorated by full
 resident months (IT-360.1), and due dates moved past weekends, federal holidays and DC Emancipation Day (IRC 7503).
+Wages and other income are split at the move date by when they are received (other income as one twelfth at each
+month end, a what-if change on its own receipt dates): the rounded NYC months prorate only the NYC standard deduction,
+so a move late in a month still puts that month's receipts in New York.
 
 ## 8. What-if scenarios
 
