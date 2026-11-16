@@ -1,6 +1,6 @@
 # Onyx — Agent Instructions
 
-Read by every coding agent (Claude Code, Codex, Cursor, Copilot, Gemini CLI, …). This is the only project-instructions file; there is no CLAUDE.md. It holds the rules for every task; the domain files in `docs/agents/` bind too.
+Read by every coding agent (Claude Code, Codex, Cursor, …). This is the only project-instructions file; there is no CLAUDE.md. It holds the rules for every task; the domain files in `docs/agents/` bind too.
 
 Onyx is Riley's personal health-data platform: root-level Python ETL scripts load devices, apps, email and finance into Supabase Postgres (schema `pds`, DDL in `sql/`); the Next.js app in `frontend/` deploys to Vercel from `master`; schedules are in `.github/workflows/`.
 
@@ -13,7 +13,7 @@ Onyx is Riley's personal health-data platform: root-level Python ETL scripts loa
 
 ## Find your domain rules
 
-Before changing anything, read the file below for the paths you touch, and their source. Dated notes, counts and schedules there are history: the source wins; if they disagree, raise it. Where an old `AGENTS.md "<name>"` citation went, and the full path table: [docs/agents/README.md](docs/agents/README.md). Change a domain rule in its file; a new section needs an index row (`tests/test_agents_docs.py`).
+Before changing anything, read the file below for the paths you touch, and their source. Dated notes, counts and schedules there are history: the source wins; if they disagree, raise it. Old `AGENTS.md "<name>"` citations, edits to the old file, and the full path table: [docs/agents/README.md](docs/agents/README.md). Change a domain rule in its file; a new section needs an index row (`tests/test_agents_docs.py`).
 
 Files (`docs/agents/<name>.md`):
 

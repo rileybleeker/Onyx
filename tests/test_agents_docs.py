@@ -14,7 +14,8 @@ docs/agents/<domain>.md with an index in docs/agents/README.md. These checks kee
   * the root keeps its hard rules (no tests before merge, tsc, secrets and privacy, isCiRoute, no DROP in
     MCP migrations, heartbeats, /status, dates, HRV alignment, speed, autosave, scroll-never-writes, UI
     copy, the audit-finding rule) and stays under its size budget;
-  * a few load-bearing rules are still present in their domain files.
+  * a few load-bearing rules are still present in their domain files, and every edit made to the old root
+    on master after the split (re-homed when the branch rebased) is in its domain file and listed in the index.
 
 Synthetic only: no database, no network, no credentials. Reads files in this repository.
 
@@ -117,6 +118,17 @@ DOMAIN_RULES = [
     ("frontend.md", "No explanatory paragraphs on the screen"),
     ("reading-journal.md", "Body — VERBATIM RULE."),
     ("log-screen.md", "A new kind of daily entry goes into a Log section"),
+]
+
+# Edits to the old root that landed on master after the split and were re-homed when this branch rebased:
+# (commit, domain file, literal text). Each commit also needs a row in the index's "Root edits made after
+# the split" table, so a rebase that keeps the new root cannot drop the edit unnoticed.
+REHOMED = [
+    ("d376776", "database.md", "Journal entries go through `pds.journal_entry_onyx_dates`; the migration has no backfill"),
+    ("d376776", "database.md", "its rollback is `sql/rollback_tz_derivation_2026-11-16.sql`"),
+    ("d376776", "database.md", "`sql/tz_derivation_preapply_counts.sql` (run before applying, SELECT only)"),
+    ("d376776", "database.md", "`sql/tz_derivation_postdeploy_checks.sql` runs right after"),
+    ("d376776", "database.md", "`sql/tz_derivation_whoop_followups.sql` (not applied)"),
 ]
 
 # Where code comments, workflows and docs cite `AGENTS.md "<name>"`.
@@ -295,6 +307,15 @@ class AgentsDocsTest(unittest.TestCase):
     def test_load_bearing_domain_rules_present(self):
         missing = [f"{f}: {t}" for f, t in DOMAIN_RULES if t not in text(DOCS / f)]
         self.assertEqual(missing, [])
+
+    def test_root_edits_after_the_split_are_rehomed(self):
+        table = section(self.index, "Root edits made after the split")
+        self.assertTrue(table, "docs/agents/README.md lost its 'Root edits made after the split' section")
+        listed = {r[0] for r in table_rows(table) if r}
+        for commit, f, literal in REHOMED:
+            with self.subTest(commit=commit, file=f):
+                self.assertTrue(any(f"`{commit}`" in cell for cell in listed), f"{commit} has no row in the index")
+                self.assertIn(literal, text(DOCS / f))
 
     # --- the helpers themselves -------------------------------------------------------------------------
     def test_slug_matches_github(self):

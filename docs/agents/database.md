@@ -3,7 +3,7 @@
 Part of the Onyx agent instructions: [root](../../AGENTS.md) · [index](README.md). These rules bind every change in this area.
 
 - **Owner (source of truth):** `sql/`, `sync_log_helper.py`, ADR-0001 (`docs/adr/0001-timezone-and-behavioral-day-handling.md`).
-- **Moved** from the root `AGENTS.md` at `65d813f` on 2026-11-16, verbatim except where a line says "Corrected" and the cross references listed under "Edited while moving" in [README.md](README.md). Last reviewed 2026-11-16.
+- **Moved** from the root `AGENTS.md` at `65d813f` on 2026-11-16, verbatim except where a line says "Corrected" and the cross references listed under "Edited while moving" in [README.md](README.md); the time-zone paragraph also carries `d376776` (#357), listed under "Root edits made after the split" there. Last reviewed 2026-11-16.
 - Dated notes, counts, schedules and "not applied yet" remarks are history: check them against the current source. Paths are repository-root-relative; `lib/…`, `app/…`, `components/…` mean `frontend/src/…`. A section name in quotes ("under Database", "see Conventions") is listed in [README.md](README.md).
 
 ## Database basics

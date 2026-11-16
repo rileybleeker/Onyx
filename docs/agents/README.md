@@ -118,3 +118,11 @@ Every heading of the old root `AGENTS.md`. A section that was split lists each p
 - Two links are now relative to this folder: delivery accountability (ops-ci.md) and ADR-0001 (database.md).
 - Today's "Clearing" and "Calendar" paragraphs sat under the Procurement heading; they are in today.md.
 - The root restates, shorter, the rules that bind every task: testing and type-check, delivery accountability (full text in ops-ci.md), privacy and access, SQL, ETL heartbeats, `/status`, dates and HRV alignment, the frontend rules and the audit-finding rule. Agent Permissions and "Never commit secrets" are in the root only.
+
+## Root edits made after the split
+
+A branch written against the old long `AGENTS.md` conflicts with the new root when it rebases. Keep the new root, find the edited line's old section under **Where the old sections went**, make the same edit in that domain file (verbatim, or the line's tightened copy there), and add a row here. `tests/test_agents_docs.py` (`REHOMED`) checks each row's text is still in its file.
+
+| Commit on `master` | Edit | Now in |
+|---|---|---|
+| `d376776` (#357, HIST-TZ-01) | Timezone convention: the sentence on journal entries (`pds.journal_entry_onyx_dates`), no backfill, the rollback, pre-apply counts, post-deploy checks and WHOOP follow-up files | [database.md › Timezone convention and matrix views](database.md#timezone-convention-and-matrix-views) |
