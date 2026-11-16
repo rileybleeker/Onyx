@@ -328,7 +328,8 @@ function BudgetRow({ l, busy, run }: { l: BudgetLine; busy: boolean; run: (fn: (
   );
 }
 
-function TotalBudget({ current, busy, run }: { current: number | null; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
+/** Exported for tests/autosave-forms.test.cjs (the overall budget field's save outcomes). */
+export function TotalBudget({ current, busy, run }: { current: number | null; busy: boolean; run: (fn: () => Promise<string | null>) => void }) {
   // The field starts empty (the current overall budget is its placeholder). Typing saves after a pause; an empty
   // field changes nothing, 0 clears the overall budget (back to the sum of categories).
   const [v, setV] = useState("");

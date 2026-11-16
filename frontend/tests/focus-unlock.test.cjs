@@ -1,12 +1,17 @@
-// Run: node --test tests/focus-unlock.test.cjs
+// Run with the rest of the suite (after deployment): node --test tests/focus-unlock.test.cjs
 // Focus habit unlock (lib/focus-unlock.ts, lib/focus-unlock-server.ts): the unlock decision under both
-// rules, the settings body, what the phone's status answer contains, and the auth boundary.
+// rules, the settings body, what the phone's status answer contains, the auth boundary (isCiRoute, a check over the
+// whole of middleware.ts and middleware() run without the owner's session), the two routes (run
+// against a fake database) and the /install settings card (mounted with the real autosave on a manual clock).
 // SYNTHETIC DATA ONLY: invented habit names, ids and dates; a fake database; no network.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { loadTs, SRC } = require("./helpers/load-ts.cjs");
+const { response } = require("./helpers/hook-harness.cjs");
+const { mountAutosaving } = require("./helpers/autosave-harness.cjs");
+const SF = require("./helpers/source-facts.cjs");
 
 const F = loadTs("lib/focus-unlock.ts");
 const S = loadTs("lib/focus-unlock-server.ts");
@@ -281,57 +286,349 @@ test("saveFocusConfig: writes the one row; refuses an id that is not a known hab
   assert.deepEqual(db3.calls.map((c) => c.table), ["focus_unlock_config"]);
 });
 
-// ─── auth boundary and wiring ────────────────────────────────────────────────
+// ─── auth boundary and routes (executed) ─────────────────────────────────────
 
 test("middleware: the token opens /api/focus/unlock-status only, as an exact path", () => {
-  const src = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
-  const m = /function isCiRoute\(pathname: string\): boolean \{([\s\S]*?)\n\}/.exec(src);
-  assert.ok(m, "isCiRoute not found");
-  const isCiRoute = new Function("pathname", m[1]);
+  const isCiRoute = SF.loadFunction("middleware.ts", "isCiRoute");
   assert.equal(isCiRoute("/api/focus/unlock-status"), true);
   for (const p of ["/api/focus", "/api/focus/", "/api/focus/config", "/api/focus/unlock-status/", "/api/focus/unlock-status/x", "/api/focus/unlock-statusx", "/api/focusx/unlock-status"]) {
     assert.equal(isCiRoute(p), false, p);
   }
+});
+
+// The test above proves what isCiRoute() admits; it cannot see the rest of middleware.ts, where an early return,
+// a regex or a matcher exclusion would make the session-only /api/focus/config reachable while isCiRoute() still
+// answers as before. This check covers the whole file: its only mention of a focus path is isCiRoute's
+// `pathname === "/api/focus/unlock-status"`, and no startsWith() anywhere takes a focus path (master's whole-file
+// rule). Literals are read from the syntax tree, so quote style, line breaks and comments change nothing. Limit: a
+// path assembled at run time from pieces that do not contain "focus" is not seen; the middleware() run below covers
+// the paths it sends.
+function focusPathProblems(sf) {
+  const { ts } = SF;
+  const textOf = (n) => (ts.isRegularExpressionLiteral(n) ? n.text.replace(/\\/g, "") : SF.literalText(n));
+  const isLiteral = (n) => ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) || ts.isTemplateExpression(n) || ts.isRegularExpressionLiteral(n);
+  const mentions = (n) => /focus/i.test(textOf(n) ?? "");
+  const shown = (n) => n.getText().replace(/\s+/g, " ");
+  const problems = [];
+  for (const c of SF.collect(sf, (n) => ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === "startsWith")) {
+    if (c.arguments.some(mentions)) problems.push(`a focus prefix: ${shown(c)}`);
+  }
+  const isCi = SF.functionNamed(sf, "isCiRoute");
+  const exactComparison = (n) => {
+    let e = n;
+    while (ts.isParenthesizedExpression(e.parent)) e = e.parent;
+    const p = e.parent;
+    return ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken && SF.refName(p.left === e ? p.right : p.left) === "pathname";
+  };
+  let allowed = 0;
+  for (const n of SF.collect(sf, isLiteral).filter(mentions)) {
+    if (textOf(n) === "/api/focus/unlock-status" && isCi && SF.enclosingFunction(n) === isCi && exactComparison(n)) allowed += 1;
+    else problems.push(`a focus path outside isCiRoute's exact comparison: ${shown(n.parent)}`);
+  }
+  if (allowed !== 1) problems.push(`isCiRoute compares pathname with "/api/focus/unlock-status" ${allowed} times (want 1)`);
+  return problems;
+}
+
+function middlewareLike({ ci = `pathname === "/api/focus/unlock-status"`, body = "", matcher = "_next/static|sw.js" } = {}) {
+  return [
+    "function isCiRoute(pathname: string): boolean {",
+    `  return pathname === "/api/habits/sync" || ${ci};`,
+    "}",
+    "export async function middleware(request: NextRequest) {",
+    body,
+    "  return null;",
+    "}",
+    `export const config = { matcher: ["/((?!${matcher}).*)"] };`,
+  ].join("\n");
+}
+const focusProblemsOf = (parts) => focusPathProblems(SF.parseSource(middlewareLike(parts), "middleware.ts"));
+
+test("middleware focus-path check: re-formatted source passes; every way around isCiRoute is caught", () => {
+  assert.deepEqual(focusProblemsOf(), []);
+  assert.deepEqual(focusProblemsOf({ ci: "pathname ===\n    ('/api/focus/unlock-status') // the phone's one path" }), [], "quotes, parentheses, a line break and a comment change nothing");
+  // The first five open a focus path past the auth boundary or past the token check while isCiRoute("/api/focus/config")
+  // stays false; the last drops the phone's one path.
+  for (const mutant of [
+    { body: `  if (request.nextUrl.pathname.startsWith("/api/focus")) return NextResponse.next({ request });` },
+    { body: "  if (/^\\/api\\/focus\\//.test(request.nextUrl.pathname)) return NextResponse.next({ request });" },
+    { body: `  if (request.nextUrl.pathname === "/api/focus/unlock-status") return NextResponse.next({ request });` },
+    { matcher: "_next/static|sw.js|api/focus" },
+    { ci: `pathname.startsWith("/api/focus/unlock-status")` },
+    { ci: `pathname === "/api/habits/other"` },
+  ]) {
+    assert.notDeepEqual(focusProblemsOf(mutant), [], JSON.stringify(mutant));
+  }
+});
+
+test("middleware: no /api/focus prefix anywhere in the file; its one focus path is isCiRoute's exact comparison", () => {
+  assert.deepEqual(focusPathProblems(SF.parseFile("middleware.ts")), []);
+  // Master's plain-text rule, kept word for word next to the syntax-tree check: the file's text (comments included)
+  // never contains startsWith("/api/focus.
+  const src = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
   assert.ok(!/startsWith\("\/api\/focus/.test(src), "never a /api/focus prefix");
 });
 
-test("routes: the status route is read-only; the settings route checks the request before reading it", () => {
-  const status = fs.readFileSync(path.join(SRC, "app/api/focus/unlock-status/route.ts"), "utf8");
-  assert.deepEqual([...status.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["GET"]);
-  assert.match(status, /loadUnlockStatus\(supabase\)/);
-  assert.match(status, /"Cache-Control": "no-store"/);
-  assert.ok(!/\.(insert|upsert|update|delete)\(/.test(status));
+// middleware() itself, run with Supabase and NextResponse stubbed. Synthetic account ids and token.
+const MW_OWNER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1";
+const MW_OTHER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2";
+const MW_TOKEN = "synthetic-ci-token";
+function loadMiddleware(claims) {
+  const prevOwner = process.env.ONYX_OWNER_USER_ID;
+  process.env.ONYX_OWNER_USER_ID = MW_OWNER;
+  try {
+    return loadTs("middleware.ts", {
+      "@supabase/ssr": { createServerClient: () => ({ auth: { getClaims: async () => ({ data: claims ? { claims } : null }) } }) },
+      "next/server": {
+        NextResponse: {
+          next: () => ({ kind: "next", cookies: { set() {} } }),
+          redirect: (url) => ({ kind: "redirect", url: String(url) }),
+          json: (body, init = {}) => ({ kind: "json", status: init.status ?? 200, body }),
+        },
+      },
+    }).middleware;
+  } finally {
+    if (prevOwner === undefined) delete process.env.ONYX_OWNER_USER_ID;
+    else process.env.ONYX_OWNER_USER_ID = prevOwner;
+  }
+}
+function mwRequest(pathname, headerValues = {}) {
+  const nextUrl = new URL(`https://onyx.example${pathname}`);
+  nextUrl.clone = () => new URL(nextUrl.href);
+  return { nextUrl, headers: new Headers(headerValues), cookies: { getAll: () => [], set() {} } };
+}
 
-  const config = fs.readFileSync(path.join(SRC, "app/api/focus/config/route.ts"), "utf8");
-  assert.deepEqual([...config.matchAll(/export async function (\w+)/g)].map((m) => m[1]), ["GET", "PUT"]);
-  assert.ok(config.indexOf("checkConfigWrite(req.headers") < config.indexOf("req.text()"));
-  assert.match(config, /text\.length > MAX_FOCUS_CONFIG_BODY_BYTES/);
-  assert.match(config, /parseConfigBody\(body\)/);
+test("middleware(): without the owner's session the CI token opens /api/focus/unlock-status and no other focus path", async () => {
+  const prevToken = process.env.ONYX_CI_TOKEN;
+  process.env.ONYX_CI_TOKEN = MW_TOKEN;
+  try {
+    const token = { "x-onyx-ci-token": MW_TOKEN };
+    for (const claims of [null, { sub: MW_OTHER }]) {
+      const who = claims ? "another account" : "signed out";
+      const middleware = loadMiddleware(claims);
+      assert.equal((await middleware(mwRequest("/api/focus/unlock-status", token))).kind, "next", `${who}: the phone's path, with the token`);
+      for (const h of [{}, { "x-onyx-ci-token": "synthetic-ci-tokeX" }]) {
+        const res = await middleware(mwRequest("/api/focus/unlock-status", h));
+        assert.deepEqual([res.kind, res.status], ["json", 401], `${who}: the phone's path without the right token`);
+      }
+      for (const p of ["/api/focus", "/api/focus/", "/api/focus/config", "/api/focus/config/", "/api/focus/unlock-status/", "/api/focus/unlock-status/x", "/api/focus/unlock-statusx", "/api/focusx/unlock-status"]) {
+        assert.notEqual((await middleware(mwRequest(p, token))).kind, "next", `${who}: ${p} is not opened by the token`);
+      }
+    }
+    // The settings route is session-only: the owner's session reaches it (so the refusals above come from the gate, not the stubs).
+    assert.equal((await loadMiddleware({ sub: MW_OWNER })(mwRequest("/api/focus/config"))).kind, "next");
+  } finally {
+    if (prevToken === undefined) delete process.env.ONYX_CI_TOKEN;
+    else process.env.ONYX_CI_TOKEN = prevToken;
+  }
 });
 
-test("the Swift decision table matches this one", () => {
+const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, headers: init.headers ?? {}, body }) } };
+const loadRoute = (rel, db) => loadTs(rel, { "@supabase/supabase-js": { createClient: () => db }, "next/server": nextServer });
+// Next.js answers a method only when the route exports a function of that name.
+const methodsOf = (route) => Object.keys(route).filter((k) => typeof route[k] === "function").sort();
+
+test("status route: GET only, read-only, never cached; a failed read answers and logs a step name only", async (t) => {
+  const logged = t.mock.method(console, "error", () => {});
+  const config = { rule: "or", habit_page_ids: [ID_A] };
+  const journal = [{ cycle_date: DAY, question: "Synthetic habit A", answer: "Yes" }];
+  const db = fakeDb({ config, map: MAP, journal });
+  const route = loadRoute("app/api/focus/unlock-status/route.ts", db);
+  assert.deepEqual(methodsOf(route), ["GET"]);
+  const res = await route.GET();
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["Cache-Control"], "no-store");
+  assert.deepEqual(res.body.habits, [{ name: "Synthetic habit A", done: true }]);
+  assert.equal(db.calls.some((c) => c.upsert), false, "nothing is written");
+
+  const failing = loadRoute("app/api/focus/unlock-status/route.ts", fakeDb({ config, map: MAP, journal, fail: { habit_journal: true } }));
+  const err = await failing.GET();
+  assert.equal(err.status, 500);
+  assert.deepEqual(Object.keys(err.body).sort(), ["error", "step"], "no habit data in a failure");
+  assert.deepEqual(logged.mock.calls.map((c) => c.arguments), [["focus unlock-status failed:", "habit_answers"]]);
+});
+
+const ORIGIN = "https://onyx.example";
+function putRequest(text, over = {}) {
+  let reads = 0;
+  const all = { origin: ORIGIN, host: "onyx.example", "content-type": "application/json", "content-length": String(text.length), ...over };
+  return {
+    headers: headers(all),
+    nextUrl: { origin: ORIGIN },
+    text: async () => {
+      reads += 1;
+      return text;
+    },
+    reads: () => reads,
+  };
+}
+
+test("settings route: a cross-site, non-JSON or oversized request is refused before the body is read", async () => {
+  const cases = [[{ origin: "https://evil.example" }, 403], [{ origin: undefined }, 403], [{ "content-type": "text/plain" }, 415], [{ "content-length": "999999" }, 413]];
+  for (const [over, status] of cases) {
+    const db = fakeDb({ config: null, map: MAP });
+    const route = loadRoute("app/api/focus/config/route.ts", db);
+    const req = putRequest(JSON.stringify({ rule: "or", habit_page_ids: [ID_A] }), over);
+    const res = await route.PUT(req);
+    assert.equal(res.status, status, JSON.stringify(over));
+    assert.equal(req.reads(), 0, "the body is never read");
+    assert.equal(db.calls.length, 0, "nothing is read or written");
+  }
+});
+
+test("settings route: a valid change is written once; a body larger than it claims, an unknown habit or bad JSON writes nothing", async () => {
+  const db = fakeDb({ config: null, map: MAP });
+  const route = loadRoute("app/api/focus/config/route.ts", db);
+  assert.deepEqual(methodsOf(route), ["GET", "PUT"]);
+  const ok = await route.PUT(putRequest(JSON.stringify({ rule: "and", habit_page_ids: [ID_A] })));
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body, { rule: "and", habit_page_ids: [ID_A], chosen: [{ id: ID_A, name: "Synthetic habit A" }] });
+  assert.equal(db.calls.filter((c) => c.upsert).length, 1);
+  const big = await route.PUT(putRequest(JSON.stringify({ rule: "or", habit_page_ids: [ID_A], pad: "x".repeat(2000) }), { "content-length": "10" }));
+  assert.equal(big.status, 413);
+  assert.equal((await route.PUT(putRequest(JSON.stringify({ rule: "or", habit_page_ids: [ID_GONE] })))).status, 400);
+  assert.equal((await route.PUT(putRequest("{not json"))).status, 400);
+  assert.equal(db.calls.filter((c) => c.upsert).length, 1, "only the valid change was written");
+});
+
+test("the Swift decision table matches this one (the phone app cannot run here)", () => {
   const swift = fs.readFileSync(path.join(SRC, "..", "..", "tools", "screentime_ios", "FocusCore", "Sources", "FocusCore", "OnyxHabits.swift"), "utf8");
-  assert.match(swift, /guard configPresent, let habitsDone else \{ return timeReady \}/);
-  assert.match(swift, /case \.and: return habitsDone && timeReady/);
-  assert.match(swift, /case \.or: return habitsDone \|\| timeReady/);
+  assert.match(swift, /guard\s+configPresent\s*,\s*let\s+habitsDone\s+else\s*\{\s*return\s+timeReady\s*\}/);
+  assert.match(swift, /case\s+\.and\s*:\s*return\s+habitsDone\s*&&\s*timeReady/);
+  assert.match(swift, /case\s+\.or\s*:\s*return\s+habitsDone\s*\|\|\s*timeReady/);
   // The phone asks the one path the token opens.
   const sync = fs.readFileSync(path.join(SRC, "..", "..", "tools", "screentime_ios", "FocusUI", "FocusHabitSync.swift"), "utf8");
   assert.match(sync, /"\/api\/focus\/unlock-status"/);
 });
 
-test("the settings card is on /install and writes with PUT", () => {
-  const page = fs.readFileSync(path.join(SRC, "app/install/page.tsx"), "utf8");
-  assert.match(page, /<FocusUnlockSettings \/>/);
-  const card = fs.readFileSync(path.join(SRC, "components/FocusUnlockSettings.tsx"), "utf8");
-  assert.match(card, /fetch\("\/api\/focus\/config", \{\s*method: "PUT"/);
-  assert.match(card, /JSON\.stringify\(\{ rule, habit_page_ids: selected \}\)/);
+// ─── the settings card on /install (mounted, real autosave on a manual clock) ─
+
+test("the settings card is on /install", () => {
+  assert.ok(SF.jsxElements(SF.parseFile("app/install/page.tsx")).some((e) => e.tag === "FocusUnlockSettings"));
 });
 
-test("the settings card autosaves: no Save button, every change goes through useAutosave", () => {
-  const card = fs.readFileSync(path.join(SRC, "components/FocusUnlockSettings.tsx"), "utf8");
-  assert.match(card, /useAutosave<FocusValue>\(\s*"focus-unlock"/);
-  assert.match(card, /<AutosaveStatus /);
-  assert.doesNotMatch(card, />\s*\{saving \? "Saving…"/);
-  assert.match(card, /changeAutosave\(\{ rule, selected: next \}\)/, "a tick is sent");
-  assert.match(card, /changeAutosave\(\{ rule: r, selected \}\)/, "a rule change is sent");
+const HABITS = [{ id: ID_A, name: "Synthetic habit A" }, { id: ID_B, name: "Synthetic habit B" }];
+const STATUS = { behavioral_date: DAY, rule: "or", config_present: false, habits: [], habits_done: false };
+const savedConfig = (ids) => response({ rule: "or", habit_page_ids: ids, chosen: [] });
+
+async function mountCard(t, { config = savedConfig([]), put = () => savedConfig([]) } = {}) {
+  return mountAutosaving(t, "components/FocusUnlockSettings.tsx", {
+    stubs: { "./InfoHint": { __esModule: true, default: () => null } },
+    answer: (call, n) => {
+      if (call.method === "PUT") return put(call, n);
+      if (call.url === "/api/focus/config") return config;
+      if (call.url === "/api/habits/list") return response({ habits: HABITS });
+      if (call.url === "/api/focus/unlock-status") return response(STATUS);
+      throw new Error(`unexpected request ${call.method} ${call.url}`);
+    },
+  });
+}
+function pick(h, text, type) {
+  const label = h.find((n) => n.type === "label" && h.text(n).includes(text))[0];
+  assert.ok(label, `${text} is listed`);
+  const input = h.nodes(label).find((n) => n.type === "input" && n.props.type === type);
+  assert.ok(input, `${text} has a ${type}`);
+  input.props.onChange();
+}
+const puts = (h) => h.net.writes().filter((c) => c.method === "PUT");
+
+test("settings card: opening writes nothing; a burst of ticks is one PUT with the chosen habits and the rule", async (t) => {
+  const h = await mountCard(t);
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0, "nothing is written on open");
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  pick(h, "Synthetic habit B", "checkbox");
+  await h.flush();
+  await h.tick(699);
+  assert.equal(puts(h).length, 0, "nothing until the pause after the last tick");
+  await h.tick(1);
+  assert.deepEqual(puts(h).map((c) => [c.url, c.body]), [["/api/focus/config", { rule: "or", habit_page_ids: [ID_A, ID_B] }]]);
+  assert.match(h.text(), /Saved/);
+  pick(h, F.FOCUS_RULE_TEXT.and.label, "radio");
+  await h.flush();
+  await h.tick(700);
+  assert.deepEqual(puts(h).map((c) => c.body), [{ rule: "or", habit_page_ids: [ID_A, ID_B] }, { rule: "and", habit_page_ids: [ID_A, ID_B] }], "a rule change is sent with the chosen habits");
+});
+
+test("settings card: ticking a habit and unticking it again sends nothing", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  await h.tick(60_000);
+  assert.equal(puts(h).length, 0, "back to what is saved");
+});
+
+test("settings card: a refusal is shown with Retry and not retried on its own", async (t) => {
+  let refuse = true;
+  const h = await mountCard(t, { put: () => (refuse ? response({ error: "Synthetic refusal" }, 400) : savedConfig([ID_A])) });
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  await h.tick(700);
+  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.doesNotMatch(h.text(), /Trying again/);
+  await h.tick(120_000);
+  assert.equal(puts(h).length, 1, "a refusal waits for Riley");
+  refuse = false;
+  h.click("Retry");
+  await h.flush();
+  assert.equal(puts(h).length, 2);
+  assert.match(h.text(), /Saved/);
+});
+
+test("settings card: an outage is shown and retried with backoff until it is saved", async (t) => {
+  let down = true;
+  const h = await mountCard(t, { put: () => (down ? response({ error: "Synthetic outage" }, 503) : savedConfig([ID_A])) });
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  await h.tick(700);
+  assert.match(h.text(), /Not saved: Synthetic outage Trying again…/);
+  down = false;
+  await h.tick(1999);
+  assert.equal(puts(h).length, 1, "retried after the backoff, not at once");
+  await h.tick(1);
+  assert.equal(puts(h).length, 2);
+  assert.match(h.text(), /Saved/);
+});
+
+test("settings card: hiding the page sends a waiting change at once, with keepalive", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  h.page.hide();
+  await h.flush();
+  assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
+});
+
+test("settings card: leaving the page (pagehide) sends a waiting change once, with keepalive", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  assert.equal(h.page.fire("pagehide"), true, "the card listens for the page being left");
+  await h.flush();
+  assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
+  await h.tick(60_000);
+  assert.equal(puts(h).length, 1, "the pause that followed sent nothing more");
+});
+
+test("settings card: leaving the card (unmount, a route change) sends a waiting change once, with keepalive, then stops", async (t) => {
+  const h = await mountCard(t);
+  pick(h, "Synthetic habit A", "checkbox");
+  await h.flush();
+  assert.equal(puts(h).length, 0, "still waiting for the pause");
+  h.unmount();
+  await h.flush();
+  assert.deepEqual(puts(h).map((c) => [c.body, c.keepalive]), [[{ rule: "or", habit_page_ids: [ID_A] }, true]]);
+  await h.tick(60_000);
+  assert.equal(puts(h).length, 1, "nothing more once the card is gone");
+});
+
+test("settings card: settings that could not load show the error and offer nothing to send", async (t) => {
+  const h = await mountCard(t, { config: response({ error: "Synthetic load failure" }, 500) });
+  assert.match(h.text(), /Couldn.t load the Focus settings\./);
+  assert.match(h.text(), /Synthetic load failure/);
+  assert.equal(h.find((n) => n.type === "input" && n.props.type === "checkbox").length, 0);
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0);
 });
