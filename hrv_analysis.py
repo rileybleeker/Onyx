@@ -890,7 +890,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
 
     log.info("  Loading supplement_intake_by_compound…")
     data["supplements"] = fetch_supplement_rollup(
-        select="calendar_date,ingredient_group,categories,unit,total_amount",
+        select="calendar_date,ingredient_group,categories,unit,unit_class,source_units,total_amount",
     )
     if not data["supplements"].empty:
         data["supplements"]["calendar_date"] = data["supplements"]["calendar_date"].astype(str)
@@ -902,6 +902,9 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["supplements"]["category"] = data["supplements"]["categories"].apply(
             lambda c: ", ".join(c) if isinstance(c, list) and c else None
         )
+    # Intakes whose label gives no readable amount are not in the rollup (its own filter); the
+    # dose-response leaves those days out instead of reading them as 0 (HIST-UNIT-01).
+    data["supplements_unquantified"] = load_supplement_unquantified()
 
     # Melatonin journal<->supplement bridge (pds.melatonin_unified, 2026-06-14):
     # one row per behavioral day unifying the frozen WHOOP journal Yes/No history
@@ -2858,16 +2861,327 @@ def print_completeness(df: pd.DataFrame) -> None:
 # PHASE 2 – STATISTICAL ANALYSIS
 # ===========================================================================
 
+# Supplement dose-response unit identity (HIST-UNIT-01). pds.supplement_intake_by_compound has
+# one row per (day, compound_key, ingredient_group, unii_code, unit_class): 'mass' = every mass
+# unit converted to mg (pds.unit_to_mg_factor_for, which also maps Vitamin A / D / E IU with that
+# vitamin's own factor), any other class = the literal unit as on the label, never converted
+# ('unitless' = a number with no unit). A compound's dose series uses ONE class, so amounts in
+# different classes never add up:
+#   - mass when the compound has mass rows, else its one literal unit;
+#   - no estimate when its only literal units are 'unitless' (amounts that cannot be compared) or
+#     it has two or more literal units and no mass;
+#   - a day with an intake in another class, or an intake whose amount is missing, has an unknown
+#     total: it is left out, never read as 0 (the value of a day without an intake). The view
+#     filters out ingredients with no readable quantity, so those days come from a separate read of
+#     the intakes and their products (load_supplement_unquantified). When that read fails nothing
+#     is published (the stored result of the last complete run stays and the heartbeat is partial);
+#     when the rollup is empty the result is empty and replaces the stored one.
+# What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
+# no estimate, in the coverage payload (supplement_impact / dose_response_coverage), which
+# /analytics/hrv shows under the dose-response chart.
+SUPPLEMENT_MASS_CLASS = "mass"
+SUPPLEMENT_UNKNOWN_UNIT_CLASS = "unitless"
+SUPPLEMENT_DOSE_COVERAGE_VERSION = 2
+
+
+def _supplement_quantity_readable(q) -> bool:
+    """The rollup's own filter (sql/supplement_iu_conversion.sql: quantity text ~ '^[0-9.]+$'),
+    same as isQuantified in frontend/src/lib/supplement-units.ts. A JSON number is readable when
+    finite and not negative (jsonb prints it as plain digits)."""
+    if isinstance(q, bool):
+        return False  # jsonb true / false prints as a word
+    if isinstance(q, (int, float, np.integer, np.floating)):
+        return bool(np.isfinite(q)) and q >= 0
+    return isinstance(q, str) and q != "" and all(ch in "0123456789." for ch in q)
+
+
+_UNQUANTIFIED_COLS = ["calendar_date", "ingredient_group"]
+
+
+def _supplement_unquantified_products(products: pd.DataFrame | None) -> pd.DataFrame:
+    """(product_id, ingredient_group) of every product ingredient with no readable quantity."""
+    pairs: list[tuple[str, str]] = []
+    if products is not None and not products.empty:
+        for pid, ings in zip(products["product_id"], products["ingredients"]):
+            if isinstance(ings, str):  # a double-encoded JSONB row (pre-2026-05-26 bug pattern)
+                try:
+                    ings = json.loads(ings)
+                except ValueError:
+                    continue
+            if not isinstance(ings, list):
+                continue
+            for ing in ings:
+                if not isinstance(ing, dict):
+                    continue
+                group = ing.get("ingredient_group")
+                if isinstance(group, str) and not _supplement_quantity_readable(ing.get("quantity")):
+                    pairs.append((str(pid), group))
+    return pd.DataFrame(pairs, columns=["product_id", "ingredient_group"]).drop_duplicates()
+
+
+def supplement_unquantified_days(products: pd.DataFrame | None,
+                                 intakes: pd.DataFrame | None) -> pd.DataFrame:
+    """(calendar_date, ingredient_group) of every intake whose product lists that compound without a
+    readable amount: exactly the ingredient rows pds.supplement_intake_by_compound filters out, so
+    the rollup alone cannot tell such a day from a day without an intake.
+
+    `products`: product_id + ingredients (the JSONB array). `intakes`: intake_date + product_id.
+    The day is the intake's own intake_date, like the view's calendar_date.
+    """
+    affected = _supplement_unquantified_products(products)
+    if affected.empty or intakes is None or intakes.empty:
+        return pd.DataFrame(columns=_UNQUANTIFIED_COLS)
+    days = intakes[["intake_date", "product_id"]].dropna().copy()
+    days["product_id"] = days["product_id"].astype(str)
+    days["calendar_date"] = days["intake_date"].astype(str)
+    out = days.merge(affected, on="product_id", how="inner")[_UNQUANTIFIED_COLS].drop_duplicates()
+    return out.sort_values(_UNQUANTIFIED_COLS).reset_index(drop=True)
+
+
+def load_supplement_unquantified(fetch=None) -> pd.DataFrame | None:
+    """Days a compound was taken from a product that gives no readable amount for it.
+
+    Returns None when a read fails: the dose-response then runs without this check and says so in
+    its coverage (`unquantified_check`). Logs an error code or type only. `fetch` defaults to
+    fetch_all (injectable for tests). Intakes are read only when some product has such an
+    ingredient.
+    """
+    fetch = fetch or fetch_all
+    try:
+        products = fetch("supplement_products", select="product_id,ingredients", order="product_id")
+        if _supplement_unquantified_products(products).empty:
+            return pd.DataFrame(columns=_UNQUANTIFIED_COLS)
+        intakes = fetch("supplement_intake", select="intake_date,product_id", order="intake_id")
+        return supplement_unquantified_days(products, intakes)
+    except Exception as e:  # postgrest APIError, network error, ...
+        log.warning(f"  Supplement amount check unavailable ({getattr(e, 'code', None) or type(e).__name__})")
+        return None
+
+
+def supplement_unit_classes(frame: pd.DataFrame) -> pd.Series:
+    """The rollup's unit_class per row. Rows without one (an older select, a test frame) take it
+    from `unit`: the view reports unit 'mg' exactly for the mass class and the class otherwise."""
+    def from_unit(u):
+        if not isinstance(u, str) or not u.strip():
+            return SUPPLEMENT_UNKNOWN_UNIT_CLASS
+        return SUPPLEMENT_MASS_CLASS if u == "mg" else u
+    units = frame["unit"] if "unit" in frame.columns else pd.Series(None, index=frame.index, dtype=object)
+    derived = units.map(from_unit)
+    if "unit_class" not in frame.columns:
+        return derived
+    given = frame["unit_class"].map(lambda c: c if isinstance(c, str) and c.strip() else None)
+    return given.where(given.notna(), derived)
+
+
+def _supplement_source_units(rows: pd.DataFrame) -> list[str]:
+    """Literal label units behind rows (the view's source_units array): the conversion provenance."""
+    out: set[str] = set()
+    if "source_units" in rows.columns:
+        for v in rows["source_units"]:
+            if isinstance(v, (list, tuple, np.ndarray)):
+                out.update(u for u in v if isinstance(u, str) and u.strip())
+            elif isinstance(v, str) and v.strip():
+                out.add(v)
+    return sorted(out)
+
+
+def _is_iu(unit: str) -> bool:
+    """Same normalisation as pds.unit_to_mg_factor_for: letters only, lower case."""
+    return "".join(ch for ch in unit.lower() if "a" <= ch <= "z") == "iu"
+
+
+def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.DataFrame,
+                                  target: str,
+                                  unquantified: pd.DataFrame | None = None) -> tuple[list[dict], dict]:
+    """Per-compound Spearman between the day's amount and that night's HRV, one unit class each.
+
+    `supplements`: the long rollup (calendar_date, ingredient_group, unit_class, unit,
+    source_units, total_amount, category). `tracked`: HRV-valid rows (calendar_date + `target`)
+    inside the supplement tracking window. `unquantified`: (calendar_date, ingredient_group) of
+    intakes the rollup filters out for having no readable amount (supplement_unquantified_days);
+    None = that check could not be made. Returns (rows, coverage); rows carry no FDR fields.
+    """
+    rows: list[dict] = []
+    excluded: list[dict] = []
+    coverage = {"version": SUPPLEMENT_DOSE_COVERAGE_VERSION, "analyzed": 0, "excluded": excluded,
+                "unquantified_check": "unavailable" if unquantified is None else "checked"}
+    unquantified_by_group: dict[str, set] = {}
+    if unquantified is not None and not unquantified.empty:
+        for group, day in zip(unquantified["ingredient_group"], unquantified["calendar_date"].astype(str)):
+            unquantified_by_group.setdefault(group, set()).add(day)
+    if supplements is None or supplements.empty:
+        supp = pd.DataFrame(columns=["calendar_date", "ingredient_group", "total_amount", "unit"])
+    else:
+        supp = supplements.dropna(subset=["ingredient_group", "calendar_date"]).copy()
+    supp["total_amount"] = (pd.to_numeric(supp["total_amount"], errors="coerce")
+                            if "total_amount" in supp.columns else np.nan)
+    supp["_unit_class"] = supplement_unit_classes(supp)
+    by_group = {g: r for g, r in supp.groupby("ingredient_group")} if not supp.empty else {}
+
+    for compound in sorted(set(by_group) | set(unquantified_by_group)):
+        comp_rows = by_group.get(compound, supp.iloc[0:0])
+        quantified = comp_rows[comp_rows["total_amount"].notna()]
+        unquantified_days = (set(comp_rows.loc[comp_rows["total_amount"].isna(), "calendar_date"])
+                             | unquantified_by_group.get(compound, set()))
+        classes = sorted(set(quantified["_unit_class"]))
+        eligible = [c for c in classes if c != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+        n_days = len(set(comp_rows["calendar_date"]) | unquantified_days)
+
+        def leave_out(reason: str) -> None:
+            excluded.append({"compound": str(compound), "reason": reason,
+                             "unit_classes": classes, "n_days": n_days})
+
+        if SUPPLEMENT_MASS_CLASS in eligible:
+            primary = SUPPLEMENT_MASS_CLASS
+        elif len(eligible) == 1:
+            primary = eligible[0]
+        else:
+            leave_out("unquantified" if not classes
+                      else "unknown_unit" if not eligible else "mixed_unconverted_units")
+            continue
+
+        other = quantified[quantified["_unit_class"] != primary]
+        other_days = set(other["calendar_date"])
+        unknown_days = other_days | unquantified_days
+        prim = quantified[(quantified["_unit_class"] == primary)
+                          & ~quantified["calendar_date"].isin(unknown_days)]
+        distinct_doses = prim["total_amount"].unique()
+        if len(distinct_doses) < 3:
+            # Too few doses is the usual "constant dose" case (the Yes/No chart covers it); it is
+            # recorded only when days were left out, so a compound never vanishes unexplained.
+            if unknown_days:
+                leave_out("too_few_comparable_days")
+            continue
+        # Amount per date; a day with no intake = 0, a day with an unknown total is not a row.
+        amt_by_date = prim.groupby("calendar_date")["total_amount"].sum()
+        base = tracked[~tracked["calendar_date"].isin(unknown_days)]
+        merged = base.merge(amt_by_date.rename("amount").reset_index(), on="calendar_date", how="left")
+        merged["amount"] = merged["amount"].fillna(0.0)
+        if merged["amount"].nunique() < 3 or len(merged) < 20:
+            if unknown_days:
+                leave_out("too_few_comparable_days")
+            continue
+        try:
+            res = stats.spearmanr(merged[target], merged["amount"])
+            r = float(res.statistic if hasattr(res, "statistic") else res[0])
+            p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
+        except Exception:
+            continue
+        category = None
+        if "category" in prim.columns and not prim["category"].dropna().empty:
+            category = prim["category"].dropna().iloc[0]
+        source_units = _supplement_source_units(prim)
+        if not source_units and primary != SUPPLEMENT_MASS_CLASS:
+            source_units = [primary]
+        rows.append({
+            "compound": str(compound),
+            "category": str(category) if category else None,
+            "unit": "mg" if primary == SUPPLEMENT_MASS_CLASS else str(primary),
+            "unit_class": str(primary),
+            "converted": primary == SUPPLEMENT_MASS_CLASS,
+            "source_units": source_units,
+            "converted_from_iu": primary == SUPPLEMENT_MASS_CLASS and any(_is_iu(u) for u in source_units),
+            "excluded_units": sorted(set(other["_unit_class"])),
+            "excluded_days": {"other_unit": len(other_days), "unquantified": len(unquantified_days)},
+            "spearman_r": r,
+            "p_value": p,
+            "n": int(len(merged)),
+            "n_distinct_doses": int(len(distinct_doses)),
+            "low_n": bool(len(merged) < 20),
+        })
+
+    coverage["analyzed"] = len(rows)
+    coverage["with_excluded_days"] = sum(
+        1 for r in rows if r["excluded_days"]["other_unit"] or r["excluded_days"]["unquantified"])
+    return rows, coverage
+
+
+def _supplement_rollup_frame(supplements: pd.DataFrame | None) -> pd.DataFrame:
+    """The rollup as the dose-response reads it. An empty read (fetch_all returns a frame with no
+    columns at all) becomes a typed empty frame, so "no quantified intake" is an ordinary input and
+    not a KeyError."""
+    if supplements is not None and not supplements.empty:
+        return supplements
+    return pd.DataFrame({
+        "calendar_date": pd.Series(dtype=object),
+        "ingredient_group": pd.Series(dtype=object),
+        "category": pd.Series(dtype=object),
+        "unit": pd.Series(dtype=object),
+        "unit_class": pd.Series(dtype=object),
+        "source_units": pd.Series(dtype=object),
+        "total_amount": pd.Series(dtype=float),
+    })
+
+
+def supplement_dose_response_results(supplements: pd.DataFrame | None, hrv_valid: pd.DataFrame,
+                                     target: str, unquantified: pd.DataFrame | None = None) -> dict:
+    """The dose-response block of run_statistical_analysis: rows (BH-FDR, sorted by |rho|) and coverage.
+
+    Both keys are returned after every successful run, the list possibly empty, so the stored
+    result is replaced when the unit rule leaves no estimate or the rollup holds no quantified
+    amount at all: a previous run's rows never stay on the dashboard. Raises on failure; the caller
+    then keeps the previous stored result. `unquantified` None means the amountless-intake check
+    could not be read; supplement_dose_response_block never publishes in that case.
+    The tracking window starts at the first day with a quantified amount, as before.
+    """
+    supplements = _supplement_rollup_frame(supplements)
+    quantified = supplements.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
+    if quantified.empty:
+        tracked = hrv_valid.iloc[0:0][["calendar_date", target]]
+    else:
+        tracked = hrv_valid[hrv_valid["calendar_date"] >= quantified["calendar_date"].min()]
+        tracked = tracked[["calendar_date", target]].dropna()
+    rows, coverage = supplement_dose_response_rows(supplements, tracked, target, unquantified)
+    if rows and HAS_FDR and len(rows) > 1:
+        p_values = np.array([r["p_value"] for r in rows])
+        passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+        for row, q, p_pass in zip(rows, q_values, passes):
+            row["q_value"] = float(q)
+            row["passes_fdr"] = bool(p_pass)
+    rows.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
+    return {"supplement_dose_response": rows, "supplement_dose_response_coverage": coverage}
+
+
+SUPPLEMENT_DOSE_WARNING_KEY = "supplement_dose_response_warning"
+SUPPLEMENT_DOSE_CHECK_WARNING = ("Supplement dose-response not updated: the check for intakes without a "
+                                 "readable amount could not be read, so the previous result is kept")
+SUPPLEMENT_DOSE_FAILED_WARNING = ("Supplement dose-response not updated: the analysis failed, so the "
+                                  "previous result is kept")
+
+
+def supplement_dose_response_block(supplements: pd.DataFrame | None, hrv_valid: pd.DataFrame, target: str,
+                                   unquantified: pd.DataFrame | None) -> tuple[dict, str | None]:
+    """What run_statistical_analysis does with the dose-response: (results to merge, heartbeat warning).
+
+    - `supplements` None: the rollup was not read at all; nothing is stored and nothing is said.
+    - `unquantified` None: the read of the intakes and products behind the amountless-intake check
+      failed. Those days would be read as 0 (no intake) or keep a partial total, so NO replacement is
+      published: the stored rows of the last complete run stay, and the warning turns the run's
+      heartbeat partial. Never "nothing found".
+    - otherwise the rows and the coverage, also when the rollup is empty: the read succeeded, so
+      "no quantified amount" is a result (an empty list, plus the compounds that only have amountless
+      intakes), and it replaces what an earlier run stored.
+    """
+    if supplements is None:
+        return {}, None
+    if unquantified is None:
+        return {}, SUPPLEMENT_DOSE_CHECK_WARNING
+    return supplement_dose_response_results(supplements, hrv_valid, target, unquantified), None
+
+
 def run_statistical_analysis(
     df: pd.DataFrame,
     skip: bool = False,
     supplements: pd.DataFrame | None = None,
+    supplements_unquantified: pd.DataFrame | None = None,
 ) -> dict:
     """Correlation analysis, journal impact, Granger tests. Returns result dict.
 
     `supplements` is the long-format supplement_intake_by_compound DataFrame
     (one row per (calendar_date, ingredient_group)). When provided, runs
     per-compound Yes/No t-tests and dose-response Spearman correlations.
+    `supplements_unquantified` (load_supplement_unquantified) lists the days an
+    intake gave no readable amount; None = not checked.
     """
     results: dict = {}
 
@@ -3354,64 +3668,31 @@ def run_statistical_analysis(
     # for compounds where the dose actually varies (≥3 distinct non-zero amounts).
     # Captures monotonic dose-response effects that Yes/No collapses on.
     # Rank-based to handle outliers and non-linear monotonic responses.
-    supplement_dose_response: list[dict] = []
-    if supplements is not None and not supplements.empty:
-        try:
-            supp = supplements.copy()
-            supp = supp.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
-            tracking_start = supp["calendar_date"].min()
-            tracked = hrv_valid[hrv_valid["calendar_date"] >= tracking_start].copy()
-            tracked = tracked[["calendar_date", STAT_TARGET]].dropna()
-
-            for compound, comp_rows in supp.groupby("ingredient_group"):
-                distinct_doses = comp_rows["total_amount"].dropna().unique()
-                if len(distinct_doses) < 3:
-                    continue
-                # Build amount-per-date series; days with no intake = 0.
-                amt_by_date = comp_rows.groupby("calendar_date")["total_amount"].sum()
-                merged = tracked.merge(
-                    amt_by_date.rename("amount").reset_index(),
-                    on="calendar_date", how="left",
-                )
-                merged["amount"] = merged["amount"].fillna(0.0)
-                if merged["amount"].nunique() < 3 or len(merged) < 20:
-                    continue
-                try:
-                    res = stats.spearmanr(merged[STAT_TARGET], merged["amount"])
-                    r = float(res.statistic if hasattr(res, "statistic") else res[0])
-                    p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
-                    unit = (comp_rows["unit"].dropna().iloc[0]
-                            if not comp_rows["unit"].dropna().empty else None)
-                    category = (comp_rows["category"].dropna().iloc[0]
-                                if not comp_rows["category"].dropna().empty else None)
-                    supplement_dose_response.append({
-                        "compound": str(compound),
-                        "category": str(category) if category else None,
-                        "unit": str(unit) if unit else None,
-                        "spearman_r": r,
-                        "p_value": p,
-                        "n": int(len(merged)),
-                        "n_distinct_doses": int(len(distinct_doses)),
-                        "low_n": bool(len(merged) < 20),
-                    })
-                except Exception:
-                    continue
-
-            if supplement_dose_response and HAS_FDR and len(supplement_dose_response) > 1:
-                p_values = np.array([r["p_value"] for r in supplement_dose_response])
-                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
-                for row, q, p_pass in zip(supplement_dose_response, q_values, passes):
-                    row["q_value"] = float(q)
-                    row["passes_fdr"] = bool(p_pass)
-
+    # One unit class per compound (supplement_dose_response_rows): mg and mL never add up. An empty
+    # rollup is a result too (it replaces the stored rows); an unreadable amountless-intake check
+    # publishes nothing and warns (supplement_dose_response_block).
+    try:
+        dose, dose_warning = supplement_dose_response_block(supplements, hrv_valid, STAT_TARGET,
+                                                            supplements_unquantified)
+        results.update(dose)
+        if dose_warning:
+            results[SUPPLEMENT_DOSE_WARNING_KEY] = dose_warning
+            log.warning(f"  {dose_warning}")
+        elif dose:
+            supplement_dose_response = dose["supplement_dose_response"]
+            dose_coverage = dose["supplement_dose_response_coverage"]
+            if dose_coverage["excluded"] or dose_coverage.get("with_excluded_days"):
+                # Counts only: the Actions log is public.
+                log.info(f"  Supplement dose-response units: {len(dose_coverage['excluded'])} compounds "
+                         f"left out, {dose_coverage.get('with_excluded_days', 0)} with days left out "
+                         f"(another unit or no amount)")
             if supplement_dose_response:
-                supplement_dose_response.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
-                results["supplement_dose_response"] = supplement_dose_response
                 log.info(f"  Supplement dose-response: {len(supplement_dose_response)} compounds (≥3 distinct doses)")
             else:
                 log.info("  Supplement dose-response: 0 compounds with ≥3 distinct doses + n≥20 rows")
-        except Exception as e:
-            log.warning(f"  Supplement dose-response analysis failed: {e}")
+    except Exception as e:
+        log.warning(f"  Supplement dose-response analysis failed: {type(e).__name__}")
+        results[SUPPLEMENT_DOSE_WARNING_KEY] = SUPPLEMENT_DOSE_FAILED_WARNING
 
     # --- Nutrition Spearman correlation ---
     # Per-nutrient rank correlation with that night's HRV. Spearman (not Pearson)
@@ -5635,6 +5916,13 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             "result_key": "dose_response",
             "result_json": stat_results["supplement_dose_response"],
         })
+    # Which compounds or days the dose-response left out for their unit (HIST-UNIT-01).
+    if "supplement_dose_response_coverage" in stat_results:
+        rows.append({
+            "result_type": "supplement_impact",
+            "result_key": "dose_response_coverage",
+            "result_json": stat_results["supplement_dose_response_coverage"],
+        })
 
     # Nutrition Spearman
     if "nutrition_impact" in stat_results:
@@ -6009,7 +6297,12 @@ def main() -> str | None:
         df,
         skip=args.skip_analysis,
         supplements=data.get("supplements"),
+        supplements_unquantified=data.get("supplements_unquantified"),
     )
+    # A dose-response that could not be refreshed (HIST-UNIT-01) ends the run as PARTIAL.
+    dose_warning = stat_results.get(SUPPLEMENT_DOSE_WARNING_KEY)
+    if dose_warning:
+        run_warning = f"{run_warning} | {dose_warning}" if run_warning else dose_warning
 
     # ---------- Phase 2.5: Causal Inference ----------
     # Runs after the descriptive stats and before the predictive models so its

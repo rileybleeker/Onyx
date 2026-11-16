@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { fallbackBehavioralToday } from "@/lib/checkin";
+import { unquantifiedIngredients } from "@/lib/supplement-units";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -15,14 +16,17 @@ function readDay(today: string) {
   return Promise.all([
     supabase
       .from("supplement_intake")
-      .select("intake_id,intake_date,intake_time,product_id,doses,notes,stack_id,supplement_products(brand_name,full_name)")
+      .select("intake_id,intake_date,intake_time,product_id,doses,notes,stack_id,supplement_products(brand_name,full_name,ingredients)")
       .eq("intake_date", today)
       .order("intake_time", { ascending: false, nullsFirst: false }),
     supabase
       .from("supplement_intake_by_compound")
       .select("compound_key,ingredient_group,ingredient_names,unii_code,categories,unit_class,unit,source_units,total_amount,total_doses,source_product_count")
       .eq("calendar_date", today)
-      .order("ingredient_group"),
+      // Unit siblings of one compound (mg and mL rows) keep a fixed order (HIST-UNIT-01).
+      .order("ingredient_group")
+      .order("unit_class")
+      .order("compound_key"),
     supabase
       .from("supplement_stack_reminder")
       .select("stack_id,status")
@@ -65,12 +69,17 @@ export async function GET() {
   if (intakesRes.error) return NextResponse.json({ error: intakesRes.error.message }, { status: 500 });
   if (compoundsRes.error) return NextResponse.json({ error: compoundsRes.error.message }, { status: 500 });
 
-  type Embedded = { brand_name: string | null; full_name: string | null } | { brand_name: string | null; full_name: string | null }[] | null;
+  type EmbeddedProduct = { brand_name: string | null; full_name: string | null; ingredients?: unknown };
+  type Embedded = EmbeddedProduct | EmbeddedProduct[] | null;
+  const labelled: { product_id: string; ingredients: unknown }[] = [];
   const decoratedIntakes = (intakesRes.data ?? []).map((row) => {
     const { supplement_products: embedded, ...i } = row as typeof row & { supplement_products: Embedded };
     const p = Array.isArray(embedded) ? embedded[0] : embedded;
+    labelled.push({ product_id: String(i.product_id), ingredients: p?.ingredients ?? null });
     return { ...i, brand_name: p?.brand_name ?? null, full_name: p?.full_name ?? null };
   });
+  // Ingredients the rollup leaves out because the label gives no readable amount (never shown as 0 or as a unit).
+  const unquantified = unquantifiedIngredients(labelled);
 
   // The view returns ingredient_names/categories as arrays (multiple source
   // ingredients can map to one UNII). Collapse to the singular scalars the UI
@@ -91,6 +100,7 @@ export async function GET() {
     date: today,
     intakes: decoratedIntakes,
     compounds,
+    unquantified,
     reminders,
   });
 }
