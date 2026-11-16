@@ -13,6 +13,9 @@ Policy:
     max_wait.
   - Other HTTP errors (4xx other than 429) are re-raised on the first attempt.
   - Final attempt's exception propagates.
+  - A retried network error is logged with its type and text; a caller whose
+    log is public and whose errors can quote ids passes quote_errors=False to
+    log the type only (the exception itself still propagates unchanged).
 
 Usage:
     resp = retry_http(
@@ -49,11 +52,17 @@ def retry_http(
     max_wait: float = 30.0,
     base_wait: float = 1.0,
     log: logging.Logger = log,
+    quote_errors: bool = True,
 ) -> httpx.Response:
     """Invoke `call` up to `max_attempts` times, retrying on transient HTTP errors.
 
     Calls .raise_for_status() on each response so HTTPStatusError can be caught
     and inspected. Non-retryable (4xx other than 429) errors propagate immediately.
+
+    quote_errors=False keeps a retried network error's text out of the
+    warning (type name only): the text of an httpx.RequestError is not under
+    the caller's control and can quote the request or the peer's reply. Only
+    the log line changes; the final exception is raised as it is.
     """
     last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
@@ -95,9 +104,11 @@ def retry_http(
             if attempt < max_attempts:
                 wait = min(max_wait, base_wait * (2 ** (attempt - 1)))
                 wait += random.uniform(0, base_wait)
+                detail = (f"{type(exc).__name__}: {exc}" if quote_errors
+                          else type(exc).__name__)
                 log.warning(
                     f"Network error on attempt {attempt}/{max_attempts}: "
-                    f"{type(exc).__name__}: {exc}; sleeping {wait:.1f}s."
+                    f"{detail}; sleeping {wait:.1f}s."
                 )
                 time.sleep(wait)
                 continue

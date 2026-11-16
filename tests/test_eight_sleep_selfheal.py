@@ -119,6 +119,8 @@ class _Query:
     def execute(self):
         if self.mode == "select":
             if self.db.fail_select:
+                if isinstance(self.db.fail_select, BaseException):
+                    raise self.db.fail_select
                 raise RuntimeError("select boom")
             out = [dict(r) for r in self.db.rows if self._match(r)]
             out.sort(key=lambda r: r["calendar_date"], reverse=self._order_desc)
@@ -331,6 +333,242 @@ def test_api_error_leaves_row_null_and_is_counted() -> None:
     assert "failed=1" in es._selfheal_summary(stats, 20)
 
 
+def test_heal_logs_no_dates_values_or_session_ids() -> None:
+    """The Actions log is public: the heal logs counters only, never a row's
+    date, a temperature or a provider id (not even inside an error message)."""
+    import logging
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    handler = _Capture()
+    logger = logging.getLogger("eight_sleep_etl")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        sb = FakeSupabase([_trend_row("2026-11-03", sid="SID-OK"),
+                           _trend_row("2026-11-02", sid="SID-GONE"),
+                           _trend_row("2026-11-01", sid="SID-BAD")])
+        client = FakeClient({"SID-OK": _interval(), "SID-GONE": None,
+                             "SID-BAD": RuntimeError("GET /users/u-left/intervals/SID-BAD")})
+        stats = _heal(sb, client)
+        _heal(FakeSupabase([_trend_row("2026-11-04", sid="SID-DRY")]),
+              FakeClient({"SID-DRY": _interval()}), dry_run=True)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    assert stats["healed"] == 1 and stats["not_found"] == 1 and stats["failed"] == 1, stats
+    text = " | ".join(seen)
+    for token in ("SID-", "2026-11-0", "25.0", "20.0", "u-left"):
+        assert token not in text, (token, text)
+
+
+def test_heal_through_the_real_http_clients_logs_no_ids_or_dates_on_any_logger() -> None:
+    """Root-log capture with the real HTTP clients behind mock transports.
+
+    httpx logs every request at INFO with its URL, and the heal's URLs carry
+    the user and session ids (GET /users/{id}/intervals/{session id}) and the
+    healed row's date (PATCH .../eight_sleep_trends?calendar_date=eq.<date>).
+    The HTTP loggers are reset to inherit DEBUG from the root first, so only
+    the heal's own quieting can keep those lines out; their levels must be put
+    back afterwards."""
+    import logging
+
+    import httpx
+    from postgrest import SyncPostgrestClient
+
+    rows = [_trend_row("2026-11-03", sid="SID-OK"),
+            _trend_row("2026-11-02", sid="SID-GONE"),
+            _trend_row("2026-11-01", sid="SID-BAD")]
+    provider_urls: list[str] = []
+    database_urls: list[str] = []
+
+    def provider(request):
+        provider_urls.append(str(request.url))
+        sid = request.url.path.rsplit("/", 1)[-1]
+        if sid == "SID-OK":
+            return httpx.Response(200, json=_interval(), request=request)
+        if sid == "SID-GONE":
+            return httpx.Response(404, json={"error": f"no session {sid}"}, request=request)
+        return httpx.Response(500, json={"error": f"session {sid} failed"}, request=request)
+
+    def database(request):
+        database_urls.append(f"{request.method} {request.url}")
+        if request.method == "GET":
+            return httpx.Response(200, json=rows, request=request)
+        return httpx.Response(200, json=[], request=request)
+
+    client = es.EightSleepClient("e", "p", "America/New_York")
+    client.token = "t"
+    client.http.close()
+    client.http = httpx.Client(transport=httpx.MockTransport(provider))
+    pds = SyncPostgrestClient("https://db.example/rest/v1", schema="pds",
+                              http_client=httpx.Client(transport=httpx.MockTransport(database)))
+
+    class _Supabase:
+        # postgrest's own .schema() builds a new client without the mock
+        # transport, so sb.schema("pds") hands back the pds client directly.
+        def schema(self, _name):
+            return pds
+
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(f"{record.name}: {self.format(record)}")
+
+    handler = _Capture(level=logging.DEBUG)
+    root = logging.getLogger()
+    names = (*es.HTTP_LOGGERS, "eight_sleep_etl", "retry_helper", "postgrest")
+    saved_levels = {n: logging.getLogger(n).level for n in names}
+    saved_root, saved_sleep = root.level, es.time.sleep
+    for n in names:
+        logging.getLogger(n).setLevel(logging.NOTSET)
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    es.time.sleep = lambda *_: None       # retry_http's backoff between the 500s
+    try:
+        stats = es.self_heal_temps(client, _Supabase(), USERS, TODAY, delay_s=0)
+        after = {n: logging.getLogger(n).level for n in es.HTTP_LOGGERS}
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(saved_root)
+        es.time.sleep = saved_sleep
+        for n, level in saved_levels.items():
+            logging.getLogger(n).setLevel(level)
+        client.close()
+        pds.session.close()
+
+    assert stats["healed"] == 1 and stats["not_found"] == 1 and stats["failed"] == 1, stats
+    # The requests really carried the ids and the date, so a request line would show them.
+    assert any("/users/u-left/intervals/SID-OK" in u for u in provider_urls), provider_urls
+    assert any(u.startswith("PATCH ") and "2026-11-03" in u for u in database_urls), database_urls
+    assert after == {n: logging.NOTSET for n in es.HTTP_LOGGERS}, "levels must be restored"
+    text = " | ".join(seen)
+    assert seen, "the heal's own warnings reach the root handler"
+    for token in ("SID-", "u-left", "2026-11-0", "25.0", "20.0", "HTTP Request",
+                  "8slp.net", "db.example"):
+        assert token not in text, (token, text)
+
+
+def test_retry_http_quote_errors_false_logs_a_network_error_by_type_only() -> None:
+    """retry_helper.retry_http(quote_errors=False): the retry warning carries the
+    exception type, never its text; the default still quotes it (other ETLs
+    are unchanged); the final exception propagates as it is either way."""
+    import logging
+
+    import httpx
+    import retry_helper
+
+    url = "https://client-api.8slp.net/v1/users/u-left/intervals/SID-NET"
+    leak = f"connect failed for {url} (2026-11-03)"
+
+    def run(**kw):
+        seen: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        logger = logging.getLogger("test_retry_quote_errors")
+        handler = _Capture(level=logging.DEBUG)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        calls = []
+
+        def call():
+            calls.append(1)
+            raise httpx.ConnectError(leak, request=httpx.Request("GET", url))
+
+        saved_sleep = retry_helper.time.sleep
+        retry_helper.time.sleep = lambda *_: None
+        try:
+            retry_helper.retry_http(call, max_attempts=3, base_wait=0, log=logger, **kw)
+        except httpx.ConnectError as exc:
+            raised = str(exc)
+        else:
+            raise AssertionError("the last attempt's ConnectError must propagate")
+        finally:
+            retry_helper.time.sleep = saved_sleep
+            logger.removeHandler(handler)
+        return seen, calls, raised
+
+    seen, calls, raised = run(quote_errors=False)
+    assert len(calls) == 3 and len(seen) == 2, (calls, seen)
+    assert all("Network error on attempt" in m and "ConnectError" in m for m in seen), seen
+    for token in ("SID-NET", "u-left", "8slp.net", "2026-11-03", "connect failed"):
+        assert token not in " | ".join(seen), (token, seen)
+    assert raised == leak, "only the log line changes; the exception is untouched"
+
+    seen, _, _ = run()
+    assert all("connect failed" in m for m in seen), "the default still quotes the text"
+
+
+def test_heal_network_error_retries_are_logged_by_type_only() -> None:
+    """A transport error during a lookup (DNS, connect, read timeout) is retried
+    by retry_http, which logs a warning per retry on the ETL's own logger, not
+    an HTTP logger, so quiet_http_logs does not cover it. Its text can quote
+    the request URL (user and session ids), so get_interval logs the retries by
+    type only; the row stays NULL, is counted as failed and the final error is
+    logged by type. Real EightSleepClient behind a transport that raises."""
+    import logging
+
+    import httpx
+
+    url_seen: list[str] = []
+
+    def provider(request):
+        url_seen.append(str(request.url))
+        raise httpx.ConnectError(
+            f"connect failed for {request.url} (user u-left, night 2026-11-03)",
+            request=request)
+
+    client = es.EightSleepClient("e", "p", "America/New_York")
+    client.token = "t"
+    client.http.close()
+    client.http = httpx.Client(transport=httpx.MockTransport(provider))
+    sb = FakeSupabase([_trend_row("2026-11-03", sid="SID-NET")])
+
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(f"{record.name}: {self.format(record)}")
+
+    handler = _Capture(level=logging.DEBUG)
+    root = logging.getLogger()
+    names = (*es.HTTP_LOGGERS, "eight_sleep_etl", "retry_helper")
+    saved_levels = {n: logging.getLogger(n).level for n in names}
+    saved_root, saved_sleep = root.level, es.time.sleep
+    for n in names:
+        logging.getLogger(n).setLevel(logging.NOTSET)
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    es.time.sleep = lambda *_: None       # retry_http's backoff between attempts
+    try:
+        stats = es.self_heal_temps(client, sb, USERS, TODAY, delay_s=0)
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(saved_root)
+        es.time.sleep = saved_sleep
+        for n, level in saved_levels.items():
+            logging.getLogger(n).setLevel(level)
+        client.close()
+
+    assert len(url_seen) == 3 and "/users/u-left/intervals/SID-NET" in url_seen[0], url_seen
+    assert stats["failed"] == 1 and stats["healed"] == 0, stats
+    assert sb.rows[0]["median_bed_temp"] is None and sb.updates == [], "row stays NULL"
+    text = " | ".join(seen + [es._selfheal_summary(stats, 20)])
+    retries = [m for m in seen if "Network error on attempt" in m]
+    assert len(retries) == 2 and all("ConnectError" in m for m in retries), seen
+    assert "a lookup failed (ConnectError)" in text, text
+    for token in ("SID-NET", "u-left", "8slp.net", "2026-11-03", "connect failed"):
+        assert token not in text, (token, text)
+
+
 def test_missing_session_unknown_side_and_empty_timeseries() -> None:
     sb = FakeSupabase([
         _trend_row("2026-11-06", sid="NOTFOUND"),                       # 404 -> None
@@ -350,8 +588,23 @@ def test_missing_session_unknown_side_and_empty_timeseries() -> None:
 
 def test_session_id_parsing_handles_json_string_and_sessionids_fallback() -> None:
     assert es._session_id_from_raw('{"mainSessionId": "A"}') == "A"
-    assert es._session_id_from_raw({"sessionIds": ["B", "C"]}) == "B"
+    # A sole session is the main one; with several and no mainSessionId the
+    # main session is unknown (the first may be a nap), so nothing is paired.
+    assert es._session_id_from_raw({"sessionIds": ["B"]}) == "B"
+    assert es._session_id_from_raw({"sessionIds": ["B", "C"]}) is None
+    assert es._session_id_from_raw({"mainSessionId": "", "sessionIds": ["B", "C"]}) is None
     assert es._session_id_from_raw({"mainSessionId": None, "sessionIds": []}) is None
+    # Never the first id: sessions[] naming a second session makes the day
+    # ambiguous even when sessionIds lists one, and a sessionIds that is not a
+    # list (a bare string would otherwise be read letter by letter) is no ids.
+    assert es._session_id_from_raw(
+        {"sessionIds": ["B"], "sessions": [{"id": "B"}, {"id": "C"}]}) is None
+    assert es._session_id_from_raw({"sessions": [{"id": "N"}, {"id": "M"}]}) is None
+    assert es._session_id_from_raw({"sessionIds": ["B"], "sessions": [{"id": "B"}]}) == "B"
+    assert es._session_id_from_raw({"sessions": [{"id": "D"}]}) == "D"
+    assert es._session_id_from_raw({"sessionIds": ["B", "B"]}) == "B"
+    assert es._session_id_from_raw({"sessionIds": "X"}) is None
+    assert es._session_id_from_raw({"sessionIds": "XY"}) is None
     assert es._session_id_from_raw("not json") is None
     assert es._session_id_from_raw(None) is None
     sb = FakeSupabase([_trend_row("2026-11-01", raw='{"mainSessionId": "S1"}')])  # double-encoded
@@ -371,9 +624,92 @@ def test_today_and_stale_rows_are_out_of_scope() -> None:
 def test_candidate_query_failure_is_reported_not_raised() -> None:
     sb = FakeSupabase([_trend_row("2026-11-01", sid="S1")], fail_select=True)
     stats = _heal(sb, FakeClient({"S1": _interval()}))
-    assert stats["scan_error"] and "select boom" in stats["scan_error"], stats
+    assert stats["scan_error"] == "candidate query failed (RuntimeError)", stats
+    assert "select boom" not in stats["scan_error"], "the error text must never be reported"
     assert stats["healed"] == 0
     assert "candidate query failed" in es._selfheal_summary(stats, 20)
+
+
+# Text an error can carry that must never reach the log or a heartbeat: a
+# request URL with provider ids and a row's date, a response body.
+_LEAKY = ("u-left", "SID-9", "2026-11-01", "stub.supabase.co", "<html>", "secret body")
+
+
+def _leaky_db_error(code="PGRST205"):
+    from postgrest.exceptions import APIError
+    return APIError({"code": code, "message": "GET https://stub.supabase.co/rest/v1/"
+                     "eight_sleep_trends?calendar_date=eq.2026-11-01",
+                     "hint": None, "details": "<html>secret body for u-left SID-9</html>"})
+
+
+def _leaky_http_error(status=503):
+    import httpx
+    url = "https://client-api.8slp.net/v1/users/u-left/intervals/SID-9?d=2026-11-01"
+    req = httpx.Request("GET", url)
+    return httpx.HTTPStatusError(f"Server error '{status}' for url '{url}'", request=req,
+                                 response=httpx.Response(status, request=req,
+                                                         text="<html>secret body</html>"))
+
+
+def test_safe_error_keeps_type_and_code_only() -> None:
+    assert es._safe_error(_leaky_db_error()) == "APIError PGRST205"
+    assert es._safe_error(_leaky_db_error("42P01")) == "APIError 42P01"
+    assert es._safe_error(_leaky_db_error("502")) == "APIError 502"
+    # A `code` that is not a known code shape is dropped, not echoed.
+    assert es._safe_error(_leaky_db_error("u-left/SID-9")) == "APIError"
+    assert es._safe_error(_leaky_http_error(503)) == "HTTPStatusError 503"
+    assert es._safe_error(RuntimeError("GET /users/u-left/intervals/SID-9")) == "RuntimeError"
+    for exc in (_leaky_db_error(), _leaky_http_error(), RuntimeError("u-left SID-9")):
+        text = es._safe_error(exc)
+        for token in _LEAKY:
+            assert token not in text, (token, text)
+
+
+def _capture_es_log():
+    import logging
+    seen: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+            if record.exc_info:
+                seen.append("TRACEBACK")
+
+    handler = _Capture(level=logging.DEBUG)
+    logger = logging.getLogger("eight_sleep_etl")
+    saved = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    def restore():
+        logger.removeHandler(handler)
+        logger.setLevel(saved)
+    return seen, restore
+
+
+def test_heal_failure_paths_log_no_error_text() -> None:
+    """Scan failure (database or HTTP error) and a failing lookup are logged and
+    reported by type and code only: no URL, id, date or response body."""
+    seen, restore = _capture_es_log()
+    try:
+        scan_db = _heal(FakeSupabase([_trend_row("2026-11-01", sid="SID-9")],
+                                     fail_select=_leaky_db_error()),
+                        FakeClient({"SID-9": _interval()}))
+        scan_http = _heal(FakeSupabase([_trend_row("2026-11-01", sid="SID-9")],
+                                       fail_select=_leaky_http_error(502)),
+                          FakeClient({"SID-9": _interval()}))
+        lookup = _heal(FakeSupabase([_trend_row("2026-11-01", sid="SID-9")]),
+                       FakeClient({"SID-9": _leaky_http_error(503)}))
+    finally:
+        restore()
+    assert scan_db["scan_error"] == "candidate query failed (APIError PGRST205)", scan_db
+    assert scan_http["scan_error"] == "candidate query failed (HTTPStatusError 502)", scan_http
+    assert lookup["failed"] == 1, lookup
+    text = " | ".join(seen + [es._selfheal_summary(s, 20) for s in (scan_db, scan_http, lookup)])
+    assert "HTTPStatusError 503" in text, text
+    assert "TRACEBACK" not in text, "no exc_info on a heal failure"
+    for token in _LEAKY:
+        assert token not in text, (token, text)
 
 
 def test_client_get_interval_maps_404_to_none_and_raises_other_errors() -> None:
@@ -439,7 +775,13 @@ class MainDB(FakeSupabase):
         return _Result(None)
 
 
-def _run_main(sb, client, argv, sync_user=lambda *a, **k: 5, users=None, heal=None):
+def _sync_stats(records=0, **extra):
+    """A sync_user result: the counters main() sums, with `records` rows upserted."""
+    return {**es._new_sync_stats(), "records": records, **extra}
+
+
+def _run_main(sb, client, argv, sync_user=lambda *a, **k: _sync_stats(5), users=None,
+              heal=None):
     """Run es.main() with every outside dependency faked. Returns sync_log rows by type."""
     client.close = lambda: None
     client.authenticate = lambda: None
@@ -479,7 +821,7 @@ def test_main_runs_heal_after_sync_and_logs_healed_count() -> None:
     assert len(client.calls) == 1, "--selfheal-max 1 must cap per-ID calls"
     # --selfheal-max 0 -> no heal, no extra sync_log row.
     sb2 = MainDB([_trend_row("2026-11-01", sid="S1")])
-    _run_main(sb2, client, ["--selfheal-max", "0"], sync_user=lambda *a, **k: 0)
+    _run_main(sb2, client, ["--selfheal-max", "0"], sync_user=lambda *a, **k: _sync_stats(0))
     assert [r["data_type"] for r in sb2.sync_logs] == ["trends"], sb2.sync_logs
     assert len(client.calls) == 1
 
@@ -518,13 +860,37 @@ def test_main_heal_crash_or_scan_failure_is_partial_not_fatal() -> None:
     sb = MainDB([])
     by_type = _run_main(sb, FakeClient({}), [], heal=crash)
     assert by_type["trends"]["status"] == "partial" and by_type["trends"]["records_synced"] == 5
-    assert "self-heal crashed: heal exploded" in by_type["trends"]["error_message"]
+    assert "self-heal crashed (RuntimeError)" in by_type["trends"]["error_message"]
+    assert "heal exploded" not in by_type["trends"]["error_message"], "never the error text"
     assert by_type["temp_selfheal"]["status"] == "partial"
     # Candidate query fails (PostgREST down for that one read).
     sb2 = MainDB([_trend_row("2026-11-01", sid="S1")], fail_select=True)
     by_type2 = _run_main(sb2, FakeClient({"S1": _interval()}), [])
     assert by_type2["trends"]["status"] == "partial"
     assert "candidate query failed" in by_type2["trends"]["error_message"]
+
+
+def test_main_heal_failures_keep_error_text_out_of_log_and_heartbeats() -> None:
+    """main(): a heal crash and a failed candidate query reach the public log
+    and both heartbeats as type and code only."""
+    def crash(*_a, **_k):
+        raise _leaky_http_error(503)
+    seen, restore = _capture_es_log()
+    try:
+        crashed = _run_main(MainDB([]), FakeClient({}), [], heal=crash)
+        scanned = _run_main(MainDB([_trend_row("2026-11-01", sid="SID-9")],
+                                   fail_select=_leaky_db_error("42P01")),
+                            FakeClient({"SID-9": _interval()}), [])
+    finally:
+        restore()
+    assert "self-heal crashed (HTTPStatusError 503)" in crashed["trends"]["error_message"]
+    assert "candidate query failed (APIError 42P01)" in scanned["trends"]["error_message"]
+    messages = [r["error_message"] or "" for by in (crashed, scanned)
+                for r in (by["trends"], by["temp_selfheal"])]
+    text = " | ".join(seen + messages)
+    assert "TRACEBACK" not in text, "no exc_info on a heal failure"
+    for token in _LEAKY:
+        assert token not in text, (token, text)
 
 
 def test_main_reports_sync_errors_and_heal_problems_together() -> None:
@@ -535,6 +901,29 @@ def test_main_reports_sync_errors_and_heal_problems_together() -> None:
     msg = by_type["trends"]["error_message"]
     assert by_type["trends"]["status"] == "partial"
     assert msg.startswith("1 error(s); temp self-heal:"), msg
+
+
+def test_main_bed_zone_mismatch_leads_the_trends_heartbeat_with_the_guard() -> None:
+    """A session reporting another UTC offset turns the /status row partial, GUARD first."""
+    sb = MainDB([])
+    by_type = _run_main(sb, FakeClient({}), ["--selfheal-max", "0"],
+                        sync_user=lambda *a, **k: _sync_stats(3, bed_tz_mismatch=1))
+    trends = by_type["trends"]
+    assert trends["status"] == "partial" and trends["records_synced"] == 3, trends
+    assert trends["error_message"].startswith("GUARD eight_sleep_bed_tz:"), trends
+    # Sides are summed: one clean side and one mismatching side still report it.
+    sides = iter([_sync_stats(2), _sync_stats(1, bed_tz_mismatch=2)])
+    sb2 = MainDB([])
+    by_type2 = _run_main(sb2, FakeClient({}), ["--selfheal-max", "0"],
+                         users={"left": "u-left", "right": "u-right"},
+                         sync_user=lambda *a, **k: next(sides))
+    assert by_type2["trends"]["records_synced"] == 3
+    assert by_type2["trends"]["error_message"].startswith(
+        "GUARD eight_sleep_bed_tz: 2 session(s)"), by_type2["trends"]
+    # A clean sync stays success.
+    sb3 = MainDB([])
+    by_type3 = _run_main(sb3, FakeClient({}), ["--selfheal-max", "0"])
+    assert by_type3["trends"]["status"] == "success", by_type3["trends"]
 
 
 def test_main_passes_selfheal_days_to_the_heal() -> None:
@@ -565,14 +954,17 @@ def test_rows_without_an_interval_do_not_overwrite_stored_temps() -> None:
     assert es._split_rows_by_temp([with_t]) == [[with_t]]
     assert es._split_rows_by_temp([]) == []
 
-    # End to end through sync_user with a fake API: 2 trend days, 1 interval.
+    # End to end through sync_user with a fake API: 2 trend days, 1 interval,
+    # paired with the 2026-11-10 day by its session id.
     class API:
         def get_intervals(self, _uid):
-            return [{"ts": "2026-11-10T08:00:00.000Z",
+            return [{"id": "S10", "ts": "2026-11-10T08:00:00.000Z",
                      "timeseries": {"tempBedC": [["t", 24.0]], "tempRoomC": [["t", 20.0]]}}]
 
         def get_trends(self, _uid, _start, _end):
-            return [{"day": "2026-11-10", "score": 80}, {"day": "2026-10-20", "score": 70}]
+            return [{"day": "2026-11-10", "score": 80, "mainSessionId": "S10",
+                     "sessionIds": ["S10"]},
+                    {"day": "2026-10-20", "score": 70}]
 
     sent: list[list[dict]] = []
 
@@ -589,7 +981,7 @@ def test_rows_without_an_interval_do_not_overwrite_stored_temps() -> None:
         n = es.sync_user(API(), SB(), "u", "left", date(2026, 10, 15), date(2026, 11, 10))
     finally:
         es.time.sleep = saved_sleep
-    assert n == 2 and len(sent) == 2, sent
+    assert n["records"] == 2 and len(sent) == 2, (n, sent)
     flat = {r["calendar_date"]: r for batch in sent for r in batch}
     assert flat["2026-11-10"]["median_bed_temp"] == 24.0
     assert "median_bed_temp" not in flat["2026-10-20"], "NULL temp would erase a stored value"
