@@ -10,6 +10,13 @@ idempotency (servings delete-by-date, daily upsert), the ~68-nutrient schema,
 Gold-timestamp behavioral dating, and the sync_log heartbeats are all reused
 unchanged. A rolling re-fetch self-heals edits/deletes made in the app.
 
+This is the one caller that passes run_import the window it requested: a day
+inside it that has no food any more (its last entry removed in Cronometer) is
+emptied in Onyx too, but only when the export passes the importer's
+completeness check and at most --max-empty-days stored days per run (a bigger
+change is refused with a partial heartbeat). A failed login or export never
+reaches the importer, so it changes nothing.
+
 UNOFFICIAL — this replays the web app's own flow (the same one gocronometer /
 cronometer-mcp use):
     1. GET  /login/                     -> scrape the `anticsrf` hidden input
@@ -57,7 +64,7 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client
 
-from cronometer_import import run_import
+from cronometer_import import DEFAULT_MAX_EMPTY_DAYS, run_import
 from sync_log_helper import log_sync, now_epoch
 
 load_dotenv()
@@ -281,7 +288,8 @@ def mint_token(client: httpx.Client, permutation: str, policy: str, user_id: int
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────
-def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False) -> tuple[int, int]:
+def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False,
+                     max_empty_days: int = DEFAULT_MAX_EMPTY_DAYS) -> tuple[int, int]:
     email = os.environ.get("CRONOMETER_EMAIL")
     password = os.environ.get("CRONOMETER_PASSWORD")
     if not email or not password:
@@ -315,7 +323,10 @@ def fetch_and_import(days: int, dry_run: bool, auth_only: bool = False) -> tuple
             f.write(servings_csv.lstrip("﻿"))
         with open(dpath, "w", encoding="utf-8-sig", newline="") as f:
             f.write(daily_csv.lstrip("﻿"))
-        return run_import([spath, dpath], dry_run=dry_run)
+        # The window is what WE asked Cronometer for (both ends inclusive); it is
+        # what lets the importer treat a day missing from the export as empty.
+        return run_import([spath, dpath], dry_run=dry_run, window=(start, end),
+                          max_empty_days=max_empty_days)
 
 
 def main() -> None:
@@ -326,7 +337,13 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="fetch + parse, no DB writes")
     ap.add_argument("--auth", action="store_true",
                     help="bootstrap/validate: fresh login + 1-day export, no import")
+    ap.add_argument("--max-empty-days", type=int, default=DEFAULT_MAX_EMPTY_DAYS,
+                    help="most stored days one run may empty because Cronometer no longer has "
+                         f"food on them (default {DEFAULT_MAX_EMPTY_DAYS}; 0 = empty none). More "
+                         "than this and none are emptied (partial heartbeat)")
     args = ap.parse_args()
+    if args.max_empty_days < 0:
+        ap.error("--max-empty-days must be 0 or more")
 
     if args.auth:
         fetch_and_import(days=1, dry_run=True, auth_only=True)
@@ -335,7 +352,8 @@ def main() -> None:
 
     t0 = now_epoch()
     try:
-        scount, dcount = fetch_and_import(args.days, dry_run=args.dry_run)
+        scount, dcount = fetch_and_import(args.days, dry_run=args.dry_run,
+                                          max_empty_days=args.max_empty_days)
         log.info("Done — %d servings, %d daily rows.", scount, dcount)
     except BaseException as e:  # noqa: BLE001  (also catches SystemExit from the importer)
         # run_import emits per-data_type success heartbeats on the happy path;
