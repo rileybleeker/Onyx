@@ -18,12 +18,14 @@ import {
   getDailyVitamins,
   getDailyNutrientsFull,
   getPhotoMealsForDays,
+  getDirectDrinksForDays,
   rangeDays,
   rangeLabel,
   type PhotoMeal,
 } from "@/lib/queries";
+import { onDrinkChange, servingsText, type DrinkRecord } from "@/lib/drink-capture";
 import PhotoMealLogger from "@/components/PhotoMealLogger";
-import { daySourceLabel, isEstimateSource, rangeSourceLabel } from "@/lib/photo-meal";
+import { baseSourceLabel, isEstimateSource, rangeSourceLabel } from "@/lib/photo-meal";
 import { formatClock } from "@/lib/delivery-leftovers";
 import { formatDate, kgToLb, sameJson } from "@/lib/format";
 import StatCard from "@/components/StatCard";
@@ -357,7 +359,33 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       setPhotoError("Network error: the meal was not removed.");
     }
   }
-  const mealsLoading = !servingsLoaded || !delivery.loaded || !photoLoaded;
+  // Drinks captured on Log (pds.photo_meals capture_kind = 'drink') of the shown day: read-only here (entered and
+  // undone on Log). Their kcal / macros are already in the daily macros (getNutrition adds pds.direct_drink_daily).
+  const [drinkState, setDrinkState] = useState<{ date: string | null; rows: DrinkRecord[]; failed?: boolean }>({ date: null, rows: [] });
+  const [drinkReload, setDrinkReload] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    getDirectDrinksForDays([mealsDay])
+      .then((rows) => {
+        if (!cancelled) setDrinkState((prev) => (prev.date === mealsDay && !prev.failed && sameJson(prev.rows, rows) ? prev : { date: mealsDay, rows }));
+      })
+      .catch((e) => {
+        console.error(e);
+        if (!cancelled) setDrinkState({ date: mealsDay, rows: [], failed: true });
+      });
+    return () => { cancelled = true; };
+  }, [mealsDay, drinkReload]);
+  const drinksLoaded = drinkState.date === mealsDay;
+  const dayDrinks = drinksLoaded ? drinkState.rows : [];
+  const drinkKcal = dayDrinks.filter((d) => d.overlap === "none").reduce((s, d) => s + d.kcal, 0);
+  // A drink saved, edited or undone on Log (this page may be mounted in the scroll at the same time): refetch the
+  // macros and the list. Registered for as long as the page is mounted.
+  useEffect(() => onDrinkChange(() => {
+    setDrinkReload((n) => n + 1);
+    refreshNutritionSilently();
+  }), [refreshNutritionSilently]);
+
+  const mealsLoading = !servingsLoaded || !delivery.loaded || !photoLoaded || !drinksLoaded;
 
   // ─── Weight loader + default date init ───
   const loadWeight = useCallback(async () => {
@@ -475,8 +503,13 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   // Days without a Cronometer log are filled with Uber Eats estimates and
   // photo-logged meals (getNutrition) — label the source honestly.
   const estDays = nutritionData.filter((d) => isEstimateSource(d.nutrition_source)).length;
-  const macroSource = rangeSourceLabel(nutritionData.map((d) => d.nutrition_source));
-  const latestSource = daySourceLabel(latest?.nutrition_source);
+  // Direct drink captures add to any day (lib/drink-capture.ts addDirectDrinks): tagged "+ DRINKS".
+  const hasDrinks = (d: any) => Number(d?.direct_drink_count) > 0;
+  const macroSource = rangeSourceLabel(nutritionData.map((d) => d.nutrition_source), nutritionData.some(hasDrinks));
+  // The KPI tiles' source tag names the food source; drinks are named in the tile's sublabel.
+  const latestSource = baseSourceLabel(latest?.nutrition_source) ?? undefined;
+  const drinkNote = latest?.nutrition_source === "direct_drink" ? "drinks only" : hasDrinks(latest) ? "incl. drinks" : null;
+  const withDrinkNote = (s: string | undefined) => (drinkNote ? (s ? `${s} · ${drinkNote}` : drinkNote) : s);
 
   // Latest day + trailing week of the micronutrient tiles and the "All tracked nutrients" table.
   const vitaminLatest = vitaminsData[vitaminsData.length - 1];
@@ -492,7 +525,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Nutrition</h2>
             <InfoHint label="Nutrition">
               Food comes from Cronometer. On days with no Cronometer log, Uber Eats dish estimates and meals
-              logged by photo fill in.
+              logged by photo fill in. Drinks logged on Log add to every day, from their label.
             </InfoHint>
           </div>
           <p className="text-sm text-text-tertiary mt-0.5">
@@ -539,7 +572,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             <StatCard
               label="Calories"
               value={latest?.calories ?? null}
-              sublabel={avgCalories > 0 ? `avg ${Math.round(avgCalories)} kcal` : undefined}
+              sublabel={withDrinkNote(avgCalories > 0 ? `avg ${Math.round(avgCalories)} kcal` : undefined)}
               source={latestSource}
             />
           )}
@@ -549,7 +582,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             <StatCard
               label="Protein"
               value={latest?.protein_g ? `${Number(latest.protein_g).toFixed(0)}g` : null}
-              sublabel={avgProtein > 0 ? `avg ${avgProtein.toFixed(0)}g` : undefined}
+              sublabel={withDrinkNote(avgProtein > 0 ? `avg ${avgProtein.toFixed(0)}g` : undefined)}
               source={latestSource}
             />
           )}
@@ -559,7 +592,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             <StatCard
               label="Carbs"
               value={latest?.carbs_g ? `${Number(latest.carbs_g).toFixed(0)}g` : null}
-              sublabel={avgCarbs > 0 ? `avg ${avgCarbs.toFixed(0)}g` : undefined}
+              sublabel={withDrinkNote(avgCarbs > 0 ? `avg ${avgCarbs.toFixed(0)}g` : undefined)}
               source={latestSource}
             />
           )}
@@ -569,7 +602,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             <StatCard
               label="Fat"
               value={latest?.fat_g ? `${Number(latest.fat_g).toFixed(0)}g` : null}
-              sublabel={avgFat > 0 ? `avg ${avgFat.toFixed(0)}g` : undefined}
+              sublabel={withDrinkNote(avgFat > 0 ? `avg ${avgFat.toFixed(0)}g` : undefined)}
               source={latestSource}
             />
           )}
@@ -756,7 +789,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
               <p className="text-[11px] font-mono text-text-tertiary uppercase tracking-widest">
                 {mealsDayOffset === 0 ? "Today's Meals" : "Meals"}
               </p>
-              <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS + PHOTOS · {mealsDay}</span>
+              <span className="text-[10px] font-mono text-text-tertiary">CRONOMETER + UBER EATS + PHOTOS + DRINKS · {mealsDay}</span>
             </div>
             <div className="flex gap-1.5" role="tablist" aria-label="Meals day">
               {[0, 1, 2].map((off) => (
@@ -777,7 +810,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             </div>
             {mealsLoading ? (
               <p className="text-xs text-text-tertiary mt-3">Loading…</p>
-            ) : todayServings.length === 0 && photoMeals.length === 0 && delivery.items.length === 0 && delivery.leftovers.length === 0 && !servingsFailed && !photoState.failed && !delivery.loadError ? (
+            ) : todayServings.length === 0 && photoMeals.length === 0 && dayDrinks.length === 0 && delivery.items.length === 0 && delivery.leftovers.length === 0 && !servingsFailed && !photoState.failed && !drinkState.failed && !delivery.loadError ? (
               <p className="text-xs text-text-tertiary mt-3">
                 Nothing logged for {mealsDayOffset === 0 ? "today" : "this day"} yet. Cronometer entries and Uber Eats orders appear here once they sync.
               </p>
@@ -785,6 +818,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
             {servingsFailed && <p className="text-xs text-red-400 mt-3">Couldn&apos;t load Cronometer entries.</p>}
             {delivery.loadError && <p className="text-xs text-red-400 mt-3">{delivery.loadError}</p>}
             {photoLoaded && photoState.failed && <p className="text-xs text-red-400 mt-3">Couldn&apos;t load photo meals.</p>}
+            {drinksLoaded && drinkState.failed && <p className="text-xs text-red-400 mt-3">Couldn&apos;t load drinks.</p>}
           </div>
         }
       >
@@ -839,6 +873,31 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
                 ))}
               </div>
               {photoError && <p className="text-[11px] text-red-400 mt-1.5">{photoError}</p>}
+            </div>
+          </Part>
+        )}
+        {dayDrinks.length > 0 && (
+          <Part id="drinks" title="Drinks">
+            <div>
+              <div className="flex items-baseline justify-between mb-1.5">
+                <span className="text-[10px] font-mono text-text-tertiary">Drinks (label)</span>
+                <span className="text-[11px] font-mono text-text-secondary">Drinks {Math.round(drinkKcal * 10) / 10} kcal</span>
+              </div>
+              {/* Read-only: drinks are entered, changed and undone on Log (one place to enter data). */}
+              <div className="bg-surface-card border border-border-subtle rounded-control divide-y divide-border-subtle">
+                {dayDrinks.map((d) => (
+                  <div key={d.client_key} className="flex items-start gap-2 px-4 py-2.5 text-sm">
+                    <span className="text-[11px] font-mono text-text-tertiary w-14 shrink-0 pt-0.5">{formatClock(d.eaten_time)}</span>
+                    <span className="flex-1 min-w-0 text-text-secondary break-words">
+                      {d.name} · {servingsText(d.servings)}
+                    </span>
+                    <span className="text-[11px] font-mono text-text-tertiary text-right shrink-0 pt-0.5">
+                      {d.overlap === "in_diary" ? "in diary, not counted" : `${Math.round(d.kcal * 10) / 10} kcal · ${Math.round(d.caffeine_mg)} mg caffeine`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-1.5"><LogLink part="drinks">Change drinks on Log</LogLink></div>
             </div>
           </Part>
         )}

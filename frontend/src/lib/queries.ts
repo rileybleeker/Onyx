@@ -3,6 +3,7 @@ import { whoopSleepDay, kjToKcal } from "./format";
 import { hoursToMs, msToMinutes, secondsToMs, type Kilocalories, type Kilojoules, type Milliseconds, type Minutes } from "./units";
 import { dishKcal, mergeDeliveryEstimates, shiftYmd } from "./delivery-portion";
 import { combineEstimateDays, isMissingRelation, type PhotoMealItem } from "./photo-meal";
+import { addDirectDrinks, DRINK_COLUMNS, toDrinkRecord, type DrinkDay, type DrinkRecord } from "./drink-capture";
 import { LEFTOVER_WINDOW_DAYS, type LeftoverRow } from "./delivery-leftovers";
 import type { UberEatsCheck } from "./log-ubereats";
 
@@ -471,8 +472,12 @@ export async function getNutrition(days: number = 30) {
   // Uber Eats: per-dish guesses from the cart (restaurant orders only, each dish
   // times the eaten portion). est_kcal > 0: a day where every dish was marked
   // "None" has no food signal; it must not show as a 0 kcal day.
-  // The three reads are independent, so they run in parallel.
-  const [matrix, delivery, photo] = await Promise.all([
+  // Direct drink captures (pds.direct_drink_daily, sql/direct_drink_capture.sql) are distinct items with a label
+  // snapshot, not estimates: they ADD to whatever the day holds (a Cronometer day too) and alone make a "drinks"
+  // day (addDirectDrinks in lib/drink-capture.ts). A drink marked as already in the diary, or removed, is not in
+  // that view. They never pass through the fallback-only estimate merge, which a diary day suppresses.
+  // The four reads are independent, so they run in parallel.
+  const [matrix, delivery, photo, drinks] = await Promise.all([
     supabase
       .from("daily_health_matrix_behavioral_mat")
       .select(
@@ -496,16 +501,49 @@ export async function getNutrition(days: number = 30) {
       .gte("behavioral_date", sinceYmd)
       .gt("est_kcal", 0)
       .order("behavioral_date", { ascending: true }),
+    // No kcal filter: a zero-calorie drink still counts (drink_count, caffeine).
+    supabase
+      .from("direct_drink_daily")
+      .select("behavioral_date, drink_count, kcal, protein_g, carbs_g, fat_g, sugar_g, sodium_mg")
+      .gte("behavioral_date", sinceYmd)
+      .order("behavioral_date", { ascending: true }),
   ]);
   if (matrix.error) throw matrix.error;
   if (delivery.error) throw delivery.error;
   // Photo meals are an add-on: until sql/photo_meals.sql is applied the view does not exist, and no other
   // failure there may take the macro charts down with it.
   if (photo.error && !isMissingRelation(photo.error.code)) console.error("photo_meal_daily:", photo.error.message);
+  // Drinks: only "not set up yet" (sql/direct_drink_capture.sql not applied: missing view) means none. Any other
+  // failure propagates (the page's stale / error path): totals without saved drinks must not look complete.
+  if (drinks.error && !isMissingRelation(drinks.error.code)) throw drinks.error;
 
   type NutritionRow = Record<string, unknown> & { calendar_date: string };
   const estimates = combineEstimateDays(delivery.data ?? [], photo.error ? [] : (photo.data ?? []));
-  return mergeDeliveryEstimates((matrix.data as unknown as NutritionRow[]) ?? [], estimates) as NutritionRow[];
+  const merged = mergeDeliveryEstimates((matrix.data as unknown as NutritionRow[]) ?? [], estimates) as NutritionRow[];
+  return addDirectDrinks(merged, drinks.error ? [] : ((drinks.data ?? []) as DrinkDay[]));
+}
+
+/**
+ * Direct drink captures (pds.photo_meals capture_kind = 'drink', not removed) of the given behavioral days, for
+ * /nutrition's day list. Includes drinks marked as already in the diary (`overlap: "in_diary"`, shown as not
+ * counted). [] before sql/direct_drink_capture.sql is applied; throws on other errors.
+ */
+export async function getDirectDrinksForDays(dates: string[]): Promise<DrinkRecord[]> {
+  if (dates.length === 0) return [];
+  const { data, error } = await supabase
+    .from("photo_meals")
+    .select(DRINK_COLUMNS)
+    .eq("capture_kind", "drink")
+    .is("deleted_at", null)
+    .in("eaten_date", dates)
+    .order("eaten_at", { ascending: true })
+    .order("meal_id", { ascending: true });
+  if (error) {
+    // Not set up yet (no drink columns): no drinks exist. Anything else is an error the page shows.
+    if (isMissingRelation(error.code) || error.code === "42703") return [];
+    throw error;
+  }
+  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map(toDrinkRecord);
 }
 
 export interface PhotoMeal {
@@ -530,12 +568,17 @@ export interface PhotoMeal {
  */
 export async function getPhotoMealsForDays(dates: string[]): Promise<PhotoMeal[]> {
   if (dates.length === 0) return [];
-  const { data, error } = await supabase
-    .from("photo_meals")
-    .select("meal_id, eaten_date, eaten_time, eaten_at, time_source, items, kcal, protein_g, carbs_g, fat_g, confidence")
-    .in("eaten_date", dates)
-    .order("eaten_at", { ascending: true })
-    .order("meal_id", { ascending: true });
+  // Photo rows only: the table also holds direct drink captures (capture_kind = 'drink'), listed on their own
+  // (getDirectDrinksForDays). Before sql/direct_drink_capture.sql the column does not exist and every row is a photo.
+  const run = (pin: boolean) => {
+    const q = supabase
+      .from("photo_meals")
+      .select("meal_id, eaten_date, eaten_time, eaten_at, time_source, items, kcal, protein_g, carbs_g, fat_g, confidence")
+      .in("eaten_date", dates);
+    return (pin ? q.eq("capture_kind", "photo") : q).order("eaten_at", { ascending: true }).order("meal_id", { ascending: true });
+  };
+  let { data, error } = await run(true);
+  if (error && error.code === "42703") ({ data, error } = await run(false));
   if (error) {
     if (isMissingRelation(error.code)) return [];
     throw error;

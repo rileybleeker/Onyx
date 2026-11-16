@@ -59,7 +59,23 @@ test("memory only: the store never touches storage or the network", () => {
   const src = read("lib/log-drafts.ts");
   assert.ok(!/localStorage|sessionStorage|indexedDB|fetch\(/.test(src.replace(/^\s*(\*|\/\/).*$/gm, "")));
   assert.equal(D.FROM_WHAT_YOU_SAID, "from what you said");
-  assert.deepEqual([...D.LOG_SECTIONS], ["checkin", "journal", "supplements", "ubereats", "weight", "reading"]);
+  assert.deepEqual([...D.LOG_SECTIONS], ["checkin", "journal", "supplements", "ubereats", "weight", "reading", "drinks"]);
+});
+
+test("drinks: several drafts at once, each with its stable key; memory only like every section", () => {
+  D.clearAllLogDrafts();
+  const key = "0b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b";
+  D.setLogDrafts({
+    drinks: [
+      { key, product_id: "gorilla-mind-energy-wild-grape-16oz", said: "one wild grape Gorilla Mind", issue: null, servings: 1, time: null, date: null, when_issue: null, captured_at: 1 },
+      { key: "1b8f2a6e-5d1c-4f3e-9a7b-2c4d6e8f0a1b", product_id: null, said: "Gorilla Mind", issue: "flavor", servings: null, time: null, date: null, when_issue: "bad_date", captured_at: 1 },
+    ],
+  }, "one wild grape Gorilla Mind and a Gorilla Mind");
+  const d = D.getLogDraft("drinks");
+  assert.equal(d.value.length, 2);
+  assert.equal(d.value[0].key, key);
+  assert.equal(d.value[1].issue, "flavor", "an unresolved drink is kept, not dropped");
+  assert.equal(D.getLogDraft("supplements"), null, "a drink is not a supplement draft");
 });
 
 test("useLogDrafts renders the section's current draft", () => {

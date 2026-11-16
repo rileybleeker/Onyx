@@ -82,6 +82,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
+    // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
+    json("/api/nutrition/drinks"),
     // Uber Eats (app/log/sections/UberEats.tsx): behavioral today, today's dish window, the harvester heartbeat.
     ...logUberEatsWarmers(),
   ],

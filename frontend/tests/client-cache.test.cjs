@@ -236,6 +236,9 @@ test('a successful write invalidates the entries it changed and refetches them i
   assert.deepEqual(writeInvalidates('/api/habits/complete'), ['/api/habits/checkin', '/api/habits/list'], '/habits writes its own journal through');
   assert.ok(writeInvalidates('/api/chat').includes('habits:'), 'chat write tools log habits');
   assert.deepEqual(writeInvalidates('/today'), []);
+  // A drink capture is one row counted by Nutrition AND Caffeine: both areas (and their feed seeds) go stale.
+  assert.deepEqual(writeInvalidates('/api/nutrition/drinks'), ['/api/nutrition', 'nutrition:', '/api/caffeine', 'caffeine:']);
+  assert.deepEqual(writeInvalidates('/api/nutrition/photo-meals'), ['/api/nutrition', 'nutrition:']);
 
   const cache = makeCache();
   cache.put('/api/habits/checkin', { today: '2031-02-03', answers: { a: 'No' } });

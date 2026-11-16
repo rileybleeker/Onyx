@@ -6,8 +6,9 @@ import InfoHint from "@/components/InfoHint";
 import { usePartOrder } from "@/components/personalize/PartGrid";
 import { VOICE_MAX_TEXT_CHARS } from "@/lib/checkin-voice";
 import { sayItJournalDraft } from "@/lib/journal-file";
-import { FROM_WHAT_YOU_SAID, reportCheckinFill, setLogDraft, setLogDrafts, useCheckinFill, type LogDraftMap } from "@/lib/log-drafts";
-import type { LogVoiceResult } from "@/lib/log-voice";
+import { itemKey, itemSlots, newUuid } from "@/lib/drink-capture";
+import { FROM_WHAT_YOU_SAID, reportCheckinFill, setLogDraft, setLogDrafts, useCheckinFill, type DrinkLogDraft, type LogDraftMap } from "@/lib/log-drafts";
+import type { DrinkVoiceItem, LogVoiceResult } from "@/lib/log-voice";
 import { LOG_PART_IDS, jumpToLogPart, type LogPartId } from "../jump";
 import { LogCard } from "./ui";
 
@@ -38,8 +39,39 @@ let keptText = "";
 let keptShown: Shown | null = null;
 /** Words went to the check-in (its result is shown under the box until the box is cleared). */
 let keptCheckinSent = false;
+/**
+ * The capture these words are (drinks, lib/drink-capture.ts): made at the Fill tap, BEFORE the request, and kept
+ * while the words stay the same, so Fill again on the same words (a retry, a lost answer) gives the same drink keys
+ * and the server answers with the drinks already saved. Changed words are a new capture: new keys. Memory only.
+ */
+interface Capture {
+  text: string;
+  id: string;
+  at: number;
+  /**
+   * The drinks of the FIRST answer accepted for these words, with their keys, frozen: Fill again on the same words
+   * replays exactly these (a model that now reads "two cans" as two items of one can, or resolves what it left
+   * unresolved, can never add keys). Riley corrects them in the Drinks section; a new drink is a new capture
+   * (changed words, Clear, or a "+ can" tap there). null until an answer was accepted.
+   */
+  drinks: DrinkLogDraft[] | null;
+  drinkLines: string[];
+}
+let keptCapture: Capture | null = null;
 
-const SECTION_NAMES: Record<string, string> = { journal: "Journal", supplements: "Supplements", ubereats: "Uber Eats", weight: "Weight", reading: "Reading" };
+function captureFor(words: string): Capture {
+  if (!keptCapture || keptCapture.text !== words) keptCapture = { text: words, id: newUuid(), at: Date.now(), drinks: null, drinkLines: [] };
+  return keptCapture;
+}
+
+/** The route's drinks with their stable keys (derived from the capture id, never fresh per answer). */
+async function drinkDrafts(items: DrinkVoiceItem[], capture: Capture): Promise<DrinkLogDraft[]> {
+  const slots = itemSlots(items);
+  const keys = await Promise.all(slots.map((s) => itemKey(capture.id, s)));
+  return items.map((d, i) => ({ ...d, key: keys[i], captured_at: capture.at }));
+}
+
+const SECTION_NAMES: Record<string, string> = { journal: "Journal", supplements: "Supplements", ubereats: "Uber Eats", weight: "Weight", reading: "Reading", drinks: "Drinks" };
 
 export default function SayItSection() {
   const [text, setText] = useState(keptText);
@@ -69,6 +101,7 @@ export default function SayItSection() {
     if (!words || busy) return;
     setBusy(true);
     show(null);
+    const capture = captureFor(words);
     // The check-in reads the same words with its own questions straight away (in parallel with the call below);
     // its result replaces this "pending" under the box (reportCheckinFill in CheckInClient).
     reportCheckinFill({ pending: true, message: null });
@@ -95,8 +128,18 @@ export default function SayItSection() {
       if (json.ubereats.length) drafts.ubereats = json.ubereats;
       if (json.weight) drafts.weight = json.weight;
       if (json.reading) drafts.reading = json.reading;
+      // Drinks: resolved or not, each is shown in the Drinks section (an unknown one is never dropped). The first
+      // accepted interpretation of these words is frozen and replayed on every later Fill of the same words.
+      if (capture.drinks == null) {
+        capture.drinks = await drinkDrafts(Array.isArray(json.drinks) ? json.drinks : [], capture);
+        capture.drinkLines = json.summary?.drinks ?? [];
+      }
+      if (capture.drinks.length) drafts.drinks = capture.drinks;
       setLogDrafts(drafts, words);
-      show({ kind: "filled", result: json });
+      show({
+        kind: "filled",
+        result: { ...json, drinks: capture.drinks, summary: { ...json.summary, drinks: capture.drinkLines } },
+      });
     } catch {
       const message = "Couldn't reach Onyx. Your words are still here.";
       if (!offerPrefixedJournal(words, message)) show({ kind: "error", message });
@@ -120,7 +163,8 @@ export default function SayItSection() {
         weight: null,
         reading: null,
         journal,
-        summary: { journal: [`Entry, ${n} word${n === 1 ? "" : "s"} of yours`], supplements: [], ubereats: [], weight: [], reading: [] },
+        drinks: [],
+        summary: { journal: [`Entry, ${n} word${n === 1 ? "" : "s"} of yours`], supplements: [], ubereats: [], weight: [], reading: [], drinks: [] },
         not_matched: [],
         error,
       },
@@ -131,6 +175,8 @@ export default function SayItSection() {
   const clear = () => {
     edit("");
     show(null);
+    // Cleared on purpose: the same words typed again are a new capture (a deliberate second drink gets new keys).
+    keptCapture = null;
     keptCheckinSent = false;
     setCheckinSent(false);
   };
@@ -141,7 +187,7 @@ export default function SayItSection() {
       action={
         <InfoHint label="Say it">
           Type, or use your keyboard&apos;s microphone. Fill reads it once and suggests answers in the check-in,
-          journal, supplements, Uber Eats, weight and reading below, marked &ldquo;{FROM_WHAT_YOU_SAID}&rdquo;. Start
+          journal, supplements, drinks, Uber Eats, weight and reading below, marked &ldquo;{FROM_WHAT_YOU_SAID}&rdquo;. Start
           with &ldquo;journal:&rdquo; to make the rest a journal entry. Each section saves what it filled on its own
           (Undo or change it there); a journal entry without &ldquo;journal:&rdquo; waits for Keep. The words go to
           Anthropic for that read and are not stored.
@@ -263,6 +309,7 @@ function Filled({ result }: { result: LogVoiceResult & { unavailable?: string[];
   const rows: Array<{ name: string; part: LogPartId; lines: string[] }> = [
     { name: "Journal", part: "journal", lines: summary.journal ?? [] },
     { name: "Supplements", part: "supplements", lines: summary.supplements },
+    { name: "Drinks", part: "drinks", lines: summary.drinks ?? [] },
     { name: "Uber Eats", part: "uber-eats", lines: summary.ubereats },
     { name: "Weight", part: "weight", lines: summary.weight },
     { name: "Reading", part: "reading", lines: summary.reading },

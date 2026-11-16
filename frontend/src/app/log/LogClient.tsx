@@ -15,7 +15,8 @@ import { SectionSkeleton } from "./sections/ui";
  * its own chunk and data (client cache first); the frame paints at once with each section's skeleton. Every section
  * saves Riley's input on its own (autosave, lib/autosave.ts). Nothing is written on open or on scroll.
  *
- * Section files (app/log/sections/*.tsx, one per section): SayIt, CheckIn, Journal, Supplements, UberEats, Weight, Reading.
+ * Section files (app/log/sections/*.tsx, one per section): SayIt, CheckIn, Journal, Supplements, Drinks, UberEats, Weight,
+ * Reading.
  * The Say it box writes suggestions to lib/log-drafts.ts; each section reads its own with useLogDrafts(section).
  */
 
@@ -28,6 +29,7 @@ import "./sections/SayIt";
 import "./sections/CheckIn";
 import "./sections/Journal";
 import "./sections/Supplements";
+import "./sections/Drinks";
 import "./sections/UberEats";
 import "./sections/Weight";
 import "./sections/Reading";
@@ -36,6 +38,7 @@ const SayIt = dynamic(() => import("./sections/SayIt"), { ssr: false, loading: (
 const CheckIn = dynamic(() => import("./sections/CheckIn"), { ssr: false, loading: () => <SectionSkeleton section="checkin" /> });
 const Journal = dynamic(() => import("./sections/Journal"), { ssr: false, loading: () => <SectionSkeleton section="journal" /> });
 const Supplements = dynamic(() => import("./sections/Supplements"), { ssr: false, loading: () => <SectionSkeleton section="supplements" /> });
+const Drinks = dynamic(() => import("./sections/Drinks"), { ssr: false, loading: () => <SectionSkeleton section="drinks" /> });
 const UberEats = dynamic(() => import("./sections/UberEats"), { ssr: false, loading: () => <SectionSkeleton section="ubereats" /> });
 const Weight = dynamic(() => import("./sections/Weight"), { ssr: false, loading: () => <SectionSkeleton section="weight" /> });
 const Reading = dynamic(() => import("./sections/Reading"), { ssr: false, loading: () => <SectionSkeleton section="reading" /> });
@@ -79,6 +82,7 @@ export default function LogClient({ headingTestId = "page-heading" }: { headingT
         <Part id="check-in" title="Check-in" nested><Anchor part="check-in" /><CheckIn /></Part>
         <Part id="journal" title="Journal"><Anchor part="journal" /><Journal /></Part>
         <Part id="supplements" title="Supplements"><Anchor part="supplements" /><Supplements /></Part>
+        <Part id="drinks" title="Drinks"><Anchor part="drinks" /><Drinks /></Part>
         <Part id="uber-eats" title="Uber Eats"><Anchor part="uber-eats" /><UberEats /></Part>
         <Part id="weight" title="Weight" width="half"><Anchor part="weight" /><Weight /></Part>
         <Part id="reading" title="Reading" width="half"><Anchor part="reading" /><Reading /></Part>
