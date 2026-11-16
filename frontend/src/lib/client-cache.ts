@@ -82,6 +82,8 @@ export function writeInvalidates(path: string): string[] {
   // A check-in or habit write also changes what Today and the delivery portions show.
   if (area === "habits") out.push("/api/delivery");
   if (area === "delivery") out.push("/api/habits/checkin");
+  // A drink capture (one row) counts in Nutrition AND Caffeine: both areas' entries (and feed seeds) go stale.
+  if (path === "/api/nutrition/drinks" || path.startsWith("/api/nutrition/drinks/")) out.push("/api/caffeine", "caffeine:");
   return out;
 }
 

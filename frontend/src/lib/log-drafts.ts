@@ -2,7 +2,7 @@
  * The Log screen's draft contract (/log, AGENTS.md "Log screen").
  *
  * The "Say it" box at the top of /log turns what Riley said or typed into SUGGESTIONS for the sections below it
- * (Check-in, Journal, Supplements, Uber Eats, Weight, Reading). It writes them here; each section subscribes to its own
+ * (Check-in, Journal, Supplements, Uber Eats, Weight, Reading, Drinks). It writes them here; each section subscribes to its own
  * key with `useLogDrafts(section)`, shows the suggestion in its own form with the mark FROM_WHAT_YOU_SAID and saves
  * it on its own like Riley's own input (autosave, 2026-11-15: they are his words), through the section's existing
  * write route with its existing validation and date rules. The one exception: a journal entry the model picked out
@@ -141,7 +141,33 @@ export interface JournalLogDraft {
   topics: string[];
 }
 
-/** Section id -> the draft value it receives. Supplements and Uber Eats take several items at once. */
+/**
+ * Drinks, one drink said (PROD-CAFF-01). Saved by the Drinks section through /api/nutrition/drinks as ONE capture
+ * (pds.photo_meals capture_kind = 'drink'), which feeds both Nutrition and Caffeine; never as a supplement too.
+ * Only a product id from lib/drink-products.ts resolves; the label values come from there, never from the model.
+ * `key` is stable for these words (lib/drink-capture.ts itemKey of the Say it capture), so filling the same words
+ * again, a lost answer or a remount gives the same drink, not a second one.
+ */
+export interface DrinkLogDraft {
+  /** UUID: the drink's client_key. */
+  key: string;
+  /** lib/drink-products.ts id; null = not resolved (see `issue`). */
+  product_id: string | null;
+  /** The words used for it, short. */
+  said: string;
+  /** Why it is not resolved: powder / pre-workout, flavor not said, not in the list. null when resolved. */
+  issue: "powder" | "flavor" | "unknown" | null;
+  /** Containers (0.25 steps); null = amount not said (the editor asks). */
+  servings: number | null;
+  /** Local "HH:MM" when said; null = not said (today: the Fill moment, shown as Now; another day: asked). */
+  time: string | null;
+  /** Behavioral day when another day was said; null = the Say it day. */
+  date: string | null;
+  /** Date.now() of the Fill tap that produced it: the "Now" instant of a today drink with no time said. */
+  captured_at: number;
+}
+
+/** Section id -> the draft value it receives. Supplements, Uber Eats and drinks take several items at once. */
 export interface LogDraftMap {
   checkin: CheckinLogDraft;
   journal: JournalLogDraft;
@@ -149,11 +175,12 @@ export interface LogDraftMap {
   ubereats: UberEatsLogDraft[];
   weight: WeightLogDraft;
   reading: ReadingLogDraft;
+  drinks: DrinkLogDraft[];
 }
 
 export type LogSectionId = keyof LogDraftMap;
 
-export const LOG_SECTIONS: readonly LogSectionId[] = ["checkin", "journal", "supplements", "ubereats", "weight", "reading"];
+export const LOG_SECTIONS: readonly LogSectionId[] = ["checkin", "journal", "supplements", "ubereats", "weight", "reading", "drinks"];
 
 /** The mark shown next to a value that came from a draft (same words as the check-in's own Say it once). */
 export const FROM_WHAT_YOU_SAID = "from what you said";

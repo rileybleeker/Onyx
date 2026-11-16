@@ -18,6 +18,7 @@ import {
   type CaffeineQualityFlag,
 } from "@/lib/queries";
 import { formatDate, formatDuration, sameJson } from "@/lib/format";
+import { onDrinkChange } from "@/lib/drink-capture";
 import { minutesToSeconds, type Minutes } from "@/lib/units";
 import StatCard from "@/components/StatCard";
 import ChartCard from "@/components/ChartCard";
@@ -129,6 +130,10 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
   const [quality, setQuality] = useState<CaffeineQualityFlag[]>(initial?.quality ?? []);
   const [loading, setLoading] = useState(!initial);
   const firstRunWithInitial = useRef(!!initial);
+  // A drink saved, edited or undone on Log (lib/drink-capture.ts) changes the live caffeine views: read them again
+  // silently while this page is mounted (also inside the continuous scroll).
+  const [reload, setReload] = useState(0);
+  useEffect(() => onDrinkChange(() => setReload((n) => n + 1)), []);
 
   useEffect(() => {
     // Silent only on the very first run when seeded — there is no range
@@ -136,7 +141,8 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
     // windows. The cancelled flag stops an unmounted/superseded run from
     // committing stale state.
     let cancelled = false;
-    const silent = firstRunWithInitial.current;
+    // Silent too for a drink-change refresh (the charts stay while the new numbers load).
+    const silent = firstRunWithInitial.current || reload > 0;
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
     Promise.all([getCaffeineDaily(windowDays), getCaffeineHrvPairs(hrvDays), getCaffeineDataQuality(qualityDays)])
@@ -156,7 +162,7 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [windowDays, hrvDays, qualityDays]);
+  }, [windowDays, hrvDays, qualityDays, reload]);
 
   // ─── KPI derivations ────────────────────────────────────────────────────
   const latest = daily[daily.length - 1];
@@ -256,8 +262,9 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
           <div className="flex items-center gap-2">
             <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Caffeine</h2>
             <InfoHint label="Caffeine data">
-              Supplement doses (from 2026-05-19) and Cronometer food (from 2026-05-31) are the only sources, so
-              the charts cover that era only. The yes/no caffeine habit is ignored: it proved unreliable.
+              Supplement doses (from 2026-05-19), Cronometer food (from 2026-05-31) and drinks logged on Log
+              (counted as dietary, from their label) are the only sources, so the charts cover that era only. The
+              yes/no caffeine habit is ignored: it proved unreliable.
             </InfoHint>
           </div>
           <p className="text-sm text-text-tertiary mt-0.5">

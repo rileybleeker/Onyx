@@ -401,22 +401,42 @@ function estimateTag(hasUber: boolean, hasPhoto: boolean): EstimateTag {
   return hasUber && hasPhoto ? "UBER EATS + PHOTO EST." : hasPhoto ? "PHOTO EST." : "UBER EATS EST.";
 }
 
-/** Chart source tag of one day's row (StatCard `source`). */
-export function daySourceLabel(source: unknown): "CRONOMETER" | EstimateTag {
-  if (!isEstimateSource(source)) return "CRONOMETER";
-  return estimateTag(source !== "photo", source !== "uber_eats");
+/**
+ * nutrition_source of a day that holds only direct drink captures (lib/drink-capture.ts addDirectDrinks). A day
+ * of another source that ALSO has drinks keeps its source and carries `direct_drink_count`; pass `drinks` true.
+ */
+const DRINKS_ONLY = "direct_drink";
+const DRINKS_TAG = "DRINKS";
+
+export type DaySourceLabel = "CRONOMETER" | EstimateTag | "DRINKS" | `${"CRONOMETER" | EstimateTag} + DRINKS`;
+
+/** The day's food source tag without drinks (StatCard `source`); null for a day of drinks only. */
+export function baseSourceLabel(source: unknown): "CRONOMETER" | EstimateTag | null {
+  if (source === DRINKS_ONLY) return null;
+  return isEstimateSource(source) ? estimateTag(source !== "photo", source !== "uber_eats") : "CRONOMETER";
 }
 
-/** Chart source tag of a range of rows: the logged source, the estimate kinds present, or both. */
-export function rangeSourceLabel(sources: ReadonlyArray<unknown>): string {
-  let logged = false, uber = false, photo = false;
+/** Full source tag of one day's row; `drinks` = the day also has direct drink captures. */
+export function daySourceLabel(source: unknown, drinks = false): DaySourceLabel {
+  const base = baseSourceLabel(source);
+  if (base == null) return DRINKS_TAG;
+  return drinks ? `${base} + ${DRINKS_TAG}` : base;
+}
+
+/** Chart source tag of a range of rows: the logged source, the estimate kinds present, drinks, or a mix. */
+export function rangeSourceLabel(sources: ReadonlyArray<unknown>, drinks = false): string {
+  let logged = false, uber = false, photo = false, drink = drinks;
   for (const s of sources) {
-    if (!isEstimateSource(s)) logged = true;
+    if (s === DRINKS_ONLY) drink = true;
+    else if (!isEstimateSource(s)) logged = true;
     else {
       if (s !== "photo") uber = true;
       if (s !== "uber_eats") photo = true;
     }
   }
-  if (!uber && !photo) return "CRONOMETER";
-  return logged ? `CRONOMETER + ${estimateTag(uber, photo)}` : estimateTag(uber, photo);
+  let base: string;
+  if (!uber && !photo) base = logged || !drink ? "CRONOMETER" : "";
+  else base = logged ? `CRONOMETER + ${estimateTag(uber, photo)}` : estimateTag(uber, photo);
+  if (!drink) return base;
+  return base ? `${base} + ${DRINKS_TAG}` : DRINKS_TAG;
 }

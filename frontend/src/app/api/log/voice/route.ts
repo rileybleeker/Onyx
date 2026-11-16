@@ -24,7 +24,8 @@ import {
 //
 // The /log "Say it" box: Riley types or dictates a few sentences and ONE model call maps them to drafts for the
 // Log sections (lib/log-drafts.ts): supplement intakes and stacks, Uber Eats portions and leftovers, weight in lb,
-// a reading session. `date` = the behavioral day the words are about (default behavioral today; today and the 2
+// a reading session, drinks (an id from lib/drink-products.ts only when brand and flavor are said, else unresolved;
+// never also a supplement; the label values are not sent to the model and are resolved by /api/nutrition/drinks). `date` = the behavioral day the words are about (default behavioral today; today and the 2
 // days before, the check-in's window). The check-in part is not read here: the box hands the words to the
 // embedded check-in, which runs its own read-only fill (POST /api/habits/checkin/voice).
 // Answers: 200 LogVoiceResult ({day, supplements, ubereats, weight, reading, summary, not_matched, unavailable}),

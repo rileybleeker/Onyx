@@ -7,13 +7,14 @@ import type { ReactNode } from "react";
 /** Same text as FROM_WHAT_YOU_SAID in lib/log-drafts.ts. */
 const FROM_WHAT_YOU_SAID = "from what you said";
 
-export type LogSkeletonId = "sayit" | "checkin" | "journal" | "supplements" | "ubereats" | "weight" | "reading";
+export type LogSkeletonId = "sayit" | "checkin" | "journal" | "supplements" | "drinks" | "ubereats" | "weight" | "reading";
 
 export const LOG_SECTION_TITLES: Record<LogSkeletonId, string> = {
   sayit: "Say it",
   checkin: "Check-in",
   journal: "Journal",
   supplements: "Supplements",
+  drinks: "Drinks",
   ubereats: "Uber Eats",
   weight: "Weight",
   reading: "Reading",
@@ -114,6 +115,15 @@ export function SectionSkeleton({ section }: { section: LogSkeletonId }) {
         <>
           <ControlRows rows={1} cols={2} />
           <div className="mt-3 space-y-2">{Array.from({ length: 3 }, (_, i) => <Bar key={i} className="h-11 rounded-control" />)}</div>
+        </>
+      );
+      break;
+    case "drinks":
+      // Same shape as the section: the day's line, then one drink row.
+      body = (
+        <>
+          <Bar className="h-4 w-1/2" />
+          <Bar className="mt-3 h-11 rounded-control" />
         </>
       );
       break;

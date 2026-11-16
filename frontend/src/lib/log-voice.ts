@@ -10,7 +10,10 @@ import { shiftYmd } from "./delivery-portion";
 import { formatClock, leftoverQuestions, LEFTOVER_WINDOW_DAYS, type LeftoverRow } from "./delivery-leftovers";
 import { JOURNAL_TOPICS } from "./journal-entry";
 import { sayItJournalDraft, SAY_IT_JOURNAL_RULES, SAY_IT_JOURNAL_SCHEMA } from "./journal-file";
+import { drinkCandidates, drinkProduct, matchDrinkProduct } from "./drink-products";
+import { servingsFrom, servingsText } from "./drink-capture";
 import type {
+  DrinkLogDraft,
   JournalLogDraft,
   LeftoverAnswer,
   PortionFraction,
@@ -162,6 +165,8 @@ export function modelInput(text: string, lists: VoiceLists, clock: VoiceClock): 
       left_now: d.leftoverOpen ? `${shareWord(d.left)} of the dish` : null,
     })),
     books: lists.books.map((b) => ({ slug: b.slug, title: b.title, author: b.author, chapters: b.total_chapters, chapters_done: b.chapters_done })),
+    // Ids and names only (lib/drink-products.ts); the label values never go to the model.
+    drinks: drinkCandidates(),
     known_topics: JOURNAL_TOPICS,
   };
 }
@@ -175,6 +180,7 @@ You get:
 - products and stacks: the supplements and supplement stacks the person tracks.
 - dishes: restaurant dishes delivered on the last few days.
 - books: the books being read.
+- drinks: packaged drinks with a known label (id and name).
 - known_topics: the journal's existing topic tags.
 
 Fill only what the note clearly says happened. Never guess: leave a list empty, and give a field its "not said" value ("" for text, 0 for a number, none for a choice) when the note does not say it. Plans and intentions ("I should take magnesium", "I'll read later") are not entries.
@@ -203,6 +209,12 @@ reading: one reading session with read true, or read false (and the rest "not sa
 - medium: audio (listened, audiobook), kindle, paper or other, when said; otherwise none.
 - recall: when the person says what they remember or took away from the reading, copy those exact words from the note, unchanged. Never summarize or rephrase. Otherwise "".
 - date: as for supplements.
+
+drinks: one entry per drink the note says was drunk: a can, bottle or cup (energy drinks, sodas, coffee drinks), not a supplement powder, pill or scoop. A drink is never also listed under supplements, and a drink in this list is not listed under not_matched.
+- product_id: the id from drinks only when the note names that exact drink (brand AND flavor); "" otherwise (another flavor, no flavor said, a powder, a drink not in the list).
+- said: the words used for it, including brand, flavor and size words as said ("wild grape Gorilla Mind", "Gorilla Mind").
+- amount and unit: a count of the drink itself ("one Gorilla Mind", "two cans", "half a can") is unit can; "12 oz" is unit fl_oz; 0 and none when no amount was said.
+- time and date: as for supplements ("HH:MM" or "", date or "").
 
 not_matched: short phrases for supplements, dishes or books the note says were taken, eaten or read that match nothing in the lists. Empty when everything matched.
 
@@ -273,10 +285,19 @@ export const LOG_VOICE_SCHEMA = {
       required: ["read", "book", "minutes", "chapter_from", "chapter_through", "medium", "recall", "date"],
       additionalProperties: false,
     },
+    drinks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { product_id: STR, said: STR, amount: NUM, unit: { type: "string", enum: ["can", "fl_oz", "none"] }, time: STR, date: STR },
+        required: ["product_id", "said", "amount", "unit", "time", "date"],
+        additionalProperties: false,
+      },
+    },
     not_matched: { type: "array", items: STR },
     journal: SAY_IT_JOURNAL_SCHEMA,
   },
-  required: ["supplements", "stacks", "dishes", "weight", "reading", "not_matched", "journal"],
+  required: ["supplements", "stacks", "dishes", "weight", "reading", "drinks", "not_matched", "journal"],
   additionalProperties: false,
 };
 
@@ -291,10 +312,15 @@ export interface LogVoiceResult {
   reading: ReadingLogDraft | null;
   /** A journal entry of the words (verbatim), when the note is (or holds) a reflection or starts with "journal:". */
   journal: JournalLogDraft | null;
+  /** Drinks said, resolved to a known product or kept unresolved with the reason (the box adds key + captured_at). */
+  drinks: DrinkVoiceItem[];
   /** One readable line per draft, per section (for the box's "what it filled"). */
-  summary: { journal: string[]; supplements: string[]; ubereats: string[]; weight: string[]; reading: string[] };
+  summary: { journal: string[]; supplements: string[]; ubereats: string[]; weight: string[]; reading: string[]; drinks: string[] };
   not_matched: string[];
 }
+
+/** One drink the route answers; the Say it box adds the stable key and the Fill moment (DrinkLogDraft). */
+export type DrinkVoiceItem = Omit<DrinkLogDraft, "key" | "captured_at">;
 
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
@@ -396,18 +422,27 @@ export function parseLogVoice(
     weight: null,
     reading: null,
     journal: null,
-    summary: { journal: [], supplements: [], ubereats: [], weight: [], reading: [] },
+    drinks: [],
+    summary: { journal: [], supplements: [], ubereats: [], weight: [], reading: [], drinks: [] },
     not_matched: [],
   };
   const notMatched = new Set<string>();
 
+  // Drinks first: what the note calls a drink must not also become a supplement draft (below).
+  const drinks = parseDrinks(out.drinks, c);
+  const drinkWords = drinks.filter((d) => d.issue !== "powder").map((d) => compactWords(d.said));
+  const overlapsDrink = (said: string | null) => !!said && drinkWords.some((w) => sameThing(w, compactWords(said)));
+
   // Supplements: one product per entry, an id from the list (or the chat tool's name match).
   const products = new Map(lists.products.map((p) => [p.product_id, p]));
   const seenProducts = new Set<string>();
+  const supplementWords: string[] = [];
   for (const item of arr(out.supplements).slice(0, 20)) {
     const s = obj(item);
     if (!s) continue;
     const said = str(s.said, 80);
+    // A drink said once is one drink (the Drinks section), never a supplement intake as well.
+    if (overlapsDrink(said)) continue;
     let product = typeof s.product_id === "string" ? products.get(s.product_id) ?? null : null;
     if (!product && said) product = resolveProduct(said);
     if (!product) {
@@ -422,6 +457,7 @@ export function parseLogVoice(
     const key = `${product.product_id}|${date}|${ts.join(",")}`;
     if (seenProducts.has(key)) continue;
     seenProducts.add(key);
+    if (said) supplementWords.push(compactWords(said));
     result.supplements.push({ kind: "product", product_id: product.product_id, name: product.name, amount: goodAmount, unit, times: ts, date });
     result.summary.supplements.push(`${product.name}${goodAmount != null ? `, ${goodAmount}${unit ? ` ${unit}` : ""}` : ""}${times(ts)}${shortDay(date)}`);
   }
@@ -533,10 +569,64 @@ export function parseLogVoice(
     result.summary.journal.push(`${journal.title ? `"${journal.title}"` : "Entry"}, ${words} word${words === 1 ? "" : "s"} of yours`);
   }
 
+  // Drinks: a powder the note also logged as a supplement product stays that supplement (no drink row for it).
+  for (const d of drinks) {
+    if (d.issue === "powder" && supplementWords.some((w) => sameThing(w, compactWords(d.said)))) continue;
+    result.drinks.push(d);
+    result.summary.drinks.push(drinkLine(d, c));
+  }
+
   for (const phrase of arr(out.not_matched)) {
     const s = str(phrase, 80);
-    if (s) notMatched.add(s);
+    // A drink is shown in the Drinks section (resolved or not), not again as "not matched".
+    if (s && !result.drinks.some((d) => sameThing(compactWords(d.said), compactWords(s)))) notMatched.add(s);
   }
   result.not_matched = Array.from(notMatched).slice(0, 8);
   return result;
+}
+
+const compactWords = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+/** The same phrase, or one containing the other (4+ letters), after dropping case, spaces and punctuation. */
+const sameThing = (a: string, b: string) => a.length >= 4 && b.length >= 4 && (a === b || a.includes(b) || b.includes(a));
+
+const DRINK_ISSUE_SHORT: Record<NonNullable<DrinkVoiceItem["issue"]>, string> = {
+  powder: "sounds like the powder, not the can",
+  flavor: "which flavor?",
+  unknown: "not in the drink list",
+};
+
+function drinkLine(d: DrinkVoiceItem, c: VoiceClock): string {
+  const p = drinkProduct(d.product_id);
+  const day = d.date && d.date !== c.day ? shortDay(d.date) : "";
+  if (!p) return `"${d.said}": ${DRINK_ISSUE_SHORT[d.issue ?? "unknown"]}`;
+  const amount = d.servings != null ? servingsText(d.servings) : "how much?";
+  return `${p.name}, ${amount}${d.time ? ` at ${formatClock(d.time)}` : ""}${day}`;
+}
+
+/**
+ * The model's drinks -> drafts. Only an id from lib/drink-products.ts resolves, and only when the words agree
+ * (matchDrinkProduct: brand AND flavor said, never the powder); anything else stays an unresolved drink with its
+ * reason, shown and editable, never dropped and never read as zero caffeine. Amounts: containers in quarter steps.
+ */
+function parseDrinks(raw: unknown, c: VoiceClock): DrinkVoiceItem[] {
+  const out: DrinkVoiceItem[] = [];
+  for (const item of arr(raw).slice(0, 10)) {
+    const d = obj(item);
+    const said = str(d?.said, 80);
+    if (!d || !said) continue;
+    const pick = typeof d.product_id === "string" && d.product_id.trim() ? d.product_id.trim() : null;
+    const match = matchDrinkProduct(said, pick);
+    const product = match?.kind === "match" ? match.product : null;
+    const unit = typeof d.unit === "string" ? d.unit.toLowerCase() : "none";
+    const servings = servingsFrom(num(d.amount), unit === "can" || unit === "fl_oz" ? unit : null, product);
+    out.push({
+      product_id: product ? product.id : null,
+      said,
+      issue: product ? null : match?.kind === "unresolved" ? match.issue : "unknown",
+      servings,
+      time: clock(d.time),
+      date: draftDate(d.date, c),
+    });
+  }
+  return out;
 }

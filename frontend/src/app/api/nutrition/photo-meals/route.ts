@@ -16,6 +16,10 @@ import {
 // Owner session only (middleware; not in isCiRoute), same-origin JSON with a size cap. The totals are summed
 // here from the items, never taken from the browser; eaten_at is computed by the table's trigger. POST is
 // idempotent on client_key (a UUID the browser makes per review), so a double tap saves one meal.
+// The table also holds direct drink captures (capture_kind = 'drink', sql/direct_drink_capture.sql, written only by
+// /api/nutrition/drinks): every read and the delete here are pinned to capture_kind = 'photo', so this route can
+// never answer with, edit or delete a drink. Inserts leave capture_kind to its default ('photo'). Before that
+// migration the column does not exist (every row is a photo meal), so the pin falls back to no filter.
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -37,6 +41,15 @@ async function readJson(req: NextRequest): Promise<{ ok: true; body: unknown } |
   } catch {
     return { ok: false, res: NextResponse.json({ error: "body must be JSON" }, { status: 400 }) };
   }
+}
+
+/** The capture_kind column does not exist yet (direct drink migration not applied): every row is a photo meal. */
+const noKindColumn = (code: string | undefined) => code === "42703" || code === "PGRST204";
+
+/** Run a query pinned to photo rows; before the drink migration, the same query without the pin. */
+async function photoOnly<R extends { error: { code?: string } | null }>(run: (pin: boolean) => PromiseLike<R>): Promise<R> {
+  const pinned = await run(true);
+  return pinned.error && noKindColumn(pinned.error.code) ? run(false) : pinned;
 }
 
 function dbError(code: string | undefined, what: string) {
@@ -79,10 +92,15 @@ export async function POST(req: NextRequest) {
   let row = data?.[0];
   if (!row) {
     // Already saved by an earlier tap with the same client_key: answer with that row.
-    const again = await supabase.from("photo_meals").select("meal_id, eaten_date, eaten_at, kcal").eq("client_key", m.client_key).limit(1);
+    // Already saved by an earlier tap with the same client_key: answer with that row (a photo row only; a key
+    // that belongs to a drink capture is a conflict, never a "saved" answer).
+    const again = await photoOnly((pin) => {
+      const q = supabase.from("photo_meals").select("meal_id, eaten_date, eaten_at, kcal").eq("client_key", m.client_key);
+      return (pin ? q.eq("capture_kind", "photo") : q).limit(1);
+    });
     if (again.error) return dbError(again.error.code, "re-read");
     row = again.data?.[0];
-    if (!row) return NextResponse.json({ error: "could not save" }, { status: 500 });
+    if (!row) return NextResponse.json({ error: "That key belongs to another entry." }, { status: 409 });
   }
 
   // The /nutrition ISR snapshot carries the daily macros, which now include this meal.
@@ -101,7 +119,11 @@ export async function DELETE(req: NextRequest) {
   const id = parseDeleteBody(read.body);
   if (id == null) return NextResponse.json({ error: "body must be exactly {meal_id: positive integer}" }, { status: 400 });
 
-  const { data, error } = await supabase.from("photo_meals").delete().eq("meal_id", id).select("meal_id");
+  // Photo rows only: a drink capture's meal_id is never deleted here (drinks are removed by tombstone).
+  const { data, error } = await photoOnly((pin) => {
+    const q = supabase.from("photo_meals").delete().eq("meal_id", id);
+    return (pin ? q.eq("capture_kind", "photo") : q).select("meal_id");
+  });
   if (error) return dbError(error.code, "delete");
   if (!data?.length) return NextResponse.json({ error: "meal not found" }, { status: 404 });
   revalidatePath("/nutrition");
