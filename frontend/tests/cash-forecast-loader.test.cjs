@@ -438,6 +438,14 @@ test("plan reads are paged: a server row cap still reads every planned item and 
   const drivers = Array.from({ length: 11 }, (_, i) => ({ key: `scenario:demo-${String(i).padStart(2, "0")}`, value: { name: `Demo ${i}`, params: {} } }));
   const cutDrivers = await loader({ txns: everyday(AT), drivers, caps: { finance_plan_drivers: 1 } })(AT);
   assert.deepEqual(cutDrivers.result.eligibility.reasons.map((r) => r.code), ["plan-unavailable"]);
+  // No server row cap at all: full 1000-row pages past the page limit (10 pages) are cut off by the limit alone, and
+  // that withholds the amount the same way.
+  const fullPages = Array.from({ length: 10_001 }, (_, i) => ({ key: `scenario:demo-${String(i).padStart(5, "0")}`, value: { name: `Demo ${i}`, params: {} } }));
+  const cutByLimit = await loader({ txns: everyday(AT), drivers: fullPages })(AT);
+  assert.equal(cutByLimit.setupPending, false, "it answered: not a failed read");
+  assert.equal(cutByLimit.drivers.length, 10_000, "ten full pages were read, no more");
+  assert.deepEqual(cutByLimit.result.eligibility.reasons.map((r) => r.code), ["plan-unavailable"]);
+  assert.equal(cutByLimit.result.headlines.safeToMoveCents, null);
   // The accounts read is paged the same way: a cap still reads every account; one cut off withholds the amount.
   const cards = Array.from({ length: 11 }, (_, i) => ({ account_key: `demo-card-${String(i).padStart(2, "0")}`, institution: "Demo Card Co", account_name: `Card ${i}`, account_type: "Credit Card", mask: null }));
   const fewAccounts = await loader({ txns: everyday(AT), accounts: cards.slice(0, 2), caps: { finance_accounts: 1 } })(AT);

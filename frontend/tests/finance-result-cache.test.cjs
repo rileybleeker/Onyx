@@ -662,6 +662,10 @@ test("fetchPaged: the page cap truncates, a small read is one request, no count 
   const nc = await L.fetchPaged(noCount.build, 40);
   assert.deepEqual(nc.rows, noCount.all);
   assert.equal(noCount.stats().maxInFlight, 1);
+  // With no count either, full pages past the page limit are cut off by the limit alone and reported.
+  const noCountCut = pagedSource(5_000, { noCount: true });
+  const ncc = await L.fetchPaged(noCountCut.build, 3);
+  assert.deepEqual([ncc.rows.length, ncc.truncated], [3_000, true]);
 });
 
 test("fetchPaged: rows removed after the count end the read instead of failing it; other errors still throw", async () => {
