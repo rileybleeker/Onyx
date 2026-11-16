@@ -12,6 +12,10 @@
  *    that may still be mid-typing (a weight that looks implausible, a journal entry's first words).
  *  - A save that throws AutosaveRefused (the server refused the value: 4xx) shows its message and is not retried
  *    until the value changes. Any other failure (offline, 5xx) is retried with backoff and shown as "not saved".
+ *  - `unknownOutcome(error)` true = that failure may have stored the value anyway (no clear answer came back). Until
+ *    a save succeeds (or reset / setBaseline say what is stored), no value counts as already saved: changing back to
+ *    the last saved value is then sent too, instead of being dropped as "unchanged" while the server may hold the
+ *    value whose answer was lost. Off by default (a form opts in when its server can tell such a failure apart).
  * No React, no DOM: unit-tested in tests/autosave.test.cjs. React: lib/use-autosave.ts; status line:
  * components/AutosaveStatus.tsx.
  */
@@ -52,6 +56,11 @@ export interface AutosaverOptions<T> {
   onState?: (s: AutosaveState) => void;
   /** Backoff for retryable failures. Default 2 s, 5 s, 15 s, then every 30 s. */
   retryDelaysMs?: number[];
+  /**
+   * True when this (non-refusal) failure may have stored the value anyway: the stored value is then unknown, so a
+   * change back to the last saved value is sent rather than dropped (see the rules above). Default: never.
+   */
+  unknownOutcome?: (error: unknown) => boolean;
   timers?: Timers;
   now?: () => number;
 }
@@ -93,6 +102,8 @@ export class Autosaver<T> {
   private latest: { value: T; manual?: boolean } | null = null;
   private saved: { value: T } | null;
   private refused: { value: T } | null = null;
+  /** A save failed with an unknown outcome (unknownOutcome): the server may hold that value instead of `saved`. */
+  private unconfirmed = false;
   private timer: unknown = null;
   private retryTimer: unknown = null;
   private retries = 0;
@@ -116,6 +127,11 @@ export class Autosaver<T> {
     return (this.opts.same ?? jsonSame)(a, b);
   }
 
+  /** `value` is known to be what the server holds (never while an earlier save's outcome is unknown). */
+  private isSaved(value: T): boolean {
+    return !!this.saved && !this.unconfirmed && this.same(value, this.saved.value);
+  }
+
   private set(next: Partial<AutosaveState>): void {
     this.state = { ...this.state, ...next };
     this.opts.onState?.(this.state);
@@ -137,6 +153,7 @@ export class Autosaver<T> {
   /** What the server holds now (after loading fresh data). Nothing is sent; a waiting equal value is dropped. */
   setBaseline(value: T): void {
     this.saved = { value };
+    this.unconfirmed = false; // fresh data says what is stored
     if (this.latest && this.same(this.latest.value, value) && !this.inflight) {
       this.clearTimers();
       this.latest = null;
@@ -152,6 +169,7 @@ export class Autosaver<T> {
     this.clearTimers();
     this.latest = null;
     this.refused = null;
+    this.unconfirmed = false;
     this.retries = 0;
     this.saved = baseline === undefined ? null : { value: baseline };
     this.set({ status: "idle", error: null, retrying: false });
@@ -169,7 +187,7 @@ export class Autosaver<T> {
       this.set({ status: "incomplete", error: why, retrying: false });
       return;
     }
-    if (this.saved && this.same(value, this.saved.value)) {
+    if (this.isSaved(value)) {
       if (!this.inflight) {
         this.latest = null;
         this.set({ status: this.state.savedAt ? "saved" : "idle", error: null, retrying: false });
@@ -211,7 +229,7 @@ export class Autosaver<T> {
     const next = this.latest;
     if (!next || this.disposed) return;
     if (this.opts.ready?.(next.value)) return;
-    if (this.saved && this.same(next.value, this.saved.value)) {
+    if (this.isSaved(next.value)) {
       this.latest = null;
       return;
     }
@@ -247,6 +265,7 @@ export class Autosaver<T> {
       await this.opts.save(value, { keepalive });
       if (this.disposed) return;
       this.saved = { value };
+      this.unconfirmed = false;
       this.retries = 0;
       const changed = !!this.latest && !this.same(this.latest.value, value);
       if (!changed) this.latest = null;
@@ -258,6 +277,8 @@ export class Autosaver<T> {
         this.set({ status: "error", error: messageOf(e), retrying: false });
         return;
       }
+      // The value may be stored even though this failed: from now on nothing counts as already saved (isSaved).
+      if (this.opts.unknownOutcome?.(e)) this.unconfirmed = true;
       const delays = this.opts.retryDelaysMs ?? [2000, 5000, 15000, 30000];
       const wait = delays[Math.min(this.retries, delays.length - 1)];
       this.retries += 1;

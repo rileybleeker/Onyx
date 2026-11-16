@@ -18,7 +18,7 @@ const PRODUCT = { product_id: "p-mag", dsld_id: null, brand_name: "Synthetic Bra
 const STACK = { stack_id: 3, name: "Synthetic Night", description: null, remind_time: null, items: [], item_count: 3, total_doses: 3 };
 const intake = (intake_id, over = {}) => ({ intake_id, intake_date: TODAY, intake_time: null, product_id: "p-mag", doses: 1, notes: null, brand_name: null, full_name: "Synthetic Magnesium", ...over });
 
-function mountPage(t, { onDelete, today = () => ({ date: TODAY, intakes: [], compounds: [] }), products = () => response({ products: [PRODUCT] }), extraStubs = {} } = {}) {
+function mountPage(t, { onDelete, today = () => ({ date: TODAY, intakes: [], compounds: [] }), products = () => response({ products: [PRODUCT] }), stacks = () => response({ stacks: [STACK] }), extraStubs = {} } = {}) {
   const calls = { posts: [], deletes: [], todayGets: 0 };
   withGlobals(t, {
     confirm: () => true,
@@ -36,7 +36,7 @@ function mountPage(t, { onDelete, today = () => ({ date: TODAY, intakes: [], com
       if (url === "/api/supplements/products") return products();
       if (url === "/api/supplements/today") { calls.todayGets++; const r = today(calls.todayGets); return typeof r?.json === "function" ? r : response(r); }
       if (url.startsWith("/api/supplements/history")) return response({ rows: [] });
-      if (url === "/api/supplements/stacks") return response({ stacks: [STACK] });
+      if (url === "/api/supplements/stacks") return stacks();
       throw new Error(`unexpected request ${method} ${url}`);
     },
   });
@@ -152,4 +152,40 @@ test("page: a cached copy for another day is not shown (speed, 2026-11-15)", asy
   assert.doesNotMatch(h.text(), /Synthetic Magnesium/, "nothing from yesterday's copy");
   held.resolve(response({ products: [PRODUCT] }));
   await h.flush();
+});
+
+// Codex review (PR 365): a failed read of the stack list after the editor saved must not re-enable Edit with the old
+// list (its version would only meet a false 409 on the next change). Edit waits, and the card offers Retry.
+test("page: a failed read of the stacks after a save keeps Edit disabled, with Retry, until a read works", async (t) => {
+  withGlobals(t, { console: { ...console, error: () => {} } });
+  const editor = {};
+  let reads = 0;
+  const h = mountPage(t, {
+    stacks: () => { reads++; return reads === 2 ? response({ error: "synthetic" }, 500) : response({ stacks: [STACK] }); },
+    extraStubs: { "@/components/StackEditorModal": { __esModule: true, default: (p) => { editor.props = p; return null; } } },
+  });
+  await h.flush();
+  assert.equal(reads, 1);
+  assert.equal(h.button("edit").props.disabled, false, "editable once the list has loaded");
+  assert.doesNotMatch(h.text(), /load your saved stacks/);
+  await editor.props.onSaved(); // the editor saved and closed: the list is read again, and that read fails
+  await h.flush();
+  assert.equal(reads, 2);
+  assert.match(h.text(), /Could not load your saved stacks/);
+  assert.equal(h.button("edit").props.disabled, true, "an old version is never handed to the editor");
+  assert.match(h.text(), /Synthetic Night/, "the list stays on screen");
+  await h.click("Retry");
+  await h.flush();
+  assert.equal(reads, 3);
+  assert.doesNotMatch(h.text(), /load your saved stacks/);
+  assert.equal(h.button("edit").props.disabled, false, "editable again once a read worked");
+});
+
+test("page: a failed first read of the stacks says so instead of 'No stacks yet'", async (t) => {
+  withGlobals(t, { console: { ...console, error: () => {} } });
+  const h = mountPage(t, { stacks: () => response({ error: "synthetic" }, 500) });
+  await h.flush();
+  assert.match(h.text(), /Could not load your saved stacks/);
+  assert.doesNotMatch(h.text(), /No stacks yet/);
+  assert.equal(h.buttons("Retry").length, 1);
 });

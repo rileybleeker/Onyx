@@ -7,19 +7,22 @@ import type { AutosaveState } from "@/lib/autosave";
 /**
  * The one line every autosaving form shows instead of a Save button (lib/autosave.ts): "Saving…", "Saved" (in
  * text-up, the success colour), or what went wrong with a Retry. `incomplete` shows the form's own reason only
- * when `showIncomplete` (a blank field is not worth a message). Nothing at all while idle.
+ * when `showIncomplete` (a blank field is not worth a message). Nothing at all while idle. `errorLabel` replaces the
+ * "Not saved:" in front of an error, for a form that knows the save may have gone through (no clear answer came back).
  */
 export function AutosaveStatus({
   state,
   onRetry,
   savedText = "Saved",
   showIncomplete = false,
+  errorLabel = "Not saved:",
   className = "",
 }: {
   state: AutosaveState;
   onRetry?: () => void;
   savedText?: string;
   showIncomplete?: boolean;
+  errorLabel?: string;
   className?: string;
 }) {
   const { status, error, retrying } = state;
@@ -37,7 +40,7 @@ export function AutosaveStatus({
     body = (
       <span className="inline-flex flex-wrap items-center gap-x-2 text-down">
         <span>
-          Not saved: {error ?? "save failed."}
+          {errorLabel} {error ?? "save failed."}
           {retrying ? " Trying again…" : ""}
         </span>
         {onRetry && (
