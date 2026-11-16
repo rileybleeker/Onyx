@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { Check } from "lucide-react";
 import { getJson } from "@/lib/reading-practice-client";
-import { checkpointRefusal, checkpointUrl, parseCheckpoint, type CheckpointData } from "@/lib/reading-map";
+import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, parseCheckpoint, shortfallLine, type CheckpointData } from "@/lib/reading-map";
 import { AlertLine } from "./PracticeCards";
 
 const PracticeRunner = dynamic(() => import("./PracticeRunner"), { ssr: false, loading: () => <div className="h-[320px]" aria-hidden="true" /> });
@@ -14,14 +14,17 @@ const PracticeRunner = dynamic(() => import("./PracticeRunner"), { ssr: false, l
  * on). Opened by the checkpoint tile's Start button, it reads the quiz round (GET /api/reading/practice/checkpoint,
  * no side effect: the same day gives the same quiz, so reopening resumes), and runs it in the practice runner in
  * checkpoint mode: 10 questions, one per idea, answers stored under one quiz key, and Done records the result through
- * POST /api/reading/quiz with op_key = quiz key (the runner does that; this part only hosts it).
+ * POST /api/reading/quiz with op_key = quiz key (the runner does that, from the database's own count of the quiz's
+ * answers, which this part reads for it; this part only hosts it).
  *
  * States, each in its own words: loading; the quiz round could not be read (Try again); not open yet (the checkpoint
- * chapter is not quizzable); questions are off; too few fresh questions ("N of 10: ideas answered in the last 7 days
- * wait"); already recorded today (the quiz key is one per day); and the quiz itself.
+ * chapter is not quizzable); questions are off; too few fresh questions (or too few from the latest chapters, or
+ * without an explain variant: "ideas answered in the last 7 days wait"); already recorded today (the quiz key is one
+ * per day); and the quiz itself.
  *
  * `onClose` says what happened so the page can refresh its numbers once answers have settled and show "Answered ·
- * record result" on a tile whose answers were stored without Done.
+ * record result" on a tile whose answers were stored without Done. That is read from the stored answers (this
+ * opening's, or an earlier one's), so closing a quiz without touching it does not lose it.
  */
 export interface CheckpointClose {
   /** Something was stored (an answer, a flag, the result). */
@@ -29,8 +32,8 @@ export interface CheckpointClose {
   /** The result was recorded. */
   recorded: boolean;
   /**
-   * Set when something was stored and no result was recorded: resolves to whether answers of this quiz are stored
-   * without a result (read from the quiz round once what was on its way has landed), so the tile can say
+   * Set when answers of this quiz may be stored without a result: resolves to whether they are (read from the quiz
+   * once what was on its way has landed, or known from the opening read when nothing changed), so the tile can say
    * "Answered · record result" only when that is true (a flag alone is not an answer).
    */
   unrecorded?: Promise<boolean>;
@@ -95,19 +98,29 @@ export default function CheckpointQuiz({
   const leave = (changed: boolean, settled?: Promise<void>) => {
     const done = recorded.current;
     let unrecorded: Promise<boolean> | undefined;
-    if (changed && !done) {
+    if (!done && changed) {
       unrecorded = (async () => {
         try {
           await settled;
         } catch {
           /* read anyway */
         }
-        const r = await getJson(url);
+        const r = await getJson(checkpointUrl(slug, chapter, true));
         const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
-        return !!parsed && !parsed.recorded && parsed.round.done > 0;
+        return !!parsed && hasUnrecordedAnswers(parsed);
       })();
+    } else if (!done && data && hasUnrecordedAnswers(data)) {
+      // Nothing changed in this opening, but an earlier one left answers without a result: still to be recorded.
+      unrecorded = Promise.resolve(true);
     }
     onClose({ changed, recorded: done, settled, unrecorded });
+  };
+
+  // The database's count of this quiz's valid answers, read when Done is tapped (the result is built from it).
+  const readTally = async () => {
+    const r = await getJson(checkpointUrl(slug, chapter, true));
+    const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
+    return parsed ? parsed.tally : null;
   };
 
   const heading = `Checkpoint · ch ${chapter}`;
@@ -151,8 +164,19 @@ export default function CheckpointQuiz({
       {state.kind === "ready" && data && !data.recorded && !data.ready && (
         <div className="mt-2 space-y-2">
           <p data-testid="quiz-few" className="text-[14px] text-text-secondary">
-            Not enough fresh questions yet · <span className="font-mono">{data.eligible} of {data.size}</span>
+            {data.shortfall === "latest" || data.shortfall === "explain" ? (
+              shortfallLine(data.shortfall, data.eligible, data.size)
+            ) : (
+              <>
+                Not enough fresh questions yet · <span className="font-mono">{data.eligible} of {data.size}</span>
+              </>
+            )}
           </p>
+          {data.tally.total > 0 && (
+            <p className="text-[14px] text-text-secondary">
+              Answered so far · <span className="font-mono">{data.tally.total} of {data.size}</span>
+            </p>
+          )}
           <p className="text-[12px] text-text-tertiary">Ideas answered in the last 7 days wait.</p>
           <button type="button" onClick={() => leave(false)} className="inline-flex min-h-11 items-center rounded-control border border-border-default px-3 text-[14px] text-text-primary">
             Close
@@ -166,7 +190,8 @@ export default function CheckpointQuiz({
             key={data.round.round_key}
             round={data.round}
             mode="checkpoint"
-            checkpoint={{ slug, chapter, key: checkpoint, quizKey: data.quizKey }}
+            checkpoint={{ slug, chapter, key: checkpoint, quizKey: data.quizKey, size: data.size }}
+            onTally={readTally}
             onClose={(changed, _finished, settled) => leave(changed, settled)}
             onRecorded={(r) => {
               recorded.current = true;

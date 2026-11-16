@@ -235,7 +235,7 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
     setRebuild({ saving: true, ok: false, message: null });
     const r = await postJson(BANK_RUN_URL, { book: slug, chapter, rebuild: true });
     if (!alive.current) return;
-    const out = classifyRunAnswer(r.status);
+    const out = classifyRunAnswer(r.status, r.body);
     setRebuild({ saving: false, ok: out.ok, message: out.message });
     setConfirm(false);
     if (out.ok) {

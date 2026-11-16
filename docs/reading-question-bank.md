@@ -22,6 +22,7 @@ the UI (S4), the chapter map / checkpoint / XP (S5) and the chat tools (S6) buil
 | `sql/reading_bank_checkpoint.sql` | Two read-only functions the checkpoint quiz needs (S5); MCP-safe, apply after `sql/reading_question_bank.sql` |
 | `frontend/src/lib/reading-checkpoint.ts`, `reading-checkpoint-server.ts` | Which ideas a checkpoint quiz asks, and `GET /api/reading/practice/checkpoint` (S5) |
 | `frontend/src/lib/reading-map.ts` | Chapter map, chapter sheet and checkpoint quiz: parsers, tile states, the quiz result (S5) |
+| `frontend/src/lib/reading-practice-ready.ts` | Import-free "Practice · N ready" count shared by the overview and Today (S5) |
 
 ## Apply order (Riley approves production schema writes)
 
@@ -312,18 +313,40 @@ highlights step links the new passage again or the idea has other evidence, and 
 - **Checkpoint quiz** (replaces the "quiz me" chat link on a checkpoint tile once the chapter is quizzable and the
   chapters up to it hold 10 ideas): 10 questions, one per idea, from chapters 1..N, core ideas first, detail never, at
   least half from the latest act (the chapters since the previous checkpoint), at least 3 explain questions, no idea
-  answered in the last 7 days. `GET /api/reading/practice/checkpoint?book=&chapter=N` builds it from
-  `pds.reading_bank_checkpoint_pool` (light rows, spoiler gate applied) and `pds.reading_bank_idea_cards` (the ten picked
-  ideas); same day, same quiz, and a reopened quiz keeps the cards answered in it. Answers carry `round_kind
-  "checkpoint"` and the quiz key (one per book, day and checkpoint: `sha256(book|day|checkpoint-quiz|chapter)`); the
-  runner has no Skip and no "Again". **Done** waits until every answer is saved and graded, then records the result
-  once through `POST /api/reading/quiz` with `op_key` = the quiz key (retried with the same request); the pass mark is
-  80%. Leaving without Done records nothing (the tile says "Answered · record result"); a quiz recorded today closes
-  that day's quiz.
+  asked in the last 7 days (an answer still waiting for its grade and a chapter recall answer that covered the idea count
+  as asking it). `GET /api/reading/practice/checkpoint?book=&chapter=N` builds it from
+  `pds.reading_bank_checkpoint_pool` (light rows plus today's answers, spoiler gate applied) and
+  `pds.reading_bank_idea_cards` (the picked ideas). **The quotas are enforced while choosing**: a quiz that cannot have
+  half from the latest act and three explain questions (or enough ideas) is withheld, and the answer's `shortfall`
+  (`ideas` / `latest` / `explain`) says which part is short; the page shows it in words and offers no quiz. Same day,
+  same quiz, and a reopened quiz keeps the cards answered in it.
+- **The quiz's size is the database's count, not the screen's.** The answer carries `tally` ({total, right, pending}):
+  every valid answer under the quiz key, counted from the pool's answers (so an answer whose idea left the quiz since,
+  flagged "Not in this chapter", still counts and takes a slot: the quiz asks only for `remaining` more, and no card is
+  drawn for the idea that is gone). Answers carry `round_kind "checkpoint"` and the quiz key (one per book, day and
+  checkpoint: `sha256(book|day|checkpoint-quiz|chapter)`); the runner has no Skip and no "Again".
+  **Done** waits until every answer is saved and graded and every flag is settled (a held or sent flag can void
+  answers), reads the tally (`?brief=1`: the same answer without cards), and records the result once through
+  `POST /api/reading/quiz` with `op_key` = the quiz key, `score` = tally.right, `total` = tally.total (retried with the
+  same request). **A result is recorded only for a quiz with its full 10 valid, graded answers** (`decideRecord`): fewer
+  (a flag took a question out: "Close, then open the checkpoint again for replacements"), more, or any still pending
+  records nothing, so one right answer with nine questions flagged away is never a passing 1 of 1. The pass mark is 80%.
+  The quiz table's refusals have their own words (`attempts_pending`, `score_mismatch`, `quiz_other_book`).
+- **"Answered · record result"** on a checkpoint tile comes from the stored answers (a light `brief=1` read per offered
+  checkpoint after the page settled, a GET with no side effect), so it survives a reload and shows on another device;
+  closing a quiz without touching it keeps it. Leaving without Done records nothing; a quiz recorded today closes that
+  day's quiz. Known limit: a quiz left open across the 06:00 behavioral rollover leaves its answers under the old day's
+  quiz key (the next day is a new quiz).
 - **XP**: `XP.perPracticeCorrect = 2` / `perPracticePartial = 1` over the day's first counted answer of each idea
   (checkpoint answers and invalidated answers left out in SQL); a day with a chapter question answered is a review day
   (`perReviewDay` once per day, never twice) and counts for the Reviewer badge. No new badge, no new streak.
   `computeOverview` carries `practice` (the bank's summary, null while the SQL is missing) and `xp.practice`; the chat
-  summary carries the counts only; Today shows one line "Practice · N ready" from the same summary.
-- **Apply order**: `sql/reading_bank_checkpoint.sql` after `sql/reading_question_bank.sql`. Until it is applied the
-  checkpoint route answers 503 `bank_unavailable` and the quiz says it is unavailable; nothing else changes.
+  summary carries the counts only (a summary about another book than the overview's is ignored: it is looked up by slug,
+  the book by its own query); Today shows one line "Practice · N ready" from the same summary, through the one
+  import-free helper `lib/reading-practice-ready.ts` the overview re-exports. It counts ideas due or never asked, so
+  after the day's round is finished it can still read ready while more ideas wait; dropping to "done today" needs an
+  answered-today count in `pds.reading_bank_summary`.
+- **Apply order**: `sql/reading_bank_checkpoint.sql` after `sql/reading_question_bank.sql` (two read-only functions; a
+  new definition replaces the earlier one). Until it is applied the checkpoint route answers 503 `bank_unavailable`
+  and the quiz says it is unavailable; nothing else changes. The chapter map says "not available yet" in one line when
+  the bank's read answers 404 / 503 while the overview says the book is on.

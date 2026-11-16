@@ -13,6 +13,8 @@ import { AutosaveRefused, saveRequest } from "@/lib/autosave";
 import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
+import { getJson } from "@/lib/reading-practice-client";
+import { checkpointUrl, hasUnrecordedAnswers, parseCheckpoint } from "@/lib/reading-map";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
@@ -66,7 +68,8 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
   const [loading, setLoading] = useState(!seed);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
-  // The checkpoint quiz open on screen (READ-QUIZ-01 S5), and the checkpoints whose answers were stored without Done.
+  // The checkpoint quiz open on screen (READ-QUIZ-01 S5), and the checkpoints whose answers were stored without Done
+  // (keyed by book and checkpoint, so another book's "ch12" is not this one's).
   const [quiz, setQuiz] = useState<Checkpoint | null>(null);
   const [unrecorded, setUnrecorded] = useState<Record<string, boolean>>({});
 
@@ -104,6 +107,31 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
     load(null, !!seed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Which offered checkpoints already hold answers without a recorded result ("Answered · record result"), read from
+  // the stored answers rather than from this page's memory, so it survives a reload and shows on another device. One
+  // light GET per offered checkpoint (no cards read, nothing written), after the page's own reads have settled.
+  const offerBook = overview?.book.slug ?? null;
+  const offered = overview ? overview.checkpoints.filter((c) => checkpointOffer(overview, c)).map((c) => `${c.key}:${c.chapter}`).join(",") : "";
+  useEffect(() => {
+    if (!offerBook || !offered) return;
+    let live = true;
+    const run = async () => {
+      for (const part of offered.split(",")) {
+        const [key, chapter] = part.split(":");
+        const r = await getJson(checkpointUrl(offerBook, Number(chapter), true));
+        const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
+        if (!live || !parsed) continue;
+        const pending = hasUnrecordedAnswers(parsed);
+        setUnrecorded((prev) => (prev[`${offerBook}:${key}`] === pending ? prev : { ...prev, [`${offerBook}:${key}`]: pending }));
+      }
+    };
+    const timer = setTimeout(() => void run(), 1200);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [offerBook, offered]);
 
   // Want to read (ReadingList.tsx): after a change, re-read the quest and the book list; a book Riley just started
   // is shown (his explicit choice). A queued book is never picked as the quest on its own.
@@ -190,12 +218,12 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
           checkpoint={quiz.key}
           chapter={quiz.chapter}
           onRecorded={(r) => {
-            setUnrecorded((prev) => ({ ...prev, [quiz.key]: false }));
+            setUnrecorded((prev) => ({ ...prev, [`${o.book.slug}:${quiz.key}`]: false }));
             showToast({ text: `Checkpoint ${r.score}/${r.total}${r.xp ? ` · +${r.xp} XP` : ""}`, kind: r.passed ? "xp" : "ok" });
             void load(slug, true);
           }}
           onClose={(r) => {
-            const key = quiz.key;
+            const key = `${o.book.slug}:${quiz.key}`;
             setQuiz(null);
             if (r.unrecorded) void r.unrecorded.then((v) => setUnrecorded((prev) => ({ ...prev, [key]: v })));
             else setUnrecorded((prev) => ({ ...prev, [key]: false }));
@@ -234,7 +262,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       >
         {o.checkpoints.map((c, i) => (
           <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
-            <CheckpointTile c={c} offer={quiz === null && checkpointOffer(o, c)} pendingRecord={unrecorded[c.key] === true} onStart={() => setQuiz(c)} />
+            <CheckpointTile c={c} offer={quiz === null && checkpointOffer(o, c)} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
           </Part>
         ))}
       </PartGroup>

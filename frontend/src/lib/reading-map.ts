@@ -33,8 +33,12 @@ const withBook = (url: string, slug: string | null, extra: Record<string, string
   return q ? `${url}?${q}` : url;
 };
 
-/** The checkpoint quiz round of one checkpoint chapter (no cache: it is read when Start is tapped). */
-export const checkpointUrl = (slug: string | null, chapter: number) => withBook(CHECKPOINT_URL, slug, { chapter: String(chapter) });
+/**
+ * The checkpoint quiz round of one checkpoint chapter (no cache: it is read when Start is tapped). `brief` leaves the
+ * cards out: the tile asks it after a reload to learn whether answers were stored without a recorded result.
+ */
+export const checkpointUrl = (slug: string | null, chapter: number, brief = false) =>
+  withBook(CHECKPOINT_URL, slug, brief ? { chapter: String(chapter), brief: "1" } : { chapter: String(chapter) });
 /** "Practice 5" of one chapter: the chapter round of the practice GET. */
 export const chapterRoundUrl = (slug: string | null, chapter: number) => withBook(PRACTICE_TODAY_URL, slug, { kind: "chapter", chapter: String(chapter) });
 /** One chapter's sheet (the book is named so the sheet can never belong to another). */
@@ -297,6 +301,17 @@ export function builtDate(iso: string | null): string | null {
 /* The checkpoint quiz                                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * The database's own count of the quiz's valid answers (every answer under the quiz key, whether or not its idea is
+ * still on screen): the result is recorded from it, because the database checks the result against exactly these.
+ */
+export interface QuizTally {
+  total: number;
+  right: number;
+  /** Answers not graded yet: the result is refused until there are none. */
+  pending: number;
+}
+
 export interface CheckpointData {
   /** The quiz as a practice round: the runner reads it like one (its kind stays "daily"; the runner knows the quiz). */
   round: PracticeRound;
@@ -306,28 +321,68 @@ export interface CheckpointData {
   quizKey: string;
   /** Today's result, once recorded (a quiz key is one per day): then there are no cards. */
   recorded: { score: number; total: number } | null;
+  /** The quiz's valid answers so far (see QuizTally). */
+  tally: QuizTally;
   /** Ideas that could be asked (answered ones included), and the size of a quiz. */
   eligible: number;
   size: number;
   /** A quiz can be taken now. */
   ready: boolean;
+  /** What is short when it cannot: not enough ideas, from the latest chapters, or with an explain question. */
+  shortfall: "ideas" | "latest" | "explain" | null;
 }
+
+const SHORTFALLS: ReadonlySet<string> = new Set(["ideas", "latest", "explain"]);
 
 /** The checkpoint GET, or null when it is not one (an error body, another shape). */
 export function parseCheckpoint(raw: unknown): CheckpointData | null {
   const round = parseRound(raw);
   if (!round || !isObj(raw) || typeof raw.checkpoint !== "string" || !isUuid(raw.quiz_key)) return null;
   const q = isObj(raw.quiz) ? raw.quiz : null;
+  const t = isObj(raw.tally) ? raw.tally : {};
   return {
     round,
     checkpoint: raw.checkpoint,
     chapter: int(raw.chapter),
     quizKey: raw.quiz_key.toLowerCase(),
     recorded: q && typeof q.score === "number" && typeof q.total === "number" ? { score: q.score, total: q.total } : null,
+    tally: { total: Math.max(0, int(t.total)), right: Math.max(0, int(t.right)), pending: Math.max(0, int(t.pending)) },
     eligible: Math.max(0, int(raw.eligible)),
     size: Math.max(1, int(raw.size, 10)),
     ready: raw.ready === true,
+    shortfall: typeof raw.shortfall === "string" && SHORTFALLS.has(raw.shortfall) ? (raw.shortfall as CheckpointData["shortfall"]) : null,
   };
+}
+
+/** Whether answers of this quiz are stored and no result was recorded (the tile then says "Answered · record result"). */
+export const hasUnrecordedAnswers = (d: Pick<CheckpointData, "recorded" | "tally">): boolean => !d.recorded && d.tally.total > 0;
+
+/** Whether a result can be recorded now, from the database's own count of the quiz's answers. */
+export type RecordDecision =
+  | { kind: "record"; score: number; total: number }
+  /** Answers are still being graded: wait. */
+  | { kind: "grading"; pending: number }
+  /** Fewer valid answers than the quiz holds (a flag took a question out): reopen for replacements, record nothing. */
+  | { kind: "short"; total: number; size: number }
+  /** More valid answers than the quiz holds: it cannot be recorded. */
+  | { kind: "over"; total: number; size: number };
+
+/**
+ * Only a quiz with exactly `size` valid answers, all graded, is recorded, and from the database's own count: a quiz cut
+ * down by flags (one answer and nine removed questions) is a smaller quiz, and a "1 of 1" would otherwise pass.
+ */
+export function decideRecord(tally: QuizTally, size: number): RecordDecision {
+  if (tally.pending > 0) return { kind: "grading", pending: tally.pending };
+  if (tally.total < size) return { kind: "short", total: tally.total, size };
+  if (tally.total > size) return { kind: "over", total: tally.total, size };
+  return { kind: "record", score: Math.min(tally.right, tally.total), total: tally.total };
+}
+
+/** Why a quiz cannot be built yet, in words (the "Ideas answered in the last 7 days wait." line stays with it). */
+export function shortfallLine(shortfall: CheckpointData["shortfall"], eligible: number, size: number): string {
+  if (shortfall === "latest") return "Not enough fresh questions from the latest chapters yet";
+  if (shortfall === "explain") return "Not enough fresh explain questions yet";
+  return `Not enough fresh questions yet · ${eligible} of ${size}`;
 }
 
 /** What the quiz GET's failure says on the screen (a short word the host shows; the refusal stored nothing). */
@@ -363,15 +418,26 @@ export function classifyQuizAnswer(status: number | null, body: unknown): QuizOu
     return { kind: "saved", passed: o.passed === true, xp: Math.max(0, int(o.xp_gained)), replayed: o.replayed === true };
   }
   if (status === 409 && code === "key_reused") return { kind: "refused", message: "Onyx already holds a different result for this quiz. Nothing new was saved." };
-  if (status === 409 || status === 400) return { kind: "refused", message: "Onyx refused this result because its answers differ from the ones on screen. Reopen the checkpoint." };
+  // The quiz table checks the result against the quiz's own answers (OXQ01..03): each has its own advice.
+  if (status === 409 && code === "attempts_pending") return { kind: "refused", message: "Some answers are still being graded. Wait a moment, then tap Done again." };
+  if (status === 409 && code === "score_mismatch") return { kind: "refused", message: "Onyx counts the quiz's answers differently from the screen. Close the checkpoint and open it again." };
+  if (status === 409 && code === "quiz_other_book") return { kind: "refused", message: "This quiz holds an answer about another book, so it cannot be recorded." };
+  if (status === 409 || status === 400) return { kind: "refused", message: "Onyx refused this result. Nothing was saved. Close the checkpoint and open it again." };
   if (status >= 400 && status < 500) return { kind: "refused", message: "Onyx refused this result. Nothing was saved." };
   return { kind: "unknown", message: "Onyx couldn't confirm the save." };
 }
 
-/** The run route's answer for Rebuild chapter (202 {queued}); the sheet shows these words. */
-export function classifyRunAnswer(status: number | null): { ok: boolean; message: string } {
+/**
+ * The run route's answer for Rebuild chapter (202 {queued}; 409 bank_off = the book is not turned on); the sheet shows
+ * these words. No answer at all is NOT "nothing started": the rebuild is counted before it is queued, so a lost answer
+ * may have committed, and another tap would pay for a second one.
+ */
+export function classifyRunAnswer(status: number | null, body?: unknown): { ok: boolean; message: string } {
   if (status !== null && status >= 200 && status < 300) return { ok: true, message: "Rebuilding. The new questions replace the old ones when it is done." };
+  if (status === null) return { ok: false, message: "No answer from Onyx, so the rebuild may have started. Check Status before trying again." };
+  const code = isObj(body) && typeof body.error === "string" ? body.error : "";
+  if (status === 409 && code === "bank_off") return { ok: false, message: "Not started: questions are off for this book. Turn them on first." };
   if (status === 409 || status === 429) return { ok: false, message: "Not started: the spending cap is reached or a rebuild is already queued." };
-  if (status === null) return { ok: false, message: "No answer from Onyx. Nothing was started." };
+  if (status >= 500) return { ok: false, message: "Onyx couldn't confirm the rebuild, so it may have started. Check Status before trying again." };
   return { ok: false, message: "Onyx couldn't start the rebuild." };
 }

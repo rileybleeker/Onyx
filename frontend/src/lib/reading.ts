@@ -176,6 +176,8 @@ export interface XpBreakdown {
  * the Review card as before).
  */
 export interface PracticeSummary {
+  /** The book the summary is about (the overview ignores one that is not its own book). */
+  bookId: number;
   enabled: boolean;
   /** "owner" = turned off by Riley, "budget" = paused at the spending cap. */
   pausedReason: "owner" | "budget" | null;
@@ -399,6 +401,7 @@ export function parsePracticeSummary(raw: unknown): PracticeSummary | null {
   };
   const xp = isObject(raw.xp) ? raw.xp : {};
   return {
+    bookId: raw.book_id,
     enabled: raw.enabled === true,
     pausedReason: raw.paused_reason === "owner" || raw.paused_reason === "budget" ? raw.paused_reason : null,
     mapping: raw.mapping === "ok" || raw.mapping === "uncertain" ? raw.mapping : "unknown",
@@ -439,12 +442,10 @@ async function readPracticeSummary(supabase: Supa, slug: string | null): Promise
 
 /**
  * Chapter questions ready for today's round, for Today's one-line "Practice · 6 ready": ideas due plus ideas never
- * asked yet, at most a round (8). 0 while the bank is off, so Today shows nothing then.
+ * asked yet, at most a round (8). 0 while the bank is off, so Today shows nothing then. Defined in an import-free file
+ * that Today imports too (lib/reading-practice-ready.ts), so the two cannot drift.
  */
-export function practiceReady(p: PracticeSummary | null | undefined, roundSize = 8): number {
-  if (!p?.enabled) return 0;
-  return Math.min(roundSize, count(p.due) + count(p.newReady));
-}
+export { practiceReady, PRACTICE_ROUND_SIZE } from "@/lib/reading-practice-ready";
 
 /* ------------------------------------------------------------------ */
 /* Derivations                                                          */
@@ -462,7 +463,8 @@ export function computeOverview(input: {
   practice?: PracticeSummary | null;
 }): ReadingOverview {
   const { book, today, sessions, highlights, reviews } = input;
-  const practice = input.practice ?? null;
+  // The summary is resolved by slug in the database, the book by its own query: one about another book is not used.
+  const practice = input.practice && input.practice.bookId === book.book_id ? input.practice : null;
   // Every result stays listed with its verification; one whose question was corrected later earns nothing.
   const quizzes = input.quizzes.map((q) => ({ ...q, verification: quizVerification(q) }));
   const countedQuizzes = quizzes.filter((q) => q.verification !== "invalidated");

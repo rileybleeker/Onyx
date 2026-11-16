@@ -6,20 +6,27 @@
 -- it. These two read-only functions give lib/reading-checkpoint.ts what it needs, in two steps:
 --   1. pds.reading_bank_checkpoint_pool(slug, chapter): every idea of chapters 1..N that may be asked (light rows:
 --      the idea's id, chapter, importance, stage, last answered day, whether it has an explain variant) plus today's
---      answers, so a quiz opened again the same day finds the cards it already has.
+--      answers (with the idea's chapter and the question's format), so a quiz opened again the same day finds the
+--      cards it already has and the code can count every valid answer of the quiz, including one whose idea has left
+--      the pool since (flagged "Not in this chapter").
 --   2. pds.reading_bank_idea_cards(slug, ids): the full idea cards (questions with their rubrics, evidence) for the
 --      few ideas the code picked, in the shape of pds.reading_bank_deck's ideas.
 -- Both apply the same spoiler gate as every bank read: only ideas that unlock at or below
 -- pds.reading_bank_quiz_through, of the current edition (chapter_hash), with valid evidence
 -- (pds.reading_bank_idea_supported), never a locked row.
 --
+-- The 7-day rest counts every answer that is not voided, graded or still waiting for its grade, and every chapter
+-- recall answer that covered the idea (the idea's own schedule moves only when a grade lands, so a pending answer is
+-- not on it yet). Answers given today are listed for the code, which tells this quiz's own from the others.
+--
 -- Apply after sql/reading_question_bank.sql (it uses that file's functions). Additive only: two functions, no table,
 -- no written row. service_role only, like every bank function.
 -- ============================================================
 
 -- 1. The pool ------------------------------------------------------------------------------------------------------
--- A detail idea is never a checkpoint question. An idea answered less than 7 days ago is left out, except one answered
--- today (it may be in this very quiz: the code keeps those whose answer belongs to the quiz's round).
+-- A detail idea is never a checkpoint question. An idea asked less than 7 days ago is left out (a pending answer and a
+-- chapter recall answer count), except one asked today: it is listed so the code can keep it when this very quiz asked
+-- it and leave it out when another round did (the code reads `answered_today`).
 CREATE OR REPLACE FUNCTION pds.reading_bank_checkpoint_pool(p_slug TEXT, p_chapter INTEGER)
 RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
   WITH bk AS (SELECT pds.reading_bank_book_id(p_slug) AS book_id),
@@ -30,11 +37,31 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
       FROM (SELECT DISTINCT i.chapter FROM pds.reading_ideas i
              WHERE i.book_id = (SELECT book_id FROM bk) AND i.status = 'active' AND i.chapter >= 1 AND i.chapter <= p_chapter) x
   ),
-  done AS (   -- today's answers, as the daily deck lists them
-    SELECT a.attempt_key, a.question_id, a.idea_id, a.covers, a.round_key, a.round_kind, a.verdict, a.grading_status
-      FROM pds.reading_question_attempts a JOIN pds.reading_questions q ON q.question_id = a.question_id
+  done AS (   -- today's answers, as the daily deck lists them, plus the quiz key, the question's format and the idea's chapter
+    SELECT a.attempt_key, a.question_id, a.idea_id, a.covers, a.round_key, a.round_kind, a.quiz_key, a.verdict, a.grading_status,
+           q.format, di.chapter
+      FROM pds.reading_question_attempts a
+      JOIN pds.reading_questions q ON q.question_id = a.question_id
+      LEFT JOIN pds.reading_ideas di ON di.idea_id = a.idea_id
      WHERE q.book_id = (SELECT book_id FROM bk) AND a.attempt_date = (SELECT d FROM today)
        AND a.ext_hash IS NOT NULL AND a.grading_status <> 'invalidated'
+  ),
+  recent AS (   -- ideas asked in the 6 days before today: the idea itself, or covered by a chapter recall answer
+    SELECT x.idea_id, max(x.d) AS last_asked
+      FROM (
+        SELECT a.idea_id AS idea_id, a.attempt_date AS d
+          FROM pds.reading_question_attempts a JOIN pds.reading_questions q ON q.question_id = a.question_id
+         WHERE q.book_id = (SELECT book_id FROM bk) AND a.ext_hash IS NOT NULL AND a.grading_status <> 'invalidated'
+           AND a.attempt_date < (SELECT d FROM today) AND a.attempt_date > (SELECT d FROM today) - 7
+        UNION ALL
+        SELECT cv.idea_id, a.attempt_date
+          FROM pds.reading_question_attempts a JOIN pds.reading_questions q ON q.question_id = a.question_id
+          CROSS JOIN LATERAL unnest(a.covers) AS cv(idea_id)
+         WHERE q.book_id = (SELECT book_id FROM bk) AND a.ext_hash IS NOT NULL AND a.grading_status <> 'invalidated'
+           AND a.attempt_date < (SELECT d FROM today) AND a.attempt_date > (SELECT d FROM today) - 7
+      ) x
+     WHERE x.idea_id IS NOT NULL
+     GROUP BY x.idea_id
   ),
   live AS (
     SELECT i.idea_id, i.chapter, i.importance, COALESCE(s.stage, 0) AS stage, s.last_reviewed,
@@ -48,8 +75,9 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
        AND i.chapter >= 1 AND i.chapter <= p_chapter
        AND i.unlock_chapter <= (SELECT through FROM t)
        AND pds.reading_bank_idea_supported(i.idea_id)
-       AND (s.last_reviewed IS NULL OR s.last_reviewed <= (SELECT d FROM today) - 7
-            OR i.idea_id IN (SELECT dn.idea_id FROM done dn WHERE dn.idea_id IS NOT NULL))
+       AND ( ((s.last_reviewed IS NULL OR s.last_reviewed <= (SELECT d FROM today) - 7)
+               AND NOT EXISTS (SELECT 1 FROM recent r WHERE r.idea_id = i.idea_id))
+             OR i.idea_id IN (SELECT dn.idea_id FROM done dn WHERE dn.idea_id IS NOT NULL) )
        AND EXISTS (SELECT 1 FROM pds.reading_questions q
                     WHERE q.idea_id = i.idea_id AND q.format IN ('cued', 'explain', 'order')
                       AND q.superseded_at IS NULL AND q.retired_at IS NULL AND q.unlock_chapter <= (SELECT through FROM t))

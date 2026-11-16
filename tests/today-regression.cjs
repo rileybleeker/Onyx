@@ -39,6 +39,9 @@ const quietBootJs = viewModule.exports.quietBootScript();
 // load fetches as usual and the requests checked below are unchanged.
 const earlyLib = ids.size; ids.set('frontend/src/lib/early-fetch.ts', earlyLib); modules[earlyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/early-fetch.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/early-fetch"\)/g, `require(${earlyLib})`);
+// "Practice · N ready" (import-free; the overview re-exports the same function).
+const readyLib = ids.size; ids.set('frontend/src/lib/reading-practice-ready.ts', readyLib); modules[readyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/reading-practice-ready.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/reading-practice-ready"\)/g, `require(${readyLib})`);
 // The overview cards under Today's panels (components/overview/) load as their own chunk and have their own
 // tests (frontend/tests/overview-cards.test.cjs); here they render nothing, so this file keeps checking Today's
 // own panels and exactly the requests those panels make.

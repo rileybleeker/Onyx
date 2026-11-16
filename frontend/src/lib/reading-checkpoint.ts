@@ -4,12 +4,19 @@
  *
  * A checkpoint quiz is CHECKPOINT_SIZE questions from chapters 1..N, one per idea: core ideas before supporting ones,
  * detail ideas never, at least half from the latest act (the chapters since the previous checkpoint), at least
- * CHECKPOINT_MIN_EXPLAIN explain questions, and no idea answered in the last CHECKPOINT_QUIET_DAYS days. The pool
- * comes from pds.reading_bank_checkpoint_pool (the spoiler gate applied in SQL); this file only chooses.
+ * CHECKPOINT_MIN_EXPLAIN explain questions, and no idea asked in the last CHECKPOINT_QUIET_DAYS days (an answer still
+ * waiting for its grade and a chapter recall answer that covered the idea count as asking it). The pool comes from
+ * pds.reading_bank_checkpoint_pool (the spoiler gate applied in SQL); this file only chooses.
  *
- * The choice is deterministic for a pool and a day, and a quiz opened again the same day keeps the ideas already
- * answered in it (their cards come back marked done), so closing and reopening resumes. An idea answered in this quiz
- * counts as a candidate again whatever its last answer date says, and is always part of the selection.
+ * The quotas are enforced while choosing, not just hoped for: a quiz that cannot be built with half from the latest
+ * act and three explain questions is withheld (`ready` false, `shortfall` says which part is short). The choice is
+ * deterministic for a pool and a day.
+ *
+ * Resuming. A quiz opened again the same day keeps what it already holds. The quiz's answers are counted from the
+ * database's own list of valid answers under its quiz key (`quizAnswers`), not from the cards that can be drawn: an
+ * idea answered here and moved out of the quiz since (flagged "Not in this chapter") still has a valid answer that the
+ * result is checked against, so it takes a slot (`remaining` = size minus every valid answer) and the quiz asks only
+ * for the rest. The result is recorded from this count (`tally`), never from what is on screen.
  */
 import {
   pickQuestion,
@@ -40,6 +47,13 @@ export interface PoolIdea {
   has_explain: boolean;
 }
 
+/** A valid answer of today, as the pool lists it: the daily deck's row plus the quiz key, the question's format and the idea's chapter. */
+export interface PoolAnswer extends DeckAnswered {
+  quiz_key?: string | null;
+  format?: string | null;
+  chapter?: number | null;
+}
+
 export interface CheckpointPool {
   book_id: number;
   today: string;
@@ -47,7 +61,7 @@ export interface CheckpointPool {
   chapter: number;
   enabled: boolean;
   ideas: PoolIdea[];
-  answered_today: DeckAnswered[];
+  answered_today: PoolAnswer[];
 }
 
 /** The round key of a checkpoint quiz: one per book, day and checkpoint chapter. */
@@ -79,9 +93,16 @@ export function parsePool(raw: unknown): CheckpointPool | null {
       has_explain: i.has_explain === true,
     });
   }
-  const answered = (Array.isArray(raw.answered_today) ? raw.answered_today : []).filter(
-    (a): a is DeckAnswered => isObj(a) && typeof a.attempt_key === "string" && typeof a.question_id === "number",
-  );
+  const answered: PoolAnswer[] = [];
+  for (const a of Array.isArray(raw.answered_today) ? raw.answered_today : []) {
+    if (!isObj(a) || typeof a.attempt_key !== "string" || typeof a.question_id !== "number") continue;
+    answered.push({
+      ...(a as unknown as DeckAnswered),
+      quiz_key: typeof a.quiz_key === "string" ? a.quiz_key.toLowerCase() : null,
+      format: typeof a.format === "string" ? a.format : null,
+      chapter: typeof a.chapter === "number" ? Math.trunc(a.chapter) : null,
+    });
+  }
   return {
     book_id: raw.book_id,
     today: raw.today,
@@ -97,37 +118,87 @@ const ymdMs = (d: string) => Date.UTC(Number(d.slice(0, 4)), Number(d.slice(5, 7
 const daysBetween = (from: string, to: string) => Math.round((ymdMs(to) - ymdMs(from)) / 86_400_000);
 const importanceRank = (i: Importance) => (i === "core" ? 0 : i === "supporting" ? 1 : 2);
 
-/** The answers that belong to THIS quiz: its round key, one per idea (the first by attempt key). */
-export function quizAnswers(pool: CheckpointPool): Map<number, DeckAnswered> {
+/**
+ * Every valid answer of THIS quiz: the quiz key when the row carries one (the database checks a result against the
+ * answers under its quiz key), else the round key; not voided; one list, ordered by attempt key. This is the list the
+ * result's total and score are checked against, whether or not the idea is still in the pool.
+ */
+export function quizAnswers(pool: CheckpointPool): PoolAnswer[] {
   const key = checkpointRoundKey(pool.book_id, pool.today, pool.chapter);
-  const out = new Map<number, DeckAnswered>();
-  for (const a of [...pool.answered_today].sort((x, y) => x.attempt_key.localeCompare(y.attempt_key))) {
-    if (a.round_key !== key || a.idea_id === null || a.idea_id === undefined || a.grading_status === "invalidated") continue;
-    if (!out.has(a.idea_id)) out.set(a.idea_id, a);
-  }
-  return out;
+  const quiz = checkpointQuizKey(pool.book_id, pool.today, pool.chapter);
+  return pool.answered_today
+    .filter((a) => a.grading_status !== "invalidated" && (a.quiz_key ? a.quiz_key === quiz : a.round_key === key))
+    .sort((x, y) => x.attempt_key.localeCompare(y.attempt_key));
 }
 
+export interface QuizTally {
+  /** Valid answers under the quiz key: what the result's total must equal. */
+  total: number;
+  /** Of those, graded right: what the result's score must equal. */
+  right: number;
+  /** Not graded yet (a model grade on its way): the result is refused until there are none. */
+  pending: number;
+}
+
+/** The counts the database checks a recorded result against (pds.reading_quiz_link_attempts). */
+export function quizTally(pool: CheckpointPool): QuizTally {
+  const own = quizAnswers(pool);
+  return {
+    total: own.length,
+    right: own.filter((a) => a.grading_status === "graded" && a.verdict === "correct").length,
+    pending: own.filter((a) => a.grading_status !== "graded").length,
+  };
+}
+
+export type Shortfall = "ideas" | "latest" | "explain";
+
 export interface CheckpointSelection {
-  /** The ideas of the quiz, best first (answered ones included). */
+  /** The quiz's ideas still in the pool, best first: the ones still to ask and the ones already answered. */
   picked: PoolIdea[];
-  /** How many ideas could be asked (answered ones included). */
+  /** The ideas still to ask (a subset of `picked`). */
+  fresh: PoolIdea[];
+  /** Ideas already answered in this quiz (one answer each), whether or not the idea is still in the pool. */
+  done: Map<number, PoolAnswer>;
+  /** Every valid answer of the quiz (`done` has one per idea; an answer whose idea left the pool is only here). */
+  answers: PoolAnswer[];
+  tally: QuizTally;
+  /** Explain answers held by valid answers whose idea has no card here (they count toward the explain quota). */
+  orphanExplain: number;
+  /** Questions still to ask: the quiz size minus every valid answer. */
+  remaining: number;
+  /** Ideas that could be asked (answered ones included). */
   eligible: number;
-  /** The ideas already answered in this quiz. */
-  done: Map<number, DeckAnswered>;
-  /** Enough ideas to offer the quiz, or a quiz that was already started. */
+  /** The quiz can be taken now (or finished). */
   ready: boolean;
+  /** What is short when it cannot. */
+  shortfall: Shortfall | null;
+  /** A resumed quiz filled without meeting the quotas (what it already holds changed under it). */
+  relaxed: boolean;
 }
 
 /**
- * Which ideas the quiz asks. Candidates: chapters 1..N, not detail, quiet for CHECKPOINT_QUIET_DAYS (or answered in this
- * quiz). Ranked by importance, then ideas with an explain variant, then a hash fixed by the idea and the day. Taken:
- * the best of the latest act until half the quiz is from it, then the best of all until the quiz is full; an idea
- * already answered in this quiz is always kept (see below).
+ * Which ideas the quiz asks. Candidates: chapters 1..N, not detail, quiet for CHECKPOINT_QUIET_DAYS, not asked
+ * elsewhere today, not already answered here, ranked by importance, then ideas with an explain variant, then a hash
+ * fixed by the idea and the day. Taken, in this order: the best of the latest act until half the quiz is from it,
+ * then explain-capable ideas until the quiz holds CHECKPOINT_MIN_EXPLAIN, then the best of the rest until it is full.
+ * What the quiz already holds counts toward each quota. A fresh quiz that cannot meet them is not ready; a resumed
+ * one that cannot is still filled (it was balanced when it began) as long as there are enough ideas.
  */
 export function selectCheckpointIdeas(pool: CheckpointPool, opts: { actFrom: number; size?: number }): CheckpointSelection {
   const size = opts.size ?? CHECKPOINT_SIZE;
-  const done = quizAnswers(pool);
+  const half = Math.ceil(size / 2);
+  const answers = quizAnswers(pool);
+  const done = new Map<number, PoolAnswer>();
+  for (const a of answers) if (a.idea_id !== null && a.idea_id !== undefined && !done.has(a.idea_id)) done.set(a.idea_id, a);
+  const ownKeys = new Set(answers.map((a) => a.attempt_key));
+  // An idea another round asked today (an answer in the daily round, a chapter recall that covered it, another
+  // checkpoint) rests, whether or not its grade has landed yet.
+  const askedElsewhere = new Set<number>();
+  for (const a of pool.answered_today) {
+    if (ownKeys.has(a.attempt_key) || a.grading_status === "invalidated") continue;
+    if (a.idea_id !== null && a.idea_id !== undefined) askedElsewhere.add(a.idea_id);
+    for (const c of a.covers ?? []) askedElsewhere.add(c);
+  }
   const hash = new Map(pool.ideas.map((i) => [i.idea_id, sha256Hex(`${i.idea_id}|${pool.today}`)]));
   const rank = (a: PoolIdea, b: PoolIdea) =>
     importanceRank(a.importance) - importanceRank(b.importance) ||
@@ -135,60 +206,101 @@ export function selectCheckpointIdeas(pool: CheckpointPool, opts: { actFrom: num
     String(hash.get(a.idea_id)).localeCompare(String(hash.get(b.idea_id))) ||
     a.idea_id - b.idea_id;
   const seen = new Set<number>();
-  const candidates = pool.ideas
-    .filter((i) => {
-      if (seen.has(i.idea_id)) return false;
-      seen.add(i.idea_id);
-      if (i.chapter < 1 || i.chapter > pool.chapter || i.importance === "detail") return false;
-      return done.has(i.idea_id) || i.last_reviewed === null || daysBetween(i.last_reviewed, pool.today) >= CHECKPOINT_QUIET_DAYS;
-    })
-    .sort(rank);
+  const inPool = new Map<number, PoolIdea>();
+  const candidates: PoolIdea[] = [];
+  for (const i of pool.ideas) {
+    if (seen.has(i.idea_id)) continue;
+    seen.add(i.idea_id);
+    inPool.set(i.idea_id, i);
+    if (i.chapter < 1 || i.chapter > pool.chapter || i.importance === "detail") continue;
+    if (done.has(i.idea_id) || askedElsewhere.has(i.idea_id)) continue;
+    if (i.last_reviewed !== null && daysBetween(i.last_reviewed, pool.today) < CHECKPOINT_QUIET_DAYS) continue;
+    candidates.push(i);
+  }
+  candidates.sort(rank);
+
   const inLatest = (i: PoolIdea) => i.chapter >= opts.actFrom;
-  // The choice is made over every candidate, answered ones included, so it is the same before and after an idea is
-  // answered; an answered idea that the choice would not have made (a pool that changed meanwhile) takes the place of
-  // the lowest-ranked one still unanswered.
-  const picked: PoolIdea[] = [];
-  const taken = new Set<number>();
-  const half = Math.ceil(size / 2);
-  for (const i of candidates) {
-    if (picked.length >= size || picked.filter(inLatest).length >= half) break;
-    if (inLatest(i)) {
-      picked.push(i);
+  const remaining = Math.max(0, size - answers.length);
+  const latestDone = answers.filter((a) => (a.chapter ?? 0) >= opts.actFrom && (a.chapter ?? 0) <= pool.chapter).length;
+  const explainDone = answers.filter((a) => a.format === "explain").length;
+  const needLatest = Math.max(0, half - latestDone);
+  const needExplain = Math.max(0, CHECKPOINT_MIN_EXPLAIN - explainDone);
+
+  const attempt = (explainFirst: boolean) => {
+    const out: PoolIdea[] = [];
+    const taken = new Set<number>();
+    const take = (i: PoolIdea) => {
+      if (out.length >= remaining || taken.has(i.idea_id)) return;
       taken.add(i.idea_id);
+      out.push(i);
+    };
+    const latest = () => out.filter(inLatest).length;
+    const explains = () => out.filter((i) => i.has_explain).length;
+    const explainThenRank = (a: PoolIdea, b: PoolIdea) => Number(!a.has_explain) - Number(!b.has_explain) || rank(a, b);
+    for (const i of candidates.filter(inLatest).sort(explainFirst ? explainThenRank : rank)) {
+      if (latest() >= needLatest) break;
+      take(i);
     }
-  }
-  for (const i of candidates) {
-    if (picked.length >= size) break;
-    if (!taken.has(i.idea_id)) {
-      picked.push(i);
-      taken.add(i.idea_id);
+    for (const i of candidates.filter((c) => c.has_explain)) {
+      if (explains() >= needExplain) break;
+      take(i);
     }
+    for (const i of candidates) take(i);
+    out.sort(rank);
+    const met = remaining === 0 || (out.length === remaining && latest() >= needLatest && explains() >= needExplain);
+    return { out, met };
+  };
+  // The first try keeps importance first; when that cannot meet both quotas, explain-capable ideas of the latest act
+  // come first (they serve both quotas at once).
+  let best = attempt(false);
+  if (!best.met) {
+    const second = attempt(true);
+    if (second.met) best = second;
   }
-  for (const i of candidates) {
-    if (!done.has(i.idea_id) || taken.has(i.idea_id)) continue;
-    picked.sort(rank);
-    const out = [...picked].reverse().findIndex((x) => !done.has(x.idea_id));
-    if (out < 0) break;
-    const [gone] = picked.splice(picked.length - 1 - out, 1);
-    taken.delete(gone.idea_id);
-    picked.push(i);
-    taken.add(i.idea_id);
+
+  const donePool = [...done.keys()].map((id) => inPool.get(id)).filter((i): i is PoolIdea => !!i);
+  const picked = [...best.out, ...donePool].sort(rank);
+  const orphanExplain = answers.filter((a) => a.format === "explain" && !(a.idea_id !== null && a.idea_id !== undefined && inPool.has(a.idea_id))).length;
+  const started = answers.length > 0;
+  const fillable = candidates.length >= remaining;
+  const ready = remaining === 0 ? true : started ? fillable : best.met;
+  let shortfall: Shortfall | null = null;
+  if (!ready) {
+    if (!fillable) shortfall = "ideas";
+    else if (candidates.filter(inLatest).length < needLatest) shortfall = "latest";
+    else shortfall = "explain";
   }
-  picked.sort(rank);
-  return { picked, eligible: candidates.length, done, ready: candidates.length >= size || done.size > 0 };
+  return {
+    picked,
+    fresh: best.out,
+    done,
+    answers,
+    tally: quizTally(pool),
+    orphanExplain,
+    remaining,
+    eligible: candidates.length + answers.length,
+    ready,
+    shortfall,
+    relaxed: ready && started && remaining > 0 && !best.met,
+  };
 }
 
 const explainOf = (idea: DeckIdea): DeckQuestion | null => (idea.questions ?? []).find((q) => q.format === "explain") ?? null;
 
+/** How many explain questions a set of cards holds, plus the explain answers whose idea has no card. */
+export const explainCount = (cards: Pick<RoundCard, "format">[], sel: Pick<CheckpointSelection, "orphanExplain">): number =>
+  cards.filter((c) => c.format === "explain").length + sel.orphanExplain;
+
 /**
  * The cards of a selection. An idea answered in this quiz keeps the question it was answered with (marked done);
  * the others take pickQuestion's variant for their stage, and the first ones that have an explain variant are turned
- * into explain questions until the quiz has CHECKPOINT_MIN_EXPLAIN of them. An idea with no usable question, or whose
- * answered question is gone, has no card. Interleaved like a round (no two of one chapter in a row when avoidable).
+ * into explain questions until the quiz has CHECKPOINT_MIN_EXPLAIN of them (answers whose idea has no card count).
+ * An idea with no usable question, or whose answered question is gone, has no card. Interleaved like a round (no two
+ * of one chapter in a row when avoidable).
  */
 export function buildCheckpointCards(sel: CheckpointSelection, ideas: DeckIdea[], today: string): RoundCard[] {
   const byId = new Map(ideas.map((i) => [i.idea_id, i]));
-  const rows: { idea: DeckIdea; question: DeckQuestion; done: DeckAnswered | null }[] = [];
+  const rows: { idea: DeckIdea; question: DeckQuestion; done: PoolAnswer | null }[] = [];
   for (const p of sel.picked) {
     const idea = byId.get(p.idea_id);
     if (!idea) continue;
@@ -197,7 +309,7 @@ export function buildCheckpointCards(sel: CheckpointSelection, ideas: DeckIdea[]
     if (!question) continue;
     rows.push({ idea, question, done: answered });
   }
-  let explains = rows.filter((r) => r.question.format === "explain").length;
+  let explains = rows.filter((r) => r.question.format === "explain").length + sel.orphanExplain;
   for (const r of rows) {
     if (explains >= CHECKPOINT_MIN_EXPLAIN) break;
     if (r.done || r.question.format === "explain") continue;

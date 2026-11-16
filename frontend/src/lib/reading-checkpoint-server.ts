@@ -5,8 +5,10 @@ import { roundMinutes, type Deck, type DeckIdea } from "./reading-recall";
 import {
   buildCheckpointCards,
   CHECKPOINT_CARDS_MAX,
+  CHECKPOINT_MIN_EXPLAIN,
   checkpointQuizKey,
   checkpointRoundKey,
+  explainCount,
   parsePool,
   selectCheckpointIdeas,
 } from "./reading-checkpoint";
@@ -19,12 +21,19 @@ import { CHECKPOINT_SIZE, checkpointActStart, checkpointChapters, checkpointKey,
  * (pds.reading_bank_checkpoint_pool, pds.reading_bank_idea_cards), so a locked chapter's ideas never leave the server.
  *
  * Two steps, the second in parallel with the quiz lookup: the pool of ideas that may be asked and today's answers, the
- * choice in code (lib/reading-checkpoint.ts selectCheckpointIdeas), then the full cards of the ten picked ideas. It
+ * choice in code (lib/reading-checkpoint.ts selectCheckpointIdeas), then the full cards of the picked ideas. It
  * writes nothing and starts nothing: the same day gives the same quiz, and a quiz opened again keeps the cards already
  * answered in it (marked done), so closing and reopening resumes. The answer is a practice round (the shape of
  * lib/reading-recall-server.ts getRound: the runner reads it as one) plus {checkpoint, chapter, quiz_key, quiz,
- * eligible, size, ready}; `quiz` is set once today's result was recorded (then there are no cards: a quiz key is one
- * per day). Errors leave as short codes only.
+ * tally, remaining, eligible, size, ready, shortfall}; `quiz` is set once today's result was recorded (then there are
+ * no cards: a quiz key is one per day). `tally` is the database's own count of the quiz's valid answers
+ * ({total, right, pending}), from every answer under the quiz key whether or not its idea is still in the quiz: the
+ * result is recorded from it, because the database checks the result against exactly those answers.
+ *
+ * A quiz is `ready` only when it can be built with the quotas met (half from the latest act, at least three explain
+ * questions); otherwise `shortfall` names what is short ("ideas" | "latest" | "explain") and there are no cards.
+ * `brief=1` answers the same without the cards (no cards read): the page asks it to learn, after a reload, whether a
+ * quiz holds answers without a recorded result. Errors leave as short codes only.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -33,16 +42,20 @@ type Supa = SupabaseClient<any, any, any>;
 export interface CheckpointQuery {
   slug: string | null;
   chapter: number;
+  /** Without the cards: the tally and today's result only. */
+  brief?: boolean;
 }
 
-/** GET query: `book` (a slug, optional) and `chapter` (the checkpoint's chapter, required). */
+/** GET query: `book` (a slug, optional), `chapter` (the checkpoint's chapter, required) and `brief=1` (optional). */
 export function parseCheckpointQuery(sp: URLSearchParams): { ok: true; query: CheckpointQuery } | { ok: false; error: string } {
   const slug = sp.get("book") || null;
   if (slug !== null && !SLUG_RE.test(slug)) return { ok: false, error: "bad_book" };
   const raw = sp.get("chapter");
   const chapter = Number(raw);
   if (raw === null || !/^\d{1,6}$/.test(raw) || !Number.isInteger(chapter) || chapter < 1) return { ok: false, error: "bad_request" };
-  return { ok: true, query: { slug, chapter } };
+  const brief = sp.get("brief");
+  if (brief !== null && brief !== "1") return { ok: false, error: "bad_request" };
+  return { ok: true, query: brief === "1" ? { slug, chapter, brief: true } : { slug, chapter } };
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -66,7 +79,7 @@ export async function getCheckpointRound(supabase: Supa, q: CheckpointQuery): Pr
     const roundKey = checkpointRoundKey(pool.book_id, pool.today, q.chapter);
     const quizKey = checkpointQuizKey(pool.book_id, pool.today, q.chapter);
     const sel = selectCheckpointIdeas(pool, { actFrom: checkpointActStart(total, q.chapter) });
-    const ids = sel.ready ? sel.picked.map((p) => p.idea_id).slice(0, CHECKPOINT_CARDS_MAX) : [];
+    const ids = !q.brief && sel.ready ? sel.picked.map((p) => p.idea_id).slice(0, CHECKPOINT_CARDS_MAX) : [];
     const cardsRead: PromiseLike<{ data: unknown; error: { code?: string; message?: string } | null }> = ids.length
       ? supabase.rpc("reading_bank_idea_cards", { p_slug: q.slug, p_ids: ids })
       : Promise.resolve({ data: [], error: null });
@@ -78,10 +91,25 @@ export async function getCheckpointRound(supabase: Supa, q: CheckpointQuery): Pr
     // A failed lookup reads as "not recorded": the answer route says quiz_closed if it was after all.
     const rec = !quizRes.error && isObj(quizRes.data) ? { score: Number(quizRes.data.score), total: Number(quizRes.data.total) } : null;
     const ideas = (Array.isArray(cardsRes.data) ? cardsRes.data : []).filter((i): i is DeckIdea => isObj(i) && typeof i.idea_id === "number");
-    const cards = rec ? [] : buildCheckpointCards(sel, ideas, pool.today);
+    const cards = rec || q.brief ? [] : buildCheckpointCards(sel, ideas, pool.today);
+    // A quiz that cannot be drawn whole is withheld, never trimmed: every idea still to ask needs a card, and a fresh
+    // quiz needs its explain questions (the choice made sure ideas with an explain variant were picked).
+    const drawn = cards.filter((c) => !c.done).length;
+    let ready = !rec && sel.ready;
+    let shortfall = sel.shortfall;
+    if (ready && !q.brief) {
+      if (drawn < sel.fresh.length) {
+        ready = false;
+        shortfall = "ideas";
+      } else if (sel.remaining > 0 && !sel.relaxed && explainCount(cards, sel) < CHECKPOINT_MIN_EXPLAIN) {
+        ready = false;
+        shortfall = "explain";
+      }
+    }
+    const shown = ready ? cards : [];
     const deck: Deck = { book_id: pool.book_id, today: pool.today, quiz_through: pool.quiz_through, enabled: true, ideas, chapter_recall: [], highlights: [], answered_today: pool.answered_today };
     const answered = answeredIdeaIds(deck);
-    const out = cards.map((c) => cardOut(c, deck, answered));
+    const out = shown.map((c) => cardOut(c, deck, answered));
     return {
       status: 200,
       body: {
@@ -93,16 +121,19 @@ export async function getCheckpointRound(supabase: Supa, q: CheckpointQuery): Pr
         n: q.chapter,
         cards: out,
         done: out.filter((c) => c.done).length,
-        minutes: roundMinutes(cards),
+        minutes: roundMinutes(shown),
         extra_available: 0,
         chapter_recall: null,
         checkpoint: checkpointKey(q.chapter),
         chapter: q.chapter,
         quiz_key: quizKey,
         quiz: rec,
+        tally: sel.tally,
+        remaining: sel.remaining,
         eligible: sel.eligible,
         size: CHECKPOINT_SIZE,
-        ready: !rec && sel.ready && out.length > 0,
+        ready,
+        shortfall: ready ? null : shortfall,
       },
     };
   } catch (e) {

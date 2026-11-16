@@ -25,8 +25,9 @@ import ChapterSheet from "./ChapterSheet";
  *
  * Reads: the bank GET (the same URL the Practice part reads, so the cache is shared; GET only), silently over what the
  * cache showed, again when the overview's bank numbers change. Nothing is written until a tap (Restore, or what the
- * sheet does), inside the continuous scroll too. With the bank off or its routes missing the part shows nothing (the
- * page then behaves as before).
+ * sheet does), inside the continuous scroll too. The page draws this part only while the overview says the bank is on;
+ * when the bank's read then answers 404 / 503 (its routes or SQL are not there yet) the part says so in one line
+ * instead of leaving an empty frame in Personalize.
  */
 export default function ChapterMap({ o, onChanged }: { o: ReadingOverview; onChanged: () => void }) {
   const slug = o.book.slug;
@@ -94,7 +95,7 @@ export default function ChapterMap({ o, onChanged }: { o: ReadingOverview; onCha
 
   if (!map) {
     if (status === "failed") return <MapFailed onRetry={() => void load()} />;
-    return status === "off" ? null : <MapSkeleton />;
+    return status === "off" ? <MapOff onRetry={() => void load()} /> : <MapSkeleton />;
   }
 
   const header = mapHeader(map, o.practice);
@@ -264,6 +265,21 @@ function MapSkeleton() {
     <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" aria-busy="true" aria-label="Chapter map">
       <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters</h3>
       <div className="mt-3 h-24 rounded-control bg-white/[0.03]" />
+    </section>
+  );
+}
+
+/** The bank's routes or SQL are not there (404 / 503): one line, so the part is never an empty frame. */
+function MapOff({ onRetry }: { onRetry: () => void }) {
+  return (
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" aria-label="Chapter map" data-testid="map-off">
+      <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters</h3>
+      <p className="mt-2 text-[13px] text-text-secondary">
+        The chapter map is not available yet.{" "}
+        <button type="button" onClick={onRetry} className="min-h-11 px-1 text-accent">
+          Check again
+        </button>
+      </p>
     </section>
   );
 }
