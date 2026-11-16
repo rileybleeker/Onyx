@@ -2872,7 +2872,9 @@ def print_completeness(df: pd.DataFrame) -> None:
 #   - a day with an intake in another class, or an intake whose amount is missing, has an unknown
 #     total: it is left out, never read as 0 (the value of a day without an intake). The view
 #     filters out ingredients with no readable quantity, so those days come from a separate read of
-#     the intakes and their products (load_supplement_unquantified).
+#     the intakes and their products (load_supplement_unquantified). When that read fails nothing
+#     is published (the stored result of the last complete run stays and the heartbeat is partial);
+#     when the rollup is empty the result is empty and replaces the stored one.
 # What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
 # no estimate, in the coverage payload (supplement_impact / dose_response_coverage), which
 # /analytics/hrv shows under the dose-response chart.
@@ -3093,15 +3095,35 @@ def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.
     return rows, coverage
 
 
-def supplement_dose_response_results(supplements: pd.DataFrame, hrv_valid: pd.DataFrame, target: str,
-                                     unquantified: pd.DataFrame | None = None) -> dict:
+def _supplement_rollup_frame(supplements: pd.DataFrame | None) -> pd.DataFrame:
+    """The rollup as the dose-response reads it. An empty read (fetch_all returns a frame with no
+    columns at all) becomes a typed empty frame, so "no quantified intake" is an ordinary input and
+    not a KeyError."""
+    if supplements is not None and not supplements.empty:
+        return supplements
+    return pd.DataFrame({
+        "calendar_date": pd.Series(dtype=object),
+        "ingredient_group": pd.Series(dtype=object),
+        "category": pd.Series(dtype=object),
+        "unit": pd.Series(dtype=object),
+        "unit_class": pd.Series(dtype=object),
+        "source_units": pd.Series(dtype=object),
+        "total_amount": pd.Series(dtype=float),
+    })
+
+
+def supplement_dose_response_results(supplements: pd.DataFrame | None, hrv_valid: pd.DataFrame,
+                                     target: str, unquantified: pd.DataFrame | None = None) -> dict:
     """The dose-response block of run_statistical_analysis: rows (BH-FDR, sorted by |rho|) and coverage.
 
     Both keys are returned after every successful run, the list possibly empty, so the stored
-    result is replaced when the unit rule leaves no estimate: a previous run's rows never stay on
-    the dashboard. Raises on failure; the caller then keeps the previous stored result.
+    result is replaced when the unit rule leaves no estimate or the rollup holds no quantified
+    amount at all: a previous run's rows never stay on the dashboard. Raises on failure; the caller
+    then keeps the previous stored result. `unquantified` None means the amountless-intake check
+    could not be read; supplement_dose_response_block never publishes in that case.
     The tracking window starts at the first day with a quantified amount, as before.
     """
+    supplements = _supplement_rollup_frame(supplements)
     quantified = supplements.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
     if quantified.empty:
         tracked = hrv_valid.iloc[0:0][["calendar_date", target]]
@@ -3117,6 +3139,33 @@ def supplement_dose_response_results(supplements: pd.DataFrame, hrv_valid: pd.Da
             row["passes_fdr"] = bool(p_pass)
     rows.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
     return {"supplement_dose_response": rows, "supplement_dose_response_coverage": coverage}
+
+
+SUPPLEMENT_DOSE_WARNING_KEY = "supplement_dose_response_warning"
+SUPPLEMENT_DOSE_CHECK_WARNING = ("Supplement dose-response not updated: the check for intakes without a "
+                                 "readable amount could not be read, so the previous result is kept")
+SUPPLEMENT_DOSE_FAILED_WARNING = ("Supplement dose-response not updated: the analysis failed, so the "
+                                  "previous result is kept")
+
+
+def supplement_dose_response_block(supplements: pd.DataFrame | None, hrv_valid: pd.DataFrame, target: str,
+                                   unquantified: pd.DataFrame | None) -> tuple[dict, str | None]:
+    """What run_statistical_analysis does with the dose-response: (results to merge, heartbeat warning).
+
+    - `supplements` None: the rollup was not read at all; nothing is stored and nothing is said.
+    - `unquantified` None: the read of the intakes and products behind the amountless-intake check
+      failed. Those days would be read as 0 (no intake) or keep a partial total, so NO replacement is
+      published: the stored rows of the last complete run stay, and the warning turns the run's
+      heartbeat partial. Never "nothing found".
+    - otherwise the rows and the coverage, also when the rollup is empty: the read succeeded, so
+      "no quantified amount" is a result (an empty list, plus the compounds that only have amountless
+      intakes), and it replaces what an earlier run stored.
+    """
+    if supplements is None:
+        return {}, None
+    if unquantified is None:
+        return {}, SUPPLEMENT_DOSE_CHECK_WARNING
+    return supplement_dose_response_results(supplements, hrv_valid, target, unquantified), None
 
 
 def run_statistical_analysis(
@@ -3618,12 +3667,17 @@ def run_statistical_analysis(
     # for compounds where the dose actually varies (≥3 distinct non-zero amounts).
     # Captures monotonic dose-response effects that Yes/No collapses on.
     # Rank-based to handle outliers and non-linear monotonic responses.
-    # One unit class per compound (supplement_dose_response_rows): mg and mL never add up.
-    if supplements is not None and not supplements.empty:
-        try:
-            dose = supplement_dose_response_results(supplements, hrv_valid, STAT_TARGET,
-                                                    supplements_unquantified)
-            results.update(dose)
+    # One unit class per compound (supplement_dose_response_rows): mg and mL never add up. An empty
+    # rollup is a result too (it replaces the stored rows); an unreadable amountless-intake check
+    # publishes nothing and warns (supplement_dose_response_block).
+    try:
+        dose, dose_warning = supplement_dose_response_block(supplements, hrv_valid, STAT_TARGET,
+                                                            supplements_unquantified)
+        results.update(dose)
+        if dose_warning:
+            results[SUPPLEMENT_DOSE_WARNING_KEY] = dose_warning
+            log.warning(f"  {dose_warning}")
+        elif dose:
             supplement_dose_response = dose["supplement_dose_response"]
             dose_coverage = dose["supplement_dose_response_coverage"]
             if dose_coverage["excluded"] or dose_coverage.get("with_excluded_days"):
@@ -3631,14 +3685,13 @@ def run_statistical_analysis(
                 log.info(f"  Supplement dose-response units: {len(dose_coverage['excluded'])} compounds "
                          f"left out, {dose_coverage.get('with_excluded_days', 0)} with days left out "
                          f"(another unit or no amount)")
-            if dose_coverage["unquantified_check"] != "checked":
-                log.info("  Supplement dose-response: days without a readable amount were not checked")
             if supplement_dose_response:
                 log.info(f"  Supplement dose-response: {len(supplement_dose_response)} compounds (≥3 distinct doses)")
             else:
                 log.info("  Supplement dose-response: 0 compounds with ≥3 distinct doses + n≥20 rows")
-        except Exception as e:
-            log.warning(f"  Supplement dose-response analysis failed: {e}")
+    except Exception as e:
+        log.warning(f"  Supplement dose-response analysis failed: {type(e).__name__}")
+        results[SUPPLEMENT_DOSE_WARNING_KEY] = SUPPLEMENT_DOSE_FAILED_WARNING
 
     # --- Nutrition Spearman correlation ---
     # Per-nutrient rank correlation with that night's HRV. Spearman (not Pearson)
@@ -6227,6 +6280,10 @@ def main() -> str | None:
         supplements=data.get("supplements"),
         supplements_unquantified=data.get("supplements_unquantified"),
     )
+    # A dose-response that could not be refreshed (HIST-UNIT-01) ends the run as PARTIAL.
+    dose_warning = stat_results.get(SUPPLEMENT_DOSE_WARNING_KEY)
+    if dose_warning:
+        run_warning = f"{run_warning} | {dose_warning}" if run_warning else dose_warning
 
     # ---------- Phase 2.5: Causal Inference ----------
     # Runs after the descriptive stats and before the predictive models so its

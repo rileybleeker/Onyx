@@ -10,7 +10,10 @@ IU provenance. A compound in one class gives exactly the numbers of the pre-chan
 The rollup view filters out ingredients without a readable quantity, so those intakes are read from
 the intakes + products (load_supplement_unquantified); the loader tests below build the rollup the
 way the view does and run the whole path. A run that leaves no estimate stores an empty list, so a
-previous run's rows never stay on the dashboard.
+previous run's rows never stay on the dashboard: also when the rollup itself is empty (a read of
+nothing but amountless intakes), where the coverage still lists those compounds. When the
+amountless-intake check cannot be read nothing is published at all (the stored rows of the last
+complete run stay) and the run warns, so a failed read never turns into days read as 0.
 
 Synthetic data only: invented compound names, dates and amounts. No network, no credentials.
 
@@ -37,6 +40,7 @@ DATES = pd.date_range("2030-01-01", periods=N_DAYS).strftime("%Y-%m-%d").tolist(
 _rng = np.random.default_rng(11)
 TRACKED = pd.DataFrame({"calendar_date": DATES, "y": _rng.normal(60, 8, N_DAYS)})
 DOSES = [100.0, 200.0, 300.0]
+EMPTY_CHECKED = pd.DataFrame(columns=["calendar_date", "ingredient_group"])  # a check that found nothing
 
 
 def row(day, group, amount, unit_class="mass", unit=None, source_units=None, category="mineral"):
@@ -207,15 +211,21 @@ def test_single_class_compound_matches_the_previous_code():
 
 def test_run_statistical_analysis_calls_the_unit_rule():
     """run_statistical_analysis(skip=False) also draws plots, so the call site is checked in the source:
-    the dose-response comes from supplement_dose_response_results (rows + coverage, both kept for storage),
-    and main() passes the loader's amountless-intake days in."""
+    the dose-response decision (empty rollup, failed amountless-intake check) is made by
+    supplement_dose_response_block, which has its own tests below; the call site must run it for every
+    rollup (not only a non-empty one), merge what it returns and pass its warning on, and main() passes
+    the loader's amountless-intake days in and turns the warning into the heartbeat."""
     src = Path(h.__file__).read_text(encoding="utf-8")
     body = src[src.index("def run_statistical_analysis("):src.index("# --- Nutrition Spearman correlation ---")]
-    assert re.search(r"supplement_dose_response_results\(\s*supplements, hrv_valid, STAT_TARGET,\s*"
+    assert re.search(r"supplement_dose_response_block\(\s*supplements, hrv_valid, STAT_TARGET,\s*"
                      r"supplements_unquantified\)", body)
     assert "results.update(dose)" in body
+    assert "results[SUPPLEMENT_DOSE_WARNING_KEY] = dose_warning" in body
+    assert "supplements.empty" not in body[body.index("# --- Supplement dose-response"):]
     main = src[src.index("stat_results = run_statistical_analysis("):]
     assert 'supplements_unquantified=data.get("supplements_unquantified")' in main[:400]
+    assert "stat_results.get(SUPPLEMENT_DOSE_WARNING_KEY)" in main[:900]
+    assert "run_warning = " in main[:900]
     assert 'supp.groupby("ingredient_group")' in body  # the Yes/No block only (taken / not taken)
     assert body.count('supp.groupby("ingredient_group")') == 1, "the dose-response no longer groups by name alone"
 
@@ -399,13 +409,12 @@ def test_too_few_comparable_days_is_recorded_not_dropped_silently():
 
 def test_a_run_with_no_estimate_replaces_the_stored_rows():
     hrv_valid = TRACKED.copy()
-    first = h.supplement_dose_response_results(frame(mass_series()), hrv_valid, "y",
-                                               pd.DataFrame(columns=["calendar_date", "ingredient_group"]))
+    first = h.supplement_dose_response_results(frame(mass_series()), hrv_valid, "y", EMPTY_CHECKED)
     assert len(first["supplement_dose_response"]) == 1
     # Next run: the compound is logged in mL and in capsules, no mass: the unit rule leaves no estimate.
     mixed = frame([row(d, "Synthetic Mineral", 5.0, unit_class="mL") for d in range(N_DAYS)]
                   + [row(d, "Synthetic Mineral", 1.0 + d % 3, unit_class="capsule") for d in range(N_DAYS)])
-    second = h.supplement_dose_response_results(mixed, hrv_valid, "y", None)
+    second = h.supplement_dose_response_results(mixed, hrv_valid, "y", EMPTY_CHECKED)
     assert second["supplement_dose_response"] == []
     assert second["supplement_dose_response_coverage"]["excluded"][0]["reason"] == "mixed_unconverted_units"
     fake = _FakeSupa()
@@ -422,9 +431,88 @@ def test_a_run_with_no_estimate_replaces_the_stored_rows():
 
 def test_results_without_any_quantified_amount_do_not_raise():
     supp = frame([row(d, "Synthetic Herb", None) for d in range(6)])
-    out = h.supplement_dose_response_results(supp, TRACKED, "y", None)
+    out = h.supplement_dose_response_results(supp, TRACKED, "y", EMPTY_CHECKED)
     assert out["supplement_dose_response"] == []
     assert out["supplement_dose_response_coverage"]["excluded"][0]["reason"] == "unquantified"
+
+
+# --- The caller: an empty rollup, and a check that could not be read ------------------------------
+
+def _stored_by_key(results: dict) -> dict:
+    """What store_analysis_results writes for these stat results, by (result_type, result_key)."""
+    fake = _FakeSupa()
+    real = h.supa
+    h.supa = fake
+    try:
+        h.store_analysis_results(results, {})
+    finally:
+        h.supa = real
+    return {(r["result_type"], r["result_key"]): r for r, _ in fake.upserts}
+
+
+def _amountless_only_days():
+    """The loader's answer when the only intakes are of a blend that gives no amount: the rollup view
+    has no row for any of them (so its read is an empty frame with no columns)."""
+    products = pd.DataFrame([PRODUCTS.iloc[1].to_dict()])
+    intakes = pd.DataFrame([{"intake_id": 1000 + d, "intake_date": DATES[d], "product_id": "synthetic_b", "doses": 1}
+                            for d in B_DAYS])
+    return h.load_supplement_unquantified(_FakeFetch({"supplement_products": products, "supplement_intake": intakes}))
+
+
+def test_empty_rollup_with_amountless_intakes_stores_an_empty_result_and_its_coverage():
+    unquantified = _amountless_only_days()
+    assert unquantified is not None and len(unquantified) == 2 * len(B_DAYS)
+    results, warning = h.supplement_dose_response_block(pd.DataFrame(), TRACKED, "y", unquantified)
+    assert warning is None
+    assert results["supplement_dose_response"] == []
+    cov = results["supplement_dose_response_coverage"]
+    assert cov["unquantified_check"] == "checked" and cov["analyzed"] == 0
+    assert sorted((e["compound"], e["reason"], e["n_days"]) for e in cov["excluded"]) == [
+        ("Synthetic Herb", "unquantified", len(B_DAYS)), ("Synthetic Mineral", "unquantified", len(B_DAYS))]
+    # Both keys are written, so an earlier run's rows are replaced, not left on the dashboard.
+    stored = _stored_by_key(results)
+    assert stored[("supplement_impact", "dose_response")]["result_json"] == []
+    assert stored[("supplement_impact", "dose_response_coverage")]["result_json"] == cov
+
+
+def test_empty_rollup_and_nothing_amountless_is_an_empty_result_not_an_error():
+    for empty in (pd.DataFrame(), pd.DataFrame(columns=["calendar_date", "ingredient_group", "total_amount"]),
+                  h._supplement_rollup_frame(None)):
+        results, warning = h.supplement_dose_response_block(empty, TRACKED, "y", EMPTY_CHECKED)
+        assert warning is None
+        assert results["supplement_dose_response"] == []
+        cov = results["supplement_dose_response_coverage"]
+        assert cov["analyzed"] == 0 and cov["excluded"] == [] and cov["unquantified_check"] == "checked"
+        assert _stored_by_key(results)[("supplement_impact", "dose_response")]["result_json"] == []
+
+
+def test_a_failed_amount_check_publishes_nothing_and_warns():
+    # The loader's own failure (the intakes read) is the input, not a hand-made None.
+    failed = h.load_supplement_unquantified(
+        _FakeFetch({"supplement_products": PRODUCTS, "supplement_intake": intakes_frame()}, fail="supplement_intake"))
+    assert failed is None
+    supp = view_rollup(PRODUCTS, intakes_frame())
+    for supplements in (supp, pd.DataFrame()):
+        results, warning = h.supplement_dose_response_block(supplements, TRACKED, "y", failed)
+        assert results == {}
+        assert warning == h.SUPPLEMENT_DOSE_CHECK_WARNING
+        # Nothing reaches storage: the rows of the last complete run stay.
+        stored = _stored_by_key(results)
+        assert ("supplement_impact", "dose_response") not in stored
+        assert ("supplement_impact", "dose_response_coverage") not in stored
+    # The same rollup with a readable check publishes: the failure, not the data, withheld it.
+    readable = h.load_supplement_unquantified(
+        _FakeFetch({"supplement_products": PRODUCTS, "supplement_intake": intakes_frame()}))
+    results, warning = h.supplement_dose_response_block(supp, TRACKED, "y", readable)
+    assert warning is None and len(results["supplement_dose_response"]) == 1
+    # A rollup that was not read at all says nothing either way.
+    assert h.supplement_dose_response_block(None, TRACKED, "y", failed) == ({}, None)
+    assert h.supplement_dose_response_block(None, TRACKED, "y", EMPTY_CHECKED) == ({}, None)
+
+
+def test_a_warning_never_carries_data():
+    for text in (h.SUPPLEMENT_DOSE_CHECK_WARNING, h.SUPPLEMENT_DOSE_FAILED_WARNING):
+        assert text.startswith("Supplement dose-response not updated") and "synthetic" not in text.lower()
 
 
 if __name__ == "__main__":
