@@ -744,7 +744,8 @@ def test_the_real_writer_end_to_end_against_an_in_memory_notion():
     page = next(iter(api.pages.values()))
     assert page["properties"]["Status"]["status"]["name"] == "Complete"
     assert page["properties"]["Estimate (ms)"]["number"] == round(store.final()["estimate"], 2)
-    assert page["properties"]["Decision"]["select"]["name"] == "Adopt A"
+    # Until METHOD_REVIEW is recorded the decision is withheld (PIPE-06): the page reads Inconclusive.
+    assert page["properties"]["Decision"]["select"]["name"] == "Inconclusive"
     heading = [b for b in api.children[page["id"]] if b["type"] == "heading_2"]
     assert len(heading) == 1 and api.children[heading[0]["id"]], "the report body sits under one heading"
     assert store.exp["notion_page_id"] == page["id"]
