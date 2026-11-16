@@ -52,8 +52,10 @@ the subject of PERF-01.
   `/.well-known/jwks.json` (no database read) in 85 ms against its usual 0.2 ms, and the gateway added another
   ~780 ms (edge origin time 865 ms). The same Auth slowdown shows at 22:33:06 (71 ms). Everything on the
   single Supabase VM (Postgres, PostgREST, Auth, gateway) was CPU-starved at once.
-* **It is not limited to the speed runs.** Over 2026-11-16, 13 seconds had a median REST latency of 700 ms or
-  more across at least 5 requests; 4 fell inside a perf-timing window, 9 did not (overnight and morning).
+* **It may not be limited to the speed runs (provisional).** A one-second bucketing of the 2026-11-16 edge logs
+  (median REST latency of 700 ms or more across at least 5 requests) found about a dozen such seconds, roughly a
+  third inside a perf-timing window and the rest overnight and in the morning. This is a single day, a coarse
+  query and not independently re-checked; repeat it over several days before leaning on it.
 * The instance is the small shared-CPU size (`max_connections` 60, `shared_buffers` 256 MB) and is
   otherwise almost idle (4 REST requests in the 5 minutes after the run).
 
@@ -64,7 +66,7 @@ the subject of PERF-01.
    cores finish quickly; whether it does depends on how the neighbour mounts and the warm-up step line up.
 2. **Shared-CPU throttling.** The small compute sizes run on burstable CPU; when the instance's CPU
    allowance is spent (or a neighbour on the host takes it), the same burst takes seconds. The out-of-run
-   stalls (9 of 13) and the Auth slowdown fit this better than cause 1.
+   stalls (provisional, above) and the Auth slowdown fit this better than cause 1, but neither proves it.
 
 ## What the next measurement needs
 
@@ -74,6 +76,17 @@ the subject of PERF-01.
   steal means cause 1. This needs Riley (dashboard) or a run holding the service key; neither was used here.
 * **An A/B on the same hour**: `/nutrition` with the continuous scroll on vs off
   (`sessionStorage["onyx.feed"] = "off"`). The harness is owned by PR #373 and was not changed here.
+
+## Why this PR ships no fix
+
+* The two causes need different fixes, and the evidence above cannot tell them apart without the instance
+  CPU / steal figures, which need the Supabase dashboard or the service key (not used in this audit lane).
+* The cause-1 fix lives in `components/ContinuousScroll.tsx`, which PR #376 is editing; changing it here
+  would collide with that PR, and the perf harness that would prove a gain is owned by PR #373.
+* The cause-2 fix is a compute-size change with a monthly cost, which is Riley's decision.
+* Shipping a guess would also blur the before/after evidence the speed budget asks for. This PR is held
+  until the measurement above is in; then the matching fix goes in its own PR with before/after timings
+  from the hourly runs.
 
 ## Fix options, by cause (not applied)
 
