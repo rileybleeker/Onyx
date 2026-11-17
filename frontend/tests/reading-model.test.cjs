@@ -165,7 +165,7 @@ test("errors leave as codes only; the API message is never returned", async () =
   }
 });
 
-test("defaultBankClient builds the SDK client with two retries", () => {
+test("defaultBankClient builds the SDK client with its own retries OFF (every attempt is an explicit, reserved step)", () => {
   let seen = null;
   function SDK(opts) {
     seen = opts;
@@ -173,8 +173,37 @@ test("defaultBankClient builds the SDK client with two retries", () => {
   }
   const M2 = loadTs("lib/reading-model.ts", { "@anthropic-ai/sdk": SDK });
   const c = M2.defaultBankClient("sk-synthetic");
-  assert.deepEqual(seen, { apiKey: "sk-synthetic", maxRetries: 2 });
+  assert.deepEqual(seen, { apiKey: "sk-synthetic", maxRetries: 0 });
   assert.equal(typeof c.beta.messages.stream, "function");
+});
+
+test("an ambiguous first attempt that an explicit retry then succeeds on keeps its uncertain charge", async () => {
+  const reserves = [];
+  const { client } = fakeClient([
+    { __throw: Object.assign(new Error("Synthetic socket text"), { name: "APIConnectionError" }) },
+    msg("end_turn", [{ type: "text", text: "Synthetic notes." }], { usage: usage({ input_tokens: 1000 }) }),
+  ]);
+  const reserve = async (total) => {
+    reserves.push(total);
+    return true;
+  };
+  const first = await M.bankModelCall(client, spec({ reserve }));
+  assert.deepEqual([first.ok, first.code, first.retryable, first.maybeBilled, first.costCents], [false, "connection", true, true, 0]);
+  // The worker's accounting (JobRun.call): a failed attempt that may have been billed keeps its reservation.
+  const charged = !first.ok && first.maybeBilled ? Math.max(first.costCents, reserves[0]) : first.costCents;
+  assert.equal(charged, reserves[0], "the uncertain first request is charged its reservation, not released to 0");
+  // The explicit retry is a new step: reserved again, and its own usage is accounted when it succeeds.
+  const second = await M.bankModelCall(client, spec({ reserve }));
+  assert.equal(second.ok, true);
+  assert.equal(reserves.length, 2, "every attempt reserves its own total before it is sent");
+  assert.ok(second.costCents > 0);
+});
+
+test("rate limits and 5xx may have been billed too; a 4xx never is", async () => {
+  for (const [status, code, maybe] of [[429, "rate_limited", true], [503, "server_error", true], [400, "bad_request", false]]) {
+    const r = await M.bankModelCall(fakeClient([{ __throw: { status, message: "Synthetic" } }]).client, spec());
+    assert.deepEqual([r.code, r.maybeBilled], [code, maybe], code);
+  }
 });
 
 /* ---------------- review round 2 ---------------- */
