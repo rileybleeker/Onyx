@@ -23,13 +23,15 @@
  *     named Synthetic Calm);
  *   - "don't log X" / "don't mark X" / "log Y, not X" is a request not to write X: it grants nothing (never a No) and
  *     refuses any write of X; "don't log it" refuses every write of the message;
- *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
- *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules, and one
- *     serving only when no other amount is stated), the clock times one to one (a time sent twice has to be said
- *     twice; every time said is sent), the chapters as chapter numbers covering exactly the chapters named (both of
- *     "chapters 3 and 4", every chapter of "ch. 5-7") and the minutes as a duration ("chapter 4 for 12 minutes"
- *     never gives chapter 12, and a stated duration is never dropped from the call); an amount or a time the action
- *     states cannot be left out;
+ *   - every argument is bound to THAT action, read from that action's own clauses (its clause plus the
+ *     argument-only clauses attached to it), never from another action's clause of the same list or sentence: the
+ *     amount with its unit kind exactly as lib/supplement-intake.ts reads it (servings, pills, a weight; "15 mg"
+ *     never becomes 15 servings, "2 servings" never 2 capsules, and one serving only when no other amount is
+ *     stated), the clock times one to one (a time sent twice has to be said twice; every time said is sent; a time
+ *     another action states never fits this one, except the one the list's last item shares with all of them), the
+ *     chapters as chapter numbers covering exactly the chapters named (both of "chapters 3 and 4", every chapter of
+ *     "ch. 5-7") and the minutes as a duration ("chapter 4 for 12 minutes" never gives chapter 12, and a stated
+ *     duration is never dropped from the call); an amount or a time the action states cannot be left out;
  *   - the day the call would write (its date, or the tool's default when it sends none) has to be the day the action
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
@@ -137,11 +139,15 @@ export interface ReadingBooks {
 
 /**
  * What this request has already been allowed: calls per tool, and the granted writes already consumed (each user
- * action authorizes one write of each record it names). Made with newWriteUsage(); the caller records every allowed
- * call with commitWrite(). A consumed key is the granted write's canonical identity — the tool, the record as the
- * user's own words name it, and the arguments the user's action states — never the model's call arguments, so a
- * repeated or varied call for the same grant maps to it and is refused. Per request only: a retry of the whole
- * message builds a fresh set and reconciles through the replay ledger (SEC-04) instead.
+ * action authorizes one write of each record it names). Made with newWriteUsage(). A consumed key is the granted
+ * write's canonical identity — the tool, the record as the user's own words name it, and the arguments the user's
+ * action states — never the model's call arguments, so a repeated or varied call for the same grant maps to it and
+ * is refused. The caller settles each allowed call around its execution: commitWrite() RESERVES it before the tool
+ * runs; afterwards a definitive refusal (releaseWrite(), nothing was written) hands the action back so a corrected
+ * call in the same request may run, while a success keeps the reservation as the completed write. An uncertain
+ * result (a timeout, a network error, a lost answer) also keeps the reservation: a repeat in this request is
+ * refused, and a retry of the message reconciles through the SEC-04 ledger under the same operation key instead of
+ * executing again. Per request only: a retry of the whole message builds a fresh set.
  */
 export interface WriteUsage { perTool: Map<string, number>; consumed: Set<string> }
 
@@ -153,11 +159,47 @@ export type WriteDecision =
   | { allowed: true; tool: WriteToolName; use: string | null }
   | { allowed: false; code: RefusalCode; reason: string };
 
-/** Records an allowed call, so the action it used cannot authorize the same write again in this request. */
+/**
+ * Reserves an allowed call's part of the grant, before the tool runs, so the action it used cannot authorize the same
+ * write again in this request while the call may still be executing. Settle it afterwards: releaseWrite() on a
+ * definitive refusal, nothing on a success (the reservation is the completed write) or an uncertain result.
+ */
 export function commitWrite(usage: WriteUsage, decision: WriteDecision): void {
   if (!decision.allowed) return;
   usage.perTool.set(decision.tool, (usage.perTool.get(decision.tool) ?? 0) + 1);
   if (decision.use) usage.consumed.add(decision.use);
+}
+
+/**
+ * Releases the reservation of a call whose tool definitively refused (a definitive error from the database, nothing
+ * written): the action can authorize a corrected call in the same request again. Only the pair of a commitWrite and
+ * a definitive refusal of that same call; a success or an uncertain result keeps the reservation.
+ */
+export function releaseWrite(usage: WriteUsage, decision: WriteDecision): void {
+  if (!decision.allowed) return;
+  const n = (usage.perTool.get(decision.tool) ?? 1) - 1;
+  if (n > 0) usage.perTool.set(decision.tool, n);
+  else usage.perTool.delete(decision.tool);
+  if (decision.use) usage.consumed.delete(decision.use);
+}
+
+/**
+ * Whether a write tool's answer is a definitive refusal: an error answer that says nothing was written (no
+ * incomplete mark), so the call's reservation is released and a corrected call may run. A throw (`failed`), a lost
+ * answer, an unparsable answer, or one that says it may be incomplete is uncertain: it may have written, so the
+ * reservation stays and a retry reconciles through the ledger instead of executing again.
+ */
+export function definitiveRefusal(result: string, failed: boolean): boolean {
+  if (failed) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const answer = parsed as Record<string, unknown>;
+  return answer.error !== undefined && !answer.incomplete && !answer.uncertain && answer.success !== true;
 }
 
 export type RefusalCode =
@@ -1418,21 +1460,23 @@ export function authorizeWrite(
     // words match one. A later item that only writes a note ("…and took a note") does not un-read the chain.
     const firstOfChain = new Map<number, Action>();
     for (const a of done) if (!firstOfChain.has(a.chain)) firstOfChain.set(a.chain, a);
-    const chains = [...new Map(done.filter((a) => !OTHER_WRITE.test(firstOfChain.get(a.chain)!.text) && (READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText))).map((a) => [a.chain, a])).values()];
-    if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
+    // Each reading action is checked against its own clause, never another action's of the same list ("chapter 3
+    // of this book and chapter 4 of that one" gives each chapter its own book).
+    const readings = done.filter((a) => !OTHER_WRITE.test(firstOfChain.get(a.chain)!.text) && (READING.test(a.text) || FINISHED_BOOK.test(a.text)));
+    if (readings.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
     // The granted session's canonical identity: the book the grant binds (the one the user names — bookCheck refuses
-    // any other — else the one being read), the day, the chapters and the minutes the user's own action states, never
-    // the call's arguments, so a repeated or varied call for the same session is refused and another chapter range
-    // or day is another session.
+    // any other — else the one being read), the day, the chapters and the minutes the user's own action states
+    // (that action's own clauses, never the rest of its list), never the call's arguments, so a repeated or varied
+    // call for the same session is refused and another chapter range or day is another session.
     const sessionIdentity = (a: Action): string => {
       const days = [...allowedDays(a, ctx.requestDay)].sort();
-      const chapters = [...chapterNumbers(a.chainText)].sort((x, y) => x - y).join(",");
-      const minutes = [...minuteValues(a.chainText)].sort((x, y) => x - y).join(",");
+      const chapters = [...chapterNumbers(a.text)].sort((x, y) => x - y).join(",");
+      const minutes = [...minuteValues(a.text)].sort((x, y) => x - y).join(",");
       const book = str(input.book) ?? ctx.books?.active ?? "";
       return [tool, book, days.length > 0 ? days.join(",") : ctx.requestDay, chapters, minutes].join("|");
     };
     let refusal: RefusalCode = "not_named";
-    for (const a of chains) {
+    for (const a of readings) {
       const r = readingSessionFits(a, input, grant, ctx);
       if (r) { refusal = r; continue; }
       const key = sessionIdentity(a);
@@ -1559,8 +1603,9 @@ function dayFits(
 
 /**
  * The times an action states, and whether the call has to send all of them. Its own times, which it must send. With
- * none of its own, the times its list states: required when only the list's last item states them ("Log X and Y at
- * 9pm" is both at 9pm), otherwise allowed but not required ("Log X at 8 and Y" gives Y no time of its own).
+ * none of its own, the one time its list's LAST item states and shares with every item ("Log X and Y at 9pm" is
+ * both at 9pm). Nothing else: a time another action of the list states on its own ("Log X at 8 and Y") is that
+ * action's, never this one's, so this one sends no time at all.
  */
 function actionTimes(a: Action, actions: Action[]): { slots: Array<Set<string>>; required: boolean } {
   const own = clockSlots(a.text);
@@ -1571,7 +1616,7 @@ function actionTimes(a: Action, actions: Action[]): { slots: Array<Set<string>>;
     const shared = clockSlots(last.text);
     if (shared.length > 0) return { slots: shared, required: true };
   }
-  return { slots: clockSlots(a.chainText), required: false };
+  return { slots: [], required: false };
 }
 
 /** Whether the call's arguments are the ones action `a` states (null) or why not. */
@@ -1602,10 +1647,10 @@ function argumentsFit(
 }
 
 /**
- * Whether a reading session call fits reading action `a` (its list): the call covers EXACTLY the chapters the action
- * grants (both of "chapters 3 and 4", every chapter of "ch. 5-7"), the minutes are the duration said and are sent
- * when one is stated ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes, and never drops the 12), the
- * day, the book, the user's words.
+ * Whether a reading session call fits reading action `a`: the call covers EXACTLY the chapters the action grants
+ * (both of "chapters 3 and 4", every chapter of "ch. 5-7"), the minutes are the duration said and are sent when one
+ * is stated ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes, and never drops the 12), the day, the
+ * book, the user's words — each read from that action's own clauses, never another action's of the same list.
  */
 function readingSessionFits(
   a: Action,
@@ -1613,8 +1658,8 @@ function readingSessionFits(
   grant: WriteGrant,
   ctx: { requestDay: string; books?: ReadingBooks | null },
 ): RefusalCode | null {
-  const text = a.chainText;
-  const book = bookCheck(input, a.sentence, ctx.books);
+  const text = a.text;
+  const book = bookCheck(input, a.text, ctx.books);
   if (book) return book;
   const chapters = grantedChapters(text);
   const through = num(input.chapter_through);

@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, RETRIEVED_DATA_NOTE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
-import { authorizeWrite, chatWritesOff, commitWrite, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
+import { authorizeWrite, chatWritesOff, commitWrite, definitiveRefusal, newWriteUsage, releaseWrite, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
 import { WRITE_GATE, WRITE_GATE_ANSWER, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, readingQuestLine, type QuestBook, type WriteReceipt } from "@/lib/chat-receipts";
 import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
@@ -2568,11 +2568,12 @@ export async function POST(req: NextRequest) {
           const decision = isWriteTool(block.name)
             ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
             : null;
-          // An allowed call consumes the granted action's canonical identity (the tool, the record as the user's
-          // words name it, the arguments the user's action states — lib/chat-write-intent.ts), so a second call for
-          // the same grant in this request is refused with a receipt whatever arguments the model sends. A retry of
-          // the whole message builds a fresh set here and reconciles through the SEC-04 ledger, which mints no new
-          // action either; nothing here persists across requests.
+          // An allowed call RESERVES the granted action's canonical identity before its tool runs (the tool, the
+          // record as the user's words name it, the arguments the user's action states — lib/chat-write-intent.ts),
+          // so a second call for the same grant in this request is refused with a receipt whatever arguments the
+          // model sends. The reservation is settled below, after the tool's answer. A retry of the whole message
+          // builds a fresh set here and reconciles through the SEC-04 ledger, which mints no new action either;
+          // nothing here persists across requests.
           if (decision?.allowed) commitWrite(writesAllowed, decision);
           if (decision && !decision.allowed) {
             // Not asked for in the user's own latest message: never run, never recorded in the ledger.
@@ -2603,6 +2604,12 @@ export async function POST(req: NextRequest) {
             const ran = await runTool(block.name, input, undefined, block.id);
             outcome = { ...ran, receipt: buildWriteReceipt(block.name, block.input, ran.result) };
           }
+          // Settle the reservation of an allowed call now that its tool has answered. A definitive refusal (an error
+          // answer, nothing written) releases it, so a corrected call in this same request may run. A success keeps
+          // it as the completed write, and so does an uncertain answer (a throw, a timeout, a lost or incomplete
+          // result): it may have written, so a repeat here is refused, and a retry of the message reconciles through
+          // the SEC-04 ledger under the same operation key instead of executing again.
+          if (decision?.allowed && definitiveRefusal(outcome.result, outcome.failed)) releaseWrite(writesAllowed, decision);
           if (outcome.receipt) receipts.push(outcome.receipt);
           toolResults.push({
             type: "tool_result" as const,

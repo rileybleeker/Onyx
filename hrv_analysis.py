@@ -1010,6 +1010,23 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
 
+    # Photo-logged meals (pds.photo_meals, 2026-11-14): meals logged from a plate photo on
+    # /nutrition. Only eaten_date / eaten_at / kcal plus the two routing columns reach the
+    # pipeline — drink captures (capture_kind='drink') and removed meals (deleted_at) are
+    # filtered out in merge_photo_meal_features. Loaded fail-open: a new source must never
+    # sink the retrain.
+    log.info("  Loading photo_meals (photo-logged meals)…")
+    try:
+        data["photo_meals"] = fetch_all(
+            "photo_meals",
+            select="eaten_date,eaten_at,kcal,capture_kind,deleted_at",
+            order="meal_id",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  photo_meals load failed ({e!r}); continuing without photo-meal features")
+        LOAD_FAILURES.add("photo_meals")
+        data["photo_meals"] = pd.DataFrame()
+
     # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11): Apple's own Screen Time
     # numbers, sent daily by the Onyx Screen Time app (tools/screentime_ios). Service-role
     # only view. Loaded fail-open: a new source must never sink the retrain.
@@ -1760,6 +1777,95 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return df
 
 
+def merge_photo_meal_features(df: pd.DataFrame, photo: pd.DataFrame | None,
+                              cycles: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Photo-logged meal features from pds.photo_meals (plate-photo meals, /nutrition).
+
+      photo_meal_count              photo meals eaten that behavioral day
+      photo_last_meal_to_sleep_min WHOOP sleep onset − last photo meal (NaN without a
+                                    timed meal or a scored sleep)
+
+    ROW PLACEMENT — a meal eaten on behavioral day D sits on matrix row D, the row whose
+    HRV is the sleep that closes day D (hrv_alignment.py). No re-keying.
+
+    DRINKS AND REMOVED MEALS — pds.photo_meals also holds drink captures (capture_kind='drink')
+    and soft-removed meals (deleted_at IS NOT NULL); both are excluded here, so only actual
+    eaten meals are counted.
+
+    CRONOMETER STAYS PRIMARY — the matrix's Cronometer-gold meal timing (meal_last_meal_to_
+    bedtime_min, itself COALESCE(cronometer_gold, meal_events)) is the primary meal signal; a
+    day where that column is non-NaN gets NO photo columns, so a meal that is both logged in
+    Cronometer and photographed is not counted twice.
+
+    NO ZERO FILL — photo logging is manual, so "no row" cannot be told apart from "not
+    logged": unlogged days stay NaN, never 0. There is no coverage window.
+
+    photo_ stays out of the forecasting models (NOT_FORECAST_PREFIXES) for the same reason as
+    delivery_: a day's photos are logged by hand at any hour, so the newest row's value is not
+    known when the evening forecast runs. Descriptive + causal analyses only.
+
+    Fail-open: any problem here logs a warning and returns df untouched.
+    """
+    if photo is None or photo.empty:
+        return df
+    try:
+        p = photo.copy()
+        p["photo_day"] = pd.to_datetime(p["eaten_date"], errors="coerce")
+        p["eaten_at"] = pd.to_datetime(p["eaten_at"], utc=True, errors="coerce")
+        p = p.dropna(subset=["photo_day", "eaten_at"])
+        # exclude drink captures and soft-removed meals (sql/direct_drink_capture.sql)
+        if "capture_kind" in p.columns:
+            p = p[p["capture_kind"].isna() | (p["capture_kind"] == "photo")]
+        if "deleted_at" in p.columns:
+            p = p[p["deleted_at"].isna()]
+        if p.empty:
+            return df
+        agg = (p.groupby("photo_day")
+                 .agg(photo_meal_count=("eaten_at", "size"), _last_meal_at=("eaten_at", "max"))
+                 .reset_index())
+        agg["calendar_date"] = agg["photo_day"].dt.strftime("%Y-%m-%d")
+
+        # Gap to sleep: WHOOP sleep onset of the cycle CLOSING the day (the main — longest —
+        # cycle whose onyx_behavioral_date is that day) minus the last meal's eaten_at.
+        agg["photo_last_meal_to_sleep_min"] = np.nan
+        if cycles is not None and not cycles.empty:
+            c = cycles.copy()
+            if {"start_time", "end_time", "onyx_behavioral_date"}.issubset(c.columns):
+                dur = (pd.to_datetime(c["end_time"], utc=True, errors="coerce")
+                       - pd.to_datetime(c["start_time"], utc=True, errors="coerce")).dt.total_seconds()
+                c["_day"] = pd.to_datetime(c["onyx_behavioral_date"], errors="coerce")
+                main = (c.assign(_dur=dur).dropna(subset=["_day", "start_time"])
+                         .sort_values("_dur", ascending=False).drop_duplicates("_day"))
+                onset = dict(zip(main["_day"].dt.strftime("%Y-%m-%d"),
+                                 pd.to_datetime(main["start_time"], utc=True, errors="coerce")))
+                last_meal = dict(zip(agg["calendar_date"],
+                                     pd.to_datetime(agg["_last_meal_at"], utc=True)))
+                for day, meal_at in last_meal.items():
+                    onset_at = onset.get(day)
+                    if onset_at is not None and pd.notna(onset_at) and pd.notna(meal_at):
+                        agg.loc[agg["calendar_date"] == day, "photo_last_meal_to_sleep_min"] = (
+                            (onset_at - meal_at).total_seconds() / 60.0
+                        )
+
+        cols = ["photo_meal_count", "photo_last_meal_to_sleep_min"]
+        out = df.drop(columns=cols, errors="ignore").merge(
+            agg[["calendar_date"] + cols], on="calendar_date", how="left")
+        # Cronometer-gold meal timing already covers the day → the photo columns stay NaN
+        if "meal_last_meal_to_bedtime_min" in out.columns:
+            cronometer_day = out["meal_last_meal_to_bedtime_min"].notna()
+            out.loc[cronometer_day, cols] = np.nan
+        assert len(out) == len(df), "photo-meal merge changed the row count"
+        log.info(
+            f"  Photo-meal features: {int(agg['photo_meal_count'].sum())} meals on "
+            f"{len(agg)} day(s), {int(out['photo_last_meal_to_sleep_min'].notna().sum())} with a gap to sleep"
+        )
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Photo-meal feature merge failed ({e!r}); continuing without photo-meal features")
+        LOAD_FAILURES.add("photo_meals")
+        return df
+
+
 def merge_estimated_intake_features(df: pd.DataFrame, delivery_nutrition: pd.DataFrame | None,
                                     photo_nutrition: pd.DataFrame | None) -> pd.DataFrame:
     """Estimated kcal intake from Uber Eats dish estimates + photo-logged meals (2026-11-16).
@@ -1825,7 +1931,7 @@ def merge_estimated_intake_features(df: pd.DataFrame, delivery_nutrition: pd.Dat
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "pc_", "aqi_", "wx_", "pollen_", "whoop_steps", "est_")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "pc_", "aqi_", "wx_", "pollen_", "whoop_steps", "est_", "photo_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -2873,6 +2979,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
         df["caffeine_total_mg_7d_mean"] = (
             df["caffeine_total_mg"].rolling(7, min_periods=4).mean()
         )
+    df = merge_photo_meal_features(df, data.get("photo_meals"), data.get("whoop_cycles"))
     df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"),
                                  data.get("delivery_unread_days"))
     df = merge_screen_time_features(df, data.get("screen"))

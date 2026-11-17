@@ -122,7 +122,7 @@ DOMAIN_RULES = [
 ]
 
 # Edits to the old root that landed on master after the split and were re-homed when this branch rebased
-# (d376776 on 2026-11-16; the 57 commits after it, onto ed46b6f4, on 2026-11-17):
+# (d376776 on 2026-11-16; the 58 commits after it, onto 86eef57c, on 2026-11-17):
 # (commit, domain file, literal text). Each commit also needs a row in the index's "Root edits made after
 # the split" table, so a rebase that keeps the new root cannot drop the edit unnoticed.
 REHOMED = [
@@ -187,6 +187,7 @@ REHOMED = [
     ("016216d7", "wearables-environment.md", "the count published on D+1 — the pollen Riley breathed on day D, befo"),
     ("07656bd0", "chat-agents.md", "/ `query_photo_meals` (read-only: `pds.photo_meals` per-meal rows + `"),
     ("ed46b6f4", "reading-journal.md", "Voluntary pacing (PROD-T06, 2026-11-17, `lib/learning-pacing.ts`, `app"),
+    ("5f7506a0", "nutrition.md", "`hrv_analysis.py:merge_photo_meal_features`"),
     ("23c40aa8", "ops-ci.md", "Codex reviews only AFTER merge and never before (Riley, 2026-11-17)."),  # same bullet, superseded by cf08a456 and e85d0281
 ]
 

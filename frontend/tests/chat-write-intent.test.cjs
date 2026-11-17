@@ -292,6 +292,29 @@ const MATRIX = [
   ["a sleep question said for today, stored on last night", [user("I used my synthetic mouth tape today")],
     "mark_habit_complete", { habit: "Used synthetic mouth tape?" }, ALLOWED],
 
+  // Round 4 (per-action argument binding): each action's arguments are read from its own clause, never from
+  // another action's clause of the same list or sentence.
+  ["the first product's own amount", [user("Log 5 mg of Synthetic Calm and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg" }, ALLOWED],
+  ["the other product's amount for the second product", [user("Log 5 mg of Synthetic Calm and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Focus", amount: 5, unit: "mg" }, refused("amount_not_stated")],
+  ["yesterday stated for one item, no date sent", [user("Log 5 mg of Synthetic Calm yesterday and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg" }, refused("day_not_stated")],
+  ["yesterday stated for one item, that date sent", [user("Log 5 mg of Synthetic Calm yesterday and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg", date: "2026-11-10" }, ALLOWED],
+  ["a non-number amount", [user("Log 15 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: "15", unit: "mg" }, refused("invalid_value")],
+  ["a time another action of the list states", [user("Log Synthetic Calm at 8 and Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Focus", times: ["08:00"] }, refused("time_not_stated")],
+  ["the time its own action states", [user("Log Synthetic Calm at 8 and Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", times: ["08:00"] }, ALLOWED],
+  ["each reading action its own book, the book being read", [user("I read chapter 3 of Synthetic Book and chapter 4 of Other Synthetic")],
+    "log_reading_session", { chapter_through: 3 }, ALLOWED],
+  ["another action's chapter written to the book being read", [user("I read chapter 3 of Synthetic Book and chapter 4 of Other Synthetic")],
+    "log_reading_session", { chapter_through: 4 }, refused("other_book")],
+  ["each reading action its own book, the other book named", [user("I read chapter 3 of Synthetic Book and chapter 4 of Other Synthetic")],
+    "log_reading_session", { chapter_through: 4, book: "other-synthetic" }, ALLOWED],
+
   // Round 4 (quiz identity): a question that is not a quiz question (an offer, a summary, "anything else") never
   // widens the quiz, and a reply to it — including "yes" — is never a quiz answer. Only the complete active quiz,
   // with its questions recognized, answered, and checkpoint bound, may be scored, once.
@@ -508,6 +531,70 @@ test("a retry is checked against the book its earlier try was pinned to (the rou
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: finished }), refused("not_named"));
   // With the pinned book (ChatLedger.storedContext book_id, mapped to its slug) it reaches the ledger.
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: BOOKS }), ALLOWED);
+});
+
+// The reservation lifecycle of an allowed call (the route reserves before the tool runs, then settles it on the
+// answer): reserved before execution, kept on a success (the completed write) or an uncertain answer, released only
+// by a definitive refusal, so a corrected call may run and a retry reconciles instead of executing again.
+const reserveAndSettle = (messages, tool, input, answers) => {
+  const grant = intent.writeGrantFor(messages);
+  const used = intent.newWriteUsage();
+  const call = (i) => {
+    const d = intent.authorizeWrite(grant, tool, input, { requestDay: DAY, used, books: BOOKS, isSleepHabit });
+    if (!d.allowed) return d.code;
+    intent.commitWrite(used, d); // reserved before the tool runs
+    const [result, failed] = answers[i] ?? [null, false];
+    if (result != null && intent.definitiveRefusal(result, failed)) intent.releaseWrite(used, d);
+    return "allowed";
+  };
+  return { used, call };
+};
+
+test("a definitive refusal from the database releases the reservation: a corrected call may run", () => {
+  const messages = [user("Log 15 mg of Synthetic Focus")];
+  const input = { product: "Synthetic Focus", amount: 15, unit: "mg" };
+  // The database definitively refused the first call (an error answer, nothing written): the corrected call runs.
+  const { call } = reserveAndSettle(messages, "log_supplement_intake", input, [
+    [JSON.stringify({ error: 'No product named "Synthetic Focus"' }), false],
+  ]);
+  assert.deepEqual([call(0), call(1)], ["allowed", "allowed"]);
+  // The same for a once-per-request tool: the released reservation frees its count.
+  const playlist = reserveAndSettle([user("Create a synthetic playlist")], "create_spotify_playlist", { name: "Synthetic Mix", track_ids: ["t1"] }, [
+    [JSON.stringify({ error: "Spotify is not reachable" }), false],
+  ]);
+  assert.deepEqual([playlist.call(0), playlist.call(1)], ["allowed", "allowed"]);
+});
+
+test("an uncertain result keeps the reservation: a repeat in this request is refused, a retry reconciles", () => {
+  const messages = [user("Log 15 mg of Synthetic Focus")];
+  const input = { product: "Synthetic Focus", amount: 15, unit: "mg" };
+  // A timeout (the tool threw) may have written: the reservation stays, so the repeat needs its own words and the
+  // retry of the message reconciles through the SEC-04 ledger under the same operation key instead of running twice.
+  const thrown = reserveAndSettle(messages, "log_supplement_intake", input, [
+    [JSON.stringify({ error: "This tool failed unexpectedly and may have completed only part of its work.", incomplete: true }), true],
+  ]);
+  assert.deepEqual([thrown.call(0), thrown.call(1)], ["allowed", "already_written"]);
+  const lost = reserveAndSettle(messages, "log_supplement_intake", input, [
+    [JSON.stringify({ error: "Onyx could not confirm this intake and it may have been logged.", incomplete: true }), false],
+  ]);
+  assert.deepEqual([lost.call(0), lost.call(1)], ["allowed", "already_written"]);
+  // A success keeps the reservation too (it is the completed write): no second call on the same words.
+  const done = reserveAndSettle(messages, "log_supplement_intake", input, [
+    [JSON.stringify({ success: true, date: DAY }), false],
+  ]);
+  assert.deepEqual([done.call(0), done.call(1)], ["allowed", "already_written"]);
+});
+
+test("definitiveRefusal: only an error answer that wrote nothing; a throw, a success or an incomplete answer is uncertain", () => {
+  const err = (extra) => JSON.stringify({ error: "synthetic refusal", ...extra });
+  assert.equal(intent.definitiveRefusal(err(), false), true);
+  assert.equal(intent.definitiveRefusal(err({ removed_since: true }), false), true); // written and removed since: not written now
+  assert.equal(intent.definitiveRefusal(err({ incomplete: true }), false), false);
+  assert.equal(intent.definitiveRefusal(err({ uncertain: true }), false), false);
+  assert.equal(intent.definitiveRefusal(JSON.stringify({ success: true, date: DAY }), false), false);
+  assert.equal(intent.definitiveRefusal(err(), true), false); // the tool threw: it may have written part of its work
+  assert.equal(intent.definitiveRefusal("not json", false), false);
+  assert.equal(intent.definitiveRefusal(JSON.stringify(["an array"]), false), false);
 });
 
 test("a bank answer or a flag is granted once per message", () => {
