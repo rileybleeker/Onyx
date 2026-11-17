@@ -8,6 +8,7 @@ import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
 import { medicalBackupCard, type BackupHeartbeat } from "@/lib/medical-backup-status";
+import { hrvArtifactState } from "@/lib/hrv-artifact-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -338,7 +339,7 @@ export async function GET() {
       ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -452,6 +453,11 @@ export async function GET() {
       // HRV retrain: daily safety net + conditional hourly runs, so its newest heartbeat (incl. a
       // failed "GUARD …" row from the alignment check) can fall out of the 100-row window.
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_analysis").eq("data_type", "retrain")
+        .order("sync_start", { ascending: false }).limit(1),
+      // HRV forecast model artifact (hrv_predict|model_artifact, PIPE-08): the predict job
+      // heartbeats which published artifact served the forecast and why a forecast was
+      // skipped. Deduped, so its newest row can fall out of the 100-row window — own read.
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_predict").eq("data_type", "model_artifact")
         .order("sync_start", { ascending: false }).limit(1),
       // Supplement stack reminders: the sms-reminders Worker polls /api/supplements/reminders/claim
       // and each poll (throttled to ~1/h when nothing is due) writes a heartbeat. Dedicated fetch so
@@ -689,27 +695,36 @@ export async function GET() {
         integrationMethod: METHOD.cronometer.method,
         methodLabel: METHOD.cronometer.label,
       },
-      hrv_analysis: {
-        label: "HRV Analysis",
-        lastSync: hrvDate,
-        // Prediction-pipeline drift takes priority over freshness lag: if
-        // any of the last 30 days is missing a live xgboost forecast, the
-        // pipeline silently broke that day — degrade to 'partial' even if
-        // today's forecast is on time.
-        status: (hrvGapsRes.data?.length ?? 0) > 0
-          ? "partial"
-          : deriveStatus(null, hrvLag),
-        latestDataDate: hrvDate,
-        daysLag: hrvLag,
-        recordsSynced: 0,
-        durationSeconds: null,
-        errorMessage: (hrvGapsRes.data?.length ?? 0) > 0
-          ? `${hrvGapsRes.data!.length} prediction gap${hrvGapsRes.data!.length === 1 ? "" : "s"} in last 30d: ${(hrvGapsRes.data as Array<{ expected_date: string; gap_type: string }>).slice(0, 3).map((g) => `${g.expected_date} (${g.gap_type})`).join(", ")}${hrvGapsRes.data!.length > 3 ? "…" : ""}`
-          : null,
-        cadence: CADENCE.hrv_analysis,
-        integrationMethod: METHOD.hrv_analysis.method,
-        methodLabel: METHOD.hrv_analysis.label,
-      },
+      hrv_analysis: (() => {
+        // The forecast's model-artifact heartbeat (hrv_predict|model_artifact, PIPE-08): a
+        // failed / partial row means the forecast was refused or served an unchecked model,
+        // which the prediction gaps above cannot see. It outranks the gap signal here; with
+        // no row yet the card keeps its prediction-gap-only reading.
+        const artifactEntry = (hrvArtifactSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? latestBySrcType["hrv_predict|model_artifact"] ?? null;
+        const artifact = hrvArtifactState(artifactEntry as Parameters<typeof hrvArtifactState>[0]);
+        const gaps = hrvGapsRes.data?.length ?? 0;
+        let status: SourceStatus["status"];
+        if (artifact.status === "failed") status = "failed";
+        else if (artifact.status === "partial") status = "partial";
+        else status = gaps > 0 ? "partial" : deriveStatus(null, hrvLag);
+        return {
+          label: "HRV Analysis",
+          lastSync: hrvDate,
+          status,
+          latestDataDate: hrvDate,
+          daysLag: hrvLag,
+          recordsSynced: 0,
+          durationSeconds: null,
+          errorMessage: artifact.errorMessage
+            ?? (gaps > 0
+              ? `${gaps} prediction gap${gaps === 1 ? "" : "s"} in last 30d: ${(hrvGapsRes.data as Array<{ expected_date: string; gap_type: string }>).slice(0, 3).map((g) => `${g.expected_date} (${g.gap_type})`).join(", ")}${gaps > 3 ? "…" : ""}`
+              : null),
+          cadence: CADENCE.hrv_analysis,
+          integrationMethod: METHOD.hrv_analysis.method,
+          methodLabel: METHOD.hrv_analysis.label,
+        };
+      })(),
       // HRV Retrain (separate from Predict above) — tracks whether
       // hrv_analysis.py is actually completing. The predict path can stay
       // green while the retrain crashes silently (cached model keeps serving),
