@@ -69,6 +69,8 @@ export function backupCodeMessage(code: string): string {
     return "A copied row points into a table no backup holds (parent_not_recoverable): see UNCOVERED_TABLES in the backup job.";
   if (code === "marker_unwritable")
     return "The backup was written but its completeness marker could not be saved (marker_unwritable): check write access to the OneDrive backup folder; nothing was pruned.";
+  if (code === "pending_upload")
+    return "The encrypted backup was written but OneDrive has not confirmed it in the cloud (pending_upload): check the OneDrive sync icon on the PC; nothing was pruned.";
   if (code === "locked") return "A backup run was already in progress (locked).";
   if (code.startsWith("crash_")) return `The backup job stopped with an error (${code}): see %LOCALAPPDATA%\\Onyx\\medical-backup\\backup.log.`;
   return `The last backup reported ${code}.`;

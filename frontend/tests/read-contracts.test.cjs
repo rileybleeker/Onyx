@@ -119,6 +119,8 @@ function fakeSupabase(respond) {
 
 const okRoutes = (rows) => (u) => {
   if (u.pathname === "/rest/v1/rpc/behavioral_today_now") return [200, TODAY];
+  // The question bank's summary (READ-QUIZ-01): no book summary answers null, like the function does.
+  if (u.pathname === "/rest/v1/rpc/reading_bank_summary") return [200, null];
   if (u.pathname === "/rest/v1/books") return [200, rows];
   return [404, { message: "unexpected " + u.pathname }];
 };
@@ -129,8 +131,8 @@ test("reading overview: one embedded books request with every child ordered and 
   const o = await R.getOverview(db.client);
   const books = db.requests.filter((r) => r.url.pathname === "/rest/v1/books");
   assert.equal(books.length, 1, "one request for the book and all its children");
-  assert.equal(db.requests.length, 2, "plus behavioral today, nothing else");
-  assert.equal(db.maxInFlight(), 2, "the two requests are in flight together");
+  assert.equal(db.requests.length, 3, "plus behavioral today and the question bank's summary, nothing else");
+  assert.equal(db.maxInFlight(), 3, "the three requests are in flight together");
   const p = books[0].url.searchParams;
   const select = p.get("select").replace(/\s/g, "");
   for (const rel of ["reading_sessions(*)", "book_highlights(*,reading_reviews(review_id,highlight_id,review_date,grade))", "reading_quizzes(*)", "book_chapters("]) {

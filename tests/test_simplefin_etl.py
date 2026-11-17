@@ -1859,6 +1859,45 @@ def test_store_marks_reported_and_reads_named_rows_by_key():
     assert sf.Store(db).history_rows(set()) == [] and db.calls == []
 
 
+def test_holding_and_activity_rows():
+    a = sf.SfAccount("A9", "Brokerage", "Demo", "", None, "USD", 100000, None,
+                     transactions=[{"id": "t1", "amount": "250.00", "posted": ts("2026-11-18"), "transacted_at": ts("2026-11-17"),
+                                    "description": "DEPOSIT"},
+                                   {"id": "t2", "amount": "-5.00", "posted": 0, "description": "PENDING"},
+                                   {"id": "", "amount": "1.00", "posted": ts("2026-11-18")}],
+                     holdings=[{"id": "h1", "symbol": "ABC", "description": "Demo fund", "shares": "10.5",
+                                "market_value": "1234.56", "cost_basis": "1000", "purchase_price": "95.2",
+                                "currency": "", "created": ts("2026-11-01")},
+                               {"id": "", "symbol": "NOID"},
+                               {"id": "h2", "shares": "n/a", "market_value": None}])
+    when = datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
+    hs = sf.holding_rows(a, "k1", when)
+    assert [h["holding_id"] for h in hs] == ["h1", "h2"]
+    assert hs[0]["market_value_cents"] == 123456 and hs[0]["cost_basis_cents"] == 100000
+    assert hs[0]["shares"] == 10.5 and hs[0]["currency"] == "USD" and hs[0]["symbol"] == "ABC"
+    assert hs[1]["shares"] is None and hs[1]["market_value_cents"] is None
+    acts = sf.activity_rows(a, "k1", when)
+    assert len(acts) == 1 and acts[0]["amount_cents"] == 25000 and acts[0]["txn_date"] == "2026-11-17"
+
+
+def test_write_investments_never_raises():
+    class Boom:
+        def upsert_holdings(self, rows):
+            raise RuntimeError("secret detail")
+
+        def upsert_activity(self, rows):
+            pass
+
+    plan = sf.Plan({}, [], [], [], [], [], sf.Counter(), [], sf.Counter(), sf.Counter(), sf.Counter(),
+                   holdings=[{"x": 1}], activity=[])
+    lines = []
+    sf.write_investments(Boom(), plan, lines.append)
+    assert lines == ["  investments: not written (RuntimeError)"]
+    lines.clear()
+    sf.write_investments(Boom(), sf.Plan({}, [], [], [], [], [], sf.Counter(), [], sf.Counter(), sf.Counter(), sf.Counter()), lines.append)
+    assert lines == []
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

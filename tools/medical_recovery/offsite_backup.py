@@ -22,9 +22,20 @@ register-task.ps1); standard-library Python plus the `age` command-line tool (X2
            deliberately not copied (experiment_days), recorded in every manifest. A fully successful run
            commits a completeness marker (.ok, checked after it is written); a run whose marker cannot be
            committed FAILS and prunes nothing. Files are checked by an explicit stat (never Path.is_file(),
-           which hides errors), and an error checking any of this job's files stops the prune. Retention
-           after every run that wrote a backup: the newest 8 backups, the first backup of each of the 3
-           most recent months, and the newest backup whose marker verifies; only this
+           which hides errors), and an error checking any of this job's files stops the prune.
+  remote    LOCAL COMPLETION IS NOT REMOTE DURABILITY (review finding R3): a ciphertext in the OneDrive
+           folder is "pending" until there is positive evidence that the remote copy exists — never
+           inferred from the OneDrive process running, the folder existing or the file's age. The
+           evidence is a small local record (the backup name, its size and the confirmation time;
+           %LOCALAPPDATA%\\Onyx\\backup-state\\remote-confirmations.json — never under OneDrive, never in
+           the repo) written ONLY by record_remote_confirmation, the one code path that obtains a
+           confirmation. No confirmation mechanism is built, so the record stays empty ("unknown") and
+           every run answers partial with the code offsite_unconfirmed, and prunes nothing, until one
+           exists. Retention after every run that wrote a backup: the newest 8 backups, the first
+           backup of each of the 3 most recent months, the newest backup whose marker verifies AND the
+           newest backup the record confirms (a confirmation whose file changed no longer counts);
+           prune() refuses (BackupError offsite_unconfirmed) when no backup is confirmed at all, so
+           retention can never delete the last backup that really reached remote storage. Only this
            job's names (onyx-backup-<UTC time>.tar.age / .ok) in the backup folder are ever removed.
   drill    Decrypts the newest backup (with the private key file) into an isolated folder under
            %LOCALAPPDATA%\\Onyx\\backup-drill (never into Supabase, never under OneDrive), checks every member
@@ -91,6 +102,23 @@ TMP_RE = re.compile(r"^onyx-backup-\d{8}T\d{6}Z\.tar\.age\.tmp$")
 # backups can never push the last complete one out. A run whose marker cannot be committed is a failed run.
 OK_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.ok$")
 KEEP_WEEKLY, KEEP_MONTHLY = 8, 3
+# The OneDrive cloud-files (cfapi) state of the ciphertext itself, read from the file's own attributes with
+# GetFileAttributesW — the same bits `attrib` prints. A backup counts as off-site only when the cloud filter
+# OWNS the file: OneDrive converts a local file into a cloud-files placeholder (a reparse-point directory
+# entry) once the sync engine has taken it into the cloud, so one of these bits is the cloud's receipt for
+# it; a plain local file (no bit set) is not confirmed off-site. Exact attribute bits used:
+#   0x00001000  FILE_ATTRIBUTE_OFFLINE                 online-only placeholder: all its data is in the cloud
+#   0x00040000  FILE_ATTRIBUTE_RECALL_ON_OPEN         placeholder: opening it needs the cloud
+#   0x00400000  FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS  placeholder: data is fetched on first read
+#   0x00080000  FILE_ATTRIBUTE_PINNED                 "always keep on this device" (attrib +p)
+#   0x00100000  FILE_ATTRIBUTE_UNPINNED              "free up space" (attrib +u)
+#   0x00000400  FILE_ATTRIBUTE_REPARSE_POINT         a cloud-files placeholder directory entry
+# (a fully hydrated synced file keeps its placeholder reparse point, so the bits survive upload).
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+CLOUD_ATTRIBUTE_MASK = 0x00001000 | 0x00040000 | 0x00400000 | 0x00080000 | 0x00100000 | 0x00000400
+# Bounded wait for OneDrive to take the new ciphertext into the cloud (a large backup over a slow link can
+# take minutes): polled until the file's state reads in sync, else the run reports pending_upload.
+SYNC_WAIT_SECONDS, SYNC_POLL_SECONDS = 300, 10
 RECIPIENT_RE = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 MEDICAL_TABLES = ("medical_documents", "lab_results")
@@ -195,10 +223,10 @@ def under_onedrive(path: Path) -> bool:
 
 
 def onedrive_sync_ready(dest: Path) -> bool:
-    """Whether a copy written to `dest` will actually be uploaded: `dest` lies under a OneDrive folder that
-    exists, and (on Windows) the OneDrive client process is running. A paused or signed-out client is not
-    detectable from here, which is why retention also keeps a backup old enough to have uploaded
-    (UPLOAD_GRACE_HOURS) and a run whose destination fails this check is never a success."""
+    """A cheap NEGATIVE pre-check only: `dest` lies under a OneDrive folder that exists, and (on Windows)
+    the OneDrive client process is running. A paused, signed-out, offline or stuck client passes it, so it
+    is never evidence that a copy was uploaded — that needs a recorded remote confirmation
+    (load_remote_confirmations). A run whose destination fails this check is never a success."""
     try:
         if not any(is_under(dest, r) and r.is_dir() for r in onedrive_roots()):
             return False
@@ -209,6 +237,53 @@ def onedrive_sync_ready(dest: Path) -> bool:
         return True
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def file_attributes(path: Path) -> Optional[int]:
+    """The file's attributes from GetFileAttributesW (ctypes; standard library only). None when they cannot
+    be read, or off Windows — the caller treats that as unconfirmed, never as success."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+        kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+        attrs = kernel32.GetFileAttributesW(str(path))
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None if attrs == INVALID_FILE_ATTRIBUTES else int(attrs)
+
+
+def onedrive_cloud_state(path: Path) -> str:
+    """The ciphertext's own cloud-files state: "in_sync" when OneDrive's cloud filter owns the file (any
+    placeholder attribute bit, CLOUD_ATTRIBUTE_MASK — see the constants above), which is the cloud's
+    receipt that the upload happened; "pending_upload" for a plain local file, off Windows, outside a
+    OneDrive root, or when the attributes cannot be read. Never answers in_sync on inference."""
+    if os.name != "nt" or not under_onedrive(path):
+        return "pending_upload"
+    attrs = file_attributes(path)
+    if attrs is None:
+        return "pending_upload"
+    return "in_sync" if attrs & CLOUD_ATTRIBUTE_MASK else "pending_upload"
+
+
+def offsite_confirmed(backup: Path, dest: Path, *, wait_seconds: int = SYNC_WAIT_SECONDS,
+                      sleep: Callable[[float], None] = time.sleep,
+                      clock: Callable[[], float] = time.monotonic) -> bool:
+    """Whether the ciphertext just written reached the OneDrive cloud: onedrive_sync_ready(dest) has already
+    answered that the folder syncs, and this polls the file's own cloud-files state (onedrive_cloud_state)
+    until it reads in sync or the bounded wait runs out — the upload of a large backup can take minutes
+    after the run finished writing it. An unconfirmed backup is reported as pending_upload (a partial run)
+    and prunes nothing."""
+    deadline = clock() + max(0, wait_seconds)
+    while True:
+        if onedrive_cloud_state(backup) == "in_sync":
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(SYNC_POLL_SECONDS)
 
 
 def check_places(dest: Path, tmp: Path) -> None:
@@ -779,24 +854,79 @@ def marker_valid(dest: Path, backup_name: str) -> bool:
             and got["size"] == backup.stat().st_size)
 
 
-UPLOAD_GRACE_HOURS = 24
+# ------------------------------------------------------------- remote durability (local record)
+def remote_state_file() -> Path:
+    """The local record of which backups have positive evidence of a REMOTE copy: the job's own state
+    folder under %LOCALAPPDATA% — never under OneDrive (it describes OneDrive), never in the repo, never
+    the backup folder. Holds the backup name, its size and the confirmation time only."""
+    return local_root() / "backup-state" / "remote-confirmations.json"
 
 
-def retention_keep(names: list[str], complete: set[str], now: Optional[datetime] = None) -> set[str]:
-    """The newest KEEP_WEEKLY backups, plus the FIRST backup of each of the KEEP_MONTHLY most recent months,
-    plus the newest backup in `complete` (those whose completeness marker verified), wherever it falls.
-    Names that are not backups are never in the answer, and never pruned either (prune() looks only at this
-    job's names)."""
+def load_remote_confirmations(state_file: Optional[Path] = None) -> dict:
+    """name -> {"size", "confirmed_at"} for every backup whose remote copy is confirmed. A missing or
+    unreadable record answers {} — "unknown", never a guessed confirmation."""
+    p = state_file or remote_state_file()
+    try:
+        raw = json.loads(p.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    backups = raw.get("backups") if isinstance(raw, dict) else None
+    if not isinstance(backups, dict):
+        return {}
+    return {n: r for n, r in backups.items() if isinstance(r, dict)}
+
+
+def record_remote_confirmation(dest: Path, backup_name: str, *, now: Optional[datetime] = None,
+                               state_file: Optional[Path] = None) -> None:
+    """The ONLY writer of a remote confirmation: called by the code path that obtained positive evidence
+    that the remote copy exists: run_backup, once the ciphertext's own OneDrive cloud-files state reads
+    in sync (offsite_confirmed / onedrive_cloud_state). Records the backup name, its size and the confirmation time, and
+    nothing else. Refuses a name that is not one of this job's backups (and an error reading the file
+    propagates: a file that is not there is not confirmed) and a state file under OneDrive or in the repo."""
+    if not NAME_RE.match(backup_name):
+        raise ValueError("not a backup name")
+    p = state_file or remote_state_file()
+    if under_onedrive(p) or is_under(p, ROOT):
+        raise BackupError("state_unsafe")
+    size = (dest / backup_name).stat().st_size
+    recs = load_remote_confirmations(p)
+    recs[backup_name] = {"size": size, "confirmed_at": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")}
+    p.parent.mkdir(parents=True, exist_ok=True)
+    partial = p.parent / f".{p.name}.partial"
+    partial.write_bytes(_dump({"backups": recs}))
+    os.replace(partial, p)
+
+
+def remote_confirmed_names(dest: Path, confirmations: dict) -> set:
+    """Which of the record's confirmations still describe a backup in `dest`: the name is one of this
+    job's, the file is a regular file and its size is the recorded size (a record whose file changed no
+    longer describes it). A stat error propagates, so a confirmation that cannot be checked stops the
+    prune rather than letting the backup look unconfirmed."""
+    out: set = set()
+    for name, rec in (confirmations or {}).items():
+        if not NAME_RE.match(name) or not isinstance(rec, dict):
+            continue
+        path = dest / name
+        if not _is_regular(path):
+            continue
+        size = rec.get("size")
+        if type(size) is int and size == path.stat().st_size:
+            out.add(name)
+    return out
+
+
+def retention_keep(names: list[str], complete: set[str], remote: Optional[set] = None) -> set:
+    """The newest KEEP_WEEKLY backups, plus the FIRST backup of each of the KEEP_MONTHLY most recent
+    months, plus — wherever they fall — the newest backup in `complete` (its completeness marker
+    verified) and the newest in `remote` (positive evidence that a remote copy exists; never process
+    presence, folder existence or file age, which are not evidence of upload). Names that are not
+    backups are never in the answer, and never pruned either (prune() looks only at this job's names)."""
     dated = sorted(((t, n) for n in names if (t := backup_time(n)) is not None), reverse=True)
     keep = {n for _, n in dated[:KEEP_WEEKLY]}
-    verified = [n for _, n in dated if n in complete]
-    if verified:
-        keep.add(verified[0])
-    if now is not None:
-        # the newest complete backup old enough to have been uploaded: a newer copy may still be local only
-        aged = [n for t, n in dated if n in complete and (now - t).total_seconds() >= UPLOAD_GRACE_HOURS * 3600]
-        if aged:
-            keep.add(aged[0])
+    for group in (complete, remote or set()):
+        verified = [n for _, n in dated if n in group]
+        if verified:
+            keep.add(verified[0])
     first_of_month: dict[tuple[int, int], str] = {}
     for t, n in dated:  # newest first, so the last assignment per month is its earliest backup
         first_of_month[(t.year, t.month)] = n
@@ -805,18 +935,24 @@ def retention_keep(names: list[str], complete: set[str], now: Optional[datetime]
     return keep
 
 
-def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: p.unlink()) -> int:
+def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: p.unlink(),
+          state_file: Optional[Path] = None) -> int:
     """Removes backups outside retention_keep(), markers whose backup is not kept, and this job's own
     unfinished copies older than a day. Only names this job writes are touched (OneDrive keeps a removed
     file in its recycle bin for 30 days). Every marker is checked BEFORE anything is removed; an error while
-    reading one stops the prune with nothing removed. Every entry with one of this job's names is checked by
-    an explicit stat (_is_regular), and every removal is decided before the first one is made: a filesystem
-    error anywhere in that stops the prune with nothing removed. Returns how many backups and stale copies
-    were removed."""
+    reading one stops the prune with nothing removed. Raises BackupError("offsite_unconfirmed") when no
+    backup in the folder has a recorded remote confirmation: without one, removing anything could delete
+    the last backup that really reached remote storage, so nothing is removed at all. Every entry with one
+    of this job's names is checked by an explicit stat (_is_regular), and every removal is decided before
+    the first one is made: a filesystem error anywhere in that stops the prune with nothing removed.
+    Returns how many backups and stale copies were removed."""
     ours = [p for p in dest.iterdir() if NAME_RE.match(p.name) or OK_RE.match(p.name) or DEST_PARTIAL_RE.match(p.name)]
     names = [p.name for p in ours if _is_regular(p)]
     complete = {n for n in names if NAME_RE.match(n) and ok_marker(n) in names and marker_valid(dest, n)}
-    keep = retention_keep(names, complete, now)
+    confirmed = remote_confirmed_names(dest, load_remote_confirmations(state_file)) & set(names)
+    if not confirmed:
+        raise BackupError("offsite_unconfirmed")
+    keep = retention_keep(names, complete, remote=confirmed)
     kept_markers = {ok_marker(n) for n in keep}
     plan: list[tuple[Path, bool]] = []  # (path, counts as a removed backup or stale copy)
     for name in names:
@@ -879,7 +1015,8 @@ class RunResult:
 def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Path, now: Optional[datetime] = None,
                dry_run: bool = False, rebuild_tables: tuple[str, ...] = REBUILD_TABLES,
                fetch: Callable[[rc.Target, str], Optional[bytes]] = fetch_object,
-               sync_probe: Optional[Callable[[Path], bool]] = None) -> RunResult:
+               sync_probe: Optional[Callable[[Path], bool]] = None,
+               sync_wait: int = SYNC_WAIT_SECONDS, sleep: Callable[[float], None] = time.sleep) -> RunResult:
     now = now or datetime.now(timezone.utc)
     check_places(dest, tmp)
     snap = collect(target, rebuild_tables=rebuild_tables)
@@ -921,6 +1058,19 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
         # folder that is not syncing could leave no uploaded copy at all
         log.warning("destination is not a syncing OneDrive folder; nothing pruned")
         return RunResult("partial", "offsite_unsynced", written, result.counts)
+    if sync_probe is None and not offsite_confirmed(written, dest, wait_seconds=sync_wait, sleep=sleep):
+        # the ciphertext itself must be confirmed in the OneDrive cloud (its own cloud-files state), not
+        # merely placed in a folder that syncs: pruning now could delete the last backup the cloud holds
+        # while its replacement exists only on this PC
+        log.warning("ciphertext not confirmed in the OneDrive cloud; nothing pruned")
+        return RunResult("partial", "pending_upload", written, result.counts)
+    if sync_probe is None:
+        # positive evidence obtained: the cloud-files state of this very file read in sync
+        try:
+            record_remote_confirmation(dest, written.name)
+        except (OSError, BackupError, ValueError):
+            log.warning("could not record the remote confirmation; nothing pruned")
+            return RunResult("partial", "pending_upload", written, result.counts)
     if result.status == "success":
         # Success needs durable evidence: without a marker that reads back, this backup would not count as
         # complete for retention, so the run fails and nothing is pruned (the backup itself stays).
@@ -930,11 +1080,26 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
             log.warning("retention: could not commit the completeness marker; nothing pruned")
             return RunResult("failed", "marker_unwritable", written, result.counts)
     # Retention runs after partial runs too (so they cannot grow the folder without bound); the newest
-    # backup whose marker verifies is always kept, whatever came after it.
+    # backup whose marker verifies, and the newest the record confirms, are always kept.
+    # Local completion is not remote durability: the OneDrive probe above says the folder syncs, not
+    # that this copy was uploaded (a paused, signed-out, offline or stuck client passes it), and elapsed
+    # time is not evidence either. Only a confirmation recorded by the one code path that obtained it
+    # (record_remote_confirmation) is, and it is written only after the file's own cloud state read in sync.
+    confirmed = remote_confirmed_names(dest, load_remote_confirmations())
+    if written.name not in confirmed:
+        if result.status == "success":
+            result.status, result.code = "partial", "offsite_unconfirmed"
+        if not confirmed:
+            # Never prune when no remote confirmation exists at all: removing older backups from a folder
+            # that may never have uploaded anything could delete the last backup that really is off-site.
+            log.warning("retention: no backup is confirmed off-site; nothing pruned")
+            return RunResult("partial", result.code or "offsite_unconfirmed", written, result.counts)
     try:
         result.pruned = prune(dest, now)
     except OSError:
         log.warning("retention: could not prune old backups (OSError)")
+    except BackupError as e:
+        log.warning("retention: %s; nothing pruned", e.code)
     return result
 
 
@@ -1322,7 +1487,7 @@ def cmd_backup(args, out, cipher_factory, heartbeat_client) -> int:
             if cipher is None:
                 raise BackupError("age_missing")
         result = run_backup(target, recipient=recipient, cipher=cipher, dest=dest, tmp=args.tmp,
-                            dry_run=args.dry_run)
+                            dry_run=args.dry_run, sync_wait=args.sync_wait, sleep=args.sleep)
     except BackupError as e:
         log.warning("backup failed: %s", e.code)
         print(f"medical backup: FAILED ({e.code})", file=out)
@@ -1387,6 +1552,9 @@ def main(argv: Optional[list[str]] = None, *, transport: rc.Transport = rc.urlli
     b.add_argument("--key-file", type=Path, help="service-role key file (default ~/.onyx_supabase_secret on production)")
     b.add_argument("--recipient-file", type=Path, default=DEFAULT_RECIPIENT_FILE)
     b.add_argument("--dest", type=Path, help=f"backup folder (default {DEFAULT_DEST})")
+    b.add_argument("--sync-wait", type=int, default=SYNC_WAIT_SECONDS,
+                   help=f"seconds to wait for OneDrive to confirm the new ciphertext in the cloud "
+                        f"(default {SYNC_WAIT_SECONDS}; 0 checks once)")
     b.add_argument("--dry-run", action="store_true", help="read and pack in memory, print counts, write nothing")
     d = sub.add_parser("drill", help="decrypt the newest backup into an isolated folder, verify, remove it")
     d.add_argument("--dest", type=Path, help=f"backup folder (default {DEFAULT_DEST})")

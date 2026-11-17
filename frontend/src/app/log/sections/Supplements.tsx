@@ -25,7 +25,7 @@ import {
   visibleOptions,
   type UsageRow,
 } from "@/lib/log-supplement-options";
-import { DraftMark, LogCard, LogSaveButton, SectionSkeleton } from "./ui";
+import { DraftMark, LogCard, LogSaveButton } from "./ui";
 
 /**
  * /log Supplements (AGENTS.md "Log screen"). Three parts, all through the existing supplement routes:
@@ -823,19 +823,9 @@ export default function SupplementsSection() {
 
   // ---- render ----
 
-  const nothingYet = !today && !stacks;
-  if (nothingYet && (todayState === "loading" || stacksState === "loading")) return <SectionSkeleton section="supplements" />;
-  if (nothingYet) {
-    return (
-      <LogCard title="Supplements">
-        <p className="text-[13px] text-text-secondary">Couldn&apos;t load supplements.</p>
-        <button type="button" className={`${btn} mt-3`} onClick={() => { setTodayState("loading"); setStacksState("loading"); loadAll(); }}>
-          Retry
-        </button>
-      </LogCard>
-    );
-  }
-
+  // The product options show as soon as the products are known (their order bounded by the device's own copies, at
+  // most LOCAL_WAIT_MS); the stacks and today reads never gate them. Each sub-area holds its own loading, error and
+  // Retry state, and the only write stays the log-product POST (and the stacks / logged-today actions) below.
   return (
     <LogCard title="Supplements">
       {openSuggestions.length > 0 && (
@@ -934,7 +924,10 @@ export default function SupplementsSection() {
           <p className="text-[13px] text-text-tertiary">No stacks yet</p>
         )
       ) : stacksState === "failed" ? (
-        <p className="text-[13px] text-text-secondary">Couldn&apos;t load stacks.</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-[13px] text-text-secondary">Couldn&apos;t load stacks.</p>
+          <button type="button" className={btn} onClick={() => { setStacksState("loading"); loadAll(); }}>Retry</button>
+        </div>
       ) : (
         <div className="space-y-2" aria-hidden>{[0, 1].map((i) => <div key={i} className="skeleton h-11 rounded-control" />)}</div>
       )}
@@ -1094,7 +1087,10 @@ export default function SupplementsSection() {
             <p className="text-[13px] text-text-tertiary">Nothing else logged today</p>
           )
         ) : todayState === "failed" ? (
-          <p className="text-[13px] text-text-secondary">Couldn&apos;t load today&apos;s intakes.</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-[13px] text-text-secondary">Couldn&apos;t load today&apos;s intakes.</p>
+            <button type="button" className={btn} onClick={() => { setTodayState("loading"); loadAll(); }}>Retry</button>
+          </div>
         ) : (
           <div className="skeleton h-11 rounded-control" aria-hidden />
         )}

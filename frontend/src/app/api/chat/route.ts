@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, RETRIEVED_DATA_NOTE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
 import { authorizeWrite, chatWritesOff, commitWrite, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
-import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
+import { WRITE_GATE, WRITE_GATE_ANSWER, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, readingQuestLine, type QuestBook, type WriteReceipt } from "@/lib/chat-receipts";
 import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
 import { createClient } from "@supabase/supabase-js";
@@ -12,8 +12,11 @@ import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/sup
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
 import { BOOK_COLS, HIGHLIGHT_COLS, HIGHLIGHT_EXISTS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
-import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
+import { findMirroredEntry, mirrorHighlight } from "@/lib/reading-notion";
+import { createEntryClaimOf, discardEntry, placeEntry, rewriteProgressNow } from "@/lib/reading-removal";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
+import { CHAT_QUESTIONS_MAX, FLAG_KINDS, SLUG_RE, chatAttemptKey, chatFlagKey, chatRoundKey, flagQuestion, questionsForChat, recordAttempt, recordChatAnswer, type ChatQuestion, type FlagKind } from "@/lib/reading-recall-server";
+import { DONT_KNOW_ANSWER, isDontKnow, normalizeAnswer, orderAnswerText, parseRubric } from "@/lib/reading-recall";
 import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
 
 /**
@@ -50,13 +53,69 @@ You can also create Spotify playlists, but only when the user explicitly asks yo
 - Use query_spotify_tracks_by_features to pick tracks from their listening history (filter by audio-feature ranges like valence, energy, tempo).
 - Use search_spotify_catalog when they want tracks they haven't listened to before, or when filling out a playlist beyond what their history covers.
 - Once you have track IDs (mix sources freely), call create_spotify_playlist directly — they already asked for it and playlists are private and easily deleted, so no extra confirmation is needed.
-- Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.
+- Default to ~25–40 tracks unless the user specifies otherwise. Give the playlist a descriptive name that reflects the user's request.`;
 
-The user is also reading a book as a tracked "reading quest" (currently The Goal by Goldratt, 40 chapters, target Nov 30 2026). Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. Kindle reading logs ITSELF: a local harvester turns Kindle highlights, notes and the reading position into source='kindle' sessions (recall = their Kindle notes), so never ask them to log Kindle sessions or re-enter Kindle highlights; manual logging is for audiobook/paper reading only. When they ask you to save or highlight a passage ("highlight this: …", "save this quote and note that …"), call add_book_highlight; a passage they merely quote while asking a question is not a request to save it. When they ask to be quizzed ("quiz me on The Goal through chapter 12"), first call get_reading_status, then ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes; grade each answer honestly; then call record_reading_quiz with checkpoint 'ch<N>' and the score. Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due).
-
-Replies are rendered as Markdown. Use a table when comparing several days or metrics side by side (at most about five columns: it is often read on a phone), short lists for steps or options, bold for the key figure, and plain paragraphs otherwise. Do not use raw HTML.
+// The reading paragraph is not in here: systemPrompt() adds it per request, because its first sentence names the
+// active book (readingQuestLine), which the public code must not.
+// After the reading paragraph; the clock follows it (systemPrompt()).
+const SYSTEM_PROMPT_TAIL = `Replies are rendered as Markdown. Use a table when comparing several days or metrics side by side (at most about five columns: it is often read on a phone), short lists for steps or options, bold for the key figure, and plain paragraphs otherwise. Do not use raw HTML.
 
 Format numbers clearly. Use relative comparisons (e.g., "your HRV is 15% above your weekly average"). When comparing across devices, note any discrepancies. When you don't have enough data, say so.`;
+
+/**
+ * Everything the model is told about reading apart from which book it is (that sentence is readingQuestLine). A quiz
+ * runs on the question bank (READ-QUIZ-01): sourced questions on finished chapters, one recorded answer each. The free
+ * quiz (record_reading_quiz, shown as unverified) is only the fallback when the bank is off for the book. Onyx records
+ * a bank answer only for the question labelled "Q<id>" in your previous message, and only as the user's own latest
+ * reply (lib/chat-write-intent.ts), so every question asked carries its label.
+ */
+const READING_RULES = `Use get_reading_status for progress, pace and coaching. When they report reading ("finished chapters 3 and 4 on my run, here's what I remember: …"), call log_reading_session and pass their recall text VERBATIM — never summarize it. Kindle reading logs ITSELF: a local harvester turns Kindle highlights, notes and the reading position into source='kindle' sessions (recall = their Kindle notes), so never ask them to log Kindle sessions or re-enter Kindle highlights; manual logging is for audiobook/paper reading only. When they ask you to save or highlight a passage ("highlight this: …", "save this quote and note that …"), call add_book_highlight; a passage they merely quote while asking a question is not a request to save it.
+
+When they ask to be quizzed ("quiz me", "quiz me on chapter 12", "quiz me on what I got wrong", "quiz me on the book I finished"), use the question bank: call get_reading_questions (mode 'chapter' with the chapter when they name one, 'weak' for what they missed before, otherwise 'due'; for a finished book pass its slug as book) and ask its questions ONE AT A TIME, each with its prompt and a label with its number and chapter, e.g. "(Q1234 · ch 3)", always written like that: Onyx records an answer only for the question labelled in your previous message. For an order question, also list its steps_to_show exactly as given, numbered 1, 2, 3 …, and ask for the right order as a list of those numbers. Never invent a question, and never show a question's reference, explanation or sources before they have answered it. Your tool results are not kept between messages, so when they answer, call get_reading_questions again with the same mode, chapter, count and book you used to ask, to read that question's reference; if it is not listed, call it once more with mode 'chapter', the chapter from the question's label and count 10. If it is still not listed, it was already answered today or it changed: record nothing, say so in a few words and move on. Their reply to the question you just asked is itself the direct report for record_reading_answer: in that same turn, grade it against that reference only and call record_reading_answer once with their answer VERBATIM, the question_id, the version and your verdict (one call per answer, never several answers at the end of the quiz: "recorded once, at the end" is the free quiz's rule for record_reading_quiz only), then tell them the verdict the tool returns (Onyx checks an order answer itself, so its verdict can differ from yours), what the reference adds and where it comes from, and ask the next question. "I don't know" is an answer (incorrect); "skip" records nothing. Pushback on your grade ("my answer was right") is neither a flag nor a new answer: explain the reference once and say plainly if they were right, but do not record the answer again and do not flag the question (the recorded verdict stays as it is). Call flag_reading_question only when their latest message says the question itself is wrong, unclear, not in that chapter, or from a chapter they have not read yet. Never call record_reading_quiz for bank questions: each answer is already recorded. If get_reading_questions says the bank is off or not available for the book, say so and offer the free quiz instead: call get_reading_status, ask 5 short questions ONE AT A TIME drawn from the chapters they have read, their highlights and recall notes, grade each answer honestly, then call record_reading_quiz with checkpoint 'ch<N>' and the score (Onyx shows that result as unverified). Keep coaching brief and specific (chapters behind pace, streak at risk, reviews due, questions ready).`;
+
+/** The system prompt of one request: the static rules, the reading paragraph for the active book, the reply format, the clock. */
+function systemPrompt(book: QuestBook | null | undefined, clock: string): string {
+  return [SYSTEM_PROMPT, `${readingQuestLine(book)} ${READING_RULES}`, SYSTEM_PROMPT_TAIL, clock].join("\n\n");
+}
+
+/**
+ * The active book's public details for the reading sentence, read per request in parallel with the clock reads. With
+ * no book in progress, the most recently finished one (its slug keeps its question bank reachable from the chat). A
+ * failed read is not an error for the chat: the sentence then sends the model to get_reading_status (undefined).
+ */
+async function activeQuestBook(): Promise<QuestBook | null | undefined> {
+  let book: Awaited<ReturnType<typeof getBook>>;
+  try {
+    book = await getBook(supabase, null);
+  } catch {
+    return undefined;
+  }
+  if (book) {
+    return { title: book.title, author: book.author, total_chapters: book.total_chapters, target_date: book.target_date, slug: book.slug, status: "reading" };
+  }
+  try {
+    const { data, error } = await supabase
+      .from("books")
+      .select("slug,title,author,total_chapters,finished_on")
+      .eq("status", "finished")
+      .order("finished_on", { ascending: false, nullsFirst: false })
+      .order("created_at", { ascending: false })
+      .limit(1);
+    const done = !error && Array.isArray(data) ? (data[0] as { slug?: unknown; title?: unknown; author?: unknown; total_chapters?: unknown; finished_on?: unknown } | undefined) : undefined;
+    if (!done || typeof done.title !== "string") return null;
+    return {
+      title: done.title,
+      author: typeof done.author === "string" ? done.author : null,
+      total_chapters: typeof done.total_chapters === "number" ? done.total_chapters : null,
+      slug: typeof done.slug === "string" ? done.slug : null,
+      finished_on: typeof done.finished_on === "string" ? done.finished_on : null,
+      status: "finished",
+    };
+  } catch {
+    // No book in progress is known; only the finished one could not be read.
+    return null;
+  }
+}
 
 const tools: Anthropic.Tool[] = [
   {
@@ -238,7 +297,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "get_reading_status",
-    description: "Get the user's reading quest for the book in progress (default: the active book): chapters done vs total, pace vs target date, streak, XP/level, badges, checkpoints with quiz results, recent sessions WITH their from-memory recall notes, highlights WITH comments, and highlights due for review. Use it for 'how is my reading going', to coach pace, and as the source material when the user asks to be quizzed on the book.",
+    description: "Get the user's reading quest for the book in progress (default: the active book): chapters done vs total, pace vs target date, streak, XP/level, badges, checkpoints with quiz results, recent sessions WITH their from-memory recall notes, highlights WITH comments, and highlights due for review. Use it for 'how is my reading going', to coach pace, and as the source material for the free quiz when get_reading_questions says the question bank is off for the book.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -283,17 +342,58 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: "record_reading_quiz",
-    description: "Record the result of a checkpoint quiz you just ran with the user about the book. Call it AFTER asking the questions one at a time and grading the answers. checkpoint is 'ch<N>' for the chapter checkpoints (e.g. 'ch12', 'ch26', 'ch40') or 'review' for a later spaced review. 80%+ passes and earns the Quiz Master badge. " + WRITE_GATE_QUIZ,
+    description: "Record the result of a checkpoint quiz you just ran with the user about the book. Call it AFTER asking the questions one at a time and grading the answers. checkpoint is 'ch<N>' for a chapter checkpoint (N = the checkpoint's chapter number) or 'review' for a later spaced review. 80%+ passes and earns the Quiz Master badge. " + WRITE_GATE_QUIZ,
     input_schema: {
       type: "object" as const,
       properties: {
-        checkpoint: { type: "string", description: "'ch12' | 'ch26' | 'ch40' | 'review' | other label" },
+        checkpoint: { type: "string", description: "'ch<N>' (a chapter checkpoint) | 'review' | other label" },
         score: { type: "number", description: "Correct answers" },
         total: { type: "number", description: "Questions asked" },
         notes: { type: "string", description: "What they missed, in one or two lines (optional)" },
         book: { type: "string", description: "Book slug (optional)" },
       },
       required: ["checkpoint", "score", "total"],
+    },
+  },
+  {
+    name: "get_reading_questions",
+    description: "Get questions from the user's reading question bank: sourced questions on the chapters they have finished (a chapter they have not finished is never returned). Each has question_id, version, chapter, format (cued = short answer, explain = in their own words, order = put the steps in order), the prompt to ask, steps_to_show (order questions only: the same steps shuffled, never in the right order; list exactly these, numbered, when you ask), the reference to grade against (cued: the answer and accepted forms; explain: the points, the one marked must is essential; order: the steps in the right order; each with an explanation), the idea it tests and its sources. mode 'due' (default) = ideas due for practice first, then new ones; 'chapter' = one chapter's questions (pass chapter); 'weak' = ideas they missed before. Ideas already answered today are left out. Use it when the user asks to be quizzed, and again on each answer to read that question's reference. Never show a reference, explanation or source to the user before they have answered. enabled: false = the bank is off for this book (offer the free quiz instead).",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        mode: { type: "string", enum: ["due", "chapter", "weak"], description: "'due' (default), 'chapter' (with chapter) or 'weak'" },
+        chapter: { type: "number", description: "Chapter number: required for mode 'chapter'; with 'weak' it keeps to that chapter" },
+        count: { type: "number", description: `How many questions (default 5, at most ${CHAT_QUESTIONS_MAX})` },
+        book: { type: "string", description: "Book slug (optional; defaults to the book in progress; pass it for a finished book)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "record_reading_answer",
+    description: "Record the user's answer to ONE question from get_reading_questions, with your grade, right after they answered it. Grade against that question's reference only: correct = it matches the answer (or an accepted form) or covers the points including the must point; partial = partly right; incorrect = wrong, missing the must point, or 'I don't know'. An order question is graded by Onyx itself: pass their reply as given (the numbers of the steps_to_show you listed, e.g. '3 1 4 2', or the steps written out one per line) and any verdict; Onyx maps it to the steps and checks the order. Pass their answer VERBATIM (their whole reply to the question, unedited), the question_id and version from get_reading_questions, your verdict, and optionally one short line of feedback. Onyx records it only for the question you asked in your previous message (its label, e.g. Q1234, is in that message) and only as the user's own latest reply. A skipped question records nothing. Returns the stored verdict (tell them that one); a refusal means nothing was recorded. " + WRITE_GATE_ANSWER,
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        question_id: { type: "number", description: "question_id from get_reading_questions" },
+        version: { type: "number", description: "version from get_reading_questions" },
+        answer: { type: "string", description: "The user's answer, verbatim" },
+        verdict: { type: "string", enum: ["correct", "partial", "incorrect"], description: "Your grade against the reference" },
+        feedback: { type: "string", description: "One short line on what was missing (optional, at most 240 characters)" },
+      },
+      required: ["question_id", "version", "answer", "verdict"],
+    },
+  },
+  {
+    name: "flag_reading_question",
+    description: "Flag a question from get_reading_questions when the user says it is wrong (the idea itself is wrong: it is retired and the answers to it stop counting), unclear (only that question is retired), not in this chapter (the idea moves to the end of the book), or about a chapter they have not read yet (that chapter is held back until they read further). Pass the question_id and the kind. Onyx flags it only when the user's own latest message says so about that question. " + WRITE_GATE,
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        question_id: { type: "number", description: "question_id from get_reading_questions" },
+        kind: { type: "string", enum: [...FLAG_KINDS], description: "wrong | unclear | not_in_chapter | not_read_yet" },
+      },
+      required: ["question_id", "kind"],
     },
   },
   {
@@ -823,6 +923,34 @@ const NOTION_UNCONFIRMED =
   "No Notion entry is recorded for it, and Onyx made none now: an earlier try may have made one. Check the book's Notion page.";
 
 /**
+ * A session or highlight an earlier call wrote that has no Notion block id stored: that call may have appended the entry
+ * and stopped before storing the id. The book's page is searched (read-only) for that exact entry: exactly one unclaimed
+ * match is adopted (its id is stored on the row, only while the row still has none) and nothing is named for Riley to
+ * check; no match, or several, stays unconfirmed. An entry is never made here, so a stopped try cannot be repeated into
+ * a second one. Returns the lines to name on the receipt.
+ */
+async function notionUnconfirmed(kind: "session" | "highlight", book: Book, row: ReadingSession | Highlight): Promise<string[]> {
+  if (row.notion_block_id) return [];
+  try {
+    const table = kind === "session" ? "reading_sessions" : "book_highlights";
+    const idColumn = kind === "session" ? "session_id" : "highlight_id";
+    const rowId = kind === "session" ? (row as ReadingSession).session_id : (row as Highlight).highlight_id;
+    const { data, error } = await supabase.from(table).select("notion_block_id").eq("book_id", book.book_id).not("notion_block_id", "is", null);
+    if (error || !Array.isArray(data)) return [NOTION_UNCONFIRMED];
+    const claimed = new Set((data as Array<{ notion_block_id: string | null }>).flatMap((r) => (r.notion_block_id ? [r.notion_block_id] : [])));
+    const id = await findMirroredEntry(book, kind, row, claimed);
+    if (!id) return [NOTION_UNCONFIRMED];
+    const { data: stored, error: storeError } = await supabase.from(table).update({ notion_block_id: id }).eq(idColumn, rowId).is("notion_block_id", null).select(idColumn);
+    if (storeError || !Array.isArray(stored) || stored.length === 0) return [NOTION_UNCONFIRMED];
+    row.notion_block_id = id;
+    return [];
+  } catch {
+    // Whatever cannot be read leaves it unconfirmed, as before.
+    return [NOTION_UNCONFIRMED];
+  }
+}
+
+/**
  * A session an EARLIER call wrote (an earlier try of the message, or an earlier call of this try) and that stopped
  * before the ledger recorded it. Whether that call also finished the book, stamped the habit and made the Notion entry
  * cannot be told from what is stored, and Riley may have changed any of them since (a habit answer cleared on purpose
@@ -844,7 +972,7 @@ async function inspectReplayedSession(book: Book, session: ReadingSession): Prom
     habitMarked = !error && (data as { answer?: unknown } | null)?.answer === "Yes";
     if (!habitMarked) unconfirmed.push(habitUnconfirmed(session.session_date));
   }
-  if (!session.notion_block_id) unconfirmed.push(NOTION_UNCONFIRMED);
+  unconfirmed.push(...(await notionUnconfirmed("session", book, session)));
   return { habitMarked, unconfirmed };
 }
 
@@ -894,8 +1022,388 @@ async function completeReplayedSession(book: Book, session: ReadingSession): Pro
   return { book: current, finished, habitMarked };
 }
 
-async function executeTool(name: string, input: Record<string, unknown>, op?: OpContext): Promise<string> {
+/* ---- Reading question bank tools: input checks and the words the model gets back (codes only, never text) ---- */
+
+const BANK_MODES = ["due", "chapter", "weak"] as const;
+type BankMode = (typeof BANK_MODES)[number];
+const BANK_VERDICTS = ["correct", "partial", "incorrect"] as const;
+type BankVerdict = (typeof BANK_VERDICTS)[number];
+
+const BANK_OFF =
+  "The question bank is off for this book, so there are no bank questions to ask. Say so, and offer the free quiz instead (get_reading_status, then record_reading_quiz; Onyx shows that result as unverified). The bank is turned on with one tap on /reading.";
+
+const BANK_UNAVAILABLE =
+  "The question bank is not available yet, so there are no bank questions to ask. Say so, and offer the free quiz instead (get_reading_status, then record_reading_quiz; Onyx shows that result as unverified).";
+
+/**
+ * Why get_reading_questions has nothing to ask: no chapter is quizzable yet, the chapter asked for is past the gate
+ * (it names only the chapter numbers, never what the chapter holds), or nothing is ready for this request.
+ */
+function noQuestionsMessage(chapter: number | null, quizThrough: number): string {
+  if (quizThrough < 1) return "No chapter is quizzable yet: a chapter unlocks once the next one is reached, they log through it, or the book is finished.";
+  if (chapter !== null && chapter > quizThrough) {
+    return `Chapter ${chapter} is not quizzable yet: questions are open through chapter ${quizThrough} (a chapter unlocks once the next one is reached, they log through it, or the book is finished). Say so, and do not quiz them on it from memory.`;
+  }
+  return "No questions are ready for this request: nothing is due, everything was answered today, or this chapter's questions are still being built.";
+}
+
+/** get_reading_questions input → questionsForChat's, or a message for the model. */
+function parseQuestionsInput(input: Record<string, unknown>): { book: string | null; chapter: number | null; mode: BankMode; count: number } | { error: string } {
+  const book = typeof input.book === "string" && input.book.trim() ? input.book.trim() : null;
+  if (book !== null && !SLUG_RE.test(book)) return { error: "Unknown book: omit book for the active book." };
+  const mode = (input.mode ?? "due") as BankMode;
+  if (!BANK_MODES.includes(mode)) return { error: "mode must be due, chapter or weak" };
+  const chapter = input.chapter == null || input.chapter === "" ? null : Number(input.chapter);
+  if (chapter !== null && !(Number.isInteger(chapter) && chapter >= 0 && chapter <= 100000)) return { error: "chapter must be a chapter number" };
+  if (mode === "chapter" && chapter === null) return { error: "mode 'chapter' needs the chapter number" };
+  const n = input.count == null ? 5 : Math.trunc(Number(input.count));
+  const count = Number.isFinite(n) ? Math.max(1, Math.min(CHAT_QUESTIONS_MAX, n)) : 5;
+  return { book, chapter, mode, count };
+}
+
+/** record_reading_answer input → recordChatAnswer's (without the tool_use id), or a message for the model. */
+function parseAnswerInput(input: Record<string, unknown>): { question_id: number; version: number; answer: string; verdict: BankVerdict; feedback: string | null } | { error: string } {
+  const questionId = Number(input.question_id);
+  const version = Number(input.version);
+  if (!Number.isInteger(questionId) || questionId < 1 || !Number.isInteger(version) || version < 1) {
+    return { error: "question_id and version must be the numbers from get_reading_questions" };
+  }
+  // Kept exactly as given (no trim): the answer is the user's own words.
+  if (typeof input.answer !== "string" || !input.answer.trim()) return { error: "answer is required: pass the user's answer verbatim" };
+  const verdict = input.verdict as BankVerdict;
+  if (!BANK_VERDICTS.includes(verdict)) return { error: "verdict must be correct, partial or incorrect" };
+  const feedback = typeof input.feedback === "string" && input.feedback.trim() ? input.feedback.trim() : null;
+  return { question_id: questionId, version, answer: input.answer, verdict, feedback };
+}
+
+function bankReadError(code: string): Record<string, unknown> {
+  if (code === "bank_unavailable") return { error: "The question bank is not set up yet.", bank: "unavailable", message: BANK_UNAVAILABLE };
+  if (code === "book_not_found") return { error: "No book in progress (or no book with that slug). For a finished book, pass its slug as book: the reading sentence names the most recently finished one." };
+  if (code === "bad_request") return { error: "That request is not valid: check mode and chapter." };
+  return { error: "The question bank could not be read right now. Say so, and do not invent questions.", code };
+}
+
+function answerRefusal(code: string): string {
+  switch (code) {
+    case "question_changed": return "This question changed since you read it, so the answer was not recorded. Call get_reading_questions again and use the current question_id and version.";
+    case "bank_off": return "The question bank is off for this book, so the answer was not recorded.";
+    case "locked": return "That chapter is not unlocked, so the answer was not recorded.";
+    case "retired": return "That question was retired after a correction, so the answer was not recorded.";
+    case "not_found": return "There is no such question, so the answer was not recorded.";
+    case "bad_answer": return "The answer is empty or longer than 4000 characters, so it was not recorded.";
+    case "bank_unavailable": return "The question bank is not set up yet, so the answer was not recorded.";
+    case "key_reused": return "A different answer is already stored under this call's key, so this one was not recorded. Do not record it again.";
+    case "bad_order": return "That reply is not an order of the steps (each step number you listed once, or every step written out one per line), so nothing was recorded. Ask them again for the order as the numbers of the steps you listed, and record that reply.";
+    case "unreadable": return "The question could not be read right now, so the answer was not recorded. Try record_reading_answer once more.";
+    default: return `The answer was not recorded (${code}).`;
+  }
+}
+
+function flagRefusal(code: string): string {
+  switch (code) {
+    case "locked": return "That question's chapter is not unlocked, so it was not flagged.";
+    case "question_changed": return "That question has changed since you read it, so it was not flagged. Call get_reading_questions again.";
+    case "not_found": return "There is no such question, so nothing was flagged.";
+    case "bank_unavailable": return "The question bank is not set up yet, so nothing was flagged.";
+    case "key_reused": return "A different flag is already stored under this call's key, so this one was not saved. Do not flag it again.";
+    case "unchecked": return "Onyx could not check that question's chapter right now, so nothing was flagged. Try flag_reading_question once more.";
+    default: return `The question was not flagged (${code}).`;
+  }
+}
+
+/**
+ * What a key lookup after a failed write found: this request's own row (`found`), nothing, a row that holds another
+ * request (`conflict`: never reported as this request's write), or no answer (`unknown`).
+ */
+type Lookup<T> = ({ state: "found" } & T) | { state: "absent" } | { state: "conflict" } | { state: "unknown" };
+
+/**
+ * After a failed record_reading_answer: is THIS answer stored under its key? The row counts only when it is this
+ * request (the same question, the chat round of this tool call, the same answer text as given: every answer is stored
+ * verbatim, an order answer too); a row under the key that holds anything else is a conflict, and an answer
+ * text already cleared cannot be compared (unknown). A 503 means the bank's SQL is not applied, so nothing can have
+ * been written (and the read would fail too). The question's chapter comes with it, for the receipt.
+ */
+async function storedChatAnswer(
+  keyId: string,
+  request: { question_id: number; answer: string },
+  status: number,
+): Promise<Lookup<{ grading_status: string; verdict: string | null; chapter: number | null }>> {
+  if (status === 503) return { state: "absent" };
+  try {
+    const { data, error } = await supabase
+      .from("reading_question_attempts")
+      .select("question_id,round_key,round_kind,answer,grading_status,verdict,reading_questions(bank_chapter)")
+      .eq("attempt_key", chatAttemptKey(keyId))
+      .maybeSingle();
+    if (error) return { state: "unknown" };
+    if (!data) return { state: "absent" };
+    const row = data as { question_id?: unknown; round_key?: unknown; round_kind?: unknown; answer?: unknown; grading_status?: unknown; verdict?: unknown; reading_questions?: unknown };
+    const sameRound = typeof row.round_key === "string" && row.round_key.toLowerCase() === chatRoundKey(keyId).toLowerCase();
+    if (Number(row.question_id) !== request.question_id || row.round_kind !== "chat" || !sameRound) return { state: "conflict" };
+    if (typeof row.answer !== "string") return { state: "unknown" };
+    if (row.answer !== request.answer) return { state: "conflict" };
+    const q = (Array.isArray(row.reading_questions) ? row.reading_questions[0] : row.reading_questions) as { bank_chapter?: unknown } | null | undefined;
+    const chapter = q && Number.isInteger(q.bank_chapter) ? (q.bank_chapter as number) : null;
+    return { state: "found", grading_status: String(row.grading_status ?? ""), verdict: typeof row.verdict === "string" ? row.verdict : null, chapter };
+  } catch {
+    return { state: "unknown" };
+  }
+}
+
+/**
+ * The same check for a flag, by its flag_key: it counts only when it is via chat with the same kind and flags the
+ * same question. pds.reading_bank_flag acts on a question's CURRENT version (a superseded id sent is redirected) and
+ * stores that version's id, so a row on another id counts when both ids are versions of one question (question_key).
+ */
+async function storedChatFlag(
+  flagKey: string,
+  request: { question_id: number; kind: FlagKind },
+  status: number,
+): Promise<Lookup<{ kind: string; invalidated: number }>> {
+  if (status === 503) return { state: "absent" };
+  try {
+    const { data, error } = await supabase.from("reading_question_flags").select("question_id,kind,via,invalidated_attempts").eq("flag_key", flagKey).maybeSingle();
+    if (error) return { state: "unknown" };
+    if (!data) return { state: "absent" };
+    const row = data as { question_id?: unknown; kind?: unknown; via?: unknown; invalidated_attempts?: unknown };
+    if (row.kind !== request.kind || row.via !== "chat") return { state: "conflict" };
+    const storedId = Number(row.question_id);
+    if (storedId !== request.question_id) {
+      const same = await sameQuestion(storedId, request.question_id);
+      if (same === null) return { state: "unknown" };
+      if (!same) return { state: "conflict" };
+    }
+    return { state: "found", kind: String(row.kind), invalidated: Number(row.invalidated_attempts) || 0 };
+  } catch {
+    return { state: "unknown" };
+  }
+}
+
+/** Whether two question ids are versions of one question (the same question_key); null when that cannot be read. */
+async function sameQuestion(a: number, b: number): Promise<boolean | null> {
+  if (!Number.isInteger(a) || a < 1) return false;
+  const { data, error } = await supabase.from("reading_questions").select("question_id,question_key").in("question_id", [a, b]);
+  if (error || !Array.isArray(data)) return null;
+  const key = (id: number) => (data as { question_id?: unknown; question_key?: unknown }[]).find((r) => Number(r.question_id) === id)?.question_key;
+  const ka = key(a);
+  const kb = key(b);
+  return typeof ka === "string" && ka === kb;
+}
+
+/**
+ * "Not read yet" holds a chapter back (pds.reading_bank_flag sets the hold to that question's chapter and checks no
+ * lock for it), so the chat sends it only for a question the gate would serve now: a question id the model did not
+ * get from get_reading_questions (one of a chapter already held back) must not move an existing hold later. Null =
+ * could not be checked (nothing is sent then). A question that does not exist is left to the flag (404 not_found).
+ * This is a pre-check, not the guard: it and the flag write are separate requests, so another flag can land between
+ * them. The authority is pds.reading_bank_flag, which runs under its advisory lock; when it answers `locked` the chat
+ * reports "not flagged" and never success (the flag is not looked up as saved, flagRefusal("locked")).
+ */
+async function servedByGate(questionId: number): Promise<boolean | null> {
+  try {
+    const { data, error } = await supabase.from("reading_questions").select("book_id,unlock_chapter").eq("question_id", questionId).maybeSingle();
+    if (error) return null;
+    if (!data) return true;
+    const q = data as { book_id?: unknown; unlock_chapter?: unknown };
+    const through = await supabase.rpc("reading_bank_quiz_through", { p_book: Number(q.book_id) });
+    if (through.error || through.data == null || !Number.isFinite(Number(through.data))) return null;
+    return Number(q.unlock_chapter) <= Number(through.data);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An order question's steps as the chat shows them when it asks: the reference steps in a fixed shuffled order (seeded
+ * by the question id), never the right order. The reference keeps the right order; the model is told never to show it
+ * before the answer. The seed is the question id alone, never the day: record_reading_answer maps the user's numbers
+ * back through this same list (orderAnswer), and the chat's tool results do not survive to the next message, so a
+ * list that changed at the 06:00 rollover between asking and answering would grade the answer against the wrong steps.
+ */
+function stepsToShow(steps: readonly string[], seed: number): string[] {
+  const out = [...steps];
+  let a = (Math.trunc(seed) >>> 0) ^ 0x9e3779b9;
+  const random = () => {
+    // mulberry32
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  // A shuffle that came out in the right order is turned by one place (with 2+ distinct steps that always differs).
+  if (out.length > 1 && out.every((step, i) => step === steps[i])) out.push(out.shift()!);
+  return out;
+}
+
+/** A bank question as the model gets it: an order question also carries the shuffled steps to show when asking. */
+function chatQuestionOut(q: ChatQuestion): ChatQuestion & { steps_to_show?: string[] } {
+  const steps = q.format === "order" ? q.reference.steps : undefined;
+  if (!Array.isArray(steps) || !steps.every((x) => typeof x === "string")) return q;
+  return { ...q, steps_to_show: stepsToShow(steps as string[], q.question_id) };
+}
+
+/**
+ * An order reply read for the code grade: the steps one per line in the user's order (the form gradeLocal reads). It is
+ * only what the grade reads: the reply itself is what is stored (record_reading_answer keeps the user's own words,
+ * qualifications and "no idea" included). The numbers refer to steps_to_show, the shuffle get_reading_questions showed
+ * (from the question id, so it is the same list here); the steps written out one per line are taken as they are;
+ * "I don't know" is the app's DONT_KNOW_ANSWER. Null = the reply is not an order of the steps.
+ */
+function orderAnswer(reply: string, steps: string[], questionId: number): string | null {
+  if (isDontKnow(reply)) return DONT_KNOW_ANSWER;
+  const n = steps.length;
+  // Written out: every line is one of the steps (a leading "1." or "2)" is dropped), each step once.
+  const byText = new Map(steps.map((step) => [normalizeAnswer(step), step]));
+  const lines = reply.split(/\r?\n/).map((l) => l.replace(/^\s*\d+\s*[.):-]\s*/, "")).filter((l) => l.trim());
+  const written = lines.map((l) => byText.get(normalizeAnswer(l)));
+  if (byText.size === n && lines.length === n && written.every((w) => w !== undefined) && new Set(written).size === n) {
+    return orderAnswerText(written as string[]);
+  }
+  // The numbers of the listed steps: "3 1 4 2", "3, 1, 4, 2", "3-1-4-2" or "3142".
+  let nums: string[] = [...(reply.match(/\d+/g) ?? [])];
+  if (nums.length === 1 && nums[0].length === n) nums = nums[0].split("");
+  const picks = nums.map(Number);
+  if (picks.length !== n || new Set(picks).size !== n || !picks.every((i) => Number.isInteger(i) && i >= 1 && i <= n)) return null;
+  const shown = stepsToShow(steps, questionId);
+  return orderAnswerText(picks.map((i) => shown[i - 1]));
+}
+
+/**
+ * What record_reading_answer needs to know about a question before it writes: whether it is an order question (its
+ * steps and chapter), another bank question, or none (`undefined`: the write answers not_found). Read server-side
+ * only; nothing of it reaches the model. "unavailable" = the bank's SQL is not applied; "unreadable" = the read failed.
+ */
+async function answerShape(
+  questionId: number,
+): Promise<{ format: string | null; steps: string[] | null; chapter: number | null } | undefined | "unavailable" | "unreadable"> {
+  try {
+    const { data, error } = await supabase.from("reading_questions").select("format,rubric,bank_chapter").eq("question_id", questionId).maybeSingle();
+    if (error) return ["42703", "42P01", "PGRST205"].includes(String((error as { code?: unknown }).code)) ? "unavailable" : "unreadable";
+    if (!data) return undefined;
+    const row = data as { format?: unknown; rubric?: unknown; bank_chapter?: unknown };
+    const rubric = parseRubric(row.rubric);
+    return {
+      format: typeof row.format === "string" ? row.format : null,
+      steps: rubric?.format === "order" ? rubric.steps : null,
+      chapter: Number.isInteger(row.bank_chapter) ? (row.bank_chapter as number) : null,
+    };
+  } catch {
+    return "unreadable";
+  }
+}
+
+type AnswerInput = { question_id: number; version: number; answer: string; verdict: BankVerdict; feedback: string | null };
+
+const MAY_BE_RECORDED = "Onyx could not confirm this answer and it may have been recorded. Do not record it again: tell the user to check /reading.";
+
+/**
+ * An order answer: the reply is read as an order of the steps (orderAnswer) for the code grade only, then recorded
+ * through recordAttempt, which grades it in code and stores answer and grade in one transaction (round kind 'chat',
+ * the keys from the tool_use id, so a replayed tool call is the same write). What is stored, and what the replay is
+ * keyed on, is the reply as the user gave it (spec 12: "answer (verbatim)"): two different replies that read as the
+ * same order are still two different answers, and the original wording is the primary record. The model's own verdict
+ * is not used: the code grade is the one returned.
+ */
+async function recordOrderAnswer(parsed: AnswerInput, steps: string[] | null, chapter: number | null, keyId: string): Promise<string> {
+  if (!steps || steps.length < 2) {
+    return JSON.stringify({ error: "That order question cannot be graded, so nothing was recorded. Move on to the next question.", code: "bad_question" });
+  }
+  const asOrder = orderAnswer(parsed.answer, steps, parsed.question_id);
+  if (asOrder === null) return JSON.stringify({ error: answerRefusal("bad_order"), code: "bad_order" });
+  const r = await recordAttempt(supabase, {
+    attempt_key: chatAttemptKey(keyId),
+    question_id: parsed.question_id,
+    version: parsed.version,
+    round_key: chatRoundKey(keyId),
+    round_date: null,
+    round_kind: "chat",
+    answer: parsed.answer,
+    grade_answer: asOrder,
+    hinted: false,
+    response_ms: null,
+    quiz_key: null,
+  });
+  const graded = (verdict: unknown, status: unknown, replayed: boolean) =>
+    JSON.stringify({
+      success: true,
+      question_id: parsed.question_id,
+      chapter,
+      verdict: typeof verdict === "string" ? verdict : null,
+      grading_status: String(status ?? ""),
+      replayed,
+      graded_by: "onyx",
+    });
+  if (r.status === 200 && r.body.success === true) return graded(r.body.verdict, r.body.grading_status, r.body.replayed === true);
+  const code = typeof r.body.error === "string" ? r.body.error : "failed";
+  if (code === "key_reused") return JSON.stringify({ error: answerRefusal(code), code });
+  const found = await storedChatAnswer(keyId, parsed, r.status);
+  if (found.state === "conflict") return JSON.stringify({ error: answerRefusal("key_reused"), code: "key_reused" });
+  if (found.state === "found") return graded(found.grading_status === "graded" ? found.verdict : null, found.grading_status, false);
+  if (found.state === "unknown" || failureMayHaveWritten(r)) return JSON.stringify({ error: MAY_BE_RECORDED, incomplete: true });
+  return JSON.stringify({ error: answerRefusal(code), code });
+}
+
+/**
+ * A cued or explain answer, graded by the chat model: recordChatAnswer stores it and writes that grade at once. When
+ * the grade write fails after the answer was stored (a race, a lost response), the stored answer is looked up by its
+ * key, and a pending one gets the chat's grade once more (the same tool call replayed: the stored answer, then the
+ * grade write again). Only if that fails too does it stay for the bank's own grade job.
+ */
+async function recordGradedAnswer(parsed: AnswerInput, keyId: string): Promise<string> {
+  const request = { ...parsed, tool_use_id: keyId };
+  const r = await recordChatAnswer(supabase, request);
+  if (r.ok) {
+    return JSON.stringify({ success: true, question_id: parsed.question_id, chapter: r.chapter, verdict: r.verdict, grading_status: r.grading_status, replayed: r.replayed });
+  }
+  // The key already holds another request: a definite refusal, never confirmed by the lookup below.
+  if (r.error === "key_reused") return JSON.stringify({ error: answerRefusal(r.error), code: r.error });
+  // A failure after the answer was stored must not read as "not recorded": this answer is looked up by its key (and
+  // checked to be this request) before anything is said about it.
+  const stored = await storedChatAnswer(keyId, parsed, r.status);
+  if (stored.state === "conflict") return JSON.stringify({ error: answerRefusal("key_reused"), code: "key_reused" });
+  if (stored.state === "found") {
+    if (stored.grading_status === "pending") {
+      const again = await recordChatAnswer(supabase, request);
+      if (again.ok && again.grading_status !== "pending") {
+        // This call stored the answer, so it is a new write even though the second call replayed it.
+        return JSON.stringify({
+          success: true,
+          question_id: parsed.question_id,
+          chapter: again.chapter ?? stored.chapter,
+          verdict: again.verdict,
+          grading_status: again.grading_status,
+          replayed: false,
+        });
+      }
+    }
+    return JSON.stringify({
+      success: true,
+      question_id: parsed.question_id,
+      chapter: stored.chapter,
+      verdict: stored.grading_status === "graded" ? stored.verdict : null,
+      grading_status: stored.grading_status,
+      replayed: false,
+      ...(stored.grading_status === "pending"
+        ? { note: "The answer is saved but your grade could not be stored; Onyx grades it later on its own, and that grade may differ from yours. Do not record it again." }
+        : {}),
+    });
+  }
+  if (stored.state === "unknown" || failureMayHaveWritten(r)) return JSON.stringify({ error: MAY_BE_RECORDED, incomplete: true });
+  return JSON.stringify({ error: answerRefusal(r.error), code: r.error });
+}
+
+/**
+ * One tool call. `callId` = the model's id for the call: the key of a question-bank write that runs without the replay
+ * ledger (a request with no request_id); through the ledger the operation id is the key, so a retry finds its row.
+ */
+async function executeTool(name: string, input: Record<string, unknown>, op?: OpContext, callId?: string): Promise<string> {
   const opId = op?.id;
+  const keyId = opId ?? callId;
   const days = (input.days as number) || 7;
   const since = new Date();
   since.setDate(since.getDate() - days);
@@ -1393,12 +1901,35 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     // Mirror inline (the chat loop has no after() boundary worth protecting). An earlier call's session with no block
     // id stored may still have its Notion entry (the call can stop between the append and storing the id), so none is
     // made for it now: inspectReplayedSession names it for Riley to check instead.
-    const blockId = result.session.notion_block_id ?? (inspected ? null : await mirrorSession(book, result.session));
-    if (blockId && !result.session.notion_block_id) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    // A keyed create stored the claim that owes this entry in its own transaction (pds.create_reading_session; Codex
+    // review of PR 376, round 2 of T01-R14): the entry is written under it and attached conditionally, so a write whose
+    // block id is lost is still found by its marker, and an entry this call never writes is written by the sweep. For
+    // this call's own insert replayed (its answer lost) the claim is looked up; none found = written as before.
+    const entryClaim =
+      result.session.notion_block_id || inspected
+        ? null
+        : (result.mirrorClaimId ?? (ownInsert ? await createEntryClaimOf(supabase, result.session.session_id, result.session.book_id) : null));
+    let blockId: string | null = result.session.notion_block_id ?? null;
+    if (entryClaim === "error") {
+      // The claim that owes this entry could not be looked up: nothing is written now (an entry with no claim to find
+      // it would be an orphan); the claim, if there is one, is written by the sweep (Codex review of PR 376, round 3).
+    } else if (!blockId && !inspected && entryClaim) {
+      const placed = await placeEntry(supabase, book, result.session, null, entryClaim);
+      if (placed.kind === "attached") blockId = placed.blockId;
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+    } else if (!blockId && !inspected) {
+      // No stored claim: placeEntry stores one before it writes (a marked entry the sweep can find, attached
+      // conditionally), and writes best effort only while the claims table does not exist.
+      const placed = await placeEntry(supabase, book, result.session, null);
+      if (placed.kind === "attached") blockId = placed.blockId;
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+    }
     const o = await getOverview(supabase, book.slug).catch(() => null);
     // Rewrites one progress line in Notion: the same text when it is already up to date. Not for an earlier call's
-    // session (read only): its date could put an older "last session" over a newer one written since.
-    if (!inspected) await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    // session (read only): its date could put an older "last session" over a newer one written since. Under the
+    // obligation a keyed create stored, written from the database and checked (rewriteProgressNow).
+    // A replay has no stored obligation: rewriteProgressNow stores its own before it writes, never an untracked write.
+    if (!inspected) await rewriteProgressNow(supabase, book.book_id, result.progressOwedId ?? null);
     return JSON.stringify({
       success: true,
       book: book.title,
@@ -1452,7 +1983,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
           created: true,
           replayed: true,
           mirrorNow: false,
-          unconfirmed: own.highlight.notion_block_id ? [] : [NOTION_UNCONFIRMED],
+          unconfirmed: await notionUnconfirmed("highlight", own.book, own.highlight),
         });
       }
     }
@@ -1503,7 +2034,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         created: true,
         replayed: true,
         mirrorNow: false,
-        unconfirmed: result.highlight.notion_block_id ? [] : [NOTION_UNCONFIRMED],
+        unconfirmed: await notionUnconfirmed("highlight", result.book, result.highlight),
       });
     }
     return highlightReply(result.book, result.highlight, { created: result.created, replayed: false, mirrorNow: result.created });
@@ -1538,6 +2069,92 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         : { error: result.error });
     }
     return quizReply({ quiz_id: result.quiz.quiz_id, checkpoint: result.quiz.checkpoint, score: result.quiz.score, total: result.quiz.total, quiz_date: result.quiz.quiz_date, passed: result.passed }, result.replayed);
+  }
+
+  // ---- Reading question bank (READ-QUIZ-01; lib/reading-recall-server.ts, every read through the SQL spoiler gate) ----
+  // The bank's writes are keyed by the operation id (keyId): the attempt key, the round key and the flag key are derived
+  // from it, so a retry that re-runs the call finds what an earlier try stored. They go through the ledger with the other
+  // write tools, after authorizeWrite (lib/chat-write-intent.ts: the reply to the question just asked, labelled Q<id>).
+  if (name === "get_reading_questions") {
+    const parsed = parseQuestionsInput(input);
+    if ("error" in parsed) return JSON.stringify(parsed);
+    const r = await questionsForChat(supabase, parsed);
+    if (!r.ok) return JSON.stringify(bankReadError(r.error));
+    // A bank turned off takes no answers (recordChatAnswer refuses them), so its questions are not offered either.
+    if (!r.enabled) return JSON.stringify({ enabled: false, quiz_through: r.quiz_through, questions: [], message: BANK_OFF });
+    return JSON.stringify({
+      enabled: true,
+      today: r.today,
+      quiz_through: r.quiz_through,
+      questions: r.questions.map(chatQuestionOut),
+      ...(r.questions.length === 0 ? { message: noQuestionsMessage(parsed.chapter, r.quiz_through) } : {}),
+    });
+  }
+
+  if (name === "record_reading_answer") {
+    const parsed = parseAnswerInput(input);
+    if ("error" in parsed) return JSON.stringify(parsed);
+    if (!keyId) return JSON.stringify({ error: KEY_UNAVAILABLE });
+    if (op?.check) {
+      // Another call of this request wrote, or may have: only read back what this key stored, never record now.
+      const stored = await storedChatAnswer(keyId, parsed, 200);
+      if (stored.state !== "found") return keyedUnconfirmed(name);
+      return JSON.stringify({
+        success: true,
+        question_id: parsed.question_id,
+        chapter: stored.chapter,
+        verdict: stored.grading_status === "graded" ? stored.verdict : null,
+        grading_status: stored.grading_status,
+        replayed: true,
+      });
+    }
+    const shape = await answerShape(parsed.question_id);
+    if (shape === "unavailable") return JSON.stringify({ error: answerRefusal("bank_unavailable"), code: "bank_unavailable" });
+    if (shape === "unreadable") return JSON.stringify({ error: answerRefusal("unreadable"), code: "unreadable" });
+    // An order answer is graded by code and stored with its grade in one transaction (pds.reading_bank_attempt's
+    // local path, as the app's are), so it is never left pending: the grade job cannot grade an order answer.
+    if (shape?.format === "order") return recordOrderAnswer(parsed, shape.steps, shape.chapter, keyId);
+    return recordGradedAnswer(parsed, keyId);
+  }
+
+  if (name === "flag_reading_question") {
+    const questionId = Number(input.question_id);
+    const kind = input.kind as FlagKind;
+    if (!Number.isInteger(questionId) || questionId < 1) return JSON.stringify({ error: "question_id must be the number from get_reading_questions" });
+    if (!FLAG_KINDS.includes(kind)) return JSON.stringify({ error: `kind must be one of ${FLAG_KINDS.join(", ")}` });
+    if (!keyId) return JSON.stringify({ error: KEY_UNAVAILABLE });
+    const flagKey = chatFlagKey(keyId);
+    if (op?.check) {
+      // Another call of this request wrote, or may have: only read back what this key stored, never flag now.
+      const stored = await storedChatFlag(flagKey, { question_id: questionId, kind }, 200);
+      if (stored.state !== "found") return keyedUnconfirmed(name);
+      return JSON.stringify({ success: true, question_id: questionId, kind: stored.kind, invalidated: stored.invalidated, replayed: true });
+    }
+    if (kind === "not_read_yet") {
+      const served = await servedByGate(questionId);
+      if (served === null) return JSON.stringify({ error: flagRefusal("unchecked"), code: "unchecked" });
+      if (!served) {
+        // Already held back: by this very flag (a replay of this tool call answers as one), or it was never served.
+        const mine = await storedChatFlag(flagKey, { question_id: questionId, kind }, 200);
+        if (mine.state === "found") return JSON.stringify({ success: true, question_id: questionId, kind: mine.kind, invalidated: mine.invalidated, replayed: true });
+        return JSON.stringify({ error: flagRefusal("locked"), code: "locked" });
+      }
+    }
+    const r = await flagQuestion(supabase, { restore: false, flag_key: flagKey, question_id: questionId, kind, via: "chat" });
+    if (r.status === 200 && r.body.success === true) {
+      return JSON.stringify({ success: true, question_id: questionId, kind: r.body.kind ?? kind, invalidated: r.body.invalidated ?? 0, replayed: r.body.replayed === true });
+    }
+    const code = typeof r.body.error === "string" ? r.body.error : "failed";
+    if (code === "key_reused") return JSON.stringify({ error: flagRefusal(code), code });
+    const stored = await storedChatFlag(flagKey, { question_id: questionId, kind }, r.status);
+    if (stored.state === "conflict") return JSON.stringify({ error: flagRefusal("key_reused"), code: "key_reused" });
+    if (stored.state === "found") {
+      return JSON.stringify({ success: true, question_id: questionId, kind: stored.kind, invalidated: stored.invalidated, replayed: false });
+    }
+    if (stored.state === "unknown" || failureMayHaveWritten(r)) {
+      return JSON.stringify({ error: "Onyx could not confirm this flag and it may have been saved. Do not flag it again: tell the user to check /reading.", incomplete: true });
+    }
+    return JSON.stringify({ error: flagRefusal(code), code });
   }
 
   if (name === "log_supplement_intake") {
@@ -1655,9 +2272,9 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
 }
 
 /** Run one tool; a throw becomes an "incomplete" result (write) or "unavailable" (lookup), never a failed request. */
-async function runTool(name: string, input: Record<string, unknown>, op?: OpContext): Promise<{ result: string; failed: boolean }> {
+async function runTool(name: string, input: Record<string, unknown>, op?: OpContext, callId?: string): Promise<{ result: string; failed: boolean }> {
   try {
-    return { result: await executeTool(name, input, op), failed: false };
+    return { result: await executeTool(name, input, op, callId), failed: false };
   } catch (toolError) {
     // A tool that throws may have written part of its work. Tell the
     // model (and the receipt) so, instead of failing the whole request
@@ -1802,6 +2419,8 @@ export async function POST(req: NextRequest) {
     const now = new Date();
     const tzRead = currentTimeZone(supabase, now);
     const bdayRead = behavioralToday(supabase);
+    // The active book, for the reading sentence of the prompt (read in the same parallel step as the clock reads).
+    const questBookRead = activeQuestBook();
     // Kept so the lease is given back in `finally` even when the other two reads fail. The request row is written
     // with this try's time, time zone and behavioral day (a retry reads the first try's back).
     opening = requestId
@@ -1811,7 +2430,7 @@ export async function POST(req: NextRequest) {
           Promise.all([tzRead, bdayRead]).then(([t, b]) => ({ now: now.toISOString(), time_zone: t, behavioral_today: b })),
         )
       : null;
-    const [opened, tz, bday] = await Promise.all([opening ?? Promise.resolve(null), tzRead, bdayRead]);
+    const [opened, tz, bday, questBook] = await Promise.all([opening ?? Promise.resolve(null), tzRead, bdayRead, questBookRead]);
     if (opened?.kind === "conflict") {
       return Response.json({ error: "This retry does not match the message it was first sent with, so nothing was run. Send your message again.", code: "request_conflict" }, { status: 409 });
     }
@@ -1841,15 +2460,18 @@ export async function POST(req: NextRequest) {
     const localNow = (pinned ? new Date(pinned.now) : now).toLocaleString("en-US", {
       timeZone: promptTz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",
     });
-    const systemPrompt = pinned
-      ? `${SYSTEM_PROMPT}\n\nThis message is a retry of one first sent at ${localNow} (${promptTz}); answer as of then. Behavioral day it was sent on ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${requestDay}.`
-      : `${SYSTEM_PROMPT}\n\nCurrent local time: ${localNow} (${tz}). Current behavioral day ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${bday}.`;
+    const system = systemPrompt(
+      questBook,
+      pinned
+        ? `This message is a retry of one first sent at ${localNow} (${promptTz}); answer as of then. Behavioral day it was sent on ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${requestDay}.`
+        : `Current local time: ${localNow} (${tz}). Current behavioral day ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${bday}.`,
+    );
 
     // Initial Claude call with tools
     let response = await anthropic.messages.create({
       model: "claude-sonnet-5-5",
       max_tokens: 2048,
-      system: systemPrompt,
+      system,
       tools,
       messages,
     }, { signal: req.signal });
@@ -1899,7 +2521,11 @@ export async function POST(req: NextRequest) {
           const decision = isWriteTool(block.name)
             ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
             : null;
-          // An allowed call uses up its part of the request (an intake, a session), so a repeat needs its own words.
+          // An allowed call consumes the granted action's canonical identity (the tool, the record as the user's
+          // words name it, the arguments the user's action states — lib/chat-write-intent.ts), so a second call for
+          // the same grant in this request is refused with a receipt whatever arguments the model sends. A retry of
+          // the whole message builds a fresh set here and reconciles through the SEC-04 ledger, which mints no new
+          // action either; nothing here persists across requests.
           if (decision?.allowed) commitWrite(writesAllowed, decision);
           if (decision && !decision.allowed) {
             // Not asked for in the user's own latest message: never run, never recorded in the ledger.
@@ -1919,7 +2545,7 @@ export async function POST(req: NextRequest) {
                 ...(typeof context.book_id === "number" ? { bookId: context.book_id } : {}),
                 ...(typeof context.started_at === "string" ? { startedAt: context.started_at } : {}),
                 ...(check ? { check: true } : {}),
-              }),
+              }, block.id),
               { behavioral_today: requestDay, now: requestNow, started_at: new Date().toISOString(), ...(bookId !== undefined ? { book_id: bookId } : {}) },
             );
           } else if (isWriteTool(block.name) && writesPaused) {
@@ -1927,7 +2553,7 @@ export async function POST(req: NextRequest) {
             outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };
           } else {
             if (!isWriteTool(block.name)) retrieved = true;
-            const ran = await runTool(block.name, input);
+            const ran = await runTool(block.name, input, undefined, block.id);
             outcome = { ...ran, receipt: buildWriteReceipt(block.name, block.input, ran.result) };
           }
           if (outcome.receipt) receipts.push(outcome.receipt);
@@ -1949,7 +2575,7 @@ export async function POST(req: NextRequest) {
       response = await anthropic.messages.create({
         model: "claude-sonnet-5-5",
         max_tokens: 2048,
-        system: systemPrompt,
+        system,
         tools,
         messages: allMessages,
       }, { signal: req.signal });

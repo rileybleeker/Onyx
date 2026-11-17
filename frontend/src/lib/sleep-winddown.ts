@@ -17,7 +17,8 @@
  *     product target Riley can change, not a medical threshold).
  *   - The target time is local wall-clock time wherever Riley is. A "Started" tap records the server's clock and is
  *     shown on time / after the target of THAT night's goal version; a report made later carries no time. Timing is
- *     shown, never counted: a next-morning report counts the same as a tap.
+ *     shown, never counted: a next-morning report counts the same as a tap. A start belongs to the habit the goal
+ *     named when it was tapped: after a goal change to another habit it is ignored (never shown, judged or counted).
  *   - Sleep data (WHOOP) is feedback only: it never marks a night and earns nothing.
  *
  * IMPORT-FREE (types only): bundled by name in tests. Tests: frontend/tests/sleep-winddown.test.cjs (synthetic).
@@ -72,7 +73,15 @@ export interface WindDownRule {
 }
 export interface WindDownPause { id: number; startDate: string; endDate: string | null; createdAt: string; endedAt: string | null }
 export interface WindDownAnswerFact { date: string; question: string; answer: NightAnswer }
-export interface WindDownStart { night: string; startedAt: string; localTime: string; tz: string; ruleId: number | null }
+export interface WindDownStart {
+  night: string;
+  startedAt: string;
+  localTime: string;
+  tz: string;
+  ruleId: number | null;
+  /** The habit the goal named when the tap was made: a start never transfers to another habit (null = unknown). */
+  habitPageId: string | null;
+}
 export interface WindDownSleepNight {
   /** The behavioral day whose evening this sleep followed (= the wind-down night). */
   night: string;
@@ -250,12 +259,24 @@ export interface WindDownProgress {
 }
 
 interface Index { answers: Map<string, NightAnswer>; starts: Map<string, WindDownStart>; rulesById: Map<number, WindDownRule> }
+/**
+ * The habit a start was tapped under: the habit stored with it, else the one of the rule version it was made under.
+ * Null = unknown (never transferred to any habit).
+ */
+function startHabit(s: WindDownStart, rulesById: ReadonlyMap<number, WindDownRule>): string | null {
+  return s.habitPageId ?? (s.ruleId != null ? rulesById.get(s.ruleId)?.habitPageId ?? null : null);
+}
 function index(p: WindDownPayload): Index {
   const answers = new Map<string, NightAnswer>();
   for (const a of p.answers) if (!answers.has(`${a.date}|${a.question}`)) answers.set(`${a.date}|${a.question}`, a.answer);
+  const rulesById = new Map(p.rules.map((r) => [r.id, r] as const));
+  // One start per (night, habit): a start made under another habit never shadows the matching one.
   const starts = new Map<string, WindDownStart>();
-  for (const s of p.starts) if (!starts.has(s.night)) starts.set(s.night, s);
-  return { answers, starts, rulesById: new Map(p.rules.map((r) => [r.id, r] as const)) };
+  for (const s of p.starts) {
+    const key = `${s.night}|${startHabit(s, rulesById) ?? ""}`;
+    if (!starts.has(key)) starts.set(key, s);
+  }
+  return { answers, starts, rulesById };
 }
 
 function evaluate(p: WindDownPayload, sorted: readonly WindDownRule[], ix: Index, date: string): NightView {
@@ -265,7 +286,9 @@ function evaluate(p: WindDownPayload, sorted: readonly WindDownRule[], ix: Index
   if (!rule) return { date, status: "before_start", answer: null, ruleId: null, question: null, targetTime: null, start: null, tonight, answerable: false };
   const question = questionOf(rule, p.habitNames);
   const answer = ix.answers.get(`${date}|${question}`) ?? null;
-  const started = answer === "Yes" ? ix.starts.get(date) ?? null : null;
+  // A start counts only under the habit it was tapped under: a goal that names another habit never shows it, judges
+  // it, or counts it (a same-habit target-time edit keeps the original start, judged by its own rule version).
+  const started = answer === "Yes" ? ix.starts.get(`${date}|${rule.habitPageId}`) ?? null : null;
   // A start is judged against the version in force when it was tapped (stored with it), else the night's version.
   const startRule = started?.ruleId != null ? ix.rulesById.get(started.ruleId) ?? rule : rule;
   const start = started ? { localTime: started.localTime, tz: started.tz, onTime: isTime(started.localTime) ? startedOnTime(started.localTime, startRule.targetTime) : null } : null;
@@ -514,7 +537,7 @@ export function parseWindDownPayload(data: unknown): WindDownPayload {
   for (const raw of list(v.starts)) {
     const r = obj(raw);
     if (!r || !isDate(r.night) || !isTime(r.localTime) || typeof r.startedAt !== "string") continue;
-    starts.push({ night: r.night, startedAt: r.startedAt, localTime: r.localTime, tz: str(r.tz) ?? "", ruleId: num(r.ruleId) });
+    starts.push({ night: r.night, startedAt: r.startedAt, localTime: r.localTime, tz: str(r.tz) ?? "", ruleId: num(r.ruleId), habitPageId: str(r.habitPageId) });
   }
   const habitNames: Record<string, string> = {};
   const hn = obj(v.habitNames);

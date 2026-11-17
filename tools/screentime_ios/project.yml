@@ -26,6 +26,7 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
+        NSHealthShareUsageDescription: Onyx reads steps, walking metrics, headphone level, mindful minutes, workouts and State of Mind from Health and sends them to your own Onyx. Nothing is shared with anyone else.
     entitlements:
       path: OnyxScreenTime/OnyxScreenTime.entitlements
       properties:

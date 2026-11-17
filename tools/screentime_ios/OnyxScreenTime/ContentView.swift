@@ -15,6 +15,7 @@ final class AppModel: ObservableObject {
     @Published var days = 30
     @Published var useLivePolicy = true
     @Published var lastSummary = Settings.lastSummary ?? "Never synced"
+    @Published var healthSummary = Settings.lastHealthSummary ?? "Never synced"
 
     private var lastJSON: String?
 
@@ -102,6 +103,21 @@ final class AppModel: ObservableObject {
         }
     }
 
+#if !ONYX_FOCUS
+    /// Asks for Health read access (the system sheet), then syncs the last `days` days.
+    func syncHealth() async {
+        busy = true
+        defer { busy = false }
+        do {
+            let summary = try await HealthSync.sync(days: days)
+            healthSummary = summary
+            append("Health: \(summary)")
+        } catch {
+            append("Health sync failed: \(error.localizedDescription) (\(error))")
+        }
+    }
+#endif
+
     func copyJSON() {
         guard let lastJSON else {
             append("Nothing to copy yet — run Preview first.")
@@ -164,6 +180,20 @@ struct ContentView: View {
                 }
                 .disabled(model.busy)
 
+#if !ONYX_FOCUS
+                Section("Apple Health") {
+                    Button("Allow Health and sync to Onyx") { Task { await model.syncHealth() } }
+                        .disabled(!model.tokenSaved || !HealthSync.isAvailable)
+                    Text(model.healthSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text("Reads steps, walking, headphone level, mindful minutes, workouts and State of Mind. Syncs by itself when you open the app (needs the phone unlocked).")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .disabled(model.busy)
+#endif
+
                 Section("Log") {
                     HStack {
                         Button("Copy log") { model.copyLog() }
@@ -183,6 +213,9 @@ struct ContentView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     model.refreshStatus()
+#if !ONYX_FOCUS
+                    Task { await HealthSync.syncIfDue() }
+#endif
 #if ONYX_FOCUS
                     // Re-check the Focus rule and Onyx habits on every return to the app,
                     // whichever screen is showing (tools/screentime_ios/FOCUS.md).

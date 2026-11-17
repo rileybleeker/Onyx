@@ -260,6 +260,15 @@ export function utf8Bytes(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
+/**
+ * Whether a failed save is worth retrying with the same value: the request never got an answer
+ * (offline, timed out: status null) or the server could not handle it (5xx, 429, 408). Any other
+ * 4xx is the server refusing the value (validation, conflict, auth): retrying it cannot succeed.
+ */
+export function isTransientSaveFailure(status: number | null): boolean {
+  return status === null || status === 429 || status === 408 || status >= 500;
+}
+
 // ---- optimistic list updates (used by the page; reverted when a save fails) --
 
 export function applyPatch(item: CareItem, patch: CarePatch): CareItem {

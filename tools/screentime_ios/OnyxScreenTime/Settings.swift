@@ -26,6 +26,22 @@ enum Settings {
         set { defaults.set(newValue, forKey: "lastSummary") }
     }
 
+    // Apple Health (HealthSync.swift): when it last synced, what it said, and whether it was set up once.
+    static var lastHealthSync: Date? {
+        get { defaults.object(forKey: "lastHealthSync") as? Date }
+        set { defaults.set(newValue, forKey: "lastHealthSync") }
+    }
+
+    static var lastHealthSummary: String? {
+        get { defaults.string(forKey: "lastHealthSummary") }
+        set { defaults.set(newValue, forKey: "lastHealthSummary") }
+    }
+
+    static var healthEnabled: Bool {
+        get { defaults.bool(forKey: "healthEnabled") }
+        set { defaults.set(newValue, forKey: "healthEnabled") }
+    }
+
     static var token: String? {
         get {
             let query: [String: Any] = [

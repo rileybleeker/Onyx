@@ -30,6 +30,20 @@ const contract = compile("../src/lib/chat-contract.ts");
 const receiptsLib = compile("../src/lib/chat-receipts.ts");
 const stepsLib = compile("../src/lib/steps.ts");
 const readingPractice = compile("../src/lib/reading-practice.ts");
+// lib/reading-recall.ts is the pure practice engine (normalization, rubrics, the order answer form): the real module.
+const recallLib = compile("../src/lib/reading-recall.ts", { "./reading-practice": readingPractice });
+// lib/reading-recall-server.ts (the question bank) imports "server-only" and the model client, so the chat route gets a
+// stand-in with the module's own constants (a test below pins them to the source); each test replaces the functions it
+// exercises. The key derivation itself is the bank's and tested in tests/reading-practice-api.test.cjs.
+const recallStub = (over = {}) => ({
+  CHAT_QUESTIONS_MAX: 10,
+  FLAG_KINDS: ["wrong", "unclear", "not_in_chapter", "not_read_yet"],
+  SLUG_RE: /^[a-z0-9-]{1,80}$/,
+  chatAttemptKey: (id) => `attempt-key-for-${id}`,
+  chatFlagKey: (id) => `flag-key-for-${id}`,
+  chatRoundKey: (id) => `round-key-for-${id}`,
+  ...over,
+});
 let portionCompiled = null;
 const portionLib = () => (portionCompiled ??= compile("../src/lib/delivery-portion.ts"));
 const user = content => ({ role: "user", content });
@@ -40,7 +54,31 @@ test("accepts ordinary text conversation and rejects malformed/tool-injected his
     assert.equal(contract.validateChatMessages(input), false);
   }
 });
-function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite = () => {}, intake = { ok: true }, stacks = {}, reading = {}, readingNotion = {}, spotify = {}, today = "2026-11-11", sandboxConsole, session = signedIn } = {}) {
+/**
+ * A stand-in for lib/reading-removal.ts built on a test's readingNotion mock: placeEntry writes the entry
+ * (mirrorSession) and stores its block id on the session, as the real placeEntry does once it attaches; the claim and
+ * sweep rules themselves are covered by tests/reading-autosave.test.cjs. `calls` records what the route asked for.
+ */
+function removalOf(readingNotion = {}, calls = [], over = {}) {
+  return {
+    createEntryClaimOf: async () => null,
+    placeEntry: async (client, book, session, replaces, claim) => {
+      calls.push({ fn: "placeEntry", replaces, claim: claim ?? null });
+      const blockId = readingNotion.mirrorSession ? await readingNotion.mirrorSession(book, session, claim ?? null) : null;
+      if (!blockId) return { kind: "none" };
+      await client.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", session.session_id);
+      return { kind: "attached", blockId };
+    },
+    discardEntry: async () => {},
+    rewriteProgressNow: async (_client, bookId, owedId) => {
+      calls.push({ fn: "rewriteProgressNow", bookId, owedId });
+      if (readingNotion.mirrorProgress) await readingNotion.mirrorProgress({ book_id: bookId }, null, null);
+      return true;
+    },
+    ...over,
+  };
+}
+function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite = () => {}, intake = { ok: true }, stacks = {}, reading = {}, readingNotion = {}, readingRemoval = null, spotify = {}, recall = recallStub(), today = "2026-11-11", sandboxConsole, session = signedIn } = {}) {
   let calls = 0, writes = 0; const requests = [];
   class Anthropic { messages = { create: async (body) => { calls++; requests.push(JSON.parse(JSON.stringify(body))); onModelCall(calls); return responses[Math.min(calls-1,responses.length-1)] ?? { stop_reason:"end_turn",content:[{type:"text",text:"A general answer"}] }; } }; }
   const exports = compile("../src/app/api/chat/route.ts", {
@@ -52,7 +90,8 @@ function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite 
     "@/lib/spotify-server": spotify,
     "@/lib/supplement-stacks": stacks,
     "@/lib/supplement-intake": {currentTimeZone: async()=>"UTC", behavioralToday: async()=>(typeof today === "function" ? today() : today), logSupplementIntake: async(_client, input)=>{writes++; onWrite(writes); return typeof intake === "function" ? intake(input) : intake;}},
-    "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-practice": readingPractice,
+    "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-removal": readingRemoval ?? removalOf(readingNotion), "@/lib/reading-practice": readingPractice,
+    "@/lib/reading-recall-server": recall, "@/lib/reading-recall": recallLib,
     "@/lib/supabase-server": session,
   }, sandboxConsole);
   return {post: body => exports.POST({json:async()=>body,signal:new AbortController().signal}), raw:exports.POST, calls:()=>calls,writes:()=>writes,requests:()=>requests};
@@ -140,7 +179,7 @@ test("model is given the general scope plus the unchanged health conventions and
   assert.match(request.system,/Garmin watch, WHOOP band, and Eight Sleep mattress/);
   assert.match(request.system,/never add supplements on top of those totals/);
   const names=request.tools.map(t=>t.name);
-  for (const name of ["query_sleep","query_hrv","query_nutrition","query_journal_entries","get_reading_status","log_supplement_intake","create_spotify_playlist"]) assert.ok(names.includes(name),name);
+  for (const name of ["query_sleep","query_hrv","query_nutrition","query_journal_entries","get_reading_status","get_reading_questions","log_supplement_intake","create_spotify_playlist"]) assert.ok(names.includes(name),name);
   assert.deepEqual(request.messages,[user("Help me write a thank-you note")]);
 });
 test("WHOOP cycle rows reach the model with the day their step count belongs to (synthetic rows)",async()=>{
@@ -179,7 +218,7 @@ test("a health data question still runs its tool and returns the result to the m
 });
 test("unexpected failures return a generic error without leaking details",async()=>{
   class Boom { messages = { create: async () => { throw new Error("secret upstream detail"); } }; }
-  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-practice":readingPractice});
+  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-removal":{},"@/lib/reading-practice":readingPractice,"@/lib/reading-recall-server":recallStub(),"@/lib/reading-recall":recallLib});
   const response=await exports.POST({json:async()=>({messages:[user("Explain")]}),signal:new AbortController().signal});
   assert.equal(response.status,500);
   assert.doesNotMatch(JSON.stringify(await response.json()),/secret upstream detail/);
@@ -201,7 +240,7 @@ test("suggestions never create a playlist: only an explicit request does",async(
 test("server logs only the error class and status, never the message, while the client gets generic text",async()=>{
   const logged=[];
   class Boom { messages = { create: async () => { const e=new Error("secret upstream detail with user text: my private note"); e.name="APIError"; e.status=529; throw e; } }; }
-  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-practice":readingPractice},{error:(...args)=>logged.push(args)});
+  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-removal":{},"@/lib/reading-practice":readingPractice,"@/lib/reading-recall-server":recallStub(),"@/lib/reading-recall":recallLib},{error:(...args)=>logged.push(args)});
   const response=await exports.POST({json:async()=>({messages:[user("my private note")]}),signal:new AbortController().signal});
   assert.equal(response.status,500);
   assert.match((await response.json()).error,/Unable to finish this request/);
@@ -257,7 +296,13 @@ test("every tool that changes data is a registered write tool with the explicit-
     assert.equal(gated, receiptsLib.isWriteTool(tool.name), tool.name);
     if (!gated) continue;
     assert.match(tool.description, /never by inference\.$/, tool.name);
-    if (tool.name === "record_reading_quiz") assert.ok(tool.description.endsWith(receiptsLib.WRITE_GATE_QUIZ));
+    if (tool.name === "record_reading_quiz") assert.ok(tool.description.endsWith(receiptsLib.WRITE_GATE_QUIZ), tool.name);
+    else if (tool.name === "record_reading_answer") {
+      // One bank answer is recorded in the turn it is given, never batched at the end like the free quiz's result.
+      assert.ok(tool.description.endsWith(receiptsLib.WRITE_GATE_ANSWER), tool.name);
+      assert.match(tool.description, /once for each answer/);
+      assert.doesNotMatch(receiptsLib.WRITE_GATE_QUIZ, /each answer/, "the free quiz's gate keeps its once-at-the-end wording");
+    }
     else if (tool.name === "create_spotify_playlist") assert.ok(tool.description.endsWith(receiptsLib.WRITE_GATE_REQUEST_ONLY));
     else {
       assert.ok(tool.description.endsWith(receiptsLib.WRITE_GATE), tool.name);
@@ -445,7 +490,8 @@ test("reading session, highlight, quiz and playlist each return a receipt built 
 test("a write tool that throws is reported as possibly incomplete, to the model and in the receipt, without leaking the error", async () => {
   const logged = [];
   const reading = { logSession: async () => { throw new TypeError("secret detail: the user's private recall text"); } };
-  const r = route(afterTool("log_reading_session", { chapter_through: 6 }, "That did not go through cleanly."), { reading, sandboxConsole: { error: (...args) => logged.push(args) } });
+  // SEC-05: a reading write is checked against the books table first; an empty one leaves the write to the tool.
+  const r = route(afterTool("log_reading_session", { chapter_through: 6 }, "That did not go through cleanly."), { supabase: fakeSupabase(), reading, sandboxConsole: { error: (...args) => logged.push(args) } });
   const response = await r.post({ messages: [user("Log my reading through chapter 6")] });
   assert.equal(response.status, 200);
   const body = await response.json();
@@ -468,12 +514,15 @@ test("when a request stops after a write, the error response still carries the r
   const body = await response.json();
   assert.match(body.error, /reached the tool limit/);
   assert.equal(body.receipts.length, contract.MAX_TOOL_ROUNDS);
-  assert.ok(body.receipts.every((receipt) => receipt.status === "saved" && receipt.details[0] === "Acme Synthetic Focus"));
+  // SEC-05: one message authorizes the write once; every repeat of the same call is refused with a receipt.
+  assert.equal(body.receipts[0].status, "saved");
+  assert.equal(body.receipts[0].details[0], "Acme Synthetic Focus");
+  assert.ok(body.receipts.slice(1).every((receipt) => receipt.status === "not_saved" && receipt.details.some((d) => /already written for this message/.test(d))));
 
   // A failure in the model call after the write: generic error text, receipt kept.
   let calls = 0;
   class FailsSecond { messages = { create: async () => { if (++calls === 1) return { stop_reason: "tool_use", content: [toolUse("log_supplement_intake", { product: "Synthetic Focus" })] }; throw new Error("upstream"); } }; }
-  const exports = compile("../src/app/api/chat/route.ts", { "@anthropic-ai/sdk": FailsSecond, "@supabase/supabase-js": { createClient: () => ({}) }, "@/lib/chat-contract": contract, "@/lib/chat-receipts": receiptsLib, "@/lib/steps": stepsLib, "@/lib/spotify-server": {}, "@/lib/supplement-stacks": {}, "@/lib/supplement-intake": { currentTimeZone: async () => "UTC", behavioralToday: async () => "2026-11-11", logSupplementIntake: async () => intake }, "@/lib/reading": {}, "@/lib/reading-notion": {}, "@/lib/reading-practice": readingPractice });
+  const exports = compile("../src/app/api/chat/route.ts", { "@anthropic-ai/sdk": FailsSecond, "@supabase/supabase-js": { createClient: () => ({}) }, "@/lib/chat-contract": contract, "@/lib/chat-receipts": receiptsLib, "@/lib/steps": stepsLib, "@/lib/spotify-server": {}, "@/lib/supplement-stacks": {}, "@/lib/supplement-intake": { currentTimeZone: async () => "UTC", behavioralToday: async () => "2026-11-11", logSupplementIntake: async () => intake }, "@/lib/reading": {}, "@/lib/reading-notion": {}, "@/lib/reading-removal": {}, "@/lib/reading-practice": readingPractice, "@/lib/reading-recall-server": recallStub(), "@/lib/reading-recall": recallLib });
   const failed = await exports.POST({ json: async () => ({ messages: [user("Log Synthetic Focus")] }), signal: new AbortController().signal });
   assert.equal(failed.status, 500);
   const failedBody = await failed.json();
@@ -752,11 +801,11 @@ test("a malformed request_id is a 400 before the model runs; a failed owner chec
 
 test("a quiz insert whose answer was lost is reported as possibly recorded; a refusal stays not recorded", async () => {
   const quiz = afterTool("record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 });
-  const lost = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
+  const lost = route(quiz, { supabase: fakeSupabase(), reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
   const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json();
   assert.equal(lostBody.receipts[0].status, "unknown");
   assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/, "the database text is not passed on");
-  const refused = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
+  const refused = route(quiz, { supabase: fakeSupabase(), reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
   assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json()).receipts[0].status, "not_saved");
 });
 
@@ -944,7 +993,7 @@ test("a retry while another try of the message still runs is a 409 and runs noth
 });
 
 test("a reading session whose insert committed but lost its answer is found by its key; what it missed is done once", async () => {
-  const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, status: "reading" }] } });
+  const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, slug: "synthetic-book", title: "Synthetic Book", status: "reading", total_chapters: 2 }] } });
   const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 2, status: "reading", finished_on: null };
   const calls = [];
   let mirrors = 0;
@@ -977,6 +1026,48 @@ test("a reading session whose insert committed but lost its answer is found by i
   assert.equal(db.rows("reading_sessions")[0].notion_block_id, "synthetic-block");
 });
 
+test("Onyx Chat's reading entry and progress line go through the stored claim and obligation; a replay never writes an unclaimed entry or an untracked line (PR 376, round 3)", async () => {
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: null, total_chapters: 20, status: "reading", finished_on: null };
+  const row = (over = {}) => ({ session_id: 1, book_id: 4, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: null, ...over });
+  // A fresh keyed create: the entry is written under the claim the create stored, the line under its obligation.
+  {
+    const calls = [];
+    const reading = {
+      logSession: async () => ({ ok: true, book, session: row(), xpGained: 20, finished: false, habitMarked: false, habitCreated: false, replayed: false, mirrorClaimId: "claim-synthetic", progressOwedId: "owed-synthetic" }),
+      getOverview: async () => null,
+    };
+    await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: fakeSupabase(), reading, readingRemoval: removalOf({}, calls) }).post({ messages: [user("I read chapters 1 and 2 on paper")] });
+    assert.deepEqual(calls, [
+      { fn: "placeEntry", replaces: null, claim: "claim-synthetic" },
+      { fn: "rewriteProgressNow", bookId: 4, owedId: "owed-synthetic" },
+    ]);
+  }
+  // This call's own insert, answer lost: the stored claim is looked up. Found = written under it; none = placeEntry
+  // stores one first (no claim argument); the lookup failed = no entry now (the sweep writes the claim, if any).
+  for (const [lookup, expected] of [["claim-found", [{ fn: "placeEntry", replaces: null, claim: "claim-found" }]], [null, [{ fn: "placeEntry", replaces: null, claim: null }]], ["error", []]]) {
+    const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, status: "reading" }] } });
+    const calls = [];
+    const looked = [];
+    let n = 0;
+    const reading = {
+      logSession: async (_client, input) => {
+        if (++n === 1) {
+          db.seed("reading_sessions", [{ session_id: 1, book_id: 4, client_key: input.client_key }]);
+          return { ok: false, error: "TypeError: fetch failed (synthetic)" };
+        }
+        // A replay carries no stored claim or obligation of its own (the replay mirrors nothing).
+        return { ok: true, book, session: row(), xpGained: 20, finished: false, habitMarked: false, habitCreated: null, replayed: true };
+      },
+      getOverview: async () => null,
+    };
+    const readingRemoval = removalOf({}, calls, { createEntryClaimOf: async (_c, sessionId, bookId) => { looked.push([sessionId, bookId]); return lookup; } });
+    await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingRemoval }).post({ request_id: RID, messages: [user("I read chapters 1 and 2 on paper")] });
+    assert.deepEqual(looked, [[1, 4]], String(lookup));
+    assert.deepEqual(calls.filter((c) => c.fn === "placeEntry"), expected, String(lookup));
+    assert.deepEqual(calls.filter((c) => c.fn === "rewriteProgressNow"), [{ fn: "rewriteProgressNow", bookId: 4, owedId: null }], "no stored obligation: rewriteProgressNow stores its own before it writes");
+  }
+});
+
 test("a replayed session never overrides an answer given since, and a lost answer with no row found reads 'check this'", async () => {
   const db = ledgerDb({ tables: { habit_journal: [{ cycle_date: "2026-11-11", question: "Read synthetic", answer: "No" }] } });
   const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 20, status: "reading", finished_on: null };
@@ -999,7 +1090,7 @@ test("a replayed session never overrides an answer given since, and a lost answe
 test("a session an earlier try wrote is only read on the retry: a habit answer cleared since stays cleared, no second finish or Notion entry", async () => {
   const state = { failFinish: true };
   const db = ledgerDb({
-    tables: { habit_journal: [], reading_sessions: [], books: [{ book_id: 4, status: "reading" }] },
+    tables: { habit_journal: [], reading_sessions: [], books: [{ book_id: 4, slug: "synthetic-book", title: "Synthetic Book", status: "reading", total_chapters: 2 }] },
     fail: ({ table, op, payload }) => (state.failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null),
   });
   const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 2, status: "reading", finished_on: null };
@@ -1920,4 +2011,209 @@ test("a reading session for another book the user names is not written to the bo
   assert.equal(sessions, 0, "nothing was written");
   assert.deepEqual(body.receipts.map((x) => [x.tool, x.status]), [["log_reading_session", "not_saved"]]);
   assert.ok(body.receipts[0].details.includes(writeIntent.REFUSAL_TEXT.other_book));
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// READ-QUIZ-01 S6 (ported onto the replay ledger and the write-authority gate): the question-bank tools.
+// get_reading_questions is a read; record_reading_answer and flag_reading_question are write tools: each call is
+// checked against the user's own latest message (lib/chat-write-intent.ts), then recorded in the ledger under an
+// operation id that is also the key of the bank write (so a retry finds the stored answer). Synthetic book and
+// questions only ("The Lighthouse Ledger"); the bank module is the stand-in at the top of this file.
+// ---------------------------------------------------------------------------------------------------------------
+const LEDGER_BOOK = { book_id: 1, slug: "lighthouse-ledger", title: "The Lighthouse Ledger", author: "A. Keeper", total_chapters: 12, target_date: "2030-01-31", status: "reading" };
+const assistantSaid = (content) => ({ role: "assistant", content });
+/** A quiz the user asked for, one question asked (label Q1201), and the user's reply to it. */
+const quizReply = (reply, label = "(Q1201 · ch 3)") => [
+  user("Quiz me on chapter 3"),
+  assistantSaid(`Question 1 ${label}: What does the keeper ring when fog rolls in?`),
+  user(reply),
+];
+const bankRows = () => [{ question_id: 1201, version: 2, format: "cued", rubric: { format: "cued", answer: "The fog bell", accept: ["fog bell"] }, bank_chapter: 3 }];
+/** A bank stand-in that honours its keys like the real one: one stored answer / flag per key. */
+function bankStore() {
+  const answers = new Map();
+  const flags = new Map();
+  const calls = { answers: [], flags: [] };
+  return {
+    answers, flags, calls,
+    recall: recallStub({
+      recordChatAnswer: async (_client, input) => {
+        calls.answers.push(input);
+        const key = input.tool_use_id;
+        const prior = answers.get(key);
+        if (prior) return { ok: true, attempt_key: key, chapter: 3, verdict: prior.verdict, grading_status: "graded", replayed: true };
+        answers.set(key, { verdict: input.verdict, answer: input.answer });
+        return { ok: true, attempt_key: key, chapter: 3, verdict: input.verdict, grading_status: "graded", replayed: false };
+      },
+      flagQuestion: async (_client, input) => {
+        calls.flags.push(input);
+        const prior = flags.get(input.flag_key);
+        flags.set(input.flag_key, input.kind);
+        return { status: 200, body: { success: true, kind: input.kind, invalidated: input.kind === "wrong" ? 2 : 0, replayed: Boolean(prior) } };
+      },
+    }),
+  };
+}
+const answerCall = { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" };
+
+test("the question-bank tools are registered: the lookup is a read, the answer and the flag are gated write tools (S6)", async () => {
+  const r = route();
+  await r.post({ messages: [user("Hello")] });
+  const byName = Object.fromEntries(r.requests()[0].tools.map((t) => [t.name, t]));
+  assert.ok(byName.get_reading_questions && !/WRITE TOOL/.test(byName.get_reading_questions.description));
+  assert.ok(receiptsLib.isWriteTool("record_reading_answer") && receiptsLib.isWriteTool("flag_reading_question"));
+  assert.ok(!receiptsLib.isWriteTool("get_reading_questions"));
+  assert.match(byName.record_reading_answer.description, /only for the question you asked in your previous message/);
+  // The stand-in's constants are the module's own.
+  const src = readFileSync(new URL("../src/lib/reading-recall-server.ts", import.meta.url), "utf8");
+  assert.match(src, /export const CHAT_QUESTIONS_MAX = 10;/);
+  assert.match(src, /export const FLAG_KINDS = \["wrong", "unclear", "not_in_chapter", "not_read_yet"\] as const;/);
+  assert.match(src, /export const SLUG_RE = \/\^\[a-z0-9-\]\{1,80\}\$\/;/);
+});
+
+test("the system prompt names the active book read at request time, and no book in code (S0)", async () => {
+  const withBook = route([], { reading: { getBook: async () => LEDGER_BOOK } });
+  await withBook.post({ messages: [user("How is my reading going?")] });
+  const { system } = withBook.requests()[0];
+  assert.ok(system.includes(receiptsLib.readingQuestLine(LEDGER_BOOK)));
+  assert.ok(system.indexOf('"reading quest"') < system.indexOf("Replies are rendered as Markdown."));
+  assert.match(system, /label with its number and chapter, e\.g\. "\(Q1234 · ch 3\)", always written like that/);
+  const src = readFileSync(new URL("../src/app/api/chat/route.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /currently The Goal|Goldratt/);
+  // A book that cannot be read sends the model to get_reading_status instead of guessing.
+  const unreadable = route([], { reading: { getBook: async () => { throw new Error("db"); } } });
+  await unreadable.post({ messages: [user("Hi")] });
+  assert.match(unreadable.requests()[0].system, /call get_reading_status to see which book/);
+});
+
+test("get_reading_questions is a read: no receipt, no ledger row, order steps shuffled (S6)", async () => {
+  const db = ledgerDb({ tables: { reading_questions: bankRows() } });
+  const order = { question_id: 1203, version: 1, chapter: 4, format: "order", prompt: "Put the watch routine in order.", reference: { steps: ["Light the lamp", "Watch the bay", "Write the entry"], explanation: "x" }, idea: { title: "t", statement: "s", key_points: [] }, sources: [] };
+  const recall = recallStub({ questionsForChat: async () => ({ ok: true, enabled: true, today: "2026-11-11", quiz_through: 4, questions: [order] }) });
+  const r = route(afterTool("get_reading_questions", { mode: "chapter", chapter: 4 }), { supabase: db, recall });
+  const body = await (await r.post({ request_id: RID, messages: [user("Quiz me on chapter 4")] })).json();
+  assert.equal(body.receipts, undefined, "a lookup never writes a receipt");
+  assert.equal(db.rows("chat_operations").length, 0);
+  const result = JSON.parse(r.requests()[1].messages.at(-1).content[0].content);
+  assert.equal(result.enabled, true);
+  assert.equal(result.questions[0].steps_to_show.length, 3);
+  assert.notDeepEqual(result.questions[0].steps_to_show, order.reference.steps, "never shown in the right order");
+});
+
+test("an answer to the question just asked is recorded through the ledger, keyed by the operation id (S6)", async () => {
+  const db = ledgerDb({ tables: { reading_questions: bankRows() } });
+  const bank = bankStore();
+  const r = route(afterTool("record_reading_answer", answerCall, "Right."), { supabase: db, recall: bank.recall });
+  const body = await (await r.post({ request_id: RID, messages: quizReply("The fog bell") })).json();
+  const ops = db.rows("chat_operations");
+  assert.equal(ops.length, 1);
+  assert.equal(ops[0].tool, "record_reading_answer");
+  assert.equal(ops[0].status, "done");
+  assert.equal(bank.calls.answers.length, 1);
+  assert.equal(bank.calls.answers[0].tool_use_id, ops[0].op_id, "the bank write is keyed by the operation id, not the model's call id");
+  assert.equal(bank.calls.answers[0].answer, "The fog bell", "the user's words as given");
+  assert.deepEqual(body.receipts.map((x) => [x.tool, x.status, x.title]), [["record_reading_answer", "saved", "Answer recorded · ch 3 · correct"]]);
+});
+
+test("a retried answer is found by its key: stored once, also when the model words its grade differently (S6)", async () => {
+  const state = { failFinish: true };
+  const db = ledgerDb({ tables: { reading_questions: bankRows() }, fail: finishFails(state) });
+  const bank = bankStore();
+  const body = { request_id: RID, messages: quizReply("The fog bell") };
+  await route(afterTool("record_reading_answer", { ...answerCall, feedback: "Right." }), { supabase: db, recall: bank.recall }).post(body);
+  assert.equal(db.rows("chat_operations")[0].status, "pending", "the answer was lost before the ledger recorded it");
+  state.failFinish = false;
+  // The retry's model words the verdict and the feedback differently: the same answer to the same question.
+  const retry = await (await route(afterTool("record_reading_answer", { ...answerCall, verdict: "partial", feedback: "Close." }), { supabase: db, recall: bank.recall }).post(body)).json();
+  assert.equal(bank.answers.size, 1, "recorded once");
+  assert.equal(new Set(bank.calls.answers.map((c) => c.tool_use_id)).size, 1, "both tries used the one operation id");
+  assert.equal(db.rows("chat_operations").length, 1);
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+  assert.equal(retry.receipts[0].status, "unchanged");
+  assert.equal(operations.intentSha("record_reading_answer", { ...answerCall, feedback: "Right." }), operations.intentSha("record_reading_answer", { ...answerCall, verdict: "incorrect", feedback: "No." }));
+  assert.notEqual(operations.intentSha("record_reading_answer", answerCall), operations.intentSha("record_reading_answer", { ...answerCall, answer: "The horn" }));
+  assert.ok(operations.RERUN_SAFE.has("record_reading_answer") && operations.RERUN_SAFE.has("flag_reading_question"));
+});
+
+test("an answer is refused unless the user asked for a quiz and is replying to the question just asked; nothing reaches the bank or the ledger (S6)", async () => {
+  const cases = [
+    ["no quiz was asked for", [user("What rings in the fog?")], answerCall, "quiz_not_asked"],
+    ["the quiz was stopped", [...quizReply("The fog bell").slice(0, 2), user("Stop the quiz, the fog bell")], answerCall, "quiz_cancelled"],
+    ["the question was not the one just asked", quizReply("The fog bell"), { ...answerCall, question_id: 1299 }, "question_not_asked"],
+    ["the question was never labelled", quizReply("The fog bell", ""), answerCall, "question_not_asked"],
+    ["the answer is not the user's words", quizReply("The fog bell"), { ...answerCall, answer: "A very different answer" }, "not_your_words"],
+    ["no reply to a question yet", [user("Quiz me on chapter 3")], answerCall, "quiz_not_answered"],
+    ["a number sent as text", quizReply("The fog bell"), { ...answerCall, version: "2" }, "invalid_value"],
+    ["a verdict the tool does not take", quizReply("The fog bell"), { ...answerCall, verdict: "great" }, "invalid_value"],
+  ];
+  for (const [name, messages, call, code] of cases) {
+    const db = ledgerDb({ tables: { reading_questions: bankRows() } });
+    const bank = bankStore();
+    const r = route(afterTool("record_reading_answer", call), { supabase: db, recall: bank.recall });
+    const body = await (await r.post({ request_id: RID, messages })).json();
+    assert.equal(bank.calls.answers.length, 0, name);
+    assert.equal(db.rows("chat_operations").length, 0, name);
+    assert.deepEqual(body.receipts.map((x) => x.status), ["not_saved"], name);
+    assert.ok(body.receipts[0].details.includes(writeIntent.REFUSAL_TEXT[code]), `${name}: ${code}`);
+  }
+});
+
+test("one message answers one question: a second answer call in the same request is refused (S6)", async () => {
+  const db = ledgerDb({ tables: { reading_questions: bankRows() } });
+  const bank = bankStore();
+  const r = route([
+    { stop_reason: "tool_use", content: [toolUse("record_reading_answer", answerCall, "a1"), toolUse("record_reading_answer", { ...answerCall, question_id: 1202 }, "a2")] },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
+  ], { supabase: db, recall: bank.recall });
+  const body = await (await r.post({ request_id: RID, messages: quizReply("The fog bell") })).json();
+  assert.equal(bank.calls.answers.length, 1);
+  assert.deepEqual(body.receipts.map((x) => x.status), ["saved", "not_saved"]);
+});
+
+test("a question is flagged only when the user's own message says so, in the kind it says (S6)", async () => {
+  const flagCall = { question_id: 1201, kind: "wrong" };
+  const db = ledgerDb({ tables: { reading_questions: bankRows() } });
+  const bank = bankStore();
+  const ok = route(afterTool("flag_reading_question", flagCall), { supabase: db, recall: bank.recall });
+  const done = await (await ok.post({ request_id: RID, messages: quizReply("That question is wrong, the keeper rings no bell") })).json();
+  assert.equal(bank.calls.flags.length, 1);
+  assert.equal(bank.calls.flags[0].via, "chat");
+  assert.equal(bank.calls.flags[0].flag_key, `flag-key-for-${db.rows("chat_operations")[0].op_id}`, "keyed by the operation id");
+  assert.deepEqual(done.receipts.map((x) => [x.status, x.title]), [["saved", "Question flagged · wrong"]]);
+
+  const cases = [
+    ["pushback on the grade", "My answer was right, you graded it wrong"],
+    ["another kind than the user said", "That question is confusing"],
+    ["a question, not a statement", "Is that question wrong?"],
+    ["a request not to flag", "Don't flag it, the question is wrong"],
+    ["not wrong", "That question is not wrong"],
+  ];
+  for (const [name, reply] of cases) {
+    const bankN = bankStore();
+    const dbN = ledgerDb({ tables: { reading_questions: bankRows() } });
+    const body = await (await route(afterTool("flag_reading_question", flagCall), { supabase: dbN, recall: bankN.recall }).post({ request_id: RID, messages: quizReply(reply) })).json();
+    assert.equal(bankN.calls.flags.length, 0, name);
+    assert.equal(dbN.rows("chat_operations").length, 0, name);
+    assert.deepEqual(body.receipts.map((x) => x.status), ["not_saved"], name);
+  }
+});
+
+test("a flag for a question that was not the one just asked is refused unless the user names it (S6)", async () => {
+  const bank = bankStore();
+  const db = ledgerDb({ tables: { reading_questions: bankRows() } });
+  const other = await (await route(afterTool("flag_reading_question", { question_id: 1299, kind: "wrong" }), { supabase: db, recall: bank.recall }).post({ request_id: RID, messages: quizReply("That question is wrong") })).json();
+  assert.equal(bank.calls.flags.length, 0);
+  assert.ok(other.receipts[0].details.includes(writeIntent.REFUSAL_TEXT.question_not_asked));
+  const named = await (await route(afterTool("flag_reading_question", { question_id: 1299, kind: "wrong" }), { supabase: ledgerDb({ tables: { reading_questions: bankRows() } }), recall: bank.recall }).post({ request_id: RID, messages: quizReply("Q1299 is wrong") })).json();
+  assert.equal(bank.calls.flags.length, 1);
+  assert.equal(named.receipts[0].status, "saved");
+});
+
+test("when the ledger cannot record an answer, nothing is written and the receipt says so (S6)", async () => {
+  const db = ledgerDb({ tables: { reading_questions: bankRows() }, fail: () => ({ code: "42P01" }) });
+  const bank = bankStore();
+  const r = route(afterTool("record_reading_answer", answerCall), { supabase: db, recall: bank.recall });
+  const body = await (await r.post({ request_id: RID, messages: quizReply("The fog bell") })).json();
+  assert.equal(bank.calls.answers.length, 0, "the ledger could not record it, so nothing ran");
+  assert.deepEqual(body.receipts.map((x) => x.status), ["not_saved"]);
 });

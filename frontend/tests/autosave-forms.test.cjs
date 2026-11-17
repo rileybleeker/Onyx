@@ -499,8 +499,9 @@ const CARE_STUBS = {
 const CARE_TITLE = byPlaceholder("e.g. Routine checkup");
 const CARE_DUE = (n) => n.type === "input" && n.props.type === "date";
 
-/** A server idempotent on the item id, like /api/care/items: a repeated create answers the row it stored first. */
-function careServer(seed, { lose, refuse } = {}) {
+/** A server idempotent on the item id, like /api/care/items: a repeated create answers the row it stored first.
+ *  `refuse` answers `refuseStatus` (default 500, a transient outage; pass 4xx for a real refusal). */
+function careServer(seed, { lose, refuse, refuseStatus = 500 } = {}) {
   const stored = new Map(seed.map((i) => [i.id, { ...i }]));
   const handle = (call) => {
     if (call.method === "POST" && call.url === "/api/care/items") {
@@ -515,7 +516,7 @@ function careServer(seed, { lose, refuse } = {}) {
     return response({ error: "Synthetic unknown request" }, 404);
   };
   const answer = (call) => {
-    if (refuse?.(call)) return response({ error: "Synthetic outage" }, 500);
+    if (refuse?.(call)) return response({ error: "Synthetic outage" }, refuseStatus);
     const res = handle(call);
     if (lose?.(call)) throw new TypeError("Synthetic lost answer");
     return res;
@@ -554,7 +555,7 @@ test("care planner: a new item is created once it has a label and a date; later 
   assert.equal(server.stored.size, 1);
 });
 
-test("care planner: a create whose answer was lost is shown with Retry, and the newer edits reach Onyx as that one item", async (t) => {
+test("care planner: a create whose answer was lost is resent on its own with the same id, and the newer edits reach Onyx as that one item", async (t) => {
   let posts = 0;
   const server = careServer([], { lose: (call) => call.method === "POST" && ++posts === 1 });
   const h = await mountCare(t, server);
@@ -563,28 +564,43 @@ test("care planner: a create whose answer was lost is shown with Retry, and the 
   change(one(h, CARE_DUE, "the date field"), "2031-04-01");
   await h.flush();
   await h.tick(1200);
-  assert.match(h.text(), /Not saved: Couldn.t save that to Onyx\./, "the failure is visible");
+  assert.match(h.text(), /Not saved: Couldn't reach Onyx\. Trying again…/, "a lost answer is a transient failure, shown as retrying");
   assert.ok(h.button("Retry"), "with Retry");
-  // Whether a lost answer is also retried on its own is not pinned here (AGENTS.md: only a refusal waits for
-  // Retry; this page treats every failure as one today: Onyx Roadmap row "Care planner (/health): retry an outage on
-  // its own", which pins it here once fixed). What must hold: one item, with the newest edits.
-  change(one(h, CARE_TITLE, "the label field"), "Synthetic checkup, moved");
-  await h.flush();
-  await h.tick(60_000);
+  await h.tick(2000); // the first backoff delay (2 s) since the failure
   const writes = h.net.writes();
   const id = writes[0].body.id;
-  assert.ok(writes.length >= 2, "the newer edit was sent");
-  assert.ok(writes.every((c) => (c.method === "POST" ? c.url === "/api/care/items" && c.body.id === id : c.url === `/api/care/items/${id}`)), "every write is for the one item: a create sent again carries the same id");
+  assert.deepEqual(methods(h), ["POST /api/care/items", "POST /api/care/items"], "the create went out again on its own");
+  assert.ok(writes.every((c) => c.url === "/api/care/items" && c.body.id === id), "resent as a create with the same id, so the route replays it");
   assert.equal(server.stored.size, 1, "one item, not two");
+  assert.doesNotMatch(h.text(), /Not saved|Couldn't reach|Trying again/, "and the status clears");
+  change(one(h, CARE_TITLE, "the label field"), "Synthetic checkup, moved");
+  await h.flush();
+  await h.tick(1200);
+  assert.deepEqual(methods(h), ["POST /api/care/items", "POST /api/care/items", `PATCH /api/care/items/${id}`], "edited in place once the create is confirmed, never a second item");
   assert.equal(server.stored.get(id).title, "Synthetic checkup, moved", "the newer label reached Onyx");
-  assert.doesNotMatch(h.text(), /Not saved|Couldn.t save/, "and the page no longer says it failed");
+  assert.equal(server.stored.size, 1);
+});
+
+test("care planner: a refused create is shown with Retry and is not resent on its own", async (t) => {
+  let posts = 0;
+  const server = careServer([], { refuse: (call) => call.method === "POST" && ++posts === 1, refuseStatus: 400 });
+  const h = await mountCare(t, server);
+  change(one(h, CARE_TITLE, "the label field"), "Synthetic checkup");
+  await h.flush();
+  change(one(h, CARE_DUE, "the date field"), "2031-04-01");
+  await h.flush();
+  await h.tick(1200);
+  assert.match(h.text(), /Not saved: Synthetic outage/, "the refusal is shown");
+  assert.ok(h.button("Retry"), "with Retry");
+  await h.tick(120_000);
+  assert.equal(h.net.writes().length, 1, "a refusal is never resent on its own");
 });
 
 test("care planner: switching to another item sends the open edit first and keeps it when it cannot be saved", async (t) => {
   const X = careItem("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Synthetic eye exam", "2031-05-01");
   const Y = careItem("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "Synthetic dental cleaning", "2031-06-01");
   let refuse = true;
-  const server = careServer([X, Y], { refuse: (call) => refuse && call.method === "PATCH" });
+  const server = careServer([X, Y], { refuse: (call) => refuse && call.method === "PATCH", refuseStatus: 400 });
   const h = await mountCare(t, server, [X, Y]);
   editButtonOf(h, "Synthetic eye exam").props.onClick();
   await h.flush();
@@ -596,7 +612,8 @@ test("care planner: switching to another item sends the open edit first and keep
   assert.match(h.text(), /The item in the form is not saved yet\. Retry it/);
   assert.equal(one(h, CARE_TITLE, "the label field").props.value, "Synthetic eye exam, rescheduled", "the edit stays in the form");
   assert.match(h.text(), /Edit care item/);
-  // (Whether a 5xx is also retried on its own is not pinned here; see the lost-answer test above.)
+  // A refused PATCH (a real 4xx) is kept for Retry, never resent on its own; the lost-answer test above
+  // pins the transient side (a lost or 5xx answer is retried with backoff).
   refuse = false;
   h.click("Retry");
   await h.flush();
@@ -1174,4 +1191,41 @@ test("forms that keep a button keep it on purpose", () => {
   assert.ok(has("app/financials/CategoryEditor.tsx", "All from this merchant"));
   // Planned items and goals have no update route; stream edits are three different actions on one date.
   assert.ok(has("app/financials/forecast/PlanConfig.tsx", "Stop from then"));
+});
+
+// ─── unsaved work in the continuous scroll (mounted) ─────────────────────────
+
+test("unsaved work: a form drawn in a page of the continuous scroll holds that page, the routed page's form none", async (t) => {
+  // The real lib/use-autosave.ts -> lib/use-unsaved-work.ts -> lib/feed-scope.ts chain, with the real context: one form
+  // inside the Provider ContinuousScroll puts around the Log page, one outside it (the routed page).
+  const api = {};
+  let work = null;
+  const probe = (load) => {
+    const { useAutosave } = load("lib/use-autosave.ts");
+    const { FeedScopeContext } = load("lib/feed-scope.ts");
+    work = load("lib/unsaved-work.ts").unsavedWork;
+    function ScopedForm({ name }) {
+      api[name] = useAutosave(`synthetic-${name}`, { save: async () => {}, delayMs: 500 }, "");
+      return null;
+    }
+    return function ScopeProbe() {
+      return [
+        jsx(FeedScopeContext.Provider, { value: "/log", children: jsx(ScopedForm, { name: "inFeed" }) }, "feed"),
+        jsx(ScopedForm, { name: "routed" }, "routed"),
+      ];
+    };
+  };
+  const h = await mountForm(t, probe);
+  assert.equal(work.has(), false, "nothing typed yet");
+  api.routed.change("synthetic words");
+  await h.flush();
+  assert.equal(work.has(), true, "the routed page's edit is unsaved work for the updater");
+  assert.equal(work.hasIn("/log"), false, "but holds no page of the scroll");
+  api.inFeed.change("synthetic words");
+  await h.flush();
+  assert.equal(work.hasIn("/log"), true, "the Log page's edit keeps that page mounted in the scroll");
+  assert.equal(work.hasIn("/today"), false, "and no other page");
+  await h.tick(500);
+  assert.equal(work.has(), false, "both saved");
+  assert.equal(work.hasIn("/log"), false, "the scroll may drop the Log page again");
 });

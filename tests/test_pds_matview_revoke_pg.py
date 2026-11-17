@@ -17,7 +17,10 @@ what it does:
   - a row-security policy that queries a matview: aborts;
   - a trigger function that reads a matview: aborts;
   - a void SECURITY DEFINER refresh function no browser role may call: passes; the same function left
-    callable by PUBLIC: aborts (fail closed, nothing changed).
+    callable by PUBLIC: aborts (fail closed, nothing changed);
+  - an unusable unique index: a matview whose only unique index is an expression index, or whose
+    unique index is invalid (indisvalid = false, superuser fixture only): aborts with the readiness
+    message and changes nothing.
   - SQL the graph cannot read (SEC01B-R3): a callable definer function that builds the matview name at
     run time ('pds.' || 'hrv_' || 'residuals_mat'): aborts, also when it is added after a successful
     revoke and the migration is re-run; a callable definer calling an invoker function with dynamic
@@ -386,6 +389,45 @@ def test_assembled_name_view_nobody_can_reach_passes_and_reruns() -> None:
 SELECT query_to_xml('SELECT k FROM pds.' || 'hrv_' || 'residuals_mat', true, false, '') AS x;
 REVOKE ALL ON pds.fixture_xml_idle FROM PUBLIC, anon, authenticated;""",
                     MIGRATE, _assert_grants(False), MIGRATE, _assert_grants(False))
+
+
+# The readiness check must refuse an index REFRESH ... CONCURRENTLY cannot use: unique and
+# non-partial is not enough when the index is an expression index (indexprs) or is invalid /
+# not ready, so those cases abort with the readiness message, grants unchanged.
+INDEX_ABORT = "has no usable unique non-partial index"
+
+
+def test_expression_unique_index_aborts() -> None:
+    # The only unique index on the matview is an expression index ((k + 0)): indisunique and
+    # indpred IS NULL pass, but a concurrent refresh cannot use it.
+    _expect_abort("""DROP INDEX pds.hrv_residuals_mat_k;
+CREATE UNIQUE INDEX hrv_residuals_mat_expr ON pds.hrv_residuals_mat ((k + 0));""",
+                  INDEX_ABORT, "hrv_residuals_mat")
+
+
+def test_invalid_unique_index_aborts() -> None:
+    # pg_index.indisvalid is only writable by a superuser; skip with a clear reason rather than
+    # faking the case when the fixture user is not one.
+    res = _run("\n".join([
+        _setup(),
+        """DO $invalid$
+BEGIN
+    IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+        RAISE EXCEPTION 'SKIP: fixture user % is not a superuser; cannot make an invalid index', current_user;
+    END IF;
+    UPDATE pg_index SET indisvalid = false
+    WHERE indrelid = 'pds.tz_log_gaps_mat'::regclass AND indisunique;
+END
+$invalid$;""",
+        MIGRATE_EXPECTING_ABORT, _assert_grants(True),
+        "SELECT 'FIXTURE_ABORTED_UNCHANGED';", "ROLLBACK;"]))
+    if "SKIP:" in res.stderr:
+        print(f"SKIP test_invalid_unique_index_aborts: {res.stderr.strip().splitlines()[-1]}")
+        return
+    assert res.returncode == 0, res.stderr[-2000:]
+    assert "FIXTURE_ABORTED_UNCHANGED" in res.stdout, res.stderr[-2000:]
+    assert INDEX_ABORT in res.stderr, res.stderr[-2000:]
+    assert "tz_log_gaps_mat" in res.stderr, res.stderr[-2000:]
 
 
 if __name__ == "__main__":

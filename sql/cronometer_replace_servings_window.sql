@@ -63,6 +63,11 @@
 --   p_dates, p_rows   as for pds.replace_cronometer_servings; both may be empty, and
 --                     then only the daily rows are written
 --   p_daily_rows      a JSON array of daily Total rows, upserted on calendar_date
+--   p_food_dates      every day the import showed (or may show) food on, whether or
+--                     not its rows are in p_rows / p_daily_rows (a file taken as
+--                     neither file, food on a day whose rows are not written): each
+--                     loses its empty-day record. Any date (it only forgets
+--                     records), may be empty.
 --   returns {"dates", "deleted", "inserted", "daily_upserted", "daily_kept"}
 --            (daily_upserted + daily_kept = the number of rows in p_daily_rows)
 --
@@ -97,7 +102,8 @@
 --     call whose rows or p_food_dates show food on it (even when its rows are
 --     not written), and EVERY call of the other writer
 --     (replace_cronometer_servings_and_daily: a manual import, a run with
---     emptying off), for each date it writes. Otherwise food seen in between
+--     emptying off), for each date it writes and each date it is shown food on
+--     (p_food_dates). Otherwise food seen in between
 --     would leave the old first look behind, and the next automated export that
 --     missed the day would empty it on one look. (A direct call of the date-set
 --     function, which no importer makes once this file is applied, does not
@@ -191,7 +197,7 @@ CREATE TABLE IF NOT EXISTS pds.cronometer_empty_day_candidates (
 );
 
 COMMENT ON TABLE pds.cronometer_empty_day_candidates IS
-    'Stored Cronometer days the automated export showed with no food, not emptied yet. pds.replace_cronometer_servings_window empties a day once an export at least 6 h after first_seen_at still shows it empty; both import functions forget a day whenever they write it, and the window function also whenever the export shows food on it, written or not. Dates only. service_role only.';
+    'Stored Cronometer days the automated export showed with no food, not emptied yet. pds.replace_cronometer_servings_window empties a day once an export at least 6 h after first_seen_at still shows it empty; both import functions forget a day whenever they write it or are shown food on it (written or not), and the window function also whenever its export shows food on it. Dates only. service_role only.';
 
 ALTER TABLE pds.cronometer_empty_day_candidates ENABLE ROW LEVEL SECURITY;
 
@@ -353,7 +359,8 @@ GRANT EXECUTE ON FUNCTION pds.cronometer_daily_rows_held(jsonb, date[]) TO servi
 CREATE OR REPLACE FUNCTION pds.replace_cronometer_servings_and_daily(
     p_dates       date[],
     p_rows        jsonb,
-    p_daily_rows  jsonb)
+    p_daily_rows  jsonb,
+    p_food_dates  date[] DEFAULT '{}')
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -367,15 +374,18 @@ DECLARE
     v_daily_write  jsonb;
 BEGIN
     IF p_dates IS NULL OR p_rows IS NULL OR jsonb_typeof(p_rows) <> 'array'
-       OR p_daily_rows IS NULL OR jsonb_typeof(p_daily_rows) <> 'array' THEN
-        RAISE EXCEPTION 'replace_cronometer_servings_and_daily: p_dates must be an array (it may be empty) and p_rows, p_daily_rows JSON arrays'
+       OR p_daily_rows IS NULL OR jsonb_typeof(p_daily_rows) <> 'array'
+       OR p_food_dates IS NULL
+       OR array_position(p_food_dates, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'replace_cronometer_servings_and_daily: p_dates and p_food_dates must be arrays (they may be empty, with no NULL) and p_rows, p_daily_rows JSON arrays'
             USING ERRCODE = '22023';
     END IF;
     IF jsonb_array_length(p_rows) = 0 AND cardinality(p_dates) > 0 THEN
         RAISE EXCEPTION 'replace_cronometer_servings_and_daily: % date(s) but no rows; this function never empties a day', cardinality(p_dates)
             USING ERRCODE = '22023';
     END IF;
-    IF jsonb_array_length(p_rows) = 0 AND jsonb_array_length(p_daily_rows) = 0 THEN
+    IF jsonb_array_length(p_rows) = 0 AND jsonb_array_length(p_daily_rows) = 0
+       AND cardinality(p_food_dates) = 0 THEN
         RAISE EXCEPTION 'replace_cronometer_servings_and_daily: no rows; nothing to do'
             USING ERRCODE = '22023';
     END IF;
@@ -384,8 +394,13 @@ BEGIN
     -- this transaction ends; taking it again inside the date-set function is fine).
     PERFORM pg_advisory_xact_lock(hashtext('pds.replace_cronometer_servings'));
 
-    -- Every day this import writes is no longer waiting to be emptied: its count
-    -- starts over, under the same lock and in the same transaction as the write.
+    -- Every day this import writes, and every day its inputs were shown to have (or
+    -- possibly have) food, is no longer waiting to be emptied: its count starts
+    -- over, under the same lock and in the same transaction as the write. A CSV the
+    -- importer could not classify (e.g. a servings file that lost its Food Name
+    -- column, whose food rows no date-set replace writes) leaves its food dates
+    -- behind in p_food_dates, so the count of a day it shows food on still starts
+    -- over, exactly as p_food_dates does for the window function (OR-369).
     -- (The dates are validated below, by the date-set function and the daily
     -- upsert; a bad one raises there and this is rolled back with the rest.)
     SELECT coalesce(array_agg((NULLIF(e.elem ->> 'calendar_date', ''))::date), '{}'::date[])
@@ -397,7 +412,7 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     DELETE FROM pds.cronometer_empty_day_candidates c
-     WHERE c.calendar_date = ANY (p_dates || v_daily_dates);
+     WHERE c.calendar_date = ANY (p_dates || v_daily_dates || p_food_dates);
 
     -- This function never empties a day, so a daily row with no food for a day
     -- without serving rows here never replaces a stored daily row that has food
@@ -418,12 +433,12 @@ BEGIN
 END;
 $function$;
 
-COMMENT ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb) IS
-    'Atomically replaces pds.cronometer_servings for the dates with rows (via pds.replace_cronometer_servings) and upserts the daily totals, under the shared import lock, and forgets the empty-day record of every date it writes. Never empties a day: a daily row with no food never replaces a stored one with food (daily_kept). Used by cronometer_import.py for imports without a window (manual exports, emptying off) and as the window function''s rollout fallback. service_role only.';
+COMMENT ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb, date[]) IS
+    'Atomically replaces pds.cronometer_servings for the dates with rows (via pds.replace_cronometer_servings) and upserts the daily totals, under the shared import lock, and forgets the empty-day record of every date it writes AND every date its inputs were shown to have (or possibly have) food on (p_food_dates, written or not), like the window function''s food dates. Never empties a day: a daily row with no food never replaces a stored one with food (daily_kept). Used by cronometer_import.py for imports without a window (manual exports, emptying off) and as the window function''s rollout fallback. service_role only.';
 
-REVOKE ALL ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb) FROM PUBLIC;
-REVOKE ALL ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb) FROM anon, authenticated;
-GRANT EXECUTE ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb) TO service_role;
+REVOKE ALL ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb, date[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb, date[]) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb, date[]) TO service_role;
 
 -- 5. The automated export ---------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.replace_cronometer_servings_window(

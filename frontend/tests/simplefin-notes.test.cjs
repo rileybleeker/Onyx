@@ -130,7 +130,8 @@ function fakeSupabase(beats, history) {
     };
     return b;
   };
-  return { from };
+  // /api/status also calls rpc("reading_bank_status") (READ-QUIZ-01 s2): answer "function missing" (not set up).
+  return { from, rpc: () => Promise.resolve({ data: null, error: { code: "PGRST202" } }) };
 }
 
 test("/api/status: the SimpleFIN card and the sync history carry only allowlisted wording", async () => {

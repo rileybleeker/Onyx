@@ -76,13 +76,23 @@ export function logEarlyGet(url: string, routed: boolean): (() => Promise<Respon
 }
 
 /**
- * True once per full page load of /log, right after the script ran (its mark is removed): LogLoader then starts
- * the Supabase reads. False for an in-app visit or a copy in the continuous scroll (no script ran).
+ * True while the head script's mark is present and still fresh (10 s): a full page load of /log is in progress.
+ * Reads WITHOUT consuming, so a caller may poll for it (app/log/early-delivery-start.ts: the starter module can be
+ * evaluated before the head script has set the mark). False for an in-app visit or a copy in the continuous scroll
+ * (no script ran, so no mark exists).
+ */
+export function peekLogEarlyMark(now = Date.now()): boolean {
+  if (typeof window === "undefined") return false;
+  const at = (window as unknown as Record<string, unknown>)[LOG_EARLY_MARK];
+  return typeof at === "number" && now - at >= 0 && now - at < 10_000;
+}
+
+/**
+ * True once per full page load of /log, and consumes the mark (a second call returns false): the caller then
+ * starts the early reads. Check first with peekLogEarlyMark() when the head script may not have run yet.
  */
 export function takeLogEarlyMark(now = Date.now()): boolean {
-  if (typeof window === "undefined") return false;
-  const w = window as unknown as Record<string, unknown>;
-  const at = w[LOG_EARLY_MARK];
-  delete w[LOG_EARLY_MARK];
-  return typeof at === "number" && now - at >= 0 && now - at < 10_000;
+  if (!peekLogEarlyMark(now)) return false;
+  delete (window as unknown as Record<string, unknown>)[LOG_EARLY_MARK];
+  return true;
 }

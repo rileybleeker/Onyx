@@ -39,6 +39,9 @@ const quietBootJs = viewModule.exports.quietBootScript();
 // load fetches as usual and the requests checked below are unchanged.
 const earlyLib = ids.size; ids.set('frontend/src/lib/early-fetch.ts', earlyLib); modules[earlyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/early-fetch.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/early-fetch"\)/g, `require(${earlyLib})`);
+// "Practice · N ready" (import-free; the overview re-exports the same function).
+const readyLib = ids.size; ids.set('frontend/src/lib/reading-practice-ready.ts', readyLib); modules[readyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/reading-practice-ready.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/reading-practice-ready"\)/g, `require(${readyLib})`);
 // The overview cards under Today's panels (components/overview/) load as their own chunk and have their own
 // tests (frontend/tests/overview-cards.test.cjs); here they render nothing, so this file keeps checking Today's
 // own panels and exactly the requests those panels make.
@@ -157,6 +160,23 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await settled(page);
         assert.equal(await page.getByText(/Couldn't refresh requests/).count(), 0);
         assert.equal(await page.getByText(/Couldn't refresh reading/).count(), 0);
+        // READ-QUIZ-01: the reading panel's one line comes from the overview's own summary (no request of its own) and
+        // shows only while the book's questions are on and something is ready (due + never asked, at most a round).
+        assert.equal(await page.getByText(/Practice ·/).count(), 0, 'no summary: no practice line');
+        await page.evaluate(() => { window.book = { ...window.book, practice: { enabled: true, due: 2, newReady: 3 } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await page.getByRole('link', { name: 'Practice · 5 ready' }).isVisible());
+        assert.equal(await page.getByRole('link', { name: 'Practice · 5 ready' }).getAttribute('href'), '/reading');
+        await page.evaluate(() => { window.book = { ...window.book, practice: { enabled: false, due: 2, newReady: 3 } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert.equal(await page.getByText(/Practice ·/).count(), 0, 'the questions off: no practice line');
+        await page.evaluate(() => { window.book = { ...window.book, practice: { enabled: true, due: 0, newReady: 0 } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert.equal(await page.getByText(/Practice ·/).count(), 0, 'nothing ready: no practice line');
+        assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
         await close(page);
         console.log('PASS healthy bound, FYI filtering, links, reading, mobile width, refresh errors preserve data/focus, retry, GET-only');
         for (const mode of ['empty', 'error', 'inbox-error', 'reading-error', 'sync-error']) {
