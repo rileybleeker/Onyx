@@ -47,19 +47,32 @@ class LoadFailed extends Error {
   }
 }
 
+/**
+ * Longest a page-data read may take (headers and body). A read that never settles would keep the section on its
+ * skeleton and block every retry (the shared revalidate job stays in flight), so it is cut off and shows the
+ * page's error state with "Try again".
+ */
+const READ_LIMIT_MS = 10_000;
+
 function fetcherFor(page: FinanceFeedPage): () => Promise<unknown> {
   const url = financePageDataUrl(page);
   return async () => {
-    const res = await fetch(url, { cache: "no-store" });
-    if (sessionEnded(res)) {
-      reportSessionEnded();
-      throw new SessionEndedError();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), READ_LIMIT_MS);
+    try {
+      const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+      if (sessionEnded(res)) {
+        reportSessionEnded();
+        throw new SessionEndedError();
+      }
+      if (isGoneStatus(res.status)) return GONE;
+      const body: unknown = await res.json().catch(() => null);
+      if (!res.ok) throw new LoadFailed(isObj(body) && isObj(body.load) && body.load.kind === "error" ? body.load : null);
+      if (!usable(page, body)) throw new LoadFailed(null);
+      return body;
+    } finally {
+      clearTimeout(timer);
     }
-    if (isGoneStatus(res.status)) return GONE;
-    const body: unknown = await res.json().catch(() => null);
-    if (!res.ok) throw new LoadFailed(isObj(body) && isObj(body.load) && body.load.kind === "error" ? body.load : null);
-    if (!usable(page, body)) throw new LoadFailed(null);
-    return body;
   };
 }
 
