@@ -15,11 +15,16 @@ the temporary folder, the printed output or the heartbeat. Covers:
   * retry: a file answered 503 twice is fetched on the third try (1 s, 2 s backoff);
   * refusals before anything is sent: another origin, no public recipient, the private key given as the
     recipient, no age tool; a drill target needs its own --dest and its own key and writes no heartbeat;
-  * tables: paging in primary-key order, a table the schema does not know is listed as missing (not a
-    failure), credentials and the trial seed / schedule are never requested;
-  * retention: newest 8 plus the first of each of the 3 latest months plus the newest complete backup (its ok
-    marker); only this job's names are removed; partial runs prune too but never the newest complete one;
-    ciphertext a killed run left in the temporary folder is removed after a day;
+  * tables: paging by primary key with a keyset cursor (never an OFFSET), single and composite keys, a row
+    removed between two pages never skips an unread row, a table that keeps changing is not certified, a
+    table without a usable primary key is not copied (partial), a table the schema does not know is listed
+    as missing (not a failure), credentials and the trial seed / schedule are never requested; a listing
+    that keeps changing is partial;
+  * retention: newest 8 plus the first of each of the 3 latest months plus the newest backup whose
+    completeness marker verifies (an empty or foreign marker is no evidence); only this job's names are
+    removed; partial runs prune too but never the newest complete one; a marker that cannot be committed
+    fails the run and prunes nothing; a marker that cannot be read stops the prune; ciphertext a killed run
+    left in the temporary folder is removed after a day;
   * the heartbeat goes to exactly the production origin with the key the backup resolved, whatever
     ONYX_SUPABASE_URL says, and a heartbeat that cannot be written never changes the run's outcome;
   * the drill fails on a changed file, a member outside the pack's names (never extracted), a ciphertext that
@@ -74,6 +79,64 @@ def labs():
             {"id": LAB_2, "test_name": "LEAK other", "value_text": "LEAK", "document_id": None, "removed_at": None}]
 
 
+def _split_top(text):
+    """Splits a PostgREST logic tree's arguments on commas outside quotes and parentheses."""
+    out, cur, depth, inq, esc = [], "", 0, False, False
+    for ch in text:
+        if inq:
+            cur += ch
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                inq = False
+            continue
+        if ch == '"':
+            inq = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    out.append(cur)
+    return out
+
+
+def _cond(text):
+    col, op, val = text.split(".", 2)
+    assert op in ("eq", "gt") and val[0] == '"' and val[-1] == '"', text
+    out, esc = "", False
+    for ch in val[1:-1]:
+        if esc:
+            out, esc = out + ch, False
+        elif ch == "\\":
+            esc = True
+        else:
+            out += ch
+    return col, op, out
+
+
+def parse_after(text):
+    """The `or` filter the backup sends: a list of terms, each a list of (column, op, value)."""
+    assert text[0] == "(" and text[-1] == ")", text
+    terms = []
+    for t in _split_top(text[1:-1]):
+        terms.append([_cond(c) for c in _split_top(t[4:-1])] if t.startswith("and(") else [_cond(t)])
+    return terms
+
+
+def row_after(row, terms):
+    def ok(col, op, v):
+        x = str(row.get(col))
+        return x == v if op == "eq" else x > v
+    return any(all(ok(*c) for c in term) for term in terms)
+
+
 class FakeSupabase:
     """PostgREST (pds tables + the OpenAPI root) and Storage (listing + download) for one project."""
 
@@ -91,6 +154,8 @@ class FakeSupabase:
         self.calls: list = []
         self.posted: list = []          # heartbeat rows POSTed to /rest/v1/sync_log
         self.heartbeat_down = False
+        self.on_read: dict = {}         # table -> fn(query) run before a read of it is answered (a concurrent change)
+        self.on_list = None             # fn() run before each documents listing is answered
 
     def spec(self):
         defs = {}
@@ -126,13 +191,21 @@ class FakeSupabase:
                 return 503, b"{}", {}
             if table not in self.tables:
                 return 404, json.dumps({"code": "PGRST205", "message": "LEAK"}).encode(), {}
+            if table in self.on_read:
+                self.on_read[table](q)
             rows = list(self.tables[table])
             key = [c.split(".")[0] for c in q.get("order", "").split(",") if c]
             rows.sort(key=lambda r: tuple(str(r.get(c)) for c in key))
+            if "or" in q:
+                rows = [r for r in rows if row_after(r, parse_after(q["or"]))]
+            if q.get("select", "*") != "*":
+                rows = [{c: r.get(c) for c in q["select"].split(",")} for r in rows]
             off, lim = int(q.get("offset", 0)), int(q.get("limit", 1000))
             return 200, json.dumps(rows[off:off + lim]).encode(), {}
         if path == f"/storage/v1/object/list/{rc.BUCKET}":
             req = json.loads(body.decode())
+            if self.on_list and req["prefix"] == "documents":
+                self.on_list()
             if req["prefix"] == "":
                 entries = [{"name": "documents", "id": None, "metadata": None}]
             else:
@@ -239,7 +312,7 @@ class Base(unittest.TestCase):
         return code, out.getvalue()
 
     def written(self):
-        """What is in the backup folder, without the empty ok markers of complete runs."""
+        """What is in the backup folder, without the completeness markers of complete runs."""
         return sorted(p for p in self.dest.iterdir() if not ob.OK_RE.match(p.name)) if self.dest.is_dir() else []
 
     def markers(self):
@@ -264,7 +337,9 @@ class HappyPath(Base):
         self.assertEqual(len(files), 1)
         self.assertRegex(files[0].name, ob.NAME_RE)
         self.assertEqual(self.markers(), [ob.ok_marker(files[0].name)], "a complete run is marked")
-        self.assertEqual((self.dest / ob.ok_marker(files[0].name)).read_bytes(), b"")
+        marker = json.loads((self.dest / ob.ok_marker(files[0].name)).read_bytes())
+        self.assertEqual(marker, {"backup": files[0].name, "size": files[0].stat().st_size}, "name and size only")
+        self.assertTrue(ob.marker_valid(self.dest, files[0].name))
         self.assert_no_plaintext_on_disk()
         self.assertEqual([p for p in ob.tmp_dir().iterdir() if p.name != ".lock"], [], "no temporary file is left")
         for marker in ("LEAK", DOC_A, "documents/", "fake-service", RECIPIENT):
@@ -363,7 +438,10 @@ class PartialRuns(Base):
         self.dest.mkdir()
         complete = self.dest / "onyx-backup-20250101T000000Z.tar.age"
         complete.write_bytes(b"x")
-        (self.dest / ob.ok_marker(complete.name)).write_bytes(b"")
+        ob.write_ok_marker(complete)
+        older = self.dest / "onyx-backup-20240101T000000Z.tar.age"  # an empty marker is no evidence
+        older.write_bytes(b"x")
+        (self.dest / ob.ok_marker(older.name)).write_bytes(b"")
         later = [self.dest / f"onyx-backup-2026{m:02d}01T000000Z.tar.age" for m in range(1, 11)]  # partials
         for p in later:
             p.write_bytes(b"x")
@@ -375,6 +453,39 @@ class PartialRuns(Base):
         self.assertIn(ob.ok_marker(complete.name), self.markers())
         self.assertLessEqual(len(left), ob.KEEP_WEEKLY + ob.KEEP_MONTHLY + 1, "partial runs prune too")
         self.assertFalse(later[0].exists())
+        self.assertFalse(older.exists(), "a backup whose marker does not verify is not protected")
+
+    def test_a_marker_that_cannot_be_committed_fails_and_prunes_nothing(self):
+        self.dest.mkdir()
+        old = [self.dest / f"onyx-backup-2025{m:02d}01T000000Z.tar.age" for m in range(1, 13)]
+        for p in old:
+            p.write_bytes(b"x")
+        with mock.patch.object(ob, "write_ok_marker", side_effect=OSError("disk")):
+            code, out = self.backup()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAILED", out)
+        hb = self.heartbeats()
+        self.assertEqual((hb[0]["status"], hb[0]["error_message"]), ("failed", "marker_unwritable"))
+        self.assertTrue(all(p.exists() for p in old), "nothing is pruned without durable completeness evidence")
+        self.assertEqual(len(self.written()), len(old) + 1, "the new backup itself stays")
+        self.assertEqual(self.markers(), [])
+
+    def test_a_marker_that_does_not_read_back_fails(self):
+        with mock.patch.object(ob, "marker_valid", return_value=False):
+            code, out = self.backup()
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.heartbeats()[0]["error_message"], "marker_unwritable")
+
+    def test_a_marker_read_error_stops_the_prune_with_nothing_removed(self):
+        self.dest.mkdir()
+        names = [f"onyx-backup-2025{m:02d}01T000000Z.tar.age" for m in range(1, 13)]
+        for n in names:
+            (self.dest / n).write_bytes(b"x")
+        ob.write_ok_marker(self.dest / names[0])
+        with mock.patch.object(ob, "marker_valid", side_effect=OSError("cloud file unavailable")):
+            with self.assertRaises(OSError):
+                ob.prune(self.dest, NOW)
+        self.assertTrue(all((self.dest / n).exists() for n in names))
 
     def test_unreadable_rebuild_table_is_partial_and_missing_table_is_not(self):
         self.sb.always_500.add("weight_log")
@@ -499,8 +610,12 @@ class Tables(Base):
         code, out = self.backup()
         self.assertEqual(code, 0, out)
         urls = [u for _, u, _ in self.sb.calls if "/rest/v1/weight_log" in u]
-        self.assertEqual(len(urls), 3)
+        self.assertEqual(len(urls), 6, "3 pages of rows, then 3 pages of keys (the consistency check)")
         self.assertTrue(all("order=log_date.asc" in u for u in urls))
+        self.assertFalse(any("offset=" in u for u in urls), "never an OFFSET")
+        queries = [dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query)) for u in urls]
+        self.assertEqual(["or" in q for q in queries], [False, True, True, False, True, True])
+        self.assertEqual([q["select"] for q in queries], ["*"] * 3 + ["log_date"] * 3)
         plain = self.cipher.open_plain(self.written()[0])
         with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
             rows = json.loads(tar.extractfile("tables/pds/weight_log.json").read())
@@ -513,17 +628,87 @@ class Tables(Base):
             for t in ob.EXCLUDED_TABLES:
                 self.assertNotIn(f"/rest/v1/{t}", url)
         with self.assertRaises(ValueError):
-            ob.read_table(rc.Target(rc.DEFAULT_URL, "k", transport=self.sb), "ci_tokens", "id.asc")
+            ob.read_table(rc.Target(rc.DEFAULT_URL, "k", transport=self.sb), "ci_tokens", ("id",))
 
-    def test_table_order(self):
-        spec = {"definitions": {"t": {"properties": {"a": {"description": "x <pk/>"}, "b": {"description": "<pk/>"}, "c": {}}},
-                                "u": {"properties": {"id": {}, "x": {}}},
-                                "v": {"properties": {"n": {"format": "text"}, "j": {"format": "jsonb"}}}}}
-        self.assertEqual(ob.table_order(spec, "t"), "a.asc,b.asc")
-        self.assertEqual(ob.table_order(spec, "u"), "id.asc")
-        self.assertEqual(ob.table_order(spec, "v"), "n.asc")
-        self.assertIsNone(ob.table_order(spec, "absent"))
-        self.assertEqual(ob.table_order(None, "anything"), "id.asc")
+    def test_table_key(self):
+        pk = "Note:\nThis is a Primary Key.<pk/>"
+        spec = {"definitions": {
+            "t": {"properties": {"a": {"description": pk, "format": "uuid"}, "b": {"description": pk, "format": "date"},
+                                 "c": {"format": "text"}}},
+            "u": {"properties": {"id": {"format": "uuid"}, "x": {"format": "text"}}},  # no primary key
+            "v": {"properties": {"j": {"description": pk, "format": "jsonb"}}},          # a key the cursor cannot compare
+            "w": {"properties": {"f": {"description": pk, "format": "double precision"}}}}}
+        self.assertEqual(ob.table_key(spec, "t"), ("a", "b"))
+        self.assertEqual(ob.table_key(spec, "u"), ob.UNKEYED)
+        self.assertEqual(ob.table_key(spec, "v"), ob.UNKEYED)
+        self.assertEqual(ob.table_key(spec, "w"), ob.UNKEYED)
+        self.assertIsNone(ob.table_key(spec, "absent"))
+        self.assertEqual(ob.table_key(None, "anything"), ("id",))
+
+    def test_after_filter_is_the_row_value_comparison_and_quotes_values(self):
+        last = {"a": 'x"y\\z,(1)', "b": 7, "c": True}
+        got = ob.after_filter("s", ("a", "b", "c"), last)
+        self.assertEqual(got, '(a.gt."x\\"y\\\\z,(1)",and(a.eq."x\\"y\\\\z,(1)",b.gt."7"),'
+                              'and(a.eq."x\\"y\\\\z,(1)",b.eq."7",c.gt."true"))')
+        self.assertEqual(parse_after(got)[0], [("a", "gt", 'x"y\\z,(1)')], "the fake reads back what was sent")
+        for bad in (None, 1.5, {"k": 1}):
+            with self.assertRaises(rc.Unreadable):
+                ob.after_filter("s", ("a",), {"a": bad})
+
+    def test_a_composite_key_pages_without_skipping(self):
+        self.sb.tables["book_chapters"] = [{"book_id": f"b{b}", "chapter": f"{c:04d}", "title": "LEAK"}
+                                           for b in range(3) for c in range(900)]
+        self.sb.pk["book_chapters"] = ["book_id", "chapter"]
+        code, out = self.backup()
+        self.assertEqual(code, 0, out)
+        plain = self.cipher.open_plain(self.written()[0])
+        with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+            rows = json.loads(tar.extractfile("tables/pds/book_chapters.json").read())
+        self.assertEqual(len({(r["book_id"], r["chapter"]) for r in rows}), 2700)
+
+    def test_a_row_removed_between_pages_never_skips_an_unread_row(self):
+        self.sb.tables["weight_log"] = [{"log_date": f"2020-{i:05d}", "note": "LEAK"} for i in range(2500)]
+        state = {"done": False}
+
+        def remove_a_read_row(q):
+            if "or" in q and q.get("select") == "*" and not state["done"]:
+                state["done"] = True
+                del self.sb.tables["weight_log"][10]  # already on page 1; an OFFSET would now skip row 1010
+        self.sb.on_read["weight_log"] = remove_a_read_row
+        code, out = self.backup()
+        self.assertEqual(code, 0, out)
+        plain = self.cipher.open_plain(self.written()[0])
+        with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+            rows = json.loads(tar.extractfile("tables/pds/weight_log.json").read())
+        self.assertEqual({r["log_date"] for r in rows}, {r["log_date"] for r in self.sb.tables["weight_log"]},
+                         "the copy is exactly the table as it stands after the read")
+
+    def test_a_table_that_keeps_changing_is_not_certified(self):
+        counter = {"n": 0}
+
+        def add_a_row(q):
+            if q.get("select") != "*":  # between the rows and the key check: every read disagrees
+                counter["n"] += 1
+                self.sb.tables["weight_log"].append({"log_date": f"2027-{counter['n']:05d}", "note": "LEAK"})
+        self.sb.on_read["weight_log"] = add_a_row
+        PartialRuns.check_partial(self, "rebuild_table_unreadable")
+
+    def test_a_table_without_a_primary_key_is_not_copied(self):
+        self.sb.pk["weight_log"] = []
+        names = PartialRuns.check_partial(self, "rebuild_table_unkeyed")
+        self.assertNotIn("tables/pds/weight_log.json", names)
+        self.assertFalse(any("/rest/v1/weight_log" in u for _, u, _ in self.sb.calls), "never read by OFFSET")
+
+    def test_a_listing_that_keeps_changing_is_partial(self):
+        def flip():
+            if f"documents/{DOC_B}" in self.sb.unlisted:
+                self.sb.unlisted.discard(f"documents/{DOC_B}")
+            else:
+                self.sb.unlisted.add(f"documents/{DOC_B}")
+        self.sb.on_list = flip
+        code, out = self.backup()
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.heartbeats()[0]["error_message"], "listing_changed")
 
 
 class Retention(Base):
@@ -533,7 +718,7 @@ class Retention(Base):
     def test_newest_eight_plus_first_of_three_months(self):
         weekly = [datetime(2026, 7, 5, 11, tzinfo=timezone.utc) + timedelta(weeks=i) for i in range(20)]
         names = self.names(weekly)
-        keep = ob.retention_keep(names + ["notes.txt"])
+        keep = ob.retention_keep(names + ["notes.txt"], set())
         self.assertTrue(set(names[-8:]) <= keep)
         newest_months = sorted({(t.year, t.month) for t in weekly}, reverse=True)[:3]
         firsts = {m: min(n for t, n in zip(weekly, names) if (t.year, t.month) == m) for m in newest_months}
@@ -563,7 +748,7 @@ class Retention(Base):
         weekly = [datetime(2026, 1, 4, tzinfo=timezone.utc) + timedelta(weeks=i) for i in range(20)]
         for n in self.names(weekly):
             (self.dest / n).write_bytes(b"x")
-            (self.dest / ob.ok_marker(n)).write_bytes(b"")
+            ob.write_ok_marker(self.dest / n)
         ob.prune(self.dest, NOW)
         backups = {p.name for p in self.written()}
         self.assertEqual({ob.ok_marker(n) for n in backups}, set(self.markers()))

@@ -450,8 +450,15 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   under `documents/`, PostgREST's schema description of `pds` (the schema-only part; the repo's `sql/`
   files are the full schema), and a fixed list of hand-entered `pds` tables Onyx cannot fetch again from
   a source (`REBUILD_TABLES` in the job: habits, supplements, weight, reading, care items, layouts, the
-  time-zone log, Uber Eats portions, the finance ledger and plan, procurement, experiments). Tables are
-  paged in primary-key order (from the schema description). Credentials (`ci_tokens`) and the N-of-1
+  time-zone log, Uber Eats portions, the finance ledger and plan, procurement, experiments; the finance
+  tables are included on purpose: they are encrypted with the rest and the private key never leaves the
+  PC and the password manager). Tables are paged by primary key with a keyset cursor (each page asks for
+  the rows after the last key read, never an OFFSET, so a row removed or added between two pages cannot
+  push an unread row out of the read), and after the last page the table's keys are read again: the copy
+  is used only when they match exactly; otherwise the table is read once more, then counts as unreadable.
+  A table with no primary key (or one of a type the cursor cannot compare) is not copied and the run is
+  partial (`rebuild_table_unkeyed`). Storage pages its listing by offset, so the listing is read twice
+  and must agree (`listing_changed` otherwise, partial). Credentials (`ci_tokens`) and the N-of-1
   trial seed and schedule are never read. A listed table the schema does not know is noted as missing
   in the manifest, not a failure. The tables and the listing are read before encryption starts, so a
   failed core read leaves no file anywhere.
@@ -464,9 +471,13 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   name, then renamed `onyx-backup-<UTC time>.tar.age`; the temporary copy is removed. Plaintext never
   touches OneDrive or the repo.
 - **Retention**, applied after every run that wrote a backup (success or partial): the newest 8 backups,
-  plus the first backup of each of the 3 most recent months, plus the newest backup of a fully successful
-  run wherever it falls (a complete run leaves an empty `onyx-backup-<UTC time>.ok` marker next to its
-  backup), so a run of partial backups can never push the last complete one out. Only names this job
+  plus the first backup of each of the 3 most recent months, plus the newest backup whose completeness
+  marker verifies, wherever it falls, so a run of partial backups can never push the last complete one
+  out. A fully successful run commits `onyx-backup-<UTC time>.ok` next to its backup (the backup's name
+  and size, nothing else; written under a hidden name, renamed, read back); a backup counts as complete
+  only when that marker reads back and matches the file. If the marker cannot be committed the run is
+  **failed** (`marker_unwritable`, failed heartbeat, exit 1) and nothing is pruned. Every marker is
+  checked before anything is removed, and an error reading one stops the prune. Only names this job
   writes are removed (OneDrive keeps them 30 days in its recycle bin); a failed run removes nothing.
   Ciphertext a killed run left in `backup-tmp` is removed after a day.
 - **Partial and failed runs.** A confirmed document whose file is not listed or not served

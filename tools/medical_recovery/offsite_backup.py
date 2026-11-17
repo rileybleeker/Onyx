@@ -13,10 +13,13 @@ register-task.ps1); standard-library Python plus the `age` command-line tool (X2
            ~/OneDrive/Backups/onyx) under a temporary name and renamed when complete, so a run that stops part
            way leaves no restore point. The pack's manifest.json (written last, inside the ciphertext) holds
            each table's row count and SHA-256 and each file's size and SHA-256; recovery-manifest.json (the
-           format recovery_check.py --manifest reads) is added when the copy is complete. Retention after every
-           run that wrote a backup: the newest 8 backups, the first backup of each of the 3 most recent
-           months, and the newest backup of a fully successful run (its empty .ok marker); only this job's
-           names (onyx-backup-<UTC time>.tar.age / .ok) in the backup folder are ever removed.
+           format recovery_check.py --manifest reads) is added when the copy is complete. Tables are paged by
+           primary key (a keyset cursor, never an OFFSET) and their keys are read again after the last page;
+           the copy counts only when both agree. A fully successful run commits a completeness marker
+           (.ok, checked after it is written); a run whose marker cannot be committed FAILS and prunes
+           nothing. Retention after every run that wrote a backup: the newest 8 backups, the first backup
+           of each of the 3 most recent months, and the newest backup whose marker verifies; only this
+           job's names (onyx-backup-<UTC time>.tar.age / .ok) in the backup folder are ever removed.
   drill    Decrypts the newest backup (with the private key file) into an isolated folder under
            %LOCALAPPDATA%\\Onyx\\backup-drill (never into Supabase, never under OneDrive), checks every member
            against the manifest (SHA-256 per file and per table, row counts, lab links, the recovery manifest),
@@ -73,10 +76,12 @@ SOURCE, DATA_TYPE = "backup", "medical_records"  # pds.sync_log heartbeat key (c
 FORMAT, FORMAT_VERSION = "onyx-offsite-backup", 1
 TOOL_VERSION = "1"
 NAME_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.tar\.age$")
-DEST_PARTIAL_RE = re.compile(r"^\.onyx-backup-\d{8}T\d{6}Z\.tar\.age\.partial$")
+DEST_PARTIAL_RE = re.compile(r"^\.onyx-backup-\d{8}T\d{6}Z\.(tar\.age|ok)\.partial$")
 TMP_RE = re.compile(r"^onyx-backup-\d{8}T\d{6}Z\.tar\.age\.tmp$")
-# An empty marker next to a backup whose run was fully successful: retention always keeps the newest such
-# backup, so a run of partial backups can never push the last complete one out. It holds nothing.
+# The completeness marker next to a backup whose run was fully successful: {"backup": <its name>, "size": <its
+# bytes>} (no counts, no names of anything inside). Retention counts a backup as complete only when its marker
+# reads back and matches the backup file, and always keeps the newest such backup, so a run of partial
+# backups can never push the last complete one out. A run whose marker cannot be committed is a failed run.
 OK_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.ok$")
 KEEP_WEEKLY, KEEP_MONTHLY = 8, 3
 RECIPIENT_RE = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
@@ -303,46 +308,74 @@ def read_openapi(target: rc.Target) -> tuple[Optional[bytes], Optional[dict]]:
     return (data, spec) if isinstance(spec, dict) else (None, None)
 
 
-ORDERABLE_FORMATS = frozenset({"text", "character varying", "uuid", "integer", "bigint", "smallint", "numeric",
-                               "date", "boolean", "double precision", "real",
-                               "timestamp with time zone", "timestamp without time zone", "time without time zone"})
+# Column types a keyset cursor can compare exactly as Postgres orders them (a float or a jsonb key could not).
+KEY_FORMATS = frozenset({"text", "character varying", "character", "uuid", "integer", "bigint", "smallint",
+                         "date", "boolean", "timestamp with time zone", "timestamp without time zone",
+                         "time without time zone"})
+UNKEYED: tuple[str, ...] = ()
 
 
-def table_order(spec: Optional[dict], table: str) -> Optional[str]:
-    """A total order for paging: the primary key columns (PostgREST marks them <pk/>), else `id`, else every
-    orderable column. None when the schema description lists no such table (it is then not backed up and
-    reported as missing). Without a schema description, `id`."""
+def table_key(spec: Optional[dict], table: str) -> Optional[tuple[str, ...]]:
+    """The table's primary key columns (PostgREST marks them <pk/>), which the keyset cursor pages by. None
+    when the schema description lists no such table (not backed up, reported as missing); UNKEYED (an empty
+    tuple) when it has no primary key, or one of a type the cursor cannot compare: such a table is never
+    copied as if complete (the run is partial). Without a schema description, ("id",) (the run is then
+    partial anyway: schema_unread)."""
     if spec is None:
-        return "id.asc"
+        return ("id",)
     props = ((spec.get("definitions") or {}).get(table) or {}).get("properties")
     if not isinstance(props, dict) or not props:
         return None
     pk = [c for c, v in props.items() if isinstance(v, dict) and "<pk/>" in str(v.get("description") or "")]
-    if pk:
-        cols = pk
-    elif "id" in props:
-        cols = ["id"]
-    else:
-        cols = [c for c, v in props.items() if isinstance(v, dict) and str(v.get("format") or "") in ORDERABLE_FORMATS]
-    if not cols or not all(re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", c) for c in cols):
-        return None
-    return ",".join(f"{c}.asc" for c in cols)
+    if not pk or not all(re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", c) for c in pk):
+        return UNKEYED
+    if not all(str(props[c].get("format") or "") in KEY_FORMATS for c in pk):
+        return UNKEYED
+    return tuple(pk)
 
 
 class TableMissing(Exception):
     pass
 
 
-def read_table(target: rc.Target, table: str, order: str, *, max_rows: int = MAX_TABLE_ROWS) -> list[dict]:
-    """Every row and column of pds.<table>, paged in a fixed order. TableMissing when PostgREST does not know
-    the table; Unreadable for anything else that cannot be read (the reason carries a status only)."""
-    if not TABLE_RE.match(table) or table in EXCLUDED_TABLES:
-        raise ValueError("not a table this job copies")
+def _quote(stage: str, value) -> str:
+    """One key value as a double-quoted PostgREST filter value (a backslash escapes a double quote and a backslash)."""
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:  # None, a float, an object: no exact comparison, so no cursor
+        raise rc.Unreadable(stage, "a key value the cursor cannot compare")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def after_filter(stage: str, key: tuple[str, ...], last: dict) -> str:
+    """The `or` filter for rows strictly after `last` in key order:
+    (k1 > v1) or (k1 = v1 and k2 > v2) or ... (the row-value comparison (k1, k2, ...) > (v1, v2, ...))."""
+    terms = []
+    for i, col in enumerate(key):
+        parts = [f"{c}.eq.{_quote(stage, last.get(c))}" for c in key[:i]] + [f"{col}.gt.{_quote(stage, last.get(col))}"]
+        terms.append(parts[0] if len(parts) == 1 else f"and({','.join(parts)})")
+    return f"({','.join(terms)})"
+
+
+def _key_of(row: dict, key: tuple[str, ...]) -> str:
+    return json.dumps([row.get(c) for c in key], sort_keys=True, separators=(",", ":"))
+
+
+def _keyset_read(target: rc.Target, stage: str, table: str, select: str, key: tuple[str, ...], max_rows: int) -> list[dict]:
+    """Every row of pds.<table> in primary-key order, each page asking for the rows AFTER the last key it has
+    (never an OFFSET: a row removed or added between two pages cannot shift an unread row out of the read)."""
     out: list[dict] = []
-    stage = f"table_{table}"
+    order = ",".join(f"{c}.asc" for c in key)
+    last: Optional[dict] = None
     while True:
-        q = urllib.parse.urlencode({"select": "*", "order": order, "limit": PAGE, "offset": len(out)})
-        status, data = target._get(stage, "GET", f"{target.url}/rest/v1/{table}?{q}",
+        params = {"select": select, "order": order, "limit": PAGE}
+        if last is not None:
+            params["or"] = after_filter(stage, key, last)
+        status, data = target._get(stage, "GET", f"{target.url}/rest/v1/{table}?{urllib.parse.urlencode(params)}",
                                    target._h(**{"Accept-Profile": "pds"}))
         if status in (400, 404) and str(rc._error_body(data).get("code") or "") in ("PGRST205", "42P01"):
             raise TableMissing(table)
@@ -350,11 +383,37 @@ def read_table(target: rc.Target, table: str, order: str, *, max_rows: int = MAX
         page = rc._json(stage, data)
         if not isinstance(page, list) or not all(isinstance(r, dict) for r in page):
             raise rc.Unreadable(stage, "answer was not a list of rows")
+        if any(r.get(c) is None for r in page for c in key):
+            raise rc.Unreadable(stage, "a row without its key")
         out.extend(page)
         if len(page) < PAGE:
             return out
         if len(out) >= max_rows:
             raise rc.Unreadable(stage, f"more than {max_rows} rows")
+        last = page[-1]
+
+
+def read_table(target: rc.Target, table: str, key: tuple[str, ...], *, max_rows: int = MAX_TABLE_ROWS,
+               attempts: int = 2) -> list[dict]:
+    """Every row and column of pds.<table>, paged by its primary key. The consistency boundary: after the
+    last page the table's keys are read again, and the copy is answered only when they are exactly the keys
+    it holds (so a row added or removed while the table was being read is never certified as a complete
+    copy: the read is repeated, then refused). TableMissing when PostgREST does not know the table;
+    Unreadable for anything else (the reason carries a status or a fixed text only)."""
+    if not TABLE_RE.match(table) or table in EXCLUDED_TABLES:
+        raise ValueError("not a table this job copies")
+    if not key or not all(re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", c) for c in key):
+        raise ValueError("a table is read only by its primary key")
+    stage = f"table_{table}"
+    for _ in range(attempts):
+        rows = _keyset_read(target, stage, table, "*", key, max_rows)
+        keys = [_key_of(r, key) for r in rows]
+        if len(set(keys)) != len(keys):
+            raise rc.Unreadable(stage, "the key is not unique")
+        again = _keyset_read(target, stage, table, ",".join(key), key, max_rows)
+        if [_key_of(r, key) for r in again] == keys:
+            return rows
+    raise rc.Unreadable(stage, "the table changed during the read")
 
 
 def list_documents(target: rc.Target) -> tuple[dict[str, dict], int]:
@@ -393,6 +452,7 @@ def fetch_object(target: rc.Target, path: str) -> Optional[bytes]:
 class Snapshot:
     tables: dict[str, list[dict]] = field(default_factory=dict)  # name -> rows (medical tables first)
     missing_tables: list[str] = field(default_factory=list)
+    unkeyed_tables: list[str] = field(default_factory=list)       # no primary key the cursor can page by: not copied
     objects: dict[str, dict] = field(default_factory=dict)        # documents/<id> -> {"size", "type"}
     unexpected_paths: int = 0
     openapi: Optional[bytes] = None
@@ -413,24 +473,37 @@ def collect(target: rc.Target, *, rebuild_tables: tuple[str, ...] = REBUILD_TABL
         snap.problem("schema_unread")
     for table in MEDICAL_TABLES:
         try:
-            snap.tables[table] = read_table(target, table, "id.asc")
+            snap.tables[table] = read_table(target, table, ("id",))  # both keyed by their uuid primary key
         except TableMissing:
             raise BackupError("medical_table_missing") from None
         except rc.Unreadable as e:
             raise BackupError("read_denied" if e.denied else f"read_failed_{table}") from None
+    # Storage pages its listing by OFFSET (no cursor there): it is read twice and must agree, so a file
+    # removed or added while it was listed is never missed silently (once more, then the run is partial).
     try:
         snap.objects, snap.unexpected_paths = list_documents(target)
+        for _ in range(2):
+            again = list_documents(target)
+            if again == (snap.objects, snap.unexpected_paths):
+                break
+            snap.objects, snap.unexpected_paths = again
+        else:
+            snap.problem("listing_changed")
     except rc.Unreadable as e:
         raise BackupError("read_denied" if e.denied else "read_failed_objects") from None
     if snap.unexpected_paths:
         snap.problem("unexpected_paths")
     for table in rebuild_tables:
-        order = table_order(spec, table)
-        if order is None:
+        key = table_key(spec, table)
+        if key is None:
             snap.missing_tables.append(table)
             continue
+        if key == UNKEYED:
+            snap.unkeyed_tables.append(table)
+            snap.problem("rebuild_table_unkeyed")  # never copied as if it were complete
+            continue
         try:
-            snap.tables[table] = read_table(target, table, order)
+            snap.tables[table] = read_table(target, table, key)
         except TableMissing:
             snap.missing_tables.append(table)
         except rc.Unreadable as e:
@@ -476,6 +549,7 @@ def write_pack(stream: BinaryIO, snap: Snapshot, target: rc.Target, now: datetim
             _add(tar, f"tables/pds/{table}.json", data, mtime)
             manifest["tables"][table] = {"rows": len(rows), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         manifest["missing_tables"] = sorted(snap.missing_tables)
+        manifest["unkeyed_tables"] = sorted(snap.unkeyed_tables)
 
         opened: dict[str, dict] = {}
         docs = {d.get("storage_path"): d for d in snap.tables.get("medical_documents", [])}
@@ -541,17 +615,43 @@ def ok_marker(backup_name: str) -> str:
     return f"onyx-backup-{m.group(1)}.ok"
 
 
-def retention_keep(names: list[str]) -> set[str]:
+def write_ok_marker(backup: Path) -> None:
+    """Commits the completeness marker for `backup`: written under a hidden .partial name, renamed, then
+    read back and checked. Raises OSError or BackupError("marker_unwritable") when it is not durable."""
+    marker = backup.parent / ok_marker(backup.name)
+    partial = backup.parent / f".{marker.name}.partial"
+    partial.write_bytes(_dump({"backup": backup.name, "size": backup.stat().st_size}))
+    os.replace(partial, marker)
+    if not marker_valid(backup.parent, backup.name):
+        raise BackupError("marker_unwritable")
+
+
+def marker_valid(dest: Path, backup_name: str) -> bool:
+    """True when the backup's completeness marker exists, names it and matches its size. A marker that is
+    missing, empty, not this job's or for another file is not evidence. An OSError while reading one that
+    exists propagates: prune() then removes nothing (a marker it could not read must never let the last
+    complete backup look incomplete)."""
+    marker, backup = dest / ok_marker(backup_name), dest / backup_name
+    if not marker.is_file() or not backup.is_file():
+        return False
+    try:
+        got = json.loads(marker.read_bytes().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (isinstance(got, dict) and got.get("backup") == backup_name and type(got.get("size")) is int
+            and got["size"] == backup.stat().st_size)
+
+
+def retention_keep(names: list[str], complete: set[str]) -> set[str]:
     """The newest KEEP_WEEKLY backups, plus the FIRST backup of each of the KEEP_MONTHLY most recent months,
-    plus the newest backup whose run was fully successful (it has an ok marker), wherever it falls. Names
-    that are not backups are never in the answer, and never pruned either (prune() looks only at this job's
-    names)."""
+    plus the newest backup in `complete` (those whose completeness marker verified), wherever it falls.
+    Names that are not backups are never in the answer, and never pruned either (prune() looks only at this
+    job's names)."""
     dated = sorted(((t, n) for n in names if (t := backup_time(n)) is not None), reverse=True)
     keep = {n for _, n in dated[:KEEP_WEEKLY]}
-    present = set(names)
-    complete = [n for _, n in dated if ok_marker(n) in present]
-    if complete:
-        keep.add(complete[0])
+    verified = [n for _, n in dated if n in complete]
+    if verified:
+        keep.add(verified[0])
     first_of_month: dict[tuple[int, int], str] = {}
     for t, n in dated:  # newest first, so the last assignment per month is its earliest backup
         first_of_month[(t.year, t.month)] = n
@@ -561,11 +661,13 @@ def retention_keep(names: list[str]) -> set[str]:
 
 
 def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: p.unlink()) -> int:
-    """Removes backups outside retention_keep(), ok markers whose backup is not kept, and this job's own
+    """Removes backups outside retention_keep(), markers whose backup is not kept, and this job's own
     unfinished copies older than a day. Only names this job writes are touched (OneDrive keeps a removed
-    file in its recycle bin for 30 days). Returns how many backups and stale copies were removed."""
+    file in its recycle bin for 30 days). Every marker is checked BEFORE anything is removed; an error while
+    reading one stops the prune with nothing removed. Returns how many backups and stale copies were removed."""
     names = [p.name for p in dest.iterdir() if p.is_file()]
-    keep = retention_keep(names)
+    complete = {n for n in names if NAME_RE.match(n) and ok_marker(n) in names and marker_valid(dest, n)}
+    keep = retention_keep(names, complete)
     kept_markers = {ok_marker(n) for n in keep}
     removed = 0
     for name in names:
@@ -664,12 +766,15 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
             pass
     result = _result(snap, manifest, written, size)
     if result.status == "success":
+        # Success needs durable evidence: without a marker that reads back, this backup would not count as
+        # complete for retention, so the run fails and nothing is pruned (the backup itself stays).
         try:
-            (dest / ok_marker(final_name)).write_bytes(b"")
-        except OSError:
-            log.warning("retention: could not mark the backup complete (OSError)")
+            write_ok_marker(written)
+        except (OSError, BackupError):
+            log.warning("retention: could not commit the completeness marker; nothing pruned")
+            return RunResult("failed", "marker_unwritable", written, result.counts)
     # Retention runs after partial runs too (so they cannot grow the folder without bound); the newest
-    # complete backup is always kept (its ok marker), whatever came after it.
+    # backup whose marker verifies is always kept, whatever came after it.
     try:
         result.pruned = prune(dest, now)
     except OSError:
@@ -1067,7 +1172,7 @@ def cmd_backup(args, out, cipher_factory, heartbeat_client) -> int:
     log.info("backup %s%s; %s", result.status, f" ({result.code})" if result.code else "", counts)
     if production:
         heartbeat(hb, result.status, started, result.code)
-    return 0 if result.status == "success" else 2
+    return {"success": 0, "partial": 2}.get(result.status, 1)
 
 
 def cmd_drill(args, out, cipher_factory) -> int:
