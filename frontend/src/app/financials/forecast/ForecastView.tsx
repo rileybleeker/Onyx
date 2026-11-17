@@ -68,14 +68,14 @@ function useCheckClock(results: readonly ({ eligibility?: unknown } | null | und
   return now;
 }
 
+// Returns null on success, else the fixed copy to show. The server's error text is never shown.
 async function send(url: string, method: string, body?: unknown): Promise<string | null> {
   try {
     const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
     if (res.ok) return null;
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
-    return j.error ?? `failed (${res.status})`;
+    return "Not saved. Try again.";
   } catch {
-    return "network error";
+    return "Not saved. Check your connection and try again.";
   }
 }
 
@@ -176,7 +176,7 @@ export default function ForecastView({
   return (
     <div className="space-y-6">
       {setupPending && <p className="text-[13px] text-mid">Planned items could not be read; showing the forecast from your history only.</p>}
-      {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
+      {error && <p role="alert" className="text-[13px] text-down">{error}</p>}
 
       {/* Personalize: every tile, chart and card is its own part; parts move within and between the sections below. */}
       <PartGrid page="/financials/forecast" title="Cash forecast" initial={layout}>
