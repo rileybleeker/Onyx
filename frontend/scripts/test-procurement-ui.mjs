@@ -227,6 +227,7 @@ try {
     await page.screenshot({path:path.join(fixture,`procurement-${width}.png`),fullPage:true});
   }
   await page.getByRole('button',{name:'Clear subscriptions'}).click();
+  await page.getByRole('button',{name:'Yes, clear the list',exact:true}).click();
   await page.getByText('No subscriptions tracked yet.',{exact:true}).waitFor();
   assert.deepEqual(errors,[]); assert.deepEqual(blocked,[]);
   console.log('PASS offline procurement UI: synthetic toggle, draft add/remove/clear/reload, recurring amount, invalid amount, subscription tracker (synthetic load, duplicate prompt, bad price, .ics download, remove, clear), prepared list and copy, duplicate-subscription warning, hard-disabled checkout, mobile/desktop overflow, no runtime errors or external requests.');

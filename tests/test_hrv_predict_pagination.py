@@ -169,9 +169,8 @@ class FetchAllOrdering(unittest.TestCase):
         self.assertEqual(sorted(df["calendar_date"]), sorted(r["calendar_date"] for r in rows))
 
     def test_unstable_read_without_order_is_detectable(self):
-        # Harness check. fetch_all pages with chunk=10 here (fetch_all's own default is 1000,
-        # which would read all 25 rows in one page and hide the instability), so the unstable
-        # fake always returns 25 rows (pages of 10, 10, 5),
+        # Harness check. fetch_all pages by its own `chunk` (default 1000), so pass chunk=10 to get
+        # pages of 10, 10, 5; the unstable fake always returns 25 rows here,
         # so a row COUNT cannot detect the instability; the detector compares the dates
         # themselves. Seeded so the shuffles are reproducible.
         random.seed(20261117)

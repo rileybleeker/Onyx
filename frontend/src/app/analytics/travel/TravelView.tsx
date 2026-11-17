@@ -176,6 +176,9 @@ export default function TravelView({ data, headingTestId }: { data: TravelPageDa
             title: "All trips",
             node: (
             <ChartCard title="All trips" subtitle="Auto-segmented from pds.trips">
+              {trips.length === 0 ? (
+                <p className="text-sm text-text-tertiary py-6 text-center">No trips found yet. Trips appear here once location data covers a stay away from home.</p>
+              ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -204,6 +207,7 @@ export default function TravelView({ data, headingTestId }: { data: TravelPageDa
                   </tbody>
                 </table>
               </div>
+              )}
             </ChartCard>
             ),
           },

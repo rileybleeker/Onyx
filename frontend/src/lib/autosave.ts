@@ -54,6 +54,11 @@ export interface AutosaverOptions<T> {
   ready?: (value: T) => string | null | undefined;
   same?: (a: T, b: T) => boolean;
   onState?: (s: AutosaveState) => void;
+  /**
+   * The text the user sees for a failed save (`error` in the status). Default: messageOf, the server's own words. A form
+   * whose status must read as plain copy passes its own, and logs the raw error itself (console.error).
+   */
+  describeError?: (e: unknown) => string;
   /** Backoff for retryable failures. Default 2 s, 5 s, 15 s, then every 30 s. */
   retryDelaysMs?: number[];
   /**
@@ -274,7 +279,7 @@ export class Autosaver<T> {
       if (this.disposed) return;
       if (e instanceof AutosaveRefused) {
         this.refused = { value };
-        this.set({ status: "error", error: messageOf(e), retrying: false });
+        this.set({ status: "error", error: (this.opts.describeError ?? messageOf)(e), retrying: false });
         return;
       }
       // The value may be stored even though this failed: from now on nothing counts as already saved (isSaved).
@@ -282,7 +287,7 @@ export class Autosaver<T> {
       const delays = this.opts.retryDelaysMs ?? [2000, 5000, 15000, 30000];
       const wait = delays[Math.min(this.retries, delays.length - 1)];
       this.retries += 1;
-      this.set({ status: "error", error: messageOf(e), retrying: true });
+      this.set({ status: "error", error: (this.opts.describeError ?? messageOf)(e), retrying: true });
       this.retryTimer = this.timers.set(() => {
         this.retryTimer = null;
         void this.flush();

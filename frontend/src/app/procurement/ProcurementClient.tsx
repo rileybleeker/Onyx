@@ -37,6 +37,7 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [confirmingClear, setConfirmingClear] = useState(false);
   const [commitment, setCommitment] = useState<Draft['commitment']>('one-time');
   const [showList, setShowList] = useState(false);
   const [subs, setSubs] = useState<Subscription[]>([]);
@@ -111,8 +112,12 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
     }
     setSubs(previous => previous.filter(item => item !== sub)); setSubError(''); setSubNotice('Subscription removed from this list. Nothing was cancelled.');
   }
+  // Two-step clear: the first click only asks; the confirm button runs clearSubscriptions.
+  function askClearSubscriptions() { setConfirmingClear(true); setSubError(''); setSubNotice(''); }
   async function clearSubscriptions() {
-    if (store === 'saved' && subs.some(sub => sub.id !== undefined)) {
+    setConfirmingClear(false);
+    const archivesSaved = store === 'saved' && subs.some(sub => sub.id !== undefined);
+    if (archivesSaved) {
       setBusy(true);
       try {
         const res = await fetch(SUBSCRIPTIONS_API, { method: 'DELETE' });
@@ -120,7 +125,9 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
       } catch { setBusy(false); setSubError('Could not clear your saved list. Nothing was changed.'); setSubNotice(''); return; }
       setBusy(false);
     }
-    setSubs([]); setSubNotice('All tracked subscriptions cleared.'); setSubError('');
+    setSubs([]);
+    setSubNotice(archivesSaved ? 'Your saved subscription list was cleared. Nothing was cancelled with any provider.' : 'All tracked subscriptions cleared.');
+    setSubError('');
   }
   function loadSynthetic() {
     const room = MAX_SUBSCRIPTIONS - subs.length;
@@ -164,7 +171,7 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
           <section className={card}><h2 className="text-xl font-semibold">Track subscriptions</h2><p className="text-sm text-text-secondary" data-testid="procurement-persistence" data-state={store}>{persistenceNote[store]}</p>
             <form onSubmit={addSubscription} className="grid md:grid-cols-2 gap-4"><label>Subscription name<input className={field} name="subName" required maxLength={80}/></label><label>Price per cycle (USD)<input className={field} name="subAmount" inputMode="decimal" required placeholder="0.00"/></label><label>Billing cycle<select className={field} name="subCycle" defaultValue="monthly"><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option></select></label><label>Next renewal date<input className={field} name="subRenews" type="date" required/></label><button className={button} type="submit" disabled={busy}>Add subscription</button></form>
             {subError && <p role="alert" className="text-red-400">{subError}</p>}<p role="status">{subNotice}</p>
-            <div className="flex flex-wrap gap-3"><button className={button} onClick={loadSynthetic}>Load synthetic demo subscriptions</button><button className={button} disabled={!subs.length || busy} onClick={clearSubscriptions}>Clear subscriptions</button></div>
+            <div className="flex flex-wrap gap-3"><button className={button} onClick={loadSynthetic}>Load synthetic demo subscriptions</button>{confirmingClear ? <><button className={button} disabled={busy} onClick={clearSubscriptions}>{store === 'saved' ? 'Yes, clear the saved list' : 'Yes, clear the list'}</button><button className={button} disabled={busy} onClick={() => setConfirmingClear(false)}>Cancel</button></> : <button className={button} disabled={!subs.length || busy} onClick={askClearSubscriptions}>Clear subscriptions</button>}</div>
             {summary ? <div className="space-y-4">
               <p>About {money(summary.monthlyCents)} / month, {money(summary.annualCents)} / year across {summary.count} tracked subscription{summary.count === 1 ? '' : 's'}.</p>
               <ul className="space-y-3">{summary.renewals.map((r, position) => <li className="border-t border-border-subtle pt-3 flex flex-wrap gap-3 justify-between" key={r.index}><div><h3>{r.sub.name}</h3><p className="text-sm">{money(r.sub.cents)} / {cycleLabel[r.sub.cycle]} · renews {formatDate(r.nextOn)} ({relative(r.daysAway)})</p></div><button className={button} disabled={busy} onClick={() => removeSubscription(r.sub)}>Remove subscription {position + 1}</button></li>)}</ul>

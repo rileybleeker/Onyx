@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate, sameJson } from "@/lib/format";
+import { rangeStatus } from "@/lib/range-load";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
@@ -721,6 +722,10 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   }));
   const shownRange = rangeView.shown; // labels describe the rows on screen
   const rangeNote = shownRange === "1d" ? "today" : `${rangeLabel(shownRange)} avg`;
+  // A failed load leaves rows empty, which must not read as "no activities". Show the banner's failure copy
+  // and Retry in the list instead. Rows from an earlier successful range still show, as before.
+  const listFailure = rows.length === 0 ? rangeStatus(rangeView, rangeLabel) : null;
+  const listFailed = listFailure?.tone === "error";
 
   if (loading) {
     return (
@@ -868,7 +873,14 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
 
       <PartGroup id="section-sessions" title="Sessions">
       <Part id="activity-list" title="Activity list">
-      {rows.length === 0 ? (
+      {listFailed ? (
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <p role="alert" className="text-down font-medium">{listFailure?.text}</p>
+          <button type="button" onClick={retryRange} className="min-h-11 px-2 mt-2 font-medium text-accent hover:underline">
+            Retry
+          </button>
+        </div>
+      ) : rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <svg className="w-10 h-10 text-text-tertiary mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />

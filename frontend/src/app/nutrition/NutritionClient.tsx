@@ -205,6 +205,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
   const [weightLoading, setWeightLoading] = useState(true);
+  const [weightError, setWeightError] = useState(false);
   // /nutrition?log=photo (Log > Meal photo): the photo logger first.
   // /nutrition?log=weight (an older shortcut): weight is entered on Log now, so the routed page forwards there.
   const logParam = useSearchParams().get("log");
@@ -392,10 +393,13 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
     setWeightLoading(true);
     try {
       const res = await fetch(`/api/weight?days=${Math.max(rangeDays(range), 90)}`);
+      if (!res.ok) throw new Error(`Weight load failed: HTTP ${res.status}`);
       const json = await res.json();
       setWeightRows((json.rows ?? []) as WeightRow[]);
+      setWeightError(false);
     } catch (e) {
       console.error("Weight load:", e);
+      setWeightError(true);
     } finally {
       setWeightLoading(false);
     }
@@ -1031,6 +1035,18 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           >
             {weightLoading ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">Loading…</p>
+            ) : weightError ? (
+              <div className="py-6 text-center">
+                <p className="text-[11px] text-text-tertiary font-mono mb-2">
+                  Couldn&apos;t load your weight history. Try again in a moment.
+                </p>
+                <button
+                  onClick={() => { void loadWeight(); }}
+                  className="text-accent text-sm hover:underline"
+                >
+                  Retry
+                </button>
+              </div>
             ) : weightChartData.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
                 No entries yet. Log your first weight above to start the trend.
