@@ -1279,12 +1279,20 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
    * `sqlOutcome` is what pds.reading_bank_finish records when it differs from what the caller is told: a job whose
    * answer is no longer pending is finished 'done' there, because any other outcome counts a grade try and writes
    * the code into the (already graded or voided) answer's grade_error.
+   *
+   * A finish the database did not record is never reported as the requested outcome: an error answer, a refusal or a
+   * non-object answer (data.ok is not true), or a thrown call, means the job is still running until its lease runs out
+   * and is claimed again, so the run reports a retry with `finish_unrecorded` and `graded: false`, and nothing (a
+   * grade to count) is counted for a finish that never landed. Grade persistence is judged apart from it: the grade
+   * itself (pds.reading_bank_grade) may have been stored, so `graded` stays false even then — only a recorded finish,
+   * or an answer already settled before this run asked for a grade, reports graded.
    */
   const finish = async (outcome: GradeJobResult["outcome"], code: string | null, graded = false, sqlOutcome: GradeJobResult["outcome"] = outcome): Promise<GradeJobResult> => {
     const retryMinutes = GRADE_RETRY_MINUTES[Math.min(Math.max(fence.attempts, 1), GRADE_RETRY_MINUTES.length) - 1];
     const safeCode = code ? bankCode(code) : null;
+    let recorded = false;
     try {
-      await supabase.rpc("reading_bank_finish", {
+      const { data, error } = await supabase.rpc("reading_bank_finish", {
         p: {
           job_id: job.job_id,
           ...fence,
@@ -1295,9 +1303,11 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
           retry_minutes: sqlOutcome === "retry" ? retryMinutes : null,
         },
       });
+      recorded = !error && !!data && typeof data === "object" && (data as { ok?: unknown }).ok === true;
     } catch {
       /* the lease runs out and the next claim settles it */
     }
+    if (!recorded) return { outcome: "retry", code: bankCode("finish_unrecorded"), graded: false, cost_cents: Math.round(cost * 100) / 100 };
     return { outcome, code: safeCode, graded, cost_cents: Math.round(cost * 100) / 100 };
   };
 
