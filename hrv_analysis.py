@@ -988,6 +988,9 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # Without the heartbeat AND the unread list, fall back to the conservative rule.
         data["delivery_covered_through"] = None
         data["delivery_unread_days"] = []
+        # The fallback zero-fills fewer days than the full read would; when the coverage reads
+        # recover, delivery_daily's own fingerprint does not move, so it must not be certified.
+        LOAD_FAILURES.add("delivery_daily")
         log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
 
     # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11): Apple's own Screen Time
@@ -2907,7 +2910,8 @@ def print_completeness(df: pd.DataFrame) -> None:
 #     total: it is left out, never read as 0 (the value of a day without an intake). The view
 #     filters out ingredients with no readable quantity, so those days come from a separate read of
 #     the intakes and their products (load_supplement_unquantified). When that read fails nothing
-#     is published (the stored result of the last complete run stays and the heartbeat is partial);
+#     is published (the stored result of the last complete run stays and the heartbeat is partial)
+#     and both relations are stored as unknown in the source baseline (never as consumed);
 #     when the rollup is empty the result is empty and replaces the stored one.
 # What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
 # no estimate, in the coverage payload (supplement_impact / dose_response_coverage), which
@@ -2971,13 +2975,20 @@ def supplement_unquantified_days(products: pd.DataFrame | None,
     return out.sort_values(_UNQUANTIFIED_COLS).reset_index(drop=True)
 
 
-def load_supplement_unquantified(fetch=None) -> pd.DataFrame | None:
+# The two relations load_supplement_unquantified reads (hrv_feature_sources: supplement_products,
+# supplement_intake). A failed read marks both: the stage that failed is not reported, and neither
+# may be stored as consumed (PIPE09-R1).
+SUPPLEMENT_UNQUANTIFIED_SOURCES = ("supplement_products", "supplement_intake")
+
+
+def load_supplement_unquantified(fetch=None, failures: set[str] | None = None) -> pd.DataFrame | None:
     """Days a compound was taken from a product that gives no readable amount for it.
 
     Returns None when a read fails: the dose-response then runs without this check and says so in
-    its coverage (`unquantified_check`). Logs an error code or type only. `fetch` defaults to
-    fetch_all (injectable for tests). Intakes are read only when some product has such an
-    ingredient.
+    its coverage (`unquantified_check`), and both sources are added to `failures` (default
+    LOAD_FAILURES), so the stored source baseline marks them unknown instead of consumed and the
+    next backfill check retries. Logs an error code or type only. `fetch` defaults to fetch_all
+    (injectable for tests). Intakes are read only when some product has such an ingredient.
     """
     fetch = fetch or fetch_all
     try:
@@ -2988,6 +2999,7 @@ def load_supplement_unquantified(fetch=None) -> pd.DataFrame | None:
         return supplement_unquantified_days(products, intakes)
     except Exception as e:  # postgrest APIError, network error, ...
         log.warning(f"  Supplement amount check unavailable ({getattr(e, 'code', None) or type(e).__name__})")
+        (LOAD_FAILURES if failures is None else failures).update(SUPPLEMENT_UNQUANTIFIED_SOURCES)
         return None
 
 

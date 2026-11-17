@@ -719,6 +719,57 @@ class FailedLoadsAndSql(unittest.TestCase):
         self.assertNotIn("error", snap["sources"]["matrix"])
         fs.mark_failed(None, {"weather_daily"})  # no snapshot: nothing to do, no error
 
+    def test_failed_supplement_amount_check_is_not_certified_and_recovers(self):
+        # PIPE09-R1: the fingerprints were captured, then the amount check's read failed open and the
+        # data did not change. The stored baseline must make the next check unknown, never "no change".
+        import hrv_analysis as h
+        sources = (fs.FeatureSource(name="supplement_intake", feeds="test",
+                                    fingerprint=fs.Fingerprint("supplement_intake", "intake_date")),
+                   LINKED[1])
+        db = linked_db()
+        # an ingredient with no readable amount, so the loader also reads the intakes
+        db.tables["supplement_products"][0]["ingredients"] = [
+            {"name": "Synthetic A", "ingredient_group": "Synthetic A", "quantity": None}]
+
+        def fetch_with(failing):
+            def fetch(table, **_):
+                if table == failing:
+                    raise ApiError("57014")
+                return pd.DataFrame(db.tables[table])
+            return fetch
+
+        for failing in ("supplement_products", "supplement_intake"):
+            base = baseline_for(db, sources=sources)
+            failures: set[str] = set()
+            self.assertIsNone(h.load_supplement_unquantified(fetch_with(failing), failures=failures))
+            self.assertEqual(failures, {"supplement_products", "supplement_intake"}, failing)
+            fs.mark_failed(base, failures)
+            det = run(db, base, sources=sources)
+            self.assertEqual(det.changed, [])
+            self.assertIn("supplement_intake/fingerprint:baseline_load_failed", det.unknown)
+            self.assertIn("supplement_products/fingerprint:baseline_load_failed", det.unknown)
+            self.assertTrue(fs.decide(det, fs.UNKNOWN_RETRAIN_AFTER_HOURS).retrain)
+            self.assertEqual(fs.decide(det, 1.0).status, "partial")
+            self.assertNotIn(PRIVATE, fs.decide(det, 1.0).message or "")
+
+        # Recovery: the next retrain reads both and stores a clean baseline.
+        base = baseline_for(db, sources=sources)
+        failures = set()
+        days = h.load_supplement_unquantified(fetch_with(None), failures=failures)
+        self.assertIsNotNone(days)
+        self.assertEqual(failures, set())
+        fs.mark_failed(base, failures)
+        det = run(db, base, sources=sources)
+        self.assertEqual((det.changed, det.unknown), ([], []))
+        self.assertFalse(fs.decide(det, 20.0).retrain)
+
+    def test_every_fail_open_source_load_marks_its_source(self):
+        src = (ROOT / "hrv_analysis.py").read_text(encoding="utf-8")
+        loader = src[src.index("def load_supplement_unquantified("):src.index("def supplement_unit_classes(")]
+        self.assertIn("update(SUPPLEMENT_UNQUANTIFIED_SOURCES)", loader)
+        coverage = src[src.index("delivery coverage load failed") - 600:src.index("delivery coverage load failed")]
+        self.assertIn('LOAD_FAILURES.add("delivery_daily")', coverage)
+
     def test_fingerprint_sql_builds_valid_aggregate_text(self):
         import pathlib
         text = (pathlib.Path(__file__).resolve().parent.parent / "sql" / "hrv_source_fingerprint.sql").read_text(encoding="utf-8")
