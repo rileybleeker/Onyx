@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
     concept: (body.concept as string) || null,
     source: (body.source as HighlightSource) || null,
   });
-  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
+  if (!result.ok) return NextResponse.json({ error: result.error }, { status: result.kind === "server" ? 500 : 400 });
 
   if (result.created) {
     after(async () => {
