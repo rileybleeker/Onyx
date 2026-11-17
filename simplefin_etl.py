@@ -160,7 +160,7 @@ NOTE_CODES: dict[str, str] = {
     "account_unmatched": "an account was not imported: it could not be matched uniquely to a ledger account (run simplefin_etl.py --dry-run locally)",
     "account_type_unset": "a new account is balances-only until its finance_accounts.account_type is set",
     "cutover_review": "rows near the Rocket Money cutover were kept though a same-amount Rocket Money row is near: check for duplicates (simplefin_etl.py --dry-run locally)",
-    "cutover_provenance_unsaved": "the cutover match record table is missing or out of date (apply sql/finance_cutover_matches.sql); nothing was written, the next run retries",
+    "cutover_provenance_unsaved": "the cutover match record table is missing or out of date. Next: apply sql/finance_cutover_matches.sql. Until then nothing is written; the next run retries.",
 }
 NOTE_LIMIT = 300      # past this the later codes keep only their token (format_notes); lib/finance-status.ts agrees
 NOTE_MAX_COUNT = 9999

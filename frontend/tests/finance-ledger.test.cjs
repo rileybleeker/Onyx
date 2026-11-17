@@ -490,6 +490,6 @@ test("the old CSV preview stays reachable and the page links the ledger copy hon
   const page = read("app/financials/page.tsx");
   assert.match(page, /Preview a CSV/);
   assert.match(page, /<FinancialsClient embedded \/>/);
-  assert.match(page, /No ledger data yet - the harvester has not run\./);
+  assert.match(page, /No ledger data yet\. The bank import has not run\./);
   assert.match(page, /Couldn't load the ledger|load\.message/);
 });
