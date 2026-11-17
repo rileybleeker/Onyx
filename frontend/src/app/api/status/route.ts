@@ -7,6 +7,7 @@ import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
+import { medicalBackupCard, type BackupHeartbeat } from "@/lib/medical-backup-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -76,6 +77,7 @@ const CADENCE: Record<string, string> = {
   ubereats: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
+  medical_backup: "Weekly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
@@ -133,6 +135,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
+  medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   simplefin:      { method: "automated",      label: "Bank feed API" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
@@ -472,6 +475,8 @@ export async function GET() {
         ["pc_activity", "usage"],
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
+        // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
+        ["backup", "medical_records"],
         // N-of-1 trial report job: one heartbeat a day.
         ["experiments", "report"],
         // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
@@ -1447,6 +1452,18 @@ export async function GET() {
           methodLabel: METHOD.google_calendar.label,
         };
       })(),
+      // Encrypted off-site backup of /health/records (tools/medical_recovery/offsite_backup.py, weekly on
+      // Riley's PC, ciphertext only into OneDrive). Heartbeat only and count-free: >8 days degraded, >15 days
+      // or a failed run red. Thresholds and messages: lib/medical-backup-status.ts.
+      medical_backup: {
+        ...medicalBackupCard({
+          entry: (latestBySrcType["backup|medical_records"] as BackupHeartbeat | undefined) ?? null,
+          nowMs: Date.now(),
+        }),
+        cadence: CADENCE.medical_backup,
+        integrationMethod: METHOD.medical_backup.method,
+        methodLabel: METHOD.medical_backup.label,
+      },
       // Care Calendar (the other direction: care items on /health -> the "Onyx care" calendar,
       // lib/care-google-server.ts). No sync_log rows: the heartbeat is care_calendar_sync.last_sync_at,
       // moved by every sync (after each /health change, Sync now, and the 6-hourly catch-up at
