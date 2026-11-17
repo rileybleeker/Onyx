@@ -96,8 +96,15 @@ def docs():
 
 
 def labs():
-    return [{"id": LAB_1, "test_name": "LEAK test", "value_num": 1.5, "document_id": DOC_A, "removed_at": None},
-            {"id": LAB_2, "test_name": "LEAK other", "value_text": "LEAK", "document_id": None, "removed_at": None}]
+    # Full pds.lab_results columns, as the table has them (NOT NULL on unit, value_text, collected_on,
+    # ref_text, strict flags): the recovery manifest validates every lab row's value / unit / range / date
+    # state, so a row with those columns missing would be refused as a malformed manifest.
+    return [{"id": LAB_1, "test_name": "LEAK test", "lab": "SYNTHETIC lab", "value_num": 1.5, "value_text": "",
+             "unit": "mg/dL", "ref_low": 1.0, "ref_high": 2.0, "ref_text": "", "ref_low_strict": False,
+             "ref_high_strict": False, "collected_on": "2026-03-01", "document_id": DOC_A, "removed_at": None},
+            {"id": LAB_2, "test_name": "LEAK other", "lab": "SYNTHETIC lab", "value_num": None, "value_text": "LEAK",
+             "unit": "", "ref_low": None, "ref_high": None, "ref_text": "", "ref_low_strict": False,
+             "ref_high_strict": False, "collected_on": "2026-03-02", "document_id": None, "removed_at": None}]
 
 
 def _split_top(text):
