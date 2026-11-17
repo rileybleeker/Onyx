@@ -723,6 +723,10 @@ async function runMapJob(supabase: Supa, run: JobRun): Promise<StepOutcome> {
   const mapping = mapVerdict(map, input);
   const { data, error: e2 } = await supabase.rpc("reading_bank_set_map", {
     p: {
+      // The claim fence: pds.reading_bank_set_map refuses a call without it (400 bad_request), as the store does.
+      job_id: job.job_id,
+      attempts: job.attempts,
+      claim_seq: job.claim_seq,
       book_id: job.book_id,
       mapping,
       narrative: map ? map.narrative : null,
