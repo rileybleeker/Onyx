@@ -217,9 +217,9 @@ export function GoalsSection({ goals, accounts, busy, run }: { goals: GoalView[]
         </ul>
       )}
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <input className={inputCls} placeholder="Goal (e.g. NYC move fund)" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} />
-        <input className={`${inputCls} w-28`} placeholder="$ target" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} />
-        <input className={inputCls} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        <input aria-label="Goal name" className={inputCls} placeholder="Goal (e.g. NYC move fund)" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} />
+        <input aria-label="Goal target amount" className={`${inputCls} w-28`} placeholder="$ target" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} />
+        <input aria-label="Goal date" className={inputCls} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
         <select className={inputCls} value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
           <option value="">Checking + savings</option>
           {options.map((a) => (
