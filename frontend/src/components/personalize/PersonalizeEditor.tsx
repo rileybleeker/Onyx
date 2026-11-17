@@ -1109,6 +1109,7 @@ export function TableTools(props: ColumnProps) {
           Freeze pane through
           <select
             value={lastFrozen}
+            aria-label="Freeze pane through"
             onChange={(e) => {
               const v = e.target.value;
               updateDraftFor(layoutKey, (l) => setColumnFreeze(l, tableId, v, defaultFreeze));

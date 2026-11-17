@@ -112,7 +112,7 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
         {field("401(k) / pre-tax ($/yr)", "preTax", "0")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Extra card payment
-          <select className={input} value={f.payoffCard} onChange={set("payoffCard")}>
+          <select className={input} value={f.payoffCard} onChange={set("payoffCard")} aria-label="Extra card payment">
             <option value="">(card)</option>
             {cards.map((a) => (
               <option key={a.account_key} value={a.account_key}>
@@ -477,7 +477,7 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         {field("NC rate (%)", "ncRate", "text", "w-20", "3.99")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Employer withholds state tax for
-          <select className={input} value={f.withholds} onChange={set("withholds")}>
+          <select className={input} value={f.withholds} onChange={set("withholds")} aria-label="Employer withholds state tax for">
             <option value="NC">North Carolina</option>
             <option value="none">no state</option>
           </select>

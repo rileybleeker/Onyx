@@ -75,7 +75,7 @@ function GoalForm({ payload, onDone }: { payload: WindDownPayload; onDone?: () =
   return (
     <div className="space-y-3">
       <label className="block text-[13px] text-text-secondary">The habit that means you started winding down
-        <select value={habitId} onChange={(e) => setHabitId(e.target.value)} className={`${field} mt-1 w-full`}>
+        <select value={habitId} onChange={(e) => setHabitId(e.target.value)} aria-label="The habit that means you started winding down" className={`${field} mt-1 w-full`}>
           <option value="">{habits ? "Choose a habit" : habitsFailed ? "Couldn't load your habits" : "Loading habits…"}</option>
           {[...knownCurrent, ...options].map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}
         </select>

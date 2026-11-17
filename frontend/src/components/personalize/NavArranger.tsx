@@ -462,6 +462,7 @@ function TabSlotChooser({ saved }: { saved: string[] | null }) {
           <span className="w-16 shrink-0">{slot < 2 ? `Left ${slot + 1}` : `Right ${slot - 1}`}</span>
           <select
             value={value}
+            aria-label={slot < 2 ? `Left ${slot + 1}` : `Right ${slot - 1}`}
             onChange={(e) => choose(slot, e.target.value)}
             className="min-h-11 min-w-0 flex-1 rounded-control border border-border-subtle bg-surface-card px-2 text-[13px] text-text-primary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
           >
