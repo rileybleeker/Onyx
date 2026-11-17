@@ -46,6 +46,10 @@ export default function CommandPalette() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const pointerSelect = useRef(false);
+  // The control that had focus when the palette opened (restored on Escape / outside click), and whether the
+  // next close should hand focus back at all (not when a page or Personalize takes it).
+  const openerRef = useRef<HTMLElement | null>(null);
+  const restoreFocus = useRef(false);
   // Ignore hover refreshes caused by rows scrolling under a stationary mouse.
   const lastPointer = useRef<string | null>(null);
 
@@ -56,8 +60,9 @@ export default function CommandPalette() {
     return query.trim() ? [PERSONALIZE_ITEM, ...pages] : [...pages, PERSONALIZE_ITEM];
   }, [query]);
 
-  const close = useCallback(() => {
+  const close = useCallback((restore: boolean) => {
     pointerSelect.current = false;
+    restoreFocus.current = restore;
     setOpen(false);
     setQuery("");
     setActive(0);
@@ -66,7 +71,8 @@ export default function CommandPalette() {
   const go = useCallback(
     (item: NavItem | undefined) => {
       if (!item) return;
-      close();
+      // Going to a page: the page owns focus. Personalize: its banner owns focus.
+      close(false);
       if (item.href === PERSONALIZE_HREF) {
         personalizeNow();
         return;
@@ -113,12 +119,31 @@ export default function CommandPalette() {
   // Focus input + reset selection on open.
   useEffect(() => {
     if (open) {
+      // Remember what had focus (null when nothing useful, e.g. body after a Ctrl+K from the page).
+      const prior = document.activeElement;
+      openerRef.current =
+        prior instanceof HTMLElement && prior !== document.body && !prior.closest('[aria-label="Command palette"]')
+          ? prior
+          : null;
       pointerSelect.current = false;
       lastPointer.current = null;
       setActive(0);
       const t = setTimeout(() => inputRef.current?.focus(), 10);
       return () => clearTimeout(t);
     }
+  }, [open]);
+
+  // Hand focus back after Escape or an outside click. Runs after the palette has unmounted (its input is gone),
+  // so focus is never left on body: the opener if it can still take focus, else the first visible Search control.
+  useEffect(() => {
+    if (open || !restoreFocus.current) return;
+    restoreFocus.current = false;
+    const opener = openerRef.current;
+    openerRef.current = null;
+    const canTakeFocus = (el: HTMLElement | null): el is HTMLElement =>
+      !!el && el.isConnected && !(el as HTMLButtonElement).disabled && el.getClientRects().length > 0;
+    const trigger = Array.from(document.querySelectorAll<HTMLElement>("[data-palette-trigger]")).find(canTakeFocus) ?? null;
+    (canTakeFocus(opener) ? opener : trigger)?.focus();
   }, [open]);
 
   // Warm the highlighted page so Enter lands on loaded data (the warm-up usually has it already).
@@ -161,14 +186,14 @@ export default function CommandPalette() {
       go(results[active]);
     } else if (e.key === "Escape") {
       e.preventDefault();
-      close();
+      close(true);
     }
   }
 
   return (
     <div
       className="fixed inset-0 z-[100] flex items-start justify-center pt-[18vh] px-4 bg-black/60 backdrop-blur-sm"
-      onClick={close}
+      onClick={() => close(true)}
       role="dialog"
       aria-modal="true"
       aria-label="Command palette"
