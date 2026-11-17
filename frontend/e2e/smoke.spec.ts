@@ -650,7 +650,7 @@ test.describe("/nyc apartment search", () => {
     await settle(page);
     await expect(page.getByText("NYC Apartment Search", { exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Couldn't load leads", { exact: false }), "Notion read failed on /nyc").toHaveCount(0);
-    await expect(page.getByText("No leads yet. nyc-scout fills this every morning."), "NYC Leads database is empty").toHaveCount(0);
+    await expect(page.getByText("No leads yet. New leads are added every morning."), "NYC Leads database is empty").toHaveCount(0);
 
     await page.getByRole("button", { name: "All incl. gone" }).click();
     await expect(page.locator('[data-testid="nyc-leads-table"] tbody tr').first()).toBeVisible({ timeout: LOAD_TIMEOUT });

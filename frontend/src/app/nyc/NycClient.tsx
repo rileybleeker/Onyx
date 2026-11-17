@@ -362,7 +362,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
           // A failed read sets `error` and the banner above says so; no empty-state copy then.
           error ? null : (
             <p className="py-8 text-center text-[13px] text-text-secondary">
-              {leads.length === 0 ? "No leads yet. nyc-scout fills this every morning." : "No leads match these filters."}
+              {leads.length === 0 ? "No leads yet. New leads are added every morning." : "No leads match these filters."}
             </p>
           )
         ) : (
