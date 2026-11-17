@@ -73,3 +73,9 @@ test('the route is not a CI route', () => {
   const mw = src('middleware.ts');
   assert.doesNotMatch(mw, /\/api\/kindle/);
 });
+
+test('the failed branch of the Run now button never echoes server text', () => {
+  const component = src('components', 'KindleRunNow.tsx');
+  assert.doesNotMatch(component, /\$\{body\.error\}/);
+  assert.match(component, /Couldn't ask the PC\. Try again\./);
+});
