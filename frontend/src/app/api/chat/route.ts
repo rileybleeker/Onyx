@@ -608,6 +608,16 @@ async function currentBookId(): Promise<number | undefined> {
   }
 }
 
+/** The slug of the book being read, to check a reading call that names a book against it (SEC-05). */
+async function currentBookSlug(): Promise<string | null> {
+  try {
+    const book = await getBook(supabase, null);
+    return typeof book?.slug === "string" ? book.slug : null;
+  } catch {
+    return null;
+  }
+}
+
 /** logSession / addHighlight refusals from before anything was written. Any other error came from a write. */
 const SESSION_NOT_WRITTEN = /^(No active book found|chapter_through must be|chapter_through cannot exceed)/;
 /** lib/reading.ts SESSION_KEY_REQUIRED: a session that must carry its key could not (nothing was written). */
@@ -1859,8 +1869,12 @@ export async function POST(req: NextRequest) {
         if (block.type === "tool_use") {
           const input = block.input as Record<string, unknown>;
           let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
+          // A reading call that names a book may use the book being read, or one the user named.
+          const activeBook = isWriteTool(block.name) && READING_BOOK_TOOLS.has(block.name) && typeof input?.book === "string" && input.book.trim()
+            ? await currentBookSlug()
+            : null;
           const decision = isWriteTool(block.name)
-            ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed })
+            ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, activeBook })
             : null;
           if (decision && !decision.allowed) {
             // Not asked for in the user's own latest message: never run, never recorded in the ledger.

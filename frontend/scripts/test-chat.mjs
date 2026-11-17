@@ -433,7 +433,7 @@ test("reading session, highlight, quiz and playlist each return a receipt built 
     tool: "add_book_highlight", status: "unchanged", title: "Highlight already saved, nothing new written",
     details: ['"Seen before"', "Synthetic Book, chapter 4"],
   }]);
-  assert.deepEqual(await run("record_reading_quiz", { checkpoint: "ch12", score: 4, total: 5 }, "Quiz me on the synthetic book"), [{
+  assert.deepEqual(await run("record_reading_quiz", { checkpoint: "ch12", score: 4, total: 5 }, "Record my synthetic quiz: 4 out of 5"), [{
     tool: "record_reading_quiz", status: "saved", title: "Quiz result recorded", details: ["ch12: 4/5 (passed)", "Day: 2026-11-11"],
   }]);
   assert.deepEqual(await run("create_spotify_playlist", { name: "Synthetic mix", track_ids: ["a", "b"] }, "Create a synthetic playlist"), [{
@@ -753,11 +753,11 @@ test("a malformed request_id is a 400 before the model runs; a failed owner chec
 test("a quiz insert whose answer was lost is reported as possibly recorded; a refusal stays not recorded", async () => {
   const quiz = afterTool("record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 });
   const lost = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
-  const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz")] })).json();
+  const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json();
   assert.equal(lostBody.receipts[0].status, "unknown");
   assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/, "the database text is not passed on");
   const refused = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
-  assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz")] })).json()).receipts[0].status, "not_saved");
+  assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json()).receipts[0].status, "not_saved");
 });
 
 test("a playlist call that may have reached Spotify is reported as possibly done, not as a clean failure", async () => {
@@ -1097,7 +1097,7 @@ test("a highlight re-run finds the highlight its earlier try made by its key, on
   // recorded it.
   const readingNotion = { mirrorHighlight: async () => { mirrors++; return mirrors === 1 ? null : "synthetic-block"; } };
   const call = { passage: "A synthetic line.", comment: "First note." };
-  const body = { request_id: RID, messages: [user("Save this synthetic line. First note.")] };
+  const body = { request_id: RID, messages: [user("Save this: A synthetic line. First note.")] };
   await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body);
   const op = db.rows("chat_operations")[0];
   assert.equal(db.rows("book_highlights")[0].client_key, op.op_id, "the created highlight carries the operation id");
@@ -1123,7 +1123,7 @@ test("a highlight whose passage and note were edited after a lost answer is neve
   const reading = highlightLibrary(db, { seen });
   const readingNotion = { mirrorHighlight: async () => "synthetic-block" };
   const call = { passage: "Another synthetic line.", comment: "Old note." };
-  const body = { request_id: RID, messages: [user("Save another synthetic line. Old note.")] };
+  const body = { request_id: RID, messages: [user("Save this: Another synthetic line. Old note.")] };
   await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body);
   state.failFinish = false;
   // Riley edits the passage and the note on /reading: no highlight has the call's passage any more.
@@ -1137,7 +1137,7 @@ test("a highlight whose passage and note were edited after a lost answer is neve
 
   // Removed (archived) since, in another message: never made again, and it says so.
   state.failFinish = true;
-  const other = { request_id: "55555555-5555-4555-8555-555555555555", messages: [user("Save a removed synthetic line")] };
+  const other = { request_id: "55555555-5555-4555-8555-555555555555", messages: [user("Save this: A removed synthetic line.")] };
   const call2 = { passage: "A removed synthetic line." };
   await route(afterTool("add_book_highlight", call2), { supabase: db, reading, readingNotion }).post(other);
   state.failFinish = false;
@@ -1164,7 +1164,7 @@ test("a highlight the earlier try may have changed is never written over an edit
   const reading = highlightLibrary(db, { seen });
   const readingNotion = { mirrorHighlight: async () => "synthetic-block" };
   const call = { passage: "An existing synthetic line.", comment: "A note from chat." };
-  const body = { request_id: RID, messages: [user("Save the existing synthetic line with a note from chat")] };
+  const body = { request_id: RID, messages: [user("Save this: An existing synthetic line. A note from chat.")] };
   await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body);
   assert.equal(db.rows("book_highlights")[0].comment, "A note from chat.");
   assert.equal(db.rows("book_highlights")[0].client_key, null, "an updated highlight gets no key");
@@ -1181,7 +1181,7 @@ test("a highlight the earlier try may have changed is never written over an edit
   const fresh = ledgerDb({ tables: { books: highlightBooks() } });
   const freshSeen = [];
   const lostBeforeWrite = { ...highlightLibrary(fresh, { seen: freshSeen }), addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
-  const third = { request_id: "77777777-7777-4777-8777-777777777777", messages: [user("Save a third synthetic line")] };
+  const third = { request_id: "77777777-7777-4777-8777-777777777777", messages: [user("Save this: A third synthetic line.")] };
   const call3 = { passage: "A third synthetic line." };
   const firstThird = await (await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: lostBeforeWrite, readingNotion }).post(third)).json();
   assert.equal(firstThird.receipts[0].status, "unknown");
@@ -1197,7 +1197,7 @@ test("a highlight whose key column cannot be read is refused, never written with
   for (const code of ["42703", "08006"]) {
     const db = ledgerDb({ tables: { books: highlightBooks() }, fail: ({ table, op }) => (table === "book_highlights" && op === "select" ? { code } : null) });
     const seen = [];
-    const body = await (await route(afterTool("add_book_highlight", { passage: "A synthetic line." }), { supabase: db, reading: highlightLibrary(db, { seen }) }).post({ request_id: RID, messages: [user("Save this synthetic line")] })).json();
+    const body = await (await route(afterTool("add_book_highlight", { passage: "A synthetic line." }), { supabase: db, reading: highlightLibrary(db, { seen }) }).post({ request_id: RID, messages: [user("Save this: A synthetic line.")] })).json();
     assert.deepEqual(seen, [], code);
     assert.equal(body.receipts[0].status, "not_saved", code);
   }
@@ -1658,7 +1658,7 @@ test("a check-mode highlight recovery never updates a highlight written between 
   const readingNotion = { mirrorHighlight: async () => "synthetic-block" };
   const lost = { ...highlightLibrary(db), addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
   const call = { passage: "A raced synthetic line.", comment: "Note from chat." };
-  const body = { request_id: RID, messages: [user("Save a raced synthetic line. Note from chat.")] };
+  const body = { request_id: RID, messages: [user("Save this: A raced synthetic line. Note from chat.")] };
   assert.equal((await (await route(afterTool("add_book_highlight", call), { supabase: db, reading: lost, readingNotion }).post(body)).json()).receipts[0].status, "unknown");
   // Retry: the check reads find nothing, then Riley's own highlight of the same passage lands before the insert.
   const insertOnly = [];
@@ -1679,7 +1679,7 @@ test("a check-mode highlight recovery never updates a highlight written between 
   // The same race where the concurrent highlight is exactly what the call asked for: confirmed, still unchanged.
   const db2 = ledgerDb({ tables: { books: highlightBooks() } });
   const lost2 = { ...highlightLibrary(db2), addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
-  const body2 = { request_id: "88888888-8888-4888-8888-888888888888", messages: [user("Save a matching synthetic line. Same note.")] };
+  const body2 = { request_id: "88888888-8888-4888-8888-888888888888", messages: [user("Save this: A matching synthetic line. Same note.")] };
   const call2 = { passage: "A matching synthetic line.", comment: "Same note." };
   await route(afterTool("add_book_highlight", call2), { supabase: db2, reading: lost2, readingNotion }).post(body2);
   const reading2 = highlightLibrary(db2, {
@@ -1763,7 +1763,7 @@ test("a quiz result runs under its operation key with the operation's day, and a
     },
   };
   const call = { checkpoint: "ch12", score: 4, total: 5 };
-  const body = { request_id: RID, messages: [user("Record my synthetic quiz")] };
+  const body = { request_id: RID, messages: [user("Record my synthetic quiz: 4 out of 5")] };
   await route(afterTool("record_reading_quiz", call), { supabase: db, reading, today: "2026-11-11" }).post(body);
   const op = db.rows("chat_operations")[0];
   assert.equal(op.status, "pending", "the answer was lost before the ledger recorded it");
