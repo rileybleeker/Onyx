@@ -333,13 +333,23 @@ export async function POST(req: NextRequest) {
   // alive for it) instead of being logged as not created while it may still land.
   let creation: Promise<CreatePlaylistResult> | null = null;
   let creationPending = false;
+  // A creation that failed after its Spotify write started. With no confirmed playlist id the
+  // outcome is ambiguous (Spotify may have made the playlist before the connection failed): the
+  // request is observed as unresolved and the client is told to check before generating again.
+  // With a confirmed id the playlist exists but is incomplete, and the client is given its link.
+  let creationAmbiguous = false;
+  let leftPlaylist: { playlist_id: string; spotify_url: string } | null = null;
   const graceAt = requestAt + PLAYLIST_CREATE_GRACE_MS;
   const createOnce = (args: Parameters<typeof createPlaylist>[0]): Promise<CreatePlaylistResult> => {
     if (!creation) {
       if (stop.signal.aborted) return Promise.reject(new Error("Request time budget exceeded"));
       creationPending = true;
       let writeStarted = false;
-      const write = createPlaylist({ ...args, onWriteStart: () => (writeStarted = true) });
+      const write = createPlaylist({
+        ...args,
+        onWriteStart: () => (writeStarted = true),
+        onCreated: (p) => (leftPlaylist = p),
+      });
       creation = write;
       write
         .then(
@@ -348,8 +358,14 @@ export async function POST(req: NextRequest) {
           },
           () => {
             // A failure before any Spotify write (empty tracks, token refresh) left nothing to
-            // protect: a corrected call may try again. A started write stays deduplicated.
-            if (!writeStarted && creation === write) creation = null;
+            // protect: a corrected call may try again. A started write stays deduplicated, and
+            // without a confirmed playlist its outcome is unknown.
+            if (!writeStarted) {
+              if (creation === write) creation = null;
+            } else if (!leftPlaylist) {
+              creationAmbiguous = true;
+              unresolved = true;
+            }
           },
         )
         .finally(() => {
@@ -362,7 +378,19 @@ export async function POST(req: NextRequest) {
         () => reject(new Error("Playlist creation is still running on Spotify")),
         Math.max(0, graceAt - Date.now()),
       );
-      work.then(resolve, reject).finally(() => clearTimeout(timer));
+      // The handlers above run first (registered first), so the flags are set here. The model is
+      // told a playlist may already exist, so it does not ask for another.
+      work
+        .then(resolve, (e) => {
+          if (leftPlaylist) {
+            reject(new Error("The playlist was created on Spotify but is incomplete. Do not create another."));
+          } else if (creationAmbiguous) {
+            reject(new Error("Playlist creation failed after Spotify started it; a playlist may exist. Do not create another."));
+          } else {
+            reject(e);
+          }
+        })
+        .finally(() => clearTimeout(timer));
     });
   };
   // Resolved when the request is fully done (its creation settled and the request observed), so
@@ -391,11 +419,23 @@ export async function POST(req: NextRequest) {
         }
       };
       // The last event: the playlist when one was created (also after a later failure, so the
-      // client does not ask for it again), the unknown outcome when a creation is still running,
-      // else the failure.
+      // client does not ask for it again), the playlist left incomplete by a failed creation, the
+      // unknown outcome when a creation is still running or failed after its write started, else
+      // the failure.
       const sendOutcome = (failure: string) => {
         if (finalResult) {
           send({ type: "done", result: finalResult });
+        } else if (leftPlaylist) {
+          send({
+            type: "error",
+            message: `The playlist was created on Spotify but is incomplete: ${leftPlaylist.spotify_url}. Check it before generating again.`,
+          });
+        } else if (creationAmbiguous) {
+          send({
+            type: "error",
+            message:
+              "Playlist creation failed after Spotify started it, so a playlist may exist. Check your playlists before generating again.",
+          });
         } else if (creationPending) {
           send({
             type: "error",

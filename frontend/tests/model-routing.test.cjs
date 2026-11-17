@@ -137,10 +137,15 @@ test("observations: none outside a pilot, attempted calls counted apart from ans
   });
   assert.deepEqual(line, {
     event: "model_pilot", task: "playlist", arm: "baseline", model: "claude-sonnet-5-5", effort: "default",
-    ok: true, calls: 3, answered: 2, unpriced: 1, units: 1, accepted: 1, latency_ms: 1234,
+    ok: true, unresolved: false, calls: 3, answered: 2, unpriced: 1, units: 1, accepted: 1, latency_ms: 1234,
     input_tokens: 250, output_tokens: 50, cache_read_tokens: 50, cache_write_tokens: 10,
   });
   for (const v of Object.values(line)) assert.ok(["string", "number", "boolean"].includes(typeof v));
+  // An unresolved outcome is carried as an explicit true, never inferred from ok.
+  const stalled = R.pilotObservation("playlist", choice, pilot, { usage: [], latencyMs: 1, ok: false, calls: 1, unresolved: true });
+  assert.equal(stalled.unresolved, true);
+  assert.equal(stalled.ok, false);
+  assert.equal(R.pilotCostEvidence([stalled]).complete, false);
 });
 
 test("effortConfig sends no effort when the API default applies", () => {
@@ -695,6 +700,55 @@ test("a creation that never settles is observed as unresolved at the hard end", 
   assert.equal(lines[0].ok, false);
   assert.equal(lines[0].unresolved, true);
   assert.equal(R.pilotCostEvidence(lines).complete, false, "an unresolved request blocks cost promotion");
+});
+
+test("a creation that fails after its Spotify write started is ambiguous: unresolved, never 'without creating'", async () => {
+  // The connection drops after the create request went out, before Spotify confirmed a playlist.
+  let writes = 0;
+  const createPlaylist = async ({ onWriteStart }) => {
+    writes++;
+    onWriteStart();
+    throw new Error("fetch failed");
+  };
+  const { lines, text } = await runPlaylistCase(["answer_tool", "answer_tool", "answer_end"], { createPlaylist });
+  assert.equal(writes, 1, "a started write is never retried in the same request");
+  assert.match(text, /a playlist may exist/);
+  assert.match(text, /Check your playlists before generating again/);
+  assert.doesNotMatch(text, /without creating a playlist/);
+  assert.doesNotMatch(text, /"type":"done"/);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].ok, false);
+  assert.equal(lines[0].unresolved, true);
+  assert.equal(R.pilotCostEvidence(lines).complete, false, "an ambiguous creation blocks cost promotion");
+});
+
+test("a creation that fails after Spotify confirmed the playlist names the incomplete playlist", async () => {
+  const createPlaylist = async ({ onWriteStart, onCreated }) => {
+    onWriteStart();
+    onCreated({ playlist_id: "pl1", spotify_url: "https://example.invalid/pl1" });
+    throw new Error("Spotify add-tracks failed (502)");
+  };
+  const { lines, text } = await runPlaylistCase(["answer_tool", "answer_end"], { createPlaylist });
+  assert.match(text, /created on Spotify but is incomplete: https:\/\/example\.invalid\/pl1/);
+  assert.doesNotMatch(text, /without creating a playlist/);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].ok, false, "an incomplete playlist is not an accepted result");
+  assert.equal(lines[0].unresolved, false, "the outcome is known");
+});
+
+test("a creation that fails before any Spotify write may be tried again in the same request", async () => {
+  let calls = 0;
+  const createPlaylist = async ({ name, trackIds, onWriteStart }) => {
+    calls++;
+    if (calls === 1) throw new Error("token refresh failed");
+    onWriteStart();
+    return { playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length };
+  };
+  const { lines, text } = await runPlaylistCase(["answer_tool", "answer_tool", "answer_end"], { createPlaylist });
+  assert.equal(calls, 2);
+  assert.match(text, /"type":"done"/);
+  assert.equal(lines[0].ok, true);
+  assert.equal(lines[0].unresolved, false);
 });
 
 for (const c of FX.playlist_measurement.cases) {

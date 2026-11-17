@@ -286,6 +286,11 @@ export interface CreatePlaylistArgs {
   clientKey?: string;
   /** Called just before the first Spotify write; a failure before it means no playlist exists. */
   onWriteStart?: () => void;
+  /**
+   * Called once Spotify has confirmed the playlist exists (before tracks are added), so a caller
+   * whose creation fails later knows which playlist was left behind instead of guessing.
+   */
+  onCreated?: (p: { playlist_id: string; spotify_url: string }) => void;
 }
 
 export interface CreatePlaylistResult {
@@ -348,6 +353,7 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlist = await createResp.json();
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
+  args.onCreated?.({ playlist_id: playlistId, spotify_url: spotifyUrl });
 
   const audit = {
     playlist_id: playlistId,

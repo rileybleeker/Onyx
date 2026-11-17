@@ -94,7 +94,11 @@ is unknown, never zero: the logged tokens give the cost only when `pilotCostEvid
 is `complete` for both arms of the window. Otherwise the cost criterion stays unmet until the
 window's cost per arm is reconciled with Anthropic's own usage report for the same models and
 dates (Console usage, or the Usage and Cost API), and the reconciled figure is linked in the
-promotion PR. A candidate that misses
+promotion PR. A line with `unresolved: true` (a playlist creation still running at the hard
+end, or one that failed after its Spotify write started without Spotify confirming a playlist)
+also keeps `complete` false: its outcome and cost are unknown, so it is reconciled by hand
+(check Spotify for the playlist and the provider's usage report for the attempt) before the
+window counts. A candidate that misses
 any threshold stays a candidate.
 
 ## Fixtures
