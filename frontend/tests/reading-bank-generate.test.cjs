@@ -106,7 +106,7 @@ function planInput(db) {
 function addJob(db, j) {
   const job = {
     job_id: db.nextJob++, book_id: BOOK, step: j.step, chapter: j.chapter ?? 0, input_hash: j.input_hash, prompt_version: j.prompt_version ?? P.BANK_PROMPT_VERSION,
-    attempt_key: j.attempt_key ?? null, status: j.status ?? "queued", priority: j.priority ?? 100, attempts: j.attempts ?? 0, next_attempt_at: j.next_attempt_at ?? db.clock,
+    attempt_key: j.attempt_key ?? null, status: j.status ?? "queued", priority: j.priority ?? 100, attempts: j.attempts ?? 0, claim_seq: j.claim_seq ?? 0, next_attempt_at: j.next_attempt_at ?? db.clock,
     lease_until: j.lease_until ?? null, reserved_cents: j.reserved_cents ?? 0, cost_cents: j.cost_cents ?? 0, usage: null, result: j.result ?? null, counts: null,
     output: j.output ?? null, store_receipt: j.store_receipt ?? null, error_code: j.error_code ?? null, created_at: j.created_at ?? new Date(db.clock).toISOString(),
   };
@@ -175,7 +175,7 @@ function rpcs(db) {
         }
         head = Math.min(head, book().approved_cents - used);
       }
-      Object.assign(job, { status: "running", attempts: job.attempts + 1, lease_until: db.clock + p.lease_seconds * 1000, reserved_cents: est });
+      Object.assign(job, { status: "running", attempts: job.attempts + 1, claim_seq: (job.claim_seq ?? 0) + 1, lease_until: db.clock + p.lease_seconds * 1000, reserved_cents: est });
       return { ok: true, job: structuredClone(job), headroom_cents: Math.max(head, est) };
     },
     reading_bank_reserve: ({ p }) => {
@@ -229,6 +229,11 @@ function rpcs(db) {
       return { ok: true, status };
     },
     reading_bank_set_map: ({ p }) => {
+      // Mirrors sql/reading_question_bank.sql: the claim fence is required, and must match the running map job.
+      if (![p.job_id, p.attempts, p.claim_seq].every((v) => Number.isInteger(v))) return { ok: false, http: 400, code: "bad_request" };
+      const mj = db.jobs.find((x) => x.job_id === p.job_id);
+      if (!mj || mj.step !== "map") return { ok: false, http: 409, code: "job_mismatch" };
+      if (mj.attempts !== p.attempts || mj.claim_seq !== p.claim_seq) return { ok: false, http: 409, code: "lease_lost" };
       Object.assign(book(), { mapping: p.mapping, narrative: p.narrative, source_chapter_count: p.source_chapter_count, map_urls: p.map_urls, toc_hash: p.toc_hash });
       return { ok: true };
     },
