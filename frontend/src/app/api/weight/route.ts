@@ -130,11 +130,14 @@ export async function PATCH(req: NextRequest) {
     .update(patch)
     .eq("log_date", body.log_date)
     .select("log_date, weight_kg, notes, logged_at, source")
-    .single();
+    .maybeSingle();
 
   if (error) {
     console.error("api/weight PATCH", error.message);
     return NextResponse.json({ error: "Couldn't save your weight. Try again." }, { status: 500 });
+  }
+  if (!data) {
+    return NextResponse.json({ error: "No weight is logged for that date." }, { status: 404 });
   }
   return NextResponse.json(data);
 }
