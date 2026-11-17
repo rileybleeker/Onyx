@@ -523,7 +523,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   async function deleteActivity(act: ActivityRow) {
     const sourceId = act.id.split(":")[1];
     const label = `${act.name} (${new Date(act.display_time).toLocaleDateString()})`;
-    if (!confirm(`Delete this activity from Onyx?\n\n${label}\n\nIt will be hidden from all charts and HRV analytics. Re-syncs won't bring it back. You can restore it by clearing is_excluded in the DB.`)) {
+    if (!confirm(`Delete this activity from Onyx?\n\n${label}\n\nIt will be hidden from all charts and HRV analytics. A later sync will not bring it back.`)) {
       return;
     }
     setRowError(null);
