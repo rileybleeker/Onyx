@@ -111,7 +111,8 @@ export default function JournalPage() {
       .then((r) => r.json())
       .then((data) => {
         if (data.error) {
-          setError(data.error);
+          console.error("Load journal:", data.error);
+          setError("Couldn't load your journal. Try again.");
           setEntries([]);
         } else {
           setEntries(data.entries || []);
@@ -156,7 +157,8 @@ export default function JournalPage() {
         entryCache.current.set(id, data.entry);
         setFullEntry(data.entry);
       } else if (data.error) {
-        setError(data.error);
+        console.error("Load journal entry:", data.error);
+        setError("Couldn't load that entry. Try again.");
       }
     } catch (e) {
       console.error("Load journal entry:", e);
