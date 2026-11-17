@@ -129,7 +129,15 @@ export async function POST(req: NextRequest) {
         ? "manual"
         : "kindle";
 
+  // `errors` goes to the browser: fixed phrases only. `errorDetails` keeps the raw text for the server log and the run log.
   const errors: string[] = [];
+  const errorDetails: string[] = [];
+  const failure = (scope: string, e: unknown) => {
+    const detail = e instanceof Error ? e.message : String(e);
+    console.error(`reading/highlights/import ${scope}:`, detail);
+    errorDetails.push(`${scope}: ${detail}`);
+    errors.push(`${scope}: couldn't be saved. Try again.`);
+  };
 
   // Book facts first (chapter map + position), so highlights can be tagged with their chapter.
   let chaptersUpserted = 0;
@@ -137,7 +145,7 @@ export async function POST(req: NextRequest) {
     try {
       chaptersUpserted = await upsertChapters(supabase, book, body.chapters);
     } catch (e) {
-      errors.push(`chapters: ${e instanceof Error ? e.message : String(e)}`);
+      failure("chapters", e);
     }
   }
   let positionAdvanced = false;
@@ -151,7 +159,7 @@ export async function POST(req: NextRequest) {
       book = r.book;
       positionAdvanced = r.advanced;
     } catch (e) {
-      errors.push(`position: ${e instanceof Error ? e.message : String(e)}`);
+      failure("position", e);
     }
   }
   const hasPositions = parsed.items.some((i) => i.position != null);
@@ -175,7 +183,9 @@ export async function POST(req: NextRequest) {
       note_at: item.note_at,
     });
     if (!r.ok) {
+      // addHighlight's messages are fixed copy (its database failures are already mapped to one phrase).
       errors.push(r.error);
+      errorDetails.push(`passage: ${r.error}`);
       continue;
     }
     if (r.created) {
@@ -190,7 +200,7 @@ export async function POST(req: NextRequest) {
     try {
       sync = await syncKindleSessions(supabase, book);
     } catch (e) {
-      errors.push(`sessions: ${e instanceof Error ? e.message : String(e)}`);
+      failure("sessions", e);
     }
   }
 
@@ -234,9 +244,9 @@ export async function POST(req: NextRequest) {
   if (body.harvest) {
     await heartbeat(
       startedAt,
-      errors.length ? "partial" : "success",
+      errorDetails.length ? "partial" : "success",
       created + (sync?.created.length ?? 0),
-      errors.length ? `${errors.length} problem(s): ${errors[0]}` : null,
+      errorDetails.length ? `${errorDetails.length} problem(s): ${errorDetails[0]}` : null,
     );
   }
 
