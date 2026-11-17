@@ -543,6 +543,25 @@ def test_download_only_exposure_fails_on_the_drill_and_is_never_a_pass_on_produc
     assert_private_output(text)
 
 
+def test_production_head_403_is_unknown_not_a_download_pass():
+    # a HEAD (info) refusal with HTTP 403 says nothing about the GET download: on production every download
+    # refusal, the public URL included, stays unknown, and no GET of a file is sent
+    docs, labs, files = healthy()
+    served = FakeServer(docs, labs, files)
+
+    def head_forbidden(method, url, headers, body, read_body=True):
+        if method == "HEAD" and "/storage/v1/object/" in url:
+            return 403, b"{}", {}
+        return served(method, url, headers, body, read_body)
+
+    code, text, report, _ = run(head_forbidden)
+    assert code == 2 and only_bytes_unknown(report), text
+    for name in DOWNLOAD_CHECKS + ("public_url_refused",):
+        assert result(report, name)["result"] == "unknown", name
+    assert not any(m == "GET" and p.startswith("/storage/v1/object/") for m, _, p in served.calls)
+    assert_private_output(text)
+
+
 def test_exposure_seen_before_a_later_error_stays_a_fail():
     # each probe stands on its own: a table the role reached is a FAIL even when its listing, its file probe
     # or the public URL could not be read afterwards; it is never folded into "unknown"
