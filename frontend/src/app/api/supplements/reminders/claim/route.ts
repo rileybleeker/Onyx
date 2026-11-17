@@ -41,6 +41,6 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     console.error("supplement reminder claim failed:", message);
-    return NextResponse.json({ ok: false, error: message }, { status: 500 });
+    return NextResponse.json({ ok: false, error: "Couldn't check reminders right now. Try again." }, { status: 500 });
   }
 }
