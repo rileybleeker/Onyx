@@ -818,13 +818,13 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   assert.deepEqual(store.keys(), [contract.pendingSendKey(idOf(1)), contract.pendingSendKey(idOf(2))], "one key per send");
   // A retry of a send (its id) replaces only itself.
   contract.storePendingSend(store, { conv: convOf(1), id: idOf(1), at: 3 });
-  assert.deepEqual(contract.readPendingSendStore(store).map((p) => [p.id, p.at]), [[idOf(2), 2], [idOf(1), 3]]);
+  assert.deepEqual(plain(contract.readPendingSendStore(store).map((p) => [p.id, p.at])), [[idOf(2), 2], [idOf(1), 3]]);
   contract.forgetPendingSend(store, idOf(2));
-  assert.deepEqual(contract.readPendingSendStore(store).map((p) => p.id), [idOf(1)]);
+  assert.deepEqual(plain(contract.readPendingSendStore(store).map((p) => p.id)), [idOf(1)]);
   // A new send of the same conversation never drops the earlier one (SEC04-R11): both stay until each is resolved,
   // and the earlier one is what a later identical send matches.
   contract.storePendingSend(store, { conv: convOf(1), id: idOf(5), at: 5 });
-  assert.deepEqual(contract.readPendingSendStore(store).map((p) => p.id), [idOf(1), idOf(5)]);
+  assert.deepEqual(plain(contract.readPendingSendStore(store).map((p) => p.id)), [idOf(1), idOf(5)]);
   assert.equal(contract.unresolvedPendingSend(contract.readPendingSendStore(store), convOf(1)).id, idOf(1));
   // An unresolved send is never dropped to make room (SEC04-R6): however many, all stay and the oldest still matches.
   const many = memoryStorage();
@@ -841,10 +841,10 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   // (seen) entries are dropped, its unresolved ones all kept.
   const legacy = memoryStorage();
   legacy.setItem(contract.PENDING_SEND_KEY, JSON.stringify([{ conv: convOf(1), id: idOf(1), at: 1, seen: true }, { conv: convOf(2), id: idOf(2), at: 2 }]));
-  assert.deepEqual(contract.readPendingSendStore(legacy).map((p) => [p.id, !!p.seen]), [[idOf(1), true], [idOf(2), false]]);
+  assert.deepEqual(plain(contract.readPendingSendStore(legacy).map((p) => [p.id, !!p.seen])), [[idOf(1), true], [idOf(2), false]]);
   contract.storePendingSend(legacy, { conv: convOf(3), id: idOf(3), at: 3 });
   assert.equal(legacy.getItem(contract.PENDING_SEND_KEY), null, "the shared list is gone");
-  assert.deepEqual(contract.readPendingSendStore(legacy).map((p) => p.id), [idOf(2), idOf(3)]);
+  assert.deepEqual(plain(contract.readPendingSendStore(legacy).map((p) => p.id)), [idOf(2), idOf(3)]);
 
   // Two tabs on one device (one localStorage), interleaved: what one remembers is never lost by the other's changes.
   // The earlier shared list was read, changed and written back, so a tab writing a list it read before the other
@@ -860,7 +860,7 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
   tabA.forget(idOf(40));
   tabB.remember({ conv: convOf(43), id: idOf(43), at: 43 });
   assert.equal(seenByA.length, 0);
-  assert.deepEqual(contract.readPendingSendStore(device).map((p) => p.id), [idOf(42), idOf(43)], "each tab's unresolved send survives the other tab's writes");
+  assert.deepEqual(plain(contract.readPendingSendStore(device).map((p) => p.id)), [idOf(42), idOf(43)], "each tab's unresolved send survives the other tab's writes");
 
   // A resolved (seen) send never matches a later message; an unresolved one does.
   const both = [{ conv: convOf(1), id: idOf(1), at: 1, seen: true }, { conv: convOf(2), id: idOf(2), at: 2 }];

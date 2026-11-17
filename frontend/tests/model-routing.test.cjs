@@ -180,7 +180,8 @@ test("dish batches hold one arm, and the observation is written after the estima
   const save = src.indexOf(".upsert(rows, { onConflict: \"est_key\"");
   const accepted = src.indexOf("observe(rows.length)");
   assert.ok(save > 0 && accepted > save, "accepted count logged only after the upsert");
-  assert.match(src, /if \(upErr\) \{\s*observe\(0\);/);
+  // A failed save may still have committed, so it is observed as unresolved (OPSMODEL review).
+  assert.match(src, /if \(upErr\) \{[\s\S]{0,400}?observe\(0, true\);/);
 });
 
 test("playlist and label requests count attempted calls before each create, observed once", () => {
