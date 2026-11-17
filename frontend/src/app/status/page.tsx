@@ -35,6 +35,7 @@ const SOURCE_BADGE: Record<string, string> = {
   procurement: "SUBS",
   photo_meals: "PHOTO",
   kindle: "KINDLE",
+  reading_bank: "CLAUDE",
   amazon_orders: "AMAZON",
   screen_usage: "IPHONE",
   tanita: "TANITA",
@@ -80,6 +81,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   procurement: "text-amber-300",
   photo_meals: "text-emerald-300",
   kindle:"text-amber-300/70",
+  reading_bank: "text-amber-300/70",
   amazon_orders: "text-orange-300",
   screen_usage: "text-fuchsia-400/70",
   tanita: "text-amber-500",
@@ -156,6 +158,7 @@ const SOURCE_ORDER = [
   "procurement",
   "photo_meals",
   "kindle",
+  "reading_bank",
   "amazon_orders",
   "screen_usage",
   "tanita",
@@ -269,6 +272,7 @@ function SourceCard({ sourceKey, info, onRefresh }: { sourceKey: string; info: S
         {info.durationSeconds != null && (
           <DetailRow label="Duration" value={`${info.durationSeconds.toFixed(1)}s`} />
         )}
+        {info.extraRows?.map((row) => <DetailRow key={row.label} label={row.label} value={row.value} />)}
       </div>
 
       {/* Error box */}
@@ -328,6 +332,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   experiments: "Experiments",
   tanita: "Tanita",
   kindle: "Kindle",
+  reading_bank: "Reading Questions",
   amazon: "Amazon Orders",
   screen_time: "Screen Time app",
   flights: "Flights",
@@ -385,6 +390,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   balances: "Balances",
   keepalive: "Keep-alive",
   snapshot: "Snapshot",
+  generate: "Generate",
   medical_records: "Medical Records",
 };
 
