@@ -679,6 +679,14 @@ test("the occurrence check ignores case, spacing and punctuation; a different wo
   assert.equal(names("Synthetic Focus", "I took Synthetic Calm"), false);
   assert.equal(names("Vitamin D", "Vitamin C"), false);
   assert.equal(names("B12", "B6"), false);
+  // Whole words only: a longer word that starts with the name never names it (synthetic words).
+  assert.equal(names("Calm", "calm"), true);
+  assert.equal(names("Calm", "  CALM!  "), true);
+  assert.equal(names("Calm", "Calmly"), false);
+  assert.equal(names("Calm", "Calmer"), false);
+  assert.equal(names("Calm", "Calmness"), false);
+  assert.equal(names("Synthetic Calm", "I took Synthetic Calmly"), false);
+  assert.equal(names("Synthetic Calm", "I took Synthetic Calms"), true); // a plural is the same word
   assert.equal(numbersIn("5000 mg").has(5000), true);
   assert.equal(numbersIn("5000 mg").has(500), false);
   assert.equal(numbersIn("500 mg").has(5000), false);
