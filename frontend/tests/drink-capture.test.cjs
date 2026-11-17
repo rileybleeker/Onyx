@@ -584,7 +584,9 @@ test("route: guards, other-kind keys, missing migration, turned off", async () =
   const M = loadRoute(m);
   const res = await M.POST(req({ ...create, client_key: K2 }));
   assert.equal(res.status, 503);
-  assert.match(res.body.error, /migration is pending/);
+  assert.equal(res.body.code, "unavailable");
+  assert.match(res.body.error, /aren't available yet/);
+  assert.doesNotMatch(res.body.error, /migration/, "no database jargon in the copy (#647/#654)");
   assert.equal((await get(M, "")).status, 503);
   m.fail = { "insert:photo_meals": "OXD00" };
   assert.match((await M.POST(req({ ...create, client_key: K3 }))).body.error, /turned off/);
