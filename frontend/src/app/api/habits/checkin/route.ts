@@ -9,6 +9,9 @@ import {
   CHECKIN_MAX_DAYS_BACK,
   fallbackBehavioralToday,
   journaledSuggestion,
+  pcActivitySuggestions,
+  Q_SKILLS,
+  Q_WORKED_LATE,
   Q_JOURNALED,
   Q_SAME_BED,
   Q_SCREEN_IN_BED,
@@ -89,6 +92,18 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
         if (!data) return;
         const row = data as { minutes_by_app: Record<string, unknown> | null };
         Object.assign(out, appHabitSuggestions(row.minutes_by_app, names));
+      })()
+    );
+  }
+
+  // PC activity logger (Riley's PC): work-program minutes answer "Worked late?" and "BI/Python/AL/Excel" (Yes only).
+  // Fails open: the view may be missing or empty, and then nothing is suggested.
+  if (names.has(Q_WORKED_LATE) || names.has(Q_SKILLS)) {
+    tasks.push(
+      (async () => {
+        const { data, error } = await supabase.from("pc_activity_daily").select("minutes_by_app, late_minutes_by_app").eq("behavioral_date", date).maybeSingle();
+        if (error || !data) return;
+        Object.assign(out, pcActivitySuggestions(data as { minutes_by_app: Record<string, unknown> | null; late_minutes_by_app: Record<string, unknown> | null }, names));
       })()
     );
   }
