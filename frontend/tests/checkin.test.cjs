@@ -103,6 +103,18 @@ test("sameBedSuggestion: a recorded night is Yes; a missing night is No only aft
   assert.equal(C.sameBedSuggestion(day, 3600, "2031-03-09"), null); // a short row: unclear, stays blank
 });
 
+test("pcActivitySuggestions: Yes only, work programs, VS Code and browsers never count", () => {
+  const names = new Set(["Worked late?", "BI/Python/AL/Excel"]);
+  const out = C.pcActivitySuggestions({ minutes_by_app: { excel: 12.4, code: 300, chrome: 90 }, late_minutes_by_app: { excel: 20, outlook: 15, chrome: 200 } }, names);
+  assert.equal(out["Worked late?"].answer, "Yes");
+  assert.equal(out["BI/Python/AL/Excel"].answer, "Yes");
+  assert.match(out["BI/Python/AL/Excel"].source, /Excel/);
+  const none = C.pcActivitySuggestions({ minutes_by_app: { code: 300, chrome: 90, pbidesktop: 9.9 }, late_minutes_by_app: { chrome: 200, excel: 29 } }, names);
+  assert.deepEqual(none, {});
+  assert.deepEqual(C.pcActivitySuggestions(null, names), {});
+  assert.deepEqual(C.pcActivitySuggestions({ minutes_by_app: { excel: 60 } }, new Set(["News"])), {});
+});
+
 test("appHabitSuggestions: Yes from 3 minutes in the app, never a No", () => {
   const names = new Set(["Duolingo Spanish", "Substack", "News"]);
   const out = C.appHabitSuggestions({ "com.duolingo.DuolingoMobile": 12.4, "com.substack.Substack": 0, "com.apple.news": 2.9 }, names);
