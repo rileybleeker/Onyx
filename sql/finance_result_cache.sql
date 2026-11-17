@@ -59,7 +59,8 @@ begin
     'finance_plan_items',
     'finance_plan_drivers',
     'finance_goals',
-    'finance_forecast_snapshots'
+    'finance_forecast_snapshots',
+    'finance_holdings'
   ] loop
     execute format(
       'create or replace trigger %I after insert or update or delete on pds.%I for each statement execute function pds.finance_inputs_changed()',
