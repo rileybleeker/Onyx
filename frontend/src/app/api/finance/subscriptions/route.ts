@@ -27,7 +27,7 @@ export async function PUT(req: NextRequest) {
   try {
     db = serviceClient();
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
   const res = b.cancelling
     ? await db.from("finance_cancel_marks").upsert({ sub_id: b.subId, marked_on: etDate(new Date().toISOString()) })

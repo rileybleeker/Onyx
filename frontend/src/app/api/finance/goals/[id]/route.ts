@@ -16,7 +16,7 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: stri
   try {
     db = serviceClient();
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
   const { data, error } = await db.from("finance_goals").update({ removed_at: new Date().toISOString() }).eq("id", id).is("removed_at", null).select("id");
   if (error) {

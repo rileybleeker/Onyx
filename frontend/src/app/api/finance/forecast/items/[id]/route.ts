@@ -17,6 +17,6 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: stri
     const res = await removePlanItem(id);
     return res.ok ? answer({ ok: true }) : answer({ error: res.status === 404 ? "unknown item" : "could not remove" }, res.status);
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
 }

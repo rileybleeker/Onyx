@@ -27,6 +27,6 @@ export async function POST(req: NextRequest) {
     const saved = await insertPlanItem(parsed.item);
     return saved.ok ? answer({ ok: true, id: saved.id }) : answer({ error: "could not save" }, saved.status);
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
 }

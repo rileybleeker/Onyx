@@ -38,7 +38,7 @@ export async function PATCH(req: NextRequest) {
   try {
     db = serviceClient();
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
   const saved = await saveFlagMark(db, parsed.mark, new Date().toISOString());
   if (!saved.ok) return answer({ error: "could not save", setupPending: saved.setupPending }, saved.status);

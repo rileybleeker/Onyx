@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
   try {
     db = serviceClient();
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
   if (accountKey) {
     const { data } = await db.from("finance_accounts").select("account_key").eq("account_key", accountKey).limit(1);

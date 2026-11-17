@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 function db(): Db | null {
   try { return procurementDb(); } catch { return null; }
 }
-const unconfigured = () => NextResponse.json({ persisted: false, setupPending: false, error: "Saving is not configured on this deploy." }, { status: 503 });
+const unconfigured = () => NextResponse.json({ persisted: false, setupPending: false, error: "Saving is not available right now. Nothing was changed." }, { status: 503 });
 const badId = () => NextResponse.json({ error: "Invalid subscription id." }, { status: 400 });
 
 /** PATCH { name, amount, cycle, renewsOn, vendor?, notes? } replaces the fields of one active subscription. */

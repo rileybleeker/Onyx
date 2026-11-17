@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 function db(): Db | null {
   try { return procurementDb(); } catch { return null; }
 }
-const unconfigured = () => NextResponse.json({ persisted: false, setupPending: false, error: "Saving is not configured on this deploy." }, { status: 503 });
+const unconfigured = () => NextResponse.json({ persisted: false, setupPending: false, error: "Saving is not available right now. Nothing was changed." }, { status: 503 });
 
 /** GET: the active subscriptions. If the table does not exist yet: 200 with persisted:false so the page works in memory. */
 export async function GET() {
