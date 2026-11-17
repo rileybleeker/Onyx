@@ -292,6 +292,29 @@ const MATRIX = [
   ["a sleep question said for today, stored on last night", [user("I used my synthetic mouth tape today")],
     "mark_habit_complete", { habit: "Used synthetic mouth tape?" }, ALLOWED],
 
+  // Round 4 (per-action argument binding): each action's arguments are read from its own clause, never from
+  // another action's clause of the same list or sentence.
+  ["the first product's own amount", [user("Log 5 mg of Synthetic Calm and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg" }, ALLOWED],
+  ["the other product's amount for the second product", [user("Log 5 mg of Synthetic Calm and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Focus", amount: 5, unit: "mg" }, refused("amount_not_stated")],
+  ["yesterday stated for one item, no date sent", [user("Log 5 mg of Synthetic Calm yesterday and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg" }, refused("day_not_stated")],
+  ["yesterday stated for one item, that date sent", [user("Log 5 mg of Synthetic Calm yesterday and 10 mg of Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg", date: "2026-11-10" }, ALLOWED],
+  ["a non-number amount", [user("Log 15 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: "15", unit: "mg" }, refused("invalid_value")],
+  ["a time another action of the list states", [user("Log Synthetic Calm at 8 and Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Focus", times: ["08:00"] }, refused("time_not_stated")],
+  ["the time its own action states", [user("Log Synthetic Calm at 8 and Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", times: ["08:00"] }, ALLOWED],
+  ["each reading action its own book, the book being read", [user("I read chapter 3 of Synthetic Book and chapter 4 of Other Synthetic")],
+    "log_reading_session", { chapter_through: 3 }, ALLOWED],
+  ["another action's chapter written to the book being read", [user("I read chapter 3 of Synthetic Book and chapter 4 of Other Synthetic")],
+    "log_reading_session", { chapter_through: 4 }, refused("other_book")],
+  ["each reading action its own book, the other book named", [user("I read chapter 3 of Synthetic Book and chapter 4 of Other Synthetic")],
+    "log_reading_session", { chapter_through: 4, book: "other-synthetic" }, ALLOWED],
+
   // Round 4 (quiz identity): a question that is not a quiz question (an offer, a summary, "anything else") never
   // widens the quiz, and a reply to it — including "yes" — is never a quiz answer. Only the complete active quiz,
   // with its questions recognized, answered, and checkpoint bound, may be scored, once.
