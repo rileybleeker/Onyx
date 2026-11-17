@@ -17,7 +17,7 @@ export type StoreResult<T> =
   | { ok: false; setupPending: false; status: number; error: string };
 
 export const COLUMNS = 'subscription_id,name,vendor,amount_cents,currency,cadence,next_renewal,notes,is_active';
-export const SETUP_PENDING_MESSAGE = 'Not saved yet - setup pending. The procurement table has not been created in Supabase.';
+export const SETUP_PENDING_MESSAGE = 'Not saved yet: saving is not set up on this site, so this change is kept for this visit only.';
 
 function failure(error: { code?: string | null; message?: string | null }): StoreResult<never> {
   if (isMissingTableError(error)) return { ok: false, setupPending: true };
