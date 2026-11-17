@@ -1060,6 +1060,7 @@ function removalWithNotion() {
     found: async () => [],
     mirrored: [],
     mirror: async () => "blk-new",
+    refresh: async () => "updated",
   };
   const RR = loadTs("lib/reading-removal.ts", {
     "./reading": { ...R, getOverview: async () => notion.overview() },
@@ -1082,6 +1083,11 @@ function removalWithNotion() {
         notion.updated.push(s.notion_block_id);
         return true;
       },
+      refreshMirroredSession: async (s) => {
+        notion.updated.push(s.notion_block_id);
+        return notion.refresh(s);
+      },
+      sessionMirrorDiffers: N.sessionMirrorDiffers,
     },
   });
   return { RR, notion };
@@ -1323,6 +1329,83 @@ test("a claim settles against its session: the session's own entry drops it, ano
   notion.trash = async () => true;
   assert.equal(await RR.settleMirrorClaim(dup, claimOf(claimRow({ block_id: "blk-1" })), AFTER_CLAIM), true);
   assert.equal(dup.tables.reading_sessions[0].notion_block_id, "blk-2", "the session's own entry stays");
+});
+
+test("T01-R10: a block id found by its marker is stored on the claim before the entry is rewritten, so a failed trash of the replaced entry is finished by the next sweep", async () => {
+  const { RR, notion } = removalWithNotion();
+  // A move's claim: the new entry on book 7's page exists (found by its marker), the old one is still to be trashed.
+  const claim = claimRow({ replaces_block_id: "blk-old" });
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: "blk-old", session_date: "2026-11-15" }], reading_mirror_claims: [claim] });
+  notion.found = async (_pageId, marker) => (marker === "c-1" ? ["blk-new"] : []);
+  notion.trash = async (id) => id !== "blk-old";
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(claim), AFTER_CLAIM), false, "the replaced entry's trash failed");
+  assert.equal(db.tables.reading_mirror_claims[0].block_id, "blk-new", "the recovered id is on the claim");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-new");
+  assert.deepEqual(notion.updated, ["blk-new"], "rewritten (marker gone) only after the id was stored");
+  // The rewrite dropped the marker: the next sweep finds nothing by it, long after the claim, and still settles.
+  notion.found = async () => [];
+  notion.trash = async () => true;
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(db.tables.reading_mirror_claims[0]), AFTER_CLAIM + 2 * 60 * 60_000), true);
+  assert.ok(notion.trashed.filter((id) => id === "blk-old").length >= 2, "the replaced entry is trashed by the next sweep");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-new", "the new entry stays");
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("T01-R10: a recovered id that cannot be stored changes nothing; a claim with no entry found still settles the entry it replaces before it goes", async () => {
+  const { RR, notion } = removalWithNotion();
+  const claim = claimRow({ replaces_block_id: "blk-old" });
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: null, session_date: "2026-11-15" }], reading_mirror_claims: [claim] });
+  notion.found = async () => ["blk-new"];
+  assert.equal(await RR.settleMirrorClaim(failingTable(db, "reading_mirror_claims", "57014"), claimOf(claim), AFTER_CLAIM), false);
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, null, "not adopted");
+  assert.deepEqual([notion.updated, notion.trashed], [[], []], "nothing rewritten or trashed: the marker still finds the entry");
+  // Session gone, no entry found an hour later: the replaced entry is trashed (confirmed) before the claim is dropped.
+  const gone = fakeDb({ books: [PAGED_BOOK], reading_mirror_claims: [claim] });
+  notion.found = async () => [];
+  notion.trash = async () => false;
+  assert.equal(await RR.settleMirrorClaim(gone, claimOf(claim), AFTER_CLAIM + 61 * 60_000), false, "a failed trash keeps the claim");
+  assert.equal(gone.tables.reading_mirror_claims.length, 1);
+  notion.trash = async () => true;
+  assert.equal(await RR.settleMirrorClaim(gone, claimOf(claim), AFTER_CLAIM + 61 * 60_000), true);
+  assert.ok(notion.trashed.includes("blk-old"));
+  assert.equal(gone.tables.reading_mirror_claims.length, 0);
+  // Session on the claim's book still holding the old entry (the move wrote nothing and its retire never ran): the
+  // old entry is trashed and taken off the session.
+  const stuck = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: "blk-old" }], reading_mirror_claims: [claim] });
+  assert.equal(await RR.settleMirrorClaim(stuck, claimOf(claim), AFTER_CLAIM + 61 * 60_000), true);
+  assert.equal(stuck.tables.reading_sessions[0].notion_block_id, null);
+  // Session moved on to another book with the old entry: a later move's claim owns it, so it is left alone.
+  notion.trashed.length = 0;
+  const elsewhere = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 8, notion_block_id: "blk-old" }], reading_mirror_claims: [claim] });
+  assert.equal(await RR.settleMirrorClaim(elsewhere, claimOf(claim), AFTER_CLAIM + 61 * 60_000), true);
+  assert.deepEqual(notion.trashed, []);
+  assert.equal(elsewhere.tables.reading_sessions[0].notion_block_id, "blk-old");
+});
+
+test("T01-R11: a failed refresh of an adopted entry keeps the claim, and the already-attached branch refreshes it until confirmed", async () => {
+  const { RR, notion } = removalWithNotion();
+  const claim = claimRow({ block_id: "blk-new" });
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: null, session_date: "2026-11-15", minutes: 20 }], reading_mirror_claims: [claim] });
+  notion.refresh = async () => "failed";
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(claim), AFTER_CLAIM), false, "a refused refresh is not settled");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-new", "adopted");
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "the claim holds the refresh");
+  // Next try: the session already has this entry; the refresh is done again, and again while it keeps failing.
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(claim), AFTER_CLAIM), false);
+  // The session is edited while the rewrite runs: written from an older state, so it is not confirmed.
+  notion.refresh = async () => {
+    db.tables.reading_sessions[0] = { ...db.tables.reading_sessions[0], minutes: 35 };
+    return "updated";
+  };
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(claim), AFTER_CLAIM), false);
+  notion.refresh = async () => "updated";
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(claim), AFTER_CLAIM), true);
+  assert.equal(notion.updated.length, 4);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+  // An entry archived in Notion by hand has nothing left to refresh: settled.
+  const archived = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: "blk-new" }], reading_mirror_claims: [claim] });
+  notion.refresh = async () => "archived";
+  assert.equal(await RR.settleMirrorClaim(archived, claimOf(claim), AFTER_CLAIM), true);
 });
 
 test("an entry carries its claim's marker, read back from either rich-text form; the session routes write every new entry through placeEntry, claim first (Codex review of PR 376, round 6)", () => {

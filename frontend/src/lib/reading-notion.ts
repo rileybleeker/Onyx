@@ -223,6 +223,28 @@ export async function updateMirroredSession(s: ReadingSession): Promise<boolean>
   }
 }
 
+/**
+ * Rewrites a session's entry from the session as it is now, for the claim sweep (Codex T01-R11): "updated" = Notion
+ * accepted the rewrite; "archived" = the entry can be read and is archived or in the trash (removed in Notion by hand:
+ * there is nothing left to bring up to date); "failed" = anything else (refused, unreadable, a 404, which can also
+ * mean the page was unshared), to be tried again.
+ */
+export async function refreshMirroredSession(s: ReadingSession): Promise<"updated" | "archived" | "failed"> {
+  if (!s.notion_block_id || !NOTION_API_KEY) return "failed";
+  try {
+    const block = sessionBlock(s);
+    const res = await notion(`/blocks/${s.notion_block_id}`, { method: "PATCH", body: JSON.stringify({ quote: block.quote }) });
+    if (res.ok) return "updated";
+    const look = await notion(`/blocks/${s.notion_block_id}`, { method: "GET" });
+    if (!look.ok) return "failed";
+    const b = (await look.json()) as { archived?: boolean; in_trash?: boolean };
+    return b.archived === true || b.in_trash === true ? "archived" : "failed";
+  } catch (e) {
+    console.error("reading-notion: refreshMirroredSession failed:", e instanceof Error ? e.name : "unknown");
+    return "failed";
+  }
+}
+
 /** Update an already-mirrored highlight block in place (comment / concept edits). */
 export async function updateMirroredHighlight(h: Highlight): Promise<boolean> {
   if (!h.notion_block_id || !NOTION_API_KEY) return false;

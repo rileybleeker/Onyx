@@ -17,8 +17,9 @@ import {
   mirrorProgress,
   mirrorSession,
   notionMirrorEnabled,
+  refreshMirroredSession,
   removeMirroredBlock,
-  updateMirroredSession,
+  sessionMirrorDiffers,
 } from "./reading-notion";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -422,13 +423,59 @@ export async function retireEntry(supabase: Supa, sessionId: number, oldBookId: 
 }
 
 /**
+ * Brings a claim's entry up to date with its session (Codex T01-R11) and confirms it: the entry is rewritten from the
+ * session, then the session is read again, and the refresh counts only when the session still holds this entry and
+ * would render the same entry. An entry archived in Notion by hand counts as settled (nothing left to refresh). False
+ * = the claim stays, and its next try (the session then has this entry: the already-attached branch) refreshes again.
+ */
+async function refreshClaimEntry(supabase: Supa, session: ReadingSession): Promise<boolean> {
+  const result = await refreshMirroredSession(session);
+  if (result === "archived") return true;
+  if (result === "failed") return false;
+  const { data, error } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("session_id", session.session_id).maybeSingle();
+  if (error) return false;
+  const now = (data as ReadingSession | null) ?? null;
+  // Gone or holding another entry since: the next try settles the claim against that.
+  if (!now || now.notion_block_id !== session.notion_block_id) return false;
+  // Edited while the rewrite ran: written from an older state, so it is done again.
+  return !sessionMirrorDiffers(session, now);
+}
+
+/**
+ * The entry a move's claim replaces, once the claim's own entry is attached, surplus, or was never written (Codex
+ * T01-R10: it is never dropped just because no new entry was found). It is trashed (confirmed) unless the session
+ * still holds it. When the session holds it on the claim's book, nothing was attached over it on the new page (the
+ * move's retire never ran), so it is trashed and taken off the session (conditionally); when the session holds it on
+ * another book, a later move's claim owns it. True when nothing of the replaced entry is left owed.
+ */
+async function settleReplaced(supabase: Supa, claim: MirrorClaim, session: ReadingSession | null, ownBlock: string | null): Promise<boolean> {
+  const old = claim.replaces;
+  if (!old || old === ownBlock) return true;
+  if (session && session.notion_block_id === old && session.book_id !== claim.bookId) return true;
+  if (!(await removeMirroredBlock(old))) return false;
+  if (session && session.notion_block_id === old) {
+    const { error } = await supabase
+      .from("reading_sessions")
+      .update({ notion_block_id: null })
+      .eq("session_id", session.session_id)
+      .eq("book_id", claim.bookId)
+      .eq("notion_block_id", old);
+    if (error) return false;
+  }
+  return true;
+}
+
+/**
  * Settles a claim the sweep found (due, so its writer is done or gone). Its entry is the block id on the claim, else
- * the page's entry carrying the claim's marker. Then, with the session on the claim's book: the session has this
- * entry: the entry it replaced (if any) is trashed; the session has no entry, or still the one this replaces: this
- * becomes its entry (conditionally) and the replaced one is trashed. Otherwise (the session is gone, on another book,
- * or has another entry) this one is surplus: it is trashed and taken off the session if it is still on it, and for a
- * gone session the book's progress line is rewritten. No entry found an hour after the claim: none was created. True
- * when settled (the claim row is deleted); false leaves it for a later try. Exported for the tests.
+ * the page's entry carrying the claim's marker; a block id found by the marker is stored on the claim FIRST (Codex
+ * T01-R10), before anything rewrites or trashes the entry (either drops the marker), so a later try still knows it.
+ * Then, with the session on the claim's book: the session has this entry: it is brought up to date (confirmed, Codex
+ * T01-R11) and the entry it replaced (if any) is trashed; the session has no entry, or still the one this replaces:
+ * this becomes its entry (conditionally), is brought up to date, and the replaced one is trashed. Otherwise (the
+ * session is gone, on another book, or has another entry) this one is surplus: it is trashed and taken off the session
+ * if it is still on it, the replaced entry is settled, and for a gone session the book's progress line is rewritten.
+ * No entry found an hour after the claim: none was created, and the replaced entry of a move is still settled before
+ * the claim goes. True when settled (the claim row is deleted); false leaves it for a later try. Exported for the tests.
  */
 export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowMs = Date.now()): Promise<boolean> {
   const { data: sessionRow, error: sessionError } = await supabase
@@ -443,18 +490,25 @@ export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowM
     const { data: bookRow, error: bookError } = await supabase.from("books").select("book_id,notion_page_id").eq("book_id", claim.bookId).maybeSingle();
     if (bookError) return false;
     const pageId = (bookRow as { notion_page_id?: string | null } | null)?.notion_page_id ?? null;
-    // No page: no entry can have been written.
-    if (!pageId) return dropClaim(supabase, claim.claimId);
+    // No page: no entry can have been written; the entry a move replaced is still settled.
+    if (!pageId) return (await settleReplaced(supabase, claim, session, null)) && dropClaim(supabase, claim.claimId);
     const found = await findSessionBlocksByMarker(pageId, claim.claimId);
     if (found === null) return false;
     // One entry per claim; should a retried append have made two, the one on the session wins and the rest go.
     blockId = (session?.notion_block_id && found.includes(session.notion_block_id) ? session.notion_block_id : found[0]) ?? null;
     for (const extra of found) if (extra !== blockId && !(await removeMirroredBlock(extra))) return false;
-    if (!blockId) return nowMs - Date.parse(claim.claimedAt) > CLAIM_NOT_FOUND_MS ? dropClaim(supabase, claim.claimId) : false;
+    if (!blockId) {
+      if (nowMs - Date.parse(claim.claimedAt) <= CLAIM_NOT_FOUND_MS) return false;
+      return (await settleReplaced(supabase, claim, session, null)) && dropClaim(supabase, claim.claimId);
+    }
+    // The marker is the entry's only identity until now: the id is kept before any step can drop the marker.
+    if (!(await recordClaimBlock(supabase, claim.claimId, blockId))) return false;
   }
   if (session && session.book_id === claim.bookId) {
     if (session.notion_block_id === blockId) {
-      if (claim.replaces && claim.replaces !== blockId && !(await removeMirroredBlock(claim.replaces))) return false;
+      // Attached earlier (by its writer or an earlier try) whose refresh may not have landed: finished here.
+      if (!(await refreshClaimEntry(supabase, session))) return false;
+      if (!(await settleReplaced(supabase, claim, session, blockId))) return false;
       return dropClaim(supabase, claim.claimId);
     }
     const current = session.notion_block_id;
@@ -468,10 +522,12 @@ export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowM
         .select(SESSION_COLS)
         .maybeSingle();
       if (error || !adopted) return false;
-      // The session may have been edited since its entry was written.
-      await updateMirroredSession(adopted as ReadingSession);
+      const row = adopted as ReadingSession;
+      // The session may have been edited since its entry was written. A failed refresh keeps the claim: the next try
+      // sees the session with this entry and refreshes again (Codex T01-R11).
+      if (!(await refreshClaimEntry(supabase, row))) return false;
       // A failed trash of the replaced entry: the next try sees the session with this entry and trashes it then.
-      if (claim.replaces && !(await removeMirroredBlock(claim.replaces))) return false;
+      if (!(await settleReplaced(supabase, claim, row, blockId))) return false;
       return dropClaim(supabase, claim.claimId);
     }
   }

@@ -164,7 +164,9 @@ COMMENT ON TABLE pds.reading_session_removals IS
 -- lib/reading-removal.ts settles a claim: the entry goes onto the live session when it is still on that book with no
 -- entry or the replaced one (and the replaced one is trashed), else the entry is trashed; a claim whose block id was
 -- never recorded is matched to the page's entry by its marker, never by its text, so it can only find its own entry.
--- A claim with no matching entry an hour after it was made is deleted (the entry was never created). A row is first
+-- A block id found by its marker is stored on the claim before the entry is rewritten (which drops the marker).
+-- A claim with no matching entry an hour after it was made is deleted (the entry was never created), once the entry
+-- it replaces (a move) is settled. A row is first
 -- due (`next_try_at`) 15 minutes after it is written, longer than a server function runs, and one the sweep could
 -- not settle is put back with a doubling delay up to six hours (`attempts`): rows are never given up for their age.
 -- Rows are deleted once settled. Stored: ids, times, a count. No reading text.
