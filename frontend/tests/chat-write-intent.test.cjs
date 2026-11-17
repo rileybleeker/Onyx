@@ -564,6 +564,10 @@ test("a granted write is consumed once: a second call for the same grant is refu
   assert.deepEqual(sequence([user("Log my synthetic evening stack and my synthetic morning stack")], "log_supplement_stack",
     [{ stack: "synthetic evening" }, { stack: "synthetic evening" }, { stack: "synthetic morning" }]),
     ["allowed", "already_written", "allowed"]);
+  // A comma list of two items splits there: the thousands comma inside "1,000" does not, and "200 mg" is its own item.
+  assert.deepEqual(sequence([user("Log synthetic vitamin D 1,000 IU, synthetic magnesium 200 mg")], "log_supplement_intake",
+    [{ product: "Synthetic Vitamin D", amount: 1000, unit: "iu" }, { product: "Synthetic Magnesium", amount: 200, unit: "mg" }]),
+    ["allowed", "allowed"]);
   // A habit reported twice in one message is one Yes.
   assert.deepEqual(sequence([user("I meditated today, and I meditated again")], "mark_habit_complete",
     [{ habit: "Meditated" }, { habit: "Meditated" }]), ["allowed", "already_written"]);
