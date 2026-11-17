@@ -489,14 +489,39 @@ export function classifyApprovalAnswer(status: number | null, body: unknown): Ap
   return { kind: "unknown", message: "Onyx couldn't confirm the change." };
 }
 
+type JsonAnswer = { status: number | null; body: unknown };
+
+/** The newest plain GET of each URL still on its way, for `getJsonShared` (READ-QUIZ-01 S5). */
+const recentGets = new Map<string, { at: number; answer: Promise<JsonAnswer> }>();
+/** A GET started this recently is "the same read" for a second reader (the page's parts mounting together). */
+const SHARE_WINDOW_MS = 100;
+
 /** One GET (no-store); `status` null when no answer came back. Never throws. */
-export async function getJson(url: string): Promise<{ status: number | null; body: unknown }> {
-  try {
-    const res = await fetch(url, { cache: "no-store" });
-    return { status: res.status, body: await res.json().catch(() => null) };
-  } catch {
-    return { status: null, body: null };
-  }
+export function getJson(url: string): Promise<JsonAnswer> {
+  const answer = (async (): Promise<JsonAnswer> => {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    } catch {
+      return { status: null, body: null };
+    }
+  })();
+  recentGets.set(url, { at: Date.now(), answer });
+  const forget = () => {
+    if (recentGets.get(url)?.answer === answer) recentGets.delete(url);
+  };
+  void answer.then(forget, forget);
+  return answer;
+}
+
+/**
+ * Like getJson, but joins a GET of the same URL that started in the last instant and is still on its way: two parts
+ * of /reading that mount together and read the same bank URL make one request. Only for reads at mount: a read after
+ * a write must call getJson, so it never joins an answer from before the write.
+ */
+export function getJsonShared(url: string): Promise<JsonAnswer> {
+  const open = recentGets.get(url);
+  return open && Date.now() - open.at < SHARE_WINDOW_MS ? open.answer : getJson(url);
 }
 
 /** One POST with JSON; `status` null when no answer came back. Never throws. */

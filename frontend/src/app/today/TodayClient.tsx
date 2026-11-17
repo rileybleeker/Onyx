@@ -21,6 +21,8 @@ import { sameJson } from "@/lib/format";
 import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyIncomplete, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
 // Import-free too: the first load takes the reads the page's HTML already started (app/today/EarlyReads.tsx).
 import { earlyOr } from "@/lib/early-fetch";
+// Import-free too: "Practice · N ready" is the overview's own helper (bundled by name in the same test).
+import { practiceReady } from "@/lib/reading-practice-ready";
 // One card per area of the app under Today's own panels (loaded as its own chunk; components/overview/).
 import TodayOverview from "@/components/overview/TodayOverview";
 // Import-free too (bundled by name in the same test): the attention model (PROD-T04) and the quiet view settings,
@@ -493,6 +495,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // A sync that never ran, or whose heartbeat could not be read (lastSync null), is not a current answer either.
   const syncStale = !!email && syncLateness(lastSync, now.getTime(), LABEL_SYNC_STALE_MS);
   const book = reading.state === "ready" ? reading.value : null;
+  // Chapter questions ready for today's round (READ-QUIZ-01): from the overview's own summary, so no extra request; 0 while the bank is off or an older cached overview has none.
+  const practiceCount = practiceReady(book?.practice);
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
   // The package email check behind the summary is late or failing (an older answer without the field: not known yet,
   // and its fresh read is already running).
@@ -1021,6 +1025,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         {reading.state === "ready" && (book ? <>
           <p className="mt-3 text-base font-medium text-text-primary">{book.book.title}</p>
           <p className="mt-1 text-sm text-text-secondary">{Number.isFinite(book.chaptersDone) && Number.isFinite(book.totalChapters) && book.totalChapters > 0 && book.chaptersDone >= 0 && book.chaptersDone <= book.totalChapters ? `${book.chaptersDone} of ${book.totalChapters} chapters recorded.` : "Chapter progress is not available."}</p>
+          {practiceCount > 0 && <p className="mt-1 text-sm"><Link href="/reading" className={linkStyle}>Practice · <span className="font-mono">{practiceCount}</span> ready</Link></p>}
           <p className="mt-1 text-xs text-text-secondary">Recorded progress may lag your latest reading.</p>
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>
