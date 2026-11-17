@@ -154,7 +154,7 @@ function GrowthEditor({ drivers, accounts, netWorth, busy, run }: { drivers: Dri
         </tbody>
       </table>
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        <input className={input} placeholder="Add a planned account (e.g. Roth IRA)" value={newName} onChange={(e) => setNewName(e.target.value)} maxLength={80} />
+        <input className={input} aria-label="Planned account name" placeholder="Add a planned account (e.g. Roth IRA)" value={newName} onChange={(e) => setNewName(e.target.value)} maxLength={80} />
         <button
           className={button}
           disabled={busy || !newName.trim()}
