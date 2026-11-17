@@ -476,7 +476,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
         owed.push({ book_id: b.book_id, owed_id: owedId });
       }
       return {
-        data: JSON.parse(JSON.stringify({ moved: true, session: row, book: newBook, finished, unfinished, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored, mirror_claim_id: claimId, replaces_block_id: sameBook ? null : prev.notion_block_id ?? null, entry_pending: pending, progress_owed: owed })),
+        data: JSON.parse(JSON.stringify({ moved: true, session: row, book: newBook, finished, unfinished, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored, mirror_claim_id: claimId, replaces_block_id: sameBook ? null : prev.notion_block_id ?? null, moved_book: !sameBook, entry_pending: pending, progress_owed: owed })),
         error: null,
       };
     });
@@ -1815,7 +1815,8 @@ test("sql/reading_session_discards.sql: additive, service-role only, one lock pe
   assert.match(lib, /DISCARDED_KEY_CODE = "OXR01"/, "lib/reading.ts maps the trigger's code");
   assert.match(lib, /rpc\("remove_reading_session", \{/, "a removal is one database call");
   assert.doesNotMatch(lib, /discard_reading_session_key/);
-  assert.doesNotMatch(lib, /insert\(key \?/, "no keyed create in separate requests");
+  // Scoped to reading sessions: a keyed highlight insert (SEC-04, #368) is one request and is not this rule.
+  assert.doesNotMatch(lib, /from\("reading_sessions"\)\.insert\(key \?/, "no keyed create in separate requests");
   const rm = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.remove_reading_session("));
   const rmBody = rm.slice(0, rm.indexOf("$$;"));
   assert.match(rmBody, /INSERT INTO pds\.reading_session_discards[\s\S]*DELETE FROM pds\.reading_sessions[\s\S]*UPDATE pds\.books[\s\S]*pds\.settle_reading_habit\([\s\S]*INSERT INTO pds\.reading_session_removals/, "discard, delete, finish, habit and cleanup row in one function");
@@ -2016,7 +2017,8 @@ test("T01-R12/R14: the move function stores its Notion work in the same transact
   assert.match(fn, /VALUES \(v_claim, p_session_id, p_book_id, v_row\.notion_block_id, NULL, false\)/);
   assert.match(fn, /INSERT INTO pds\.reading_progress_owed \(owed_id, book_id\) VALUES \(v_owed_id, p_book_id\)/);
   assert.match(fn, /INSERT INTO pds\.reading_progress_owed \(owed_id, book_id\) VALUES \(v_owed_id, v_old_book\.book_id\)/);
-  assert.match(fn, /'mirror_claim_id', v_claim,\s+'replaces_block_id', CASE WHEN v_same_book THEN NULL ELSE v_prev\.notion_block_id END,\s+'entry_pending', v_pending,\s+'progress_owed', v_owed/);
+  assert.match(fn, /'mirror_claim_id', v_claim,\s+'replaces_block_id', CASE WHEN v_same_book THEN NULL ELSE v_prev\.notion_block_id END,\s+'moved_book', NOT v_same_book,\s+'entry_pending', v_pending,\s+'progress_owed', v_owed/, "the move answers whether it moved the book, read under the session's lock (round 3)");
+  assert.match(fn, /SELECT \* INTO v_prev FROM pds\.reading_sessions AS s WHERE s\.session_id = p_session_id FOR UPDATE;[\s\S]*v_same_book := v_prev\.book_id = p_book_id;/, "decided from the row the transaction locked");
   assert.match(fn, /c\.session_id = p_session_id AND c\.book_id = p_book_id AND c\.owes_entry/, "a pending entry is a claim on this book only");
   const create = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.create_reading_session("), sql.indexOf("CREATE OR REPLACE FUNCTION pds.move_reading_session("));
   assert.match(create, /VALUES \(v_claim, v_row\.session_id, p_book_id, NULL, NULL, true\)/, "a keyed create stores the claim that owes its entry (round 2 of T01-R14)");
@@ -2096,5 +2098,107 @@ test("round 2 of T01-R14: Onyx Chat writes a keyed create's entry under the clai
   const chat = fs.readFileSync(path.join(SRC, "app/api/chat/route.ts"), "utf8");
   assert.match(chat, /placeEntry\(supabase, book, result\.session, null, entryClaim\)/);
   assert.match(chat, /result\.mirrorClaimId \?\? \(ownInsert \? await createEntryClaimOf\(/);
-  assert.match(chat, /rewriteProgressNow\(supabase, book\.book_id, result\.progressOwedId\)/);
+  assert.match(chat, /rewriteProgressNow\(supabase, book\.book_id, result\.progressOwedId \?\? null\)/, "a replay (no stored obligation) passes null: rewriteProgressNow stores its own first (round 3)");
+});
+
+/* ---------- Codex review round 3 of PR 376 (head 75d45059): T01-R15 behaviour cases ---------- */
+
+test("round 3: an edit's moved flag comes from its own transaction, so a concurrent move cannot turn a real move into a plain refresh", async () => {
+  // The edit reads the session on book 7 (no book given: stays on 7). Before its transaction runs, another edit moves
+  // the session to book 8 with an entry there; this transaction then moves it back to 7, a real move.
+  const db = fakeDb({ books: [{ ...PAGED_BOOK }, { ...PAGED_BOOK2 }], reading_sessions: [session({ notion_block_id: "blk-1" })] });
+  const realRpc = db.rpc;
+  db.rpc = async (name, args) => {
+    if (name === "move_reading_session") Object.assign(db.tables.reading_sessions[0], { book_id: 8, notion_block_id: "blk-8" });
+    return realRpc(name, args);
+  };
+  const r = await R.updateSession(db, 41, upd({ minutes: 30 }));
+  assert.equal(r.ok, true);
+  assert.equal(r.book.book_id, r.previousBook.book_id, "this request's own read sees no book change");
+  assert.equal(r.movedBook, true, "the transaction moved the session 8 -> 7 under its lock");
+  assert.equal(r.mirrorReplaces, "blk-8", "and the move replaces the entry it read, on book 8");
+  const claim = db.tables.reading_mirror_claims.find((c) => c.claim_id === r.mirrorClaimId);
+  assert.deepEqual([claim.book_id, claim.replaces_block_id, claim.owes_entry], [7, "blk-8", true], "the move's claim owes the new entry on book 7");
+  // The reverse: the request asks for book 8, a concurrent edit already put the session there: no move by this edit.
+  const db2 = fakeDb({ books: [{ ...PAGED_BOOK }, { ...PAGED_BOOK2 }], reading_sessions: [session({ notion_block_id: "blk-1" })] });
+  const realRpc2 = db2.rpc;
+  db2.rpc = async (name, args) => {
+    if (name === "move_reading_session") Object.assign(db2.tables.reading_sessions[0], { book_id: 8, notion_block_id: "blk-8" });
+    return realRpc2(name, args);
+  };
+  const r2 = await R.updateSession(db2, 41, upd({ book: "other-book", minutes: 30 }));
+  assert.equal(r2.ok, true);
+  assert.notEqual(r2.book.book_id, r2.previousBook.book_id, "this request's own read sees a book change");
+  assert.equal(r2.movedBook, false, "the transaction found the session already on book 8");
+  assert.equal(r2.mirrorReplaces, null);
+  const own = db2.tables.reading_mirror_claims.find((c) => c.claim_id === r2.mirrorClaimId);
+  assert.deepEqual([own.book_id, own.block_id, own.owes_entry], [8, "blk-8", false], "a rewrite claim on the entry already there, not a move's");
+  // The route dispatches on the transaction's flag; the books it read are only the fallback without the SQL file.
+  const patch = fs.readFileSync(path.join(SRC, "app/api/reading/sessions/[id]/route.ts"), "utf8");
+  assert.match(patch, /const movedBook = r\.movedBook \?\? r\.book\.book_id !== r\.previousBook\.book_id;/);
+  const lib = fs.readFileSync(path.join(SRC, "lib/reading.ts"), "utf8");
+  assert.match(lib, /movedBook: typeof out\.moved_book === "boolean" \? out\.moved_book : null/, "a missing or malformed flag is null (the fallback), never a guess");
+});
+
+test("round 3: a move's entry is attached when an older claim's cleanup already took the replaced entry off the session", async () => {
+  const { RR, notion } = removalWithNotion();
+  // The session moved to book 8; an older claim's cleanup then cleared the entry this move replaces ("blk-x").
+  const db = fakeDb({ books: [{ ...PAGED_BOOK2 }], reading_sessions: [session({ book_id: 8, notion_block_id: null })] });
+  const id = "00000000-0000-4000-8000-0000000000b1";
+  db.tables.reading_mirror_claims.push(claimRow({ claim_id: id, book_id: 8, replaces_block_id: "blk-x", owes_entry: true }));
+  notion.mirror = async () => "blk-moved";
+  const placed = await RR.placeEntry(db, { ...PAGED_BOOK2 }, { ...db.tables.reading_sessions[0] }, "blk-x", id);
+  assert.equal(placed.kind, "attached", "not surplus: the session had no entry left");
+  assert.equal(placed.blockId, "blk-moved");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-moved");
+  assert.ok(!notion.trashed.includes("blk-moved"), "the new entry is kept");
+  assert.equal(db.tables.reading_mirror_claims.length, 0, "the replaced entry is gone and the new one attached: the claim is settled");
+});
+
+test("round 3: the conditional attach that loses its race again treats the entry as surplus and keeps the claim while the replaced entry is owed", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [{ ...PAGED_BOOK2 }], reading_sessions: [session({ book_id: 8, notion_block_id: null })] });
+  const id = "00000000-0000-4000-8000-0000000000b2";
+  db.tables.reading_mirror_claims.push(claimRow({ claim_id: id, book_id: 8, replaces_block_id: "blk-x", owes_entry: true }));
+  notion.mirror = async () => "blk-own";
+  notion.trash = async (blk) => blk !== "blk-x";
+  // The session read after the first attach shows no entry; another writer attaches its own right after that read,
+  // so the second (conditional) attach finds no row either.
+  let reads = 0;
+  const raced = {
+    ...db,
+    from(t) {
+      const b = db.from(t);
+      if (t !== "reading_sessions") return b;
+      let wrote = false;
+      const update = b.update.bind(b);
+      b.update = (p) => { wrote = true; return update(p); };
+      const maybe = b.maybeSingle.bind(b);
+      b.maybeSingle = async () => {
+        const out = await maybe();
+        if (!wrote && reads++ === 0) db.tables.reading_sessions[0].notion_block_id = "blk-other";
+        return out;
+      };
+      return b;
+    },
+  };
+  const placed = await RR.placeEntry(raced, { ...PAGED_BOOK2 }, { ...db.tables.reading_sessions[0] }, "blk-x", id);
+  assert.equal(reads >= 2, true, "the session was read again after the lost conditional attach");
+  assert.equal(placed.kind, "surplus");
+  assert.ok(notion.trashed.includes("blk-own"), "its own entry is trashed");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-other", "the other writer's entry stays");
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "the replaced entry could not be trashed: the claim stays for the sweep");
+});
+
+test("round 3: createEntryClaimOf tells a failed lookup ('error') from no claim (null)", async () => {
+  const { RR } = removalWithNotion();
+  const db = fakeDb({ books: [{ ...PAGED_BOOK }], reading_sessions: [session({})] });
+  assert.equal(await RR.createEntryClaimOf(db, 41, 7), null, "no claim stored");
+  const id = "00000000-0000-4000-8000-0000000000b3";
+  db.tables.reading_mirror_claims.push(claimRow({ claim_id: id, owes_entry: true }));
+  assert.equal(await RR.createEntryClaimOf(db, 41, 7), id);
+  // A read that fails (timeout): the chat route then writes no entry (an entry no claim can find would be an orphan).
+  const refusing = new Proxy({}, { get: (_o, k) => (k === "then" ? (res, rej) => Promise.resolve({ data: null, error: { code: "57014", message: "refused" } }).then(res, rej) : () => refusing) });
+  const broken = { ...db, from: (t) => (t === "reading_mirror_claims" ? refusing : db.from(t)) };
+  assert.equal(await RR.createEntryClaimOf(broken, 41, 7), "error", "a failed read is never 'no claim'");
 });
