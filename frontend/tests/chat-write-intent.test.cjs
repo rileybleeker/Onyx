@@ -478,6 +478,8 @@ const MATRIX = [
     "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
   ["a flag: the question is marked as wrong, which is a flag phrase", BANK_FLAG("Q1201 is marked as wrong"),
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the question was marked as wrong", BANK_FLAG("Q1201 was marked as wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
