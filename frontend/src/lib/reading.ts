@@ -114,6 +114,9 @@ export interface Review {
   grade: Grade;
 }
 
+/** The one review field the overview reads: which day a review happened (streaks, XP, badges, today's count). */
+export type ReviewDate = Pick<Review, "review_date">;
+
 export interface Quiz {
   quiz_id: number;
   book_id: number;
@@ -448,17 +451,22 @@ export async function listBooks(supabase: Supa): Promise<Book[]> {
 /**
  * One book with every row the overview needs, in ONE PostgREST request (embedded resources over the foreign keys
  * book_id and highlight_id), sent in parallel with behavioral today. Same rows and order as separate queries:
- * sessions newest first, unarchived highlights newest first with their reviews, quizzes newest first, chapters by
+ * sessions newest first, unarchived highlights newest first with their review dates, quizzes newest first, chapters by
  * position. (2026-11-14: was four round trips in a row.)
+ *
+ * The embedded reviews carry only review_date: the overview never shows a review itself, it counts the days and the
+ * day's reviews (grade, id and highlight id were shipped and then dropped). Sessions, highlights and quizzes stay whole
+ * because the UI lists them and their counts, XP, streak and badges are computed over the full history. A bounded
+ * embed would change those displayed values, so the history is not truncated here.
  */
 const OVERVIEW_SELECT =
-  "*, reading_sessions(*), book_highlights(*, reading_reviews(review_id,highlight_id,review_date,grade)), reading_quizzes(*), book_chapters(chapter,start_position,end_position,start_page,end_page)";
+  "*, reading_sessions(*), book_highlights(*, reading_reviews(review_date)), reading_quizzes(*), book_chapters(chapter,start_position,end_position,start_page,end_page)";
 
 type OverviewRow = Book & {
   /** pds.books.theme: only there once sql/reading_book_theme.sql is applied (the `*` select carries it then). */
   theme?: unknown;
   reading_sessions?: ReadingSession[] | null;
-  book_highlights?: (Highlight & { reading_reviews?: Review[] | null })[] | null;
+  book_highlights?: (Highlight & { reading_reviews?: ReviewDate[] | null })[] | null;
   reading_quizzes?: Quiz[] | null;
   book_chapters?: ChapterSpan[] | null;
 };
@@ -487,7 +495,7 @@ export async function getOverview(supabase: Supa, slug?: string | null): Promise
   // The raw theme column is read into the overview's own `theme` (validated, with defaults) and kept off the book.
   const { reading_sessions, book_highlights, reading_quizzes, book_chapters, theme: rawTheme, ...book } = row;
   const sessions = reading_sessions ?? [];
-  const reviews: Review[] = [];
+  const reviews: ReviewDate[] = [];
   const highlights = (book_highlights ?? []).map(({ reading_reviews, ...h }) => {
     for (const r of reading_reviews ?? []) reviews.push(r);
     return { ...h, ease: Number(h.ease) } as Highlight;
@@ -597,7 +605,7 @@ export function computeOverview(input: {
   today: string;
   sessions: ReadingSession[];
   highlights: Highlight[];
-  reviews: Review[];
+  reviews: ReviewDate[];
   quizzes: Quiz[];
   chapters?: ChapterSpan[];
   /** pds.reading_bank_summary parsed (getOverview); absent or null = the question bank is not set up. */
@@ -844,7 +852,7 @@ function computeBadges(ctx: {
   book: Book;
   sessions: ReadingSession[];
   highlights: Highlight[];
-  reviews: Review[];
+  reviews: ReviewDate[];
   /** Days a chapter question was answered: they join the review days for the Reviewer badge. */
   practiceDays?: string[];
   quizzes: Quiz[];
