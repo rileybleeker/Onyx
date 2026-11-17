@@ -1876,7 +1876,48 @@ test("the dispatch checks write authority before the ledger and before any tool 
   assert.ok(gate > 0, "every write-tool call goes through authorizeWrite");
   assert.ok(gate < loop.indexOf("ledger.run("), "before the ledger records it");
   assert.ok(gate < loop.indexOf("runTool(block.name"), "before it runs");
+  // An allowed call is recorded before it runs, so a second call cannot reuse what it used.
+  const commit = loop.indexOf("commitWrite(writesAllowed, decision)");
+  assert.ok(commit > gate, "an allowed call uses up its part of the request");
+  assert.ok(commit < loop.indexOf("ledger.run("), "before the ledger records it");
   // The grant is made from the user's messages, before the first model call reads anything.
   assert.ok(src.indexOf("writeGrantFor(messages") > 0);
   assert.ok(src.indexOf("writeGrantFor(messages") < src.indexOf("anthropic.messages.create("));
+});
+
+test("one message authorizes one intake of what it names; a repeat or a value sent as text is refused (SEC-05)", async () => {
+  const logged = [];
+  const r = route([
+    { stop_reason: "tool_use", content: [
+      toolUse("log_supplement_intake", { product: "Synthetic Calm" }, "w1"),
+      toolUse("log_supplement_intake", { product: "Synthetic Calm" }, "w2"),
+      toolUse("log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, "w3"),
+    ] },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
+  ], {
+    intake: (input) => { logged.push(input.product); return { ok: true, product: "Synthetic Calm", intake_date: "2026-11-11", timezone: "UTC", doses_each: 1, logged: [{ intake_id: logged.length, time: "9:00 AM" }] }; },
+  });
+  const body = await (await r.post({ messages: [user("Log my Synthetic Calm")] })).json();
+  assert.deepEqual(logged, ["Synthetic Calm"], "written once");
+  assert.deepEqual(body.receipts.map((x) => x.status), ["saved", "not_saved", "not_saved"]);
+  assert.ok(body.receipts[1].details.includes(writeIntent.REFUSAL_TEXT.already_written));
+  assert.ok(body.receipts[2].details.includes(writeIntent.REFUSAL_TEXT.invalid_value));
+});
+
+test("a reading session for another book the user names is not written to the book being read (SEC-05)", async () => {
+  let sessions = 0;
+  const supabase = fakeSupabase({
+    books: [
+      { slug: "synthetic-book", title: "Synthetic Book", status: "reading", total_chapters: 20 },
+      { slug: "other-synthetic", title: "Other Synthetic", status: "queued", total_chapters: 10 },
+    ],
+  });
+  const r = route(afterTool("log_reading_session", { chapter_through: 4 }), {
+    supabase,
+    reading: { logSession: async () => { sessions++; return { ok: false, error: "No active book found" }; } },
+  });
+  const body = await (await r.post({ messages: [user("I read chapter 4 of Other Synthetic")] })).json();
+  assert.equal(sessions, 0, "nothing was written");
+  assert.deepEqual(body.receipts.map((x) => [x.tool, x.status]), [["log_reading_session", "not_saved"]]);
+  assert.ok(body.receipts[0].details.includes(writeIntent.REFUSAL_TEXT.other_book));
 });

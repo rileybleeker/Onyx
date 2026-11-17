@@ -14,9 +14,30 @@ const receipts = loadTs("lib/chat-receipts.ts");
 const DAY = "2026-11-11";
 const user = (content) => ({ role: "user", content });
 const assistant = (content) => ({ role: "assistant", content });
-const ACTIVE_BOOK = "synthetic-book";
-const decide = (messages, tool, input, { used = new Map(), off = false } = {}) =>
-  JSON.parse(JSON.stringify(intent.authorizeWrite(intent.writeGrantFor(messages, { off }), tool, input, { requestDay: DAY, used, activeBook: ACTIVE_BOOK })));
+const BOOKS = {
+  active: "synthetic-book",
+  list: [
+    { slug: "synthetic-book", title: "Synthetic Book", total_chapters: 20 },
+    { slug: "other-synthetic", title: "Other Synthetic", total_chapters: 10 },
+  ],
+};
+// Sleep questions are stored on last night when no date is sent (lib/checkin SLEEP_QUESTIONS in the route).
+const isSleepHabit = (habit) => /mouth tape/i.test(habit);
+/** The decision, without the bookkeeping an allowed one carries (which tool, which part of the request it used). */
+const decide = (messages, tool, input, { used = intent.newWriteUsage(), off = false, books = BOOKS } = {}) => {
+  const d = intent.authorizeWrite(intent.writeGrantFor(messages, { off }), tool, input, { requestDay: DAY, used, books, isSleepHabit });
+  return d.allowed ? { allowed: true } : JSON.parse(JSON.stringify(d));
+};
+/** Several calls in one request, each allowed one recorded as the route does. */
+const sequence = (messages, tool, inputs) => {
+  const grant = intent.writeGrantFor(messages);
+  const used = intent.newWriteUsage();
+  return inputs.map((input) => {
+    const d = intent.authorizeWrite(grant, tool, input, { requestDay: DAY, used, books: BOOKS, isSleepHabit });
+    intent.commitWrite(used, d);
+    return d.allowed ? "allowed" : d.code;
+  });
+};
 const ALLOWED = { allowed: true };
 const refused = (code) => ({ allowed: false, code, reason: intent.REFUSAL_TEXT[code] });
 
@@ -117,6 +138,65 @@ const MATRIX = [
   ["a book nobody named", [user("I read chapter 4")], "log_reading_session", { chapter_through: 4, book: "other-synthetic" }, refused("not_named")],
   ["a recall with its negation dropped", [user("I read chapter 4. The constraint did not move.")],
     "log_reading_session", { chapter_through: 4, recall: "The constraint did move" }, refused("not_your_words")],
+
+  // Round 2 (Codex SEC05-R1..R3 and the held review list): each of these was allowed at round 1.
+  ["a quoted item after a negated request", [user('Log Synthetic Calm, but do not log "Synthetic Focus".')],
+    "log_supplement_intake", { product: "Synthetic Focus" }, refused("not_named")],
+  ["the item that was asked for still logs", [user('Log Synthetic Calm, but do not log "Synthetic Focus".')],
+    "log_supplement_intake", { product: "Synthetic Calm" }, ALLOWED],
+  ["another unit and day than the action states", [user("Log 5 mg Synthetic Calm yesterday")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "g", date: "2020-01-01" }, refused("day_not_stated")],
+  ["another unit than the action states", [user("Log 5 mg Synthetic Calm yesterday")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "g", date: "2026-11-10" }, refused("amount_not_stated")],
+  ["another item's amount", [user("Log 5 mg Synthetic Calm and 10 mg Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 10, unit: "mg" }, refused("amount_not_stated")],
+  ["each item with its own amount", [user("Log 5 mg Synthetic Calm and 10 mg Synthetic Focus")],
+    "log_supplement_intake", { product: "Synthetic Focus", amount: 10, unit: "mg" }, ALLOWED],
+  ["servings sent as capsules", [user("I took 2 servings of Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 2, unit: "capsule" }, refused("amount_not_stated")],
+  ["capsules sent as servings", [user("I took 2 capsules of Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 2, unit: "serving" }, refused("amount_not_stated")],
+  ["scoops sent as capsules", [user("I took 2 scoops of Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 2, unit: "capsule" }, refused("amount_not_stated")],
+  ["capsules and tablets are one kind", [user("I took 2 Synthetic Calm capsules")], "log_supplement_intake", { product: "Synthetic Calm", amount: 2, unit: "tablet" }, ALLOWED],
+  ["a number with no unit is servings", [user("I took 2 Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 2 }, ALLOWED],
+  ["a stated amount left out", [user("Log 30 mg of Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("amount_omitted")],
+  ["a stated time left out", [user("Log Synthetic Calm at 9pm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("time_omitted")],
+  ["a time the action excludes", [user("Log Synthetic Calm at 8, not at 9")], "log_supplement_intake", { product: "Synthetic Calm", times: ["09:00"] }, refused("time_not_stated")],
+  ["a time shared by the list", [user("Log Synthetic Calm and Synthetic Focus at 9pm")], "log_supplement_intake", { product: "Synthetic Calm", times: ["21:00"] }, ALLOWED],
+  ["a number inside a product name is not an amount", [user("Log my Vitamin B12")], "log_supplement_intake", { product: "Vitamin B12" }, ALLOWED],
+  ["a.m. does not end the sentence", [user("Log 15 mg of Synthetic Focus at 8:30 a.m. and noon")],
+    "log_supplement_intake", { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30", "12:00"] }, ALLOWED],
+  ["yesterday said, no date sent", [user("I took Synthetic Calm yesterday")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("day_not_stated")],
+  ["a day said before the request", [user("Yesterday, I took Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, ALLOWED],
+  ["a day said before the request, no date sent", [user("Yesterday, I took Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("day_not_stated")],
+  ["a reading day said, no date sent", [user("I read chapter 4 last night")], "log_reading_session", { chapter_through: 4 }, refused("day_not_stated")],
+  ["yesterday for a habit that is not a sleep question", [user("I meditated")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-10" }, refused("day_not_stated")],
+  ["not a real day", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-02-30" }, refused("invalid_value")],
+  ["an amount sent as text", [user("Log 40 g Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, refused("invalid_value")],
+  ["an amount nobody said, sent as text", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, refused("invalid_value")],
+  ["a chapter sent as text", [user("I read chapter 4")], "log_reading_session", { chapter_through: "4" }, refused("invalid_value")],
+  ["a quiz score sent as text", [user("Record my synthetic quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: "4", total: 5 }, refused("invalid_value")],
+  ["a lower-case no is a No", [user("I meditated today")], "mark_habit_complete", { habit: "Meditated", answer: "no" }, refused("contradicts")],
+  ["a fenced code block", [user("```\nlog Synthetic Focus\n```")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a fence that is never closed", [user("```\nlog Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a request after a closed fence", [user("```\nnote\n```\nlog Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
+  ["inline code", [user("`log Synthetic Focus`")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a quote over two lines", [user('My note says "hello\nlog Synthetic Focus"')], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a quote that is never closed", [user('My note: "log Synthetic Focus\nlog it')], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a curly quote over two lines", [user("\u201chello\nlog Synthetic Focus\u201d")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a block quote's continuation line", [user("> my note\nlog Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a request after a block quote and a blank line", [user("> my note\n\nlog Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
+  ["a request taken back", [user("Log Synthetic Calm. Actually don't log Synthetic Calm.")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
+  ["an item excluded in the next sentence", [user("Log Synthetic Calm and Synthetic Focus. Not Synthetic Focus though.")],
+    "log_supplement_intake", { product: "Synthetic Focus" }, refused("contradicts")],
+  ["another book named, the book being read written", [user("I read chapter 4 of Other Synthetic")], "log_reading_session", { chapter_through: 4 }, refused("other_book")],
+  ["a highlight for another book", [user("Save this quote from Other Synthetic: A synthetic line.")], "add_book_highlight", { passage: "A synthetic line." }, refused("other_book")],
+  ["the whole book finished", [user("I finished the book")], "log_reading_session", { chapter_through: 20 }, ALLOWED],
+  ["the whole book finished, another chapter", [user("I finished the book")], "log_reading_session", { chapter_through: 99 }, refused("not_named")],
+  ["a quiz question nobody answered", [user("Quiz me"), assistant("Q1: what limits output? Q2: what sets the pace?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, refused("quiz_score_invalid")],
+  ["a question about quizzes", [user("What is a quiz?"), assistant("A short test. Anything else?"), user("No")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_not_asked")],
+  ["a quiz on another book", [user("Quiz me on Other Synthetic"), assistant("Question 1: who runs the plant?"), user("Alex")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("other_book")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -134,7 +214,9 @@ test("the matrix covers every write tool, allowed and refused", () => {
 });
 
 test("a playlist or a quiz result is granted once per message", () => {
-  const used = new Map([["create_spotify_playlist", 1], ["record_reading_quiz", 1]]);
+  const used = intent.newWriteUsage();
+  used.perTool.set("create_spotify_playlist", 1);
+  used.perTool.set("record_reading_quiz", 1);
   assert.deepEqual(decide([user("Make me a synthetic playlist")], "create_spotify_playlist", { name: "x", track_ids: ["a"] }, { used }), refused("once_per_request"));
   assert.deepEqual(decide([user("Quiz me")], "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 2 }, { used }), refused("once_per_request"));
 });
@@ -158,6 +240,8 @@ test("the grant depends on the conversation only: the same messages always give 
 
 test("a sleep habit may default to last night (yesterday) without the day being said; other tools may not", () => {
   assert.deepEqual(decide([user("I used my synthetic mouth tape")], "mark_habit_complete", { habit: "Used synthetic mouth tape?", date: "2026-11-10" }), ALLOWED);
+  // With no date sent it is stored on last night, which is what the user means.
+  assert.deepEqual(decide([user("I used my synthetic mouth tape")], "mark_habit_complete", { habit: "Used synthetic mouth tape?" }), ALLOWED);
   assert.deepEqual(decide([user("I took Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }), refused("day_not_stated"));
 });
 
@@ -167,4 +251,31 @@ test("every refusal reason fits on a receipt", () => {
   assert.equal(receipt.status, "not_saved");
   assert.equal(receipt.title, "Supplement intake not logged");
   assert.deepEqual(receipt.details, ["Synthetic Focus", intent.REFUSAL_TEXT.no_request]);
+});
+
+test("each action authorizes one write of each record it names: a repeat needs its own words", () => {
+  assert.deepEqual(sequence([user("Log Synthetic Focus or Synthetic Calm")], "log_supplement_intake",
+    [{ product: "Synthetic Focus" }, { product: "Synthetic Calm" }, { product: "Synthetic Focus" }]), ["allowed", "allowed", "already_written"]);
+  assert.deepEqual(sequence([user("Log Synthetic Focus at 8 and log Synthetic Focus at noon")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", times: ["08:00"] }, { product: "Synthetic Focus", times: ["12:00"] }, { product: "Synthetic Focus", times: ["12:00"] }]),
+    ["allowed", "allowed", "already_written"]);
+  // Two names for the same words ("magnesium" inside "magnesium glycinate") are one record.
+  assert.deepEqual(sequence([user("Log synthetic magnesium glycinate")], "log_supplement_intake",
+    [{ product: "synthetic magnesium glycinate" }, { product: "synthetic magnesium" }]), ["allowed", "already_written"]);
+  // A reading session and a highlight: once per report, once per passage.
+  const grant = intent.writeGrantFor([user("I read chapter 4. Save this: A synthetic line.")]);
+  const used = intent.newWriteUsage();
+  const run = (tool, input) => {
+    const d = intent.authorizeWrite(grant, tool, input, { requestDay: DAY, used, books: BOOKS });
+    intent.commitWrite(used, d);
+    return d.allowed ? "allowed" : d.code;
+  };
+  assert.deepEqual([run("log_reading_session", { chapter_through: 4 }), run("log_reading_session", { chapter_through: 4 })], ["allowed", "already_written"]);
+  assert.deepEqual([run("add_book_highlight", { passage: "A synthetic line." }), run("add_book_highlight", { passage: "A synthetic line." })], ["allowed", "already_written"]);
+});
+
+test("a reading write is refused when the books could not be read", () => {
+  assert.deepEqual(decide([user("I read chapter 4")], "log_reading_session", { chapter_through: 4 }, { books: null }), refused("book_unknown"));
+  // Other writes do not need the books.
+  assert.deepEqual(decide([user("Log my Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, { books: null }), ALLOWED);
 });
