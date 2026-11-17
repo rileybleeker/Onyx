@@ -1058,6 +1058,8 @@ function removalWithNotion() {
     progress: async () => true,
     overview: async () => ({ chaptersDone: 3, sessions: [] }),
     found: async () => [],
+    mirrored: [],
+    mirror: async () => "blk-new",
   };
   const RR = loadTs("lib/reading-removal.ts", {
     "./reading": { ...R, getOverview: async () => notion.overview() },
@@ -1070,9 +1072,12 @@ function removalWithNotion() {
         notion.written.push(chaptersDone);
         return notion.progress(chaptersDone);
       },
-      findSessionBlocksByDigest: async (pageId, digest, notBefore) => notion.found(pageId, digest, notBefore),
+      findSessionBlocksByMarker: async (pageId, marker) => notion.found(pageId, marker),
+      mirrorSession: async (book, s, marker) => {
+        notion.mirrored.push({ book: book.book_id, session: s.session_id, marker });
+        return notion.mirror(book, s, marker);
+      },
       notionMirrorEnabled: () => true,
-      sessionBlockDigest: () => "digest-1",
       updateMirroredSession: async (s) => {
         notion.updated.push(s.notion_block_id);
         return true;
@@ -1212,7 +1217,7 @@ test("overlapping workers on one cleanup row: one closes it, the other's line ma
   assert.equal(db.tables.reading_progress_owed.length, 1, "A's own obligation is still stored: B could not clear it");
   // Later the sweep finds the obligation (older than two minutes), writes the line from the database and clears it.
   notion.overview = async () => ({ chaptersDone: chapters, sessions: [] });
-  for (const r of db.tables.reading_progress_owed) r.owed_at = new Date(Date.now() - 5 * 60_000).toISOString();
+  for (const r of db.tables.reading_progress_owed) r.next_try_at = new Date(Date.now() - 60_000).toISOString();
   await RR.sweepPendingRemovals(db);
   assert.deepEqual(notion.written, [5, 3, 3], "the current line is written last");
   assert.equal(db.tables.reading_progress_owed.length, 0);
@@ -1245,8 +1250,9 @@ test("a progress write that cannot be checked is owed durably, with no cleanup r
 
 /* ---------- Notion entries whose block id may not be stored (pds.reading_mirror_claims, round 5) ---------- */
 
-const claimRow = (over = {}) => ({ claim_id: "c-1", session_id: 41, book_id: 7, digest: "digest-1", block_id: null, claimed_at: "2026-11-15T20:00:00.000Z", ...over });
-const claimOf = (row) => ({ claimId: row.claim_id, sessionId: row.session_id, bookId: row.book_id, digest: row.digest, blockId: row.block_id, claimedAt: row.claimed_at });
+const PAST = "2026-11-15T20:00:00.000Z";
+const claimRow = (over = {}) => ({ claim_id: "c-1", session_id: 41, book_id: 7, block_id: null, replaces_block_id: null, claimed_at: PAST, attempts: 0, next_try_at: PAST, ...over });
+const claimOf = (row) => ({ claimId: row.claim_id, sessionId: row.session_id, bookId: row.book_id, blockId: row.block_id, replaces: row.replaces_block_id, claimedAt: row.claimed_at, attempts: row.attempts });
 const AFTER_CLAIM = Date.parse("2026-11-15T20:05:00.000Z");
 
 test("a late entry that could be neither recorded nor trashed keeps its claim, and a later sweep (nothing in memory) trashes it (Codex review of PR 376, round 5)", async () => {
@@ -1259,21 +1265,6 @@ test("a late entry that could be neither recorded nor trashed keeps its claim, a
   });
   // Recording the entry in the removal row fails, and so does every trash.
   notion.trash = async () => false;
-test("the sweep gives up claims and progress obligations still open after a day, without touching Notion", async () => {
-  const { RR, notion } = removalWithNotion();
-  const dayAgo = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
-  const db = fakeDb({
-    books: [PAGED_BOOK],
-    reading_mirror_claims: [claimRow({ claimed_at: dayAgo })],
-    reading_progress_owed: [{ owed_id: "o-1", book_id: 7, owed_at: dayAgo }],
-  });
-  await RR.sweepPendingRemovals(db);
-  assert.equal(db.tables.reading_mirror_claims.length, 0);
-  assert.equal(db.tables.reading_progress_owed.length, 0);
-  assert.deepEqual([notion.trashed, notion.written], [[], []]);
-});
-
-
   const late = await RR.trashLateBlock(failingTable(db, "reading_session_removals", "57014"), 41, "blk-late", async () => true);
   assert.deepEqual([late.recorded, late.trashed], [false, false]);
   assert.equal(db.tables.reading_mirror_claims.length, 1, "nothing confirmed: the claim (with the block id) stays");
@@ -1284,33 +1275,39 @@ test("the sweep gives up claims and progress obligations still open after a day,
   assert.equal(db.tables.reading_mirror_claims.length, 0);
 });
 
-test("a claim whose block id was never stored is matched by its digest: trashed for a removed session, adopted by a live one, dropped when no entry shows up", async () => {
+test("a claim whose block id was never stored is matched by its own marker: trashed for a removed session, adopted by a live one, dropped when no entry shows up (Codex review of PR 376, round 6)", async () => {
   const { RR, notion } = removalWithNotion();
-  // Removed session: the page's entry with the claim's digest that is no session's entry is trashed.
+  // Removed session: only the entry carrying this claim's marker is looked at; an entry of another session with the
+  // same text has another marker and is never found.
   const gone = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 50, book_id: 7, notion_block_id: "blk-other" }], reading_mirror_claims: [claimRow()] });
-  notion.found = async (pageId, digest) => (pageId === "page-1" && digest === "digest-1" ? ["blk-other", "blk-late"] : []);
+  notion.found = async (pageId, marker) => (pageId === "page-1" && marker === "c-1" ? ["blk-late"] : []);
   assert.equal(await RR.settleMirrorClaim(gone, claimOf(claimRow()), AFTER_CLAIM), true);
-  assert.deepEqual(notion.trashed, ["blk-late"], "another session's entry with the same text is never touched");
+  assert.deepEqual(notion.trashed, ["blk-late"]);
   assert.equal(gone.tables.reading_mirror_claims.length, 0);
+  // An older claim of a removed session with identical text cannot reach a newer session's entry: its marker differs.
+  const newer = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 42, book_id: 7, notion_block_id: null }], reading_mirror_claims: [claimRow()] });
+  notion.found = async (_pageId, marker) => (marker === "c-2" ? ["blk-newer"] : []);
+  notion.trashed.length = 0;
+  assert.equal(await RR.settleMirrorClaim(newer, claimOf(claimRow()), AFTER_CLAIM), false, "nothing of its own found yet");
+  assert.deepEqual(notion.trashed, [], "the newer session's entry is not touched");
   // Live session without an entry: the found entry becomes its entry and is brought up to date.
   const live = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: null, session_date: "2026-11-15" }], reading_mirror_claims: [claimRow()] });
   notion.found = async () => ["blk-new"];
-  notion.trashed.length = 0;
   assert.equal(await RR.settleMirrorClaim(live, claimOf(claimRow()), AFTER_CLAIM), true);
   assert.equal(live.tables.reading_sessions[0].notion_block_id, "blk-new");
   assert.deepEqual(notion.updated, ["blk-new"]);
   assert.deepEqual(notion.trashed, [], "a live session's entry is kept");
-  // Nothing found: kept for a while, dropped 15 minutes after the claim (no entry was created).
+  // Nothing found: kept, and dropped an hour after the claim (no entry was created).
   const none = fakeDb({ books: [PAGED_BOOK], reading_mirror_claims: [claimRow()] });
   notion.found = async () => [];
-  assert.equal(await RR.settleMirrorClaim(none, claimOf(claimRow()), AFTER_CLAIM), false);
+  assert.equal(await RR.settleMirrorClaim(none, claimOf(claimRow()), AFTER_CLAIM + 30 * 60_000), false);
   assert.equal(none.tables.reading_mirror_claims.length, 1);
-  assert.equal(await RR.settleMirrorClaim(none, claimOf(claimRow()), AFTER_CLAIM + 15 * 60_000), true);
+  assert.equal(await RR.settleMirrorClaim(none, claimOf(claimRow()), AFTER_CLAIM + 61 * 60_000), true);
   assert.equal(none.tables.reading_mirror_claims.length, 0);
   // The page could not be read: the claim stays, however old.
   const unread = fakeDb({ books: [PAGED_BOOK], reading_mirror_claims: [claimRow()] });
   notion.found = async () => null;
-  assert.equal(await RR.settleMirrorClaim(unread, claimOf(claimRow()), AFTER_CLAIM + 60 * 60_000), false);
+  assert.equal(await RR.settleMirrorClaim(unread, claimOf(claimRow()), AFTER_CLAIM + 24 * 60 * 60_000), false);
   assert.equal(unread.tables.reading_mirror_claims.length, 1);
 });
 
@@ -1328,17 +1325,147 @@ test("a claim settles against its session: the session's own entry drops it, ano
   assert.equal(dup.tables.reading_sessions[0].notion_block_id, "blk-2", "the session's own entry stays");
 });
 
-test("sessionBlockDigest is a SHA-256 of the entry's text (the block's plain text in Notion); the create stores the claim before the entry", () => {
-  const crypto = require("node:crypto");
-  const session = { session_id: 1, book_id: 7, session_date: "2030-01-02", chapter_from: 1, chapter_through: 2, minutes: 20, medium: "audio", recall: "Synthetic recall.", question: null, source: "manual", in_chapter: null };
-  const expected = crypto.createHash("sha256").update("2030-01-02 · ch 1–2 · 20 min · audio\nSynthetic recall.", "utf8").digest("hex");
-  assert.equal(N.sessionBlockDigest(session), expected);
-  assert.notEqual(N.sessionBlockDigest({ ...session, minutes: 21 }), expected);
-  const route = fs.readFileSync(path.join(SRC, "app/api/reading/sessions/route.ts"), "utf8");
-  const claimAt = route.indexOf("claimMirror(supabase, result.session)");
-  const mirrorAt = route.indexOf("mirrorSession(result.book, result.session)");
-  assert.ok(claimAt > 0 && mirrorAt > claimAt, "the claim is stored before the entry is created");
-  assert.match(route, /claim === null \? null : await mirrorSession/, "no claim stored, no entry");
+test("an entry carries its claim's marker, read back from either rich-text form; the session routes write every new entry through placeEntry, claim first (Codex review of PR 376, round 6)", () => {
+  const marked = (link) => ({ type: "quote", quote: { rich_text: [{ type: "text", text: { content: "2030-01-02 · ch 1–2" } }, link] } });
+  assert.equal(N.entryMarker(marked({ type: "text", text: { content: "​", link: { url: "https://onyx.invalid/reading-entry/abc-1" } } })), "abc-1");
+  assert.equal(N.entryMarker(marked({ type: "text", plain_text: "​", href: "https://onyx.invalid/reading-entry/abc-2" })), "abc-2");
+  assert.equal(N.entryMarker(marked({ type: "text", text: { content: "x", link: { url: "https://example.com/other" } } })), null);
+  assert.equal(N.entryMarker({ type: "quote", quote: { rich_text: [] } }), null);
+  const readSrc = (rel) => fs.readFileSync(path.join(SRC, rel), "utf8");
+  const post = readSrc("app/api/reading/sessions/route.ts");
+  const patch = readSrc("app/api/reading/sessions/[id]/route.ts");
+  assert.match(post, /placeEntry\(supabase, result\.book, result\.session, null\)/);
+  assert.match(post, /placeEntry\(supabase, other as Book, placed\.row, null\)/, "the create's catch-up after a move is claimed too");
+  assert.match(patch, /placeEntry\(supabase, r\.book, r\.session, old\)/, "a move's new entry is claimed and replaces the old one");
+  for (const src of [post, patch]) assert.doesNotMatch(src, /mirrorSession\(/, "no entry is written outside placeEntry");
+  const lib = readSrc("lib/reading-removal.ts");
+  const fn = lib.slice(lib.indexOf("export async function placeEntry"), lib.indexOf("export async function discardEntry"));
+  assert.ok(fn.indexOf("claimMirror(") > 0 && fn.indexOf("mirrorSession(") > fn.indexOf("claimMirror("), "the claim is stored before the entry");
+  assert.match(fn, /if \(claim === null\) return \{ kind: "none" \}/, "no claim stored, no entry");
+  assert.match(fn, /mirrorSession\(book, session, own\?\.claimId \?\? null\)/, "the entry carries the claim's id");
+  assert.doesNotMatch(lib, /GIVE_UP/, "nothing is given up for its age");
+});
+
+const PAGED_BOOK2 = { ...BOOK, book_id: 8, slug: "other-book", notion_page_id: "page-2" };
+const movedSession = (over = {}) => ({ session_id: 41, book_id: 8, session_date: "2026-11-15", notion_block_id: "blk-old", chapter_through: 2, ...over });
+
+test("a move writes its new entry under a claim and attaches it only over the old one; the old entry is trashed (Codex review of PR 376, round 6)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK, PAGED_BOOK2], reading_sessions: [movedSession()] });
+  notion.mirror = async () => "blk-moved";
+  const placed = await RR.placeEntry(db, PAGED_BOOK2, movedSession(), "blk-old");
+  assert.equal(placed.kind, "attached");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-moved");
+  assert.deepEqual(notion.trashed, ["blk-old"]);
+  assert.equal(notion.mirrored[0].book, 8);
+  assert.match(String(notion.mirrored[0].marker), /^[0-9a-f-]{36}$/, "the entry carries its claim's random id");
+  assert.equal(db.tables.reading_mirror_claims.length, 0, "settled: the claim goes");
+});
+
+test("a move's new entry for a session removed meanwhile is reported gone and trashed by its claim; a failed attach leaves the claim for the sweep (Codex review of PR 376, round 6)", async () => {
+  const { RR, notion } = removalWithNotion();
+  // Removed while the new entry was being written.
+  const db = fakeDb({ books: [PAGED_BOOK, PAGED_BOOK2], reading_sessions: [] });
+  notion.mirror = async () => "blk-moved";
+  notion.trash = async () => false;
+  const placed = await RR.placeEntry(db, PAGED_BOOK2, movedSession(), "blk-old");
+  assert.equal(placed.kind, "gone");
+  assert.equal(await RR.discardEntry(db, placed.blockId, placed.claimId), false, "Notion refuses the trash");
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "the claim (with the block id) stays");
+  assert.equal(db.tables.reading_mirror_claims[0].block_id, "blk-moved");
+  notion.trash = async () => true;
+  const { RR: later, notion: n2 } = removalWithNotion();
+  const row = db.tables.reading_mirror_claims[0];
+  assert.equal(await later.settleMirrorClaim(db, claimOf(row), Date.now()), true);
+  assert.deepEqual(n2.trashed, ["blk-moved"]);
+  // A database failure on the attach: not known whether it attached, so the claim stays and the sweep adopts it.
+  const db2 = fakeDb({ books: [PAGED_BOOK, PAGED_BOOK2], reading_sessions: [movedSession()] });
+  const unknown = await RR.placeEntry(failingTable(db2, "reading_sessions", "57014"), PAGED_BOOK2, movedSession(), "blk-old");
+  assert.equal(unknown.kind, "unknown");
+  const claim = db2.tables.reading_mirror_claims[0];
+  assert.deepEqual([claim.block_id, claim.replaces_block_id], ["blk-moved", "blk-old"]);
+  n2.trashed.length = 0;
+  assert.equal(await later.settleMirrorClaim(db2, claimOf(claim), Date.now()), true);
+  assert.equal(db2.tables.reading_sessions[0].notion_block_id, "blk-moved", "adopted over the entry it replaces");
+  assert.deepEqual(n2.trashed, ["blk-old"]);
+});
+
+test("two writers of one session's entry: only one attaches, the other trashes its own (Codex review of PR 376, round 6)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK2], reading_sessions: [movedSession({ notion_block_id: null })] });
+  let n = 0;
+  notion.mirror = async () => `blk-${++n}`;
+  const a = await RR.placeEntry(db, PAGED_BOOK2, movedSession({ notion_block_id: null }), null);
+  const b = await RR.placeEntry(db, PAGED_BOOK2, movedSession({ notion_block_id: null }), null);
+  assert.deepEqual([a.kind, b.kind], ["attached", "surplus"]);
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-1");
+  assert.deepEqual(notion.trashed, ["blk-2"]);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("a move whose new page got no entry retires the old one under a claim, so a failed trash is finished by the sweep (Codex review of PR 376, round 6)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK, PAGED_BOOK2], reading_sessions: [movedSession()] });
+  notion.trash = async () => false;
+  await RR.retireEntry(db, 41, 7, "blk-old");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, null, "taken off the session");
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "the trash failed: the claim holds the entry");
+  notion.trash = async () => true;
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(db.tables.reading_mirror_claims[0]), Date.now()), true);
+  assert.ok(notion.trashed.length >= 2 && notion.trashed.every((id) => id === "blk-old"), "only the old entry is trashed");
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("claims and progress obligations are never given up for their age: a failed try is deferred with a doubling delay, and rows not due yet are left alone (Codex review of PR 376, round 6)", async () => {
+  const { RR, notion } = removalWithNotion();
+  assert.deepEqual([0, 1, 2, 3, 6, 20].map((a) => RR.retryDelayMs(a) / 60_000), [15, 15, 30, 60, 360, 360]);
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+  const soon = new Date(Date.now() + 10 * 60_000).toISOString();
+  const db = fakeDb({
+    books: [PAGED_BOOK],
+    reading_mirror_claims: [claimRow({ claimed_at: weekAgo, next_try_at: weekAgo, block_id: "blk-x", attempts: 3 }), claimRow({ claim_id: "c-later", next_try_at: soon })],
+    reading_progress_owed: [{ owed_id: "o-1", book_id: 7, owed_at: weekAgo, attempts: 2, next_try_at: weekAgo }],
+  });
+  // Notion refuses everything: nothing can be settled.
+  notion.trash = async () => false;
+  notion.progress = async () => false;
+  await RR.sweepPendingRemovals(db);
+  const old = db.tables.reading_mirror_claims.find((c) => c.claim_id === "c-1");
+  assert.ok(old, "the week-old claim is kept");
+  assert.equal(old.attempts, 4);
+  assert.ok(Date.parse(old.next_try_at) > Date.now() + 100 * 60_000, "and tried again later");
+  assert.equal(db.tables.reading_mirror_claims.find((c) => c.claim_id === "c-later").attempts, 0, "a claim not due is not tried");
+  assert.equal(db.tables.reading_progress_owed.length, 1, "the obligation is kept (carried by the sweep's own row)");
+  assert.equal(db.tables.reading_progress_owed[0].attempts, 3);
+  assert.ok(Date.parse(db.tables.reading_progress_owed[0].next_try_at) > Date.now() + 50 * 60_000);
+});
+
+test("two sweeps on one book's obligation: the one that clears it cannot clear the other's line, which lands stale and then cannot be checked (Codex review of PR 376, round 6)", async () => {
+  const { RR: A, notion: nA } = removalWithNotion();
+  const { RR: B, notion: nB } = removalWithNotion();
+  const due = new Date(Date.now() - 60_000).toISOString();
+  const db = fakeDb({ books: [PAGED_BOOK], reading_progress_owed: [{ owed_id: "o-1", book_id: 7, owed_at: due, attempts: 0, next_try_at: due }] });
+  let chapters = 5;
+  nA.overview = nB.overview = async () => ({ chaptersDone: chapters, sessions: [] });
+  // Sweep A read "5"; its Notion write is slow.
+  const gate = deferred();
+  nA.progress = () => gate.promise;
+  const a = A.sweepPendingRemovals(db);
+  while (!nA.written.length) await new Promise((r) => setImmediate(r));
+  // The book changes; sweep B (another instance) finds the same row, writes "3", checks it and clears what it found.
+  chapters = 3;
+  await B.sweepPendingRemovals(db);
+  assert.deepEqual(nB.written, [3]);
+  assert.equal(db.tables.reading_progress_owed.some((r) => r.owed_id === "o-1"), false, "B cleared the row it found");
+  assert.equal(db.tables.reading_progress_owed.length, 1, "A's own row, stored before its write, is still there");
+  // A's stale "5" lands last and A can no longer check it.
+  nA.overview = async () => {
+    throw new Error("process gone");
+  };
+  gate.resolve(true);
+  await a;
+  assert.deepEqual(nA.written, [5]);
+  assert.equal(db.tables.reading_progress_owed.length, 1, "the stale line is still owed durably");
 });
 
 test("a removal cleanup writes the progress line from the database at write time, not from the answer's overview (Codex review of PR 376, round 4)", async () => {

@@ -1,8 +1,8 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
-import { mirrorSession, notionMirrorEnabled, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
-import { claimMirror, dropClaim, recordClaimBlock, removalAnswer, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals, trashLateBlock } from "@/lib/reading-removal";
+import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, type Book, type Medium } from "@/lib/reading";
+import { sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
+import { discardEntry, dropClaim, placeEntry, removalAnswer, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals, trashLateBlock } from "@/lib/reading-removal";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -58,47 +58,33 @@ export async function POST(req: NextRequest) {
     // Set when a removal ran meanwhile: trashLateBlock then owns the progress rewrite too, and closes the removal's
     // cleanup row only once the trash AND the rewrite succeeded (Codex T01-R9).
     let progressHandled = false;
-    // The entry's claim is stored BEFORE the entry is created (Codex review of PR 376, round 5), so an entry whose
-    // block id cannot be recorded afterwards (a removal landed, then the database or this process failed) is still
-    // found and settled by the sweep. No claim stored, no entry: a removal could otherwise leave one nothing knows.
-    const claim = result.book.notion_page_id && notionMirrorEnabled() ? await claimMirror(supabase, result.session) : "missing";
-    const blockId = claim === null ? null : await mirrorSession(result.book, result.session);
-    const own = claim !== null && claim !== "missing" ? claim : null;
-    if (blockId) {
-      if (own) await recordClaimBlock(supabase, own.claimId, blockId);
-      // The autosaving forms may edit or remove the session while its entry is being written: an edit that ran
-      // before the block id was stored could not update the entry, so the row comes back from the same update.
-      const { data: fresh, error: freshError } = await supabase
-        .from("reading_sessions")
-        .update({ notion_block_id: blockId })
-        .eq("session_id", id)
-        .select(SESSION_COLS)
-        .maybeSingle();
-      const now = fresh as ReadingSession | null;
-      if (freshError) {
-        // Not known whether the session is still there: the claim stays and the sweep settles the entry.
-      } else if (!now) {
-        // A removal that ran meanwhile found no block id in its cleanup row: record this one there first (so a
-        // retried removal owes it), then trash it and rewrite the progress line. The claim goes only once the entry
-        // is trashed.
-        const late = await trashLateBlock(supabase, id, blockId, rewriteProgress);
-        progressHandled = true;
-        if (own && late.trashed) await dropClaim(supabase, own.claimId);
-      } else if (now.book_id !== result.session.book_id) {
-        // Moved to another book while the entry was written: this entry is on the old book's page. The claim stays
-        // until it is trashed (the sweep sees the session with another entry and trashes this one).
-        const trashed = await removeMirroredBlock(blockId);
-        if (own && trashed) await dropClaim(supabase, own.claimId);
-        const { data: other } = await supabase.from("books").select(BOOK_COLS).eq("book_id", now.book_id).maybeSingle();
-        const moved = other ? await mirrorSession(other as Book, now) : null;
-        await supabase.from("reading_sessions").update({ notion_block_id: moved }).eq("session_id", id);
-      } else {
-        if (own) await dropClaim(supabase, own.claimId);
-        if (sessionMirrorDiffers(result.session, now)) await updateMirroredSession({ ...now, notion_block_id: blockId });
+    // The entry is written under a claim stored BEFORE it is created (Codex review of PR 376, rounds 5 and 6), and
+    // attached only while the session is still on this book with no entry (lib/reading-removal.ts placeEntry): an
+    // entry whose block id cannot be recorded afterwards (a removal landed, then the database or this process failed)
+    // is still found by its marker and settled by the sweep. No claim stored, no entry.
+    const placed = await placeEntry(supabase, result.book, result.session, null);
+    if (placed.kind === "attached") {
+      // The autosaving forms may edit the session while its entry is being written: an edit that ran before the block
+      // id was stored could not update the entry, so the attached row is compared with what was written.
+      if (sessionMirrorDiffers(result.session, placed.row)) await updateMirroredSession(placed.row);
+    } else if (placed.kind === "gone") {
+      // A removal that ran meanwhile found no block id in its cleanup row: record this one there first (so a retried
+      // removal owes it), then trash it and rewrite the progress line. The claim goes only once the entry is trashed.
+      const late = await trashLateBlock(supabase, id, placed.blockId, rewriteProgress);
+      progressHandled = true;
+      if (placed.claimId && late.trashed) await dropClaim(supabase, placed.claimId);
+    } else if (placed.kind === "surplus" && placed.row.book_id !== result.book.book_id && !placed.row.notion_block_id) {
+      // Moved to another book while the entry was written (this one, on the old page, is trashed) and that move left
+      // no entry: the session gets one on its new book's page, through the same claim and conditional attach (a move
+      // still writing its own entry and this one never both attach).
+      const { data: other } = await supabase.from("books").select(BOOK_COLS).eq("book_id", placed.row.book_id).maybeSingle();
+      if (other) {
+        const moved = await placeEntry(supabase, other as Book, placed.row, null);
+        if (moved.kind === "gone") await discardEntry(supabase, moved.blockId, moved.claimId);
       }
     }
-    // No entry came back: either none was written (the claim is then dropped by the sweep once no entry with its
-    // digest shows up) or Notion wrote one and its answer was lost (the sweep finds it by the digest).
+    // "none" with a claim: either no entry was written (the sweep drops the claim once no entry with its marker shows
+    // up) or Notion wrote one and its answer was lost (the sweep finds it by the marker). "unknown": the claim stays.
     // The progress line is written from the database as it is NOW, not from the values this request saw: a removal
     // or an edit that ran during the mirroring above has changed them (review of PR 376, round 3).
     if (!progressHandled) await rewriteProgress();

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { Book, Highlight, ReadingSession } from "./reading";
 
 /**
@@ -118,7 +117,17 @@ async function highlightsAnchor(pageId: string, blocks: NotionBlock[]): Promise<
   return data.results?.[1]?.id ?? data.results?.[0]?.id ?? null;
 }
 
-function sessionBlock(s: ReadingSession): Record<string, unknown> {
+/**
+ * The claim marker (Codex review of PR 376, round 6): a session entry written under a claim in
+ * pds.reading_mirror_claims ends with one zero-width character linked to MARKER_BASE + the claim's random id. It is
+ * invisible on the page and is the entry's identity until its block id is stored: two sessions with identical text
+ * get different markers, so a claim can only ever find its own entry. The id is a random UUID; nothing about the
+ * session is in it. Rewriting the entry (updateMirroredSession) drops the marker, which is only needed until then.
+ */
+const MARKER_BASE = "https://onyx.invalid/reading-entry/";
+const MARKER_TEXT = "​";
+
+function sessionBlock(s: ReadingSession, marker: string | null = null): Record<string, unknown> {
   const span =
     s.chapter_through != null
       ? `ch ${s.chapter_from ?? "?"}–${s.chapter_through}`
@@ -127,9 +136,22 @@ function sessionBlock(s: ReadingSession): Record<string, unknown> {
         : "ch ?";
   const head = `${s.session_date} · ${span}${s.minutes ? ` · ${s.minutes} min` : ""}${s.medium ? ` · ${s.medium}` : ""}${s.source === "kindle" ? " · auto from Kindle" : ""}`;
   const rich: RichText[] = [text(head, { bold: true })];
-  if (s.recall) rich.push(text(`\n${s.recall}`));
-  if (s.question) rich.push(text(`\nQ: ${s.question}`, { italic: true }));
+  if (s.recall) rich.push(text(`
+${s.recall}`));
+  if (s.question) rich.push(text(`
+Q: ${s.question}`, { italic: true }));
+  if (marker) rich.push({ type: "text", text: { content: MARKER_TEXT, link: { url: MARKER_BASE + marker } } });
   return { object: "block", type: "quote", quote: { rich_text: rich } };
+}
+
+/** The claim marker an entry carries, or null (pure; exported for the tests). */
+export function entryMarker(block: { type?: string; [k: string]: unknown }): string | null {
+  const inner = block.type ? (block[block.type] as { rich_text?: Array<Record<string, unknown>> } | undefined) : undefined;
+  for (const r of inner?.rich_text ?? []) {
+    const href = typeof r.href === "string" ? r.href : ((r.text as { link?: { url?: string } | null } | undefined)?.link?.url ?? null);
+    if (href && href.startsWith(MARKER_BASE)) return href.slice(MARKER_BASE.length);
+  }
+  return null;
 }
 
 function highlightBlock(h: Highlight): Record<string, unknown> {
@@ -141,46 +163,34 @@ function highlightBlock(h: Highlight): Record<string, unknown> {
 }
 
 /**
- * A SHA-256 of the text a session's entry carries (exactly the rich-text contents sessionBlock sends, so the same as
- * the block's plain text in Notion). Stored in pds.reading_mirror_claims before the entry is created, so an entry
- * whose block id was never stored can still be found on the page (Codex review of PR 376, round 5). No reading text
- * leaves this function.
+ * The page's live session entries carrying this claim marker (normally one). null when the page could not be read.
+ * Only top-level quote blocks are looked at: that is where mirrorSession puts entries.
  */
-export function sessionBlockDigest(s: ReadingSession): string {
-  const rich = (sessionBlock(s).quote as { rich_text: Array<{ text: { content: string } }> }).rich_text;
-  return createHash("sha256").update(rich.map((r) => r.text.content).join(""), "utf8").digest("hex");
-}
-
-/**
- * The page's session entries whose text has this digest and that were created at or after `notBefore` (Notion's
- * created_time counts whole minutes, so one minute of slack is allowed), oldest first. null when the page could not
- * be read. Only top-level quote blocks are looked at: that is where mirrorSession puts entries.
- */
-export async function findSessionBlocksByDigest(pageId: string, digest: string, notBefore: string): Promise<string[] | null> {
+export async function findSessionBlocksByMarker(pageId: string, marker: string): Promise<string[] | null> {
   if (!NOTION_API_KEY) return null;
   try {
-    const since = Date.parse(notBefore) - 2 * 60_000;
-    const hits: Array<{ id: string; at: number }> = [];
+    const hits: string[] = [];
     for (const b of await listChildren(pageId)) {
       if (b.type !== "quote" || b.archived === true || b.in_trash === true) continue;
-      const at = typeof b.created_time === "string" ? Date.parse(b.created_time) : NaN;
-      if (!Number.isFinite(at) || at < since) continue;
-      if (createHash("sha256").update(plainText(b), "utf8").digest("hex") === digest) hits.push({ id: b.id, at });
+      if (entryMarker(b) === marker) hits.push(b.id);
     }
-    return hits.sort((a, b) => a.at - b.at).map((h) => h.id);
+    return hits;
   } catch (e) {
-    console.error("reading-notion: findSessionBlocksByDigest failed:", e instanceof Error ? e.name : "unknown");
+    console.error("reading-notion: findSessionBlocksByMarker failed:", e instanceof Error ? e.name : "unknown");
     return null;
   }
 }
 
-/** Append a session entry under "Session log". Returns the new block id or null. */
-export async function mirrorSession(book: Book, session: ReadingSession): Promise<string | null> {
+/**
+ * Append a session entry under "Session log". Returns the new block id or null. `marker` = the claim id the entry is
+ * written under (pds.reading_mirror_claims), so the sweep can find it before its block id is stored.
+ */
+export async function mirrorSession(book: Book, session: ReadingSession, marker: string | null = null): Promise<string | null> {
   if (!book.notion_page_id || !NOTION_API_KEY) return null;
   try {
     const blocks = await listChildren(book.notion_page_id);
     const after = await sessionAnchor(blocks);
-    return await insertAfter(book.notion_page_id, after, [sessionBlock(session)]);
+    return await insertAfter(book.notion_page_id, after, [sessionBlock(session, marker)]);
   } catch (e) {
     console.error("reading-notion: mirrorSession failed:", e);
     return null;

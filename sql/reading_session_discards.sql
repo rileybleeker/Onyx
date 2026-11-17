@@ -154,25 +154,31 @@ GRANT SELECT, INSERT, UPDATE ON pds.reading_session_removals TO service_role;
 COMMENT ON TABLE pds.reading_session_removals IS
   'Removed /log Reading sessions whose Notion cleanup may still be owed (mirror_done_at NULL); replayed on a retried removal (PROD-T01).';
 
--- A Notion session entry that may exist while no database row knows its block id (Codex review of PR 376, round 5).
--- A create's callback writes the session's Notion entry after the response; a removal can land while it does, and
--- the entry's block id then has to be recorded somewhere that outlives the session. Recording it AFTER the entry is
--- created can fail (the database or the process going away in between), which left an entry nothing could find. So
--- the callback writes a claim BEFORE it creates the entry: the session and book, the time, and a SHA-256 of the
--- entry's text (`digest`), then the block id once Notion answers. lib/reading-removal.ts settles a claim: the block
--- id goes onto the live session (or the entry is trashed when the session is gone), and a claim whose block id was
--- never recorded is matched to the page's entry by its digest and creation time. A claim with no matching entry
--- after 15 minutes is deleted too (the entry was never created). Rows are deleted once settled. Stored: ids, a time, a
--- hash. No reading text.
+-- A Notion session entry that may exist while no database row knows its block id (Codex review of PR 376, rounds 5
+-- and 6). A session route writes an entry after the response (a create, or a move to another book's page); a removal
+-- or another write can land while it does, and the entry's block id then has to be recorded somewhere that outlives
+-- the session. Recording it AFTER the entry is created can fail (the database or the process going away in between),
+-- which left an entry nothing could find. So the route writes a claim BEFORE it creates the entry: the session, the
+-- book whose page the entry goes on, the entry it replaces (`replaces_block_id`, a move) and a random `claim_id`
+-- that the entry itself carries as an invisible marker (a zero-width link), then the block id once Notion answers.
+-- lib/reading-removal.ts settles a claim: the entry goes onto the live session when it is still on that book with no
+-- entry or the replaced one (and the replaced one is trashed), else the entry is trashed; a claim whose block id was
+-- never recorded is matched to the page's entry by its marker, never by its text, so it can only find its own entry.
+-- A claim with no matching entry an hour after it was made is deleted (the entry was never created). A row is first
+-- due (`next_try_at`) 15 minutes after it is written, longer than a server function runs, and one the sweep could
+-- not settle is put back with a doubling delay up to six hours (`attempts`): rows are never given up for their age.
+-- Rows are deleted once settled. Stored: ids, times, a count. No reading text.
 CREATE TABLE IF NOT EXISTS pds.reading_mirror_claims (
-    claim_id    uuid        PRIMARY KEY,
-    session_id  bigint      NOT NULL,
-    book_id     bigint      NOT NULL,
-    digest      text        NOT NULL,
-    block_id    text,
-    claimed_at  timestamptz NOT NULL DEFAULT now()
+    claim_id           uuid        PRIMARY KEY,
+    session_id         bigint      NOT NULL,
+    book_id            bigint      NOT NULL,
+    block_id           text,
+    replaces_block_id  text,
+    claimed_at         timestamptz NOT NULL DEFAULT now(),
+    attempts           integer     NOT NULL DEFAULT 0,
+    next_try_at        timestamptz NOT NULL DEFAULT now() + interval '15 minutes'
 );
-CREATE INDEX IF NOT EXISTS idx_reading_mirror_claims_claimed ON pds.reading_mirror_claims (claimed_at);
+CREATE INDEX IF NOT EXISTS idx_reading_mirror_claims_due ON pds.reading_mirror_claims (next_try_at);
 
 ALTER TABLE pds.reading_mirror_claims ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON pds.reading_mirror_claims FROM anon, authenticated;
@@ -181,23 +187,27 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON pds.reading_mirror_claims TO service_rol
 COMMENT ON TABLE pds.reading_mirror_claims IS
   'Notion reading-session entries that may exist before their block id is stored on a session (PROD-T01); settled and deleted by lib/reading-removal.ts.';
 
--- A book page progress line that may be stale (Codex review of PR 376, round 5). Notion keeps the last write and
--- serverless instances share no lock, so two writers of one book's line can land in either order. Each writer adds a
--- row here BEFORE it writes, and deletes its own row only once it read the book again after its write and found the
--- state its line was written from (lib/reading-removal.ts rewriteProgressNow). A writer whose line may have landed
--- last with an older state keeps its row, also when its process ends first; the sweep rewrites the line from the
--- state then and deletes the row. One row per writer, never shared, so no writer can clear another's obligation.
--- Stored: a random id, a book id and a time.
+-- A book page progress line that may be stale (Codex review of PR 376, rounds 5 and 6). Notion keeps the last write
+-- and serverless instances share no lock, so two writers of one book's line can land in either order. Each writer,
+-- the sweep included, adds its own row here BEFORE it writes, and deletes its own row only once it read the book
+-- again after its write and found the state its line was written from (lib/reading-removal.ts rewriteProgressNow).
+-- A writer whose line may have landed last with an older state keeps its row, also when its process ends first; the
+-- sweep rewrites the line from the state then and deletes the rows it found. One row per writer, never shared, so no
+-- writer can clear another's obligation while that writer may still run: a row is first due (`next_try_at`) 15
+-- minutes after it is written, and a row the sweep could not settle is put back with a doubling delay up to six
+-- hours (`attempts`); rows are never given up for their age. Stored: a random id, a book id, times and a count.
 CREATE TABLE IF NOT EXISTS pds.reading_progress_owed (
-    owed_id    uuid        PRIMARY KEY,
-    book_id    bigint      NOT NULL,
-    owed_at    timestamptz NOT NULL DEFAULT now()
+    owed_id      uuid        PRIMARY KEY,
+    book_id      bigint      NOT NULL,
+    owed_at      timestamptz NOT NULL DEFAULT now(),
+    attempts     integer     NOT NULL DEFAULT 0,
+    next_try_at  timestamptz NOT NULL DEFAULT now() + interval '15 minutes'
 );
-CREATE INDEX IF NOT EXISTS idx_reading_progress_owed_at ON pds.reading_progress_owed (owed_at);
+CREATE INDEX IF NOT EXISTS idx_reading_progress_owed_due ON pds.reading_progress_owed (next_try_at);
 
 ALTER TABLE pds.reading_progress_owed ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON pds.reading_progress_owed FROM anon, authenticated;
-GRANT SELECT, INSERT, DELETE ON pds.reading_progress_owed TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON pds.reading_progress_owed TO service_role;
 
 COMMENT ON TABLE pds.reading_progress_owed IS
   'Reading book-page progress lines that may be stale, one row per writer until its line is verified (PROD-T01).';

@@ -2,8 +2,8 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull } from "@/lib/reading";
-import { mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
-import { removalAnswer, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
+import { sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
+import { discardEntry, placeEntry, removalAnswer, retireEntry, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
 import { SESSION_GONE_CODE } from "@/lib/reading-removal-receipt";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -77,10 +77,18 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
 
   after(async () => {
     if (r.book.book_id !== r.previousBook.book_id) {
-      // Moved to another book: its entry belongs on that book's page.
-      await removeMirroredBlock(r.previous.notion_block_id);
-      const blockId = await mirrorSession(r.book, r.session);
-      await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", id);
+      // Moved to another book: its entry belongs on that book's page. The new entry is written under a claim and
+      // attached only while the session is still on that book with its old entry (or none), then the old entry is
+      // trashed (lib/reading-removal.ts placeEntry; Codex review of PR 376, round 6): a removal, another move or a
+      // create callback that lands meanwhile, or a failure in between, leaves no entry nothing knows.
+      const old = r.previous.notion_block_id ?? null;
+      const placed = await placeEntry(supabase, r.book, r.session, old);
+      // An edit that ran while the entry was written updated the old entry, not this one.
+      if (placed.kind === "attached" && sessionMirrorDiffers(r.session, placed.row)) await updateMirroredSession(placed.row);
+      // Removed meanwhile: its removal's cleanup row holds the old entry; the new one is trashed here (or by its claim).
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+      // No entry could be written on the new page: the old one comes off the old book's page all the same.
+      else if (placed.kind === "none" && old) await retireEntry(supabase, id, r.previousBook.book_id, old);
       await rewriteProgressNow(supabase, r.previousBook.book_id);
     } else if (r.session.notion_block_id) {
       await updateMirroredSession(r.session);
