@@ -26,6 +26,8 @@ const FIVE = [
   prod("p-delta", "Synthetic Delta"),
   prod("p-eps", "Synthetic Epsilon"),
 ];
+// With no order history or intakes yet, lib/log-supplement-options.ts orderOptions sorts the options by name.
+const NAMES_BY_LABEL = ["Synthetic Alpha", "Synthetic Beta", "Synthetic Delta", "Synthetic Epsilon", "Synthetic Gamma"];
 const STACK = { stack_id: 3, name: "Synthetic Night", remind_time: null, item_count: 2 };
 const TODAY_RESP = { date: TODAY, intakes: [], reminders: [] };
 
@@ -107,13 +109,13 @@ test("gate: with the products cached and both the today and stacks GETs stalled,
     answers: { [URL.products]: pending, [URL.today]: pending, [URL.stacks]: pending, [URL.history]: pending },
   });
   await h.flush();
-  assert.deepEqual(h.optionNames(), ["Synthetic Alpha", "Synthetic Beta", "Synthetic Gamma", "Synthetic Delta", "Synthetic Epsilon"],
+  assert.deepEqual(h.optionNames(), NAMES_BY_LABEL,
     "the product options paint from the cached products while the other reads are still out");
-  assert.doesNotMatch(h.text(), /Couldn&apos;t load supplements\.|Couldn't load supplements\.|Couldn&apos;t load stacks\.|Couldn&apos;t load today&apos;s intakes\./);
+  assert.doesNotMatch(h.text(), /Couldn't load supplements\.|Couldn't load stacks\.|Couldn't load today's intakes\./);
   assert.equal(h.calls.writes.length, 0, "opening the section writes nothing");
   held.resolve(response({ stacks: [STACK] }));
   await h.flush();
-  assert.deepEqual(h.optionNames(), ["Synthetic Alpha", "Synthetic Beta", "Synthetic Gamma", "Synthetic Delta", "Synthetic Epsilon"],
+  assert.deepEqual(h.optionNames(), NAMES_BY_LABEL,
     "a late stacks answer does not disturb the options");
 });
 
@@ -127,11 +129,11 @@ test("gate: with both the today and stacks GETs failing, the options stay usable
     },
   });
   await h.flush();
-  assert.deepEqual(h.optionNames(), ["Synthetic Alpha", "Synthetic Beta", "Synthetic Gamma", "Synthetic Delta", "Synthetic Epsilon"],
+  assert.deepEqual(h.optionNames(), NAMES_BY_LABEL,
     "a failed stacks/today read never hides the picker");
-  assert.doesNotMatch(h.text(), /Couldn&apos;t load supplements\.|Couldn't load supplements\./, "no whole-card failure");
-  assert.match(h.text(), /Couldn&apos;t load stacks\./);
-  assert.match(h.text(), /Couldn&apos;t load today&apos;s intakes\./);
+  assert.doesNotMatch(h.text(), /Couldn't load supplements\./, "no whole-card failure");
+  assert.match(h.text(), /Couldn't load stacks\./);
+  assert.match(h.text(), /Couldn't load today's intakes\./);
   // The picker still works end to end (a tap selects it and writes nothing; Log selected is the only write).
   const gamma = h.options().find((n) => h.text(n) === "Synthetic Gamma");
   assert.ok(gamma);
@@ -155,13 +157,13 @@ test("gate: the stacks and today Retry buttons still reload their area after a f
     },
   });
   await h.flush();
-  assert.match(h.text(), /Couldn&apos;t load stacks\./);
+  assert.match(h.text(), /Couldn't load stacks\./);
   stacksDown = false;
   todayDown = false;
   // The stacks area comes before "Log a product" / "Logged today", so its Retry is the first.
   h.click("Retry", 0);
   await h.flush();
-  assert.doesNotMatch(h.text(), /Couldn&apos;t load stacks\./);
+  assert.doesNotMatch(h.text(), /Couldn't load stacks\./);
   assert.match(h.text(), /Synthetic Night/, "the stack row appears after Retry");
   assert.ok(h.buttons("Log it").some((b) => !b.props.disabled), "the stack's Log it is usable");
 
@@ -176,11 +178,11 @@ test("gate: the stacks and today Retry buttons still reload their area after a f
     },
   });
   await h2.flush();
-  assert.match(h2.text(), /Couldn&apos;t load today&apos;s intakes\./);
+  assert.match(h2.text(), /Couldn't load today's intakes\./);
   todayDown = false;
   h2.click("Retry", 0);
   await h2.flush();
-  assert.doesNotMatch(h2.text(), /Couldn&apos;t load today&apos;s intakes\./);
+  assert.doesNotMatch(h2.text(), /Couldn't load today's intakes\./);
   assert.match(h2.text(), /Synthetic Epsilon/, "today's intake row appears after Retry");
   assert.equal(h2.calls.writes.length, 0, "Retry only re-reads; nothing is written");
 });

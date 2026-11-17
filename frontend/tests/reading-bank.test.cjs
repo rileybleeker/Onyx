@@ -6,6 +6,7 @@ const crypto = require("node:crypto");
 const { loadTs } = require("./helpers/load-ts.cjs");
 
 const B = loadTs("lib/reading-bank.ts");
+const F = loadTs("lib/reading-bank-finish.ts");
 const TITLE = "The Lighthouse Ledger";
 const V = "bank-test.1";
 const sha = (t) => crypto.createHash("sha256").update(t, "utf8").digest("hex");
@@ -547,9 +548,119 @@ test("heartbeat: counts, chapter numbers and known codes only; never a title", (
   assert.equal(B.bankHeartbeatStatus(s), "partial");
   assert.equal(B.bankHeartbeatStatus({ ...s, codes: [] }), "success");
   assert.equal(B.bankHeartbeatStatus({ ...s, codes: [], chapters: [{ ...s.chapters[0], result: "thin" }] }), "partial");
-  assert.equal(B.bankHeartbeatStatus({ ...s, failed: 1 }), "failed");
+  assert.equal(B.bankHeartbeatStatus({ ...s, failed: 1 }), "failed", "run-level failure with no step finished done");
   assert.equal(B.bankHeartbeatRecords(s), 16);
   assert.equal(B.bankHeartbeatMessage({ chapters: [], graded: 0, failed: 0, codes: [] }), "nothing to do");
   assert.equal(B.bankCode("Monthly_Cap"), "monthly_cap");
   assert.equal(B.bankCode("an api message with words"), "other");
+});
+
+test("heartbeat status: success only when no claimed step ended retry/failed", () => {
+  const base = { chapters: [], graded: 0, failed: 0, done: 0, unfinished: 0, codes: [] };
+  // Nothing claimed, or every claimed step skipped: success (no retry / failed step).
+  assert.equal(B.bankHeartbeatStatus(base), "success");
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 2 }), "success");
+  // Every claimed step ended retry (the old bug: 'success' with codes other).
+  const retried = { ...base, unfinished: 2, codes: ["other", "other"] };
+  assert.equal(B.bankHeartbeatStatus(retried), "failed", "claimed, none done");
+  assert.equal(B.bankHeartbeatStatus({ ...retried, failed: 1 }), "failed", "run-level failure, none done");
+  // Some done, some retry or failed: partial.
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 1, unfinished: 1, codes: ["other"] }), "partial");
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 3, failed: 1, unfinished: 1, codes: ["other"] }), "partial");
+  // A partial code still makes the heartbeat partial when nothing is unfinished.
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 1, codes: ["budget"] }), "partial");
+  // Counts and codes only: the message names the unfinished count, never book text.
+  const msg = B.bankHeartbeatMessage({ ...retried, codes: ["other", TITLE] });
+  assert.match(msg, /unfinished 2/);
+  assert.match(msg, /codes other/);
+  assert.doesNotMatch(msg, /lighthouse|ledger/i);
+});
+
+/* ---------------- the finish of a queue job: status reconciliation and the fenced readback ---------------- */
+
+test("a finish the database accepted is reported as the status it stored: a retry at the third attempt is failed", () => {
+  assert.equal(F.reconcileFinishStatus("retry", "queued"), "retry");
+  assert.equal(F.reconcileFinishStatus("retry", "failed"), "failed", "pds.reading_bank_finish answers failed for a retry at attempt 3");
+  for (const o of ["done", "failed", "skipped"]) assert.equal(F.reconcileFinishStatus(o, o), o);
+  // A status the requested outcome cannot produce (or none at all) is not guessed.
+  assert.equal(F.reconcileFinishStatus("retry", "done"), null);
+  assert.equal(F.reconcileFinishStatus("retry", "running"), null);
+  assert.equal(F.reconcileFinishStatus("retry", undefined), null);
+  assert.equal(F.reconcileFinishStatus("done", "queued"), null);
+  assert.equal(F.reconcileFinishStatus("skipped", "done"), null);
+  assert.equal(F.reconcileFinishStatus("failed", null), null);
+});
+
+test("a deferral (a refusal to spend, nothing billed) is the SQL's v_defer: it gives the try back", () => {
+  for (const c of ["cost_limit", "monthly_cap", "budget", "paused"]) assert.equal(F.finishDefers({ outcome: "retry", cost_cents: 0, error_code: c }), true, c);
+  assert.equal(F.finishDefers({ outcome: "retry", cost_cents: 0.4, error_code: "monthly_cap" }), false, "something was billed: the try is used");
+  assert.equal(F.finishDefers({ outcome: "retry", cost_cents: 0, error_code: "timeout" }), false);
+  assert.equal(F.finishDefers({ outcome: "skipped", cost_cents: 0, error_code: "budget" }), false);
+  assert.equal(F.finishDefers({ outcome: "retry", cost_cents: 0, error_code: null }), false);
+});
+
+test("the readback of an ambiguous finish must match job_id, attempts AND claim_seq", () => {
+  const sent = { job_id: 9, attempts: 2, claim_seq: 5, outcome: "retry", cost_cents: 1.2, error_code: "timeout" };
+  const row = (o = {}) => ({ job_id: 9, status: "queued", attempts: 2, claim_seq: 5, error_code: "timeout", ...o });
+  const J = (r, s = sent) => F.judgeFinishReadback(r, s);
+  assert.deepEqual(J(row()), { state: "recorded", outcome: "retry" });
+  assert.deepEqual(J(row({ claim_seq: "5" })), { state: "recorded", outcome: "retry" }, "a bigint as PostgREST can return it");
+  assert.deepEqual(J(row({ status: "failed" }), { ...sent, attempts: 3 }), { state: "unknown" }, "a row at attempts 2 under a call of attempt 3: the attempts differ");
+  assert.deepEqual(J(row({ status: "failed", attempts: 3 }), { ...sent, attempts: 3 }), { state: "recorded", outcome: "failed" }, "stored as failed at the third attempt");
+
+  // The fence: the same job and the same attempts under another claim cannot say whether THIS call committed.
+  assert.deepEqual(J(row({ claim_seq: 6 })), { state: "unknown" }, "claimed again since (a re-queue resets attempts, so attempts alone is no fence)");
+  assert.deepEqual(J(row({ claim_seq: 4 })), { state: "unknown" });
+  assert.deepEqual(J(row({ job_id: 10 })), { state: "unknown" });
+  assert.deepEqual(J(row({ attempts: 1 })), { state: "unknown" }, "the same claim but another attempts number");
+  assert.deepEqual(J(row({ claim_seq: undefined })), { state: "unknown" });
+  assert.deepEqual(J(row({ claim_seq: null })), { state: "unknown" });
+  assert.deepEqual(J(row({ attempts: null })), { state: "unknown" });
+
+  // Not recorded: still running under the fence, or settled by the claim for an expired lease under the fence.
+  assert.deepEqual(J(row({ status: "running", error_code: "server_error" })), { state: "not_recorded" });
+  assert.deepEqual(J(row({ status: "running", attempts: 3 })), { state: "unknown" });
+  assert.deepEqual(J(row({ status: "running", claim_seq: 6 })), { state: "unknown" }, "running under another claim");
+  assert.deepEqual(J(row({ status: "queued", error_code: "lease_expired" })), { state: "not_recorded" });
+  assert.deepEqual(J(row({ status: "failed", error_code: "lease_expired" })), { state: "not_recorded" });
+  assert.deepEqual(J(row({ status: "skipped", error_code: "lease_expired" })), { state: "not_recorded" }, "settled, then skipped by the planner");
+  assert.deepEqual(J(row({ status: "queued", error_code: "lease_expired", claim_seq: 6 })), { state: "unknown" }, "another claim's settlement says nothing about this call");
+  assert.deepEqual(J(row({ error_code: "lease_expired" }), { ...sent, error_code: "lease_expired" }), { state: "unknown" }, "a call that sent that very code cannot be told from a settlement");
+
+  // Anything else the call could not have written.
+  assert.deepEqual(J(row({ error_code: "overloaded" })), { state: "unknown" }, "another code");
+  assert.deepEqual(J(row({ error_code: null })), { state: "unknown" });
+  assert.deepEqual(J(row({ status: "done" })), { state: "unknown" }, "a retry cannot leave done");
+  assert.deepEqual(J(row({ status: "skipped" })), { state: "unknown" });
+  for (const bad of [null, undefined, "x", 7, [], {}, { job_id: 9 }, row({ status: 3 })]) assert.deepEqual(J(bad), { state: "unknown" });
+
+  // done carries no error code; a call sent as done for a skipped grade job keeps its code (the SQL stores what it is given).
+  const done = { job_id: 9, attempts: 1, claim_seq: 1, outcome: "done", cost_cents: 3, error_code: null };
+  assert.deepEqual(J({ job_id: 9, status: "done", attempts: 1, claim_seq: 1, error_code: null }, done), { state: "recorded", outcome: "done" });
+  assert.deepEqual(J({ job_id: 9, status: "queued", attempts: 1, claim_seq: 1, error_code: null }, done), { state: "unknown" });
+  assert.deepEqual(J({ job_id: 9, status: "done", attempts: 1, claim_seq: 2, error_code: null }, done), { state: "unknown" }, "finished by a later claim");
+  const notPending = { ...done, error_code: "not_pending" };
+  assert.deepEqual(J({ job_id: 9, status: "done", attempts: 1, claim_seq: 1, error_code: "not_pending" }, notPending), { state: "recorded", outcome: "done" });
+});
+
+test("the readback of a deferral expects the try given back (attempts one lower), as the SQL leaves it", () => {
+  const sent = { job_id: 4, attempts: 2, claim_seq: 7, outcome: "retry", cost_cents: 0, error_code: "monthly_cap" };
+  const row = (o = {}) => ({ job_id: 4, status: "queued", attempts: 1, claim_seq: 7, error_code: "monthly_cap", ...o });
+  assert.deepEqual(F.judgeFinishReadback(row(), sent), { state: "recorded", outcome: "retry" });
+  assert.deepEqual(F.judgeFinishReadback(row({ attempts: 2 }), sent), { state: "unknown" }, "a deferral always lowers attempts: this row is not its result");
+  assert.deepEqual(F.judgeFinishReadback(row({ attempts: 0 }), sent), { state: "unknown" });
+  // The first attempt cannot go below 0.
+  assert.deepEqual(F.judgeFinishReadback(row({ attempts: 0 }), { ...sent, attempts: 1 }), { state: "recorded", outcome: "retry" });
+  // A running row still carries the attempts number of the claim.
+  assert.deepEqual(F.judgeFinishReadback(row({ status: "running", attempts: 2 }), sent), { state: "not_recorded" });
+});
+
+test("finish_unconfirmed and finish_unrecorded are known codes; a claimed step that ended retry is never a clean run", () => {
+  assert.equal(B.bankCode("finish_unconfirmed"), "finish_unconfirmed");
+  assert.equal(B.bankCode("finish_unrecorded"), "finish_unrecorded");
+  // A finish that is not recorded or not confirmed is a retry (lost), so it counts as an unfinished step.
+  const lost = { chapters: [], graded: 0, failed: 0, done: 0, unfinished: 1, codes: ["finish_unconfirmed"] };
+  assert.equal(B.bankHeartbeatStatus(lost), "failed", "claimed, none done");
+  assert.equal(B.bankHeartbeatStatus({ ...lost, done: 1 }), "partial");
+  assert.match(B.bankHeartbeatMessage(lost), /codes finish_unconfirmed/);
 });

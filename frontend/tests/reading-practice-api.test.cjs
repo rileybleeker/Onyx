@@ -73,6 +73,16 @@ function makeDb() {
     finishRefuse: null,
     /** true: the next pds.reading_bank_finish throws (a transport error) instead of answering. */
     finishThrows: false,
+    /**
+     * true: the next pds.reading_bank_finish COMMITS and its reply is lost (a transport error after the commit).
+     * `finishAfterCommit(job)` (optional) then changes the job's row before the readback, as later writers could.
+     */
+    finishLoseReply: false,
+    finishAfterCommit: null,
+    /** true: the next pds.reading_bank_finish answers {ok: true} with no status field. */
+    finishOmitStatus: false,
+    /** A code pds.reading_bank_reserve refuses with (a cap): the model is never asked. */
+    reserveRefuse: null,
     nextJob: 1,
   };
   const idea = (idea_id, chapter, importance, o = {}) =>
@@ -355,6 +365,7 @@ function fakeSupabase(db) {
       if (!job) return refuse(404, "not_found");
       if (job.status !== "running") return refuse(409, "not_running");
       if (p.attempts !== job.attempts || p.claim_seq !== job.claim_seq) return refuse(409, "lease_lost");
+      if (db.reserveRefuse) return refuse(409, db.reserveRefuse);
       db.reserves.push(p);
       return { ok: true, reserved_cents: p.total_cents };
     },
@@ -367,9 +378,23 @@ function fakeSupabase(db) {
       if (p.attempts !== job.attempts || p.claim_seq !== job.claim_seq) return refuse(409, "lease_lost");
       if (db.finishRefuse) return refuse(409, db.finishRefuse);
       db.finished.push(p);
-      job.status = p.outcome === "retry" ? (job.attempts >= 3 ? "failed" : "queued") : p.outcome;
+      // Mirrors sql/reading_question_bank.sql reading_bank_finish: a retry with a refusal-to-spend code and no cost is a
+      // deferral (queued again, the try given back); any other retry is queued, or failed at the third attempt.
+      const defer = p.outcome === "retry" && p.cost_cents === 0 && ["cost_limit", "monthly_cap", "budget", "paused"].includes(p.error_code ?? "");
+      job.status = p.outcome === "retry" ? (job.attempts >= 3 && !defer ? "failed" : "queued") : p.outcome;
+      if (defer) job.attempts = Math.max(job.attempts - 1, 0);
+      job.error_code = p.error_code ?? null;
       job.cost_cents += p.cost_cents;
-      if (p.outcome !== "done") Object.assign(db.attempts.get(job.attempt_key) ?? {}, { grade_tries: (db.attempts.get(job.attempt_key)?.grade_tries ?? 0) + 1, grade_error: p.error_code });
+      if (p.outcome !== "done" && !defer) Object.assign(db.attempts.get(job.attempt_key) ?? {}, { grade_tries: (db.attempts.get(job.attempt_key)?.grade_tries ?? 0) + 1, grade_error: p.error_code });
+      if (db.finishLoseReply) {
+        db.finishLoseReply = false;
+        if (db.finishAfterCommit) db.finishAfterCommit(job);
+        throw Object.assign(new Error("connection closed"), { name: "ConnectionError" });
+      }
+      if (db.finishOmitStatus) {
+        db.finishOmitStatus = false;
+        return { ok: true };
+      }
       return { ok: true, status: job.status };
     },
   };
@@ -1069,6 +1094,95 @@ test("a grade finish the database never recorded (an error, a refusal, or a thro
   assert.deepEqual([c.db.finished.length, [...c.db.jobs.values()][0].status], [0, "running"], "nothing recorded: the job stays running until the next claim settles it");
 });
 
+// RQS3-R1: the grade job's finish is reported as the QUEUE holds it. The fake's reading_bank_finish mirrors the installed
+// SQL (a retry is queued, or failed at the job's third attempt; a refusal-to-spend retry with no cost gives the try back).
+const GRADE_REPLY = modelReply({ points: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "yes" }], wrong_claims: [], feedback: "Right." });
+const SERVER_ERROR = () => {
+  throw Object.assign(new Error("synthetic server error"), { status: 500 });
+};
+
+/** A grade job as the claim leaves it (the bare job row), run through runGradeJob at the given fence. */
+async function gradeJobAt({ attempts = 1, claim_seq = 1, model = fakeModel(GRADE_REPLY), setup = () => {} } = {}) {
+  const db = makeDb();
+  const r = load(db, model);
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const k = res.body.attempt_key;
+  const job = [...db.jobs.values()][0];
+  Object.assign(job, { status: "running", attempts, claim_seq, reserved_cents: 1 });
+  setup(db, job);
+  db.reads.length = 0; // count only what the job's run reads
+  const bare = { job_id: job.job_id, book_id: BOOK, step: "grade", attempt_key: k, attempts, claim_seq, reserved_cents: 1 };
+  const out = await r.S.runGradeJob(r.supabase, bare, { client: model.client });
+  return { out, db, job, k, model };
+}
+const jobReads = (db) => db.reads.filter((n) => n === "reading_bank_jobs").length;
+
+test("a grade retry the database stores as failed (the job's third attempt) is reported failed, not as a retry still to come", async () => {
+  const second = await gradeJobAt({ attempts: 2, claim_seq: 2, model: fakeModel(SERVER_ERROR) });
+  assert.deepEqual([second.out.outcome, second.out.code, second.out.graded], ["retry", "server_error", false]);
+  assert.equal(second.job.status, "queued", "a second failed try is queued again");
+
+  const third = await gradeJobAt({ attempts: 3, claim_seq: 3, model: fakeModel(SERVER_ERROR) });
+  assert.equal(third.db.finishCalls[0].outcome, "retry", "the worker asked for a retry");
+  assert.equal(third.job.status, "failed", "the installed SQL stores a retry at attempt 3 as failed");
+  assert.deepEqual([third.out.outcome, third.out.code, third.out.graded], ["failed", "server_error", false], "the queue is terminal: reported failed");
+  assert.equal(third.db.finishCalls.length, 1, "answered: nothing resent, nothing read back");
+  assert.equal(jobReads(third.db), 0);
+});
+
+test("a grade finish whose reply was lost after the commit is read back by job, attempt and claim, and reported as the queue holds it", async () => {
+  // done: committed, reply lost. Not sent a second time; the row shows done under the same fence: recorded, graded.
+  const done = await gradeJobAt({ setup: (db) => { db.finishLoseReply = true; } });
+  assert.deepEqual([done.out.outcome, done.out.code, done.out.graded], ["done", null, true]);
+  assert.equal(done.db.finishCalls.length, 1);
+  assert.equal(done.job.status, "done");
+  assert.equal(jobReads(done.db), 1, "the job's row was read back");
+
+  // The third attempt's retry, stored as failed, reply lost: failed, not a retry.
+  const third = await gradeJobAt({ attempts: 3, claim_seq: 3, model: fakeModel(SERVER_ERROR), setup: (db) => { db.finishLoseReply = true; } });
+  assert.deepEqual([third.out.outcome, third.out.code, third.out.graded], ["failed", "server_error", false]);
+  assert.equal(third.job.status, "failed");
+
+  // A deferral (the reservation refused: nothing billed) gives the try back: the row carries one attempt fewer than the call.
+  const deferred = await gradeJobAt({ attempts: 2, claim_seq: 4, setup: (db) => { db.reserveRefuse = "monthly_cap"; db.finishLoseReply = true; } });
+  assert.equal(deferred.model.calls.length, 0, "the model was never asked");
+  assert.equal(deferred.db.finishCalls[0].cost_cents, 0);
+  assert.equal(deferred.job.attempts, 1, "the try was given back");
+  assert.deepEqual([deferred.out.outcome, deferred.out.code, deferred.out.graded], ["retry", "cost_limit", false], "recorded: not mistaken for an unknown state");
+  assert.equal(jobReads(deferred.db), 1);
+});
+
+test("a grade finish whose status the answer left out is settled from the job's row", async () => {
+  const third = await gradeJobAt({ attempts: 3, claim_seq: 3, model: fakeModel(SERVER_ERROR), setup: (db) => { db.finishOmitStatus = true; } });
+  assert.deepEqual([third.out.outcome, third.out.code, third.out.graded], ["failed", "server_error", false], "the row says failed");
+  assert.equal(jobReads(third.db), 1);
+  const done = await gradeJobAt({ setup: (db) => { db.finishOmitStatus = true; } });
+  assert.deepEqual([done.out.outcome, done.out.graded], ["done", true]);
+});
+
+test("a lost grade finish reply is never counted as recorded when the readback cannot establish it (claimed again, another claim, unreadable)", async () => {
+  const cases = [
+    // The job was claimed again since (running under the next claim).
+    ["claimed again", (db) => { db.finishAfterCommit = (job) => Object.assign(job, { status: "running", attempts: 2, claim_seq: 2 }); }],
+    // The same attempts number under another claim (re-queued, which resets attempts, then claimed and finished again):
+    // attempts alone is no fence.
+    ["same attempts, another claim", (db) => { db.finishAfterCommit = (job) => Object.assign(job, { claim_seq: 2 }); }],
+    // The row cannot be read.
+    ["unreadable", (db) => { db.finishAfterCommit = () => { db.missing = true; }; }],
+  ];
+  for (const [name, hook] of cases) {
+    const x = await gradeJobAt({ setup: (db) => { db.finishLoseReply = true; hook(db); } });
+    assert.deepEqual([x.out.outcome, x.out.code, x.out.graded], ["retry", "finish_unconfirmed", false], name);
+    assert.equal(x.db.attempts.get(x.k).grading_status, "graded", `${name}: the grade itself was stored; only the finalization is unknown`);
+  }
+  // The same for the third attempt: not reported failed (or retry) from an unconfirmed row.
+  const third = await gradeJobAt({
+    attempts: 3, claim_seq: 3, model: fakeModel(SERVER_ERROR),
+    setup: (db) => { db.finishLoseReply = true; db.finishAfterCommit = (job) => Object.assign(job, { claim_seq: 4 }); },
+  });
+  assert.deepEqual([third.out.outcome, third.out.code], ["retry", "finish_unconfirmed"]);
+});
+
 test("a chapter recall answer is graded per idea: a covered core idea counts, a missed one comes back as due tomorrow", async () => {
   const db = makeDb();
   db.ideas.set(105, { ...db.ideas.get(101), idea_id: 105, title: "Synthetic idea 105", statement: "Synthetic statement 105." });
@@ -1284,9 +1398,7 @@ test("recordAttempt stores the reply as given and grades grade_answer when there
   const reply = "3 1 2 (not sure about the middle)";
   const input = {
     attempt_key: key(), question_id: 1003, version: 1, round_key: key(), round_date: null, round_kind: "chat",
-    answer: reply, grade_answer: "Light the lamp
-Watch the bay
-Write the entry", hinted: false, response_ms: null, quiz_key: null,
+    answer: reply, grade_answer: "Light the lamp\nWatch the bay\nWrite the entry", hinted: false, response_ms: null, quiz_key: null,
   };
   const res = await r.S.recordAttempt(r.supabase, input);
   assert.deepEqual([res.status, res.body.verdict, res.body.grading_status], [200, "correct", "graded"]);
@@ -1301,9 +1413,7 @@ Write the entry", hinted: false, response_ms: null, quiz_key: null,
   const plain = await r.S.recordAttempt(r.supabase, { ...input, attempt_key: key(), round_key: key(), grade_answer: undefined });
   assert.deepEqual([plain.status, plain.body.verdict], [200, "incorrect"]);
   // The HTTP body never carries it.
-  const viaRoute = await r.attempt.POST(post(answer({ question_id: 1003, answer: reply, grade_answer: "Light the lamp
-Watch the bay
-Write the entry" })));
+  const viaRoute = await r.attempt.POST(post(answer({ question_id: 1003, answer: reply, grade_answer: "Light the lamp\nWatch the bay\nWrite the entry" })));
   assert.equal(viaRoute.status, 400);
 });
 

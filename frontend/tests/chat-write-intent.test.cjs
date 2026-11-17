@@ -304,6 +304,19 @@ const MATRIX = [
     "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg", date: "2026-11-10" }, ALLOWED],
   ["a non-number amount", [user("Log 15 mg of Synthetic Calm")],
     "log_supplement_intake", { product: "Synthetic Calm", amount: "15", unit: "mg" }, refused("invalid_value")],
+  // Comma thousands groups are one number; "1,5" is not a decimal.
+  ["a grouped thousands amount with its unit", [user("Log 5,000 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5000, unit: "mg" }, ALLOWED],
+  ["a grouped amount in larger groups", [user("Log 1,250,000 IU of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1250000, unit: "iu" }, ALLOWED],
+  ["the leading digit of a grouped amount", [user("Log 5,000 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg" }, refused("amount_not_stated")],
+  ["a grouped amount with another unit", [user("Log 5,000 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 5000, unit: "g" }, refused("amount_not_stated")],
+  ["a comma and one or two digits is not a decimal", [user("Log 1,5 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1.5, unit: "mg" }, refused("amount_not_stated")],
+  ["a comma and two digits does not read as its first number", [user("Log 1,5 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1, unit: "mg" }, refused("amount_not_stated")],
   ["a time another action of the list states", [user("Log Synthetic Calm at 8 and Synthetic Focus")],
     "log_supplement_intake", { product: "Synthetic Focus", times: ["08:00"] }, refused("time_not_stated")],
   ["the time its own action states", [user("Log Synthetic Calm at 8 and Synthetic Focus")],
@@ -619,4 +632,83 @@ test("the question just asked is read from the conversation only: an earlier que
 test("the free quiz's result and the bank answers do not authorize each other", () => {
   assert.deepEqual(decide(BANK_QUIZ("The fog bell"), "record_reading_quiz", { checkpoint: "ch3", score: 1, total: 1 }), ALLOWED);
   assert.deepEqual(decide([user("I got 1 out of 1 on the quiz")], "record_reading_answer", { question_id: 1201, version: 2, answer: "x", verdict: "correct" }), refused("quiz_not_asked"));
+});
+
+// --- Equivalence helpers (lib/chat-write-intent.ts). The matrix above reaches them through authorizeWrite; these pin
+// the semantics a refactor must keep: word reduction, whole-word occurrence, order, case / spacing / punctuation
+// tolerance, and negation (which a plain word check never reads, so it is pinned at authorizeWrite).
+const { flat, verbatimIn, names, numbersIn, tokens } = intent;
+/** Every order of a list of words. */
+const orders = (xs) => (xs.length <= 1 ? [xs] : xs.flatMap((x, i) => orders([...xs.slice(0, i), ...xs.slice(i + 1)]).map((rest) => [x, ...rest])));
+
+test("word reduction: case, spacing and punctuation aside, words stay whole", () => {
+  assert.equal(flat("  Synthetic   FOCUS!! "), "synthetic focus");
+  assert.equal(flat("Synthetic-Focus"), "synthetic focus");
+  assert.equal(flat("Café"), "cafe");
+  assert.deepEqual(tokens("Take 5 mg, twice."), ["take", "5", "mg", "twice"]);
+  assert.notEqual(flat("tablet"), flat("tablets"));
+});
+
+test("occurrence check: a part matches only as whole words, in both directions", () => {
+  assert.equal(verbatimIn("tablet", "I took two tablets"), false);
+  assert.equal(verbatimIn("tablets", "I took one tablet"), false);
+  assert.equal(verbatimIn("tablet", "one tablet."), true);
+  assert.equal(verbatimIn("synth", "Synthetic Focus"), false);
+  assert.equal(verbatimIn("Focus", "Synthetic-Focus"), true);
+  assert.equal(verbatimIn("", "anything"), false);
+  assert.equal(verbatimIn(" ... ", "anything"), false);
+});
+
+test("equivalence (each text states the other) is symmetric; containment is one way; quoted words keep their order", () => {
+  const mutual = (a, b) => verbatimIn(a, b) && verbatimIn(b, a);
+  for (const [a, b] of [["Synthetic Focus", "synthetic  focus."], ["Café", "cafe"], ["Take it", "take IT!"]]) {
+    assert.equal(mutual(a, b), true, `${a} / ${b}`);
+    assert.equal(verbatimIn(a, b), verbatimIn(b, a), `${a} / ${b}`);
+  }
+  for (const [a, b] of [["tablet", "tablets"], ["Synthetic Focus", "Synthetic Calm"], ["5000 mg", "500 mg"]]) {
+    assert.equal(mutual(a, b), false, `${a} / ${b}`);
+  }
+  // A part inside a longer message matches; the longer message never matches the part.
+  assert.equal(verbatimIn("Synthetic Focus", "Take Synthetic Focus now"), true);
+  assert.equal(verbatimIn("Take Synthetic Focus now", "Synthetic Focus"), false);
+  // Quoted text is read in the user's order.
+  assert.equal(verbatimIn("mg 5000", "5000 mg"), false);
+});
+
+test("the record's words are found in any order: every order of the same words matches alike", () => {
+  for (const order of orders(["Synthetic", "Focus", "took", "noon"])) {
+    assert.equal(names("Synthetic Focus", order.join(" ")), true, order.join(" "));
+    assert.equal(names("Synthetic Calm", order.join(" ")), false, order.join(" "));
+  }
+  for (const order of orders(["15", "mg", "two", "tablets"])) {
+    assert.deepEqual(numbersIn(order.join(" ")), new Set([15, 2]), order.join(" "));
+  }
+});
+
+test("the occurrence check ignores case, spacing and punctuation; a different word or number does not match", () => {
+  assert.equal(names("synthetic focus", "SYNTHETIC-FOCUS!"), true);
+  assert.equal(names("Synthetic Focus", "I took  Synthetic\nFocus"), true);
+  assert.equal(names("Synthetic Calm", "I took Synthetic Calms"), true); // a plural form of the same word
+  assert.equal(names("Synthetic Focus", "I took Synthetic Calm"), false);
+  assert.equal(names("Vitamin D", "Vitamin C"), false);
+  assert.equal(names("B12", "B6"), false);
+  // Whole words only: a longer word that starts with the name never names it (synthetic words).
+  assert.equal(names("Calm", "calm"), true);
+  assert.equal(names("Calm", "  CALM!  "), true);
+  assert.equal(names("Calm", "Calmly"), false);
+  assert.equal(names("Calm", "Calmer"), false);
+  assert.equal(names("Calm", "Calmness"), false);
+  assert.equal(names("Synthetic Calm", "I took Synthetic Calmly"), false);
+  assert.equal(names("Synthetic Calm", "I took Synthetic Calms"), true); // a plural is the same word
+  assert.equal(numbersIn("5000 mg").has(5000), true);
+  assert.equal(numbersIn("5000 mg").has(500), false);
+  assert.equal(numbersIn("500 mg").has(5000), false);
+  assert.equal(numbersIn("twenty five mg").has(25), true);
+  assert.equal(numbersIn("0.5 tablet").has(0.5), true);
+});
+
+test("negation cannot drop or add a match: a negated amount never authorizes the affirmative one", () => {
+  const intake = { product: "Synthetic Focus", amount: 5000, unit: "mg" };
+  assert.deepEqual(decide([user("I took 5000 mg of Synthetic Focus")], "log_supplement_intake", intake), ALLOWED);
+  assert.equal(decide([user("I didn't take 5000 mg of Synthetic Focus")], "log_supplement_intake", intake).allowed, false);
 });

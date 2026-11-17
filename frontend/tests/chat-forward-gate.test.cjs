@@ -47,7 +47,7 @@ test("the chat page holds a blocked write-capable send back and shows the messag
   const send = F.functionNamed(sf, "send");
   assert.ok(send, "chat/page.tsx exports a send function");
   const calls = F.calls(send);
-  const gate = calls.find((c) => c.name === "writeForwardGate(");
+  const gate = calls.find((c) => c.name === "writeForwardGate");
   assert.ok(gate, "send runs the write-forward gate");
   const refusal = calls.find((c) => c.name === "setError" && F.refName(c.node.arguments?.[0]) === "WRITE_FORWARD_GATE_MESSAGE");
   assert.ok(refusal, "the gate's refusal sets the visible WRITE_FORWARD_GATE_MESSAGE as the error");

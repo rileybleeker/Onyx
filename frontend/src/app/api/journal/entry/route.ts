@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { easternDate, JOURNAL_MAX_REQUEST_BYTES, validateJournalEntry } from "@/lib/journal-entry";
-import { createJournalPage, findSameTitleEntry, notionConfigured, notionRefusalMessage, NotionRefused } from "@/lib/journal-file-server";
+import { createJournalPage, findSameTitleEntry, JournalLookupIncomplete, notionConfigured, notionRefusalMessage, NotionRefused } from "@/lib/journal-file-server";
 
 // POST /api/journal/entry   Body: { date, title, mood, confidence, source, topics, body }
 //
@@ -17,8 +17,8 @@ import { createJournalPage, findSameTitleEntry, notionConfigured, notionRefusalM
 // A different entry under the same date and title is a conflict (409): the draft stays editable, nothing is written
 // and nothing is reported as saved (Onyx#168 P1: it used to answer "already in your journal" for unsaved words).
 //
-// Answers: 200 { url, existing? }, 400 with the reason, 409 { error, url } on a same-title conflict, 502 when Notion
-// refuses.
+// Answers: 200 { url, existing? }, 400 with the reason, 409 { error, url } on a same-title conflict, 503 when the
+// same-title lookup could not read the whole list (nothing written; retry), 502 when Notion refuses.
 // Privacy: the text goes only to Notion. It is never logged; errors log a short code only.
 // Auth: session only (middleware; NOT in isCiRoute), plus a same-origin JSON check against cross-site posts.
 
@@ -60,6 +60,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ url: await createJournalPage(v.entry) });
   } catch (e) {
     if (e instanceof NotionRefused) return refusedByNotion(e.status);
+    // The same-title list did not finish within the page cap: nothing was written (the lookup runs before the create).
+    if (e instanceof JournalLookupIncomplete) {
+      return NextResponse.json(
+        { error: "Couldn't finish checking your journal for this title, so nothing was saved. Your words are still here; try again." },
+        { status: 503 },
+      );
+    }
     console.error("[journal-entry] unreachable");
     return NextResponse.json({ error: "Couldn't reach Notion. The entry is still here; try again." }, { status: 502 });
   }

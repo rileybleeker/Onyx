@@ -456,7 +456,7 @@ export function PortionControl({
             onClick={() => onPick(o.value)}
             aria-pressed={on}
             title={isSuggested ? "From what you said. Not saved yet." : on && assumed ? "Assumed (not set yet). Tap to confirm." : undefined}
-            className={`h-7 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors ${
+            className={`h-7 max-md:h-11 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors ${
               isSuggested
                 ? SUGGESTED_CLASS
                 : lit
@@ -619,7 +619,7 @@ export function LeftoverList({
                           ? `${o.label} of what was left`
                           : undefined
                   }
-                  className={`h-7 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors disabled:opacity-40 ${
+                  className={`h-7 max-md:h-11 min-w-[2.25rem] px-1.5 rounded-control border text-[11px] font-mono transition-colors disabled:opacity-40 ${
                     on ? "border-accent/70 bg-accent/20 text-accent" : isSuggested ? SUGGESTED_CLASS : "border-border-subtle text-text-tertiary hover:text-text-secondary"
                   }`}
                 >
@@ -641,13 +641,13 @@ export function LeftoverList({
                   if (v === "") onTime(q, null);
                   else if (/^\d{2}:\d{2}$/.test(v)) onTime(q, v);
                 }}
-                className="h-7 px-1.5 rounded-control border border-border-subtle bg-transparent text-[11px] font-mono text-text-secondary"
+                className="h-7 max-md:h-11 px-1.5 rounded-control border border-border-subtle bg-transparent text-[11px] font-mono text-text-secondary"
               />
               {showNow && (
                 <button
                   type="button"
                   onClick={() => onTime(q, clockNow())}
-                  className="h-7 px-1.5 rounded-control border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
+                  className="h-7 max-md:h-11 px-1.5 rounded-control border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
                 >
                   Now
                 </button>
@@ -656,7 +656,7 @@ export function LeftoverList({
                 <button
                   type="button"
                   onClick={() => onTime(q, shared)}
-                  className="h-7 px-1.5 rounded-control border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
+                  className="h-7 max-md:h-11 px-1.5 rounded-control border border-border-subtle text-[11px] font-mono text-text-tertiary hover:text-text-secondary"
                 >
                   Same as {formatClock(shared)}
                 </button>

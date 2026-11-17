@@ -67,7 +67,10 @@ function makeDb(o = {}) {
     planIncludesNotes: false,
     /** A code pds.reading_bank_finish answers instead of finishing (a lease that was lost meanwhile). */
     refuseFinish: null,
-    /** The next finish commits, but its answer never arrives (a transport error). */
+    /**
+     * The next finish commits, but its answer never arrives (a transport error). A function is called with the job's
+     * row after the commit (what a later writer could do to it before the readback: claim it again, ...).
+     */
     loseFinishAnswer: false,
     /** The next finish never commits: the lease ran out first and the claim settled the job (queued again, lease_expired). */
     expireOnFinish: false,
@@ -181,7 +184,7 @@ function rpcs(db) {
     reading_bank_reserve: ({ p }) => {
       const j = db.jobs.find((x) => x.job_id === p.job_id);
       if (!j || j.status !== "running" || j.lease_until < db.clock) return { ok: false, http: 409, code: "not_running" };
-      if (p.attempts !== j.attempts) return { ok: false, http: 409, code: "lease_lost" };
+      if (p.attempts !== j.attempts || p.claim_seq !== j.claim_seq) return { ok: false, http: 409, code: "lease_lost" };
       const total = Math.round(p.total_cents * 100) / 100;
       if (total <= j.reserved_cents) return { ok: true, reserved_cents: j.reserved_cents };
       const delta = total - j.reserved_cents;
@@ -209,8 +212,12 @@ function rpcs(db) {
         throw Object.assign(new Error("synthetic transport error"), { code: "08006" });
       }
       if (j.status !== "running") return { ok: false, http: 409, code: "not_running" };
-      if (p.attempts !== j.attempts) return { ok: false, http: 409, code: "lease_lost" };
-      const status = p.outcome === "retry" ? (j.attempts >= 3 ? "failed" : "queued") : p.outcome;
+      if (p.attempts !== j.attempts || p.claim_seq !== j.claim_seq) return { ok: false, http: 409, code: "lease_lost" };
+      // Mirrors sql/reading_question_bank.sql reading_bank_finish: a retry with a refusal-to-spend code and no cost is a
+      // deferral (queued again, the try given back); any other retry is queued, or failed at the third attempt.
+      const defer = p.outcome === "retry" && (p.cost_cents ?? 0) === 0 && ["cost_limit", "monthly_cap", "budget", "paused"].includes(p.error_code ?? "");
+      const status = p.outcome === "retry" ? (j.attempts >= 3 && !defer ? "failed" : "queued") : p.outcome;
+      if (defer) j.attempts = Math.max(j.attempts - 1, 0);
       Object.assign(j, {
         status, lease_until: null, reserved_cents: 0, cost_cents: j.cost_cents + (p.cost_cents ?? 0), usage: p.usage ?? j.usage,
         result: p.result ?? j.result, counts: p.counts ?? j.counts, output: p.output ?? j.output, error_code: p.error_code ?? null,
@@ -223,7 +230,9 @@ function rpcs(db) {
         db.chapters.set(j.chapter, c);
       }
       if (db.loseFinishAnswer) {
+        const after = db.loseFinishAnswer;
         db.loseFinishAnswer = false;
+        if (typeof after === "function") after(j);
         throw Object.assign(new Error("synthetic transport error"), { code: "08006" });
       }
       return { ok: true, status };
@@ -582,6 +591,126 @@ test("mapVerdict: count and title checks; unknown counts are uncertain", () => {
   assert.equal(env.S.titlesMatch("Chapter IV. Fog Over the Bay", "Fog Over the Bay"), true, "a Roman numeral prefix is removed");
 });
 
+/* mapUrls: the research step's URL list (a spending and safety guard). Invented hosts and pages only. */
+const webSrc = (url, title = "Chapter guide") => ({ url, domain: new URL(url).hostname, title, cited_text: "A cited sentence." });
+const mapSrc = (url, scope = "whole_book") => ({ url, scope });
+const pageUrl = (n) => `${GUIDE}/page-${n}`;
+
+test("mapUrls: never more than MAP_URLS_MAX (8) pages, even with many cited whole-book pages", () => {
+  const env = load(makeDb());
+  const cited = Array.from({ length: 12 }, (_, i) => webSrc(pageUrl(i + 1)));
+  const map = { narrative: false, chapter_count: 4, chapters: [], sources: cited.map((s) => mapSrc(s.url)) };
+  assert.equal(env.S.MAP_URLS_MAX, 8);
+  const out = env.S.mapUrls(map, cited);
+  assert.equal(out.length, 8);
+  assert.deepEqual(out, cited.slice(0, 8).map((s) => s.url), "the first eight in map order");
+  assert.equal(new Set(out).size, out.length, "no duplicates");
+});
+
+test("mapUrls: per-chapter scope sources come before whole-book ones, and survive the 8-cap", () => {
+  const env = load(makeDb());
+  const whole = Array.from({ length: 10 }, (_, i) => webSrc(pageUrl(`w${i + 1}`)));
+  const perChapter = [webSrc(pageUrl("c1")), webSrc(pageUrl("c2"))];
+  const cited = [...whole, ...perChapter];
+  // Whole-book pages listed first in the map; the per-chapter guides come last and must still lead the list.
+  const map = {
+    narrative: false,
+    chapter_count: 4,
+    chapters: [],
+    sources: [...whole.map((s) => mapSrc(s.url)), ...perChapter.map((s) => mapSrc(s.url, "per_chapter"))],
+  };
+  const out = env.S.mapUrls(map, cited);
+  assert.equal(out.length, 8);
+  assert.deepEqual(out.slice(0, 2), perChapter.map((s) => s.url), "per-chapter guides first, in map order");
+  assert.deepEqual(out.slice(2), whole.slice(0, 6).map((s) => s.url), "then whole-book pages in map order");
+
+  const mixed = {
+    narrative: false,
+    chapter_count: 4,
+    chapters: [],
+    sources: [mapSrc(pageUrl("w1")), mapSrc(pageUrl("c1"), "per_chapter"), mapSrc(pageUrl("w2")), mapSrc(pageUrl("c2"), "per_chapter")],
+  };
+  const mixedOut = env.S.mapUrls(mixed, [webSrc(pageUrl("w1")), webSrc(pageUrl("w2")), webSrc(pageUrl("c1")), webSrc(pageUrl("c2"))]);
+  assert.deepEqual(mixedOut, [pageUrl("c1"), pageUrl("c2"), pageUrl("w1"), pageUrl("w2")]);
+});
+
+test("mapUrls: a blocked page is never included (blocked host, or a piracy title), and a URL the map cited but the search did not is never added", () => {
+  const env = load(makeDb());
+  const cited = [
+    webSrc("https://libgen.rs/book/ledger", "Chapter guide"),
+    webSrc(pageUrl("ok-1")),
+    webSrc(pageUrl("title-blocked"), "Full text of the lighthouse ledger"),
+    webSrc(pageUrl("ok-2")),
+  ];
+  const map = {
+    narrative: false,
+    chapter_count: 4,
+    chapters: [],
+    sources: [
+      mapSrc("https://libgen.rs/book/ledger", "per_chapter"),
+      mapSrc(pageUrl("title-blocked"), "per_chapter"),
+      mapSrc(pageUrl("not-cited"), "per_chapter"),
+      mapSrc(pageUrl("ok-1")),
+      mapSrc(pageUrl("ok-2")),
+    ],
+  };
+  const out = env.S.mapUrls(map, cited);
+  assert.deepEqual(out, [pageUrl("ok-1"), pageUrl("ok-2")]);
+  assert.equal(out.some((u) => u.includes("libgen.rs") || u.includes("title-blocked") || u.includes("not-cited")), false);
+});
+
+test("mapUrls: with no usable second call (null or no matching sources), the cited pages are used, blocked ones still out", () => {
+  const env = load(makeDb());
+  const cited = [webSrc(pageUrl("a")), webSrc("https://libgen.rs/book/ledger"), webSrc(pageUrl("b"))];
+  const expected = [pageUrl("a"), pageUrl("b")];
+  assert.deepEqual(env.S.mapUrls(null, cited), expected, "no map at all");
+  assert.deepEqual(
+    env.S.mapUrls({ narrative: false, chapter_count: 0, chapters: [], sources: [] }, cited),
+    expected,
+    "a map that lists no sources",
+  );
+  assert.deepEqual(
+    env.S.mapUrls({ narrative: false, chapter_count: 0, chapters: [], sources: [mapSrc(pageUrl("elsewhere"))] }, cited),
+    expected,
+    "a map whose sources were never cited",
+  );
+  assert.deepEqual(env.S.mapUrls(null, []), [], "nothing cited, nothing to research");
+});
+
+test("mapUrls: a cited page the second call did not re-list is left out when another page matches", () => {
+  const env = load(makeDb());
+  const cited = [webSrc(pageUrl("listed")), webSrc(pageUrl("unlisted"))];
+  const map = { narrative: false, chapter_count: 4, chapters: [], sources: [mapSrc(pageUrl("listed"), "per_chapter")] };
+  assert.deepEqual(env.S.mapUrls(map, cited), [pageUrl("listed")], "a matching source wins; the unlisted page is left out");
+});
+
+test("mapVerdict: the 70% title share sits at the boundary, counts only titled chapters, and counts alone decide when nothing is titled", () => {
+  const env = load(makeDb());
+  // One-word titles never match each other, so the number of matching chapters is exact.
+  const WORDS = ["Anchor", "Beacon", "Compass", "Dune", "Ember", "Fathom", "Gull", "Harbor", "Isle", "Jetty"];
+  const map = (titles, count = 10) => ({ narrative: false, chapter_count: count, chapters: titles.map((t, i) => ({ chapter: i + 1, title: t })), sources: [] });
+  // The first k chapters keep their title; the rest get a title that matches nothing.
+  const withMatches = (k, count) => map(WORDS.map((w, i) => (i < k ? w : "Zephyr")), count);
+  const titled = (n) => ({ total_chapters: 10, chapters: WORDS.map((w, i) => ({ chapter: i + 1, title: i < n ? w : "" })) });
+
+  // Exactly 70% (7 of 10) is not "fewer than 70%", so it is ok; 6 of 10 is under the line.
+  assert.equal(env.S.mapVerdict(withMatches(7), titled(10)), "ok", "7 of 10 is exactly 70%");
+  assert.equal(env.S.mapVerdict(withMatches(6), titled(10)), "uncertain", "6 of 10 is under 70%");
+  assert.equal(env.S.mapVerdict(withMatches(8), titled(10)), "ok", "comfortably above 70%");
+  assert.equal(env.S.mapVerdict(withMatches(10, 9), titled(10)), "uncertain", "all titles match but the count is off");
+
+  // Only the 7 chapters with a table of contents title are counted: 6 of 7 is about 86%, 4 of 7 about 57%.
+  assert.equal(env.S.mapVerdict(withMatches(6), titled(7)), "ok", "6 of the 7 titled chapters match");
+  assert.equal(env.S.mapVerdict(withMatches(4), titled(7)), "uncertain", "4 of the 7 titled chapters match");
+
+  // No chapter has a title to compare: only the count decides.
+  assert.equal(env.S.mapVerdict(withMatches(0), titled(0)), "ok", "no titles and equal counts");
+  assert.equal(env.S.mapVerdict(withMatches(0, 9), titled(0)), "uncertain", "no titles and a different count");
+
+  // An unknown total is uncertain whatever the map says.
+  assert.equal(env.S.mapVerdict(withMatches(10), { total_chapters: NaN, chapters: [] }), "uncertain", "NaN total");
+});
+
 test("titlesMatch removes a chapter / part prefix only when the next word is a number, not an ordinary word that looks like one", () => {
   const env = load(makeDb());
   // "Book Value" must keep "book": with the old pattern it became "alue", which sits inside "value chains".
@@ -840,6 +969,53 @@ test("a finish whose answer never arrived: recorded when it had committed, not r
   assert.match(hb.error_message, /build ch 2 not recorded/);
   assert.match(hb.error_message, /not_running/);
   assert.equal(/ch 2 (ready|thin|anchors_only|no_sources) /.test(hb.error_message), false, "no stored chapter is reported");
+});
+
+test("a finish whose reply was lost is read back on job_id, attempts AND claim_seq: a job claimed again since is unconfirmed, never recorded (RQS2-R1)", async () => {
+  // The first call commits (done) and its reply is lost; before the readback the job's row has moved to a later claim
+  // (claim_seq one higher; a re-queue resets attempts, so the same attempts number under another claim is possible).
+  // The second finish answers not_running, and the row no longer carries this claim's fence: unknown.
+  const db = makeDb({ loseFinishAnswer: (j) => Object.assign(j, { claim_seq: j.claim_seq + 1 }) });
+  seedBuild(db);
+  const env = load(db);
+  await kick(env);
+  const job = db.jobs.find((j) => j.step === "build");
+  assert.equal(job.status, "done", "the first call did commit; the run cannot tell, and does not claim to");
+  const hb = db.sync.at(-1);
+  assert.match(hb.error_message, /build ch 2 not confirmed/);
+  assert.match(hb.error_message, /codes .*finish_unconfirmed/);
+  assert.equal(/ch 2 (ready|thin|anchors_only|no_sources) /.test(hb.error_message), false, "no stored chapter is reported");
+  assert.equal(hb.status, "partial", "an unknown queue state is not a clean run");
+  assert.equal(hb.records_synced, 0);
+});
+
+test("a finish that never reached the server (no answer twice) is read back: still running under the fence is not recorded", async () => {
+  const db = makeDb({ throwOn: "reading_bank_finish" });
+  seedBuild(db);
+  const env = load(db);
+  await kick(env);
+  assert.equal(db.jobs.find((j) => j.step === "build").status, "running", "left for its lease to run out and a later claim");
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_finish").length, 2, "one more try, then the readback");
+  const hb = db.sync.at(-1);
+  assert.match(hb.error_message, /build ch 2 not recorded/);
+  assert.match(hb.error_message, /finish_unrecorded/);
+  assert.equal(/finish_unconfirmed|not confirmed/.test(hb.error_message), false, "the row settled it: not unknown");
+  assert.equal(hb.records_synced, 0);
+});
+
+test("a retry the database fails at the job's third attempt is counted failed even when the reply was lost after the commit", async () => {
+  const db = makeDb({ loseFinishAnswer: true });
+  seedBuilt(db, [2]);
+  addJob(db, { step: "research", chapter: 2, input_hash: B.researchInputHash(P.BANK_PROMPT_VERSION, chHash(db, 2), db.bb.map_urls, 0), priority: 20, attempts: 2, error_code: "server_error" });
+  const env = load(db, fakeModel({ research: () => ({ __throw: { status: 500, message: "Synthetic" } }) }));
+  await kick(env);
+  const job = db.jobs.find((j) => j.step === "research");
+  assert.equal(job.attempts, 3);
+  assert.equal(job.status, "failed", "committed by the first call");
+  const hb = db.sync.at(-1);
+  assert.equal(hb.status, "failed", "read back as the status the database stored, not reported as a retry still to come");
+  assert.match(hb.error_message, /failed 1/);
+  assert.equal(/not confirmed|not recorded/.test(hb.error_message), false);
 });
 
 /* ------------------------------------------------------------------ */

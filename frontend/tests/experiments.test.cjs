@@ -235,7 +235,7 @@ test("the /status card reads the report job's heartbeat only", () => {
   assert.match(route, /ingestionHeartbeatStatus\("success", entry, 26, 30\)/);
   assert.ok(!/from\("experiment/.test(route), "no experiment table is read by the CDN-cacheable status endpoint");
   const page = read("app/status/page.tsx");
-  for (const pattern of [/experiments: "N-OF-1"/, /"hrv_retrain",\s*"experiments",/, /experiments: "Experiments"/, /report: "Trial Report"/]) {
+  for (const pattern of [/experiments: "N-OF-1"/, /"preprocessing",\s*"experiments",/, /experiments: "Experiments"/, /report: "Trial Report"/]) {
     assert.match(page, pattern);
   }
 });

@@ -17,9 +17,9 @@
  *   timeoutMs says otherwise, and never past deadlineAt (the STEP's absolute deadline, shared by a step's two calls:
  *   stepDeadlineAt), enforced with an abort signal, so a call cannot outlive the worker's budget (an unbounded call
  *   is what lets a lease run out after a billed request);
- * - money is checked before EVERY request, the first included: requestBoundCents is a conservative bound on what
+ * - money is checked before EVERY request, the first included: requestBoundCents is an approximate estimate of what
  *   the request can cost (its whole output at UNKNOWN_PRICE, its prompt at the cache-write rate, every allowed web
- *   search and fetch at full size); the request is sent only when the job's spend so far (priorCostCents + this
+ *   search and fetch at full size; see its doc for what it leaves out); the request is sent only when the job's spend so far (priorCostCents + this
  *   call's) plus that bound can be reserved: with `reserve` (the worker) only after the database raised the job's
  *   reservation to that total atomically (pds.reading_bank_reserve, which counts every other running job live and
  *   pauses the book at its cap, so two jobs at once cannot spend the same headroom and a book that is out of money
@@ -201,7 +201,9 @@ export const BOUND_CHARS_PER_TOKEN = 2.5;
  * requested model's price and UNKNOWN_PRICE (a server-side fallback may serve it), plus every allowed web search
  * (1 cent and BOUND_SEARCH_TOKENS of results each) and fetch (its max_content_tokens) as input once. It does not
  * multiply for the server tool loop re-reading earlier results or for a refusal mid-stream followed by a fallback
- * answer, which can each cost more; the ledger charges the real usage at finish either way.
+ * answer, which can each cost more. So this is an APPROXIMATE ESTIMATE, not a hard spend bound: the hard gate is the
+ * database reservation (`reserve`, which reads the book's and the month's real caps), and the ledger charges the
+ * real usage at finish, so a request that costs more than estimated is recorded as spent, not silently dropped.
  */
 export function requestBoundCents(spec: Pick<BankCallSpec, "model" | "system" | "maxTokens" | "tools" | "schema">, messages: unknown[]): number {
   const p = dearer(priceOf(spec.model), UNKNOWN_PRICE);
@@ -299,9 +301,13 @@ export function asBankClient(client: { beta: { messages: { stream: (...args: nev
   return client as unknown as BankClient;
 }
 
-/** A real client: the SDK retries 429 / 5xx / connection errors twice by itself. */
+/**
+ * A real client with the SDK's own retries OFF (maxRetries: 0). An SDK retry is a hidden second request: after an
+ * ambiguous first attempt (timeout, dropped connection) it could be billed without the worker ever seeing it, so
+ * every attempt is an explicit step here instead: reserved (`reserve`), accounted, and retried only by the worker.
+ */
 export function defaultBankClient(apiKey: string | undefined = process.env.ANTHROPIC_API_KEY): BankClient {
-  return asBankClient(new Anthropic({ apiKey, maxRetries: 2 }));
+  return asBankClient(new Anthropic({ apiKey, maxRetries: 0 }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -364,8 +370,12 @@ export type BankCallCode =
 
 /** Codes worth another try later (the worker's retry ladder); the rest fail the job. */
 export const RETRYABLE_CODES = new Set<BankCallCode>(["max_tokens", "bad_output", "pause_limit", "rate_limited", "overloaded", "server_error", "connection", "timeout", "cost_limit"]);
-/** Failures after which a request may have been billed with no usage reported (the worker charges the reservation). */
-export const MAYBE_BILLED_CODES = new Set<BankCallCode>(["timeout", "connection", "failed"]);
+/**
+ * Failures after which a request may have been billed with no usage reported (the worker charges the reservation).
+ * Every retryable failure that came back from the transport counts: the request was sent, and a 429 / 529 / 5xx can
+ * still have been billed. Pre-send refusals (cost_limit) and 4xx errors do not.
+ */
+export const MAYBE_BILLED_CODES = new Set<BankCallCode>(["timeout", "connection", "failed", "rate_limited", "overloaded", "server_error"]);
 
 export type BankCallResult =
   | { ok: true; content: ContentBlockLike[]; text: string; json: unknown; model: string; continuations: number; usage: UsageTotals; costCents: number }
@@ -478,6 +488,8 @@ export async function bankModelCall(client: BankClient, spec: BankCallSpec): Pro
         const timeout = turn === 0 && !spec.reserve ? budgetMs : Math.max(1, deadline - Date.now());
         msg = asMessage(await client.beta.messages.stream(bankParams(spec, messages), { timeout, signal: abort.signal }).finalMessage());
       } catch (err) {
+        // The SDK's retries are off (defaultBankClient), so this is the only attempt: an ambiguous failure is
+        // reported as maybe-billed and the worker keeps the reservation; the next attempt is a new, reserved step.
         const c = abort.signal.aborted ? { code: "timeout" as BankCallCode, retryable: true } : classifyError(err);
         return fail(c.code, c.retryable, MAYBE_BILLED_CODES.has(c.code));
       }

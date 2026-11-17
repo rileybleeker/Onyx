@@ -37,6 +37,7 @@ import {
   type Verdict,
 } from "./reading-recall";
 import { bankCode, cutAtWord, monthlyCapCents, registrableDomain, STEP_ESTIMATE_CENTS, STEP_MAX_SECONDS } from "./reading-bank";
+import { sendFinish, settleFinish } from "./reading-bank-finish";
 import { BANK_SONNET, bankModelCall, defaultBankClient, type BankClient } from "./reading-model";
 import { checkVoiceRequest } from "./checkin-voice";
 
@@ -1287,35 +1288,42 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
    * answer is no longer pending is finished 'done' there, because any other outcome counts a grade try and writes
    * the code into the (already graded or voided) answer's grade_error.
    *
-   * A finish the database did not record is never reported as the requested outcome: an error answer, a refusal or a
-   * non-object answer (data.ok is not true), or a thrown call, means the job is still running until its lease runs out
-   * and is claimed again, so the run reports a retry with `finish_unrecorded` and `graded: false`, and nothing (a
-   * grade to count) is counted for a finish that never landed. Grade persistence is judged apart from it: the grade
-   * itself (pds.reading_bank_grade) may have been stored, so `graded` stays false even then — only a recorded finish,
-   * or an answer already settled before this run asked for a grade, reports graded.
+   * What is reported follows what the QUEUE holds (settleFinish), never just what was asked for:
+   * - a recorded retry is reported as the status the database stored: the installed pds.reading_bank_finish answers
+   *   `{ok: true, status: 'failed'}` for a retry at the job's third attempt, so a job that will never be claimed again
+   *   is reported failed, not as a retry still to come;
+   * - a finish the database refused (`{ok: false}`), or one a fenced readback shows did not commit, is reported as a
+   *   retry with `finish_unrecorded` and `graded: false`: the job is still running until its lease runs out and is
+   *   then claimed again;
+   * - a finish whose answer is ambiguous (a database error answer, a thrown call, no usable answer) is read back by
+   *   job_id, attempts AND claim_seq: the reply can be lost after the commit, so it is neither assumed recorded nor
+   *   assumed lost. What the readback cannot establish (the job was claimed again since, the row was not read, or it
+   *   cannot be told from a lease settlement) is reported as a retry with `finish_unconfirmed` and `graded: false`.
+   *
+   * Grade persistence is judged apart from it: the grade itself (pds.reading_bank_grade) may have been stored, so
+   * `graded` is true only for a finish known to be recorded (the queue and cost finalization stay a separate fact).
    */
   const finish = async (outcome: GradeJobResult["outcome"], code: string | null, graded = false, sqlOutcome: GradeJobResult["outcome"] = outcome): Promise<GradeJobResult> => {
     const retryMinutes = GRADE_RETRY_MINUTES[Math.min(Math.max(fence.attempts, 1), GRADE_RETRY_MINUTES.length) - 1];
     const safeCode = code ? bankCode(code) : null;
-    let recorded = false;
-    try {
-      const { data, error } = await supabase.rpc("reading_bank_finish", {
-        p: {
-          job_id: job.job_id,
-          ...fence,
-          outcome: sqlOutcome,
-          cost_cents: Math.round(cost * 100) / 100,
-          usage,
-          error_code: safeCode,
-          retry_minutes: sqlOutcome === "retry" ? retryMinutes : null,
-        },
-      });
-      recorded = !error && !!data && typeof data === "object" && (data as { ok?: unknown }).ok === true;
-    } catch {
-      /* the lease runs out and the next claim settles it */
+    const costCents = Math.round(cost * 100) / 100;
+    const sent = {
+      job_id: job.job_id,
+      ...fence,
+      outcome: sqlOutcome,
+      cost_cents: costCents,
+      usage,
+      error_code: safeCode,
+      retry_minutes: sqlOutcome === "retry" ? retryMinutes : null,
+    };
+    const settled = await settleFinish(supabase, sent, await sendFinish(supabase, sent));
+    if (settled.state === "recorded") {
+      // The caller's own word (e.g. skipped, sent as done) stands while the queue holds what was sent; a retry the
+      // database stored as failed is reported as failed.
+      const reported = settled.outcome === sqlOutcome ? outcome : settled.outcome;
+      return { outcome: reported, code: safeCode, graded, cost_cents: costCents };
     }
-    if (!recorded) return { outcome: "retry", code: bankCode("finish_unrecorded"), graded: false, cost_cents: Math.round(cost * 100) / 100 };
-    return { outcome, code: safeCode, graded, cost_cents: Math.round(cost * 100) / 100 };
+    return { outcome: "retry", code: bankCode(settled.state === "unknown" ? "finish_unconfirmed" : "finish_unrecorded"), graded: false, cost_cents: costCents };
   };
 
   try {

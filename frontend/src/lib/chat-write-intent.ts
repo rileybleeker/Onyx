@@ -270,7 +270,7 @@ export function chatWritesOff(env: Record<string, string | undefined>): boolean 
 const norm = (s: string) =>
   s.normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/[‘’ʼ]/g, "'").toLowerCase();
 
-const tokens = (s: string): string[] => norm(s).match(/[a-z0-9]+(?:'[a-z]+)?/g) ?? [];
+export const tokens = (s: string): string[] => norm(s).match(/[a-z0-9]+(?:'[a-z]+)?/g) ?? [];
 
 const own = <T>(table: Record<string, T>, key: string | undefined): T | undefined =>
   key !== undefined && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
@@ -304,14 +304,14 @@ function stem(w: string): string {
   return base;
 }
 
+/**
+ * The same whole word: equal, or the same stem ("calms" / "calm", "journals" / "journal", "meditated" / "meditation").
+ * Never a longer word that starts with it: "Calm" is not "Calmly", "focus" is not "focusrin".
+ */
 function sameWord(a: string, b: string): boolean {
   if (a === b) return true;
   if (/\d/.test(a) || /\d/.test(b)) return false;
-  const sa = stem(a), sb = stem(b);
-  if (sa === sb) return true;
-  const [short, long] = sa.length <= sb.length ? [sa, sb] : [sb, sa];
-  // A word form ("meditat" / "meditation"), not another word that starts the same ("focus" / "focusrin").
-  return short.length >= 4 && long.length - short.length <= 3 && long.startsWith(short);
+  return stem(a) === stem(b);
 }
 
 /**
@@ -337,13 +337,13 @@ function namedSpan(item: string, text: string, loose = false): [number, number] 
   return [Math.min(...near), Math.max(...near)];
 }
 
-const names = (item: string, text: string, loose = false) => namedSpan(item, text, loose) !== null;
+export const names =(item: string, text: string, loose = false) => namedSpan(item, text, loose) !== null;
 
 /** Text reduced to words: case, spacing and punctuation aside. */
-const flat = (s: string) => norm(s).replace(/[^a-z0-9']+/g, " ").trim();
+export const flat =(s: string) => norm(s).replace(/[^a-z0-9']+/g, " ").trim();
 
 /** `part` occurs word for word in `whole` (case, spacing and punctuation aside). */
-function verbatimIn(part: string, whole: string): boolean {
+export function verbatimIn(part: string, whole: string): boolean {
   const p = flat(part);
   return p.length > 0 && ` ${flat(whole)} `.includes(` ${p} `);
 }
@@ -355,9 +355,12 @@ const NUMBER_WORDS: Record<string, number> = {
   half: 0.5, a: 1, an: 1, single: 1, couple: 2, both: 2,
 };
 
-function numbersIn(text: string): Set<number> {
+/** A number as written: digits with comma thousands groups ("5,000", "1,250,000") read as one number; "1,5" is not. */
+const numberText = (s: string): number => Number(s.replace(/,/g, ""));
+
+export function numbersIn(text: string): Set<number> {
   const out = new Set<number>();
-  for (const m of norm(text).matchAll(/(?<![a-z\d])\d+(?:\.\d+)?/g)) out.add(Number(m[0]));
+  for (const m of norm(text).matchAll(/(?<![a-z\d])(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.\d+)?/g)) out.add(numberText(m[0]));
   const words = tokens(text);
   for (let i = 0; i < words.length; i++) {
     const n = own(NUMBER_WORDS, words[i]);
@@ -427,11 +430,11 @@ interface Quantity { value: number; unit: string | null; word: string }
 function quantities(text: string): Quantity[] {
   // A written date ("2026-11-10", "11/10") is a day, never amounts.
   const dateless = norm(text).replace(/\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, " ");
-  const toks = dateless.match(/[a-z]+\d[a-z\d]*|\d+(?:\.\d+)?|[a-z]+(?:'[a-z]+)?|:/g) ?? [];
+  const toks = dateless.match(/[a-z]+\d[a-z\d]*|\d{1,3}(?:,\d{3})+(?!\d)(?:\.\d+)?|\d+(?:\.\d+)?|[a-z]+(?:'[a-z]+)?|:/g) ?? [];
   const out: Quantity[] = [];
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
-    const value = /^\d/.test(t) ? Number(t) : own(NUMBER_WORDS, t);
+    const value = /^\d/.test(t) ? numberText(t) : own(NUMBER_WORDS, t);
     if (value === undefined) continue;
     const prev = toks[i - 1], next = toks[i + 1];
     if (prev === ":" || next === ":") continue; // 8:30
@@ -892,7 +895,7 @@ type Polarity = "pos" | "neg" | "ambiguous";
  * "I didn't skip it"; or "without" / "except" inside it, "I meditated without music"). Read from the clause before any
  * reason or circumstance (SUBORDINATE), never by counting negations over the whole clause.
  */
-function polarity(s: string): Polarity {
+export function polarity(s: string): Polarity {
   const main = mainPart(s).replace(NOT_NEGATION, " ");
   const strong = main.match(NEGATION)?.length ?? 0;
   const partial = main.match(PARTIAL_NEGATION)?.length ?? 0;
@@ -903,7 +906,7 @@ function polarity(s: string): Polarity {
 function mainPart(s: string): string {
   return s.split(SUBORDINATE)[0].trim();
 }
-const negated = (s: string) => polarity(s) !== "pos";
+export const negated = (s: string) => polarity(s) !== "pos";
 
 /** A clause that starts its own statement (a subject, a question word, another command): it does not continue a list. */
 const OWN_START =
