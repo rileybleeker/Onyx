@@ -94,7 +94,9 @@ const DATA: Record<string, () => DataWarmer[]> = {
   "/log": () => [
     json("/api/habits/checkin"),
     json(journalTodayUrl(new Date())),
-    json("/api/weight?days=365"),
+    // Weight is shown only on /log (and the Weight section's undo reads this window): warmed on intent, not by the
+    // sweep, so the sweep's visits to other pages (e.g. /supplements) do not fetch it.
+    { ...json("/api/weight?days=365"), intentOnly: true },
     json("/api/reading"),
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),

@@ -17,6 +17,12 @@ export interface DataWarmer {
   fetch: () => Promise<unknown>;
   /** Skip the fetch when the cached value is younger than this (default 60 s). */
   freshMs?: number;
+  /**
+   * Only warmed when the user reaches for the page (hover, focus, press, command palette: warmRoute), never by the
+   * background sweep. For reads that only that page shows (e.g. /api/weight on /log), so other pages do not compete
+   * with the sweep's requests. The page itself still fetches the read on open.
+   */
+  intentOnly?: boolean;
 }
 
 export interface WarmTarget {
@@ -160,7 +166,7 @@ export function runWarmup(targets: WarmTarget[], deps: WarmupDeps, current: stri
       }
       let warmers: DataWarmer[] = [];
       try { warmers = target.data?.() ?? []; } catch { warmers = []; }
-      await warmData(deps, warmers, false, alive);
+      await warmData(deps, warmers.filter((w) => !w.intentOnly), false, alive);
       if (cancelled) return;
       await deps.wait(STEP_GAP_MS);
     }
