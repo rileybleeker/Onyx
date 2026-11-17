@@ -414,7 +414,7 @@ const PAGES: SmokePage[] = [
     route: "/bland-altman",
     heading: "Bland-Altman Analysis",
     signal: "charts",
-    hardEmpty: ["No data available. Make sure your ETL pipelines have synced data."],
+    hardEmpty: ["No data available yet. Data shows up here after your health data has synced."],
   },
   {
     route: "/habits",

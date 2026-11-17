@@ -181,7 +181,7 @@ export default function BlandAltmanPage({ initial, headingTestId = "page-heading
           </div>
           <RangeFilter value={range} onChange={setRange} />
         </div>
-        <p className="text-text-tertiary">No data available. Make sure your ETL pipelines have synced data.</p>
+        <p className="text-text-tertiary">No data available yet. Data shows up here after your health data has synced.</p>
       </>
     );
   }
