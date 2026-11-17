@@ -742,7 +742,11 @@ class RecoveryTests(unittest.TestCase):
 
 class RunTests(unittest.TestCase):
     def test_heartbeat_status(self):
-        required = [(a, "pw") for a in ("first@example.com", "second@example.com")]
+        # Since #754 an empty REQUIRED_ACCOUNTS (secret unset in CI) fails closed to 'partial'; pin the
+        # two mailboxes this test wires in so 'both read' is still a clean success.
+        case_accounts = ("first@example.com", "second@example.com")
+        self.enterContext(patch.object(u, "REQUIRED_ACCOUNTS", case_accounts))
+        required = [(a, "pw") for a in case_accounts]
         self.assertEqual(run_with([FakeIMAP(), FakeIMAP()], required, FakeSupa())["status"], "success")
         one_failed = run_with([FakeIMAP(), FakeIMAP(fail_login=True)], required, FakeSupa())
         self.assertEqual(one_failed["status"], "partial")
