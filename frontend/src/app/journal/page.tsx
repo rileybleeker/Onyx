@@ -159,8 +159,9 @@ export default function JournalPage() {
       if (data.entry) {
         entryCache.current.set(id, data.entry);
         setFullEntry(data.entry);
-      } else if (data.error) {
-        console.error("Load journal entry:", data.error);
+      } else {
+        // Any response without an entry (JSON error body or not) shows the fixed copy.
+        console.error("Load journal entry:", data.error ?? `HTTP ${r.status}`);
         setEntryError("Couldn't load that entry. Try again.");
       }
     } catch (e) {
