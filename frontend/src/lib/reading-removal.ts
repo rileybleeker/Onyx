@@ -324,9 +324,9 @@ export async function claimMirror(
 /**
  * The claim a keyed create stored for the session's entry (pds.create_reading_session: owes the entry on `bookId`'s
  * page, nothing replaced, no block id yet), for a caller that knows the create committed but not its answer (Onyx
- * Chat's retry of its own insert). Null when there is none or it cannot be read: the caller then writes as before.
+ * Chat's retry of its own insert). Null when there is none; "error" when it cannot be read (the caller then writes nothing).
  */
-export async function createEntryClaimOf(supabase: Supa, sessionId: number, bookId: number): Promise<string | null> {
+export async function createEntryClaimOf(supabase: Supa, sessionId: number, bookId: number): Promise<string | null | "error"> {
   const { data, error } = await supabase
     .from("reading_mirror_claims")
     .select("claim_id")
@@ -337,7 +337,9 @@ export async function createEntryClaimOf(supabase: Supa, sessionId: number, book
     .is("block_id", null)
     .order("claimed_at", { ascending: true })
     .limit(1);
-  if (error || !Array.isArray(data) || data.length === 0) return null;
+  // A failed lookup is not "no claim": the caller must not write an entry no claim can find (Codex review of PR 376, round 3).
+  if (error || !Array.isArray(data)) return "error";
+  if (data.length === 0) return null;
   const id = (data[0] as { claim_id?: unknown }).claim_id;
   return typeof id === "string" ? id : null;
 }
@@ -458,6 +460,30 @@ export async function placeEntry(
   if (!now) return { kind: "gone", blockId, claimId: own?.claimId ?? null };
   // A sweep settled this claim first and put the entry on the session itself.
   if (now.notion_block_id === blockId) return attached(now);
+  // An older claim's cleanup took the entry this one replaces off the session after the move committed (the session is
+  // on this book with no entry): attach conditionally on that, rather than treating this entry as surplus and trashing
+  // it, which would leave the session without any mirrored entry (Codex review of PR 376, round 3).
+  if (replaces && now.book_id === book.book_id && now.notion_block_id === null) {
+    const { data: again, error: againError } = await supabase
+      .from("reading_sessions")
+      .update({ notion_block_id: blockId })
+      .eq("session_id", session.session_id)
+      .eq("book_id", book.book_id)
+      .is("notion_block_id", null)
+      .select(SESSION_COLS)
+      .maybeSingle();
+    if (againError) return { kind: "unknown", blockId };
+    if (again) return attached(again as ReadingSession);
+    // Lost the race again: the session moved on; read it once more below for the surplus decision.
+    const { data: latest, error: latestError } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("session_id", session.session_id).maybeSingle();
+    if (latestError) return { kind: "unknown", blockId };
+    const l = (latest as ReadingSession | null) ?? null;
+    if (!l) return { kind: "gone", blockId, claimId: own?.claimId ?? null };
+    if (l.notion_block_id === blockId) return attached(l);
+    const trashedAgain = await trashWithRetry(blockId);
+    if (trashedAgain && own && (await settleReplaced(supabase, own, l, blockId))) await dropClaim(supabase, own.claimId);
+    return { kind: "surplus", row: l };
+  }
   // Surplus: this entry is trashed, and the claim goes only once the entry it replaces (a move) is settled too
   // (settleReplaced: left alone while the session holds it on another book, where a later move's claim owns it), so a
   // claim never goes with its replaced entry still owed (Codex review of PR 376, round 2 of T01-R14).

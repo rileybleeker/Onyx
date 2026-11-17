@@ -882,6 +882,7 @@ async function moveSessionTx(
     habit_created?: unknown;
     mirror_claim_id?: unknown;
     replaces_block_id?: unknown;
+    moved_book?: unknown;
     entry_pending?: unknown;
     progress_owed?: unknown;
   } | null;
@@ -924,15 +925,22 @@ export interface EditMirrorWork {
    * fail and dropped the move's claim, leaving the old entry on the old page and none on the new one.
    */
   mirrorReplaces: string | null;
+  /**
+   * Whether the edit's own transaction moved the session to another book, read under the session's lock. The route
+   * dispatches on this, never on the book it read before the edit: a concurrent edit can have changed the session's
+   * book in between, and a move treated as a plain refresh rewrote the old book's entry and dropped the move's claim.
+   * null = not stored by the RPC (the plain-update fallback).
+   */
+  movedBook: boolean | null;
   /** A move's claim still owes the session's entry: nothing is rewritten now, that claim writes it from the session. */
   entryPending: boolean;
   /** One stored progress obligation per book whose page line this edit changed. */
   progressOwed: { bookId: number; owedId: string }[];
 }
 
-const NO_MIRROR_WORK: EditMirrorWork = { mirrorStored: false, mirrorClaimId: null, mirrorReplaces: null, entryPending: false, progressOwed: [] };
+const NO_MIRROR_WORK: EditMirrorWork = { mirrorStored: false, mirrorClaimId: null, mirrorReplaces: null, movedBook: null, entryPending: false, progressOwed: [] };
 
-function editMirrorWork(out: { mirror_claim_id?: unknown; replaces_block_id?: unknown; entry_pending?: unknown; progress_owed?: unknown }): EditMirrorWork {
+function editMirrorWork(out: { mirror_claim_id?: unknown; replaces_block_id?: unknown; moved_book?: unknown; entry_pending?: unknown; progress_owed?: unknown }): EditMirrorWork {
   const claim = typeof out.mirror_claim_id === "string" && UUID_RE.test(out.mirror_claim_id) ? out.mirror_claim_id : null;
   const owed: { bookId: number; owedId: string }[] = [];
   if (Array.isArray(out.progress_owed)) {
@@ -944,7 +952,7 @@ function editMirrorWork(out: { mirror_claim_id?: unknown; replaces_block_id?: un
     }
   }
   const replaces = typeof out.replaces_block_id === "string" && out.replaces_block_id ? out.replaces_block_id : null;
-  return { mirrorStored: true, mirrorClaimId: claim, mirrorReplaces: replaces, entryPending: out.entry_pending === true, progressOwed: owed };
+  return { mirrorStored: true, mirrorClaimId: claim, mirrorReplaces: replaces, movedBook: typeof out.moved_book === "boolean" ? out.moved_book : null, entryPending: out.entry_pending === true, progressOwed: owed };
 }
 
 /** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
@@ -1355,6 +1363,7 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
       mirrorStored: tx.mirrorStored,
       mirrorClaimId: tx.mirrorClaimId,
       mirrorReplaces: tx.mirrorReplaces,
+      movedBook: tx.movedBook,
       entryPending: tx.entryPending,
       progressOwed: tx.progressOwed,
     };

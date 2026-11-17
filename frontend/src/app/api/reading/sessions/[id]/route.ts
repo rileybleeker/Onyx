@@ -86,7 +86,9 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   const overview = await getOverview(supabase, r.book.slug).catch(() => null);
 
   after(async () => {
-    const movedBook = r.book.book_id !== r.previousBook.book_id;
+    // The edit's own transaction says whether it moved the session (read under the session's lock); the books this
+    // request read before it can be stale after a concurrent edit (Codex review of PR 376, round 3).
+    const movedBook = r.movedBook ?? r.book.book_id !== r.previousBook.book_id;
     const old = r.previous.notion_block_id ?? null;
     if (r.mirrorStored) {
       // The Notion work this edit owes was stored in the edit's own transaction (pds.move_reading_session; Codex

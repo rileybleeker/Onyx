@@ -874,6 +874,7 @@ BEGIN
         'habit_restored', v_restored,
         'mirror_claim_id', v_claim,
         'replaces_block_id', CASE WHEN v_same_book THEN NULL ELSE v_prev.notion_block_id END,
+        'moved_book', NOT v_same_book,
         'entry_pending', v_pending,
         'progress_owed', v_owed);
 END;

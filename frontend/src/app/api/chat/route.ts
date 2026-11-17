@@ -11,7 +11,7 @@ import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/sup
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
 import { BOOK_COLS, HIGHLIGHT_COLS, HIGHLIGHT_EXISTS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
-import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
+import { mirrorHighlight } from "@/lib/reading-notion";
 import { createEntryClaimOf, discardEntry, placeEntry, rewriteProgressNow } from "@/lib/reading-removal";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
 import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
@@ -1375,22 +1375,26 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         ? null
         : (result.mirrorClaimId ?? (ownInsert ? await createEntryClaimOf(supabase, result.session.session_id, result.session.book_id) : null));
     let blockId: string | null = result.session.notion_block_id ?? null;
-    if (!blockId && !inspected && entryClaim) {
+    if (entryClaim === "error") {
+      // The claim that owes this entry could not be looked up: nothing is written now (an entry with no claim to find
+      // it would be an orphan); the claim, if there is one, is written by the sweep (Codex review of PR 376, round 3).
+    } else if (!blockId && !inspected && entryClaim) {
       const placed = await placeEntry(supabase, book, result.session, null, entryClaim);
       if (placed.kind === "attached") blockId = placed.blockId;
       else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
     } else if (!blockId && !inspected) {
-      blockId = await mirrorSession(book, result.session);
-      if (blockId) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+      // No stored claim: placeEntry stores one before it writes (a marked entry the sweep can find, attached
+      // conditionally), and writes best effort only while the claims table does not exist.
+      const placed = await placeEntry(supabase, book, result.session, null);
+      if (placed.kind === "attached") blockId = placed.blockId;
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
     }
     const o = await getOverview(supabase, book.slug).catch(() => null);
     // Rewrites one progress line in Notion: the same text when it is already up to date. Not for an earlier call's
     // session (read only): its date could put an older "last session" over a newer one written since. Under the
     // obligation a keyed create stored, written from the database and checked (rewriteProgressNow).
-    if (!inspected) {
-      if (result.progressOwedId) await rewriteProgressNow(supabase, book.book_id, result.progressOwedId);
-      else await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
-    }
+    // A replay has no stored obligation: rewriteProgressNow stores its own before it writes, never an untracked write.
+    if (!inspected) await rewriteProgressNow(supabase, book.book_id, result.progressOwedId ?? null);
     return JSON.stringify({
       success: true,
       book: book.title,
