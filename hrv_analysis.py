@@ -1663,9 +1663,11 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
                 "total_amount"] = np.nan
     grouped["_col"] = [col_name(g, c) for g, c in
                        zip(grouped["ingredient_group"], grouped["_unit_class"])]
+    # sum(min_count=1): a cell whose inputs are all NaN (an unknown day) stays
+    # NaN; a plain sum would turn it into 0.0. A real recorded 0 still sums to 0.
     wide = grouped.pivot_table(
         index="calendar_date", columns="_col",
-        values="total_amount", aggfunc="sum",
+        values="total_amount", aggfunc=lambda s: s.sum(min_count=1),
     ).reset_index()
     wide.columns = ["calendar_date"] + list(wide.columns[1:])
     return dedup_cleaned_names(wide), tracking_start, unknown_days
