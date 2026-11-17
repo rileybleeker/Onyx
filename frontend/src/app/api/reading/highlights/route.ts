@@ -17,7 +17,10 @@ export async function GET(req: NextRequest) {
   let q = supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("book_id", book.book_id).order("created_at", { ascending: false });
   if (!req.nextUrl.searchParams.get("include_archived")) q = q.eq("archived", false);
   const { data, error } = await q;
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("reading/highlights GET", error.message);
+    return NextResponse.json({ error: "Couldn't load your highlights. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ book, highlights: data ?? [] });
 }
 

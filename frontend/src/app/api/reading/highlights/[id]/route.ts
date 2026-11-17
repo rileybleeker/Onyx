@@ -44,7 +44,8 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
     // (book_id, passage) is unique: the same passage is already saved for this book.
     if (error.code === "23505") return NextResponse.json({ error: "That passage is already saved for this book." }, { status: 409 });
     if (error.code === "PGRST116") return NextResponse.json({ error: "That highlight no longer exists." }, { status: 404 });
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("reading/highlights/[id] PATCH", error.message);
+    return NextResponse.json({ error: "Couldn't update or remove that highlight. Try again." }, { status: 500 });
   }
   const h = data as Highlight;
   if (h.notion_block_id && !("archived" in patch)) after(() => updateMirroredHighlight(h));
@@ -60,7 +61,10 @@ export async function DELETE(_req: NextRequest, ctx: Ctx) {
   const highlight_id = Number(id);
   if (!Number.isFinite(highlight_id)) return NextResponse.json({ error: "bad id" }, { status: 400 });
   const { data, error } = await supabase.from("book_highlights").update({ archived: true }).eq("highlight_id", highlight_id).select("book_id");
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("reading/highlights/[id] DELETE", error.message);
+    return NextResponse.json({ error: "Couldn't update or remove that highlight. Try again." }, { status: 500 });
+  }
   const bookId = Number((data as { book_id?: unknown }[] | null)?.[0]?.book_id);
   if (Number.isInteger(bookId) && bookId > 0) kickAfter(bookId, requestStartedAt);
   return NextResponse.json({ success: true });
