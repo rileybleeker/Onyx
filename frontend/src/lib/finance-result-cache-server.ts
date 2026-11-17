@@ -9,7 +9,7 @@ import { asOfNow } from "@/lib/cash-forecast-eligibility";
 import type { RenewalsAhead } from "@/lib/procurement-renewals";
 import { INPUTS_KEY, cacheBuild, decide, jsonSafe, parseAlertsBody, parseLoadBody, parseRow, type ResultKey, type StoredRow } from "@/lib/finance-result-cache";
 
-// Speed (PERF-02, 2026-11-17): the computations (forecast engine + tax plan, budgets, subscription detection) are
+// Speed (PERF-02, 2026-11-16): the computations (forecast engine + tax plan, budgets, subscription detection) are
 // loaded only when a result is actually computed. A request answered from the stored row (the usual Today read)
 // loads this module, the parse rules and the small client module only, so a cold first request does not parse
 // the forecast engine first. Each loader is one shared import() per server instance.

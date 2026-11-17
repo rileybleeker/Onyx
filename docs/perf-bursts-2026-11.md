@@ -1,6 +1,6 @@
 # Isolated multi-second slow views in the hourly speed runs (PERF-02, 2026-11-16)
 
-Status: **diagnosis only.** The last section (2026-11-17) adds a lazy-loading change for the two Today finance
+Status: **diagnosis only.** The last section (2026-11-16) adds a lazy-loading change for the two Today finance
 routes, proposed in PR #396: it is not deployed and its effect on speed has not been measured. The evidence rules out the suspected scheduled-job collisions and
 locates the stall, but it does not prove its cause. Three candidates remain open (below): our own fan-out,
 shared-CPU throttling and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
@@ -133,7 +133,7 @@ mounts) still lowers the burst size, but it does not remove the swap.
 
 Neither loosens the budget or moves the perf schedule.
 
-## Runs 43995593029 and 44003258302: what they show, and one hypothesis tested in code (2026-11-17)
+## Runs 43995593029 and 44003258302: what they show, and one hypothesis tested in code (2026-11-16)
 
 These are observations from two runs. Neither proves a cause; each hypothesis below says what evidence it rests
 on and what would confirm or refute it. One cold view and three warm views per page is a small sample, and the
