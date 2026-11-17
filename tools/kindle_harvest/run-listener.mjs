@@ -153,20 +153,66 @@ const rest = (path, init = {}) =>
     headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, "Content-Type": "application/json", "Accept-Profile": "pds", "Content-Profile": "pds", ...(init.headers || {}) },
   });
 
-async function patch(ids, fields) {
-  const filter = `id=in.(${ids.join(",")})`;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      const r = await rest(`pc_run_requests?${filter}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(fields) });
-      if (r.ok) return true;
-      log(`patch http ${r.status}`);
-    } catch {
-      log("patch network error");
+/**
+ * Retrying PATCH writer for pds.pc_run_requests. A write that fails all 4 attempts is kept in
+ * `pending` (ids + fields) so a later `drain()` — on the next websocket reconnect or the periodic
+ * catch-up timer — retries it with the same backoff. An entry leaves only once its own PATCH
+ * succeeds, so a run that finished locally still gets its receipt home even after a network outage.
+ * `restFn` and `logFn` are injectable for tests; this never logs an id or a secret, only the HTTP
+ * status or "network error", exactly as before.
+ */
+export function createPatchWriter(restFn, { limit = 50, log: logFn = () => {}, sleep = (ms) => new Promise((d) => setTimeout(d, ms)) } = {}) {
+  const pending = [];
+  let draining = false;
+
+  async function attempt(ids, fields) {
+    const filter = `id=in.(${ids.join(",")})`;
+    for (let a = 0; a < 4; a++) {
+      try {
+        const r = await restFn(`pc_run_requests?${filter}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify(fields),
+        });
+        if (r.ok) return true;
+        logFn(`patch http ${r.status}`);
+      } catch {
+        logFn("patch network error");
+      }
+      await sleep(backoffMs(a + 1));
     }
-    await new Promise((d) => setTimeout(d, backoffMs(attempt + 1)));
+    return false;
   }
-  return false;
+
+  /** Retry every queued PATCH once each; drop an entry only after its PATCH succeeds. */
+  async function drain() {
+    if (draining) return;
+    draining = true;
+    try {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (await attempt(pending[i].ids, pending[i].fields)) pending.splice(i, 1);
+      }
+    } finally {
+      draining = false;
+    }
+  }
+
+  /** PATCH now; on total failure keep (ids, fields) for a later drain. Returns whether it landed. */
+  async function write(ids, fields) {
+    if (await attempt(ids, fields)) return true;
+    if (pending.length >= limit) {
+      const overflow = pending.length - limit + 1;
+      const dropped = pending.splice(0, overflow).length;
+      logFn(`pending-writes: dropped ${dropped} (${pending.length} left)`);
+    }
+    pending.push({ ids: [...ids], fields: { ...fields } });
+    return false;
+  }
+
+  return { write, drain, pending };
 }
+
+const patchWriter = createPatchWriter(rest, { limit: 50, log });
 
 // ---------- the run ----------
 
@@ -183,7 +229,7 @@ async function handle(record) {
   if (current) {
     current.ids.push(record.id);
     log(`request ${short}: joins the run already going`);
-    await patch([record.id], { picked_up_at: now, outcome: "already_running" });
+    await patchWriter.write([record.id], { picked_up_at: now, outcome: "already_running" });
     return;
   }
 
@@ -194,12 +240,12 @@ async function handle(record) {
     if (!info.ok) {
       const detail = info.missing ? "task_missing" : "task_query_failed";
       log(`request ${short}: ${detail}`);
-      await patch(run.ids, { picked_up_at: now, outcome: "failed", detail, finished_at: new Date().toISOString() });
+      await patchWriter.write(run.ids, { picked_up_at: now, outcome: "failed", detail, finished_at: new Date().toISOString() });
       return;
     }
     run.outcome = info.before === "Running" ? "already_running" : "started";
     log(`request ${short}: ${run.outcome}`);
-    await patch(run.ids, { picked_up_at: now, outcome: run.outcome });
+    await patchWriter.write(run.ids, { picked_up_at: now, outcome: run.outcome });
 
     let result = { done: false };
     for (let checks = 1; !result.done; checks++) {
@@ -212,10 +258,10 @@ async function handle(record) {
       if (!result.done) await new Promise((d) => setTimeout(d, RUN_CHECK_MS));
     }
     log(`run for ${run.ids.length} request(s): finished, exit ${result.exit_code ?? "-"} ${result.detail ?? ""}`.trim());
-    await patch(run.ids, { finished_at: new Date().toISOString(), exit_code: result.exit_code, detail: result.detail });
+    await patchWriter.write(run.ids, { finished_at: new Date().toISOString(), exit_code: result.exit_code, detail: result.detail });
   } catch (e) {
     log(`run error ${e?.name || "Error"}`);
-    await patch(run.ids, { finished_at: new Date().toISOString(), detail: "task_query_failed" });
+    await patchWriter.write(run.ids, { finished_at: new Date().toISOString(), detail: "task_query_failed" });
   } finally {
     current = null;
   }
@@ -231,6 +277,9 @@ async function catchUp() {
     for (const row of rows) void handle(row);
   } catch {
     log("catch-up network error");
+  } finally {
+    // On every reconnect (catch-up follows each subscribe) retry PATCHes that failed earlier.
+    void patchWriter.drain();
   }
 }
 
@@ -335,7 +384,10 @@ function main() {
       reconnect();
     });
     process.on("unhandledRejection", () => log("unhandled rejection"));
-    setInterval(keepAlive, HEARTBEAT_MS);
+    setInterval(() => {
+      keepAlive();
+      void patchWriter.drain();
+    }, HEARTBEAT_MS);
     connect();
   });
 }
