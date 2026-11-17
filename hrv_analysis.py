@@ -2102,6 +2102,45 @@ def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) ->
         return df
 
 
+# Audio-feature means of the spotify_daily_signature view that get masked on
+# low-coverage days. Documented coverage gap: Garmin offline playback is
+# invisible to Spotify, so workout-heavy listening days under-count. Days with
+# featurized_plays < 5 have too-thin a sample to give reliable audio-feature
+# means and are set to NaN ("no listening signal today" rather than biasing
+# the mean by 1-2 random tracks).
+SPOTIFY_AVG_COLS = (
+    "avg_valence", "avg_energy", "avg_tempo", "avg_danceability",
+    "avg_acousticness", "avg_instrumentalness", "avg_loudness",
+)
+SPOTIFY_FEATURIZED_MIN = 5
+
+
+def merge_spotify_features(df: pd.DataFrame, sp_data: pd.DataFrame | None):
+    """Merge the opt-in Spotify daily signature onto the matrix spine.
+
+    Pure: returns (merged_df, n_masked). With no/empty spotify data the frame
+    is returned unchanged and n_masked is None (no sp_ columns added). Loaded
+    only when ONYX_INCLUDE_SPOTIFY=1 (see load_data); the env gate stays there.
+    """
+    if sp_data is None or sp_data.empty:
+        return df, None
+    sp = sp_data.copy()
+    # Numeric coerce
+    for c in sp.columns:
+        if c != "calendar_date":
+            sp[c] = pd.to_numeric(sp[c], errors="coerce")
+    # Mask audio-feature means below the featurization threshold.
+    low_coverage = sp["featurized_plays"].fillna(0) < SPOTIFY_FEATURIZED_MIN
+    for c in SPOTIFY_AVG_COLS:
+        if c in sp.columns:
+            sp.loc[low_coverage, c] = np.nan
+    # Prefix all spotify columns so they're distinguishable in SHAP / Spearman
+    sp = sp.rename(columns={c: f"sp_{c}" for c in sp.columns if c != "calendar_date"})
+    out = df.merge(sp, on="calendar_date", how="left")
+    assert len(out) == len(df), "Spotify daily signature merge changed the row count"
+    return out, int(low_coverage.sum())
+
+
 def build_feature_matrix(data: dict) -> pd.DataFrame:
     """Join all tables onto the daily_health_matrix spine and engineer features."""
     log.info("Building feature matrix…")
@@ -2533,29 +2572,10 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                  f"({len(nj_daily['nj_mood_ord'].dropna())} with mood)")
 
     # --- Join Spotify daily signature (opt-in) ---
-    # Documented coverage gap: Garmin offline playback is invisible, so
-    # workout-heavy listening days under-count. Days with featurized_plays<5
-    # have too-thin a sample to give reliable audio-feature means and are
-    # zero'd out (treated as "no listening signal today" rather than biasing
-    # the mean by 1-2 random tracks).
-    sp_data = data.get("spotify_daily")
-    if sp_data is not None and not sp_data.empty:
-        sp = sp_data.copy()
-        # Numeric coerce
-        for c in sp.columns:
-            if c != "calendar_date":
-                sp[c] = pd.to_numeric(sp[c], errors="coerce")
-        # Mask audio-feature means below the featurization threshold.
-        low_coverage = sp["featurized_plays"].fillna(0) < 5
-        for c in ("avg_valence", "avg_energy", "avg_tempo", "avg_danceability",
-                  "avg_acousticness", "avg_instrumentalness", "avg_loudness"):
-            if c in sp.columns:
-                sp.loc[low_coverage, c] = np.nan
-        # Prefix all spotify columns so they're distinguishable in SHAP / Spearman
-        sp = sp.rename(columns={c: f"sp_{c}" for c in sp.columns if c != "calendar_date"})
-        df = df.merge(sp, on="calendar_date", how="left")
-        log.info(f"  Spotify daily signature: {len(sp)} days merged "
-                 f"(audio features masked on {int(low_coverage.sum())} low-coverage days)")
+    df, sp_masked = merge_spotify_features(df, data.get("spotify_daily"))
+    if sp_masked is not None:
+        log.info(f"  Spotify daily signature: merged "
+                 f"(audio features masked on {sp_masked} low-coverage days)")
 
     # --- Sort by date ---
     df = df.sort_values("calendar_date").reset_index(drop=True)
