@@ -253,10 +253,11 @@ export async function readEnvDoseResponseData(): Promise<SweetSpotRow[]> {
   // this historical chart) through an explicit all-scalar column list (SWEET_SPOT_COLUMNS).
   // Paged: every HRV night is needed (not just temperature nights), which passes PostgREST's
   // 1000-row cap as history grows. onyx_behavioral_date is unique in the matview, so the order
-  // is total (the client's sameJson bailout needs that). The first page carries count:"exact"
-  // and the other pages run in parallel, so this one /api/derived call stays one round trip
-  // deep; a page that still comes back full (no count, or rows added by a refresh in between)
-  // is followed serially.
+  // is total (the client's sameJson bailout needs that). The first page carries count:"exact",
+  // so a read of at most one page is one request. The remaining pages are requested together
+  // only after that count is known, so a read of more than one page takes two request rounds;
+  // a page that still comes back full (no count, or rows added by a refresh in between) is
+  // followed one at a time.
   const PAGE = 1000;
   const page = (from: number, withCount: boolean) =>
     supabase

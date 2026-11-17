@@ -6,17 +6,31 @@ import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CONCEPTS, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { CHECKPOINT_SIZE, checkpointOffer, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
 import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
+import { getJson } from "@/lib/reading-practice-client";
+import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, mapSignature, parseCheckpoint } from "@/lib/reading-map";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
 import ReviewCard from "./ReviewCard";
+import PracticePart from "./PracticePart";
+import RetrievalSession from "./RetrievalSession";
+import ChapterMap from "./ChapterMap";
+import CheckpointQuiz from "./CheckpointQuiz";
+import ConceptPicker from "./ConceptPicker";
+
+/**
+ * Which checkpoints held answers without a result, as last read, kept for the session (memory only, one entry per book
+ * and checkpoint) so the page coming back into view (the continuous scroll mounts and unmounts it) does not read again.
+ */
+const UNRECORDED_TTL_MS = 120_000;
+const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -63,6 +77,17 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
   const [loading, setLoading] = useState(!seed);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
+  // The checkpoint quiz open on screen (READ-QUIZ-01 S5), and the checkpoints whose answers were stored without Done
+  // (keyed by book and checkpoint, so another book's "ch12" is not this one's).
+  const [quiz, setQuiz] = useState<Checkpoint | null>(null);
+  const [unrecorded, setUnrecorded] = useState<Record<string, boolean>>({});
+  // Checkpoints whose quiz read answered "not available" (the checkpoint SQL is not applied yet): no Start button for
+  // them, so the tile never leads to a dead end.
+  const [offerOff, setOfferOff] = useState<Record<string, boolean>>({});
+  const markUnrecorded = useCallback((book: string, key: string, pending: boolean) => {
+    unrecordedMemo.set(`${book}:${key}`, { at: Date.now(), pending });
+    setUnrecorded((prev) => (prev[`${book}:${key}`] === pending ? prev : { ...prev, [`${book}:${key}`]: pending }));
+  }, []);
 
   const showToast = useCallback((t: Toast) => {
     setToast(t);
@@ -98,6 +123,43 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
     load(null, !!seed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Which offered checkpoints already hold answers without a recorded result ("Answered · record result"), read from
+  // the stored answers rather than from this page's memory, so it survives a reload and shows on another device. One
+  // light GET per offered checkpoint (no cards read, nothing written), all at once and after the page's own reads have
+  // settled; the answer is kept for the session. The copy in the continuous scroll reads nothing: the routed page does.
+  const offerBook = overview?.book.slug ?? null;
+  const offered = overview ? overview.checkpoints.filter((c) => checkpointOffer(overview, c)).map((c) => `${c.key}:${c.chapter}`).join(",") : "";
+  useEffect(() => {
+    if (feed || !offerBook || !offered) return;
+    let live = true;
+    const run = async () => {
+      await Promise.all(
+        offered.split(",").map(async (part) => {
+          const [key, chapter] = part.split(":");
+          const seen = unrecordedMemo.get(`${offerBook}:${key}`);
+          if (seen && Date.now() - seen.at < UNRECORDED_TTL_MS) {
+            if (live) markUnrecorded(offerBook, key, seen.pending);
+            return;
+          }
+          const r = await getJson(checkpointUrl(offerBook, Number(chapter), true));
+          if (!live) return;
+          // The quiz round is not available (the checkpoint SQL is missing): do not offer a quiz that cannot open.
+          if (r.status !== 200 && checkpointRefusal(r.status, r.body).kind === "off") {
+            setOfferOff((prev) => (prev[`${offerBook}:${key}`] === true ? prev : { ...prev, [`${offerBook}:${key}`]: true }));
+            return;
+          }
+          const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
+          if (parsed) markUnrecorded(offerBook, key, hasUnrecordedAnswers(parsed));
+        }),
+      );
+    };
+    const timer = setTimeout(() => void run(), 1200);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [feed, offerBook, offered, markUnrecorded]);
 
   // Want to read (ReadingList.tsx): after a change, re-read the quest and the book list; a book Riley just started
   // is shown (his explicit choice). A queued book is never picked as the quest on its own.
@@ -176,6 +238,29 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         )}
       </div>
 
+      {/* The checkpoint quiz opens in place (a full-screen sheet on a phone) and closes back to the tiles. */}
+      {quiz && (
+        <CheckpointQuiz
+          key={`${o.book.slug}:${quiz.key}`}
+          slug={o.book.slug}
+          checkpoint={quiz.key}
+          chapter={quiz.chapter}
+          onRecorded={(r) => {
+            markUnrecorded(o.book.slug, quiz.key, false);
+            showToast({ text: `Checkpoint ${r.score}/${r.total}${r.xp ? ` · +${r.xp} XP` : ""}`, kind: r.passed ? "xp" : "ok" });
+            void load(slug, true);
+          }}
+          onClose={(r) => {
+            const book = o.book.slug;
+            const key = quiz.key;
+            setQuiz(null);
+            if (r.unrecorded) void r.unrecorded.then((v) => markUnrecorded(book, key, v));
+            else markUnrecorded(book, key, false);
+            if (r.changed) void Promise.resolve(r.settled).then(() => load(slug, true));
+          }}
+        />
+      )}
+
       {/* Personalize: every card, checkpoint tile and list is its own part; sections have no extra heading on screen. */}
       <PartGrid page="/reading" title="Reading" gap={16}>
       <PartGroup id="section-quest" title="Quest & pace">
@@ -206,14 +291,34 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       >
         {o.checkpoints.map((c, i) => (
           <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
-            <CheckpointTile c={c} />
+            <CheckpointTile c={c} offer={quiz === null && checkpointOffer(o, c) && offerOff[`${o.book.slug}:${c.key}`] !== true} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
           </Part>
         ))}
       </PartGroup>
 
+      {/* Chapters (READ-QUIZ-01 S5): the chapter map, once the book's questions are on. */}
+      {o.practice?.enabled && (
+        <PartGroup id="section-chapters" title="Chapters">
+          <Part id="chapter-map" title="Chapter map">
+            <ChapterMap key={o.book.slug} o={o} onChanged={() => load(slug, true)} />
+          </Part>
+        </PartGroup>
+      )}
+
       <PartGroup id="section-practice" title="Review & capture">
-        <Part id="review" title="Review">
-          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />
+        {/* Practice (READ-QUIZ-01): the chapter question round when the book's questions are on; otherwise the Review
+            card as before (with the approval card above it). The part keeps its id so saved layouts keep their place. */}
+        <Part id="review" title="Practice">
+          <PracticePart
+            key={o.book.slug}
+            o={o}
+            onChanged={() => load(slug, true)}
+            review={<ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
+          />
+        </Part>
+
+        <Part id="retrieval" title="Practice from memory">
+          <RetrievalSession key={o.book.slug} o={o} />
         </Part>
 
         {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
@@ -365,7 +470,7 @@ function CheckpointsHeader() {
   );
 }
 
-function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
+function CheckpointTile({ c, offer, pendingRecord, onStart }: { c: ReadingOverview["checkpoints"][number]; offer: boolean; pendingRecord: boolean; onStart: () => void }) {
   const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
   const border =
     state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
@@ -387,6 +492,8 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
                 without its per-question answers, so the score can't be checked (still counted). */}
             {c.quiz.verification === "invalidated" ? " · corrected" : c.quiz.verification === "unverified" ? " · unverified" : ""}
           </span>
+        ) : offer || pendingRecord ? (
+          "no result yet"
         ) : c.reached ? (
           <Link href="/chat" className="text-accent/80 underline underline-offset-2">
             quiz me →
@@ -395,6 +502,24 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
           "no quiz yet"
         )}
       </div>
+      {/* A newer quiz for this checkpoint was corrected later, so an older counted result is shown instead: say so,
+          or the score change looks unexplained (PR 362 follow-up). Plain text, never color alone. */}
+      {c.correctedNewer && (
+        <div className="mt-1 text-[11px] leading-snug text-text-tertiary">
+          A newer quiz was corrected, so this earlier result is shown
+          {c.correctedNewerQuiz ? ` (${c.correctedNewerQuiz.score}/${c.correctedNewerQuiz.total} · ${fmtDate(c.correctedNewerQuiz.date)})` : ""}.
+        </div>
+      )}
+      {/* The quiz in the app (READ-QUIZ-01): offered once the book's questions are on and the chapter is quizzable. */}
+      {(offer || pendingRecord) && (
+        <button
+          type="button"
+          onClick={onStart}
+          className="mt-2 inline-flex min-h-11 w-full items-center justify-center rounded-full border border-accent/60 px-2 py-1.5 text-center text-[12px] leading-tight text-accent"
+        >
+          {pendingRecord ? "Answered · record result" : `Start checkpoint · ${CHECKPOINT_SIZE} questions`}
+        </button>
+      )}
     </div>
   );
 }
@@ -614,22 +739,18 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
               placeholder="ch."
               className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
             />
-            <select
+            {/* The concept tags: the book's own (pds.books.theme, none by default) plus the titles of its linked ideas. */}
+            <ConceptPicker
+              slug={o.book.slug}
+              on={o.practice?.enabled === true}
+              signature={mapSignature(o.practice)}
+              themeConcepts={o.theme?.concepts}
               value={concept}
-              onChange={(e) => {
-                setConcept(e.target.value);
-                commit({ concept: e.target.value });
+              onChange={(v) => {
+                setConcept(v);
+                commit({ concept: v });
               }}
-              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
-            >
-              <option value="">Concept (optional)</option>
-              {CONCEPTS.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-              <option value="__custom">Other…</option>
-            </select>
+            />
           </div>
           {concept === "__custom" && (
             <input

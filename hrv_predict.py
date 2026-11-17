@@ -258,11 +258,19 @@ def _clean_for_json(obj):
 
 
 def fetch_all(table: str, select: str = "*", filters: list | None = None,
-              chunk: int = 1000) -> pd.DataFrame:
+              chunk: int = 1000, order: list[str] | None = None) -> pd.DataFrame:
+    """Page a table to the end. `order` names a unique, total ordering (e.g. the table's key
+    columns) that is applied BEFORE .range(): without an ORDER BY, PostgREST returns rows in
+    an unspecified order and offset paging can skip a row and repeat another across page
+    boundaries (PR #393 review P2 — a skipped recent matrix night made backfill_actuals clear
+    its correct stored actual)."""
     rows = []
     offset = 0
     while True:
         q = supa.schema("pds").from_(table).select(select)
+        if order:
+            for col in order:
+                q = q.order(col)
         if filters:
             for col, op, val in filters:
                 if op == "eq":
@@ -560,8 +568,10 @@ def backfill_actuals() -> int:
     rescore_from = (et_today() - timedelta(days=RESCORE_WINDOW_DAYS)).isoformat()
     cols = "prediction_date,model,horizon_days,model_version,predicted_hrv,actual_hrv,residual"
 
-    missing = fetch_all("hrv_predictions", select=cols, filters=[("actual_hrv", "is_", "null")])
-    recent = fetch_all("hrv_predictions", select=cols, filters=[("prediction_date", "gte", rescore_from)])
+    missing = fetch_all("hrv_predictions", select=cols, filters=[("actual_hrv", "is_", "null")],
+                        order=list(_PRED_KEY))
+    recent = fetch_all("hrv_predictions", select=cols, filters=[("prediction_date", "gte", rescore_from)],
+                       order=list(_PRED_KEY))
     frames = [f for f in (missing, recent) if not f.empty]
     if not frames:
         log.info("  No predictions to backfill.")
@@ -577,6 +587,7 @@ def backfill_actuals() -> int:
         "daily_health_matrix_behavioral",
         select="calendar_date,whoop_hrv_rmssd",
         filters=[("calendar_date", "gte", min_date)],
+        order=["calendar_date"],
     )
     # The read above is complete (paged to the end, and a failed page raises, so a failed or partial
     # read never reaches this point). A night with no matrix row at all (its last source row was
@@ -630,6 +641,7 @@ def recompute_rolling_metrics() -> list[dict]:
         select="prediction_date,model,horizon_days,predicted_hrv,actual_hrv,"
                "prediction_lower,prediction_upper,model_version,created_at",
         filters=[("prediction_date", "gte", window_start), ("horizon_days", "eq", 1)],
+        order=list(_PRED_KEY),
     )
     live = select_live_forecasts(preds)
     rows = []

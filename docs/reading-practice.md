@@ -164,6 +164,40 @@ Tests: `frontend/tests/reading-questions.test.cjs` (synthetic): parsing (only pe
 per operation, replay / conflict codes, export, verification and XP rules, the memory-only cache key, and SQL
 guards (permitted sources, database-made hashes, lock order, invalidate-never-remove, grants, additive only).
 
+## Practice from memory: sourced retrieval session (PROD-T08)
+
+`frontend/src/app/reading/RetrievalSession.tsx` (the "Practice from memory" part on `/reading`), rules in
+`lib/reading-retrieval.ts`. It uses only the PROD-T07 storage (`GET / POST /api/reading/questions`); no new table,
+route, notification, XP or setting. Decisions made 2026-11-17 (Riley: build, pick the defaults):
+
+- **Questions are authored by Riley, not generated.** A "new" card is a highlight no question uses yet, with an editable
+  default prompt that names the chapter and concept but never quotes the highlight. He may add an optional rubric.
+  No model call, no unattended spending. A generated-question pipeline stays a separate future slice.
+- **Order of a session:** answers saved but not graded, then delayed checks that are due (21-day before 7-day, oldest
+  first), then new cards.
+- **Answer first, then reveal.** The prompt is shown; the source (highlight + note, recall note or chapter) and the
+  rubric appear only after Submit or Skip. Skip records nothing and costs nothing. After submitting, Riley grades
+  himself ("I got it" / "I missed it", `grader: "self"`), told to judge by meaning, not wording.
+- **Wrong question:** "This question is wrong" sends a `correct` operation (new version; by default earlier answers
+  stop counting, a checkbox keeps them). Corrected answers are invalidated by the server and left out of the report.
+- **Safe offline:** the unconfirmed answer or grade is kept in this device's local storage (`onyx.reading.retrieval.*`,
+  wiped at sign-out) with its own operation key until the server answers definitely. It is sent again only by the Send
+  / Retry button (never on open or scroll), with the same key, so a request that landed is answered from its receipt.
+- **Bounded and resumable:** Riley picks 3 / 5 / 10 cards and optionally 5 / 10 / 15 minutes. The cap is checked
+  between cards. The session is kept for the behavioral day; each pause counts at most 5 minutes, so closing the tab
+  costs no time. Stop ends it without penalty.
+- **Delayed recall** is measured from a question's first graded attempt: a graded attempt 7 to 20 days later is a
+  7-day recall, 21 days or more a 21-day recall. Shown as First try / 7-day / 21-day with counts, apart from minutes
+  and XP (this feature adds none). Invalidated and ungraded answers are never counted.
+- **Not claimed:** this is practice with provenance, not evidence of memory or brain health. Burden is judged by Riley;
+  stop or hide the part (Personalize) if it becomes a chore.
+
+Not built here, and why: PROD-T06 pacing (not required by this slice), model grading (spending), questions drawn from
+sessions or chapters in the UI (the server already accepts those sources; existing questions of any permitted kind are
+shown). Rollback: hide the part in Personalize or revert the two files; the tables and answers stay.
+
+Tests: `frontend/tests/reading-retrieval.test.cjs` (synthetic).
+
 ## Rollback
 
 Revert the route and card code. The additive columns, the receipt table and the functions can stay (read-only for

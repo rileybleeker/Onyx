@@ -134,6 +134,10 @@ SCHEDULED: dict[str, Sched] = {
         'Scheduled tests', _m(90), True, 'every 30 min at :07/:37; new 2026-11-14 (replaced the per-PR test jobs)'),
     'cash-forecast-snapshot.yml': Sched(
         'Cash Forecast Snapshot', _h(8 * 24), True, 'weekly Monday 12:30 UTC; new 2026-11-14, no run history yet'),
+    'reading-bank.yml': Sched(
+        'Reading Question Bank', _m(150), True,
+        'hourly at :17; new READ-QUIZ-01, no run history yet; a re-run is safe (spending is capped per book and '
+        'per month, claims are leased)'),
     'merge-train.yml': Sched(
         'Merge train', _m(90), True, '*/15 plus PR and CI events; the cron alone can be delayed by half an hour'),
     'live-checks.yml': Sched(

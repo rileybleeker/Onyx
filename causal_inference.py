@@ -546,6 +546,12 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("screen_after_midnight_min",         "behavior", "Phone use after midnight above median",   "min"),
     ("screen_last_hour_before_sleep_min", "behavior", "Phone use in the last hour before sleep above median", "min"),
     ("screen_social_min",                 "behavior", "Social-app minutes above median",         "min"),
+    # Windows PC activity (pds.pc_activity_daily via tools/pc_activity_logger, 2026-11-16).
+    # Only the coarse late total: evening PC use is the candidate sleep disruptor, and
+    # per-program columns are deliberately absent (privacy: the pipeline never features
+    # a program). Days the logger never ran are NaN, so these sit in dropped_low_n until
+    # MIN_CONTINUOUS_N complete days accrue, then enter the FDR family on their own.
+    ("pc_late_min",                       "behavior", "PC active minutes after 9 PM above median", "min"),
     ("screen_pickups",                    "behavior", "Phone pickups above median",              None),
     # Outdoor air quality (pds.air_quality_daily via air_quality_etl.py, 2026-11-11): mean PM2.5
     # of the ET clock day that precedes the sleep (same row, hrv_alignment.py). Exogenous (weather,

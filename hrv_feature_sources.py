@@ -200,6 +200,16 @@ SOURCES: tuple[FeatureSource, ...] = (
                   feeds="photo_meals (photo-logged meals: photo_*)",
                   fingerprint=Fingerprint("photo_meals", "eaten_date",
                                           exclude=("created_at", "updated_at"))),
+    # est_intake_kcal (2026-11-16): views recomputed from delivery_order_items x
+    # delivery_item_nutrition and photo_meals, so any correction (a portion, an eaten
+    # fraction, a leftover, an edited photo meal) moves the views' rows. Days logged in
+    # Cronometer/MFP are masked in pandas, not here; the mask is derived from the matrix.
+    FeatureSource(name="delivery_nutrition_daily",
+                  feeds="delivery_nutrition_daily (est_intake_kcal, Uber Eats dish estimates)",
+                  fingerprint=Fingerprint("delivery_nutrition_daily", "behavioral_date")),
+    FeatureSource(name="photo_meal_daily",
+                  feeds="photo_meal_daily (est_intake_kcal, photo-logged meals)",
+                  fingerprint=Fingerprint("photo_meal_daily", "behavioral_date")),
     # hrv_analysis.load_all_data reads the receipts NOT parsed ('unmatched' / 'error'): their day and
     # the day before are never zero-filled. A historical receipt that parses later (or fails on a
     # --reprocess) turns delivery features between 0 and unknown without changing delivery_daily, so

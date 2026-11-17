@@ -210,6 +210,33 @@ export async function mirrorHighlight(book: Book, h: Highlight): Promise<string 
   }
 }
 
+/**
+ * The Notion entry an earlier, stopped try already made for this row: a try can append the entry and stop before
+ * storing its block id, and the row then reads as "not mirrored". Read-only: the page's quote blocks are compared with
+ * what mirrorSession / mirrorHighlight would write for the row now, ignoring blocks other rows already claim. Exactly
+ * one match is the entry (its id); none, several (it cannot be told which), a Notion outage or no Notion access is
+ * null, never a guess, and nothing is ever written here.
+ */
+export async function findMirroredEntry(
+  book: Book,
+  kind: "session" | "highlight",
+  row: ReadingSession | Highlight,
+  claimed: ReadonlySet<string>,
+): Promise<string | null> {
+  if (!book.notion_page_id || !NOTION_API_KEY) return null;
+  try {
+    const block = kind === "session" ? sessionBlock(row as ReadingSession) : highlightBlock(row as Highlight);
+    const want = (((block.quote as { rich_text?: Array<{ text?: { content?: string } }> }).rich_text) ?? []).map((r) => r.text?.content ?? "").join("");
+    if (!want) return null;
+    const blocks = await listChildren(book.notion_page_id);
+    const hits = blocks.filter((b) => b.type === "quote" && !claimed.has(b.id) && plainText(b) === want);
+    return hits.length === 1 ? hits[0].id : null;
+  } catch (e) {
+    console.error("reading-notion: findMirroredEntry failed:", e);
+    return null;
+  }
+}
+
 /** Update an already-mirrored session block in place (Kindle-derived sessions grow as notes arrive). */
 export async function updateMirroredSession(s: ReadingSession): Promise<boolean> {
   if (!s.notion_block_id || !NOTION_API_KEY) return false;

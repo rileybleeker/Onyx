@@ -247,6 +247,34 @@ test("XP counts durable stored attempts only: a replayed quiz adds no row, so th
   assert.equal(legacy.xp.quizzes, 8 * R.XP.perQuizPoint);
 });
 
+test("a corrected newer checkpoint quiz is visible: the older counted result is shown and correctedNewer is set", () => {
+  const book = { book_id: 7, slug: "synthetic-book", title: "Synthetic Book", author: null, total_chapters: 10, start_date: "2026-03-01", target_date: "2026-03-31", status: "reading", finished_on: null, notion_page_id: null, habit_name: null, asin: null, last_position: null, last_position_at: null, total_positions: null };
+  const counted = { quiz_id: 5, book_id: 7, checkpoint: "ch3", score: 4, total: 5, notes: null, quiz_date: "2026-03-05", question_count: 5, invalidated_count: 0 };
+  const invalidated = { quiz_id: 6, book_id: 7, checkpoint: "ch3", score: 5, total: 5, notes: null, quiz_date: "2026-03-08", question_count: 5, invalidated_count: 1 };
+  // Newest first (the read orders by taken_at desc): the invalidated result is the newest for the key.
+  const o = R.computeOverview({ book, today: TODAY, sessions: [], highlights: [], reviews: [], quizzes: [invalidated, counted] });
+  const cp = o.checkpoints.find((c) => c.key === "ch3");
+  assert.equal(cp.quiz.quiz_id, 5, "the newer invalidated result is replaced by the older counted one");
+  assert.equal(cp.correctedNewer, true, "the checkpoint says the newer result was corrected away");
+  assert.deepEqual(cp.correctedNewerQuiz, { date: "2026-03-08", score: 5, total: 5 });
+  assert.equal(o.xp.quizzes, 4 * R.XP.perQuizPoint, "XP counts the shown counted result only; the invalidated one earns nothing");
+  // Without a newer invalidated result, or when the invalidated result is the only one, nothing is flagged.
+  const plain = R.computeOverview({ book, today: TODAY, sessions: [], highlights: [], reviews: [], quizzes: [counted] });
+  const cpPlain = plain.checkpoints.find((c) => c.key === "ch3");
+  assert.equal(cpPlain.correctedNewer, false);
+  assert.equal(cpPlain.correctedNewerQuiz, null);
+  assert.equal(cpPlain.quiz.quiz_id, 5);
+  const onlyInvalidated = R.computeOverview({ book, today: TODAY, sessions: [], highlights: [], reviews: [], quizzes: [invalidated] });
+  const cpOnly = onlyInvalidated.checkpoints.find((c) => c.key === "ch3");
+  assert.equal(cpOnly.quiz.quiz_id, 6, "the invalidated result is shown when nothing counted exists (it already says 'corrected')");
+  assert.equal(cpOnly.correctedNewer, false, "no older counted result is being shown");
+  // The chat summary passes the flag through.
+  const s = R.summarizeForChat(o);
+  const sc = s.checkpoints.find((c) => c.key === "ch3");
+  assert.equal(sc.corrected_newer, true);
+  assert.deepEqual(sc.corrected_newer_quiz, { date: "2026-03-08", score: 5, total: 5 });
+});
+
 test("routes: same-origin JSON with a size cap; codes only in errors; no direct table write in either route", () => {
   for (const rel of ["app/api/reading/review/route.ts", "app/api/reading/quiz/route.ts"]) {
     const src = read(rel);

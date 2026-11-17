@@ -423,6 +423,28 @@ def resolve_inputs(paths: list[str], tmpdir: str) -> tuple[str | None, str | Non
     return inputs.servings, inputs.daily
 
 
+def manual_food_dates(inputs: ExportInputs) -> tuple[str, ...]:
+    """Days a no-window import's inputs show (or may show) food on, whether or not
+    they are written, following the same rule the automated export's food list uses
+    (scan_export_file's FileScan.food_dates of each input): every servings row's
+    date, a daily day with any nutrient above 0 or an unreadable value, and every
+    dated row of a file resolve_export_inputs took as neither file (a file that may
+    hold food, e.g. a servings file that lost its Food Name column; its rows are
+    never written here, but the days they show food on must still start their
+    empty-day count over). Each day loses its empty-day record in the same
+    transaction as the write (pds.replace_cronometer_servings_and_daily's
+    p_food_dates), so a manual import whose servings file shows food on a day but
+    cannot write it does not leave the day one look from being emptied (OR-369).
+    """
+    food: set[str] = set()
+    for path, kind in ((inputs.servings, "servings"), (inputs.daily, "daily")):
+        if path:
+            food |= scan_export_file(path, kind).food_dates
+    for path in inputs.rejected:
+        food |= scan_export_file(path, "servings").food_dates
+    return tuple(sorted(food))
+
+
 # ── Row builders ────────────────────────────────────────────────────────────────
 def _nutrient_cols(row: dict[str, str], col_index: dict[str, int], cells: list[str]) -> dict:
     """Map every recognized nutrient header in this row to its db column + numeric value."""
@@ -1040,7 +1062,7 @@ def daily_row_has_food(row: dict) -> bool:
 
 
 def import_servings_and_daily(rows: list[dict], daily_rows: list[dict], dry_run: bool,
-                              sb=None) -> tuple[int, int, int, str]:
+                              sb=None, food_dates=()) -> tuple[int, int, int, str]:
     """Replace the servings of the dates in `rows` AND upsert `daily_rows`, in ONE
     transaction (pds.replace_cronometer_servings_and_daily, which takes the same lock
     as the automated export's write). Used by every import without a window (a
@@ -1049,6 +1071,12 @@ def import_servings_and_daily(rows: list[dict], daily_rows: list[dict], dry_run:
     have rows are replaced, so nothing is emptied.
     Every date it writes (servings or a daily row) also loses its empty-day record,
     so a day an earlier automated export showed empty needs two new looks again.
+    food_dates: every day the import's inputs showed (or may show) food on, whether
+    or not its rows are in rows / daily_rows (manual_food_dates: a servings row's
+    date, a daily day with any nutrient above 0 or an unreadable value, and the
+    readable dates of a file taken as neither). Each also loses its empty-day record
+    in the same call, so food seen on a day whose rows are not written (a servings
+    file that lost its Food Name column) still starts its count over.
     A daily row with no food (every nutrient 0 or blank) for a day without serving
     rows here is not written over a stored daily row that has food: this import
     never empties a day, and a zero (or blank) total would wipe its stored totals.
@@ -1066,14 +1094,14 @@ def import_servings_and_daily(rows: list[dict], daily_rows: list[dict], dry_run:
     minus every no-food row for a day without serving rows, since that path cannot
     see the stored row), "dry_run" or "none" (no call).
     """
-    if not rows and not daily_rows:
+    if not rows and not daily_rows and not food_dates:
         return 0, 0, 0, "none"
     if dry_run:
         return len(rows), len(daily_rows), 0, "dry_run"
     if sb is None:
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     params = {"p_dates": sorted({r["calendar_date"] for r in rows}), "p_rows": rows,
-              "p_daily_rows": daily_rows}
+              "p_daily_rows": daily_rows, "p_food_dates": sorted(set(food_dates))}
     try:
         res = sb.schema("pds").rpc(REPLACE_IMPORT_RPC, params).execute()
     except Exception as e:  # noqa: BLE001
@@ -1306,7 +1334,8 @@ def run_import(paths: list[str], dry_run: bool = False, window: tuple[date, date
     empty-day record in the same call. Without a window (manual export) the
     servings of the dates with rows are replaced and the daily totals upserted in
     one call, which never empties a day and starts the empty-day count of every
-    day it writes over.
+    day it writes or is shown food on (a taken-as-neither file's dated rows
+    included) over.
 
     roles: one of "servings" / "daily" per path (check_roles), from the automated
     export, which wrote both files itself. With a window each path is then read as
@@ -1326,7 +1355,8 @@ def run_import(paths: list[str], dry_run: bool = False, window: tuple[date, date
         if trusted is None:
             if not inputs.servings and not inputs.daily:
                 raise SystemExit("No Cronometer servings.csv or dailysummary.csv found in inputs.")
-            return _import_dates(inputs.servings, inputs.daily, dry_run, sb, tz_log)
+            return _import_dates(inputs.servings, inputs.daily, dry_run, sb, tz_log,
+                                 manual_food_dates(inputs))
         # An automated export whose files are all rejected still goes through the
         # check: those files may hold food on any day of the window, and their
         # empty-day records must be forgotten even though nothing is written.
@@ -1346,14 +1376,17 @@ def _log_range(sb, data_type: str, status: str, rows: list[dict], count: int, st
              date_range_end=date.fromisoformat(dr[-1]) if dr else None)
 
 
-def _import_dates(servings_path, daily_path, dry_run, sb, tz_log) -> tuple[int, int]:
+def _import_dates(servings_path, daily_path, dry_run, sb, tz_log,
+                  food_dates=()) -> tuple[int, int]:
     """Manual export (inbox, CLI, a very long backfill): the date-set replace of the
-    servings plus the daily upsert, in one call (import_servings_and_daily)."""
+    servings plus the daily upsert, in one call (import_servings_and_daily).
+    food_dates: days the import's inputs show (or may show) food on, written or not
+    (manual_food_dates); each loses its empty-day record in the same call."""
     t0 = now_epoch()
     try:
         srows = build_serving_rows(servings_path, tz_log) if servings_path else []
         drows = build_daily_rows(daily_path) if daily_path else []
-        scount, dcount, dkept, _mode = import_servings_and_daily(srows, drows, dry_run, sb)
+        scount, dcount, dkept, _mode = import_servings_and_daily(srows, drows, dry_run, sb, food_dates)
     except Exception as e:  # noqa: BLE001
         if sb:
             for data_type in ("servings", "daily"):

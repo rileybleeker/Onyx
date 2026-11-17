@@ -7,6 +7,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
   db: { schema: "pds" },
 });
 
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
+
 /**
  * POST /api/reading/sessions
  * Body: { book?: slug, date?: YYYY-MM-DD, chapter_through: number, chapter_from?: number,
@@ -23,6 +26,7 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
  * A key whose entry was discarded (DELETE below) answers 409 `discarded`.
  */
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const result = await logSession(supabase, {
     slug: (body.book as string) || null,
@@ -93,6 +97,16 @@ export async function POST(req: NextRequest) {
     if (!progressHandled) await rewriteProgress();
     await sweepPendingRemovals(supabase);
   });
+
+  // The question bank (READ-QUIZ-01): a chapter Riley logged through may now be quizzable; plan and build after the
+  // response (a replayed create changed nothing).
+  if (!result.replayed) {
+    const bookId = result.book.book_id;
+    after(async () => {
+      const { kickBank } = await import("@/lib/reading-bank-server"); // inside after(): keeps the SDK graph out of the cold start
+      await kickBank(supabase, { bookId, reason: "session", requestStartedAt });
+    });
+  }
 
   return NextResponse.json({
     success: true,

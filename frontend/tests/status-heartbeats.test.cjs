@@ -22,6 +22,8 @@ function loadTs(relPath, stubs) {
   const localRequire = (spec) => {
     if (Object.prototype.hasOwnProperty.call(stubs, spec)) return stubs[spec];
     if (spec.startsWith("@/")) return loadTs(`${spec.slice(2)}.ts`, stubs);
+    // lib files import each other relatively (lib/reading-bank.ts -> ./reading-recall since READ-QUIZ-01 s2)
+    if (spec.startsWith("./") || spec.startsWith("../")) return loadTs(`${path.join(path.dirname(relPath), spec)}.ts`, stubs);
     return require(spec);
   };
   new Function("exports", "require", "module", outputText)(mod.exports, localRequire, mod);
@@ -54,12 +56,13 @@ function fakeSupabase(fixture) {
     };
     return b;
   };
-  return { client: { from }, calls };
+  // /api/status also calls rpc("reading_bank_status") (READ-QUIZ-01 s2): answer "function missing" (not set up).
+  return { client: { from, rpc: () => Promise.resolve({ data: null, error: { code: "PGRST202" } }) }, calls };
 }
 
 let current = fakeSupabase({});
 const stubs = {
-  "@supabase/supabase-js": { createClient: () => ({ from: (table) => current.client.from(table) }) },
+  "@supabase/supabase-js": { createClient: () => ({ from: (table) => current.client.from(table), rpc: (...a) => current.client.rpc(...a) }) },
   "next/server": {
     NextResponse: { json: (body, init) => ({ status: (init && init.status) || 200, body }) },
   },

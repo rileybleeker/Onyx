@@ -16,5 +16,18 @@ export const dynamic = "force-dynamic";
  */
 export async function GET() {
   const service = createPhoneMessagesService({ getEnv: () => process.env });
-  return NextResponse.json(service.status(), { headers: { "Cache-Control": "no-store" } });
+  // 2026-11-17: the one supported source is a Shortcuts automation on the phone that pushes new texts to
+  // POST /api/phone-messages/ingest. That is a push endpoint, not an adapter, so `reason` above is unchanged.
+  const enabled = process.env.ONYX_PHONE_MESSAGES_ENABLED === "true";
+  return NextResponse.json(
+    {
+      ...service.status(),
+      shortcutsPush: {
+        ingestEnabled: enabled,
+        senderAllowListSet: Boolean((process.env.ONYX_PHONE_MESSAGES_SENDERS ?? "").trim()),
+        coverage: "new texts the phone automation sends; never the existing inbox",
+      },
+    },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }
