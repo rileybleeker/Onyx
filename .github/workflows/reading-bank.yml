@@ -1,6 +1,6 @@
 name: Reading Question Bank
 
-# Hourly: builds and grades for the Reading question bank (docs/reading-question-bank.md) when Riley's PC is off.
+# Hourly: builds and grades for the Reading question bank (docs/reading-question-bank.md) when the collector PC is off.
 # Heartbeat reading_bank|generate -> /status "Reading Questions". The log is public: counts and error codes only.
 on:
   schedule:
