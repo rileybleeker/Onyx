@@ -23,15 +23,15 @@ test("nextChange within the cap is a short wait plus the 250 ms margin", () => {
 });
 
 test("nextChange more than six hours ahead is capped so the timer re-arms", () => {
-  const tenHours = 10 * 3_600_000;
-  const delay = lapseDelay(now + tenHours, now);
-  assert.equal(delay, LAPSE_CAP_MS); // fires at the cap, not at ten hours
-  // Re-arming from the capped fire: the remaining wait (still past the cap) reports the cap again.
+  const fifteenHours = 15 * 3_600_000;
+  const delay = lapseDelay(now + fifteenHours, now);
+  assert.equal(delay, LAPSE_CAP_MS); // fires at the cap, not at fifteen hours
+  // Re-arming from the capped fire: the remaining wait (9 hours, still past the cap) reports the cap again.
   const afterFirstFire = now + LAPSE_CAP_MS;
-  assert.equal(lapseDelay(now + tenHours, afterFirstFire), LAPSE_CAP_MS);
-  // Once the real time draws within the cap, the delay drops to the actual remaining margin.
-  const close = now + LAPSE_CAP_MS + 5 * 3_600_000; // 5 hours left after the first fire
-  assert.equal(lapseDelay(now + tenHours, close), now + tenHours - close + LAPSE_MARGIN_MS);
+  assert.equal(lapseDelay(now + fifteenHours, afterFirstFire), LAPSE_CAP_MS);
+  // Once the real time draws within the cap, the delay drops to the actual remaining wait plus the margin.
+  const close = now + 10 * 3_600_000; // 5 hours left
+  assert.equal(lapseDelay(now + fifteenHours, close), now + fifteenHours - close + LAPSE_MARGIN_MS);
 });
 
 test("cap is exactly six hours", () => {
