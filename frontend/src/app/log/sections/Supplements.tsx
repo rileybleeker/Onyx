@@ -702,6 +702,7 @@ export default function SupplementsSection() {
   /** A Say it suggestion: one product through the same route. Returns an error message, or null when saved (or there). */
   async function logProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
+    event_key?: string;
   }): Promise<string | null> {
     const outcome = await sendProduct(args);
     void reloadToday();
@@ -857,6 +858,7 @@ export default function SupplementsSection() {
     return (stackRows.get(stackId)?.length ?? 0) > 0 || justLogged.has(stackId);
   }
 
+  const suggestionKeys = useRef(new Map<number, string>());
   async function saveSuggestions() {
     if (!suggestions || savingSuggestions) return;
     const { draftId } = suggestions;
@@ -868,7 +870,11 @@ export default function SupplementsSection() {
       let err: string | null = null;
       if (s.item.kind === "product") {
         const d = s.item;
-        err = await logProduct({ product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date });
+        // One event key per suggestion, kept across its retries: a lost answer for an untimed earlier-day dose
+        // (which the duplicate check cannot recognise) is replayed by the server, not written twice.
+        let eventKey = suggestionKeys.current.get(s.key);
+        if (!eventKey) { eventKey = crypto.randomUUID(); suggestionKeys.current.set(s.key, eventKey); }
+        err = await logProduct({ product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date, event_key: eventKey });
       } else {
         const d = s.item;
         const stack = findStack(stacks ?? [], d);
