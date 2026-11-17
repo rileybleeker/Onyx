@@ -21,7 +21,7 @@ import { addDaysYmd, scheduleAfterGrade, type PracticeGrade } from "./reading-pr
 /* Constants                                                            */
 /* ------------------------------------------------------------------ */
 
-/** A daily round; Quick 3 is its first 3 cards. A constant until PROD-T06 adds a pacing preference. */
+/** A daily round; Quick 3 is its first 3 cards. Fixed constants, deliberately not tied to the PROD-T06 reading pacing preference (which governs weekly sessions and minutes, not round composition). */
 export const ROUND_SIZE = 8;
 export const QUICK_SIZE = 3;
 /** Chapter sheet "Practice 5". */
