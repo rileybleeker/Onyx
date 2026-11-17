@@ -9,9 +9,12 @@ import { parseRemindTime } from "@/lib/supplement-reminders";
  *
  * Request fields the editor adds (lib/supplement-stack-chain.ts): expected_version (the version it last saw),
  * save_id (a UUID per save; a resend of a save that already went through is answered with replayed: true) and
- * after_save_ids (its earlier saves whose answer it never got). An update without expected_version, or a retried
- * create without save_id (a tab still running the previous build, or a list read before the migration), is refused
- * with 409 "reload": it cannot show that it is not a late body overwriting a newer save.
+ * after_save_ids (its earlier saves whose answer it never got). An update that carries save_id but no expected_version
+ * is refused here with 409 "reload", before anything is written: even an exact resend is refused, because a page that
+ * knows no version cannot show that it is not a late body overwriting a newer save. An update without save_id and
+ * without expected_version is passed on, and the database refuses it the same way (OXS05). A create without
+ * expected_version is accepted; a retried create without save_id (a tab still running the previous build, or a list
+ * read before the migration) is refused by the database with 409 "reload".
  *
  * Errors are mapped from the database CODE only, never its message text (a unique violation also names the
  * client_key index, and must never be read as "no such column").
@@ -55,7 +58,11 @@ export interface StackSaveRequest {
   items: StackItemInput[] | null;
 }
 
-export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
+/** A refusal; `code: "reload"` means the route answers 409 (an out-of-date page), otherwise 400. */
+export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string; code?: "reload" };
+
+/** Answer for an update that carries save_id but no expected_version (refused before any write). */
+export const STACK_NO_VERSION_MESSAGE = "This stack changed in another tab. Refresh it, then save again.";
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const isPositiveInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
@@ -150,6 +157,11 @@ export function parseStackSave(body: unknown, mode: "create" | "update"): Parsed
   if (body.save_id !== undefined && body.save_id !== null) {
     if (typeof body.save_id !== "string" || !UUID_RE.test(body.save_id)) return { ok: false, error: "save_id must be a UUID" };
     saveId = body.save_id.toLowerCase();
+  }
+
+  // An update that names a save but no version: refused before the database, never replayed or saved.
+  if (mode === "update" && saveId !== null && expectedVersion === null) {
+    return { ok: false, error: STACK_NO_VERSION_MESSAGE, code: "reload" };
   }
 
   const afterSaveIds: string[] = [];
