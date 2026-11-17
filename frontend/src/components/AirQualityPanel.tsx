@@ -57,7 +57,7 @@ export default function AirQualityPanel() {
   if (load.s === "loading") {
     body = <div className="animate-pulse rounded bg-surface-hover/40" style={{ minHeight: MIN_HEIGHT }} aria-label="Loading air quality" />;
   } else if (load.s === "not_connected") {
-    body = <Note>Air-quality table not set up yet</Note>;
+    body = <Note>Air-quality data is not set up yet.</Note>;
   } else if (load.s === "error") {
     body = <Note>Couldn&apos;t load air quality</Note>;
   } else if (load.days.length === 0) {
