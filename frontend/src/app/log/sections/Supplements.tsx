@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Plus, X } from "lucide-react";
 import { useInFeed } from "@/components/FeedContext";
 import { cachedJson, clientCache, fetchJsonValue, GONE } from "@/lib/client-cache";
@@ -14,13 +14,13 @@ import {
   LOG_SUPPLEMENTS_TODAY_URL,
   logEarlyGet,
 } from "@/lib/log-early";
+import { logEach, type ItemResult } from "@/lib/log-supplement-batch";
 import {
   filterOptions,
   keepOrder,
   OPTIONS_CAP,
   optionLabels,
   orderOptions,
-  unitAfterPick,
   usageByProduct,
   visibleOptions,
   type UsageRow,
@@ -33,11 +33,13 @@ import { DraftMark, LogCard, LogSaveButton } from "./ui";
  *     /api/supplements/stacks/log with only the stack id (the server stamps behavioral today + now, like the
  *     /agents card); Skip only for a reminder card still open (status "prompted" in pds.supplement_stack_reminder),
  *     through POST /api/supplements/reminders/respond. Undo deletes that stack's rows for the day.
- *   - Log a product: tap one of the /supplements products (listed without typing, most used first, the order fixed
- *     while the section is mounted, the search box filters them; lib/log-supplement-options.ts), amount + unit,
- *     clock times, day. POST
- *     /api/supplements/log-product, which runs the chat tool's logSupplementIntake (lib/supplement-intake.ts), so
- *     amounts, times, the awake tail and the no-time rule are the same as "log 15 mg of X at 8:30" in chat.
+ *   - Log a product: check one or more of the /supplements products (listed without typing, most used first, the order
+ *     fixed while the section is mounted, the search box filters them; lib/log-supplement-options.ts). Each checked
+ *     product has its own amount and unit; clock times and day are shared. "Log selected (N)" writes the products one
+ *     at a time (lib/log-supplement-batch.ts logEach), each through POST /api/supplements/log-product, which runs the
+ *     chat tool's logSupplementIntake (lib/supplement-intake.ts), so amounts, times, the awake tail and the no-time
+ *     rule are the same as "log 15 mg of X at 8:30" in chat. A logged product is unchecked; a failed one stays checked
+ *     with its error and its own Retry. Filtering never unchecks anything.
  *   - Logged today: single products logged on behavioral today, each with Undo (DELETE /api/supplements/log-intake).
  * Say it drafts (useLogDrafts("supplements")) are listed marked "from what you said" and logged on their own 0.8 s
  * later (autosave; each row then has Undo); a failed one stays listed with Edit and Retry. "Log a product" keeps its
@@ -520,13 +522,18 @@ export default function SupplementsSection() {
   // ---- log a product ----
 
   const [query, setQuery] = useState("");
-  const [picked, setPicked] = useState<Product | null>(null);
-  const [amount, setAmount] = useState("");
-  const [unit, setUnit] = useState("serving");
+  // The checked products, in the order they were checked: each with its own amount and unit ("" = one serving, the
+  // placeholder). `sentTimes` is set on the first send and reused by every retry, so a retry of a dose that did land
+  // before its answer was lost is recognised by the server as already logged (the same time, not a new "now").
+  interface Pick { amount: string; unit: string; sentTimes?: string[] }
+  const [checked, setChecked] = useState<Map<string, Pick>>(() => new Map());
+  const [results, setResults] = useState<Map<string, ItemResult>>(() => new Map());
+  const [saving, setSaving] = useState<Set<string>>(() => new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const batchRef = useRef(false); // a synchronous guard: one batch at a time
   const [times, setTimes] = useState<string[]>([]);
   const [dayChoice, setDayChoice] = useState<string>("today"); // "today" | "yesterday" | YYYY-MM-DD
   const [formFromDraft, setFormFromDraft] = useState(false);
-  const [formBusy, setFormBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<string | null>(null);
   const receiptTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -564,84 +571,57 @@ export default function SupplementsSection() {
   const optionOrder = useMemo(() => keepOrder(ordered, frozenOrder), [ordered, frozenOrder]);
   const matches = useMemo(() => filterOptions(optionOrder, query), [optionOrder, query]);
   const labels = useMemo(() => optionLabels(products ?? []), [products]);
-  const { shown: shownOptions, more: moreOptions } = visibleOptions(matches, showAllOptions, picked?.product_id ?? null);
-  // Roving focus: Tab reaches the chosen option (else the first); the arrow keys move within the group.
-  const focusOption = Math.max(0, shownOptions.findIndex((p) => p.product_id === picked?.product_id));
+  // The checkboxes below are the real controls: Tab moves between them, Space checks one (no roving focus).
+  const { shown: shownOptions, more: moreOptions } = visibleOptions(matches, showAllOptions, null);
   const formDate = dayChoice === "today" ? null : dayChoice === "yesterday" ? (day ? addDays(day, -1) : null) : dayChoice;
 
-  // Bumped by every change to the dose (a pick, an amount, a unit, a time, the day) and, apart, to the search box: a
-  // Log whose answer comes back after Riley moved on to another product never clears what he picked or typed since.
-  const formGen = useRef(0);
-  const filterGen = useRef(0);
-  const touchForm = () => { formGen.current += 1; };
-  const touchFilter = () => { filterGen.current += 1; };
-
-  /** Empty the dose form; `keepFilter`: leave the search box as it is (Riley typed in it while the dose saved). */
-  function resetForm({ keepFilter = false }: { keepFilter?: boolean } = {}) {
-    touchForm();
-    if (!keepFilter) {
-      touchFilter();
-      setQuery("");
-      setFilterOpen(false);
-    }
-    setPicked(null);
-    setAmount("");
-    setUnit("serving");
+  /** Empty the selection and the shared day and times; `keepFilter`: leave the search box as it is. */
+  function clearSelection() {
+    if (batchRef.current) return;
+    setChecked(new Map());
+    setResults(new Map());
+    setQuery("");
+    setFilterOpen(false);
     setTimes([]);
     setDayChoice("today");
     setFormFromDraft(false);
     setFormError(null);
   }
 
-  // After a tap the form below the options is scrolled into view (on a phone a long list can push it off screen).
-  const formRef = useRef<HTMLDivElement | null>(null);
-  const scrollToForm = useRef(false);
-  useEffect(() => {
-    if (!picked || !scrollToForm.current) return;
-    scrollToForm.current = false;
-    formRef.current?.scrollIntoView?.({ block: "nearest" });
-  }, [picked]);
-
-  /** Choosing an option: the product, same as choosing a search result (one serving unless an amount is already in
-   *  that still applies; times and day stay). State only: Log is the write. `tap`: scroll the form into view.
-   *  `base`: the amount and unit to carry over (default: what the form holds now). */
-  function pickProduct(p: Product, tap: boolean, base: { amount: string; unit: string } = { amount, unit }) {
-    const next = unitAfterPick(base.amount, base.unit, p.serving_unit);
-    // A tap on the option already chosen changes nothing (and must not keep a saved dose's form up).
-    if (picked?.product_id !== p.product_id || next.amount !== amount || next.unit !== unit) touchForm();
-    setPicked(p);
-    setAmount(next.amount);
-    setUnit(next.unit);
+  /** Check or uncheck a product (its amount and unit start empty and as one serving). Filtering never does this. */
+  function toggleProduct(p: Product, on: boolean) {
     setFormError(null);
-    if (tap && picked?.product_id !== p.product_id) scrollToForm.current = true;
+    setChecked((m) => {
+      const n = new Map(m);
+      if (on) n.set(p.product_id, { amount: "", unit: "serving" });
+      else n.delete(p.product_id);
+      return n;
+    });
+    if (on) {
+      // A new check starts a fresh attempt: an old "logged" mark for this product goes.
+      setResults((r) => {
+        if (!r.has(p.product_id)) return r;
+        const n = new Map(r);
+        n.delete(p.product_id);
+        return n;
+      });
+    }
   }
 
-  // The amount and unit when the arrow keys started moving through the options: every step is worked out from these,
-  // so passing a product that cannot take the typed unit ("2 scoops" over a capsule product) does not lose it for
-  // the next one that can. Cleared when focus leaves the group or an option is clicked.
-  const keyBase = useRef<{ amount: string; unit: string } | null>(null);
-
-  /** The options are one radio group: the arrow keys (and Home / End) move to and choose another option. */
-  function onOptionsKey(e: KeyboardEvent<HTMLDivElement>) {
-    const n = shownOptions.length;
-    const i = Number((e.target as HTMLElement).dataset?.optionIndex);
-    if (n === 0 || !Number.isInteger(i)) return;
-    const step: Record<string, number> = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
-    const j = e.key in step ? (i + step[e.key] + n) % n : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
-    if (j < 0) return;
-    e.preventDefault();
-    keyBase.current ??= { amount, unit };
-    pickProduct(shownOptions[j], false, keyBase.current);
-    (e.currentTarget.children[j] as HTMLElement | undefined)?.focus();
-  }
-  function onOptionsBlur(e: FocusEvent<HTMLDivElement>) {
-    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) keyBase.current = null;
+  function setPick(id: string, patch: Partial<Pick>) {
+    setChecked((m) => {
+      const cur = m.get(id);
+      if (!cur) return m;
+      const n = new Map(m);
+      n.set(id, { ...cur, ...patch });
+      return n;
+    });
   }
 
-  /** One product write through the chat tool's rules. Returns an error message, or null when saved. */
+  /** One product write through the chat tool's rules. Returns an error message, or null when saved. `quiet`: no receipt. */
   async function logProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
-  }): Promise<string | null> {
+  }, quiet = false): Promise<string | null> {
     if (args.date && day && args.date > day) return "That day has not started yet";
     writeSeq.current += 1;
     try {
@@ -668,10 +648,12 @@ export default function SupplementsSection() {
       }
       const skipped = Array.isArray(r.json.skipped_duplicates) ? r.json.skipped_duplicates.length : 0;
       const when = r.json.intake_date === day ? "" : `, ${dayLabel(String(r.json.intake_date), day)}`;
-      showReceipt(
-        `Saved ${label}${logged.length > 1 ? `, ${logged.length} times` : ""}${when}` +
-          (skipped ? ` (${skipped} already logged)` : ""),
-      );
+      if (!quiet) {
+        showReceipt(
+          `Saved ${label}${logged.length > 1 ? `, ${logged.length} times` : ""}${when}` +
+            (skipped ? ` (${skipped} already logged)` : ""),
+        );
+      }
       return null;
     } catch {
       return "No answer from Onyx";
@@ -680,29 +662,75 @@ export default function SupplementsSection() {
     }
   }
 
-  async function onLogProduct() {
-    if (!picked) return;
-    const amt = amount.trim() === "" ? null : Number(amount);
-    if (amt != null && (!Number.isFinite(amt) || amt <= 0)) {
-      setFormError("Amount must be a positive number");
-      return;
-    }
+  /**
+   * Log the given checked products (the button: all of them; a Retry: one). Each is written on its own through
+   * logProduct, in order, by logEach; a product that logs is unchecked, one that fails stays checked with its error.
+   * A product already logged is never sent again. The shared day and times apply to all; a dose with no time and
+   * today's day gets this moment's time, which then stays with the product for any retry (see Pick.sentTimes).
+   */
+  async function submit(ids: string[]) {
+    if (batchRef.current) return;
+    const todo = ids.filter((id) => checked.has(id) && results.get(id)?.status !== "logged");
+    if (todo.length === 0) return;
     const clean = times.map((t) => t.slice(0, 5));
     if (clean.some((t) => !/^([01]\d|2[0-3]):[0-5]\d$/.test(t))) {
       setFormError("Fill in or remove the empty time");
       return;
     }
-    setFormBusy(true);
+    const items: { key: string; name: string; amount: number | null; unit: string; times: string[] }[] = [];
+    for (const id of todo) {
+      const pk = checked.get(id)!;
+      const p = products?.find((x) => x.product_id === id);
+      const name = p ? productLabel(p) : "Product";
+      const amt = pk.amount.trim() === "" ? null : Number(pk.amount);
+      if (amt != null && (!Number.isFinite(amt) || amt <= 0)) {
+        setFormError(`${name}: amount must be a positive number`);
+        return;
+      }
+      const todayDose = formDate == null || formDate === day;
+      const sent = pk.sentTimes ?? (clean.length ? clean : todayDose ? [nowHHMM()] : []);
+      items.push({ key: id, name, amount: amt, unit: pk.unit, times: sent });
+    }
+
+    batchRef.current = true;
+    setBatchBusy(true);
     setFormError(null);
-    const sent = picked;
-    const gen = formGen.current;
-    const filter = filterGen.current;
-    const err = await logProduct({ product_id: sent.product_id, name: productLabel(sent), amount: amt, unit, times: clean, date: formDate });
-    setFormBusy(false);
-    // Riley picked or typed something else while this was saving: that stays; the receipt / the error names the dose.
-    const untouched = formGen.current === gen;
-    if (err) setFormError(untouched ? err : `${productLabel(sent)} not saved: ${err}`);
-    else if (untouched) resetForm({ keepFilter: filterGen.current !== filter });
+    setSaving(new Set(todo));
+    // Remember the times this attempt sends, so a retry sends the same ones.
+    setChecked((m) => {
+      const n = new Map(m);
+      for (const it of items) {
+        const cur = n.get(it.key);
+        if (cur && !cur.sentTimes) n.set(it.key, { ...cur, sentTimes: it.times });
+      }
+      return n;
+    });
+    try {
+      const done = await logEach(
+        items,
+        (it) => logProduct({ product_id: it.key, name: it.name, amount: it.amount, unit: it.amount == null ? null : it.unit, times: it.times, date: formDate }, true),
+        results,
+        (key, r) => setResults((prev) => new Map(prev).set(key, r)),
+      );
+      const loggedKeys = items.filter((it) => done.get(it.key)?.status === "logged").map((it) => it.key);
+      setChecked((m) => {
+        const n = new Map(m);
+        loggedKeys.forEach((k) => n.delete(k));
+        return n;
+      });
+      setResults((prev) => {
+        const n = new Map(prev);
+        for (const it of items) {
+          const r = done.get(it.key);
+          if (r) n.set(it.key, r);
+        }
+        return n;
+      });
+    } finally {
+      setSaving(new Set());
+      batchRef.current = false;
+      setBatchBusy(false);
+    }
   }
 
   // ---- Say it drafts ----
@@ -741,17 +769,16 @@ export default function SupplementsSection() {
     const match = d.product_id
       ? products?.find((p) => p.product_id === d.product_id) ?? null
       : (() => { const m = searchProducts(products ?? [], d.name); return m.length === 1 ? m[0] : null; })();
-    setPicked(match);
+    // The product is checked with the draft's amount and unit; the day and times are shared, so they take the draft's.
+    if (match) {
+      setChecked((m) => new Map(m).set(match.product_id, { amount: d.amount != null ? String(d.amount) : "", unit: d.amount != null && d.unit ? d.unit : "serving" }));
+      setResults((r) => { const n = new Map(r); n.delete(match.product_id); return n; });
+    }
     setQuery(match ? "" : d.name);
-    setAmount(d.amount != null ? String(d.amount) : "");
-    setUnit(d.amount != null && d.unit ? d.unit : "serving");
     setTimes(d.times);
     setDayChoice(!d.date || d.date === day ? "today" : day && d.date === addDays(day, -1) ? "yesterday" : d.date);
-    touchForm();
-    touchFilter();
     setFormFromDraft(true);
     setFormError(null);
-    scrollToForm.current = true;
     dropSuggestion(s.key);
   }
 
@@ -944,7 +971,7 @@ export default function SupplementsSection() {
               <input
                 type="search"
                 value={query}
-                onChange={(e) => { touchFilter(); setQuery(e.target.value); setFilterOpen(true); setFormError(null); }}
+                onChange={(e) => { setQuery(e.target.value); setFilterOpen(true); setFormError(null); }}
                 placeholder="Filter your supplements"
                 aria-label="Filter your supplements"
                 className={`${input} mb-2 w-full`}
@@ -952,25 +979,23 @@ export default function SupplementsSection() {
             )}
             {matches.length > 0 ? (
               <>
-                <div role="radiogroup" aria-label="Your supplements" className="flex flex-wrap gap-2" onKeyDown={onOptionsKey} onBlur={onOptionsBlur}>
-                  {shownOptions.map((p, i) => {
-                    const on = picked?.product_id === p.product_id;
+                <div role="group" aria-label="Your supplements" className="flex flex-wrap gap-2">
+                  {shownOptions.map((p) => {
+                    const on = checked.has(p.product_id);
                     const label = labels.get(p.product_id) ?? productLabel(p);
+                    const logged = !on && results.get(p.product_id)?.status === "logged";
                     return (
-                      <button
-                        key={p.product_id}
-                        type="button"
-                        role="radio"
-                        aria-checked={on}
-                        tabIndex={i === focusOption ? 0 : -1}
-                        data-option-index={i}
-                        title={label}
-                        onClick={() => { keyBase.current = null; pickProduct(p, true); }}
-                        className={`${pill} ${on ? pillOn : pillOff}`}
-                      >
-                        {on && <Check className="w-4 h-4 shrink-0" aria-hidden />}
+                      <label key={p.product_id} title={label} className={`${pill} ${on ? pillOn : pillOff}`}>
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          disabled={batchBusy}
+                          onChange={(e) => toggleProduct(p, e.target.checked)}
+                          className="h-4 w-4 shrink-0 accent-accent"
+                        />
                         <span className="min-w-0 truncate">{label}</span>
-                      </button>
+                        {logged && <Check className="w-4 h-4 shrink-0 text-up" aria-label="logged" />}
+                      </label>
                     );
                   })}
                 </div>
@@ -1003,27 +1028,57 @@ export default function SupplementsSection() {
         ) : (
           <div className="flex flex-wrap gap-2" aria-hidden>{[0, 1, 2, 3].map((i) => <div key={i} className="skeleton h-11 w-28 rounded-control" />)}</div>
         )}
-        {picked && (
-          <div ref={formRef} className="mt-3 space-y-3">
-            <div className="text-[14px] text-text-primary truncate">{productLabel(picked)}</div>
-            <div className="flex flex-wrap gap-2">
-              <input
-                type="number"
-                inputMode="decimal"
-                min="0"
-                step="any"
-                value={amount}
-                onChange={(e) => { touchForm(); setAmount(e.target.value); }}
-                placeholder="1"
-                aria-label="Amount"
-                className={`${input} w-24`}
-              />
-              <select value={unit} onChange={(e) => { touchForm(); setUnit(e.target.value); }} aria-label="Unit" className={`${input} min-w-0 flex-1 bg-surface-card`}>
-                {unitOptions(picked).map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
-                {!unitOptions(picked).some((u) => u.value === unit) && <option value={unit}>{unit}</option>}
-              </select>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
+        {/* The checked products: each with its own amount and unit; a failed one keeps its error and its own Retry */}
+        {checked.size === 0 ? (
+          <p className="mt-3 text-[13px] text-text-tertiary">Nothing selected</p>
+        ) : (
+          <ul aria-label="Selected supplements" className="mt-3 space-y-3">
+            {[...checked.entries()].map(([id, pk]) => {
+              const p = products?.find((x) => x.product_id === id) ?? null;
+              const label = p ? labels.get(id) ?? productLabel(p) : "Product";
+              const units = unitOptions(p);
+              const r = results.get(id);
+              const isSaving = saving.has(id);
+              return (
+                <li key={id} className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="min-w-0 flex-1 basis-40 truncate text-[14px] text-text-primary" title={label}>{label}</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      min="0"
+                      step="any"
+                      value={pk.amount}
+                      disabled={isSaving || batchBusy}
+                      onChange={(e) => setPick(id, { amount: e.target.value })}
+                      placeholder="1"
+                      aria-label={`Amount of ${label}`}
+                      className={`${input} w-24`}
+                    />
+                    <select
+                      value={pk.unit}
+                      disabled={isSaving || batchBusy}
+                      onChange={(e) => setPick(id, { unit: e.target.value })}
+                      aria-label={`Unit of ${label}`}
+                      className={`${input} min-w-0 flex-1 bg-surface-card`}
+                    >
+                      {units.map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
+                      {!units.some((u) => u.value === pk.unit) && <option value={pk.unit}>{pk.unit}</option>}
+                    </select>
+                    {isSaving && <span role="status" className="text-[12px] text-text-tertiary">Saving…</span>}
+                    {r?.status === "failed" && !isSaving && (
+                      <button type="button" className={btn} disabled={batchBusy} onClick={() => void submit([id])}>Retry</button>
+                    )}
+                  </div>
+                  {r?.status === "failed" && !isSaving && <p role="alert" className="text-[12px] text-down">{r.error}</p>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {checked.size > 0 && (
+            <>
               {times.length === 0 && (
                 <span className="text-[13px] text-text-tertiary">{formDate && formDate !== day ? "No time" : "Now"}</span>
               )}
@@ -1032,30 +1087,50 @@ export default function SupplementsSection() {
                   <input
                     type="time"
                     value={t}
-                    onChange={(e) => { touchForm(); setTimes((l) => l.map((x, j) => (j === i ? e.target.value : x))); }}
+                    onChange={(e) => setTimes((l) => l.map((x, j) => (j === i ? e.target.value : x)))}
                     aria-label={`Time ${i + 1}`}
                     className={`${input} w-32`}
                   />
-                  <button type="button" aria-label={`Remove time ${i + 1}`} className={`${btn} px-2`} onClick={() => { touchForm(); setTimes((l) => l.filter((_, j) => j !== i)); }}>
+                  <button type="button" aria-label={`Remove time ${i + 1}`} className={`${btn} px-2`} onClick={() => setTimes((l) => l.filter((_, j) => j !== i))}>
                     <X className="w-4 h-4" aria-hidden />
                   </button>
                 </span>
               ))}
-              <button type="button" className={`${btn} inline-flex items-center gap-1`} disabled={times.length >= 12} onClick={() => { touchForm(); setTimes((l) => [...l, nowHHMM()]); }}>
+              <button type="button" className={`${btn} inline-flex items-center gap-1`} disabled={times.length >= 12 || batchBusy} onClick={() => setTimes((l) => [...l, nowHHMM()])}>
                 <Plus className="w-4 h-4" aria-hidden />
                 Time
               </button>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <select value={dayChoice} onChange={(e) => { touchForm(); setDayChoice(e.target.value); }} aria-label="Day" className={`${input} bg-surface-card`}>
-                <option value="today">Today</option>
-                <option value="yesterday">Yesterday</option>
-                {dayChoice !== "today" && dayChoice !== "yesterday" && <option value={dayChoice}>{dayLabel(dayChoice, day)}</option>}
-              </select>
-              <LogSaveButton onClick={() => void onLogProduct()} saving={formBusy} label="Log" />
-              <button type="button" className="min-h-11 px-2 text-[13px] text-text-secondary hover:text-text-primary" onClick={() => resetForm()}>Cancel</button>
-            </div>
-          </div>
+            </>
+          )}
+          <select value={dayChoice} disabled={batchBusy} onChange={(e) => setDayChoice(e.target.value)} aria-label="Day" className={`${input} bg-surface-card`}>
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            {dayChoice !== "today" && dayChoice !== "yesterday" && <option value={dayChoice}>{dayLabel(dayChoice, day)}</option>}
+          </select>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button type="button" className={btnAccent} disabled={checked.size === 0 || batchBusy} onClick={() => void submit([...checked.keys()])}>
+            {`Log selected (${checked.size})`}
+          </button>
+          {checked.size > 0 && (
+            <button type="button" className="min-h-11 px-2 text-[13px] text-text-secondary hover:text-text-primary disabled:opacity-50" disabled={batchBusy} onClick={clearSelection}>
+              Clear
+            </button>
+          )}
+        </div>
+        {/* Logged in this visit: unchecked, with a check mark (Undo is on the Logged today list below) */}
+        {[...results.entries()].some(([, r]) => r.status === "logged") && (
+          <ul aria-label="Logged" className="mt-3 space-y-1">
+            {[...results.entries()].filter(([, r]) => r.status === "logged").map(([id]) => {
+              const p = products?.find((x) => x.product_id === id) ?? null;
+              return (
+                <li key={id} className="flex items-center gap-2 text-[13px] text-up">
+                  <Check className="w-4 h-4 shrink-0" aria-hidden />
+                  <span className="min-w-0 truncate">{p ? labels.get(id) ?? productLabel(p) : "Product"}</span>
+                </li>
+              );
+            })}
+          </ul>
         )}
         {formError && <p role="alert" className="mt-2 text-[13px] text-down">{formError}</p>}
         {receipt && <p role="status" className="mt-2 text-[13px] text-up">{receipt}</p>}
