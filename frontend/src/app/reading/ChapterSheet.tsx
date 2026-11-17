@@ -370,7 +370,7 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
               {confirm ? (
                 <div role="group" aria-label="Rebuild chapter" className="space-y-2 rounded-control border border-border-subtle p-3 text-[13px] text-text-primary">
                   <p>
-                    Rebuild chapter {chapter}? {perChapterCents !== null ? <span className="font-mono">About {dollars(perChapterCents)}</span> : "It uses part of this book's spending cap"}. The chapter's ideas and questions are replaced and start again at New; earlier chapter-recall answers for it stop counting.
+                    Rebuild chapter {chapter}? {perChapterCents !== null ? <span className="font-mono">About {dollars(perChapterCents)}</span> : "It uses part of this book's spending cap"}. The chapter&apos;s ideas and questions are replaced and start again at New; earlier chapter-recall answers for it stop counting.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <button
