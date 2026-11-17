@@ -85,6 +85,7 @@ import {
   type VerifyMaterialIdea,
 } from "./reading-bank-prompts";
 import { bankFailure, repairDirtyStates, runGradeJob, SLUG_RE, type BankAnswer } from "./reading-recall-server";
+import { sendFinish, settleFinish } from "./reading-bank-finish";
 import { isMissingSchema } from "./reading-practice";
 import { sha256Hex } from "./reading-recall";
 
@@ -503,9 +504,11 @@ export interface StepOutcome {
   ideasAdded?: number;
   costCents: number;
   /**
-   * The finish was not recorded (pds.reading_bank_finish refused it, not_running / lease_lost, or never answered):
-   * the job is still running until its lease runs out, then claimed again. Reported as a retry with that code, never
-   * as done, and nothing it produced is counted.
+   * The finish was not recorded (pds.reading_bank_finish refused it, not_running / lease_lost, or a fenced readback
+   * shows it did not commit) or could not be confirmed (no answer, and the job's row no longer carries this claim's
+   * job_id, attempts and claim_seq: code finish_unconfirmed): the job is still running until its lease runs out, then
+   * claimed again, or its state is unknown. Reported as a retry with that code, never as done, and nothing it produced
+   * is counted.
    */
   lost?: boolean;
 }
@@ -577,6 +580,20 @@ export class JobRun {
     return r;
   }
 
+  /**
+   * Finish the job (pds.reading_bank_finish) and report what the QUEUE holds, never just what was asked for:
+   * - recorded: reported as the status the database answered, so a retry it stored as failed (the job's third
+   *   attempt) counts as failed in the run's summary, and the heartbeat and the card agree;
+   * - not recorded (the database refused it, not_running / lease_lost, or a fenced readback shows it did not commit):
+   *   `lost`, a retry with that code; the job stays running until its lease runs out and is then claimed again;
+   * - unconfirmed: no answer arrived (a transport error, a database error answer) and the job's row cannot settle it,
+   *   because it no longer carries this claim's job_id, attempts AND claim_seq (claimed again since, or not read), or
+   *   cannot be told from a lease settlement: `lost` with `finish_unconfirmed`. Never counted as recorded, never
+   *   reported as a stored chapter.
+   * A call with no answer is sent once more (when the first did commit, the second answers not_running, as it does
+   * for a job whose lease ran out and was settled meanwhile); the job's own row, matched on the fence, tells those
+   * two apart (settleFinish).
+   */
   async finish(
     outcome: StepOutcome["outcome"],
     code: string | null,
@@ -597,69 +614,20 @@ export class JobRun {
       error_code: outcome === "done" ? null : safe,
       retry_minutes: outcome === "retry" ? retryMinutes(this.job.attempts) : null,
     };
-    type Sent = { answered: boolean; ok: boolean; code: string; status: string | null };
-    const send = async (): Promise<Sent> => {
-      try {
-        const { data, error } = await this.supabase.rpc("reading_bank_finish", { p });
-        if (error) return { answered: false, ok: false, code: errCode(error), status: null };
-        if (plainObject(data) && data.ok === true) return { answered: true, ok: true, code: "", status: typeof data.status === "string" ? data.status : null };
-        return { answered: true, ok: false, code: plainObject(data) && typeof data.code === "string" ? bankCode(data.code) : "other", status: null };
-      } catch {
-        return { answered: false, ok: false, code: "other", status: null };
-      }
-    };
-    let r = await send();
-    if (!r.answered) {
-      // No answer (a transport error): one more try. When the first one did commit, this one answers not_running; so
-      // does a job whose lease ran out and was settled meanwhile, which the job's own row tells apart.
-      const again = await send();
-      if (again.answered && !again.ok && again.code === "not_running") {
-        const status = await this.recordedStatus(outcome);
-        r = status ? { answered: true, ok: true, code: "", status } : again;
-      } else r = again;
+    let answer = await sendFinish(this.supabase, p);
+    const unanswered = answer.kind === "ambiguous";
+    if (unanswered) answer = await sendFinish(this.supabase, p);
+    const settled = await settleFinish(this.supabase, p, answer, unanswered);
+    if (settled.state !== "recorded") {
+      // Not recorded, or not confirmed: the job stays running until its lease runs out (its reservation is then
+      // charged) and is claimed again; a build or highlights batch already stored is then finished from its store
+      // receipt without a model call. Never reported as done.
+      const known = settled.state === "not_recorded" ? settled.code : "finish_unconfirmed";
+      const lostCode = ["lease_lost", "not_running", "schema_missing", "finish_unrecorded", "finish_unconfirmed"].includes(known) ? known : "other";
+      const what = settled.state === "unknown" ? "not confirmed" : "not recorded";
+      return { step: this.job.step, outcome: "retry", code: lostCode, costCents: round2(this.cost), lost: true, note: `${this.job.step} ch ${this.job.chapter} ${what}` };
     }
-    if (!r.ok) {
-      // Not recorded: the job stays running until its lease runs out (its reservation is then charged) and is
-      // claimed again; a build or highlights batch already stored is then finished from its store receipt without a
-      // model call. Never reported as done.
-      const lostCode = r.code === "lease_lost" || r.code === "not_running" || r.code === "schema_missing" ? r.code : "other";
-      return { step: this.job.step, outcome: "retry", code: lostCode, costCents: round2(this.cost), lost: true, note: `${this.job.step} ch ${this.job.chapter} not recorded` };
-    }
-    // pds.reading_bank_finish fails a retry at the job's third attempt: report what the database stored, so the run's
-    // summary counts it as failed (the heartbeat, and the card's failed_24h, agree).
-    const settled = outcome === "retry" && r.status === "failed" ? "failed" : outcome;
-    return { step: this.job.step, outcome: settled, code: safe, costCents: round2(this.cost) };
-  }
-
-  /**
-   * Whether the job's own row shows THIS attempt's finish (the first, unanswered call committed): the status it would
-   * have stored, else null. A done, skipped or failed row can only come from a finish; a retry shows as queued (or
-   * failed at the third attempt), and a lease that ran out is told by its own error code (and a new attempt number once
-   * the job was claimed again), so a settled-by-expiry job is never taken for a recorded one.
-   */
-  private async recordedStatus(outcome: StepOutcome["outcome"]): Promise<string | null> {
-    try {
-      // The fence of this claim: job_id, attempts and claim_seq (claim_seq never resets, so a later claim never matches).
-      const { data, error } = await this.supabase
-        .from("reading_bank_jobs")
-        .select("status,attempts,claim_seq,error_code")
-        .eq("job_id", this.job.job_id)
-        .eq("attempts", this.job.attempts)
-        .eq("claim_seq", this.job.claim_seq)
-        .limit(1);
-      const row = (data as { status?: unknown; attempts?: unknown; claim_seq?: unknown; error_code?: unknown }[] | null)?.[0];
-      if (
-        error ||
-        !row ||
-        Number(row.attempts) !== this.job.attempts ||
-        Number(row.claim_seq) !== this.job.claim_seq ||
-        row.error_code === "lease_expired"
-      ) return null;
-      const status = String(row.status ?? "");
-      return (outcome === "retry" ? status === "queued" || status === "failed" : status === outcome) ? status : null;
-    } catch {
-      return null;
-    }
+    return { step: this.job.step, outcome: settled.outcome, code: safe, costCents: round2(this.cost) };
   }
 
   /** A model call that did not answer, as the job's outcome (spec §7.5). */

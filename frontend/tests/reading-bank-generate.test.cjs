@@ -67,7 +67,10 @@ function makeDb(o = {}) {
     planIncludesNotes: false,
     /** A code pds.reading_bank_finish answers instead of finishing (a lease that was lost meanwhile). */
     refuseFinish: null,
-    /** The next finish commits, but its answer never arrives (a transport error). */
+    /**
+     * The next finish commits, but its answer never arrives (a transport error). A function is called with the job's
+     * row after the commit (what a later writer could do to it before the readback: claim it again, ...).
+     */
     loseFinishAnswer: false,
     /** The next finish never commits: the lease ran out first and the claim settled the job (queued again, lease_expired). */
     expireOnFinish: false,
@@ -181,7 +184,7 @@ function rpcs(db) {
     reading_bank_reserve: ({ p }) => {
       const j = db.jobs.find((x) => x.job_id === p.job_id);
       if (!j || j.status !== "running" || j.lease_until < db.clock) return { ok: false, http: 409, code: "not_running" };
-      if (p.attempts !== j.attempts) return { ok: false, http: 409, code: "lease_lost" };
+      if (p.attempts !== j.attempts || p.claim_seq !== j.claim_seq) return { ok: false, http: 409, code: "lease_lost" };
       const total = Math.round(p.total_cents * 100) / 100;
       if (total <= j.reserved_cents) return { ok: true, reserved_cents: j.reserved_cents };
       const delta = total - j.reserved_cents;
@@ -209,8 +212,12 @@ function rpcs(db) {
         throw Object.assign(new Error("synthetic transport error"), { code: "08006" });
       }
       if (j.status !== "running") return { ok: false, http: 409, code: "not_running" };
-      if (p.attempts !== j.attempts) return { ok: false, http: 409, code: "lease_lost" };
-      const status = p.outcome === "retry" ? (j.attempts >= 3 ? "failed" : "queued") : p.outcome;
+      if (p.attempts !== j.attempts || p.claim_seq !== j.claim_seq) return { ok: false, http: 409, code: "lease_lost" };
+      // Mirrors sql/reading_question_bank.sql reading_bank_finish: a retry with a refusal-to-spend code and no cost is a
+      // deferral (queued again, the try given back); any other retry is queued, or failed at the third attempt.
+      const defer = p.outcome === "retry" && (p.cost_cents ?? 0) === 0 && ["cost_limit", "monthly_cap", "budget", "paused"].includes(p.error_code ?? "");
+      const status = p.outcome === "retry" ? (j.attempts >= 3 && !defer ? "failed" : "queued") : p.outcome;
+      if (defer) j.attempts = Math.max(j.attempts - 1, 0);
       Object.assign(j, {
         status, lease_until: null, reserved_cents: 0, cost_cents: j.cost_cents + (p.cost_cents ?? 0), usage: p.usage ?? j.usage,
         result: p.result ?? j.result, counts: p.counts ?? j.counts, output: p.output ?? j.output, error_code: p.error_code ?? null,
@@ -223,7 +230,9 @@ function rpcs(db) {
         db.chapters.set(j.chapter, c);
       }
       if (db.loseFinishAnswer) {
+        const after = db.loseFinishAnswer;
         db.loseFinishAnswer = false;
+        if (typeof after === "function") after(j);
         throw Object.assign(new Error("synthetic transport error"), { code: "08006" });
       }
       return { ok: true, status };
@@ -960,6 +969,53 @@ test("a finish whose answer never arrived: recorded when it had committed, not r
   assert.match(hb.error_message, /build ch 2 not recorded/);
   assert.match(hb.error_message, /not_running/);
   assert.equal(/ch 2 (ready|thin|anchors_only|no_sources) /.test(hb.error_message), false, "no stored chapter is reported");
+});
+
+test("a finish whose reply was lost is read back on job_id, attempts AND claim_seq: a job claimed again since is unconfirmed, never recorded (RQS2-R1)", async () => {
+  // The first call commits (done) and its reply is lost; before the readback the job's row has moved to a later claim
+  // (claim_seq one higher; a re-queue resets attempts, so the same attempts number under another claim is possible).
+  // The second finish answers not_running, and the row no longer carries this claim's fence: unknown.
+  const db = makeDb({ loseFinishAnswer: (j) => Object.assign(j, { claim_seq: j.claim_seq + 1 }) });
+  seedBuild(db);
+  const env = load(db);
+  await kick(env);
+  const job = db.jobs.find((j) => j.step === "build");
+  assert.equal(job.status, "done", "the first call did commit; the run cannot tell, and does not claim to");
+  const hb = db.sync.at(-1);
+  assert.match(hb.error_message, /build ch 2 not confirmed/);
+  assert.match(hb.error_message, /codes .*finish_unconfirmed/);
+  assert.equal(/ch 2 (ready|thin|anchors_only|no_sources) /.test(hb.error_message), false, "no stored chapter is reported");
+  assert.equal(hb.status, "partial", "an unknown queue state is not a clean run");
+  assert.equal(hb.records_synced, 0);
+});
+
+test("a finish that never reached the server (no answer twice) is read back: still running under the fence is not recorded", async () => {
+  const db = makeDb({ throwOn: "reading_bank_finish" });
+  seedBuild(db);
+  const env = load(db);
+  await kick(env);
+  assert.equal(db.jobs.find((j) => j.step === "build").status, "running", "left for its lease to run out and a later claim");
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_finish").length, 2, "one more try, then the readback");
+  const hb = db.sync.at(-1);
+  assert.match(hb.error_message, /build ch 2 not recorded/);
+  assert.match(hb.error_message, /finish_unrecorded/);
+  assert.equal(/finish_unconfirmed|not confirmed/.test(hb.error_message), false, "the row settled it: not unknown");
+  assert.equal(hb.records_synced, 0);
+});
+
+test("a retry the database fails at the job's third attempt is counted failed even when the reply was lost after the commit", async () => {
+  const db = makeDb({ loseFinishAnswer: true });
+  seedBuilt(db, [2]);
+  addJob(db, { step: "research", chapter: 2, input_hash: B.researchInputHash(P.BANK_PROMPT_VERSION, chHash(db, 2), db.bb.map_urls, 0), priority: 20, attempts: 2, error_code: "server_error" });
+  const env = load(db, fakeModel({ research: () => ({ __throw: { status: 500, message: "Synthetic" } }) }));
+  await kick(env);
+  const job = db.jobs.find((j) => j.step === "research");
+  assert.equal(job.attempts, 3);
+  assert.equal(job.status, "failed", "committed by the first call");
+  const hb = db.sync.at(-1);
+  assert.equal(hb.status, "failed", "read back as the status the database stored, not reported as a retry still to come");
+  assert.match(hb.error_message, /failed 1/);
+  assert.equal(/not confirmed|not recorded/.test(hb.error_message), false);
 });
 
 /* ------------------------------------------------------------------ */

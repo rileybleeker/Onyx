@@ -51,6 +51,7 @@ titles, concept tags, badge labels) is kept out of code. Code comments cite its 
 | `frontend/src/lib/reading-bank-prompts.ts` | The generation prompts (generic, versioned), their JSON schemas and the parsers of what a model answers (S2) |
 | `frontend/src/lib/reading-bank-server.ts` | The generator: planning, the claim / step / finish loop, the kicks the write routes run, the hourly worker, the bank routes' helpers (S2) |
 | `frontend/src/lib/reading-bank-status.ts` | The `/status` "Reading Questions" card's states (pure; S2) |
+| `frontend/src/lib/reading-bank-finish.ts` | The finish of a queue job, shared by the generator and the grade job: the status the database stored, and the readback of the job's row bound to the claim fence when the answer is lost |
 | `frontend/src/app/api/reading/bank/**` | Chapter map and estimate, approval, Build now / Rebuild, chapter sheet, inspection export (S2) |
 | `frontend/scripts/reading-bank-run.cjs`, `.github/workflows/reading-bank.yml` | The hourly worker and its workflow (S2, S2W) |
 | `frontend/src/lib/reading-recall-server.ts`, `frontend/src/app/api/reading/practice/**` | The practice API and grading: round, attempt, a round's attempts, override, flag, checkpoint (S3, S5) |
@@ -267,7 +268,14 @@ highlights step links the new passage again or the idea has other evidence, and 
   (one more with every claim, never reset). Reserve, finish, store and the source-map write
   (`pds.reading_bank_set_map`, which also needs the book's own map job, running) require both, so a worker whose
   lease ran out can never match a later claim, however often the job was re-queued in between. A map made for a
-  table of contents the book no longer has is not written (`toc_changed`; the planner maps the new one). A month's
+  table of contents the book no longer has is not written (`toc_changed`; the planner maps the new one). What a
+  finish came to is what the queue holds, never just what was asked for: `pds.reading_bank_finish` answers the status
+  it stored, so a retry at the third attempt is reported `failed` (generation steps and grade jobs alike). A finish
+  whose answer is lost (a transport error or a database error answer; the reply can be lost after the commit) is
+  read back from the job's row on `job_id`, `attempts` AND `claim_seq` (after a deferral the row carries one attempt
+  fewer): the row shows the finish (recorded, with the status it holds), the job still running or settled for an
+  expired lease under the same fence (not recorded, `finish_unrecorded`), or something else, above all a row that
+  was claimed again since: unknown (`finish_unconfirmed`, a partial heartbeat), never counted as recorded. A month's
   spend is read from each job's
   `charged_at` (set whenever its cost grows), never from the queue's own `finished_at`, so queueing a skipped job
   again cannot hide what it already cost; a job whose attempts span two months counts all its cost in the month of
@@ -383,6 +391,7 @@ applied; nothing is written then.
 | A missing table or function | `failed` with `schema_missing`; the heartbeat names `sql/reading_question_bank.sql` |
 | `pds.reading_bank_schema_ok()` false | No claims; a partial heartbeat `schema_checks` names `sql/reading_question_bank_checks.sql` |
 | A lease that ran out (a crash, a function stopped at its limit) | The reservation is charged, then the job is claimed again; at the third attempt it fails (`lease_expired`) |
+| A finish whose answer never arrived | Read back on job, attempt and claim: recorded, not recorded (`finish_unrecorded`) or unknown (`finish_unconfirmed`, partial heartbeat); never reported as done unless the row shows it |
 | The book's cap or the monthly cap | No claim; the book is paused (`paused_reason budget`); the heartbeat says `budget` or `monthly_cap` |
 | A grade that failed 3 times | The answer stays pending with its `grade_error`; the summary offers "Grade it yourself" |
 

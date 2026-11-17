@@ -1079,7 +1079,7 @@ export const BANK_CODES: ReadonlySet<string> = new Set([
   "schema_missing", "lease_expired", "lease_lost", "not_running", "raced", "thin", "no_sources", "anchors_only", "ready",
   "no_citations", "store_failed", "verify_failed", "no_research", "invalidated", "already_graded", "cost_limit",
   "chapter_changed", "highlight_changed", "job_mismatch", "not_pending", "question_changed", "superseded", "stale_generation",
-  "paused", "toc_changed", "finish_unrecorded", "other",
+  "paused", "toc_changed", "finish_unrecorded", "finish_unconfirmed", "other",
 ]);
 
 /** A safe error / outcome code from BANK_CODES ("other" for anything else), never message text. */

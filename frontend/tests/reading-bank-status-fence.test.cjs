@@ -69,7 +69,7 @@ test("a row from a later claim (same job, higher claim_seq) is not taken as this
   const out = await finishWith(fakeSupabase(row), claimed, "done");
   assert.equal(out.lost, true);
   assert.equal(out.outcome, "retry");
-  assert.equal(out.code, "not_running");
+  assert.equal(out.code, "finish_unconfirmed", "unknown, not a repeat of the refusal: whether the first call committed cannot be told");
 });
 
 test("a row with a different attempts number is not taken as this run's status", async () => {
