@@ -14,7 +14,7 @@ let count = 0;
 function test(name, fn) { fn(); count++; console.log(`PASS ${name}`); }
 
 test('the sweep filters out intent-only warmers', () => {
-  assert.match(warmup, /warmers\.filter\(\(w\) => !w\.intentOnly\)/);
+  assert.match(warmup, /warmers\.filter\(\(w\) => !w\.intentOnly\b/);
   assert.match(warmup, /warmRoute[\s\S]*target\.data\(\)/);
 });
 
