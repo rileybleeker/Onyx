@@ -274,7 +274,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
           clientCache.remove(url); // the server refused it: never show that cached copy again
         }
         setRefreshFailed(true);
-        setError(json.error || `Couldn't load the check-in (${res.status}).`);
+        setError(`Couldn't load the check-in (${res.status}).`);
         return;
       }
       const payload = json as CheckinPayload;
@@ -457,8 +457,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       });
       if (!res.ok) {
         const json = await res.json().catch(() => ({}));
-        if (res.status === 409 && json.stale) throw new StaleDayError(json.error || "A new day started since this page loaded.");
-        const message = json.error || `Save failed (${res.status}). Your answers are still here.`;
+        if (res.status === 409 && json.stale) throw new StaleDayError("A new day started since this page loaded. Reload the page to continue.");
+        const message = `Save failed (${res.status}). Your answers are still here.`;
         // A refusal (bad date, a sleep answer for tonight) is not retried until the next tap; an outage is.
         if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(message);
         throw new Error(message);
@@ -682,7 +682,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json || typeof json !== "object" || !("url" in json)) {
-        setJournal((cur) => cur && { ...cur, status: "draft", error: json?.error || `Couldn't save the journal entry (${res.status}). It is still here.` });
+        setJournal((cur) => cur && { ...cur, status: "draft", error: `Couldn't save the journal entry (${res.status}). It is still here.` });
         return;
       }
       setJournal((cur) => cur && { ...cur, status: "saved", url: typeof json.url === "string" ? json.url : null, existing: !!json.existing });
