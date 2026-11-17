@@ -1858,11 +1858,13 @@ export interface AddHighlightInput {
 
 /** addHighlight with insert_only met a highlight that has this passage and is not this call's own: nothing changed. */
 export const HIGHLIGHT_EXISTS = "a highlight with this passage already exists, so nothing was changed";
+/** addHighlight's database failures: the browser gets this copy; the raw database text goes to the server log only. */
+const HIGHLIGHT_SAVE_FAILED = "Couldn't save the highlight. Try again.";
 
 export async function addHighlight(
   supabase: Supa,
   input: AddHighlightInput,
-): Promise<{ ok: true; book: Book; highlight: Highlight; created: boolean; readBack?: true } | { ok: false; error: string }> {
+): Promise<{ ok: true; book: Book; highlight: Highlight; created: boolean; readBack?: true } | { ok: false; error: string; kind?: "server" }> {
   const book = input.book_id
     ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
@@ -1898,9 +1900,15 @@ export async function addHighlight(
     if (!key) return { ok: false, error: "client_key must be a UUID" };
     const { data, error } = await supabase.from("book_highlights").insert({ ...row, client_key: key }).select(HIGHLIGHT_COLS).single();
     if (!error) return { ok: true, book, highlight: data as Highlight, created: true };
-    if (error.code !== "23505") return { ok: false, error: error.message };
+    if (error.code !== "23505") {
+      console.error("reading/highlights addHighlight", error.message);
+      return { ok: false, error: HIGHLIGHT_SAVE_FAILED, kind: "server" };
+    }
     const { data: own, error: ownError } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("client_key", key).maybeSingle();
-    if (ownError) return { ok: false, error: ownError.message };
+    if (ownError) {
+      console.error("reading/highlights addHighlight", ownError.message);
+      return { ok: false, error: HIGHLIGHT_SAVE_FAILED, kind: "server" };
+    }
     // This call's own key: a copy of this same call wrote it (created by this operation, not by this insert).
     if (own) return { ok: true, book, highlight: own as Highlight, created: true, readBack: true };
     return { ok: false, error: HIGHLIGHT_EXISTS };
@@ -1926,14 +1934,20 @@ export async function addHighlight(
     }
     if (Object.keys(patch).length) {
       const { data, error } = await supabase.from("book_highlights").update(patch).eq("highlight_id", existing.highlight_id).select(HIGHLIGHT_COLS).single();
-      if (error) return { ok: false, error: error.message };
+      if (error) {
+        console.error("reading/highlights addHighlight", error.message);
+        return { ok: false, error: HIGHLIGHT_SAVE_FAILED, kind: "server" };
+      }
       return { ok: true, book, highlight: data as Highlight, created: false };
     }
     return { ok: true, book, highlight: existing as Highlight, created: false };
   }
 
   const { data, error } = await supabase.from("book_highlights").insert(key ? { ...row, client_key: key } : row).select(HIGHLIGHT_COLS).single();
-  if (error) return { ok: false, error: error.message };
+  if (error) {
+    console.error("reading/highlights addHighlight", error.message);
+    return { ok: false, error: HIGHLIGHT_SAVE_FAILED, kind: "server" };
+  }
   return { ok: true, book, highlight: data as Highlight, created: true };
 }
 
