@@ -19,6 +19,8 @@ import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
 import ReviewCard from "./ReviewCard";
+import PacingCard from "./PacingCard";
+import { useLearningPrefs } from "@/lib/use-learning-prefs";
 import PracticePart from "./PracticePart";
 import RetrievalSession from "./RetrievalSession";
 import ChapterMap from "./ChapterMap";
@@ -77,6 +79,9 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
   const [loading, setLoading] = useState(!seed);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
+  // Voluntary pacing (PROD-T06): XP, streak, level, badges and deadline furniture show until Riley turns them off.
+  const learning = useLearningPrefs();
+  const incentives = learning.prefs.showIncentives;
   // The checkpoint quiz open on screen (READ-QUIZ-01 S5), and the checkpoints whose answers were stored without Done
   // (keyed by book and checkpoint, so another book's "ch12" is not this one's).
   const [quiz, setQuiz] = useState<Checkpoint | null>(null);
@@ -247,7 +252,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
           chapter={quiz.chapter}
           onRecorded={(r) => {
             markUnrecorded(o.book.slug, quiz.key, false);
-            showToast({ text: `Checkpoint ${r.score}/${r.total}${r.xp ? ` · +${r.xp} XP` : ""}`, kind: r.passed ? "xp" : "ok" });
+            showToast({ text: `Checkpoint ${r.score}/${r.total}${r.xp && incentives ? ` · +${r.xp} XP` : ""}`, kind: r.passed && incentives ? "xp" : "ok" });
             void load(slug, true);
           }}
           onClose={(r) => {
@@ -264,12 +269,16 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       {/* Personalize: every card, checkpoint tile and list is its own part; sections have no extra heading on screen. */}
       <PartGrid page="/reading" title="Reading" gap={16}>
       <PartGroup id="section-quest" title="Quest & pace">
-        <Part id="quest" title="Quest (progress, level, streak)">
-          <QuestCard o={o} />
+        <Part id="pacing" title="Your pace">
+          <PacingCard o={o} prefsState={learning} accept={learning.accept} />
         </Part>
 
-        {/* Burn-up */}
-        <Part id="burnup" title="Chapters vs pace">
+        <Part id="quest" title="Quest (progress, level, streak)">
+          <QuestCard o={o} incentives={incentives} />
+        </Part>
+
+        {/* Burn-up (deadline furniture: hidden with the other incentives; nothing is deleted) */}
+        {incentives && <Part id="burnup" title="Chapters vs pace">
           <section className="bg-surface-card border border-border-subtle rounded-card shadow-card px-4 pt-3 pb-1">
             <div className="flex items-baseline justify-between mb-1">
               <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
@@ -279,7 +288,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             </div>
             <BurnupChart data={o.burnup} today={o.today} total={o.totalChapters} />
           </section>
-        </Part>
+        </Part>}
       </PartGroup>
 
       {/* Checkpoints: one tile each (ids by position, so a layout carries over to the next book), three across like before. */}
@@ -291,7 +300,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       >
         {o.checkpoints.map((c, i) => (
           <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
-            <CheckpointTile c={c} offer={quiz === null && checkpointOffer(o, c) && offerOff[`${o.book.slug}:${c.key}`] !== true} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
+            <CheckpointTile c={c} incentives={incentives} offer={quiz === null && checkpointOffer(o, c) && offerOff[`${o.book.slug}:${c.key}`] !== true} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
           </Part>
         ))}
       </PartGroup>
@@ -313,7 +322,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             key={o.book.slug}
             o={o}
             onChanged={() => load(slug, true)}
-            review={<ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
+            review={<ReviewCard o={o} onGraded={(xp) => { if (xp && incentives) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
           />
         </Part>
 
@@ -329,7 +338,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         </Part>
 
         <Part id="add-highlight" title="Highlight + comment">
-          <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+          <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? (incentives ? "+5 XP · highlight" : "Highlight saved") : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
         </Part>
       </PartGroup>
 
@@ -340,9 +349,9 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       </PartGroup>
 
       <PartGroup id="section-history" title="Badges & history">
-        <Part id="badges" title="Badges">
+        {incentives && <Part id="badges" title="Badges">
           <Badges o={o} />
-        </Part>
+        </Part>}
 
         <Part id="highlights" title="Highlights by concept">
           <HighlightsList o={o} onChanged={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
@@ -372,7 +381,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
 
 /* ------------------------------------------------------------------ */
 
-function QuestCard({ o }: { o: ReadingOverview }) {
+function QuestCard({ o, incentives }: { o: ReadingOverview; incentives: boolean }) {
   const pace = o.pace;
   const paceText =
     o.book.status === "finished"
@@ -383,6 +392,37 @@ function QuestCard({ o }: { o: ReadingOverview }) {
           ? `${pace.aheadBy} chapter${pace.aheadBy === 1 ? "" : "s"} ahead`
           : `${-pace.aheadBy} chapter${pace.aheadBy === -1 ? "" : "s"} behind`;
   const paceColor = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-[var(--color-down)]";
+
+  if (!incentives) {
+    // Quiet view: progress and what was read, no XP, level, streak, pace or target date. History is untouched.
+    return (
+      <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
+        <div className="flex gap-4 items-center">
+          <MetricRing
+            value={o.chaptersDone}
+            max={Math.max(1, o.totalChapters)}
+            size={96}
+            thickness={8}
+            color="var(--color-accent)"
+            centerValue={<span className="text-[22px]">{o.chaptersDone}</span>}
+            centerUnit={`/ ${o.totalChapters || "?"}`}
+            sublabel="chapters"
+          />
+          <div className="flex-1 min-w-0 flex flex-wrap gap-x-4 gap-y-1 text-[12px] font-mono text-text-tertiary">
+            <span>{o.sessions.length} sessions</span>
+            <span>{o.minutesTotal} min</span>
+            <span>{o.highlights.length} highlights</span>
+            {o.position?.chapter != null && (
+              <span className="text-amber-300/80" title="Kindle reading position (Whispersync), as of the last harvest">
+                Kindle: ch {o.position.chapter}
+                {o.position.page != null ? ` · p. ${o.position.page}` : ""}
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
@@ -464,25 +504,27 @@ function CheckpointsHeader() {
     <div className="mb-2">
       <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Checkpoints</h3>
       <p className="mt-0.5 text-[11px] text-text-tertiary">
-        Quiz in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
+        Quiz in <Link href="/chat" className="underline underline-offset-2">Onyx Chat</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
       </p>
     </div>
   );
 }
 
-function CheckpointTile({ c, offer, pendingRecord, onStart }: { c: ReadingOverview["checkpoints"][number]; offer: boolean; pendingRecord: boolean; onStart: () => void }) {
-  const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
+function CheckpointTile({ c, incentives, offer, pendingRecord, onStart }: { c: ReadingOverview["checkpoints"][number]; incentives: boolean; offer: boolean; pendingRecord: boolean; onStart: () => void }) {
+  // Without the incentives there is no due date or on-time / late / missed: a checkpoint is reached or not yet.
+  const state = !incentives ? (c.reached ? "reached" : "upcoming") : c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
   const border =
     state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
   return (
     <div className={`bg-surface-card border ${border} rounded-control px-3 py-2.5`}>
       <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
-      <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
+      {incentives && <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>}
       <div className="mt-1.5 text-[11px] font-mono">
         {state === "done" && <span className="text-up">✓ on time</span>}
         {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
         {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
-        {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
+        {state === "reached" && <span className="text-up">✓ reached</span>}
+        {state === "upcoming" && <span className="text-text-tertiary">{incentives ? "upcoming" : "not yet"}</span>}
       </div>
       <div className="mt-1 text-[11px] font-mono text-text-tertiary">
         {c.quiz ? (
