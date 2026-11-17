@@ -627,7 +627,8 @@ test("settings card: leaving the card (unmount, a route change) sends a waiting 
 test("settings card: settings that could not load show the error and offer nothing to send", async (t) => {
   const h = await mountCard(t, { config: response({ error: "Synthetic load failure" }, 500) });
   assert.match(h.text(), /Couldn.t load the Focus settings\./);
-  assert.match(h.text(), /Synthetic load failure/);
+  assert.match(h.text(), /Couldn.t load your focus unlock settings\. Try again\./);
+  assert.doesNotMatch(h.text(), /Synthetic load failure/, "the raw server error is never shown (#714)");
   assert.equal(h.find((n) => n.type === "input" && n.props.type === "checkbox").length, 0);
   await h.tick(60_000);
   assert.equal(h.net.writes().length, 0);
