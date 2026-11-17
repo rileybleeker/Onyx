@@ -121,7 +121,7 @@ test("a send that leaves /log in flight is recorded at dispatch and survives the
   const changed = { amount: 9, unit: "g", times: ["20:00"], date: null };
   const again = M.attemptFor(shown[0], changed, () => { throw new Error("a replay must not mint a key"); });
   assert.equal(again.eventKey, KEY);
-  assert.deepEqual({ amount: again.amount, times: again.times, date: again.date }, payload);
+  assert.deepEqual({ amount: again.amount, unit: again.unit, times: again.times, date: again.date }, payload);
   assert.equal(again.lost, true, "a replay refused later stays unconfirmed, as any replay");
 
   // 5. A late answer after the unmount settles the retained record only: saved -> removed; unconfirmed -> kept.
@@ -162,7 +162,7 @@ test("source: the section replays a lost attempt from its stored values and gate
   assert.match(src, /times: a\.times, date: a\.date, event_key: a\.eventKey/, "the POST carries the attempt's own times, day and key");
   assert.match(src, /disabled=\{saving \|\| busy\[k\] \|\| o\?\.kind === "unconfirmed"\}/, "a lost item cannot be removed from the selection");
   assert.match(src, /disabled=\{batchBusy \|\| anyLost\}/, "Clear waits until no lost attempt is pending");
-  assert.match(src, /useState<Selection>\(\(\) => unconfirmedItems\)/, "an unconfirmed save survives a remount of the section");
+  assert.match(src, /let retainedSends: Selection = \[\];/, "the retained sends live in a module-level store, so a remount seeds from it");
   assert.match(src, /disabled=\{batchBusy \|\| anyLost\} onChange=\{\(e\) => setDayChoice/, "the Day control is locked while a save is unconfirmed");
   assert.match(src, /disabled=\{batchBusy \|\| anyLost \|\| times\.length >= 12\}/, "adding a time is locked while a save is unconfirmed");
   const lib = fs.readFileSync(path.join(__dirname, "..", "src", "lib", "log-supplement-multi.ts"), "utf8");
