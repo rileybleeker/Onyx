@@ -1,11 +1,12 @@
 // Run: node --test tests/log-supplement-options.test.cjs
 // /log Supplements, "Log a product" (2026-11-16, Riley: "I should be able to click the existing options, instead of
-// having to search"): every /supplements product is a tappable option without typing, most used first (single
-// doses in the last 30 days, then the most recent, then the name); the search box filters the same options; tapping
-// one fills the form like choosing a search result did and writes nothing (Log stays the write); the options never
-// wait for a network read of the history, and their order is fixed on first display while the section is mounted;
-// a Log answering late never clears a newer pick; Say it suggestions moved in with Edit keep their amount, unit and
-// times.
+// having to search"; PR 527: several at once): every /supplements product is a checkbox option without typing, most
+// used first (single doses in the last 30 days, then the most recent, then the name); checking one writes nothing and
+// gives it its own amount and unit (one serving at first); "Log selected (N)" writes the checked products one at a
+// time (a logged one is unchecked, a failed one stays checked with its error and its own Retry, a logged product is
+// never sent again); the search box filters the same options and never unchecks; the options never wait for a network
+// read of the history, and their order is fixed on first display while the section is mounted; Say it suggestions
+// moved in with Edit keep their amount, unit and times.
 // SYNTHETIC DATA ONLY: invented product names, ids and dates; no network, no database.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -91,7 +92,9 @@ test("labels: the name; the brand only when two products share the name", () => 
   assert.equal(labels.get("4"), "Synthetic Solo");
 });
 
-test("unit after a tap: one serving on a fresh form; an amount stays only with a unit that applies to the new product", () => {
+// unitAfterPick is exported but the picker no longer calls it (PR 527 gives each checked product its own amount and
+// unit); this pins the pure rule only. See the PR body.
+test("unitAfterPick (exported, not called by the picker): one serving on a fresh form; an amount stays only with a unit that applies to the new product", () => {
   assert.deepEqual(O.unitAfterPick("", "mg", "capsule"), { amount: "", unit: "serving" });
   assert.deepEqual(O.unitAfterPick("  ", "Scoop", "capsule"), { amount: "  ", unit: "serving" });
   assert.deepEqual(O.unitAfterPick("15", "mg", "capsule"), { amount: "15", unit: "mg" }, "15 mg never becomes 15 servings");
@@ -202,15 +205,24 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
       "@/lib/log-drafts": { useLogDrafts: () => drafts.current },
     },
   });
-  const options = () => h.find((n) => n.type === "button" && n.props.role === "radio");
+  // An option is its <label> (the title is the product's label); its checkbox is the <input> inside it.
+  const options = () => h.find((n) => n.type === "label" && typeof n.props.title === "string");
   const optionNames = () => options().map((n) => h.text(n));
   const option = (name) => {
     const found = options().find((n) => h.text(n) === name);
     assert.ok(found, `option exists: ${name}`);
     return found;
   };
+  const box = (name) => {
+    const input = option(name).props.children.find((c) => c && c.type === "input" && c.props.type === "checkbox");
+    assert.ok(input, `checkbox exists: ${name}`);
+    return input;
+  };
+  const isOn = (name) => box(name).props.checked === true;
+  const tick = (name, on = true) => box(name).props.onChange({ target: { checked: on } });
   const field = (label) => h.find((n) => (n.type === "input" || n.type === "select") && n.props["aria-label"] === label)[0];
-  return { ...h, calls, options, optionNames, option, field };
+  const selectedText = () => h.text(h.find((n) => n.props?.["aria-label"] === "Selected supplements")[0]);
+  return { ...h, calls, options, optionNames, option, box, isOn, tick, field, selectedText };
 }
 
 test("section: the options show from this device's cache before any read answers, most used first, and nothing is written", async (t) => {
@@ -226,41 +238,59 @@ test("section: the options show from this device's cache before any read answers
   await h.flush();
   // Beta 3 single doses, Epsilon 1 + today's 1, Gamma 1; Delta's doses all came from a stack (= never), Alpha never.
   assert.deepEqual(h.optionNames(), ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"]);
-  assert.ok(h.options().every((n) => n.props["aria-checked"] === false), "nothing selected yet");
+  assert.ok(h.optionNames().every((name) => h.isOn(name) === false), "nothing checked yet");
+  assert.match(h.text(), /Nothing selected/, "the selected list says so");
   assert.equal(h.field("Filter your supplements"), undefined, "a short list needs no search box");
   assert.equal(h.calls.writes.length, 0, "opening the section writes nothing");
 });
 
-test("section: tapping an option fills the form like a search result and writes nothing; Log is the write", async (t) => {
+test("section: checking a product writes nothing and gives it its own amount and unit; Log selected is the write", async (t) => {
   const h = mountSection(t, {
-    post: () => response({ ok: true, product: "Synthetic Gamma", logged: [{ intake_id: 99, time: null }], doses_each: 1, intake_date: TODAY }),
+    post: () => response({ ok: true, product: "Synthetic Beta", logged: [{ intake_id: 99, time: null }], doses_each: 1, intake_date: TODAY }),
   });
   await h.flush();
   assert.deepEqual(h.optionNames(), ["Synthetic Beta", "Synthetic Epsilon", "Synthetic Gamma", "Synthetic Alpha", "Synthetic Delta"], "ordered from the server's answers");
-  assert.equal(h.field("Amount"), undefined, "no form before a pick");
+  assert.equal(h.field("Amount of Synthetic Gamma"), undefined, "no amount field before a check");
+  assert.equal(h.buttons("Log selected (0)").length, 1, "the count starts at zero");
+  assert.equal(h.buttons("Log selected (0)")[0].props.disabled, true, "nothing to log yet");
 
-  h.option("Synthetic Gamma").props.onClick();
+  h.tick("Synthetic Gamma");
   await h.flush();
-  assert.equal(h.option("Synthetic Gamma").props["aria-checked"], true, "the tapped option is marked");
-  assert.equal(h.options().filter((n) => n.props["aria-checked"]).length, 1);
-  assert.equal(h.field("Amount").props.value, "", "amount = one serving (the label's)");
-  assert.equal(h.field("Unit").props.value, "serving");
+  assert.equal(h.isOn("Synthetic Gamma"), true, "the checked option is marked");
+  assert.equal(h.field("Amount of Synthetic Gamma").props.value, "", "amount starts empty = one serving (the label's)");
+  assert.equal(h.field("Unit of Synthetic Gamma").props.value, "serving");
   assert.equal(h.field("Day").props.value, "today", "behavioral today");
   assert.match(h.text(), /Now/, "time = now");
-  assert.equal(h.calls.writes.length, 0, "a tap writes nothing");
+  assert.equal(h.calls.writes.length, 0, "a check writes nothing");
 
-  h.option("Synthetic Beta").props.onClick();
+  h.tick("Synthetic Beta");
   await h.flush();
-  assert.equal(h.option("Synthetic Beta").props["aria-checked"], true, "another tap switches the product");
-  assert.equal(h.option("Synthetic Gamma").props["aria-checked"], false);
+  assert.equal(h.isOn("Synthetic Beta"), true, "a second check adds a product");
+  assert.equal(h.isOn("Synthetic Gamma"), true, "and the first stays checked");
+  assert.match(h.selectedText(), /Synthetic Gamma[\s\S]*Synthetic Beta/, "the selected list keeps the order of the checks");
+  assert.equal(h.buttons("Log selected (2)").length, 1, "the count shows both");
   assert.equal(h.calls.writes.length, 0);
 
-  await h.click("Log");
+  h.tick("Synthetic Gamma", false);
+  await h.flush();
+  assert.equal(h.isOn("Synthetic Gamma"), false, "unchecking removes it");
+  assert.equal(h.field("Amount of Synthetic Gamma"), undefined);
+  assert.equal(h.buttons("Log selected (1)").length, 1);
+  assert.equal(h.calls.writes.length, 0);
+
+  await h.click("Log selected (1)");
   await h.flush();
   assert.equal(h.calls.writes.length, 1);
   assert.equal(h.calls.writes[0].url, "/api/supplements/log-product");
-  assert.deepEqual(h.calls.writes[0].body, { product_id: "p-beta", product: "Synthetic Beta", amount: null, unit: null, times: [], date: null });
-  assert.equal(h.field("Amount"), undefined, "the form resets after the log");
+  assert.equal(h.calls.writes[0].body.product_id, "p-beta");
+  assert.equal(h.calls.writes[0].body.product, "Synthetic Beta");
+  assert.equal(h.calls.writes[0].body.amount, null, "no amount typed: the product's one serving");
+  assert.equal(h.calls.writes[0].body.unit, null);
+  assert.equal(h.calls.writes[0].body.date, null, "today: no date sent");
+  assert.equal(h.calls.writes[0].body.times.length, 1, "one time: now, as the label says");
+  assert.match(h.calls.writes[0].body.times[0], /^\d{2}:\d{2}$/);
+  assert.equal(h.isOn("Synthetic Beta"), false, "a logged product is unchecked");
+  assert.equal(h.field("Amount of Synthetic Beta"), undefined, "its form row goes with the check");
 });
 
 test("section: a long list is capped with Show all, and the search box filters the same options", async (t) => {
@@ -275,16 +305,23 @@ test("section: a long list is capped with Show all, and the search box filters t
   assert.equal(h.options().length, 14);
   assert.ok(h.buttons("Show fewer").length === 1);
 
+  // A checked product is kept while the filter hides it: filtering never unchecks.
+  h.tick("Synthetic Cedar");
+  await h.flush();
   h.field("Filter your supplements").props.onChange({ target: { value: "cedar" } });
   await h.flush();
   assert.deepEqual(h.optionNames(), ["Synthetic Cedar"], "the filter narrows the options");
+  assert.equal(h.isOn("Synthetic Cedar"), true);
   h.field("Filter your supplements").props.onChange({ target: { value: "quartz" } });
   await h.flush();
   assert.equal(h.options().length, 0);
   assert.match(h.text(), /No match in your supplements/);
+  assert.match(h.selectedText(), /Synthetic Cedar/, "the checked product stays in the selected list while filtered out");
+  assert.equal(h.buttons("Log selected (1)").length, 1, "and still counts");
   h.field("Filter your supplements").props.onChange({ target: { value: "" } });
   await h.flush();
   assert.equal(h.options().length, 14, "clearing the filter brings every option back");
+  assert.equal(h.isOn("Synthetic Cedar"), true, "still checked after the filter cleared");
   assert.equal(h.calls.writes.length, 0);
 });
 
@@ -311,18 +348,18 @@ test("section: cached products show on the first flush while the history read is
   await h.flush();
   assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "a later history answer never moves an option under the finger");
 
-  h.option("Synthetic Alpha").props.onClick();
+  h.tick("Synthetic Alpha");
   await h.flush();
-  await h.click("Log");
+  await h.click("Log selected (1)");
   await h.flush();
   assert.equal(h.calls.writes.length, 1);
   assert.ok(todayReads >= 2, "today was read again after the Log");
   assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "a dose just logged does not move the options");
-  h.option("Synthetic Gamma").props.onClick();
+  h.tick("Synthetic Gamma");
   await h.flush();
-  await h.click("Cancel");
+  await h.click("Clear");
   await h.flush();
-  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "nor does Cancel: the order is fixed while the section is mounted");
+  assert.deepEqual(h.optionNames(), WITHOUT_HISTORY, "nor does Clear: the order is fixed while the section is mounted");
 });
 
 test("section: a history copy on this device (the persisted cache) orders the options before they show", async (t) => {
@@ -373,31 +410,42 @@ test("section: the history read is registered, so a supplement write's cache inv
   assert.equal(h.calls.writes.length, 0);
 });
 
-test("section: the options are one radio group; the arrow keys move to and choose the next option, Tab reaches the chosen one", async (t) => {
+test("section: several products can be checked; each keeps its own amount and unit, and Log selected counts and sends each one", async (t) => {
   const h = mountSection(t);
   await h.flush();
-  const group = h.find((n) => n.props?.role === "radiogroup")[0];
-  assert.equal(group.props["aria-label"], "Your supplements");
-  assert.deepEqual(h.options().map((n) => n.props.tabIndex), [0, -1, -1, -1, -1], "nothing chosen: Tab reaches the first");
-  const focused = [];
-  const key = (k, i) => group.props.onKeyDown({
-    key: k,
-    target: { dataset: { optionIndex: String(i) } },
-    currentTarget: { children: Array.from({ length: 5 }, (_, j) => ({ focus: () => focused.push(j) })) },
-    preventDefault() {},
-  });
-  key("ArrowRight", 0);
+  const group = h.find((n) => n.props?.role === "group" && n.props["aria-label"] === "Your supplements")[0];
+  assert.ok(group, "the options are one group named for the supplements");
+  h.tick("Synthetic Beta");
+  h.tick("Synthetic Delta");
   await h.flush();
-  assert.equal(h.option("Synthetic Epsilon").props["aria-checked"], true);
-  assert.deepEqual(h.options().map((n) => n.props.tabIndex), [-1, 0, -1, -1, -1]);
-  key("ArrowLeft", 0);
+  assert.equal(h.isOn("Synthetic Beta"), true);
+  assert.equal(h.isOn("Synthetic Delta"), true, "a check does not uncheck the others");
+  assert.equal(h.buttons("Log selected (2)").length, 1);
+
+  h.field("Amount of Synthetic Beta").props.onChange({ target: { value: "3" } });
+  h.field("Unit of Synthetic Beta").props.onChange({ target: { value: "mg" } });
   await h.flush();
-  assert.equal(h.option("Synthetic Delta").props["aria-checked"], true, "wraps to the last");
-  assert.deepEqual(focused, [1, 4]);
-  assert.equal(h.calls.writes.length, 0, "choosing with the keyboard writes nothing");
+  assert.equal(h.field("Amount of Synthetic Beta").props.value, "3");
+  assert.equal(h.field("Unit of Synthetic Beta").props.value, "mg");
+  assert.equal(h.field("Amount of Synthetic Delta").props.value, "", "Delta's amount is its own: still one serving");
+  assert.equal(h.field("Unit of Synthetic Delta").props.value, "serving");
+  assert.equal(h.calls.writes.length, 0, "typing writes nothing");
+
+  await h.click("Log selected (2)");
+  await h.flush();
+  assert.equal(h.calls.writes.length, 2, "one write per checked product");
+  assert.equal(h.calls.writes[0].body.product_id, "p-beta");
+  assert.equal(h.calls.writes[0].body.amount, 3);
+  assert.equal(h.calls.writes[0].body.unit, "mg");
+  assert.equal(h.calls.writes[1].body.product_id, "p-delta");
+  assert.equal(h.calls.writes[1].body.amount, null, "Delta: no amount typed, so one serving");
+  assert.equal(h.calls.writes[1].body.unit, null);
+  assert.equal(h.buttons("Log selected (0)")[0].props.disabled, true, "both logged: nothing left checked");
+  assert.equal(h.isOn("Synthetic Beta"), false);
+  assert.equal(h.isOn("Synthetic Delta"), false);
 });
 
-test("section: arrowing past a product that cannot take the typed unit does not lose the amount for the next one that can", async (t) => {
+test("section: each product's unit list is its own: a scoop product offers its count unit, a capsule product does not", async (t) => {
   const scoop = (id, name) => ({ ...prod(id, name), serving_unit: "Scoop" });
   const three = [scoop("p-aa", "Synthetic Aa"), prod("p-bb", "Synthetic Bb"), scoop("p-cc", "Synthetic Cc")];
   const h = mountSection(t, {
@@ -409,62 +457,67 @@ test("section: arrowing past a product that cannot take the typed unit does not 
   });
   await h.flush();
   assert.deepEqual(h.optionNames(), ["Synthetic Aa", "Synthetic Bb", "Synthetic Cc"]);
-  h.option("Synthetic Aa").props.onClick();
+  h.tick("Synthetic Aa");
+  h.tick("Synthetic Bb");
   await h.flush();
-  h.field("Amount").props.onChange({ target: { value: "2" } });
-  h.field("Unit").props.onChange({ target: { value: "Scoop" } });
+  h.field("Amount of Synthetic Aa").props.onChange({ target: { value: "2" } });
+  h.field("Unit of Synthetic Aa").props.onChange({ target: { value: "Scoop" } });
   await h.flush();
-  // The group as last rendered (its handler sees that render's state), like a real key press.
-  const key = (k, i) => h.find((n) => n.props?.role === "radiogroup")[0].props.onKeyDown({
-    key: k,
-    target: { dataset: { optionIndex: String(i) } },
-    currentTarget: { children: Array.from({ length: 3 }, () => ({ focus() {} })) },
-    preventDefault() {},
-  });
-  key("ArrowRight", 0);
+  const unitsOf = (label) => h.find((n) => n.type === "select" && n.props["aria-label"] === label)[0].props.children
+    .flatMap((c) => (Array.isArray(c) ? c : [c])).filter((o) => o && o.type === "option").map((o) => o.props.value);
+  assert.ok(unitsOf("Unit of Synthetic Aa").includes("Scoop"), "a scoop product offers scoops");
+  assert.ok(!unitsOf("Unit of Synthetic Bb").includes("Scoop"), "a capsule product does not");
+  assert.equal(h.field("Amount of Synthetic Bb").props.value, "", "Bb's amount is not Aa's");
+  assert.equal(h.field("Unit of Synthetic Bb").props.value, "serving");
+  h.tick("Synthetic Cc");
   await h.flush();
-  assert.equal(h.option("Synthetic Bb").props["aria-checked"], true);
-  assert.equal(h.field("Amount").props.value, "", "a capsule product cannot take 2 scoops: one serving");
-  key("ArrowRight", 1);
-  await h.flush();
-  assert.equal(h.option("Synthetic Cc").props["aria-checked"], true);
-  assert.equal(h.field("Amount").props.value, "2", "the typed amount comes back for a product that takes scoops");
-  assert.equal(h.field("Unit").props.value, "Scoop");
+  assert.equal(h.field("Amount of Synthetic Cc").props.value, "", "a product checked later starts at one serving");
+  assert.equal(h.field("Amount of Synthetic Aa").props.value, "2", "the earlier one keeps its amount");
+  assert.equal(h.field("Unit of Synthetic Aa").props.value, "Scoop");
   assert.equal(h.calls.writes.length, 0);
 });
 
-test("section: a Log answering after Riley picked another product keeps the new pick and what he typed; only the first dose is sent", async (t) => {
+test("section: Log selected sends each checked product in turn; a refused one stays checked with its error and its own Retry, and Retry sends only that one", async (t) => {
+  // Write 1 (Alpha) is held; the checks are locked while the batch runs. Write 2 (Beta) is refused; write 3 (Gamma) saves.
   const first = deferred();
-  const second = deferred();
-  const h = mountSection(t, { post: (url, n) => (n === 1 ? first.promise : second.promise) });
+  const h = mountSection(t, {
+    post: (url, n) => {
+      if (n === 1) return first.promise;
+      if (n === 2) return response({ ok: false, error: "Synthetic refusal" }, 422);
+      return response({ ok: true, product: "Synthetic", logged: [{ intake_id: 60 + n, time: null }], doses_each: 1, intake_date: TODAY });
+    },
+  });
   await h.flush();
-  h.option("Synthetic Alpha").props.onClick();
+  h.tick("Synthetic Alpha");
+  h.tick("Synthetic Beta");
+  h.tick("Synthetic Gamma");
   await h.flush();
-  await h.click("Log");
+  await h.click("Log selected (3)");
   await h.flush();
-  h.option("Synthetic Beta").props.onClick();
-  await h.flush();
-  h.field("Amount").props.onChange({ target: { value: "3" } });
-  await h.flush();
+  assert.equal(h.calls.writes.length, 1, "the first one is in flight; the next waits for it");
+  assert.equal(h.box("Synthetic Gamma").props.disabled, true, "the checks are locked while the batch runs");
+
   first.resolve(response({ ok: true, product: "Synthetic Alpha", logged: [{ intake_id: 50, time: null }], doses_each: 1, intake_date: TODAY }));
   await h.flush();
-  assert.equal(h.calls.writes.length, 1);
-  assert.equal(h.calls.writes[0].body.product_id, "p-alpha", "the dose sent is the one picked when Log was tapped");
-  assert.equal(h.option("Synthetic Beta").props["aria-checked"], true, "the new pick survives the first answer");
-  assert.equal(h.field("Amount").props.value, "3", "and so does what was typed");
-  assert.match(h.text(), /Saved Synthetic Alpha/);
+  assert.deepEqual(h.calls.writes.map((w) => w.body.product_id), ["p-alpha", "p-beta", "p-gamma"], "each in turn, one refusal does not stop the next");
+  assert.equal(h.isOn("Synthetic Alpha"), false, "a saved one is unchecked");
+  assert.equal(h.isOn("Synthetic Gamma"), false, "and so is the one after the refusal");
+  assert.equal(h.isOn("Synthetic Beta"), true, "the refused one stays checked");
+  assert.match(h.text(), /Synthetic refusal/, "with its error");
+  const beta = h.calls.writes[1].body;
+  assert.equal(h.field("Amount of Synthetic Beta").props.value, "", "its amount is what was typed (none)");
+  assert.equal(h.box("Synthetic Beta").props.disabled, false, "unlocked again after the batch");
 
-  // The same when the earlier Log is refused: the error names that dose, the new pick stays.
-  await h.click("Log");
+  // Retry: only Beta is sent again, at the times its first attempt used; Alpha and Gamma are not sent again.
+  await h.click("Retry");
   await h.flush();
-  h.option("Synthetic Gamma").props.onClick();
-  await h.flush();
-  second.resolve(response({ ok: false, error: "Synthetic refusal" }, 422));
-  await h.flush();
-  assert.equal(h.calls.writes.length, 2);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
-  assert.equal(h.option("Synthetic Gamma").props["aria-checked"], true);
-  assert.match(h.text(), /Synthetic Beta not saved: Synthetic refusal/);
+  assert.equal(h.calls.writes.length, 4);
+  assert.equal(h.calls.writes[3].body.product_id, "p-beta");
+  assert.deepEqual(h.calls.writes[3].body.times, beta.times, "the retry sends the same time as the first attempt");
+  assert.equal(h.isOn("Synthetic Beta"), false, "saved on retry: unchecked");
+  assert.equal(h.buttons("Retry").length, 0);
+  assert.equal(h.calls.writes.filter((w) => w.body.product_id === "p-alpha").length, 1, "Alpha was never sent twice");
+  assert.equal(h.calls.writes.filter((w) => w.body.product_id === "p-gamma").length, 1, "Gamma was never sent twice");
 });
 
 test("section: a Say it product moved into the form with Edit keeps its amount, unit and time when another option is tapped", async (t) => {
@@ -483,30 +536,37 @@ test("section: a Say it product moved into the form with Edit keeps its amount, 
   assert.match(h.text(), /Synthetic refusal/);
   await h.click("Edit");
   await h.flush();
-  assert.equal(h.option("Synthetic Beta").props["aria-checked"], true, "Edit selects the suggested product");
-  assert.equal(h.field("Amount").props.value, "15");
-  assert.equal(h.field("Unit").props.value, "mg");
+  assert.equal(h.isOn("Synthetic Beta"), true, "Edit checks the suggested product");
+  assert.equal(h.field("Amount of Synthetic Beta").props.value, "15");
+  assert.equal(h.field("Unit of Synthetic Beta").props.value, "mg");
   assert.equal(h.field("Time 1").props.value, "08:30");
 
-  h.option("Synthetic Gamma").props.onClick();
+  // Another check keeps the suggestion's own amount and unit; the new product has its own (one serving).
+  h.tick("Synthetic Gamma");
   await h.flush();
-  assert.equal(h.field("Unit").props.value, "mg", "15 mg stays 15 mg");
-  assert.equal(h.calls.writes.length, 1, "the tap writes nothing");
-  await h.click("Log");
+  assert.equal(h.isOn("Synthetic Beta"), true);
+  assert.equal(h.field("Unit of Synthetic Beta").props.value, "mg", "15 mg stays 15 mg");
+  assert.equal(h.field("Amount of Synthetic Gamma").props.value, "", "Gamma starts at one serving");
+  assert.equal(h.calls.writes.length, 1, "the check writes nothing");
+  await h.click("Log selected (2)");
   await h.flush();
-  assert.equal(h.calls.writes.length, 2);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-gamma", product: "Synthetic Gamma", amount: 15, unit: "mg", times: ["08:30"], date: null });
+  assert.equal(h.calls.writes.length, 3);
+  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 15, unit: "mg", times: ["08:30"], date: null });
+  assert.deepEqual(h.calls.writes[2].body, { product_id: "p-gamma", product: "Synthetic Gamma", amount: null, unit: null, times: ["08:30"], date: null });
 });
 
-test("source: the options are radio buttons with 44 px targets, accent when selected, visible focus; a tap only sets state", () => {
+test("source: the options are checkboxes in one group, 44 px targets, accent when checked, visible focus; a check only sets state, Log selected is the write", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "src", "app/log/sections/Supplements.tsx"), "utf8");
   assert.match(src, /const pill =\s*"[^"]*min-h-11[^"]*max-w-full|const pill =\s*"[^"]*max-w-full[^"]*min-h-11/);
   assert.match(src, /const pill =\s*"[^"]*focus-visible:outline-accent/);
   assert.match(src, /const pillOn = "border-accent bg-accent\/15/);
-  assert.match(src, /role="radiogroup" aria-label="Your supplements" className="flex flex-wrap gap-2"/);
-  assert.match(src, /role="radio"\s+aria-checked=\{on\}/);
-  const pick = src.slice(src.indexOf("function pickProduct("), src.indexOf("/** One product write"));
-  assert.ok(pick.length > 0 && !/fetch\(|postJson|logProduct\(/.test(pick), "pickProduct writes nothing");
+  assert.match(src, /role="group" aria-label="Your supplements" className="flex flex-wrap gap-2"/);
+  assert.match(src, /type="checkbox"\s+checked=\{on\}/);
+  assert.match(src, /onChange=\{\(e\) => toggleProduct\(p, e\.target\.checked\)\}/);
+  assert.match(src, /onClick=\{\(\) => void submit\(\[\.\.\.checked\.keys\(\)\]\)\}/, "Log selected sends every checked product");
+  assert.match(src, /`Log selected \(\$\{checked\.size\}\)`/);
+  const pick = src.slice(src.indexOf("function toggleProduct("), src.indexOf("/** One product write"));
+  assert.ok(pick.length > 0 && !/fetch\(|postJson|logProduct\(/.test(pick), "toggleProduct writes nothing");
   // The history is one of the HTML's early reads (the options never wait for it, it only orders them).
   assert.match(src, /const HISTORY_URL = LOG_SUPPLEMENTS_HISTORY_URL;/);
   const early = loadTs("lib/log-early.ts");
