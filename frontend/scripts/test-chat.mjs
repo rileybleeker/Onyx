@@ -768,12 +768,12 @@ test("stack and reading writes get the operation id as their own key; a reading 
   const readingBody = { request_id: "33333333-3333-4333-8333-333333333333", messages: [user("I read chapters 1 and 2 on paper")] };
   // The first try stops before the ledger records the session (its record update fails).
   db.setFailure(({ table, op, payload }) => (table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null));
-  await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
+  await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
   db.setFailure(null);
   const readingOp = db.rows("chat_operations").find((r) => r.tool === "log_reading_session");
   assert.equal(readingOp.status, "pending");
   assert.equal(mirrors, 1, "the first try mirrored the session once");
-  await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
+  await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingNotion }).post(readingBody);
   assert.deepEqual(keys, [readingOp.op_id, readingOp.op_id], "the library client_key is the operation id on both tries");
   assert.equal(mirrors, 1, "the replayed session already had its Notion entry: no second one");
 });
@@ -879,7 +879,7 @@ test("the chat page sends a request id and reuses it only for the same text at t
 test("sends whose answer never arrived are remembered by hash + id only, never expire, and are cleared once answered", async () => {
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   // Stored before the request goes out, reused for the same conversation, settled on an answer or a 409.
-  assert.match(page, /if \(conv\) rememberSend\(\{ conv, id: requestId, at: Date\.now\(\) \}\)/);
+  assert.match(page, /const stored = conv \? rememberSend\(\{ conv, id: requestId, at: Date\.now\(\) \}\) : false/);
   assert.match(page, /unresolvedPendingSend\(readPendingSends\(\), conv\)/);
   assert.equal((page.match(/settlePendingSend\(requestId\)/g) ?? []).length, 3);
   // Each send has its own key: the page never reads a shared list, changes it and writes it back (SEC04-R11).
@@ -1364,10 +1364,10 @@ test("an intake or reading session written by a lost try and removed since is ne
   };
   const readingNotion = { mirrorSession: async () => "b", mirrorProgress: async () => {} };
   const readingBody = { request_id: "33333333-3333-4333-8333-333333333333", messages: [user("I read chapters 1 and 2")] };
-  await route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody);
+  await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody);
   rstate.failFinish = false;
   rdb.seed("chat_operation_tombstones", [{ op_id: rdb.rows("chat_operations")[0].op_id, target: "reading_sessions" }]);
-  const readingRetry = await (await route(afterTool("log_reading_session", { chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody)).json();
+  const readingRetry = await (await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody)).json();
   assert.equal(sessions, 1, "the session was not written again");
   assert.equal(readingRetry.receipts[0].status, "not_saved");
 
