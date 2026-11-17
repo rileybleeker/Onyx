@@ -184,6 +184,9 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
   const [journal, setJournal] = useState<JournalEntry[]>(() => clientCache.peek<JournalEntry[]>(CACHE_KEYS.habitsJournal) ?? []);
   const [history, setHistory] = useState<HabitMetadataInterval[]>(() => clientCache.peek<HabitMetadataInterval[]>(CACHE_KEYS.habitsHistory) ?? []);
   const [loading, setLoading] = useState(() => !(clientCache.peek(LIST_URL) && clientCache.peek(CACHE_KEYS.habitsJournal) && clientCache.peek(CACHE_KEYS.habitsHistory)));
+  // True when the initial read failed. Shown instead of the "No active habits" copy so a network or API
+  // error is not mistaken for an empty list.
+  const [loadError, setLoadError] = useState(false);
   const shownRef = useRef(!loading);
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
@@ -209,8 +212,10 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
       setJournal(keep(journalData ?? []));
       setHistory(keep(historyData ?? []));
       shownRef.current = true;
+      setLoadError(false);
     } catch (e) {
       console.error(e);
+      setLoadError(true);
     } finally {
       setLoading(false);
     }
@@ -944,7 +949,19 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
       })()}
 
 
-      {habits.length === 0 && (
+      {habits.length === 0 && loadError && (
+        <div className="text-center py-20">
+          <p className="text-text-secondary text-sm mb-3">Could not load habits.</p>
+          <button
+            onClick={() => { void load(); }}
+            className="text-accent text-sm hover:underline"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {habits.length === 0 && !loadError && (
         <div className="text-center py-20">
           <p className="text-text-secondary text-sm mb-3">No active habits found.</p>
           <a
