@@ -459,32 +459,108 @@ def predict_tomorrow(model_bundle: dict, artifact_sha256: str | None = None) -> 
     }
 
 
-def backfill_actuals() -> int:
-    """Fill actual_hrv and residual for past predictions where actual is NULL.
+# Stored actuals are checked against the matrix again for this many days (audit PIPE-09): a
+# corrected or rescored WHOOP recovery then updates actual_hrv and residual of every forecast for
+# that night. 35 days covers the 30-day live metric window plus the days its eval_date can lag.
+# Older rows are left as they are (bounded work per hourly run).
+RESCORE_WINDOW_DAYS = 35
+# The matrix holds HRV to 4 decimals; a difference below this is the same value.
+ACTUAL_TOLERANCE = 1e-3
+_PRED_KEY = ("prediction_date", "model", "horizon_days", "model_version")
 
-    Only predictions whose prediction_date is strictly before today are eligible:
-    today's WHOOP cycle is still in progress or unscored, so the actual is not
-    yet observable.
+
+def _num(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def plan_actual_updates(preds: pd.DataFrame, matrix_hrv: dict, today: str,
+                        rescore_from: str) -> tuple[list[dict], dict]:
+    """The actual_hrv / residual writes that bring stored forecasts in line with the matrix.
+
+    preds: forecast rows (prediction_date, model, horizon_days, model_version, predicted_hrv,
+    actual_hrv, residual). matrix_hrv: {calendar_date: HRV or None} for every matrix row read; a
+    date missing from it is not judged. Only dates before `today` are eligible.
+      * actual missing, matrix has it                -> fill  (any date, as before)
+      * actual stored, matrix differs (rescored)     -> rescore (date >= rescore_from)
+      * actual stored, matrix row has no HRV now     -> clear (date >= rescore_from)
+      * actual unchanged but residual inconsistent   -> rescore the residual only
+    Each write carries exactly the key + actual_hrv + residual: the issued forecast (predicted value,
+    interval, created_at, model version, artifact) is never sent, so it never changes. Running it
+    twice writes nothing the second time. Returns (updates, counts)."""
+    counts = {"filled": 0, "rescored": 0, "cleared": 0}
+    updates: list[dict] = []
+    if preds is None or preds.empty:
+        return updates, counts
+    seen: set = set()
+    for _, row in preds.iterrows():
+        d = str(row["prediction_date"])
+        key = (d, str(row["model"]), int(row["horizon_days"]), row.get("model_version"))
+        if d >= today or key in seen or d not in matrix_hrv:
+            continue
+        seen.add(key)
+        stored = _num(row.get("actual_hrv"))
+        current = _num(matrix_hrv[d])
+        pred = _num(row.get("predicted_hrv"))
+        if stored is None:
+            if current is None:
+                continue
+            kind, actual = "filled", current
+        elif d < rescore_from:
+            continue
+        elif current is None:
+            kind, actual = "cleared", None
+        elif abs(current - stored) > ACTUAL_TOLERANCE:
+            kind, actual = "rescored", current
+        else:
+            want = None if pred is None else stored - pred
+            have = _num(row.get("residual"))
+            same = (want is None and have is None) or (
+                want is not None and have is not None and abs(want - have) <= ACTUAL_TOLERANCE)
+            if same:
+                continue
+            kind, actual = "rescored", stored
+        counts[kind] += 1
+        updates.append({
+            "prediction_date": d,
+            "model": key[1],
+            "horizon_days": key[2],
+            "model_version": key[3],
+            "actual_hrv": actual,
+            "residual": None if (actual is None or pred is None) else actual - pred,
+        })
+    return updates, counts
+
+
+def backfill_actuals() -> int:
+    """Fill, and keep correct, actual_hrv and residual of past forecasts.
+
+    Fills every forecast whose actual is NULL (as before) and, for the last RESCORE_WINDOW_DAYS,
+    rescores forecasts whose stored actual no longer matches the matrix (a corrected source: WHOOP
+    rescored the recovery, or the cycle was removed). Only forecasts dated strictly before today are
+    eligible: today's WHOOP cycle is still in progress or unscored. See plan_actual_updates.
     """
     log.info("Backfilling actuals…")
+    today = str(et_today())
+    rescore_from = (et_today() - timedelta(days=RESCORE_WINDOW_DAYS)).isoformat()
+    cols = "prediction_date,model,horizon_days,model_version,predicted_hrv,actual_hrv,residual"
 
-    past_preds = fetch_all(
-        "hrv_predictions",
-        select="prediction_date,model,horizon_days,model_version,predicted_hrv",
-        filters=[("actual_hrv", "is_", "null")],
-    )
-    if past_preds.empty:
+    missing = fetch_all("hrv_predictions", select=cols, filters=[("actual_hrv", "is_", "null")])
+    recent = fetch_all("hrv_predictions", select=cols, filters=[("prediction_date", "gte", rescore_from)])
+    frames = [f for f in (missing, recent) if not f.empty]
+    if not frames:
         log.info("  No predictions to backfill.")
         return 0
-
-    today = str(et_today())
-    past_preds = past_preds[past_preds["prediction_date"] < today]
-
-    if past_preds.empty:
+    preds = pd.concat(frames, ignore_index=True)
+    preds = preds[preds["prediction_date"].astype(str) < today]
+    if preds.empty:
         log.info("  No observable predictions to backfill.")
         return 0
 
-    min_date = past_preds["prediction_date"].min()
+    min_date = str(preds["prediction_date"].astype(str).min())
     actuals_raw = fetch_all(
         "daily_health_matrix_behavioral",
         select="calendar_date,whoop_hrv_rmssd",
@@ -492,37 +568,19 @@ def backfill_actuals() -> int:
     )
     if actuals_raw.empty:
         return 0
+    matrix_hrv = dict(zip(actuals_raw["calendar_date"].astype(str), actuals_raw["whoop_hrv_rmssd"]))
 
-    actuals_map = dict(zip(actuals_raw["calendar_date"], actuals_raw["whoop_hrv_rmssd"]))
-
-    updates = []
-    for _, row in past_preds.iterrows():
-        actual = actuals_map.get(row["prediction_date"])
-        if actual is None or pd.isna(actual):
-            continue
-        actual_f = float(actual)
-        if actual_f != actual_f:  # NaN survivors
-            continue
-        pred_f = float(row["predicted_hrv"])
-        updates.append({
-            "prediction_date": str(row["prediction_date"]),
-            "model": str(row["model"]),
-            "horizon_days": int(row["horizon_days"]),
-            "model_version": row.get("model_version"),
-            "actual_hrv": actual_f,
-            "residual": actual_f - pred_f,
-        })
-
+    updates, counts = plan_actual_updates(preds, matrix_hrv, today, rescore_from)
     if updates:
-        # Audit P1 (G1): on_conflict now targets the (date,model,horizon,version)
-        # unique index so each retrain run preserves history. NULL versions are
-        # handled via NULLS NOT DISTINCT on the underlying index.
+        # Audit P1 (G1): on_conflict targets the (date,model,horizon,version) unique index so each
+        # retrain run preserves history. NULL versions are handled via NULLS NOT DISTINCT on the
+        # underlying index. Every row carries the same keys (one key set per bulk upsert).
         supa.schema("pds").from_("hrv_predictions").upsert(
             _clean_for_json(updates),
-            on_conflict="prediction_date,model,horizon_days,model_version"
+            on_conflict=",".join(_PRED_KEY),
         ).execute()
-        log.info(f"  Backfilled actuals for {len(updates)} predictions.")
-
+        log.info(f"  Actuals: {counts['filled']} filled, {counts['rescored']} rescored after a source "
+                 f"correction, {counts['cleared']} cleared (source no longer has that night).")
     return len(updates)
 
 

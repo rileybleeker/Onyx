@@ -708,12 +708,17 @@ export async function GET() {
         const lastSync = (hrvRetrainEntry?.sync_start as string)
           ?? hrvRetrainComputedAt;
         const heartbeatStatus = hrvRetrainEntry?.status as string | undefined;
+        // The hourly backfill check (hrv_backfill_check.py, audit PIPE-09) writes a partial
+        // "GUARD hrv_backfill_detection:" row while it cannot check an input, and one success row
+        // once it can again; until then corrected history may not reach the retrain.
+        const detectEntry = latestBySrcType["hrv_analysis|backfill_check"] ?? null;
+        const detectProblem = detectEntry && detectEntry.status !== "success" ? detectEntry : null;
         const ageHours = hoursSince(lastSync);
         let status: SourceStatus["status"];
         if (heartbeatStatus === "failed") status = "failed";
         else if (!lastSync) status = "unknown";
         else if (ageHours > 30) status = "failed";        // missed daily safety net
-        else if (ageHours > 26 || heartbeatStatus === "partial") status = "partial";
+        else if (ageHours > 26 || heartbeatStatus === "partial" || detectProblem) status = "partial";
         else status = "success";
         return {
           label: "HRV Retrain",
@@ -724,6 +729,7 @@ export async function GET() {
           recordsSynced: (hrvRetrainEntry?.records_synced as number) ?? 0,
           durationSeconds: (hrvRetrainEntry?.duration_seconds as number) ?? null,
           errorMessage: (hrvRetrainEntry?.error_message as string)
+            ?? (detectProblem?.error_message as string | undefined)
             ?? (ageHours > 30 ? `Last successful retrain ${ageHours}h ago (daily safety-net runs at 12:00 UTC).` : null),
           cadence: CADENCE.hrv_retrain,
           integrationMethod: METHOD.hrv_retrain.method,

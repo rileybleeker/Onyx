@@ -103,6 +103,7 @@ except ImportError:
 import hashlib
 
 import hrv_alignment as al
+import hrv_feature_sources as feature_sources
 import hrv_model_artifact as model_artifact
 
 warnings.filterwarnings("ignore")
@@ -6285,6 +6286,23 @@ def check_alignment(data: dict, df: pd.DataFrame) -> str | None:
     return None
 
 
+def capture_source_lineage() -> dict | None:
+    """Fingerprints of the HRV inputs' history (hrv_feature_sources.capture). Fail-open: a problem
+    here never stops the retrain; the backfill check then sees no fresh baseline and says so."""
+    try:
+        snapshot = feature_sources.capture(supa, et_today())
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Source fingerprints not captured ({feature_sources.error_code(e)})")
+        return None
+    if snapshot is None:
+        log.info("  Source fingerprints skipped: pds.hrv_source_fingerprint is not installed")
+        return None
+    failed = sorted(n for n, v in snapshot["sources"].items() if v.get("error"))
+    log.info(f"  Source fingerprints captured for {len(snapshot['sources']) - len(failed)} source(s)"
+             + (f"; failed: {', '.join(failed)}" if failed else ""))
+    return snapshot
+
+
 def main() -> str | None:
     """Returns a warning for a PARTIAL heartbeat, or None for success."""
     global INPUT_DATA_HASH
@@ -6298,6 +6316,10 @@ def main() -> str | None:
 
     # ---------- Phase 1: Data Pipeline ----------
     log.info("=== PHASE 1: DATA PIPELINE ===")
+    # Fingerprints of every input's history, taken BEFORE the data is read (audit PIPE-09,
+    # hrv_feature_sources.py). Stored after the results below; the hourly backfill check compares
+    # against them, so an edit or deletion after this point triggers the next retrain.
+    source_lineage = capture_source_lineage()
     data = load_all_data()
     df = build_feature_matrix(data)
     print_completeness(df)
@@ -6455,6 +6477,11 @@ def main() -> str | None:
         },
         dose_response=dose_response,
     )
+    # Last, so it exists only when this run's results were stored (hrv_feature_sources.py).
+    if feature_sources.store_baseline(supa, source_lineage):
+        log.info(f"    Upserted: {feature_sources.LINEAGE_RESULT_TYPE}/{feature_sources.LINEAGE_RESULT_KEY}")
+    elif source_lineage:
+        log.warning("    Source fingerprints not stored; the next backfill check treats the baseline as stale")
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------
     # Dump the full feature list + top-20 SHAP / permutation / controllable lists
