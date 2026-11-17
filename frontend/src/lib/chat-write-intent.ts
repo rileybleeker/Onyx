@@ -298,7 +298,7 @@ const significant = (s: string) => tokens(s).filter((w) => !STOP.has(w) && !GENE
 /** A light stem: "meditated", "meditating", "meditation" and "meditate" share a prefix. */
 function stem(w: string): string {
   const base = w.replace(/'s$/, "");
-  for (const suffix of ["ation", "ing", "ed", "es", "s", "e"]) {
+  for (const suffix of ["ation", "ating", "ated", "ates", "ate", "ing", "ed", "es", "s", "e"]) {
     if (base.length - suffix.length >= 4 && base.endsWith(suffix)) return base.slice(0, -suffix.length);
   }
   return base;
