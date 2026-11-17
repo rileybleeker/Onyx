@@ -164,7 +164,7 @@ test("model is given the general scope plus the unchanged health conventions and
   assert.match(request.system,/Garmin watch, WHOOP band, and Eight Sleep mattress/);
   assert.match(request.system,/never add supplements on top of those totals/);
   const names=request.tools.map(t=>t.name);
-  for (const name of ["query_sleep","query_hrv","query_nutrition","query_journal_entries","get_reading_status","log_supplement_intake","create_spotify_playlist"]) assert.ok(names.includes(name),name);
+  for (const name of ["query_sleep","query_hrv","query_nutrition","query_meals_log","query_photo_meals","query_journal_entries","get_reading_status","log_supplement_intake","create_spotify_playlist"]) assert.ok(names.includes(name),name);
   assert.deepEqual(request.messages,[user("Help me write a thank-you note")]);
 });
 test("WHOOP cycle rows reach the model with the day their step count belongs to (synthetic rows)",async()=>{
@@ -200,6 +200,43 @@ test("a health data question still runs its tool and returns the result to the m
   assert.equal(followUp.content[0].type,"tool_result");
   assert.equal(followUp.content[0].tool_use_id,"t1");
   assert.deepEqual(JSON.parse(followUp.content[0].content),rows);
+});
+test("query_photo_meals returns per-meal rows with items and daily totals, and fails open while not set up (synthetic rows)",async()=>{
+  const meals=[{meal_id:1,eaten_date:"2026-11-10",eaten_time:"19:30:00",time_source:"photo",items:[{name:"Synthetic rice bowl",portion:"1 bowl",kcal:500,protein_g:30,carbs_g:60,fat_g:12}],kcal:500,protein_g:30,carbs_g:60,fat_g:12,confidence:"medium"}];
+  const daily=[{behavioral_date:"2026-11-10",meal_count:1,est_kcal:500,est_protein_g:30,est_carbs_g:60,est_fat_g:12}];
+  const r=route([
+    {stop_reason:"tool_use",content:[{type:"tool_use",id:"t1",name:"query_photo_meals",input:{days:3}}]},
+    {stop_reason:"end_turn",content:[{type:"text",text:"Synthetic summary"}]},
+  ],{supabase:fakeSupabase({photo_meals:meals,photo_meal_daily:daily})});
+  const response=await r.post({messages:[user("What did I log by photo?")]});
+  assert.equal(response.status,200);
+  const result=JSON.parse(r.requests()[1].messages.at(-1).content[0].content);
+  assert.deepEqual(result.meals,meals);
+  assert.deepEqual(result.daily_totals,daily);
+  assert.equal("receipts" in (await response.json()),false,"a read-only tool never produces a receipt");
+
+  // sql/photo_meals.sql not applied yet (missing table/view): an empty answer with a note, never an error.
+  const missing=()=>({select:()=>o,gte:()=>o,eq:()=>o,is:()=>o,order:()=>o,limit:()=>o,then:(resolve)=>resolve({data:null,error:{code:"PGRST205",message:"synthetic detail"}})});
+  const o=missing();
+  const r2=route([
+    {stop_reason:"tool_use",content:[{type:"tool_use",id:"t1",name:"query_photo_meals",input:{}}]},
+    {stop_reason:"end_turn",content:[{type:"text",text:"Synthetic summary"}]},
+  ],{supabase:{from:()=>o}});
+  const response2=await r2.post({messages:[user("What did I log by photo?")]});
+  assert.equal(response2.status,200);
+  const result2=JSON.parse(r2.requests()[1].messages.at(-1).content[0].content);
+  assert.deepEqual(result2.meals,[]);
+  assert.deepEqual(result2.daily_totals,[]);
+  assert.match(result2.note,/not set up yet/);
+  assert.doesNotMatch(JSON.stringify(result2),/synthetic detail/);
+
+  // The description carries the counting rule so the model never double-counts.
+  const r3=route();
+  await r3.post({messages:[user("Hello")]});
+  const tool=r3.requests()[0].tools.find(t=>t.name==="query_photo_meals");
+  assert.match(tool.description,/only counts toward a day's nutrition when that day has NO Cronometer\/MyFitnessPal log/);
+  assert.match(tool.description,/never double-counts an Uber Eats order/);
+  assert.doesNotMatch(tool.description,/WRITE TOOL:/,"read-only: never a write tool");
 });
 test("unexpected failures return a generic error without leaking details",async()=>{
   class Boom { messages = { create: async () => { throw new Error("secret upstream detail"); } }; }

@@ -45,7 +45,7 @@ For a single item — any supplement OR medication on their /supplements product
 
 The user also keeps a free-form *personal* journal in Notion (prose entries about life, mood, relationships, training, mental health). Use query_journal_entries when they ask about what they wrote, how they were feeling, or to find context behind biometric trends — combine it with biometric tools to answer questions like "what was my HRV on days I logged a 'low' mood?". When a question is thematic rather than date-specific, set semantic_query to do similarity search.
 
-You also have the user's nutrition data. FOOD comes from Cronometer (cutover 2026-05-31; MyFitnessPal for older history). Use query_nutrition for daily macros and query_meals_log for the per-meal food log. For vitamins/minerals use query_vitamins — it already COMBINES dietary intake (food, from Cronometer) with supplemental intake (pills, from Onyx's /supplements tracker) and returns the dietary, supplement, and total amounts per nutrient, so never add supplements on top of those totals. The rule is: Cronometer = food, Onyx /supplements = pills. Use query_micronutrient_trend for single-nutrient trends.
+You also have the user's nutrition data. FOOD comes from Cronometer (cutover 2026-05-31; MyFitnessPal for older history). Use query_nutrition for daily macros and query_meals_log for the per-meal food log. For vitamins/minerals use query_vitamins — it already COMBINES dietary intake (food, from Cronometer) with supplemental intake (pills, from Onyx's /supplements tracker) and returns the dietary, supplement, and total amounts per nutrient, so never add supplements on top of those totals. The rule is: Cronometer = food, Onyx /supplements = pills. Use query_micronutrient_trend for single-nutrient trends. A meal can also be logged from a plate photo (query_photo_meals): a photo meal counts toward a day's totals only when that day has no Cronometer log, and it never double-counts an Uber Eats order — do not add photo meals on top of a logged diary day.
 
 You can also create Spotify playlists, but only when the user explicitly asks you to create, make or save one. A request for suggestions, ideas or recommendations (e.g. "suggest music for a focused afternoon") is NOT a request to create a playlist: answer with the suggested tracks in your reply and offer to turn them into a playlist, but do not call create_spotify_playlist. The user has private-playlist write access enabled. When explicitly asked to make a playlist:
 - Use query_spotify_tracks_by_features to pick tracks from their listening history (filter by audio-feature ranges like valence, energy, tempo).
@@ -371,7 +371,7 @@ const tools: Anthropic.Tool[] = [
   {
     name: "query_nutrition",
     description:
-      "Daily nutrition macros (calories, protein, carbs, fat, fiber, sugar, sodium, water) plus caffeine per behavioral day. caffeine_total_mg (diet + supplement) is the canonical total caffeine — nutrition_caffeine_mg is the dietary-only archive. Also returns caffeine_supplement_mg, caffeine_mg_at_bedtime (5h half-life residual at sleep onset; null without trusted timestamps), and caffeine_to_bedtime_min. Source is Cronometer for new days and MyFitnessPal for pre-2026-05-31 history, transparently COALESCE'd. Macros are FOOD intake only — for supplement-inclusive vitamin/mineral totals use query_vitamins.",
+      "Daily nutrition macros (calories, protein, carbs, fat, fiber, sugar, sodium, water) plus caffeine per behavioral day. caffeine_total_mg (diet + supplement) is the canonical total caffeine — nutrition_caffeine_mg is the dietary-only archive. Also returns caffeine_supplement_mg, caffeine_mg_at_bedtime (5h half-life residual at sleep onset; null without trusted timestamps), and caffeine_to_bedtime_min. Source is Cronometer for new days and MyFitnessPal for pre-2026-05-31 history, transparently COALESCE'd. Macros are FOOD intake only — for supplement-inclusive vitamin/mineral totals use query_vitamins. Meals logged from a photo (query_photo_meals) count toward a day only when it has no Cronometer/MFP log here — never add them on top of a logged day.",
     input_schema: {
       type: "object" as const,
       properties: { days: { type: "number", description: "How many days back (default 7)" } },
@@ -380,7 +380,7 @@ const tools: Anthropic.Tool[] = [
   {
     name: "query_meals_log",
     description:
-      "Per-entry Cronometer food log: each logged food with its meal group (Breakfast/Lunch/Dinner/Snacks/Uncategorized), amount, and macros. Use for 'what did I eat' / meal-by-meal questions. Pass `date` (YYYY-MM-DD, ET behavioral day) for a single day, or `days` for a range.",
+      "Per-entry Cronometer food log: each logged food with its meal group (Breakfast/Lunch/Dinner/Snacks/Uncategorized), amount, and macros. Use for 'what did I eat' / meal-by-meal questions. Pass `date` (YYYY-MM-DD, ET behavioral day) for a single day, or `days` for a range. This is the Cronometer diary only — meals the user logged from a photo (query_photo_meals) are NOT in it unless they also logged them in Cronometer.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -388,6 +388,18 @@ const tools: Anthropic.Tool[] = [
         date: { type: "string", description: "Single ET behavioral day, YYYY-MM-DD" },
         limit: { type: "number", description: "Max entries (default 100)" },
       },
+    },
+  },
+  {
+    name: "query_photo_meals",
+    description:
+      "Meals the user logged from a plate photo (a vision estimate they confirmed or edited): per-meal rows with the behavioral eaten_date, local eaten_time, the item list (name, portion, kcal, macros), the meal's totals and confidence, PLUS per-day totals (meal_count, est_kcal, est macros). Use for 'what did I log by photo' or meals on days without a Cronometer diary log. Counting rule: a photo meal only counts toward a day's nutrition when that day has NO Cronometer/MyFitnessPal log (a logged diary day already contains the meal), and it never double-counts an Uber Eats order — the save screen warns when a delivery landed within 2 h of the meal. Combine with query_nutrition / query_meals_log instead of adding these numbers on top of a diary day.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        days: { type: "number", description: "Days back (default 14, max 90)" },
+      },
+      required: [],
     },
   },
   {
@@ -954,6 +966,41 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     const { data, error } = await q;
     if (error) return JSON.stringify({ error: error.message });
     return JSON.stringify(data ?? []);
+  }
+
+  // Nutrition: meals logged from a plate photo (pds.photo_meals / pds.photo_meal_daily, sql/photo_meals.sql).
+  // Read-only. Fail open (empty result with a note) while the schema file is not applied yet, like getNutrition's
+  // photo add-on: a missing relation must not break a nutrition answer.
+  if (name === "query_photo_meals") {
+    const photoDays = Math.min(Math.max((input.days as number) || 14, 1), 90);
+    const photoSince = new Date();
+    photoSince.setDate(photoSince.getDate() - photoDays);
+    const photoSinceStr = photoSince.toISOString().split("T")[0];
+    // Photo rows only: the table also holds direct drink captures (capture_kind = 'drink', sql/direct_drink_capture.sql);
+    // before that migration the column does not exist and every row is a photo (same pin/fallback as queries.ts).
+    const photoQuery = (pin: boolean) => {
+      const q = supabase
+        .from("photo_meals")
+        .select("meal_id, eaten_date, eaten_time, time_source, items, kcal, protein_g, carbs_g, fat_g, confidence")
+        .gte("eaten_date", photoSinceStr);
+      return (pin ? q.eq("capture_kind", "photo") : q)
+        .order("eaten_date", { ascending: false })
+        .order("meal_id", { ascending: false })
+        .limit(200);
+    };
+    let meals = await photoQuery(true);
+    if (meals.error && meals.error.code === "42703") meals = await photoQuery(false);
+    const daily = await supabase
+      .from("photo_meal_daily")
+      .select("behavioral_date, meal_count, est_kcal, est_protein_g, est_carbs_g, est_fat_g")
+      .gte("behavioral_date", photoSinceStr)
+      .order("behavioral_date", { ascending: false });
+    if (MISSING_SCHEMA.has(meals.error?.code ?? "") || MISSING_SCHEMA.has(daily.error?.code ?? "")) {
+      return JSON.stringify({ meals: [], daily_totals: [], note: "Photo meals are not set up yet, so none exist." });
+    }
+    if (meals.error) return JSON.stringify({ error: meals.error.message });
+    if (daily.error) return JSON.stringify({ error: daily.error.message });
+    return JSON.stringify({ meals: meals.data ?? [], daily_totals: daily.data ?? [] });
   }
 
   // Nutrition: micronutrient totals (dietary + supplement + total per nutrient)
