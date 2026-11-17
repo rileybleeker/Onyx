@@ -68,9 +68,9 @@ export default function BarcodeScannerModal({
         }
         controlsRef.current = controls;
         setStatus("scanning");
-      } catch (e) {
+      } catch {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError("Couldn't start the camera. Check that this site may use it, then try again.");
         setStatus("idle");
       }
     };

@@ -117,9 +117,9 @@ export default function FocusUnlockSettings() {
         setSelected(ids);
         setBaseline({ rule: nextRule, selected: ids });
         setLoad("ready");
-      } catch (e) {
+      } catch {
         if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : String(e));
+        setLoadError("Couldn't load your focus unlock settings. Try again.");
         setLoad("error");
       }
     })();
