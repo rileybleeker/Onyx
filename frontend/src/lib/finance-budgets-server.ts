@@ -57,7 +57,29 @@ export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: Bu
   return { txns, budgets, today, rules: [...fixes.rules.entries()].map(([merchantKey, category]) => ({ merchantKey, category })), setupPending: !!budgetsRes.error };
 }
 
+/**
+ * Longest the budgets load may take before it answers with its error state. The Supabase reads have no timeout of
+ * their own, so a read that never returns would leave the page on its loading state forever (the page and the
+ * page-data route both wait for this). Below the function's own time limit, so the error is ours, not the platform's.
+ */
+const LOAD_LIMIT_MS = 8_000;
+
 export async function loadBudgets(now: Date = new Date()): Promise<BudgetsLoad> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<BudgetsLoad>((resolve) => {
+    timer = setTimeout(() => {
+      console.error("budgets load failed: timeout");
+      resolve({ kind: "error", code: "timeout" });
+    }, LOAD_LIMIT_MS);
+  });
+  try {
+    return await Promise.race([readBudgets(now), limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readBudgets(now: Date): Promise<BudgetsLoad> {
   try {
     // The cancel marks are read at the same time as the ledger (one round trip, not two in a row).
     const marksRead = Promise.resolve(serviceClient().from("finance_cancel_marks").select("sub_id,marked_on"));
