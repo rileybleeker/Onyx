@@ -16,6 +16,11 @@ export type UseAutosave<T> = {
   reset: (baseline?: T) => void;
   /** Anything not saved yet. */
   dirty: boolean;
+  /**
+   * True when a failed save is armed to retry on its own right now. Read live from the saver, not from `state`:
+   * `state` is the last render's copy and lags right after a failure (a load that runs at once still sees "saving").
+   */
+  retryArmed: () => boolean;
 };
 
 /**
@@ -77,8 +82,12 @@ export function useAutosave<T>(name: string, opts: Omit<AutosaverOptions<T>, "on
   const retry = useCallback(() => saver.retry(), [saver]);
   const setBaseline = useCallback((value: T) => saver.setBaseline(value), [saver]);
   const reset = useCallback((b?: T) => saver.reset(b), [saver]);
+  const retryArmed = useCallback(() => saver.state.retrying, [saver]);
 
-  return useMemo(() => ({ state, change, flush, retry, setBaseline, reset, dirty }), [state, change, flush, retry, setBaseline, reset, dirty]);
+  return useMemo(
+    () => ({ state, change, flush, retry, setBaseline, reset, dirty, retryArmed }),
+    [state, change, flush, retry, setBaseline, reset, dirty, retryArmed],
+  );
 }
 
 export type UseRetainedAutosave<T, D> = UseAutosave<T> & {
@@ -159,9 +168,10 @@ export function useRetainedAutosave<T, D extends object>(
   const retry = useCallback(() => live().retry(), [live]);
   const setBaseline = useCallback((value: T) => saver.setBaseline(value), [saver]);
   const reset = useCallback((b?: T) => saver.reset(b), [saver]);
+  const retryArmed = useCallback(() => saver.state.retrying, [saver]);
 
   return useMemo(
-    () => ({ state, change, flush, retry, setBaseline, reset, dirty, data: form.data, restored: taken.restored }),
-    [state, change, flush, retry, setBaseline, reset, dirty, form, taken.restored],
+    () => ({ state, change, flush, retry, setBaseline, reset, dirty, retryArmed, data: form.data, restored: taken.restored }),
+    [state, change, flush, retry, setBaseline, reset, dirty, retryArmed, form, taken.restored],
   );
 }
