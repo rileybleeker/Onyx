@@ -1,6 +1,6 @@
 """Encrypted off-site backup of /health/records, and its restore drill (SEC-06, option A).
 
-docs/medical-records-recovery.md sections 4 and 9. Runs on Riley's PC (weekly Task Scheduler job,
+docs/medical-records-recovery.md sections 4 and 9. Runs on the collector PC (weekly Task Scheduler job,
 register-task.ps1); standard-library Python plus the `age` command-line tool (X25519 public-key encryption).
 
   backup   Reads, read-only with the service role (~/.onyx_supabase_secret), every column of

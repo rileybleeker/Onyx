@@ -1,5 +1,5 @@
 -- ============================================================
--- Onyx: "Run now" requests for jobs on Riley's PC (2026-11-16)
+-- Onyx: "Run now" requests for jobs on the collector PC (2026-11-16)
 -- ============================================================
 -- One row per press of a Run now button. Today only the Kindle harvester (task 'kindle').
 --
