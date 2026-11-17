@@ -268,6 +268,25 @@ const MATRIX = [
   ["don't log it refuses every write", [user("I took Synthetic Calm, don't log it")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
   ["a sleep question said for today, stored on last night", [user("I used my synthetic mouth tape today")],
     "mark_habit_complete", { habit: "Used synthetic mouth tape?" }, ALLOWED],
+
+  // Round 4 (action-bound record kind): the clause that carries the verb decides what is written. A record-shaped
+  // name inside another write (a playlist's name, a shopping-list item, a note's topic) authorizes nothing else.
+  ["a playlist request authorizes the playlist only", [user("Create a playlist called Synthetic Calm")],
+    "create_spotify_playlist", { name: "Synthetic Calm", track_ids: ["t1"] }, ALLOWED],
+  ["a playlist name never logs an intake", [user("Create a playlist called Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1 }, refused("not_named")],
+  ["a saved playlist name never logs an intake", [user("Save a playlist called Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm" }, refused("not_named")],
+  ["a shopping list item is not an intake", [user("Add Synthetic Milk to my shopping list")],
+    "log_supplement_intake", { product: "Synthetic Milk", amount: 1 }, refused("not_named")],
+  ["a shopping list item is not a stack", [user("Add Synthetic Milk to my shopping list")],
+    "log_supplement_stack", { stack: "Synthetic Milk" }, refused("not_named")],
+  ["a note about reading is not a reading session", [user("Save a note about reading chapter 4")],
+    "log_reading_session", { chapter_through: 4 }, refused("no_request")],
+  ["a note about reading is not a highlight", [user("Save a note about reading chapter 4")],
+    "add_book_highlight", { passage: "reading chapter 4" }, refused("no_request")],
+  ["a note taken after a reading report keeps the session", [user("I read chapter 4 and took a note")],
+    "log_reading_session", { chapter_through: 4 }, ALLOWED],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {

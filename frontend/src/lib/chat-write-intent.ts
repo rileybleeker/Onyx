@@ -17,6 +17,10 @@
  *     same polarity, read from the action's own clause (never by counting negations): "I skipped X" allows the
  *     answer No for X and nothing that says X was done, "I didn't take X" logs nothing for X, a record named both ways
  *     is refused, and a statement whose polarity cannot be read ("I didn't skip X", "…without X") refuses it;
+ *   - the kind of write is bound to the clause that carries the verb: a clause that writes something else (a
+ *     playlist, a shopping-list item, a note about a topic) names no record, whatever record-shaped name it
+ *     contains ("create a playlist called Synthetic Calm" authorizes the playlist, never an intake of a product
+ *     named Synthetic Calm);
  *   - "don't log X" / "don't mark X" / "log Y, not X" is a request not to write X: it grants nothing (never a No) and
  *     refuses any write of X; "don't log it" refuses every write of the message;
  *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
@@ -1060,6 +1064,15 @@ const FINISHED_BOOK = /\b(finished|completed|done with)\b[^.!?\n]*\bbook\b/;
 const HIGHLIGHT = /\b(highlight|quote|passage|line|excerpt|save|keep|note)\b/;
 const PLAYLIST_VERB = /\b(create|make|build|generate|save|start|put together|turn)\b/;
 const QUIZ_WORD = /\b(quiz|score|checkpoint|result)\b/;
+/**
+ * The words of another thing a clause writes: a playlist, a list the user shops from, a cart, a note, a journal.
+ * The kind of a write is read from the clause that carries its verb, so a clause with one of these ("add X to my
+ * shopping list", "save a note about reading chapter 4", "save a playlist called X") writes that thing, not a
+ * record: a record-shaped name in it (the playlist's name, the list item) authorizes no record write, highlight or
+ * reading session, however well it matches one.
+ */
+const OTHER_WRITE =
+  /\b(?:playlists?|(?:shopping|wish|watch)[ -]?lists?|carts?|baskets?|notes?|journals?)\b/;
 
 /** The request verbs that ask to record a supplement, a stack or a habit (never "create", "make", "highlight"). */
 const RECORD_REQUEST = /^(?:log|record|mark|save|add|track|enter)$/;
@@ -1215,7 +1228,7 @@ export function authorizeWrite(
     if (notText(input.passage) || notText(input.comment) || notNumber(input.chapter) || notText(input.book)) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => HIGHLIGHT.test(a.text));
     if (blocked) return deny(blocked);
-    const asked = done.filter((a) => HIGHLIGHT.test(a.text));
+    const asked = done.filter((a) => HIGHLIGHT.test(a.text) && !OTHER_WRITE.test(a.text));
     if (asked.length === 0) return deny("no_request");
     const passage = str(input.passage);
     if (!passage || significant(passage).length === 0 || !verbatimIn(passage, grant.ownWords)) return deny("not_your_words");
@@ -1234,7 +1247,12 @@ export function authorizeWrite(
     for (const field of ["recall", "question", "medium", "book"]) if (notText(input[field])) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText));
     if (blocked) return deny(blocked);
-    const chains = [...new Map(done.filter((a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText)).map((a) => [a.chain, a])).values()];
+    // The kind of write is read from the clause that carries the verb (the chain's first): a chain that starts by
+    // writing something else ("save a note about reading chapter 4") is not a reading report, however well its
+    // words match one. A later item that only writes a note ("…and took a note") does not un-read the chain.
+    const firstOfChain = new Map<number, Action>();
+    for (const a of done) if (!firstOfChain.has(a.chain)) firstOfChain.set(a.chain, a);
+    const chains = [...new Map(done.filter((a) => !OTHER_WRITE.test(firstOfChain.get(a.chain)!.text) && (READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText))).map((a) => [a.chain, a])).values()];
     if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
     let refusal: RefusalCode = "not_named";
     for (const a of chains) {
@@ -1292,7 +1310,7 @@ export function authorizeWrite(
   // or reports this kind of write ("I took X" logs an intake; "I bought X" does not).
   const candidates = same.filter((a) => {
     const at = span(a);
-    return at !== null && !topicOnly(a, at) && verbFits(tool, a);
+    return at !== null && !topicOnly(a, at) && !OTHER_WRITE.test(a.text) && verbFits(tool, a);
   });
   if (candidates.length === 0) return deny("not_named");
 
