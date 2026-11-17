@@ -9,6 +9,7 @@ import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
 import { readingBankCard, type ReadingBankHeartbeat, type ReadingBankStatusCounts } from "@/lib/reading-bank-status";
 import { monthlyCapCents } from "@/lib/reading-bank";
+import { medicalBackupCard, type BackupHeartbeat } from "@/lib/medical-backup-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -81,8 +82,10 @@ const CADENCE: Record<string, string> = {
   google_calendar: "Hourly :55",
   care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
+  gopuff: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
+  medical_backup: "Weekly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
@@ -139,8 +142,10 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
+  gopuff:         { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
+  medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   simplefin:      { method: "automated",      label: "Bank feed API" },
   matrix_mat:     { method: "automated",      label: "Matview refresh" },
@@ -349,7 +354,7 @@ export async function GET() {
       ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -453,6 +458,8 @@ export async function GET() {
       // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "ubereats").eq("data_type", "items")
         .order("sync_start", { ascending: false }).limit(1),
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "gopuff").eq("data_type", "items")
+        .order("sync_start", { ascending: false }).limit(1),
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "kindle").eq("data_type", "highlights")
         .order("sync_start", { ascending: false }).limit(1),
       // Onyx Screen Time iPhone app: one heartbeat a day, so it also needs its own fetch.
@@ -488,6 +495,8 @@ export async function GET() {
         ["pc_activity", "usage"],
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
+        // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
+        ["backup", "medical_records"],
         // N-of-1 trial report job: one heartbeat a day.
         ["experiments", "report"],
         // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
@@ -1279,6 +1288,35 @@ export async function GET() {
           methodLabel: METHOD.ubereats.label,
         };
       })(),
+      // goPuff item harvester (tools/gopuff_harvest/harvest.mjs on Riley's PC): same shape and
+      // thresholds as the Uber Eats card. 'failed' usually means the goPuff session expired (phone +
+      // SMS sign-in on the harvester profile) or the page's response format changed (--probe).
+      gopuff: (() => {
+        const entry = latestBySrcType["gopuff|items"]
+          ?? (gopuffSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 48
+            ? "failed"
+            : entry.status === "partial" || ageH > 18
+              ? "partial"
+              : "success";
+        return {
+          label: "goPuff Items",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.gopuff,
+          integrationMethod: METHOD.gopuff.method,
+          methodLabel: METHOD.gopuff.label,
+        };
+      })(),
       // PC activity logger (tools/pc_activity_logger on Riley's PC): active / idle time per
       // hour + the foreground program's name, upserted hourly to pds.pc_activity_hours/apps with
       // a pc_activity|usage heartbeat per upload. It only runs while Riley is signed in to the PC,
@@ -1490,6 +1528,18 @@ export async function GET() {
           methodLabel: METHOD.google_calendar.label,
         };
       })(),
+      // Encrypted off-site backup of /health/records (tools/medical_recovery/offsite_backup.py, weekly on
+      // Riley's PC, ciphertext only into OneDrive). Heartbeat only and count-free: >8 days degraded, >15 days
+      // or a failed run red. Thresholds and messages: lib/medical-backup-status.ts.
+      medical_backup: {
+        ...medicalBackupCard({
+          entry: (latestBySrcType["backup|medical_records"] as BackupHeartbeat | undefined) ?? null,
+          nowMs: Date.now(),
+        }),
+        cadence: CADENCE.medical_backup,
+        integrationMethod: METHOD.medical_backup.method,
+        methodLabel: METHOD.medical_backup.label,
+      },
       // Care Calendar (the other direction: care items on /health -> the "Onyx care" calendar,
       // lib/care-google-server.ts). No sync_log rows: the heartbeat is care_calendar_sync.last_sync_at,
       // moved by every sync (after each /health change, Sync now, and the 6-hourly catch-up at

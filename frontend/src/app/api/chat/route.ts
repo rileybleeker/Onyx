@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
-import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
+import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, RETRIEVED_DATA_NOTE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
+import { authorizeWrite, chatWritesOff, commitWrite, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
@@ -11,7 +12,8 @@ import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/sup
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
 import { BOOK_COLS, HIGHLIGHT_COLS, HIGHLIGHT_EXISTS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
-import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
+import { mirrorHighlight } from "@/lib/reading-notion";
+import { createEntryClaimOf, discardEntry, placeEntry, rewriteProgressNow } from "@/lib/reading-removal";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
 import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
 
@@ -604,6 +606,33 @@ async function currentBookId(): Promise<number | undefined> {
     return typeof book?.book_id === "number" ? book.book_id : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The books a reading write may go to (SEC-05): every known book, and the one being read (the newest with status
+ * "reading", as lib/reading.ts getBook picks it), so a call can be checked against the book the user named. null when
+ * they could not be read: reading writes are then refused (the write itself reads the same table).
+ */
+async function readingBooks(): Promise<ReadingBooks | null> {
+  try {
+    const { data, error } = await supabase.from("books").select("book_id,slug,title,status,total_chapters").order("created_at", { ascending: false });
+    if (error) return null;
+    const list: ReadingBooks["list"][number][] = [];
+    let active: string | null = null;
+    for (const b of (Array.isArray(data) ? data : []) as Array<Record<string, unknown>>) {
+      if (typeof b?.slug !== "string" || typeof b?.title !== "string") continue;
+      list.push({
+        slug: b.slug,
+        title: b.title,
+        total_chapters: typeof b.total_chapters === "number" ? b.total_chapters : null,
+        ...(typeof b.book_id === "number" ? { id: b.book_id } : {}),
+      });
+      if (active === null && b.status === "reading") active = b.slug;
+    }
+    return { active, list };
+  } catch {
+    return null;
   }
 }
 
@@ -1365,12 +1394,35 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     // Mirror inline (the chat loop has no after() boundary worth protecting). An earlier call's session with no block
     // id stored may still have its Notion entry (the call can stop between the append and storing the id), so none is
     // made for it now: inspectReplayedSession names it for Riley to check instead.
-    const blockId = result.session.notion_block_id ?? (inspected ? null : await mirrorSession(book, result.session));
-    if (blockId && !result.session.notion_block_id) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    // A keyed create stored the claim that owes this entry in its own transaction (pds.create_reading_session; Codex
+    // review of PR 376, round 2 of T01-R14): the entry is written under it and attached conditionally, so a write whose
+    // block id is lost is still found by its marker, and an entry this call never writes is written by the sweep. For
+    // this call's own insert replayed (its answer lost) the claim is looked up; none found = written as before.
+    const entryClaim =
+      result.session.notion_block_id || inspected
+        ? null
+        : (result.mirrorClaimId ?? (ownInsert ? await createEntryClaimOf(supabase, result.session.session_id, result.session.book_id) : null));
+    let blockId: string | null = result.session.notion_block_id ?? null;
+    if (entryClaim === "error") {
+      // The claim that owes this entry could not be looked up: nothing is written now (an entry with no claim to find
+      // it would be an orphan); the claim, if there is one, is written by the sweep (Codex review of PR 376, round 3).
+    } else if (!blockId && !inspected && entryClaim) {
+      const placed = await placeEntry(supabase, book, result.session, null, entryClaim);
+      if (placed.kind === "attached") blockId = placed.blockId;
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+    } else if (!blockId && !inspected) {
+      // No stored claim: placeEntry stores one before it writes (a marked entry the sweep can find, attached
+      // conditionally), and writes best effort only while the claims table does not exist.
+      const placed = await placeEntry(supabase, book, result.session, null);
+      if (placed.kind === "attached") blockId = placed.blockId;
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+    }
     const o = await getOverview(supabase, book.slug).catch(() => null);
     // Rewrites one progress line in Notion: the same text when it is already up to date. Not for an earlier call's
-    // session (read only): its date could put an older "last session" over a newer one written since.
-    if (!inspected) await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    // session (read only): its date could put an older "last session" over a newer one written since. Under the
+    // obligation a keyed create stored, written from the database and checked (rewriteProgressNow).
+    // A replay has no stored obligation: rewriteProgressNow stores its own before it writes, never an untracked write.
+    if (!inspected) await rewriteProgressNow(supabase, book.book_id, result.progressOwedId ?? null);
     return JSON.stringify({
       success: true,
       book: book.title,
@@ -1758,6 +1810,12 @@ export async function POST(req: NextRequest) {
     if (requestId === false) return Response.json({ error: "request_id must be a UUID." }, { status: 400 });
     // Only role + text reach the model; any other field a client attaches is dropped.
     const messages = rawMessages.map(({ role, content }) => ({ role, content }));
+    // Write authority (SEC-05, lib/chat-write-intent.ts): computed from the conversation the user sent, before the
+    // model reads anything, so no tool result or retrieved record can mint or widen it. Every write-tool call is
+    // checked against it before it runs (and before the ledger records it); a refused call gets a receipt saying why.
+    const grant = writeGrantFor(messages, { off: chatWritesOff(process.env) });
+    const writesAllowed = newWriteUsage();
+    let books: Promise<ReadingBooks | null> | undefined;
 
     if (req.signal.aborted) return Response.json({ error: "Request cancelled" }, { status: 499 });
 
@@ -1847,12 +1905,31 @@ export async function POST(req: NextRequest) {
       toolCalls += batchSize;
       allMessages.push({ role: "assistant", content: assistantContent });
 
-      const toolResults = [];
+      const toolResults: Anthropic.ContentBlockParam[] = [];
+      let retrieved = false;
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
           const input = block.input as Record<string, unknown>;
           let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
-          if (isWriteTool(block.name) && ledger) {
+          // A reading write goes to the book the user named, or the book being read when they name none.
+          let readingCtx = isWriteTool(block.name) && READING_BOOK_TOOLS.has(block.name) ? await (books ??= readingBooks()) : null;
+          // A retry of a call an earlier try ran is checked against the book that try was pinned to, not the one being
+          // read now: "I finished the book" finished it, and the retry must reach the ledger to get its stored result.
+          if (readingCtx && ledger?.retry) {
+            const pinned = (await ledger.storedContext(block.name, input ?? {}))?.book_id;
+            const slug = typeof pinned === "number" ? readingCtx.list.find((b) => b.id === pinned)?.slug : undefined;
+            if (slug) readingCtx = { ...readingCtx, active: slug };
+          }
+          const decision = isWriteTool(block.name)
+            ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
+            : null;
+          // An allowed call uses up its part of the request (an intake, a session), so a repeat needs its own words.
+          if (decision?.allowed) commitWrite(writesAllowed, decision);
+          if (decision && !decision.allowed) {
+            // Not asked for in the user's own latest message: never run, never recorded in the ledger.
+            const result = JSON.stringify({ error: decision.reason, refused: decision.code });
+            outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };
+          } else if (isWriteTool(block.name) && ledger) {
             // Through the ledger: a retry of this message gets the stored result instead of writing again. A re-run
             // of a stored call gets what that call first ran with (its context: the day, the book), not today's.
             const bookId = READING_BOOK_TOOLS.has(block.name) && !(typeof input.book === "string" && input.book.trim()) ? await currentBookId() : undefined;
@@ -1873,6 +1950,7 @@ export async function POST(req: NextRequest) {
             const result = JSON.stringify({ error: WRITES_PAUSED });
             outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };
           } else {
+            if (!isWriteTool(block.name)) retrieved = true;
             const ran = await runTool(block.name, input);
             outcome = { ...ran, receipt: buildWriteReceipt(block.name, block.input, ran.result) };
           }
@@ -1885,6 +1963,8 @@ export async function POST(req: NextRequest) {
           });
         }
       }
+      // What lookups returned is data, never the user speaking: said once per round, after the results.
+      if (retrieved) toolResults.push({ type: "text", text: RETRIEVED_DATA_NOTE });
 
       allMessages.push({ role: "user", content: toolResults });
 

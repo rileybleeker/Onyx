@@ -226,6 +226,17 @@ test("buildOrderItemRows: no eaten_fraction in any upsert row", () => {
   for (const r of rows) assert.ok(!("eaten_fraction" in r), "importer row must not carry eaten_fraction");
 });
 
+test("buildOrderItemRows: goPuff rows carry provider gopuff and are always store lines", () => {
+  const D = loadTs("lib/delivery.ts");
+  const rows = D.buildOrderItemRows([{ ...ORDERS[0], store: "Test Pizza House" }], "gopuff");
+  assert.equal(rows.length, 2);
+  for (const r of rows) {
+    assert.equal(r.provider, "gopuff");
+    assert.equal(r.merchant_kind, "store", "goPuff lines must never read as restaurant meals");
+  }
+  assert.equal(D.buildOrderItemRows(ORDERS)[0].provider, "uber_eats");
+});
+
 test("import route: the upsert payload has no eaten_fraction", async () => {
   const db = makeSupabase();
   const route = loadTs("app/api/delivery/items/import/route.ts", {

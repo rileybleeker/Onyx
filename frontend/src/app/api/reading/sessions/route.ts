@@ -1,7 +1,7 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { BOOK_COLS, getOverview, logSession, SESSION_COLS, type Book, type Medium, type ReadingSession } from "@/lib/reading";
-import { mirrorProgress, mirrorSession, removeMirroredBlock, sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
+import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, type Book, type Medium } from "@/lib/reading";
+import { discardEntry, dropClaim, placeEntry, removalAnswer, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals, trashLateBlock } from "@/lib/reading-removal";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
   db: { schema: "pds" },
@@ -23,6 +23,7 @@ export const maxDuration = 300;
  * through PATCH /api/reading/sessions/[id]. It sends `client_key` (a UUID per
  * new session): a create retried after a lost answer returns the stored
  * session (`replayed: true`) with no second XP, habit stamp or Notion entry.
+ * A key whose entry was discarded (DELETE below) answers 409 `discarded`.
  */
 export async function POST(req: NextRequest) {
   const requestStartedAt = Date.now();
@@ -38,33 +39,63 @@ export async function POST(req: NextRequest) {
     question: (body.question as string) || null,
     client_key: typeof body.client_key === "string" ? body.client_key : null,
   });
-  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
+  // 409 discarded: this client_key's entry was discarded (sql/reading_session_discards.sql), so nothing is created
+  // under it again; the /log form continues an entry edited since under a new key.
+  // 503 (also `retryable`: a transport or infrastructure failure, where a create whose answer was lost may have
+  // committed; only a confirmed refusal is 400): a keyed create needs pds.create_reading_session (one transaction); until it is there nothing is stored and the
+  // form retries (never the create in separate requests, which a Discard could land between).
+  if (!result.ok) {
+    return result.discarded
+      ? NextResponse.json({ error: result.error, discarded: true }, { status: 409 })
+      : result.unavailable || result.retryable
+        ? NextResponse.json({ error: result.error }, { status: 503 })
+        : NextResponse.json({ error: result.error }, { status: 400 });
+  }
 
   const overview = await getOverview(supabase, result.book.slug).catch(() => null);
 
-  // A retried create (same client_key): the first request made the session and its Notion entry.
+  // A retried create (same client_key): the first request made the session, and its transaction stored the Notion
+  // work it owes (pds.create_reading_session: the entry's claim and the progress obligation; Codex review of PR 376,
+  // round 2 of T01-R14). When that request's answer was lost before its own Notion step ran, the sweep finishes it:
+  // the claim's entry once no entry with its marker exists an hour on, the line once its obligation is due. The replay
+  // writes nothing itself, so it never races the first request's callback.
   if (!result.replayed) after(async () => {
     const id = result.session.session_id;
-    const blockId = await mirrorSession(result.book, result.session);
-    if (blockId) {
-      await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", id);
-      // The autosaving forms may edit or remove the session while its entry is being written: an edit that ran
-      // before the block id was stored could not update the entry, so compare with the row as it is now.
-      const { data: fresh } = await supabase.from("reading_sessions").select(SESSION_COLS).eq("session_id", id).maybeSingle();
-      const now = fresh as ReadingSession | null;
-      if (!now) await removeMirroredBlock(blockId);
-      else if (now.book_id !== result.session.book_id) {
-        await removeMirroredBlock(blockId);
-        const { data: other } = await supabase.from("books").select(BOOK_COLS).eq("book_id", now.book_id).maybeSingle();
-        const moved = other ? await mirrorSession(other as Book, now) : null;
-        await supabase.from("reading_sessions").update({ notion_block_id: moved }).eq("session_id", id);
-      } else if (sessionMirrorDiffers(result.session, now)) await updateMirroredSession({ ...now, notion_block_id: blockId });
+    // Under the obligation the create stored (keyed creates); a keyless create stores its own first.
+    const rewriteProgress = () => rewriteProgressNow(supabase, result.book.book_id, result.progressOwedId);
+    // Set when a removal ran meanwhile: trashLateBlock then owns the progress rewrite too, and closes the removal's
+    // cleanup row only once the trash AND the rewrite succeeded (Codex T01-R9).
+    let progressHandled = false;
+    // The entry is written under a claim stored BEFORE it is created (Codex review of PR 376, rounds 5 and 6), and
+    // attached only while the session is still on this book with no entry (lib/reading-removal.ts placeEntry): an
+    // entry whose block id cannot be recorded afterwards (a removal landed, then the database or this process failed)
+    // is still found by its marker and settled by the sweep. No claim stored, no entry.
+    // An edit that ran while the entry was written is caught up inside placeEntry, under the entry's claim (the claim
+    // goes only once that rewrite is confirmed, Codex T01-R11 round 2).
+    // A keyed create's entry is written under the claim its transaction stored (result.mirrorClaimId).
+    const placed = await placeEntry(supabase, result.book, result.session, null, result.mirrorClaimId);
+    if (placed.kind === "gone") {
+      // A removal that ran meanwhile found no block id in its cleanup row: record this one there first (so a retried
+      // removal owes it), then trash it and rewrite the progress line. The claim goes only once the entry is trashed.
+      const late = await trashLateBlock(supabase, id, placed.blockId, rewriteProgress);
+      progressHandled = true;
+      if (placed.claimId && late.trashed) await dropClaim(supabase, placed.claimId);
+    } else if (placed.kind === "surplus" && placed.row.book_id !== result.book.book_id && !placed.row.notion_block_id) {
+      // Moved to another book while the entry was written (this one, on the old page, is trashed) and that move left
+      // no entry: the session gets one on its new book's page, through the same claim and conditional attach (a move
+      // still writing its own entry and this one never both attach).
+      const { data: other } = await supabase.from("books").select(BOOK_COLS).eq("book_id", placed.row.book_id).maybeSingle();
+      if (other) {
+        const moved = await placeEntry(supabase, other as Book, placed.row, null);
+        if (moved.kind === "gone") await discardEntry(supabase, moved.blockId, moved.claimId);
+      }
     }
-    await mirrorProgress(
-      { ...result.book, finished_on: result.finished ? result.session.session_date : result.book.finished_on },
-      overview?.chaptersDone ?? result.session.chapter_through ?? 0,
-      result.session.session_date,
-    );
+    // "none" with a claim: either no entry was written (the sweep drops the claim once no entry with its marker shows
+    // up) or Notion wrote one and its answer was lost (the sweep finds it by the marker). "unknown": the claim stays.
+    // The progress line is written from the database as it is NOW, not from the values this request saw: a removal
+    // or an edit that ran during the mirroring above has changed them (review of PR 376, round 3).
+    if (!progressHandled) await rewriteProgress();
+    await sweepPendingRemovals(supabase);
   });
 
   // The question bank (READ-QUIZ-01): a chapter Riley logged through may now be quizzable; plan and build after the
@@ -88,4 +119,57 @@ export async function POST(req: NextRequest) {
     replayed: result.replayed,
     overview,
   });
+}
+
+/** Same-origin check for a request without a body (DELETE): the Origin header must be this site. */
+function originRefused(req: NextRequest): { status: number; error: string } | null {
+  const origin = req.headers.get("origin");
+  if (!origin) return { status: 403, error: "missing Origin" };
+  let o: URL;
+  try {
+    o = new URL(origin);
+  } catch {
+    return { status: 403, error: "bad Origin" };
+  }
+  const hosts = [req.headers.get("x-forwarded-host"), req.headers.get("host"), req.nextUrl.host].filter(Boolean);
+  return hosts.includes(o.host) ? null : { status: 403, error: "cross-origin request refused" };
+}
+
+/**
+ * DELETE /api/reading/sessions?client_key=<uuid>
+ *
+ * Discard of an autosaving /log Reading entry whose create may have been stored although its answer never arrived
+ * (PROD-T01): the form knows no session id, only the create's client_key. The key is recorded as discarded first
+ * (sql/reading_session_discards.sql), so a create of it still running on the server is either found or refused, then
+ * the session that key made (if any) is removed here like DELETE /api/reading/sessions/[id] (lib/reading.ts
+ * deleteSessionByClientKey: finish undone, and the habit change the create made taken back from the create's own
+ * record in the database unless the habit was answered again since, Codex T01-R7). Nothing is
+ * created: `removed: null` tells the form nothing of the entry is stored, and nothing can be stored under that key
+ * any more. Repeating it is safe.
+ * Auth: owner session only (middleware; NOT in isCiRoute), plus a same-origin check.
+ * Answers: 200 { success, discarded: true, client_key, removed: id | null, unfinished, overview } (the form clears
+ * the entry only on exactly this receipt for its own key, Codex T01-R8; a retry of a removal whose answer was lost
+ * answers its id and replays its Notion cleanup), 400 for a key that is not a UUID, 503 while the
+ * discard cannot be recorded (SQL not applied), 500 on a database failure (the form retries both).
+ */
+export async function DELETE(req: NextRequest) {
+  const refused = originRefused(req);
+  if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
+  const clientKey = (req.nextUrl.searchParams.get("client_key") ?? "").toLowerCase();
+  const r = await deleteSessionByClientKey(supabase, clientKey);
+  if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
+  // The receipt names the key whose discard is recorded (Codex T01-R8).
+  const receipt = { success: true, discarded: true, client_key: clientKey };
+  if (!r.removed && !r.cleanup) return NextResponse.json({ ...receipt, removed: null, unfinished: false, overview: null });
+  // A fresh removal, or a retry of one whose answer was lost: the Notion cleanup it still owes runs after the
+  // response (lib/reading-removal.ts). A create's own after() that was still writing the Notion entry trashes it
+  // once it sees the row gone.
+  const answer = await removalAnswer(supabase, r);
+  const { overview, removedId } = answer;
+  after(async () => {
+    if (answer.owed) await runRemovalCleanup(supabase, r, answer);
+    await sweepPendingRemovals(supabase);
+  });
+
+  return NextResponse.json({ ...receipt, removed: removedId, unfinished: r.unfinished, overview });
 }

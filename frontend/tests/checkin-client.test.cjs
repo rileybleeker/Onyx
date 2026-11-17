@@ -7,6 +7,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
 const { manualTimers, clockCache, advance, pageEvents, partGridPassThrough } = require("./helpers/autosave-harness.cjs");
+const { contextShim } = require("./helpers/hook-harness.cjs");
 
 const DAY = "Synthetic daytime question?";
 const SLEEP = "Synthetic sleep question?";
@@ -56,7 +57,11 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   const browser = pageEvents(hash === undefined ? {} : { location: { hash, pathname: "/check-in", search: "" }, history: { replaceState: (_state, _title, url) => replaced.push(url) } });
   const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
   const slot = () => [frame.slots, frame.index++];
+  // React context (lib/use-unsaved-work.ts, under lib/use-autosave.ts, reads lib/feed-scope.ts's context).
+  const context = contextShim();
   const hooks = {
+    createContext: context.createContext,
+    useContext: context.useContext,
     useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${i}:`; },
     useState(initialValue) {
       const [slots, i] = slot();
@@ -115,7 +120,7 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "@/components/DeliveryPortions": { useDeliveryDishes: () => ({ groups: [], leftovers: [] }), DeliveryDishList: () => null, LeftoverList: () => null },
     // The trial question loads on its own (its own route, covered by tests/experiments.test.cjs).
     "./ExperimentAdherence": { __esModule: true, default: () => null },
-    // /check-in is a personalized page since #272; the grid uses React context, which this hook shim does not
+    // /check-in is a personalized page since #272; the grid needs the personalize store and providers this shim does not
     // provide. The pass-through renders what the real grid renders, group headers included (the day tabs live in
     // one), and throws on any other prop that holds UI instead of dropping it.
     "@/components/personalize/PartGrid": partGridPassThrough(),
@@ -129,6 +134,8 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     if (node == null || typeof node === "boolean") return null;
     if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
     if (typeof node !== "object") return node;
+    const provided = context.provide(node, (children) => expand(children, id));
+    if (provided) return provided.rendered;
     if (typeof node.type === "function") {
       const key = `${id}:${node.type.name}`;
       if (!frames.has(key)) frames.set(key, { slots: [], index: 0 });
