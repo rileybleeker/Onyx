@@ -593,6 +593,11 @@ def backfill_actuals() -> int:
         matrix_hrv.setdefault(d, None)
 
     updates, counts = plan_actual_updates(preds, matrix_hrv, today, rescore_from)
+    if actuals_raw.empty and counts.get("cleared"):
+        # Visible in the run log: a whole range coming back empty is unusual (deleted source rows,
+        # or a matview caught mid-rebuild); the next run re-fills the actuals if the rows return.
+        log.warning(f"  Matrix read returned no rows from {min_date}: clearing {counts['cleared']} "
+                    f"stored actual(s) older than {CLEAR_AFTER_DAYS} days.")
     if updates:
         # Audit P1 (G1): on_conflict targets the (date,model,horizon,version) unique index so each
         # retrain run preserves history. NULL versions are handled via NULLS NOT DISTINCT on the

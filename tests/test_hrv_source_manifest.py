@@ -538,6 +538,8 @@ class LinkedAndPreferred(unittest.TestCase):
         db.missing_relations.add("supplement_intake_by_compound_mat")
         base = baseline_for(db, sources=LINKED)
         self.assertNotIn("error", base["sources"]["supplement_rollup"])
+        # the fallback is recorded as the relation actually read
+        self.assertEqual(base["sources"]["supplement_rollup"]["relation"], "supplement_intake_by_compound")
         db.tables["supplement_intake_by_compound"][0]["total_amount"] = 9
         det = run(db, base, sources=LINKED)
         self.assertIn("supplement_rollup/fingerprint", det.changed)
@@ -565,8 +567,15 @@ class Lineage(unittest.TestCase):
         journal = next(p for _, p in db.rpc_calls if p["p_relation"] == "journal_entries")
         self.assertIn("synced_at", journal["p_exclude"])
         self.assertIn("content_md", journal["p_exclude"])
-        for entry in snap["sources"].values():
-            self.assertLessEqual(set(entry), {"before", "row_count", "fingerprint", "error"})
+        by_name = {src.name: src for src in fs.SOURCES}
+        for name, entry in snap["sources"].items():
+            # metadata only: no row values; `relation` names where the fingerprint was read
+            self.assertLessEqual(set(entry), {"before", "row_count", "fingerprint", "relation", "error"})
+            if "error" not in entry:
+                fp = by_name[name].fingerprint
+                # every relation answers here, so the first one tried (the preferred) is used
+                self.assertEqual(entry["relation"], (*fp.prefer, fp.relation)[0])
+        self.assertEqual(snap["sources"]["supplement_rollup"]["relation"], "supplement_intake_by_compound_mat")
 
     def test_baseline_round_trip(self):
         db = seeded_db()
