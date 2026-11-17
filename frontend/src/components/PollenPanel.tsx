@@ -14,6 +14,7 @@ import {
 } from "@/lib/pollen";
 
 const POLLEN_URL = "/api/pollen";
+const POLLEN_FRESH_MS = 5 * 60_000;
 
 type Load =
   | { s: "loading" }
@@ -82,7 +83,9 @@ export default function PollenPanel() {
       const cached = asLoad(raw);
       if (alive && cached) setLoad((prev) => (prev.s === "loading" ? cached : prev));
     }).catch(() => {});
-    cachedJson(POLLEN_URL, { check: checkAnswer })
+    // A copy fetched in the last 5 minutes is reused on a repeat visit (no second GET); writes do not touch it
+    // and a published count changes at most once a day.
+    cachedJson(POLLEN_URL, { check: checkAnswer, freshMs: POLLEN_FRESH_MS })
       .then((raw) => {
         if (!alive) return;
         show(asLoad(raw) ?? { s: "error" });
