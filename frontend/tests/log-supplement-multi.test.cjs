@@ -620,7 +620,7 @@ test("section: a Say it product moved in with Edit is selected with its amount, 
   await h.click("Log selected (2)");
   await h.flush();
   assert.equal(h.calls.writes.length, 3);
-  const by = Object.fromEntries(h.calls.writes.slice(1).map((w) => [w.body.product_id, w.body]));
+  const by = Object.fromEntries(h.calls.writes.slice(1).map((w) => { const { event_key, ...rest } = w.body; assert.match(event_key, UUID_RE); return [rest.product_id, rest]; }));
   assert.deepEqual(by["p-beta"], { product_id: "p-beta", product: "Synthetic Beta", amount: 15, unit: "mg", times: ["08:30"], date: null });
   assert.deepEqual(by["p-gamma"], { product_id: "p-gamma", product: "Synthetic Gamma", amount: null, unit: null, times: ["08:30"], date: null });
 });

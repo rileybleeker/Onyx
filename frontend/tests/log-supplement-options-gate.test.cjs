@@ -174,9 +174,12 @@ test("gate: the stacks and today Retry buttons still reload their area after a f
   await h.flush();
   assert.deepEqual(h.calls.gets.slice(todayBefore), [URL.today], "the today Retry re-reads only today");
   assert.doesNotMatch(h.text(), /Couldn't load today's intakes\./);
+});
 
-  // Round 2: today only fails; its Retry (again the only one on screen) brings today's rows back.
-  todayDown = true;
+// Its own test (was round 2 of the test above): two mounts in one test restored the first mount's globals before the
+// second mount's unmount ran, so that unmount found no document.
+test("gate: with only today failing, its Retry brings today's rows back and writes nothing", async (t) => {
+  let todayDown = true;
   const h2 = mountSection(t, {
     answers: {
       [URL.products]: () => response({ products: FIVE }),
