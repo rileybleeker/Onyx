@@ -289,6 +289,45 @@ highlights step links the new passage again or the idea has other evidence, and 
   a question acts on its current version; Restore of a chapter recall question is refused (`superseded`) once a
   rebuild gave the chapter another one.
 
+## Chat (S6)
+
+- The reading sentence of the chat system prompt is built at request time from the active book (`readingQuestLine`:
+  title, author, chapter count, target date), so the public code names no book. When no book is in progress the most
+  recently finished one is used, so its bank stays reachable from the chat.
+- **`get_reading_questions`** `{book?, chapter?, mode: due|chapter|weak, count <= 10}`: questions below the spoiler
+  gate with their rubric points and sources, through the same SQL gate as the app. `weak` is ideas with a lapse or a
+  last verdict of incorrect. A chapter that is not quizzable yet is never returned, and the answer says so.
+- **`record_reading_answer`** `{question_id, version, answer (verbatim), verdict, feedback?}`: one write, graded at
+  once through `pds.reading_bank_grade` with grader `model` (the chat model graded it); an order question is graded by
+  Onyx's own code (the reply is stored as given). It is a write tool (receipt "Answer recorded") and, like every chat
+  write, goes through (1) the write-authority gate (`lib/chat-write-intent.ts`, SEC-05): only inside a quiz the user
+  asked for and did not stop, only when the user's latest message is the reply to the question just asked (the
+  assistant's message right before it carries that question's label, "Q1234"), the answer a verbatim span of that
+  reply, once per message; and (2) the replay ledger (`lib/chat-operations.ts`, SEC-04): the operation id is the key of
+  the attempt (`chatAttemptKey(opId)`), so a retry finds the stored answer; the model's `verdict` and `feedback` are
+  not part of the call's identity, so a retry that words them differently still gets the stored result. A request
+  with no request_id (an older page) keys the write by the model's call id and has no replay.
+- **`flag_reading_question`** `{question_id, kind}`: a write tool (receipt "Question flagged"), flag key derived from
+  the operation id the same way. Allowed only when the user's own latest message says that question is wrong, unclear,
+  not in that chapter, or from a chapter they have not read, in the kind sent, about the question just asked (or one
+  they name as "Q1234"); pushback on a grade, a question ("is it wrong?") and "don't flag it" flag nothing.
+- When asked to be quizzed the model calls `get_reading_questions`, asks one question at a time, grades against the
+  points, records each answer, and never invents questions. With the bank off for the book it says so and offers the
+  old free quiz (`record_reading_quiz` stays, shown as unverified).
+- `get_reading_status` carries the practice summary, counts only.
+
+## Speed and the client cache
+
+- Budgets: the round GET is one RPC (under 300 ms); the attempt POST is one read plus one RPC (under 400 ms); the
+  overview carries the bank's summary in parallel with the book and today's date, so it adds no round trip; a local
+  verdict shows before the POST returns; a model grade is never awaited.
+- `lib/client-cache.ts`: raw answers and feedback live in memory only (`/api/reading/practice/round/` and the bank
+  export are sensitive keys); the round and the bank persist (book-derived content and schedules, no answers), and the
+  client shows a cached round only when its day equals the overview's. An attempt POST invalidates nothing: the runner
+  keeps its own state and refreshes the overview and the round once when it closes.
+- The warm-up (`components/AppData.tsx`) reads the round and the bank for `/reading` and loads the runner's chunk.
+- A GET never writes and never starts generation, inside the continuous scroll too: only Riley's taps write.
+
 ## Privacy and the public repo
 
 - Sent to Anthropic: book title, author and table-of-contents titles (also seen by the web search provider);

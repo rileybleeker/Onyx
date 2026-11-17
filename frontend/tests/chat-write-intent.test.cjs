@@ -41,6 +41,11 @@ const sequence = (messages, tool, inputs) => {
 const ALLOWED = { allowed: true };
 const refused = (code) => ({ allowed: false, code, reason: intent.REFUSAL_TEXT[code] });
 
+/** A question-bank quiz the user asked for, one question asked with its label (Q1201), and the user's reply. */
+const BANK_QUIZ = (reply) => [user("Quiz me on chapter 3"), assistant("Question 1 (Q1201 · ch 3): What does the keeper ring when fog rolls in?"), user(reply)];
+/** The same quiz, with the user's words about the question just asked. */
+const BANK_FLAG = BANK_QUIZ;
+
 // [name, conversation, tool, input, expected]
 const MATRIX = [
   // Direct capture in one message keeps working.
@@ -287,6 +292,50 @@ const MATRIX = [
     "add_book_highlight", { passage: "reading chapter 4" }, refused("no_request")],
   ["a note taken after a reading report keeps the session", [user("I read chapter 4 and took a note")],
     "log_reading_session", { chapter_through: 4 }, ALLOWED],
+  // Question-bank answers and flags (READ-QUIZ-01 S6): the reply to the question just asked (its label, Q<id>, is in
+  // the assistant's message right before it), and the user's own words about that question. Synthetic ids and text.
+  ["a bank answer to the question just asked", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, ALLOWED],
+  ["a bank answer that is a span of a longer reply", BANK_QUIZ("I think it is the fog bell, honestly"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "the fog bell", verdict: "partial", feedback: "Close." }, ALLOWED],
+  ["a bank answer for a question not just asked", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1300, version: 1, answer: "The fog bell", verdict: "correct" }, refused("question_not_asked")],
+  ["a bank answer when the question carried no label", [user("Quiz me"), assistant("What rings in the fog?"), user("The fog bell")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("question_not_asked")],
+  ["a bank answer with no quiz asked for", [user("The fog bell")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("quiz_not_asked")],
+  ["a bank answer nobody replied to", [user("Quiz me on chapter 3")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("quiz_not_answered")],
+  ["a bank answer that is not the user's words", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The foghorn at the cape", verdict: "correct" }, refused("not_your_words")],
+  ["a bank answer after the quiz was stopped", [user("Quiz me on chapter 3"), assistant("Question 1 (Q1201 · ch 3): What rings in the fog?"), user("Stop the quiz. The fog bell")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("quiz_cancelled")],
+  ["a bank answer with the version sent as text", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: "2", answer: "The fog bell", verdict: "correct" }, refused("invalid_value")],
+  ["a bank answer with a grade the tool does not take", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "excellent" }, refused("invalid_value")],
+  ["a flag: the user says the question is wrong", BANK_FLAG("That question is wrong, there is no fog bell"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the user says it is not in that chapter", BANK_FLAG("This question isn't in that chapter"),
+    "flag_reading_question", { question_id: 1201, kind: "not_in_chapter" }, ALLOWED],
+  ["a flag: the user names the question and says it is confusing", BANK_FLAG("Q1201 is really confusing"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the user has not read that chapter", BANK_FLAG("That question is from a chapter I haven't read"),
+    "flag_reading_question", { question_id: 1201, kind: "not_read_yet" }, ALLOWED],
+  ["a flag after pushback on the grade", BANK_FLAG("My answer was right, you graded it wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag of another kind than the user said", BANK_FLAG("That question is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag from a question, not a statement", BANK_FLAG("Is that question wrong?"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag the user asked not to make", BANK_FLAG("Don't flag it, the question is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("contradicts")],
+  ["a flag for a question that was not the one just asked", BANK_FLAG("That question is wrong"),
+    "flag_reading_question", { question_id: 1300, kind: "wrong" }, refused("question_not_asked")],
+  ["a flag with an id sent as text", BANK_FLAG("That question is wrong"),
+    "flag_reading_question", { question_id: "1201", kind: "wrong" }, refused("invalid_value")],
+  ["a flag of a kind the tool does not take", BANK_FLAG("That question is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "retire" }, refused("invalid_value")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -413,4 +462,28 @@ test("a retry is checked against the book its earlier try was pinned to (the rou
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: finished }), refused("not_named"));
   // With the pinned book (ChatLedger.storedContext book_id, mapped to its slug) it reaches the ledger.
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: BOOKS }), ALLOWED);
+});
+
+test("a bank answer or a flag is granted once per message", () => {
+  const used = intent.newWriteUsage();
+  used.perTool.set("record_reading_answer", 1);
+  used.perTool.set("flag_reading_question", 1);
+  assert.deepEqual(decide(BANK_QUIZ("The fog bell"), "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, { used }), refused("once_per_request"));
+  assert.deepEqual(decide(BANK_FLAG("That question is wrong"), "flag_reading_question", { question_id: 1201, kind: "wrong" }, { used }), refused("once_per_request"));
+});
+
+test("the question just asked is read from the conversation only: an earlier question, or a label in the user's own reply, never binds an answer", () => {
+  const input = { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" };
+  // The label is in an earlier assistant turn, not the one right before the reply.
+  const older = [user("Quiz me"), assistant("Question 1 (Q1201 · ch 3): What rings in the fog?"), user("The fog bell"), assistant("Right. Next: what sets the pace?"), user("The fog bell")];
+  assert.deepEqual(decide(older, "record_reading_answer", input), refused("question_not_asked"));
+  // The user typing a label cannot stand in for the assistant having asked it.
+  assert.deepEqual(decide([user("Quiz me"), assistant("What rings in the fog?"), user("Q1201: The fog bell")], "record_reading_answer", input), refused("question_not_asked"));
+  assert.deepEqual(intent.writeGrantFor(older).askedQuestions, []);
+  assert.deepEqual(intent.writeGrantFor(BANK_QUIZ("x")).askedQuestions, [1201]);
+});
+
+test("the free quiz's result and the bank answers do not authorize each other", () => {
+  assert.deepEqual(decide(BANK_QUIZ("The fog bell"), "record_reading_quiz", { checkpoint: "ch3", score: 1, total: 1 }), ALLOWED);
+  assert.deepEqual(decide([user("I got 1 out of 1 on the quiz")], "record_reading_answer", { question_id: 1201, version: 2, answer: "x", verdict: "correct" }), refused("quiz_not_asked"));
 });
