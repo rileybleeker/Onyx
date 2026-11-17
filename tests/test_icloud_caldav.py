@@ -258,3 +258,8 @@ def test_run_failed_discovery_is_failed_and_stores_nothing(monkeypatch):
     status, total, note = etl.run(sb, [], 400, today=date(2026, 6, 1), caldav_sources=[SOURCE])
     assert (status, total) == ("failed", 0) and sb.t.upserts == []
     assert PASSWORD not in note and USER not in note
+
+
+if __name__ == "__main__":
+    # run_offline_tests.py runs each file as a script; these are pytest-style tests (fixtures, parametrize).
+    raise SystemExit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))

@@ -1,5 +1,11 @@
 """Synthetic checks for uber_rides_import (written 2026-11-17; not run before merge, per policy)."""
-import uber_rides_import as u
+import sys
+from pathlib import Path
+
+# run_offline_tests.py runs each file as `python tests/test_x.py`, so the repo root is not on sys.path by itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import uber_rides_import as u  # noqa: E402
 
 CSV = (
     "City,Product Type,Trip or Order Status,Request Time,Begin Trip Time,Begin Trip Address,"
@@ -24,3 +30,10 @@ def test_idempotent_key():
     a, _ = u.rows_from_csv(CSV)
     b, _ = u.rows_from_csv(CSV)
     assert [r["ride_key"] for r in a] == [r["ride_key"] for r in b]
+
+
+if __name__ == "__main__":
+    for _name, _fn in list(globals().items()):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
+            print(f"PASS {_name}")
