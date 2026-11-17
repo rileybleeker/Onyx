@@ -144,6 +144,12 @@ test("the app warm-up list: /log warms the Supplements history read the section 
   // The warm-up's /log entry reads the SAME constant as the section, so the one-key-per-GET cache key matches.
   assert.match(app, /json\(LOG_SUPPLEMENTS_HISTORY_URL\)/, 'AppData /log warms the history via the constant');
   assert.ok(/LOG_SUPPLEMENTS_HISTORY_URL[^}]*\} from "@\/lib\/log-early"/.test(app), 'the constant is imported from lib/log-early');
+  // The sweep leaves this read out while /check-in is on screen, and keeps it on /log.
+  const entry = /\{ \.\.\.json\(LOG_SUPPLEMENTS_HISTORY_URL\), skipOn: (\(page(?:: string)?\) => [^}]+?) \}/.exec(app);
+  assert.ok(entry, 'the history warmer has a skipOn rule');
+  const skipOnCheckIn = new Function(`return ${entry[1].replace(': string', '')}`)();
+  for (const page of ['/check-in', '/check-in/x']) assert.equal(skipOnCheckIn(page), true, page);
+  for (const page of ['/log', '/log/sections', '/today', '/check-inbox']) assert.equal(skipOnCheckIn(page), false, page);
 });
 
 test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step and on intent', async () => {
