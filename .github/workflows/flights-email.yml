@@ -49,8 +49,8 @@ jobs:
           # Account 1 — the pre-existing IMAP pair (shared with the MFP/WHOOP email importers)
           IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
           IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}
-          # Accounts 2-3 — Riley's two Gmail accounts (slot 2 = rileybleeker, slot 3 =
-          # rileybleeklm, where all the Delta mail is). An unset pair is skipped and the
+          # Accounts 2-3 — the two Gmail accounts (slot 2 = the second Gmail account, slot 3 =
+          # the first Gmail account, where all the Delta mail is). An unset pair is skipped and the
           # heartbeat names the missing account. Slots 4-5 are spare.
           IMAP_EMAIL_2: ${{ secrets.IMAP_EMAIL_2 }}
           IMAP_APP_PASSWORD_2: ${{ secrets.IMAP_APP_PASSWORD_2 }}
