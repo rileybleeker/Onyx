@@ -35,6 +35,7 @@ import sys
 import json
 import time
 import base64
+import unicodedata
 import argparse
 import logging
 import secrets
@@ -654,39 +655,97 @@ def upsert_tracks(sb: Client, tracks: list[dict], features_by_id: dict[str, dict
     return len(rows)
 
 
-def fetch_musicbrainz_tags(artist_name: str) -> list[str]:
+def normalize_artist_name(name: str) -> str:
     """
-    Look up an artist by name on MusicBrainz, take the top-scored match, return its
+    Pure normalizer for MusicBrainz fallback lookups: NFKD-decompose, strip
+    accent/combining marks, casefold, drop punctuation/symbols (keep letters,
+    digits, whitespace) and collapse whitespace. Diacritic variants
+    (e.g. 'JAY-Z' written with an accented letter) and symbol-heavy collab
+    names reduce to a comparable plain form.
+    """
+    decomposed = unicodedata.normalize("NFKD", name)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    folded = stripped.casefold()
+    cleaned = "".join(ch for ch in folded if ch.isalnum() or ch.isspace())
+    return " ".join(cleaned.split())
+
+
+def _musicbrainz_query(get, query: str):
+    """
+    One MusicBrainz artist search. Returns (results, error): results is the
+    parsed 'artists' list ([] when nothing matched) and error is None; on any
+    transport/parse failure returns ([], error).
+    """
+    try:
+        resp = get(
+            f"{MUSICBRAINZ_API}/artist",
+            params={"query": query, "fmt": "json", "limit": 1},
+            headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return [], f"HTTP {resp.status_code}"
+        return (resp.json().get("artists") or []), None
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        return [], e
+
+
+def _musicbrainz_accept(result: dict, query: str) -> bool:
+    """A candidate result is only accepted when its normalized name equals the
+    normalized query, or its MusicBrainz similarity score is >= 95."""
+    score = result.get("score") or 0
+    if score >= 95:
+        return True
+    return normalize_artist_name(result.get("name") or "") == normalize_artist_name(query)
+
+
+def fetch_musicbrainz_tags(artist_name: str, get=None, sleep=time.sleep) -> list[str]:
+    """
+    Look up an artist by name on MusicBrainz, take the top match, return its
     top tags (highest user-applied counts first) as a list of strings.
 
     Why MusicBrainz: Spotify's Dev Mode strips `genres` from the artist endpoint
     post-Feb 2026, so we use MusicBrainz's crowdsourced tag data as the genre
     source. No API key required — just a polite User-Agent.
 
+    Fallback for name-format misses (diacritics, symbols-only collab names):
+    when the raw name yields no acceptable match, retry once with the
+    NFKD/accents-stripped/casefolded/punctuation-removed form. A retry result
+    is only accepted when its normalized name matches the normalized query or
+    its score is >= 95. The 1-req/sec ceiling holds between the attempts.
+
     Returns [] if no match, no tags, or any error. Caller is responsible for the
     1-req/sec rate limit between calls.
     """
+    if get is None:
+        get = httpx.get
     if not artist_name:
         return []
-    try:
-        resp = httpx.get(
-            f"{MUSICBRAINZ_API}/artist",
-            params={"query": artist_name, "fmt": "json", "limit": 1},
-            headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            log.warning(f"MusicBrainz returned {resp.status_code} for {artist_name!r}")
-            return []
-        results = resp.json().get("artists") or []
-        if not results:
-            return []
-        tags = results[0].get("tags") or []
+
+    def _tags_of(result):
+        tags = result.get("tags") or []
         tags.sort(key=lambda t: t.get("count", 0), reverse=True)
         return [t["name"] for t in tags[:8] if t.get("name")]
-    except (httpx.HTTPError, KeyError, ValueError) as e:
-        log.warning(f"MusicBrainz lookup failed for {artist_name!r}: {e}")
+
+    results, err = _musicbrainz_query(get, artist_name)
+    if err is not None:
+        log.warning(f"MusicBrainz lookup failed for {artist_name!r}: {err}")
         return []
+    if results and _musicbrainz_accept(results[0], artist_name):
+        return _tags_of(results[0])
+
+    # Retry with the normalized name when it actually differs beyond case.
+    normalized = normalize_artist_name(artist_name)
+    if not normalized or normalized == " ".join(artist_name.casefold().split()):
+        return []
+    sleep(1.05)  # keep the 1-req/sec ceiling between attempts
+    results, err = _musicbrainz_query(get, normalized)
+    if err is not None:
+        log.warning(f"MusicBrainz normalized lookup failed for {normalized!r}: {err}")
+        return []
+    if results and _musicbrainz_accept(results[0], normalized):
+        return _tags_of(results[0])
+    return []
 
 
 def enrich_genres_via_musicbrainz(sb: Client, pairs: list[dict]) -> int:

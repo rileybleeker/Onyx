@@ -576,6 +576,15 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("wx_apparent_temp_max",              "behavior", "Feels-like high above median",            "°C"),
     ("wx_sunshine_hours",                 "behavior", "Sunshine hours above median",             "h"),
     ("wx_night_temp_mean",                "behavior", "Outdoor temperature during sleep above median", "°C"),
+    # Pollen (pds.pollen_daily via pollen_etl.py, 2026-11-17): total count published for the
+    # day before the sleep (moved one day earlier by date in
+    # hrv_analysis.merge_pollen_features, the same -1 move as wx_night_temp_mean). EXPLORATORY
+    # for the same reason as the weather treatments: there is NO seasonal adjustment in this
+    # layer, and pollen is almost pure season (Atlanta's tree season runs late Feb-May), so
+    # the median split is close to "peak season vs off season" and an effect can be season,
+    # not pollen. Family 'behavior' with the common lag-1 confounders only. Atlanta only; the
+    # series ends at the NYC move.
+    ("pollen_total",                      "behavior", "Pollen count above median",               "grains/m³"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),
