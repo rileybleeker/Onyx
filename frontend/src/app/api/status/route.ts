@@ -4,6 +4,7 @@ import { getNycScoutFreshness } from "@/lib/nyc";
 import { staleCheckNote, swrCacheTimed } from "@/lib/swr-cache";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
+import { getPhoneMessagesStatusCard } from "@/lib/phone-messages-status";
 import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
@@ -79,6 +80,7 @@ const CADENCE: Record<string, string> = {
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   cash_forecast: "Weekly, Monday 12:30 UTC (forecast snapshot)",
   urgent_email: "Hourly :15 (both Gmail accounts)",
+  phone_messages: "Event driven (iPhone automation pushes each new text)",
   google_calendar: "Hourly :55",
   care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
@@ -141,6 +143,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   renewal_reminders: { method: "automated", label: "Worker push cards" },
   cash_forecast:  { method: "automated",      label: "Snapshot job" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
+  phone_messages: { method: "semi-automated", label: "iPhone Shortcuts push" },
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
@@ -319,6 +322,8 @@ export async function GET() {
       .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1).then((res) => res);
     // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
     const urgentEmailCardPromise = getUrgentEmailStatusCard(supabase);
+    // iPhone Messages push (Shortcuts automation, event driven): newest push heartbeat only.
+    const phoneMessagesCardPromise = getPhoneMessagesStatusCard(supabase);
     // Google Calendar WRITE side (care items -> the "Onyx care" calendar): the one sync-state row,
     // which holds timestamps, counts and a short code only (never pds.ci_tokens, never an item).
     // Inert until set up: without the two Google variables nothing is read, as in care-google-server.ts.
@@ -620,6 +625,7 @@ export async function GET() {
     const renewalRemindersRes = await renewalRemindersPromise;
     const cashForecastRes = await cashForecastPromise;
     const urgentEmailCard = await urgentEmailCardPromise;
+    const phoneMessagesCard = await phoneMessagesCardPromise;
     const pollenRes = await pollenLatestPromise;
     const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
     const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
@@ -1621,6 +1627,13 @@ export async function GET() {
         cadence: CADENCE.urgent_email,
         integrationMethod: METHOD.urgent_email.method,
         methodLabel: METHOD.urgent_email.label,
+      },
+      // iPhone Messages: texts pushed by a Shortcuts automation (no iOS inbox API). Heartbeat only.
+      phone_messages: {
+        ...phoneMessagesCard,
+        cadence: CADENCE.phone_messages,
+        integrationMethod: METHOD.phone_messages.method,
+        methodLabel: METHOD.phone_messages.label,
       },
     };
 

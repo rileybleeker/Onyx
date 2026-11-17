@@ -43,7 +43,10 @@ function isCiRoute(pathname: string): boolean {
     // 3 days (Riley's decision, 2026-11-13). The response carries only an opaque id, the merchant
     // name, the estimated date and the days until it - never an amount. Exact path: every other
     // procurement route, and everything else over the finance ledger, stays session-only.
-    pathname === "/api/procurement/renewals/claim"
+    pathname === "/api/procurement/renewals/claim" ||
+    // iPhone Messages: texts pushed by Riley's own Shortcuts automation (2026-11-17). Exact path; the route is
+    // OFF unless ONYX_PHONE_MESSAGES_ENABLED=true. Reading (/api/phone-messages/messages) stays session-only.
+    pathname === "/api/phone-messages/ingest"
   );
 }
 
