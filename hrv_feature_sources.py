@@ -235,6 +235,27 @@ SOURCES: tuple[FeatureSource, ...] = (
         scans=(RowScan("weather_daily", "calendar_date", "synced_at", "change"),),
         fingerprint=Fingerprint("weather_daily", "calendar_date"),
     ),
+    # tools/pc_activity_logger upserts a day's hourly totals whenever it syncs (a late sync moves
+    # synced_at on the view's row, and the loader's completeness rule reads that). The loader reads
+    # only active / late minutes; the other view columns are not hashed.
+    FeatureSource(
+        name="pc_activity_daily", feeds="pc_activity_daily (PC active / late-hours minutes)", settle_days=8,
+        scans=(RowScan("pc_activity_daily", "behavioral_date", "synced_at", "change"),),
+        fingerprint=Fingerprint("pc_activity_daily", "behavioral_date",
+                                exclude=("hours_reported", "idle_minutes", "after_midnight_active_minutes",
+                                         "first_active_hour_start", "last_active_hour_end", "apps_used",
+                                         "minutes_by_app", "late_minutes_by_app")),
+    ),
+    # pollen_etl.py re-upserts every count of the month on each run (a late or corrected count heals
+    # itself), so the settle window covers a calendar month. Only the count and the four levels are
+    # read by the loader; the contributor lists and count_level are not hashed.
+    FeatureSource(
+        name="pollen_daily", feeds="pollen_daily (Atlanta pollen count and levels)", settle_days=32,
+        scans=(RowScan("pollen_daily", "count_date", "synced_at", "change"),),
+        fingerprint=Fingerprint("pollen_daily", "count_date",
+                                exclude=("count_level", "tree_contributors", "grass_contributors",
+                                         "weed_contributors", "source")),
+    ),
     FeatureSource(
         name="journal_entries", feeds="journal_entries (nj_* mood / confidence / words)",
         scans=(RowScan("journal_entries", "entry_date", "notion_edited_at", "change"),),
