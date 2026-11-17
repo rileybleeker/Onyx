@@ -30,7 +30,7 @@ function isCiRoute(pathname: string): boolean {
     // Apple Health upload from the same iPhone app (HealthKit, 2026-11-17). Exact path.
     pathname === "/api/apple-health/import" ||
     pathname === "/api/delivery/items/import" ||
-    // Personal Amazon order list, read by the Kindle harvester on Riley's PC (2026-11-12). Exact path.
+    // Personal Amazon order list, read by the Kindle harvester on the collector PC (2026-11-12). Exact path.
     pathname === "/api/orders/amazon/import" ||
     // Supplement stack reminders: the sms-reminders Worker claims due stacks and
     // relays Log it / Skip taps (2026-11-11). Exact paths - never /api/supplements/*.

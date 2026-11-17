@@ -1,5 +1,5 @@
 /**
- * POST /api/orders/amazon/import (tools/kindle_harvest/amazon-orders.mjs, Riley's PC, CI token):
+ * POST /api/orders/amazon/import (tools/kindle_harvest/amazon-orders.mjs, the collector PC, CI token):
  * the personal Amazon account's "Your Orders" list -> pds.online_order_events rows. Pure, no imports.
  *
  * Each order becomes insert-only events (message_id "amazon-web:<order>:<status>:<date>"), so the

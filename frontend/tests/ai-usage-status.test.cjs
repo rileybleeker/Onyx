@@ -1,5 +1,5 @@
 // Run: node --test tests/ai-usage-status.test.cjs
-// AI tool usage (tools/ai_usage_harvest on Riley's PC): the /status card is wired in the three places
+// AI tool usage (tools/ai_usage_harvest on the collector PC): the /status card is wired in the three places
 // AGENTS.md "Every integration must appear on /status" names, and it reads the heartbeat only (the
 // route never selects rows of pds.ai_tool_usage_daily). Static checks; no network, no database.
 const { test } = require("node:test");

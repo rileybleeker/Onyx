@@ -3,7 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { MAX_AMAZON_BODY_BYTES, eventsFor, parseAmazonImport } from "@/lib/amazon-orders";
 
 // POST /api/orders/amazon/import: the personal Amazon account's order list, read by the Kindle
-// harvester on Riley's PC (tools/kindle_harvest/amazon-orders.mjs). Auth: middleware's CI-token
+// harvester on the collector PC (tools/kindle_harvest/amazon-orders.mjs). Auth: middleware's CI-token
 // carve-out (exact path, x-onyx-ci-token). Writes pds.online_order_events (insert-only: an event
 // keeps its first-seen time) and one pds.sync_log heartbeat (amazon|orders) per call, success or
 // failure. orders_email_etl.py folds the events into pds.online_orders on its next run.

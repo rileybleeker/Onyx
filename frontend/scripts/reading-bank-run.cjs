@@ -1,5 +1,5 @@
 // Hourly worker for the Reading question bank (docs/reading-question-bank.md, READ-QUIZ-01). Run by
-// .github/workflows/reading-bank.yml (held PR) so builds and grades continue while Riley's PC is off.
+// .github/workflows/reading-bank.yml (held PR) so builds and grades continue while the collector PC is off.
 // One pass (lib/reading-bank-server.ts runWorker): plan every approved book, grade answers still pending after
 // 2 minutes, build for up to 10 minutes, repair dirty schedules, and once a day clear raw answers older than
 // READING_BANK_CLEAR_ANSWERS_DAYS (180; 0 = off). Writes a reading_bank|generate heartbeat.

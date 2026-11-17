@@ -27,7 +27,7 @@ function failed(code: string | undefined, what: string) {
 
 /**
  * POST /api/kindle/run   body {}
- * Asks Riley's PC to run the Kindle harvester now. Owner session only (middleware; NOT in the CI
+ * Asks the collector PC to run the Kindle harvester now. Owner session only (middleware; NOT in the CI
  * carve-out), same-origin JSON, at most 256 bytes. Writes one pds.pc_run_requests row, which
  * Supabase Realtime pushes to the idle listener on the PC; a press while the newest request is still
  * unanswered (< 2 min) or still running (< 25 min) returns that request instead of a second row.

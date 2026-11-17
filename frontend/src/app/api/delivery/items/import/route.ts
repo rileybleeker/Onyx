@@ -19,7 +19,7 @@ import {
   type RouteDeadline,
 } from "@/lib/model-routing";
 
-// Uber Eats item harvester endpoint (tools/ubereats_harvest/harvest.mjs on Riley's PC).
+// Uber Eats item harvester endpoint (tools/ubereats_harvest/harvest.mjs on the collector PC).
 // Auth: the middleware CI carve-out (x-onyx-ci-token) or a Supabase session.
 //
 // One POST does one of three things, chosen by the body:
