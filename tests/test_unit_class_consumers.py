@@ -121,7 +121,7 @@ class MicronutrientViewTest(unittest.TestCase):
 
     def test_every_mass_sum_filters_unit_class(self):
         sums = _sum_filters(self.new_cte)
-        self.assertEqual(len(sums), 24, "expected 24 supplement sums")
+        self.assertEqual(len(sums), 25, "expected 25 supplement sums (vitamins A-K, B1-B12, folate, 10 minerals, omega-3/EPA/DHA)")
         for clause, has_mass in sums:
             self.assertTrue(has_mass, f"sum without unit_class filter: {clause[:80]}")
 
@@ -148,7 +148,7 @@ class MicronutrientViewTest(unittest.TestCase):
             )
 
         self.assertEqual(_aliases(outer(self.old)), _aliases(outer(self.new)))
-        self.assertEqual(len(_aliases(outer(self.new))), 73)
+        self.assertEqual(len(_aliases(outer(self.new))), 76)
 
 
 class MigrationFileTest(unittest.TestCase):

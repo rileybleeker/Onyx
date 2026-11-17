@@ -64,6 +64,11 @@ class FakeResponse:
     def text(self):
         return json.dumps(self._body) if isinstance(self._body, (dict, list)) else str(self._body)
 
+    def raise_for_status(self):
+        # refresh_access_token calls this after its own 400/401 check (#464).
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 class FakeSupabase:
     """sync_log sink only — a rejected refresh writes exactly one row."""
@@ -97,7 +102,7 @@ def test_rotated_response_replaces_the_stored_refresh_token() -> None:
     assert out["refresh_token"] == "rotated-refresh"
     assert out["access_token"] == "new-access"
     assert out["expires_in"] == 2592000
-    assert "obtained_at" not in out, "the pure merge stamps no clock (refresh_access_token does)"
+    assert out.get("obtained_at") == STORED["obtained_at"], "the pure merge stamps no clock (refresh_access_token does)"
     assert STORED["refresh_token"] == "stored-refresh", "the input dict is never mutated"
 
 
