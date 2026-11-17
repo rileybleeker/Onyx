@@ -479,7 +479,10 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   rows, bytes and SHA-256, each file's size, type and SHA-256). The ciphertext is written to
   `%LOCALAPPDATA%\Onyx\backup-tmp`, copied into `~/OneDrive/Backups/onyx` under a hidden `.partial`
   name, then renamed `onyx-backup-<UTC time>.tar.age`; the temporary copy is removed. Plaintext never
-  touches OneDrive or the repo.
+  touches OneDrive or the repo. A run counts as off-site only when the folder is under an existing OneDrive
+  folder and the OneDrive client is running; otherwise the run is partial (`offsite_unsynced`) and nothing
+  is pruned. Retention also keeps the newest complete backup that is at least 24 hours old (old enough to
+  have uploaded), so a paused client cannot leave no uploaded copy. `keygen` refuses one path for both key files.
 - **Retention**, applied after every run that wrote a backup (success or partial): the newest 8 backups,
   plus the first backup of each of the 3 most recent months, plus the newest backup whose completeness
   marker verifies, wherever it falls, so a run of partial backups can never push the last complete one

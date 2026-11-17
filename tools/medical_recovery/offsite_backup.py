@@ -194,6 +194,23 @@ def under_onedrive(path: Path) -> bool:
     return any(is_under(path, r) for r in onedrive_roots())
 
 
+def onedrive_sync_ready(dest: Path) -> bool:
+    """Whether a copy written to `dest` will actually be uploaded: `dest` lies under a OneDrive folder that
+    exists, and (on Windows) the OneDrive client process is running. A paused or signed-out client is not
+    detectable from here, which is why retention also keeps a backup old enough to have uploaded
+    (UPLOAD_GRACE_HOURS) and a run whose destination fails this check is never a success."""
+    try:
+        if not any(is_under(dest, r) and r.is_dir() for r in onedrive_roots()):
+            return False
+        if os.name == "nt":
+            res = subprocess.run(["tasklist", "/FI", "IMAGENAME eq OneDrive.exe", "/NH"], capture_output=True,
+                                 text=True, check=False, timeout=20, creationflags=_no_window())
+            return "onedrive.exe" in (res.stdout or "").lower()
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def check_places(dest: Path, tmp: Path) -> None:
     """The ciphertext goes to `dest`; plaintext never touches disk at all. `tmp` (ciphertext before it is
     complete) is local, never under OneDrive or the repo, and `dest` is never inside the repo."""
@@ -762,7 +779,10 @@ def marker_valid(dest: Path, backup_name: str) -> bool:
             and got["size"] == backup.stat().st_size)
 
 
-def retention_keep(names: list[str], complete: set[str]) -> set[str]:
+UPLOAD_GRACE_HOURS = 24
+
+
+def retention_keep(names: list[str], complete: set[str], now: Optional[datetime] = None) -> set[str]:
     """The newest KEEP_WEEKLY backups, plus the FIRST backup of each of the KEEP_MONTHLY most recent months,
     plus the newest backup in `complete` (those whose completeness marker verified), wherever it falls.
     Names that are not backups are never in the answer, and never pruned either (prune() looks only at this
@@ -772,6 +792,11 @@ def retention_keep(names: list[str], complete: set[str]) -> set[str]:
     verified = [n for _, n in dated if n in complete]
     if verified:
         keep.add(verified[0])
+    if now is not None:
+        # the newest complete backup old enough to have been uploaded: a newer copy may still be local only
+        aged = [n for t, n in dated if n in complete and (now - t).total_seconds() >= UPLOAD_GRACE_HOURS * 3600]
+        if aged:
+            keep.add(aged[0])
     first_of_month: dict[tuple[int, int], str] = {}
     for t, n in dated:  # newest first, so the last assignment per month is its earliest backup
         first_of_month[(t.year, t.month)] = n
@@ -791,7 +816,7 @@ def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: 
     ours = [p for p in dest.iterdir() if NAME_RE.match(p.name) or OK_RE.match(p.name) or DEST_PARTIAL_RE.match(p.name)]
     names = [p.name for p in ours if _is_regular(p)]
     complete = {n for n in names if NAME_RE.match(n) and ok_marker(n) in names and marker_valid(dest, n)}
-    keep = retention_keep(names, complete)
+    keep = retention_keep(names, complete, now)
     kept_markers = {ok_marker(n) for n in keep}
     plan: list[tuple[Path, bool]] = []  # (path, counts as a removed backup or stale copy)
     for name in names:
@@ -853,7 +878,8 @@ class RunResult:
 
 def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Path, now: Optional[datetime] = None,
                dry_run: bool = False, rebuild_tables: tuple[str, ...] = REBUILD_TABLES,
-               fetch: Callable[[rc.Target, str], Optional[bytes]] = fetch_object) -> RunResult:
+               fetch: Callable[[rc.Target, str], Optional[bytes]] = fetch_object,
+               sync_probe: Optional[Callable[[Path], bool]] = None) -> RunResult:
     now = now or datetime.now(timezone.utc)
     check_places(dest, tmp)
     snap = collect(target, rebuild_tables=rebuild_tables)
@@ -890,6 +916,11 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
         except OSError:
             pass
     result = _result(snap, manifest, written, size)
+    if not (sync_probe or onedrive_sync_ready)(dest):
+        # a copy that only exists on this PC is not an off-site backup, and removing older backups from a
+        # folder that is not syncing could leave no uploaded copy at all
+        log.warning("destination is not a syncing OneDrive folder; nothing pruned")
+        return RunResult("partial", "offsite_unsynced", written, result.counts)
     if result.status == "success":
         # Success needs durable evidence: without a marker that reads back, this backup would not count as
         # complete for retention, so the run fails and nothing is pruned (the backup itself stays).
@@ -1131,6 +1162,9 @@ def keygen(identity: Path = DEFAULT_IDENTITY_FILE, recipient_file: Path = DEFAUL
         if under_onedrive(p) or is_under(p, ROOT):
             print("refused: a key file never goes under OneDrive or into the repo", file=out)
             return 1
+    if _resolved(identity) == _resolved(recipient_file):
+        print("refused: the private key and the public recipient need two different files", file=out)
+        return 1
     if identity.exists() or recipient_file.exists():
         print("refused: a backup key already exists; nothing was changed (a new key could not read the old backups)",
               file=out)

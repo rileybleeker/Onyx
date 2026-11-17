@@ -307,6 +307,9 @@ class Base(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.local), "SUPABASE_SERVICE_ROLE_KEY": "fake-service",
                                                 "SUPABASE_URL": "", "RECOVERY_DRILL_SERVICE_KEY": ""})
         self.env.start()
+        sync = mock.patch.object(ob, "onedrive_sync_ready", lambda d: True)
+        sync.start()
+        self.addCleanup(sync.stop)
         self.sb = FakeSupabase()
         self.client = FakeClient()
         self.sleeps = []
@@ -837,6 +840,25 @@ class References(Base):
 
 
 class Retention(Base):
+    def test_unsynced_destination_is_partial_and_prunes_nothing(self):
+        self.backup()
+        old = self.dest / "onyx-backup-20200101T000000Z.tar.age"
+        old.write_bytes(b"x")
+        with mock.patch.object(ob, "onedrive_sync_ready", lambda d: False):
+            code, out = self.backup()
+        self.assertEqual(code, 2)
+        self.assertIn("offsite_unsynced", out)
+        self.assertTrue(old.exists())
+
+    def test_keeps_the_newest_complete_backup_old_enough_to_have_uploaded(self):
+        from datetime import datetime, timezone
+        names = [f"onyx-backup-202611{d:02d}T000000Z.tar.age" for d in range(2, 13)]
+        now = datetime(2026, 11, 12, 0, 30, tzinfo=timezone.utc)
+        complete = {"onyx-backup-20261112T000000Z.tar.age", "onyx-backup-20261104T000000Z.tar.age"}
+        keep = ob.retention_keep(names, complete, now)
+        self.assertNotIn("onyx-backup-20261104T000000Z.tar.age", ob.retention_keep(names, complete))
+        self.assertIn("onyx-backup-20261104T000000Z.tar.age", keep)
+
     def names(self, times):
         return [f"onyx-backup-{t.strftime('%Y%m%dT%H%M%SZ')}.tar.age" for t in times]
 
@@ -1004,6 +1026,14 @@ class Drill(Base):
 
 
 class Keygen(Base):
+    def test_refuses_one_path_for_both_files(self):
+        out = io.StringIO()
+        same = self.tmp / "k" / "same.txt"
+        same.parent.mkdir()
+        self.assertEqual(ob.keygen(same, same, run=None, out=out), 1)
+        self.assertEqual(ob.keygen(same, same.parent / ".." / "k" / "same.txt", run=None, out=out), 1)
+        self.assertFalse(same.exists())
+
     def test_refuses_to_overwrite_and_refuses_the_repo(self):
         out = io.StringIO()
         self.assertEqual(ob.keygen(self.identity, self.tmp / "r.txt", run=None, out=out), 1)
