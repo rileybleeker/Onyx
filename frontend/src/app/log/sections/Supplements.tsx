@@ -874,7 +874,8 @@ export default function SupplementsSection() {
     return (stackRows.get(stackId)?.length ?? 0) > 0 || justLogged.has(stackId);
   }
 
-  const suggestionKeys = useRef(new Map<number, string>());
+  // Event key per draft item, keyed "draftId:itemKey" so item 0 of one draft never shares a key with item 0 of another.
+  const suggestionKeys = useRef(new Map<string, string>());
   async function saveSuggestions() {
     if (!suggestions || savingSuggestions) return;
     const { draftId } = suggestions;
@@ -888,8 +889,9 @@ export default function SupplementsSection() {
         const d = s.item;
         // One event key per suggestion, kept across its retries: a lost answer for an untimed earlier-day dose
         // (which the duplicate check cannot recognise) is replayed by the server, not written twice.
-        let eventKey = suggestionKeys.current.get(s.key);
-        if (!eventKey) { eventKey = crypto.randomUUID(); suggestionKeys.current.set(s.key, eventKey); }
+        const keyId = `${draftId}:${s.key}`;
+        let eventKey = suggestionKeys.current.get(keyId);
+        if (!eventKey) { eventKey = crypto.randomUUID(); suggestionKeys.current.set(keyId, eventKey); }
         err = await logProduct({ product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date, event_key: eventKey });
       } else {
         const d = s.item;
@@ -913,6 +915,7 @@ export default function SupplementsSection() {
       if (err) items = items.map((x) => (x.key === s.key ? { ...x, state: "failed", error: err } : x));
       else {
         done.push(s.key);
+        suggestionKeys.current.delete(`${draftId}:${s.key}`);
         const logged = loggedItems.get(draftId) ?? new Set<number>();
         logged.add(s.key);
         loggedItems.set(draftId, logged);
