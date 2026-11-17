@@ -479,14 +479,21 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   rows, bytes and SHA-256, each file's size, type and SHA-256). The ciphertext is written to
   `%LOCALAPPDATA%\Onyx\backup-tmp`, copied into `~/OneDrive/Backups/onyx` under a hidden `.partial`
   name, then renamed `onyx-backup-<UTC time>.tar.age`; the temporary copy is removed. Plaintext never
-  touches OneDrive or the repo. A run counts as off-site only when the folder is under an existing OneDrive
-  folder and the OneDrive client is running; otherwise the run is partial (`offsite_unsynced`) and nothing
-  is pruned. Retention also keeps the newest complete backup that is at least 24 hours old (old enough to
-  have uploaded), so a paused client cannot leave no uploaded copy. `keygen` refuses one path for both key files.
-- **Retention**, applied after every run that wrote a backup (success or partial): the newest 8 backups,
-  plus the first backup of each of the 3 most recent months, plus the newest backup whose completeness
-  marker verifies, wherever it falls, so a run of partial backups can never push the last complete one
-  out. A fully successful run commits `onyx-backup-<UTC time>.ok` next to its backup (the backup's name
+  touches OneDrive or the repo. A folder under an existing OneDrive folder with the client running is a
+  cheap negative pre-check only (`offsite_unsynced` when it fails, nothing pruned): a paused, signed-out,
+  offline or stuck client passes it, so it is never evidence that a copy was uploaded. Local completion is
+  not remote durability — a ciphertext in the OneDrive folder is *pending* until a small local record
+  (`%LOCALAPPDATA%\Onyx\backup-state\remote-confirmations.json`, never under OneDrive, never in the repo)
+  holds a positive confirmation for it, written only by the one code path that obtains one
+  (`record_remote_confirmation`; no confirmation mechanism is built, so the record stays empty and every
+  run is partial with the code `offsite_unconfirmed`). Elapsed time is not evidence of upload either.
+  `keygen` refuses one path for both key files.
+- **Retention**, applied after every run that wrote a backup: the newest 8 backups, plus the first backup
+  of each of the 3 most recent months, plus the newest backup whose completeness marker verifies, plus
+  the newest backup the remote record confirms, wherever they fall, so a run of partial backups can never
+  push the last complete or confirmed one out. When no backup is confirmed off-site at all, nothing is
+  pruned (`offsite_unconfirmed`), so retention can never delete the last backup that really reached remote
+  storage; a confirmation whose file changed size no longer counts. A fully successful run commits `onyx-backup-<UTC time>.ok` next to its backup (the backup's name
   and size, nothing else; written under a hidden name, renamed, read back); a backup counts as complete
   only when that marker reads back and matches the file. If the marker cannot be committed the run is
   **failed** (`marker_unwritable`, failed heartbeat, exit 1) and nothing is pruned. Every marker is

@@ -31,6 +31,15 @@ the temporary folder, the printed output or the heartbeat. Covers:
     fails the run and prunes nothing; a marker that cannot be read, or whose stat fails (Path.is_file()
     would call it absent), stops the prune; ciphertext a killed run left in the temporary folder is
     removed after a day;
+  * off-site durability (review finding R3): local completion is not remote durability. A run whose copy
+    is not confirmed by the LOCAL record is partial (offsite_unconfirmed) and prunes nothing, whatever
+    the OneDrive probe says; the record is written only by record_remote_confirmation (no confirmation
+    mechanism is built, so it stays empty and every run answers partial), holds the backup name, size
+    and confirmation time only, never lives under OneDrive or in the repo, and a missing or corrupt
+    record is "unknown", never a guessed confirmation; prune() itself refuses when no backup is
+    confirmed; a recorded confirmation protects the newest confirmed backup wherever it falls (elapsed
+    time alone was never evidence) and lets retention run again; a confirmation whose file changed no
+    longer counts;
   * the heartbeat goes to exactly the production origin with the key the backup resolved, whatever
     ONYX_SUPABASE_URL says, and a heartbeat that cannot be written never changes the run's outcome;
   * the drill fails on a changed file, a member outside the pack's names (never extracted), a ciphertext that
@@ -310,6 +319,22 @@ class Base(unittest.TestCase):
         sync = mock.patch.object(ob, "onedrive_sync_ready", lambda d: True)
         sync.start()
         self.addCleanup(sync.stop)
+        # A stand-in for the confirmation mechanism (none is built): confirms every backup that is in the
+        # folder at read time, so the behaviour tests exercise success and pruning as before. The
+        # off-site-durability tests override this with the REAL local record.
+        self.real_load = ob.load_remote_confirmations
+
+        def confirm_all(state_file=None):
+            recs = {}
+            if self.dest.is_dir():
+                for p in self.dest.iterdir():
+                    if ob.NAME_RE.match(p.name) and p.is_file():
+                        recs[p.name] = {"size": p.stat().st_size, "confirmed_at": NOW.isoformat(timespec="seconds")}
+            return recs
+
+        load = mock.patch.object(ob, "load_remote_confirmations", confirm_all)
+        load.start()
+        self.addCleanup(load.stop)
         self.sb = FakeSupabase()
         self.client = FakeClient()
         self.sleeps = []
@@ -850,14 +875,16 @@ class Retention(Base):
         self.assertIn("offsite_unsynced", out)
         self.assertTrue(old.exists())
 
-    def test_keeps_the_newest_complete_backup_old_enough_to_have_uploaded(self):
-        from datetime import datetime, timezone
+    def test_keeps_the_newest_remotely_confirmed_backup(self):
+        # Elapsed time is not evidence of upload (the old UPLOAD_GRACE_HOURS rule): only a recorded
+        # confirmation is, and it protects the newest confirmed backup wherever it falls.
         names = [f"onyx-backup-202611{d:02d}T000000Z.tar.age" for d in range(2, 13)]
-        now = datetime(2026, 11, 12, 0, 30, tzinfo=timezone.utc)
-        complete = {"onyx-backup-20261112T000000Z.tar.age", "onyx-backup-20261104T000000Z.tar.age"}
-        keep = ob.retention_keep(names, complete, now)
-        self.assertNotIn("onyx-backup-20261104T000000Z.tar.age", ob.retention_keep(names, complete))
+        complete = {"onyx-backup-20261112T000000Z.tar.age"}
+        remote = {"onyx-backup-20261104T000000Z.tar.age"}  # outside the newest 8, not a month's first
+        keep = ob.retention_keep(names, complete, remote=remote)
         self.assertIn("onyx-backup-20261104T000000Z.tar.age", keep)
+        self.assertNotIn("onyx-backup-20261104T000000Z.tar.age", ob.retention_keep(names, complete))
+        self.assertIn("onyx-backup-20261112T000000Z.tar.age", keep)
 
     def names(self, times):
         return [f"onyx-backup-{t.strftime('%Y%m%dT%H%M%SZ')}.tar.age" for t in times]
@@ -921,6 +948,103 @@ class Retention(Base):
         code, _ = self.backup()
         self.assertEqual(code, 0)
         self.assertLessEqual(len(self.written()), ob.KEEP_WEEKLY + ob.KEEP_MONTHLY)
+
+
+class OffsiteConfirmation(Base):
+    """Local completion is not remote durability (review finding R3): the OneDrive process running, the
+    folder existing and file age are never evidence that the remote copy exists. These tests use the REAL
+    local record (empty in every test unless record_remote_confirmation wrote one — the only writer)."""
+
+    def setUp(self):
+        super().setUp()
+        real = mock.patch.object(ob, "load_remote_confirmations", self.real_load)
+        real.start()
+        self.addCleanup(real.stop)
+
+    def seed(self, times):
+        self.dest.mkdir(parents=True, exist_ok=True)
+        made = []
+        for t in times:
+            p = self.dest / f"onyx-backup-{t.strftime('%Y%m%dT%H%M%SZ')}.tar.age"
+            p.write_bytes(b"x")
+            made.append(p)
+        return made
+
+    def backups_here(self):
+        return sorted(p.name for p in self.dest.iterdir() if ob.NAME_RE.match(p.name))
+
+    def test_a_run_with_no_remote_confirmation_is_partial_and_prunes_nothing(self):
+        made = self.seed([datetime(2025, m, 1, tzinfo=timezone.utc) for m in range(1, 13)])
+        ob.write_ok_marker(made[0])
+        code, out = self.backup()
+        self.assertEqual(code, 2, out)
+        self.assertIn("offsite_unconfirmed", out)
+        hb = self.heartbeats()
+        self.assertEqual((hb[0]["status"], hb[0]["error_message"], hb[0]["records_synced"]),
+                         ("partial", "offsite_unconfirmed", 0))
+        self.assertTrue({p.name for p in made} <= set(self.backups_here()),
+                        "nothing is pruned without a confirmed remote copy")
+        self.assertEqual(len(self.backups_here()), len(made) + 1, "the new copy itself stays")
+
+    def test_prune_refuses_when_no_backup_is_confirmed(self):
+        made = self.seed([datetime(2025, m, 1, tzinfo=timezone.utc) for m in range(1, 4)])
+        with self.assertRaises(ob.BackupError) as cm:
+            ob.prune(self.dest, NOW)
+        self.assertEqual(cm.exception.code, "offsite_unconfirmed")
+        self.assertTrue(all(p.exists() for p in made))
+
+    def test_a_recorded_confirmation_lets_a_run_prune_and_keeps_the_confirmed_backup(self):
+        made = self.seed([datetime(2025, m, 1, tzinfo=timezone.utc) for m in range(1, 13)])
+        ob.record_remote_confirmation(self.dest, made[0].name, now=NOW)  # the oldest: protected by the record
+        code, out = self.backup()
+        self.assertEqual(code, 2, out)  # this run's own new copy is still unconfirmed
+        self.assertIn("offsite_unconfirmed", out)
+        self.assertTrue(made[0].exists(), "the newest confirmed backup survives wherever it falls")
+        self.assertLessEqual(len(self.backups_here()), ob.KEEP_WEEKLY + ob.KEEP_MONTHLY + 2,
+                              "older unconfirmed backups are pruned again")
+
+    def test_a_confirmation_that_no_longer_matches_its_file_prunes_nothing(self):
+        made = self.seed([datetime(2025, m, 1, tzinfo=timezone.utc) for m in range(1, 13)])
+        ob.record_remote_confirmation(self.dest, made[0].name, now=NOW)
+        made[0].write_bytes(b"changed since")  # the record no longer describes the file
+        code, out = self.backup()
+        self.assertEqual(code, 2, out)
+        self.assertEqual(len(self.backups_here()), len(made) + 1, "a failed confirmation never deletes anything")
+
+    def test_the_record_holds_name_size_and_time_only_and_stays_local(self):
+        made = self.seed([datetime(2026, 3, 1, tzinfo=timezone.utc)])
+        ob.record_remote_confirmation(self.dest, made[0].name, now=NOW)
+        recs = self.real_load()
+        self.assertEqual(set(recs), {made[0].name})
+        self.assertEqual(set(recs[made[0].name]), {"size", "confirmed_at"})
+        self.assertEqual(recs[made[0].name]["size"], made[0].stat().st_size)
+        state = ob.remote_state_file()
+        self.assertFalse(ob.under_onedrive(state), "the record never lives under OneDrive")
+        self.assertFalse(ob.is_under(state, ob.ROOT), "the record never lives in the repo")
+        self.assertTrue(ob.is_under(state, ob.local_root()))
+        data = state.read_bytes()
+        for marker in (b"LEAK", b"SYNTHETIC", str(self.dest).encode()):
+            self.assertNotIn(marker, data, f"the record holds the name, size and time only, not {marker!r}")
+        self.assertEqual(ob.load_remote_confirmations(self.dest / "missing.json"), {}, "a missing record is unknown")
+
+    def test_record_refuses_bad_names_missing_files_and_unsafe_state(self):
+        self.seed([datetime(2026, 3, 1, tzinfo=timezone.utc)])
+        with self.assertRaises(ValueError):
+            ob.record_remote_confirmation(self.dest, "not-a-backup.tar.age", now=NOW)
+        with self.assertRaises(OSError):
+            ob.record_remote_confirmation(self.dest, "onyx-backup-20260101T000000Z.tar.age", now=NOW)
+        with mock.patch.object(ob, "remote_state_file", lambda: ob.ROOT / "state.json"):
+            with self.assertRaises(ob.BackupError):
+                ob.record_remote_confirmation(self.dest, "onyx-backup-20260301T000000Z.tar.age", now=NOW)
+        self.assertEqual(ob.load_remote_confirmations(), {}, "nothing was written by a refused record")
+
+    def test_a_corrupt_record_is_unknown_never_a_guessed_confirmation(self):
+        self.seed([datetime(2026, 3, 1, tzinfo=timezone.utc)])
+        ob.remote_state_file().parent.mkdir(parents=True, exist_ok=True)
+        ob.remote_state_file().write_bytes(b"{not json")
+        self.assertEqual(ob.remote_confirmed_names(self.dest, ob.load_remote_confirmations()), set())
+        with self.assertRaises(ob.BackupError):
+            ob.prune(self.dest, NOW)
 
 
 class Drill(Base):
