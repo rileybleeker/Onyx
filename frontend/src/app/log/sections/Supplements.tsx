@@ -701,7 +701,7 @@ export default function SupplementsSection() {
       showReceipt(`Saved ${outcome.label}${n > 1 ? `, ${n} times` : ""}${when}` + (outcome.skipped ? ` (${outcome.skipped} already logged)` : ""));
       return null;
     }
-    if (outcome.kind === "unconfirmed") return `Not confirmed: ${outcome.error}. It may be saved, check Logged today.`;
+    if (outcome.kind === "unconfirmed") return "Not confirmed. It may be saved, so check Logged today before trying again.";
     return outcome.kind === "refused" ? outcome.error : "Not saved";
   }
 
