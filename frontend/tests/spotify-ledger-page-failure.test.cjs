@@ -12,7 +12,7 @@ const src = fs.readFileSync(
 );
 
 test("ledger request ignores superseded responses", () => {
-  const effect = src.slice(src.indexOf("getSpotifyLedger(range, ledgerPage"));
+  const effect = src.slice(src.lastIndexOf("useEffect(() => {", src.indexOf("getSpotifyLedger(range, ledgerPage")));
   const body = effect.slice(0, effect.indexOf("[range, ledgerPage, ledgerRetry]"));
   assert.match(body, /let cancelled = false;/);
   assert.match(body, /if \(cancelled\) return;\s*setLedger\(rows\);/);

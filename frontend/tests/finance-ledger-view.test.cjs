@@ -176,7 +176,7 @@ async function renderPage(load) {
 
 test("page states: empty ledger, query failure and data are three different things", async () => {
   const empty = await renderPage({ kind: "empty", freshness: null });
-  assert.match(empty, /No ledger data yet - the harvester has not run\./);
+  assert.match(empty, /No ledger data yet\. The bank import has not run\./);
   assert.doesNotMatch(empty, /Couldn(&#x27;|')t load the ledger/);
   assert.match(empty, /Preview a CSV/);
   assert.match(empty, /data-csv="true"/);
@@ -185,7 +185,7 @@ test("page states: empty ledger, query failure and data are three different thin
     kind: "empty",
     freshness: S.financeLedgerCard(beat(1, { status: "failed", error_message: "Login required" }), null, NOW.getTime()),
   });
-  assert.match(ranButEmpty, /the harvester has run but imported nothing/);
+  assert.match(ranButEmpty, /The bank import ran but found no transactions\./);
   assert.match(ranButEmpty, /Login required/);
 
   const failed = await renderPage({ kind: "error", message: "Couldn't load the ledger.", hint: "The database query failed (code 57014). Try again in a moment." });
