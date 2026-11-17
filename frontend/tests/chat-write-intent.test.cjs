@@ -190,6 +190,18 @@ const MATRIX = [
   ["a day said before the request, no date sent", [user("Yesterday, I took Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("day_not_stated")],
   ["a reading day said, no date sent", [user("I read chapter 4 last night")], "log_reading_session", { chapter_through: 4 }, refused("day_not_stated")],
   ["yesterday for a habit that is not a sleep question", [user("I meditated")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-10" }, refused("day_not_stated")],
+  // SEC-05 overlap: "day before yesterday" is one phrase (its own day, not yesterday's too); a day phrase that is negated
+  // names no day; two different day phrases in one action's words refuse that action.
+  ["the day before yesterday, one phrase", [user("I took Synthetic Calm the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-09" }, ALLOWED],
+  ["the day before yesterday does not allow yesterday", [user("I took Synthetic Calm the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, refused("day_not_stated")],
+  ["yesterday, not the day before yesterday: yesterday allowed", [user("I took Synthetic Calm yesterday, not the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, ALLOWED],
+  ["yesterday, not the day before yesterday: the negated day refused", [user("I took Synthetic Calm yesterday, not the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-09" }, refused("day_not_stated")],
+  ["two day phrases in one action refuse it (stack)", [user("I took my synthetic evening stack for the day before yesterday and yesterday")], "log_supplement_stack", { stack: "synthetic evening", date: "2026-11-09" }, refused("day_not_stated")],
+  ["two day phrases in one action refuse it (the other date)", [user("I took my synthetic evening stack for the day before yesterday and yesterday")], "log_supplement_stack", { stack: "synthetic evening", date: "2026-11-10" }, refused("day_not_stated")],
+  ["two day phrases in one action refuse it (habit)", [user("I meditated the day before yesterday and yesterday")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-09" }, refused("day_not_stated")],
+  ["a habit on the day before yesterday, one phrase", [user("I meditated the day before yesterday")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-09" }, ALLOWED],
+  ["a yesterday phrase with an unrelated record in the same message", [user("I took Synthetic Calm yesterday and meditated today")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, ALLOWED],
+  ["the same message, the unrelated record's day for the product", [user("I took Synthetic Calm yesterday and meditated today")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-11" }, refused("day_not_stated")],
   ["not a real day", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-02-30" }, refused("invalid_value")],
   ["an amount sent as text", [user("Log 40 g Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, refused("invalid_value")],
   ["an amount nobody said, sent as text", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, refused("invalid_value")],
