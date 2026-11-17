@@ -1,7 +1,7 @@
 # Isolated multi-second slow views in the hourly speed runs (PERF-02, 2026-11-16)
 
-Status: **diagnosis only for the stalls below; a cold-start fix for the two Today finance routes followed
-(last section, 2026-11-17).** The evidence rules out the suspected scheduled-job collisions and
+Status: **diagnosis only.** The last section (2026-11-17) adds a lazy-loading change for the two Today finance
+routes, proposed in PR #396: it is not deployed and its effect on speed has not been measured. The evidence rules out the suspected scheduled-job collisions and
 locates the stall, but it does not prove its cause. Three candidates remain open (below): our own fan-out,
 shared-CPU throttling and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
 minute averages and cannot show a 2 s event. Read-only evidence: the
@@ -133,46 +133,67 @@ mounts) still lowers the burst size, but it does not remove the swap.
 
 Neither loosens the budget or moves the perf schedule.
 
-## Run 43995593029 (after the Small compute move): cold paths, not stalls (2026-11-17)
+## Runs 43995593029 and 44003258302: what they show, and one hypothesis tested in code (2026-11-17)
 
-Five enforced breaches, all single calls of about 1.0-1.8 s; the median of the same endpoints over the last two
-runs is about 200 ms (p90 about 300 ms; 466 samples). Each breach sits on a cold path:
+These are observations from two runs. Neither proves a cause; each hypothesis below says what evidence it rests
+on and what would confirm or refute it. One cold view and three warm views per page is a small sample, and the
+cold view's function / CDN state was not controlled.
 
-| Breach | When | Cold path |
-|---|---|---|
-| Today cold data-ready 1143 ms, `/api/finance/alerts` 1033 ms, `/api/procurement/renewals/summary` 1021 ms | first page of the run, 25 min after the previous run | Vercel function cold start + first PostgREST requests |
-| `/supplements` warm data-ready 1759 ms, `/api/weight` 1084 ms | 01:34:2x | ba4af90b promoted to Production at 01:34:20 (inside the page's window) |
-| phone Today tap 4750 ms (observational) | 01:45:2x | 71c5cc79 promoted at 01:45:19 (inside the tap series; no long task, no reload) |
+**Run 43995593029** (harness v2; result groups served c5c8f436 (6), ba4af90b (20) and a mix of revisions (2)).
+Five enforced breaches, kept as recorded and not pooled across revisions:
 
-* **Database time is not the cost.** `pg_stat_statements`: the finance result-cache read averages 0.6 ms
-  (max 7.8 ms), `ui_preferences` 0.1 ms, `weight_log` 0.1 ms, today's compound rollup uses its index (0.3 ms).
-  During both promotion windows the Supabase edge origin times stayed at a 20-60 ms median (max 433 ms).
-* **Cold PostgREST requests cost ~200-290 ms each.** In the Today cold second, the first wave of REST
-  requests from the functions had origin times of 185-285 ms; the same tables a second later took 25-55 ms.
-  The first middleware isolates also fetched the signing keys (`/.well-known/jwks.json`) at 270-290 ms (a
-  CDN miss; the warm fetch is 6 ms). Neither is code in this repo.
-* **The Vercel cold start is the rest, and it grows with the route's module graph.** `/api/ui/preferences`
-  (a one-row read with almost no imports) took 841 ms on the same cold view; the two finance routes, which
-  also read one row, took ~190 ms longer. Both loaded the forecast engine, the tax plan, the budgets and the
-  subscription detection at import time (26 modules, ~349 KB of source) although a stored answer needs none.
+| Breach | Served revision | Repeats | Coincides with |
+|---|---|---|---|
+| Today cold data-ready 1143 ms | c5c8f436 | cold, 1 view | first page of the run, 25 min after the previous run |
+| Today cold `/api/finance/alerts` 1033 ms | c5c8f436 | cold, 1 view | same view |
+| Today cold `/api/procurement/renewals/summary` 1021 ms | c5c8f436 | cold, 1 view | same view |
+| `/supplements` warm data-ready, max 1759 ms (p95 1689 ms) | mixed | **2 of 3 warm views over budget** | ba4af90b promoted to Production at 01:34:20, inside the page's window |
+| `/supplements` warm `/api/weight`, max 1084 ms | mixed | 1 of 3 warm views | same window |
+| phone Today tap, max 4750 ms (observational) | mixed | 3 taps | 71c5cc79 promoted at 01:45:19, inside the tap series |
 
-**Fix shipped (claude/perf-03):** `lib/finance-result-cache-server.ts` loads the computations with
-`import()` only when it computes, and takes the service-role client from the new small
-`lib/finance-service-client.ts` (re-exported by `lib/finance-ledger-server.ts`, one client per instance).
-A stored answer now loads 7 modules / ~53 KB (alerts) and 10 / ~97 KB (renewals) instead of 26 / ~349 KB.
-Expected: the two finance routes' cold first call drops to about the `/api/ui/preferences` cold floor
-(~850 ms in this run), so Today cold data-ready lands under the budget; warm calls are unchanged (~200 ms).
-The next hourly runs confirm it: Today cold `/api/finance/alerts` and `/api/procurement/renewals/summary`
-at or below `/api/ui/preferences` cold in the same sample, on a run whose `deployed.start` equals `deployed.end`.
+**Run 44003258302** (harness v2; all 28 result groups served 62243ab8, a single revision; before PR #396). Five
+enforced breaches: Today cold data-ready 4886 ms, Today warm data-ready max 1006 ms (1 of 3), Today cold
+`/api/urgent-email` 2480 ms, Today cold `/api/nyc/leads` 1016 ms, Log cold data-ready 1017 ms. Observational:
+phone Today warm max 1027 ms (1 of 3), phone Log cold 1291 ms; phone Today taps max 766 ms (3 of 3 fine). In
+this run the two finance routes were **not** among the breaches: cold `/api/finance/alerts` 361 ms,
+`/api/procurement/renewals/summary` 349 ms, `/api/ui/preferences` 188 ms.
 
-**Not fixed here, with the reason:**
+What was checked, and what it does and does not show:
 
-* The remaining cold floor (~850 ms: middleware isolate + key fetch, function boot, first PostgREST
-  connections) is platform cost. Options, each needing a decision: keep functions warm after idle and after a
-  promotion (a post-deploy warm-up request per route; a workflow change), or verify tokens against keys
-  shipped with the build (no key fetch; a revoked key would then be accepted until the next deploy, which is a
-  security trade-off for Riley).
-* Breaches inside a promotion window measure the new deployment's cold start, not the page; the harness
-  already records `deployed.start` / `deployed.end` and the reviewer does not pool mixed revisions. The 4.75 s
-  phone Today tap is one of these (no long task, no reload, database fast), so it is not a router or
-  `ContinuousScroll` defect and nothing is handed to PR #376 for it.
+* **Database time.** `pg_stat_statements`: the finance result-cache read averages 0.6 ms (max 7.8 ms),
+  `ui_preferences` 0.1 ms, `weight_log` 0.1 ms, today's compound rollup uses its index (0.3 ms). During both
+  promotion windows of run 43995593029 the Supabase edge origin times had a 20-60 ms median (max 433 ms). These
+  are aggregates; they make a slow query an unlikely explanation for these breaches but do not exclude a single
+  slow request.
+* **First PostgREST requests and the signing-key fetch.** In the Today cold view of run 43995593029, the first
+  wave of REST requests had origin times of 185-285 ms; the same tables a second later took 25-55 ms. The first
+  middleware instances fetched `/.well-known/jwks.json` at 270-290 ms (the warm fetch is 6 ms). This shows a
+  first-request cost in that view; how much of each breach it explains is not measured.
+
+**Hypothesis A (the one PR #396 acts on): the two finance routes pay extra cold-start time for their module
+graph.** Evidence: on the same cold view, the finance routes took about 180-190 ms longer than
+`/api/ui/preferences` in run 43995593029 (1021-1033 ms vs 841 ms) and about 160-175 ms longer in run 44003258302
+(349-361 ms vs 188 ms); both answer a stored one-row read, but at import time they loaded the forecast engine,
+tax plan, budgets and subscription detection (26 modules, ~349 KB of source) that a stored answer does not use.
+What it does not establish: the routes also differ in their handlers and queries, and two cold samples with
+uncontrolled function state cannot attribute the difference to module loading. PR #396 makes
+`lib/finance-result-cache-server.ts` load those modules with `import()` only when it computes (a stored answer now
+loads 7 modules / ~53 KB for alerts and 10 / ~97 KB for renewals) and takes the service-role client from the new
+small `lib/finance-service-client.ts`. **Would confirm it:** after PR #396 is deployed, single-revision runs
+(every result group serving the same revision) in which the finance routes' cold call is consistently no slower
+than `/api/ui/preferences` on the same view, where it was consistently slower before. **Would refute it:** the
+gap stays the same after deployment. Either way the larger cold variation between runs (841 ms vs 188 ms for the
+same one-row route) is not explained by this change.
+
+**Hypothesis B: breaches that overlap a Production promotion measure the new deployment's first requests.**
+Evidence: in run 43995593029 the `/supplements` warm breaches (2 of 3 views) and the 4.75 s phone tap fall inside
+promotion windows, and those groups served mixed revisions; for the tap no long task or reload was recorded and
+the database was fast. This overlap is a confound, not proof: it does not show that the delay is only a cold
+start, and it does not rule out the page, the router or `ContinuousScroll`. **Would confirm or refute it:**
+per-sample served revision and timing for these pages in runs with no promotion inside the window. Until then
+these breaches are **unresolved**; none is handed to PR #376.
+
+**Unresolved:** every breach of run 44003258302 (Today cold 4886 ms with `/api/urgent-email` 2480 ms and
+`/api/nyc/leads` 1016 ms, Today warm 1 of 3, Log cold), the mixed-revision `/supplements` and phone-tap breaches
+of run 43995593029, and the size of the cold cost that is common to all routes. PR #396 is not expected to change
+any of these. PERF-02 stays open until deployed single-revision runs meet the budget.
