@@ -363,6 +363,13 @@ export class ClientCache {
     return this.mem.get(key)?.at ?? this.rows.get(key)?.at;
   }
 
+  /** The in-memory value when it was fetched less than `maxAgeMs` ago, else undefined (no request is made). */
+  freshPeek<T = unknown>(key: string, maxAgeMs: number): T | undefined {
+    const entry = this.mem.get(key);
+    if (!entry || this.now() - entry.at >= maxAgeMs) return undefined;
+    return this.peek<T>(key);
+  }
+
   /** The cached value from memory or the persisted store (waits briefly for the store to attach). */
   async read<T = unknown>(key: string): Promise<T | undefined> {
     const hit = this.peek<T>(key);
@@ -640,9 +647,15 @@ export function reportSessionEnded() { onSessionEnded(); }
  * 404 / 410 / 204 removes the entry (GoneError); 401 or a redirect to /login wipes the client (SessionEndedError).
  * `get`: how to GET `url` when it differs from a plain no-store fetch (e.g. taking the answer a page's HTML already
  * started, lib/log-early.ts); same URL, GET only.
+ * `freshMs`: a memory copy fetched less than this long ago (the warm-up's or a hover's answer) is returned without a
+ * new GET. Opt-in per call; a write still invalidates the entry, so the copy is never older than the last write.
  */
-export async function cachedJson<T = unknown>(url: string, options: { check?: (data: unknown) => void; persist?: boolean; cache?: ClientCache; get?: () => Promise<Response> } = {}): Promise<T> {
+export async function cachedJson<T = unknown>(url: string, options: { check?: (data: unknown) => void; persist?: boolean; cache?: ClientCache; get?: () => Promise<Response>; freshMs?: number } = {}): Promise<T> {
   const cache = options.cache ?? clientCache;
+  if (options.freshMs !== undefined) {
+    const fresh = cache.freshPeek<T>(url, options.freshMs);
+    if (fresh !== undefined) return fresh;
+  }
   const value = await cache.revalidate<T>(url, async () => {
     const data = await fetchJsonValue(url, options.get);
     if (data !== GONE) options.check?.(data);
