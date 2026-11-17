@@ -463,27 +463,35 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   `%LOCALAPPDATA%\Onyx\backup-tmp`, copied into `~/OneDrive/Backups/onyx` under a hidden `.partial`
   name, then renamed `onyx-backup-<UTC time>.tar.age`; the temporary copy is removed. Plaintext never
   touches OneDrive or the repo.
-- **Retention**, applied only after a fully successful run: the newest 8 backups plus the first backup of
-  each of the 3 most recent months. Only names this job writes are removed (OneDrive keeps them 30 days
-  in its recycle bin); a partial or failed run removes nothing.
+- **Retention**, applied after every run that wrote a backup (success or partial): the newest 8 backups,
+  plus the first backup of each of the 3 most recent months, plus the newest backup of a fully successful
+  run wherever it falls (a complete run leaves an empty `onyx-backup-<UTC time>.ok` marker next to its
+  backup), so a run of partial backups can never push the last complete one out. Only names this job
+  writes are removed (OneDrive keeps them 30 days in its recycle bin); a failed run removes nothing.
+  Ciphertext a killed run left in `backup-tmp` is removed after a day.
 - **Partial and failed runs.** A confirmed document whose file is not listed or not served
   (`files_missing`), a file whose size differs from its row or listing (`size_mismatch`), a file that
   keeps failing after two retries (`files_unread`), entries outside `documents/<id>`, a wider table that
-  cannot be read: the pack is still written, without the recovery manifest, and the run is `partial`.
+  cannot be read, a wider table or file larger than one member may be (64 MiB, the drill's own limit:
+  `table_too_large`, `files_too_large`): the pack is still written, without the recovery manifest, and the
+  run is `partial`. A medical table over that limit fails the run (`medical_table_too_large`).
   A refused read, a failed read of a medical table or the listing, no recipient, no `age`, a failed
   encryption or write, a crash: `failed`, nothing in the backup folder.
 - **Heartbeat** (decision 5): one `pds.sync_log` row per production run, source `backup`, data type
   `medical_records`, status `success` / `partial` / `failed`, `records_synced` always 0, `error_message`
-  only a short code (`files_missing`, `crash_OSError`). A dry run, a drill-target run and a drill write
-  none. `/status` card **Medical Backup**: more than 8 days without a run degraded, more than 15 days or
+  only a short code (`files_missing`, `crash_OSError`). It is sent through the backup's own request path
+  to exactly the production origin with the service-role key the backup resolved (never
+  `ONYX_SUPABASE_URL` / `ONYX_SUPABASE_SECRET_FILE`), and a heartbeat that cannot be written never changes
+  the run's outcome. A dry run, a drill-target run and a drill write none. `/status` card **Medical Backup**: more than 8 days without a run degraded, more than 15 days or
   a failed run red, with what to do per code (`lib/medical-backup-status.ts`). Printed output and the
   log (`%LOCALAPPDATA%\Onyx\medical-backup\backup.log`) hold counts and codes only.
 - **Restore drill** (`drill`): decrypts the newest backup into a new folder under
   `%LOCALAPPDATA%\Onyx\backup-drill` (never into Supabase; refused under OneDrive, in the repo or in the
   backup folder), refuses and never extracts any member outside the pack's names, then checks every
   table's SHA-256, bytes and row count, every file's size and SHA-256, that nothing is missing or extra,
-  that every lab result's document link and every ready document's file are in the pack, and that the
-  recovery manifest is valid and agrees with the files. It prints counts, booleans, the restore time and
+  that every lab result's document link and every ready document's file are in the pack, that the backup
+  recorded no problem (`backup_complete`: a partial backup never passes, even when what it holds
+  verifies), and that the recovery manifest is valid and agrees with the files. It prints counts, booleans, the restore time and
   the backup's age, and removes the decrypted folder, also when a check or the decryption fails.
   `--hold` writes `open-me.<ext>` (a copy of one restored document) and waits for Enter, so a person
   opens it before the folder is removed: that is the `file_opened_in_viewer` evidence.

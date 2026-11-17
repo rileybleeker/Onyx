@@ -49,12 +49,15 @@ export function backupCodeMessage(code: string): string {
   if (code === "read_denied") return "Supabase refused the read (read_denied): check the service-role key in ~/.onyx_supabase_secret.";
   if (code.startsWith("read_failed")) return `Supabase could not be read (${code}); the next run retries.`;
   if (code === "medical_table_missing") return "A medical table is missing (medical_table_missing): run the recovery check.";
+  if (code === "medical_table_too_large")
+    return "A medical table is larger than one backup member allows (medical_table_too_large): the backup job needs chunking before it can copy it.";
   if (code === "encrypt_failed" || code === "dest_unwritable" || code === "tmp_unwritable")
     return `The encrypted copy could not be written (${code}): check the OneDrive backup folder and free disk space.`;
   if (code === "files_missing" || code === "files_unread" || code === "size_mismatch" || code === "recovery_manifest_refused"
-      || code === "unexpected_paths")
+      || code === "unexpected_paths" || code === "files_too_large")
     return `Some medical files were not copied as expected (${code}): run tools/medical_recovery/recovery_check.py.`;
-  if (code === "rebuild_table_unreadable" || code === "schema_unread")
+  if (code === "rebuild_table_unreadable" || code === "schema_unread" || code === "table_too_large"
+      || code === "schema_too_large")
     return `Part of the wider table copy was skipped (${code}); the medical records were copied.`;
   if (code === "locked") return "A backup run was already in progress (locked).";
   if (code.startsWith("crash_")) return `The backup job stopped with an error (${code}): see %LOCALAPPDATA%\\Onyx\\medical-backup\\backup.log.`;

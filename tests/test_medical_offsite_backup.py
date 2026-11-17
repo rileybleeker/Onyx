@@ -9,15 +9,19 @@ the temporary folder, the printed output or the heartbeat. Covers:
     folder, every check passes (tables, rows, files and hashes, lab links, the recovery manifest) and the
     decrypted copy is removed;
   * failure recovery: a file missing from the listing or from storage, a size that differs, a read that keeps
-    failing are a PARTIAL run (written, flagged, no pruning, no recovery manifest); a refused read, a failed
+    failing, a wider table that cannot be read or is too large for a member are a PARTIAL run (written,
+    flagged, no recovery manifest, and the drill does not pass it); a refused read, a failed
     encryption, a crash are a FAILED run with nothing in the backup folder and a failed heartbeat;
   * retry: a file answered 503 twice is fetched on the third try (1 s, 2 s backoff);
   * refusals before anything is sent: another origin, no public recipient, the private key given as the
     recipient, no age tool; a drill target needs its own --dest and its own key and writes no heartbeat;
   * tables: paging in primary-key order, a table the schema does not know is listed as missing (not a
     failure), credentials and the trial seed / schedule are never requested;
-  * retention: newest 8 plus the first of each of the 3 latest months; only this job's names are removed,
-    and only after a fully successful run;
+  * retention: newest 8 plus the first of each of the 3 latest months plus the newest complete backup (its ok
+    marker); only this job's names are removed; partial runs prune too but never the newest complete one;
+    ciphertext a killed run left in the temporary folder is removed after a day;
+  * the heartbeat goes to exactly the production origin with the key the backup resolved, whatever
+    ONYX_SUPABASE_URL says, and a heartbeat that cannot be written never changes the run's outcome;
   * the drill fails on a changed file, a member outside the pack's names (never extracted), a ciphertext that
     does not decrypt, and refuses a folder in the repo or under OneDrive; the decrypted copy is always removed.
 
@@ -85,6 +89,8 @@ class FakeSupabase:
         self.always_500: set = set()    # paths or tables that never answer
         self.denied = False
         self.calls: list = []
+        self.posted: list = []          # heartbeat rows POSTed to /rest/v1/sync_log
+        self.heartbeat_down = False
 
     def spec(self):
         defs = {}
@@ -109,6 +115,9 @@ class FakeSupabase:
         parts = urllib.parse.urlsplit(url)
         q = dict(urllib.parse.parse_qsl(parts.query))
         path = parts.path
+        if method == "POST" and path == "/rest/v1/sync_log":
+            self.posted.extend(json.loads(body.decode()))
+            return (500, b"{}", {}) if self.heartbeat_down else (201, b"", {})
         if path == "/rest/v1/":
             return 200, json.dumps(self.spec()).encode(), {}
         if path.startswith("/rest/v1/"):
@@ -230,7 +239,11 @@ class Base(unittest.TestCase):
         return code, out.getvalue()
 
     def written(self):
-        return sorted(p for p in self.dest.iterdir()) if self.dest.is_dir() else []
+        """What is in the backup folder, without the empty ok markers of complete runs."""
+        return sorted(p for p in self.dest.iterdir() if not ob.OK_RE.match(p.name)) if self.dest.is_dir() else []
+
+    def markers(self):
+        return sorted(p.name for p in self.dest.iterdir() if ob.OK_RE.match(p.name)) if self.dest.is_dir() else []
 
     def heartbeats(self):
         return [r for t, r in self.client.rows if t == "sync_log"]
@@ -250,6 +263,8 @@ class HappyPath(Base):
         files = self.written()
         self.assertEqual(len(files), 1)
         self.assertRegex(files[0].name, ob.NAME_RE)
+        self.assertEqual(self.markers(), [ob.ok_marker(files[0].name)], "a complete run is marked")
+        self.assertEqual((self.dest / ob.ok_marker(files[0].name)).read_bytes(), b"")
         self.assert_no_plaintext_on_disk()
         self.assertEqual([p for p in ob.tmp_dir().iterdir() if p.name != ".lock"], [], "no temporary file is left")
         for marker in ("LEAK", DOC_A, "documents/", "fake-service", RECIPIENT):
@@ -314,6 +329,7 @@ class PartialRuns(Base):
         code, out = self.backup()
         self.assertEqual(code, 2, out)
         self.assertEqual(len(self.written()), 1, "a partial backup is still written")
+        self.assertEqual(self.markers(), [], "a partial backup is never marked complete")
         hb = self.heartbeats()
         self.assertEqual((hb[0]["status"], hb[0]["error_message"], hb[0]["records_synced"]), ("partial", code_name, 0))
         self.assert_no_plaintext_on_disk()
@@ -343,18 +359,43 @@ class PartialRuns(Base):
         self.check_partial("files_unread")
         self.assertEqual(self.sleeps.count(1.0), 1)
 
-    def test_partial_runs_never_prune(self):
+    def test_partial_runs_prune_but_keep_the_newest_complete_backup(self):
         self.dest.mkdir()
-        old = [self.dest / f"onyx-backup-2025{m:02d}01T000000Z.tar.age" for m in range(1, 13)]
-        for p in old:
+        complete = self.dest / "onyx-backup-20250101T000000Z.tar.age"
+        complete.write_bytes(b"x")
+        (self.dest / ob.ok_marker(complete.name)).write_bytes(b"")
+        later = [self.dest / f"onyx-backup-2026{m:02d}01T000000Z.tar.age" for m in range(1, 11)]  # partials
+        for p in later:
             p.write_bytes(b"x")
         self.sb.unlisted.add(f"documents/{DOC_A}")
-        self.backup()
-        self.assertTrue(all(p.exists() for p in old))
+        code, _ = self.backup()
+        self.assertEqual(code, 2)
+        left = {p.name for p in self.written()}
+        self.assertIn(complete.name, left, "the newest complete backup survives any run of partials")
+        self.assertIn(ob.ok_marker(complete.name), self.markers())
+        self.assertLessEqual(len(left), ob.KEEP_WEEKLY + ob.KEEP_MONTHLY + 1, "partial runs prune too")
+        self.assertFalse(later[0].exists())
 
     def test_unreadable_rebuild_table_is_partial_and_missing_table_is_not(self):
         self.sb.always_500.add("weight_log")
         self.check_partial("rebuild_table_unreadable")
+        report = ob.run_drill(dest=self.dest, identity=self.identity, cipher=self.cipher, root=self.tmp / "drill")
+        self.assertTrue(report.checks["tables_match"], "what the pack holds still verifies")
+        self.assertFalse(report.checks["backup_complete"], "but the omitted table is not ignored")
+        self.assertEqual(report.status, "fail")
+
+    def test_a_wider_table_too_large_for_a_member_is_left_out(self):
+        self.sb.tables["weight_log"] = [{"log_date": f"2026-02-{d:02d}", "note": "LEAK" * 400} for d in range(1, 20)]
+        with mock.patch.object(ob, "MAX_MEMBER_BYTES", 4096):
+            names = self.check_partial("table_too_large")
+        self.assertNotIn("tables/pds/weight_log.json", names, "never packed past the drill's limit")
+
+    def test_a_medical_table_too_large_for_a_member_fails(self):
+        with mock.patch.object(ob, "MAX_MEMBER_BYTES", 1):
+            code, out = self.backup()
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.written(), [])
+        self.assertEqual(self.heartbeats()[0]["error_message"], "medical_table_too_large")
 
     def test_missing_rebuild_table_is_listed_not_failed(self):
         code, out = self.backup()
@@ -517,6 +558,30 @@ class Retention(Base):
         self.assertEqual(removed, 20 - len(left - {other.name}) + 1)
         self.assertLessEqual(len(left - {other.name}), ob.KEEP_WEEKLY + ob.KEEP_MONTHLY)
 
+    def test_markers_of_pruned_backups_go_with_them(self):
+        self.dest.mkdir()
+        weekly = [datetime(2026, 1, 4, tzinfo=timezone.utc) + timedelta(weeks=i) for i in range(20)]
+        for n in self.names(weekly):
+            (self.dest / n).write_bytes(b"x")
+            (self.dest / ob.ok_marker(n)).write_bytes(b"")
+        ob.prune(self.dest, NOW)
+        backups = {p.name for p in self.written()}
+        self.assertEqual({ob.ok_marker(n) for n in backups}, set(self.markers()))
+
+    def test_stale_ciphertext_in_the_temporary_folder_is_removed(self):
+        ob.tmp_dir().mkdir(parents=True, exist_ok=True)
+        stale = ob.tmp_dir() / "onyx-backup-20260101T000000Z.tar.age.tmp"
+        fresh = ob.tmp_dir() / "onyx-backup-20261122T150000Z.tar.age.tmp"
+        other = ob.tmp_dir() / "notes.txt"
+        old_time = NOW.timestamp() - 3 * 86400
+        for f in (stale, fresh, other):
+            f.write_bytes(b"x")
+            os.utime(f, (old_time, old_time))
+        os.utime(fresh, (NOW.timestamp() - 60, NOW.timestamp() - 60))
+        ob.clear_stale_tmp(ob.tmp_dir(), NOW)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists() and other.exists())
+
     def test_a_successful_run_prunes(self):
         self.dest.mkdir()
         for n in self.names([datetime(2025, m, 1, tzinfo=timezone.utc) for m in range(1, 13)]):
@@ -590,11 +655,26 @@ class Drill(Base):
     def test_no_backup_or_no_key_is_incomplete(self):
         r = self.drill()
         self.assertFalse(r.checks["backup_found"])
-        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.status, "incomplete")
         self.make()
         self.identity.unlink()
         r = self.drill()
         self.assertFalse(r.checks["private_key_found"])
+        self.assertEqual(r.status, "incomplete")
+
+    def test_a_manifest_without_its_problems_list_is_invalid(self):
+        p = self.make()
+
+        def drop(ms):
+            for m in ms:
+                if m[0] == "manifest.json":
+                    d = json.loads(m[1])
+                    d.pop("problems")
+                    m[1] = json.dumps(d).encode()
+        self.rebuild(p, drop)
+        r = self.drill()
+        self.assertFalse(r.checks["manifest_valid"])
+        self.assertEqual(r.status, "fail")
 
     def test_the_drill_folder_must_be_isolated(self):
         self.make()
@@ -647,6 +727,32 @@ class Keygen(Base):
 
 
 class Heartbeat(Base):
+    def test_goes_to_the_production_origin_with_the_resolved_key(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"ONYX_SUPABASE_URL": "https://example.com",
+                                          "ONYX_SUPABASE_SECRET_FILE": str(self.tmp / "other-key")}):
+            code = ob.main(["backup", "--recipient-file", str(self.rfile), "--dest", str(self.dest)],
+                           transport=self.sb, sleep=self.sleeps.append, cipher_factory=lambda: self.cipher, out=out)
+        self.assertEqual(code, 0, out.getvalue())
+        posts = [(u, h) for m, u, h in self.sb.calls if m == "POST" and "/rest/v1/" in u]
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(posts[0][0].startswith(rc.DEFAULT_URL + "/rest/v1/sync_log"))
+        self.assertEqual(posts[0][1]["apikey"], "fake-service")
+        self.assertEqual([(r["source"], r["status"], r["records_synced"]) for r in self.sb.posted],
+                         [("backup", "success", 0)])
+
+    def test_a_heartbeat_that_cannot_be_written_does_not_change_the_outcome(self):
+        self.sb.heartbeat_down = True
+        out = io.StringIO()
+        code = ob.main(["backup", "--recipient-file", str(self.rfile), "--dest", str(self.dest)],
+                       transport=self.sb, sleep=self.sleeps.append, cipher_factory=lambda: self.cipher, out=out)
+        self.assertEqual(code, 0, out.getvalue())
+
+        class Boom:
+            def schema(self, _):
+                raise RuntimeError("LEAK")
+        ob.heartbeat(Boom(), "failed", NOW.timestamp(), "x")  # never raises
+
     def test_only_a_short_code_is_ever_stored(self):
         ob.heartbeat(self.client, "failed", NOW.timestamp(), "a sentence with LEAK in it")
         ob.heartbeat(self.client, "partial", NOW.timestamp(), "files_missing")

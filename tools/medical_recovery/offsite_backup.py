@@ -13,9 +13,10 @@ register-task.ps1); standard-library Python plus the `age` command-line tool (X2
            ~/OneDrive/Backups/onyx) under a temporary name and renamed when complete, so a run that stops part
            way leaves no restore point. The pack's manifest.json (written last, inside the ciphertext) holds
            each table's row count and SHA-256 and each file's size and SHA-256; recovery-manifest.json (the
-           format recovery_check.py --manifest reads) is added when the copy is complete. Retention after a
-           fully successful run: the newest 8 backups plus the first backup of each of the 3 most recent
-           months; only files named onyx-backup-<UTC time>.tar.age in the backup folder are ever removed.
+           format recovery_check.py --manifest reads) is added when the copy is complete. Retention after every
+           run that wrote a backup: the newest 8 backups, the first backup of each of the 3 most recent
+           months, and the newest backup of a fully successful run (its empty .ok marker); only this job's
+           names (onyx-backup-<UTC time>.tar.age / .ok) in the backup folder are ever removed.
   drill    Decrypts the newest backup (with the private key file) into an isolated folder under
            %LOCALAPPDATA%\\Onyx\\backup-drill (never into Supabase, never under OneDrive), checks every member
            against the manifest (SHA-256 per file and per table, row counts, lab links, the recovery manifest),
@@ -60,7 +61,7 @@ from typing import BinaryIO, Callable, Iterator, Optional
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-for _p in (HERE, ROOT, ROOT / "tools" / "pc_activity_logger"):
+for _p in (HERE, ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -74,6 +75,9 @@ TOOL_VERSION = "1"
 NAME_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.tar\.age$")
 DEST_PARTIAL_RE = re.compile(r"^\.onyx-backup-\d{8}T\d{6}Z\.tar\.age\.partial$")
 TMP_RE = re.compile(r"^onyx-backup-\d{8}T\d{6}Z\.tar\.age\.tmp$")
+# An empty marker next to a backup whose run was fully successful: retention always keeps the newest such
+# backup, so a run of partial backups can never push the last complete one out. It holds nothing.
+OK_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.ok$")
 KEEP_WEEKLY, KEEP_MONTHLY = 8, 3
 RECIPIENT_RE = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -98,7 +102,10 @@ EXCLUDED_TABLES = frozenset({"ci_tokens", "experiment_secrets", "experiment_sche
 assert not EXCLUDED_TABLES & set(REBUILD_TABLES) and not set(MEDICAL_TABLES) & set(REBUILD_TABLES)
 PAGE = 1000
 MAX_TABLE_ROWS = 500_000
-MAX_MEMBER_BYTES = 64 * 1024 * 1024  # a drill refuses any member larger than this (files are capped at 25 MB)
+# One limit for both sides: the backup never packs a member larger than this (a wider table over it is left
+# out and the run is partial; a medical table over it fails the run), and a drill refuses any member over it,
+# so every backup the job reports is one the drill can read. Files are capped at 25 MB by the bucket.
+MAX_MEMBER_BYTES = 64 * 1024 * 1024
 # The pack's members: nothing else is written, and a drill refuses (and never extracts) anything else.
 MEMBER_RE = re.compile(r"^(manifest\.json|recovery-manifest\.json|schema/openapi\.json|tables/pds/[a-z_][a-z0-9_]{0,62}\.json"
                        r"|objects/documents/[0-9a-f-]{36})$")
@@ -454,11 +461,18 @@ def write_pack(stream: BinaryIO, snap: Snapshot, target: rc.Target, now: datetim
                       "created_at": now.isoformat(timespec="seconds"), "tables": {}, "missing_tables": [],
                       "objects": {}, "schema": False, "recovery_manifest": False, "unexpected_paths": snap.unexpected_paths}
     with tarfile.open(fileobj=stream, mode="w|", format=tarfile.PAX_FORMAT) as tar:
-        if snap.openapi is not None:
+        if snap.openapi is not None and len(snap.openapi) > MAX_MEMBER_BYTES:
+            snap.problem("schema_too_large")
+        elif snap.openapi is not None:
             _add(tar, "schema/openapi.json", snap.openapi, mtime)
             manifest["schema"] = True
         for table, rows in snap.tables.items():
             data = _dump(rows)
+            if len(data) > MAX_MEMBER_BYTES:  # the drill could not read it back: never report it as copied
+                if table in MEDICAL_TABLES:
+                    raise BackupError("medical_table_too_large")
+                snap.problem("table_too_large")
+                continue
             _add(tar, f"tables/pds/{table}.json", data, mtime)
             manifest["tables"][table] = {"rows": len(rows), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         manifest["missing_tables"] = sorted(snap.missing_tables)
@@ -479,6 +493,9 @@ def write_pack(stream: BinaryIO, snap: Snapshot, target: rc.Target, now: datetim
                 continue
             if data is None:
                 snap.problem("files_missing")
+                continue
+            if len(data) > MAX_MEMBER_BYTES:
+                snap.problem("files_too_large")
                 continue
             declared = (docs.get(path) or {}).get("size_bytes")
             listed = snap.objects[path].get("size")
@@ -517,12 +534,24 @@ def backup_time(name: str) -> Optional[datetime]:
         return None
 
 
+def ok_marker(backup_name: str) -> str:
+    m = NAME_RE.match(backup_name)
+    if not m:
+        raise ValueError("not a backup name")
+    return f"onyx-backup-{m.group(1)}.ok"
+
+
 def retention_keep(names: list[str]) -> set[str]:
-    """The newest KEEP_WEEKLY backups, plus the FIRST backup of each of the KEEP_MONTHLY most recent months.
-    Names that are not backups are never in the answer, and never pruned either (prune() looks only at
-    backup names)."""
+    """The newest KEEP_WEEKLY backups, plus the FIRST backup of each of the KEEP_MONTHLY most recent months,
+    plus the newest backup whose run was fully successful (it has an ok marker), wherever it falls. Names
+    that are not backups are never in the answer, and never pruned either (prune() looks only at this job's
+    names)."""
     dated = sorted(((t, n) for n in names if (t := backup_time(n)) is not None), reverse=True)
     keep = {n for _, n in dated[:KEEP_WEEKLY]}
+    present = set(names)
+    complete = [n for _, n in dated if ok_marker(n) in present]
+    if complete:
+        keep.add(complete[0])
     first_of_month: dict[tuple[int, int], str] = {}
     for t, n in dated:  # newest first, so the last assignment per month is its earliest backup
         first_of_month[(t.year, t.month)] = n
@@ -532,10 +561,12 @@ def retention_keep(names: list[str]) -> set[str]:
 
 
 def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: p.unlink()) -> int:
-    """Removes backups outside retention_keep() and this job's own unfinished copies older than a day. Only
-    names this job writes are touched (OneDrive keeps a removed file in its recycle bin for 30 days)."""
+    """Removes backups outside retention_keep(), ok markers whose backup is not kept, and this job's own
+    unfinished copies older than a day. Only names this job writes are touched (OneDrive keeps a removed
+    file in its recycle bin for 30 days). Returns how many backups and stale copies were removed."""
     names = [p.name for p in dest.iterdir() if p.is_file()]
     keep = retention_keep(names)
+    kept_markers = {ok_marker(n) for n in keep}
     removed = 0
     for name in names:
         path = dest / name
@@ -543,7 +574,24 @@ def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: 
         if (NAME_RE.match(name) and name not in keep) or stale_partial:
             unlink(path)
             removed += 1
+        elif OK_RE.match(name) and name not in kept_markers:
+            unlink(path)
     return removed
+
+
+def clear_stale_tmp(tmp: Path, now: datetime) -> None:
+    """Ciphertext a killed run left in the temporary folder (an exception removes its own): this job's
+    .tmp names only, older than a day, in that folder only."""
+    try:
+        entries = list(tmp.iterdir()) if tmp.is_dir() else []
+    except OSError:
+        return
+    for p in entries:
+        try:
+            if TMP_RE.match(p.name) and p.is_file() and now.timestamp() - p.stat().st_mtime > 86400:
+                p.unlink()
+        except OSError:
+            pass
 
 
 def newest_backup(dest: Path) -> Optional[Path]:
@@ -591,6 +639,7 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
         tmp.mkdir(parents=True, exist_ok=True)
     except OSError:
         raise BackupError("tmp_unwritable") from None
+    clear_stale_tmp(tmp, now)
     tmp_file = tmp / f"{final_name}.tmp"
     try:
         try:
@@ -616,9 +665,15 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
     result = _result(snap, manifest, written, size)
     if result.status == "success":
         try:
-            result.pruned = prune(dest, now)
+            (dest / ok_marker(final_name)).write_bytes(b"")
         except OSError:
-            log.warning("retention: could not prune old backups (OSError)")
+            log.warning("retention: could not mark the backup complete (OSError)")
+    # Retention runs after partial runs too (so they cannot grow the folder without bound); the newest
+    # complete backup is always kept (its ok marker), whatever came after it.
+    try:
+        result.pruned = prune(dest, now)
+    except OSError:
+        log.warning("retention: could not prune old backups (OSError)")
     return result
 
 
@@ -741,12 +796,17 @@ def _verify(run_dir: Path, seen: dict, report: DrillReport) -> None:
         except (OSError, ValueError):
             manifest = None
     ok = (isinstance(manifest, dict) and manifest.get("format") == FORMAT and manifest.get("version") == FORMAT_VERSION
-          and isinstance(manifest.get("tables"), dict) and isinstance(manifest.get("objects"), dict))
+          and isinstance(manifest.get("tables"), dict) and isinstance(manifest.get("objects"), dict)
+          and isinstance(manifest.get("problems"), list))
     c["manifest_valid"] = ok
     if not ok:
-        for k in ("tables_match", "objects_match", "no_unlisted_members", "medical_links_hold", "recovery_manifest_valid"):
+        for k in ("backup_complete", "tables_match", "objects_match", "no_unlisted_members", "medical_links_hold",
+                  "recovery_manifest_valid"):
             c[k] = False if "decrypted" in c and c["decrypted"] else None
         return
+    # A backup that recorded a problem (a wider table it could not read, a file it could not copy) is not a
+    # full restore point, even when everything it does hold verifies: the drill never passes it.
+    c["backup_complete"] = manifest["problems"] == []
     tables, objects = manifest["tables"], manifest["objects"]
     rows_total, tables_ok = 0, True
     parsed: dict[str, list] = {}
@@ -862,23 +922,58 @@ def keygen(identity: Path = DEFAULT_IDENTITY_FILE, recipient_file: Path = DEFAUL
 
 
 # ---------------------------------------------------------------- heartbeat, logging, CLI
-def heartbeat(client, status: str, started_at: float, code: Optional[str]) -> None:
-    """ONE count-free row: status, a short code, the time (decision 5). records is always 0."""
-    from sync_log_helper import log_sync  # the one shared sync_log writer (swallows its own failures)
+class _HeartbeatClient:
+    """The supabase-py shape sync_log_helper.log_sync speaks (schema().table().insert().execute()), over the
+    backup's own request path: exactly the production origin (checked before anything is sent), a redirect
+    never followed, the service-role key the backup resolved and read with. Deliberately not
+    activity_logger.make_client(), which has its own URL and key settings the backup never checked."""
 
+    def __init__(self, target: rc.Target) -> None:
+        self._target, self._table, self._row = target, None, None
+
+    def schema(self, _name: str) -> "_HeartbeatClient":
+        return self
+
+    def table(self, name: str) -> "_HeartbeatClient":
+        if name != "sync_log":
+            raise ValueError("the backup writes only its heartbeat")
+        self._table = name
+        return self
+
+    def insert(self, row: dict) -> "_HeartbeatClient":
+        self._row = row
+        return self
+
+    def execute(self) -> None:
+        t = self._target
+        status, _ = rc.request(t.transport, "heartbeat", "POST", f"{rc.base_url(rc.PRODUCTION_ORIGIN)}/rest/v1/sync_log",
+                               t._h(**{"Content-Type": "application/json", "Content-Profile": "pds",
+                                       "Prefer": "return=minimal"}),
+                               json.dumps([self._row]).encode("utf-8"), origin=rc.PRODUCTION_ORIGIN,
+                               attempts=2, sleep=t.sleep)
+        rc._ok("heartbeat", status)
+
+
+def production_client(target: rc.Target) -> Optional[_HeartbeatClient]:
+    """The heartbeat's writer for a production target; None for anything else."""
+    if target.origin != rc.PRODUCTION_ORIGIN or target.drill:
+        return None
+    return _HeartbeatClient(target)
+
+
+def heartbeat(client, status: str, started_at: float, code: Optional[str]) -> None:
+    """ONE count-free row: status, a short code, the time (decision 5). records is always 0. Never raises:
+    a heartbeat that cannot be written is logged by its exception type only."""
     if client is None:
-        try:
-            from activity_logger import HttpError, make_client  # the PC's PostgREST write path
-            try:
-                client = make_client()
-            except HttpError:
-                log.warning("heartbeat skipped: no Supabase key file")
-                return
-        except ImportError:
-            log.warning("heartbeat skipped: no client")
-            return
+        log.warning("heartbeat skipped: no production client (the key was not resolved)")
+        return
     safe = code if code and re.fullmatch(r"[A-Za-z0-9_]{1,60}", code) else None
-    log_sync(client, SOURCE, DATA_TYPE, status, records=0, started_at=started_at, error=safe)
+    try:
+        from sync_log_helper import log_sync  # the one shared sync_log writer
+
+        log_sync(client, SOURCE, DATA_TYPE, status, records=0, started_at=started_at, error=safe)
+    except Exception as e:  # noqa: BLE001 - the run's own outcome stands; the type name only
+        log.warning("heartbeat not written: %s", type(e).__name__)
 
 
 def _stdout():
@@ -937,10 +1032,13 @@ def cmd_backup(args, out, cipher_factory, heartbeat_client) -> int:
         print("refused: a drill target needs its own --dest (never the real backup folder)", file=out)
         return 1
     dest = args.dest or DEFAULT_DEST
+    hb = heartbeat_client  # tests inject one; production builds it from the validated target below
     try:
         target, kind = _target(args, out)
         if target is None:
             return 1
+        if production and hb is None:
+            hb = production_client(target)
         recipient = read_recipient(args.recipient_file)
         cipher = None
         if not args.dry_run:
@@ -953,14 +1051,14 @@ def cmd_backup(args, out, cipher_factory, heartbeat_client) -> int:
         log.warning("backup failed: %s", e.code)
         print(f"medical backup: FAILED ({e.code})", file=out)
         if production:
-            heartbeat(heartbeat_client, "failed", started, e.code)
+            heartbeat(hb, "failed", started, e.code)
         return 1
     except Exception as e:  # noqa: BLE001 - a crash still writes its heartbeat; the type name only
         code = f"crash_{type(e).__name__}"[:60]
         log.warning("backup crashed: %s", code)
         print(f"medical backup: FAILED ({code})", file=out)
         if production:
-            heartbeat(heartbeat_client, "failed", started, code)
+            heartbeat(hb, "failed", started, code)
         return 1
     counts = ", ".join(f"{k} {v}" for k, v in result.counts.items())
     label = "DRY RUN (nothing written)" if args.dry_run else result.status.upper()
@@ -968,7 +1066,7 @@ def cmd_backup(args, out, cipher_factory, heartbeat_client) -> int:
     print(f"counts: {counts}; old backups pruned {result.pruned}", file=out)
     log.info("backup %s%s; %s", result.status, f" ({result.code})" if result.code else "", counts)
     if production:
-        heartbeat(heartbeat_client, result.status, started, result.code)
+        heartbeat(hb, result.status, started, result.code)
     return 0 if result.status == "success" else 2
 
 
