@@ -104,7 +104,12 @@ export interface ReadingBooks {
 
 /**
  * What this request has already been allowed: calls per tool, and the actions (each authorizes one write of each
- * record it names). Made with newWriteUsage(); the caller records every allowed call with commitWrite().
+ * record it names). Made with newWriteUsage(). The caller settles each allowed call around its execution:
+ * commitWrite() RESERVES it before the tool runs; afterwards a definitive refusal (releaseWrite(), nothing was
+ * written) hands the action back so a corrected call in the same request may run, while a success keeps the
+ * reservation as the completed write. An uncertain result (a timeout, a network error, a lost answer) also keeps
+ * the reservation: a repeat in this request is refused, and a retry of the message reconciles through the SEC-04
+ * ledger under the same operation key instead of executing again.
  */
 export interface WriteUsage { perTool: Map<string, number>; consumed: Set<string> }
 
@@ -116,11 +121,47 @@ export type WriteDecision =
   | { allowed: true; tool: WriteToolName; use: string | null }
   | { allowed: false; code: RefusalCode; reason: string };
 
-/** Records an allowed call, so the action it used cannot authorize the same write again in this request. */
+/**
+ * Reserves an allowed call's part of the grant, before the tool runs, so the action it used cannot authorize the same
+ * write again in this request while the call may still be executing. Settle it afterwards: releaseWrite() on a
+ * definitive refusal, nothing on a success (the reservation is the completed write) or an uncertain result.
+ */
 export function commitWrite(usage: WriteUsage, decision: WriteDecision): void {
   if (!decision.allowed) return;
   usage.perTool.set(decision.tool, (usage.perTool.get(decision.tool) ?? 0) + 1);
   if (decision.use) usage.consumed.add(decision.use);
+}
+
+/**
+ * Releases the reservation of a call whose tool definitively refused (a definitive error from the database, nothing
+ * written): the action can authorize a corrected call in the same request again. Only the pair of a commitWrite and
+ * a definitive refusal of that same call; a success or an uncertain result keeps the reservation.
+ */
+export function releaseWrite(usage: WriteUsage, decision: WriteDecision): void {
+  if (!decision.allowed) return;
+  const n = (usage.perTool.get(decision.tool) ?? 1) - 1;
+  if (n > 0) usage.perTool.set(decision.tool, n);
+  else usage.perTool.delete(decision.tool);
+  if (decision.use) usage.consumed.delete(decision.use);
+}
+
+/**
+ * Whether a write tool's answer is a definitive refusal: an error answer that says nothing was written (no
+ * incomplete mark), so the call's reservation is released and a corrected call may run. A throw (`failed`), a lost
+ * answer, an unparsable answer, or one that says it may be incomplete is uncertain: it may have written, so the
+ * reservation stays and a retry reconciles through the ledger instead of executing again.
+ */
+export function definitiveRefusal(result: string, failed: boolean): boolean {
+  if (failed) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const answer = parsed as Record<string, unknown>;
+  return answer.error !== undefined && !answer.incomplete && !answer.uncertain && answer.success !== true;
 }
 
 export type RefusalCode =

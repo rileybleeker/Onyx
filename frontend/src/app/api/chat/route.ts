@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, RETRIEVED_DATA_NOTE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
-import { authorizeWrite, chatWritesOff, commitWrite, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
+import { authorizeWrite, chatWritesOff, commitWrite, definitiveRefusal, newWriteUsage, releaseWrite, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
@@ -1923,7 +1923,8 @@ export async function POST(req: NextRequest) {
           const decision = isWriteTool(block.name)
             ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
             : null;
-          // An allowed call uses up its part of the request (an intake, a session), so a repeat needs its own words.
+          // An allowed call's part of the request is RESERVED before the tool runs (an intake, a session, a
+          // playlist): a repeat while it executes needs its own words. It is settled below, after the answer.
           if (decision?.allowed) commitWrite(writesAllowed, decision);
           if (decision && !decision.allowed) {
             // Not asked for in the user's own latest message: never run, never recorded in the ledger.
@@ -1954,6 +1955,12 @@ export async function POST(req: NextRequest) {
             const ran = await runTool(block.name, input);
             outcome = { ...ran, receipt: buildWriteReceipt(block.name, block.input, ran.result) };
           }
+          // Settle the reservation of an allowed call now that its tool has answered. A definitive refusal (an error
+          // answer, nothing written) releases it, so a corrected call in this same request may run. A success keeps
+          // it as the completed write, and so does an uncertain answer (a throw, a timeout, a lost or incomplete
+          // result): it may have written, so a repeat here is refused, and a retry of the message reconciles through
+          // the SEC-04 ledger under the same operation key instead of executing again.
+          if (decision?.allowed && definitiveRefusal(outcome.result, outcome.failed)) releaseWrite(writesAllowed, decision);
           if (outcome.receipt) receipts.push(outcome.receipt);
           toolResults.push({
             type: "tool_result" as const,
