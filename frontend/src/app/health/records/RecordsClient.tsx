@@ -108,7 +108,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
     mark(r.id, true);
     const a = await call('DELETE', `/api/medical/labs/${r.id}`);
     mark(r.id, false);
-    if (!a.ok) { setNotice({ text: `Could not remove the result: ${a.error}`, error: true }); return; }
+    if (!a.ok) { console.error('remove lab result failed:', a.error); setNotice({ text: "Couldn't remove that result. Try again.", error: true }); return; }
     setResults(cur => cur.filter(x => x.id !== r.id));
     if (editing === r.id) setEditing(null);
     setNotice(null);
@@ -117,7 +117,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
       run: async () => {
         const back = await call('PATCH', `/api/medical/labs/${r.id}`, { removed: false });
         const restored = back.ok ? rowFromApiLab(back.data.result) : null;
-        if (!restored) { setNotice({ text: `Could not bring it back: ${back.ok ? 'unexpected answer' : back.error}`, error: true }); return; }
+        if (!restored) { console.error('restore lab result failed:', back.ok ? 'unexpected answer' : back.error); setNotice({ text: "Couldn't bring it back. Try again.", error: true }); return; }
         setResults(cur => [...cur.filter(x => x.id !== restored.id), restored]);
         setNotice({ text: 'Brought back.' });
       },
@@ -128,7 +128,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
     mark(d.id, true);
     const a = await call('DELETE', `/api/medical/documents/${d.id}`);
     mark(d.id, false);
-    if (!a.ok) { setNotice({ text: `Could not remove the document: ${a.error}`, error: true }); return; }
+    if (!a.ok) { console.error('remove medical document failed:', a.error); setNotice({ text: "Couldn't remove that document. Try again.", error: true }); return; }
     setDocs(cur => cur.filter(x => x.id !== d.id));
     setNotice(null);
     setUndo({
@@ -136,7 +136,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
       run: async () => {
         const back = await call('PATCH', `/api/medical/documents/${d.id}`, { removed: false });
         const restored = back.ok ? rowFromApiDoc(back.data.document) : null;
-        if (!restored) { setNotice({ text: `Could not bring it back: ${back.ok ? 'unexpected answer' : back.error}`, error: true }); return; }
+        if (!restored) { console.error('restore medical document failed:', back.ok ? 'unexpected answer' : back.error); setNotice({ text: "Couldn't bring it back. Try again.", error: true }); return; }
         setDocs(cur => [...cur.filter(x => x.id !== restored.id), restored]);
         setNotice({ text: 'Brought back.' });
       },

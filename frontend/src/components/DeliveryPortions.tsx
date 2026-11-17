@@ -87,7 +87,12 @@ type Opts = {
 
 async function failure(res: Response) {
   const j = await res.json().catch(() => ({}));
-  return { ok: false as const, error: j?.error ? `Not saved: ${j.error}` : `Not saved (${res.status}).` };
+  console.error("delivery save failed:", res.status, j?.error);
+  // A 409 carries a sentence written for the user (the leftover rule that refused the save); other errors are server codes.
+  if (res.status === 409 && typeof j?.error === "string" && j.error) {
+    return { ok: false as const, error: `Not saved: ${j.error.charAt(0).toUpperCase()}${j.error.slice(1)}.` };
+  }
+  return { ok: false as const, error: "Not saved. Try again." };
 }
 
 async function sendPortion(itemId: number, fraction: number | null) {

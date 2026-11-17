@@ -18,7 +18,7 @@ function syncText(sync: CalendarSyncSummary, now: number): string {
   if (sync.ok) return `Last sync ${when}: ${sync.created} added, ${sync.updated} changed, ${sync.removed} taken off, ${sync.unchanged} already up to date.`;
   if (sync.error === 'google_auth') return `Last sync ${when} failed: Google no longer accepts Onyx's access. Disconnect, then connect again.`;
   if (sync.error === 'calendar_missing') return `Last sync ${when} failed: the calendar Onyx created is gone from Google. Disconnect, then connect again to make a new one.`;
-  return `Last sync ${when} did not finish (${sync.failed} item${sync.failed === 1 ? '' : 's'} failed${sync.error ? `, ${sync.error}` : ''}). It is retried on the next change or with Sync now.`;
+  return `Last sync ${when} did not finish (${sync.failed} item${sync.failed === 1 ? '' : 's'} failed). It is retried on the next change or with Sync now.`;
 }
 
 // Google Calendar connection for /health. Not connected is the default and what every failure
