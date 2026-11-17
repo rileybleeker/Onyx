@@ -262,10 +262,10 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     setError(null);
     try {
       const res = await fetch(`/api/supplements/stacks?stack_id=${id}`, { method: "DELETE" });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error("delete failed");
       onSaved();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch {
+      setError("Couldn't delete this stack. Try again.");
     } finally {
       setDeleting(false);
     }
