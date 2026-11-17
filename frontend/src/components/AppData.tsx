@@ -128,7 +128,9 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
     // The Supplements section's product options history (most used first; lib/log-early.ts LOG_SUPPLEMENTS_HISTORY_URL).
-    json(LOG_SUPPLEMENTS_HISTORY_URL),
+    // Left out while /check-in is on screen: that page does not read it, and its sweep competed with the page's reads
+    // (perf-timing run 44148312755, 2026-11-17: "/check-in (in-app): /api/supplements/history took 1735 ms").
+    { ...json(LOG_SUPPLEMENTS_HISTORY_URL), skipOn: (page) => page === "/check-in" || page.startsWith("/check-in/") },
     // Wind-down (app/log/sections/WindDown.tsx): GET only, same key as the store (lib/use-winddown.ts).
     windDownWarmer(),
     // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
