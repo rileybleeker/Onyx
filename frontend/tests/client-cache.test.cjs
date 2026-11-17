@@ -439,6 +439,25 @@ test('deep-equal bailout: an identical answer is not a change and notifies nobod
   assert.notEqual(cache.peek('k:list'), first);
 });
 
+test('reading practice (READ-QUIZ-01): round attempts and the bank export stay in memory; an answer invalidates nothing', () => {
+  const round = '/api/reading/practice/round/00000000-0000-4000-8000-000000000001';
+  for (const key of [round, `${round}?x=1`, '/api/reading/bank/export', '/api/reading/bank/export?book=synthetic-ledger']) {
+    assert.equal(isSensitiveKey(key), true, key);
+  }
+  // Book-derived content and schedules (no answers): persisted like /api/reading.
+  for (const key of ['/api/reading/practice/today', '/api/reading/practice/today?kind=extra&n=1', '/api/reading/bank', '/api/reading/bank?book=synthetic-ledger',
+    '/api/reading/bank/chapter/3?book=synthetic-ledger', '/api/reading/practice/rounds']) {
+    assert.equal(isSensitiveKey(key), false, key);
+  }
+  // The runner keeps its own state and refreshes /api/reading + the round once when it closes.
+  assert.deepEqual(writeInvalidates('/api/reading/practice/attempt'), []);
+  assert.deepEqual(writeInvalidates('/api/reading/practice/attempt/00000000-0000-4000-8000-000000000002/override'), []);
+  // Flags, approval and run use the area default.
+  for (const p of ['/api/reading/practice/flag', '/api/reading/bank/approval', '/api/reading/bank/run', '/api/reading/practice/attempt/x/other']) {
+    assert.deepEqual(writeInvalidates(p), ['/api/reading', 'reading:'], p);
+  }
+});
+
 test('a successful write invalidates the entries it changed and refetches them in the background', async () => {
   assert.deepEqual(writeInvalidates('/api/habits/checkin'), ['/api/habits', 'habits:', '/api/delivery', '/api/sleep/winddown']);
   // A wind-down answer is the chosen habit's own row (PROD-SLEEP-01): habits and wind-down go stale together.
