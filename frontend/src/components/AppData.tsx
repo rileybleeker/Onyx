@@ -14,6 +14,7 @@ import {
 } from "@/lib/client-cache";
 import { IdbCacheBackend, idbAvailable } from "@/lib/client-cache-idb";
 import { journalTodayUrl } from "@/lib/journal-file";
+import { LOG_SUPPLEMENTS_HISTORY_URL } from "@/lib/log-early";
 import { bankUrl, practiceUrl, readingSlugOf } from "@/lib/reading-practice-urls";
 import {
   REWARM_AFTER_MS, REWARM_EVERY_MS, VISITS_KEY, browserIdle, configureWarmup, orderTargets, parseVisits, recordVisit, routeOf, runWarmup,
@@ -98,6 +99,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
+    // The Supplements section's product options history (most used first; lib/log-early.ts LOG_SUPPLEMENTS_HISTORY_URL).
+    json(LOG_SUPPLEMENTS_HISTORY_URL),
     // Wind-down (app/log/sections/WindDown.tsx): GET only, same key as the store (lib/use-winddown.ts).
     windDownWarmer(),
     // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
