@@ -858,7 +858,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Experiment Report workflow has not reported."
+            ?? (!entry ? "No run yet. The Experiment Report has not reported."
               : ageHours > 30 ? `No trial report run for ${ageHours}h (daily at 15:00 UTC).` : null),
           cadence: CADENCE.experiments,
           integrationMethod: METHOD.experiments.method,
@@ -1071,7 +1071,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Kindle harvester's Amazon pass has not reported." : null),
+            ?? (!entry ? "No run yet. The Kindle Amazon order check has not reported." : null),
           cadence: CADENCE.amazon_orders,
           integrationMethod: METHOD.amazon_orders.method,
           methodLabel: METHOD.amazon_orders.label,
@@ -1166,7 +1166,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Online Orders Email workflow has not reported." : ageH > 12 ? `No run for ${Math.floor(ageH)}h - check the Online Orders Email workflow.` : null),
+            ?? (!entry ? "No run yet. The Online Orders check has not reported." : ageH > 12 ? `No run for ${Math.floor(ageH)}h. The Online Orders check may need a look.` : null),
           cadence: CADENCE.online_orders,
           integrationMethod: METHOD.online_orders.method,
           methodLabel: METHOD.online_orders.label,
@@ -1296,9 +1296,9 @@ export async function GET() {
             ?? (countStale ? `No new count since ${pollenLatest} (${countLag} days). The station skips weekends and holidays.` : null)
             ?? (entry ? null
               : pollenPending
-                ? "pds.pollen_daily is missing. Next: apply sql/pollen_schema.sql. Then add the Pollen ETL workflow (YAML in the roadmap row)."
+                ? "pds.pollen_daily is missing. Next: apply sql/pollen_schema.sql. Then set up the Pollen import."
                 : pollenRes.error?.message
-                  ?? "No run yet. Next: add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
+                  ?? "No run yet. The Pollen import has not been set up yet."),
           cadence: CADENCE.pollen,
           integrationMethod: METHOD.pollen.method,
           methodLabel: METHOD.pollen.label,
@@ -1676,7 +1676,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Google Calendar ETL workflow has not reported." : ageH > 8 ? `No run for ${Math.floor(ageH)}h - check the Google Calendar ETL workflow.` : null),
+            ?? (!entry ? "No run yet. The Google Calendar sync has not reported." : ageH > 8 ? `No run for ${Math.floor(ageH)}h. The Google Calendar sync may need a look.` : null),
           cadence: CADENCE.google_calendar,
           integrationMethod: METHOD.google_calendar.method,
           methodLabel: METHOD.google_calendar.label,
