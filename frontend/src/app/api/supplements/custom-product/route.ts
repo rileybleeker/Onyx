@@ -80,7 +80,8 @@ export async function POST(req: NextRequest) {
     .from("supplement_products")
     .insert(row);
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("[supplements/custom-product insert]", error.message);
+    return NextResponse.json({ error: "Couldn't save that supplement. Try again." }, { status: 500 });
   }
   return NextResponse.json({
     product_id,
