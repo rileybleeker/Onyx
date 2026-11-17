@@ -330,6 +330,8 @@ const NOT_AMOUNT_AFTER = /^(?:min|mins|minutes?|hours?|hrs?|h|days?|weeks?|month
 const NOT_AMOUNT_BEFORE = /^(?:at|around|about|by|after|before|until|till|since|from|to|chapter|chapters|ch|page|pages|jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)$/;
 /** Words that end the search for the unit of a number ("2 of the magnesium capsules" looks past "of the magnesium"). */
 const UNIT_SEARCH_STOP = /^(?:and|or|but|then|plus|at|with|around|by|before|after|on|yesterday|today|tonight|this|last)$/;
+/** Fraction words whose article ("half a tablet") is part of the fraction, never a second amount. */
+const FRACTION_WORDS = new Set(["half", "quarter", "third"]);
 
 interface Quantity { value: number; unit: string | null; word: string }
 
@@ -349,6 +351,13 @@ function quantities(text: string): Quantity[] {
     const prev = toks[i - 1], next = toks[i + 1];
     if (prev === ":" || next === ":") continue; // 8:30
     if ((next === "a" || next === "p") && toks[i + 2] === "m") continue; // 8 a.m.
+    // The bare article is the number one only when it directly precedes a unit or noun, and never inside a
+    // fraction phrase: in "half a tablet" the article belongs to the fraction (one amount of 0.5), so it is
+    // not a second quantity of one.
+    if (t === "a" || t === "an") {
+      if (prev !== undefined && FRACTION_WORDS.has(prev)) continue;
+      if (next === undefined || NOT_AMOUNT_AFTER.test(next) || UNIT_SEARCH_STOP.test(next) || next === ":") continue;
+    }
     // "half a tablet"
     let j = i + 1;
     if (t === "half" && (toks[j] === "a" || toks[j] === "an")) j += 1;
