@@ -37,10 +37,9 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
     const q = new URLSearchParams(window.location.search);
     const result = q.get('calendar');
     if (!result) return;
-    const reason = (q.get('reason') || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 60);
     if (result === 'connected') setMessage({ text: 'Google Calendar is connected. The first sync runs in the background; press Sync now to see its result.' });
     else if (result === 'denied') setMessage({ text: 'The Google sign-in was cancelled. Nothing was connected.' });
-    else setMessage({ text: `Could not connect Google Calendar${reason ? ` (${reason})` : ''}. Nothing was connected.`, error: true });
+    else setMessage({ text: 'Could not connect Google Calendar. Nothing was connected. Try again.', error: true });
     q.delete('calendar'); q.delete('reason');
     const rest = q.toString();
     window.history.replaceState(null, '', window.location.pathname + (rest ? `?${rest}` : ''));
