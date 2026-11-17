@@ -210,6 +210,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
   const deferredLoad = useRef<{ date: string | null } | null>(null);
+  const skipRevertFlush = useRef(false);
 
   const loadSeq = useRef(0);
   // Set once a GET answered: a cached copy is shown only before that.
@@ -249,12 +250,18 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   }, [drafts]);
 
   const load = useCallback(async (date: string | null, afterSave = false) => {
+    // The load that puts the URL back on the shown day (below) must not save the failed tap again: its retry timer
+    // (autosave backoff) sends it. Taken once, by that load only.
+    const afterRevert = skipRevertFlush.current;
+    skipRevertFlush.current = false;
     // A tap still waiting to be saved goes first, under the day it was made on: the GET below replaces the screen.
     // If that save failed (or was refused) and this load would switch to another day, the screen stays on its day
     // with the draft and the save-failed line (Retry) shown; nothing is replaced. A same-day refresh (resume, clock
     // check) still goes on to the GET, so an authoritative refusal (400/401/403) or a new day is still noticed.
-    if (!afterSave && !(await autosaveRef.current.flush().catch(() => false)) && date !== shownDate.current) {
+    if (!afterSave && !afterRevert && !(await autosaveRef.current.flush().catch(() => false)) && date !== shownDate.current) {
       // Back/forward may already have moved the URL to the other day: put it back on the day still on screen.
+      // A retry is armed for the failed save: the URL change reloads this day, and that load must not resend it at once.
+      skipRevertFlush.current = autosaveRef.current.state.retrying;
       showDate(shownDate.current);
       return;
     }

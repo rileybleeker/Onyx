@@ -571,6 +571,12 @@ for (const stale of [false, true]) {
     assert.match(h.text(), stale ? /Daytime 2031-03-05/ : /Daytime · TodayWed, Mar 5/);
     assert.equal(h.posts.length, 1);
     assert.equal(h.hasButton("Save now"), false, "unreviewed drafts never follow navigation into a save");
+    if (!stale) {
+      // The day switch that was put back must not resend the failed save at once; its backoff retry sends it later.
+      await h.tick(2000);
+      assert.equal(h.posts.length, 2, "the failed save is retried after its backoff");
+      assert.deepEqual(h.posts[1], h.posts[0], "the retry carries the same answers under the same day");
+    }
   });
 }
 
