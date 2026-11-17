@@ -13,7 +13,6 @@ import { FeedSkeleton, RetryButton, StaleNote, useFinancePageData } from "../fee
 export default function BudgetsFeedSection() {
   const { rootRef, data, failed, refresh, retry } = useFinancePageData<BudgetsLoad>("budgets");
   const load = data?.load ?? null;
-  const code = failed?.load?.kind === "error" ? failed.load.code : "unavailable";
 
   return (
     <section ref={rootRef} aria-labelledby="feed-budgets-heading" className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
@@ -42,7 +41,7 @@ export default function BudgetsFeedSection() {
       {!load && failed && (
         <section role="alert" className="rounded-card border border-down/30 bg-down/5 p-4">
           <h3 className="font-semibold text-down">Budgets could not be loaded</h3>
-          <p className="mt-1 text-[13px] text-text-secondary">Error code {code}. This is a failed query, not an empty ledger.</p>
+          <p className="mt-1 text-[13px] text-text-secondary">Couldn&apos;t load this page. Try again.</p>
           <RetryButton onClick={retry} />
         </section>
       )}

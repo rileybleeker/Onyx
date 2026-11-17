@@ -82,8 +82,9 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
     let cancelled = false;
     fetch("/api/nyc/leads")
       .then(async (r) => {
-        const body = await r.json();
-        if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+        // A failed request can answer with an HTML page, so the body is read defensively.
+        const body = await r.json().catch(() => null);
+        if (!r.ok || !Array.isArray(body?.leads)) throw new Error(`Leads request failed: HTTP ${r.status}`);
         return body.leads as NycLead[];
       })
       .then((next) => {
@@ -94,7 +95,8 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         setLeads((prev) => (sameJson(prev, next) ? prev : next));
       })
       .catch((e) => {
-        if (!cancelled) setError((e as Error).message);
+        console.error("NYC leads load failed:", e);
+        if (!cancelled) setError("Couldn't load leads. Try again.");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -209,15 +211,16 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         body: JSON.stringify(patch),
       });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`Lead save failed: HTTP ${res.status}`);
       if (seq.current[lead.id] === my) setLeads((prev) => prev.map((l) => (l.id === lead.id ? body.lead : l)));
       return null;
     } catch (e) {
       if (seq.current[lead.id] === my) {
         setLeads((prev) => prev.map((l) => (l.id === lead.id ? before : l)));
-        if (!quiet) setSaveError(`Couldn't save lead ${lead.number}: ${(e as Error).message}`);
+        console.error("NYC lead save failed:", e);
+        if (!quiet) setSaveError(`Couldn't save lead ${lead.number}. Try again.`);
       }
-      return e instanceof TypeError ? "network" : (e as Error).message;
+      return e instanceof TypeError ? "network" : "Couldn't save this. Try again.";
     }
   }
 
@@ -251,7 +254,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
 
       {error && (
         <div className="border border-down/40 bg-down/10 rounded-control px-4 py-3 text-[12px] text-down">
-          Couldn&apos;t load leads: {error}
+          {error}
         </div>
       )}
 

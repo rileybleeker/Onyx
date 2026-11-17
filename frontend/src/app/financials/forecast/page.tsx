@@ -23,6 +23,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
   const levers = parseScenarioParams((k) => (typeof sp[k] === "string" ? (sp[k] as string) : null));
   const now = new Date();
   const load = hasLevers(levers) ? await loadForecast(now, levers) : await cachedForecast(now);
+  if (load.kind === "error") console.error("Forecast page: load failed, code", load.code);
   // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
   const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/financials/forecast"))?.value);
   return (
@@ -44,7 +45,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       {load.kind === "error" && (
         <section role="alert" className="rounded-card border border-down/30 bg-down/5 p-4">
           <h2 className="font-semibold text-down">The forecast could not be loaded</h2>
-          <p className="mt-1 text-[13px] text-text-secondary">Error code {load.code}. This is a failed query, not an empty ledger.</p>
+          <p className="mt-1 text-[13px] text-text-secondary">Couldn&apos;t load this page. Try again.</p>
         </section>
       )}
       {load.kind === "empty" && (

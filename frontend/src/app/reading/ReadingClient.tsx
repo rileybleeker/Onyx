@@ -113,7 +113,8 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         if (json.overview && !which) setSlug(json.overview.book.slug);
         return true;
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Couldn't load");
+        console.error("Reading load failed:", e);
+        setError("Couldn't load your reading. Try again.");
         // The Review card's Refresh keeps its card blocked and says so (ReviewCard.tsx).
         return false;
       } finally {
@@ -690,7 +691,8 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       startNew();
       onSaved();
     } catch (e) {
-      onError(e instanceof Error ? `Couldn't remove the highlight: ${e.message}` : "Couldn't remove the highlight");
+      console.error("Highlight removal failed:", e);
+      onError("Couldn't remove the highlight. Try again.");
     } finally {
       if (alive.current) setRemoving(false);
     }
@@ -705,7 +707,8 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       if (!res.ok) throw new Error(json.error || "failed");
       setPreview({ format: json.format, count: json.count });
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't parse");
+      console.error("Highlight preview failed:", e);
+      onError("Couldn't read that text. Try again.");
     } finally {
       setSaving(false);
     }
@@ -721,7 +724,8 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       setPreview(null);
       onAdded(json.created ?? 0);
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Import failed");
+      console.error("Highlight import failed:", e);
+      onError("Import failed. Try again.");
     } finally {
       setSaving(false);
     }
@@ -924,7 +928,8 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
       setEditing(null);
       onChanged();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't save");
+      console.error("Highlight comment save failed:", e);
+      onError("Couldn't save the comment. Try again.");
     }
   };
   const archive = async (h: Highlight) => {
@@ -933,7 +938,8 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
       if (!res.ok) throw new Error((await res.json()).error || "failed");
       onChanged();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't archive");
+      console.error("Highlight archive failed:", e);
+      onError("Couldn't remove the highlight. Try again.");
     }
   };
 
