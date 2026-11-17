@@ -330,7 +330,9 @@ test("section: Log selected sends one request per product to the existing route,
   await h.flush();
   assert.equal(h.calls.writes.length, 3, "one request per product");
   assert.ok(h.calls.writes.every((w) => w.url === "/api/supplements/log-product" && w.method === "POST"), "only the existing route");
-  const by = Object.fromEntries(h.calls.writes.map((w) => [w.body.product_id, w.body]));
+  const keys = h.calls.writes.map((w) => w.body.event_key);
+  assert.ok(keys.every((k) => UUID_RE.test(k)) && new Set(keys).size === 3, "each product has its own event_key");
+  const by = Object.fromEntries(h.calls.writes.map((w) => { const { event_key, ...rest } = w.body; return [rest.product_id, rest]; }));
   const yesterday = new Date(`${TODAY}T12:00:00Z`);
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
   const date = yesterday.toISOString().slice(0, 10);
@@ -492,7 +494,9 @@ test("section: an amount that is not a number is refused on screen without a req
   await h.click("Log selected (1)");
   await h.flush();
   assert.equal(h.calls.writes.length, 2);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
+  const { event_key, ...sent } = h.calls.writes[1].body;
+  assert.match(event_key, UUID_RE, "every multi-select POST carries its own event_key");
+  assert.deepEqual(sent, { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
 });
 
 test("section: an empty time is refused for the whole batch before anything is sent", async (t) => {
@@ -655,6 +659,66 @@ test("source: checkboxes with 44 px targets and visible focus; a tap writes noth
   const route = fs.readFileSync(path.join(__dirname, "..", "src", "app/api/supplements/log-product/route.ts"), "utf8");
   assert.match(route, /export async function POST/);
   // The route (which since #530 accepts an optional event_key) is not changed by the multi-select: still one product per
-  // request. The section does not send an event_key: a lost answer is "not confirmed" and goes out only on Log again.
-  assert.doesNotMatch(src, /event_key/, "the multi-select sends no event_key; its replay safety is client-side");
+  // request. The section sends one event_key per product (fresh per send; a lost answer's retry reuses it, so the
+  // route replays the stored rows), and the pure module decides which key goes out.
+  assert.match(src, /event_key: r\.eventKey/, "the multi-select sends its per-product event_key");
+  assert.match(src, /eventKeyFor\(item, \(\) => crypto\.randomUUID\(\)\)/);
+});
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+test("event_key: one key per product per send; a lost answer's retry keeps its key; a refused or fresh send gets a new one", () => {
+  let n = 0;
+  const fresh = () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`;
+  let sel = M.toggleItem(M.toggleItem(M.EMPTY_SELECTION, "a"), "b");
+  const ka = M.eventKeyFor(sel[0], fresh);
+  const kb = M.eventKeyFor(sel[1], fresh);
+  assert.notEqual(ka, kb, "two products in one batch never share a key (the route reads a key's rows without a product filter)");
+  sel = M.beginSend(sel, ["a", "b"], new Map(), new Map([["a", ka], ["b", kb]]));
+  assert.equal(sel[0].eventKey, ka);
+  sel = M.settle(sel, "a", { kind: "unconfirmed", error: "No answer from Onyx" });
+  sel = M.settle(sel, "b", SAVED());
+  assert.equal(M.eventKeyFor(sel[0], fresh), ka, "a lost answer's retry resends the same key: the route replays it");
+  const refusedA = sel.map((i) => (i.productId === "a" ? { ...i, outcome: { kind: "refused", error: "Synthetic refusal" } } : i));
+  assert.notEqual(M.eventKeyFor(refusedA[0], fresh), ka, "a refused send wrote nothing: its next send is a fresh log");
+  assert.notEqual(M.eventKeyFor(M.toggleItem(M.EMPTY_SELECTION, "c")[0], fresh), ka, "a new selection gets a fresh key");
+});
+
+test("event_key: beginSend keeps the key of a retried item and sets the key on each queued item", () => {
+  const sel = M.toggleItem(M.toggleItem(M.EMPTY_SELECTION, "a"), "b");
+  const out = M.beginSend(sel, ["a"], new Map(), new Map([["a", "11111111-1111-4111-8111-111111111111"]]));
+  assert.equal(out[0].eventKey, "11111111-1111-4111-8111-111111111111");
+  assert.equal(out[1].eventKey, undefined, "an item not queued has no key yet");
+  const again = M.beginSend(M.settle(out, "a", { kind: "unconfirmed", error: "x" }), ["a"]);
+  assert.equal(again[0].eventKey, "11111111-1111-4111-8111-111111111111", "a retry without a new key keeps the old one");
+});
+
+test("section: each product is sent with its own event_key; a lost answer's retry resends the same key; a new Log selected sends fresh keys", async (t) => {
+  let betaTries = 0;
+  const h = mountSection(t, {
+    post: ({ body, n }) => {
+      if (body.product_id === "p-beta" && ++betaTries === 1) return Promise.reject(new Error("synthetic network failure"));
+      return okFor(body, n);
+    },
+  });
+  await h.flush();
+  await h.tap("Synthetic Alpha", "Synthetic Beta");
+  await h.click("Log selected (2)");
+  await h.flush();
+  const [alpha, beta] = h.calls.writes;
+  assert.match(alpha.body.event_key, UUID_RE);
+  assert.match(beta.body.event_key, UUID_RE);
+  assert.notEqual(alpha.body.event_key, beta.body.event_key, "one key per product");
+  await h.click("Log Synthetic Beta again");
+  await h.flush();
+  assert.equal(h.calls.writes[2].body.product_id, "p-beta");
+  assert.equal(h.calls.writes[2].body.event_key, beta.body.event_key, "the lost answer's retry resends the same key (the route replays it, no second insert)");
+  assert.equal(h.rows().filter((r) => /Saved/.test(r)).length, 2);
+  await h.tap("Synthetic Gamma");
+  await h.click("Log selected (1)");
+  await h.flush();
+  const gamma = h.calls.writes[3].body;
+  assert.equal(gamma.product_id, "p-gamma");
+  assert.match(gamma.event_key, UUID_RE);
+  assert.ok(![alpha, beta].some((w) => w.body.event_key === gamma.event_key), "a separate confirmation is a genuinely new log");
 });

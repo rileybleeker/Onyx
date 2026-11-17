@@ -35,6 +35,7 @@ import {
   LOG_CONCURRENCY,
   outcomeFromAnswer,
   parseAmount,
+  eventKeyFor,
   runPool,
   sendable,
   setItemDose,
@@ -64,7 +65,8 @@ import { DraftMark, LogCard, LogSaveButton } from "./ui";
  *     same as "log 15 mg of X at 8:30" in chat. Each product then shows its own outcome (Saved + Undo / Already
  *     logged / Not saved + Retry / Not confirmed). The selection state and the rules about what may be sent again
  *     are pure, in lib/log-supplement-multi.ts: a confirmed item is never sent twice; an item whose answer was lost is
- *     "not confirmed", not saved, and goes out again only on its own "Log again" tap.
+ *     "not confirmed", not saved, and goes out again only on its own "Log again" tap. Each product is sent with its own
+ *     event_key (a fresh UUID per send; a lost answer's retry resends the same one, so the route replays it, never writes twice).
  *   - Logged today: single products logged on behavioral today, each with Undo (DELETE /api/supplements/log-intake).
  * Say it drafts (useLogDrafts("supplements")) are listed marked "from what you said" and logged on their own 0.8 s
  * later (autosave; each row then has Undo); a failed one stays listed with Edit (which selects that product with its
@@ -637,6 +639,8 @@ export default function SupplementsSection() {
    *  screen; no re-read (the caller re-reads once). Never throws: a request that failed is "not confirmed". */
   async function sendProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
+    /** The multi-select's per-product event_key (see lib/log-supplement-multi.ts `eventKeyFor`). Omitted = unkeyed. */
+    event_key?: string;
   }): Promise<Outcome> {
     if (args.date && day && args.date > day) return { kind: "refused", error: "That day has not started yet" };
     writeSeq.current += 1;
@@ -649,6 +653,7 @@ export default function SupplementsSection() {
         unit: args.amount == null ? null : args.unit,
         times: args.times,
         date: args.date,
+        event_key: args.event_key,
       });
     } catch {
       answer = null;
@@ -709,18 +714,18 @@ export default function SupplementsSection() {
     }
     setFormError(null);
     const bad = new Map<string, string>();
-    const ready: { id: string; name: string; amount: number | null; unit: string }[] = [];
+    const ready: { id: string; name: string; amount: number | null; unit: string; eventKey: string }[] = [];
     for (const item of targets) {
       const amount = parseAmount(item.amount);
       if (amount === "invalid") bad.set(item.productId, "Amount must be a positive number");
-      else ready.push({ id: item.productId, name: nameOf(item.productId), amount, unit: item.unit });
+      else ready.push({ id: item.productId, name: nameOf(item.productId), amount, unit: item.unit, eventKey: eventKeyFor(item, () => crypto.randomUUID()) });
     }
-    setSelection((s) => beginSend(s, ready.map((r) => r.id), bad));
+    setSelection((s) => beginSend(s, ready.map((r) => r.id), bad, new Map(ready.map((r) => [r.id, r.eventKey]))));
     if (ready.length === 0) return;
     await runPool(ready, LOG_CONCURRENCY, async (r) => {
       let outcome: Outcome;
       try {
-        outcome = await sendProduct({ product_id: r.id, name: r.name, amount: r.amount, unit: r.unit, times: clean, date: formDate });
+        outcome = await sendProduct({ product_id: r.id, name: r.name, amount: r.amount, unit: r.unit, times: clean, date: formDate, event_key: r.eventKey });
       } catch {
         outcome = { kind: "unconfirmed", error: "No answer from Onyx" };
       }

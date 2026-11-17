@@ -40,6 +40,8 @@ export interface SelectedItem {
   unit: string;
   /** null = not sent yet. */
   outcome: Outcome | null;
+  /** The event_key of this item's last send (a UUID). A lost answer's retry resends it; see `eventKeyFor`. */
+  eventKey?: string;
 }
 
 export type Selection = readonly SelectedItem[];
@@ -115,11 +117,30 @@ export function sendable(sel: Selection, opts: { only?: readonly string[]; inclu
 /** The N of "Log selected (N)": what a plain tap would send. */
 export const countToLog = (sel: Selection): number => sendable(sel).length;
 
-/** Queue `ids` for sending (their outcome becomes "saving") and record `bad` ids as refused without sending them. */
-export function beginSend(sel: Selection, ids: readonly string[], bad: ReadonlyMap<string, string> = new Map()): Selection {
+/**
+ * The event_key a product's POST carries. A product whose answer was lost (`unconfirmed`) keeps the key of its last
+ * send, so its retry is a replay: the route returns the rows the first call stored instead of writing them again.
+ * Every other send gets a fresh key (`fresh()`), so "Log selected" again is a genuinely new log.
+ * One key per PRODUCT, not one per batch: the route reads a key's rows without a product filter
+ * (rowsForEvent, lib/supplement-intake.ts), so a key shared by two products would hand the second one the first one's rows.
+ */
+export function eventKeyFor(item: SelectedItem, fresh: () => string): string {
+  return item.outcome?.kind === "unconfirmed" && item.eventKey ? item.eventKey : fresh();
+}
+
+/**
+ * Queue `ids` for sending (their outcome becomes "saving") and record `bad` ids as refused without sending them.
+ * `keys` gives each queued id the event_key it will be sent with (see `eventKeyFor`).
+ */
+export function beginSend(
+  sel: Selection,
+  ids: readonly string[],
+  bad: ReadonlyMap<string, string> = new Map(),
+  keys: ReadonlyMap<string, string> = new Map(),
+): Selection {
   return sel.map((i) => {
     if (bad.has(i.productId)) return { ...i, outcome: { kind: "refused", error: bad.get(i.productId)! } };
-    if (ids.includes(i.productId)) return { ...i, outcome: { kind: "saving" } };
+    if (ids.includes(i.productId)) return { ...i, outcome: { kind: "saving" }, eventKey: keys.get(i.productId) ?? i.eventKey };
     return i;
   });
 }
