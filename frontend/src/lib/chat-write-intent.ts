@@ -34,7 +34,12 @@
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
  *   - each action authorizes one write of each record: a repeated intake needs its own words ("…at 8 and again at 9"
- *     is one call with two times, or two actions);
+ *     is one call with two times, or two actions). Each granted write is consumed once per request under a canonical
+ *     identity — the tool, the record as the user's own words name it, and the day, amount, times, chapters or answer
+ *     the user's action itself states, never the call's arguments — so a second call for the same grant, in whatever
+ *     form the model sends it (a changed optional argument, another name for the same record, a restatement in the
+ *     user's message), is refused; a retry of the whole message starts with a fresh set here and reconciles through
+ *     the replay ledger (SEC-04), which mints no new action either;
  *   - a reading write goes to the book the user named, or the book being read when the user names none; naming another
  *     known book refuses a call that would write to the book being read;
  *   - text stored as the user's words (a recall note, a question, a passage, a comment) has to be a verbatim span of
@@ -109,8 +114,12 @@ export interface ReadingBooks {
 }
 
 /**
- * What this request has already been allowed: calls per tool, and the actions (each authorizes one write of each
- * record it names). Made with newWriteUsage(); the caller records every allowed call with commitWrite().
+ * What this request has already been allowed: calls per tool, and the granted writes already consumed (each user
+ * action authorizes one write of each record it names). Made with newWriteUsage(); the caller records every allowed
+ * call with commitWrite(). A consumed key is the granted write's canonical identity — the tool, the record as the
+ * user's own words name it, and the arguments the user's action states — never the model's call arguments, so a
+ * repeated or varied call for the same grant maps to it and is refused. Per request only: a retry of the whole
+ * message builds a fresh set and reconciles through the replay ledger (SEC-04) instead.
  */
 export interface WriteUsage { perTool: Map<string, number>; consumed: Set<string> }
 
@@ -1254,11 +1263,22 @@ export function authorizeWrite(
     for (const a of done) if (!firstOfChain.has(a.chain)) firstOfChain.set(a.chain, a);
     const chains = [...new Map(done.filter((a) => !OTHER_WRITE.test(firstOfChain.get(a.chain)!.text) && (READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText))).map((a) => [a.chain, a])).values()];
     if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
+    // The granted session's canonical identity: the book the grant binds (the one the user names — bookCheck refuses
+    // any other — else the one being read), the day, the chapters and the minutes the user's own action states, never
+    // the call's arguments, so a repeated or varied call for the same session is refused and another chapter range
+    // or day is another session.
+    const sessionIdentity = (a: Action): string => {
+      const days = [...allowedDays(a, ctx.requestDay)].sort();
+      const chapters = [...chapterNumbers(a.chainText)].sort((x, y) => x - y).join(",");
+      const minutes = [...minuteValues(a.chainText)].sort((x, y) => x - y).join(",");
+      const book = str(input.book) ?? ctx.books?.active ?? "";
+      return [tool, book, days.length > 0 ? days.join(",") : ctx.requestDay, chapters, minutes].join("|");
+    };
     let refusal: RefusalCode = "not_named";
     for (const a of chains) {
       const r = readingSessionFits(a, input, grant, ctx);
       if (r) { refusal = r; continue; }
-      const key = `${tool}|c${a.chain}`;
+      const key = sessionIdentity(a);
       if (!fresh(key)) { refusal = "already_written"; continue; }
       return allow(tool, key);
     }
@@ -1314,30 +1334,54 @@ export function authorizeWrite(
   });
   if (candidates.length === 0) return deny("not_named");
 
+  // The granted write's canonical identity: the tool, the record as the user's own words name it, and the arguments
+  // the user's action itself states — the day (the days it names, else the default), the amounts with their unit kind
+  // and the clock times (an intake), a habit's answer. Never the call's arguments, so a second call for the same
+  // grant is refused whatever the model sends (a changed optional argument cannot mint a new write), two actions
+  // that grant the same write are one, and actions with different stated arguments remain one write each. Per request
+  // only; a retry of the whole message starts fresh here and reconciles through the replay ledger (SEC-04).
+  const mention = (a: Action): string => {
+    const at = span(a)!;
+    const toks = tokens(a.text);
+    // A word continues the record's mention when it is part of its name, not an argument or glue: "synthetic
+    // magnesium" and "synthetic magnesium glycinate" are the mention "synthetic magnesium glycinate".
+    const word = (w: string) =>
+      !STOP.has(w) && !GENERIC.has(w) && (!ARGUMENT_WORD.test(w) || /^\d+(?:\.\d+)?$/.test(w));
+    let [from, to] = at;
+    while (from > 0 && word(toks[from - 1])) from -= 1;
+    while (to + 1 < toks.length && word(toks[to + 1])) to += 1;
+    return flat(toks.slice(from, to + 1).join(" "));
+  };
+  const grantIdentity = (a: Action): string => {
+    const days = [...allowedDays(a, ctx.requestDay)].sort();
+    const parts = [tool, mention(a), days.length > 0 ? days.join(",") : defaultDay(tool, record!, ctx)];
+    if (tool === "log_supplement_intake") {
+      parts.push(quantities(a.text).map((q) => `${q.value}:${q.unit ?? "serving"}`).sort().join(";"));
+      parts.push(actionTimes(a, actions).slots.map((s) => [...s].sort().join("/")).join(";"));
+    }
+    if (tool === "mark_habit_complete") parts.push(a.negated ? "no" : "yes");
+    return parts.join("|");
+  };
   let refusal: RefusalCode = "not_named";
   for (const a of candidates) {
     const r = argumentsFit(tool, a, actions, input, record, ctx);
     if (r) { refusal = r; continue; }
-    const [from, to] = span(a)!;
-    const prefix = `${tool}|a${a.id}|`;
-    // The words this call names were already used by an allowed call of this action: the same record again.
-    const taken = [...ctx.used.consumed].some((k) => {
-      if (!k.startsWith(prefix)) return false;
-      const [f, t] = k.slice(prefix.length).split("-").map(Number);
-      return f <= to && from <= t;
-    });
-    if (taken) { refusal = "already_written"; continue; }
-    return allow(tool, `${prefix}${from}-${to}`);
+    const key = grantIdentity(a);
+    if (!fresh(key)) { refusal = "already_written"; continue; }
+    return allow(tool, key);
   }
   return deny(refusal);
 }
 
-/** The day a call writes, when it sends none: today, or last night for a sleep question (lib/checkin sleepAnswerDate). */
-function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
-  const date = str(input.date);
-  if (date) return date;
+/** The day a grant names none: today, or last night for a sleep question (lib/checkin sleepAnswerDate). */
+function defaultDay(tool: WriteToolName, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
   if (tool === "mark_habit_complete" && ctx.isSleepHabit?.(record)) return dayBefore(ctx.requestDay) ?? ctx.requestDay;
   return ctx.requestDay;
+}
+
+/** The day a call writes, when it sends none: the grant's default day. */
+function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
+  return str(input.date) ?? defaultDay(tool, record, ctx);
 }
 
 /** The day check: the day the call writes is one the action names, or the default day when it names none. */
