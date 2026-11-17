@@ -24,9 +24,9 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json(result);
   } catch (err) {
-    console.error("Spotify create-playlist route error:", err);
+    console.error("POST /api/spotify/create-playlist failed:", err);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Internal error" },
+      { error: "Couldn't create the playlist. Try again." },
       { status: 500 }
     );
   }
