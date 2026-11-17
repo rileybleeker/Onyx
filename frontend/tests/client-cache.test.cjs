@@ -643,7 +643,7 @@ test('freshMs: a copy fetched within the window is reused with no GET; an older 
   await cachedJson(url, { cache, freshMs: 60_000 });
   assert.equal(gets, 3, 'an older copy is fetched again');
 
-  cache.remove([url]);
+  cache.remove(url);
   await cachedJson(url, { cache, freshMs: 60_000 });
   assert.equal(gets, 4, 'an invalidated entry is never reused');
 });
