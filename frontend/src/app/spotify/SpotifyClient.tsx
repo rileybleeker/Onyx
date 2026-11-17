@@ -372,18 +372,24 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
   }, [range, retryCount]);
 
   useEffect(() => {
+    let cancelled = false;
     setLedgerLoading(true);
     setLedgerFailed(false);
     getSpotifyLedger(range, ledgerPage, LEDGER_PER_PAGE)
       .then(({ rows, totalCount }) => {
+        if (cancelled) return;
         setLedger(rows);
         setLedgerTotal(totalCount);
       })
       .catch((err) => {
+        if (cancelled) return;
         console.error("Spotify ledger:", err);
         setLedgerFailed(true);
       })
-      .finally(() => setLedgerLoading(false));
+      .finally(() => {
+        if (!cancelled) setLedgerLoading(false);
+      });
+    return () => { cancelled = true; };
   }, [range, ledgerPage, ledgerRetry]);
 
   const hasData = (kpis?.totalPlays ?? 0) > 0;
@@ -1160,6 +1166,23 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
             )}
             {ledger.length > 0 && (
               <>
+                {ledgerFailed && (
+                  <div
+                    role="alert"
+                    className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-control border border-border-default px-3 py-2"
+                  >
+                    <p className="text-[12px] text-text-secondary">
+                      Couldn&apos;t load that page of plays. Showing the last page that loaded.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setLedgerRetry((c) => c + 1)}
+                      className="rounded-full border border-border-default px-3 py-1 text-[12px] text-text-primary hover:bg-surface-hover"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
                 <div className="overflow-x-auto -mx-1">
                   <table className="w-full text-[12px] font-mono">
                     <thead>
