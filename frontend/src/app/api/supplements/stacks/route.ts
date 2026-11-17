@@ -132,13 +132,16 @@ export async function POST(req: NextRequest) {
  * omitted leaves it alone). `items`, when present, is the COMPLETE list and replaces the old one in the same
  * transaction ([] clears the stack on purpose; anything that is not a valid array is refused with 400 and nothing
  * changes). The save is refused with 409 { code: "stale" } when the stack changed since expected_version, unless the
- * change was this editor's own unanswered save (after_save_ids). A body without expected_version (a tab running the
- * previous build) is refused with 409 { code: "reload" } and changes nothing; an exact resend of a save that already
- * went through (same save_id) is still answered as a replay.
+ * change was this editor's own unanswered save (after_save_ids). An update with save_id but no expected_version is
+ * refused with 409 { code: "reload" } before anything is written, even an exact resend. An update with neither (a tab
+ * running the previous build) is refused with 409 { code: "reload" } by the database and changes nothing.
  */
 export async function PATCH(req: NextRequest) {
   const parsed = parseStackSave(await readBody(req), "update");
-  if (!parsed.ok) return NextResponse.json({ error: parsed.error, code: "invalid" }, { status: 400 });
+  if (!parsed.ok) {
+    const reload = parsed.code === "reload";
+    return NextResponse.json({ error: parsed.error, code: reload ? "reload" : "invalid" }, { status: reload ? 409 : 400 });
+  }
   const r = await saveStack(supabase, parsed.value);
   return NextResponse.json(r.body, { status: r.status });
 }

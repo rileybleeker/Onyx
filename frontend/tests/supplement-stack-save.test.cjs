@@ -479,28 +479,84 @@ test("a body that knows no version (previous build, delayed legacy retry) is ref
   // A newer save from the current editor first.
   const newer = await patch({ stack_id: id, name: "Test stack", items: [{ product_id: "prod-a", doses: 3 }], expected_version: 1, save_id: uuid(850) });
   assert.equal(newer.status, 200);
-  for (const late of [
-    { stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }] }, // previous build: no version fields
-    { stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }], save_id: uuid(851) }, // list read before the migration
-  ]) {
-    const r = await patch(late);
-    assert.equal(r.status, 409, JSON.stringify(late));
-    assert.equal(r.body.code, "reload");
-    assert.equal(current.db.rpcCalls.at(-1).args.p_expected_version, null);
-  }
+  // Previous build: no version and no save id. The database refuses it (OXS05).
+  const old = await patch({ stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }] });
+  assert.equal(old.status, 409);
+  assert.equal(old.body.code, "reload");
+  assert.equal(current.db.rpcCalls.at(-1).args.p_expected_version, null);
+  // List read before the migration, with a save id: refused by the route before any database call.
+  const calls = current.db.rpcCalls.length;
+  const listed = await patch({ stack_id: id, name: "Test stack", items: [{ product_id: "prod-c", doses: 1 }], save_id: uuid(851) });
+  assert.equal(listed.status, 409);
+  assert.equal(listed.body.code, "reload");
+  assert.equal(current.db.rpcCalls.length, calls, "refused before the database");
   assert.deepEqual(itemsOf(current.db, id), [["prod-a", 3]], "the newer save stays");
   assert.equal(current.db.stacks[0].version, 2);
 });
 
-test("an exact resend of a save that went through is still a replay, even without a version", async () => {
+test("an exact resend of a save that went through is refused without a version, and replayed with one", async () => {
   const db = reset();
   const id = await seedStack(db);
   const body = { stack_id: id, name: "Test stack", items: [{ product_id: "prod-b", doses: 1 }] };
   assert.equal((await patch({ ...body, expected_version: 1, save_id: uuid(860) })).status, 200);
-  const again = await patch({ ...body, save_id: uuid(860) });
+  const noVersion = await patch({ ...body, save_id: uuid(860) });
+  assert.equal(noVersion.status, 409);
+  assert.equal(noVersion.body.code, "reload");
+  assert.equal(current.db.stacks[0].version, 2, "nothing written by the refused resend");
+  const again = await patch({ ...body, expected_version: 1, save_id: uuid(860) });
   assert.equal(again.status, 200);
   assert.equal(again.body.replayed, true);
   assert.equal(again.body.version, 2);
+});
+
+test("an update with save_id and no expected_version is refused before the database, whatever the stack holds", async () => {
+  const db = reset();
+  const id = await seedStack(db);
+  const calls = db.rpcCalls.length;
+  const r = await patch({ stack_id: id, name: "Test stack", items: [], save_id: uuid(861) });
+  assert.equal(r.status, 409);
+  assert.equal(r.body.code, "reload");
+  assert.equal(r.body.error, "This stack changed in another tab. Refresh it, then save again.");
+  assert.equal(db.rpcCalls.length, calls);
+  assert.deepEqual(db.writes, []);
+});
+
+test("parser: an update with save_id and a positive expected_version still parses", () => {
+  const r = lib.parseStackSave({ stack_id: 1, name: "Test stack", items: [], expected_version: 2, save_id: uuid(862) }, "update");
+  assert.equal(r.ok, true);
+  assert.equal(r.value.expectedVersion, 2);
+  assert.equal(r.value.saveId, uuid(862));
+});
+
+test("parser: a create with save_id and no expected_version still parses", () => {
+  const r = lib.parseStackSave({ ...BODY, client_key: uuid(863), save_id: uuid(864) }, "create");
+  assert.equal(r.ok, true);
+  assert.equal(r.value.expectedVersion, null);
+  assert.equal(r.value.saveId, uuid(864));
+});
+
+test("parser: an update without save_id and without expected_version keeps its current behaviour (parsed, then refused by the database)", async () => {
+  const r = lib.parseStackSave({ stack_id: 1, name: "Test stack", items: [] }, "update");
+  assert.equal(r.ok, true);
+  assert.equal(r.value.expectedVersion, null);
+  assert.equal(r.value.saveId, null);
+  const db = reset();
+  const id = await seedStack(db);
+  const calls = db.rpcCalls.length;
+  const body = await patch({ stack_id: id, name: "Test stack", items: [] });
+  assert.equal(body.status, 409);
+  assert.equal(body.body.code, "reload");
+  assert.equal(db.rpcCalls.length, calls + 1, "passed on to the database");
+});
+
+test("StackSaveChain.learnVersion takes a version only when none is held", () => {
+  const c = new chainLib.StackSaveChain(null, idGen(1100));
+  c.learnVersion(4);
+  assert.equal(c.knownVersion, 4);
+  c.learnVersion(9);
+  assert.equal(c.knownVersion, 4, "a known version is not replaced");
+  c.learnVersion(null);
+  assert.equal(new chainLib.StackSaveChain(null, idGen(1)).knownVersion, null);
 });
 
 test("a retried create without a save id (previous build) is refused when its stack exists; a first create still works", async () => {
@@ -783,6 +839,9 @@ test("the route saves only through the function; the editor sends versions and h
   assert.match(modal, /if \(e instanceof StackSaveUnconfirmed\) savedAny\.current = true;/, "closing re-reads the list after a maybe-saved change");
   assert.match(read("lib/use-autosave.ts"), /unknownOutcome: \(e\) => optsRef\.current\.unknownOutcome\?\.\(e\) \?\? false,/);
   assert.match(modal, /chain\.current\.accepted\(json\.version\)/);
+  // An existing stack with no version reads it first, so an update with a save id never goes out without one.
+  assert.match(modal, /chain\.current\.knownVersion === null\) \{\s+chain\.current\.learnVersion\(await readVersion\(stackIdRef\.current\)\)/);
+  assert.match(modal, /fetch\("\/api\/supplements\/stacks\?include_archived=1"/);
   assert.match(modal, /new StackSaveChain\(stack\.stack_id \? \(stack\.version \?\? null\) : null, newClientKey\)/);
   assert.match(modal, /Load the latest version/);
   const page = read("app/supplements/SupplementsClient.tsx");

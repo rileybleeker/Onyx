@@ -62,6 +62,17 @@ function formOf(name: string, description: string, remindTime: string, items: St
   };
 }
 
+/**
+ * The stack's current version from the list (a stack whose list was read before versions existed has none). A failed
+ * read throws (nothing is written; autosave retries). Null when the server has no version for it.
+ */
+async function readVersion(stackId: number): Promise<number | null> {
+  const res = await fetch("/api/supplements/stacks?include_archived=1", { cache: "no-store" });
+  if (!res.ok) throw new Error("The stack's latest version could not be read. Nothing was saved; retrying.");
+  const json = (await res.json().catch(() => null)) as { stacks?: { stack_id: number; version?: number | null }[] } | null;
+  return json?.stacks?.find((s) => s.stack_id === stackId)?.version ?? null;
+}
+
 /** One random id per new stack: a retried create (lost answer) then returns the same stack instead of a second. */
 function newClientKey(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -124,6 +135,11 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         remind_time: f.remind_time || null,
         items: f.items,
       };
+      // An existing stack with no version yet (loaded before versions existed): read it first, so the save carries a
+      // version instead of none (the server refuses a save without one).
+      if (stackIdRef.current !== null && chain.current.knownVersion === null) {
+        chain.current.learnVersion(await readVersion(stackIdRef.current));
+      }
       const fields = chain.current.next(body);
       const creating = stackIdRef.current === null;
       let json: Record<string, unknown>;

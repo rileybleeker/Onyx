@@ -11,8 +11,9 @@ import { AutosaveRefused } from "@/lib/autosave";
  *  - after_save_ids: the earlier saves whose answer never came. The server accepts a save when the stack is still at
  *    expected_version, or when its last write was one of these (then every write since was this editor's own).
  * Anything else means another window (or a late request) changed the stack: the server answers 409 and the editor
- * offers to load the latest version instead of overwriting it. An update the editor cannot give a version for (its
- * list was read before the migration) gets 409 "reload", handled the same way.
+ * offers to load the latest version instead of overwriting it. An update with a save_id but no version is refused by
+ * the server (409 "reload"), handled the same way; the editor reads the stack's version before such a save (see
+ * components/StackEditorModal.tsx), so this happens only when the server has no versions at all.
  */
 
 export interface StackSaveFields {
@@ -57,6 +58,11 @@ export class StackSaveChain {
       if (this.pending.length > STACK_PENDING_MAX) this.pending.shift();
     }
     return { save_id: id, expected_version: this.version, after_save_ids: this.pending.filter((p) => p.id !== id).map((p) => p.id) };
+  }
+
+  /** A version read from the server, taken only when this editor holds none yet (pending saves are kept). */
+  learnVersion(version: unknown): void {
+    if (this.version === null && typeof version === "number" && Number.isSafeInteger(version) && version > 0) this.version = version;
   }
 
   /** The server saved it (or recognised it as already saved): this is now the version the editor holds. */
