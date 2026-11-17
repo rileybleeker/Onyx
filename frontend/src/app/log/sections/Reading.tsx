@@ -145,6 +145,8 @@ type ReadingFormData = {
   clientKey: string;
   /** The day of the habit row that session made, as the server reported it (sent back on a move or removal). */
   habitCreatedOn: string | null;
+  /** The newest edit number sent (rises with every PATCH; the server refuses an older one that commits late). */
+  editSeq: number;
   saved: SavedInfo;
   heldDraft: boolean;
   seenDraft: number | null;
@@ -247,6 +249,7 @@ const newReadingData = (): ReadingFormData => ({
   sessionId: null,
   clientKey: "",
   habitCreatedOn: null,
+  editSeq: 0,
   saved: null,
   heldDraft: false,
   seenDraft: null,
@@ -296,6 +299,12 @@ export default function ReadingSection() {
     const id = kept.sessionId;
     const target = readingSaveTarget("sessions", id);
     const send = (url: string, method: string, body: Record<string, unknown>) => saveRequest(url, { method, body, keepalive });
+    // Every PATCH carries a number above the one before it, also across a remount or a reload (milliseconds), so a
+    // request that kept running on the server after its connection dropped cannot overwrite a newer edit.
+    const patchBody = (): Record<string, unknown> => {
+      kept.editSeq = Math.max(kept.editSeq + 1, Date.now());
+      return { ...v.body, habit_created_on: kept.habitCreatedOn, edit_seq: kept.editSeq };
+    };
     let json: Record<string, unknown>;
     try {
       if (id === null) {
@@ -314,7 +323,7 @@ export default function ReadingSection() {
         kept.createSent = true;
         json = await send(target.url, "POST", body);
       } else {
-        json = await send(target.url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+        json = await send(target.url, "PATCH", patchBody());
       }
     } catch (e) {
       if (cancelled()) return;
@@ -340,6 +349,12 @@ export default function ReadingSection() {
     }
     if (cancelled()) return;
     const session = json.session as ReadingSession | undefined;
+    // A truncated or non-JSON 200 reads as {} (saveRequest): never "Saved" without the stored session named. The
+    // failure is not a refusal, so the value stays unconfirmed and the save is retried (a create by its client_key,
+    // an edit by the same session).
+    if (!session || typeof session.session_id !== "number" || (id !== null && session.session_id !== id)) {
+      throw new Error("The save was not confirmed. Retrying.");
+    }
     if (id === null && session?.session_id && kept.sessionId === null) {
       setSessionId(session.session_id);
       // The server chose the day (the day on screen was not known to be current): show the day it stored.
@@ -351,7 +366,7 @@ export default function ReadingSection() {
       if (json.replayed) {
         // A retry of a create whose answer was lost: the stored row holds the values of the first send, so the
         // values on screen now are written onto it.
-        json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", { ...v.body, habit_created_on: kept.habitCreatedOn });
+        json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", patchBody());
         if (cancelled()) return;
       }
     }

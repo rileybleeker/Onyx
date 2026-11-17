@@ -850,6 +850,7 @@ async function moveSessionTx(
     question: string | null;
   },
   habitCreatedOn: string | null,
+  editSeq: number | null,
 ): Promise<
   | ({ ok: true; session: ReadingSession; book: Book | null; finished: boolean; unfinished: boolean; marked: boolean; created: boolean } & EditMirrorWork)
   | { ok: false; status: number; error: string }
@@ -865,6 +866,7 @@ async function moveSessionTx(
     p_recall: patch.recall,
     p_question: patch.question,
     p_habit_created_on: habitCreatedOn,
+    p_edit_seq: editSeq,
   });
   if (error) {
     if (error.code === KINDLE_SESSION_CODE) return { ok: false, status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
@@ -874,6 +876,7 @@ async function moveSessionTx(
   }
   const out = (data ?? null) as {
     moved?: unknown;
+    stale?: unknown;
     session?: unknown;
     book?: unknown;
     finished?: unknown;
@@ -888,6 +891,7 @@ async function moveSessionTx(
   } | null;
   if (!out || typeof out !== "object" || typeof out.moved !== "boolean") return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
   if (!out.moved) return { ok: false, status: 404, error: "That session no longer exists." };
+  if (out.stale === true) return { ok: false, status: 409, error: "A newer edit of this session was already saved." };
   const raw = out.session;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
   const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, (raw as Record<string, unknown>)[k] ?? null])) as unknown as ReadingSession;
@@ -1193,9 +1197,11 @@ export interface SessionUpdate {
    * when no other session is on it.
    */
   habit_created_on: string | null;
+  /** The form's own rising edit number: an edit older than the stored one is refused (Codex review of PR 376). */
+  edit_seq: number | null;
 }
 
-const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question", "habit_created_on"]);
+const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question", "habit_created_on", "edit_seq"]);
 const SESSION_TEXT_MAX = 20000;
 
 /** A real calendar date as YYYY-MM-DD, or null. */
@@ -1232,6 +1238,8 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
   if (date === undefined) return { ok: false, error: "date must be YYYY-MM-DD" };
   const habitCreatedOn = ymdOrNull(b.habit_created_on);
   if (habitCreatedOn === undefined) return { ok: false, error: "habit_created_on must be YYYY-MM-DD" };
+  const editSeq = b.edit_seq === undefined || b.edit_seq === null ? null : b.edit_seq;
+  if (editSeq !== null && !(typeof editSeq === "number" && Number.isSafeInteger(editSeq) && editSeq > 0)) return { ok: false, error: "edit_seq must be a positive integer" };
   let medium: Medium | null = null;
   if (b.medium !== undefined && b.medium !== null && b.medium !== "") {
     if (typeof b.medium !== "string" || !["audio", "kindle", "paper", "other"].includes(b.medium)) return { ok: false, error: "medium must be audio, kindle, paper or other" };
@@ -1252,7 +1260,7 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
     if (typeof b.book !== "string" || b.book.length > 200) return { ok: false, error: "book must be a slug" };
     book = b.book;
   }
-  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question, habit_created_on: habitCreatedOn } };
+  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question, habit_created_on: habitCreatedOn, edit_seq: editSeq } };
 }
 
 export type SessionEditResult =
@@ -1356,7 +1364,7 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
   let finishedOn = book.finished_on;
   let status = book.status;
   let mirrorWork: EditMirrorWork = NO_MIRROR_WORK;
-  const tx = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on);
+  const tx = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on, input.edit_seq);
   if (tx.ok) {
     session = tx.session;
     mirrorWork = {

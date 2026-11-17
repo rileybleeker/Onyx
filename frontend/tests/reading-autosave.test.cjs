@@ -2202,3 +2202,17 @@ test("round 3: createEntryClaimOf tells a failed lookup ('error') from no claim 
   const broken = { ...db, from: (t) => (t === "reading_mirror_claims" ? refusing : db.from(t)) };
   assert.equal(await RR.createEntryClaimOf(broken, 41, 7), "error", "a failed read is never 'no claim'");
 });
+
+test("edit order and unreadable receipts: source pins (Codex review of PR 376)", () => {
+  const sql = fs.readFileSync(path.join(__dirname, "..", "..", "sql", "reading_session_discards.sql"), "utf8");
+  // An edit older than the stored one is refused before anything is written; the newest number is stored.
+  assert.match(sql, /p_edit_seq < v_prev\.edit_seq[\s\S]*?'stale', true/);
+  assert.match(sql, /edit_seq = COALESCE\(p_edit_seq, s\.edit_seq\)/);
+  const form = fs.readFileSync(path.join(SRC, "app", "log", "sections", "Reading.tsx"), "utf8");
+  assert.match(form, /edit_seq: kept\.editSeq/);
+  // A 200 that does not name the stored session is an unconfirmed (retryable) failure, never "Saved".
+  assert.match(form, /session\.session_id !== id\)[\s\S]*?throw new Error\("The save was not confirmed/);
+  const parsed = R.parseSessionUpdate({ chapter_through: 4, edit_seq: 5 });
+  assert.equal(parsed.ok && parsed.input.edit_seq, 5);
+  assert.equal(R.parseSessionUpdate({ chapter_through: 4, edit_seq: -1 }).ok, false);
+});

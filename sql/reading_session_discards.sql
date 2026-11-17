@@ -680,6 +680,14 @@ $$;
 -- after the edit), finished, unfinished, habit_marked, habit_created, habit_removed, habit_restored, mirror_claim_id,
 -- replaces_block_id, entry_pending, progress_owed: [{book_id, owed_id}]}. Raises OXR02 for a Kindle session and OXR03 when the target
 -- book does not exist.
+-- Edit order (Codex review of PR 376): the row lock serializes two edits but not their order, so an edit whose
+-- connection dropped and which kept running could commit after a newer, acknowledged one and overwrite it. Each
+-- edit now carries p_edit_seq (the form's own, always rising), the newest is stored on the row, and an edit with a
+-- lower number than the stored one is refused as stale (nothing written). The old 10-argument form is dropped so
+-- a call cannot reach it.
+ALTER TABLE pds.reading_sessions ADD COLUMN IF NOT EXISTS edit_seq bigint;
+DROP FUNCTION IF EXISTS pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date);
+
 CREATE OR REPLACE FUNCTION pds.move_reading_session(
     p_session_id       bigint,
     p_book_id          bigint,
@@ -690,7 +698,8 @@ CREATE OR REPLACE FUNCTION pds.move_reading_session(
     p_medium           text,
     p_recall           text,
     p_question         text,
-    p_habit_created_on date
+    p_habit_created_on date,
+    p_edit_seq         bigint DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -736,6 +745,11 @@ BEGIN
         RAISE EXCEPTION 'Kindle sessions are written by the harvester' USING ERRCODE = 'OXR02';
     END IF;
 
+    -- A newer edit was already stored: this older one changes nothing.
+    IF p_edit_seq IS NOT NULL AND v_prev.edit_seq IS NOT NULL AND p_edit_seq < v_prev.edit_seq THEN
+        RETURN pg_catalog.jsonb_build_object('moved', true, 'stale', true);
+    END IF;
+
     -- Both books' rows, lower id first, before any habit lock.
     PERFORM 1 FROM pds.books AS b WHERE b.book_id IN (v_prev.book_id, p_book_id) ORDER BY b.book_id FOR UPDATE;
     SELECT * INTO v_new_book FROM pds.books AS b WHERE b.book_id = p_book_id;
@@ -766,7 +780,7 @@ BEGIN
     UPDATE pds.reading_sessions AS s
        SET book_id = p_book_id, session_date = p_session_date, chapter_from = p_chapter_from,
            chapter_through = p_chapter_through, minutes = p_minutes, medium = p_medium, recall = p_recall,
-           question = p_question
+           question = p_question, edit_seq = COALESCE(p_edit_seq, s.edit_seq)
      WHERE s.session_id = p_session_id
     RETURNING * INTO v_row;
 
@@ -891,8 +905,8 @@ REVOKE ALL ON FUNCTION pds.remove_reading_session(bigint, uuid, date) FROM PUBLI
 GRANT EXECUTE ON FUNCTION pds.remove_reading_session(bigint, uuid, date) TO service_role;
 REVOKE ALL ON FUNCTION pds.create_reading_session(uuid, bigint, date, integer, integer, integer, text, text, text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION pds.create_reading_session(uuid, bigint, date, integer, integer, integer, text, text, text, text) TO service_role;
-REVOKE ALL ON FUNCTION pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date) TO service_role;
+REVOKE ALL ON FUNCTION pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date, bigint) TO service_role;
 
 -- Make PostgREST pick up the new functions without waiting for a restart.
 NOTIFY pgrst, 'reload schema';
