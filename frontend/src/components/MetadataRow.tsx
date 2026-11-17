@@ -5,7 +5,15 @@ type Tone = "primary" | "secondary" | "tertiary" | "accent" | "up" | "down";
 
 export type MetaItem =
   | string
-  | { text: ReactNode; tone?: Tone; title?: boolean };
+  | {
+      text: ReactNode;
+      tone?: Tone;
+      title?: boolean;
+      /** Plain-words hover/focus tooltip for a short badge (e.g. "n=42" or "FDR✓"). */
+      tooltip?: string;
+      /** Screen-reader text that replaces the visible text for assistive tech. */
+      srText?: string;
+    };
 
 interface MetadataRowProps {
   /** Ordered segments. Falsy entries are dropped, so you can inline conditionals. */
@@ -43,11 +51,24 @@ export default function MetadataRow({ items, className }: MetadataRowProps) {
         const isObj = typeof seg === "object";
         const tone: Tone = isObj ? seg.tone ?? "tertiary" : "tertiary";
         const isTitle = isObj && seg.title;
+        const tooltip = isObj ? seg.tooltip : undefined;
+        const srText = isObj ? seg.srText : undefined;
         return (
           <span key={i} className="flex items-center gap-x-1.5">
             {i > 0 && <span className="text-text-tertiary/50" aria-hidden>·</span>}
-            <span className={clsx(TONE_CLASS[tone], isTitle && "font-semibold normal-case tracking-[0.02em] text-text-secondary")}>
-              {isObj ? seg.text : seg}
+            <span
+              className={clsx(TONE_CLASS[tone], isTitle && "font-semibold normal-case tracking-[0.02em] text-text-secondary")}
+              title={tooltip}
+              tabIndex={tooltip ? 0 : undefined}
+            >
+              {srText && isObj ? (
+                <>
+                  <span aria-hidden>{seg.text}</span>
+                  <span className="sr-only">{srText}</span>
+                </>
+              ) : (
+                isObj ? seg.text : seg
+              )}
             </span>
           </span>
         );
