@@ -1,7 +1,9 @@
 # Isolated multi-second slow views in the hourly speed runs (PERF-02, 2026-11-16)
 
 Status: **diagnosis only, no fix shipped.** The evidence rules out the suspected scheduled-job collisions and
-locates the stall, but it does not yet separate the two remaining causes (below). Read-only evidence: the
+locates the stall, but it does not prove its cause. Three candidates remain open (below): our own fan-out,
+shared-CPU throttling and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
+minute averages and cannot show a 2 s event. Read-only evidence: the
 three `perf-timing.yml` artifacts, Supabase edge / PostgREST / Postgres / Auth logs, `pg_stat_statements`,
 `pg_stat_activity`, `cron.job_run_details` and the GitHub Actions run list. Counts and timings only.
 
@@ -51,7 +53,8 @@ the subject of PERF-01.
 * **The whole instance was slow, not only Postgres.** During the 21:31:33 stall the Auth service served
   `/.well-known/jwks.json` (no database read) in 85 ms against its usual 0.2 ms, and the gateway added another
   ~780 ms (edge origin time 865 ms). The same Auth slowdown shows at 22:33:06 (71 ms). Everything on the
-  single Supabase VM (Postgres, PostgREST, Auth, gateway) was CPU-starved at once.
+  single Supabase VM (Postgres, PostgREST, Auth, gateway) slowed at once. That points to a shared resource on the
+VM (CPU, memory or disk IO), not to one service. The logs do not show which.
 * **It may not be limited to the speed runs (provisional).** A one-second bucketing of the 2026-11-16 edge logs
   (median REST latency of 700 ms or more across at least 5 requests) found about a dozen such seconds, roughly a
   third inside a perf-timing window and the rest overnight and in the morning. This is a single day, a coarse
@@ -59,14 +62,18 @@ the subject of PERF-01.
 * The instance is the small shared-CPU size (`max_connections` 60, `shared_buffers` 256 MB) and is
   otherwise almost idle (4 REST requests in the 5 minutes after the run).
 
-## The two causes still open
+## The candidate causes still open
 
-1. **Our own bursts saturate the instance's CPU.** A /nutrition open (page + scroll neighbours + warm-up)
+1. **Our own bursts overload the instance.** A /nutrition open (page + scroll neighbours + warm-up)
    sometimes lands as one ~1.5 s wave of 40-60 queries plus PostgREST JSON encoding, more than two shared
    cores finish quickly; whether it does depends on how the neighbour mounts and the warm-up step line up.
 2. **Shared-CPU throttling.** The small compute sizes run on burstable CPU; when the instance's CPU
    allowance is spent (or a neighbour on the host takes it), the same burst takes seconds. The out-of-run
    stalls (provisional, above) and the Auth slowdown fit this better than cause 1, but neither proves it.
+3. **Memory pressure (swap).** The Micro instance (1 GB) has about 500 MB in swap all week and memory
+   commitment at its limit (see the metrics section). A burst that touches cold pages pays disk reads, and
+   that slows every service on the VM. This fits the instance-wide slowdown and the IOwait bump, and it fits the
+   idle CPU better than causes 1 and 2.
 
 ## What the next measurement needs
 
@@ -83,9 +90,9 @@ Read in the dashboard's Observability > Database charts and Settings > Infrastru
 
 * **Compute size Micro: 1 GB RAM, shared CPU.** The total-RAM line rose from ~0.4 GB to ~0.86 GB around
   2026-11-11 (the Nano to Micro move).
-* **CPU was mostly idle at both stalls.** 21:33 UTC: idle 78.7 %, user 9.3 %, system 3.0 %, IOwait 6.7 %.
+* **CPU was mostly idle in the stall minutes (minute averages).** 21:33 UTC: idle 78.7 %, user 9.3 %, system 3.0 %, IOwait 6.7 %.
   23:31 UTC showed the same small dip (idle about 75 %). There was no CPU saturation and no steal series near
-  100 % busy, so neither cause 1 nor cause 2 as stated above matches.
+  100 % busy. A minute average cannot rule out a 2 s CPU spike, so causes 1 and 2 are weakened, not excluded.
 * **Memory is the constraint.** Swap in use is about 450-650 MB all week, more than the ~400 MB "used" RAM.
   Memory commitment is 1.83-2.0 GB against a ~1.9 GB limit and is flagged SEVERE by the dashboard. It has
   risen steadily since 2026-11-11 and is at or over the limit on 2026-11-16. Swap rose by about 100 MB at
@@ -94,10 +101,11 @@ Read in the dashboard's Observability > Database charts and Settings > Infrastru
 * **Connections are 32 of 60.** PostgREST holds 21 idle connections; the rest is Realtime, exporter and
   management. Postgres settings are the Micro defaults (shared_buffers 256 MB, work_mem 3.5 MB).
 
-**Revised reading:** the instance-wide ~2 s stall fits **memory pressure**: a burst of 40-60 queries on a
+**Current reading (a hypothesis, not proof):** the instance-wide ~2 s stall fits **memory pressure** best: a burst of 40-60 queries on a
 1 GB box that is already about 500 MB into swap pages memory back in. That would explain why Auth's JWKS
 call slowed too, and why IOwait rises while CPU stays idle. A per-minute chart cannot show a 2 s event
-directly, so this is the strongest fit, not proof.
+directly. The test is to move to a size with more RAM and see whether the isolated stalls stop in the
+hourly runs; if they do not, return to causes 1 and 2.
 
 **Fix:** compute size Small (2 GB RAM). About $15.04 a month against Micro's $9.81 (the Pro plan's $10
 compute credit covers Micro), so about +$5 a month. Applying it restarts the database for about 2 minutes.
@@ -106,8 +114,8 @@ mounts) still lowers the burst size, but it does not remove the swap.
 
 ## Why this PR ships no fix
 
-* The two causes need different fixes, and the evidence above cannot tell them apart without the instance
-  CPU / steal figures, which need the Supabase dashboard or the service key (not used in this audit lane).
+* The candidate causes need different fixes. The minute-level metrics favour memory pressure but cannot prove
+  it; the compute change that would test it changes the monthly bill and needs Riley's yes.
 * The cause-1 fix lives in `components/ContinuousScroll.tsx`, which PR #376 is editing; changing it here
   would collide with that PR, and the perf harness that would prove a gain is owned by PR #373.
 * The cause-2 fix is a compute-size change with a monthly cost, which is Riley's decision.
