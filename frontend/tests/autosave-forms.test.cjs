@@ -185,7 +185,11 @@ function stackServer(seed = []) {
         return response({ error: `Synthetic server: no ${call.method} ${call.url}` }, 404);
       }
       const parsed = STACK_SAVE.parseStackSave(call.body, call.method === "POST" ? "create" : "update");
-      if (!parsed.ok) return response({ error: parsed.error, code: "invalid" }, 400);
+      if (!parsed.ok) {
+        // Same mapping as the route (app/api/supplements/stacks/route.ts): a "reload" refusal is a 409, anything else a 400.
+        const reload = parsed.code === "reload";
+        return response({ error: parsed.error, code: reload ? "reload" : "invalid" }, reload ? 409 : 400);
+      }
       const quiet = console.error;
       console.error = () => {}; // saveStack logs a refusal's code; the tests read the answer instead
       try {
