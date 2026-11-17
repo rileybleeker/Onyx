@@ -417,7 +417,7 @@ try {
   await cardBox.getByText(/Disconnected\. The "Onyx care" calendar and its events are still in Google Calendar/).waitFor();
   assert.deepEqual(googleCalls.splice(0), ['POST /api/care/google/sync origin=true', 'POST /api/care/google/sync origin=true', 'POST /api/care/google/disconnect origin=true']);
   await page.goto(url + '/?cal=ready&calendar=error&reason=wrong_scope');
-  await cardAlert.filter({ hasText: 'Could not connect Google Calendar (wrong_scope). Nothing was connected.' }).waitFor();
+  await cardAlert.filter({ hasText: 'Could not connect Google Calendar. Nothing was connected. Try again.' }).waitFor();
   await page.goto(url + '/?cal=ready&calendar=denied');
   await cardBox.getByText('The Google sign-in was cancelled. Nothing was connected.', { exact: true }).waitFor();
   assert.deepEqual(googleCalls, []);
