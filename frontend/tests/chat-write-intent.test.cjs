@@ -54,6 +54,13 @@ const MATRIX = [
   ["reported stack", [user("I took my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, ALLOWED],
   ["reported habit", [user("I meditated today")], "mark_habit_complete", { habit: "Meditated" }, ALLOWED],
   ["reported No", [user("I skipped Synthetic Stretching today")], "mark_habit_complete", { habit: "Synthetic Stretching", answer: "No" }, ALLOWED],
+  // Reported speech with no quotation marks names what someone else said: it never authorizes a write.
+  ["reported request, no quotes", [user("She said please log my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, refused("no_request")],
+  ["reported request, app, no quotes", [user("The app told me to mark my synthetic evening stack taken")], "log_supplement_stack", { stack: "synthetic evening" }, refused("no_request")],
+  ["reported record, note, no quotes", [user("My note says I took my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, refused("no_request")],
+  // Direct requests still grant.
+  ["direct request, log", [user("Log my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, ALLOWED],
+  ["direct request, please mark taken", [user("Please mark my synthetic evening stack taken")], "log_supplement_stack", { stack: "synthetic evening" }, ALLOWED],
   ["reading report", [user("Finished chapters 5 and 6 on my run")], "log_reading_session", { chapter_from: 5, chapter_through: 6 }, ALLOWED],
   ["explicit playlist", [user("Create a playlist for a focused afternoon")], "create_spotify_playlist", { name: "Synthetic Focus Mix", track_ids: ["t1"] }, ALLOWED],
   ["highlight in the user's words", [user("Save this quote: “The constraint sets the pace.” I like it")],
