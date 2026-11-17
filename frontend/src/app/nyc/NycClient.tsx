@@ -359,9 +359,12 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
         {loading ? (
           <p className="py-8 text-center text-[12px] font-mono text-text-tertiary">Loading leads…</p>
         ) : visible.length === 0 ? (
-          <p className="py-8 text-center text-[13px] text-text-secondary">
-            {leads.length === 0 ? "No leads yet. nyc-scout fills this every morning." : "No leads match these filters."}
-          </p>
+          // A failed read sets `error` and the banner above says so; no empty-state copy then.
+          error ? null : (
+            <p className="py-8 text-center text-[13px] text-text-secondary">
+              {leads.length === 0 ? "No leads yet. nyc-scout fills this every morning." : "No leads match these filters."}
+            </p>
+          )
         ) : (
           <div className="overflow-x-auto -mx-4 px-4">
             <table className="w-full min-w-[860px] text-[12px]" data-testid="nyc-leads-table">
