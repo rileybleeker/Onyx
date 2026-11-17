@@ -1197,8 +1197,11 @@ export function recordOutcome(summary: BankRunSummary, out: StepOutcome): void {
   if (out.chapter) summary.chapters.push(out.chapter);
   if (out.graded) summary.graded += 1;
   if (out.outcome === "done") summary.done += 1;
-  if (out.outcome === "retry" || out.outcome === "failed") summary.unfinished += 1;
-  if (out.outcome === "failed" && !(out.code && PARTIAL_FAILURES.has(out.code))) summary.failed += 1;
+  // A partial failure (a refusal, web search off) is neither a run failure nor unfinished work: its code alone makes the
+  // heartbeat partial (PARTIAL_CODES), so a run whose only problem is a refusal does not read as "failed".
+  const partialFailure = out.outcome === "failed" && !!out.code && PARTIAL_FAILURES.has(out.code);
+  if (out.outcome === "retry" || (out.outcome === "failed" && !partialFailure)) summary.unfinished += 1;
+  if (out.outcome === "failed" && !partialFailure) summary.failed += 1;
   if (out.code && !QUIET_CODES.has(out.code)) summary.codes.push(out.code);
 }
 
