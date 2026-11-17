@@ -505,9 +505,30 @@ test("heartbeat: counts, chapter numbers and known codes only; never a title", (
   assert.equal(B.bankHeartbeatStatus(s), "partial");
   assert.equal(B.bankHeartbeatStatus({ ...s, codes: [] }), "success");
   assert.equal(B.bankHeartbeatStatus({ ...s, codes: [], chapters: [{ ...s.chapters[0], result: "thin" }] }), "partial");
-  assert.equal(B.bankHeartbeatStatus({ ...s, failed: 1 }), "failed");
+  assert.equal(B.bankHeartbeatStatus({ ...s, failed: 1 }), "failed", "run-level failure with no step finished done");
   assert.equal(B.bankHeartbeatRecords(s), 16);
   assert.equal(B.bankHeartbeatMessage({ chapters: [], graded: 0, failed: 0, codes: [] }), "nothing to do");
   assert.equal(B.bankCode("Monthly_Cap"), "monthly_cap");
   assert.equal(B.bankCode("an api message with words"), "other");
+});
+
+test("heartbeat status: success only when no claimed step ended retry/failed", () => {
+  const base = { chapters: [], graded: 0, failed: 0, done: 0, unfinished: 0, codes: [] };
+  // Nothing claimed, or every claimed step skipped: success (no retry / failed step).
+  assert.equal(B.bankHeartbeatStatus(base), "success");
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 2 }), "success");
+  // Every claimed step ended retry (the old bug: 'success' with codes other).
+  const retried = { ...base, unfinished: 2, codes: ["other", "other"] };
+  assert.equal(B.bankHeartbeatStatus(retried), "failed", "claimed, none done");
+  assert.equal(B.bankHeartbeatStatus({ ...retried, failed: 1 }), "failed", "run-level failure, none done");
+  // Some done, some retry or failed: partial.
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 1, unfinished: 1, codes: ["other"] }), "partial");
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 3, failed: 1, unfinished: 1, codes: ["other"] }), "partial");
+  // A partial code still makes the heartbeat partial when nothing is unfinished.
+  assert.equal(B.bankHeartbeatStatus({ ...base, done: 1, codes: ["budget"] }), "partial");
+  // Counts and codes only: the message names the unfinished count, never book text.
+  const msg = B.bankHeartbeatMessage({ ...retried, codes: ["other", TITLE] });
+  assert.match(msg, /unfinished 2/);
+  assert.match(msg, /codes other/);
+  assert.doesNotMatch(msg, /lighthouse|ledger/i);
 });

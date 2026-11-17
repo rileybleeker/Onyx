@@ -1204,13 +1204,15 @@ const QUIET_CODES = new Set(["superseded", "not_pending", "already_graded", "inv
 const PARTIAL_FAILURES = new Set(["refusal", "web_search_disabled"]);
 
 export function emptySummary(): BankRunSummary {
-  return { chapters: [], graded: 0, failed: 0, codes: [] };
+  return { chapters: [], graded: 0, failed: 0, done: 0, unfinished: 0, codes: [] };
 }
 
 /** Fold one job's outcome into the run summary. */
 export function recordOutcome(summary: BankRunSummary, out: StepOutcome): void {
   if (out.chapter) summary.chapters.push(out.chapter);
   if (out.graded) summary.graded += 1;
+  if (out.outcome === "done") summary.done += 1;
+  if (out.outcome === "retry" || out.outcome === "failed") summary.unfinished += 1;
   if (out.outcome === "failed" && !(out.code && PARTIAL_FAILURES.has(out.code))) summary.failed += 1;
   if (out.code && !QUIET_CODES.has(out.code)) summary.codes.push(out.code);
 }
@@ -1600,6 +1602,8 @@ export async function runWorker(supabase: Supa, opts: WorkerOptions = {}): Promi
         outcomes.push(...r.outcomes);
         summary.chapters.push(...r.summary.chapters);
         summary.graded += r.summary.graded;
+        summary.done += r.summary.done;
+        summary.unfinished += r.summary.unfinished;
         summary.failed += r.summary.failed;
         summary.codes.push(...r.summary.codes);
       }
