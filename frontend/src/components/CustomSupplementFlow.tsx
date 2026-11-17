@@ -459,6 +459,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                     <select
                       value={ing.category ?? ""}
                       onChange={(e) => updateIngredient(idx, { category: e.target.value || null })}
+                      aria-label="Ingredient category"
                       className="px-2 py-1 text-[11px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     >
                       <option value="">category…</option>
