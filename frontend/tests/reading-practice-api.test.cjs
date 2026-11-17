@@ -1284,9 +1284,7 @@ test("recordAttempt stores the reply as given and grades grade_answer when there
   const reply = "3 1 2 (not sure about the middle)";
   const input = {
     attempt_key: key(), question_id: 1003, version: 1, round_key: key(), round_date: null, round_kind: "chat",
-    answer: reply, grade_answer: "Light the lamp
-Watch the bay
-Write the entry", hinted: false, response_ms: null, quiz_key: null,
+    answer: reply, grade_answer: "Light the lamp\nWatch the bay\nWrite the entry", hinted: false, response_ms: null, quiz_key: null,
   };
   const res = await r.S.recordAttempt(r.supabase, input);
   assert.deepEqual([res.status, res.body.verdict, res.body.grading_status], [200, "correct", "graded"]);
@@ -1301,9 +1299,7 @@ Write the entry", hinted: false, response_ms: null, quiz_key: null,
   const plain = await r.S.recordAttempt(r.supabase, { ...input, attempt_key: key(), round_key: key(), grade_answer: undefined });
   assert.deepEqual([plain.status, plain.body.verdict], [200, "incorrect"]);
   // The HTTP body never carries it.
-  const viaRoute = await r.attempt.POST(post(answer({ question_id: 1003, answer: reply, grade_answer: "Light the lamp
-Watch the bay
-Write the entry" })));
+  const viaRoute = await r.attempt.POST(post(answer({ question_id: 1003, answer: reply, grade_answer: "Light the lamp\nWatch the bay\nWrite the entry" })));
   assert.equal(viaRoute.status, 400);
 });
 
