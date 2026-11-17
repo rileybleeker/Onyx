@@ -72,7 +72,7 @@ const json = (body: unknown, status = 200) => NextResponse.json(body, { status, 
 function dbError(code: string | undefined, what: string) {
   if (code && MISSING.has(code)) return json({ error: "Drinks are not set up yet: the database migration is pending.", code: "unavailable" }, 503);
   if (code === "OXD00") return json({ error: "Drink capture is turned off.", code: "unavailable" }, 503);
-  if (code === "OXP01") return json({ error: "That time has not happened yet." }, 409);
+  if (code === "OXP01") return json({ error: "That time has not happened yet.", code: "future" }, 409);
   if (code === "OXD01" || code === "22023") return json({ error: "That time does not fit its day or time zone." }, 400);
   if (code === "OXD03") return json({ error: "This drink was removed.", code: "removed" }, 410);
   if (code === "23514") return json({ error: "A number is out of range." }, 400);
