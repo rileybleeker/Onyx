@@ -1047,6 +1047,26 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         LOAD_FAILURES.add("weather_daily")
         data["weather"] = pd.DataFrame()
 
+    # Estimated intake kcal (2026-11-16): Claude-estimated kcal from delivered restaurant orders
+    # (pds.delivery_nutrition_daily, delivery_item estimates) and photo-logged meals
+    # (pds.photo_meal_daily), merged into est_intake_kcal only on days with no Cronometer/MFP
+    # nutrition_calories (merge_estimated_intake_features). Loaded fail-open — estimates, and
+    # the photo table may not exist yet (PGRST205), so neither may sink the retrain.
+    for key, relation in (("delivery_nutrition", "delivery_nutrition_daily"),
+                          ("photo_nutrition", "photo_meal_daily")):
+        log.info(f"  Loading {relation} (estimated intake kcal)…")
+        try:
+            data[key] = fetch_all(relation, select="behavioral_date,est_kcal",
+                                  order="behavioral_date")
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", None)
+            if code in _MISSING_RELATION_CODES:
+                log.info(f"  {relation} not present yet; continuing without it")
+            else:
+                log.warning(f"  {relation} load failed ({e!r}); continuing without estimated intake")
+            LOAD_FAILURES.add(relation)
+            data[key] = pd.DataFrame()
+
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
     # content + embedding stay out (handled by the chat tool, not HRV analysis).
@@ -1628,8 +1648,72 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return df
 
 
+def merge_estimated_intake_features(df: pd.DataFrame, delivery_nutrition: pd.DataFrame | None,
+                                    photo_nutrition: pd.DataFrame | None) -> pd.DataFrame:
+    """Estimated kcal intake from Uber Eats dish estimates + photo-logged meals (2026-11-16).
+
+      est_intake_kcal   Claude-estimated kcal for the day: pds.delivery_nutrition_daily
+                        (delivered restaurant orders, quantity x per-dish estimate, portions and
+                        leftovers folded in) + pds.photo_meal_daily, summed. Estimates from dish
+                        names and photos — fine for big-vs-small days, not gram-level.
+
+    ROW PLACEMENT — behavioral day D sits on matrix row D, whose HRV is the sleep that closes
+    day D (hrv_alignment.py). Both views are already keyed on the behavioral date; no re-keying.
+
+    NO DOUBLE COUNT — the value is written ONLY on days where the Cronometer/MFP
+    nutrition_calories column is NaN (nothing logged in the primary nutrition source). A logged
+    day keeps est_intake_kcal NaN however much was estimated, so the two never sum.
+
+    NEVER ZERO-FILLED — a day with no estimated row is unknown, not 0: a no-delivery, no-photo
+    day could equally be an untracked eating day. Only days with at least one estimate carry a
+    value. Deliberately NOT a causal treatment: a median split would add a second calories
+    signal next to nutrition_calories in the nutrition FDR family (one signal per family, like
+    the Garmin-steps drop). Exploratory Spearman / SHAP only.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): on the evening the forecast
+    runs, today's harvest may not have run and photos may not be logged yet, so the newest row
+    reads NaN where training rows read values.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if ((delivery_nutrition is None or delivery_nutrition.empty)
+            and (photo_nutrition is None or photo_nutrition.empty)):
+        return df
+    try:
+        kcal = None
+        for frame in (delivery_nutrition, photo_nutrition):
+            if frame is None or frame.empty or "behavioral_date" not in frame.columns:
+                continue
+            e = frame.copy()
+            e["day"] = pd.to_datetime(e["behavioral_date"], errors="coerce")
+            e = e.dropna(subset=["day"]).drop_duplicates("day")
+            s = pd.Series(pd.to_numeric(e["est_kcal"], errors="coerce").to_numpy(),
+                          index=e["day"]).dropna()
+            if s.empty:
+                continue
+            # both views are one row per day, so a day present in only one is that one's value
+            kcal = s if kcal is None else kcal.add(s, fill_value=0.0)
+        if kcal is None or kcal.empty:
+            return df
+        est = pd.DataFrame({"calendar_date": kcal.index.strftime("%Y-%m-%d"),
+                            "est_intake_kcal": kcal.to_numpy(dtype=float)})
+        out = df.drop(columns=["est_intake_kcal"], errors="ignore").merge(
+            est, on="calendar_date", how="left")
+        assert len(out) == len(df), "estimated-intake merge changed the row count"
+        if "nutrition_calories" in out.columns:
+            logged = pd.to_numeric(out["nutrition_calories"], errors="coerce").notna()
+            out.loc[logged, "est_intake_kcal"] = np.nan
+        log.info(f"  Estimated intake features: {int(out['est_intake_kcal'].notna().sum())} day(s) "
+                 f"with estimated kcal (days logged in Cronometer/MFP excluded)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Estimated-intake feature merge failed ({e!r}); continuing without it")
+        LOAD_FAILURES.update(("delivery_nutrition_daily", "photo_meal_daily"))
+        return df
+
+
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps", "est_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -2522,6 +2606,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_air_quality_features(df, data.get("air_quality"))
     df = merge_weather_features(df, data.get("weather"))
     df = merge_whoop_steps_features(df, data.get("whoop_steps"))
+    df = merge_estimated_intake_features(df, data.get("delivery_nutrition"),
+                                          data.get("photo_nutrition"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
