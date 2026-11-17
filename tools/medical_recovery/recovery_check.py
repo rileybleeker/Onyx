@@ -39,7 +39,8 @@ it is the target's own signed route for that very file.
 On a DRILL target only it can also download every file into memory (are the bytes served at their
 declared size, SHA-256, does each parse as its declared type, and one file fetched through a 60-second
 signed link, the app's own viewing path) and write or compare a manifest of every file's size and
-hash, every document's path / size / type / state and every lab result's document link. The parse is
+hash, every document's path / size / type / state and every lab result's state (document link,
+removal, value, unit, reference range and collection date). The parse is
 structural (no decoder renders a page), so "a restored file opens" is reported as not checked: a
 person opens one in a viewer during the drill. On production those options are refused: real records
 are never downloaded by this tool. A manifest is compared only once manifest_problem() accepts it (the
@@ -94,9 +95,13 @@ PATH_RE = re.compile(r"^documents/[0-9a-f-]{36}$")
 ID_RE = re.compile(r"^[0-9a-f-]{36}$")  # a row id (UUID), the same shape as the id in a storage path
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Only ids, paths, sizes, types and states: no text column (title, provider, notes, test name,
-# value, unit, range, lab) is ever requested.
+# value, unit, range, lab) is ever requested. Production (the "no text column" rule) reads a lab
+# result's identity, document link and removal only; a drill target adds the value / unit / range /
+# date columns a restore must preserve.
 DOC_SELECT = "id,storage_path,mime_type,size_bytes,status,removed_at"
 LAB_SELECT = "id,document_id,removed_at"
+LAB_SELECT_DRILL = ("id,document_id,removed_at,value_num,value_text,unit,"
+                    "ref_low,ref_high,ref_text,ref_low_strict,ref_high_strict,collected_on")
 TABLES = ("medical_documents", "lab_results")
 PAGE = 1000
 MAX_ROWS = 50_000
@@ -123,7 +128,26 @@ MANIFEST_VERSION = 1
 MANIFEST_KEYS = frozenset({"version", "created_at", "documents", "labs", "lab_results_linked", "objects",
                            "document_rows", "lab_rows"})
 DOC_STATE_KEYS = frozenset({"storage_path", "size_bytes", "mime_type", "status", "removed"})
-LAB_STATE_KEYS = frozenset({"document_id", "removed"})
+# The fields build_manifest() writes per lab row: the document link, removal and the value / unit /
+# reference-range state a restore must preserve. Free-text name / note columns (test_name, lab, notes)
+# are deliberately not part of it.
+LAB_STATE_KEYS = frozenset({"document_id", "removed",
+                            "value_num", "value_text", "unit",
+                            "ref_low", "ref_high", "ref_text",
+                            "ref_low_strict", "ref_high_strict", "collected_on"})
+# The lab-state fields grouped under one count each in the drill comparison: (fields, check name,
+# always_fetched). document link and removal are in LAB_SELECT (production too); the value / unit /
+# range / date fields need LAB_SELECT_DRILL, so on a production read they are unknown, never a pass.
+LAB_STATE_GROUPS = (
+    (("document_id",), "manifest_lab_links_match", True),
+    (("removed",), "manifest_lab_removed_match", True),
+    (("value_num", "value_text"), "manifest_lab_values_match", False),
+    (("unit",), "manifest_lab_units_match", False),
+    (("ref_low", "ref_high", "ref_text", "ref_low_strict", "ref_high_strict"),
+     "manifest_lab_ranges_match", False),
+    (("collected_on",), "manifest_lab_collected_match", False),
+)
+LAB_STATE_CHECK_NAMES = tuple(n for _, n, _ in LAB_STATE_GROUPS)
 # PostgREST's answers that mean "this role may not read it" (permission denied; schema not exposed
 # to the request). Anything else (an invalid JWT, a missing table, a gateway error) proves nothing.
 REFUSAL_CODES = frozenset({"42501", "PGRST106"})
@@ -752,7 +776,7 @@ def parses_as(mime: str, data: bytes) -> bool:
 @dataclass
 class Inventory:
     documents: list[dict] = field(default_factory=list)   # DOC_SELECT columns
-    labs: list[dict] = field(default_factory=list)        # LAB_SELECT columns
+    labs: list[dict] = field(default_factory=list)        # LAB_SELECT (production) / LAB_SELECT_DRILL (drill)
     objects: dict[str, dict] = field(default_factory=dict)  # "documents/<id>" -> {"size", "type"}
     unexpected_paths: int = 0                              # files or folders outside documents/<id>
     bucket: Optional[dict] = None
@@ -786,8 +810,20 @@ def doc_state(d: dict) -> dict:
 
 
 def lab_state(r: dict) -> dict:
-    """What a restore must bring back for one lab result row: its document link and removal."""
-    return {"document_id": r.get("document_id") or None, "removed": bool(r.get("removed_at"))}
+    """What a restore must bring back for one lab result row: its document link, removal, value (number
+    or text), unit, reference range with its strict flags, and collection date. Free-text name and note
+    columns (test_name, lab, notes) are not compared."""
+    return {"document_id": r.get("document_id") or None,
+            "removed": bool(r.get("removed_at")),
+            "value_num": r.get("value_num"),
+            "value_text": r.get("value_text") or "",
+            "unit": r.get("unit") or "",
+            "ref_low": r.get("ref_low"),
+            "ref_high": r.get("ref_high"),
+            "ref_text": r.get("ref_text") or "",
+            "ref_low_strict": bool(r.get("ref_low_strict")),
+            "ref_high_strict": bool(r.get("ref_high_strict")),
+            "collected_on": r.get("collected_on")}
 
 
 def evaluate(inv: Inventory) -> dict:
@@ -935,8 +971,23 @@ def evaluate(inv: Inventory) -> dict:
         add("manifest_document_state_match", sum(1 for i, s in m_docs.items()
                                                  if i in by_id and doc_state(by_id[i]) != s), stage=doc_stage)
         add("manifest_lab_rows", sum(1 for i in m_labs if i not in labs_by_id), stage="labs" if not labs_ok else None)
-        add("manifest_lab_links_match", sum(1 for i, s in m_labs.items()
-                                            if i in labs_by_id and lab_state(labs_by_id[i]) != s), stage=link_stage)
+        # the full lab state a restore must preserve, compared per field group: counts and pass / fail
+        # only, never a value, unit, range or id. The value / unit / range / date fields need the drill
+        # select; on a production read they are unknown, never a pass or a fail.
+        lab_diff: dict[str, int] = {n: 0 for n in LAB_STATE_CHECK_NAMES}
+        for i, s in m_labs.items():
+            if i not in labs_by_id:
+                continue
+            got = lab_state(labs_by_id[i])
+            for fields, name, _ in LAB_STATE_GROUPS:
+                if any(got[f] != s[f] for f in fields):
+                    lab_diff[name] += 1
+        labs_full = all("value_num" in r for r in labs_by_id.values()) if labs_by_id else True
+        for _fields, name, always in LAB_STATE_GROUPS:
+            if not always and not labs_full:
+                checks.append(_check(name, "unknown"))
+            else:
+                add(name, lab_diff[name], stage=link_stage)
         add("files_newer_than_manifest", sum(1 for p in inv.objects if p not in m_objects), warn=True, stage=both)
 
     # database backups
@@ -1090,7 +1141,7 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
     except Unreadable as e:
         note(e)
     try:
-        inv.labs = target.rows("labs", "lab_results", LAB_SELECT)
+        inv.labs = target.rows("labs", "lab_results", LAB_SELECT_DRILL if target.drill else LAB_SELECT)
     except Unreadable as e:
         note(e)
     try:
@@ -1202,9 +1253,10 @@ def collect(target: Target, *, anon_key: Optional[str], access_token: Optional[s
 
 def build_manifest(inv: Inventory, now: datetime) -> dict:
     """What a backup (or the drill's seed) holds: every file's size and hash, every document's path /
-    size / type / state, every lab result's document link and removal, and the row counts. It holds
-    ids, so it is kept privately (drill folder, or encrypted with the off-site copy), never in the repo.
-    main() writes it only when manifest_problem() accepts it, the same rule --manifest applies."""
+    size / type / state, every lab result's state (document link, removal, value, unit, reference
+    range and collection date) and the row counts. It holds ids and values, so it is kept privately
+    (drill folder, or encrypted with the off-site copy), never in the repo. main() writes it only when
+    manifest_problem() accepts it, the same rule --manifest applies."""
     if inv.opened is None:
         raise ValueError("a manifest needs the files opened (local drill target only)")
     return {
@@ -1227,6 +1279,11 @@ class ManifestInvalid(ValueError):
 
 def _whole(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _num(v) -> bool:
+    """A NUMERIC value as PostgREST encodes it (a JSON number; a bool is not one)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def manifest_problem(data) -> Optional[str]:
@@ -1275,7 +1332,17 @@ def manifest_problem(data) -> Optional[str]:
     for i, s in labs.items():
         if not (isinstance(i, str) and ID_RE.match(i) and isinstance(s, dict) and set(s) == LAB_STATE_KEYS
                 and (s["document_id"] is None or (isinstance(s["document_id"], str) and ID_RE.match(s["document_id"])))
-                and isinstance(s["removed"], bool)):
+                and isinstance(s["removed"], bool)
+                and (s["value_num"] is None or _num(s["value_num"]))
+                and isinstance(s["value_text"], str)
+                and isinstance(s["unit"], str)
+                and (s["ref_low"] is None or _num(s["ref_low"]))
+                and (s["ref_high"] is None or _num(s["ref_high"]))
+                and isinstance(s["ref_text"], str)
+                and isinstance(s["ref_low_strict"], bool)
+                and isinstance(s["ref_high_strict"], bool)
+                and isinstance(s["collected_on"], str)
+                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s["collected_on"]) is not None):
             return "a lab_rows entry is malformed"
         if s["document_id"] is not None and s["document_id"] not in docs:
             return "a lab link names a document that is not in the manifest"
