@@ -1131,3 +1131,40 @@ test("sleep feedback: onset spread across midnight, freshness, and it never chan
   assert.deepEqual(W.windDownProgress(p), W.windDownProgress(payload({})), "sleep data never marks a night");
   assert.equal(W.durationLabel(330), "5 h 30 min");
 });
+
+test("a refused save shows fixed copy on screen, never the server's sentence (the sentence goes to the console only)", async () => {
+  const SERVER = "Synthetic server sentence: the night was changed elsewhere.";
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const realFetch = globalThis.fetch;
+  const realError = console.error;
+  const logged = [];
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: SERVER, code: "x" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    const UW = loadTs("lib/use-winddown.ts", {
+      "@/lib/client-cache": { GONE: Symbol("gone"), clientCache: {}, fetchJsonValue: async () => null, reportSessionEnded() {}, sessionEnded: () => false },
+      "@/lib/unsaved-work": { unsavedWork: { setDirty() {} } },
+      "@/lib/ui-preferences": { UI_PREFS_PATH: "/api/ui-preferences" },
+      "@/lib/sleep-winddown": W,
+    });
+    const P = loadTs("components/sleep/WindDownPanel.tsx", {
+      "next/link": () => null,
+      "lucide-react": { Check: () => null, CircleDashed: () => null, CircleQuestionMark: () => null, Moon: () => null, Pause: () => null, X: () => null },
+      "@/lib/sleep-winddown": W,
+      "@/lib/use-winddown": UW,
+    });
+    const saver = new W.WindDownSaver({ send: (i) => UW.send("/api/sleep/winddown/night", "POST", { night: i.night }) });
+    saver.submit(intent());
+    await flush();
+    await flush();
+    assert.equal(saver.current.status, "refused");
+    const html = renderToStaticMarkup(React.createElement(P.SaveLine, { s: { saver: saver.current, last: null, notice: null }, p: {} }));
+    assert.ok(html.includes("Not saved. Check the entry and try again."), html);
+    assert.ok(!html.includes("Synthetic server sentence"), "the server's sentence is not on screen");
+    assert.ok(logged.some((l) => l.includes(SERVER)), "the raw sentence is still logged for debugging");
+  } finally {
+    globalThis.fetch = realFetch;
+    console.error = realError;
+  }
+});
