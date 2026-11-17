@@ -52,6 +52,10 @@ component = component.replace(/require\("@\/components\/personalize\/PartGrid"\)
 component = component.replace(/require\("@\/components\/InfoHint"\)/g, '({__esModule:true,default:()=>null})');
 // The wind-down streak (components/sleep/WindDownPanel, tested in frontend/tests/sleep-winddown.test.cjs) is opt-in
 // and reads its own endpoint: here it is not set up, so Today renders and requests exactly what it did before.
+// Learning pacing (lib/learning-pacing.ts, tested in frontend/tests/learning-pacing.test.cjs): the pure rules are bundled, the
+// settings read is stubbed to 'nothing saved' (Today only ever reads it; the suggestion line is covered by its own test).
+const pacingLib = ids.size; ids.set('frontend/src/lib/learning-pacing.ts', pacingLib); modules[pacingLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/learning-pacing.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/learning-pacing"\)/g, `require(${pacingLib})`).replace(/require\("@\/lib\/use-learning-prefs"\)/g, '({__esModule:true,useLearningPrefs:()=>({load:"ready",prefs:{v:1,goal:"",weeklySessions:2,sessionMinutes:20,pauseUntil:null,showIncentives:true},configured:false,accept:()=>{}})})');
 component = component.replace(/require\("@\/components\/sleep\/WindDownPanel"\)/g, '({__esModule:true,default:()=>null,useWindDownToday:()=>({show:false,source:null})})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {

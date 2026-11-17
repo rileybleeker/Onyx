@@ -372,6 +372,6 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
         </Part>}
       </PartGroup>
     </PartGrid>
-    <nav aria-label="Health dashboards" className="flex flex-wrap gap-4 text-sm text-accent"><Link href="/sleep">Sleep & recovery</Link><Link href="/supplements">Supplements</Link><Link href="/chat">Health Q&A</Link></nav>
+    <nav aria-label="Health dashboards" className="flex flex-wrap gap-4 text-sm text-accent"><Link href="/sleep">Sleep & recovery</Link><Link href="/supplements">Supplements</Link><Link href="/chat">Onyx Chat</Link></nav>
   </div>;
 }
