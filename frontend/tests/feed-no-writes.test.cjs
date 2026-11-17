@@ -70,7 +70,7 @@ test("/reading Want to read: mounting (page or scroll) only reads the list; the 
   const list = read("app/reading/ReadingList.tsx");
   // The only POST is inside `send`, which is called from taps and the autosave of typed words.
   assert.equal((list.match(/method: "POST"/g) || []).length, 1);
-  const mount = /\/\/ Mount: read only\.[^\n]*\n\s*useEffect\(\(\) => \{([\s\S]*?)\n  \}, \[/.exec(list);
+  const mount = /\/\/ Mount: read only\.[^\n]*(?:\n\s*\/\/[^\n]*)*\n\s*useEffect\(\(\) => \{([\s\S]*?)\n  \}, \[/.exec(list);
   assert.ok(mount, "the list's mount effect is found");
   assert.ok(!/send\(|method:|retryPending|act\(/.test(mount[1]), "the mount effect writes nothing");
   assert.match(read("app/reading/ReadingClient.tsx"), /<ReadingList books=\{books\} onChanged=\{onListChanged\} \/>/);
