@@ -317,7 +317,12 @@ test("keep-alive heartbeat: a failing visit newer than the imports drags the car
   assert.equal(S.financeLedgerCard(beat(1), beat(1), NOW.getTime(), K(3, { status: "failed", error_message: "x" })).status, "success");
   // an import failure keeps its own text first
   const login = S.financeLedgerCard(beat(5, { status: "failed", error_message: "login required: run node harvest.mjs --login" }), beat(5), NOW.getTime(), fail2);
-  assert.equal(login.errorMessage, "login required: run node harvest.mjs --login");
+  assert.equal(login.errorMessage, S.LEDGER_SIGN_IN_COPY);
+  assert.equal(login.errorMessage, "Rocket Money needs you to sign in again. Ask Claude to run the Rocket Money sign-in on your PC.");
+  assert.doesNotMatch(login.errorMessage, /node|\.mjs|--login|harvest/);
+  // a command-naming text from the importer is never shown; a plain text still is
+  assert.equal(card(beat(1, { status: "failed", error_message: "run node harvest.mjs" }), beat(1)).errorMessage, "The latest transactions import failed (no error text recorded).");
+  assert.equal(card(beat(1, { status: "failed", error_message: "Login required" }), beat(1)).errorMessage, S.LEDGER_SIGN_IN_COPY);
   // no import heartbeat at all: still unknown, a keep-alive alone says nothing about the ledger
   assert.equal(S.financeLedgerCard(null, null, NOW.getTime(), fail2).status, "unknown");
   // the records count is the imports' only
