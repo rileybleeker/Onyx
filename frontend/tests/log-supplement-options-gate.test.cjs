@@ -145,7 +145,7 @@ test("gate: with both the today and stacks GETs failing, the options stay usable
 });
 
 test("gate: the stacks and today Retry buttons still reload their area after a failure", async (t) => {
-  // Round 1: stacks fails. Its Retry (the only one on screen) refetches everything and the row appears.
+  // Round 1: stacks and today both fail. The stacks Retry re-reads only the stacks endpoint; today keeps its own Retry.
   let stacksDown = true;
   let todayDown = true;
   const h = mountSection(t, {
@@ -160,12 +160,20 @@ test("gate: the stacks and today Retry buttons still reload their area after a f
   assert.match(h.text(), /Couldn't load stacks\./);
   stacksDown = false;
   todayDown = false;
+  const before = h.calls.gets.length;
   // The stacks area comes before "Log a product" / "Logged today", so its Retry is the first.
   h.click("Retry", 0);
   await h.flush();
+  assert.deepEqual(h.calls.gets.slice(before), [URL.stacks], "the stacks Retry re-reads only the stacks");
   assert.doesNotMatch(h.text(), /Couldn't load stacks\./);
   assert.match(h.text(), /Synthetic Night/, "the stack row appears after Retry");
   assert.ok(h.buttons("Log it").some((b) => !b.props.disabled), "the stack's Log it is usable");
+  assert.match(h.text(), /Couldn't load today's intakes\./, "the failed today area is not reloaded by the stacks Retry");
+  const todayBefore = h.calls.gets.length;
+  h.click("Retry", 0);
+  await h.flush();
+  assert.deepEqual(h.calls.gets.slice(todayBefore), [URL.today], "the today Retry re-reads only today");
+  assert.doesNotMatch(h.text(), /Couldn't load today's intakes\./);
 
   // Round 2: today only fails; its Retry (again the only one on screen) brings today's rows back.
   todayDown = true;
