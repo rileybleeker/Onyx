@@ -295,4 +295,12 @@ export class Autosaver<T> {
     this.disposed = true;
     this.clearTimers();
   }
+
+  /**
+   * Undo dispose() for a saver with nothing unsaved (lib/autosave-retain.ts: a form let go as clean is taken back by
+   * the component that already holds it). Its last saved value stays its baseline. No-op while anything is unsaved.
+   */
+  revive(): void {
+    if (!this.dirty) this.disposed = false;
+  }
 }

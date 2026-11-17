@@ -906,7 +906,8 @@ BEGIN
     v_psha := NULL;
     IF v_src->>'kind' = 'highlight' THEN
       SELECT pds.reading_sha256(h.passage) INTO v_psha FROM pds.book_highlights h
-       WHERE h.highlight_id = (v_src->>'highlight_id')::bigint AND h.book_id = v_book AND NOT h.archived;
+       WHERE h.highlight_id = (v_src->>'highlight_id')::bigint AND h.book_id = v_book AND NOT h.archived
+         AND NOT (h.highlighted_at IS NULL AND h.note_at IS NOT NULL);   -- a standalone note is a comment, never evidence
       IF v_psha IS NULL THEN
         RAISE EXCEPTION USING ERRCODE = 'OXB02', MESSAGE = 'highlight evidence is not a live highlight of this book';
       END IF;
@@ -936,6 +937,7 @@ BEGIN
           SELECT h2.highlight_id, pds.reading_sha256(h2.passage)
             FROM pds.book_highlights h2
            WHERE p->'seen' IS NULL AND h2.book_id = v_book AND NOT h2.archived
+             AND NOT (h2.highlighted_at IS NULL AND h2.note_at IS NOT NULL)
              AND ((v_replace AND h2.chapter = v_ch)
                   OR h2.highlight_id IN (SELECT NULLIF(x->>'highlight_id', '')::bigint
                                            FROM jsonb_array_elements(COALESCE(p->'sources', '[]'::jsonb)) x WHERE x->>'kind' = 'highlight'))) s
@@ -1832,7 +1834,11 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
     'highlights', COALESCE((SELECT jsonb_agg(jsonb_build_object('highlight_id', x.highlight_id, 'chapter', x.chapter,
                 'passage_sha', x.sha) ORDER BY x.highlight_id)
                 FROM (SELECT h.highlight_id, h.chapter, pds.reading_sha256(h.passage) AS sha
-                        FROM pds.book_highlights h WHERE h.book_id = p_book AND NOT h.archived) x
+                        FROM pds.book_highlights h
+                       WHERE h.book_id = p_book AND NOT h.archived
+                         -- A Kindle note with no highlight under it is stored as a row whose passage is the note's own
+                         -- text (highlighted_at NULL, note_at set): Riley's comment, which never reaches a model.
+                         AND NOT (h.highlighted_at IS NULL AND h.note_at IS NOT NULL)) x
                WHERE NOT EXISTS (SELECT 1 FROM pds.reading_bank_highlight_seen sn
                                   WHERE sn.highlight_id = x.highlight_id AND sn.passage_sha = x.sha)
                  AND NOT EXISTS (SELECT 1 FROM pds.reading_bank_sources src
@@ -1877,12 +1883,15 @@ BEGIN
      AND job_id IN (SELECT j::bigint FROM jsonb_array_elements_text(COALESCE(p->'skip_jobs', '[]'::jsonb)) j);
   -- A job skipped earlier (its chapter left the planning window, e.g. under a hold) is queued again when planned again.
   -- Its cost_cents and charged_at stay as they were: what it already spent keeps counting in its month.
+  -- finished_at is left as it is: it dates the charge in cost_cents, which this month's spend is summed from, so a job
+  -- that was charged earlier (a retry, then a refusal at a cap) keeps counting toward the monthly cap when it is queued
+  -- again (clearing it let that spend fall out of the month's sum and reopened the headroom).
   INSERT INTO pds.reading_bank_jobs AS jb (book_id, step, chapter, input_hash, prompt_version, priority)
   SELECT v_book, j->>'step', (j->>'chapter')::int, j->>'input_hash', j->>'prompt_version', COALESCE((j->>'priority')::int, 100)
     FROM jsonb_array_elements(COALESCE(p->'jobs', '[]'::jsonb)) j
    WHERE j->>'step' IN ('map', 'research', 'build', 'highlights')
   ON CONFLICT (book_id, step, chapter, input_hash) DO UPDATE
-     SET status = 'queued', attempts = 0, next_attempt_at = NOW(), finished_at = NULL, error_code = NULL, priority = EXCLUDED.priority
+     SET status = 'queued', attempts = 0, next_attempt_at = NOW(), error_code = NULL, priority = EXCLUDED.priority
    WHERE jb.status = 'skipped'
       OR (jb.status = 'failed' AND jb.error_code = 'web_search_disabled' AND jb.finished_at < NOW() - interval '6 hours');
   GET DIAGNOSTICS v_n = ROW_COUNT;
@@ -2200,23 +2209,50 @@ BEGIN
   RETURN jsonb_build_object('ok', FOUND, 'stored', FOUND);
 END $fn$;
 
--- p: {book_id, chapter}. "Rebuild chapter": a new rebuild count makes new job hashes, so the planner queues a fresh
--- research + build; the stored ideas stay served until the rebuilt batch replaces them. Chapter 0 (or no chapter)
--- is the book level: it also counts a map rebuild (part of the map job's hash), so a source map that failed
--- (refusal, bad output, an expired lease, web search off) is tried again, and the whole-book build with it.
+-- p: {book_id, chapter, expected?, plan?}. "Rebuild chapter": a new rebuild count makes new job hashes, so the planner
+-- queues a fresh research + build; the stored ideas stay served until the rebuilt batch replaces them. Chapter 0
+-- (or no chapter) is the book level: it also counts a map rebuild (part of the map job's hash), so a source map that
+-- failed (refusal, bad output, an expired lease, web search off) is tried again, and the whole-book build with it.
+-- A rebuild is counted ONCE per round of work, decided and written under the claim lock in this one call:
+--   * while the chapter's research or build (chapter 0: the map or the whole-book build) is queued or running, or
+--   * when `expected` (the rebuild count the caller read before planning) no longer equals the stored count, because
+--     another Rebuild was counted in between,
+-- nothing is counted and the answer is {pending: true}. Counting needs no separate check beforehand: two overlapping
+-- taps both reach this lock, the first counts, the second finds its jobs queued (or the count moved) and does not,
+-- which would make the first one's jobs obsolete and pay for research and build twice.
+-- `plan` (what the planner would queue once the count is one higher: lib/reading-bank-server.ts planForBook) is
+-- enqueued in the same transaction, so there is no moment with the count raised and its jobs not yet queued, in which
+-- a third tap would count again. Without `plan` only the counter moves (a caller that plans afterwards).
+-- -> {ok, pending, chapter, rebuilds, map_rebuilds, enqueued}
 CREATE OR REPLACE FUNCTION pds.reading_bank_rebuild(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
-DECLARE v_book BIGINT; v_ch INTEGER; v_n INTEGER; v_m INTEGER;
+DECLARE
+  v_book BIGINT; v_ch INTEGER; v_exp INTEGER; v_plan_book BIGINT;
+  v_cur INTEGER; v_n INTEGER; v_m INTEGER; v_enq INTEGER;
+  v_has_plan BOOLEAN := p->'plan' IS NOT NULL AND jsonb_typeof(p->'plan') <> 'null';
 BEGIN
   BEGIN
     v_book := (p->>'book_id')::bigint;
     v_ch := COALESCE(NULLIF(p->>'chapter', '')::int, 0);
+    v_exp := NULLIF(p->>'expected', '')::int;
+    v_plan_book := CASE WHEN v_has_plan AND jsonb_typeof(p->'plan') = 'object' THEN NULLIF(p->'plan'->>'book_id', '')::bigint END;
   EXCEPTION WHEN others THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END;
-  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END IF;
+  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR (v_exp IS NOT NULL AND v_exp < 0)
+     OR (v_has_plan AND v_plan_book IS DISTINCT FROM v_book) THEN
+    RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pds.books WHERE book_id = v_book) THEN
     RETURN jsonb_build_object('ok', false, 'http', 404, 'code', 'book_not_found');
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
+  SELECT c.rebuilds INTO v_cur FROM pds.reading_bank_chapters c WHERE c.book_id = v_book AND c.chapter = v_ch;
+  v_cur := COALESCE(v_cur, 0);
+  IF (v_exp IS NOT NULL AND v_exp <> v_cur)
+     OR EXISTS (SELECT 1 FROM pds.reading_bank_jobs j
+                 WHERE j.book_id = v_book AND j.chapter = v_ch AND j.status IN ('queued', 'running')
+                   AND j.step = ANY (CASE WHEN v_ch = 0 THEN ARRAY['map', 'build'] ELSE ARRAY['research', 'build'] END)) THEN
+    RETURN jsonb_build_object('ok', true, 'pending', true, 'chapter', v_ch, 'rebuilds', v_cur);
+  END IF;
   INSERT INTO pds.reading_bank_chapters AS c (book_id, chapter, rebuilds) VALUES (v_book, v_ch, 1)
   ON CONFLICT (book_id, chapter) DO UPDATE SET rebuilds = c.rebuilds + 1
   RETURNING rebuilds INTO v_n;
@@ -2225,7 +2261,9 @@ BEGIN
     ON CONFLICT (book_id) DO UPDATE SET map_rebuilds = b.map_rebuilds + 1, updated_at = NOW()
     RETURNING map_rebuilds INTO v_m;
   END IF;
-  RETURN jsonb_build_object('ok', true, 'chapter', v_ch, 'rebuilds', v_n, 'map_rebuilds', v_m);
+  -- The claim lock is held by this transaction already; taking it again inside the enqueue is allowed.
+  IF v_has_plan THEN v_enq := pds.reading_bank_enqueue(p->'plan'); END IF;
+  RETURN jsonb_build_object('ok', true, 'pending', false, 'chapter', v_ch, 'rebuilds', v_n, 'map_rebuilds', v_m, 'enqueued', v_enq);
 END $fn$;
 
 -- 25. Access: every table and function is service_role only ----------------------------------------------------------

@@ -248,6 +248,17 @@ def test_dynamic_sql_definers_fail_closed_before_the_revoke() -> None:
     assert "targets" not in check
 
 
+def test_readiness_requires_a_usable_unique_index() -> None:
+    # REFRESH ... CONCURRENTLY needs a plain, valid, ready unique index. An expression index
+    # (indexprs) or an invalid / not-ready one satisfies indisunique AND indpred IS NULL but
+    # PostgreSQL cannot use it for the concurrent refresh, so both the migration's readiness
+    # check and the post-apply check must also require indexprs IS NULL, indisvalid, indisready.
+    for path in (FORWARD, VERIFY):
+        code = _code(path)
+        assert "i.indisunique AND i.indpred IS NULL" in code, path.name
+        assert "i.indexprs IS NULL AND i.indisvalid AND i.indisready" in code, path.name
+
+
 def test_verify_check_runs_the_same_dynamic_sql_check_and_list() -> None:
     assert _dynamic_check(_code(VERIFY)) == _dynamic_check(_code(FORWARD))
     assert _reviewed(_code(VERIFY)) == _reviewed(_code(FORWARD))

@@ -46,11 +46,12 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphoneos
 
+      # project-health.yml = project.yml + the HealthKit entitlement, so the compile check covers it too.
       - name: Generate Xcode project
         working-directory: tools/screentime_ios
         run: |
           brew install xcodegen
-          xcodegen generate
+          xcodegen generate --spec project-health.yml
 
       - name: Build
         working-directory: tools/screentime_ios
@@ -275,11 +276,23 @@ jobs:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$GITHUB_ENV"
 
+      # HealthKit (Apple Health sync) needs the capability ticked on the App ID AND a profile made after
+      # that. The entitlement is added only when the installed profile carries it: a profile without it
+      # keeps producing the same working Screen Time build, and the app says Health sync is unavailable.
       - name: Generate Xcode project
         working-directory: tools/screentime_ios
         run: |
+          set -euo pipefail
           brew install xcodegen
-          xcodegen generate
+          HK="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.healthkit' "$RUNNER_TEMP/signing/profile.plist" 2>/dev/null || true)"
+          if [ "$HK" = "true" ]; then
+            echo "The provisioning profile carries HealthKit: building with the HealthKit entitlement."
+            xcodegen generate --spec project-health.yml
+            echo "HEALTHKIT=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning title=HealthKit::The provisioning profile does not carry HealthKit, so this build cannot sync Apple Health. Tick HealthKit on the App ID com.rileybleeker.onyxscreentime in the developer portal, create a new iOS App Development profile, update the IOS_PROFILE_B64 secret and run this workflow again."
+            xcodegen generate
+          fi
 
       - name: Archive (manual signing)
         working-directory: tools/screentime_ios
@@ -375,6 +388,12 @@ jobs:
             echo "app claims $ENT"
           done
 
+          # 2b. HealthKit, when this build was made with it
+          if [ "${HEALTHKIT:-0}" = "1" ]; then
+            [ "$($PB -c 'Print :com.apple.developer.healthkit' "$V/app-entitlements.plist" 2>/dev/null || true)" = "true" ]               || fail "Entitlement missing from the signed app" "com.apple.developer.healthkit is not in the code signature."
+            echo "app claims com.apple.developer.healthkit"
+          fi
+
           # 3. what the embedded profile ALLOWS
           security cms -D -i "$APP/embedded.mobileprovision" -o "$V/embedded.plist" 2>/dev/null \
             || fail "Embedded profile" "No decodable embedded.mobileprovision in the app."
@@ -385,6 +404,10 @@ jobs:
           done
           [ "$($PB -c 'Print :Entitlements:get-task-allow' "$V/embedded.plist" 2>/dev/null || true)" = "true" ] \
             || fail "Profile type" "The embedded profile is not a development profile."
+          if [ "${HEALTHKIT:-0}" = "1" ]; then
+            [ "$($PB -c 'Print :Entitlements:com.apple.developer.healthkit' "$V/embedded.plist" 2>/dev/null || true)" = "true" ]               || fail "Entitlement missing from the embedded profile" "com.apple.developer.healthkit is not allowed by the embedded profile."
+            echo "profile allows com.apple.developer.healthkit"
+          fi
 
           # 4. the iPhone is in the profile (the UDID itself is never printed: public logs)
           DEVICES="$($PB -c 'Print :ProvisionedDevices' "$V/embedded.plist" 2>/dev/null || true)"

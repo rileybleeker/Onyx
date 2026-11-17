@@ -20,6 +20,7 @@ import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
 import ReviewCard from "./ReviewCard";
 import PracticePart from "./PracticePart";
+import RetrievalSession from "./RetrievalSession";
 import ChapterMap from "./ChapterMap";
 import CheckpointQuiz from "./CheckpointQuiz";
 import ConceptPicker from "./ConceptPicker";
@@ -314,6 +315,10 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             onChanged={() => load(slug, true)}
             review={<ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
           />
+        </Part>
+
+        <Part id="retrieval" title="Practice from memory">
+          <RetrievalSession key={o.book.slug} o={o} />
         </Part>
 
         {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}

@@ -1,10 +1,10 @@
 # Medical records: backup and recovery (SEC-06, 2026-11-16)
 
-Plan and check only. Nothing in this document is scheduled, paid for or restored. The decisions are
-recorded in section 8 (2026-11-16): off-site option A, PITR off, and a count-free heartbeat for the
-future backup job. Building that job, creating the encryption key and running the drill is separate
-follow-up work; nothing here copies a real record out of Supabase or restores anything. The read-only
-check `tools/medical_recovery/recovery_check.py` exists now.
+The decisions are recorded in section 8 (2026-11-16): off-site option A, PITR off, and a count-free
+heartbeat for the backup job. The read-only check `tools/medical_recovery/recovery_check.py` and the
+backup job with its restore drill, `tools/medical_recovery/offsite_backup.py` (section 9, built
+2026-11-16), both exist. Creating the key, registering the weekly task, the first real backup and the
+first drill are run after review; until then nothing copies a real record out of Supabase.
 
 `/health/records` stores two kinds of things (see `docs/medical-records.md`): rows in
 `pds.medical_documents` and `pds.lab_results`, and the original files in the private storage bucket
@@ -21,7 +21,7 @@ different recovery points.
 | The bucket's list of files (`storage.objects` rows) | Postgres | Yes, but only the list: the bytes are not in it | Comes back with the database, so a restore can list files whose bytes are gone. A HEAD request is answered from the same row, so only downloading a file tells the two apart (section 6 step 6) |
 | Bucket settings (private, 25 MB cap, six file types), RLS, grants | `storage.buckets` and the catalog; also `sql/medical_records_schema.sql` in git | Yes (an in-place restore brings them back); "Restore to a new project" does not copy storage settings | In place: nothing to do. On a new project: re-apply `sql/medical_records_schema.sql` |
 | Service-role key | Supabase project settings | Not needed | Re-issued in the dashboard after a project is rebuilt; update Vercel and the PC's key file |
-| Backup encryption key (section 4) | Offline, with Riley | Never stored online | Riley's password manager entry or the printed copy |
+| Backup encryption key (sections 4, 9) | `~/.onyx_backup_age_key` on the PC (signed-in user only), the password manager, one printed copy | Never stored online, never under OneDrive | Riley's password manager entry or the printed copy |
 
 Supabase's own docs say it plainly: database backups "do not include objects you store via the
 Storage API", restoring an old backup "does not restore objects you deleted after that backup",
@@ -92,7 +92,12 @@ RPO = how much recent work can be lost. RTO = how long until it is back and chec
 **Proposed targets:** rows RPO 24 h / RTO 4 h; files RPO 24 h / RTO 4 h. A lost day of typing can be
 redone; a lost original usually cannot, which is why the files are the priority.
 
-## 4. Off-site copy: encrypted, with retention (option A chosen; not built yet)
+## 4. Off-site copy: encrypted, with retention (option A chosen; built: section 9)
+
+As built (section 9), each weekly run writes ONE self-contained encrypted pack (both tables, every
+file, the recovery manifest and the manifest), kept as the newest 8 packs plus the first pack of each
+of the 3 most recent months. That replaces the per-file copies and the 30-daily / 12-monthly snapshot
+schedule sketched below: every pack restores on its own, and the drill checks exactly that.
 
 ### The same for every option
 
@@ -245,11 +250,14 @@ $schema = (Resolve-Path sql\medical_records_schema.sql).Path
    before going on. Put the file back
    (`Invoke-RestMethod -Method Post "$api/storage/v1/object/medical-records/documents/$($rows[0].id)" -Headers ($h + @{ "x-upsert" = "true" }) -ContentType "application/pdf" -InFile "$d\files\synthetic-drill-document.pdf"`)
    and the check must PASS again.
-7. **Back up** with the off-site job chosen in section 4, pointed at the local stack and a drill-only
-   destination and a drill-only key pair (`age-keygen -o "$d\drill-key.txt"`, never the real key).
-   Until that job exists, the same by hand: download both files and both tables
-   (`GET $api/rest/v1/medical_documents?select=*` with `Accept-Profile: pds`) and encrypt each with
-   `age -r <drill public key>` into `$d\offsite`.
+7. **Back up** with the off-site job (section 9), pointed at the local stack, a drill-only
+   destination and a drill-only key pair, never the real key:
+   ```powershell
+   $job = (Resolve-Path tools\medical_recovery\offsite_backup.py).Path   # set in the repo root, with $check
+   age-keygen -o "$d\drill-key.txt"; age-keygen -y "$d\drill-key.txt" > "$d\drill-recipient.txt"
+   python $job backup --url http://127.0.0.1:54321 --recipient-file "$d\drill-recipient.txt" --dest "$d\offsite"
+   python $job drill --dest "$d\offsite" --identity "$d\drill-key.txt"   # must print PASS
+   ```
 8. **Disaster.** `npx supabase stop --no-backup` (this removes the local stack's data, and only the
    local stack), `npx supabase start`, repeat step 2. Step 6's check command must now FAIL (files
    and rows missing): this proves the check notices a loss.
@@ -414,3 +422,120 @@ decisions; Riley's merge of this change confirms them.
    small inline check, because criterion 3 needs the evidence it reports. The audit's two-week
    benefit check still applies: if it adds burden without a safety benefit, simplify it while
    keeping the privacy and integrity rules.
+
+## 9. The backup job: `tools/medical_recovery/offsite_backup.py` (built 2026-11-16)
+
+Option A as built. Standard-library Python plus the `age` command-line tool (`winget install
+FiloSottile.age`; the job finds it on PATH or in winget's folders). Chosen over the Python `pyrage`
+or `cryptography` packages: `age` streams (no file is ever written in the clear), is the reference
+implementation of the format, and needs no pip install on the PC.
+
+```powershell
+python tools\medical_recovery\offsite_backup.py keygen          # once: the key pair (below)
+python tools\medical_recovery\offsite_backup.py backup --dry-run  # read + pack in memory, print counts, write nothing
+python tools\medical_recovery\offsite_backup.py backup            # what the weekly task runs
+python tools\medical_recovery\offsite_backup.py drill --hold      # restore drill; --hold pauses so a person opens a file
+pwsh -File tools\medical_recovery\register-task.ps1               # the weekly task "Onyx Medical Backup"
+```
+
+- **Key.** `keygen` runs `age-keygen` once: the private key goes to `~/.onyx_backup_age_key` (access
+  limited to the signed-in user with `icacls`), the public recipient to `~/.onyx_backup_age_recipient`.
+  It refuses to overwrite either file (a new key could not read the old backups) and refuses any path
+  under OneDrive or in the repo. **Right after, copy the private key file's contents into the password
+  manager and print one copy**: without it no backup can be decrypted. The backup reads only the
+  recipient file and refuses one that holds a private key; only `drill` (through `age`) reads the key.
+- **What a run reads** (read-only, service role from `~/.onyx_supabase_secret`, the same target rules
+  as the check: production is the exact production origin, anything else is refused before a key is
+  read): every column of `pds.medical_documents` and `pds.lab_results`, the bucket listing, every file
+  under `documents/`, PostgREST's schema description of `pds` (the schema-only part; the repo's `sql/`
+  files are the full schema), and a fixed list of hand-entered `pds` tables Onyx cannot fetch again from
+  a source (`REBUILD_TABLES` in the job: habits, supplements, weight, reading, care items, layouts, the
+  time-zone log, Uber Eats portions, the finance ledger and plan, procurement, the experiment protocols;
+  the finance tables are included on purpose: they are encrypted with the rest and the private key never
+  leaves the PC and the password manager). **Not covered, on purpose (`UNCOVERED_TABLES`):**
+  `pds.experiment_days` (trial adherence). Its required foreign key points into the trial schedule, which
+  is never copied (concealment), so a copy could not be restored into the declared schema; it stays out
+  until the schedule has a recovery path of its own, and every manifest lists it under
+  `uncovered_tables`. Tables are paged by primary key with a keyset cursor (each page asks for
+  the rows after the last key read, never an OFFSET, so a row removed or added between two pages cannot
+  push an unread row out of the read), and after the last page the table's keys are read again: the copy
+  is used only when they match exactly; otherwise the table is read once more, then counts as unreadable.
+  A table with no primary key (or one of a type the cursor cannot compare) is not copied and the run is
+  partial (`rebuild_table_unkeyed`). Storage pages its listing by offset, so the listing is read twice
+  and must agree (`listing_changed` otherwise, partial). Tables are read one after another, so after the
+  last one every foreign key between two copied tables (from the schema description, plus a lab result's
+  document) is checked: a row whose parent row the copy does not hold (a stack and its items created or
+  removed between the two reads) makes the job read both tables again, up to 3 times; still broken is
+  partial (`tables_inconsistent`). A copied row that points into a table no backup holds is partial
+  (`parent_not_recoverable`). Known limit: a row changed (not added or removed) during its table's read
+  may be copied as it was a moment earlier. Credentials (`ci_tokens`) and the N-of-1
+  trial seed and schedule are never read. A listed table the schema does not know is noted as missing
+  in the manifest, not a failure. The tables and the listing are read before encryption starts, so a
+  failed core read leaves no file anywhere.
+- **What a run writes.** One tar stream piped straight into `age -r <recipient>`: the plaintext exists
+  only in the job's memory and the pipe, one file at a time, never on disk. Members: `schema/openapi.json`,
+  `tables/pds/<table>.json`, `objects/documents/<id>`, `recovery-manifest.json` (the check's
+  `--manifest` format, included only when the copy is complete) and `manifest.json` last (each table's
+  rows, bytes and SHA-256, each file's size, type and SHA-256). The ciphertext is written to
+  `%LOCALAPPDATA%\Onyx\backup-tmp`, copied into `~/OneDrive/Backups/onyx` under a hidden `.partial`
+  name, then renamed `onyx-backup-<UTC time>.tar.age`; the temporary copy is removed. Plaintext never
+  touches OneDrive or the repo. A run counts as off-site only when the ciphertext itself is confirmed in
+  the OneDrive cloud. First the folder must be under an existing OneDrive folder with the client running
+  (else `offsite_unsynced`, nothing pruned; a cheap negative pre-check only); then the job polls the new
+  file's own cloud-files state for up to `--sync-wait` seconds (default 300). The state is read with
+  `GetFileAttributesW` — the cfapi placeholder bits `attrib` prints: `FILE_ATTRIBUTE_OFFLINE` (0x1000),
+  `FILE_ATTRIBUTE_RECALL_ON_OPEN` (0x40000), `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (0x400000),
+  `FILE_ATTRIBUTE_PINNED` (0x80000), `FILE_ATTRIBUTE_UNPINNED` (0x100000) and
+  `FILE_ATTRIBUTE_REPARSE_POINT` (0x400). OneDrive takes a local file into the cloud by converting it into
+  a cloud-files placeholder, so one of those bits is the cloud's receipt for the upload; a plain local
+  file, an unreadable one, a path outside OneDrive or a non-Windows host reads `pending_upload` (a
+  **partial** run, nothing pruned). Only then does the one writer of the remote record
+  (`record_remote_confirmation`: backup name, size and time in
+  `%LOCALAPPDATA%\Onyxackup-stateemote-confirmations.json`, never under OneDrive or in the repo)
+  store the confirmation. Elapsed time is not evidence of upload. `keygen` refuses one path for both key
+  files.
+- **Retention**, applied after every run whose ciphertext is confirmed in the cloud (an unconfirmed run
+  prunes nothing): the newest 8 backups, plus the first backup of each of the 3 most recent months, plus
+  the newest backup whose completeness marker verifies, plus the newest backup the remote record
+  confirms, wherever they fall. When no backup is confirmed off-site at all, nothing is pruned
+  (`offsite_unconfirmed`); a confirmation whose file changed size no longer counts. A fully successful run commits `onyx-backup-<UTC time>.ok` next to its backup (the backup's name
+  and size, nothing else; written under a hidden name, renamed, read back); a backup counts as complete
+  only when that marker reads back and matches the file. If the marker cannot be committed the run is
+  **failed** (`marker_unwritable`, failed heartbeat, exit 1) and nothing is pruned. Every marker is
+  checked before anything is removed, by an explicit file status call (not `Path.is_file()`, which on
+  Python 3.14 calls an unreadable file absent), and every removal is decided before the first is made: an
+  error reading or checking any of this job's files stops the prune with nothing removed. Only names this job
+  writes are removed (OneDrive keeps them 30 days in its recycle bin); a failed run removes nothing.
+  Ciphertext a killed run left in `backup-tmp` is removed after a day.
+- **Partial and failed runs.** A confirmed document whose file is not listed or not served
+  (`files_missing`), a file whose size differs from its row or listing (`size_mismatch`), a file that
+  keeps failing after two retries (`files_unread`), entries outside `documents/<id>`, a wider table that
+  cannot be read, a wider table or file larger than one member may be (64 MiB, the drill's own limit:
+  `table_too_large`, `files_too_large`): the pack is still written, without the recovery manifest, and the
+  run is `partial`. A medical table over that limit fails the run (`medical_table_too_large`).
+  A refused read, a failed read of a medical table or the listing, no recipient, no `age`, a failed
+  encryption or write, a crash: `failed`, nothing in the backup folder.
+- **Heartbeat** (decision 5): one `pds.sync_log` row per production run, source `backup`, data type
+  `medical_records`, status `success` / `partial` / `failed`, `records_synced` always 0, `error_message`
+  only a short code (`files_missing`, `crash_OSError`). It is sent through the backup's own request path
+  to exactly the production origin with the service-role key the backup resolved (never
+  `ONYX_SUPABASE_URL` / `ONYX_SUPABASE_SECRET_FILE`), and a heartbeat that cannot be written never changes
+  the run's outcome. A dry run, a drill-target run and a drill write none. `/status` card **Medical Backup**: more than 8 days without a run degraded, more than 15 days or
+  a failed run red, with what to do per code (`lib/medical-backup-status.ts`). Printed output and the
+  log (`%LOCALAPPDATA%\Onyx\medical-backup\backup.log`) hold counts and codes only.
+- **Restore drill** (`drill`): decrypts the newest backup into a new folder under
+  `%LOCALAPPDATA%\Onyx\backup-drill` (never into Supabase; refused under OneDrive, in the repo or in the
+  backup folder), refuses and never extracts any member outside the pack's names, then checks every
+  table's SHA-256, bytes and row count, every file's size and SHA-256, that nothing is missing or extra,
+  that every lab result's document link and every ready document's file are in the pack, that every
+  foreign key the pack's own schema declares between its tables holds and none points into a table no
+  backup holds (`references_hold`), that the backup
+  recorded no problem (`backup_complete`: a partial backup never passes, even when what it holds
+  verifies), and that the recovery manifest is valid and agrees with the files. It prints counts, booleans, the restore time and
+  the backup's age, and removes the decrypted folder, also when a check or the decryption fails.
+  `--hold` writes `open-me.<ext>` (a copy of one restored document) and waits for Enter, so a person
+  opens it before the folder is removed: that is the `file_opened_in_viewer` evidence.
+- **Weekly task** (`register-task.ps1`): Sunday 11:10, signed-in user only, `pythonw.exe` (no window),
+  runs on battery, catches up after sleep, one hour limit, never wakes the PC.
+- Tests: `tests/test_medical_offsite_backup.py` (synthetic rows and files, a fake Supabase, a fake
+  cipher), `frontend/tests/medical-backup-status.test.cjs` (the card).
