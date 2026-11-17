@@ -60,6 +60,16 @@ const MATRIX = [
     assistant("Correct. Question 2: what sets the pace?"), user("The drum")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
   ["a quiz result the user states", [user("Record my synthetic quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 }, ALLOWED],
+  ["a complete quiz with unnumbered questions", [user("Quiz me on the synthetic book"), assistant("What limits output?"), user("The bottleneck"),
+    assistant("Correct. What sets the pace?"), user("The drum")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
+  ["the checkpoint the quiz request named", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, ALLOWED],
+  ["a review quiz", [user("Give me a review quiz"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, ALLOWED],
+  ["a new quiz after a cancelled one", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz"),
+    user("Quiz me again"), assistant("Question 1: what sets the pace?"), user("The drum")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, ALLOWED],
   ["a report with a plan after it", [user("I took 15 mg of Synthetic Focus at 8:30, will take the rest later")],
     "log_supplement_intake", { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] }, ALLOWED],
   ["a list continues the request", [user("Log Synthetic Calm and Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
@@ -237,6 +247,28 @@ const MATRIX = [
   ["don't log it refuses every write", [user("I took Synthetic Calm, don't log it")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
   ["a sleep question said for today, stored on last night", [user("I used my synthetic mouth tape today")],
     "mark_habit_complete", { habit: "Used synthetic mouth tape?" }, ALLOWED],
+
+  // Round 4 (quiz identity): a question that is not a quiz question (an offer, a summary, "anything else") never
+  // widens the quiz, and a reply to it — including "yes" — is never a quiz answer. Only the complete active quiz,
+  // with its questions recognized, answered, and checkpoint bound, may be scored, once.
+  ["a summary question after the quiz is not a quiz answer", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck"),
+    assistant("Would you like a summary?"), user("Yes")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 2 }, refused("quiz_not_answered")],
+  ["a stopped quiz stays closed after a later question", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz"),
+    assistant("Would you like a summary?"), user("Yes")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 3, total: 7 }, refused("quiz_cancelled")],
+  ["an anything-else after the quiz is not a quiz question", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck"),
+    assistant("Nice. Anything else?"), user("No")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_not_answered")],
+  ["a total that does not match the quiz questions asked", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck"),
+    assistant("Correct. Question 2: what sets the pace?"), user("The drum")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_score_invalid")],
+  ["another checkpoint than the quiz named", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch5", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
+  ["a chapter quiz recorded as a review", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
+  ["a checkpoint sent as a number", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: 4, score: 1, total: 1 }, refused("invalid_value")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -259,6 +291,12 @@ test("a playlist or a quiz result is granted once per message", () => {
   used.perTool.set("record_reading_quiz", 1);
   assert.deepEqual(decide([user("Make me a synthetic playlist")], "create_spotify_playlist", { name: "x", track_ids: ["a"] }, { used }), refused("once_per_request"));
   assert.deepEqual(decide([user("Quiz me")], "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 2 }, { used }), refused("once_per_request"));
+});
+
+test("a complete quiz with one finalization authorizes exactly one score", () => {
+  const messages = [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck")];
+  assert.deepEqual(sequence(messages, "record_reading_quiz",
+    [{ checkpoint: "ch1", score: 1, total: 1 }, { checkpoint: "ch1", score: 1, total: 1 }]), ["allowed", "once_per_request"]);
 });
 
 test("CHAT_WRITES=off keeps chat read-only; a missing or other value never turns writes off", () => {
