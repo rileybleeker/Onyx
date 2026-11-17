@@ -1,5 +1,5 @@
 import "server-only";
-import { createClient } from "@supabase/supabase-js";
+import { LedgerQueryError, serviceClient } from "@/lib/finance-service-client";
 import { etDate } from "@/lib/format";
 import {
   LIST_PAGE_SIZE,
@@ -59,18 +59,9 @@ interface PgErr {
   code?: string;
   message?: string;
 }
-export class LedgerQueryError extends Error {
-  constructor(readonly code: string | null) {
-    super(code ?? "query failed");
-  }
-}
-
-export function serviceClient() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new LedgerQueryError("not-configured");
-  return createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
-}
+// The client and its error live in lib/finance-service-client.ts (a small module the stored-result routes load
+// without this one); re-exported here so every existing import is unchanged.
+export { LedgerQueryError, serviceClient };
 type Db = ReturnType<typeof serviceClient>;
 
 function check<T extends { error: PgErr | null }>(res: T): T {

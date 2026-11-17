@@ -1,6 +1,7 @@
 # Isolated multi-second slow views in the hourly speed runs (PERF-02, 2026-11-16)
 
-Status: **diagnosis only, no fix shipped.** The evidence rules out the suspected scheduled-job collisions and
+Status: **diagnosis only.** The last section (2026-11-16) adds a lazy-loading change for the two Today finance
+routes, proposed in PR #396: it is not deployed and its effect on speed has not been measured. The evidence rules out the suspected scheduled-job collisions and
 locates the stall, but it does not prove its cause. Three candidates remain open (below): our own fan-out,
 shared-CPU throttling and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
 minute averages and cannot show a 2 s event. Read-only evidence: the
@@ -131,3 +132,68 @@ mounts) still lowers the burst size, but it does not remove the swap.
 * Cause 2 / memory: compute size Small (2 GB, about +$5 a month net; see the metrics section). Riley's decision: it changes the monthly cost.
 
 Neither loosens the budget or moves the perf schedule.
+
+## Runs 43995593029 and 44003258302: what they show, and one hypothesis tested in code (2026-11-16)
+
+These are observations from two runs. Neither proves a cause; each hypothesis below says what evidence it rests
+on and what would confirm or refute it. One cold view and three warm views per page is a small sample, and the
+cold view's function / CDN state was not controlled.
+
+**Run 43995593029** (harness v2; result groups served c5c8f436 (6), ba4af90b (20) and a mix of revisions (2)).
+Five enforced breaches, kept as recorded and not pooled across revisions:
+
+| Breach | Served revision | Repeats | Coincides with |
+|---|---|---|---|
+| Today cold data-ready 1143 ms | c5c8f436 | cold, 1 view | first page of the run, 25 min after the previous run |
+| Today cold `/api/finance/alerts` 1033 ms | c5c8f436 | cold, 1 view | same view |
+| Today cold `/api/procurement/renewals/summary` 1021 ms | c5c8f436 | cold, 1 view | same view |
+| `/supplements` warm data-ready, max 1759 ms (p95 1689 ms) | mixed | **2 of 3 warm views over budget** | ba4af90b promoted to Production at 01:34:20, inside the page's window |
+| `/supplements` warm `/api/weight`, max 1084 ms | mixed | 1 of 3 warm views | same window |
+| phone Today tap, max 4750 ms (observational) | mixed | 3 taps | 71c5cc79 promoted at 01:45:19, inside the tap series |
+
+**Run 44003258302** (harness v2; all 28 result groups served 62243ab8, a single revision; before PR #396). Five
+enforced breaches: Today cold data-ready 4886 ms, Today warm data-ready max 1006 ms (1 of 3), Today cold
+`/api/urgent-email` 2480 ms, Today cold `/api/nyc/leads` 1016 ms, Log cold data-ready 1017 ms. Observational:
+phone Today warm max 1027 ms (1 of 3), phone Log cold 1291 ms; phone Today taps max 766 ms (3 of 3 fine). In
+this run the two finance routes were **not** among the breaches: cold `/api/finance/alerts` 361 ms,
+`/api/procurement/renewals/summary` 349 ms, `/api/ui/preferences` 188 ms.
+
+What was checked, and what it does and does not show:
+
+* **Database time.** `pg_stat_statements`: the finance result-cache read averages 0.6 ms (max 7.8 ms),
+  `ui_preferences` 0.1 ms, `weight_log` 0.1 ms, today's compound rollup uses its index (0.3 ms). During both
+  promotion windows of run 43995593029 the Supabase edge origin times had a 20-60 ms median (max 433 ms). These
+  are aggregates; they make a slow query an unlikely explanation for these breaches but do not exclude a single
+  slow request.
+* **First PostgREST requests and the signing-key fetch.** In the Today cold view of run 43995593029, the first
+  wave of REST requests had origin times of 185-285 ms; the same tables a second later took 25-55 ms. The first
+  middleware instances fetched `/.well-known/jwks.json` at 270-290 ms (the warm fetch is 6 ms). This shows a
+  first-request cost in that view; how much of each breach it explains is not measured.
+
+**Hypothesis A (the one PR #396 acts on): the two finance routes pay extra cold-start time for their module
+graph.** Evidence: on the same cold view, the finance routes took about 180-190 ms longer than
+`/api/ui/preferences` in run 43995593029 (1021-1033 ms vs 841 ms) and about 160-175 ms longer in run 44003258302
+(349-361 ms vs 188 ms); both answer a stored one-row read, but at import time they loaded the forecast engine,
+tax plan, budgets and subscription detection (26 modules, ~349 KB of source) that a stored answer does not use.
+What it does not establish: the routes also differ in their handlers and queries, and two cold samples with
+uncontrolled function state cannot attribute the difference to module loading. PR #396 makes
+`lib/finance-result-cache-server.ts` load those modules with `import()` only when it computes (a stored answer now
+loads 7 modules / ~53 KB for alerts and 10 / ~97 KB for renewals) and takes the service-role client from the new
+small `lib/finance-service-client.ts`. **Would confirm it:** after PR #396 is deployed, single-revision runs
+(every result group serving the same revision) in which the finance routes' cold call is consistently no slower
+than `/api/ui/preferences` on the same view, where it was consistently slower before. **Would refute it:** the
+gap stays the same after deployment. Either way the larger cold variation between runs (841 ms vs 188 ms for the
+same one-row route) is not explained by this change.
+
+**Hypothesis B: breaches that overlap a Production promotion measure the new deployment's first requests.**
+Evidence: in run 43995593029 the `/supplements` warm breaches (2 of 3 views) and the 4.75 s phone tap fall inside
+promotion windows, and those groups served mixed revisions; for the tap no long task or reload was recorded and
+the database was fast. This overlap is a confound, not proof: it does not show that the delay is only a cold
+start, and it does not rule out the page, the router or `ContinuousScroll`. **Would confirm or refute it:**
+per-sample served revision and timing for these pages in runs with no promotion inside the window. Until then
+these breaches are **unresolved**; none is handed to PR #376.
+
+**Unresolved:** every breach of run 44003258302 (Today cold 4886 ms with `/api/urgent-email` 2480 ms and
+`/api/nyc/leads` 1016 ms, Today warm 1 of 3, Log cold), the mixed-revision `/supplements` and phone-tap breaches
+of run 43995593029, and the size of the cold cost that is common to all routes. PR #396 is not expected to change
+any of these. PERF-02 stays open until deployed single-revision runs meet the budget.
