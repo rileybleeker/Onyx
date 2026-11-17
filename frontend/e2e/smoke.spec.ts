@@ -747,7 +747,7 @@ test("/analytics/travel lists flights in the Flights card", async ({ page }) => 
     "/analytics/travel did not render its Travel Analysis heading"
   ).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(
-    page.getByText("No flights parsed yet", { exact: false }),
+    page.getByText("No flights found yet", { exact: false }),
     "Flights card shows its empty state"
   ).toHaveCount(0);
   const flightsCard = page
