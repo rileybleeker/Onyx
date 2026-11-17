@@ -319,3 +319,20 @@ test("SQL: permitted sources only, hashes made by the database, lock before writ
   const alter = sql.slice(sql.indexOf("ALTER TABLE pds.reading_quizzes"), sql.indexOf(";", sql.indexOf("ALTER TABLE pds.reading_quizzes")));
   assert.doesNotMatch(alter, /NOT NULL|DEFAULT/, "columns added to the existing quiz table are nullable, no rewrite");
 });
+
+test("check mode: an order answer re-run keeps graded_by onyx from the stored question format, with no model call", () => {
+  const src = read("app/api/chat/route.ts");
+  // The stored lookup reads the question's format with its chapter.
+  assert.match(src, /reading_questions\(bank_chapter,format\)/);
+  assert.match(src, /const format = typeof q\?\.format === "string" \? q\.format : null;/);
+  // The check-mode branch of record_reading_answer returns graded_by only for an order question.
+  const start = src.indexOf('if (name === "record_reading_answer")');
+  const end = src.indexOf('if (name === "flag_reading_question")', start);
+  const branch = src.slice(start, end);
+  const check = branch.slice(branch.indexOf("if (op?.check)"), branch.indexOf("const shape = await answerShape"));
+  assert.match(check, /stored\.format === "order" \? \{ graded_by: "onyx" \} : \{\}/);
+  assert.match(check, /replayed: true/);
+  assert.doesNotMatch(check, /recordOrderAnswer|recordGradedAnswer|answerShape|recordAttempt|recordChatAnswer/, "check mode never grades or writes");
+  // The first grading of an order answer sets the same detail.
+  assert.match(src, /graded_by: "onyx",\n\s+\}\);/);
+});

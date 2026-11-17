@@ -1129,6 +1129,9 @@ function flagRefusal(code: string): string {
  */
 type Lookup<T> = ({ state: "found" } & T) | { state: "absent" } | { state: "conflict" } | { state: "unknown" };
 
+/** The stored answer's question format (the grading detail recordOrderAnswer sets as graded_by: an order is graded by Onyx). */
+type StoredAnswerFormat = { format: string | null };
+
 /**
  * After a failed record_reading_answer: is THIS answer stored under its key? The row counts only when it is this
  * request (the same question, the chat round of this tool call, the same answer text as given: every answer is stored
@@ -1140,24 +1143,26 @@ async function storedChatAnswer(
   keyId: string,
   request: { question_id: number; answer: string },
   status: number,
-): Promise<Lookup<{ grading_status: string; verdict: string | null; chapter: number | null }>> {
+): Promise<Lookup<{ grading_status: string; verdict: string | null; chapter: number | null } & StoredAnswerFormat>> {
   if (status === 503) return { state: "absent" };
   try {
     const { data, error } = await supabase
       .from("reading_question_attempts")
-      .select("question_id,round_key,round_kind,answer,grading_status,verdict,reading_questions(bank_chapter)")
+      .select("question_id,round_key,round_kind,answer,grading_status,verdict,reading_questions(bank_chapter,format)")
       .eq("attempt_key", chatAttemptKey(keyId))
       .maybeSingle();
     if (error) return { state: "unknown" };
     if (!data) return { state: "absent" };
     const row = data as { question_id?: unknown; round_key?: unknown; round_kind?: unknown; answer?: unknown; grading_status?: unknown; verdict?: unknown; reading_questions?: unknown };
+    // The question's format is read with its chapter (below): an order answer's grading detail comes back from it.
     const sameRound = typeof row.round_key === "string" && row.round_key.toLowerCase() === chatRoundKey(keyId).toLowerCase();
     if (Number(row.question_id) !== request.question_id || row.round_kind !== "chat" || !sameRound) return { state: "conflict" };
     if (typeof row.answer !== "string") return { state: "unknown" };
     if (row.answer !== request.answer) return { state: "conflict" };
-    const q = (Array.isArray(row.reading_questions) ? row.reading_questions[0] : row.reading_questions) as { bank_chapter?: unknown } | null | undefined;
+    const q = (Array.isArray(row.reading_questions) ? row.reading_questions[0] : row.reading_questions) as { bank_chapter?: unknown; format?: unknown } | null | undefined;
     const chapter = q && Number.isInteger(q.bank_chapter) ? (q.bank_chapter as number) : null;
-    return { state: "found", grading_status: String(row.grading_status ?? ""), verdict: typeof row.verdict === "string" ? row.verdict : null, chapter };
+    const format = typeof q?.format === "string" ? q.format : null;
+    return { state: "found", grading_status: String(row.grading_status ?? ""), verdict: typeof row.verdict === "string" ? row.verdict : null, chapter, format };
   } catch {
     return { state: "unknown" };
   }
@@ -2153,6 +2158,8 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         verdict: stored.grading_status === "graded" ? stored.verdict : null,
         grading_status: stored.grading_status,
         replayed: true,
+        // The same grading detail the first grading returned (recordOrderAnswer): an order answer was graded by Onyx.
+        ...(stored.format === "order" ? { graded_by: "onyx" } : {}),
       });
     }
     const shape = await answerShape(parsed.question_id);
