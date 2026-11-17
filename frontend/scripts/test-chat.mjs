@@ -469,7 +469,8 @@ test("reading session, highlight, quiz and playlist each return a receipt built 
 test("a write tool that throws is reported as possibly incomplete, to the model and in the receipt, without leaking the error", async () => {
   const logged = [];
   const reading = { logSession: async () => { throw new TypeError("secret detail: the user's private recall text"); } };
-  const r = route(afterTool("log_reading_session", { chapter_through: 6 }, "That did not go through cleanly."), { reading, sandboxConsole: { error: (...args) => logged.push(args) } });
+  // SEC-05: a reading write is checked against the books table first; an empty one leaves the write to the tool.
+  const r = route(afterTool("log_reading_session", { chapter_through: 6 }, "That did not go through cleanly."), { supabase: fakeSupabase(), reading, sandboxConsole: { error: (...args) => logged.push(args) } });
   const response = await r.post({ messages: [user("Log my reading through chapter 6")] });
   assert.equal(response.status, 200);
   const body = await response.json();
@@ -492,7 +493,10 @@ test("when a request stops after a write, the error response still carries the r
   const body = await response.json();
   assert.match(body.error, /reached the tool limit/);
   assert.equal(body.receipts.length, contract.MAX_TOOL_ROUNDS);
-  assert.ok(body.receipts.every((receipt) => receipt.status === "saved" && receipt.details[0] === "Acme Synthetic Focus"));
+  // SEC-05: one message authorizes the write once; every repeat of the same call is refused with a receipt.
+  assert.equal(body.receipts[0].status, "saved");
+  assert.equal(body.receipts[0].details[0], "Acme Synthetic Focus");
+  assert.ok(body.receipts.slice(1).every((receipt) => receipt.status === "not_saved" && receipt.details.some((d) => /already written for this message/.test(d))));
 
   // A failure in the model call after the write: generic error text, receipt kept.
   let calls = 0;
@@ -776,11 +780,11 @@ test("a malformed request_id is a 400 before the model runs; a failed owner chec
 
 test("a quiz insert whose answer was lost is reported as possibly recorded; a refusal stays not recorded", async () => {
   const quiz = afterTool("record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 });
-  const lost = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
+  const lost = route(quiz, { supabase: fakeSupabase(), reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
   const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json();
   assert.equal(lostBody.receipts[0].status, "unknown");
   assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/, "the database text is not passed on");
-  const refused = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
+  const refused = route(quiz, { supabase: fakeSupabase(), reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
   assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json()).receipts[0].status, "not_saved");
 });
 
@@ -968,7 +972,7 @@ test("a retry while another try of the message still runs is a 409 and runs noth
 });
 
 test("a reading session whose insert committed but lost its answer is found by its key; what it missed is done once", async () => {
-  const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, status: "reading" }] } });
+  const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, slug: "synthetic-book", title: "Synthetic Book", status: "reading", total_chapters: 2 }] } });
   const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 2, status: "reading", finished_on: null };
   const calls = [];
   let mirrors = 0;
@@ -1065,7 +1069,7 @@ test("a replayed session never overrides an answer given since, and a lost answe
 test("a session an earlier try wrote is only read on the retry: a habit answer cleared since stays cleared, no second finish or Notion entry", async () => {
   const state = { failFinish: true };
   const db = ledgerDb({
-    tables: { habit_journal: [], reading_sessions: [], books: [{ book_id: 4, status: "reading" }] },
+    tables: { habit_journal: [], reading_sessions: [], books: [{ book_id: 4, slug: "synthetic-book", title: "Synthetic Book", status: "reading", total_chapters: 2 }] },
     fail: ({ table, op, payload }) => (state.failFinish && table === "chat_operations" && op === "update" && payload?.status ? { code: "08006" } : null),
   });
   const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: "Read synthetic", total_chapters: 2, status: "reading", finished_on: null };
