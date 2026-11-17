@@ -1,5 +1,5 @@
 import "server-only";
-import { createClient } from "@supabase/supabase-js";
+import { LedgerQueryError, serviceClient } from "@/lib/finance-service-client";
 import { etDate } from "@/lib/format";
 import {
   LIST_PAGE_SIZE,
@@ -26,7 +26,7 @@ import {
   type LedgerQuery,
   type LedgerTxn,
 } from "@/lib/finance-ledger";
-import { FINANCE_SOURCE, SIMPLEFIN_THRESHOLDS, financeLedgerCard } from "@/lib/finance-status";
+import { FINANCE_SOURCE, simplefinLedgerCard } from "@/lib/finance-status";
 import { NO_FIXES, applyFixes, fixedCategory, type CategoryFixes } from "@/lib/finance-categories";
 import { merchantKey } from "@/lib/procurement-recurring";
 
@@ -59,18 +59,9 @@ interface PgErr {
   code?: string;
   message?: string;
 }
-export class LedgerQueryError extends Error {
-  constructor(readonly code: string | null) {
-    super(code ?? "query failed");
-  }
-}
-
-export function serviceClient() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new LedgerQueryError("not-configured");
-  return createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
-}
+// The client and its error live in lib/finance-service-client.ts (a small module the stored-result routes load
+// without this one); re-exported here so every existing import is unchanged.
+export { LedgerQueryError, serviceClient };
 type Db = ReturnType<typeof serviceClient>;
 
 function check<T extends { error: PgErr | null }>(res: T): T {
@@ -144,26 +135,41 @@ async function heartbeat(db: Db, dataType: string): Promise<Record<string, unkno
   return error ? null : ((data?.[0] as Record<string, unknown> | undefined) ?? null);
 }
 
+const FIX_MAX_PAGES = 20; // 20k merchant rules or one-off fixes; a read that still stops there is reported
+
 /**
  * Category fixes Riley made (merchant rules, one-off overrides). Fail-open: a missing table or a failed read
- * shows the source categories, never an error page.
+ * shows the source categories, never an error page. `failed` (optional, so other callers are unaffected) says a
+ * read failed for another reason than a missing table; `truncated` says a read answered but stopped at its page
+ * limit, so some fixes were not read. The cash forecast withholds its safe-to-move amount on either.
+ *
+ * Both tables are read in pages ordered by their primary key (fetchPaged): a single select would stop at the
+ * server's row cap without an error and the missing fixes would go unnoticed.
  */
-export async function loadCategoryFixes(db: Db): Promise<CategoryFixes> {
-  let rules: { data: unknown[] | null; error: unknown };
-  let overrides: { data: unknown[] | null; error: unknown };
-  try {
-    [rules, overrides] = await Promise.all([
-      db.from("finance_category_rules").select("merchant_key,category"),
-      db.from("finance_txn_categories").select("txn_key,category"),
-    ]);
-  } catch {
-    return NO_FIXES;
-  }
-  if (rules.error && overrides.error) return NO_FIXES;
-  return {
-    rules: new Map(((rules.data ?? []) as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
-    overrides: new Map(((overrides.data ?? []) as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
+export async function loadCategoryFixes(db: Db): Promise<CategoryFixes & { failed?: boolean; truncated?: boolean }> {
+  // A missing table (migration not applied) means no fixes were ever saved: the source categories are right.
+  const MISSING = ["42P01", "PGRST205"];
+  type FixRead = { rows: unknown[]; truncated: boolean; error: "missing" | "failed" | null };
+  const read = async (build: Parameters<typeof fetchPaged>[0]): Promise<FixRead> => {
+    try {
+      const r = await fetchPaged(build, FIX_MAX_PAGES);
+      return { rows: r.rows, truncated: r.truncated, error: null };
+    } catch (e) {
+      const code = e instanceof LedgerQueryError ? e.code : null;
+      return { rows: [], truncated: false, error: code && MISSING.includes(code) ? "missing" : "failed" };
+    }
   };
+  const [rules, overrides] = await Promise.all([
+    read((f, t, c) => db.from("finance_category_rules").select("merchant_key,category", c ? { count: "exact" } : undefined).order("merchant_key", { ascending: true }).range(f, t)),
+    read((f, t, c) => db.from("finance_txn_categories").select("txn_key,category", c ? { count: "exact" } : undefined).order("txn_key", { ascending: true }).range(f, t)),
+  ]);
+  const failed = rules.error === "failed" || overrides.error === "failed";
+  const truncated = rules.truncated || overrides.truncated;
+  const fixes: CategoryFixes = {
+    rules: new Map((rules.rows as { merchant_key: string; category: string }[]).map((r) => [r.merchant_key, r.category])),
+    overrides: new Map((overrides.rows as { txn_key: string; category: string }[]).map((r) => [r.txn_key, r.category])),
+  };
+  return { ...fixes, ...(failed ? { failed } : {}), ...(truncated ? { truncated } : {}) };
 }
 
 export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Promise<LedgerLoad> {
@@ -186,7 +192,7 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
       .map(parseAccount)
       .filter((a): a is LedgerAccount => a !== null);
     const freshness =
-      txHeartbeat || balHeartbeat ? financeLedgerCard(txHeartbeat, balHeartbeat, now.getTime(), null, SIMPLEFIN_THRESHOLDS) : null;
+      txHeartbeat || balHeartbeat ? simplefinLedgerCard(txHeartbeat, balHeartbeat, now.getTime()) : null;
 
     if (accounts.length === 0 && maxDate === null) return { kind: "empty", freshness };
 

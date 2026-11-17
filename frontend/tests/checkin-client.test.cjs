@@ -1,14 +1,13 @@
 // Execute the real CheckInClient and its event callbacks with a tiny hook scheduler.
 // Synthetic data only: no DOM/browser, credentials, requests, database or delivery writes.
-// Autosave (2026-11-15): answers save a short delay after the last tap. The real scheduler (lib/autosave.ts) runs on
-// a manual clock here: h.tick() fires what is due (default: the check-in's 600 ms delay).
+// Autosave (2026-11-15): answers save a short delay after the last tap. The real scheduler AND the real hook
+// (lib/autosave.ts, lib/use-autosave.ts) run on a manual clock here (tests/helpers/autosave-harness.cjs): h.tick()
+// fires what is due (default: the check-in's 600 ms delay), h.hide() is the browser hiding the page.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
-// Loaded once and passed to the client as "@/lib/autosave": loadTs has no module cache, and a second copy would give
-// the client its own AutosaveRefused class, which the scheduler's instanceof check does not recognise.
-const autosaveLib = loadTs("lib/autosave.ts");
-const { Autosaver } = autosaveLib;
+const { manualTimers, clockCache, advance, pageEvents, partGridPassThrough } = require("./helpers/autosave-harness.cjs");
+const { contextShim } = require("./helpers/hook-harness.cjs");
 
 const DAY = "Synthetic daytime question?";
 const SLEEP = "Synthetic sleep question?";
@@ -22,26 +21,6 @@ const page = (today = "2031-03-05", date = today) => ({
   days: [0, -1, -2].map((n) => ({ date: addDay(today, n), answered: 0, total: 1 })),
 });
 const response = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
-/** Manual clock for the autosave scheduler only (other code keeps real timers). */
-function manualTimers() {
-  let now = 0;
-  let next = 1;
-  const pending = new Map();
-  return {
-    set: (fn, ms) => { const id = next++; pending.set(id, { at: now + ms, fn }); return id; },
-    clear: (id) => { pending.delete(id); },
-    due(ms) {
-      const until = now + ms;
-      const hit = [...pending.entries()].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
-      if (!hit) { now = until; return null; }
-      pending.delete(hit[0]);
-      const left = until - hit[1].at;
-      now = hit[1].at;
-      return { fn: hit[1].fn, left };
-    },
-    count: () => pending.size,
-  };
-}
 const deferred = () => {
   let resolve;
   const promise = new Promise((r) => { resolve = r; });
@@ -73,12 +52,16 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   const postOptions = [];
   const gets = [];
   const done = [];
+  // The autosave scheduler's clock only (other code keeps real timers).
   const timers = manualTimers();
-  let saver = null;
-  const windowEvents = new Map();
+  const browser = pageEvents(hash === undefined ? {} : { location: { hash, pathname: "/check-in", search: "" }, history: { replaceState: (_state, _title, url) => replaced.push(url) } });
   const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
   const slot = () => [frame.slots, frame.index++];
+  // React context (lib/use-unsaved-work.ts, under lib/use-autosave.ts, reads lib/feed-scope.ts's context).
+  const context = contextShim();
   const hooks = {
+    createContext: context.createContext,
+    useContext: context.useContext,
     useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${i}:`; },
     useState(initialValue) {
       const [slots, i] = slot();
@@ -103,12 +86,8 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   };
   const replacements = {
     localStorage: draftStorage,
-    document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
-    window: {
-      addEventListener: (name, fn) => windowEvents.set(name, fn),
-      removeEventListener: (name) => windowEvents.delete(name),
-      ...(hash === undefined ? {} : { location: { hash, pathname: "/check-in", search: "" }, history: { replaceState: (_state, _title, url) => replaced.push(url) } }),
-    },
+    document: browser.document,
+    window: browser.window,
     fetch: async (url, options = {}) => {
       if (url === "/api/habits/checkin/voice" && onVoice) return onVoice(JSON.parse(options.body));
       if (url === "/api/journal/entry" && onJournal) return onJournal(JSON.parse(options.body));
@@ -141,30 +120,22 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
     "@/components/DeliveryPortions": { useDeliveryDishes: () => ({ groups: [], leftovers: [] }), DeliveryDishList: () => null, LeftoverList: () => null },
     // The trial question loads on its own (its own route, covered by tests/experiments.test.cjs).
     "./ExperimentAdherence": { __esModule: true, default: () => null },
-    // /check-in is a personalized page since #272; the grid uses React context, which this hook shim does not
-    // provide. Pass its parts through so the client renders as before.
-    "@/components/personalize/PartGrid": { PartGrid: ({ children }) => children, PartGroup: ({ header, children }) => [header, children], Part: ({ children }) => children },
+    // /check-in is a personalized page since #272; the grid needs the personalize store and providers this shim does not
+    // provide. The pass-through renders what the real grid renders, group headers included (the day tabs live in
+    // one), and throws on any other prop that holds UI instead of dropping it.
+    "@/components/personalize/PartGrid": partGridPassThrough(),
     // The /log Say it drafts (only the embedded check-in reads them; covered by tests/log-drafts.test.cjs).
     "@/lib/log-drafts": { useLogDrafts: () => ({ draft: null, clear: () => {} }), setLogDraft: () => {} },
-    // The real scheduler on the manual clock; the hook's page-hidden / unmount listeners are lib/use-autosave.ts
-    // (h.hide() stands in for "the page was hidden": flush with keepalive).
-    "@/lib/autosave": autosaveLib,
-    "@/lib/use-autosave": {
-      useAutosave: (_name, opts) => {
-        const [state, setState] = hooks.useState({ status: "idle", error: null, retrying: false, savedAt: null });
-        const optsRef = hooks.useRef(opts);
-        optsRef.current = opts;
-        const [s] = hooks.useState(() => new Autosaver({ save: (v, c) => optsRef.current.save(v, c), delayMs: opts.delayMs, timers, onState: (next) => setState({ ...next }) }));
-        saver = s;
-        const dirty = ["waiting", "saving", "error", "incomplete"].includes(state.status);
-        return { state, dirty, change: (v, o) => s.change(v, o), flush: () => s.flush(), retry: () => s.retry(), setBaseline: (v) => s.setBaseline(v), reset: (b) => s.reset(b) };
-      },
-    },
-  }).default;
+    // The real scheduler on the manual clock, registered under its file (clockCache) so every import of it gets the
+    // same module. lib/use-autosave.ts is NOT stubbed: the shipped hook runs, with its page-hidden (keepalive) and
+    // unmount handling, and builds its saver from that module.
+  }, { cache: clockCache(timers) }).default;
   function expand(node, id = "root") {
     if (node == null || typeof node === "boolean") return null;
     if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
     if (typeof node !== "object") return node;
+    const provided = context.provide(node, (children) => expand(children, id));
+    if (provided) return provided.rendered;
     if (typeof node.type === "function") {
       const key = `${id}:${node.type.name}`;
       if (!frames.has(key)) frames.set(key, { slots: [], index: 0 });
@@ -206,19 +177,13 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
   await flush();
   let resumeOffset = 0;
   /** Advance the autosave clock: run every scheduler timer due within `ms`, rendering after each. */
-  async function tick(ms = 600) {
-    for (let left = ms; ;) {
-      const hit = timers.due(left);
-      if (!hit) break;
-      left = hit.left;
-      hit.fn();
-      await flush();
-    }
-    await flush();
-  }
-  return { posts, postOptions, gets, done, flush, tick, text, button, click, windowEvents, replaced, storage: draftStorage,
+  const tick = (ms = 600) => advance(timers, flush, ms);
+  return { posts, postOptions, gets, done, flush, tick, text, button, click, replaced, storage: draftStorage,
     timersPending: () => timers.count(),
-    hide: async () => { await saver.flush(true); await flush(); },
+    /** Fire a window event (beforeunload, pageshow); false when nothing listens to it. */
+    fire: (name, event) => browser.fire(name, event),
+    /** The browser hides the page: the autosave hook sends what is waiting, with keepalive. */
+    hide: async () => { browser.hide(); await flush(); },
     type: (label, value) => {
       const field = nodes().find((n) => n.props?.["aria-label"] === label && typeof n.props.onChange === "function");
       assert.ok(field, `field exists: ${label}`);
@@ -231,7 +196,7 @@ async function mount(t, { initial = page(), draftStorage = storage(), onPost, on
       const now = Date.now;
       resumeOffset += 61_000;
       Date.now = () => now() + resumeOffset;
-      try { windowEvents.get("pageshow")?.(); } finally { Date.now = now; }
+      try { browser.fire("pageshow"); } finally { Date.now = now; }
       await flush();
     },
   };
@@ -455,7 +420,7 @@ test("client: failed storage retains drafts through stale reload and warns befor
   h.click(`${DAY}: yes`); await h.flush();
   assert.match(h.text(), /Some drafts could not be read or stored/);
   let warned = false;
-  h.windowEvents.get("beforeunload")({ preventDefault: () => { warned = true; } });
+  assert.ok(h.fire("beforeunload", { preventDefault: () => { warned = true; } }), "a leave warning is registered");
   assert.equal(warned, true);
   h.setPage(page("2031-03-06"));
   await h.tick();

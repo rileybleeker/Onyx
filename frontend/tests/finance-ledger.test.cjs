@@ -353,7 +353,8 @@ function fakeSupabase(beats) {
     };
     return b;
   };
-  return { client: { from }, reads };
+  // /api/status also calls rpc("reading_bank_status") (READ-QUIZ-01 s2): answer "function missing" (not set up).
+  return { client: { from, rpc: () => Promise.resolve({ data: null, error: { code: "PGRST202" } }) }, reads };
 }
 
 async function statusBody(beats) {
@@ -384,11 +385,15 @@ test("/status has a SimpleFIN card: automated, every 6h, worst-of-two heartbeats
   assert.deepEqual(dedicated, ["balances", "transactions"], "each heartbeat has its own limit-1 read");
   assert.equal(ok.reads.some((q) => q.table.startsWith("finance_")), false, "the cacheable status endpoint never reads ledger rows");
 
-  const revoked = await statusBody({ transactions: fresh(1, { status: "failed", error_message: "SimpleFIN refused the Access URL" }), balances: fresh(1) });
+  // Heartbeat text reaches the card only as re-rendered from its allowlisted codes (SEC-07).
+  const refused = S.formatSimplefinNotes({ sf_access_refused: 1 });
+  const revoked = await statusBody({ transactions: fresh(1, { status: "failed", error_message: refused }), balances: fresh(1) });
   assert.equal(revoked.body.sources.simplefin.status, "failed");
-  assert.equal(revoked.body.sources.simplefin.errorMessage, "SimpleFIN refused the Access URL");
+  assert.equal(revoked.body.sources.simplefin.errorMessage, refused);
+  assert.match(refused, /^SimpleFIN refused the Access URL .* \[sf_access_refused\]$/);
   const reconnect = await statusBody({ transactions: fresh(1, { status: "partial", error_message: "SimpleFIN: Reconnect Demo Bank" }), balances: fresh(1) });
   assert.equal(reconnect.body.sources.simplefin.status, "partial");
+  assert.equal(reconnect.body.sources.simplefin.errorMessage, S.SIMPLEFIN_UNREADABLE_NOTE, "an older free-text row is never shown");
 
   assert.equal((await statusBody({ transactions: fresh(13), balances: fresh(13) })).body.sources.simplefin.status, "success");
   assert.equal((await statusBody({ transactions: fresh(15), balances: fresh(1) })).body.sources.simplefin.status, "partial");
@@ -414,7 +419,7 @@ test("the status page lists the card and labels its history", () => {
 // ─── privacy and architecture guards ─────────────────────────────────────────
 
 const read = (rel) => fs.readFileSync(path.join(SRC, rel), "utf8");
-const financeFiles = ["lib/finance-ledger.ts", "lib/finance-ledger-server.ts", "lib/finance-status.ts", "app/financials/page.tsx", "app/financials/LedgerView.tsx", "app/financials/FilterBar.tsx", "app/financials/SpendingTrendChart.tsx"];
+const financeFiles = ["lib/finance-ledger.ts", "lib/finance-ledger-server.ts", "lib/finance-service-client.ts", "lib/finance-status.ts", "app/financials/page.tsx", "app/financials/LedgerView.tsx", "app/financials/FilterBar.tsx", "app/financials/SpendingTrendChart.tsx"];
 
 test("the page is rendered per request: force-dynamic, no ISR, no client fetching of ledger data", () => {
   const page = read("app/financials/page.tsx");
@@ -432,7 +437,13 @@ test("the page is rendered per request: force-dynamic, no ISR, no client fetchin
 test("ledger tables are read only by server code with the service role, with explicit columns", () => {
   const server = read("lib/finance-ledger-server.ts");
   assert.match(server, /^import "server-only";/);
-  assert.match(server, /SUPABASE_SERVICE_ROLE_KEY/);
+  // The service-role client lives in its own small server-only module (PERF-02), re-exported by the ledger server.
+  const client = read("lib/finance-service-client.ts");
+  assert.match(client, /^import "server-only";/);
+  assert.match(client, /SUPABASE_SERVICE_ROLE_KEY/);
+  assert.doesNotMatch(client, /ANON_KEY/);
+  assert.match(server, /from "@\/lib\/finance-service-client"/);
+  assert.match(server, /export \{ LedgerQueryError, serviceClient \}/);
   assert.doesNotMatch(server, /ANON_KEY/);
   assert.doesNotMatch(server, /select\(\s*["'`]\*["'`]/, 'never select "*"');
   assert.match(server, /console\.error\("\[\/financials\] ledger query failed", code/, "only an error code is logged");
@@ -450,7 +461,7 @@ test("ledger tables are read only by server code with the service role, with exp
   for (const f of clientFiles) {
     const src = fs.readFileSync(f, "utf8");
     assert.doesNotMatch(src, /finance_(accounts|transactions|balance_snapshots)/, f);
-    assert.doesNotMatch(src, /finance-ledger-server/, f);
+    assert.doesNotMatch(src, /finance-ledger-server|finance-service-client/, f);
   }
 });
 

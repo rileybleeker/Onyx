@@ -5,7 +5,8 @@ Why this exists: each ETL grew its own ad-hoc sync_log insert. Some passed
 sync_start as a derived timestamp, some relied on the Postgres NOW() default;
 none populated sync_end, so the /status freshness / duration computation was
 inconsistent. This module is the one and only writer — every ETL should call
-log_sync() and pass the started_at it captured at function entry.
+log_sync() and pass the started_at it captured at function entry (or
+write_sync(), the same write that returns whether the row landed).
 
 Schema columns populated:
   source, data_type, status, records_synced,
@@ -52,6 +53,24 @@ def log_sync(
     started_at may be a float (time.time()), a datetime, or None.
     sync_end is captured at write time. duration_seconds is computed from both.
     """
+    write_sync(supa, source, data_type, status, records=records, started_at=started_at, error=error,
+               date_range_start=date_range_start, date_range_end=date_range_end)
+
+
+def write_sync(
+    supa,
+    source: str,
+    data_type: str,
+    status: str,
+    records: int = 0,
+    started_at: StartedAt = None,
+    error: Optional[str] = None,
+    date_range_start: Optional[date] = None,
+    date_range_end: Optional[date] = None,
+) -> bool:
+    """log_sync that says whether the heartbeat was written: True when the insert went through, False when it
+    failed (logged as a category code like log_sync, never raised). For an ETL that must know its heartbeat
+    landed: simplefin_etl.py keeps reporting a row kept for review until a written heartbeat has carried it."""
     end_dt = datetime.now(timezone.utc)
     # No start given = an instantaneous event: use ONE clock reading for both ends
     # (a second now() would put sync_start a few microseconds after sync_end).
@@ -82,6 +101,8 @@ def log_sync(
         except Exception:
             code = "unexpected_error"
         log.warning(f"sync_log insert ({source}|{data_type}) failed: {code}")
+        return False
+    return True
 
 
 def now_epoch() -> float:

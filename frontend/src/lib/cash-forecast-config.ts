@@ -24,8 +24,16 @@ export const FORECAST = {
   matchWindowDays: 5,
   lateMatchDays: 31,
   matchTolerance: 0.1,
-  /** A pool balance older than this marks the forecast stale. */
+  /** A pool balance older than this marks the forecast stale (and withholds the safe-to-move amount). */
   staleBalanceHours: 48,
+  /**
+   * A pool balance smaller than this never puts the stale badge on the projection (a small account that rarely
+   * updates). The safe-to-move amount is withheld by a stale balance of ANY size (only Riley's "Leave it out" stops
+   * an account counting).
+   */
+  smallBalanceCents: 10_000,
+  /** A pool balance dated more than this far after `now` is not valid (clock skew allowance). */
+  futureBalanceSkewMs: 3_600_000,
   /** Pairing windows: transfers between two pool accounts, and a pool payment to a card. */
   internalPairDays: 3,
   cardPairDays: 5,

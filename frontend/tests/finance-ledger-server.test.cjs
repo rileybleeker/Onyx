@@ -124,7 +124,8 @@ test("an empty ledger is its own state, with the heartbeat if one exists", async
   const ran = await load(makeDb({ beats: [{ source: "simplefin", data_type: "transactions", status: "failed", sync_start: hoursAgo(1), records_synced: 0, duration_seconds: 1, error_message: "Login required" }] })).loadLedger(q(), NOW);
   assert.equal(ran.kind, "empty");
   assert.equal(ran.freshness.status, "failed");
-  assert.equal(ran.freshness.errorMessage, "Login required");
+  // SimpleFIN heartbeat text is shown only as re-rendered from its allowlisted codes (SEC-07): free text never.
+  assert.match(ran.freshness.errorMessage, /^SimpleFIN reported a problem; its details are not shown here/);
 });
 
 test("default month is the newest with data; flows, trend and month list match an independent sum", async () => {
@@ -286,4 +287,78 @@ test("every read lists its columns - none selects everything", async () => {
   for (const c of db.calls) {
     assert.ok(c.cols && c.cols !== "*" && !c.cols.includes("*"), `${c.table}: ${c.cols}`);
   }
+});
+
+test("category fixes: a missing table means no fixes; any other failed read is reported (the forecast withholds its amount)", async () => {
+  const S = load(makeDb(base));
+  // A PostgREST stand-in for the two fix tables: select (+ exact count) / order / range, at most `maxRows` rows per
+  // request (a server row cap), an error answer or a rejected request.
+  const fake = (answers, maxRows = 1000) => ({
+    from: (t) => {
+      let range = null;
+      let count = false;
+      const b = {
+        select: (_cols, o) => ((count = !!(o && o.count === "exact")), b),
+        order: () => b,
+        range: (from, to) => ((range = [from, to]), b),
+        then: (res, rej) => {
+          const a = answers[t];
+          if (a instanceof Error) return Promise.reject(a).then(res, rej);
+          if (a.error) return Promise.resolve({ data: null, error: a.error, count: null }).then(res, rej);
+          const [from, to] = range ?? [0, a.data.length - 1];
+          return Promise.resolve({ data: a.data.slice(from, Math.min(to + 1, from + maxRows)), error: null, count: count ? a.data.length : null }).then(res, rej);
+        },
+      };
+      return b;
+    },
+  });
+  const ok = (rows) => ({ data: rows, error: null });
+  const err = (code) => ({ data: null, error: { code, message: "synthetic" } });
+  const both = await S.loadCategoryFixes(fake({ finance_category_rules: ok([{ merchant_key: "demo", category: "Fun" }]), finance_txn_categories: ok([{ txn_key: "t1", category: "Groceries" }]) }));
+  assert.equal(both.rules.get("demo"), "Fun");
+  assert.equal(both.overrides.get("t1"), "Groceries");
+  assert.equal(both.failed, undefined);
+  const missing = await S.loadCategoryFixes(fake({ finance_category_rules: err("42P01"), finance_txn_categories: err("PGRST205") }));
+  assert.equal(missing.failed, undefined, "a migration not applied yet is not a failure");
+  assert.equal(missing.rules.size + missing.overrides.size, 0);
+  const oneFailed = await S.loadCategoryFixes(fake({ finance_category_rules: err("57014"), finance_txn_categories: ok([{ txn_key: "t1", category: "Groceries" }]) }));
+  assert.equal(oneFailed.failed, true, "half the fixes is not all of them");
+  assert.equal(oneFailed.overrides.get("t1"), "Groceries", "what was read is still used");
+  assert.equal((await S.loadCategoryFixes(fake({ finance_category_rules: err("42P01"), finance_txn_categories: err("57014") }))).failed, true);
+  assert.equal((await S.loadCategoryFixes(fake({ finance_category_rules: new Error("network"), finance_txn_categories: ok([]) }))).failed, true);
+});
+
+test("category fixes are read in pages: a server row cap still returns every fix; a read cut off at its page limit is reported", async () => {
+  const S = load(makeDb(base));
+  const fake = (answers, maxRows) => ({
+    from: (t) => {
+      let range = null;
+      let count = false;
+      const b = {
+        select: (_cols, o) => ((count = !!(o && o.count === "exact")), b),
+        order: () => b,
+        range: (from, to) => ((range = [from, to]), b),
+        then: (res, rej) => {
+          const rows = answers[t];
+          const [from, to] = range ?? [0, rows.length - 1];
+          return Promise.resolve({ data: rows.slice(from, Math.min(to + 1, from + maxRows)), error: null, count: count ? rows.length : null }).then(res, rej);
+        },
+      };
+      return b;
+    },
+  });
+  const rules = (n) => Array.from({ length: n }, (_, i) => ({ merchant_key: `demo-merchant-${String(i).padStart(5, "0")}`, category: "Fun" }));
+  const overrides = (n) => Array.from({ length: n }, (_, i) => ({ txn_key: `t${String(i).padStart(6, "0")}`, category: "Groceries" }));
+  // 100 rows per request (the server's cap, below the 1000 asked for): 1,500 rules and 250 overrides all come back.
+  const all = await S.loadCategoryFixes(fake({ finance_category_rules: rules(1_500), finance_txn_categories: overrides(250) }, 100));
+  assert.equal(all.rules.size, 1_500);
+  assert.equal(all.overrides.size, 250);
+  assert.equal(all.truncated, undefined);
+  assert.equal(all.failed, undefined);
+  // More pages than the limit (20 x 100 rows): the read answered, but not with every fix. Reported, not an error.
+  const cut = await S.loadCategoryFixes(fake({ finance_category_rules: rules(2_500), finance_txn_categories: overrides(10) }, 100));
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.failed, undefined);
+  assert.equal(cut.rules.size, 2_000, "what was read is still used");
+  assert.equal(cut.overrides.size, 10);
 });

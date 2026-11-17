@@ -14,6 +14,8 @@ import {
 } from "@/lib/client-cache";
 import { IdbCacheBackend, idbAvailable } from "@/lib/client-cache-idb";
 import { journalTodayUrl } from "@/lib/journal-file";
+import { LOG_SUPPLEMENTS_HISTORY_URL } from "@/lib/log-early";
+import { bankUrl, practiceUrl, readingSlugOf } from "@/lib/reading-practice-urls";
 import {
   REWARM_AFTER_MS, REWARM_EVERY_MS, VISITS_KEY, browserIdle, configureWarmup, orderTargets, parseVisits, recordVisit, routeOf, runWarmup,
   type DataWarmer, type PrefetchMode, type WarmRun, type WarmTarget, type WarmupDeps,
@@ -41,7 +43,17 @@ function localDay(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// Read through the wind-down store so the answer is tagged with the write count at its start (a late pre-save
+// response must never replace a confirmed answer).
+const windDownWarmer = (): DataWarmer => ({ key: "/api/sleep/winddown", fetch: () => import("@/lib/use-winddown").then((m) => m.warmWindDownRead()) });
+
 const inboxWarmer: DataWarmer = { key: CACHE_KEYS.agentsInbox, fetch: () => agentsApi.inbox() };
+
+/** /reading's Practice part reads (READ-QUIZ-01) for the active book, once the cached overview names it. */
+function readingPracticeWarmers(): DataWarmer[] {
+  const slug = readingSlugOf(clientCache.peek("/api/reading"));
+  return slug ? [json(practiceUrl(slug)), json(bankUrl(slug))] : [];
+}
 
 function logUberEatsWarmers(): DataWarmer[] {
   // Same day the section paints first, so the warmed window is the one it reads.
@@ -71,6 +83,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
       json("/api/orders/summary"),
       json("/api/procurement/renewals/summary"),
       json("/api/finance/alerts"),
+      // The wind-down panel (components/sleep/WindDownPanel, opt-in): GET only, same key as its store.
+      windDownWarmer(),
       // The overview cards under Today's panels (shown cards only; memory-only and Today's own keys excluded).
       ...overviewWarmers(),
     ];
@@ -85,6 +99,10 @@ const DATA: Record<string, () => DataWarmer[]> = {
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
+    // The Supplements section's product options history (most used first; lib/log-early.ts LOG_SUPPLEMENTS_HISTORY_URL).
+    json(LOG_SUPPLEMENTS_HISTORY_URL),
+    // Wind-down (app/log/sections/WindDown.tsx): GET only, same key as the store (lib/use-winddown.ts).
+    windDownWarmer(),
     // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
     json("/api/nutrition/drinks"),
     // Uber Eats (app/log/sections/UberEats.tsx): behavioral today, today's dish window, the harvester heartbeat.
@@ -106,8 +124,11 @@ const DATA: Record<string, () => DataWarmer[]> = {
     { key: CACHE_KEYS.habitsJournal, fetch: () => import("@/lib/queries").then((q) => q.getHabitJournal(365)), freshMs: 5 * 60_000 },
     { key: CACHE_KEYS.habitsHistory, fetch: () => import("@/lib/queries").then((q) => q.getHabitMetadataHistory()), freshMs: 5 * 60_000 },
   ],
-  // The Want to read list (app/reading/ReadingList.tsx): GET only, same key as the list.
-  "/reading": () => [json("/api/reading"), json("/api/reading/list")],
+  // The Want to read list (app/reading/ReadingList.tsx): GET only, same key as the list. The Practice part's two reads
+  // (READ-QUIZ-01: today's round and the bank's state, both GET only and side-effect free) for the active book, under
+  // the same URLs the part reads (app/reading/PracticePart.tsx); the book comes from the cached /api/reading answer.
+  // The pacing choices (PROD-T06) are one more GET under the same key the Your pace card reads.
+  "/reading": () => [json("/api/reading"), json("/api/reading/list"), json("/api/ui/preferences?key=reading.pacing")].concat(readingPracticeWarmers()),
   "/status": () => [json("/api/status")],
 };
 
@@ -124,7 +145,8 @@ const CODE: Record<string, () => Promise<unknown>> = {
   "/health/records": () => import("@/app/health/records/LabTrendChart"),
   "/nutrition": () => import("@/app/nutrition/NutritionClient"),
   "/nyc": () => import("@/app/nyc/NycClient"),
-  "/reading": () => import("@/app/reading/BurnupChart"),
+  // The practice runner is its own chunk too (PracticePart's dynamic import), so Start opens it at once.
+  "/reading": () => Promise.all([import("@/app/reading/BurnupChart"), import("@/app/reading/PracticeRunner")]),
   "/sleep": () => import("@/app/sleep/SleepClient"),
   "/spotify": () => import("@/app/spotify/SpotifyClient"),
   "/supplements": () => import("@/app/supplements/SupplementsClient"),

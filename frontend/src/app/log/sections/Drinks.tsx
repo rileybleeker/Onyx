@@ -33,6 +33,8 @@ import {
 } from "@/lib/drink-capture";
 import { drinkSession, saveDrinkWith, undoDrinkWith, type Call, type KeyRead } from "@/lib/drink-session";
 import { useLogDrafts, type DrinkLogDraft } from "@/lib/log-drafts";
+import { LOG_DRINKS_URL, logEarlyGet } from "@/lib/log-early";
+import { useInFeed } from "@/components/FeedContext";
 import { DraftMark, LogCard, SectionSkeleton } from "./ui";
 
 /**
@@ -198,6 +200,9 @@ export default function DrinksSection() {
   const [baseState, setBaseState] = useState<"loading" | "ok" | "failed" | "unavailable">("loading");
   const alive = useRef(true);
   const loading = useRef(new Set<string>());
+  // The routed page's first read of today takes the GET its HTML already started (lib/log-early.ts), once; a copy
+  // drawn in the continuous scroll, and every later read, fetches for itself.
+  const routed = !useInFeed();
 
   useSyncExternalStore(drinkSession.subscribe, getVersion, serverVersion);
   const items = drinkSession.items().filter((i) => i.status !== "dismissed");
@@ -207,7 +212,8 @@ export default function DrinksSection() {
     if (loading.current.has(url)) return;
     loading.current.add(url);
     if (!day) setBaseState((s) => (s === "ok" ? s : "loading"));
-    cachedJson(url, { check: checkDay })
+    const get = !day && url === LOG_DRINKS_URL ? logEarlyGet(url, routed) : undefined;
+    cachedJson(url, { check: checkDay, get })
       .then((raw) => {
         const v = asDay(raw);
         if (!v || !alive.current) return;
@@ -222,7 +228,7 @@ export default function DrinksSection() {
         setBaseState(/HTTP 503/.test(String((e as Error)?.message)) ? "unavailable" : "failed");
       })
       .finally(() => loading.current.delete(url));
-  }, []);
+  }, [routed]);
 
   // Open: read today's drinks, and READ each drink kept on the device after a reload (never a write).
   useEffect(() => {

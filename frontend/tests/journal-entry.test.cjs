@@ -1,11 +1,12 @@
-// Run: node --test tests/journal-entry.test.cjs
+// Run with the rest of the suite (after deployment): node --test tests/journal-entry.test.cjs
 // The journal entry Onyx writes to the Notion journal from the /check-in draft: the pure rules
-// (lib/journal-entry.ts) and the rules of POST /api/journal/entry. SYNTHETIC text only; no network, no Notion.
+// (lib/journal-entry.ts) and POST /api/journal/entry, run with a fake Notion layer (what is written, what is
+// refused, what is logged). SYNTHETIC text only; no network, no Notion.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
 const path = require("node:path");
 const { loadTs, SRC } = require("./helpers/load-ts.cjs");
+const SF = require("./helpers/source-facts.cjs");
 
 const J = loadTs("lib/journal-entry.ts");
 
@@ -110,29 +111,138 @@ test("the duplicate check looks for the same date and title", () => {
   });
 });
 
-test("route rules: POST only, session only (not a CI route), same-origin, Notion only, text never logged", () => {
+// ─── POST /api/journal/entry (executed with a fake Notion layer) ─────────────
+
+const nextServer = { NextResponse: { json: (body, init = {}) => ({ status: init.status ?? 200, body }) } };
+const ORIGIN = "https://onyx.example";
+const WORDS = "Synthetic private words that must never reach a log.";
+
+/** The route with lib/journal-file-server replaced: records what reaches Notion, answers `same` for the duplicate check. */
+function journalRoute({ same = null, create } = {}) {
+  const asked = [];
+  const created = [];
+  class NotionRefused extends Error {
+    constructor(status) {
+      super("Synthetic Notion refusal");
+      this.status = status;
+    }
+  }
+  const notion = {
+    __esModule: true,
+    notionConfigured: () => true,
+    findSameTitleEntry: async (e) => {
+      asked.push(e);
+      return same;
+    },
+    createJournalPage: async (e) => {
+      created.push(e);
+      return create ? create(NotionRefused) : "https://notion.example/synthetic-page";
+    },
+    notionRefusalMessage: (status) => `Synthetic refusal message ${status}`,
+    NotionRefused,
+  };
+  return { route: loadTs("app/api/journal/entry/route.ts", { "@/lib/journal-file-server": notion, "next/server": nextServer }), asked, created };
+}
+function post(body, over = {}) {
+  const text = typeof body === "string" ? body : JSON.stringify(body);
+  const h = { origin: ORIGIN, host: "onyx.example", "content-type": "application/json", ...over };
+  return { headers: { get: (k) => (k in h && h[k] !== undefined ? h[k] : null) }, nextUrl: { origin: ORIGIN }, text: async () => text };
+}
+const todays = (over = {}) => entry({ date: J.easternDate(new Date()), body: WORDS, ...over });
+/** Every console line written during the test (and nothing printed). */
+function consoleLines(t) {
+  const lines = [];
+  for (const level of ["log", "info", "warn", "error", "debug"]) t.mock.method(console, level, (...args) => lines.push({ level, text: args.map(String).join(" ") }));
+  return lines;
+}
+
+test("route: only POST is answered, and a new entry is written to Notion once with the words exactly as sent", async (t) => {
+  const lines = consoleLines(t);
+  const { route, created } = journalRoute();
+  assert.deepEqual(Object.keys(route).filter((k) => typeof route[k] === "function"), ["POST"]);
+  const res = await route.POST(post(todays()));
+  assert.deepEqual([res.status, res.body], [200, { url: "https://notion.example/synthetic-page" }]);
+  assert.equal(created.length, 1);
+  assert.equal(created[0].body, WORDS);
+  assert.deepEqual(lines, [], "a save logs nothing");
+});
+
+test("route: a repeat with the same date, title and words answers the entry already there and writes nothing", async () => {
+  const { route, created } = journalRoute({ same: { url: "https://notion.example/synthetic-existing", sameWords: true } });
+  const res = await route.POST(post(todays()));
+  assert.deepEqual([res.status, res.body], [200, { url: "https://notion.example/synthetic-existing", existing: true }]);
+  assert.equal(created.length, 0);
+});
+
+test("route: a different entry under the same date and title is a 409, never reported as saved", async () => {
+  const { route, created } = journalRoute({ same: { url: "https://notion.example/synthetic-existing", sameWords: false } });
+  const res = await route.POST(post(todays()));
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /different entry with this title/);
+  assert.equal(res.body.existing, undefined);
+  assert.equal(created.length, 0, "nothing written: the draft stays editable");
+});
+
+test("route: a cross-site, non-JSON, oversized or invalid request is refused before Notion is asked", async () => {
+  const cases = [
+    [todays(), { origin: "https://evil.example" }, 403],
+    [todays(), { origin: undefined }, 403],
+    [todays(), { "content-type": "text/plain" }, 415],
+    [todays(), { "content-length": String(J.JOURNAL_MAX_REQUEST_BYTES + 1) }, 413],
+    [todays({ body: "x".repeat(J.JOURNAL_MAX_REQUEST_BYTES) }), {}, 413], // no Content-Length: the body itself is measured
+    ["{not json", {}, 400],
+    [todays({ mood: "sad" }), {}, 400],
+    [todays({ date: "2999-01-01" }), {}, 400],
+  ];
+  for (const [body, over, status] of cases) {
+    const { route, asked, created } = journalRoute();
+    const res = await route.POST(post(body, over));
+    assert.equal(res.status, status, JSON.stringify(over));
+    assert.deepEqual([asked.length, created.length], [0, 0], `Notion is not asked (${status})`);
+  }
+});
+
+test("route: Notion refusing or unreachable answers 502, and the log holds a short code, never the entry", async (t) => {
+  const lines = consoleLines(t);
+  const refused = journalRoute({ create: (NotionRefused) => { throw new NotionRefused(403); } });
+  const a = await refused.route.POST(post(todays()));
+  assert.deepEqual([a.status, a.body.error], [502, "Synthetic refusal message 403"]);
+  const down = journalRoute({ create: () => { throw new Error(`Synthetic failure quoting ${WORDS}`); } });
+  const b = await down.route.POST(post(todays()));
+  assert.equal(b.status, 502);
+  assert.match(b.body.error, /Couldn't reach Notion/);
+  assert.ok(lines.length >= 2, "both failures are logged");
+  for (const l of lines) {
+    assert.equal(l.level, "error");
+    assert.equal(l.text.includes("Synthetic private words"), false, l.text);
+    assert.equal(l.text.includes(entry().title), false, l.text);
+  }
+});
+
+// ─── boundaries that cannot be settled by one run (syntax tree) ──────────────
+
+test("the journal write is session only: no CI token path reaches it", () => {
+  const isCiRoute = SF.loadFunction("middleware.ts", "isCiRoute");
+  assert.equal(isCiRoute("/api/habits/checkin"), true, "the CI prefix itself is recognised (the check works)");
+  for (const p of ["/api/journal/entry", "/api/journal/file", "/api/journal/file/synthetic-page", "/api/journal"]) assert.equal(isCiRoute(p), false, p);
   const file = path.join(SRC, "app/api/journal/entry/route.ts");
-  assert.ok(fs.existsSync(file));
-  const route = fs.readFileSync(file, "utf8");
-  assert.deepEqual([...route.matchAll(/export (?:async )?(?:function|const) (\w+)/g)].map((m) => m[1]).filter((n) => n !== "maxDuration"), ["POST"]);
-  assert.match(route, /checkVoiceRequest\(req\.headers, req\.nextUrl\.origin, JOURNAL_MAX_REQUEST_BYTES\)/);
-  assert.match(route, /validateJournalEntry\(/);
-  assert.match(route, /easternDate\(new Date\(\)\)/);
-  // A same date + title match is acknowledged only when its words are the same; otherwise 409, never "saved" (#168 P1).
-  assert.match(route, /findSameTitleEntry\(v\.entry\)/);
-  assert.match(route, /same\?\.sameWords\) return NextResponse\.json\(\{ url: same\.url, existing: true \}\)/);
-  assert.match(route, /status: 409/);
-  // The Notion calls are shared with POST /api/journal/file (lib/journal-file-server.ts).
-  assert.match(route, /from "@\/lib\/journal-file-server"/);
-  const server = fs.readFileSync(path.join(SRC, "lib/journal-file-server.ts"), "utf8");
-  assert.match(server, /NOTION_JOURNAL_DB \|\| "96541038264d45aba2a9601d9b175a7e"/, "the database journal_etl.py syncs");
-  assert.equal(/\.(upsert|insert|update|delete)\(|journal_entries"\)|createClient|console\./.test(server.replace(/createHash\("sha256"\)\.update\(/g, "")), false, "Notion only; nothing logged");
-  assert.equal(/\.(upsert|insert|update|delete)\(|journal_entries"\)|createClient/.test(route), false, "Notion is the journal's only write surface");
-  assert.equal(/console\.(log|info)/.test(route), false);
-  for (const line of route.split("\n").filter((l) => /console\./.test(l))) assert.equal(/text|body|title|entry\b(?!\])/i.test(line.replace(/\[journal-entry\]/, "")), false, line);
-  const mw = fs.readFileSync(path.join(SRC, "middleware.ts"), "utf8");
-  const start = mw.indexOf("function isCiRoute");
-  const ci = mw.slice(start, mw.indexOf("\n}\n", start));
-  assert.equal(/journal/i.test(ci), false, "the CI token never reaches the journal write");
   assert.equal(path.relative(SRC, file).split(path.sep).join("/").startsWith("app/api/habits/"), false, "not under the CI-reachable /api/habits prefix");
+});
+
+test("Notion is the journal's only write surface, and no path logs entry text", () => {
+  const route = SF.parseFile("app/api/journal/entry/route.ts");
+  assert.ok(SF.imports(route).includes("@/lib/journal-file-server"), "the Notion calls are shared with POST /api/journal/file");
+  const server = SF.parseFile("lib/journal-file-server.ts");
+  for (const [name, sf] of [["route", route], ["server", server]]) {
+    assert.equal(SF.imports(sf).some((s) => /supabase/i.test(s)), false, `${name}: no database client`);
+    const writes = SF.calls(sf).filter((c) => c.name === "createClient" || /\.from\(\)\.(insert|upsert|update|delete)$/.test(c.name ?? ""));
+    assert.deepEqual(writes.map((c) => c.name), [], `${name}: no database write`);
+  }
+  assert.deepEqual(SF.calls(server).filter((c) => /^console\./.test(c.name ?? "")).map((c) => c.name), [], "the Notion layer logs nothing");
+  for (const c of SF.calls(route).filter((c) => /^console\./.test(c.name ?? ""))) {
+    assert.equal(c.name, "console.error", "errors only");
+    for (const a of c.node.arguments) assert.ok(SF.ts.isStringLiteral(a) || (SF.ts.isIdentifier(a) && a.text === "status"), `logs a code, never entry text: ${a.getText()}`);
+  }
+  const db = SF.topLevelConst(server, "NOTION_JOURNAL_DB");
+  assert.ok(db && SF.ts.isBinaryExpression(db) && SF.ts.isStringLiteral(db.right) && db.right.text === "96541038264d45aba2a9601d9b175a7e", "the database journal_etl.py syncs");
 });

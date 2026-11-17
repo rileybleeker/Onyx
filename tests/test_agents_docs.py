@@ -95,7 +95,7 @@ ROOT_RULES = [
     ("audit severity kept", r"P0 → `Critical`, P1 → `High`"),
     ("destructive commands need asking", r"ask before `rm`, `kill`"),
     ("delivery states", r"Launched, code written, reviewed, merged, deployed and verified are distinct states"),
-    ("independent review", r"Codex independently reviews the actual resulting diff"),
+    ("Codex reviews only after merge", r"Codex reviews only AFTER merge, never before"),
     ("backlog in Notion", r"Source = \"Onyx Roadmap\""),
 ]
 
@@ -104,6 +104,7 @@ DOMAIN_RULES = [
     ("ops-ci.md", "offline-checks"),
     ("ops-ci.md", "Type-check the frontend before you open a PR"),
     ("ops-ci.md", "Audit and review findings are settled against the data"),
+    ("ops-ci.md", "Codex reviews only AFTER merge and never before (Riley, 2026-11-17)"),
     ("ops-ci.md", "Token recovery (Spotify)"),
     ("access-and-auth.md", "do NOT re-exempt `/api/habits`"),
     ("access-and-auth.md", "never `GRANT USAGE ON SCHEMA pds TO anon`"),
@@ -120,7 +121,8 @@ DOMAIN_RULES = [
     ("log-screen.md", "A new kind of daily entry goes into a Log section"),
 ]
 
-# Edits to the old root that landed on master after the split and were re-homed when this branch rebased:
+# Edits to the old root that landed on master after the split and were re-homed when this branch rebased
+# (d376776 on 2026-11-16; the 57 commits after it, onto ed46b6f4, on 2026-11-17):
 # (commit, domain file, literal text). Each commit also needs a row in the index's "Root edits made after
 # the split" table, so a rebase that keeps the new root cannot drop the edit unnoticed.
 REHOMED = [
@@ -129,6 +131,63 @@ REHOMED = [
     ("d376776", "database.md", "`sql/tz_derivation_preapply_counts.sql` (run before applying, SELECT only)"),
     ("d376776", "database.md", "`sql/tz_derivation_postdeploy_checks.sql` runs right after"),
     ("d376776", "database.md", "`sql/tz_derivation_whoop_followups.sql` (not applied)"),
+    ("90de62c5", "personalize.md", "Keyboard (2026-11-16, `components/personalize/banner-focus.ts`): the"),
+    ("a2955a30", "today.md", "**Attention model (2026-11-16, `lib/today-attention.ts`, import-free)"),
+    ("d57d6ceb", "supplements.md", "; every save is ONE call to `pds.save_supplement_stack` (`sql/suppleme"),
+    ("ef17db5e", "experiments.md", "The same-night and carryover p-values / intervals allow for one-night"),
+    ("846a24d8", "health-records.md", "**Backups: Supabase's database backups do not hold the bucket's files*"),
+    ("aa11f1fe", "ops-ci.md", "**Provenance (DEL-02, 2026-11-16):** a post-merge run counts for a co"),
+    ("16206d24", "wearables-environment.md", "**Dates (2026-11-16, `docs/eight-sleep-date-contract.md`):** `calenda"),
+    ("9bbc479c", "reading-journal.md", ". Per-question records (`sql/reading_learning_questions.sql`, `/api/re"),
+    ("44233681", "finance.md", "**Safe to move is gated** (`result.eligibility`, read only through `l"),
+    ("44255edb", "hrv-pipeline.md", "Model publication (2026-11-16, PIPE-08):** `hrv_model_artifact.py` and"),
+    ("67921de8", "frontend.md", "Form tests mount the real component and hook on a manual clock (`fron"),
+    ("3030285b", "experiments.md", ". The independent review is recorded (doc 8.3, 2026-11-16: two non-Ant"),
+    ("66608bab", "supplements.md", "**Unit identity (HIST-UNIT-01):** the rollup keeps one row per compou"),
+    ("ee1618f4", "finance.md", "allowlisted SimpleFIN note (S"),
+    ("98ae3503", "frontend.md", "Today, `/log` (which also starts the Drinks section's read) and `/age"),
+    ("afecf1b7", "access-and-auth.md", "`sql/pds_matview_revoke_authenticated.sql` (check: `sql/checks/verify"),
+    ("a2d8807b", "frontend.md", ". Harness version 2 (2026-11-16) also records each result file's produ"),
+    ("dc1f183a", "nutrition.md", "**Days emptied upstream (2026-11-16, `sql/cronometer_replace_servings"),
+    ("5b1b1903", "log-screen.md", "**Wind-down** (`sections/WindDown.tsx` and the Today panel, PROD-SLEE"),
+    ("39fef078", "devices.md", "**Export completeness (PIPE-11, 2026-11-16, `sql/phone_usage_complete"),
+    ("61dd90b5", "chat-agents.md", "**Replay-safe writes (SEC-04, 2026-11-16, `lib/chat-operations.ts`, `s"),
+    ("ba4af90b", "frontend.md", "- **Isolated multi-second slow views (PERF-02, 2026-11-16, open).** Th"),
+    ("99c5a7be", "nutrition.md", "; model and effort from `lib/model-routing.ts`, where a bounded pilot"),
+    ("e23e474c", "hrv-pipeline.md", "- **One HRV input manifest (audit PIPE-09, 2026-11-16).** Every HRV in"),
+    ("4d9a25ab", "finance.md", "A stored answer loads only the parse rules (PERF-02, 2026-11-16): `li"),
+    ("753af004", "orientation.md", "├── tools/local_cleanup/     # LOCAL-PC %TEMP% cleanup (stdlib Python,"),
+    ("cf08a456", "ops-ci.md", "and sends the fixes to make as items in the dev backlog; Claude builds"),
+    ("eafd66a4", "health-records.md", "- **Off-site backup (SEC-06, built 2026-11-16; supersedes \"not built y"),
+    ("b842aaae", "chat-agents.md", ". **Write authority (SEC-05, 2026-11-16, `lib/chat-write-intent.ts`):*"),
+    ("9a5c4538", "reading-journal.md", "); a block a create wrote after its removal is recorded in the removal"),
+    ("78210319", "health-records.md", "a failed save is classified by `isTransientSaveFailure` (offline / tim"),
+    ("e85d0281", "ops-ci.md", "; that hold list applies once the required builder prerequisites have"),
+    ("c06ff3ac", "nutrition.md", "- **goPuff items (2026-11-17, `tools/gopuff_harvest`, README there).**"),
+    ("1455ccca", "devices.md", "## YouTube watch history (2026-11-17)"),
+    ("30e76720", "frontend.md", "changes RAM and baseline disk IO together and cannot by itself identi"),
+    ("901e910a", "orientation.md", "├── myfitnesspal_etl.py      # MyFitnessPal CSV → Supabase (shared MFP"),
+    ("269d1661", "nutrition.md", "- **Uber rides (2026-11-17, `uber_rides_import.py`, `sql/uber_rides_sc"),
+    ("c9d58f68", "nutrition.md", "as `est_intake_kcal` (2026-11-16, `hrv_analysis.py:merge_estimated_in"),
+    ("409486f3", "habits-checkin.md", "is no longer parked: `/check-in` (embedded on `/log`) is built and is"),
+    ("f71d6f3e", "today.md", "**Apartment reset (2026-11-17, `components/HomeResetPanel.tsx`, `lib/h"),
+    ("79ce8365", "nutrition.md", "**Photo-meal timing: `pds.meal_timing_from_photo_meals` (`sql/meal_ti"),
+    ("f926f9c7", "devices.md", "b/checkin-pc-server.ts` (server-only, service role, explicit columns,"),
+    ("fdd3c742", "email-calendar-sources.md", "**iCloud (CalDAV, 2026-11-17, `caldav_source.py`, optional):** the Git"),
+    ("93a90b2c", "health-records.md", "off-site success is verified from the new ciphertext's own OneDrive cl"),
+    ("6ba5801c", "wearables-environment.md", "** via the pure decision function `tanita_etl.merge_refresh_response`:"),
+    ("825a4d1e", "finance.md", "). Investment accounts (Fidelity, the Wells Fargo brokerage; 2026-11-1"),
+    ("5f115c5a", "devices.md", "## iPhone Messages (2026-11-17)"),
+    ("84ad0217", "devices.md", "- **Apple Health — `pds.apple_health_*` from the Onyx iPhone app (2026"),
+    ("fd9eef3d", "reading-journal.md", "**Question bank (READ-QUIZ-01, 2026-11-16):** a private, sourced ques"),
+    ("d5de1c76", "devices.md", "**HRV pipeline (2026-11-16):** `hrv_analysis.py:merge_pc_activity_fea"),
+    ("50ce9825", "personalize.md", "ts`): `/financials`, `/financials/budgets`, `/financials/forecast`, `/"),
+    ("a4f0a4b1", "reading-journal.md", "(`record_reading_answer` / `flag_reading_question` are write tools: a"),
+    ("3ede71e7", "spotify.md", "; the lookup now retries a no-match with a normalized name (`normalize"),
+    ("016216d7", "wearables-environment.md", "the count published on D+1 — the pollen Riley breathed on day D, befo"),
+    ("07656bd0", "chat-agents.md", "/ `query_photo_meals` (read-only: `pds.photo_meals` per-meal rows + `"),
+    ("ed46b6f4", "reading-journal.md", "Voluntary pacing (PROD-T06, 2026-11-17, `lib/learning-pacing.ts`, `app"),
+    ("23c40aa8", "ops-ci.md", "Codex reviews only AFTER merge and never before (Riley, 2026-11-17)."),  # same bullet, superseded by cf08a456 and e85d0281
 ]
 
 # Where code comments, workflows and docs cite `AGENTS.md "<name>"`.

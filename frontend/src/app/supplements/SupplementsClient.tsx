@@ -18,6 +18,7 @@ import { rangeDays, rangeLabel, type Range } from "@/lib/queries";
 import { Check, X } from "lucide-react";
 import { clientCache } from "@/lib/client-cache";
 import { fallbackBehavioralToday } from "@/lib/checkin";
+import { compoundRowKey, compoundUnitLabel, distinctCompoundCount, type UnquantifiedIngredient } from "@/lib/supplement-units";
 
 // The page's two data-ready reads, under the client cache's keys (lib/client-cache.ts: one key per GET, the URL).
 const PRODUCTS_URL = "/api/supplements/products";
@@ -53,7 +54,11 @@ interface CompoundRow {
   ingredient_name: string | null;
   unii_code: string | null;
   category: string | null;
+  /** 'mass' (mg after conversion) or the literal label unit; one compound in two classes is two rows. */
+  unit_class?: string | null;
   unit: string | null;
+  /** Literal label units behind the row (conversion provenance, e.g. IU). */
+  source_units?: (string | null)[] | null;
   total_amount: number;
   total_doses: number;
   source_product_count: number;
@@ -86,6 +91,8 @@ interface Stack {
   items: StackItem[];
   item_count: number;
   total_doses: number;
+  /** Sent back with each editor save (409 when the stack changed elsewhere); absent before the migration. */
+  version?: number | null;
 }
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -140,6 +147,8 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   const [products, setProducts] = useState<Product[]>([]);
   const [intakes, setIntakes] = useState<Intake[]>([]);
   const [compounds, setCompounds] = useState<CompoundRow[]>([]);
+  // Ingredients of today's intakes whose label gives no readable amount (not in the rollup, never a 0).
+  const [unquantified, setUnquantified] = useState<UnquantifiedIngredient[]>([]);
   const [loading, setLoading] = useState(true);
   const [busyProductId, setBusyProductId] = useState<string | null>(null);
 
@@ -147,6 +156,18 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   // created/edited; null = closed.
   const [stacks, setStacks] = useState<Stack[]>([]);
   const [editingStack, setEditingStack] = useState<EditableStack | null>(null);
+  /**
+   * The stack list is being read again after the editor saved: until it answers, the list still holds the versions
+   * from before those saves, so reopening a stack then would start from an old version and get a false 409.
+   */
+  const [stacksReloading, setStacksReloading] = useState(false);
+  /**
+   * The newest read of the stack list failed: the list may hold versions older than a save made since, so Edit waits
+   * for a read that works (Retry) instead of opening a stack that would only get a false 409 on its next change.
+   */
+  const [stacksLoadFailed, setStacksLoadFailed] = useState(false);
+  /** Only the newest stack-list read updates the list (an older one answering late is ignored). */
+  const stacksReadSeq = useRef(0);
   // Single-row deletes the server refused: the row is back on the list, listed here with Retry.
   const [failedDeletes, setFailedDeletes] = useState<{ intake_id: number; label: string }[]>([]);
 
@@ -224,6 +245,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
       // Only server-confirmed rows live in `intakes`; rows still saving are drawn from `writes`.
       setIntakes(tRes.intakes ?? []);
       setCompounds(tRes.compounds ?? []);
+      setUnquantified(tRes.unquantified ?? []);
     } catch (e) {
       // A failed read keeps what is on screen (never an empty "nothing logged").
       console.error("Supplements load:", e);
@@ -246,12 +268,24 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
     }
   }, [historyDays]);
 
-  const loadStacks = useCallback(async () => {
+  /**
+   * Reads the stack list. `blocking` (after the editor saved, and Retry) keeps Edit disabled until a read that started
+   * then has answered. A failure is kept (stacksLoadFailed: Edit stays disabled, the card offers Retry), never
+   * swallowed: the list on screen would otherwise hand the editor an old version.
+   */
+  const loadStacks = useCallback(async (opts?: { blocking?: boolean }) => {
+    const seq = ++stacksReadSeq.current;
+    if (opts?.blocking) setStacksReloading(true);
     try {
       const json = await getJson("/api/supplements/stacks");
+      if (seq !== stacksReadSeq.current) return; // a newer read answers for the list
       setStacks(json.stacks ?? []);
+      setStacksLoadFailed(false);
     } catch (e) {
       console.error("Stacks load:", e);
+      if (seq === stacksReadSeq.current) setStacksLoadFailed(true);
+    } finally {
+      if (seq === stacksReadSeq.current) setStacksReloading(false);
     }
   }, []);
 
@@ -261,7 +295,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   // 1.0-1.4 s in perf-timing run 43668835523).
   useEffect(() => {
     let alive = true;
-    type TodayCopy = { date?: unknown; intakes?: Intake[]; compounds?: CompoundRow[] };
+    type TodayCopy = { date?: unknown; intakes?: Intake[]; compounds?: CompoundRow[]; unquantified?: UnquantifiedIngredient[] };
     const seed = (p: { products?: Product[] } | undefined, t: TodayCopy | undefined) => {
       if (!alive || answeredRef.current || !p || !t || !Array.isArray(p.products) || !Array.isArray(t.intakes)) return;
       if (t.date !== fallbackBehavioralToday(new Date())) return;
@@ -269,6 +303,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
       setProducts(p.products);
       setIntakes(t.intakes);
       setCompounds(t.compounds ?? []);
+      setUnquantified(t.unquantified ?? []);
       setLoading(false);
     };
     const p = clientCache.peek<{ products?: Product[] }>(PRODUCTS_URL);
@@ -306,6 +341,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
         const tRes = await getJson("/api/supplements/today");
         setIntakes(tRes.intakes ?? []);
         setCompounds(tRes.compounds ?? []);
+        setUnquantified(tRes.unquantified ?? []);
       } catch (e) {
         console.error("Silent today refresh:", e);
       }
@@ -426,7 +462,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
   );
 
   const intakeCount = intakes.length;
-  const distinctCompounds = compounds.length;
+  const distinctCompounds = distinctCompoundCount(compounds);
 
   return (
     <div className="space-y-6">
@@ -498,10 +534,25 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
               </button>
             </div>
 
+            {stacksLoadFailed && (
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2 text-[11px] font-mono text-down">
+                <span>Could not load your saved stacks. Editing waits until they load.</span>
+                <button
+                  type="button"
+                  onClick={() => void loadStacks({ blocking: true })}
+                  disabled={stacksReloading}
+                  className="px-2 py-1 border border-border-subtle rounded-control text-text-primary hover:border-accent/50 disabled:opacity-40 transition-colors"
+                >
+                  {stacksReloading ? "Loading…" : "Retry"}
+                </button>
+              </div>
+            )}
             {stacks.length === 0 ? (
-              <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
-                No stacks yet. Create one to log your recurring supplements in a single tap on Log.
-              </p>
+              stacksLoadFailed ? null : (
+                <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
+                  No stacks yet. Create one to log your recurring supplements in a single tap on Log.
+                </p>
+              )
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {stacks.map((s) => (
@@ -527,6 +578,7 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                           name: s.name,
                           description: s.description,
                           remind_time: s.remind_time,
+                          version: s.version ?? null,
                           items: s.items.map((i) => ({
                             product_id: i.product_id,
                             doses: Number(i.doses),
@@ -535,8 +587,15 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                           })),
                         })
                       }
-                      className="px-2 py-2 text-[10px] font-mono text-text-tertiary hover:text-text-primary transition-colors"
-                      title="Edit stack"
+                      disabled={stacksReloading || stacksLoadFailed}
+                      className="px-2 py-2 text-[10px] font-mono text-text-tertiary hover:text-text-primary disabled:opacity-40 transition-colors"
+                      title={
+                        stacksReloading
+                          ? "Loading the saved stack…"
+                          : stacksLoadFailed
+                            ? "Load your saved stacks first (Retry above)"
+                            : "Edit stack"
+                      }
                     >
                       edit
                     </button>
@@ -655,13 +714,13 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
             title="Today's compound totals"
             subtitle="Cross-product rollup by UNII code — Vitamin C from a multivitamin and a standalone Vitamin C tablet sum here."
             source="DSLD"
-            info="Each row is one compound. total_amount sums every intake event today × that product's dose. source_product_count tells you how many different products in your library contribute to that compound."
+            info="Each row is one compound. total_amount sums every intake event today × that product's dose. source_product_count tells you how many different products in your library contribute to that compound. Mass units are converted to mg (IU only for vitamins A, D and E, with each vitamin's own factor); any other unit stays as on the label on its own row and is never added to the mg row."
           >
-            {compounds.length === 0 ? (
+            {compounds.length === 0 && unquantified.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
                 No intakes logged today yet.
               </p>
-            ) : (
+            ) : compounds.length === 0 ? null : (
               <div className="overflow-x-auto">
                 <PersonalTable
                   id="compounds"
@@ -669,26 +728,45 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
                   headRowClassName="text-[10px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle"
                   rowClassName="border-b border-border-subtle/50 hover:bg-white/[0.02]"
                   columns={COMPOUND_COLUMNS}
-                  rows={compounds.map((c) => ({
-                    key: c.compound_key,
-                    cells: {
-                      category: (
-                        <span className={`${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
-                          {c.category ?? "—"}
-                        </span>
-                      ),
-                      compound: c.ingredient_group ?? c.ingredient_name ?? c.compound_key,
-                      amount: (
-                        <>
-                          {Number(c.total_amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
-                          <span className="text-text-tertiary">{c.unit}</span>
-                        </>
-                      ),
-                      sources: c.source_product_count,
-                    },
-                  }))}
+                  // One row per compound AND unit class (HIST-UNIT-01): an mg and an mL row of one compound are
+                  // two rows with their own keys, never one key for both.
+                  rows={compounds.map((c) => {
+                    const label = compoundUnitLabel(c);
+                    return {
+                      key: compoundRowKey(c),
+                      cells: {
+                        category: (
+                          <span className={`${categoryColor(c.category)} uppercase text-[10px] tracking-wide`}>
+                            {c.category ?? "—"}
+                          </span>
+                        ),
+                        compound: c.ingredient_group ?? c.ingredient_name ?? c.compound_key,
+                        amount: (
+                          <>
+                            {Number(c.total_amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            {label.unit ? <>{" "}<span className="text-text-tertiary">{label.unit}</span></> : null}
+                            {label.note ? (
+                              <>
+                                {" "}
+                                <span className="text-[10px] text-text-tertiary" title={label.title ?? undefined}>
+                                  · {label.note}
+                                </span>
+                              </>
+                            ) : null}
+                          </>
+                        ),
+                        sources: c.source_product_count,
+                      },
+                    };
+                  })}
                 />
               </div>
+            )}
+            {unquantified.length > 0 && (
+              <p className="text-[11px] text-text-tertiary font-mono pt-2" data-testid="compounds-unquantified">
+                No amount on the label (not counted):{" "}
+                {unquantified.map((u) => (u.label ? `${u.name} (${u.label})` : u.name)).join(", ")}
+              </p>
             )}
           </ChartCard>
           </Part>
@@ -782,7 +860,8 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
         onClose={() => setEditingStack(null)}
         onSaved={async () => {
           setEditingStack(null);
-          await loadStacks();
+          // Edit stays disabled until a read started after these saves answers (a failure keeps it so, with Retry).
+          await loadStacks({ blocking: true });
         }}
       />
 

@@ -67,6 +67,9 @@
 -- changing tz_log_gaps / hrv_prediction_gaps / spotify_daily_signature /
 -- recovery_vs_pace MUST drop + recreate the matching _mat (+ unique index +
 -- grants) in the same migration. NEVER DROP VIEW ... CASCADE on these views.
+-- Grants = service role only (2026-11-16, sql/pds_matview_revoke_authenticated.sql):
+--   REVOKE ALL ON pds.<name>_mat FROM PUBLIC, anon, authenticated;
+--   GRANT SELECT ON pds.<name>_mat TO service_role;
 --
 -- WHO READS WHAT
 -- --------------

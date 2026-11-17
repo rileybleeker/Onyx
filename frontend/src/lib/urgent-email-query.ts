@@ -3,6 +3,7 @@ import {
   FUTURE_SKEW_MS,
   assessEmail,
   daysUntilDeadline,
+  etDateIso,
   etDayLabel,
   gmailMessageHref,
   gmailThreadHref,
@@ -46,7 +47,8 @@ export interface UrgentEmailItem {
   lastSeenAt: string | null;
   labels: AgentLabel[];
   unread: boolean;
-  deadline: { daysLeft: number; label: string } | null;
+  /** `date`: the deadline's own Eastern day ("YYYY-MM-DD"); `daysLeft` counts from the moment of this answer. */
+  deadline: { daysLeft: number; label: string; date: string } | null;
   /** Why it is shown, strongest first. */
   reasons: string[];
   nextStep: string;
@@ -155,7 +157,7 @@ export function describeThread(thread: Thread, now: Date): UrgentEmailItem | nul
   const ageDays = (now.getTime() - time(newest.received_at)) / DAY_MS;
   if (!Number.isFinite(ageDays)) return null;
   const days = labels.includes("Agent/Deadline") ? threadDeadline(rows, now) : null;
-  const deadline = days !== null && days >= 0 && days <= DEADLINE_AHEAD_DAYS ? { daysLeft: days, label: etDayLabel(now, days) } : null;
+  const deadline = days !== null && days >= 0 && days <= DEADLINE_AHEAD_DAYS ? { daysLeft: days, label: etDayLabel(now, days), date: etDateIso(now, days) } : null;
   const showAction = labels.includes("Agent/Action") && ageDays <= ACTION_DAYS;
   const showDeadline = labels.includes("Agent/Deadline") && (deadline !== null || (days === null && ageDays <= UNDATED_DEADLINE_DAYS));
   if (!showAction && !showDeadline) return null;
@@ -309,13 +311,18 @@ export async function getUrgentEmail(client: Supa, now: Date = new Date()): Prom
 
   const shown: UrgentEmailItem[] = [];
   let cleared = 0;
+  const described: UrgentEmailItem[] = [];
   for (const t of threads.values()) {
     const item = describeThread(t, now);
-    if (!item) continue;
-    const through = clearedThrough.size > 0 ? clearedThrough.get(await clearKeyHash(item.key)) : undefined;
+    if (item) described.push(item);
+  }
+  // The clear-mark hashes are computed together (one await, not one per thread in a row), only when a mark exists.
+  const hashes = clearedThrough.size > 0 ? await Promise.all(described.map((item) => clearKeyHash(item.key))) : null;
+  described.forEach((item, i) => {
+    const through = hashes ? clearedThrough.get(hashes[i]) : undefined;
     if (through && stillCleared(item.receivedAt, through)) cleared++;
     else shown.push(item);
-  }
+  });
   shown.sort((a, b) => rank(a) - rank(b) || time(b.receivedAt) - time(a.receivedAt) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   return {
     status: "ready",

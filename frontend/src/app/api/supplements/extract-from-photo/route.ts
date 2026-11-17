@@ -2,6 +2,20 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import type { NormalizedIngredient, NormalizedProduct } from "@/lib/dsld";
+import { isUsableLabel } from "@/lib/label-extract";
+import {
+  attemptTimeoutMs,
+  callWithCountedRetries,
+  chooseModel,
+  effortConfig,
+  isRetryableModelError,
+  logPilotObservation,
+  MODEL_CALL_RETRIES,
+  pilotFromEnv,
+  pilotObservation,
+  retryAfterMs,
+  routeDeadline,
+} from "@/lib/model-routing";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
@@ -11,7 +25,7 @@ const supabase = createClient(
   { db: { schema: "pds" } },
 );
 
-const MODEL = "claude-sonnet-5-5";
+// Model + effort come from lib/model-routing.ts (baseline, or the bounded pilot when it is on).
 
 // Cap reference list at ~120 entries so the prompt stays small. The full DSLD
 // universe is larger but the user's library is the realistic intersection.
@@ -58,11 +72,12 @@ interface RefEntry {
  * vocabulary. Voted UNII per group: pick the most-common UNII observed for
  * that group across all products. Same for category.
  */
-async function buildReferenceTable(): Promise<RefEntry[]> {
+async function buildReferenceTable(signal: AbortSignal): Promise<RefEntry[]> {
   const { data, error } = await supabase
     .from("supplement_products")
     .select("ingredients")
-    .eq("is_active", true);
+    .eq("is_active", true)
+    .abortSignal(signal);
   if (error) throw new Error(`Reference fetch failed: ${error.message}`);
 
   type Tally = Map<string, number>;
@@ -242,6 +257,8 @@ export const maxDuration = 60;
  * Anthropic call.
  */
 export async function POST(req: NextRequest) {
+  // The function budget counts from the handler's entry (body parsing and the reference read are inside it).
+  const deadline = routeDeadline(Date.now(), Date.now());
   const { image_base64, media_type } = (await req.json()) as {
     image_base64?: string;
     media_type?: string;
@@ -260,13 +277,42 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const now = Date.now();
+  const pilot = pilotFromEnv(now);
+  const choice = chooseModel("supplement_photo", crypto.randomUUID(), pilot, now);
+  const started = Date.now();
+  let usage: Anthropic.Usage | null = null;
+  // Provider attempts, counted before each one (retries included, also when it throws); 0 when the
+  // request failed before the model call (e.g. the reference table read), so those failures are
+  // not charged to the model.
+  let attempts = 0;
+  // Observed once per request: a throw after the outcome was logged must not log a second one.
+  let observed = false;
+  const observe = (ok: boolean) => {
+    if (observed) return;
+    observed = true;
+    logPilotObservation(
+      pilotObservation("supplement_photo", choice, pilot, {
+        usage: usage ? [usage] : [],
+        latencyMs: Date.now() - started,
+        ok,
+        calls: attempts,
+      }),
+    );
+  };
+
   try {
-    const reference = await buildReferenceTable();
+    const reference = await buildReferenceTable(deadline.signal);
     const prompt = buildPrompt(reference);
 
-    const resp = await anthropic.messages.create({
-      model: MODEL,
+    // The SDK's default timeout and retries outlast the 60 s function limit. The route retries the
+    // errors the SDK would (MODEL_CALL_RETRIES, honouring Retry-After, counting each attempt) only
+    // while the model deadline allows, and `modelSignal` ends the call, body read included, inside
+    // it, so a slow call still writes its failure observation.
+    const resp = await callWithCountedRetries(() => anthropic.messages.create({
+      model: choice.model,
       max_tokens: 4096,
+      ...(choice.effort ? { output_config: effortConfig(choice) } : {}),
       messages: [
         {
           role: "user",
@@ -283,10 +329,21 @@ export async function POST(req: NextRequest) {
           ],
         },
       ],
+    }, { timeout: attemptTimeoutMs(deadline.modelAt, Date.now()), maxRetries: 0, signal: deadline.modelSignal }), {
+      retries: MODEL_CALL_RETRIES,
+      isRetryable: (e) => isRetryableModelError(e, (x) => x instanceof Anthropic.APIConnectionError),
+      retryAfterMs: (e) => retryAfterMs(e, Date.now()),
+      deadlineMs: deadline.modelAt,
+      signal: deadline.modelSignal,
+      onAttempt: () => {
+        attempts++;
+      },
     });
+    usage = resp.usage;
 
     const textBlock = resp.content.find((b) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") {
+      observe(false);
       return NextResponse.json(
         { error: "Claude returned no text content" },
         { status: 502 },
@@ -297,6 +354,7 @@ export async function POST(req: NextRequest) {
     try {
       parsed = extractJson(textBlock.text) as ExtractedShape;
     } catch (e) {
+      observe(false);
       return NextResponse.json(
         {
           error: "Could not parse Claude response as JSON",
@@ -309,14 +367,21 @@ export async function POST(req: NextRequest) {
 
     const aligned = alignWithReference(parsed, reference);
     const product = toNormalizedShape(aligned);
+    // Accepted only when the label produced a usable product (a name and named ingredients);
+    // the response is unchanged, so a thin read still reaches the review form to fix by hand.
+    observe(isUsableLabel(product));
 
     return NextResponse.json({
       product,
       reference_size: reference.length,
       stop_reason: resp.stop_reason,
       usage: resp.usage,
+      // Which model read the label (pilot arm or baseline); saved with the product's raw_json.
+      model: choice.model,
+      model_effort: choice.effort ?? "default",
     });
   } catch (e) {
+    observe(false);
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 502 },

@@ -705,6 +705,7 @@ test.describe("Today home", () => {
     await expect(page.getByText("Checking your calendar...")).toHaveCount(0, { timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Couldn't check the calendar.", { exact: false })).toHaveCount(0);
     await expect(page.getByRole("link", { name: "Open check-in", exact: true })).toHaveAttribute("href", "/log#log-part-check-in");
+    await expect(page.getByRole("link", { name: "Start your check-in", exact: true })).toHaveAttribute("href", "/log");
     await expect(page.getByRole("link", { name: "System status", exact: true })).toHaveAttribute("href", "/status");
     await expectNoClientCrash(page);
   });

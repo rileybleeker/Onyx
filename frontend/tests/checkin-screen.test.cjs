@@ -19,6 +19,8 @@ function row(over = {}) {
     synced_at: "2030-01-11T15:00:00+00:00",
     minutes_last_hour_before_sleep_est: 28.3,
     minutes_by_app: {},
+    export_complete: true, // the day and the hour before onset are backed by a complete export (PIPE-11)
+    pre_sleep_complete: true,
     ...over,
   };
 }
@@ -51,6 +53,20 @@ test("blank at 05:59 ET the next day, offered from 06:00 ET when the sync is an 
   assert.equal(suggest(row({ ...late, synced_at: "2030-01-11T11:30:00Z" })).answer, "Yes");
 });
 
+test("an export that cannot vouch for the day or the hour before sleep: blank, never a No (PIPE-11)", () => {
+  // An app build without completeness metadata, synced the next morning: the old time rule alone would pass.
+  assert.equal(suggest(row({ export_complete: false, pre_sleep_complete: false, minutes_last_hour_before_sleep_est: 0 })), null);
+  // A run the watchdog stopped: the day is not backed.
+  assert.equal(suggest(row({ export_complete: false })), null);
+  // The day is backed but the hour before onset is not (a reading of 0 there is missing data).
+  assert.equal(suggest(row({ pre_sleep_complete: false, minutes_last_hour_before_sleep_est: 0 })), null);
+  // Flags absent (an older database): blank.
+  const bare = row();
+  delete bare.export_complete;
+  delete bare.pre_sleep_complete;
+  assert.equal(suggest(bare), null);
+});
+
 test("no scored sleep, no sync time, no row, or another day's row: blank", () => {
   assert.equal(suggest(row({ sleep_start: null, minutes_last_hour_before_sleep_est: null })), null);
   assert.equal(suggest(row({ synced_at: null })), null);
@@ -73,7 +89,7 @@ test("the route reads the gate's columns and passes the minutes through the gate
   assert.match(route, /screenInBedSuggestion\(settledLastHourMinutes\(data, night\)\)/);
   assert.match(route, /\.from\("phone_usage_daily"\)\s*\.select\(CHECKIN_SCREEN_COLUMNS\)/);
   assert.ok(!/screenInBedSuggestion\(row\./.test(route));
-  for (const col of ["behavioral_date", "sleep_start", "synced_at", "minutes_last_hour_before_sleep_est", "minutes_by_app"]) {
+  for (const col of ["behavioral_date", "sleep_start", "synced_at", "minutes_last_hour_before_sleep_est", "minutes_by_app", "export_complete", "pre_sleep_complete"]) {
     assert.ok(G.CHECKIN_SCREEN_COLUMNS.includes(col), col);
   }
 });

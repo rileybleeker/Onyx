@@ -24,6 +24,23 @@ struct UsageSegment: Codable {
     let items: [UsageItem]
 }
 
+/// Completeness of the export a chunk belongs to (PIPE-11; frontend/src/lib/screen-time-upload.ts).
+/// Every chunk of one sync carries the same run_id, window, source_updated_at and stream_ended. Onyx
+/// marks the run's hours verified only when every chunk arrived and stream_ended is true, and only the
+/// hours that ended by the earlier of window_end and source_updated_at; a watchdog stop, a failed chunk or
+/// an app stopped halfway leaves them unverified (not counted as complete days).
+struct RunInfo: Codable {
+    let run_id: String          // one UUID per sync run
+    let window_start: Date      // the start of the window asked for (local midnight, days back)
+    let window_end: Date        // when the export was read
+    let source_updated_at: Date // when Apple's own data was last updated (the earliest the stream reported):
+                                // a clean stream served from a stale cache is current only up to here
+    let stream_ended: Bool      // false = stopped by the idle/timeout watchdog
+    let segment_count: Int      // hours in the whole run
+    let chunk_index: Int        // 0-based
+    let chunk_count: Int
+}
+
 struct UsagePayload: Codable {
     let device: String
     let device_name: String?
@@ -31,6 +48,7 @@ struct UsagePayload: Codable {
     let app_version: String
     let generated_at: Date
     let segments: [UsageSegment]
+    let run: RunInfo?           // nil only in the in-app preview; omitted from the JSON then
 }
 
 /// A failed sync, reported to the same route so /status turns red at once.
@@ -49,7 +67,12 @@ struct ExportResult {
     let segments: [UsageSegment]
     let deviceName: String?
     let deviceModel: String?
-    let streamEnded: Bool       // false = stopped by the idle/timeout watchdog
+    let streamEnded: Bool       // true only when Apple's stream ended by itself with no error
+    let streamFailed: Bool      // the stream threw an error (so streamEnded is false and the hours are not certified)
+    let windowStart: Date       // the requested window (the DeviceActivityFilter interval)
+    let windowEnd: Date         // when the export was read
+    let sourceUpdatedAt: Date   // when Apple's data was last updated; the window start when Apple reported nothing
+                                // (then nothing is certified)
 
     var totalMinutes: Double { segments.reduce(0) { $0 + $1.total_seconds } / 60 }
     var firstStart: Date? { segments.map(\.start).min() }

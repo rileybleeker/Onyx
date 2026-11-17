@@ -26,18 +26,40 @@ component = component.replace(/require\("@\/lib\/format"\)/g, `require(${formatL
 // How current the money alerts are (import-free).
 const moneyLib = ids.size; ids.set('frontend/src/lib/money-alerts-view.ts', moneyLib); modules[moneyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/money-alerts-view.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/money-alerts-view"\)/g, `require(${moneyLib})`);
+// The attention model and the quiet view settings / marks / row widths (both import-free; PROD-T04 / PROD-T05).
+const attentionLib = ids.size; ids.set('frontend/src/lib/today-attention.ts', attentionLib); modules[attentionLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/today-attention.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/today-attention"\)/g, `require(${attentionLib})`);
+const viewLib = ids.size; ids.set('frontend/src/lib/today-view.ts', viewLib); modules[viewLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/today-view.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/today-view"\)/g, `require(${viewLib})`);
+// The pre-paint script as the page's HTML runs it (today-view.ts has type imports only, so it runs on its own here).
+const viewModule = { exports: {} };
+new Function('module', 'exports', 'require', modules[viewLib])(viewModule, viewModule.exports, () => ({}));
+const quietBootJs = viewModule.exports.quietBootScript();
 // Takes the reads Today's HTML started before the JavaScript (import-free). Here no script started any, so the first
 // load fetches as usual and the requests checked below are unchanged.
 const earlyLib = ids.size; ids.set('frontend/src/lib/early-fetch.ts', earlyLib); modules[earlyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/early-fetch.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/early-fetch"\)/g, `require(${earlyLib})`);
+// "Practice · N ready" (import-free; the overview re-exports the same function).
+const readyLib = ids.size; ids.set('frontend/src/lib/reading-practice-ready.ts', readyLib); modules[readyLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/reading-practice-ready.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/reading-practice-ready"\)/g, `require(${readyLib})`);
 // The overview cards under Today's panels (components/overview/) load as their own chunk and have their own
 // tests (frontend/tests/overview-cards.test.cjs); here they render nothing, so this file keeps checking Today's
 // own panels and exactly the requests those panels make.
 component = component.replace(/require\("@\/components\/overview\/TodayOverview"\)/g, '({__esModule:true,default:()=>null})');
 // Personalize (components/personalize/PartGrid, tested in frontend/tests/personalize.test.cjs): here the grid
-// renders its parts in the default order, as the server does, so this file keeps checking the panels themselves.
+// renders its parts in the default order, as the server does, so this file keeps checking the panels themselves
+// (usePartOrder: the default layout, every part shown in its default order).
 component = component.replace(/require\("@\/components\/personalize\/PartGrid"\)/g,
-  '({__esModule:true,Part:({children})=>React.createElement(React.Fragment,null,children),PartGrid:({children})=>React.createElement("div",{className:"pz-grid"},children)})');
+  '({__esModule:true,Part:({children})=>React.createElement(React.Fragment,null,children),PartGrid:({children})=>React.createElement("div",{className:"pz-grid"},children),usePartOrder:(page,ids)=>ids.slice()})');
+// The "i" note (components/InfoHint, closed by default) holds no text this file checks.
+component = component.replace(/require\("@\/components\/InfoHint"\)/g, '({__esModule:true,default:()=>null})');
+// The wind-down streak (components/sleep/WindDownPanel, tested in frontend/tests/sleep-winddown.test.cjs) is opt-in
+// and reads its own endpoint: here it is not set up, so Today renders and requests exactly what it did before.
+// Learning pacing (lib/learning-pacing.ts, tested in frontend/tests/learning-pacing.test.cjs): the pure rules are bundled, the
+// settings read is stubbed to 'nothing saved' (Today only ever reads it; the suggestion line is covered by its own test).
+const pacingLib = ids.size; ids.set('frontend/src/lib/learning-pacing.ts', pacingLib); modules[pacingLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/learning-pacing.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/learning-pacing"\)/g, `require(${pacingLib})`).replace(/require\("@\/lib\/use-learning-prefs"\)/g, '({__esModule:true,useLearningPrefs:()=>({load:"ready",prefs:{v:1,goal:"",weeklySessions:2,sessionMinutes:20,pauseUntil:null,showIncentives:true},configured:false,accept:()=>{}})})');
+component = component.replace(/require\("@\/components\/sleep\/WindDownPanel"\)/g, '({__esModule:true,default:()=>null,useWindDownToday:()=>({show:false,source:null})})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
@@ -63,6 +85,8 @@ const urgentFixtures = {
     none: { status: 'ready', windowDays: 30, scanned: 12, total: 0, hidden: 12, lastSync: { at: ago(20 / 60), status: 'success', error: null }, items: [] },
     items: { status: 'ready', windowDays: 30, scanned: 9, total: 3, hidden: 6, lastSync: { at: ago(20 / 60), status: 'success', error: null }, items: urgentItems },
     stale_sync: { status: 'ready', windowDays: 30, scanned: 9, total: 3, hidden: 6, lastSync: { at: ago(6.2), status: 'partial', error: 'synthetic' }, items: urgentItems },
+    // The label sync has never reported a run (or its heartbeat could not be read): not a confirmed answer.
+    never_synced: { status: 'ready', windowDays: 30, scanned: 0, total: 0, hidden: 0, lastSync: null, items: [] },
 };
 // inbox-triage email cards: one links labelled thread 9001 (must merge into it), one is a search link (stands alone).
 const emailCards = [
@@ -103,7 +127,7 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         })(); window.experimentMode = experiment; window.experimentFixtures = experimentFixtures; window.experimentCalls = 0; window.urgentMode = urgent; window.urgentFixtures = urgentFixtures; window.fixtureWithEmail = fixtureWithEmail; window.urgentCalls = []; window.strict = strict; window.reactEnv = strict ? 'development' : 'production'; window.fixture = fixture; window.book = book; window.mode = mode; window.calls = []; window.unexpectedRequests = []; window.pending = []; window.dismissCalls = []; window.clearCalls = []; window.mockDismiss = o => { window.dismissCalls.push(o); return window.dismissMode === 'error' ? Promise.reject(Error('synthetic')) : Promise.resolve({ ok: true, codes: (o.codes || []).map(c => c.toUpperCase()), badge: 2 }); }; window.mockInbox = () => { window.calls.push({ url: '/onyx/inbox', method: 'GET' }); if (window.mode === 'sync-error')
             throw Error('synthetic'); if (['error', 'inbox-error', 'refresh-error'].includes(window.mode))
             return Promise.reject(Error('synthetic')); if (window.mode === 'defer')
-            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.fetch = (url, init) => { if (url === '/api/urgent-email/clear' && init?.method === 'POST') { window.clearCalls.push(JSON.parse(init.body)); return Promise.resolve(window.clearMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => ({ ok: true }) }); } if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (String(url).startsWith('/api/calendar/events?') && !(init?.method && init.method !== 'GET')) { window.calendarCalls.push(String(url)); return Promise.resolve(window.calendarMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.calendarFixtures[window.calendarMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [] }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/finance/alerts' && !(init?.method && init.method !== 'GET')) { window.moneyCalls = (window.moneyCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => (window.moneyFixture || { status: 'ready', alerts: [] }) }); } if (url === '/api/finance/alerts?fresh=1' && !(init?.method && init.method !== 'GET')) { window.moneyFreshCalls = (window.moneyFreshCalls || 0) + 1; return Promise.resolve(window.moneyFreshFixture === 'error' ? { ok: false, status: 500, json: async () => ({ status: 'unavailable' }) } : { ok: true, status: 200, json: async () => (window.moneyFreshFixture || { status: 'ready', alerts: [] }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
+            return new Promise((resolve, reject) => window.pending.push({ kind: 'inbox', resolve, reject })); return Promise.resolve(window.mode === 'empty' ? { ...window.fixture, items: [] } : window.mode === 'email-cards' ? window.fixtureWithEmail : window.fixture); }; window.quietGets = 0; window.quietPuts = []; window.fetch = (url, init) => { if (url === '/api/ui/preferences?key=today.quiet' && !(init?.method && init.method !== 'GET')) { window.quietGets++; return Promise.resolve({ ok: true, status: 200, json: async () => ({ key: 'today.quiet', value: null, updatedAt: null }) }); } if (url === '/api/ui/preferences' && init?.method === 'PUT') { const body = JSON.parse(init.body); window.quietPuts.push(body); return Promise.resolve(window.quietPutMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => ({ key: body.key, value: body.value, updatedAt: new Date().toISOString() }) }); } if (url === '/api/urgent-email/clear' && init?.method === 'POST') { window.clearCalls.push(JSON.parse(init.body)); return Promise.resolve(window.clearMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => ({ ok: true }) }); } if (url === '/api/urgent-email' && !(init?.method && init.method !== 'GET')) { window.urgentCalls.push(url); return Promise.resolve(window.urgentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.urgentFixtures[window.urgentMode] }); } if (String(url).startsWith('/api/calendar/events?') && !(init?.method && init.method !== 'GET')) { window.calendarCalls.push(String(url)); return Promise.resolve(window.calendarMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.calendarFixtures[window.calendarMode] }); } if (url === '/api/orders/summary' && !(init?.method && init.method !== 'GET')) { window.ordersCalls = (window.ordersCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: 'ready', attention: 0, arrivingToday: 0, onTheWay: 0, top: [], lastSync: { at: new Date().toISOString(), status: 'success' } }) }); } if (url === '/api/procurement/renewals/summary' && !(init?.method && init.method !== 'GET')) { window.renewalsCalls = (window.renewalsCalls || 0) + 1; return Promise.resolve(window.renewalsFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/procurement/renewals/summary?fresh=1' && !(init?.method && init.method !== 'GET')) { window.renewalsFreshCalls = (window.renewalsFreshCalls || 0) + 1; return Promise.resolve(window.renewalsFreshFixture === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => (window.renewalsFreshFixture || { status: 'ready', count: 0, soon: [], withinDays: 3 }) }); } if (url === '/api/finance/alerts' && !(init?.method && init.method !== 'GET')) { window.moneyCalls = (window.moneyCalls || 0) + 1; return Promise.resolve({ ok: true, status: 200, json: async () => (window.moneyFixture || { status: 'ready', alerts: [] }) }); } if (url === '/api/finance/alerts?fresh=1' && !(init?.method && init.method !== 'GET')) { window.moneyFreshCalls = (window.moneyFreshCalls || 0) + 1; return Promise.resolve(window.moneyFreshFixture === 'error' ? { ok: false, status: 500, json: async () => ({ status: 'unavailable' }) } : { ok: true, status: 200, json: async () => (window.moneyFreshFixture || { status: 'ready', alerts: [] }) }); } if (url === '/api/experiments/today' && !(init?.method && init.method !== 'GET')) { window.experimentCalls++; return Promise.resolve(window.experimentMode === 'error' ? { ok: false, status: 500, json: async () => ({ error: 'x' }) } : { ok: true, status: 200, json: async () => window.experimentFixtures[window.experimentMode] }); } if (url !== '/api/reading' || (init?.method && init.method !== 'GET')) { window.unexpectedRequests.push(String(url)); return Promise.reject(Error('Unexpected request')); } window.calls.push({ url, method: init?.method || 'GET' }); if (['error', 'reading-error', 'refresh-error'].includes(window.mode))
             return Promise.resolve({ ok: false }); if (window.mode === 'defer')
             return new Promise(resolve => window.pending.push({ kind: 'reading', resolve })); return Promise.resolve({ ok: true, json: async () => ({ overview: window.mode === 'empty' ? null : window.book }) }); }; }, { fixture, book, mode, strict, urgent, urgentFixtures, fixtureWithEmail, experiment, experimentFixtures, calendar }); await page.addScriptTag({ content: script }); await page.getByRole('heading', { name: 'Today', exact: true }).waitFor(); assert.equal(await page.locator('[role=status]').evaluate(el => getComputedStyle(el).position), 'absolute', 'compiled CSS must be applied'); return page; }
         async function close(page) { assert.deepEqual(await page.evaluate(() => window.unexpectedRequests), [], 'Only expected GET endpoints may be requested'); await page.close(); }
@@ -116,7 +140,9 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert.equal(await page.getByRole('link', { name: 'See the rest in your inbox' }).getAttribute('href'), '/agents?view=unread');
         assert.equal(await page.getByRole('link', { name: /Review a proposed plan/ }).getAttribute('href'), '/agents?t=fixture-agent#m1');
         assert.equal(await page.getByRole('link', { name: 'Continue reading' }).getAttribute('href'), '/reading');
-        assert.equal(await page.getByRole('link', { name: 'Open check-in' }).getAttribute('href'), '/log#log-part-check-in');
+        assert.equal(await page.getByRole('link', { name: 'Start your check-in' }).getAttribute('href'), '/log', 'the one primary action opens Log');
+        assert.equal(await page.getByRole('link', { name: /^Habit/ }).getAttribute('href'), '/log#log-part-check-in');
+        assert.equal(await page.getByRole('link', { name: 'Open check-in' }).getAttribute('href'), '/log#log-part-check-in', 'the "A moment to check in" card stays');
         assert(await page.getByText('3 of 12 chapters recorded.').isVisible());
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         await page.setViewportSize({ width: 1440, height: 1000 });
@@ -134,6 +160,23 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         await settled(page);
         assert.equal(await page.getByText(/Couldn't refresh requests/).count(), 0);
         assert.equal(await page.getByText(/Couldn't refresh reading/).count(), 0);
+        // READ-QUIZ-01: the reading panel's one line comes from the overview's own summary (no request of its own) and
+        // shows only while the book's questions are on and something is ready (due + never asked, at most a round).
+        assert.equal(await page.getByText(/Practice ·/).count(), 0, 'no summary: no practice line');
+        await page.evaluate(() => { window.book = { ...window.book, practice: { enabled: true, due: 2, newReady: 3 } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await page.getByRole('link', { name: 'Practice · 5 ready' }).isVisible());
+        assert.equal(await page.getByRole('link', { name: 'Practice · 5 ready' }).getAttribute('href'), '/reading');
+        await page.evaluate(() => { window.book = { ...window.book, practice: { enabled: false, due: 2, newReady: 3 } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert.equal(await page.getByText(/Practice ·/).count(), 0, 'the questions off: no practice line');
+        await page.evaluate(() => { window.book = { ...window.book, practice: { enabled: true, due: 0, newReady: 0 } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert.equal(await page.getByText(/Practice ·/).count(), 0, 'nothing ready: no practice line');
+        assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
         await close(page);
         console.log('PASS healthy bound, FYI filtering, links, reading, mobile width, refresh errors preserve data/focus, retry, GET-only');
         for (const mode of ['empty', 'error', 'inbox-error', 'reading-error', 'sync-error']) {
@@ -355,6 +398,28 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await page.evaluate(() => window.renewalsCalls) >= 4);
         await close(page);
         console.log('PASS renewals panel: hidden when nothing is due, lists what renews soon without amounts, failed check keeps the last answer, empty ledger hides it');
+        // Renewals freshness: an older stored "nothing renews" (updating) is followed up once with ?fresh=1 and is
+        // never an all-clear while that follow-up is pending or after it failed.
+        page = await setup();
+        await settled(page);
+        assert.equal(await page.evaluate(() => window.renewalsFreshCalls || 0), 0, 'a current renewals answer is not followed up');
+        await page.evaluate(() => {
+            window.renewalsFixture = { status: 'ready', count: 0, soon: [], withinDays: 3, asOf: new Date(Date.now() - 5 * 3600000).toISOString(), updating: true };
+            window.renewalsFreshFixture = 'error';
+        });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await page.getByText('Nothing renews in the next 3 days. From the check 5 h ago. Updating...').isVisible(), 'an older answer says how old it is');
+        await page.getByText("Nothing renews in the next 3 days. Not confirmed: this is from the check 5 h ago and couldn't be brought up to date.").waitFor({ timeout: 15000 });
+        assert.equal(await page.evaluate(() => window.renewalsFreshCalls), 1, 'exactly one follow-up');
+        // The follow-up answers: confirmed, with no age note.
+        await page.evaluate(() => { window.renewalsFreshCalls = 0; window.renewalsFreshFixture = { status: 'ready', count: 0, soon: [], withinDays: 3 }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        await page.waitForFunction(() => window.renewalsFreshCalls === 1, null, { timeout: 15000 });
+        await page.getByText('Nothing renews in the next 3 days.', { exact: true }).waitFor({ timeout: 15000 });
+        await close(page);
+        console.log('PASS renewals freshness: an older stored answer says how old it is, is followed up once with ?fresh=1, and is never an all-clear when that fails');
         // Money panel (Codex #191 D5): an older stored answer says so and is followed up once with ?fresh=1.
         page = await setup();
         await settled(page);
@@ -495,6 +560,151 @@ css += '\n' + fs.readFileSync('frontend/src/app/today/Today.module.css', 'utf8')
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
         await close(page);
         console.log('PASS calendar: not connected vs never ran vs empty vs events, today + tomorrow in the page zone, all-day first, read-only link only, failed refresh keeps list, error is not empty, stale sync flagged');
+        // Quiet view (PROD-T05): off by default; opening Today only reads the setting (GET, after the page settles)
+        // and writes nothing. Turning it on ranks a few obligations from every source, urgent ones past the budget,
+        // with the full list one tap away; Snooze / Hide are display marks that never close anything.
+        page = await setup('email-cards', 390, false, 'items', 'active');
+        await settled(page);
+        // A locator belongs to one page: made again after every setup() (an older one still points at a closed page).
+        const quietOf = (p) => p.locator('section[aria-labelledby="quiet-heading"]');
+        let quietPanel = quietOf(page);
+        assert.equal(await quietPanel.count(), 0, 'off by default');
+        assert(await page.locator('section[aria-labelledby="requests-heading"]').isVisible(), 'the full page is unchanged while off');
+        assert.equal(await page.getByRole('button', { name: 'Quiet view', exact: true }).getAttribute('aria-pressed'), 'false');
+        await page.waitForFunction(() => window.quietGets === 1, null, { timeout: 10000 });
+        assert.deepEqual(await page.evaluate(() => window.quietPuts), [], 'opening Today writes no setting');
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor();
+        assert.equal(await page.getByRole('button', { name: 'Quiet view', exact: true }).getAttribute('aria-pressed'), 'true');
+        assert.deepEqual(await page.evaluate(() => window.quietPuts), [{ key: 'today.quiet', value: { v: 1, on: true, budget: 3, learning: true } }], 'the change is stored under its own UI preference');
+        assert(await page.locator('#today-full').isHidden(), 'the full page is hidden, not removed');
+        const quietLog = quietPanel.getByRole('link', { name: 'Start your check-in' });
+        assert(await quietLog.isVisible(), 'the primary Log action stays in the quiet view');
+        assert.equal(await quietLog.getAttribute('href'), '/log');
+        // Personalize while the quiet view is on: the full page (every part) shows again, and hides when editing ends.
+        await page.evaluate(() => document.querySelector('#today-full .pz-grid').setAttribute('data-pz-editing', ''));
+        assert(await page.locator('#today-full').isVisible(), 'personalizing shows the full page under the quiet view');
+        assert(await page.locator('section[aria-labelledby="requests-heading"]').isVisible());
+        await page.evaluate(() => document.querySelector('#today-full .pz-grid').removeAttribute('data-pz-editing'));
+        assert(await page.locator('#today-full').isHidden());
+        const priorities = quietPanel.getByRole('list', { name: 'Priorities' });
+        assert.deepEqual(await texts(priorities.locator('li > div:first-child > p:nth-child(2)')), ['Synthetic labelled email 1', 'A synthetic sign-in check', 'Arm A: Synthetic instruction for arm A.'], 'urgent first (nearest deadline first), then the arm, ranked the same every time');
+        assert(await priorities.locator('li').first().getByText(/^Urgent · Urgent email · checked/).isVisible(), 'each item names its urgency, source and how current it is');
+        assert(await quietPanel.getByText('7 more open; see All open items.').isVisible());
+        assert(await quietPanel.getByRole('list', { name: 'Optional learning action' }).getByText('Continue A book for steady progress').isVisible(), 'one optional learning action');
+        assert(await quietPanel.getByText('Not connected yet: Calendar.').isVisible());
+        assert.equal(await quietPanel.getByText(/Not confirmed/).count(), 0, 'every connected source answered');
+        assert.equal(await quietPanel.getByText(/Nothing needs you/).count(), 0);
+        await quietPanel.getByText('All open items (11)').click();
+        assert.equal(await quietPanel.getByRole('list', { name: 'All open items' }).locator('li').count(), 11, 'every open item is one tap away');
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+        // Budget 1: both urgent items stay, the second says why it is past the number.
+        await quietPanel.getByText('Quiet view settings').click();
+        await quietPanel.getByRole('combobox', { name: 'Priorities to show' }).selectOption('1');
+        await page.waitForFunction(() => window.quietPuts.length === 2);
+        assert.deepEqual(await page.evaluate(() => window.quietPuts[1].value), { v: 1, on: true, budget: 1, learning: true });
+        assert.equal(await priorities.locator('li').count(), 3, "today's experiment arm is never cut by the budget");
+        assert(await priorities.locator('li').nth(1).getByText(/Urgent, so it is shown past your number/).isVisible());
+        assert(await priorities.locator('li').nth(2).getByText(/Today's instruction, so it is always shown/).isVisible());
+        assert.equal(await priorities.locator('li').nth(2).getByRole('button').count(), 0, 'the arm cannot be snoozed or hidden');
+        assert(await quietPanel.getByText('1 urgent item is shown past your 1.').isVisible());
+        // Snooze: leaves the list, stays open in All open items, comes back with Show again. Nothing is sent anywhere.
+        const before = await page.evaluate(() => [window.dismissCalls.length, window.clearCalls.length, window.quietPuts.length]);
+        // Email 1's deadline is tomorrow, so its snooze ends by the start of that day (never past its own due time).
+        await quietPanel.getByRole('button', { name: /^Snooze until .+: Synthetic labelled email 1$/ }).click();
+        assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.id), 'quiet-heading', 'focus moves to the list heading, not the page top');
+        assert(await quietPanel.getByText(/^Snoozed until .+\. Still open, and listed under All open items\./).isVisible());
+        assert.equal(await priorities.getByText('Synthetic labelled email 1').count(), 0);
+        const all = quietPanel.getByRole('list', { name: 'All open items' });
+        assert(await all.getByText(/^Snoozed until /).first().isVisible(), 'the snoozed item is still listed, unresolved');
+        assert.deepEqual(await page.evaluate(() => [window.dismissCalls.length, window.clearCalls.length, window.quietPuts.length]), before, 'a snooze clears nothing and stores nothing on the server');
+        await all.getByRole('button', { name: 'Show again: Synthetic labelled email 1' }).click();
+        await priorities.getByText('Synthetic labelled email 1').waitFor();
+        await quietPanel.getByRole('button', { name: 'Hide here: A synthetic sign-in check' }).click();
+        assert(await all.getByText(/^Hidden here until it changes\./).isVisible());
+        // The full page is one action away; a failed refresh of a source is reported, never an all-clear.
+        await quietPanel.getByRole('button', { name: 'Show the full Today page' }).click();
+        assert(await page.locator('section[aria-labelledby="requests-heading"]').isVisible());
+        assert.equal(await quietPanel.getByRole('button', { name: 'Hide the full Today page' }).getAttribute('aria-expanded'), 'true');
+        await page.evaluate(() => window.urgentMode = 'error');
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(couldn't refresh/).isVisible());
+        await page.setViewportSize({ width: 1440, height: 1000 });
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+        // Off again: the full page as before.
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor({ state: 'detached' });
+        assert(await page.locator('#today-full').isVisible());
+        assert.deepEqual(await page.evaluate(() => window.quietPuts[window.quietPuts.length - 1].value), { v: 1, on: false, budget: 1, learning: true });
+        assert((await page.evaluate(() => window.calls)).every(c => c.method === 'GET'));
+        await close(page);
+        // Nothing open and every source answered: a clear day. A source that failed: not an all-clear.
+        page = await setup('empty', 390, false, 'none');
+        quietPanel = quietOf(page);
+        await settled(page);
+        // A full load with the quiet view on: the pre-paint style (run before React, here on a device copy that says
+        // on) hides the full page and shows the quiet slot, against the compiled CSS (Tailwind's [hidden] rule
+        // included). Checked in one step, before any render can remove the style.
+        const boot = await page.evaluate((js) => {
+            const slot = () => getComputedStyle(document.querySelector('[data-today-quiet]')).display;
+            const before = slot();
+            new Function('localStorage', js)({ getItem: () => JSON.stringify({ settings: { v: 1, on: true, budget: 3, learning: true } }) });
+            const result = { before, shown: slot(), full: getComputedStyle(document.getElementById('today-full')).display };
+            document.getElementById('today-quiet-boot').remove();
+            return result;
+        }, quietBootJs);
+        assert.deepEqual(boot, { before: 'none', shown: 'block', full: 'none' }, 'the quiet slot is painted before React, the full page is not');
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor();
+        assert(await quietPanel.getByText('Nothing needs you right now. Every source answered.').isVisible());
+        await close(page);
+        page = await setup('empty', 390, false, 'error');
+        quietPanel = quietOf(page);
+        await settled(page);
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor();
+        assert(await quietPanel.getByText('Nothing to show yet, but not every source could be checked, so this is not an all-clear.').isVisible());
+        assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(couldn't check\)/).isVisible());
+        assert.equal(await quietPanel.getByText(/Nothing needs you/).count(), 0, 'a failed source is never a clear day');
+        await close(page);
+        // A label sync that never reported a run: the answer is not confirmed either.
+        page = await setup('empty', 390, false, 'never_synced');
+        quietPanel = quietOf(page);
+        await settled(page);
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor();
+        assert(await quietPanel.getByText('Nothing to show yet, but not every source could be checked, so this is not an all-clear.').isVisible());
+        assert(await quietPanel.getByText(/^Not confirmed: Urgent email \(its sync hasn't reported a run/).isVisible());
+        assert.equal(await quietPanel.getByText(/Nothing needs you/).count(), 0, 'missing sync freshness is never a clear day');
+        await close(page);
+        // Money answered with no alert, but the cash forecast's input check failed: not an all-clear either.
+        page = await setup('empty', 390, false, 'none');
+        quietPanel = quietOf(page);
+        await settled(page);
+        await page.evaluate(() => { window.moneyFixture = { status: 'ready', alerts: [], asOf: new Date().toISOString(), cash: { eligible: false, reasons: ['The balance for Synthetic Checking is older than 48 hours.'] } }; });
+        await page.getByRole('button', { name: 'Refresh Today' }).click();
+        await settled(page);
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.waitFor();
+        assert(await quietPanel.getByText('Nothing to show yet, but not every source could be checked, so this is not an all-clear.').isVisible());
+        assert(await quietPanel.getByText(/Money \(the cash forecast's inputs are incomplete, so an alert may be missing\)/).isVisible());
+        assert.equal(await quietPanel.getByText(/Nothing needs you/).count(), 0, 'an incomplete cash forecast is never a clear day');
+        await close(page);
+        // A failed save stays on this device and says so; Retry (Riley's tap) sends it.
+        page = await setup('empty', 390, false, 'none');
+        quietPanel = quietOf(page);
+        await settled(page);
+        await page.evaluate(() => { window.quietPutMode = 'error'; });
+        await page.getByRole('button', { name: 'Quiet view', exact: true }).click();
+        await quietPanel.getByText(/Couldn't save the quiet view settings to your account/).waitFor();
+        assert(await quietPanel.isVisible(), 'the change still applies on this screen');
+        await page.evaluate(() => { window.quietPutMode = 'ok'; });
+        await quietPanel.getByRole('button', { name: 'Retry' }).click();
+        await quietPanel.getByText(/Couldn't save the quiet view settings/).waitFor({ state: 'detached' });
+        assert.equal(await page.evaluate(() => window.quietPuts.length), 2);
+        await close(page);
+        console.log('PASS quiet view: off by default, opening only reads the setting, ranked obligations with source/freshness, urgent past the budget, full list one tap away, snooze/hide are display only, unknown is never an all-clear, failed save kept + Retry, 390/1440 widths');
         assert.deepEqual(errors, []);
         console.log('PASS no browser exceptions; no health data, credentials, or screenshots collected');
     }

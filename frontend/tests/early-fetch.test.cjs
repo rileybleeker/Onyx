@@ -247,3 +247,153 @@ test("/log: logEarlyGet takes the started answer once on the routed page, never 
   assert.equal((await get()).early, true);
   assert.equal((await get()).url, "/api/reading", "the second read is the section's own fetch");
 });
+
+// ---- PERF-01 (2026-11-16): the early scripts load from the head, and do nothing once the app is running ----------
+
+const ALL_SCRIPTS = () => [
+  ["status-style inline", E.earlyFetchScript("/api/status")],
+  ["Today", T.todayEarlyScript(SUPABASE, WORKER)],
+  ["/log", L.logEarlyScript()],
+  ["/agents", T.agentsEarlyScript(SUPABASE, WORKER)],
+];
+
+test("once the document has finished loading (React inserted the script on an in-app navigation), no script starts a read or sets the /log mark", (t) => {
+  const calls = withWindow(t, { cookie: `${COOKIE}=base64-${b64url(session(3600))}` });
+  t.after(() => { delete global.next; delete global[L.LOG_EARLY_MARK]; });
+  global.document.readyState = "complete";
+  for (const next of [true, false]) {
+    if (next) global.next = { version: "synthetic", appDir: true };
+    else delete global.next;
+    for (const [name, script] of ALL_SCRIPTS()) {
+      calls.length = 0;
+      delete global[E.EARLY_FETCH_KEY];
+      new Function(script)();
+      assert.equal(calls.length, 0, `${name} (next=${next})`);
+    }
+    assert.equal(L.takeLogEarlyMark(), false, `no /log mark (next=${next})`);
+  }
+});
+
+test("during a full page load every script runs, however late: it never depends on Next's own globals", (t) => {
+  const calls = withWindow(t, { cookie: `${COOKIE}=base64-${b64url(session(3600))}` });
+  t.after(() => { delete global.next; delete global[L.LOG_EARLY_MARK]; });
+  // An inline script runs while the parser runs ("loading"); the head's async script holds the load event back, so even
+  // a late run (HTML parsed, Next already started) is "interactive" at the latest, never "complete".
+  for (const [next, state] of [[false, "loading"], [true, "loading"], [false, "interactive"], [true, "interactive"]]) {
+    if (next) global.next = { version: "synthetic", appDir: true };
+    else delete global.next;
+    global.document.readyState = state;
+    for (const [name, script] of ALL_SCRIPTS()) {
+      calls.length = 0;
+      delete global[E.EARLY_FETCH_KEY];
+      new Function(script)();
+      assert.ok(calls.length >= 1, `${name} (next=${next}, ${state})`);
+    }
+    assert.equal(L.takeLogEarlyMark(), true, `the /log mark (next=${next}, ${state})`);
+  }
+});
+
+test("a script that runs twice in one load sends each read once; a taken or claimed URL is never started again while fresh", (t) => {
+  const calls = withWindow(t);
+  const script = E.earlyFetchesScript(["/api/a", "/api/b"]);
+  new Function(script)();
+  new Function(script)();
+  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b"], "the second run starts nothing");
+  const first = global[E.EARLY_FETCH_KEY]["/api/a"].p;
+  assert.equal(E.takeEarlyFetch("/api/a"), first, "the first answer is the one taken");
+  new Function(script)();
+  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b"], "taken: the claim holds, /api/b still pending");
+  // A claim ages out like any entry: an old one no longer stops the script.
+  global[E.EARLY_FETCH_KEY]["/api/b"].at = Date.now() - E.EARLY_FETCH_MAX_AGE_MS - 1;
+  new Function(script)();
+  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b", "/api/b"], "too old: started again");
+});
+
+// ---- Shared first-read ownership (OR-384): the client's take or fallback claims the URL -----------------------------
+
+test("the client falls back first, then the script runs: exactly one request in total", async (t) => {
+  const calls = withWindow(t);
+  const fallback = () => { calls.push({ url: "/api/x (client)", init: {} }); return Promise.resolve({ fallback: true }); };
+  assert.equal((await E.earlyOr("/api/x", fallback)).fallback, true);
+  assert.equal(calls.length, 1, "only the client's own fetch");
+  new Function(E.earlyFetchScript("/api/x"))();
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1, "a late script run (document still interactive) claims nothing new");
+});
+
+test("the script runs first, the client takes it: exactly one request", async (t) => {
+  const calls = withWindow(t);
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1);
+  const res = await E.earlyOr("/api/x", () => { calls.push({ url: "/api/x (client)", init: {} }); return Promise.resolve({ fallback: true }); });
+  assert.equal(res.url, "/api/x", "the early answer is used");
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1, "the take claims the URL; a later script run starts nothing");
+});
+
+test("a 401 answer is fetched again by the client, and the late script run still adds no third request", async (t) => {
+  const calls = withWindow(t);
+  global.fetch = (url, init) => { calls.push({ url, init }); return Promise.resolve({ ok: false, status: 401, redirected: false, url }); };
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1);
+  const res = await E.earlyOr("/api/x", () => Promise.resolve({ ok: false, status: 401, redirected: false, url: "/api/x" }));
+  assert.equal(calls.length, 2, "the client refetches the sign-in failure itself");
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 2, "no duplicate read from the late script");
+  assert.equal(res.status, 401);
+});
+
+test("earlyScriptSrc: a data: URL of only URL-safe characters that decodes to exactly the script, and runs", (t) => {
+  const calls = withWindow(t);
+  const PREFIX = "data:text/javascript;charset=utf-8,";
+  for (const [name, script] of ALL_SCRIPTS()) {
+    const src = E.earlyScriptSrc(script);
+    assert.ok(src.startsWith(PREFIX), name);
+    const body = src.slice(PREFIX.length);
+    // No raw '#' (it would end the URL), quote, angle bracket, space or newline: every other byte is %-escaped.
+    assert.match(body, /^[A-Za-z0-9\-_.!~*'()%]*$/, name);
+    assert.equal(decodeURIComponent(body), script, name);
+  }
+  new Function(decodeURIComponent(E.earlyScriptSrc(E.earlyFetchScript("/api/habits/checkin")).slice(PREFIX.length)))();
+  assert.deepEqual(calls.map((c) => c.url), ["/api/habits/checkin"]);
+});
+
+test("Today, /log and /agents render their early script as an async script with a src (hoisted into the head), not inline", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const read = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
+  for (const f of ["app/today/EarlyReads.tsx", "app/log/EarlyReads.tsx", "app/agents/EarlyInbox.tsx"]) {
+    const src = read(f);
+    assert.match(src, /<script async src=\{SRC\} \/>/, `${f}: async + src`);
+    assert.match(src, /earlyScriptSrc\(/, `${f}: the data: URL helper`);
+    // An inline script in the body waits for the stylesheet; React hoists a <script> only with async + src and no handlers.
+    assert.ok(!/dangerouslySetInnerHTML/.test(src), `${f}: nothing inline`);
+    assert.ok(!/onLoad|onError/.test(src), `${f}: no handlers`);
+  }
+});
+
+test("/log: the Drinks section's first read is started with the others, at the URL the section reads, on the routed page only", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const read = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
+  assert.ok(L.LOG_EARLY_GETS.includes(L.LOG_DRINKS_URL));
+  // The URL the section builds for behavioral today (no ?day=) is the one the script starts.
+  assert.match(read("lib/drink-capture.ts"), new RegExp(`export const DRINKS_URL = "${L.LOG_DRINKS_URL}";`));
+  const drinks = read("app/log/sections/Drinks.tsx");
+  assert.ok(drinks.includes("LOG_DRINKS_URL") && drinks.includes("logEarlyGet(url, routed)"), "the section takes the started read");
+  assert.ok(drinks.includes("useInFeed()"), "a copy in the continuous scroll fetches for itself");
+});
+
+test("/log: the Uber Eats section's reads start before the frame and the sections are evaluated, on a full page load only", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const read = (f) => fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8");
+  const loader = read("app/log/LogLoader.tsx");
+  // ES imports run in order: the starter module must come before ./LogClient, whose evaluation is the slow part.
+  const start = loader.indexOf('import "./early-delivery-start";');
+  const client = loader.indexOf('import "./LogClient";');
+  assert.ok(start !== -1 && client !== -1 && start < client, "early-delivery-start is imported before LogClient");
+  const starter = read("app/log/early-delivery-start.ts");
+  assert.ok(starter.includes("takeLogEarlyMark()"), "only a full page load of /log (the head script's mark)");
+  assert.ok(!/fetch\(|method:\s*"(POST|PUT|PATCH|DELETE)"/.test(starter), "read-only: nothing is sent from here");
+});

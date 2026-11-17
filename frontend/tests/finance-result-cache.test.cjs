@@ -102,10 +102,10 @@ function world() {
   out.push(ftx("card", "2030-06-07", 1_599, "DEMO STREAMING", "Entertainment"), ftx("card", "2030-06-10", 45_000, "DEMO GROCER", "Groceries"));
   return out;
 }
-function synthForecast() {
+function synthForecast(now = NOW) {
   return F.forecastCash({
     today: TODAY,
-    now: NOW,
+    now,
     accounts: ACCOUNTS,
     txns: world(),
     balances: [
@@ -219,6 +219,7 @@ function harness({ readError = null, forecast = { kind: "empty" }, budgets = { k
       after: (fn) => queue.push(fn),
       NextResponse: { json: (body, init = {}) => ({ body, status: init.status ?? 200, headers: init.headers ?? {} }) },
     },
+    "@/lib/finance-service-client": { serviceClient: () => db.client },
     "@/lib/finance-ledger-server": { serviceClient: () => db.client },
     "@/lib/cash-forecast-server": { loadForecast: async () => { calls.forecast++; return typeof state.forecast === "function" ? state.forecast() : state.forecast; } },
     "@/lib/finance-budgets-server": { loadBudgets: async () => { calls.budgets++; return state.budgets; } },
@@ -256,6 +257,80 @@ test("first call computes inline and stores after the answer; the next call is s
   assert.equal(h.calls.forecast, 1);
   assert.equal((await h.S.cachedBudgets(addMs(NOW, 60_000))).kind, "ok");
   assert.equal(h.calls.budgets, 1);
+});
+
+// Speed (PERF-02): the computation modules are loaded only when something is computed, so a cold request answered
+// from the stored row does not parse the forecast engine, the budgets or the subscription detection first.
+const COMPUTE_MODULES = ["@/lib/cash-forecast-server", "@/lib/finance-budgets-server", "@/lib/procurement-recurring-server"];
+function watchLoads(stubs) {
+  const loaded = [];
+  for (const spec of COMPUTE_MODULES) {
+    const mod = stubs[spec];
+    Object.defineProperty(stubs, spec, { enumerable: true, configurable: true, get() { loaded.push(spec); return mod; } });
+  }
+  return loaded;
+}
+const storedRow = (key, body, over = {}) => ({ key, version: 1, et_date: TODAY, build: BUILD, computed_at: NOW.toISOString(), failed_at: null, body, ...over });
+
+test("a stored answer loads no computation module; a stale one loads them only for the refresh after the response", async () => {
+  const h = harness({ detected: { state: "empty" } });
+  const loaded = watchLoads(h.stubs);
+  h.db.rows.set("alerts", storedRow("alerts", { status: "ready", alerts: [] }));
+  h.db.rows.set("renewals", storedRow("renewals", { status: "empty" }));
+  const at = addMs(NOW, 60_000);
+  assert.deepEqual(await h.S.cachedMoneyAlerts(at), { status: "ready", alerts: [], asOf: NOW.toISOString() });
+  assert.deepEqual((await h.S.cachedRenewalsAheadWithAge(at, "stale-ok")).value, { status: "empty" });
+  assert.deepEqual(loaded, [], "fresh stored rows: nothing computed, no computation module loaded");
+  assert.deepEqual([h.calls.forecast, h.calls.budgets, h.calls.detected], [0, 0, 0]);
+
+  h.db.bump(); // an input table was written: both rows are stale
+  const stale = await h.S.cachedMoneyAlerts(at);
+  assert.equal(stale.updating, true, "the stored answer at once");
+  await h.S.cachedRenewalsAheadWithAge(at, "stale-ok");
+  assert.deepEqual(loaded, [], "still nothing loaded before the answers");
+  assert.equal(h.queue.length, 2);
+  await h.drain();
+  assert.deepEqual([...new Set(loaded)].sort(), [...COMPUTE_MODULES].sort(), "the refresh after the response loads them");
+  assert.deepEqual([h.calls.forecast, h.calls.budgets, h.calls.detected], [1, 1, 1]);
+});
+
+test("a computation module that fails to load answers like a failed computation; the stored row is kept and marked", async () => {
+  const h = harness();
+  h.db.rows.set("renewals", storedRow("renewals", { status: "empty" }));
+  h.db.bump();
+  Object.defineProperty(h.stubs, "@/lib/procurement-recurring-server", { enumerable: true, configurable: true, get() { throw new Error("chunk failed"); } });
+  const { value: served, lines } = await quiet(async () => {
+    const v = await h.S.cachedRenewalsAheadWithAge(addMs(NOW, 1_000), "stale-ok");
+    await h.drain();
+    return v;
+  });
+  assert.equal(served.stale, true, "the stored detection is answered");
+  assert.ok(h.db.rows.get("renewals").failed_at, "the failed refresh is remembered, so the next call computes first");
+  assert.ok(lines.every((l) => !/chunk failed/.test(l)), "only a code is logged");
+});
+
+test("nothing stored and the computation module fails to load: null (the route's 500 JSON), nothing stored, a code logged", async () => {
+  const h = harness();
+  Object.defineProperty(h.stubs, "@/lib/cash-forecast-server", { enumerable: true, configurable: true, get() { throw new Error("chunk failed"); } });
+  const { value, lines } = await quiet(() => h.S.cachedMoneyAlerts(NOW));
+  assert.equal(value, null);
+  assert.equal(h.queue.length, 0, "nothing scheduled to store");
+  assert.equal(h.db.rows.has("alerts"), false);
+  assert.ok(lines.some((l) => /compute failed alerts/.test(l)) && lines.every((l) => !/chunk failed/.test(l)), "only a code is logged");
+  const route = loadTs("app/api/finance/alerts/route.ts", h.stubs);
+  const res = await quiet(() => route.GET());
+  assert.deepEqual([res.value.status, res.value.body], [500, { status: "unavailable" }]);
+});
+
+test("source: the stored-result module imports the computations lazily and the small client module", () => {
+  const src = fs.readFileSync(path.join(SRC, "lib/finance-result-cache-server.ts"), "utf8");
+  for (const spec of [...COMPUTE_MODULES, "@/lib/procurement-renewals"]) {
+    const esc = spec.replace(/[/.-]/g, (c) => "\\" + c);
+    assert.doesNotMatch(src, new RegExp(`^import \\{[^}]*\\} from "${esc}"`, "m"), `${spec}: no value import at load`);
+    assert.match(src, new RegExp(`import\\("${esc}"\\)`), `${spec}: loaded with import()`);
+  }
+  assert.match(src, /from "@\/lib\/finance-service-client"/);
+  assert.doesNotMatch(src, /from "@\/lib\/finance-ledger-server"/, "the ledger arithmetic is not loaded for a stored answer");
 });
 
 test("after an input write: the stored answer comes back at once and is recomputed after the response", async () => {
@@ -317,6 +392,91 @@ test("half-failed alerts are answered marked partial, and never stored", async (
   assert.equal(await h.S.cachedMoneyAlerts(NOW), null, "both failed: unavailable");
   h.state.forecast = { kind: "empty" };
   assert.equal((await h.S.cachedMoneyAlerts(NOW)).partial, "budgets");
+});
+
+test("the alerts answer carries the cash forecast's input check, and the stored copy serves it back unchanged", async () => {
+  const forecastLoad = (result) => ({ kind: "ok", result, items: [], drivers: [], accounts: [], setupPending: false, profile: null, tax: [], scenario: null, saved: [], accuracy: [], goals: [], move: null });
+  const fresh = synthForecast();
+  assert.equal(fresh.eligibility.eligible, true);
+  const h = harness({ forecast: forecastLoad(fresh), budgets: { kind: "empty" } });
+  const first = await h.S.cachedMoneyAlerts(NOW);
+  assert.deepEqual(first.cash, { eligible: true, reasons: [] });
+  await h.drain();
+  assert.deepEqual(h.db.rows.get("alerts").body.cash, { eligible: true, reasons: [], validUntil: fresh.eligibility.validUntil }, "stored with the alerts, and when it stops holding");
+  assert.deepEqual(await h.S.cachedMoneyAlerts(addMs(NOW, 60_000)), first, "served from the stored row, same check");
+
+  // The same ledger read three days later with no new balance: Today is told the forecast is incomplete.
+  const later = addMs(NOW, 3 * 86_400_000);
+  const stale = synthForecast(later);
+  assert.equal(stale.headlines.safeToMoveCents, null);
+  const h2 = harness({ forecast: forecastLoad(stale), budgets: { kind: "empty" } });
+  const answer = await h2.S.cachedMoneyAlerts(NOW);
+  assert.equal(answer.cash.eligible, false);
+  assert.deepEqual(answer.cash.reasons, stale.eligibility.reasons.map((r) => r.text));
+  assert.match(answer.cash.reasons[0], /Demo Checking.*older than 48 hours/);
+  assert.doesNotMatch(JSON.stringify(answer.cash), /\$\d|cents/, "no amounts in the check");
+  // No ledger at all: nothing to check, no field (the existing answer shape).
+  const none = await harness().S.cachedMoneyAlerts(NOW);
+  assert.equal("cash" in none, false);
+  // A failed forecast is `partial`, not a cash check.
+  const failed = await harness({ forecast: { kind: "error", code: "57014" }, budgets: { kind: "empty" } }).S.cachedMoneyAlerts(NOW);
+  assert.deepEqual([failed.partial, "cash" in failed], ["forecast", false]);
+});
+
+test("a stored forecast and Today's check stop offering an amount once a counted balance turns 48 hours old", async () => {
+  const HOUR = 3_600_000;
+  const forecastLoad = (result) => ({ kind: "ok", result, items: [], drivers: [], accounts: [], setupPending: false, profile: null, tax: [], scenario: { params: {}, result, tax: [] }, saved: [], accuracy: [], goals: [], move: null });
+  // Computed 47.5 hours after the synthetic balance: the check holds 30 more minutes, inside the fresh window.
+  const at = new Date(Date.parse("2030-06-15T06:00:00Z") + 47.5 * HOUR);
+  const result = synthForecast(at);
+  assert.equal(result.eligibility.eligible, true);
+  assert.equal(result.eligibility.validUntil, "2030-06-17T06:00:00.000Z");
+  const h = harness({ forecast: forecastLoad(result), budgets: { kind: "empty" } });
+  const first = await h.S.cachedForecast(at);
+  assert.equal(typeof first.result.headlines.safeToMoveCents, "number");
+  await h.drain();
+  // Today's first answer at the same moment, stored alongside.
+  assert.deepEqual((await h.S.cachedMoneyAlerts(at)).cash, { eligible: true, reasons: [] });
+  await h.drain();
+  const callsBefore = h.calls.forecast;
+  // 45 minutes on: the stored load is still in its fresh hour, but its check no longer holds, so the page recomputes
+  // it (the ledger now gives the real, per-account reason) instead of serving a withheld copy.
+  const later = addMs(at, 45 * 60_000);
+  const recomputed = synthForecast(later);
+  h.state.forecast = () => forecastLoad(recomputed);
+  const served = await h.S.cachedForecast(later);
+  assert.equal(h.calls.forecast, callsBefore + 1, "an expired check is recomputed, not served");
+  assert.equal(served.result.headlines.safeToMoveCents, null);
+  assert.equal(served.result.eligibility.eligible, false);
+  assert.deepEqual(served.result.eligibility.reasons.map((r) => [r.code, r.account]), [["stale-balance", "chk"]], "the real reason, naming the account");
+  assert.equal(served.scenario.result.headlines.safeToMoveCents, null, "the what-if agrees");
+  await h.drain();
+  assert.equal(h.db.rows.get("forecast").body.result.headlines.safeToMoveCents, null, "the recomputed load is stored");
+  assert.equal(h.calls.forecast, callsBefore + 1);
+  await h.S.cachedForecast(addMs(later, 60_000));
+  assert.equal(h.calls.forecast, callsBefore + 1, "and served from then on (its own check holds no expiry that has passed)");
+  // The computed value is checked against the clock too: a load whose check has already expired is withheld.
+  const h2 = harness({ forecast: forecastLoad(result), budgets: { kind: "empty" } });
+  const old = await h2.S.cachedForecast(later);
+  assert.equal(h2.calls.forecast, 1);
+  assert.equal(old.result.headlines.safeToMoveCents, null);
+  assert.equal(old.result.eligibility.reasons[0].code, "stale-balance");
+  // Today: the stored answer's check has expired, so it is answered at once marked updating (Today asks again with
+  // ?fresh=1), and its verdict is not eligible.
+  h.state.forecast = () => forecastLoad(recomputed);
+  const laterAlerts = await h.S.cachedMoneyAlerts(later);
+  assert.equal(laterAlerts.cash.eligible, false);
+  assert.match(laterAlerts.cash.reasons[0], /gone stale/);
+  assert.equal(laterAlerts.updating, true, "expired: being recomputed");
+  assert.equal("validUntil" in laterAlerts.cash, false, "the answer carries only the verdict");
+  await h.drain();
+  const followUp = await h.S.cachedMoneyAlerts(addMs(later, 4_000), "fresh-only");
+  assert.equal(followUp.updating, undefined, "the follow-up gets the recomputed answer");
+  assert.deepEqual(followUp.cash.reasons, recomputed.eligibility.reasons.map((r) => r.text));
+  // An older answer served while its refresh is pending (or after a refresh failed) is not eligible either.
+  const dayLater = await h.S.cachedMoneyAlerts(addMs(at, 26 * HOUR));
+  assert.equal(dayLater.updating, true);
+  assert.equal(dayLater.cash.eligible, false);
 });
 
 test("an older stored answer is marked updating with the time it was computed; fresh-only computes before answering", async () => {
@@ -440,6 +600,31 @@ test("renewals route: ready / empty / 500, uncached, from the stored form", asyn
   assert.deepEqual([failed.status, failed.body, failed.headers["Cache-Control"]], [500, { error: "renewals unavailable" }, "no-store"]);
 });
 
+test("renewals route: an older stored detection is marked updating; ?fresh=1 computes before answering", async () => {
+  // An outdated "nothing renews" must never read as current: Today treats `updating` as not confirmed and asks again.
+  const h = harness({ detected: { state: "empty" } });
+  const route = loadTs("app/api/procurement/renewals/summary/route.ts", h.stubs);
+  const a = await route.GET();
+  assert.deepEqual([a.status, a.body], [200, { status: "empty" }], "computed now: current, no marker");
+  await h.drain();
+  h.db.bump(); // the ETL wrote the ledger
+  const b = await route.GET(new Request("http://localhost/api/procurement/renewals/summary"));
+  assert.equal(b.body.status, "empty");
+  assert.equal(b.body.updating, true);
+  assert.ok(Number.isFinite(Date.parse(b.body.asOf)), "says when the stored detection was computed");
+  assert.equal(h.calls.detected, 1, "answered at once from the stored row");
+  h.queue.length = 0; // the background refresh has not landed yet
+  const c = await route.GET(new Request("http://localhost/api/procurement/renewals/summary?fresh=1"));
+  assert.equal(h.calls.detected, 2, "?fresh=1 computed before answering");
+  assert.deepEqual(c.body, { status: "empty" });
+  // The follow-up read fails: a 500, never the outdated answer.
+  h.db.bump();
+  h.state.detected = { state: "error", code: "57014" };
+  h.queue.length = 0;
+  const d = await route.GET(new Request("http://localhost/api/procurement/renewals/summary?fresh=1"));
+  assert.deepEqual([d.status, d.body], [500, { error: "renewals unavailable" }]);
+});
+
 // ─── source and SQL guards ──────────────────────────────────────────────────────────────────────
 const REPO = path.join(SRC, "..", "..");
 const SQL = fs.readFileSync(path.join(REPO, "sql", "finance_result_cache.sql"), "utf8");
@@ -552,6 +737,10 @@ test("fetchPaged: the page cap truncates, a small read is one request, no count 
   const nc = await L.fetchPaged(noCount.build, 40);
   assert.deepEqual(nc.rows, noCount.all);
   assert.equal(noCount.stats().maxInFlight, 1);
+  // With no count either, full pages past the page limit are cut off by the limit alone and reported.
+  const noCountCut = pagedSource(5_000, { noCount: true });
+  const ncc = await L.fetchPaged(noCountCut.build, 3);
+  assert.deepEqual([ncc.rows.length, ncc.truncated], [3_000, true]);
 });
 
 test("fetchPaged: rows removed after the count end the read instead of failing it; other errors still throw", async () => {

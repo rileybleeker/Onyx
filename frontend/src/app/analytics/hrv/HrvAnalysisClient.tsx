@@ -31,6 +31,9 @@ import {
   SAME_NIGHT_FIRST_PREDICTION_DATE, forecastSource, isSameNightComparable, splitComparable,
 } from "@/lib/hrv-forecast-cutover";
 import type { SweetSpotBaked, SweetSpotRow } from "@/lib/sweet-spot";
+import {
+  doseCoverageLines, doseRowLeftOutDays, doseRowUnit, parseDoseCoverage, showDoseResponseCard,
+} from "@/lib/supplement-units";
 import type { HrvInitial } from "./HrvLoader";
 import SweetSpotPanel from "./SweetSpotPanel";
 
@@ -304,6 +307,7 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
   const [habitShap, setHabitShap] = useState<any[]>(initial?.habitShap ?? []);
   const [supplementImpact, setSupplementImpact] = useState<any[]>(initial?.supplementImpact ?? []);
   const [supplementDoseResponse, setSupplementDoseResponse] = useState<any[]>(initial?.supplementDoseResponse ?? []);
+  const [supplementDoseCoverage, setSupplementDoseCoverage] = useState<any | null>(initial?.supplementDoseCoverage ?? null);
   const [nutritionImpact, setNutritionImpact] = useState<any[]>(initial?.nutritionImpact ?? []);
   const [workoutGap, setWorkoutGap] = useState<WorkoutSleepGap[]>(initial?.workoutGap ?? []);
   const [causalBinary, setCausalBinary] = useState<any[]>(initial?.causalBinary ?? []);
@@ -413,6 +417,7 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         setSarimaxForecast(prev => sameJson(prev, d.sarimaxForecast) ? prev : d.sarimaxForecast);
         setSupplementImpact(prev => sameJson(prev, d.supplementImpact) ? prev : d.supplementImpact);
         setSupplementDoseResponse(prev => sameJson(prev, d.supplementDoseResponse) ? prev : d.supplementDoseResponse);
+        setSupplementDoseCoverage((prev: any) => sameJson(prev, d.supplementDoseCoverage) ? prev : d.supplementDoseCoverage);
         setNutritionImpact(prev => sameJson(prev, d.nutritionImpact) ? prev : d.nutritionImpact);
         setHabitImpact(prev => sameJson(prev, d.habitImpact) ? prev : d.habitImpact);
         setHabitCorrelations(prev => sameJson(prev, d.habitCorrelations) ? prev : d.habitCorrelations);
@@ -1420,17 +1425,35 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
         </DeferredMount>
         </Part>
 
-        {/* Supplement Dose-Response — conditional render */}
-        {supplementDoseResponse.length > 0 && (
+        {/* Supplement Dose-Response — conditional render (estimates, or compounds left out for their unit) */}
+        {showDoseResponseCard(supplementDoseResponse, parseDoseCoverage(supplementDoseCoverage)) && (
           <Part id="supplement-dose-response" title="Supplement Dose-Response" width="half">
           <DeferredMount minHeight={460}>
           <ChartCard collapsible
             title="Supplement Dose-Response"
             subtitle="Spearman ρ between daily amount and that night's HRV (compounds with ≥3 distinct doses)"
             source="SPEARMAN ρ"
-            info="What it shows: for compounds where the dose actually varies, whether 'more = better/worse?' Only includes compounds with ≥3 distinct non-zero doses (constant-dose compounds appear in the Yes/No chart above instead). Method: Spearman ρ — a rank-based correlation between daily total amount and that night's HRV; robust to outliers and skewed distributions; handles non-linear monotonic dose-response curves; scores range −1.0 to +1.0. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights; doses is the count of distinct non-zero dose levels seen. BH-FDR corrected across compounds. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
+            info="What it shows: for compounds where the dose actually varies, whether 'more = better/worse?' Only includes compounds with ≥3 distinct non-zero doses (constant-dose compounds appear in the Yes/No chart above instead). One unit per compound: mg (IU converted with the vitamin's own factor), else the label's one unit; amounts in different units are never added, and a day with an intake in another unit or without a readable amount on the label is left out rather than counted as 0. Compounds with no comparable series are listed under the chart. Method: Spearman ρ — a rank-based correlation between daily total amount and that night's HRV; robust to outliers and skewed distributions; handles non-linear monotonic dose-response curves; scores range −1.0 to +1.0. Tooltip: ρ is the correlation; p is the p-value (chance the link is random noise — <0.05 is the conventional significance threshold); n is the number of nights; doses is the count of distinct non-zero dose levels seen. BH-FDR corrected across compounds. ⚠ marks rows with n<20 — estimates are unstable. Associational, not causal."
           >
             {(() => {
+              const coverageLines = doseCoverageLines(parseDoseCoverage(supplementDoseCoverage));
+              const coverageNote = coverageLines.length > 0 ? (
+                <div className="px-6 pt-2 space-y-1" data-testid="dose-response-coverage">
+                  {coverageLines.map((line, i) => (
+                    <p key={i} className="text-[11px] text-text-tertiary leading-relaxed">{line}</p>
+                  ))}
+                </div>
+              ) : null;
+              if (supplementDoseResponse.length === 0) {
+                return (
+                  <>
+                    <p className="text-[11px] text-text-tertiary py-6 text-center px-6">
+                      No compound has enough days in one comparable unit.
+                    </p>
+                    {coverageNote}
+                  </>
+                );
+              }
               // dose-response rows may or may not carry passes_fdr depending
               // on pipeline version; treat missing as "FDR unknown" — when
               // the global FDR filter is ON we hide only rows that EXPLICITLY
@@ -1439,21 +1462,29 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
                 ? supplementDoseResponse.filter((d: any) => d.passes_fdr !== false)
                 : supplementDoseResponse
               ).slice(0, 12);
-              const drDecorated = dr.map((d: any) => ({
-                ...d,
-                displayLabel: `${d.low_n ? "⚠ " : ""}${d.passes_fdr === true ? "✓ " : ""}${d.compound}${d.unit ? ` (${d.unit})` : ""}`,
-              }));
+              const drDecorated = dr.map((d: any) => {
+                const unit = doseRowUnit(d);
+                return {
+                  ...d,
+                  displayLabel: `${d.low_n ? "⚠ " : ""}${d.passes_fdr === true ? "✓ " : ""}${d.compound}${unit ? ` (${unit})` : ""}`,
+                  leftOutDays: doseRowLeftOutDays(d),
+                };
+              });
               if (drDecorated.length === 0) {
                 return (
-                  <p className="text-[11px] text-text-tertiary py-6 text-center px-6">
-                    No dose-response rows survive BH-FDR at q&lt;0.05.{" "}
-                    <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
-                      Show all
-                    </button>.
-                  </p>
+                  <>
+                    <p className="text-[11px] text-text-tertiary py-6 text-center px-6">
+                      No dose-response rows survive BH-FDR at q&lt;0.05.{" "}
+                      <button onClick={() => setFdrOnly(false)} className="text-accent hover:underline">
+                        Show all
+                      </button>.
+                    </p>
+                    {coverageNote}
+                  </>
                 );
               }
               return (
+                <>
                 <ResponsiveContainer width="100%" height={chartHeight(drDecorated.map((d: any) => d.displayLabel), chars.xlong, 240)}>
                   <BarChart data={drDecorated} layout="vertical"
                             margin={{ left: 8, right: 20, top: 4, bottom: 20 }}>
@@ -1468,8 +1499,9 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
                                const d = p?.payload ?? {};
                                const fdr = d.passes_fdr === true ? " · FDR✓"
                                          : d.passes_fdr === false ? " · FDR✗" : "";
+                               const leftOut = d.leftOutDays ? ` · ${d.leftOutDays}` : "";
                                return [
-                                 `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses}${fdr})`,
+                                 `${Number(v).toFixed(3)} (p=${(d.p_value ?? 0).toFixed(3)}, n=${d.n}, doses=${d.n_distinct_doses}${fdr})${leftOut}`,
                                  "Spearman ρ",
                                ];
                              }} />
@@ -1482,6 +1514,8 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
+                {coverageNote}
+                </>
               );
             })()}
           </ChartCard>

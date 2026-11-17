@@ -59,7 +59,11 @@ DECLARE
     e pds.experiments%ROWTYPE;
     last_day date;
     effect_keys text[] := ARRAY['estimate', 'ci_low', 'ci_high', 'p_value', 'carryover', 'two_night_total',
-                                'decision', 'sensitivity', 'secondary_outcomes', 'allocation', 'aa_check'];
+                                'decision', 'sensitivity', 'secondary_outcomes', 'allocation', 'aa_check',
+                                'p_carryover', 'p_value_no_effect', 'p_carryover_no_effect',
+                                'carryover_ci_low', 'carryover_ci_high', 'carryover_exceeds_half_mid',
+                                'hac_se', 'hac_se_carryover', 'decision_if_supported', 'decision_firm',
+                                'decision_withheld', 'inference'];
 BEGIN
     NEW.updated_at := now();
     IF (NEW.payload ->> 'report_kind') IS DISTINCT FROM NEW.report_kind THEN

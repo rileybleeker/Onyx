@@ -172,7 +172,8 @@ class Store(admin.Store):
 
     def screen_rows(self, first: date, last: date) -> list[dict]:
         return self._paged(lambda lo, hi: self._t("phone_usage_daily").select(
-            "behavioral_date,sleep_start,synced_at,minutes_last_hour_before_sleep_est").gte(
+            "behavioral_date,sleep_start,synced_at,minutes_last_hour_before_sleep_est,export_complete,"
+            "pre_sleep_complete").gte(
             "behavioral_date", first.isoformat()).lte("behavioral_date", last.isoformat()).order("behavioral_date").range(lo, hi))
 
     def set_status(self, experiment_id: str, status: str) -> None:
@@ -340,7 +341,16 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     """The verdict of an A/A check (protocol kind: aa), None for a treatment trial.
 
     Both arms carried the same instruction, so a significant difference can only be a false one.
-    The other two items are the rest of Phase 2's "done when" (doc 12): every trial day was revealed
+    With identical arms Fisher's sharp null (the schedule changes no night) holds exactly, so the
+    check reads its randomization p (p_value_no_effect): exact, and as sensitive as the design
+    allows. The same-night p_value also allows for any carryover, which makes it conservative and,
+    on a 4-week check, close to 1 (doc 8.1), so it is used only for a report stored before
+    p_value_no_effect existed. `p_source` names the one used.
+    That p counts only when the report marks it supported (inference.outputs[p_source].supported):
+    missing nights caused by the arm invalidate Fisher's test too, so a non-significant p from an
+    unsupported test is not a pass (`inference_supported`, with the failed checks' reasons in
+    `unsupported_reasons`). A report stored before the inference block existed carries no mark.
+    The last two items are the rest of Phase 2's "done when" (doc 12): every trial day was revealed
     on Today, and 90% or more of the days have a check-in answer. Report re-runs being idempotent is
     shown by the tests and by the final report being written once.
     """
@@ -349,17 +359,38 @@ def aa_check(exp: dict[str, Any], report: dict[str, Any], n_done: int, revealed:
     start = _day(exp["start_date"])
     days = [(start + timedelta(days=i)).isoformat() for i in range(n_done)]
     days_revealed = sum(1 for d in days if d in revealed)
-    p_value = report.get("p_value")
-    analysed = isinstance(p_value, (int, float)) and not isinstance(p_value, bool) and not report.get("not_analysable")
+
+    def number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    p_source = "p_value_no_effect" if number(report.get("p_value_no_effect")) else "p_value"
+    p_value = report.get(p_source)
+    analysed = number(p_value) and not report.get("not_analysable")
     false_effect = bool(p_value < float(exp["alpha"])) if analysed else None
     answer_pct = round(100.0 * answered / n_done, 1) if n_done else None
+    # Whether the test the check reads rests on assumptions that held (None = no inference block).
+    inference = report.get("inference") if isinstance(report.get("inference"), dict) else {}
+    outputs = inference.get("outputs") if isinstance(inference.get("outputs"), dict) else {}
+    entry = outputs.get(p_source) if isinstance(outputs.get(p_source), dict) else {}
+    supported = entry.get("supported") if isinstance(entry.get("supported"), bool) else None
+    if supported is None and p_source in (inference.get("unsupported_outputs") or []):
+        supported = False
+    needs = set(entry.get("needs") or [])
+    unsupported_reasons = [str(c.get("reason")) for c in inference.get("checks") or []
+                           if isinstance(c, dict) and c.get("status") == "failed"
+                           and (needs & set(c.get("covers") or []) or not needs)] if supported is False else []
     done = {
         "no_false_effect": false_effect is False,
+        "inference_supported": supported is not False,
         "every_day_revealed": n_done > 0 and days_revealed == n_done,
         "answers_on_90pct_of_days": answer_pct is not None and answer_pct >= AA_MIN_ANSWER_PCT,
     }
     return {
         "expected": "no difference: both arms carried the same instruction",
+        "p_source": p_source,
+        "p_value": float(p_value) if analysed else None,
+        "p_supported": supported,
+        "unsupported_reasons": unsupported_reasons,
         "false_effect": false_effect,
         "days": n_done,
         "days_revealed": days_revealed,
@@ -465,11 +496,20 @@ def _final(store: Store, exp: dict[str, Any], today: date, arms: list[str], seed
            day_rows: list[dict], screen_rows: list[dict], alignment_version: str) -> dict[str, Any]:
     """Run the registered analysis. experiment_analysis.analyze_trial refuses before the end."""
     experiment_id, start, n_sched = exp["experiment_id"], _day(exp["start_date"]), int(exp["n_days"])
+    # The registered protocol's declarations for the untestable parts of the model (doc 8.1).
+    registered = (exp.get("protocol") or {}).get("analysis") if isinstance(exp.get("protocol"), dict) else None
+    registered = registered if isinstance(registered, dict) else {}
+    carryover_nights = registered.get("carryover_nights")
+    justification = registered.get("model_justification")
     spec = analysis.TrialSpec(
         experiment_id=experiment_id, start=start, planned_end=_day(exp["planned_end"]), mid_ms=float(exp["mid_ms"]),
         block_len=int(exp["block_len"]), n_a=int(exp["n_a_per_block"]), alpha=float(exp["alpha"]),
         n_redraws=int(exp["n_redraws"]), control_arm=exp.get("control_arm") or "B",
-        stopped_on=_day(exp["stopped_on"]) if exp.get("stopped_on") else None)
+        stopped_on=_day(exp["stopped_on"]) if exp.get("stopped_on") else None,
+        kind=design.trial_kind(exp.get("protocol")),
+        carryover_nights=carryover_nights if isinstance(carryover_nights, int) and not isinstance(carryover_nights, bool) else None,
+        model_justification=justification if isinstance(justification, str) else None,
+        inference_method=registered.get("inference_method") if isinstance(registered.get("inference_method"), str) else None)
     analysis.assert_reportable(spec, today)
 
     first, last = start - timedelta(days=7), start + timedelta(days=n_sched)
@@ -501,6 +541,8 @@ def _final(store: Store, exp: dict[str, Any], today: date, arms: list[str], seed
 
     data = analysis.TrialData(
         arms=arms, outcome=y, excluded_blocks=set(exclusions["blocks"]), adherent=adherent,
+        # Built from earlier nights, inside the trial too, so they depend on earlier arms: these fits'
+        # p-value and interval are approximate, their no-effect p exact (analysis.output_semantics).
         covariates={"hrv_lag1": lag1, "hrv_7d_mean": mean7},
         # Eight Sleep keys a night by its wake-up day, so the sleep that closes day D is on row D + 1.
         secondary_outcomes={"eight_sleep_hrv": series("eight_sleep_hrv", offset=1), "whoop_rhr": series("whoop_rhr")})

@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Area, CartesianGrid, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { accentColor, axisTick, chartColors, chartTooltip, gridStyle } from "@/lib/chart-theme";
 import type { ForecastResult } from "@/lib/cash-forecast";
+import { nextExpiry, safeToMoveTile } from "@/lib/cash-forecast-eligibility";
 import type { DriverRow } from "@/lib/cash-forecast-store";
 import type { AccuracyRow, ForecastAccountView, PlanItemView } from "@/lib/cash-forecast-server";
 import type { ScenarioParams } from "@/lib/cash-forecast-scenario";
@@ -31,6 +32,41 @@ const dateLabel = (iso: string, opts: Intl.DateTimeFormatOptions = { month: "sho
 const card = "rounded-card shadow-card border border-border-subtle bg-surface-card p-4";
 const input = "rounded-control border border-border-subtle bg-transparent px-2 py-1 text-[13px]";
 const button = "rounded-control border border-border-subtle px-3 py-1 text-[13px] hover:bg-white/5 disabled:opacity-50";
+
+/**
+ * The client's clock for the safe-to-move check, so a page (or a scroll section, or a copy kept by the client cache)
+ * left open past the check's expiry withholds the amount instead of showing it as actionable. undefined until
+ * mounted, so the first render equals the server's (the server already applied its own clock). Re-read at the
+ * earliest expiry ahead and whenever the page comes back into view (a sleeping laptop delays timers).
+ */
+function useCheckClock(results: readonly ({ eligibility?: unknown } | null | undefined)[]): number | undefined {
+  const [now, setNow] = useState<number | undefined>(undefined);
+  const untils = results.map((r) => (r?.eligibility as { validUntil?: unknown } | undefined)?.validUntil ?? "").join("|");
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = () => {
+      const t = Date.now();
+      setNow(t);
+      if (timer) clearTimeout(timer);
+      timer = null;
+      const next = nextExpiry(results, t);
+      // +1 s past the expiry; setTimeout's longest delay is about 24.8 days.
+      if (next !== null) timer = setTimeout(tick, Math.min(next - t + 1_000, 2 ** 31 - 1));
+    };
+    tick();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+    // The check's expiry times are what matter; the result objects change identity on every refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [untils]);
+  return now;
+}
 
 async function send(url: string, method: string, body?: unknown): Promise<string | null> {
   try {
@@ -82,6 +118,26 @@ export default function ForecastView({
   const [error, setError] = useState<string | null>(null);
   const h = result.headlines;
   const buffer = Number((drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0);
+  // Safe to move: an amount only when the inputs were complete and fresh (result.eligibility), else the reasons.
+  // checkNow = this browser's clock (after mount): an amount whose check has expired since it was computed is withheld.
+  const checkNow = useCheckClock([result, scenario?.result]);
+  const safe = safeToMoveTile(result, buffer, checkNow);
+  // Pool accounts Riley left out of the amount (driver "safe-to-move"): an account the feed no longer refreshes would
+  // otherwise withhold it for good. Leaving one out takes its balance out of the amount; the projection keeps it.
+  // One account per request, merged with the saved list on the server (never this page's copy of the drivers).
+  const setLeftOut = (account: string, out: boolean) => run(() => send("/api/finance/forecast/drivers", "PUT", { key: "safe-to-move", account, leaveOut: out }));
+  // Keyed by account AND text (index for an exact repeat): two accounts can share a label, so the same sentence can
+  // name two accounts, and each Leave it out button must stay bound to its own account.
+  const reasonItem = (r: { text: string; account?: string }, i: number) => (
+    <li key={`${i}|${r.account ?? ""}|${r.text}`}>
+      {r.text}
+      {r.account && (
+        <button type="button" className="ml-1 underline disabled:opacity-50" disabled={busy} onClick={() => void setLeftOut(r.account as string, true)}>
+          Leave it out
+        </button>
+      )}
+    </li>
+  );
 
   const run = async (fn: () => Promise<string | null>) => {
     setBusy(true);
@@ -133,12 +189,49 @@ export default function ForecastView({
             </div>
           </Part>
           <Part id="safe-to-move" title="Safe to move to savings" width="quarter">
-            <div className={card}>
+            {/* The amount and the reason it is withheld live in ONE part, so Personalize cannot hide one without the other. */}
+            <div className={`${card} ${safe.kind === "unavailable" ? "border-mid/40" : ""}`} data-testid="safe-to-move">
               <p className="text-[12px] text-text-tertiary">Safe to move to savings / investing</p>
-              <p className="text-xl font-semibold">{usd(h.safeToMoveCents)}</p>
-              <p className="text-[12px] text-text-secondary">
-                keeps the cautious path above {buffer > 0 ? usd(buffer) : "$0"} for 13 weeks{h.safeToMoveCents > 0 ? ` · or about ${usd(Math.floor(h.safeToMoveCents / 13))} a week` : ""}
-              </p>
+              {safe.kind === "amount" ? (
+                <>
+                  <p className="text-xl font-semibold">{usd(safe.cents)}</p>
+                  <p className="text-[12px] text-text-secondary">
+                    keeps the cautious path above {safe.bufferSet ? `${usd(safe.bufferCents)} (your buffer)` : "$0"} for 13 weeks
+                    {safe.perWeekCents !== null ? ` · or about ${usd(safe.perWeekCents)} a week` : ""}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-xl font-semibold text-mid">Not available</p>
+                  <ul className="mt-1 space-y-0.5 text-[12px] text-mid" aria-label="Why there is no amount">
+                    {safe.reasons.map(reasonItem)}
+                    {safe.more.length > 0 && (
+                      <li>
+                        <details>
+                          <summary className="cursor-pointer">{`${safe.more.length} more`}</summary>
+                          <ul className="mt-0.5 space-y-0.5">{safe.more.map(reasonItem)}</ul>
+                        </details>
+                      </li>
+                    )}
+                  </ul>
+                  <p className="mt-1 text-[12px] text-text-secondary">The projection below is an estimate.</p>
+                </>
+              )}
+              {safe.leftOut.length > 0 && (
+                <ul className="mt-1 space-y-0.5 text-[12px] text-text-secondary" aria-label="Accounts not counted in this amount">
+                  {safe.leftOut.map((l) => (
+                    <li key={l.account}>
+                      {l.text}
+                      {l.chosen && (
+                        <button type="button" className="ml-1 underline disabled:opacity-50" disabled={busy} onClick={() => void setLeftOut(l.account, false)}>
+                          Count it again
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {safe.asOf && <p className="mt-1 text-[12px] text-text-tertiary">Cash as of {safe.asOf}</p>}
             </div>
           </Part>
           <Part id="cash-13w" title="Cash in 13 weeks" width="quarter">
@@ -180,7 +273,7 @@ export default function ForecastView({
           </Part>
           {scenario && (
             <Part id="compare" title="Base plan vs what-if">
-              <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} />
+              <CompareTable base={result} baseTax={tax} scen={scenario.result} scenTax={scenario.tax} now={checkNow} />
             </Part>
           )}
         </PartGroup>

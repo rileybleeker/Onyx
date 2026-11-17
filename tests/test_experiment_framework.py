@@ -5,12 +5,13 @@ Covers
     stream or SeedSequence ever changes), balance and uniformity, the re-draws use the same
     procedure, seed commitment, protocol template + validation rules (8 ms floor, future start,
     alignment version, seed commitment, supported objective source);
-  * experiment_analysis: on synthetic AR(1) nights with missing data, the randomization test's
-    type I error is near nominal, it detects a planted effect, the carryover term keeps the
-    same-night estimate unbiased when the effect lingers, slow drift is absorbed, the interval
-    covers the truth and agrees with the p-value, missing nights are never imputed, the
-    missingness check flags arm-dependent gaps, and analyze_trial REFUSES before the
-    pre-registered end;
+  * experiment_analysis: on synthetic AR(1) nights with missing data, Fisher's no-effect test is
+    exact and the same-night test (Berger-Boos, carryover as a nuisance) keeps its type I error at
+    or under nominal, it detects a planted effect, the carryover term keeps the same-night
+    estimate unbiased when the effect lingers, slow drift is absorbed, the interval covers the
+    truth and agrees with the p-value, missing nights are never imputed, the missingness check
+    flags arm-dependent gaps, and analyze_trial REFUSES before the pre-registered end (the
+    inference under carryover and its calibration: tests/test_experiment_calibration.py);
   * experiment_admin: seed / register / verify / stop against an in-memory store: nothing
     printed contains a seed or an arm, registration needs a merged clean protocol and a matching
     commitment, a tampered schedule is a GUARD failure, every write leaves a heartbeat;
@@ -25,7 +26,7 @@ import io
 import re
 import sys
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -37,6 +38,7 @@ import numpy as np  # noqa: E402
 import experiment_admin as admin  # noqa: E402
 import experiment_analysis as ea  # noqa: E402
 import experiment_design as ed  # noqa: E402
+import experiment_fingerprint as ef  # noqa: E402
 
 GOLDEN_SEED = hashlib.sha256(b"onyx experiment framework golden test seed (synthetic)").digest()
 GOLDEN_SCHEDULE = "ABBABABAABBAABABBAABABBABAABAABBABBAABBABAABBABA"
@@ -145,21 +147,25 @@ def test_schedule_rows():
 # ---------------------------------------------------------------------------
 
 def test_type_one_error_is_near_nominal_on_null_data():
-    fits = _simulate(seed=11, reps=400)
-    rate = np.mean([f["p_value"] < 0.05 for f in fits])
+    fits = _simulate(seed=11, reps=400, n_redraws=999)
     # 400 trials: one standard error of a true 5% rate is 1.1 points.
-    assert 0.02 <= rate <= 0.085, f"type I error {rate:.3f} is not near 0.05"
+    exact = np.mean([f["p_value_no_effect"] < 0.05 for f in fits])
+    assert 0.02 <= exact <= 0.085, f"Fisher's no-effect test rejects {exact:.3f} of the time, not about 0.05"
+    # The same-night test allows for any carryover, so it may be conservative but never above nominal.
+    rate = np.mean([f["p_value"] < 0.05 for f in fits])
+    assert rate <= 0.085, f"same-night type I error {rate:.3f} is above 0.05"
+    assert all(f["p_value"] >= f["nuisance_beta"] for f in fits), "a Berger-Boos p-value is never below beta"
     assert abs(np.mean([f["estimate"] for f in fits])) < 0.6, "no effect must estimate to about zero"
     carry_rate = np.mean([f["p_carryover"] < 0.05 for f in fits])
     assert carry_rate <= 0.085, f"carryover test rejects too often under the null ({carry_rate:.3f})"
 
 
 def test_detects_a_planted_effect():
-    fits = _simulate(seed=12, reps=300, effect=8.0)
+    fits = _simulate(seed=12, reps=300, effect=8.0, n_redraws=999)
     power = np.mean([f["p_value"] < 0.05 for f in fits])
     assert power > 0.65, f"power {power:.2f} at +8 ms over 232 days (the design assumes about 0.8)"
     assert abs(np.mean([f["estimate"] for f in fits]) - 8.0) < 0.8
-    weak = np.mean([f["p_value"] < 0.05 for f in _simulate(seed=13, reps=200, effect=1.0)])
+    weak = np.mean([f["p_value"] < 0.05 for f in _simulate(seed=13, reps=200, effect=1.0, n_redraws=999)])
     assert weak < 0.25, "a 1 ms effect must not look detectable"
 
 
@@ -181,7 +187,8 @@ def test_interval_covers_the_truth_and_agrees_with_the_test():
     fits = _simulate(seed=16, reps=150, effect=8.0, n_redraws=999, with_ci=True)
     covered = np.mean([f["ci_low"] <= 8.0 <= f["ci_high"] for f in fits])
     assert covered >= 0.90, f"95% interval covers the true effect in {covered:.2f} of trials"
-    disagree = sum((f["p_value"] <= 0.05) != (f["ci_low"] > 0 or f["ci_high"] < 0) for f in fits)
+    # One boundary everywhere: rejected when p < alpha (the decision rule), accepted when p >= alpha.
+    disagree = sum((f["p_value"] < 0.05) != (f["ci_low"] > 0 or f["ci_high"] < 0) for f in fits)
     assert disagree <= 2, f"interval and p-value disagree about zero in {disagree} trials"
     for f in fits[:20]:
         assert f["ci_low"] < f["estimate"] < f["ci_high"]
@@ -259,6 +266,11 @@ def test_report_is_deterministic_and_complete():
         assert key in first, key
     assert first["days_scheduled"] == N_DAYS and first["n_nights"] == int((~np.isnan(data.outcome)).sum())
     assert first["decision"] in ("adopt_A", "no_meaningful_effect", "inconclusive")
+    for key in ("p_value_no_effect", "p_carryover_no_effect", "carryover_ci_low", "carryover_ci_high",
+                "decision_if_supported", "decision_firm", "decision_withheld", "inference"):
+        assert key in first, key
+    assert first["inference"]["method"] == ea.INFERENCE_METHOD and first["nuisance_beta"] == ea.nuisance_beta_for(999)
+    assert first["decision"] == (first["decision_if_supported"] if first["decision_firm"] else "inconclusive")
     assert "ln_outcome" in first["sensitivity"] and "per_protocol" not in first["sensitivity"]
     assert np.sign(first["sensitivity"]["ln_outcome"]["estimate_pct"]) == np.sign(first["estimate"])
 
@@ -282,6 +294,11 @@ def test_stopped_early_trial_is_reported_as_such():
     report = ea.analyze_trial(spec, data, stop + timedelta(days=1))
     assert report["stopped_early"] is True and report["last_day_analysed"] == stop.isoformat()
     assert report["days_in_scope"] <= 122 and report["n_nights"] < 122
+    # The stop withholds a firm decision and is named (review PIPE06-FOLLOWUP-R1).
+    check = {c["id"]: c for c in report["inference"]["checks"]}["stopping_not_outcome_dependent"]
+    assert check["status"] == "failed" and check["blocks_decision"] is True and stop.isoformat() in check["reason"]
+    assert report["decision_firm"] is False and report["decision"] == "inconclusive"
+    assert check["reason"] in report["decision_withheld"]
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +372,35 @@ def test_protocol_rules():
     assert "front matter" in " ".join(_catch(lambda: ed.parse_protocol(b"# no front matter\n")))
     assert _validate(_protocol_text(**{"    arm: A\n": "    arm: A\n  min_pct: 80\n"}))["adherence"]["min_pct"] == 80
     assert "min_pct" in _problems(_protocol_text(**{"    arm: A\n": "    arm: A\n  min_pct: 180\n"}))
+
+
+def test_protocol_declares_the_untestable_model_and_the_registered_method():
+    # Doc 8.1: one night of carryover, declared and justified per trial; anything longer is the period design.
+    assert "carryover_nights must be 1" in _problems(_protocol_text(**{"carryover_nights: 1 ": "carryover_nights: 2 "}))
+    assert "carryover_nights must be 1" in _problems(_protocol_text(**{"  carryover_nights: 1 ": "  # carryover_nights: 1 "}))
+    # An integer only: the report job reads it as an int, so 1.0 would register and then leave the
+    # (written-once) final report's decision withheld for good.
+    for text in ("1.0", "true", "'1'"):
+        assert "carryover_nights must be 1" in _problems(_protocol_text(**{"carryover_nights: 1 ": f"carryover_nights: {text} "})), text
+    justification = ("  model_justification: >-\n"
+                     "    Phone use in the last hour acts on that night's sleep; nothing in it is expected to last past\n"
+                     "    the next night, and the effect should be about the same size every night. The day before the\n"
+                     "    trial is a usual evening, like arm B.\n")
+    assert "model_justification is missing" in _problems(_protocol_text(**{justification: ""}))
+    assert "model_justification is missing" in _problems(_protocol_text(**{justification: "  model_justification: '  '\n"}))
+    # The register step passes the analysis that would run; the protocol must name the same one.
+    assert _validate(_protocol_text(), inference_method=ea.INFERENCE_METHOD)["n_redraws"] == 10000
+    assert "analysis.inference_method" in _problems(_protocol_text(), inference_method="synthetic_other_v9")
+    assert "analysis.inference_method" in _problems(_protocol_text(**{
+        "  inference_method: joint_sharp_null_berger_boos_v1 ": "  # inference_method: none "}),
+        inference_method=ea.INFERENCE_METHOD)
+    # alpha must leave room above the nuisance level, or the same-night test could almost never reject.
+    tight = _protocol_text(**{"  alpha: 0.05\n": "  alpha: 0.01\n", "  n_redraws: 10000\n": "  n_redraws: 999\n"})
+    assert "too little room above the nuisance level" in _problems(tight)
+    assert "too little room" in _problems(_protocol_text(**{"  alpha: 0.05\n": "  alpha: 0.0015\n"}))
+    assert "too little room" not in _problems(_protocol_text(**{"  alpha: 0.05\n": "  alpha: 0.01\n"})), \
+        "alpha 0.01 is fine with 10,000 re-draws (beta 0.001)"
+    assert ea.nuisance_beta_for(999) == ed.nuisance_beta_for(999), "one nuisance level for the rules and the analysis"
 
 
 def test_protocol_kind_keeps_an_aa_check_and_a_treatment_trial_apart():
@@ -480,6 +526,33 @@ def _refused(fn):
     raise AssertionError("expected a refusal")
 
 
+@contextmanager
+def _reviewed(**changes):
+    """A synthetic METHOD_REVIEW covering the template's configuration, restored afterwards."""
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        fingerprint = ef.inference_fingerprint()
+        ea.METHOD_REVIEW.update(
+            method=ea.INFERENCE_METHOD, interval_method=ea.INTERVAL_METHOD,
+            independent_review={"reference": "synthetic-review-ref", "reviewers": ("synthetic-a", "synthetic-b"),
+                                "verdicts": ("sound", "sound"), "reviewed_revision": "synthetic-revision",
+                                "inference_fingerprint": fingerprint},
+            calibration_report={"reference": "synthetic-report-ref", "revision": "synthetic-revision",
+                                "inference_fingerprint": fingerprint, "harness_fingerprint": "synthetic-harness",
+                                "review_ready": True, "suite_run": "synthetic-suite-run"},
+            n_redraws=(10000,), alpha=(0.05,), block_designs=((4, 2),), n_blocks=(7, 58))
+        ea.METHOD_REVIEW.update(changes)
+        yield
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+
+
+def _register_reviewed(*args, **kw):
+    with _reviewed():
+        return admin.cmd_register(*args, **kw)
+
+
 def test_admin_seed_then_register_then_verify():
     store = FakeStore()
     with tempfile.TemporaryDirectory() as tmp:
@@ -503,8 +576,20 @@ def test_admin_seed_then_register_then_verify():
             "a trial cannot be registered before its report table exists"
         store.reports_ready = True
         assert store.rows["EXP-901"]["status"] == "draft" and store.sched == {}, "a refused registration writes nothing"
+        # A treatment trial waits for the method review that covers its alpha and re-draw count (doc 8.1):
+        # its final report is written once, so it could otherwise never reach a firm decision.
+        pending = _refused(lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
+        assert "cannot be registered yet" in pending and "independent statistical review" in pending
+        with _reviewed(n_redraws=(999,)):
+            assert "re-draw counts, not this trial's 10000" in _refused(
+                lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
+        # ... and its block design: a calibration that never ran this many blocks does not cover it.
+        with _reviewed(n_blocks=(7, 40)):
+            assert "covers 7 to 40 scheduled blocks, not this trial's 58" in _refused(
+                lambda: admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
+        assert store.rows["EXP-901"]["status"] == "draft" and store.sched == {}, "a refused registration writes nothing"
 
-        out = "\n".join(admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
+        out = "\n".join(_register_reviewed(store, path, "EXP-901", root=root, today=TODAY, git=MERGED))
         row, rows = store.rows["EXP-901"], store.sched["EXP-901"]
         assert row["status"] == "registered" and row["git_commit"] == "c0ffee" and row["protocol_path"] == path
         assert row["protocol_sha256"] == ed.protocol_sha256((root / path).read_bytes())
@@ -536,6 +621,27 @@ def test_admin_refuses_bad_protocol_files():
         assert store.rows == {}
 
 
+def test_admin_registers_an_aa_check_before_the_method_review():
+    # The A/A check is judged on Fisher's no-effect test, so it may run before the review is recorded.
+    store = FakeStore()
+    raw = (ROOT / "docs" / "experiments" / "EXP-900.md").read_text(encoding="utf-8")
+    seeded = raw.replace("seed_sha256: paste-the-value-printed-by-the-seed-step", f"seed_sha256: {GOLDEN_COMMITMENT}")
+    start = ed._as_date(ed.parse_protocol(raw.encode())["start"])
+    saved = dict(ea.METHOD_REVIEW)
+    try:
+        ea.METHOD_REVIEW.update(calibration_report=None, independent_review=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            root, path = _repo(tmp, text=seeded, name="EXP-900.md")
+            admin.cmd_seed(store, path, root=root, new_seed=lambda: GOLDEN_SEED)
+            out = "\n".join(admin.cmd_register(store, path, "EXP-900", root=root, today=start - timedelta(days=1), git=MERGED))
+    finally:
+        ea.METHOD_REVIEW.clear()
+        ea.METHOD_REVIEW.update(saved)
+    assert "EXP-900 registered and locked" in out and store.rows["EXP-900"]["status"] == "registered"
+    assert store.rows["EXP-900"]["protocol"]["analysis"]["inference_method"] == ea.INFERENCE_METHOD, \
+        "the registered protocol records the inference method"
+
+
 def test_admin_stop_and_status():
     store = FakeStore()
     assert admin.cmd_status(store) == ["No experiments."]
@@ -543,7 +649,7 @@ def test_admin_stop_and_status():
         root, path = _repo(tmp)
         admin.cmd_seed(store, path, root=root, new_seed=lambda: GOLDEN_SEED)
         assert "not an active trial" in _refused(lambda: admin.cmd_stop(store, "EXP-901", "ill", "EXP-901"))
-        admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED)
+        _register_reviewed(store, path, "EXP-901", root=root, today=TODAY, git=MERGED)
     assert "--confirm" in _refused(lambda: admin.cmd_stop(store, "EXP-901", "ill", "no"))
     assert "--reason" in _refused(lambda: admin.cmd_stop(store, "EXP-901", "  ", "EXP-901"))
     assert "stopped early on 2030-02-01" in admin.cmd_stop(store, "EXP-901", "ill", "EXP-901")[0]
@@ -574,7 +680,8 @@ def test_admin_power_is_read_only_aggregates_and_refused_during_a_trial():
     assert store.hrv_window == (last - timedelta(days=119), last), "the window ends yesterday and is whole blocks"
     text = "\n".join(out)
     assert "of 120 nights with HRV" in text and re.search(r"needs about \d+ days \(\d+ blocks\) for 80% power", text)
-    assert len(re.findall(r"\d{4}-\d{2}-\d{2}", text)) == 2 and len(out) == 4, "the window's two dates and aggregates, no per-day values"
+    assert len(re.findall(r"\d{4}-\d{2}-\d{2}", text)) == 2 and len(out) == 5, "the window's two dates and aggregates, no per-day values"
+    assert "lower bound" in out[-1] and "calibration report" in out[-1], "the power gap of the carryover-robust test is named"
     assert store.rows == {} and store.supa.heartbeats == [], "the planning check writes nothing"
     assert "--window" in _refused(lambda: admin.cmd_power(store, 30, 8.0))
     store.hrv = {}
@@ -588,7 +695,7 @@ def test_admin_main_leaves_a_heartbeat_and_guard_prefix():
     with tempfile.TemporaryDirectory() as tmp:
         root, path = _repo(tmp)
         admin.cmd_seed(store, path, root=root, new_seed=lambda: GOLDEN_SEED)
-        admin.cmd_register(store, path, "EXP-901", root=root, today=TODAY, git=MERGED)
+        _register_reviewed(store, path, "EXP-901", root=root, today=TODAY, git=MERGED)
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         assert admin.main(["verify", "--experiment", "EXP-901"], store=store) == 0

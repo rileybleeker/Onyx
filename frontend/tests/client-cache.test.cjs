@@ -439,8 +439,33 @@ test('deep-equal bailout: an identical answer is not a change and notifies nobod
   assert.notEqual(cache.peek('k:list'), first);
 });
 
+test('reading practice (READ-QUIZ-01): round attempts and the bank export stay in memory; an answer invalidates nothing', () => {
+  const round = '/api/reading/practice/round/00000000-0000-4000-8000-000000000001';
+  for (const key of [round, `${round}?x=1`, '/api/reading/bank/export', '/api/reading/bank/export?book=synthetic-ledger']) {
+    assert.equal(isSensitiveKey(key), true, key);
+  }
+  // Book-derived content and schedules (no answers): persisted like /api/reading.
+  for (const key of ['/api/reading/practice/today', '/api/reading/practice/today?kind=extra&n=1', '/api/reading/bank', '/api/reading/bank?book=synthetic-ledger',
+    '/api/reading/bank/chapter/3?book=synthetic-ledger', '/api/reading/practice/rounds']) {
+    assert.equal(isSensitiveKey(key), false, key);
+  }
+  // The runner keeps its own state and refreshes /api/reading + the round once when it closes.
+  assert.deepEqual(writeInvalidates('/api/reading/practice/attempt'), []);
+  assert.deepEqual(writeInvalidates('/api/reading/practice/attempt/00000000-0000-4000-8000-000000000002/override'), []);
+  // Flags, approval and run use the area default.
+  for (const p of ['/api/reading/practice/flag', '/api/reading/bank/approval', '/api/reading/bank/run', '/api/reading/practice/attempt/x/other']) {
+    assert.deepEqual(writeInvalidates(p), ['/api/reading', 'reading:'], p);
+  }
+});
+
 test('a successful write invalidates the entries it changed and refetches them in the background', async () => {
-  assert.deepEqual(writeInvalidates('/api/habits/checkin'), ['/api/habits', 'habits:', '/api/delivery']);
+  assert.deepEqual(writeInvalidates('/api/habits/checkin'), ['/api/habits', 'habits:', '/api/delivery', '/api/sleep/winddown']);
+  // A wind-down answer is the chosen habit's own row (PROD-SLEEP-01): habits and wind-down go stale together.
+  assert.deepEqual(writeInvalidates('/api/sleep/winddown/night'), ['/api/sleep', 'sleep:', '/api/habits', 'habits:']);
+  // A cancel that finds the tap had landed changed the same habit row.
+  assert.deepEqual(writeInvalidates('/api/sleep/winddown/cancel'), ['/api/sleep', 'sleep:', '/api/habits', 'habits:']);
+  // A goal or pause change touches no habit row: only the wind-down entries go stale.
+  assert.deepEqual(writeInvalidates('/api/sleep/winddown/rule'), ['/api/sleep', 'sleep:']);
   assert.deepEqual(writeInvalidates('/api/reading/sessions'), ['/api/reading', 'reading:']);
   // A Want to read change refreshes the quest (/api/reading, the switcher's book list) and the list itself.
   assert.deepEqual(writeInvalidates('/api/reading/list'), ['/api/reading', 'reading:']);
@@ -449,7 +474,7 @@ test('a successful write invalidates the entries it changed and refetches them i
   assert.deepEqual(writeInvalidates('/api/urgent-email/clear'), ['/api/urgent-email', 'urgent-email:']);
   assert.deepEqual(writeInvalidates('/onyx/dismiss'), ['agents:']);
   assert.deepEqual(writeInvalidates('/api/habits/sync'), [], 'the page itself re-reads what the sync changed');
-  assert.deepEqual(writeInvalidates('/api/habits/complete'), ['/api/habits/checkin', '/api/habits/list'], '/habits writes its own journal through');
+  assert.deepEqual(writeInvalidates('/api/habits/complete'), ['/api/habits/checkin', '/api/habits/list', '/api/sleep/winddown'], '/habits writes its own journal through');
   assert.ok(writeInvalidates('/api/chat').includes('habits:'), 'chat write tools log habits');
   assert.deepEqual(writeInvalidates('/today'), []);
   // A drink capture is one row counted by Nutrition AND Caffeine: both areas (and their feed seeds) go stale.

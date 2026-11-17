@@ -263,3 +263,113 @@ test('flush() answers whether anything is left unsaved', async () => {
   s.change('');
   assert.equal(await s.flush(), false, 'incomplete input is not saved');
 });
+
+// unknownOutcome (PR 365, Codex review round 2): a save can commit and still fail (its answer was lost). Putting the
+// form back the way it loaded must then be SENT, not dropped as "unchanged", or the unwanted value stays stored.
+class LostAnswer extends Error {}
+
+test('unknownOutcome: after a save that may have gone through, changing back to the stored value is sent', async () => {
+  const t = fakeTimers();
+  const server = { value: 'stored' };
+  const sent = [];
+  let lose = true;
+  const s = new Autosaver({
+    timers: t,
+    delayMs: 100,
+    unknownOutcome: (e) => e instanceof LostAnswer,
+    save: async (v) => {
+      sent.push(v);
+      server.value = v; // the write commits ...
+      if (lose) { lose = false; throw new LostAnswer('no answer'); } // ... and its answer is lost
+    },
+  }, 'stored');
+  s.change('typo');
+  await t.advance(100);
+  assert.equal(server.value, 'typo', 'the save went through; only its answer was lost');
+  assert.equal(s.state.status, 'error');
+  assert.equal(s.state.retrying, true);
+  s.change('stored'); // the form is put back to what it loaded
+  assert.equal(s.state.status, 'waiting', 'not idle: the server may hold the lost save');
+  assert.equal(s.dirty, true);
+  await t.advance(100);
+  assert.deepEqual(sent, ['typo', 'stored']);
+  assert.equal(server.value, 'stored', 'the change back is stored');
+  assert.equal(s.state.status, 'saved');
+  assert.equal(s.dirty, false);
+  s.change('stored'); // known again after a save that answered: sends nothing
+  await t.advance(60000);
+  assert.deepEqual(sent, ['typo', 'stored']);
+});
+
+test('unknownOutcome: a change back made while the lost save was in flight is sent by the retry', async () => {
+  const t = fakeTimers();
+  const server = { value: 'stored' };
+  const sent = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let first = true;
+  const s = new Autosaver({
+    timers: t,
+    delayMs: 100,
+    retryDelaysMs: [1000],
+    unknownOutcome: (e) => e instanceof LostAnswer,
+    save: async (v) => {
+      sent.push(v);
+      if (first) { first = false; await gate; server.value = v; throw new LostAnswer('no answer'); }
+      server.value = v;
+    },
+  }, 'stored');
+  s.change('typo');
+  await t.advance(100); // sent, still waiting for its answer
+  s.change('stored');
+  release();
+  await settle();
+  await settle();
+  assert.equal(s.state.status, 'error');
+  assert.equal(server.value, 'typo');
+  await t.advance(1000); // the retry sends the newest value: the change back
+  assert.deepEqual(sent, ['typo', 'stored']);
+  assert.equal(server.value, 'stored');
+  assert.equal(s.state.status, 'saved');
+});
+
+test('unknownOutcome: a failure it does not claim (and the default) keeps the stored value as known', async () => {
+  for (const opts of [{}, { unknownOutcome: (e) => e instanceof LostAnswer }]) {
+    const t = fakeTimers();
+    const sent = [];
+    let fail = true;
+    const s = new Autosaver({
+      ...opts,
+      timers: t,
+      delayMs: 100,
+      save: async (v) => { if (fail) { fail = false; throw new Error('offline'); } sent.push(v); },
+    }, 'stored');
+    s.change('typo');
+    await t.advance(100);
+    assert.equal(s.state.status, 'error');
+    s.change('stored');
+    await t.advance(60000);
+    assert.deepEqual(sent, [], 'nothing was written, so changing back sends nothing');
+    assert.equal(s.state.status, 'idle');
+  }
+});
+
+test('unknownOutcome: reset and setBaseline say what is stored again', async () => {
+  for (const settleWith of ['reset', 'setBaseline']) {
+    const t = fakeTimers();
+    const sent = [];
+    let lose = true;
+    const s = new Autosaver({
+      timers: t,
+      delayMs: 100,
+      unknownOutcome: (e) => e instanceof LostAnswer,
+      save: async (v) => { if (lose) { lose = false; throw new LostAnswer('no answer'); } sent.push(v); },
+    }, 'stored');
+    s.change('typo');
+    await t.advance(100);
+    s[settleWith]('stored'); // fresh data (or a reset on purpose) says what the server holds
+    s.change('stored');
+    await t.advance(60000);
+    assert.deepEqual(sent, [], settleWith);
+  }
+});

@@ -42,7 +42,7 @@ function load(file, mocks = {}, cache = new Map()) {
   return mod.exports;
 }
 const nav = load('src/lib/nav.ts');
-const Sidebar = load('src/components/Sidebar.tsx', {
+const sidebarModule = load('src/components/Sidebar.tsx', {
   'next/link': ({ children, ...props }) => React.createElement('a', props, children),
   'next/navigation': { usePathname: () => pathname, useRouter: () => ({ push() {} }) },
   '@/lib/nav': nav,
@@ -58,7 +58,8 @@ const Sidebar = load('src/components/Sidebar.tsx', {
     ReloadAppButton: () => React.createElement('button', null, 'Reload fixture'),
     usePaletteShortcutLabel: () => 'Ctrl K',
   },
-}).default;
+});
+const Sidebar = sidebarModule.default;
 const render = () => renderToStaticMarkup(React.createElement(Sidebar));
 // Link destinations only: React 19's server render also emits <link rel="preload" href> for the sidebar logo.
 // Every page is rendered in Quick access AND in its section (for the pre-paint script); the copy that is not shown
@@ -66,7 +67,8 @@ const render = () => renderToStaticMarkup(React.createElement(Sidebar));
 const hrefs = (html) => [...html.matchAll(/<a\b[^>]*>/g)].map((m) => m[0])
   .filter((tag) => !/\sdata-off="true"/.test(tag))
   .map((tag) => (tag.match(/\shref="([^"]+)"/) || [])[1])
-  .filter(Boolean);
+  // Destinations only: the "Skip to page content" link points inside the page (#page-content).
+  .filter((href) => Boolean(href) && !href.startsWith('#'));
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Sidebar's element tree, captured inside a real render so its hooks run in React (calling it bare would not).
 function sidebarTree() {
@@ -134,6 +136,75 @@ test('installed app controls remain present and sidebar remains desktop-only', (
   // The real Personalize button (components/personalize/PersonalizeButton.tsx), not a fixture.
   assert.ok(html.includes('>Personalize</button>'), 'Personalize');
   assert.ok(html.includes('max-md:hidden'));
+});
+// PROD-T11 (2026-11-16): one h1 per page, and a way past the side panel for the keyboard.
+test('the wordmark is not a heading: each page title is the page\'s only h1', () => {
+  const html = render();
+  assert.ok(html.includes('Onyx</p>'), 'wordmark still shown');
+  assert.doesNotMatch(html, /<h[1-6]\b/, 'no heading in the side panel');
+});
+test('"Skip to page content" is the first link and only shows on focus', () => {
+  const html = render();
+  const skip = html.indexOf('Skip to page content');
+  assert.ok(skip > 0, 'skip link present');
+  assert.ok(skip < html.indexOf('Search…'), 'before the search button');
+  assert.ok(skip < html.indexOf('href="/today"'), 'before every page link');
+  const tag = html.slice(html.lastIndexOf('<a', skip), skip);
+  assert.match(tag, /class="sr-only focus:not-sr-only /);
+});
+test('the skip link targets the opened page title, then the page, then <main>', () => {
+  const { pageContentTarget } = sidebarModule;
+  // Synthetic stand-ins for the DOM: the routed page is the scroll root's div child; neighbours are sections.
+  const node = (name, kids = {}) => ({ name, querySelector: (sel) => kids[sel] ?? null });
+  const heading = node('heading');
+  const routed = node('routed', { '[data-testid="page-heading"]': heading });
+  const docWith = (map) => ({ querySelector: (sel) => map[sel] ?? null });
+  const ROUTED = '[data-feed-root] > div[data-feed-route]';
+  assert.equal(pageContentTarget(docWith({ [ROUTED]: routed, main: node('main') })), heading);
+  const bare = node('bare');
+  assert.equal(pageContentTarget(docWith({ [ROUTED]: bare })), bare, 'a page without a title: the page itself');
+  const main = node('main');
+  assert.equal(pageContentTarget(docWith({ main })), main, 'no scroll root: <main>');
+  // /agents is drawn without <main>: its title, else the screen after the side panel (review round 1).
+  const title = node('agents h1');
+  const screen = node('agents screen');
+  assert.equal(pageContentTarget(docWith({ h1: title, [sidebarModule.AFTER_SIDE_PANEL]: screen })), title, 'no <main>: the h1');
+  assert.equal(pageContentTarget(docWith({ [sidebarModule.AFTER_SIDE_PANEL]: screen })), screen, 'no title: what follows the side panel');
+  assert.equal(pageContentTarget(docWith({ h1: title, main })), main, '<main> first when there is one');
+  assert.equal(pageContentTarget(docWith({})), null, 'nothing to skip to');
+});
+// Review round 2 (2026-11-16): the page in view, not always the routed one, when the continuous scroll has moved on.
+test('the skip link targets the page in view of the continuous scroll', () => {
+  const { pageContentTarget } = sidebarModule;
+  const page = (route, kids = {}) => ({ route, getAttribute: (a) => (a === 'data-feed-route' ? route : null), querySelector: (sel) => kids[sel] ?? null });
+  const TITLE = '[data-testid="page-heading"], [data-testid="feed-page-heading"]';
+  const routedTitle = { name: 'routed title' };
+  const neighbourTitle = { name: 'neighbour title' };
+  const routed = page('/log', { '[data-testid="page-heading"]': routedTitle, [TITLE]: routedTitle });
+  const neighbour = page('/nutrition', { [TITLE]: neighbourTitle });
+  const loading = page('/habits');
+  const docWith = (pages) => ({
+    querySelectorAll: (sel) => (sel === '[data-feed-root] > [data-feed-route]' ? pages : []),
+    querySelector: (sel) => (sel === '[data-feed-root] > div[data-feed-route]' ? routed : null),
+  });
+  const doc = docWith([routed, neighbour, loading]);
+  assert.equal(pageContentTarget(doc, '/nutrition'), neighbourTitle, 'a neighbour in view: its title');
+  assert.equal(pageContentTarget(doc, '/habits'), loading, 'still a skeleton: the page itself');
+  assert.equal(pageContentTarget(doc, '/log'), routedTitle, 'the routed page');
+  assert.equal(pageContentTarget(doc, '/status'), routedTitle, 'not in the scroll: the routed page');
+  assert.equal(pageContentTarget(doc, null), routedTitle, 'no page in view given');
+});
+test('the skip link never falls through to the browser jump, and the side panel is marked for the fallback', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'Sidebar.tsx'), 'utf8');
+  const body = src.slice(src.indexOf('function skipToPage'), src.indexOf('export default function Sidebar'));
+  assert.ok(body.indexOf('event.preventDefault()') >= 0 && body.indexOf('event.preventDefault()') < body.indexOf('if (!target) return'), 'prevented before the target check');
+  // A tabindex the link adds goes again on blur (left in place, a click on the page's text would focus the page).
+  const added = body.indexOf('target.setAttribute("tabindex", "-1");');
+  const removed = body.indexOf('target.addEventListener("blur", () => target.removeAttribute("tabindex"), { once: true });');
+  assert.ok(added > 0 && removed > added && removed < body.indexOf('target.focus('), 'tabindex removed on blur when the link added it');
+  assert.match(src, /onClick=\{\(e\) => skipToPage\(e, current\)\}/, 'the page in view');
+  assert.match(src, /<aside data-side-panel=""/);
+  assert.match(sidebarModule.AFTER_SIDE_PANEL, /^\[data-side-panel\] ~ /);
 });
 // CI's offline stage has no browser installed. Opt in after installing Playwright:
 // RUN_DESKTOP_LAYOUT=1 node --test tests/desktop-navigation.test.cjs

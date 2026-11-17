@@ -271,15 +271,18 @@ export default function ScreenTimeView({
         (() => {
           const s = data.summary;
           const basis = s.completeDays === 1 ? "1 complete day" : `${s.completeDays} complete days`;
+          const unverified = s.unverifiedDays ?? 0; // an answer cached before the field existed has none
+          const leftOut = [
+            s.partialDays > 0 ? `${s.partialDays === 1 ? "1 day is" : `${s.partialDays} days are`} still syncing` : null,
+            unverified > 0 ? `${unverified === 1 ? "1 day has" : `${unverified} days have`} no completeness check` : null,
+          ].filter((x): x is string => x !== null);
           return (
             <div className={clsx("space-y-6", busy && "opacity-60")}>
               <div className="space-y-1">
                 <SyncLine sync={data.sync} />
                 <p className="text-[12px] text-text-tertiary">
                   Averages use {basis} in the last {data.windowDays} days
-                  {s.partialDays > 0
-                    ? `; ${s.partialDays === 1 ? "1 day is" : `${s.partialDays} days are`} still syncing and left out.`
-                    : "."}
+                  {leftOut.length > 0 ? `; ${leftOut.join(", ")} and left out.` : "."}
                   {data.skippedRows > 0 ? ` ${data.skippedRows} unreadable row(s) skipped.` : ""}
                 </p>
               </div>

@@ -200,6 +200,7 @@ def cmd_seed(store: Store, protocol_path: str, *, root: Path = ROOT,
 
 def cmd_register(store: Store, protocol_path: str, confirm: str, *, root: Path = ROOT, today: date | None = None,
                  git: Callable[[str], dict[str, Any]] = git_info) -> list[str]:
+    import experiment_analysis as analysis
     import hrv_alignment
 
     rel = _protocol_relpath(protocol_path, root)
@@ -228,7 +229,17 @@ def cmd_register(store: Store, protocol_path: str, confirm: str, *, root: Path =
 
     fields = design.validate_protocol(protocol, today=today or et_today(),
                                       alignment_version=hrv_alignment.ALIGNMENT_VERSION,
-                                      seed_sha256=existing["seed_sha256"])
+                                      seed_sha256=existing["seed_sha256"],
+                                      inference_method=analysis.INFERENCE_METHOD)
+    # A final report is written once and never changes, so a treatment trial registered before its
+    # inference method is reviewed for its alpha, re-draw count and block design could never reach a firm
+    # decision (docs/experiment-framework.md 8.1). An A/A check is judged on Fisher's test and may run first.
+    if design.trial_kind(protocol) == design.KIND_TREATMENT:
+        problem = analysis.method_review_problem(fields["alpha"], fields["n_redraws"], block_len=fields["block_len"],
+                                                 n_a=fields["n_a_per_block"], n_blocks=fields["n_blocks"])
+        if problem:
+            raise AdminError(f"a treatment trial cannot be registered yet: {problem}. Its final decision could never "
+                             "be firm; record what METHOD_REVIEW is missing first (an A/A check may run before)")
     seed_hex = store.seed_hex(experiment_id)
     if not seed_hex or design.seed_commitment(bytes.fromhex(seed_hex)) != existing["seed_sha256"]:
         raise AdminError("GUARD experiment_schedule: the stored seed does not match its commitment")
@@ -273,7 +284,9 @@ def cmd_stop(store: Store, experiment_id: str, reason: str, confirm: str) -> lis
         raise AdminError(f"{experiment_id} is not an active trial")
     stopped_on = store.behavioral_today()
     store.stop(experiment_id, stopped_on, reason.strip())
-    return [f"{experiment_id} stopped early on {stopped_on}. It stays on record and can be analysed as stopped_early."]
+    return [f"{experiment_id} stopped early on {stopped_on}. It stays on record and can be analysed as stopped_early; "
+            "a stop before the planned end means its final report covers the nights before the stop and gives no firm "
+            "decision (docs/experiment-framework.md 8.1, stopping_not_outcome_dependent)."]
 
 
 def cmd_power(store: Store, window_days: int, effect_ms: float, *, n_trials: int = 500) -> list[str]:
@@ -303,7 +316,9 @@ def cmd_power(store: Store, window_days: int, effect_ms: float, *, n_trials: int
             f"mean {obs.mean():.1f} ms, SD {obs.std(ddof=1):.1f} ms.",
             f"Placebo schedules ({n_trials}) analysed as planned: the estimate's chance SD is {sd:.2f} ms over {window_days} days.",
             f"An effect of {effect_ms:g} ms needs about {need} days ({need // 4} blocks) for 80% power, if the noise stays like this window.",
-            "Longer windows that include a noisier period give larger numbers; see docs/experiment-framework.md 7.6."]
+            "Longer windows that include a noisier period give larger numbers; see docs/experiment-framework.md 7.6.",
+            "This is a lower bound: the registered same-night test also allows for any carryover (Berger-Boos, doc 8.1), "
+            "which costs power. Check the length against the power rates in the calibration report (experiment_calibration.py)."]
 
 
 def cmd_status(store: Store) -> list[str]:

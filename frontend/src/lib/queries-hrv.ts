@@ -155,7 +155,8 @@ export const HRV_ANALYSIS_PANELS: readonly (readonly [string, string?])[] = [
   ["correlation", "spearman_top50"], ["journal_impact"],
   ["feature_importance", "shap_mean_abs"], ["correlation", "spearman_journal"],
   ["feature_importance", "shap_journal"], ["supplement_impact", "yes_no"],
-  ["supplement_impact", "dose_response"], ["nutrition_impact", "spearman"],
+  ["supplement_impact", "dose_response"], ["supplement_impact", "dose_response_coverage"],
+  ["nutrition_impact", "spearman"],
   ["habit_impact"], ["correlation", "spearman_habit"],
   ["feature_importance", "shap_habit"], ["causal", "binary_treatments"],
   ["causal", "continuous_treatments"], ["causal", "dag"],
@@ -170,7 +171,7 @@ export async function getHrvAnalysisBatch() {
   const filter = exactPanels.map(([type, key]) =>
     `and(result_type.eq.${type},result_key.eq.${key})`).join(",");
   // The existing unique (result_type, result_key) constraint bounds this to
-  // 16 rows. Type-only selectors retain their LIMIT 1 queries, so future keys
+  // 17 rows. Type-only selectors retain their LIMIT 1 queries, so future keys
   // cannot turn one rendered panel into an unbounded download of JSON blobs.
   const [exact, journal, habits] = await Promise.all([
     supabase.from("hrv_analysis_results")
@@ -252,10 +253,11 @@ export async function readEnvDoseResponseData(): Promise<SweetSpotRow[]> {
   // this historical chart) through an explicit all-scalar column list (SWEET_SPOT_COLUMNS).
   // Paged: every HRV night is needed (not just temperature nights), which passes PostgREST's
   // 1000-row cap as history grows. onyx_behavioral_date is unique in the matview, so the order
-  // is total (the client's sameJson bailout needs that). The first page carries count:"exact"
-  // and the other pages run in parallel, so this one /api/derived call stays one round trip
-  // deep; a page that still comes back full (no count, or rows added by a refresh in between)
-  // is followed serially.
+  // is total (the client's sameJson bailout needs that). The first page carries count:"exact",
+  // so a read of at most one page is one request. The remaining pages are requested together
+  // only after that count is known, so a read of more than one page takes two request rounds;
+  // a page that still comes back full (no count, or rows added by a refresh in between) is
+  // followed one at a time.
   const PAGE = 1000;
   const page = (from: number, withCount: boolean) =>
     supabase
@@ -420,6 +422,8 @@ export interface HrvDashboardData extends HrvRangeDependent {
   journalShap: any[];
   supplementImpact: any[];
   supplementDoseResponse: any[];
+  /** supplement_impact / dose_response_coverage (raw; parseDoseCoverage in lib/supplement-units.ts reads it). */
+  supplementDoseCoverage: any | null;
   nutritionImpact: any[];
   habitImpact: any[];
   habitCorrelations: any[];
@@ -462,7 +466,7 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
   const panel = (type: string, key?: string) => analysis.then(select => select(type, key));
   const [
     tomorrow, m, corr, ji, fi, res, prophet, jCorr, jShap, sarimax,
-    suppImp, suppDose, nutImp, hi, hCorr, hShap,
+    suppImp, suppDose, suppDoseCov, nutImp, hi, hCorr, hShap,
     cBin, cCont, cDag, cMeta, cDrop, xgbDiag, sweetSpot,
   ] = await Promise.all([
     getTomorrowPrediction(),
@@ -477,6 +481,7 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
     getSarimaxForecast(),
     panel("supplement_impact", "yes_no"),
     panel("supplement_impact", "dose_response"),
+    panel("supplement_impact", "dose_response_coverage"),
     panel("nutrition_impact", "spearman"),
     panel("habit_impact"),
     panel("correlation", "spearman_habit"),
@@ -503,6 +508,7 @@ async function loadHrvStatic(): Promise<Omit<HrvDashboardData, keyof HrvRangeDep
     journalShap: parsedArray(jShap),
     supplementImpact: parsedArray(suppImp),
     supplementDoseResponse: parsedArray(suppDose),
+    supplementDoseCoverage: parsedObject(suppDoseCov),
     nutritionImpact: parsedArray(nutImp),
     habitImpact: parsedArray(hi),
     habitCorrelations: parsedArray(hCorr),

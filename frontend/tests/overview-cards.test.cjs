@@ -174,6 +174,17 @@ test("money: alert count with a word for urgency, renewals, read-only note; no a
   assert.match(v.note, /never moves money/);
 });
 
+test("money: an incomplete cash forecast is never 'nothing to act on'", () => {
+  const limited = V.cardState("money", [ready({ status: "ready", alerts: [], cash: { eligible: false, reasons: ["synthetic reason"] } }), ready({ status: "empty" })], NOW).view;
+  assert.equal(limited.metrics[0].value, "0");
+  assert.equal(limited.metrics[0].sub, "cash forecast incomplete");
+  assert.equal(limited.metrics[0].tone, "mid");
+  const complete = V.cardState("money", [ready({ status: "ready", alerts: [], cash: { eligible: true, reasons: [] } }), ready({ status: "empty" })], NOW).view;
+  assert.equal(complete.metrics[0].sub, "nothing to act on");
+  const urgent = V.cardState("money", [ready({ status: "ready", alerts: [{ kind: "low-cash", severity: "high", title: "Synthetic", detail: "synthetic", href: "/financials/forecast" }], cash: { eligible: false, reasons: [] } }), ready({ status: "empty" })], NOW).view;
+  assert.match(urgent.metrics[0].sub, /need action now/, "an alert to act on still leads");
+});
+
 test("habits, agents, status, screen time, calendar: numbers from the synthetic answers", () => {
   const h = V.cardState("habits", [ready({ today: day(0), days: [{ date: day(0), answered: 20, total: 20 }, { date: day(-1), answered: 3, total: 20 }] }), ready({ overview: { book: { title: "A synthetic book" }, percent: 42, chaptersDone: 5, totalChapters: 12, streak: { current: 4, best: 9, loggedToday: false, atRisk: true } } })], NOW).view;
   assert.equal(h.metrics[0].value, "20/20");

@@ -431,6 +431,7 @@ await test("one item per thread even when both labels sit on different messages 
   assert.deepEqual(out.items[0].labels, ["Agent/Action", "Agent/Deadline"]);
   assert.equal(out.items[0].subject, "Re: Lease question, reply by Nov 12", "newest message names the thread");
   assert.equal(out.items[0].deadline.daysLeft, 1);
+  assert.equal(out.items[0].deadline.date, "2026-11-12", "the deadline's own Eastern day, so a copy kept past midnight still names it");
   assert.equal(out.items[0].href, `https://mail.google.com/mail/?authuser=owner%40example.com#all/thread-f:${thread}`);
 });
 
@@ -477,6 +478,74 @@ await test("a failed heartbeat read only drops the sync line", async () => {
   const out = await getUrgentEmail(fakeClient({ rows: [row()], beatError: { code: "XX000" } }).client, NOW);
   assert.equal(out.lastSync, null);
   assert.equal(out.items.length, 1);
+});
+
+// ---- Speed (PERF-01): one round trip, hashes together, an edge route ------------------------
+await test("the three reads go out together: none waits for another", async () => {
+  // A fake whose reads stay open until released: all three must be requested before any answers.
+  const calls = [];
+  const gates = [];
+  const from = (table) => {
+    const chain = {
+      select() { return chain; }, eq() { return chain; }, gte() { return chain; }, lte() { return chain; }, order() { return chain; },
+      limit() {
+        calls.push(table);
+        return new Promise((resolve) => gates.push(() => resolve(
+          table === "inbox_emails" ? { data: [row({ subject: "Parallel" })], error: null } : { data: [], error: null },
+        )));
+      },
+    };
+    return chain;
+  };
+  const pending = getUrgentEmail({ from }, NOW);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(calls.slice().sort(), ["inbox_emails", "sync_log", "today_cleared_emails"], "every read is under way before any answers");
+  for (const open of gates) open();
+  const out = await pending;
+  assert.deepEqual(out.items.map((i) => i.subject), ["Parallel"]);
+});
+
+await test("many cleared threads: each mark hides exactly its own thread (hashes computed together keep their order)", async () => {
+  const { clearKeyHash } = await import("../src/lib/today-clear.ts");
+  const rows = Array.from({ length: 30 }, (_, i) => row({ subject: `Synthetic ${i}`, received_at: hoursAgo(2 + i / 10) }));
+  const key = (r) => `thread:${ACCT}:${r.gmail_thread_id}`;
+  // Every third thread is cleared through its newest message; one more mark is for a thread not in the window.
+  const cleared = await Promise.all(rows.filter((_, i) => i % 3 === 0).map(async (r) => ({ key_hash: await clearKeyHash(key(r)), cleared_through: r.received_at })));
+  cleared.push({ key_hash: await clearKeyHash(`thread:${ACCT}:1999999999999999999`), cleared_through: hoursAgo(1) });
+  const out = await getUrgentEmail(fakeClient({ rows, beat: BEAT, cleared }).client, NOW);
+  assert.equal(out.cleared, 10);
+  assert.equal(out.total, 20);
+  const shown = new Set(out.items.map((i) => i.subject));
+  rows.forEach((r, i) => assert.equal(shown.has(r.subject), i % 3 !== 0, r.subject));
+});
+
+await test("/api/urgent-email and /api/calendar/events run on the edge runtime next to the database, with no Node API", async () => {
+  const fs = await import("node:fs");
+  const src = (f) => fs.readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
+  for (const f of ["app/api/urgent-email/route.ts", "app/api/calendar/events/route.ts"]) {
+    const route = src(f);
+    assert.match(route, /export const runtime = "edge";/, f);
+    assert.match(route, /export const preferredRegion = "iad1";/, `${f}: the region of Supabase (us-east-1) and the Node functions`);
+    assert.match(route, /export const dynamic = "force-dynamic";/, f);
+  }
+  // The edge runtime has no Node built-ins: every module these routes load (followed through their @/lib imports)
+  // must do without them, and nothing outside @/lib but next/server, supabase-js and the server-only marker is loaded.
+  const seen = new Set();
+  const visit = (f) => {
+    if (seen.has(f)) return;
+    seen.add(f);
+    const code = src(f).replace(/^\s*(\*|\/\/).*$/gm, "");
+    assert.ok(!/from "node:|require\(|\bBuffer\b|\bprocess\.(cwd|versions|nextTick)\b|from "(fs|path|crypto|os|stream|zlib|http|https|net|child_process)"/.test(code), `${f} uses no Node API`);
+    for (const [, spec] of code.matchAll(/(?:from|import) "([^"]+)"/g)) {
+      if (spec.startsWith("@/lib/")) visit(`lib/${spec.slice(6)}.ts`);
+      else assert.ok(["next/server", "@supabase/supabase-js", "server-only"].includes(spec), `${f} imports ${spec}`);
+    }
+  };
+  visit("app/api/urgent-email/route.ts");
+  visit("app/api/calendar/events/route.ts");
+  for (const f of ["lib/urgent-email-query.ts", "lib/urgent-email.ts", "lib/today-clear.ts", "lib/calendar-events-server.ts", "lib/calendar-events.ts"]) {
+    assert.ok(seen.has(f), `${f} is checked`);
+  }
 });
 
 // ---- /status card ---------------------------------------------------------------------
@@ -558,6 +627,18 @@ await test("each merged item says what a Clear removes: its cards and its thread
   assert.deepEqual(solo.clear, { cards: ["Z9"], emails: [] });
 });
 
+await test("each merged item keeps the expiry of every request merged into it (Today never lets a snooze outlast it)", () => {
+  const e = emailItem();
+  const link = `https://mail.google.com/mail/?authuser=${ACCT}#all/thread-f:${e.threadId}`;
+  const c = card({}, { name: "Urgent: reply today", link, expires: "2026-11-11T18:00:00Z" });
+  const again = card({ messageId: 998 }, { code: "Q78", name: "Urgent: reply today (again)", link, expires: null });
+  const alone = card({ messageId: 997 }, { code: "Z8", name: "Urgent: other thing", link: "", expires: "2026-11-12" });
+  const out = mergeUrgent([e], [c, again, alone], Infinity, { bySearch: false });
+  assert.deepEqual(out.items.find((i) => i.key === `email:${e.key}`).cardExpires, ["2026-11-11T18:00:00Z"], "a card without an expiry adds none");
+  assert.deepEqual(out.items.find((i) => i.key === "card:Z8").cardExpires, ["2026-11-12"]);
+  assert.deepEqual(mergeUrgent([emailItem()], []).items[0].cardExpires, [], "an email with no request has none");
+});
+
 await test("same thread id in another mailbox does not merge; same Message-ID in both mailboxes does", () => {
   const e = emailItem();
   const other = card({}, { link: `https://mail.google.com/mail/?authuser=second@example.com#all/thread-f:${e.threadId}` });
@@ -593,6 +674,19 @@ await test("a #search card merges into the one labelled email holding every word
   // 6 days 23 h before the card still counts
   const old = emailItem({ subject: "Invoice overdue", receivedAt: "2026-11-04T14:00:00.000Z" });
   assert.equal(mergeUrgent([old], [c]).total, 1);
+});
+
+await test("bySearch: false (Today's attention model) merges by identity only: a #search card stays its own item", () => {
+  const e = emailItem({ subject: "Invoice 42 is overdue, please pay", receivedAt: "2026-11-11T10:00:00.000Z" });
+  const c = card({}, { name: "Urgent: invoice overdue", link: SEARCH("Invoice+overdue") });
+  assert.equal(mergeUrgent([e], [c]).total, 1, "the panel still folds them (default)");
+  const out = mergeUrgent([e], [c], Infinity, { bySearch: false });
+  assert.equal(out.total, 2, "matching words alone never fold two obligations");
+  assert.deepEqual(out.items.map((i) => i.key).sort(), [`card:${c.card.code.toUpperCase()}`, `email:${e.key}`].sort());
+  assert.deepEqual(out.items.find((i) => i.key === `email:${e.key}`).sources, ["Gmail"]);
+  // A link that names the thread is the thread's identity: still one item.
+  const named = card({ messageId: 2001 }, { code: "T1", link: `https://mail.google.com/mail/?authuser=${e.account}#all/thread-f:${e.threadId}` });
+  assert.equal(mergeUrgent([e], [named], Infinity, { bySearch: false }).total, 1);
 });
 
 await test("a #search card stays separate: missing word, ambiguous, other account, wrong time window", () => {

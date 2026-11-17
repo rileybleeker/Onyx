@@ -1,5 +1,5 @@
 /**
- * The Log screen's first reads (AGENTS.md "Log screen"), started by an inline script in the HTML of /log
+ * The Log screen's first reads (AGENTS.md "Log screen"), started by a script in the head of /log
  * (app/log/EarlyReads.tsx) instead of after the page's JavaScript, the section chunks and their mount (speed budget,
  * 2026-11-15: the cold first visit took about 1.4 s, its 9 reads only starting at about 670 ms). Each section takes
  * its answer once on its first load, on the routed page only (never a copy in the continuous scroll), through
@@ -23,6 +23,11 @@ export const LOG_SUPPLEMENTS_PRODUCTS_URL = "/api/supplements/products";
 export const LOG_SUPPLEMENTS_HISTORY_URL = "/api/supplements/history?days=30&perPage=200";
 /** Same as BEHAVIORAL_TODAY_URL in lib/log-ubereats.ts (the Uber Eats section's day). */
 export const LOG_BEHAVIORAL_TODAY_URL = "/api/behavioral-today";
+/**
+ * The Drinks section's first read: behavioral today's drinks (DRINKS_URL in lib/drink-capture.ts, no `?day=`). GET
+ * only, read-only (PERF-01: it used to start only once the section had mounted, the last read of a cold /log).
+ */
+export const LOG_DRINKS_URL = "/api/nutrition/drinks";
 /** Prefix of journalTodayUrl() in lib/journal-file.ts: `?from=<New York date>&to=<same>&limit=20`. */
 export const LOG_JOURNAL_LIST_PATH = "/api/journal/list";
 
@@ -42,10 +47,11 @@ export const LOG_EARLY_GETS = [
   LOG_WEIGHT_URL,
   LOG_READING_URL,
   LOG_BEHAVIORAL_TODAY_URL,
+  LOG_DRINKS_URL,
 ] as const;
 
 /**
- * Plain-ES5 inline script for /log: the mark above, the fixed GETs, then today's journal list for the New York date
+ * Plain-ES5 script for /log: the mark above, the fixed GETs, then today's journal list for the New York date
  * (the same Intl call as easternDate() in lib/journal-entry.ts). Never throws; a failure leaves a read to its section.
  */
 export function logEarlyScript(): string {
@@ -70,13 +76,23 @@ export function logEarlyGet(url: string, routed: boolean): (() => Promise<Respon
 }
 
 /**
- * True once per full page load of /log, right after the script ran (its mark is removed): LogLoader then starts
- * the Supabase reads. False for an in-app visit or a copy in the continuous scroll (no script ran).
+ * True while the head script's mark is present and still fresh (10 s): a full page load of /log is in progress.
+ * Reads WITHOUT consuming, so a caller may poll for it (app/log/early-delivery-start.ts: the starter module can be
+ * evaluated before the head script has set the mark). False for an in-app visit or a copy in the continuous scroll
+ * (no script ran, so no mark exists).
+ */
+export function peekLogEarlyMark(now = Date.now()): boolean {
+  if (typeof window === "undefined") return false;
+  const at = (window as unknown as Record<string, unknown>)[LOG_EARLY_MARK];
+  return typeof at === "number" && now - at >= 0 && now - at < 10_000;
+}
+
+/**
+ * True once per full page load of /log, and consumes the mark (a second call returns false): the caller then
+ * starts the early reads. Check first with peekLogEarlyMark() when the head script may not have run yet.
  */
 export function takeLogEarlyMark(now = Date.now()): boolean {
-  if (typeof window === "undefined") return false;
-  const w = window as unknown as Record<string, unknown>;
-  const at = w[LOG_EARLY_MARK];
-  delete w[LOG_EARLY_MARK];
-  return typeof at === "number" && now - at >= 0 && now - at < 10_000;
+  if (!peekLogEarlyMark(now)) return false;
+  delete (window as unknown as Record<string, unknown>)[LOG_EARLY_MARK];
+  return true;
 }

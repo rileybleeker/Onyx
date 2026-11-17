@@ -1,0 +1,353 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle } from "lucide-react";
+import type { Highlight, ReadingOverview } from "@/lib/reading";
+import {
+  attemptFor,
+  classifyReviewAnswer,
+  earlierSaveNotice,
+  GRADE_LABEL,
+  intervalLabel,
+  PRACTICE_GRADES,
+  remainingQueue,
+  REVIEW_ALERT_HEADING,
+  reviewPreview,
+  storedEarlierGrade,
+  type PracticeGrade,
+  type ReviewAttempt,
+} from "@/lib/reading-practice";
+
+/**
+ * /reading Review card (PROD-T03). One due highlight at a time: say what it means, reveal the note, grade it.
+ *
+ * - Each grade button shows the interval the server will actually store (reviewPreview, the same scheduler the
+ *   commit uses; the first Good is 1 day).
+ * - One grade request at a time: while it is saving the buttons are aria-disabled (they keep focus) and a line says
+ *   why. The card and the note stay on screen until the server confirms.
+ * - A failure keeps the card. No answer / a server error: "Save not confirmed" (the grade may have been stored and
+ *   only its answer lost, so never "Not saved") with Retry, which sends the SAME operation key
+ *   (lib/reading-practice.ts attemptFor), so a grade that did land is answered from its receipt instead of being
+ *   stored twice. A refusal of a Retry says nothing about the earlier try, so it stays "Save not confirmed" with
+ *   the same key. A refusal of a first try: "Not saved", nothing was written, any grade can be picked again.
+ *   Graded on another screen (409): "Card out of date" with Refresh, which keeps the grades blocked ("Refreshing")
+ *   until the re-read lands; a re-read that fails keeps the card stale with its own message and Refresh. The message
+ *   is a role=alert line with a word and an icon, not color alone.
+ * - Success advances exactly once (this card's graded ids are kept, so a reload that raced the grade cannot bring
+ *   the card back) and moves focus to the next card's reveal button, or to the "Nothing due" line. When the answer
+ *   is key_reused (an earlier try under the key was stored with another grade), a status line says the tap was not
+ *   stored and names the grade that was, when only one earlier try could have been stored.
+ * - Retry and Refresh leave the screen while they work, so focus never drops to the page: both put it on the note
+ *   (which stays on screen) while they work; a Retry that fails again then puts it on the new Retry button, a
+ *   Refresh on the next card once the re-read overview replaces this one, or back on Refresh when the re-read
+ *   failed.
+ */
+
+const fmtDate = (d: string | null | undefined) =>
+  d ? new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" }) : "—";
+
+type Status =
+  | { kind: "idle" }
+  | { kind: "saving"; grade: PracticeGrade }
+  /** Refresh was pressed: the overview is being re-read. Grades stay blocked until it lands. */
+  | { kind: "refreshing"; grade: PracticeGrade }
+  | { kind: "unknown" | "refused" | "stale"; grade: PracticeGrade; message: string };
+
+const GRADE_CLASS: Record<PracticeGrade, string> = {
+  again: "border-[var(--color-down)]/50 text-[var(--color-down)]",
+  good: "border-border-default text-text-primary",
+  easy: "border-accent/60 text-accent",
+};
+
+export default function ReviewCard({
+  o,
+  onGraded,
+  onRefresh,
+}: {
+  o: ReadingOverview;
+  /** After a stored grade: the XP the server reported (0 on a replay of an earlier try). */
+  onGraded: (xp: number) => void;
+  /** Re-read the overview (the card changed on another screen). `false` = the re-read failed. */
+  onRefresh: () => Promise<boolean> | boolean | void;
+}) {
+  const [graded, setGraded] = useState<number[]>([]);
+  const [revealedId, setRevealedId] = useState<number | null>(null);
+  const [status, setStatus] = useState<Status>({ kind: "idle" });
+  // The last request whose outcome is unknown: the next tap on this card reuses its key.
+  const [pending, setPending] = useState<ReviewAttempt | null>(null);
+  // The grades sent under the pending key that may have been stored (no answer, or a server error): after a
+  // key_reused answer, the stored grade is one of them.
+  const maybeStored = useRef<{ op_key: string; grades: PracticeGrade[] } | null>(null);
+  // "Saved earlier as ...": shown after a key_reused advance until the next grade or Refresh.
+  const [notice, setNotice] = useState<string | null>(null);
+  const [focus, setFocus] = useState<"next" | "note" | "retry" | null>(null);
+  // Set by Refresh: when the re-read overview puts another card on top, focus moves to it.
+  const focusNextCard = useRef(false);
+  const retryRef = useRef<HTMLButtonElement | null>(null);
+  const inFlight = useRef(false);
+  const alive = useRef(true);
+  const revealRef = useRef<HTMLButtonElement | null>(null);
+  const noteRef = useRef<HTMLParagraphElement | null>(null);
+  const doneRef = useRef<HTMLParagraphElement | null>(null);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  // A new behavioral day or another book: the graded list starts over.
+  useEffect(() => {
+    setGraded((prev) => (prev.length ? [] : prev));
+  }, [o.book.book_id, o.today]);
+
+  const queue = useMemo(() => remainingQueue(o.dueReviews, new Set(graded)), [o.dueReviews, graded]);
+  const cur: Highlight | undefined = queue[0];
+  const cardKey = cur ? `${cur.highlight_id}:${cur.review_count}` : "";
+  const curRef = useRef<Highlight | undefined>(cur);
+  curRef.current = cur;
+
+  // Another card on top (advanced, or a reload changed it): its own fresh state. Not while a request is out.
+  useEffect(() => {
+    if (inFlight.current) return;
+    setStatus((s) => (s.kind === "idle" ? s : { kind: "idle" }));
+    setPending((p) => (p && cur && p.highlight_id === cur.highlight_id && p.expected_review_count === cur.review_count ? p : null));
+    if (focusNextCard.current) {
+      focusNextCard.current = false;
+      setFocus("next");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cardKey]);
+
+  useEffect(() => {
+    if (!focus) return;
+    if (focus === "next") (revealRef.current ?? doneRef.current ?? noteRef.current)?.focus();
+    else if (focus === "retry") (retryRef.current ?? noteRef.current)?.focus();
+    else noteRef.current?.focus();
+    // Functional: a target another effect set in this same pass (Refresh, then the next card) is kept.
+    setFocus((f) => (f === focus ? null : f));
+  }, [focus, cardKey, revealedId]);
+
+  const preview = useMemo(() => (cur ? reviewPreview(cur, o.today) : null), [cur, o.today]);
+  const nextDue = useMemo(() => {
+    const future = o.highlights.map((h) => h.next_review).filter((d): d is string => !!d && d > o.today).sort();
+    return future[0] ?? null;
+  }, [o.highlights, o.today]);
+
+  const saving = status.kind === "saving";
+  const refreshing = status.kind === "refreshing";
+  const blocked = saving || refreshing || status.kind === "stale";
+
+  // `fromRetry`: the Retry button that was pressed leaves the screen while this request is out.
+  const grade = async (g: PracticeGrade, fromRetry = false) => {
+    if (!cur || inFlight.current || status.kind === "stale" || status.kind === "refreshing") return;
+    const attempt = attemptFor(pending, cur, g);
+    // This tap reuses the key of a try whose answer never came: a refusal of it settles nothing about that try.
+    const retryOfUnconfirmed = pending !== null && pending.op_key === attempt.op_key;
+    const earlier = maybeStored.current?.op_key === attempt.op_key ? maybeStored.current.grades : [];
+    setNotice(null);
+    // A Refresh that left this card on top must not move focus when a later answer changes it.
+    focusNextCard.current = false;
+    inFlight.current = true;
+    setPending(attempt);
+    setStatus({ kind: "saving", grade: g });
+    let httpStatus: number | null = null;
+    let body: unknown = null;
+    try {
+      const res = await fetch("/api/reading/review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(attempt),
+      });
+      httpStatus = res.status;
+      body = await res.json().catch(() => null);
+    } catch {
+      httpStatus = null;
+    }
+    inFlight.current = false;
+    if (!alive.current) return;
+    const out = classifyReviewAnswer(httpStatus, body, retryOfUnconfirmed);
+    if (out.kind === "saved") {
+      maybeStored.current = null;
+      if (out.earlier) setNotice(earlierSaveNotice(storedEarlierGrade(earlier, g), g));
+      setPending(null);
+      setStatus({ kind: "idle" });
+      setRevealedId(null);
+      setGraded((prev) => (prev.includes(attempt.highlight_id) ? prev : [...prev, attempt.highlight_id]));
+      setFocus("next");
+      onGraded(out.xp);
+      return;
+    }
+    // Refused (a first try under this key) or stale (no receipt under it): nothing is stored under this key, so it is
+    // not reused. A refused Retry comes back as unknown and keeps the key until its receipt is read.
+    if (out.kind !== "unknown") {
+      setPending(null);
+      maybeStored.current = null;
+    } else if (httpStatus === null || httpStatus >= 500) {
+      // Only a try that may have reached the function (no answer, or a server error) can have been stored.
+      maybeStored.current = { op_key: attempt.op_key, grades: earlier.includes(g) ? earlier : [...earlier, g] };
+    }
+    // The card left the top while the request was out (the overview was re-read): its message would sit on another card.
+    if (curRef.current?.highlight_id !== attempt.highlight_id) {
+      setStatus({ kind: "idle" });
+      if (fromRetry) setFocus("next");
+      return;
+    }
+    setStatus({ kind: out.kind, grade: g, message: out.message });
+    if (fromRetry) setFocus("retry");
+  };
+
+  // Refresh: grades stay blocked until the re-read lands. A re-read that puts another card on top resets the status
+  // and moves focus to that card (the cardKey effect); one that leaves this card unblocks it; a failed one keeps it
+  // stale, with focus back on Refresh.
+  const refresh = (g: PracticeGrade) => {
+    setNotice(null);
+    setStatus({ kind: "refreshing", grade: g });
+    focusNextCard.current = true;
+    setFocus("note");
+    let reread: Promise<boolean> | boolean | void;
+    try {
+      reread = onRefresh();
+    } catch {
+      reread = false;
+    }
+    void Promise.resolve(reread)
+      .then(
+        (r) => r !== false,
+        () => false,
+      )
+      .then((ok) => {
+        if (!alive.current) return;
+        // Queued after the re-read's own state updates, so a card that changed has already reset this.
+        setStatus((s) => {
+          if (s.kind !== "refreshing") return s;
+          if (ok) return { kind: "idle" };
+          return { kind: "stale", grade: s.grade, message: "Couldn't refresh this card. Check the connection, then try again." };
+        });
+        if (!ok) {
+          focusNextCard.current = false;
+          setFocus("retry");
+        }
+      });
+  };
+
+  const header = queue.length
+    ? `${queue.length} due`
+    : o.reviewsToday
+      ? `${o.reviewsToday} done today`
+      : nextDue
+        ? `next ${fmtDate(nextDue)}`
+        : "nothing scheduled";
+
+  return (
+    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
+        <span className="text-[11px] font-mono text-text-tertiary">{header}</span>
+      </div>
+      {/* Always in the page, so the line is announced when it is filled after the card advanced. */}
+      <p role="status" data-testid="reading-review-notice" className={notice ? "mt-2 text-[12px] text-text-secondary" : "sr-only"}>
+        {notice ?? ""}
+      </p>
+      {cur && preview ? (
+        <div className="mt-2" data-testid="reading-review-card">
+          <blockquote className="text-[14px] text-text-primary leading-relaxed border-l-2 border-accent/60 pl-3">{cur.passage}</blockquote>
+          <div className="mt-2 text-[11px] font-mono text-text-tertiary">
+            {cur.chapter != null ? `ch ${cur.chapter}` : ""} {cur.concept ? `· ${cur.concept}` : ""}
+          </div>
+          {revealedId !== cur.highlight_id ? (
+            <button
+              ref={revealRef}
+              onClick={() => {
+                setRevealedId(cur.highlight_id);
+                setFocus("note");
+              }}
+              className="mt-3 min-h-11 px-3 py-2 text-[13px] rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary"
+            >
+              Say what this means, then reveal your note
+            </button>
+          ) : (
+            <>
+              <p ref={noteRef} tabIndex={-1} className="mt-3 text-[13px] text-text-secondary italic outline-none">
+                {cur.comment || "No comment on this one. Add one below."}
+              </p>
+              <div className="mt-3 flex gap-3" role="group" aria-label="Grade this highlight">
+                {PRACTICE_GRADES.map((g) => {
+                  const days = preview[g].interval_days;
+                  return (
+                    <button
+                      key={g}
+                      type="button"
+                      aria-label={`${GRADE_LABEL[g]}, next review in ${intervalLabel(days)}`}
+                      aria-disabled={blocked || undefined}
+                      onClick={() => {
+                        if (!blocked) void grade(g);
+                      }}
+                      className={`flex-1 min-h-12 px-2 py-1.5 rounded-control border bg-white/[0.02] ${blocked ? "opacity-40 cursor-not-allowed" : ""} ${GRADE_CLASS[g]}`}
+                    >
+                      <span className="block text-[14px] font-medium leading-none">{GRADE_LABEL[g]}</span>
+                      <span className="block text-[11px] font-mono opacity-80 mt-1">{intervalLabel(days)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {saving && (
+                <p role="status" className="mt-2 text-[12px] text-text-secondary">
+                  Saving your {GRADE_LABEL[status.grade]} grade. The grade buttons wait until Onyx answers.
+                </p>
+              )}
+              {refreshing && (
+                <p role="status" className="mt-2 text-[12px] text-text-secondary">
+                  Refreshing this card. The grade buttons wait until it is re-read.
+                </p>
+              )}
+              {(status.kind === "unknown" || status.kind === "refused" || status.kind === "stale") && (
+                <div role="alert" className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-[12px] text-text-primary">
+                  <span className="inline-flex items-center gap-1.5">
+                    <AlertTriangle
+                      aria-hidden="true"
+                      className={`h-4 w-4 ${status.kind === "unknown" ? "text-[var(--color-mid)]" : "text-[var(--color-down)]"}`}
+                    />
+                    <span>
+                      <strong className="font-medium">{REVIEW_ALERT_HEADING[status.kind]}:</strong> {status.message}
+                      {status.kind === "refused" ? " Pick a grade again." : ""}
+                      {status.kind === "unknown" ? " Retry can't store it twice." : ""}
+                    </span>
+                  </span>
+                  {status.kind === "unknown" && (
+                    <button
+                      ref={retryRef}
+                      type="button"
+                      onClick={() => {
+                        // The Retry button leaves the screen while it saves: focus waits on the note.
+                        setFocus("note");
+                        void grade(status.grade, true);
+                      }}
+                      className="min-h-11 px-3 rounded-control border border-border-default text-text-primary"
+                    >
+                      Retry {GRADE_LABEL[status.grade]}
+                    </button>
+                  )}
+                  {status.kind === "stale" && (
+                    <button
+                      ref={retryRef}
+                      type="button"
+                      onClick={() => refresh(status.grade)}
+                      className="min-h-11 px-3 rounded-control border border-border-default text-text-primary">
+                      Refresh
+                    </button>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      ) : (
+        <p ref={doneRef} tabIndex={-1} className="mt-2 text-[13px] text-text-tertiary outline-none">
+          Nothing due. New highlights come up the next day, then at growing intervals based on your grades.
+        </p>
+      )}
+    </section>
+  );
+}

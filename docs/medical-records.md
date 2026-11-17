@@ -15,6 +15,7 @@ A private store for lab results and medical documents. The care planner (`/healt
 - **Upload flow** (Vercel caps a request body at ~4.5 MB, so files bypass Onyx's server): `POST /api/medical/documents` stores the details as `pending` and answers a one-time signed upload token for `documents/<id>` (the path carries only the id); the browser uploads straight to the bucket with it; `POST /api/medical/documents/[id]/complete` checks the file is there with the declared size and type and marks the row `ready`. Only ready rows are listed or served. A pending row whose upload never finished is harmless and never shown.
 - **Viewing**: `GET /api/medical/documents/[id]/file` (add `?download=1` to save) redirects to a signed link that works for 60 seconds, sent with `no-store` and `no-referrer`.
 - Removal is soft (`removed_at`), on both tables; the file stays in the bucket so Undo works. The app has no path that physically removes a row or a file.
+- Backups and recovery: Supabase's database backups do not include the bucket's files. RPO / RTO, the encrypted off-site plan and the recovery drill are in `docs/medical-records-recovery.md`; `tools/medical_recovery/recovery_check.py` is the read-only check.
 - Not an ingestion source: no heartbeat, no `/status` card. Smoke test: `/health/records` in `e2e/smoke.spec.ts` (empty account skips; a failed query fails).
 
 ## Tests

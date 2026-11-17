@@ -134,6 +134,10 @@ SCHEDULED: dict[str, Sched] = {
         'Scheduled tests', _m(90), True, 'every 30 min at :07/:37; new 2026-11-14 (replaced the per-PR test jobs)'),
     'cash-forecast-snapshot.yml': Sched(
         'Cash Forecast Snapshot', _h(8 * 24), True, 'weekly Monday 12:30 UTC; new 2026-11-14, no run history yet'),
+    'reading-bank.yml': Sched(
+        'Reading Question Bank', _m(150), True,
+        'hourly at :17; new READ-QUIZ-01, no run history yet; a re-run is safe (spending is capped per book and '
+        'per month, claims are leased)'),
     'merge-train.yml': Sched(
         'Merge train', _m(90), True, '*/15 plus PR and CI events; the cron alone can be delayed by half an hour'),
     'live-checks.yml': Sched(
@@ -726,9 +730,13 @@ def check_master(ctx: Ctx) -> list[Finding]:
         newest = last_two[0]
         out.append(Finding(
             'smoke-failed-twice', 'Production Smoke Test failed twice in a row',
-            f'Last two completed runs failed ({last_two[1].get("html_url", "")} and {newest.get("html_url", "")}); '
-            'production is serving an empty or broken panel.',
-            'Open the newest run, download the Playwright report artifact, and fix the page or the data behind it.',
+            f'Last two completed runs failed ({last_two[1].get("html_url", "")} and {newest.get("html_url", "")}): '
+            'production is serving an empty or broken panel, or the run could not confirm which commit production '
+            'serves (a Vercel rollback, a broken /api/version, a deploy that failed).',
+            'Open the newest run. Its job summary (the smoke receipt) names the expected commit, what production '
+            'served before and after the tests and the verdict; a "Smoke target not confirmed" or "Smoke provenance '
+            'broken" annotation means the target, not a page, is the problem. CI keeps no Playwright report: '
+            'reproduce a failing page locally with `npx playwright test` and fix the page or the data behind it.',
             since=parse_ts(last_two[1]['created_at']) if last_two[1].get('created_at') else None))
 
     live = [w for w in ctx.workflows() if w.get('state') == 'active'

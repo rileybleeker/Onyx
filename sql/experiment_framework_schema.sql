@@ -399,6 +399,11 @@ END $$;
 --    (adherence.objective = {source, max, arm}); the only source wired so far is Screen Time's
 --    pre-bed minutes. It applies to the days of the named arm only (the other arm is "usual
 --    behaviour", so there is nothing to check).
+--    NOT GATED ON EXPORT COMPLETENESS (PIPE-11): objective_value / objective_adherent read the
+--    estimate whether or not the phone export behind it was verified complete, so a partly sent
+--    export can read as "adherent". Nothing reads this view (experiment_adherence.py, which does
+--    check pds.phone_usage_daily.export_complete and pre_sleep_complete, decides adherence); a new
+--    reader must apply the same gate or use that module.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW pds.experiment_day_status
 WITH (security_invoker = true) AS

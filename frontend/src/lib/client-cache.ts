@@ -41,6 +41,11 @@ const SENSITIVE: RegExp[] = [
   // journal: the personal journal's titles, moods and snippets (the /log Journal section's read).
   // care: the /health care planner's items (every caller already passes persist: false; enforced here too).
   /^\/api\/(finance|procurement|medical|care|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
+  // reading questions: raw quiz answers and grading feedback (PROD-T07, sql/reading_learning_questions.sql).
+  /^\/api\/reading\/questions(\/|\?|$)/,
+  // reading practice (READ-QUIZ-01): a round's attempts (grader feedback on Riley's answers) and the bank export.
+  /^\/api\/reading\/practice\/round(\/|\?|$)/,
+  /^\/api\/reading\/bank\/export(\/|\?|$)/,
   /^\/(financials|procurement|screen-time|health\/records)(\/|\?|$)/,
   /^(finance|procurement|medical|care|screen-time|spotify|experiments):/,
   // Mixed payloads (SEC-03, 2026-11-16): the agents inbox and conversations (message bodies and cards can quote
@@ -87,17 +92,24 @@ export function writeInvalidates(path: string): string[] {
   if (path.startsWith("/onyx/")) return ["agents:"];
   // POSTs that change no cached data, or whose page refreshes what changed itself.
   if (NO_INVALIDATE.includes(path)) return [];
+  // A practice answer or a Disagree / self grade (READ-QUIZ-01): the runner keeps its own state and refreshes
+  // /api/reading and the round once when it closes, so a tap invalidates nothing (flags, approval and run use the
+  // area default below).
+  if (/^\/api\/reading\/practice\/attempt(\/[^/?#]+\/override)?$/.test(path)) return [];
   // A /habits tap: that page keeps its own cached journal in step (a 365-day re-read per tap would be waste);
   // the check-in screen and the habit list still re-read.
-  if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list"];
+  if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list", "/api/sleep/winddown"];
   // Chat write tools log habits, supplements, reading and playlists.
-  if (path === "/api/chat") return ["/api/habits", "habits:", "/api/supplements", "/api/reading", "/api/delivery"];
+  if (path === "/api/chat") return ["/api/habits", "habits:", "/api/supplements", "/api/reading", "/api/delivery", "/api/sleep/winddown"];
   const m = /^\/api\/([^/?#]+)/.exec(path);
   if (!m) return [];
   const area = m[1];
   const out = [`/api/${area}`, `${area}:`];
   // A check-in or habit write also changes what Today and the delivery portions show.
-  if (area === "habits") out.push("/api/delivery");
+  if (area === "habits") out.push("/api/delivery", "/api/sleep/winddown");
+  // A wind-down NIGHT answer (or a cancel that found it had landed) IS the chosen habit's answer (PROD-SLEEP-01): the check-in and /habits go stale too
+  // (a goal or pause change touches no habit row).
+  if (path === "/api/sleep/winddown/night" || path === "/api/sleep/winddown/cancel") out.push("/api/habits", "habits:");
   if (area === "delivery") out.push("/api/habits/checkin");
   // A drink capture (one row) counts in Nutrition AND Caffeine: both areas' entries (and feed seeds) go stale.
   if (path === "/api/nutrition/drinks" || path.startsWith("/api/nutrition/drinks/")) out.push("/api/caffeine", "caffeine:");
@@ -219,6 +231,7 @@ export class ClientCache {
   private flushing: Promise<void> = Promise.resolve();
   /** Bumped by wipe(): async work started before a wipe never writes after it. */
   private generation = 0;
+  private wipeListeners = new Set<() => void>();
   private readyResolved = false;
   private resolveReady!: () => void;
   private readyPromise: Promise<void>;
@@ -585,9 +598,19 @@ export class ClientCache {
     await backend.writeScope(next).catch(() => {});
   }
 
+  /**
+   * Run `listener` (synchronously, first thing) whenever wipe() runs: sign-out, a 401, a redirect to sign-in. For a
+   * module that keeps private data or a pending write of its own outside this cache and must drop it with the session.
+   */
+  onWipe(listener: () => void): () => void {
+    this.wipeListeners.add(listener);
+    return () => { this.wipeListeners.delete(listener); };
+  }
+
   /** Forget everything: memory, queued writes and the whole persisted store. Persistence stays off until attach(). */
   async wipe(): Promise<void> {
     this.generation++;
+    for (const fn of Array.from(this.wipeListeners)) { try { fn(); } catch { /* a listener never stops a wipe */ } }
     const backend = this.backend;
     const keys = this.keys();
     this.backend = null;
@@ -661,11 +684,22 @@ function defaultDeleteDatabase(name: string): Promise<void> {
 }
 
 /**
+ * Fired (on window) at the start of every wipe: memory outside this cache that holds the session's entries listens
+ * and forgets them (lib/autosave-retain.ts: forms kept past their component, with their retries). An event because
+ * this module stays import-free; the retainer repeats the name.
+ */
+export const CLIENT_WIPE_EVENT = "onyx:client-wipe";
+
+/**
  * Sign-out / session end: wipe the in-memory cache, the IndexedDB store, every Cache Storage cache on this
- * origin and this app's localStorage keys (unrelated keys stay). Bounded by a timeout so a blocked delete
- * never holds up signing out. Never throws.
+ * origin and this app's localStorage keys (unrelated keys stay), and tell kept forms to forget their entries
+ * (CLIENT_WIPE_EVENT). Bounded by a timeout so a blocked delete never holds up signing out. Never throws.
  */
 export async function wipeClientData(deps: WipeDeps = {}): Promise<void> {
+  try {
+    const target = globalThis as unknown as { dispatchEvent?: (e: Event) => boolean };
+    if (typeof target.dispatchEvent === "function" && typeof Event === "function") target.dispatchEvent(new Event(CLIENT_WIPE_EVENT));
+  } catch { /* a listener's failure never holds up signing out */ }
   const g = globalThis as unknown as { localStorage?: Storage; caches?: CacheStorage };
   const cache = deps.cache ?? clientCache;
   let storage: WipeDeps["storage"] = null;

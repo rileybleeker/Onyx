@@ -105,14 +105,71 @@ Stages: `access`, `read`, `encode`, `network`, `http`. A missing token or one
 Onyx refuses (401) cannot be reported; the card catches those when the last
 heartbeat is more than 36 h old. Builds before this one report nothing.
 
+Export completeness (from the build after 2026-11-16, PIPE-11): every chunk
+carries a `run` object (one id per sync, the requested window, Apple's own
+last-update time for the data (`source_updated_at`, the earliest the stream
+reported: `DeviceActivityData.lastUpdatedDate`), whether Apple's stream ended on
+its own, the hour count and the chunk's index / count). Onyx counts the hours as
+verified only when every chunk of the run arrived and the stream ended by itself
+with no error, and only the hours that ended by the run's coverage end (the
+earlier of the export time and `source_updated_at`: a stream that ends cleanly
+from a stale cache is current only that far, and the hours after it are unknown,
+not "no usage"). A sync the watchdog stopped ("[stream stopped by watchdog]" in
+the summary), a stream that threw part-way ("[stream failed before it ended]"),
+a chunk that failed or an app stopped halfway leaves them unverified, and the
+summary ends with what Onyx made of the run ("verified complete through <time>"
+or "not verified: ..."). An hour Onyx already verified keeps that
+snapshot until a LATER run completes, which then replaces it (a later run that
+does not complete changes nothing). Uploads from older builds are still accepted
+but never verified, so Screen Time days read as unverified until this build
+syncs; a "Days back: 30" sync from the app re-sends (and can verify) the last 30
+days. Needs `sql/phone_usage_completeness.sql` applied first (before the site
+that receives these uploads is deployed). Open question for the first device
+check: if the live policy never ends its stream, every sync reads "stream stopped
+by watchdog" and nothing is ever verified (the safe outcome); switch the
+scheduled sync to the cached policy or change how the end is detected.
+
 If neither install link works, download the `.ipa` from `/install` on the PC and
 install over USB with `pymobiledevice3 apps install <file>` (it also prints the
 phone's real error). `pymobiledevice3 amfi reveal-developer-mode` shows the
 Developer Mode switch if it never appears.
 
+## Apple Health (added 2026-11-17)
+
+The same app also reads Apple Health and sends it to `POST /api/apple-health/import`
+(tables `pds.apple_health_*`, `sql/apple_health_schema.sql`, applied). HealthKit is
+readable only by code on the iPhone and **never while the phone is locked**, so it
+cannot ride the locked daily Screen Time automation: the app syncs itself whenever it
+comes to the foreground (at most every 30 minutes, after Health was set up once), and
+the Shortcuts action **Sync Apple Health to Onyx** does the same for a "when Onyx is
+opened" automation. Read: steps, walking + running distance, flights, walking speed,
+walking steadiness, headphone audio level, mindful minutes, workouts written by other
+apps (Strava / Peloton "send to Health"), State of Mind. Not read: heart rate, HRV,
+sleep (copies of WHOOP / Garmin / Eight Sleep), locations, routes, raw samples. Health
+Records / lab results are NOT included (they need the Clinical Health Records
+entitlement and a connected provider; roadmap row).
+
+One-time steps that stay with Riley (they need the Apple login or the phone in hand):
+
+1. Developer portal, Identifiers, `com.rileybleeker.onyxscreentime`: tick **HealthKit**.
+2. Profiles: delete and re-create the iOS App Development profile for that App ID (same
+   certificate and iPhone), download it, set `IOS_PROFILE_B64` (command above).
+3. `gh workflow run screentime-ios.yml`. The log says "building with the HealthKit
+   entitlement" (a profile without HealthKit still builds the old Screen Time-only app and
+   prints a warning). Install the new build from `/install`.
+4. Open the app, tap **Allow Health and sync to Onyx**, turn on the metrics in the system
+   sheet. HealthKit never says whether read access was refused: a metric left off just has
+   no rows. `/status` card **Apple Health** turns green on the first upload.
+5. Optional: Shortcuts, Automation, "When app is opened" Onyx, action **Sync Apple Health
+   to Onyx** (the app already syncs itself when opened; this also covers a quick open).
+
+The Focus build (`project-focus.yml`) compiles none of the Health code.
+
 ## Files
 
 - `project.yml` — XcodeGen spec; the `.xcodeproj` is generated in CI.
+- `project-health.yml` — project.yml + the HealthKit entitlement (used when the profile has it).
+- `OnyxScreenTime/HealthSync.swift` — HealthKit read + upload (`#if !ONYX_FOCUS`).
 - `OnyxScreenTime/` — the app (SwiftUI, App Intent, exporter, Keychain token).
 - `ci/asc_signing.py` — App Store Connect API path for certificate + profile.
 - `ci/focus_signing_check.py` — profile and signed-bundle gates for the Focus

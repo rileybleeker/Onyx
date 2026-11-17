@@ -20,7 +20,6 @@ import argparse
 import json
 import logging
 import os
-import pickle
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -31,6 +30,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
+import hrv_model_artifact as model_artifact
 from sync_log_helper import log_sync as _shared_log_sync
 
 load_dotenv()
@@ -79,6 +79,10 @@ ROLLING_WINDOW_DAYS = 30
 # A separate label keeps both rows without changing the key. Readers: the /analytics/hrv
 # page (frontend/src/lib/queries-hrv.ts LIVE_METRICS_SUFFIX) and check_drift() below.
 LIVE_METRICS_SUFFIX = "_live_rolling"
+# A model's live accuracy is published only from this many scored live forecasts.
+MIN_LIVE_FORECASTS = 5
+# Models whose live forecasts are scored ('<model>_live_rolling' rows).
+LIVE_MODELS = ("xgboost", "sarimax", "prophet")
 # The first live forecast made by the same-night code (hrv_alignment.py, PR #5) was
 # created 2026-11-11 01:06 ET; the last one made by the old code at 00:05 ET that day
 # (prediction_date 2026-11-12, model_version '2026-11-11_v1', so the version date alone
@@ -94,12 +98,28 @@ ALIGNMENT_CUTOVER_AT = pd.Timestamp("2026-11-11T01:00:00", tz=ET_TZ)
 # one "success" row only when the newest row of this heartbeat is not already "success".
 PREPROCESSING_HEARTBEAT = ("hrv_predict", "preprocessing")
 PREPROCESSING_REPORT_EVERY_HOURS = 12
+# Heartbeat for the model artifact a forecast is made with (audit PIPE-08, hrv_model_artifact.py):
+# success = exactly the artifact the registry selected; partial = served without that check
+# (registry table not applied yet, a pre-PIPE-08 pickle, the selected one missing from the cache,
+# or the forecast stored without its artifact column); failed = refused before unpickling, or no
+# forecast at all (registry unreadable, pinned artifact unservable by this code or gone from the
+# cache). Same repeat rule as the preprocessing heartbeat.
+MODEL_ARTIFACT_HEARTBEAT = ("hrv_predict", "model_artifact")
 
 
 def report_preprocessing(status: str, message: str | None) -> bool:
     """Write the preprocessing heartbeat unless it would repeat (see above). Never raises.
     Returns True when a row was written."""
-    source, data_type = PREPROCESSING_HEARTBEAT
+    return _report_deduped(PREPROCESSING_HEARTBEAT, status, message)
+
+
+def report_model_artifact(status: str, message: str | None) -> bool:
+    """Write the model-artifact heartbeat unless it would repeat. Never raises."""
+    return _report_deduped(MODEL_ARTIFACT_HEARTBEAT, status, message)
+
+
+def _report_deduped(heartbeat: tuple[str, str], status: str, message: str | None) -> bool:
+    source, data_type = heartbeat
     last = None
     try:
         resp = (
@@ -110,7 +130,7 @@ def report_preprocessing(status: str, message: str | None) -> bool:
         )
         last = (resp.data or [None])[0]
     except Exception as e:  # noqa: BLE001 - the heartbeat must never stop a forecast
-        log.warning(f"  preprocessing heartbeat lookup failed ({type(e).__name__}); writing it anyway")
+        log.warning(f"  {data_type} heartbeat lookup failed ({type(e).__name__}); writing it anyway")
     if status == "success":
         if last is None or last.get("status") == "success":
             return False
@@ -125,7 +145,7 @@ def report_preprocessing(status: str, message: str | None) -> bool:
         _shared_log_sync(supa, source=source, data_type=data_type, status=status,
                          records=0, error=message)
     except Exception as e:  # noqa: BLE001
-        log.warning(f"  preprocessing heartbeat write failed ({type(e).__name__})")
+        log.warning(f"  {data_type} heartbeat write failed ({type(e).__name__})")
         return False
     return True
 
@@ -238,11 +258,19 @@ def _clean_for_json(obj):
 
 
 def fetch_all(table: str, select: str = "*", filters: list | None = None,
-              chunk: int = 1000) -> pd.DataFrame:
+              chunk: int = 1000, order: list[str] | None = None) -> pd.DataFrame:
+    """Page a table to the end. `order` names a unique, total ordering (e.g. the table's key
+    columns) that is applied BEFORE .range(): without an ORDER BY, PostgREST returns rows in
+    an unspecified order and offset paging can skip a row and repeat another across page
+    boundaries (PR #393 review P2 — a skipped recent matrix night made backfill_actuals clear
+    its correct stored actual)."""
     rows = []
     offset = 0
     while True:
         q = supa.schema("pds").from_(table).select(select)
+        if order:
+            for col in order:
+                q = q.order(col)
         if filters:
             for col, op, val in filters:
                 if op == "eq":
@@ -262,12 +290,46 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def load_model() -> dict | None:
-    if not MODEL_PATH.exists():
-        log.error(f"Model not found at {MODEL_PATH}. Run hrv_analysis.py first.")
-        return None
-    with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
+def load_model() -> tuple[dict | None, dict]:
+    """The model bundle to serve and the report for its artifact heartbeat (audit PIPE-08).
+
+    The workflow restores the artifact the registry selected and passes its checksum
+    (HRV_MODEL_SELECTED_SHA256, HRV_MODEL_RESTORED = exact-key hit): the file must be exactly that
+    artifact, and its manifest must match the pickle and this code, before anything is unpickled.
+    An unreadable registry, or a pinned artifact that this code cannot serve or that is gone from
+    the cache, refuses outright.
+    report = {"sha256", "status", "message"}; the bundle is None when it must not be served."""
+    from hrv_analysis import SPARSE_FILL_VERSIONS
+    import hrv_alignment as al
+
+    refusal = model_artifact.serving_refusal(os.environ)     # registry unreadable / pin unservable or lost
+    if refusal:
+        log.error(refusal)
+        return None, {"sha256": None, "status": "failed", "message": refusal}
+    selected = os.environ.get("HRV_MODEL_SELECTED_SHA256", "")
+    restored = os.environ.get("HRV_MODEL_RESTORED", "") == "true"
+    try:
+        loaded = model_artifact.load_artifact(
+            MODEL_PATH, expected_sha=selected if (selected and restored) else None,
+            alignment_version=al.ALIGNMENT_VERSION, preprocessing_versions=SPARSE_FILL_VERSIONS,
+            runtime_deps=model_artifact.dependency_versions())
+    except model_artifact.ArtifactError as e:
+        log.error(str(e))
+        return None, {"sha256": None, "status": "failed", "message": str(e)}
+    status, message = model_artifact.serving_report(loaded)
+    trained = (loaded.manifest or {}).get("provenance", {})
+    log.info(f"Model artifact {loaded.sha256[:12]} (trained {trained.get('trained_at', 'unknown')}, "
+             f"data through {trained.get('data_cutoff', 'unknown')}): {status}")
+    return loaded.bundle, {"sha256": loaded.sha256, "status": status, "message": message}
+
+
+def _store_forecast(rows: list[dict]) -> None:
+    # Audit P1 (G1): on_conflict targets the 4-tuple so retrain versions accumulate as separate
+    # rows; same-day reruns with the same version upsert in place.
+    supa.schema("pds").from_("hrv_predictions").upsert(
+        _clean_for_json(rows),
+        on_conflict="prediction_date,model,horizon_days,model_version",
+    ).execute()
 
 
 def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
@@ -298,8 +360,9 @@ def get_latest_features(feat_cols: list) -> pd.DataFrame | None:
         return None, None
 
 
-def predict_tomorrow(model_bundle: dict) -> dict | None:
-    """Predict tonight's sleep (wake-up tomorrow) using the loaded model."""
+def predict_tomorrow(model_bundle: dict, artifact_sha256: str | None = None) -> dict | None:
+    """Predict tonight's sleep (wake-up tomorrow) using the loaded model. `artifact_sha256` is the
+    checksum of the artifact the bundle came from; the forecast row records it."""
     from hrv_analysis import (FEATURE_LABELS, compute_input_data_hash, TARGET, serve_features,
                               model_preprocessing, SPARSE_FILL_VERSION, SPARSE_FILL_VERSIONS)
     import hrv_alignment as al
@@ -403,73 +466,159 @@ def predict_tomorrow(model_bundle: dict) -> dict | None:
         "training_window_end": train_end,
         "today_hrv": today_hrv,
         "input_data_hash": input_data_hash,
+        # Which artifact produced this forecast (pds.hrv_model_artifacts, PIPE-08).
+        model_artifact.LINK_COLUMN: artifact_sha256,
     }
 
 
-def backfill_actuals() -> int:
-    """Fill actual_hrv and residual for past predictions where actual is NULL.
+# Stored actuals are checked against the matrix again for this many days (audit PIPE-09): a
+# corrected or rescored WHOOP recovery then updates actual_hrv and residual of every forecast for
+# that night. 35 days covers the 30-day live metric window plus the days its eval_date can lag.
+# Older rows are left as they are (bounded work per hourly run).
+RESCORE_WINDOW_DAYS = 35
+# The matrix holds HRV to 4 decimals; a difference below this is the same value.
+ACTUAL_TOLERANCE = 1e-3
+# A stored actual is cleared only when the matrix has had no HRV for that night for this many
+# days: a recent night can lose its HRV for a while (WHOOP re-scoring it, a sync gap), and clearing
+# then would drop it from the live metric until the next run fills it again.
+CLEAR_AFTER_DAYS = 3
+_PRED_KEY = ("prediction_date", "model", "horizon_days", "model_version")
 
-    Only predictions whose prediction_date is strictly before today are eligible:
-    today's WHOOP cycle is still in progress or unscored, so the actual is not
-    yet observable.
+
+def _num(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def plan_actual_updates(preds: pd.DataFrame, matrix_hrv: dict, today: str,
+                        rescore_from: str) -> tuple[list[dict], dict]:
+    """The actual_hrv / residual writes that bring stored forecasts in line with the matrix.
+
+    preds: forecast rows (prediction_date, model, horizon_days, model_version, predicted_hrv,
+    actual_hrv, residual). matrix_hrv: {calendar_date: HRV or None} for every matrix row read; a
+    date missing from it is not judged. Only dates before `today` are eligible.
+      * actual missing, matrix has it                -> fill  (any date, as before)
+      * actual stored, matrix differs (rescored)     -> rescore (date >= rescore_from)
+      * actual stored, matrix row has no HRV now     -> clear (date >= rescore_from, and at least
+                                                        CLEAR_AFTER_DAYS old; a newer night keeps it)
+      * actual unchanged but residual inconsistent   -> rescore the residual only
+    Each write carries exactly the key + actual_hrv + residual: the issued forecast (predicted value,
+    interval, created_at, model version, artifact) is never sent, so it never changes. Running it
+    twice writes nothing the second time. Returns (updates, counts)."""
+    counts = {"filled": 0, "rescored": 0, "cleared": 0}
+    updates: list[dict] = []
+    if preds is None or preds.empty:
+        return updates, counts
+    seen: set = set()
+    clear_before = (date.fromisoformat(str(today)[:10]) - timedelta(days=CLEAR_AFTER_DAYS - 1)).isoformat()
+    for _, row in preds.iterrows():
+        d = str(row["prediction_date"])
+        key = (d, str(row["model"]), int(row["horizon_days"]), row.get("model_version"))
+        if d >= today or key in seen or d not in matrix_hrv:
+            continue
+        seen.add(key)
+        stored = _num(row.get("actual_hrv"))
+        current = _num(matrix_hrv[d])
+        pred = _num(row.get("predicted_hrv"))
+        if stored is None:
+            if current is None:
+                continue
+            kind, actual = "filled", current
+        elif d < rescore_from:
+            continue
+        elif current is None:
+            if d >= clear_before:
+                continue        # possibly a passing gap: keep the stored actual for now
+            kind, actual = "cleared", None
+        elif abs(current - stored) > ACTUAL_TOLERANCE:
+            kind, actual = "rescored", current
+        else:
+            want = None if pred is None else stored - pred
+            have = _num(row.get("residual"))
+            same = (want is None and have is None) or (
+                want is not None and have is not None and abs(want - have) <= ACTUAL_TOLERANCE)
+            if same:
+                continue
+            kind, actual = "rescored", stored
+        counts[kind] += 1
+        updates.append({
+            "prediction_date": d,
+            "model": key[1],
+            "horizon_days": key[2],
+            "model_version": key[3],
+            "actual_hrv": actual,
+            "residual": None if (actual is None or pred is None) else actual - pred,
+        })
+    return updates, counts
+
+
+def backfill_actuals() -> int:
+    """Fill, and keep correct, actual_hrv and residual of past forecasts.
+
+    Fills every forecast whose actual is NULL (as before) and, for the last RESCORE_WINDOW_DAYS,
+    rescores forecasts whose stored actual no longer matches the matrix (a corrected source: WHOOP
+    rescored the recovery, or the cycle was removed). Only forecasts dated strictly before today are
+    eligible: today's WHOOP cycle is still in progress or unscored. See plan_actual_updates.
     """
     log.info("Backfilling actuals…")
+    today = str(et_today())
+    rescore_from = (et_today() - timedelta(days=RESCORE_WINDOW_DAYS)).isoformat()
+    cols = "prediction_date,model,horizon_days,model_version,predicted_hrv,actual_hrv,residual"
 
-    past_preds = fetch_all(
-        "hrv_predictions",
-        select="prediction_date,model,horizon_days,model_version,predicted_hrv",
-        filters=[("actual_hrv", "is_", "null")],
-    )
-    if past_preds.empty:
+    missing = fetch_all("hrv_predictions", select=cols, filters=[("actual_hrv", "is_", "null")],
+                        order=list(_PRED_KEY))
+    recent = fetch_all("hrv_predictions", select=cols, filters=[("prediction_date", "gte", rescore_from)],
+                       order=list(_PRED_KEY))
+    frames = [f for f in (missing, recent) if not f.empty]
+    if not frames:
         log.info("  No predictions to backfill.")
         return 0
-
-    today = str(et_today())
-    past_preds = past_preds[past_preds["prediction_date"] < today]
-
-    if past_preds.empty:
+    preds = pd.concat(frames, ignore_index=True)
+    preds = preds[preds["prediction_date"].astype(str) < today]
+    if preds.empty:
         log.info("  No observable predictions to backfill.")
         return 0
 
-    min_date = past_preds["prediction_date"].min()
+    min_date = str(preds["prediction_date"].astype(str).min())
     actuals_raw = fetch_all(
         "daily_health_matrix_behavioral",
         select="calendar_date,whoop_hrv_rmssd",
         filters=[("calendar_date", "gte", min_date)],
+        order=["calendar_date"],
     )
+    # The read above is complete (paged to the end, and a failed page raises, so a failed or partial
+    # read never reaches this point). A night with no matrix row at all (its last source row was
+    # deleted) therefore has no HRV now, exactly like a row with a NULL, and that includes a range
+    # where the successful read came back with no rows at all (PIPE09-R2: returning early there
+    # left the deleted nights scored, while one unrelated row would have cleared them).
+    # plan_actual_updates still clears only inside the rescore window and for nights at least
+    # CLEAR_AFTER_DAYS old, so a recent matrix lag keeps the stored actual.
     if actuals_raw.empty:
-        return 0
+        matrix_hrv = {}
+    else:
+        matrix_hrv = dict(zip(actuals_raw["calendar_date"].astype(str), actuals_raw["whoop_hrv_rmssd"]))
+    for d in preds["prediction_date"].astype(str).unique():
+        matrix_hrv.setdefault(d, None)
 
-    actuals_map = dict(zip(actuals_raw["calendar_date"], actuals_raw["whoop_hrv_rmssd"]))
-
-    updates = []
-    for _, row in past_preds.iterrows():
-        actual = actuals_map.get(row["prediction_date"])
-        if actual is None or pd.isna(actual):
-            continue
-        actual_f = float(actual)
-        if actual_f != actual_f:  # NaN survivors
-            continue
-        pred_f = float(row["predicted_hrv"])
-        updates.append({
-            "prediction_date": str(row["prediction_date"]),
-            "model": str(row["model"]),
-            "horizon_days": int(row["horizon_days"]),
-            "model_version": row.get("model_version"),
-            "actual_hrv": actual_f,
-            "residual": actual_f - pred_f,
-        })
-
+    updates, counts = plan_actual_updates(preds, matrix_hrv, today, rescore_from)
+    if actuals_raw.empty and counts.get("cleared"):
+        # Visible in the run log: a whole range coming back empty is unusual (deleted source rows,
+        # or a matview caught mid-rebuild); the next run re-fills the actuals if the rows return.
+        log.warning(f"  Matrix read returned no rows from {min_date}: clearing {counts['cleared']} "
+                    f"stored actual(s) older than {CLEAR_AFTER_DAYS} days.")
     if updates:
-        # Audit P1 (G1): on_conflict now targets the (date,model,horizon,version)
-        # unique index so each retrain run preserves history. NULL versions are
-        # handled via NULLS NOT DISTINCT on the underlying index.
+        # Audit P1 (G1): on_conflict targets the (date,model,horizon,version) unique index so each
+        # retrain run preserves history. NULL versions are handled via NULLS NOT DISTINCT on the
+        # underlying index. Every row carries the same keys (one key set per bulk upsert).
         supa.schema("pds").from_("hrv_predictions").upsert(
             _clean_for_json(updates),
-            on_conflict="prediction_date,model,horizon_days,model_version"
+            on_conflict=",".join(_PRED_KEY),
         ).execute()
-        log.info(f"  Backfilled actuals for {len(updates)} predictions.")
-
+        log.info(f"  Actuals: {counts['filled']} filled, {counts['rescored']} rescored after a source "
+                 f"correction, {counts['cleared']} cleared (source no longer has that night).")
     return len(updates)
 
 
@@ -492,25 +641,53 @@ def recompute_rolling_metrics() -> list[dict]:
         select="prediction_date,model,horizon_days,predicted_hrv,actual_hrv,"
                "prediction_lower,prediction_upper,model_version,created_at",
         filters=[("prediction_date", "gte", window_start), ("horizon_days", "eq", 1)],
+        order=list(_PRED_KEY),
     )
     live = select_live_forecasts(preds)
+    rows = []
     if live.empty:
         log.info("  No scored live forecasts since the alignment cutover yet.")
-        return []
-
-    rows = []
-    for model_name, sub in live.groupby("model", sort=True):
-        if len(sub) >= 5:
+    for model_name, sub in (live.groupby("model", sort=True) if not live.empty else ()):
+        if len(sub) >= MIN_LIVE_FORECASTS:
             rows.append(live_metrics_row(sub, str(model_name), today_str))
         else:
-            log.info(f"  {model_name}: {len(sub)} scored live forecast(s), need 5 — skipped")
+            log.info(f"  {model_name}: {len(sub)} scored live forecast(s), need {MIN_LIVE_FORECASTS} — skipped")
 
     if rows:
         supa.schema("pds").from_("hrv_model_metrics").upsert(
             _clean_for_json(rows), on_conflict="eval_date,model,horizon_days"
         ).execute()
         log.info(f"  Updated live metrics for {len(rows)} models (last {ROLLING_WINDOW_DAYS} days).")
+    models = set(LIVE_MODELS)
+    if not preds.empty and "model" in preds:
+        models |= {str(m) for m in preds["model"].dropna().unique()}
+    invalidate_stale_live_metrics({live_metrics_model(m) for m in models}, {r["model"] for r in rows})
     return rows
+
+
+def invalidate_stale_live_metrics(candidates: set[str], current: set[str]) -> list[str]:
+    """Remove the live rows of every model that no longer has MIN_LIVE_FORECASTS scored forecasts.
+
+    The page and check_drift read a model's NEWEST '<model>_live_rolling' row. When backfill_actuals
+    clears corrected actuals (or the window slides past old forecasts) and a model drops below the
+    minimum, no new row is written, so the previous one, computed from actuals that are no longer
+    true, would stay published and keep feeding the drift check. Its older rows would take its place
+    if only the newest were removed, so all of them go: they are derived numbers, recomputed from
+    hrv_predictions as soon as the model has enough scored forecasts again.
+
+    `candidates` = live labels of every model that writes forecasts (LIVE_MODELS plus any model in
+    this run's window), `current` = the labels this run wrote. One bounded delete, no listing read
+    (a list of every live row would be cut at PostgREST's row cap). Returns the labels asked to go."""
+    stale = sorted(set(candidates) - set(current))
+    if not stale:
+        return []
+    resp = (supa.schema("pds").from_("hrv_model_metrics").delete()
+            .in_("model", stale).eq("horizon_days", 1).execute())
+    removed = len(resp.data or [])
+    if removed:
+        log.info(f"  Removed {removed} stale live metrics row(s): model below {MIN_LIVE_FORECASTS} "
+                 "scored live forecasts")
+    return stale
 
 
 def latest_live_mae(model: str = "xgboost") -> float | None:
@@ -590,12 +767,13 @@ def main() -> None:
         log.exception(f"recompute_rolling_metrics failed: {e}")
 
     if args.predict:
+        artifact = None
         try:
-            model_bundle = load_model()
+            model_bundle, artifact = load_model()
             if model_bundle is None:
                 stage_errors.append("load_model")
             else:
-                prediction = predict_tomorrow(model_bundle)
+                prediction = predict_tomorrow(model_bundle, artifact_sha256=artifact["sha256"])
                 if prediction is None:
                     stage_errors.append("predict_tomorrow")
                     log.error("Failed to generate prediction.")
@@ -603,13 +781,9 @@ def main() -> None:
                     today_hrv = prediction.pop("today_hrv", None)
 
                     payload = [{k: v for k, v in prediction.items() if v is not None}]
-                    # Audit P1 (G1): on_conflict targets the 4-tuple so retrain
-                    # versions accumulate as separate rows; same-day reruns
-                    # with the same version upsert in place.
-                    supa.schema("pds").from_("hrv_predictions").upsert(
-                        _clean_for_json(payload),
-                        on_conflict="prediction_date,model,horizon_days,model_version",
-                    ).execute()
+                    if not model_artifact.upsert_with_artifact_link(_store_forecast, payload):
+                        artifact = model_artifact.with_unlinked_forecast(artifact)
+                        log.warning(artifact["message"])
 
                     log.info(
                         f"Tonight's sleep (night of {prediction['prediction_date']}): "
@@ -627,6 +801,8 @@ def main() -> None:
         except Exception as e:
             stage_errors.append("predict")
             log.exception(f"predict stage failed: {e}")
+        if artifact is not None:
+            report_model_artifact(artifact["status"], artifact["message"])
 
     if stage_errors:
         log.error(f"{len(stage_errors)} stage(s) failed: {', '.join(stage_errors)}")

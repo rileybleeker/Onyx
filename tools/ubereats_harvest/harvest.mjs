@@ -240,23 +240,45 @@ try {
         let skip = 0;
         let single = 0;
         let failedInRow = 0;
+        // A failed batch names its model arm (the route sends each arm's dishes in separate calls
+        // during a model pilot); the one-dish retries then stay inside that arm, so the other
+        // arm's dishes are not called one by one. retryOffset counts within the arm, and `skip`
+        // grows only for a dish that actually failed or came back without an estimate.
+        let retryArm = null;
+        let retryOffset = 0;
+        // Dishes that failed alone, per arm: sent with full batches so each arm steps past only its own.
+        const armSkips = { baseline: 0, pilot: 0 };
+        const skippedTotal = () => skip + armSkips.baseline + armSkips.pilot;
         for (let i = 0; i < 400; i++) {
           const limit = single > 0 ? 1 : 25;
           let r;
+          const retrying = limit === 1 && retryArm;
           try {
-            r = await post({ estimate: true, limit, offset: skip });
+            r = await post(retrying ? { estimate: true, limit, offset: retryOffset, arm: retryArm } : { estimate: true, limit, offset: skip, skips: { ...armSkips } });
           } catch (e) {
             estimateError = e.message;
-            log(`estimate call failed (limit ${limit}, offset ${skip}): ${e.message}`);
+            log(`estimate call failed (limit ${limit}, offset ${retrying ? retryOffset : skip}): ${e.message}`);
             if (++failedInRow > 4) break;
-            if (limit === 1) { skip++; single--; } else single = 25;
+            if (limit === 1) { if (retrying) armSkips[retryArm]++; else skip++; retryOffset++; single--; } else {
+              single = 25;
+              const m = /"arm":"(baseline|pilot)","arm_offset":(\d+)/.exec(e.message);
+              retryArm = m ? m[1] : null;
+              retryOffset = m ? Number(m[2]) : 0;
+            }
             continue;
           }
           failedInRow = 0;
           estimated += r.estimated || 0;
           remaining = r.remaining ?? 0;
-          if (limit === 1) { single--; if (!r.estimated) skip++; } else if (!r.estimated) break;
-          if (remaining <= skip) break;
+          if (retrying && r.arm_exhausted) {
+            // That arm has no dish left at retryOffset: no dish was skipped, so leave the one-dish
+            // retries (counting nothing) and carry on with full batches.
+            single = 0;
+            retryArm = null;
+            continue;
+          }
+          if (limit === 1) { single--; if (!r.estimated) { if (retrying) armSkips[retryArm]++; else skip++; retryOffset++; } } else if (!r.estimated) break;
+          if (remaining <= skippedTotal()) break;
         }
         log(`estimated ${estimated} dish(es); ${remaining === null ? "an unknown number" : remaining} left without an estimate`);
 

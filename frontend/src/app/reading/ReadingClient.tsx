@@ -6,16 +6,33 @@ import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CONCEPTS, type Grade, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { CHECKPOINT_SIZE, checkpointOffer, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
 import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
+import { getJson } from "@/lib/reading-practice-client";
+import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, mapSignature, parseCheckpoint } from "@/lib/reading-map";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
+import ReviewCard from "./ReviewCard";
+import PacingCard from "./PacingCard";
+import { useLearningPrefs } from "@/lib/use-learning-prefs";
+import PracticePart from "./PracticePart";
+import RetrievalSession from "./RetrievalSession";
+import ChapterMap from "./ChapterMap";
+import CheckpointQuiz from "./CheckpointQuiz";
+import ConceptPicker from "./ConceptPicker";
+
+/**
+ * Which checkpoints held answers without a result, as last read, kept for the session (memory only, one entry per book
+ * and checkpoint) so the page coming back into view (the continuous scroll mounts and unmounts it) does not read again.
+ */
+const UNRECORDED_TTL_MS = 120_000;
+const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -62,6 +79,20 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
   const [loading, setLoading] = useState(!seed);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
+  // Voluntary pacing (PROD-T06): XP, streak, level, badges and deadline furniture show until Riley turns them off.
+  const learning = useLearningPrefs();
+  const incentives = learning.prefs.showIncentives;
+  // The checkpoint quiz open on screen (READ-QUIZ-01 S5), and the checkpoints whose answers were stored without Done
+  // (keyed by book and checkpoint, so another book's "ch12" is not this one's).
+  const [quiz, setQuiz] = useState<Checkpoint | null>(null);
+  const [unrecorded, setUnrecorded] = useState<Record<string, boolean>>({});
+  // Checkpoints whose quiz read answered "not available" (the checkpoint SQL is not applied yet): no Start button for
+  // them, so the tile never leads to a dead end.
+  const [offerOff, setOfferOff] = useState<Record<string, boolean>>({});
+  const markUnrecorded = useCallback((book: string, key: string, pending: boolean) => {
+    unrecordedMemo.set(`${book}:${key}`, { at: Date.now(), pending });
+    setUnrecorded((prev) => (prev[`${book}:${key}`] === pending ? prev : { ...prev, [`${book}:${key}`]: pending }));
+  }, []);
 
   const showToast = useCallback((t: Toast) => {
     setToast(t);
@@ -80,8 +111,11 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         setOverview((prev) => (sameJson(prev, json.overview) ? prev : json.overview));
         setBooks((prev) => (sameJson(prev, json.books ?? []) ? prev : json.books ?? []));
         if (json.overview && !which) setSlug(json.overview.book.slug);
+        return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Couldn't load");
+        // The Review card's Refresh keeps its card blocked and says so (ReviewCard.tsx).
+        return false;
       } finally {
         setLoading(false);
       }
@@ -94,6 +128,43 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
     load(null, !!seed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Which offered checkpoints already hold answers without a recorded result ("Answered · record result"), read from
+  // the stored answers rather than from this page's memory, so it survives a reload and shows on another device. One
+  // light GET per offered checkpoint (no cards read, nothing written), all at once and after the page's own reads have
+  // settled; the answer is kept for the session. The copy in the continuous scroll reads nothing: the routed page does.
+  const offerBook = overview?.book.slug ?? null;
+  const offered = overview ? overview.checkpoints.filter((c) => checkpointOffer(overview, c)).map((c) => `${c.key}:${c.chapter}`).join(",") : "";
+  useEffect(() => {
+    if (feed || !offerBook || !offered) return;
+    let live = true;
+    const run = async () => {
+      await Promise.all(
+        offered.split(",").map(async (part) => {
+          const [key, chapter] = part.split(":");
+          const seen = unrecordedMemo.get(`${offerBook}:${key}`);
+          if (seen && Date.now() - seen.at < UNRECORDED_TTL_MS) {
+            if (live) markUnrecorded(offerBook, key, seen.pending);
+            return;
+          }
+          const r = await getJson(checkpointUrl(offerBook, Number(chapter), true));
+          if (!live) return;
+          // The quiz round is not available (the checkpoint SQL is missing): do not offer a quiz that cannot open.
+          if (r.status !== 200 && checkpointRefusal(r.status, r.body).kind === "off") {
+            setOfferOff((prev) => (prev[`${offerBook}:${key}`] === true ? prev : { ...prev, [`${offerBook}:${key}`]: true }));
+            return;
+          }
+          const parsed = r.status === 200 ? parseCheckpoint(r.body) : null;
+          if (parsed) markUnrecorded(offerBook, key, hasUnrecordedAnswers(parsed));
+        }),
+      );
+    };
+    const timer = setTimeout(() => void run(), 1200);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [feed, offerBook, offered, markUnrecorded]);
 
   // Want to read (ReadingList.tsx): after a change, re-read the quest and the book list; a book Riley just started
   // is shown (his explicit choice). A queued book is never picked as the quest on its own.
@@ -172,15 +243,42 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         )}
       </div>
 
+      {/* The checkpoint quiz opens in place (a full-screen sheet on a phone) and closes back to the tiles. */}
+      {quiz && (
+        <CheckpointQuiz
+          key={`${o.book.slug}:${quiz.key}`}
+          slug={o.book.slug}
+          checkpoint={quiz.key}
+          chapter={quiz.chapter}
+          onRecorded={(r) => {
+            markUnrecorded(o.book.slug, quiz.key, false);
+            showToast({ text: `Checkpoint ${r.score}/${r.total}${r.xp && incentives ? ` · +${r.xp} XP` : ""}`, kind: r.passed && incentives ? "xp" : "ok" });
+            void load(slug, true);
+          }}
+          onClose={(r) => {
+            const book = o.book.slug;
+            const key = quiz.key;
+            setQuiz(null);
+            if (r.unrecorded) void r.unrecorded.then((v) => markUnrecorded(book, key, v));
+            else markUnrecorded(book, key, false);
+            if (r.changed) void Promise.resolve(r.settled).then(() => load(slug, true));
+          }}
+        />
+      )}
+
       {/* Personalize: every card, checkpoint tile and list is its own part; sections have no extra heading on screen. */}
       <PartGrid page="/reading" title="Reading" gap={16}>
       <PartGroup id="section-quest" title="Quest & pace">
-        <Part id="quest" title="Quest (progress, level, streak)">
-          <QuestCard o={o} />
+        <Part id="pacing" title="Your pace">
+          <PacingCard o={o} prefsState={learning} accept={learning.accept} />
         </Part>
 
-        {/* Burn-up */}
-        <Part id="burnup" title="Chapters vs pace">
+        <Part id="quest" title="Quest (progress, level, streak)">
+          <QuestCard o={o} incentives={incentives} />
+        </Part>
+
+        {/* Burn-up (deadline furniture: hidden with the other incentives; nothing is deleted) */}
+        {incentives && <Part id="burnup" title="Chapters vs pace">
           <section className="bg-surface-card border border-border-subtle rounded-card shadow-card px-4 pt-3 pb-1">
             <div className="flex items-baseline justify-between mb-1">
               <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Chapters vs pace</h3>
@@ -190,7 +288,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             </div>
             <BurnupChart data={o.burnup} today={o.today} total={o.totalChapters} />
           </section>
-        </Part>
+        </Part>}
       </PartGroup>
 
       {/* Checkpoints: one tile each (ids by position, so a layout carries over to the next book), three across like before. */}
@@ -202,14 +300,34 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       >
         {o.checkpoints.map((c, i) => (
           <Part key={c.key} id={`checkpoint-${i + 1}`} title={`Checkpoint ${i + 1} (ch ${c.chapter})`}>
-            <CheckpointTile c={c} />
+            <CheckpointTile c={c} incentives={incentives} offer={quiz === null && checkpointOffer(o, c) && offerOff[`${o.book.slug}:${c.key}`] !== true} pendingRecord={quiz === null && unrecorded[`${o.book.slug}:${c.key}`] === true} onStart={() => setQuiz(c)} />
           </Part>
         ))}
       </PartGroup>
 
+      {/* Chapters (READ-QUIZ-01 S5): the chapter map, once the book's questions are on. */}
+      {o.practice?.enabled && (
+        <PartGroup id="section-chapters" title="Chapters">
+          <Part id="chapter-map" title="Chapter map">
+            <ChapterMap key={o.book.slug} o={o} onChanged={() => load(slug, true)} />
+          </Part>
+        </PartGroup>
+      )}
+
       <PartGroup id="section-practice" title="Review & capture">
-        <Part id="review" title="Review">
-          <ReviewCard o={o} onGraded={(xp) => { if (xp) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} />
+        {/* Practice (READ-QUIZ-01): the chapter question round when the book's questions are on; otherwise the Review
+            card as before (with the approval card above it). The part keeps its id so saved layouts keep their place. */}
+        <Part id="review" title="Practice">
+          <PracticePart
+            key={o.book.slug}
+            o={o}
+            onChanged={() => load(slug, true)}
+            review={<ReviewCard o={o} onGraded={(xp) => { if (xp && incentives) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
+          />
+        </Part>
+
+        <Part id="retrieval" title="Practice from memory">
+          <RetrievalSession key={o.book.slug} o={o} />
         </Part>
 
         {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
@@ -220,7 +338,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         </Part>
 
         <Part id="add-highlight" title="Highlight + comment">
-          <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? "+5 XP · highlight" : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
+          <HighlightForm key={o.book.slug} o={o} onAdded={(n) => { showToast({ text: n === 1 ? (incentives ? "+5 XP · highlight" : "Highlight saved") : `${n} highlights imported`, kind: "ok" }); load(slug, true); }} onSaved={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
         </Part>
       </PartGroup>
 
@@ -231,9 +349,9 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       </PartGroup>
 
       <PartGroup id="section-history" title="Badges & history">
-        <Part id="badges" title="Badges">
+        {incentives && <Part id="badges" title="Badges">
           <Badges o={o} />
-        </Part>
+        </Part>}
 
         <Part id="highlights" title="Highlights by concept">
           <HighlightsList o={o} onChanged={() => load(slug, true)} onError={(m) => showToast({ text: m, kind: "err" })} />
@@ -263,7 +381,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
 
 /* ------------------------------------------------------------------ */
 
-function QuestCard({ o }: { o: ReadingOverview }) {
+function QuestCard({ o, incentives }: { o: ReadingOverview; incentives: boolean }) {
   const pace = o.pace;
   const paceText =
     o.book.status === "finished"
@@ -274,6 +392,37 @@ function QuestCard({ o }: { o: ReadingOverview }) {
           ? `${pace.aheadBy} chapter${pace.aheadBy === 1 ? "" : "s"} ahead`
           : `${-pace.aheadBy} chapter${pace.aheadBy === -1 ? "" : "s"} behind`;
   const paceColor = o.book.status === "finished" || pace.aheadBy >= 0 ? "text-up" : pace.aheadBy >= -2 ? "text-[var(--color-mid)]" : "text-[var(--color-down)]";
+
+  if (!incentives) {
+    // Quiet view: progress and what was read, no XP, level, streak, pace or target date. History is untouched.
+    return (
+      <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
+        <div className="flex gap-4 items-center">
+          <MetricRing
+            value={o.chaptersDone}
+            max={Math.max(1, o.totalChapters)}
+            size={96}
+            thickness={8}
+            color="var(--color-accent)"
+            centerValue={<span className="text-[22px]">{o.chaptersDone}</span>}
+            centerUnit={`/ ${o.totalChapters || "?"}`}
+            sublabel="chapters"
+          />
+          <div className="flex-1 min-w-0 flex flex-wrap gap-x-4 gap-y-1 text-[12px] font-mono text-text-tertiary">
+            <span>{o.sessions.length} sessions</span>
+            <span>{o.minutesTotal} min</span>
+            <span>{o.highlights.length} highlights</span>
+            {o.position?.chapter != null && (
+              <span className="text-amber-300/80" title="Kindle reading position (Whispersync), as of the last harvest">
+                Kindle: ch {o.position.chapter}
+                {o.position.page != null ? ` · p. ${o.position.page}` : ""}
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
@@ -355,31 +504,38 @@ function CheckpointsHeader() {
     <div className="mb-2">
       <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Checkpoints</h3>
       <p className="mt-0.5 text-[11px] text-text-tertiary">
-        Quiz in <Link href="/chat" className="underline underline-offset-2">Health Q&amp;A</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
+        Quiz in <Link href="/chat" className="underline underline-offset-2">Onyx Chat</Link> (&ldquo;quiz me through chapter 12&rdquo;). 80% passes.
       </p>
     </div>
   );
 }
 
-function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
-  const state = c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
+function CheckpointTile({ c, incentives, offer, pendingRecord, onStart }: { c: ReadingOverview["checkpoints"][number]; incentives: boolean; offer: boolean; pendingRecord: boolean; onStart: () => void }) {
+  // Without the incentives there is no due date or on-time / late / missed: a checkpoint is reached or not yet.
+  const state = !incentives ? (c.reached ? "reached" : "upcoming") : c.reached ? (c.onTime ? "done" : "late") : c.onTime === false ? "missed" : "upcoming";
   const border =
     state === "done" ? "border-accent/60" : state === "late" ? "border-[var(--color-mid)]/60" : state === "missed" ? "border-[var(--color-down)]/60" : "border-border-subtle";
   return (
     <div className={`bg-surface-card border ${border} rounded-control px-3 py-2.5`}>
       <div className="text-[13px] font-medium text-text-primary">Ch {c.chapter}</div>
-      <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>
+      {incentives && <div className="text-[11px] font-mono text-text-tertiary">by {fmtDate(c.due)}</div>}
       <div className="mt-1.5 text-[11px] font-mono">
         {state === "done" && <span className="text-up">✓ on time</span>}
         {state === "late" && <span className="text-[var(--color-mid)]">✓ late</span>}
         {state === "missed" && <span className="text-[var(--color-down)]">missed</span>}
-        {state === "upcoming" && <span className="text-text-tertiary">upcoming</span>}
+        {state === "reached" && <span className="text-up">✓ reached</span>}
+        {state === "upcoming" && <span className="text-text-tertiary">{incentives ? "upcoming" : "not yet"}</span>}
       </div>
       <div className="mt-1 text-[11px] font-mono text-text-tertiary">
         {c.quiz ? (
-          <span className={c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
+          <span className={c.quiz.verification !== "invalidated" && c.quiz.score / c.quiz.total >= 0.8 ? "text-accent" : "text-text-secondary"}>
             quiz {c.quiz.score}/{c.quiz.total}
+            {/* A question in it was corrected later (lib/reading-questions.ts): kept, earns no XP. Unverified = recorded
+                without its per-question answers, so the score can't be checked (still counted). */}
+            {c.quiz.verification === "invalidated" ? " · corrected" : c.quiz.verification === "unverified" ? " · unverified" : ""}
           </span>
+        ) : offer || pendingRecord ? (
+          "no result yet"
         ) : c.reached ? (
           <Link href="/chat" className="text-accent/80 underline underline-offset-2">
             quiz me →
@@ -388,84 +544,25 @@ function CheckpointTile({ c }: { c: ReadingOverview["checkpoints"][number] }) {
           "no quiz yet"
         )}
       </div>
-    </div>
-  );
-}
-
-function ReviewCard({ o, onGraded }: { o: ReadingOverview; onGraded: (xp: number) => void }) {
-  const [queue, setQueue] = useState<Highlight[]>(o.dueReviews);
-  const [revealed, setRevealed] = useState(false);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    setQueue(o.dueReviews);
-    setRevealed(false);
-  }, [o.dueReviews]);
-
-  const cur = queue[0];
-  const nextDue = useMemo(() => {
-    const future = o.highlights.map((h) => h.next_review).filter((d): d is string => !!d && d > o.today).sort();
-    return future[0] ?? null;
-  }, [o.highlights, o.today]);
-
-  const grade = async (g: Grade) => {
-    if (!cur || busy) return;
-    setBusy(true);
-    try {
-      const res = await fetch("/api/reading/review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ highlight_id: cur.highlight_id, grade: g }) });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      setQueue((q) => q.slice(1));
-      setRevealed(false);
-      onGraded(json.xp_gained ?? 0);
-    } catch {
-      /* toast handled by parent reload */
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-review">
-      <div className="flex items-baseline justify-between">
-        <h3 className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">Review</h3>
-        <span className="text-[11px] font-mono text-text-tertiary">
-          {queue.length ? `${queue.length} due` : o.reviewsToday ? `${o.reviewsToday} done today` : nextDue ? `next ${fmtDate(nextDue)}` : "nothing scheduled"}
-        </span>
-      </div>
-      {cur ? (
-        <div className="mt-2">
-          <blockquote className="text-[14px] text-text-primary leading-relaxed border-l-2 border-accent/60 pl-3">{cur.passage}</blockquote>
-          <div className="mt-2 text-[11px] font-mono text-text-tertiary">
-            {cur.chapter != null ? `ch ${cur.chapter}` : ""} {cur.concept ? `· ${cur.concept}` : ""}
-          </div>
-          {!revealed ? (
-            <button onClick={() => setRevealed(true)} className="mt-3 px-3 py-1.5 text-[13px] rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-text-secondary">
-              Say what this means, then reveal your note
-            </button>
-          ) : (
-            <>
-              <p className="mt-3 text-[13px] text-text-secondary italic">{cur.comment || "No comment on this one. Add one below."}</p>
-              <div className="mt-3 flex gap-2">
-                <GradeBtn label="Again" sub="1d" onClick={() => grade("again")} disabled={busy} className="border-[var(--color-down)]/50 text-[var(--color-down)]" />
-                <GradeBtn label="Good" sub={cur.interval_days ? `${Math.max(1, Math.round(cur.interval_days * Number(cur.ease)))}d` : "3d"} onClick={() => grade("good")} disabled={busy} className="border-border-default text-text-primary" />
-                <GradeBtn label="Easy" sub="longer" onClick={() => grade("easy")} disabled={busy} className="border-accent/60 text-accent" />
-              </div>
-            </>
-          )}
+      {/* A newer quiz for this checkpoint was corrected later, so an older counted result is shown instead: say so,
+          or the score change looks unexplained (PR 362 follow-up). Plain text, never color alone. */}
+      {c.correctedNewer && (
+        <div className="mt-1 text-[11px] leading-snug text-text-tertiary">
+          A newer quiz was corrected, so this earlier result is shown
+          {c.correctedNewerQuiz ? ` (${c.correctedNewerQuiz.score}/${c.correctedNewerQuiz.total} · ${fmtDate(c.correctedNewerQuiz.date)})` : ""}.
         </div>
-      ) : (
-        <p className="mt-2 text-[13px] text-text-tertiary">Nothing due. New highlights come up the next day, then at growing intervals based on your grades.</p>
       )}
-    </section>
-  );
-}
-
-function GradeBtn({ label, sub, onClick, disabled, className }: { label: string; sub: string; onClick: () => void; disabled: boolean; className: string }) {
-  return (
-    <button onClick={onClick} disabled={disabled} className={`flex-1 h-11 rounded-control border bg-white/[0.02] disabled:opacity-40 ${className}`}>
-      <div className="text-[13px] font-medium leading-none">{label}</div>
-      <div className="text-[10px] font-mono opacity-70 mt-1">{sub}</div>
-    </button>
+      {/* The quiz in the app (READ-QUIZ-01): offered once the book's questions are on and the chapter is quizzable. */}
+      {(offer || pendingRecord) && (
+        <button
+          type="button"
+          onClick={onStart}
+          className="mt-2 inline-flex min-h-11 w-full items-center justify-center rounded-full border border-accent/60 px-2 py-1.5 text-center text-[12px] leading-tight text-accent"
+        >
+          {pendingRecord ? "Answered · record result" : `Start checkpoint · ${CHECKPOINT_SIZE} questions`}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -684,22 +781,18 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
               placeholder="ch."
               className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
             />
-            <select
+            {/* The concept tags: the book's own (pds.books.theme, none by default) plus the titles of its linked ideas. */}
+            <ConceptPicker
+              slug={o.book.slug}
+              on={o.practice?.enabled === true}
+              signature={mapSignature(o.practice)}
+              themeConcepts={o.theme?.concepts}
               value={concept}
-              onChange={(e) => {
-                setConcept(e.target.value);
-                commit({ concept: e.target.value });
+              onChange={(v) => {
+                setConcept(v);
+                commit({ concept: v });
               }}
-              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
-            >
-              <option value="">Concept (optional)</option>
-              {CONCEPTS.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-              <option value="__custom">Other…</option>
-            </select>
+            />
           </div>
           {concept === "__custom" && (
             <input

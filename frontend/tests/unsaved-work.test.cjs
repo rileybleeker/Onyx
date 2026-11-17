@@ -116,4 +116,81 @@ test('only text-like fields count', () => {
   assert.equal(isTextField({ tagName: 'SELECT', dataset: {} }), false);
   assert.equal(isTextField({ tagName: 'DIV', isContentEditable: true, dataset: {} }), true);
   assert.equal(isTextField({ tagName: 'TEXTAREA', dataset: { unsavedIgnore: '' } }), false);
+  // A filter or search box is not an entry: typing in it never pins its page of the scroll or blocks an update.
+  // closest() stand-in: the field's ancestors match these simple selectors (one per ancestor).
+  const within = (...ancestors) => ({
+    tagName: 'INPUT', type: 'text', dataset: {},
+    closest: (sel) => (sel.split(',').some((part) => ancestors.includes(part.trim())) ? {} : null),
+  });
+  assert.equal(isTextField(within('[role="search"]')), false, 'inside a role="search" box');
+  assert.equal(isTextField(within('[data-unsaved-ignore]')), false, 'inside an ignored container');
+  assert.equal(isTextField(within('[data-feed-route]')), true, 'an entry field in a page of the scroll still counts');
+  assert.equal(isTextField({ tagName: 'INPUT', type: 'text', dataset: {}, closest: () => { throw new Error('detached'); } }), true);
+});
+
+// ---- per page of the continuous scroll (PROD-T01, 2026-11-16) ----------------------------------------------------
+// The scroll asks hasIn(route) before unmounting a page far from the screen: a page holding unsaved work stays.
+
+/** A typed field drawn inside the scroll page `route` (closest() finds the page's section). */
+const fieldIn = (route, value = '') => ({
+  ...textarea(value),
+  closest: (selector) => (selector === '[data-feed-route]' ? { getAttribute: (name) => (name === 'data-feed-route' ? route : null) } : null),
+});
+
+test('hasIn: a registered form counts for the scroll page it is drawn in, not for others or the routed page', () => {
+  const work = new UnsavedWork();
+  work.setDirty('autosave:log-reading:1', true, '/log');
+  work.setDirty('autosave:nyc-note:2', true); // routed page: no scope
+  assert.equal(work.hasIn('/log'), true);
+  assert.equal(work.hasIn('/sleep'), false);
+  assert.equal(work.has(), true);
+  work.setDirty('autosave:log-reading:1', false);
+  assert.equal(work.hasIn('/log'), false, 'saved or discarded: the page is no longer held');
+  assert.equal(work.has(), true, 'the routed page form still protects the reload');
+});
+
+test('hasIn: text typed into a field of a scroll page holds that page until a write saves it', async () => {
+  const work = new UnsavedWork();
+  const win = fakeWindow(async () => ({ ok: true }));
+  trackUnsavedWork(win, work);
+  const field = fieldIn('/log', '25 minutes');
+  win.type(field);
+  assert.equal(work.hasIn('/log'), true);
+  assert.equal(work.hasIn('/today'), false);
+  await win.fetch('/api/reading/sessions', { method: 'POST' });
+  assert.equal(work.hasIn('/log'), false, 'a successful write after the typing released it');
+  win.type(fieldIn('/log', ''));
+  assert.equal(work.hasIn('/log'), false, 'an empty field holds nothing');
+  const gone = fieldIn('/log', 'x');
+  win.type(gone);
+  gone.isConnected = false;
+  assert.equal(work.hasIn('/log'), false, 'a field no longer on the page holds nothing');
+});
+
+test('subscribe: told when a form becomes dirty or clean (and when its page changes), never twice for the same state', () => {
+  const work = new UnsavedWork();
+  let calls = 0;
+  const off = work.subscribe(() => { calls += 1; });
+  work.setDirty('a', true, '/log');
+  work.setDirty('a', true, '/log');
+  assert.equal(calls, 1, 'same state again: no call');
+  work.setDirty('a', true, '/nutrition');
+  assert.equal(calls, 2, 'drawn in another page now');
+  work.setDirty('a', false);
+  work.setDirty('a', false);
+  assert.equal(calls, 3);
+  work.setDirty('never-dirty', false);
+  assert.equal(calls, 3, 'clearing an unknown key changes nothing');
+  off();
+  work.setDirty('a', true);
+  assert.equal(calls, 3, 'unsubscribed');
+});
+
+test('subscribe: a failing listener does not stop the others', () => {
+  const work = new UnsavedWork();
+  let heard = false;
+  work.subscribe(() => { throw new Error('synthetic listener failure'); });
+  work.subscribe(() => { heard = true; });
+  work.setDirty('a', true, '/log');
+  assert.equal(heard, true);
 });

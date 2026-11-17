@@ -332,6 +332,12 @@ export function gmailThreadHref(account: string | null | undefined, threadId: st
   return `https://mail.google.com/mail/?authuser=${authuser}#all/thread-f:${id}`;
 }
 
+/** "2026-11-12": the Eastern calendar day `days` after the Eastern day of `now`, as a date. */
+export function etDateIso(now: Date, days: number): string {
+  const today = etDay(now);
+  return new Date(Date.UTC(today.year, today.month, today.day + days, 12)).toISOString().slice(0, 10);
+}
+
 /** "Thu, Nov 12": the Eastern calendar day `days` after the Eastern day of `now`. */
 export function etDayLabel(now: Date, days: number): string {
   const today = etDay(now);
@@ -356,7 +362,7 @@ export interface InboxCardLike {
   thread: string;
   messageId: number;
   created_at: string;
-  card: { code: string; agent: string; name: string; link?: string | null };
+  card: { code: string; agent: string; name: string; link?: string | null; expires?: string | null };
 }
 
 /** The part of a GET /api/urgent-email item (lib/urgent-email-query.ts) this file reads. */
@@ -369,7 +375,11 @@ export interface EmailItemLike {
   subject: string;
   receivedAt: string;
   labels: readonly string[];
-  deadline: { daysLeft: number; label: string } | null;
+  /**
+   * `daysLeft` is counted when the answer was made; `date` ("YYYY-MM-DD", Eastern) is the deadline's own day, so a
+   * copy kept past midnight still names the same day (absent in an answer from before it was added).
+   */
+  deadline: { daysLeft: number; label: string; date?: string } | null;
   reasons: string[];
   nextStep: string;
   href: string | null;
@@ -396,6 +406,11 @@ export interface TodayUrgentItem {
    * newer message arrives), including the same message's copy in the other mailbox.
    */
   clear: { cards: string[]; emails: { key: string; receivedAt: string }[] };
+  /**
+   * The expiry of every Agent Inbox card merged into this item, as the Worker sent it (cards without one are left
+   * out), so Today's attention model (lib/today-attention.ts) never lets a snooze outlast a request's expiry.
+   */
+  cardExpires?: string[];
 }
 
 const URGENT_PREFIX = /^\s*urgent\s*:\s*/i;
@@ -574,12 +589,18 @@ function emailRank(item: EmailItemLike): number {
  * Merge the label-sourced emails and the email cards of the Agent Inbox into one list,
  * each thing once: same Gmail thread (card link ↔ email thread id, same account when the
  * link names one) or same Message-ID in two mailboxes. Best first, bounded to `limit`.
+ * `bySearch` (default true, the Urgent email panel): a card whose link is a Gmail search is also
+ * folded into the one labelled email that search would find. false (Today's attention model,
+ * lib/today-attention.ts): identity only, so such a card always stays its own item; matching words
+ * never fold two obligations into one.
  */
 export function mergeUrgent(
   emails: readonly EmailItemLike[],
   cards: readonly InboxCardLike[],
   limit: number = MAX_URGENT_SHOWN,
+  opts: { bySearch?: boolean } = {},
 ): { items: TodayUrgentItem[]; total: number } {
+  const bySearch = opts.bySearch !== false;
   type Entry = { item: TodayUrgentItem; rank: number; threadId: string | null; account: string | null };
   const entries: Entry[] = [];
   const byMessageId = new Map<string, Entry>();
@@ -609,6 +630,7 @@ export function mergeUrgent(
         gmailHref: href,
         requestHref: null,
         clear: { cards: [], emails: [{ key: e.key, receivedAt: e.receivedAt }] },
+        cardExpires: [],
       },
     };
     entries.push(entry);
@@ -627,7 +649,7 @@ export function mergeUrgent(
     let match: Entry | undefined;
     if (ref?.threadId) {
       match = entries.find((x) => x.threadId === ref.threadId && (!ref.account || !x.account || x.account === ref.account));
-    } else if (ref) {
+    } else if (ref && bySearch) {
       // A Gmail search link names no thread: merge only into the ONE labelled email the search
       // would find (every word in its subject or sender name; searchMatchesEmail), from the
       // same account, received up to 7 days before the card. Two candidates = no merge.
@@ -644,8 +666,10 @@ export function mergeUrgent(
         if (hits.length === 1) match = hits[0];
       }
     }
+    const expires = c.card.expires ? [c.card.expires] : [];
     if (match) {
       match.item.clear.cards.push(code);
+      match.item.cardExpires = [...(match.item.cardExpires ?? []), ...expires];
       if (!match.item.sources.includes("Agent Inbox")) {
         match.item.sources.push("Agent Inbox");
         match.item.sourceDetail += ` + Agent Inbox (${c.card.agent})`;
@@ -673,6 +697,7 @@ export function mergeUrgent(
         gmailHref: c.card.link && ref ? c.card.link : null,
         requestHref,
         clear: { cards: [code], emails: [] },
+        cardExpires: expires,
       },
     });
   }

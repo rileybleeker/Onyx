@@ -13,7 +13,7 @@ Onyx is Riley's personal health-data platform: root-level Python ETL scripts loa
 
 ## Find your domain rules
 
-Before changing anything, read the file below for the paths you touch, and their source. Dated notes, counts and schedules there are history: the source wins; if they disagree, raise it. Old `AGENTS.md "<name>"` citations, edits to the old file, and the full path table: [docs/agents/README.md](docs/agents/README.md). Change a domain rule in its file; a new section needs an index row (`tests/test_agents_docs.py`).
+Read the file below for the paths you touch, and its source. Dated notes, counts and schedules there are history: the source wins; if they disagree, raise it. Path table, old `AGENTS.md "<name>"` citations and edits to the old file: [docs/agents/README.md](docs/agents/README.md). Change a rule in its file; a new section needs an index row (`tests/test_agents_docs.py`).
 
 Files (`docs/agents/<name>.md`):
 
@@ -37,7 +37,7 @@ Files (`docs/agents/<name>.md`):
 
 ## Delivery accountability (Riley, 2026-11-15)
 
-- Authorized implementation: headless Claude Code builders with bounded scope and acceptance criteria; **Codex independently reviews the actual resulting diff**; resolve concrete findings before release. A builder's summary or exit code is not a review.
+- Authorized implementation: headless Claude Code builders, bounded scope and acceptance criteria. **Codex reviews only AFTER merge, never before (Riley, 2026-11-17)**: the deployed revision, with fixes filed as dev-backlog items; never a merge gate. Pre-merge: only the builder's `npx tsc --noEmit` (frontend) and repo CI. Hold a PR only for an unapplied required migration, a decision that is Riley's, or an investigation-only change. A builder's summary or exit code is not a review.
 - **Launched, code written, reviewed, merged, deployed and verified are distinct states.** Record task, attempt, exact revisions, evidence and next action. Never mark Done from launch, a model's claim, a merge or a `/login` 200.
 - The orchestrator supervises to verified completion or an explicit blocker without reminders: persist recovery state first, bound retries, reconcile after a restart instead of duplicating, tell Riley essential blockers and decisions.
 - One writer per task/worktree, one owner per release transition; respect locks and branch ownership. A new head voids its review/check receipts. Keep private receipts across chats; never invent evidence.

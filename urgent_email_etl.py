@@ -43,6 +43,13 @@ Two scopes, kept apart on purpose
    reconciliation UNKNOWN: nothing is cleared, the rows are counted as kept,
    and the heartbeat is 'partial'. A message that really lost its label is
    cleared by the first run that reconciles completely.
+3. RECOVER (bounded, same complete membership only). A stored row a window-only cleanup cleared
+   by mistake (still labelled in Gmail but outside the --days window at the time) stays hidden even
+   when a complete all-age membership proves the label is still there. So each run re-reads rows
+   marked labeled=False in message_id order (RECOVERY_PAGE at a time, resuming just past where the
+   previous run stopped) and, when a row's Gmail message id is present in the same COMPLETE membership
+   the clear path proves, sets it back to labeled=True with synced_at=now. Bounded per run (MAX_RECOVER
+   rows per account); a None or incomplete membership recovers nothing, never from a window read alone.
 
 Identity stays (account, message_id). A refreshed message is first matched to
 the stored row with the same Gmail message id and updated under THAT key, so a
@@ -107,6 +114,8 @@ GMAIL_LABEL_QUERY = "{label:agent-action label:agent-deadline}"
 DEFAULT_DAYS = 30
 MAX_MESSAGES = 300            # refresh cap per account per run; inbox-triage labels a handful a day
 MAX_MEMBERSHIP = 20_000       # all-age labeled messages the reconciliation will map; more = unknown
+MAX_RECOVER = 100             # recovery cap per account per run: how many mis-cleared rows are re-labelled
+RECOVERY_PAGE = 1000          # recovery scan reads labeled=False rows this many at a time, in message_id order
 MAX_BODY_BYTES = 2_000_000    # skip the snippet for anything bigger (the stored one stays)
 SNIPPET_MAX = 240
 SUBJECT_MAX = 500
@@ -127,6 +136,7 @@ _INVISIBLE = re.compile("[͏​‌‍⁠­﻿]")
 # Reconciliation outcome codes (counts-only diagnostics).
 RECONCILE_COMPLETE = "complete"
 MAILBOX_NOT_ALL_MAIL = "mailbox_not_all_mail"
+
 MEMBERSHIP_SEARCH_FAILED = "membership_search_failed"
 MEMBERSHIP_SEARCH_MALFORMED = "membership_search_malformed"
 MEMBERSHIP_OVER_CAP = "membership_over_cap"
@@ -659,7 +669,8 @@ def store_account(supa: Any, account: str, rows: list[dict], seen_at: str,
     """
     acct = account.strip().lower()
     result = {"refreshed": 0, "upserted": 0, "identity_ambiguous": 0, "labeled_rows": 0, "seen": 0,
-              "retained": 0, "cleared": 0, "would_clear": 0, "unknown": 0, "unidentified": 0}
+              "retained": 0, "cleared": 0, "would_clear": 0, "unknown": 0, "unidentified": 0,
+              "recovered": 0, "would_recover": 0}
     rows, result["identity_ambiguous"] = resolve_identities(
         rows, stored_identities(supa, acct, (r.get("gmail_message_id") for r in rows)))
     result["refreshed"] = len(rows)
@@ -672,13 +683,55 @@ def store_account(supa: Any, account: str, rows: list[dict], seen_at: str,
         result[key] = len(split[key])
     if dry_run:
         result["would_clear"] = len(split["clear"])
+        result["would_recover"] = recover_cleared_rows(supa, acct, membership, seen_at, dry_run=True)
         return result
     for mid in split["clear"]:
         # One exact row per update. lt(last_seen_at) keeps a row refreshed by this run labeled.
         (_table(supa).update({"labeled": False, "synced_at": seen_at})
             .eq("account", acct).eq("message_id", mid).eq("labeled", True).lt("last_seen_at", seen_at).execute())
         result["cleared"] += 1
+    result["recovered"] = recover_cleared_rows(supa, acct, membership, seen_at)
     return result
+
+
+def recover_cleared_rows(supa: Any, account: str, membership: Optional[set[str]],
+                         seen_at: str, dry_run: bool = False) -> int:
+    """Re-label rows a window-only cleanup cleared by mistake. Counts (would-)recovered.
+
+    A stored row labeled=False whose Gmail message id IS in a COMPLETE all-age Agent/* membership was
+    cleared while it was still labelled (outside the --days window at the time); the membership now
+    proves the label is still there, so the row is set back to labeled=True with synced_at=now. Bounded
+    and resumable: labeled=False rows are read in message_id order, RECOVERY_PAGE at a time, advancing
+    past the last message_id seen (a recovered row leaves the set on its own, so the next run resumes
+    naturally just past it); at most MAX_RECOVER rows are recovered per account per run. membership None
+    = reconciliation unknown: nothing is recovered (never from a window read alone). Every update is
+    guarded on labeled=False — the state this scan read — exactly like the clear path. Returns the
+    (would-)recovered count; dry_run reads only and writes nothing."""
+    if not membership:
+        return 0
+    recovered = 0
+    after: Optional[str] = None                 # message-id cursor: read only rows strictly after this one
+    while recovered < MAX_RECOVER:
+        q = (_table(supa).select("message_id,gmail_message_id").eq("account", account)
+             .eq("labeled", False).order("message_id"))
+        if after is not None:
+            q = q.gt("message_id", after)
+        page = q.range(0, RECOVERY_PAGE - 1).execute().data or []
+        if not page:
+            break
+        for r in page:
+            after = r["message_id"]
+            if recovered >= MAX_RECOVER:
+                break
+            gm = row_gmail_id(r)
+            if gm is None or gm not in membership:
+                continue
+            recovered += 1
+            if not dry_run:
+                # One exact row per update, guarded on the state this scan read.
+                (_table(supa).update({"labeled": True, "synced_at": seen_at})
+                    .eq("account", account).eq("message_id", r["message_id"]).eq("labeled", False).execute())
+    return recovered
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +765,11 @@ def _account_notes(fp: str, stats: dict, rec: dict, dry_run: bool, refresh_limit
                      f"{'unknown number of' if kept is None else kept} labeled row(s) kept")
     if rec.get("unidentified"):
         notes.append(f"account {fp}: {rec['unidentified']} labeled row(s) without a Gmail id kept")
+    recovered = rec.get("recovered") or 0
+    if recovered:
+        notes.append(f"account {fp}: {recovered} row(s) re-labelled by a complete membership (recovered)")
+    if dry_run and rec.get("would_recover"):
+        notes.append(f"account {fp}: {rec['would_recover']} row(s) would be re-labelled by a complete membership")
     if dry_run and rec.get("would_clear") is None:
         notes.append(f"account {fp}: would-clear count unknown ({NO_DATABASE})")
     return notes
@@ -754,7 +812,7 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
             if supa is None:            # dry run without a database: nothing is read or written
                 rec = {"refreshed": len(rows), "upserted": 0, "identity_ambiguous": None, "labeled_rows": None,
                        "seen": None, "retained": None, "cleared": 0, "would_clear": None, "unknown": None,
-                       "unidentified": None}
+                       "unidentified": None, "recovered": 0, "would_recover": None}
             else:
                 rec = store_account(supa, account, rows, seen_at, membership, dry_run=dry_run)
         except Exception as e:
@@ -773,7 +831,7 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
                  f"unreadable={stats['skipped']} snippet_gaps={stats['bodies_missing'] + stats['snippet_errors']} "
                  f"reconcile={stats['membership']} labeled_rows={rec['labeled_rows']} "
                  f"{cleared_label}={rec[cleared_label]} retained={rec['retained']} unknown={rec['unknown']} "
-                 f"unidentified={rec['unidentified']}")
+                 f"unidentified={rec['unidentified']} recovered={rec.get('recovered') or 0}")
         notes.extend(_account_notes(fp, stats, rec, dry_run, refresh_limit))
     report["records"] = total
     if len(failures) == len(accounts):
@@ -802,7 +860,7 @@ def run(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = F
 # The integer counters a preview prints per account (allowlist; nothing else from the report is emitted).
 PREVIEW_STATS = ("window_candidates", "dropped_by_cap", "messages", "membership_size", "skipped")
 PREVIEW_RECONCILE = ("labeled_rows", "seen", "retained", "would_clear", "unknown", "unidentified",
-                     "identity_ambiguous", "upserted", "cleared")
+                     "identity_ambiguous", "upserted", "cleared", "recovered", "would_recover")
 
 
 def _open_preview_client() -> Any:

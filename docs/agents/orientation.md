@@ -26,6 +26,7 @@ Onyx/
 ├── eight_sleep_etl.py       # Eight Sleep API → Supabase (1 table)
 ├── myfitnesspal_import.py   # MyFitnessPal CSV → Supabase (nutrition table); manual fallback only, Cronometer is primary
 ├── myfitnesspal_email.py    # IMAP monitor for MFP export emails; manual fallback only (workflow cron removed 2026-05-31)
+├── myfitnesspal_etl.py      # MyFitnessPal CSV → Supabase (shared MFP import core; CSV-export path, no scraping)
 ├── mfp_inbox/               # MFP CSVs picked up only when `myfitnesspal_email.py` is run by hand (no scheduled job)
 ├── mfp_archive/             # Processed CSVs moved here
 ├── cronometer_etl.py        # Automated Cronometer web-export → Supabase (unofficial endpoints; replaces the manual export click)
@@ -41,6 +42,7 @@ Onyx/
 ├── meal_schema.sql          # meal_events + meal_timing_daily view (clock-time meal events for HRV timing analysis)
 ├── weight_schema.sql        # weight_log: one row per ET day, kg-stored body weight (tanita rollup primary + manual /nutrition override)
 ├── tanita_etl.py            # Tanita Health Planet → Supabase (tanita_measurements raw + weight_log daily rollup)
+├── eight_sleep_temp_backfill.py  # Eight Sleep bed/room-temp gap filler: same self-heal as the ETL with no look-back bound (`--compare` = read-only check)
 ├── flights_email_etl.py     # Delta confirmation/trip-details/check-in emails (IMAP, BOTH Gmail accounts) → pds.flights (+ user_tz_log flight-auto)
 ├── delivery_email_etl.py    # Uber Eats receipt emails (IMAP, shares flights_email_etl.py plumbing) → pds.delivery_orders (merchant, order/delivery time, total — NO items)
 ├── air_quality_etl.py       # Open-Meteo Air Quality (keyless) → pds.air_quality_daily (hourly PM2.5 / US AQI averaged per ET day; heartbeat `air_quality|daily`); `--dry-run` needs no .env
@@ -50,6 +52,8 @@ Onyx/
 ├── simplefin_etl.py         # SimpleFIN Bridge (read-only bank feed, Access URL secret) -> pds.finance_accounts / finance_transactions / finance_balance_snapshots for /financials; counts-only output; heartbeats `simplefin|transactions` + `simplefin|balances`
 ├── orders_email_etl.py      # Shipping / delivery emails from stores, Amazon and UPS/FedEx/USPS (IMAP, both Gmail accounts, read-only) → pds.online_order_events → pds.online_orders for /orders
 ├── urgent_email_etl.py      # inbox-triage's Gmail labels Agent/Action + Agent/Deadline (IMAP, read-only, both accounts) → pds.inbox_emails metadata for Today's Urgent email
+├── email_log_safety.py      # Counts-and-codes diagnostics for the email ETLs (their logs and heartbeats are public; this checks nothing private leaks)
+├── email_preview_readonly.py # Guarded read-only DB client for urgent_email_etl.py --preview-db (retention preview; sends nothing that can change data)
 ├── tanita_schema.sql        # tanita_measurements DDL (ADR-0001 quad trigger, RLS) + weight_log.source column
 ├── spotify_schema.sql       # Spotify table DDL + spotify_daily_signature view
 ├── spotify_playlists_schema.sql  # Spotify playlists audit table DDL
@@ -64,6 +68,8 @@ Onyx/
 ├── experiment_adherence.py  # N-of-1 trials: per-day adherence from Screen Time (once settled) + the check-in answer (pure)
 ├── experiment_report.py     # N-of-1 trials: daily report job (progress counts while running, the final analysis once, at the end)
 ├── experiment_notion.py     # N-of-1 trials: Notion mirror of a trial in "Onyx Experiments" (called by experiment_report.py; best-effort)
+├── experiment_calibration.py # N-of-1 trials: seeded synthetic calibration of the end-of-trial inference (METHOD_REVIEW input; doc 8.2)
+├── experiment_fingerprint.py # N-of-1 trials: fingerprint of the code a method review / calibration report covers (doc 8.3)
 ├── hrv_analysis.py          # HRV deep analysis pipeline (Phases 1-3.5): data loading,
 │                            #   ~350-column / ~250-feature matrix, stat analysis, XGBoost/SARIMAX/Prophet,
 │                            #   walk-forward backtest, stores results to Supabase
@@ -77,12 +83,18 @@ Onyx/
 │                            #   than 2 days, updated since the last hrv_analysis_results
 │                            #   computed_at). Emits GitHub Actions output
 │                            #   backfill_detected=true|false.
+├── hrv_alignment.py         # THE one-place HRV alignment rule: which sleep a matrix row's HRV describes, column re-keying, cycle waking days (every consumer goes through it)
+├── hrv_feature_sources.py   # One manifest of every HRV input and how a correction to it is seen (row scan, habit_journal trigger, source fingerprint)
+├── hrv_model_artifact.py    # Publishes each trained model once with provenance and serves it by registry rule (PIPE-08)
+├── gps_tz_backfill.py       # Garmin GPS → pds.user_tz_log auto-population (runs at the end of garmin_etl.py; --apply = full history)
+├── whoop_tz_backfill.py     # WHOOP cycle offsets → pds.user_tz_log auto-population (runs at the end of whoop_etl.py)
+├── audit_runner.py          # Fires the repo audit at external reviewer models in parallel; responses gitignored under analysis_output/audit/
 ├── requirements-analysis.txt # Python deps for HRV analysis (xgboost, statsmodels, prophet, etc.)
 ├── analysis_output/         # Generated plots + xgboost_hrv_model.pkl (gitignored)
 ├── tools/kindle_harvest/    # LOCAL-PC Kindle harvester (Playwright + signed-in Chrome, Task Scheduler every 3h): reads the Kindle for Web reader (TOC, page map, annotations w/ positions+timestamps, Whispersync position) → POST /api/reading/highlights/import (CI token) → auto sessions; heartbeats kindle|highlights
 ├── tools/ubereats_harvest/  # LOCAL-PC Uber Eats item harvester (Playwright + signed-in Chrome in an OFF-SCREEN window — headless is blocked by Uber; Task Scheduler "Onyx Uber Eats Harvest" every 6h): order history → POST /api/delivery/items/import (CI token) → pds.delivery_order_items + per-dish kcal/macro estimates; heartbeats ubereats|items
 ├── tools/pc_activity_logger/ # LOCAL-PC activity logger (stdlib Python under pythonw.exe, Task Scheduler "Onyx PC Activity Logger", one long-running process sampling every 30 s): idle seconds + the foreground program's exe name only (never titles, URLs or keys) → hourly upsert to pds.pc_activity_hours/apps with ~/.onyx_supabase_secret; heartbeats pc_activity|usage
-├── tools/local_cleanup/     # LOCAL-PC %TEMP% cleanup (stdlib Python, dry run by default; weekly Task Scheduler "Onyx Local Cleanup" via pythonw --apply once Riley runs register-task.ps1): Recycle Bin only, for agent scratch / test temp leftovers; never .git folders, listed Claude sessions' scratch, anything touched in 12 h or paths over 259 chars. Rules: docs/local-cleanup.md
+├── tools/local_cleanup/     # LOCAL-PC %TEMP% cleanup (stdlib Python, dry run by default; weekly Task Scheduler "Onyx Local Cleanup" via pythonw --apply, registered 2026-11-17, Sundays 04:30): Recycle Bin only, for agent scratch / test temp leftovers; never .git folders, listed Claude sessions' scratch, anything touched in 12 h or paths over 259 chars. Rules: docs/local-cleanup.md
 ├── tools/ai_usage_harvest/ # LOCAL-PC AI tool usage harvester (stdlib Python under pythonw.exe, Task Scheduler "Onyx AI Usage Harvest" every 3h): Claude Code + Codex session logs → METADATA ONLY (times, token counts, prompt / tool-call counts, model names, project folder name; never text, paths or ids) → per-day upsert to pds.ai_tool_usage_daily with ~/.onyx_supabase_secret; heartbeats ai_usage|sessions
 ├── .github/workflows/
 │   ├── daily-etl.yml            # Hourly Health ETL: Garmin + WHOOP (`0 * * * *`)
@@ -103,7 +115,23 @@ Onyx/
 │   ├── orders-email.yml         # Online Orders Email — every 3h at :05 (`5 */3 * * *`)
 │   ├── simplefin-etl.yml        # SimpleFIN ETL — every 6h at :30 (`30 */6 * * *`), finance ledger
 │   ├── hrv-prediction.yml       # HRV prediction — auto-runs after each ETL via workflow_run, plus guaranteed 23:50 ET finalization (DST-safe)
-│   └── hrv-retrain-on-backfill.yml  # HRV Analysis Retrain — hourly backfill check + daily 12:00 UTC safety-net
+│   ├── hrv-retrain-on-backfill.yml  # HRV Analysis Retrain — hourly backfill check + daily 12:00 UTC safety-net
+│   ├── experiment-admin.yml     # N-of-1 trials: seed / register / verify / stop (manual, Riley only)
+│   ├── experiment-report.yml    # N-of-1 trials: daily report job (progress while running, final analysis once at the end)
+│   ├── care-calendar-catch-up.yml # Scheduled Google Calendar write sync for care items (every 6h)
+│   ├── cash-forecast-backtest.yml # Manual cash-forecast backtest (prints percentages only)
+│   ├── cash-forecast-snapshot.yml # Weekly cash-forecast snapshot (Mondays 12:30 UTC) + finance_forecast|snapshot heartbeat
+│   ├── screentime-ios.yml       # Screen Time iPhone app CI build (see also focus-ios.yml / focus-ios-signed.yml for the Focus app)
+│   ├── keepalive.yml            # Re-enables cron workflows GitHub auto-disables after 60 quiet days (Mondays)
+│   ├── smoke-test.yml           # Production Playwright smoke every 6h (see "Smoke testing")
+│   ├── perf-timing.yml          # Hourly production speed-budget sampling (see "Speed budget")
+│   ├── scheduled-tests.yml      # Credential-free suite on the 30-minute schedule against each deployed revision
+│   ├── post-merge.yml / merge-train.yml / deployed-revision.yml # Post-merge test runs, the merge train and deployed-revision bookkeeping
+│   ├── watchdog.yml / live-checks.yml # Cloud + live watchdogs (red runs raise speed-budget-broken etc.)
+│   ├── monthly-audit.yml / autonomous-ci.yml # Monthly external-model audit; autonomous agent CI
+│   ├── kindle-harvester-test.yml / rocketmoney-harvester-test.yml # Node tests for the local-PC harvesters
+│   ├── delete-closed-pr-branch.yml # Cleanup of merged PR branches
+│   └── (see .github/workflows/ for the full list)
 ├── whoop_schema.sql         # WHOOP table DDL
 ├── eight_sleep_schema.sql   # Eight Sleep DDL + daily_health_matrix view
 ├── sql/
@@ -122,14 +150,14 @@ Onyx/
 │   ├── photo_meals.sql      # pds.photo_meals (meals logged from a plate photo: Claude estimate, confirmed by Riley) + pds.photo_meal_daily view
 │   ├── phone_screen_time_schema.sql # RETIRED 2026-11-13 (v1 Shortcuts path, never used): pds.phone_app_events + phone_app_sessions + phone_screen_daily views still exist, empty
 │   ├── pc_activity_schema.sql # PC activity logger: pds.pc_activity_hours (per UTC hour: active/idle s) + pds.pc_activity_apps (per hour + program) + view pds.pc_activity_daily (behavioral day); service-role only
-│   ├── ai_tool_usage_schema.sql # AI tool usage harvester: pds.ai_tool_usage_daily (per device, behavioral day, tool, project folder name: sessions, prompts, tool calls, active / late minutes, tokens, models); owner read + service role. NOT APPLIED yet (Riley)
+│   ├── ai_tool_usage_schema.sql # AI tool usage harvester: pds.ai_tool_usage_daily (per device, behavioral day, tool, project folder name: sessions, prompts, tool calls, active / late minutes, tokens, models); owner read + service role. Applied
 │   ├── reading_schema.sql   # Reading module: books, reading_sessions, book_highlights (SM-2 review), reading_reviews, reading_quizzes
 │   └── medical_records_schema.sql # /health/records: pds.medical_documents + pds.lab_results + private bucket medical-records (service-role only)
 ├── ARCHITECTURE.md          # Full system architecture reference
 ├── .env                     # Secrets (NEVER commit)
 └── frontend/                # Next.js 15 app
     └── src/
-        ├── app/             # Pages (13 routes; `/` redirects to /today, `/meals` redirects to /nutrition) + API routes
+        ├── app/             # Pages (one page.tsx per route; the route list lives in `lib/nav.ts` NAV_SECTIONS — `/` renders Today directly, `/meals` redirects to /nutrition) + API routes
         │   ├── analytics/hrv/  # HRV Analysis dashboard (predictions, SHAP, models)
         │   ├── reading/        # Reading quest: progress ring + pace, streak, XP/levels, badges, checkpoints, burn-up chart, SM-2 review, session + highlight capture (Kindle export import); mirrors to Notion
         │   └── spotify/        # Spotify listening dashboard (volume, mood signature, sonic profile radar, top artists/tracks)
@@ -140,7 +168,7 @@ Onyx/
 ## Tech Stack (summary)
 
 - **ETL**: Python 3, httpx, garminconnect, supabase-py, python-dotenv
-- **Database**: Supabase (Postgres 17), schema `pds`, 19 tables + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_artists`, `spotify_playlists`, `spotify_daily_signature` view) + Supplements (`supplement_products`, `supplement_intake`, `supplement_intake_by_compound` view, `daily_supplement_matrix` view) + Notion personal Journal (`journal_entries` with pgvector embeddings, `search_journal_entries` RPC) + Tanita body comp (`tanita_measurements` raw + `weight_log` daily rollup)
+- **Database**: Supabase (Postgres 17), schema `pds` (table DDL lives in the root `*_schema.sql` files and `sql/*.sql`; add a table by adding a schema file there, not by extending this list) + `journal` unified view + 3 HRV analysis tables (`hrv_predictions`, `hrv_model_metrics`, `hrv_analysis_results`) + Spotify (`spotify_plays`, `spotify_tracks`, `spotify_artists`, `spotify_playlists`, `spotify_daily_signature` view) + Supplements (`supplement_products`, `supplement_intake`, `supplement_intake_by_compound` view, `daily_supplement_matrix` view) + Notion personal Journal (`journal_entries` with pgvector embeddings, `search_journal_entries` RPC) + Tanita body comp (`tanita_measurements` raw + `weight_log` daily rollup)
 - **Frontend**: Next.js 15, React 19, Tailwind CSS 4, Recharts 3.8, TypeScript 5
 - **Hosting**: Vercel (frontend; **Pro plan since 2026-11-12** — the Hobby cap of 100 deployments/day was exhausted by agent PR previews, which blocked production deploys; `frontend/vercel.json` `ignoreCommand` now builds `master` only, so PRs get no Vercel preview), Supabase Cloud (database)
 

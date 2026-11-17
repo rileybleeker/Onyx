@@ -103,6 +103,9 @@ except ImportError:
 import hashlib
 
 import hrv_alignment as al
+import hrv_column_guard
+import hrv_feature_sources as feature_sources
+import hrv_model_artifact as model_artifact
 
 warnings.filterwarnings("ignore")
 
@@ -166,6 +169,9 @@ def et_today() -> date:
 
 MODEL_VERSION = f"{et_today().isoformat()}_behavioral_v1"
 TARGET = al.TARGET  # whoop_hrv_rmssd; outcome alignment lives in hrv_alignment.py
+# The outcome must be the WHOOP column itself — never a blend with the Garmin /
+# Eight Sleep HRV columns (hrv_column_guard, AGENTS.md "not interchangeable").
+hrv_column_guard.assert_target_is_whoop(TARGET)
 
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
@@ -494,6 +500,11 @@ FEATURE_LABELS: dict[str, str] = {
     "wx_uv_max": "Peak UV Index",
     "wx_night_temp_mean": "Outdoor Temperature During Sleep (°C)",
     "wx_night_temp_min": "Outdoor Low During Sleep (°C)",
+    "pollen_total": "Pollen Count (grains/m³)",
+    "pollen_tree_level_ord": "Tree Pollen Level (0-3)",
+    "pollen_grass_level_ord": "Grass Pollen Level (0-3)",
+    "pollen_weed_level_ord": "Weed Pollen Level (0-3)",
+    "pollen_mold_level_ord": "Mold Level (0-3)",
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
@@ -600,6 +611,9 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
 SUPPLEMENT_ROLLUP_MAT = "supplement_intake_by_compound_mat"
 SUPPLEMENT_ROLLUP_VIEW = "supplement_intake_by_compound"
 _MISSING_RELATION_CODES = {"PGRST205", "42P01"}
+# Relation each fingerprinted source was actually loaded from this run (hrv_feature_sources
+# .mark_relation_mismatch compares it with the relation the fingerprint was taken from).
+LOADED_RELATIONS: dict[str, str] = {}
 
 
 def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
@@ -612,7 +626,9 @@ def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
     """
     fetch = fetch or fetch_all
     try:
-        return fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+        out = fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+        LOADED_RELATIONS["supplement_rollup"] = SUPPLEMENT_ROLLUP_MAT
+        return out
     except Exception as e:  # postgrest APIError, network error, ...
         code = getattr(e, "code", None)
         msg = f"  {SUPPLEMENT_ROLLUP_MAT} unavailable ({code or type(e).__name__}); reading {SUPPLEMENT_ROLLUP_VIEW}"
@@ -620,7 +636,9 @@ def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
             log.info(msg)
         else:
             log.warning(f"{msg}: {str(e)[:200]}")
-        return fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+        out = fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+        LOADED_RELATIONS["supplement_rollup"] = SUPPLEMENT_ROLLUP_VIEW
+        return out
 
 
 def to_date_str(s: pd.Series) -> pd.Series:
@@ -805,6 +823,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  whoop_cycles.step_count load failed ({e!r}); continuing without WHOOP steps")
+        LOAD_FAILURES.add("whoop_cycles")
         data["whoop_steps"] = pd.DataFrame()
 
     # Recovery per cycle, for the alignment guard (hrv_alignment.check_matrix_hrv).
@@ -889,7 +908,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
 
     log.info("  Loading supplement_intake_by_compound…")
     data["supplements"] = fetch_supplement_rollup(
-        select="calendar_date,ingredient_group,categories,unit,total_amount",
+        select="calendar_date,ingredient_group,categories,unit,unit_class,source_units,total_amount",
     )
     if not data["supplements"].empty:
         data["supplements"]["calendar_date"] = data["supplements"]["calendar_date"].astype(str)
@@ -901,6 +920,9 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["supplements"]["category"] = data["supplements"]["categories"].apply(
             lambda c: ", ".join(c) if isinstance(c, list) and c else None
         )
+    # Intakes whose label gives no readable amount are not in the rollup (its own filter); the
+    # dose-response leaves those days out instead of reading them as 0 (HIST-UNIT-01).
+    data["supplements_unquantified"] = load_supplement_unquantified()
 
     # Melatonin journal<->supplement bridge (pds.melatonin_unified, 2026-06-14):
     # one row per behavioral day unifying the frozen WHOOP journal Yes/No history
@@ -945,6 +967,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         data["delivery"] = pd.DataFrame()
     # How far the receipt ETL has verifiably looked: the view has a row only on days WITH an
     # order, so "no row" after the last order is a true zero only if the ETL kept running.
@@ -981,6 +1004,10 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # Without the heartbeat AND the unread list, fall back to the conservative rule.
         data["delivery_covered_through"] = None
         data["delivery_unread_days"] = []
+        # The fallback zero-fills fewer days than the full read would; when the coverage reads
+        # recover, neither delivery_daily's nor delivery_email_log's fingerprint moves, so neither
+        # may be certified.
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
 
     # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11): Apple's own Screen Time
@@ -992,11 +1019,33 @@ def load_all_data() -> dict[str, pd.DataFrame]:
             "phone_usage_daily",
             select="behavioral_date,total_minutes,late_night_minutes,after_midnight_minutes,pickups,"
                    "notifications,minutes_by_category,minutes_last_hour_before_sleep_est,"
-                   "minutes_during_sleep_est,synced_at",
+                   "minutes_during_sleep_est,synced_at,sleep_start,"
+                   "export_complete,pre_sleep_complete,during_sleep_complete",
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  phone_usage_daily load failed ({e!r}); continuing without screen-time features")
+        LOAD_FAILURES.add("phone_usage_daily")
         data["screen"] = pd.DataFrame()
+
+    # PC activity (pds.pc_activity_daily, 2026-11-14): coarse active-minute totals per
+    # behavioral day from the local logger (tools/pc_activity_logger). Service-role-only
+    # view; loaded fail-open like screen time — a missing relation (PGRST205 before the
+    # schema is applied) must never sink the retrain.
+    log.info("  Loading pc_activity_daily (PC activity)…")
+    try:
+        data["pc_activity"] = fetch_all(
+            "pc_activity_daily",
+            select="behavioral_date,active_minutes,late_active_minutes,synced_at",
+            order="behavioral_date",
+        )
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "code", None)
+        if code in _MISSING_RELATION_CODES:
+            log.info("  pc_activity_daily not present yet; continuing without it")
+        else:
+            log.warning(f"  pc_activity_daily load failed ({e!r}); continuing without PC-activity features")
+        LOAD_FAILURES.add("pc_activity_daily")
+        data["pc_activity"] = pd.DataFrame()
 
     # Air quality (pds.air_quality_daily, 2026-11-11): daily PM2.5 / US AQI per ET clock day from
     # the keyless Open-Meteo Air Quality API (air_quality_etl.py). Loaded fail-open: a brand-new
@@ -1010,6 +1059,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  air_quality_daily load failed ({e!r}); continuing without air-quality features")
+        LOAD_FAILURES.add("air_quality_daily")
         data["air_quality"] = pd.DataFrame()
 
     # Weather (pds.weather_daily, 2026-11-13): daily outdoor weather per ET clock day from the
@@ -1023,7 +1073,42 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  weather_daily load failed ({e!r}); continuing without weather features")
+        LOAD_FAILURES.add("weather_daily")
         data["weather"] = pd.DataFrame()
+
+    # Pollen (pds.pollen_daily, 2026-11-17): Atlanta Allergy & Asthma daily count, one row per
+    # PUBLISHED count day (pollen_etl.py). Loaded fail-open, like weather.
+    log.info("  Loading pollen_daily (Atlanta pollen)…")
+    try:
+        data["pollen"] = fetch_all(
+            "pollen_daily",
+            select="count_date,total_count,tree_level,grass_level,weed_level,mold_level",
+            order="count_date",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  pollen_daily load failed ({e!r}); continuing without pollen features")
+        LOAD_FAILURES.add("pollen_daily")
+        data["pollen"] = pd.DataFrame()
+
+    # Estimated intake kcal (2026-11-16): Claude-estimated kcal from delivered restaurant orders
+    # (pds.delivery_nutrition_daily, delivery_item estimates) and photo-logged meals
+    # (pds.photo_meal_daily), merged into est_intake_kcal only on days with no Cronometer/MFP
+    # nutrition_calories (merge_estimated_intake_features). Loaded fail-open — estimates, and
+    # the photo table may not exist yet (PGRST205), so neither may sink the retrain.
+    for key, relation in (("delivery_nutrition", "delivery_nutrition_daily"),
+                          ("photo_nutrition", "photo_meal_daily")):
+        log.info(f"  Loading {relation} (estimated intake kcal)…")
+        try:
+            data[key] = fetch_all(relation, select="behavioral_date,est_kcal",
+                                  order="behavioral_date")
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", None)
+            if code in _MISSING_RELATION_CODES:
+                log.info(f"  {relation} not present yet; continuing without it")
+            else:
+                log.warning(f"  {relation} load failed ({e!r}); continuing without estimated intake")
+            LOAD_FAILURES.add(relation)
+            data[key] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1447,10 +1532,10 @@ def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     return pivot, label_map
 
 
-def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None, dict[str, set[str]]]:
     """Pivot per-compound supplement intake into per-compound dose columns.
 
-    Returns (wide_df, tracking_start) where:
+    Returns (wide_df, tracking_start, unknown_days) where:
       - wide_df has one row per calendar_date with columns:
             supplement_<compound>_amount  (sum across products that day)
         For dates within the tracking window where the compound wasn't taken,
@@ -1459,13 +1544,33 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
         distinguish "untracked" from "took zero".
       - tracking_start is the earliest calendar_date in the supplements data,
         used by callers to fill NaN → 0 only within the tracking window.
+      - unknown_days maps each supplement column to the set of dates whose
+        TOTAL is unknown and must stay NaN (never 0): a day with an intake in
+        the unknown unit class, or with an unreadable amount.
+
+    UNIT CLASSES (HIST-UNIT-01, mirroring supplement_dose_response_rows): when
+    the input carries a `unit_class` column, the grouping becomes
+    (calendar_date, ingredient_group, unit_class) and every (compound, unit
+    class) pair that occurs gets its OWN feature column, so a 1 mg tablet and
+    a 1 mL liquid of the same compound on one day are two columns — never one
+    summed amount of 2. The mass class ('mg', including IU-converted vitamins
+    A / D / E, which the rollup already converted) keeps the historical column
+    name supplement_<compound>_amount so existing feature names do not change;
+    every other class gets its own suffix (e.g. supplement_<compound>_amount_ml).
+    Rows of the unknown unit class (SUPPLEMENT_UNKNOWN_UNIT_CLASS) carry no
+    readable amount in any class, so they produce no column; instead they make
+    that compound's day unknown in every column it has (unknown_days), exactly
+    like a row whose total_amount is unreadable. Without a `unit_class` column
+    the previous behaviour is kept exactly: one column per compound, summed
+    across whatever rows exist, and unknown_days is empty.
 
     Caller is responsible for merging on calendar_date and applying the
-    tracking-window fillna(0). We keep that here at the matrix layer rather
+    tracking-window fillna(0), skipping the unknown_days so an unknown total is
+    never written as 0. We keep that here at the matrix layer rather
     than inside this function because the matrix has the full date spine.
     """
     if supplements is None or supplements.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, {}
 
     def clean_col(c: str) -> str:
         return ("supplement_" + str(c).lower()
@@ -1476,28 +1581,77 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
                 .replace(".", "").replace("&", "and")
                 .strip("_") + "_amount")
 
+    def col_name(group, unit_class) -> str:
+        base = clean_col(group)
+        if unit_class == SUPPLEMENT_MASS_CLASS:
+            return base
+        slug = "".join(ch for ch in str(unit_class).lower() if ch.isalnum())
+        return base[: -len("_amount")] + "_amount_" + slug if slug else base
+
+    def dedup_cleaned_names(wide: pd.DataFrame) -> pd.DataFrame:
+        # Distinct group (or group x unit class) values can collapse to the same
+        # cleaned column name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid"
+        # both -> alpha_lipoic_acid). Sum across the duplicates so downstream
+        # merges don't choke on non-unique columns.
+        if wide.columns.duplicated().any():
+            dups = wide.columns[wide.columns.duplicated()].unique().tolist()
+            log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
+            wide = wide.T.groupby(level=0).sum(min_count=1).T
+            # groupby on transposed loses calendar_date column ordering; restore
+            cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
+            wide = wide[cols]
+        return wide
+
     supp = supplements.copy().dropna(subset=["calendar_date", "ingredient_group"])
     supp["total_amount"] = pd.to_numeric(supp["total_amount"], errors="coerce")
     tracking_start = str(supp["calendar_date"].min())
+    unknown_days: dict[str, set[str]] = {}
 
-    grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
-                   .agg(total_amount=("total_amount", "sum")))
+    if "unit_class" not in supp.columns:
+        grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
+                       .agg(total_amount=("total_amount", "sum")))
+        wide = grouped.pivot_table(
+            index="calendar_date", columns="ingredient_group",
+            values="total_amount", aggfunc="sum",
+        ).reset_index()
+        wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
+        return dedup_cleaned_names(wide), tracking_start, unknown_days
+
+    supp["_unit_class"] = supplement_unit_classes(supp)
+    known = supp[supp["_unit_class"] != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+    # A day whose total is unknown in ANY class of a compound (an unreadable
+    # amount, or an intake in the unknown unit class) is unknown for the
+    # compound as a whole: excluded from every column that compound has, the
+    # same "other_days | unquantified_days" rule supplement_dose_response_rows
+    # applies to the primary class.
+    bad = supp["total_amount"].isna() | (supp["_unit_class"] == SUPPLEMENT_UNKNOWN_UNIT_CLASS)
+    classes_by_group = {g: set(grp["_unit_class"]) for g, grp in known.groupby("ingredient_group")}
+    for day, group in (supp.loc[bad, ["calendar_date", "ingredient_group"]]
+                       .drop_duplicates().itertuples(index=False)):
+        for unit_class in classes_by_group.get(group, set()):
+            unknown_days.setdefault(col_name(group, unit_class), set()).add(str(day))
+
+    if known.empty:
+        return pd.DataFrame(), tracking_start, unknown_days
+    grouped = (known.groupby(["calendar_date", "ingredient_group", "_unit_class"], as_index=False)
+                    ["total_amount"].sum(min_count=1))
+    # A day with any unknown row is unknown for the compound as a whole: its
+    # summed total (which would otherwise be the partial sum of the readable
+    # rows) becomes NaN, so neither the pivot nor the caller's 0-fill can turn
+    # it into a number.
+    bad_pairs = {(str(d), g) for d, g in
+                 zip(supp.loc[bad, "calendar_date"], supp.loc[bad, "ingredient_group"])}
+    grouped.loc[[(str(d), g) in bad_pairs for d, g in
+                 zip(grouped["calendar_date"], grouped["ingredient_group"])],
+                "total_amount"] = np.nan
+    grouped["_col"] = [col_name(g, c) for g, c in
+                       zip(grouped["ingredient_group"], grouped["_unit_class"])]
     wide = grouped.pivot_table(
-        index="calendar_date", columns="ingredient_group",
+        index="calendar_date", columns="_col",
         values="total_amount", aggfunc="sum",
     ).reset_index()
-    wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
-    # Distinct ingredient_group values can collapse to the same cleaned column
-    # name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid" both -> alpha_lipoic_acid).
-    # Sum across the duplicates so downstream merges don't choke on non-unique columns.
-    if wide.columns.duplicated().any():
-        dups = wide.columns[wide.columns.duplicated()].unique().tolist()
-        log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
-        wide = wide.T.groupby(level=0).sum(min_count=1).T
-        # groupby on transposed loses calendar_date column ordering; restore
-        cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
-        wide = wide[cols]
-    return wide, tracking_start
+    wide.columns = ["calendar_date"] + list(wide.columns[1:])
+    return dedup_cleaned_names(wide), tracking_start, unknown_days
 
 
 def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
@@ -1602,11 +1756,76 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Delivery feature merge failed ({e!r}); continuing without delivery features")
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
+        return df
+
+
+def merge_estimated_intake_features(df: pd.DataFrame, delivery_nutrition: pd.DataFrame | None,
+                                    photo_nutrition: pd.DataFrame | None) -> pd.DataFrame:
+    """Estimated kcal intake from Uber Eats dish estimates + photo-logged meals (2026-11-16).
+
+      est_intake_kcal   Claude-estimated kcal for the day: pds.delivery_nutrition_daily
+                        (delivered restaurant orders, quantity x per-dish estimate, portions and
+                        leftovers folded in) + pds.photo_meal_daily, summed. Estimates from dish
+                        names and photos — fine for big-vs-small days, not gram-level.
+
+    ROW PLACEMENT — behavioral day D sits on matrix row D, whose HRV is the sleep that closes
+    day D (hrv_alignment.py). Both views are already keyed on the behavioral date; no re-keying.
+
+    NO DOUBLE COUNT — the value is written ONLY on days where the Cronometer/MFP
+    nutrition_calories column is NaN (nothing logged in the primary nutrition source). A logged
+    day keeps est_intake_kcal NaN however much was estimated, so the two never sum.
+
+    NEVER ZERO-FILLED — a day with no estimated row is unknown, not 0: a no-delivery, no-photo
+    day could equally be an untracked eating day. Only days with at least one estimate carry a
+    value. Deliberately NOT a causal treatment: a median split would add a second calories
+    signal next to nutrition_calories in the nutrition FDR family (one signal per family, like
+    the Garmin-steps drop). Exploratory Spearman / SHAP only.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): on the evening the forecast
+    runs, today's harvest may not have run and photos may not be logged yet, so the newest row
+    reads NaN where training rows read values.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if ((delivery_nutrition is None or delivery_nutrition.empty)
+            and (photo_nutrition is None or photo_nutrition.empty)):
+        return df
+    try:
+        kcal = None
+        for frame in (delivery_nutrition, photo_nutrition):
+            if frame is None or frame.empty or "behavioral_date" not in frame.columns:
+                continue
+            e = frame.copy()
+            e["day"] = pd.to_datetime(e["behavioral_date"], errors="coerce")
+            e = e.dropna(subset=["day"]).drop_duplicates("day")
+            s = pd.Series(pd.to_numeric(e["est_kcal"], errors="coerce").to_numpy(),
+                          index=e["day"]).dropna()
+            if s.empty:
+                continue
+            # both views are one row per day, so a day present in only one is that one's value
+            kcal = s if kcal is None else kcal.add(s, fill_value=0.0)
+        if kcal is None or kcal.empty:
+            return df
+        est = pd.DataFrame({"calendar_date": kcal.index.strftime("%Y-%m-%d"),
+                            "est_intake_kcal": kcal.to_numpy(dtype=float)})
+        out = df.drop(columns=["est_intake_kcal"], errors="ignore").merge(
+            est, on="calendar_date", how="left")
+        assert len(out) == len(df), "estimated-intake merge changed the row count"
+        if "nutrition_calories" in out.columns:
+            logged = pd.to_numeric(out["nutrition_calories"], errors="coerce").notna()
+            out.loc[logged, "est_intake_kcal"] = np.nan
+        log.info(f"  Estimated intake features: {int(out['est_intake_kcal'].notna().sum())} day(s) "
+                 f"with estimated kcal (days logged in Cronometer/MFP excluded)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Estimated-intake feature merge failed ({e!r}); continuing without it")
+        LOAD_FAILURES.update(("delivery_nutrition_daily", "photo_meal_daily"))
         return df
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "pc_", "aqi_", "wx_", "pollen_", "whoop_steps", "est_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -1633,10 +1852,16 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
     ROW PLACEMENT: day D's use sits on row D, whose HRV is the sleep that closes day D
     (hrv_alignment.py), so no re-keying.
 
-    COMPLETENESS: the app syncs around 10 AM for the days before, so the newest day is often
-    partial. A day counts only once a sync happened after it ended (synced_at >= D + 1 day
-    06:00 ET); partial days stay NaN. Days the app never reported (before the first sync's
-    ~30-day backfill, or a gap) are NaN too, never zero: phone use is never truly zero.
+    COMPLETENESS (same contract as frontend/src/lib/screen-time.ts and
+    the N-of-1 adherence module's settled_screen_minutes): a day counts only once a sync happened after
+    it ended (synced_at >= D + 1 day 06:00 ET) AND the view says the whole day is backed by a
+    complete export (export_complete, PIPE-11: every chunk of an app run arrived and Apple's
+    stream ended on its own). An upload the app's watchdog cut short, a missing chunk or an
+    app build that reports no completeness leaves the day NaN, whatever the upload time. The
+    two sleep-anchored columns additionally need the scored sleep, a sync at least an hour past
+    its onset, and that window backed (pre_sleep_complete / during_sleep_complete); otherwise
+    they are NaN on an otherwise complete day. Only a literal True counts. Days the app never
+    reported (before the first sync's ~30-day backfill, or a gap) are NaN too, never zero.
 
     Kept out of the forecasting models (NOT_FORECAST_PREFIXES): the evening the forecast
     runs, today's use is not synced yet. Descriptive and causal analyses only; they switch
@@ -1652,8 +1877,23 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
         s = s.dropna(subset=["day"]).drop_duplicates("day")
         synced = pd.to_datetime(s["synced_at"], errors="coerce", utc=True)
         day_end = (s["day"] + pd.Timedelta(days=1, hours=6)).dt.tz_localize(ET_TZ)
-        s = s[(synced >= day_end).fillna(False)]
+
+        def flag(col: str) -> pd.Series:
+            # Only a literal True: a missing column, NULL or anything else is "not known complete".
+            if col not in s.columns:
+                return pd.Series(False, index=s.index)
+            return s[col].map(lambda v: v is True or v is np.True_)
+
+        s = s[(synced >= day_end).fillna(False) & flag("export_complete")]
+        synced = pd.to_datetime(s["synced_at"], errors="coerce", utc=True)
+        onset = pd.to_datetime(s["sleep_start"], errors="coerce", utc=True) if "sleep_start" in s.columns \
+            else pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns, UTC]")
+        onset_sent = (onset.notna() & (synced >= onset + pd.Timedelta(hours=1))).fillna(False)
         feats = {feat: pd.to_numeric(s[src], errors="coerce") for feat, src in SCREEN_COLS.items()}
+        feats["screen_last_hour_before_sleep_min"] = feats["screen_last_hour_before_sleep_min"].where(
+            onset_sent & flag("pre_sleep_complete"))
+        feats["screen_during_sleep_min"] = feats["screen_during_sleep_min"].where(
+            onset_sent & flag("during_sleep_complete"))
         feats["screen_social_min"] = s["minutes_by_category"].map(
             lambda c: float(c.get("Social", 0.0)) if isinstance(c, dict) else np.nan)
         f = pd.DataFrame(feats, index=s.index)
@@ -1663,10 +1903,73 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
             f[["calendar_date"] + cols], on="calendar_date", how="left")
         assert len(out) == len(df), "screen-time merge changed the row count"
         log.info(f"  Screen-time features: {int(out['screen_total_min'].notna().sum())} complete days "
-                 f"({len(screen) - len(s)} partial/undated day(s) left NaN)")
+                 f"({len(screen) - len(s)} partial, unverified or undated day(s) left NaN)")
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")
+        LOAD_FAILURES.add("phone_usage_daily")
+        return df
+
+
+PC_ACTIVITY_COLS = {
+    # feature column  <- pds.pc_activity_daily column
+    "pc_active_min": "active_minutes",        # total active minutes of the behavioral day
+    "pc_late_min":   "late_active_minutes",   # active minutes in hours starting 21:00-05:59 local
+}
+
+
+def merge_pc_activity_features(df: pd.DataFrame, pc: pd.DataFrame | None) -> pd.DataFrame:
+    """Windows PC activity from pds.pc_activity_daily (tools/pc_activity_logger, one row
+    per behavioral day; a day the logger never ran has no row).
+
+      pc_active_min  active minutes of the day (input within the last 3 minutes)
+      pc_late_min    active minutes in hours starting 21:00-05:59 local (the view's
+                     late_active_minutes)
+
+    Only the two coarse totals — deliberately NO per-program columns (pc_activity_apps
+    holds executable names; privacy: the pipeline never features a program).
+
+    ROW PLACEMENT: day D's PC use sits on row D, whose HRV is the sleep that closes
+    day D (hrv_alignment.py), so no re-keying.
+
+    COMPLETENESS: a day counts only once the hourly upsert synced at least an hour
+    after the day ended (synced_at >= D + 1 day at 07:00 ET, the 06:00 behavioral-day
+    end + 1 h) — like the iPhone Screen Time contract, so the hour the upload would
+    touch is over first. The day's partial or unsynced rows are NaN, never zero. Days
+    the logger never ran (before its first run, a gap, the PC being off) are NaN too,
+    never zero: absence is "unknown", not "no use".
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): on the evening the
+    forecast runs, today's hours are not uploaded yet. Descriptive and causal analyses
+    only; they switch themselves on as days accrue (Spearman >= 20 days, causal
+    MIN_CONTINUOUS_N).
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    cols = list(PC_ACTIVITY_COLS)
+    if pc is None or pc.empty:
+        return df
+    try:
+        p = pc.copy()
+        p["day"] = pd.to_datetime(p["behavioral_date"], errors="coerce")
+        p = p.dropna(subset=["day"]).drop_duplicates("day")
+        synced = pd.to_datetime(p["synced_at"], errors="coerce", utc=True)
+        # The day ends at 06:00 ET the next morning (the −6 h behavioral rule); count it
+        # once a sync landed at least an hour past that.
+        day_end_plus_1h = (p["day"] + pd.Timedelta(days=1, hours=7)).dt.tz_localize(ET_TZ)
+        p = p[(synced >= day_end_plus_1h).fillna(False)]
+        f = pd.DataFrame({feat: pd.to_numeric(p[src], errors="coerce")
+                          for feat, src in PC_ACTIVITY_COLS.items()}, index=p.index)
+        f["calendar_date"] = p["day"].dt.strftime("%Y-%m-%d")
+        out = df.drop(columns=cols, errors="ignore").merge(
+            f[["calendar_date"] + cols], on="calendar_date", how="left")
+        assert len(out) == len(df), "pc-activity merge changed the row count"
+        log.info(f"  PC-activity features: {int(out['pc_active_min'].notna().sum())} complete days "
+                 f"({len(pc) - len(p)} partial, unsynced or undated day(s) left NaN)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  PC-activity feature merge failed ({e!r}); continuing without PC-activity features")
+        LOAD_FAILURES.add("pc_activity_daily")
         return df
 
 
@@ -1720,6 +2023,7 @@ def merge_air_quality_features(df: pd.DataFrame, air: pd.DataFrame | None) -> pd
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Air-quality feature merge failed ({e!r}); continuing without air-quality features")
+        LOAD_FAILURES.add("air_quality_daily")
         return df
 
 
@@ -1826,6 +2130,83 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")
+        LOAD_FAILURES.add("weather_daily")
+        return df
+
+
+POLLEN_LEVEL_ORD = {"low": 0.0, "medium": 1.0, "high": 2.0, "extreme": 3.0}
+POLLEN_COLS = {
+    # feature column          <- pds.pollen_daily column (count_date P -> matrix row P - 1)
+    "pollen_total": "total_count",             # grains/m3 over the 24 h before the published morning
+    "pollen_tree_level_ord": "tree_level",     # low/medium/high/extreme -> 0..3, else NaN
+    "pollen_grass_level_ord": "grass_level",
+    "pollen_weed_level_ord": "weed_level",
+    "pollen_mold_level_ord": "mold_level",
+}
+
+
+def _pollen_level_ord(value) -> float:
+    """The station's level word as an ordinal 0..3, NaN for anything else."""
+    if isinstance(value, str):
+        return POLLEN_LEVEL_ORD.get(value.strip().lower(), np.nan)
+    return np.nan
+
+
+def merge_pollen_features(df: pd.DataFrame, pollen: pd.DataFrame | None) -> pd.DataFrame:
+    """Daily pollen count from pds.pollen_daily (one row per PUBLISHED count day,
+    pollen_etl.py, Atlanta Allergy & Asthma).
+
+    ROW PLACEMENT: count_date is the PUBLICATION date — the count is grains/m3
+    over the previous 24 h, sampled up to that morning, so it mostly describes
+    clock day count_date - 1. The frame is therefore moved one day EARLIER by
+    date (hrv_alignment.wake_date_to_closing_day, the same -1 move the weather
+    night columns use), so matrix row D carries the count published on D + 1:
+    the pollen Riley breathed on day D, before the sleep that closes day D.
+
+    COMPLETENESS: the station skips most weekends and holidays and publishes
+    some days as "N/A" — those days have no row, and no row is ever invented.
+    Missing days stay NaN, never zero (a published 0 IS stored as a real 0 by
+    the ETL and passes through as one). A level word outside the station's
+    low/medium/high/extreme vocabulary, or a missing level, is NaN.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): the count for
+    today's row is published tomorrow morning, so when the evening forecast
+    runs the newest row always reads NaN where training rows have values.
+    Descriptive (Spearman) and causal analyses only. Not in
+    CONTROLLABLE_FEATURE_PREFIXES: nothing Riley does changes the pollen.
+
+    Atlanta only: the series is for the fixed home location and ends at the
+    NYC move.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if pollen is None or pollen.empty:
+        return df
+    try:
+        p = pollen.rename(columns={"count_date": "calendar_date"}).copy()
+        p["calendar_date"] = pd.to_datetime(p["calendar_date"], errors="coerce")
+        p = p.dropna(subset=["calendar_date"]).drop_duplicates("calendar_date", keep="last")
+        if p.empty:
+            return df
+        # The count published on date P describes clock day P - 1 -> row P - 1.
+        p = al.wake_date_to_closing_day(p)
+        f = pd.DataFrame({
+            "pollen_total": pd.to_numeric(p["total_count"], errors="coerce"),
+            "pollen_tree_level_ord": p["tree_level"].map(_pollen_level_ord),
+            "pollen_grass_level_ord": p["grass_level"].map(_pollen_level_ord),
+            "pollen_weed_level_ord": p["weed_level"].map(_pollen_level_ord),
+            "pollen_mold_level_ord": p["mold_level"].map(_pollen_level_ord),
+        }, index=p.index)
+        f["calendar_date"] = p["calendar_date"]
+        out = df.drop(columns=list(POLLEN_COLS), errors="ignore").merge(f, on="calendar_date", how="left")
+        assert len(out) == len(df), "pollen merge changed the row count"
+        log.info(f"  Pollen features: {int(out['pollen_total'].notna().sum())} count days, "
+                 f"{int(out['pollen_tree_level_ord'].notna().sum())} level days "
+                 f"({len(pollen) - len(p)} undated or duplicate day(s) dropped)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Pollen feature merge failed ({e!r}); continuing without pollen features")
+        LOAD_FAILURES.add("pollen_daily")
         return df
 
 
@@ -1894,7 +2275,47 @@ def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) ->
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  WHOOP steps merge failed ({e!r}); continuing without WHOOP steps")
+        LOAD_FAILURES.add("whoop_cycles")
         return df
+
+
+# Audio-feature means of the spotify_daily_signature view that get masked on
+# low-coverage days. Documented coverage gap: Garmin offline playback is
+# invisible to Spotify, so workout-heavy listening days under-count. Days with
+# featurized_plays < 5 have too-thin a sample to give reliable audio-feature
+# means and are set to NaN ("no listening signal today" rather than biasing
+# the mean by 1-2 random tracks).
+SPOTIFY_AVG_COLS = (
+    "avg_valence", "avg_energy", "avg_tempo", "avg_danceability",
+    "avg_acousticness", "avg_instrumentalness", "avg_loudness",
+)
+SPOTIFY_FEATURIZED_MIN = 5
+
+
+def merge_spotify_features(df: pd.DataFrame, sp_data: pd.DataFrame | None):
+    """Merge the opt-in Spotify daily signature onto the matrix spine.
+
+    Pure: returns (merged_df, n_masked). With no/empty spotify data the frame
+    is returned unchanged and n_masked is None (no sp_ columns added). Loaded
+    only when ONYX_INCLUDE_SPOTIFY=1 (see load_data); the env gate stays there.
+    """
+    if sp_data is None or sp_data.empty:
+        return df, None
+    sp = sp_data.copy()
+    # Numeric coerce
+    for c in sp.columns:
+        if c != "calendar_date":
+            sp[c] = pd.to_numeric(sp[c], errors="coerce")
+    # Mask audio-feature means below the featurization threshold.
+    low_coverage = sp["featurized_plays"].fillna(0) < SPOTIFY_FEATURIZED_MIN
+    for c in SPOTIFY_AVG_COLS:
+        if c in sp.columns:
+            sp.loc[low_coverage, c] = np.nan
+    # Prefix all spotify columns so they're distinguishable in SHAP / Spearman
+    sp = sp.rename(columns={c: f"sp_{c}" for c in sp.columns if c != "calendar_date"})
+    out = df.merge(sp, on="calendar_date", how="left")
+    assert len(out) == len(df), "Spotify daily signature merge changed the row count"
+    return out, int(low_coverage.sum())
 
 
 def build_feature_matrix(data: dict) -> pd.DataFrame:
@@ -2236,13 +2657,16 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     supp_tracking_start = None  # set below; referenced by the melatonin bridge
     supp_data = data.get("supplements")
     if supp_data is not None and not supp_data.empty:
-        sdf, supp_tracking_start = pivot_supplements(supp_data)
+        sdf, supp_tracking_start, supp_unknown_days = pivot_supplements(supp_data)
         if not sdf.empty:
             df = df.merge(sdf, on="calendar_date", how="left")
             supp_cols = [c for c in sdf.columns if c != "calendar_date"]
             in_window = df["calendar_date"] >= supp_tracking_start
             for col in supp_cols:
-                df.loc[in_window, col] = df.loc[in_window, col].fillna(0)
+                # A day whose total is unknown (unreadable amount, or an intake
+                # in the unknown unit class) stays NaN: never 0.
+                fillable = in_window & ~df["calendar_date"].isin(supp_unknown_days.get(col, set()))
+                df.loc[fillable, col] = df.loc[fillable, col].fillna(0)
             log.info(f"  Supplements pivoted: {len(supp_cols)} compound columns "
                      f"(tracking window from {supp_tracking_start})")
 
@@ -2325,29 +2749,10 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
                  f"({len(nj_daily['nj_mood_ord'].dropna())} with mood)")
 
     # --- Join Spotify daily signature (opt-in) ---
-    # Documented coverage gap: Garmin offline playback is invisible, so
-    # workout-heavy listening days under-count. Days with featurized_plays<5
-    # have too-thin a sample to give reliable audio-feature means and are
-    # zero'd out (treated as "no listening signal today" rather than biasing
-    # the mean by 1-2 random tracks).
-    sp_data = data.get("spotify_daily")
-    if sp_data is not None and not sp_data.empty:
-        sp = sp_data.copy()
-        # Numeric coerce
-        for c in sp.columns:
-            if c != "calendar_date":
-                sp[c] = pd.to_numeric(sp[c], errors="coerce")
-        # Mask audio-feature means below the featurization threshold.
-        low_coverage = sp["featurized_plays"].fillna(0) < 5
-        for c in ("avg_valence", "avg_energy", "avg_tempo", "avg_danceability",
-                  "avg_acousticness", "avg_instrumentalness", "avg_loudness"):
-            if c in sp.columns:
-                sp.loc[low_coverage, c] = np.nan
-        # Prefix all spotify columns so they're distinguishable in SHAP / Spearman
-        sp = sp.rename(columns={c: f"sp_{c}" for c in sp.columns if c != "calendar_date"})
-        df = df.merge(sp, on="calendar_date", how="left")
-        log.info(f"  Spotify daily signature: {len(sp)} days merged "
-                 f"(audio features masked on {int(low_coverage.sum())} low-coverage days)")
+    df, sp_masked = merge_spotify_features(df, data.get("spotify_daily"))
+    if sp_masked is not None:
+        log.info(f"  Spotify daily signature: merged "
+                 f"(audio features masked on {sp_masked} low-coverage days)")
 
     # --- Sort by date ---
     df = df.sort_values("calendar_date").reset_index(drop=True)
@@ -2471,9 +2876,13 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"),
                                  data.get("delivery_unread_days"))
     df = merge_screen_time_features(df, data.get("screen"))
+    df = merge_pc_activity_features(df, data.get("pc_activity"))
     df = merge_air_quality_features(df, data.get("air_quality"))
     df = merge_weather_features(df, data.get("weather"))
+    df = merge_pollen_features(df, data.get("pollen"))
     df = merge_whoop_steps_features(df, data.get("whoop_steps"))
+    df = merge_estimated_intake_features(df, data.get("delivery_nutrition"),
+                                          data.get("photo_nutrition"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships
@@ -2857,16 +3266,336 @@ def print_completeness(df: pd.DataFrame) -> None:
 # PHASE 2 – STATISTICAL ANALYSIS
 # ===========================================================================
 
+# Supplement dose-response unit identity (HIST-UNIT-01). pds.supplement_intake_by_compound has
+# one row per (day, compound_key, ingredient_group, unii_code, unit_class): 'mass' = every mass
+# unit converted to mg (pds.unit_to_mg_factor_for, which also maps Vitamin A / D / E IU with that
+# vitamin's own factor), any other class = the literal unit as on the label, never converted
+# ('unitless' = a number with no unit). A compound's dose series uses ONE class, so amounts in
+# different classes never add up:
+#   - mass when the compound has mass rows, else its one literal unit;
+#   - no estimate when its only literal units are 'unitless' (amounts that cannot be compared) or
+#     it has two or more literal units and no mass;
+#   - a day with an intake in another class, or an intake whose amount is missing, has an unknown
+#     total: it is left out, never read as 0 (the value of a day without an intake). The view
+#     filters out ingredients with no readable quantity, so those days come from a separate read of
+#     the intakes and their products (load_supplement_unquantified). When that read fails nothing
+#     is published (the stored result of the last complete run stays and the heartbeat is partial)
+#     and both relations are stored as unknown in the source baseline (never as consumed);
+#     when the rollup is empty the result is empty and replaces the stored one.
+# What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
+# no estimate, in the coverage payload (supplement_impact / dose_response_coverage), which
+# /analytics/hrv shows under the dose-response chart.
+SUPPLEMENT_MASS_CLASS = "mass"
+SUPPLEMENT_UNKNOWN_UNIT_CLASS = "unitless"
+SUPPLEMENT_DOSE_COVERAGE_VERSION = 2
+
+
+def _supplement_quantity_readable(q) -> bool:
+    """The rollup's own filter (sql/supplement_iu_conversion.sql: quantity text ~ '^[0-9.]+$'),
+    same as isQuantified in frontend/src/lib/supplement-units.ts. A JSON number is readable when
+    finite and not negative (jsonb prints it as plain digits)."""
+    if isinstance(q, bool):
+        return False  # jsonb true / false prints as a word
+    if isinstance(q, (int, float, np.integer, np.floating)):
+        return bool(np.isfinite(q)) and q >= 0
+    return isinstance(q, str) and q != "" and all(ch in "0123456789." for ch in q)
+
+
+_UNQUANTIFIED_COLS = ["calendar_date", "ingredient_group"]
+
+
+def _supplement_unquantified_products(products: pd.DataFrame | None) -> pd.DataFrame:
+    """(product_id, ingredient_group) of every product ingredient with no readable quantity."""
+    pairs: list[tuple[str, str]] = []
+    if products is not None and not products.empty:
+        for pid, ings in zip(products["product_id"], products["ingredients"]):
+            if isinstance(ings, str):  # a double-encoded JSONB row (pre-2026-05-26 bug pattern)
+                try:
+                    ings = json.loads(ings)
+                except ValueError:
+                    continue
+            if not isinstance(ings, list):
+                continue
+            for ing in ings:
+                if not isinstance(ing, dict):
+                    continue
+                group = ing.get("ingredient_group")
+                if isinstance(group, str) and not _supplement_quantity_readable(ing.get("quantity")):
+                    pairs.append((str(pid), group))
+    return pd.DataFrame(pairs, columns=["product_id", "ingredient_group"]).drop_duplicates()
+
+
+def supplement_unquantified_days(products: pd.DataFrame | None,
+                                 intakes: pd.DataFrame | None) -> pd.DataFrame:
+    """(calendar_date, ingredient_group) of every intake whose product lists that compound without a
+    readable amount: exactly the ingredient rows pds.supplement_intake_by_compound filters out, so
+    the rollup alone cannot tell such a day from a day without an intake.
+
+    `products`: product_id + ingredients (the JSONB array). `intakes`: intake_date + product_id.
+    The day is the intake's own intake_date, like the view's calendar_date.
+    """
+    affected = _supplement_unquantified_products(products)
+    if affected.empty or intakes is None or intakes.empty:
+        return pd.DataFrame(columns=_UNQUANTIFIED_COLS)
+    days = intakes[["intake_date", "product_id"]].dropna().copy()
+    days["product_id"] = days["product_id"].astype(str)
+    days["calendar_date"] = days["intake_date"].astype(str)
+    out = days.merge(affected, on="product_id", how="inner")[_UNQUANTIFIED_COLS].drop_duplicates()
+    return out.sort_values(_UNQUANTIFIED_COLS).reset_index(drop=True)
+
+
+# The two relations load_supplement_unquantified reads (hrv_feature_sources: supplement_products,
+# supplement_intake). A failed read marks both: the stage that failed is not reported, and neither
+# may be stored as consumed (PIPE09-R1).
+SUPPLEMENT_UNQUANTIFIED_SOURCES = ("supplement_products", "supplement_intake")
+
+
+def load_supplement_unquantified(fetch=None, failures: set[str] | None = None) -> pd.DataFrame | None:
+    """Days a compound was taken from a product that gives no readable amount for it.
+
+    Returns None when a read fails: the dose-response then runs without this check and says so in
+    its coverage (`unquantified_check`), and both sources are added to `failures` (default
+    LOAD_FAILURES), so the stored source baseline marks them unknown instead of consumed and the
+    next backfill check retries. Logs an error code or type only. `fetch` defaults to fetch_all
+    (injectable for tests). Intakes are read only when some product has such an ingredient.
+    """
+    fetch = fetch or fetch_all
+    try:
+        products = fetch("supplement_products", select="product_id,ingredients", order="product_id")
+        if _supplement_unquantified_products(products).empty:
+            return pd.DataFrame(columns=_UNQUANTIFIED_COLS)
+        intakes = fetch("supplement_intake", select="intake_date,product_id", order="intake_id")
+        return supplement_unquantified_days(products, intakes)
+    except Exception as e:  # postgrest APIError, network error, ...
+        log.warning(f"  Supplement amount check unavailable ({getattr(e, 'code', None) or type(e).__name__})")
+        (LOAD_FAILURES if failures is None else failures).update(SUPPLEMENT_UNQUANTIFIED_SOURCES)
+        return None
+
+
+def supplement_unit_classes(frame: pd.DataFrame) -> pd.Series:
+    """The rollup's unit_class per row. Rows without one (an older select, a test frame) take it
+    from `unit`: the view reports unit 'mg' exactly for the mass class and the class otherwise."""
+    def from_unit(u):
+        if not isinstance(u, str) or not u.strip():
+            return SUPPLEMENT_UNKNOWN_UNIT_CLASS
+        return SUPPLEMENT_MASS_CLASS if u == "mg" else u
+    units = frame["unit"] if "unit" in frame.columns else pd.Series(None, index=frame.index, dtype=object)
+    derived = units.map(from_unit)
+    if "unit_class" not in frame.columns:
+        return derived
+    given = frame["unit_class"].map(lambda c: c if isinstance(c, str) and c.strip() else None)
+    return given.where(given.notna(), derived)
+
+
+def _supplement_source_units(rows: pd.DataFrame) -> list[str]:
+    """Literal label units behind rows (the view's source_units array): the conversion provenance."""
+    out: set[str] = set()
+    if "source_units" in rows.columns:
+        for v in rows["source_units"]:
+            if isinstance(v, (list, tuple, np.ndarray)):
+                out.update(u for u in v if isinstance(u, str) and u.strip())
+            elif isinstance(v, str) and v.strip():
+                out.add(v)
+    return sorted(out)
+
+
+def _is_iu(unit: str) -> bool:
+    """Same normalisation as pds.unit_to_mg_factor_for: letters only, lower case."""
+    return "".join(ch for ch in unit.lower() if "a" <= ch <= "z") == "iu"
+
+
+def supplement_dose_response_rows(supplements: pd.DataFrame | None, tracked: pd.DataFrame,
+                                  target: str,
+                                  unquantified: pd.DataFrame | None = None) -> tuple[list[dict], dict]:
+    """Per-compound Spearman between the day's amount and that night's HRV, one unit class each.
+
+    `supplements`: the long rollup (calendar_date, ingredient_group, unit_class, unit,
+    source_units, total_amount, category). `tracked`: HRV-valid rows (calendar_date + `target`)
+    inside the supplement tracking window. `unquantified`: (calendar_date, ingredient_group) of
+    intakes the rollup filters out for having no readable amount (supplement_unquantified_days);
+    None = that check could not be made. Returns (rows, coverage); rows carry no FDR fields.
+    """
+    rows: list[dict] = []
+    excluded: list[dict] = []
+    coverage = {"version": SUPPLEMENT_DOSE_COVERAGE_VERSION, "analyzed": 0, "excluded": excluded,
+                "unquantified_check": "unavailable" if unquantified is None else "checked"}
+    unquantified_by_group: dict[str, set] = {}
+    if unquantified is not None and not unquantified.empty:
+        for group, day in zip(unquantified["ingredient_group"], unquantified["calendar_date"].astype(str)):
+            unquantified_by_group.setdefault(group, set()).add(day)
+    if supplements is None or supplements.empty:
+        supp = pd.DataFrame(columns=["calendar_date", "ingredient_group", "total_amount", "unit"])
+    else:
+        supp = supplements.dropna(subset=["ingredient_group", "calendar_date"]).copy()
+    supp["total_amount"] = (pd.to_numeric(supp["total_amount"], errors="coerce")
+                            if "total_amount" in supp.columns else np.nan)
+    supp["_unit_class"] = supplement_unit_classes(supp)
+    by_group = {g: r for g, r in supp.groupby("ingredient_group")} if not supp.empty else {}
+
+    for compound in sorted(set(by_group) | set(unquantified_by_group)):
+        comp_rows = by_group.get(compound, supp.iloc[0:0])
+        quantified = comp_rows[comp_rows["total_amount"].notna()]
+        unquantified_days = (set(comp_rows.loc[comp_rows["total_amount"].isna(), "calendar_date"])
+                             | unquantified_by_group.get(compound, set()))
+        classes = sorted(set(quantified["_unit_class"]))
+        eligible = [c for c in classes if c != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+        n_days = len(set(comp_rows["calendar_date"]) | unquantified_days)
+
+        def leave_out(reason: str) -> None:
+            excluded.append({"compound": str(compound), "reason": reason,
+                             "unit_classes": classes, "n_days": n_days})
+
+        if SUPPLEMENT_MASS_CLASS in eligible:
+            primary = SUPPLEMENT_MASS_CLASS
+        elif len(eligible) == 1:
+            primary = eligible[0]
+        else:
+            leave_out("unquantified" if not classes
+                      else "unknown_unit" if not eligible else "mixed_unconverted_units")
+            continue
+
+        other = quantified[quantified["_unit_class"] != primary]
+        other_days = set(other["calendar_date"])
+        unknown_days = other_days | unquantified_days
+        prim = quantified[(quantified["_unit_class"] == primary)
+                          & ~quantified["calendar_date"].isin(unknown_days)]
+        distinct_doses = prim["total_amount"].unique()
+        if len(distinct_doses) < 3:
+            # Too few doses is the usual "constant dose" case (the Yes/No chart covers it); it is
+            # recorded only when days were left out, so a compound never vanishes unexplained.
+            if unknown_days:
+                leave_out("too_few_comparable_days")
+            continue
+        # Amount per date; a day with no intake = 0, a day with an unknown total is not a row.
+        amt_by_date = prim.groupby("calendar_date")["total_amount"].sum()
+        base = tracked[~tracked["calendar_date"].isin(unknown_days)]
+        merged = base.merge(amt_by_date.rename("amount").reset_index(), on="calendar_date", how="left")
+        merged["amount"] = merged["amount"].fillna(0.0)
+        if merged["amount"].nunique() < 3 or len(merged) < 20:
+            if unknown_days:
+                leave_out("too_few_comparable_days")
+            continue
+        try:
+            res = stats.spearmanr(merged[target], merged["amount"])
+            r = float(res.statistic if hasattr(res, "statistic") else res[0])
+            p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
+        except Exception:
+            continue
+        category = None
+        if "category" in prim.columns and not prim["category"].dropna().empty:
+            category = prim["category"].dropna().iloc[0]
+        source_units = _supplement_source_units(prim)
+        if not source_units and primary != SUPPLEMENT_MASS_CLASS:
+            source_units = [primary]
+        rows.append({
+            "compound": str(compound),
+            "category": str(category) if category else None,
+            "unit": "mg" if primary == SUPPLEMENT_MASS_CLASS else str(primary),
+            "unit_class": str(primary),
+            "converted": primary == SUPPLEMENT_MASS_CLASS,
+            "source_units": source_units,
+            "converted_from_iu": primary == SUPPLEMENT_MASS_CLASS and any(_is_iu(u) for u in source_units),
+            "excluded_units": sorted(set(other["_unit_class"])),
+            "excluded_days": {"other_unit": len(other_days), "unquantified": len(unquantified_days)},
+            "spearman_r": r,
+            "p_value": p,
+            "n": int(len(merged)),
+            "n_distinct_doses": int(len(distinct_doses)),
+            "low_n": bool(len(merged) < 20),
+        })
+
+    coverage["analyzed"] = len(rows)
+    coverage["with_excluded_days"] = sum(
+        1 for r in rows if r["excluded_days"]["other_unit"] or r["excluded_days"]["unquantified"])
+    return rows, coverage
+
+
+def _supplement_rollup_frame(supplements: pd.DataFrame | None) -> pd.DataFrame:
+    """The rollup as the dose-response reads it. An empty read (fetch_all returns a frame with no
+    columns at all) becomes a typed empty frame, so "no quantified intake" is an ordinary input and
+    not a KeyError."""
+    if supplements is not None and not supplements.empty:
+        return supplements
+    return pd.DataFrame({
+        "calendar_date": pd.Series(dtype=object),
+        "ingredient_group": pd.Series(dtype=object),
+        "category": pd.Series(dtype=object),
+        "unit": pd.Series(dtype=object),
+        "unit_class": pd.Series(dtype=object),
+        "source_units": pd.Series(dtype=object),
+        "total_amount": pd.Series(dtype=float),
+    })
+
+
+def supplement_dose_response_results(supplements: pd.DataFrame | None, hrv_valid: pd.DataFrame,
+                                     target: str, unquantified: pd.DataFrame | None = None) -> dict:
+    """The dose-response block of run_statistical_analysis: rows (BH-FDR, sorted by |rho|) and coverage.
+
+    Both keys are returned after every successful run, the list possibly empty, so the stored
+    result is replaced when the unit rule leaves no estimate or the rollup holds no quantified
+    amount at all: a previous run's rows never stay on the dashboard. Raises on failure; the caller
+    then keeps the previous stored result. `unquantified` None means the amountless-intake check
+    could not be read; supplement_dose_response_block never publishes in that case.
+    The tracking window starts at the first day with a quantified amount, as before.
+    """
+    supplements = _supplement_rollup_frame(supplements)
+    quantified = supplements.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
+    if quantified.empty:
+        tracked = hrv_valid.iloc[0:0][["calendar_date", target]]
+    else:
+        tracked = hrv_valid[hrv_valid["calendar_date"] >= quantified["calendar_date"].min()]
+        tracked = tracked[["calendar_date", target]].dropna()
+    rows, coverage = supplement_dose_response_rows(supplements, tracked, target, unquantified)
+    if rows and HAS_FDR and len(rows) > 1:
+        p_values = np.array([r["p_value"] for r in rows])
+        passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
+        for row, q, p_pass in zip(rows, q_values, passes):
+            row["q_value"] = float(q)
+            row["passes_fdr"] = bool(p_pass)
+    rows.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
+    return {"supplement_dose_response": rows, "supplement_dose_response_coverage": coverage}
+
+
+SUPPLEMENT_DOSE_WARNING_KEY = "supplement_dose_response_warning"
+SUPPLEMENT_DOSE_CHECK_WARNING = ("Supplement dose-response not updated: the check for intakes without a "
+                                 "readable amount could not be read, so the previous result is kept")
+SUPPLEMENT_DOSE_FAILED_WARNING = ("Supplement dose-response not updated: the analysis failed, so the "
+                                  "previous result is kept")
+
+
+def supplement_dose_response_block(supplements: pd.DataFrame | None, hrv_valid: pd.DataFrame, target: str,
+                                   unquantified: pd.DataFrame | None) -> tuple[dict, str | None]:
+    """What run_statistical_analysis does with the dose-response: (results to merge, heartbeat warning).
+
+    - `supplements` None: the rollup was not read at all; nothing is stored and nothing is said.
+    - `unquantified` None: the read of the intakes and products behind the amountless-intake check
+      failed. Those days would be read as 0 (no intake) or keep a partial total, so NO replacement is
+      published: the stored rows of the last complete run stay, and the warning turns the run's
+      heartbeat partial. Never "nothing found".
+    - otherwise the rows and the coverage, also when the rollup is empty: the read succeeded, so
+      "no quantified amount" is a result (an empty list, plus the compounds that only have amountless
+      intakes), and it replaces what an earlier run stored.
+    """
+    if supplements is None:
+        return {}, None
+    if unquantified is None:
+        return {}, SUPPLEMENT_DOSE_CHECK_WARNING
+    return supplement_dose_response_results(supplements, hrv_valid, target, unquantified), None
+
+
 def run_statistical_analysis(
     df: pd.DataFrame,
     skip: bool = False,
     supplements: pd.DataFrame | None = None,
+    supplements_unquantified: pd.DataFrame | None = None,
 ) -> dict:
     """Correlation analysis, journal impact, Granger tests. Returns result dict.
 
     `supplements` is the long-format supplement_intake_by_compound DataFrame
     (one row per (calendar_date, ingredient_group)). When provided, runs
     per-compound Yes/No t-tests and dose-response Spearman correlations.
+    `supplements_unquantified` (load_supplement_unquantified) lists the days an
+    intake gave no readable amount; None = not checked.
     """
     results: dict = {}
 
@@ -3353,64 +4082,31 @@ def run_statistical_analysis(
     # for compounds where the dose actually varies (≥3 distinct non-zero amounts).
     # Captures monotonic dose-response effects that Yes/No collapses on.
     # Rank-based to handle outliers and non-linear monotonic responses.
-    supplement_dose_response: list[dict] = []
-    if supplements is not None and not supplements.empty:
-        try:
-            supp = supplements.copy()
-            supp = supp.dropna(subset=["ingredient_group", "calendar_date", "total_amount"])
-            tracking_start = supp["calendar_date"].min()
-            tracked = hrv_valid[hrv_valid["calendar_date"] >= tracking_start].copy()
-            tracked = tracked[["calendar_date", STAT_TARGET]].dropna()
-
-            for compound, comp_rows in supp.groupby("ingredient_group"):
-                distinct_doses = comp_rows["total_amount"].dropna().unique()
-                if len(distinct_doses) < 3:
-                    continue
-                # Build amount-per-date series; days with no intake = 0.
-                amt_by_date = comp_rows.groupby("calendar_date")["total_amount"].sum()
-                merged = tracked.merge(
-                    amt_by_date.rename("amount").reset_index(),
-                    on="calendar_date", how="left",
-                )
-                merged["amount"] = merged["amount"].fillna(0.0)
-                if merged["amount"].nunique() < 3 or len(merged) < 20:
-                    continue
-                try:
-                    res = stats.spearmanr(merged[STAT_TARGET], merged["amount"])
-                    r = float(res.statistic if hasattr(res, "statistic") else res[0])
-                    p = float(res.pvalue if hasattr(res, "pvalue") else res[1])
-                    unit = (comp_rows["unit"].dropna().iloc[0]
-                            if not comp_rows["unit"].dropna().empty else None)
-                    category = (comp_rows["category"].dropna().iloc[0]
-                                if not comp_rows["category"].dropna().empty else None)
-                    supplement_dose_response.append({
-                        "compound": str(compound),
-                        "category": str(category) if category else None,
-                        "unit": str(unit) if unit else None,
-                        "spearman_r": r,
-                        "p_value": p,
-                        "n": int(len(merged)),
-                        "n_distinct_doses": int(len(distinct_doses)),
-                        "low_n": bool(len(merged) < 20),
-                    })
-                except Exception:
-                    continue
-
-            if supplement_dose_response and HAS_FDR and len(supplement_dose_response) > 1:
-                p_values = np.array([r["p_value"] for r in supplement_dose_response])
-                passes, q_values = fdrcorrection(p_values, alpha=FDR_Q_THRESHOLD)
-                for row, q, p_pass in zip(supplement_dose_response, q_values, passes):
-                    row["q_value"] = float(q)
-                    row["passes_fdr"] = bool(p_pass)
-
+    # One unit class per compound (supplement_dose_response_rows): mg and mL never add up. An empty
+    # rollup is a result too (it replaces the stored rows); an unreadable amountless-intake check
+    # publishes nothing and warns (supplement_dose_response_block).
+    try:
+        dose, dose_warning = supplement_dose_response_block(supplements, hrv_valid, STAT_TARGET,
+                                                            supplements_unquantified)
+        results.update(dose)
+        if dose_warning:
+            results[SUPPLEMENT_DOSE_WARNING_KEY] = dose_warning
+            log.warning(f"  {dose_warning}")
+        elif dose:
+            supplement_dose_response = dose["supplement_dose_response"]
+            dose_coverage = dose["supplement_dose_response_coverage"]
+            if dose_coverage["excluded"] or dose_coverage.get("with_excluded_days"):
+                # Counts only: the Actions log is public.
+                log.info(f"  Supplement dose-response units: {len(dose_coverage['excluded'])} compounds "
+                         f"left out, {dose_coverage.get('with_excluded_days', 0)} with days left out "
+                         f"(another unit or no amount)")
             if supplement_dose_response:
-                supplement_dose_response.sort(key=lambda r: abs(r["spearman_r"]), reverse=True)
-                results["supplement_dose_response"] = supplement_dose_response
                 log.info(f"  Supplement dose-response: {len(supplement_dose_response)} compounds (≥3 distinct doses)")
             else:
                 log.info("  Supplement dose-response: 0 compounds with ≥3 distinct doses + n≥20 rows")
-        except Exception as e:
-            log.warning(f"  Supplement dose-response analysis failed: {e}")
+    except Exception as e:
+        log.warning(f"  Supplement dose-response analysis failed: {type(e).__name__}")
+        results[SUPPLEMENT_DOSE_WARNING_KEY] = SUPPLEMENT_DOSE_FAILED_WARNING
 
     # --- Nutrition Spearman correlation ---
     # Per-nutrient rank correlation with that night's HRV. Spearman (not Pearson)
@@ -4505,14 +5201,24 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
     # Last night's HRV (the newest scored sleep).
     today_hrv = float(df[TARGET].dropna().iloc[-1]) if df[TARGET].dropna().shape[0] > 0 else None
 
-    # Save model
+    # Save model: one artifact with its training provenance and checksum, in the pickle and in
+    # the sidecar manifest (audit PIPE-08, hrv_model_artifact.py). The workflow caches it under
+    # its content key and publishes it only after this whole run succeeded.
     model_path = OUTPUT_DIR / "xgboost_hrv_model.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump({"model": production_model, "feat_cols": feat_cols,
-                     "pred_std": pred_std, "model_version": MODEL_VERSION,
-                     "alignment": al.ALIGNMENT_VERSION,
-                     "preprocessing": SPARSE_FILL_VERSION}, f)
-    log.info(f"  Model saved: {model_path}")
+    artifact_manifest = model_artifact.write_artifact(
+        {"model": production_model, "feat_cols": feat_cols,
+         "pred_std": pred_std, "model_version": MODEL_VERSION,
+         "alignment": al.ALIGNMENT_VERSION,
+         "preprocessing": SPARSE_FILL_VERSION},
+        model_artifact.build_provenance(
+            model_version=MODEL_VERSION,
+            data_cutoff=model_df["calendar_date"].iloc[-1],
+            training_rows=len(X), feat_cols=feat_cols,
+            input_data_hash=INPUT_DATA_HASH,
+            alignment_version=al.ALIGNMENT_VERSION,
+            preprocessing_version=SPARSE_FILL_VERSION),
+        model_path)
+    log.info(f"  Model saved: {model_path} (artifact {artifact_manifest['artifact_sha256'][:12]})")
 
     results = {
         "model": production_model,
@@ -4529,6 +5235,8 @@ def train_xgboost(df: pd.DataFrame) -> tuple:
         "controllable_importance": controllable_importance,
         "top_drivers": top_drivers,
         "tomorrow_pred": tomorrow_pred,
+        # Checksum of the saved artifact: stored on the live forecast row it produced.
+        "artifact_sha256": artifact_manifest["artifact_sha256"],
         # Behavioral date of the predicted sleep (stored as prediction_date; the page
         # shows the wake-up date = this + 1).
         "serve_date": serve_date,
@@ -5442,6 +6150,7 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
             "training_window_start": xgb_results.get("train_start"),
             "training_window_end": xgb_results.get("train_end"),
             "input_data_hash": INPUT_DATA_HASH,
+            model_artifact.LINK_COLUMN: xgb_results.get("artifact_sha256"),
         })
 
     # SARIMAX 1–7 day forecasts
@@ -5506,8 +6215,13 @@ def store_predictions(xgb_results: dict, sarimax_results: dict,
     log.info(f"  Upserting {len(rows)} prediction rows…")
     # Audit P1 (G1): on_conflict targets the 4-tuple including model_version
     # so backtest reruns from different versions accumulate as separate rows.
-    upsert_batch("hrv_predictions", rows,
-                 "prediction_date,model,horizon_days,model_version")
+    # The live XGBoost row names its artifact; until sql/hrv_model_artifacts.sql is applied the
+    # rows are stored without that column (PIPE-08).
+    if not model_artifact.upsert_with_artifact_link(
+            lambda batch: upsert_batch("hrv_predictions", batch,
+                                       "prediction_date,model,horizon_days,model_version"), rows):
+        log.warning(f"  pds.hrv_predictions has no {model_artifact.LINK_COLUMN} column yet: "
+                    "forecast stored without its artifact (apply sql/hrv_model_artifacts.sql)")
 
 
 def store_metrics(eval_results: dict) -> None:
@@ -5615,6 +6329,13 @@ def store_analysis_results(stat_results: dict, feature_importance: dict,
             "result_type": "supplement_impact",
             "result_key": "dose_response",
             "result_json": stat_results["supplement_dose_response"],
+        })
+    # Which compounds or days the dose-response left out for their unit (HIST-UNIT-01).
+    if "supplement_dose_response_coverage" in stat_results:
+        rows.append({
+            "result_type": "supplement_impact",
+            "result_key": "dose_response_coverage",
+            "result_json": stat_results["supplement_dose_response_coverage"],
         })
 
     # Nutrition Spearman
@@ -5956,6 +6677,28 @@ def check_alignment(data: dict, df: pd.DataFrame) -> str | None:
     return None
 
 
+# Sources whose load or merge failed open this run: their stored baseline is marked unknown, so
+# the omitted history is never reported as consumed (hrv_feature_sources.mark_failed).
+LOAD_FAILURES: set[str] = set()
+
+
+def capture_source_lineage() -> dict | None:
+    """Fingerprints of the HRV inputs' history (hrv_feature_sources.capture). Fail-open: a problem
+    here never stops the retrain; the backfill check then sees no fresh baseline and says so."""
+    try:
+        snapshot = feature_sources.capture(supa, et_today())
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Source fingerprints not captured ({feature_sources.error_code(e)})")
+        return None
+    if snapshot is None:
+        log.info("  Source fingerprints skipped: pds.hrv_source_fingerprint is not installed")
+        return None
+    failed = sorted(n for n, v in snapshot["sources"].items() if v.get("error"))
+    log.info(f"  Source fingerprints captured for {len(snapshot['sources']) - len(failed)} source(s)"
+             + (f"; failed: {', '.join(failed)}" if failed else ""))
+    return snapshot
+
+
 def main() -> str | None:
     """Returns a warning for a PARTIAL heartbeat, or None for success."""
     global INPUT_DATA_HASH
@@ -5969,6 +6712,10 @@ def main() -> str | None:
 
     # ---------- Phase 1: Data Pipeline ----------
     log.info("=== PHASE 1: DATA PIPELINE ===")
+    # Fingerprints of every input's history, taken BEFORE the data is read (audit PIPE-09,
+    # hrv_feature_sources.py). Stored after the results below; the hourly backfill check compares
+    # against them, so an edit or deletion after this point triggers the next retrain.
+    source_lineage = capture_source_lineage()
     data = load_all_data()
     df = build_feature_matrix(data)
     print_completeness(df)
@@ -5990,7 +6737,12 @@ def main() -> str | None:
         df,
         skip=args.skip_analysis,
         supplements=data.get("supplements"),
+        supplements_unquantified=data.get("supplements_unquantified"),
     )
+    # A dose-response that could not be refreshed (HIST-UNIT-01) ends the run as PARTIAL.
+    dose_warning = stat_results.get(SUPPLEMENT_DOSE_WARNING_KEY)
+    if dose_warning:
+        run_warning = f"{run_warning} | {dose_warning}" if run_warning else dose_warning
 
     # ---------- Phase 2.5: Causal Inference ----------
     # Runs after the descriptive stats and before the predictive models so its
@@ -6121,6 +6873,13 @@ def main() -> str | None:
         },
         dose_response=dose_response,
     )
+    # Last, so it exists only when this run's results were stored (hrv_feature_sources.py).
+    feature_sources.mark_failed(source_lineage, LOAD_FAILURES)
+    feature_sources.mark_relation_mismatch(source_lineage, LOADED_RELATIONS)
+    if feature_sources.store_baseline(supa, source_lineage, INPUT_DATA_HASH):
+        log.info(f"    Upserted: {feature_sources.LINEAGE_RESULT_TYPE}/{feature_sources.LINEAGE_RESULT_KEY}")
+    elif source_lineage:
+        log.warning("    Source fingerprints not stored; the next backfill check treats the baseline as stale")
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------
     # Dump the full feature list + top-20 SHAP / permutation / controllable lists

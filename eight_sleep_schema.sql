@@ -9,8 +9,12 @@
 -- 1. Eight Sleep Trend Data (one row per night per bed side)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS pds.eight_sleep_trends (
-    calendar_date   DATE NOT NULL,
-    bed_side        TEXT NOT NULL,              -- 'left' or 'right'
+    calendar_date   DATE NOT NULL,              -- trends API `day` = wake-up date in the
+                                                -- requested zone (docs/eight-sleep-date-contract.md)
+    bed_side        TEXT NOT NULL,              -- 'left' / 'right'; 'away' = the side label the
+                                                -- Pod reported at sync time (away mode). Such rows
+                                                -- repeat the sleeper's own in-bed sessions; they
+                                                -- are not nights spent away.
 
     -- Sleep scores
     sleep_score             INTEGER,            -- 0-100

@@ -99,9 +99,23 @@ export function sleepAnswerDate(today: string): string {
  * (The plain Eastern date would be a day ahead between midnight and 06:00 and turn "last night" into tonight.)
  */
 export function fallbackBehavioralToday(now: Date): string {
-  // Same rule as SQL ((ts AT TIME ZONE tz) - 6h)::date: take the Eastern WALL clock, then subtract 6 hours.
-  // (Subtracting from the instant first is an hour off on the two daylight-saving days.)
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(now);
+  return wallClockBehavioralDay(now, "America/New_York");
+}
+
+/**
+ * Behavioral day on this device's own clock (its time zone's wall clock minus 6 hours), or in `timeZone` when given.
+ * A phone's zone follows where Riley is, so a browser sees the day roll at 06:00 local while travelling, which the
+ * Eastern guess above misses (06:00 Pacific is 09:00 Eastern; PROD-T01). Browser use: on the server it is the server's
+ * zone. A guess like the one above, never a replacement for pds.behavioral_today_now().
+ */
+export function deviceBehavioralDay(now: Date, timeZone?: string): string {
+  return wallClockBehavioralDay(now, timeZone);
+}
+
+function wallClockBehavioralDay(now: Date, timeZone: string | undefined): string {
+  // Same rule as SQL ((ts AT TIME ZONE tz) - 6h)::date: take the WALL clock of the zone, then subtract 6 hours.
+  // (Subtracting from the instant first is an hour off on the two daylight-saving days.) No zone = the device's own.
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(now);
   const part = (type: string) => Number(parts.find((p) => p.type === type)?.value);
   return new Date(Date.UTC(part("year"), part("month") - 1, part("day"), part("hour") - 6)).toISOString().slice(0, 10);
 }

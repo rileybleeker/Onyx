@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { ForecastResult } from "@/lib/cash-forecast";
+import { eligibilityOf, safeToMoveOf } from "@/lib/cash-forecast-eligibility";
 import { scenarioToQuery, type ScenarioParams } from "@/lib/cash-forecast-scenario";
 import type { ForecastAccountView } from "@/lib/cash-forecast-server";
 import type { Jur, TaxProfile, TaxYearResult } from "@/lib/tax-plan";
@@ -169,12 +170,27 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
 const taxDue = (tax: TaxYearResult[], year: number) => tax.find((t) => t.year === year)?.jurisdictions.reduce((s, j) => s + Math.max(0, j.balanceCents), 0) ?? 0;
 const refunds = (tax: TaxYearResult[], year: number) => tax.find((t) => t.year === year)?.jurisdictions.reduce((s, j) => s + Math.max(0, -j.balanceCents), 0) ?? 0;
 
-export function CompareTable({ base, baseTax, scen, scenTax }: { base: ForecastResult; baseTax: TaxYearResult[]; scen: ForecastResult; scenTax: TaxYearResult[] }) {
+export function CompareTable({
+  base,
+  baseTax,
+  scen,
+  scenTax,
+  now,
+}: {
+  base: ForecastResult;
+  baseTax: TaxYearResult[];
+  scen: ForecastResult;
+  scenTax: TaxYearResult[];
+  /** The browser's clock (ms) once mounted: a check that has expired since the forecast was computed withholds the amount. */
+  now?: number;
+}) {
   const y = Number(base.today.slice(0, 4));
   const interest = (r: ForecastResult) => r.cards.reduce((s, c) => s + c.interestNext12Cents, 0);
+  // Safe to move uses the same gate as the headline tile: null = withheld (incomplete or stale inputs).
+  const withheld = Array.from(new Set([...eligibilityOf(base, now).reasons, ...eligibilityOf(scen, now).reasons].map((r) => r.text)));
   const rows: [string, number | null | undefined, number | null | undefined][] = [
     ["Lowest point, 13 weeks (cautious)", base.headlines.lowest?.cents, scen.headlines.lowest?.cents],
-    ["Safe to move", base.headlines.safeToMoveCents, scen.headlines.safeToMoveCents],
+    ["Safe to move", safeToMoveOf(base, now), safeToMoveOf(scen, now)],
     ["Cash in 13 weeks (likely)", base.headlines.end13w?.likely, scen.headlines.end13w?.likely],
     ["Cash in 12 months (likely)", base.headlines.end12m?.likely, scen.headlines.end12m?.likely],
     ["Net worth in 12 months", base.netWorth[11]?.netWorth, scen.netWorth[11]?.netWorth],
@@ -191,24 +207,26 @@ export function CompareTable({ base, baseTax, scen, scenTax }: { base: ForecastR
           <tr>
             <th className="text-left font-normal"></th>
             <th className="text-right font-normal">Base</th>
-            <th className="text-right font-normal">What-if</th>
+            <th className="text-right font-normal">What-if (estimate)</th>
             <th className="text-right font-normal">Change</th>
           </tr>
         </thead>
         <tbody>
           {rows.map(([label, a, b]) => {
-            const diff = (b ?? 0) - (a ?? 0);
+            // null (only safe to move uses it) = withheld: no amount and no change.
+            const diff = a === null || b === null ? 0 : (b ?? 0) - (a ?? 0);
             return (
               <tr key={label} className="border-t border-border-subtle">
                 <td className="py-1">{label}</td>
-                <td className="py-1 text-right">{usd(a)}</td>
-                <td className="py-1 text-right font-semibold">{usd(b)}</td>
+                <td className="py-1 text-right">{a === null ? "not available" : usd(a)}</td>
+                <td className="py-1 text-right font-semibold">{b === null ? "not available" : usd(b)}</td>
                 <td className={`py-1 text-right ${diff > 0 ? "text-up" : diff < 0 ? "text-down" : "text-text-tertiary"}`}>{diff === 0 ? "-" : `${diff > 0 ? "+" : ""}${usd(diff)}`}</td>
               </tr>
             );
           })}
         </tbody>
       </table>
+      {withheld.length > 0 && <p className="mt-2 text-[12px] text-mid">Safe to move is not available: {withheld.slice(0, 3).join(" ")}</p>}
       <p className="mt-2 text-[12px] text-text-tertiary">Colors follow cash; for tax and interest rows lower is better.</p>
     </section>
   );

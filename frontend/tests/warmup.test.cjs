@@ -122,6 +122,16 @@ test('the app warm-up list: no experiment reveal, write-coupled server pages war
   for (const nav of ['Sidebar.tsx', 'MobileNav.tsx']) assert.match(src('components', nav), /navIntentProps\(/, nav);
 });
 
+test("the app warm-up list: /log warms the Supplements history read the section requests", () => {
+  const app = src('components', 'AppData.tsx');
+  const early = src('lib', 'log-early.ts');
+  const history = /LOG_SUPPLEMENTS_HISTORY_URL = "([^"]+)"/.exec(early)[1];
+  assert.ok(history.startsWith('/api/supplements/history?'), 'the constant is the history URL');
+  // The warm-up's /log entry reads the SAME constant as the section, so the one-key-per-GET cache key matches.
+  assert.match(app, /json\(LOG_SUPPLEMENTS_HISTORY_URL\)/, 'AppData /log warms the history via the constant');
+  assert.ok(/LOG_SUPPLEMENTS_HISTORY_URL[^}]*\} from "@/lib\/log-early"/.test(app), 'the constant is imported from lib/log-early');
+});
+
 test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step and on intent', async () => {
   const { deps, log } = harness();
   let loads = 0;
