@@ -102,6 +102,23 @@ TMP_RE = re.compile(r"^onyx-backup-\d{8}T\d{6}Z\.tar\.age\.tmp$")
 # backups can never push the last complete one out. A run whose marker cannot be committed is a failed run.
 OK_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.ok$")
 KEEP_WEEKLY, KEEP_MONTHLY = 8, 3
+# The OneDrive cloud-files (cfapi) state of the ciphertext itself, read from the file's own attributes with
+# GetFileAttributesW — the same bits `attrib` prints. A backup counts as off-site only when the cloud filter
+# OWNS the file: OneDrive converts a local file into a cloud-files placeholder (a reparse-point directory
+# entry) once the sync engine has taken it into the cloud, so one of these bits is the cloud's receipt for
+# it; a plain local file (no bit set) is not confirmed off-site. Exact attribute bits used:
+#   0x00001000  FILE_ATTRIBUTE_OFFLINE                 online-only placeholder: all its data is in the cloud
+#   0x00040000  FILE_ATTRIBUTE_RECALL_ON_OPEN         placeholder: opening it needs the cloud
+#   0x00400000  FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS  placeholder: data is fetched on first read
+#   0x00080000  FILE_ATTRIBUTE_PINNED                 "always keep on this device" (attrib +p)
+#   0x00100000  FILE_ATTRIBUTE_UNPINNED              "free up space" (attrib +u)
+#   0x00000400  FILE_ATTRIBUTE_REPARSE_POINT         a cloud-files placeholder directory entry
+# (a fully hydrated synced file keeps its placeholder reparse point, so the bits survive upload).
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+CLOUD_ATTRIBUTE_MASK = 0x00001000 | 0x00040000 | 0x00400000 | 0x00080000 | 0x00100000 | 0x00000400
+# Bounded wait for OneDrive to take the new ciphertext into the cloud (a large backup over a slow link can
+# take minutes): polled until the file's state reads in sync, else the run reports pending_upload.
+SYNC_WAIT_SECONDS, SYNC_POLL_SECONDS = 300, 10
 RECIPIENT_RE = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 MEDICAL_TABLES = ("medical_documents", "lab_results")
@@ -220,6 +237,53 @@ def onedrive_sync_ready(dest: Path) -> bool:
         return True
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def file_attributes(path: Path) -> Optional[int]:
+    """The file's attributes from GetFileAttributesW (ctypes; standard library only). None when they cannot
+    be read, or off Windows — the caller treats that as unconfirmed, never as success."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+        kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+        attrs = kernel32.GetFileAttributesW(str(path))
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None if attrs == INVALID_FILE_ATTRIBUTES else int(attrs)
+
+
+def onedrive_cloud_state(path: Path) -> str:
+    """The ciphertext's own cloud-files state: "in_sync" when OneDrive's cloud filter owns the file (any
+    placeholder attribute bit, CLOUD_ATTRIBUTE_MASK — see the constants above), which is the cloud's
+    receipt that the upload happened; "pending_upload" for a plain local file, off Windows, outside a
+    OneDrive root, or when the attributes cannot be read. Never answers in_sync on inference."""
+    if os.name != "nt" or not under_onedrive(path):
+        return "pending_upload"
+    attrs = file_attributes(path)
+    if attrs is None:
+        return "pending_upload"
+    return "in_sync" if attrs & CLOUD_ATTRIBUTE_MASK else "pending_upload"
+
+
+def offsite_confirmed(backup: Path, dest: Path, *, wait_seconds: int = SYNC_WAIT_SECONDS,
+                      sleep: Callable[[float], None] = time.sleep,
+                      clock: Callable[[], float] = time.monotonic) -> bool:
+    """Whether the ciphertext just written reached the OneDrive cloud: onedrive_sync_ready(dest) has already
+    answered that the folder syncs, and this polls the file's own cloud-files state (onedrive_cloud_state)
+    until it reads in sync or the bounded wait runs out — the upload of a large backup can take minutes
+    after the run finished writing it. An unconfirmed backup is reported as pending_upload (a partial run)
+    and prunes nothing."""
+    deadline = clock() + max(0, wait_seconds)
+    while True:
+        if onedrive_cloud_state(backup) == "in_sync":
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(SYNC_POLL_SECONDS)
 
 
 def check_places(dest: Path, tmp: Path) -> None:
@@ -815,8 +879,8 @@ def load_remote_confirmations(state_file: Optional[Path] = None) -> dict:
 def record_remote_confirmation(dest: Path, backup_name: str, *, now: Optional[datetime] = None,
                                state_file: Optional[Path] = None) -> None:
     """The ONLY writer of a remote confirmation: called by the code path that obtained positive evidence
-    that the remote copy exists (none is built yet — until one is, the record stays empty and every run
-    answers offsite_unconfirmed). Records the backup name, its size and the confirmation time, and
+    that the remote copy exists: run_backup, once the ciphertext's own OneDrive cloud-files state reads
+    in sync (offsite_confirmed / onedrive_cloud_state). Records the backup name, its size and the confirmation time, and
     nothing else. Refuses a name that is not one of this job's backups (and an error reading the file
     propagates: a file that is not there is not confirmed) and a state file under OneDrive or in the repo."""
     if not NAME_RE.match(backup_name):
@@ -951,7 +1015,8 @@ class RunResult:
 def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Path, now: Optional[datetime] = None,
                dry_run: bool = False, rebuild_tables: tuple[str, ...] = REBUILD_TABLES,
                fetch: Callable[[rc.Target, str], Optional[bytes]] = fetch_object,
-               sync_probe: Optional[Callable[[Path], bool]] = None) -> RunResult:
+               sync_probe: Optional[Callable[[Path], bool]] = None,
+               sync_wait: int = SYNC_WAIT_SECONDS, sleep: Callable[[float], None] = time.sleep) -> RunResult:
     now = now or datetime.now(timezone.utc)
     check_places(dest, tmp)
     snap = collect(target, rebuild_tables=rebuild_tables)
@@ -993,6 +1058,19 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
         # folder that is not syncing could leave no uploaded copy at all
         log.warning("destination is not a syncing OneDrive folder; nothing pruned")
         return RunResult("partial", "offsite_unsynced", written, result.counts)
+    if sync_probe is None and not offsite_confirmed(written, dest, wait_seconds=sync_wait, sleep=sleep):
+        # the ciphertext itself must be confirmed in the OneDrive cloud (its own cloud-files state), not
+        # merely placed in a folder that syncs: pruning now could delete the last backup the cloud holds
+        # while its replacement exists only on this PC
+        log.warning("ciphertext not confirmed in the OneDrive cloud; nothing pruned")
+        return RunResult("partial", "pending_upload", written, result.counts)
+    if sync_probe is None:
+        # positive evidence obtained: the cloud-files state of this very file read in sync
+        try:
+            record_remote_confirmation(dest, written.name)
+        except (OSError, BackupError, ValueError):
+            log.warning("could not record the remote confirmation; nothing pruned")
+            return RunResult("partial", "pending_upload", written, result.counts)
     if result.status == "success":
         # Success needs durable evidence: without a marker that reads back, this backup would not count as
         # complete for retention, so the run fails and nothing is pruned (the backup itself stays).
@@ -1006,8 +1084,7 @@ def run_backup(target: rc.Target, *, recipient: str, cipher, dest: Path, tmp: Pa
     # Local completion is not remote durability: the OneDrive probe above says the folder syncs, not
     # that this copy was uploaded (a paused, signed-out, offline or stuck client passes it), and elapsed
     # time is not evidence either. Only a confirmation recorded by the one code path that obtained it
-    # (record_remote_confirmation) is; no mechanism is built, so the record stays empty ("unknown") and
-    # the run is partial (offsite_unconfirmed) until one exists.
+    # (record_remote_confirmation) is, and it is written only after the file's own cloud state read in sync.
     confirmed = remote_confirmed_names(dest, load_remote_confirmations())
     if written.name not in confirmed:
         if result.status == "success":
@@ -1410,7 +1487,7 @@ def cmd_backup(args, out, cipher_factory, heartbeat_client) -> int:
             if cipher is None:
                 raise BackupError("age_missing")
         result = run_backup(target, recipient=recipient, cipher=cipher, dest=dest, tmp=args.tmp,
-                            dry_run=args.dry_run)
+                            dry_run=args.dry_run, sync_wait=args.sync_wait, sleep=args.sleep)
     except BackupError as e:
         log.warning("backup failed: %s", e.code)
         print(f"medical backup: FAILED ({e.code})", file=out)
@@ -1475,6 +1552,9 @@ def main(argv: Optional[list[str]] = None, *, transport: rc.Transport = rc.urlli
     b.add_argument("--key-file", type=Path, help="service-role key file (default ~/.onyx_supabase_secret on production)")
     b.add_argument("--recipient-file", type=Path, default=DEFAULT_RECIPIENT_FILE)
     b.add_argument("--dest", type=Path, help=f"backup folder (default {DEFAULT_DEST})")
+    b.add_argument("--sync-wait", type=int, default=SYNC_WAIT_SECONDS,
+                   help=f"seconds to wait for OneDrive to confirm the new ciphertext in the cloud "
+                        f"(default {SYNC_WAIT_SECONDS}; 0 checks once)")
     b.add_argument("--dry-run", action="store_true", help="read and pack in memory, print counts, write nothing")
     d = sub.add_parser("drill", help="decrypt the newest backup into an isolated folder, verify, remove it")
     d.add_argument("--dest", type=Path, help=f"backup folder (default {DEFAULT_DEST})")

@@ -47,6 +47,13 @@ test("a partial run is degraded with the recovery-check pointer; a stale partial
   assert.equal(card({ status: "partial", sync_start: daysAgo(16), error_message: "files_missing" }).status, "failed");
 });
 
+test("a backup OneDrive has not confirmed in the cloud says so and pruned nothing", () => {
+  const c = card({ status: "partial", sync_start: daysAgo(1), error_message: "pending_upload" });
+  assert.equal(c.status, "partial");
+  assert.match(c.errorMessage, /pending_upload/);
+  assert.match(c.errorMessage, /nothing was pruned/);
+});
+
 test("a stored text that is not a short code is never echoed", () => {
   const c = card({ status: "failed", sync_start: daysAgo(0), error_message: "LEAK some sentence with a title" });
   assert.equal(c.status, "failed");
