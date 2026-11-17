@@ -17,6 +17,7 @@ import {
   FLAG_LABEL,
   FLAG_URL,
   getJson,
+  heldAttemptFor,
   inDays,
   nextLine,
   offeredOrder,
@@ -26,12 +27,14 @@ import {
   POLL_FOR_MS,
   postJson,
   realTimers,
+  resendAttempt,
   REVIEW_URL,
   roundAttemptsUrl,
   SELF_VERDICTS,
   summarize,
   VERDICT_VIEW,
   weekday,
+  type AttemptOutbox,
   type AttemptReceipt,
   type AttemptRequest,
   type AttemptResult,
@@ -63,7 +66,10 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  *   changed and checked again, except a refusal of a RETRY that names no reason (session, origin, size, rate limit),
  *   which proves nothing about the earlier try and stays "not sure" with the same key (a highlight grade and a
  *   Disagree behave the same). Typed answers live in memory only; unconfirmed requests are re-sent with keepalive
- *   when the page hides. Nothing is written to disk.
+ *   when the page hides. Nothing is written to disk. Those requests are held by the Practice part (`outbox`), not by
+ *   the runner: closing, or the wait for them running out, settles nothing about a request that failed or is slow, so
+ *   a reopened round shows that card as "Not sure it saved" with the same request (Retry, same attempt_key) instead of
+ *   asking the question again under a new key while the first request may still commit.
  * - Skip for now stores nothing and moves the card to the end (a second Skip takes it out of today's round). An
  *   incorrect answer brings the idea back once at the end with another variant ("Again"; it never moves the
  *   schedule); a model grade that comes after the round ended offers it on the summary instead. Flags (Wrong,
@@ -160,11 +166,64 @@ function newItem(card: PracticeCard, question: PracticeQuestion | null = card.qu
   };
 }
 
+/**
+ * A card whose answer was sent before the runner was closed and never confirmed (see AttemptOutbox): back as "Not sure
+ * it saved" with the same request, so Retry sends it under the same key (a stored answer answers its receipt) and the
+ * question is never asked again under a new one. The answer is shown as Riley gave it.
+ */
+function withHeldRequest(it: Item, req: AttemptRequest): Item {
+  const q = it.question;
+  if (!q || it.card.kind === "highlight") return it;
+  const rub = parseRubric(q.rubric);
+  const options = rub?.format === "cued" ? rub.options ?? [] : [];
+  const steps = rub?.format === "order" ? rub.steps : [];
+  const dontKnow = req.answer === DONT_KNOW_ANSWER;
+  const choice = q.format === "cued" && req.hinted ? options.indexOf(req.answer) : -1;
+  const used = new Set<number>();
+  const order =
+    q.format === "order"
+      ? req.answer.split("\n").map((line) => {
+          const i = steps.findIndex((step, k) => step === line && !used.has(k));
+          if (i >= 0) used.add(i);
+          return i;
+        })
+      : [];
+  const g = gradeLocal(q.format, q.rubric, req.answer, req.hinted);
+  return {
+    ...it,
+    phase: "unknown",
+    req,
+    hinted: req.hinted,
+    answer: q.format === "order" || (q.format === "cued" && req.hinted) || dontKnow ? "" : req.answer,
+    choice: choice >= 0 ? choice : null,
+    order: order.length === steps.length && order.every((i) => i >= 0) ? order : [],
+    local: g.kind === "graded" ? g.verdict : null,
+    message: "This answer was sent before you closed the round, and Onyx never confirmed it. Retry to find out.",
+  };
+}
+
+/** The round's cards as items, the ones with an unconfirmed request back as such (the first of them opens the runner). */
+function seedRound(round: PracticeRound, mode: PracticeRunnerProps["mode"], outbox: AttemptOutbox): { items: Record<string, Item>; order: string[]; held: string | null } {
+  const cards = startingCards(round, mode);
+  const items: Record<string, Item> = {};
+  for (const c of cards) {
+    const base = newItem(c);
+    const req = base.stored ? null : heldAttemptFor(outbox, round.round_key, c.question);
+    items[c.key] = req ? withHeldRequest(base, req) : base;
+  }
+  return { items, order: cards.map((c) => c.key), held: cards.find((c) => items[c.key].phase === "unknown")?.key ?? null };
+}
+
 /** The answer's key (lower case, as the round's attempts are keyed): this sitting's request, or the earlier one. */
 const attemptKeyOf = (it: Item): string | null => (it.req?.attempt_key ?? it.card.attempt_key ?? null)?.toLowerCase() ?? null;
 const isDone = (it: Item) => it.phase === "past" || it.phase === "out";
 const answerable = (it: Item) => it.phase === "open" || it.phase === "refused";
 const canNext = (it: Item) => it.phase === "saved" || it.phase === "stale";
+/**
+ * Still to be shown: not asked yet, or asked with an answer whose save was not confirmed (a card the runner reopened
+ * with, see withHeldRequest, comes first; in this sitting an unconfirmed card is always the one on screen).
+ */
+const isWaiting = (it: Item) => it.phase === "open" || it.phase === "unknown";
 /** The card shows a text box (not steps to order, not the four choices) ... */
 const showsTextBox = (it: Item) => !it.earlier && it.question?.format !== "order" && !(it.question?.format === "cued" && it.hinted);
 /** ... and Riley typed something in it that was not checked yet: it lives in memory only, so closing would lose it. */
@@ -240,6 +299,11 @@ export interface PracticeRunnerProps {
   onMore?: (settled?: Promise<void>) => void;
   /** Re-read the round (after a "Not read yet" hold); cards it no longer holds leave this sitting. */
   onReread?: () => Promise<PracticeRound | null>;
+  /**
+   * Answers sent and not confirmed (see AttemptOutbox). The Practice part passes the one that outlives this runner; a
+   * runner mounted without one keeps its own for this sitting only.
+   */
+  outbox?: AttemptOutbox;
   /** The clock and timers (tests pass a manual one). */
   timers?: Timers;
 }
@@ -248,10 +312,15 @@ export interface PracticeRunnerProps {
 const startingCards = (round: PracticeRound, mode: PracticeRunnerProps["mode"]): PracticeCard[] =>
   mode === "quick" ? round.cards.filter((c) => !c.done).slice(0, QUICK_SIZE) : round.cards;
 
-export default function PracticeRunner({ round, mode, onClose, onMore, onReread, timers = realTimers }: PracticeRunnerProps) {
-  const [items, setItems] = useState<Record<string, Item>>(() => Object.fromEntries(startingCards(round, mode).map((c) => [c.key, newItem(c)])));
-  const [order, setOrder] = useState<string[]>(() => startingCards(round, mode).map((c) => c.key));
-  const [currentKey, setCurrentKey] = useState<string | null>(null);
+export default function PracticeRunner({ round, mode, onClose, onMore, onReread, outbox: held, timers = realTimers }: PracticeRunnerProps) {
+  const ownOutbox = useRef<AttemptOutbox | null>(null);
+  if (!ownOutbox.current) ownOutbox.current = new Map();
+  // Requests sent and not confirmed: re-sent with keepalive when the page hides, and kept past this runner when it closes.
+  const outbox: AttemptOutbox = held ?? ownOutbox.current;
+  const [seed] = useState(() => seedRound(round, mode, outbox));
+  const [items, setItems] = useState<Record<string, Item>>(seed.items);
+  const [order, setOrder] = useState<string[]>(seed.order);
+  const [currentKey, setCurrentKey] = useState<string | null>(seed.held);
   const [results, setResults] = useState<Results>({});
   const [flags, setFlags] = useState<HeldFlag[]>([]);
   const [voided, setVoided] = useState(0);
@@ -289,13 +358,13 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const finished = useRef(false);
   const announced = useRef(new Set<string>());
   const againDone = useRef(new Set<string>());
-  // Requests sent and not confirmed (in flight, or no answer): re-sent with keepalive when the page hides.
-  const outbox = useRef(new Map<string, AttemptRequest>());
   // Requests on their way (answers, grades, highlight reviews, flags) and the answers among them: closing waits for
   // them (leave) before the part re-reads.
   const inflight = useRef(new Set<Promise<unknown>>());
   const inflightKeys = useRef(new Set<string>());
   const drained = useRef(false);
+  // Card keys of unanswered chapter recalls that list an idea a sent "Not in this chapter" moved (see reconcile).
+  const staleRecall = useRef(new Set<string>());
   const rootRef = useRef<HTMLDivElement | null>(null);
   const promptRef = useRef<HTMLHeadingElement | null>(null);
   const nextRef = useRef<HTMLButtonElement | null>(null);
@@ -329,9 +398,10 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   if (!queueRef.current) {
     queueRef.current = createFlagQueue({
       timers,
-      send: async (f, keepalive) => {
+      send: async (f, keepalive, retried) => {
         const r = await track(postJson(FLAG_URL, { flag_key: f.flag_key, question_id: f.question_id, kind: f.kind }, { keepalive }));
-        return classifyFlagAnswer(r.status, r.body);
+        // A retry whose refusal names no reason proves nothing about the earlier try: it stays "not sure" with Retry.
+        return classifyFlagAnswer(r.status, r.body, retried);
       },
       onChange: (list) => {
         if (alive.current) setFlags(list);
@@ -354,14 +424,54 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   }
   const queue = queueRef.current;
 
-  // A "Not read yet" hold lowered the spoiler gate: re-read the round, and the cards it no longer holds leave.
+  /**
+   * A "Not read yet" hold lowered the spoiler gate, or a "Not in this chapter" moved an idea: re-read the round. The
+   * cards it no longer holds leave, and an unanswered card it still holds under ANOTHER question (a card key does not
+   * carry the question: `recall:<chapter>` stays while the server re-versions the chapter recall without the moved
+   * idea) takes the new question, so Check never reveals, or sends an answer to, a version that is gone. A card with a
+   * request on its way is left to the server's answer.
+   */
   async function reconcile() {
     const fresh = await onRereadRef.current?.().catch(() => null);
-    if (!fresh || !alive.current) return;
-    const keep = new Set(fresh.cards.map((c) => c.key));
+    if (!alive.current) return;
+    // Recall cards that list a moved idea (lockIdea noted them): they cannot be offered as they are.
+    const stale = staleRecall.current;
+    staleRecall.current = new Set();
+    if (!fresh) {
+      if (stale.size) {
+        setItems((prev) => {
+          const next = { ...prev };
+          for (const [k, it] of Object.entries(prev)) if (stale.has(it.card.key) && !isDone(it) && !it.stored && answerable(it) && !it.req) next[k] = { ...it, phase: "out" };
+          return next;
+        });
+      }
+      return;
+    }
+    const freshByKey = new Map(fresh.cards.map((c) => [c.key, c]));
     setItems((prev) => {
       const next = { ...prev };
-      for (const [k, it] of Object.entries(prev)) if (!isDone(it) && !it.stored && !keep.has(it.card.key)) next[k] = { ...it, phase: "out" };
+      for (const [k, it] of Object.entries(prev)) {
+        if (isDone(it) || it.stored) continue;
+        const fc = freshByKey.get(it.card.key);
+        if (!fc) {
+          next[k] = { ...it, phase: "out" };
+          continue;
+        }
+        // An "Again" repeat asks the idea's other variant; every other card its own question.
+        const q = it.again ? fc.again_question : fc.question;
+        if (!q || !it.question || it.card.kind === "highlight" || !answerable(it) || it.req) continue;
+        if (q.question_id === it.question.question_id && q.version === it.question.version) continue;
+        next[k] = {
+          ...it,
+          card: fc,
+          question: q,
+          // What was picked or ordered belongs to the old question's options; a typed answer stays only for the same question.
+          hinted: false,
+          choice: null,
+          order: [],
+          answer: q.question_id === it.question.question_id ? it.answer : "",
+        };
+      }
       return next;
     });
   }
@@ -392,12 +502,15 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
    * questions that list it were re-versioned without it. The answers stay valid (the counts stay), but their cards
    * leave the summary's list and the opened results like a held chapter's, and a chapter recall answer that listed
    * the idea leaves the Covered / Missed lists with it (the server hides that attempt too). An unanswered card of
-   * the idea is already off screen (the flag's own cards), and an unanswered recall card is left to the re-read.
+   * the idea is already off screen (the flag's own cards), and an unanswered recall card takes the re-versioned
+   * question from the re-read (reconcile), or leaves when the round cannot be read.
    */
   function lockIdea(f: HeldFlag) {
     const all = Object.values(itemsRef.current);
     const ideaId = all.find((x) => x.question?.question_id === f.question_id)?.card.idea?.idea_id ?? null;
     if (ideaId === null) return;
+    // An unanswered recall that lists the idea is re-versioned by the server: the re-read replaces it (or drops it).
+    for (const x of all) if (x.card.kind === "chapter_recall" && !x.stored && answerable(x) && !x.req && recallListsIdea(x, ideaId)) staleRecall.current.add(x.card.key);
     const keys = all
       .filter((x) => x.card.kind !== "highlight" && (x.card.idea?.idea_id === ideaId || (x.card.kind === "chapter_recall" && x.stored && recallListsIdea(x, ideaId))))
       .map((x) => x.card.key);
@@ -463,7 +576,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   const curKey =
     currentKey && visible.includes(currentKey) && !isDone(items[currentKey])
       ? currentKey
-      : visible.find((k) => items[k].phase === "open") ?? null;
+      : visible.find((k) => isWaiting(items[k])) ?? null;
   const cur = curKey ? items[curKey] : null;
   const showSummary = cur === null;
   // An answered card opened again from the summary.
@@ -623,7 +736,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   function sendPending(keepalive: boolean): Promise<unknown>[] {
     const work: Promise<unknown>[] = [...inflight.current];
     if (queue.list().some((f) => f.status === "held" || f.status === "unknown" || (keepalive && f.status === "sending"))) work.push(queue.flush(keepalive));
-    for (const [key, req] of outbox.current) if (keepalive || !inflightKeys.current.has(key)) work.push(postJson(ATTEMPT_URL, req, { keepalive }));
+    for (const [key, req] of outbox) if (keepalive || !inflightKeys.current.has(key)) work.push(resendAttempt(outbox, req, keepalive));
     return work;
   }
 
@@ -703,17 +816,19 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   async function send(key: string, req: AttemptRequest) {
     // A request still in the outbox was sent before without a confirmed answer, so it may be stored already: a
     // refusal of this retry that proves nothing (session, origin, size, rate limit) must not free its key.
-    const retried = outbox.current.has(req.attempt_key);
+    const retried = outbox.has(req.attempt_key);
     busy.current = true;
-    outbox.current.set(req.attempt_key, req);
+    outbox.set(req.attempt_key, req);
     inflightKeys.current.add(req.attempt_key);
     const { status, body } = await track(postJson(ATTEMPT_URL, req));
     inflightKeys.current.delete(req.attempt_key);
     busy.current = false;
-    if (!alive.current) return;
     const out = classifyAttemptAnswer(status, body, retried);
+    // The held request follows its answer whether or not this runner is still on screen: a conclusive answer
+    // (stored, refused, left out) releases it, an unknown one stays for the reopened round to retry under the same key.
+    if (out.kind !== "unknown") outbox.delete(req.attempt_key);
+    if (!alive.current) return;
     if (out.kind === "saved") {
-      outbox.current.delete(req.attempt_key);
       changed.current = true;
       const receipt = out.receipt;
       patch(key, (it) => ({
@@ -740,7 +855,6 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       setFocus("retry");
       return;
     }
-    outbox.current.delete(req.attempt_key);
     if (gatedNow) return;
     if (out.kind === "refused") {
       patch(key, { phase: "refused", message: out.message, req: null, local: null });
@@ -833,7 +947,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     const it = cur;
     if (!it || !canNext(it)) return;
     patch(it.key, { phase: "past" });
-    const nextKey = visible.find((k) => k !== it.key && items[k].phase === "open") ?? null;
+    const nextKey = visible.find((k) => k !== it.key && isWaiting(items[k])) ?? null;
     setCurrentKey(nextKey);
     setAnnounce("");
     setFocus(nextKey ? "prompt" : "summary");
@@ -849,7 +963,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       patch(it.key, { skips: 1 });
       setOrder((prev) => [...prev.filter((k) => k !== it.key), it.key]);
     }
-    const others = visible.filter((k) => k !== it.key && items[k].phase === "open");
+    const others = visible.filter((k) => k !== it.key && isWaiting(items[k]));
     const nextKey = others[0] ?? (it.skips >= 1 ? null : it.key);
     setCurrentKey(nextKey);
     setFocus(nextKey ? "prompt" : "summary");
@@ -877,7 +991,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
       setFocus("summary");
       return;
     }
-    const nextKey = visible.find((k) => !keys.includes(k) && items[k].phase === "open") ?? null;
+    const nextKey = visible.find((k) => !keys.includes(k) && isWaiting(items[k])) ?? null;
     setCurrentKey(nextKey);
     setFocus(nextKey ? "prompt" : "summary");
   }

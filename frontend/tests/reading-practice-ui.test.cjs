@@ -12,6 +12,11 @@
 // waits until the round was read again. Review round 3: a retry refused before the receipt lookup (a session, origin or
 // rate-limit refusal) stays "not sure" under the same key, for an answer, a highlight grade and Disagree; "Not in this
 // chapter" locks its idea like "Not read yet" locks a chapter (summary, opened results, chapter recall lists).
+// Review round 4: Start waits for the first read of the mount (and of every return after a minute away) and a round that
+// could not be checked is not offered; a chapter recall the server re-versioned takes the new question after "Not in
+// this chapter" (or leaves when the round cannot be read); a flag retried after a lost answer stays "not sure" under
+// the same flag_key unless the refusal names a reason; an answer sent and never confirmed stays held past a closed
+// runner (also when the 10 s wait ran out), and the reopened round retries the SAME request instead of a new key.
 // Synthetic data only (invented prompts and answers); no network, no storage.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -206,7 +211,7 @@ function fakeTarget(extra = {}) {
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const keyEvent = (key, o = {}) => ({ key, target: { tagName: "BODY" }, preventDefault() {}, ...o });
 
-function mountRunner(t, { cards, answer, poll, override, review, flagAnswer, win, doc, extra = 0, onReread, mode = "daily" } = {}) {
+function mountRunner(t, { cards, answer, poll, override, review, flagAnswer, win, doc, extra = 0, onReread, mode = "daily", outbox } = {}) {
   const calls = [];
   const timers = fakeTimers();
   const count = (url) => calls.filter((c) => c.url === url).length;
@@ -236,6 +241,7 @@ function mountRunner(t, { cards, answer, poll, override, review, flagAnswer, win
       },
       onMore: () => undefined,
       onReread,
+      outbox,
       timers,
     },
     stubs: STUBS,
@@ -1460,7 +1466,7 @@ test("a retry's refusal that names no reason is 'not sure'; a named reason is pr
 
 const overview = { book: { book_id: 7, slug: "synthetic-book", title: "Synthetic", total_chapters: 12 }, today: TODAY };
 
-function mountPart(t, { roundAnswer, bankAnswer, approval, cache = {} }) {
+function mountPart(t, { roundAnswer, bankAnswer, approval, cache = {}, win, doc, now }) {
   const calls = [];
   withGlobals(t, {
     fetch: async (url, init = {}) => {
@@ -1470,11 +1476,13 @@ function mountPart(t, { roundAnswer, bankAnswer, approval, cache = {} }) {
       if (url.startsWith(`${C.BANK_URL}?`) || url === C.BANK_URL) return bankAnswer(url, calls);
       throw new Error(`unexpected fetch ${url}`);
     },
+    ...(win ? { window: win } : {}),
+    ...(doc ? { document: doc } : {}),
   });
   const store = { ...cache };
   const changed = [];
   const h = mountClient("app/reading/PracticePart.tsx", {
-    props: { o: overview, review: React.createElement("p", null, "REVIEW CARD"), onChanged: () => changed.push(1) },
+    props: { o: overview, review: React.createElement("p", null, "REVIEW CARD"), onChanged: () => changed.push(1), ...(now ? { now } : {}) },
     stubs: {
       ...STUBS,
       "@/lib/client-cache": { clientCache: { peek: (k) => store[k], put: (k, v) => (store[k] = v), remove: (k) => delete store[k] } },
@@ -1975,4 +1983,317 @@ test("the flag queue: a flag on its way is sent again with keepalive when the pa
   await tick();
   assert.equal(q.list()[0].status, "sent", "the first request's late answer does not turn a sent flag back");
   assert.deepEqual(reported, ["a"], "reported once");
+});
+
+/* ------------------------------------------------------------------ */
+/* Review round 4: the day of the round Start opens, a re-versioned     */
+/* recall, a retried flag, requests held past a closed runner           */
+/* ------------------------------------------------------------------ */
+
+const partCache = () => ({
+  [C.practiceUrl("synthetic-book")]: round([cued(1), cued(2)]),
+  [C.bankUrl("synthetic-book")]: bankBody({ enabled: true, approved_cents: 1900 }),
+});
+const onBank = () => response(bankBody({ enabled: true, approved_cents: 1900 }));
+
+test("practice part: Start waits for this mount's first read, so a cached round (and overview) of another day never opens", async (t) => {
+  runnerProps.length = 0;
+  const gate = deferred();
+  const p = mountPart(t, { cache: partCache(), roundAnswer: () => gate.promise, bankAnswer: onBank });
+  await p.h.flush();
+  assert.match(p.h.text(), /2 ready/, "the cached round is on screen at once");
+  assert.equal(p.h.button("Start").props["aria-disabled"], true, "but Start waits for the server's answer");
+  p.h.button("Start").props.onClick();
+  await p.h.flush();
+  assert.equal(p.h.find((n) => n.props["data-testid"] === "runner-stub").length, 0, "a tap opens nothing");
+  // The server's round is for another day than the overview's: nothing opens (the part waits for the overview).
+  gate.resolve(response({ ...round([cued(1), cued(2)]), today: "2026-03-11" }));
+  await p.h.flush();
+  assert.equal(p.h.buttons("Start").length, 0, "a round for another day than the overview's is not offered");
+  assert.match(p.h.text(), /Loading today's round/);
+});
+
+test("practice part: once the read answers, Start opens the server's round, not the cached one", async (t) => {
+  runnerProps.length = 0;
+  const gate = deferred();
+  const p = mountPart(t, { cache: partCache(), roundAnswer: () => gate.promise, bankAnswer: onBank });
+  await p.h.flush();
+  gate.resolve(response(round([cued(1), cued(2), cued(3)])));
+  await p.h.flush();
+  assert.match(p.h.text(), /3 ready/);
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined);
+  p.h.click("Start");
+  await p.h.flush();
+  assert.equal(runnerProps[runnerProps.length - 1].round.cards.length, 3);
+});
+
+test("practice part: a read that fails keeps the cached round off until Try again confirms it", async (t) => {
+  runnerProps.length = 0;
+  let reads = 0;
+  const p = mountPart(t, { cache: partCache(), roundAnswer: () => (++reads === 1 ? response({ error: "failed" }, 500) : response(round([cued(1), cued(2)]))), bankAnswer: onBank });
+  await p.h.flush();
+  assert.match(p.h.text(), /2 ready/);
+  assert.equal(p.h.button("Start").props["aria-disabled"], true, "a round that could not be checked is not offered");
+  assert.match(p.h.text(), /Couldn't load: today's round could not be checked/);
+  p.h.click("Try again");
+  await p.h.flush();
+  assert.equal(reads, 2);
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined);
+  assert.doesNotMatch(p.h.text(), /Couldn't load/);
+});
+
+test("practice part: back in the app after a minute the overview and the round are read again; Start waits meanwhile; never while the runner is open", async (t) => {
+  runnerProps.length = 0;
+  const win = fakeTarget();
+  const doc = fakeTarget({ visibilityState: "visible" });
+  let clock = 5_000_000;
+  let reads = 0;
+  let gate = null;
+  const p = mountPart(t, {
+    win,
+    doc,
+    now: () => clock,
+    roundAnswer: () => {
+      reads += 1;
+      return gate ? gate.promise : response(round([cued(1), cued(2)]));
+    },
+    bankAnswer: onBank,
+  });
+  await p.h.flush();
+  assert.equal(reads, 1);
+  // 59 s away: nothing is read again.
+  doc.visibilityState = "hidden";
+  doc.fire("visibilitychange");
+  clock += 59_000;
+  doc.visibilityState = "visible";
+  doc.fire("visibilitychange");
+  await p.h.flush();
+  assert.equal(reads, 1);
+  assert.deepEqual(p.changed, []);
+  // 61 s away: the overview and the round are read again, and Start waits for the answer.
+  doc.visibilityState = "hidden";
+  doc.fire("visibilitychange");
+  clock += 61_000;
+  gate = deferred();
+  doc.visibilityState = "visible";
+  doc.fire("visibilitychange");
+  await p.h.flush();
+  assert.equal(reads, 2);
+  assert.deepEqual(p.changed, [1], "the overview too");
+  assert.equal(p.h.button("Start").props["aria-disabled"], true);
+  gate.resolve(response(round([cued(1), cued(2)])));
+  await p.h.flush();
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined);
+  // The window losing and regaining focus counts the same way.
+  gate = null;
+  win.fire("blur");
+  clock += 120_000;
+  win.fire("focus");
+  await p.h.flush();
+  assert.equal(reads, 3);
+  // Not while the runner is open; it reads once the runner closes, though nothing was answered.
+  p.h.click("Start");
+  await p.h.flush();
+  const props = runnerProps[runnerProps.length - 1];
+  win.fire("blur");
+  clock += 120_000;
+  win.fire("focus");
+  await p.h.flush();
+  assert.equal(reads, 3, "the open round keeps its day");
+  props.onClose(false, false);
+  await p.h.flush();
+  assert.equal(reads, 4, "read once it closes");
+  assert.equal(p.changed.length, 3);
+});
+
+test("Not in this chapter re-versions the chapter recall: the unanswered recall card takes the new question, so Check never shows the moved idea", async (t) => {
+  const recall = recallCard(2);
+  const revised = {
+    ...recall,
+    question: { ...recall.question, version: 2, rubric: { v: 1, format: "chapter_recall", ideas: [{ idea_id: 52, title: "Synthetic supporting idea", importance: "supporting" }] } },
+  };
+  const cards = [cued(51, { chapter: 2, again: false }), recall];
+  const r = mountRunner(t, { cards, onReread: async () => round([revised]) });
+  await r.h.flush();
+  await menu(r.h, "Not in this chapter");
+  assert.match(r.h.text(), /What do you remember of chapter 2\?/, "the recall card is next");
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent()[0].body.kind, "not_in_chapter");
+  r.h.click("I don't know");
+  await r.h.flush();
+  const a = r.attempts()[0].body;
+  assert.deepEqual({ question_id: a.question_id, version: a.version }, { question_id: 902, version: 2 }, "the re-versioned question is answered, not the old one");
+  assert.match(r.h.text(), /Synthetic supporting idea/);
+  assert.doesNotMatch(r.h.text(), /Synthetic core idea/, "the moved idea is not revealed");
+});
+
+test("Not in this chapter, and the round cannot be read again: an unanswered recall that listed the idea leaves instead of staying as it was", async (t) => {
+  const cards = [cued(51, { chapter: 2, again: false }), recallCard(2)];
+  const r = mountRunner(t, { cards, onReread: async () => null });
+  await r.h.flush();
+  await menu(r.h, "Not in this chapter");
+  assert.match(r.h.text(), /What do you remember of chapter 2\?/);
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.match(r.h.text(), /Round done/);
+  assert.doesNotMatch(r.h.text(), /What do you remember of chapter 2\?/);
+  assert.equal(r.attempts().length, 0);
+});
+
+test("flag answers: a retry's refusal that names no reason is 'not sure'; a named reason is proof; a first try is proof either way", () => {
+  for (const [status, body] of [[403, { error: "bad_request" }], [415, { error: "bad_request" }], [413, { error: "bad_request" }], [401, { error: "unauthorized" }], [429, { error: "rate_limited" }], [409, { error: "refused" }], [400, null], [404, null]]) {
+    assert.equal(C.classifyFlagAnswer(status, body).kind, "refused", `first try ${status}`);
+    assert.equal(C.classifyFlagAnswer(status, body, true).kind, "unknown", `retry ${status} ${JSON.stringify(body)}`);
+  }
+  for (const [status, body] of [[404, { error: "not_found" }], [409, { error: "key_reused" }], [409, { error: "locked" }], [409, { error: "question_changed" }], [409, { error: "superseded" }], [400, { error: "bad_request" }]]) {
+    assert.equal(C.classifyFlagAnswer(status, body, true).kind, "refused", `retry ${status} ${body.error}`);
+  }
+  assert.equal(C.classifyFlagAnswer(null, null, true).kind, "unknown");
+  assert.equal(C.classifyFlagAnswer(409, { error: "raced" }, true).kind, "unknown");
+  assert.equal(C.classifyFlagAnswer(200, { success: true, kind: "wrong", invalidated: 1 }, true).kind, "saved");
+});
+
+test("the flag queue tells a send whether it is a retry of the same flag_key", async () => {
+  const timers = fakeTimers();
+  const seen = [];
+  const q = C.createFlagQueue({
+    timers,
+    send: async (f, keepalive, retried) => {
+      seen.push({ key: f.flag_key, retried });
+      return seen.length === 1 ? { kind: "unknown", message: "x" } : { kind: "saved", value: { invalidated: 0, kind: f.kind } };
+    },
+  });
+  q.add({ flag_key: "a", question_id: 1, kind: "wrong", cardKeys: [] });
+  await timers.advance(C.FLAG_HOLD_MS);
+  await tick();
+  await tick();
+  await q.retry("a");
+  assert.deepEqual(seen, [{ key: "a", retried: false }, { key: "a", retried: true }]);
+});
+
+test("a flag whose answer was lost and whose retry is refused without a reason stays 'not sure' with Retry; its cards do not come back", async (t) => {
+  let n = 0;
+  const r = mountRunner(t, {
+    cards: [cued(1), cued(2)],
+    flagAnswer: (b) => {
+      n += 1;
+      if (n === 1) throw new TypeError("offline");
+      if (n === 2) return response({ error: "rate_limited" }, 429);
+      return response({ success: true, kind: b.kind, invalidated: 0, replayed: true });
+    },
+  });
+  await r.h.flush();
+  await menu(r.h, "Unclear");
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.match(r.h.text(), /Flag not sure:/);
+  r.h.click("Retry flag");
+  await r.h.flush();
+  assert.match(r.h.text(), /Flag not sure: Onyx refused this retry/);
+  assert.doesNotMatch(r.h.text(), /Flag not saved/);
+  assert.equal(r.h.buttons("Retry flag").length, 1, "Retry stays");
+  assert.doesNotMatch(r.h.text(), /Synthetic prompt 1\?/, "the flagged card stays off screen while the flag may be stored");
+  r.h.click("Retry flag");
+  await r.h.flush();
+  assert.equal(r.flagsSent().length, 3);
+  assert.equal(new Set(r.flagsSent().map((f) => f.body.flag_key)).size, 1, "every try carries the same flag_key");
+  assert.doesNotMatch(r.h.text(), /Flag not/);
+});
+
+test("held requests: matched by round, question and version only; a conclusive answer releases one, an unknown one keeps it", async (t) => {
+  const outbox = new Map();
+  const req = { attempt_key: "0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a", question_id: 101, version: 1, round_key: ROUND_KEY, round_date: TODAY, round_kind: "daily", answer: "alpha 1", hinted: false, response_ms: 5 };
+  outbox.set(req.attempt_key, req);
+  assert.equal(C.heldAttemptFor(outbox, ROUND_KEY, { question_id: 101, version: 1 }), req);
+  assert.equal(C.heldAttemptFor(outbox, ROUND_KEY, { question_id: 101, version: 2 }), null, "another version of the question");
+  assert.equal(C.heldAttemptFor(outbox, ROUND_KEY, { question_id: 102, version: 1 }), null);
+  assert.equal(C.heldAttemptFor(outbox, "1f1f1f1f-1f1f-4f1f-8f1f-1f1f1f1f1f1f", { question_id: 101, version: 1 }), null, "another round");
+  assert.equal(C.heldAttemptFor(outbox, ROUND_KEY, null), null);
+  let reply = "offline";
+  withGlobals(t, {
+    fetch: async () => {
+      if (reply === "offline") throw new TypeError("offline");
+      return reply;
+    },
+  });
+  assert.equal((await C.resendAttempt(outbox, req, true)).kind, "unknown");
+  assert.equal(outbox.size, 1, "no answer: still held");
+  reply = response({ error: "unauthorized" }, 401);
+  assert.equal((await C.resendAttempt(outbox, req)).kind, "unknown", "a refusal that names no reason proves nothing about the earlier try");
+  assert.equal(outbox.size, 1);
+  reply = response(serverReceipt([cued(1)], req, { replayed: true }));
+  assert.equal((await C.resendAttempt(outbox, req)).kind, "saved");
+  assert.equal(outbox.size, 0, "the receipt released it");
+});
+
+test("closing with an unconfirmed answer keeps its request: the reopened round shows that card as 'not sure' first, and Retry sends the SAME request (never a new key)", async (t) => {
+  const outbox = new Map();
+  const cards = [cued(1), cued(2)];
+  const r1 = mountRunner(t, {
+    cards,
+    outbox,
+    answer: () => {
+      throw new TypeError("offline");
+    },
+  });
+  await r1.h.flush();
+  await menu(r1.h, "Skip for now");
+  assert.match(r1.h.text(), /Synthetic prompt 2\?/);
+  typeAnswer(r1.h, "alpha 2");
+  await r1.h.flush();
+  r1.h.click("Check");
+  await r1.h.flush();
+  assert.match(r1.alerts()[0], /Not sure it saved/);
+  r1.h.click("Close practice");
+  await r1.h.flush();
+  assert.equal(r1.closed.length, 1);
+  r1.h.unmount();
+  assert.equal(outbox.size, 1, "the request outlives the runner");
+
+  const r2 = mountRunner(t, { cards, outbox });
+  await r2.h.flush();
+  assert.match(r2.h.text(), /Synthetic prompt 2\?/, "the card with the unconfirmed answer comes first, though card 1 is still open");
+  assert.match(r2.alerts()[0], /Not sure it saved: This answer was sent before you closed the round/);
+  assert.equal(r2.h.buttons("Check").length, 0, "the question cannot be answered again under a new key");
+  assert.equal(r2.h.find((n) => n.type === "textarea")[0].props.value, "alpha 2", "the answer is shown as it was given");
+  r2.h.click("Retry");
+  await r2.h.flush();
+  assert.equal(r2.attempts().length, 1);
+  assert.deepEqual(r2.attempts()[0].body, r1.attempts()[0].body, "the same request: the same attempt_key");
+  assert.equal(new Set([...r1.attempts(), ...r2.attempts()].map((a) => a.body.attempt_key)).size, 1);
+  assert.equal(r2.alerts().length, 0);
+  assert.equal(outbox.size, 0, "the receipt released it");
+  r2.h.click("Next");
+  await r2.h.flush();
+  assert.match(r2.h.text(), /Synthetic prompt 1\?/, "then the cards still open");
+});
+
+test("closing while an answer is still on its way: the wait runs out, the request stays held, a reopened round retries the SAME key, and the late answer releases it", async (t) => {
+  const outbox = new Map();
+  const gate = deferred();
+  const cards = [cued(1), cued(2)];
+  const r1 = mountRunner(t, { cards, outbox, answer: (b) => gate.promise.then(() => response(serverReceipt(cards, b))) });
+  await r1.h.flush();
+  typeAnswer(r1.h, "alpha 1");
+  await r1.h.flush();
+  r1.h.click("Check");
+  await r1.h.flush();
+  r1.h.click("Close practice");
+  let settled = false;
+  void r1.settles[0].then(() => (settled = true));
+  await r1.timers.advance(10_000, r1.h);
+  assert.equal(settled, true, "the wait ran out although the request is still on its way");
+  r1.h.unmount();
+  assert.equal(outbox.size, 1);
+
+  const r2 = mountRunner(t, { cards, outbox });
+  await r2.h.flush();
+  assert.equal(r2.h.buttons("Check").length, 0, "no new key while the first request may still commit");
+  assert.match(r2.alerts()[0], /Not sure it saved/);
+  gate.resolve();
+  await r2.h.flush();
+  assert.equal(outbox.size, 0, "the late answer released the request");
+  r2.h.click("Retry");
+  await r2.h.flush();
+  assert.equal(r2.attempts().length, 1);
+  assert.equal(r2.attempts()[0].body.attempt_key, r1.attempts()[0].body.attempt_key);
+  assert.equal(r2.alerts().length, 0);
 });

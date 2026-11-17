@@ -377,6 +377,38 @@ function classifyFirstTry(status: number | null, body: unknown): AttemptOutcome 
   return { kind: "unknown", message: "Onyx couldn't confirm the save." };
 }
 
+/**
+ * Answers sent without a confirmed answer (on their way, or no answer came), by attempt_key. Memory only (typed answers
+ * are never written to disk). The Practice part owns one that outlives the runner: closing the runner, or its
+ * SETTLE_MAX_MS wait running out, settles nothing about these requests (a failed fetch and a slow one look alike, and a
+ * request on its way may still commit), so a reopened round must not ask the same question again under a new key. It
+ * shows that card as "Not sure it saved" with Retry, which sends the SAME request. Only a conclusive answer (stored,
+ * refused, left out) releases an entry.
+ */
+export type AttemptOutbox = Map<string, AttemptRequest>;
+/** The part's outbox; a runner mounted without one (a test) keeps its own. */
+export const sharedAttemptOutbox: AttemptOutbox = new Map();
+
+/** The unconfirmed request for this question in this round, or null (what a reopened runner takes the card from). */
+export function heldAttemptFor(outbox: AttemptOutbox, roundKey: string, question: { question_id: number; version: number } | null): AttemptRequest | null {
+  if (!question) return null;
+  for (const req of outbox.values()) {
+    if (req.round_key === roundKey && req.question_id === question.question_id && req.version === question.version) return req;
+  }
+  return null;
+}
+
+/**
+ * Send an unconfirmed request again (the same key, so a stored one answers its receipt) and release it from the outbox
+ * once the answer is conclusive. Never throws. Used where no card is waiting for the answer: closing, the page hiding.
+ */
+export async function resendAttempt(outbox: AttemptOutbox, req: AttemptRequest, keepalive = false): Promise<AttemptOutcome> {
+  const { status, body } = await postJson(ATTEMPT_URL, req, { keepalive });
+  const out = classifyAttemptAnswer(status, body, true);
+  if (out.kind !== "unknown" && outbox.get(req.attempt_key) === req) outbox.delete(req.attempt_key);
+  return out;
+}
+
 export type SmallOutcome<T> = { kind: "saved"; value: T } | { kind: "unknown"; message: string } | { kind: "refused"; message: string };
 
 /**
@@ -405,7 +437,34 @@ export interface FlagResult {
   invalidated: number;
   kind: string | null;
 }
-export function classifyFlagAnswer(status: number | null, body: unknown): SmallOutcome<FlagResult> {
+
+/**
+ * The codes the flag route answers only after it looked the flag_key up (reading_bank_flag checks the key before it
+ * looks at the question): a stored flag would have been answered its receipt (200, replayed) instead, so one of them
+ * on a retry proves the earlier try stored nothing. A 400 bad_request from the body's own check is the same for every
+ * try with that body (the first one was refused alike); the request checks (origin, content type, size: 403 / 413 /
+ * 415) and a session or rate-limit refusal prove nothing.
+ */
+const FLAG_PROVES_NOT_STORED = new Set(["not_found", "key_reused", "locked", "question_changed", "superseded"]);
+
+/**
+ * What the flag route's answer means. `retry`: this request reuses the flag_key of an earlier try whose answer never
+ * came, so that try may have been stored: a refusal that proves nothing (FLAG_PROVES_NOT_STORED) stays "not sure",
+ * with the same key, and only a receipt (a later Retry) settles it. Calling it "refused" would put the flagged cards
+ * back on screen and take Retry away while the flag may be stored.
+ */
+export function classifyFlagAnswer(status: number | null, body: unknown, retry = false): SmallOutcome<FlagResult> {
+  const out = classifyFlagFirstTry(status, body);
+  if (retry && out.kind === "refused") {
+    const code = isObj(body) && typeof body.error === "string" ? body.error : "";
+    if (!(FLAG_PROVES_NOT_STORED.has(code) || (status === 400 && code === "bad_request"))) {
+      return { kind: "unknown", message: "Onyx refused this retry, so the earlier try may be saved. Retry again." };
+    }
+  }
+  return out;
+}
+
+function classifyFlagFirstTry(status: number | null, body: unknown): SmallOutcome<FlagResult> {
   if (status === null) return { kind: "unknown", message: "No answer from Onyx, so the flag may not be saved." };
   if (status >= 200 && status < 300 && isObj(body) && body.success === true) {
     return { kind: "saved", value: { invalidated: Math.max(0, int(body.invalidated)), kind: typeof body.kind === "string" ? body.kind : null } };
@@ -584,6 +643,8 @@ export interface HeldFlag {
   cardKeys: string[];
   status: "held" | "sending" | "unknown" | "sent" | "refused";
   message?: string;
+  /** A request for this flag_key has been sent (its answer may have been lost): a later send is a retry of it. */
+  tried?: boolean;
 }
 
 export interface Timers {
@@ -616,7 +677,8 @@ export interface FlagQueue {
  * every state change, `onSent` once per flag the server confirmed.
  */
 export function createFlagQueue(opts: {
-  send: (f: HeldFlag, keepalive: boolean) => Promise<SmallOutcome<FlagResult>>;
+  /** `retried`: an earlier request for this flag_key was sent (see HeldFlag.tried). */
+  send: (f: HeldFlag, keepalive: boolean, retried: boolean) => Promise<SmallOutcome<FlagResult>>;
   onChange?: (flags: HeldFlag[]) => void;
   onSent?: (f: HeldFlag, r: FlagResult) => void;
   timers?: Timers;
@@ -644,9 +706,10 @@ export function createFlagQueue(opts: {
       timers.clear(h);
       handles.delete(key);
     }
-    patch(key, { status: "sending", message: undefined });
+    const retried = f.tried === true;
+    patch(key, { status: "sending", message: undefined, tried: true });
     changed();
-    const out = await opts.send(flags.get(key)!, keepalive);
+    const out = await opts.send(flags.get(key)!, keepalive, retried);
     if (flags.get(key)?.status === "sent") return;
     if (out.kind === "saved") {
       patch(key, { status: "sent" });

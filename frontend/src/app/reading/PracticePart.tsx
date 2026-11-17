@@ -21,6 +21,7 @@ import {
   practiceUrl,
   roundForToday,
   roundProgress,
+  sharedAttemptOutbox,
   weekday,
   type BankState,
   type PracticeRound,
@@ -33,6 +34,9 @@ const PracticeRunner = dynamic(loadRunner, { ssr: false, loading: () => <div cla
 const prefetchRunner = () => {
   void loadRunner().catch(() => undefined);
 };
+
+/** Away from the app at least this long, coming back re-reads the overview and the round (the day may have turned). */
+export const RETURN_REREAD_MS = 60_000;
 
 /**
  * /reading Practice part (READ-QUIZ-01 S4): the `review` part's content.
@@ -51,8 +55,26 @@ const prefetchRunner = () => {
  * reopened round never asks a question whose answer is still being stored. Start keeps waiting until the round has been
  * read again and replaced the one the runner was opened from; when that read fails the old round is dropped (and its
  * cached copy), never offered again: its answered cards would be asked, and sent, a second time.
+ *
+ * Which day's round Start opens: a cached round and the overview's `today` can both be from yesterday (the server
+ * takes an answer's round_date up to one day back, meant for a sitting that straddles 06:00, not for an idle page).
+ * So Start waits for the first read of this mount (and of every new behavioral day, and of every return) to answer,
+ * and stays off until a read of the round succeeded: a round that could not be checked is not offered, with Try
+ * again. Coming back to the app after RETURN_REREAD_MS or more away (tab visible again, window focused again)
+ * re-reads the overview and the round, never while the runner is open (it then reads once the runner closes).
  */
-export default function PracticePart({ o, review, onChanged }: { o: ReadingOverview; review: ReactNode; onChanged: () => void }) {
+export default function PracticePart({
+  o,
+  review,
+  onChanged,
+  now = Date.now,
+}: {
+  o: ReadingOverview;
+  review: ReactNode;
+  onChanged: () => void;
+  /** The clock (tests pass a manual one). */
+  now?: () => number;
+}) {
   const slug = o.book.slug;
   const roundUrl = practiceUrl(slug);
   const bUrl = bankUrl(slug);
@@ -70,7 +92,20 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
   const [offState, setOffState] = useState<{ saving: boolean; message: string | null; unsure: boolean }>({ saving: false, message: null, unsure: false });
   // Answers or flags from a closed runner still on their way: Start waits, and the round is re-read once they land.
   const [settling, setSettling] = useState(false);
+  // The first read of this mount / day / return is on its way: the round on screen may be a cached one from another day.
+  const [checking, setChecking] = useState(true);
+  // A read of the round succeeded since the last failure: what is on screen is the server's round for today.
+  const [confirmed, setConfirmed] = useState(false);
   const alive = useRef(true);
+  const checkSeq = useRef(0);
+  const runnerOpen = useRef(false);
+  runnerOpen.current = runner !== null;
+  // A return to the app while the runner was open: read again once it closes, even when nothing was answered.
+  const staleRound = useRef(false);
+  const nowRef = useRef(now);
+  nowRef.current = now;
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
 
   useEffect(() => {
     alive.current = true;
@@ -89,6 +124,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
         setRound((prev) => (sameJson(prev, parsed) ? prev : parsed));
         setAvail("ok");
         setLoadFailed(false);
+        setConfirmed(true);
         return parsed;
       }
     }
@@ -98,6 +134,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
       setAvail("off");
       return null;
     }
+    setConfirmed(false);
     setLoadFailed(true);
     return null;
   }, [roundUrl]);
@@ -125,11 +162,58 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
     return fresh;
   }, [loadRound, loadBank]);
 
-  // Mount (and a new behavioral day): read both, silently over what the cache showed.
+  /** A read with Start held back until it answers (the latest one counts when reads overlap). */
+  const recheck = useCallback(async (): Promise<PracticeRound | null> => {
+    const n = ++checkSeq.current;
+    setChecking(true);
+    let fresh: PracticeRound | null = null;
+    try {
+      fresh = await load();
+    } finally {
+      if (alive.current && n === checkSeq.current) setChecking(false);
+    }
+    return fresh;
+  }, [load]);
+
+  // Mount (and a new behavioral day): read both, silently over what the cache showed; Start waits for the answer.
   useEffect(() => {
-    void load();
+    void recheck();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [o.today]);
+
+  // Back in the app after a while (tab visible again, window focused again): the day may have turned since the
+  // overview and the round were read, so read them again. Not while the runner is open: that sitting keeps its round
+  // (the part reads once it closes).
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof document.addEventListener !== "function") return;
+    const doc = document;
+    const win = typeof window !== "undefined" && typeof window.addEventListener === "function" ? window : null;
+    let leftAt: number | null = doc.visibilityState === "hidden" ? nowRef.current() : null;
+    const leave = () => {
+      if (leftAt === null) leftAt = nowRef.current();
+    };
+    const back = () => {
+      if (doc.visibilityState === "hidden") return;
+      const was = leftAt;
+      leftAt = null;
+      if (was === null || nowRef.current() - was < RETURN_REREAD_MS) return;
+      if (runnerOpen.current) {
+        staleRound.current = true;
+        return;
+      }
+      onChangedRef.current();
+      void recheck();
+    };
+    const onVisibility = () => (doc.visibilityState === "hidden" ? leave() : back());
+    doc.addEventListener("visibilitychange", onVisibility);
+    win?.addEventListener("blur", leave);
+    win?.addEventListener("focus", back);
+    return () => {
+      doc.removeEventListener("visibilitychange", onVisibility);
+      win?.removeEventListener("blur", leave);
+      win?.removeEventListener("focus", back);
+    };
+  }, [recheck]);
 
   const shown = roundForToday(round, o.today);
   const enabled = shown ? shown.enabled : bank?.enabled === true;
@@ -144,10 +228,11 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
    */
   const afterRunner = useCallback(
     (changed: boolean, settled: Promise<void> | undefined, then?: () => void) => {
-      if (!settled && !changed) {
+      if (!settled && !changed && !staleRound.current) {
         then?.();
         return;
       }
+      staleRound.current = false;
       setSettling(true);
       void (async () => {
         let fresh: PracticeRound | null = null;
@@ -236,20 +321,23 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
   }
 
   const roundDone = !!shown && (p.ready === 0 || finishedKey === shown.round_key) && p.total > 0;
+  // A round opens only once the server confirmed it for today: not while the first read of this mount / day / return
+  // is on its way, not after a read that failed (a cached round may be from another day), not while answers settle.
+  const canStart = !settling && !checking && confirmed;
   const startButton = (mode: "daily" | "quick", label: string, primary: boolean) => (
     <button
       type="button"
       onPointerEnter={prefetchRunner}
       onFocus={prefetchRunner}
-      aria-disabled={settling || undefined}
+      aria-disabled={!canStart || undefined}
       onClick={() => {
-        if (shown && !settling) setRunner({ round: shown, mode });
+        if (shown && canStart) setRunner({ round: shown, mode });
       }}
       className={`${
         primary
           ? "inline-flex min-h-11 items-center justify-center rounded-full bg-accent px-5 text-[15px] font-medium text-on-accent"
           : "inline-flex min-h-11 items-center px-2 text-[14px] text-accent underline-offset-2 hover:underline"
-      } ${settling ? "opacity-60" : ""}`}
+      } ${canStart ? "" : "opacity-60"}`}
     >
       {label}
     </button>
@@ -311,6 +399,7 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
             round={runner.round}
             mode={runner.mode}
             onClose={closeRunner}
+            outbox={sharedAttemptOutbox}
             onMore={(settled) => {
               // Offered on the summary only: this sitting finished its round.
               if (runner.mode === "daily") setFinishedKey(runner.round.round_key);
@@ -338,9 +427,9 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
                     type="button"
                     onPointerEnter={prefetchRunner}
                     onFocus={prefetchRunner}
-                    aria-disabled={extraState === "loading" || settling || undefined}
+                    aria-disabled={extraState === "loading" || !canStart || undefined}
                     onClick={() => {
-                      if (extraState !== "loading" && !settling) void startExtra();
+                      if (extraState !== "loading" && canStart) void startExtra();
                     }}
                     className="inline-flex min-h-11 items-center justify-center rounded-full border border-accent/60 px-4 text-[14px] text-accent"
                   >
@@ -388,10 +477,10 @@ export default function PracticePart({ o, review, onChanged }: { o: ReadingOverv
             {notice?.kind === "paused" && notice.moreCents === null && bank?.cap_cents != null && (
               <p className="text-[12px] text-text-tertiary">Book cap {capDollars(bank.cap_cents)} reached</p>
             )}
-            {loadFailed && !shown && (
+            {loadFailed && (!shown || !confirmed) && (
               <p role="alert" className="text-[12px] text-text-primary">
-                <strong className="font-medium">Couldn&apos;t load:</strong> today&apos;s round could not be read.{" "}
-                <button type="button" onClick={() => void load()} className="min-h-11 px-1 text-accent">
+                <strong className="font-medium">Couldn&apos;t load:</strong> today&apos;s round could not be {shown ? "checked" : "read"}.{" "}
+                <button type="button" onClick={() => void recheck()} className="min-h-11 px-1 text-accent">
                   Try again
                 </button>
               </p>
