@@ -1084,6 +1084,18 @@ test("server read: the habit's own answers since the goal, the starts and WHOOP 
   assert.ok(!db.calls.some((c) => c.ops.some(([op]) => ["insert", "upsert", "update", "delete"].includes(op))), "the read writes nothing");
 });
 
+test("server read: the answers and the WHOOP feedback are read only once the goal is set up", async () => {
+  const db = fakeDb({ sleep_winddown_rules: [], sleep_winddown_pauses: [], habit_journal: [], whoop_sleep: [], sleep_winddown_starts: [] });
+  const p = await S.readWindDown(db);
+  assert.equal(p.status, "not_set_up");
+  assert.ok(!db.calls.some((c) => c.table === "habit_journal"), "no answers before a goal exists");
+  const db2 = fakeDb({ sleep_winddown_rules: [RULE_ROW], sleep_winddown_pauses: [], habit_name_map: [{ notion_page_id: ID_A, habit_name: HABIT }], habit_journal: [], whoop_sleep: [], sleep_winddown_starts: [] });
+  const p2 = await S.readWindDown(db2);
+  assert.equal(p2.status, "ready");
+  assert.equal(db2.calls.filter((c) => c.table === "whoop_sleep").length, 1, "WHOOP is read once");
+  assert.equal(db2.calls.filter((c) => c.table === "sleep_winddown_starts").length, 1, "the starts are read once");
+});
+
 test("server read: after a rename in Notion the answers are read under the habit's current name", async () => {
   const db = fakeDb({
     sleep_winddown_rules: [RULE_ROW], sleep_winddown_pauses: [],
