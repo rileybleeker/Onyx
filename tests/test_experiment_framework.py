@@ -629,7 +629,10 @@ def test_admin_registers_an_aa_check_before_the_method_review():
     # The A/A check is judged on Fisher's no-effect test, so it may run before the review is recorded.
     store = FakeStore()
     raw = (ROOT / "docs" / "experiments" / "EXP-900.md").read_text(encoding="utf-8")
-    seeded = raw.replace("seed_sha256: paste-the-value-printed-by-the-seed-step", f"seed_sha256: {GOLDEN_COMMITMENT}")
+    # EXP-900 is already seeded, so its file holds a committed hex value, not the placeholder text.
+    # Match either form (as the test above does) so the protocol carries GOLDEN_COMMITMENT.
+    commitment_line = re.compile(r"seed_sha256: (?:paste-the-value-printed-by-the-seed-step|[0-9a-f]{64})")
+    seeded = commitment_line.sub(f"seed_sha256: {GOLDEN_COMMITMENT}", raw)
     start = ed._as_date(ed.parse_protocol(raw.encode())["start"])
     saved = dict(ea.METHOD_REVIEW)
     try:
