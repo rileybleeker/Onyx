@@ -21,7 +21,11 @@ export class NotionHabitsError extends Error {
 }
 
 export async function fetchActiveHabits(): Promise<NotionHabit[]> {
-  if (!NOTION_API_KEY) throw new NotionHabitsError("NOTION_API_KEY not configured", 500, "");
+  if (!NOTION_API_KEY) {
+    // The routes forward this message to the screen, so it carries plain copy only; the setting name is logged here.
+    console.error("habits: NOTION_API_KEY is not set");
+    throw new NotionHabitsError("Habits isn't connected yet. Try again later.", 500, "");
+  }
 
   const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
     method: "POST",

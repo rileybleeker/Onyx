@@ -98,7 +98,11 @@ function toLead(page: { id: string; url: string; properties: Record<string, Prop
 }
 
 function headers(): HeadersInit {
-  if (!NOTION_API_KEY) throw new Error("NOTION_API_KEY is not set");
+  if (!NOTION_API_KEY) {
+    // The /api/nyc routes forward this message to the screen, so it carries plain copy only; the setting name is logged here.
+    console.error("nyc: NOTION_API_KEY is not set");
+    throw new Error("NYC leads isn't connected yet. Try again later.");
+  }
   return {
     Authorization: `Bearer ${NOTION_API_KEY}`,
     "Notion-Version": NOTION_VERSION,

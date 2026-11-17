@@ -27,7 +27,8 @@ const supabase = createClient(
  */
 export async function POST() {
   if (!NOTION_API_KEY) {
-    return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
+    console.error("habits sync: NOTION_API_KEY is not set");
+    return NextResponse.json({ error: "Habits isn't connected yet. Try again later." }, { status: 500 });
   }
 
   // Keep the shared habit-list cache (lib/habits-notion.ts) warm: this route runs hourly and on every /habits visit,
