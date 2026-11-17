@@ -390,8 +390,9 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
     stamps = [intake_date === today ? (input.now && Number.isFinite(Date.parse(input.now)) ? new Date(input.now).toISOString() : new Date().toISOString()) : null];
   }
 
-  // A re-sent message must not double-log: skip a timed entry that already
-  // exists for this product + day + instant + dose.
+  // A re-sent UNKEYED message must not double-log: skip a timed entry that already
+  // exists for this product + day + instant + dose. A keyed log is identified by its
+  // event_key alone (replay above), so another key's rows never suppress it.
   const { data: existing } = await supabase
     .from("supplement_intake")
     .select("intake_time,doses")
@@ -402,7 +403,7 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       .filter((r) => r.intake_time)
       .map((r) => `${new Date(r.intake_time as string).getTime()}|${Number(r.doses)}`),
   );
-  const timed = !!(input.times && input.times.length > 0);
+  const timed = !!(input.times && input.times.length > 0) && !key;
   const fresh = stamps.filter((s) => !(timed && s && seen.has(`${new Date(s).getTime()}|${dose.doses}`)));
   const skipped = stamps.filter((s) => !fresh.includes(s)) as string[];
 

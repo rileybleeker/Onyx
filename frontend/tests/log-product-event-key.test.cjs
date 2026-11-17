@@ -60,6 +60,8 @@ test("different event_keys are two logs", async () => {
   const b = await logProduct(d, OTHER_KEY);
   assert.equal(a.replayed, undefined);
   assert.equal(b.replayed, undefined);
+  assert.equal(b.logged.length, 2, "the second key's two times are both written, not skipped as duplicates");
+  assert.equal(b.skipped_duplicates, undefined);
   assert.equal(d.rows("supplement_intake").length, 4);
 });
 
