@@ -139,15 +139,21 @@ export function sendable(sel: Selection, opts: { only?: readonly string[]; inclu
 export const countToLog = (sel: Selection): number => sendable(sel).length;
 
 /**
- * The attempt a product's POST carries. A product whose answer was lost keeps its attempt untouched (same event_key,
- * same amount, unit, times and day), so its replay is the same request: the route returns the rows the first call
- * stored instead of writing them again. Every other send is a genuinely new save: a fresh key (`fresh()`) and the
- * values as they are now (`payload`).
+ * A replay: the item has an attempt whose answer is unknown, either lost in this page or waiting as unconfirmed (also
+ * after a remount, see `resumeRetained`). A replay repeats its attempt; it never mints a new key.
+ */
+export const isReplay = (item: SelectedItem): boolean =>
+  !!item.attempt && (item.attempt.lost || item.outcome?.kind === "unconfirmed");
+
+/**
+ * The attempt a product's POST carries. A replay keeps its attempt untouched (same event_key, same amount, unit, times
+ * and day), so its replay is the same request: the route returns the rows the first call stored instead of writing
+ * them again. Every other send is a genuinely new save: a fresh key (`fresh()`) and the values as they are now (`payload`).
  * One key per PRODUCT, not one per batch: the route reads a key's rows without a product filter
  * (rowsForEvent, lib/supplement-intake.ts), so a key shared by two products would hand the second one the first one's rows.
  */
 export function attemptFor(item: SelectedItem, payload: Omit<Attempt, "eventKey" | "lost">, fresh: () => string): Attempt {
-  if (item.attempt?.lost) return item.attempt;
+  if (item.attempt && isReplay(item)) return { ...item.attempt, lost: true };
   return { ...payload, eventKey: fresh(), lost: false };
 }
 
@@ -182,6 +188,37 @@ export function settle(sel: Selection, productId: string, outcome: Outcome): Sel
       return { ...i, outcome: { kind: "unconfirmed", error: `the repeat was refused (${outcome.error})` }, attempt: i.attempt };
     }
     return { ...i, outcome, attempt: undefined };
+  });
+}
+
+/**
+ * The sends that just went out, kept by the module (outside the mounted section) so they survive leaving /log: one
+ * record per product, the newest replaces an older one. Each record is `saving` until its answer comes.
+ */
+export function retainSends(list: Selection, sent: readonly SelectedItem[]): Selection {
+  const ids = new Set(sent.map((s) => s.productId));
+  return [...list.filter((i) => !ids.has(i.productId)), ...sent];
+}
+
+/**
+ * A remount while a send is still out: the answer is not known yet, so the record shows as unconfirmed with its own
+ * attempt (same key, same payload). "Log again" is its way out; a late answer still settles it (`settleLate`).
+ */
+export function resumeRetained(list: Selection): Selection {
+  return list.map((i) =>
+    isSaving(i.outcome) ? { ...i, outcome: { kind: "unconfirmed", error: "Onyx had not answered when you left this page" } } : i,
+  );
+}
+
+/**
+ * A late answer for the send with this key, mounted or not. Only a record still waiting (saving or unconfirmed) is
+ * settled, by the same rules as `settle`: a confirmed one is never changed by a second answer.
+ */
+export function settleLate(sel: Selection, productId: string, eventKey: string, outcome: Outcome): Selection {
+  return sel.map((i) => {
+    if (i.productId !== productId || i.attempt?.eventKey !== eventKey) return i;
+    if (!isSaving(i.outcome) && i.outcome?.kind !== "unconfirmed") return i;
+    return settle([{ ...i, outcome: { kind: "saving" } }], productId, outcome)[0];
   });
 }
 

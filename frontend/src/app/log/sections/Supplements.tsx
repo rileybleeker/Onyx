@@ -37,10 +37,13 @@ import {
   outcomeFromAnswer,
   parseAmount,
   attemptFor,
+  isReplay,
+  resumeRetained,
+  retainSends,
   runPool,
   sendable,
   setItemDose,
-  settle,
+  settleLate,
   summarize,
   summaryText,
   toggleItem,
@@ -48,6 +51,7 @@ import {
   type Answer,
   type Outcome,
   type Selection,
+  type SelectedItem,
 } from "@/lib/log-supplement-multi";
 import { DraftMark, LogCard, LogSaveButton } from "./ui";
 
@@ -82,10 +86,17 @@ import { DraftMark, LogCard, LogSaveButton } from "./ui";
 // same suggestion twice. A draft is auto-saved once; what failed stays listed with Retry.
 const triedDrafts = new Set<number>();
 const loggedItems = new Map<number, Set<number>>(); // draft id -> indexes of items already logged
-// The products whose save is NOT confirmed (their attempt keeps its key and payload, lib/log-supplement-multi.ts). Kept
-// for the page's life, like the drafts above: if the section unmounts while a save is unknown, the next mount shows it
-// again with "Log again" (same key), so a fresh tap can never write the same untimed dose a second time.
-let unconfirmedItems: Selection = [];
+// The multi-select sends still out or unconfirmed (their attempt keeps its key and payload, lib/log-supplement-multi.ts).
+// Kept for the page's life, like the drafts above: a send recorded at dispatch stays here until its answer settles it,
+// even if the section unmounts first. The next mount shows an unanswered one as unconfirmed with "Log again" (same key),
+// so a fresh tap can never write the same untimed dose a second time.
+let retainedSends: Selection = [];
+// The mounted section's way to take a late answer (null while unmounted; the answer then only settles retainedSends).
+let liveAnswer: ((productId: string, eventKey: string, outcome: Outcome) => void) | null = null;
+function answerSend(productId: string, eventKey: string, outcome: Outcome) {
+  retainedSends = settleLate(retainedSends, productId, eventKey, outcome).filter((i) => !!i.attempt);
+  liveAnswer?.(productId, eventKey, outcome);
+}
 
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
@@ -580,10 +591,13 @@ export default function SupplementsSection() {
   const [query, setQuery] = useState("");
   // The selected products, each with its own amount + unit and, once sent, its outcome (lib/log-supplement-multi.ts).
   // Only the selection holds them: filtering the options never touches it.
-  const [selection, setSelection] = useState<Selection>(() => unconfirmedItems);
+  const [selection, setSelection] = useState<Selection>(() => resumeRetained(retainedSends));
   useEffect(() => {
-    unconfirmedItems = selection.filter((i) => i.outcome?.kind === "unconfirmed");
-  }, [selection]);
+    const apply = (productId: string, eventKey: string, outcome: Outcome) =>
+      setSelection((s) => settleLate(s, productId, eventKey, outcome));
+    liveAnswer = apply;
+    return () => { if (liveAnswer === apply) liveAnswer = null; };
+  }, []);
   // Shared by every selected product that is still to be logged.
   const [times, setTimes] = useState<string[]>([]);
   const [dayChoice, setDayChoice] = useState<string>("today"); // "today" | "yesterday" | YYYY-MM-DD
@@ -740,7 +754,7 @@ export default function SupplementsSection() {
     if (targets.length === 0) return;
     const clean = times.map((t) => t.slice(0, 5));
     // A replay carries the times and day it was first sent with (its attempt), so only a new send checks the shared fields.
-    const hasNewSend = targets.some((t) => !t.attempt?.lost);
+    const hasNewSend = targets.some((t) => !isReplay(t));
     if (hasNewSend && clean.some((t) => !TIME_RE.test(t))) {
       setFormError("Fill in or remove the empty time");
       return;
@@ -751,18 +765,20 @@ export default function SupplementsSection() {
     }
     setFormError(null);
     const bad = new Map<string, string>();
-    const ready: { id: string; name: string; attempt: Attempt }[] = [];
+    const ready: { id: string; name: string; attempt: Attempt; item: SelectedItem }[] = [];
     for (const item of targets) {
       const amount = parseAmount(item.amount);
-      if (amount === "invalid" && !item.attempt?.lost) {
+      if (amount === "invalid" && !isReplay(item)) {
         bad.set(item.productId, "Amount must be a positive number");
         continue;
       }
       const payload = { amount: amount === "invalid" ? null : amount, unit: item.unit, times: clean, date: formDate };
-      ready.push({ id: item.productId, name: nameOf(item.productId), attempt: attemptFor(item, payload, () => crypto.randomUUID()) });
+      ready.push({ id: item.productId, name: nameOf(item.productId), attempt: attemptFor(item, payload, () => crypto.randomUUID()), item });
     }
     setSelection((s) => beginSend(s, ready.map((r) => r.id), bad, new Map(ready.map((r) => [r.id, r.attempt]))));
     if (ready.length === 0) return;
+    // Recorded at dispatch, before the request: if the section unmounts meanwhile, the module keeps it until its answer.
+    retainedSends = retainSends(retainedSends, ready.map((r): SelectedItem => ({ ...r.item, outcome: { kind: "saving" }, attempt: r.attempt })));
     await runPool(ready, LOG_CONCURRENCY, async (r) => {
       let outcome: Outcome;
       const a = r.attempt;
@@ -771,7 +787,7 @@ export default function SupplementsSection() {
       } catch {
         outcome = { kind: "unconfirmed", error: "No answer from Onyx" };
       }
-      setSelection((s) => settle(s, r.id, outcome));
+      answerSend(r.id, a.eventKey, outcome);
     });
     void reloadToday();
   }
