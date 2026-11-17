@@ -496,6 +496,11 @@ FEATURE_LABELS: dict[str, str] = {
     "wx_uv_max": "Peak UV Index",
     "wx_night_temp_mean": "Outdoor Temperature During Sleep (°C)",
     "wx_night_temp_min": "Outdoor Low During Sleep (°C)",
+    "pollen_total": "Pollen Count (grains/m³)",
+    "pollen_tree_level_ord": "Tree Pollen Level (0-3)",
+    "pollen_grass_level_ord": "Grass Pollen Level (0-3)",
+    "pollen_weed_level_ord": "Weed Pollen Level (0-3)",
+    "pollen_mold_level_ord": "Mold Level (0-3)",
     "caffeine_first_hour": "First Caffeine (ET hour)",
     "caffeine_last_hour": "Last Caffeine (ET hour)",
     "caffeine_window_hours": "Caffeine Window (h)",
@@ -1046,6 +1051,20 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         log.warning(f"  weather_daily load failed ({e!r}); continuing without weather features")
         LOAD_FAILURES.add("weather_daily")
         data["weather"] = pd.DataFrame()
+
+    # Pollen (pds.pollen_daily, 2026-11-17): Atlanta Allergy & Asthma daily count, one row per
+    # PUBLISHED count day (pollen_etl.py). Loaded fail-open, like weather.
+    log.info("  Loading pollen_daily (Atlanta pollen)…")
+    try:
+        data["pollen"] = fetch_all(
+            "pollen_daily",
+            select="count_date,total_count,tree_level,grass_level,weed_level,mold_level",
+            order="count_date",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  pollen_daily load failed ({e!r}); continuing without pollen features")
+        LOAD_FAILURES.add("pollen_daily")
+        data["pollen"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
@@ -1629,7 +1648,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "pollen_", "whoop_steps")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -1873,6 +1892,82 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")
         LOAD_FAILURES.add("weather_daily")
+        return df
+
+
+POLLEN_LEVEL_ORD = {"low": 0.0, "medium": 1.0, "high": 2.0, "extreme": 3.0}
+POLLEN_COLS = {
+    # feature column          <- pds.pollen_daily column (count_date P -> matrix row P - 1)
+    "pollen_total": "total_count",             # grains/m3 over the 24 h before the published morning
+    "pollen_tree_level_ord": "tree_level",     # low/medium/high/extreme -> 0..3, else NaN
+    "pollen_grass_level_ord": "grass_level",
+    "pollen_weed_level_ord": "weed_level",
+    "pollen_mold_level_ord": "mold_level",
+}
+
+
+def _pollen_level_ord(value) -> float:
+    """The station's level word as an ordinal 0..3, NaN for anything else."""
+    if isinstance(value, str):
+        return POLLEN_LEVEL_ORD.get(value.strip().lower(), np.nan)
+    return np.nan
+
+
+def merge_pollen_features(df: pd.DataFrame, pollen: pd.DataFrame | None) -> pd.DataFrame:
+    """Daily pollen count from pds.pollen_daily (one row per PUBLISHED count day,
+    pollen_etl.py, Atlanta Allergy & Asthma).
+
+    ROW PLACEMENT: count_date is the PUBLICATION date — the count is grains/m3
+    over the previous 24 h, sampled up to that morning, so it mostly describes
+    clock day count_date - 1. The frame is therefore moved one day EARLIER by
+    date (hrv_alignment.wake_date_to_closing_day, the same -1 move the weather
+    night columns use), so matrix row D carries the count published on D + 1:
+    the pollen Riley breathed on day D, before the sleep that closes day D.
+
+    COMPLETENESS: the station skips most weekends and holidays and publishes
+    some days as "N/A" — those days have no row, and no row is ever invented.
+    Missing days stay NaN, never zero (a published 0 IS stored as a real 0 by
+    the ETL and passes through as one). A level word outside the station's
+    low/medium/high/extreme vocabulary, or a missing level, is NaN.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): the count for
+    today's row is published tomorrow morning, so when the evening forecast
+    runs the newest row always reads NaN where training rows have values.
+    Descriptive (Spearman) and causal analyses only. Not in
+    CONTROLLABLE_FEATURE_PREFIXES: nothing Riley does changes the pollen.
+
+    Atlanta only: the series is for the fixed home location and ends at the
+    NYC move.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if pollen is None or pollen.empty:
+        return df
+    try:
+        p = pollen.rename(columns={"count_date": "calendar_date"}).copy()
+        p["calendar_date"] = pd.to_datetime(p["calendar_date"], errors="coerce")
+        p = p.dropna(subset=["calendar_date"]).drop_duplicates("calendar_date", keep="last")
+        if p.empty:
+            return df
+        # The count published on date P describes clock day P - 1 -> row P - 1.
+        p = al.wake_date_to_closing_day(p)
+        f = pd.DataFrame({
+            "pollen_total": pd.to_numeric(p["total_count"], errors="coerce"),
+            "pollen_tree_level_ord": p["tree_level"].map(_pollen_level_ord),
+            "pollen_grass_level_ord": p["grass_level"].map(_pollen_level_ord),
+            "pollen_weed_level_ord": p["weed_level"].map(_pollen_level_ord),
+            "pollen_mold_level_ord": p["mold_level"].map(_pollen_level_ord),
+        }, index=p.index)
+        f["calendar_date"] = p["calendar_date"]
+        out = df.drop(columns=list(POLLEN_COLS), errors="ignore").merge(f, on="calendar_date", how="left")
+        assert len(out) == len(df), "pollen merge changed the row count"
+        log.info(f"  Pollen features: {int(out['pollen_total'].notna().sum())} count days, "
+                 f"{int(out['pollen_tree_level_ord'].notna().sum())} level days "
+                 f"({len(pollen) - len(p)} undated or duplicate day(s) dropped)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Pollen feature merge failed ({e!r}); continuing without pollen features")
+        LOAD_FAILURES.add("pollen_daily")
         return df
 
 
@@ -2521,6 +2616,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_screen_time_features(df, data.get("screen"))
     df = merge_air_quality_features(df, data.get("air_quality"))
     df = merge_weather_features(df, data.get("weather"))
+    df = merge_pollen_features(df, data.get("pollen"))
     df = merge_whoop_steps_features(df, data.get("whoop_steps"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
