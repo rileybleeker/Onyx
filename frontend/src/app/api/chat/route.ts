@@ -12,7 +12,7 @@ import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/sup
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
 import { BOOK_COLS, HIGHLIGHT_COLS, HIGHLIGHT_EXISTS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
-import { mirrorHighlight } from "@/lib/reading-notion";
+import { findMirroredEntry, mirrorHighlight } from "@/lib/reading-notion";
 import { createEntryClaimOf, discardEntry, placeEntry, rewriteProgressNow } from "@/lib/reading-removal";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
 import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
@@ -824,6 +824,34 @@ const NOTION_UNCONFIRMED =
   "No Notion entry is recorded for it, and Onyx made none now: an earlier try may have made one. Check the book's Notion page.";
 
 /**
+ * A session or highlight an earlier call wrote that has no Notion block id stored: that call may have appended the entry
+ * and stopped before storing the id. The book's page is searched (read-only) for that exact entry: exactly one unclaimed
+ * match is adopted (its id is stored on the row, only while the row still has none) and nothing is named for Riley to
+ * check; no match, or several, stays unconfirmed. An entry is never made here, so a stopped try cannot be repeated into
+ * a second one. Returns the lines to name on the receipt.
+ */
+async function notionUnconfirmed(kind: "session" | "highlight", book: Book, row: ReadingSession | Highlight): Promise<string[]> {
+  if (row.notion_block_id) return [];
+  try {
+    const table = kind === "session" ? "reading_sessions" : "book_highlights";
+    const idColumn = kind === "session" ? "session_id" : "highlight_id";
+    const rowId = kind === "session" ? (row as ReadingSession).session_id : (row as Highlight).highlight_id;
+    const { data, error } = await supabase.from(table).select("notion_block_id").eq("book_id", book.book_id).not("notion_block_id", "is", null);
+    if (error || !Array.isArray(data)) return [NOTION_UNCONFIRMED];
+    const claimed = new Set((data as Array<{ notion_block_id: string | null }>).flatMap((r) => (r.notion_block_id ? [r.notion_block_id] : [])));
+    const id = await findMirroredEntry(book, kind, row, claimed);
+    if (!id) return [NOTION_UNCONFIRMED];
+    const { data: stored, error: storeError } = await supabase.from(table).update({ notion_block_id: id }).eq(idColumn, rowId).is("notion_block_id", null).select(idColumn);
+    if (storeError || !Array.isArray(stored) || stored.length === 0) return [NOTION_UNCONFIRMED];
+    row.notion_block_id = id;
+    return [];
+  } catch {
+    // Whatever cannot be read leaves it unconfirmed, as before.
+    return [NOTION_UNCONFIRMED];
+  }
+}
+
+/**
  * A session an EARLIER call wrote (an earlier try of the message, or an earlier call of this try) and that stopped
  * before the ledger recorded it. Whether that call also finished the book, stamped the habit and made the Notion entry
  * cannot be told from what is stored, and Riley may have changed any of them since (a habit answer cleared on purpose
@@ -845,7 +873,7 @@ async function inspectReplayedSession(book: Book, session: ReadingSession): Prom
     habitMarked = !error && (data as { answer?: unknown } | null)?.answer === "Yes";
     if (!habitMarked) unconfirmed.push(habitUnconfirmed(session.session_date));
   }
-  if (!session.notion_block_id) unconfirmed.push(NOTION_UNCONFIRMED);
+  unconfirmed.push(...(await notionUnconfirmed("session", book, session)));
   return { habitMarked, unconfirmed };
 }
 
@@ -1476,7 +1504,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
           created: true,
           replayed: true,
           mirrorNow: false,
-          unconfirmed: own.highlight.notion_block_id ? [] : [NOTION_UNCONFIRMED],
+          unconfirmed: await notionUnconfirmed("highlight", own.book, own.highlight),
         });
       }
     }
@@ -1527,7 +1555,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         created: true,
         replayed: true,
         mirrorNow: false,
-        unconfirmed: result.highlight.notion_block_id ? [] : [NOTION_UNCONFIRMED],
+        unconfirmed: await notionUnconfirmed("highlight", result.book, result.highlight),
       });
     }
     return highlightReply(result.book, result.highlight, { created: result.created, replayed: false, mirrorNow: result.created });
