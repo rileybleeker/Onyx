@@ -129,7 +129,7 @@ test("the app warm-up list: /log warms the Supplements history read the section 
   assert.ok(history.startsWith('/api/supplements/history?'), 'the constant is the history URL');
   // The warm-up's /log entry reads the SAME constant as the section, so the one-key-per-GET cache key matches.
   assert.match(app, /json\(LOG_SUPPLEMENTS_HISTORY_URL\)/, 'AppData /log warms the history via the constant');
-  assert.ok(/LOG_SUPPLEMENTS_HISTORY_URL[^}]*\} from "@/lib\/log-early"/.test(app), 'the constant is imported from lib/log-early');
+  assert.ok(/LOG_SUPPLEMENTS_HISTORY_URL[^}]*\} from "@\/lib\/log-early"/.test(app), 'the constant is imported from lib/log-early');
 });
 
 test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step and on intent', async () => {
