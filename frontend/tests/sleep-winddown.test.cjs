@@ -1092,7 +1092,8 @@ test("server read: after a rename in Notion the answers are read under the habit
   });
   const p = await S.readWindDown(db);
   assert.deepEqual(p.answers.map((a) => a.question), ["Renamed synthetic routine?"]);
-  assert.equal(db.calls.filter((c) => c.table === "habit_journal").length, 2, "one read under the stored name, one under the new name");
+  assert.equal(db.calls.filter((c) => c.table === "habit_journal").length, 1, "one read covers the stored name and the new name");
+  assert.equal(db.calls.filter((c) => c.table === "habit_name_map").length, 1, "the name map is read once");
   assert.equal(W.windDownProgress(p).question, "Renamed synthetic routine?");
 });
 
