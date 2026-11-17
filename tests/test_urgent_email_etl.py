@@ -17,6 +17,7 @@ import unittest
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("SUPABASE_URL", "http://localhost")
@@ -269,6 +270,15 @@ class FakeSupa:
         return self.rows[(account, mid)]
 
 
+def use_required_accounts(case):
+    """Pin the required-mailbox tuple these tests were written against (both fixture mailboxes).
+
+    urgent_email_etl reads REQUIRED_ACCOUNTS at call time; it comes from the FLIGHTS_REQUIRED_GMAIL_ACCOUNTS
+    secret, which is unset in CI (an empty tuple), so the 'partial' expectations need this pinned explicitly.
+    """
+    case.enterContext(patch.object(u, "REQUIRED_ACCOUNTS", (ACCT_A, ACCT_B)))
+
+
 def stored(account, mid, gm, **kw):
     return {"account": account, "message_id": mid, "gmail_message_id": gm, "received_at": "2026-09-01T00:00:00+00:00",
             "from_address": "sender@example.org", "subject": "Stored subject", "snippet": "Stored snippet.",
@@ -414,6 +424,7 @@ class ParsingTests(unittest.TestCase):
 
 class RefreshTests(unittest.TestCase):
     def test_read_only_imap_and_rows(self):
+        use_required_accounts(self)
         fake, supa = FakeIMAP(), FakeSupa()
         r = run_with([fake], [(ACCT_A, "pw")], supa)
         status, total, error = r["status"], r["records"], r["error"]
@@ -536,6 +547,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(all(op[0] in ("upsert", "update", "select") for op in supa.log), "never deletes")
 
     def test_still_labeled_older_than_window_is_kept(self):
+        use_required_accounts(self)
         messages = {b"501": msg(501, ["Agent/Deadline"]), b"502": msg(502, ["Agent/Action"])}
         supa = FakeSupa([stored(ACCT_A, "synthetic-501@example.org", GM(501))])
         r = run_with([FakeIMAP(messages=messages, window=[b"502"])], [(ACCT_A, "pw")], supa)
@@ -741,6 +753,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(run_with([], [], FakeSupa())["status"], "failed")
 
     def test_run_keeps_its_tuple_interface(self):
+        use_required_accounts(self)
         original = u.imaplib.IMAP4_SSL
         u.imaplib.IMAP4_SSL = lambda host: FakeIMAP()
         try:
