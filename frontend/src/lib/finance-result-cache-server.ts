@@ -1,14 +1,22 @@
 import "server-only";
 import { after } from "next/server";
 import { etDate } from "@/lib/format";
-import { serviceClient } from "@/lib/finance-ledger-server";
-import { loadForecast, type ForecastLoad } from "@/lib/cash-forecast-server";
-import { loadBudgets, type BudgetsLoad } from "@/lib/finance-budgets-server";
+import { serviceClient } from "@/lib/finance-service-client";
+import type { ForecastLoad } from "@/lib/cash-forecast-server";
+import type { BudgetsLoad } from "@/lib/finance-budgets-server";
 import { cashCheckAt, cashCheckExpired, cashForecastCheck, moneyAlerts, type CashForecastCheck, type MoneyAlert } from "@/lib/finance-alerts";
 import { asOfNow } from "@/lib/cash-forecast-eligibility";
-import { loadDetectedSubscriptions } from "@/lib/procurement-recurring-server";
-import { parseRenewalsAhead, renewalsAhead, type RenewalsAhead } from "@/lib/procurement-renewals";
+import type { RenewalsAhead } from "@/lib/procurement-renewals";
 import { INPUTS_KEY, cacheBuild, decide, jsonSafe, parseAlertsBody, parseLoadBody, parseRow, type ResultKey, type StoredRow } from "@/lib/finance-result-cache";
+
+// Speed (PERF-02, 2026-11-17): the computations (forecast engine + tax plan, budgets, subscription detection) are
+// loaded only when a result is actually computed. A request answered from the stored row (the usual Today read)
+// loads this module, the parse rules and the small client module only, so a cold first request does not parse
+// the forecast engine first. Each loader is one shared import() per server instance.
+const forecastServer = () => import("@/lib/cash-forecast-server");
+const budgetsServer = () => import("@/lib/finance-budgets-server");
+const recurringServer = () => import("@/lib/procurement-recurring-server");
+const renewalsLib = () => import("@/lib/procurement-renewals");
 
 /**
  * Stored finance results (sql/finance_result_cache.sql; rules in lib/finance-result-cache.ts). SERVICE ROLE
@@ -163,7 +171,14 @@ export async function serveStoredWithAge<T>(
       return { value, computedAt: stored.row.computedAt, stale: decision === "stale" };
     }
   }
-  const c = await compute();
+  let c: Computed<T>;
+  try {
+    c = await compute();
+  } catch (e) {
+    // A computation that throws (a module that failed to load) answers like a failed read: null = the caller's 500.
+    console.error("[finance cache] compute failed", key, codeOf(e));
+    return null;
+  }
   // The version read BEFORE computing is the one stored: a write during the computation leaves it stale.
   if (stored && c.store.length) later(() => save(stored.version, today, now, c.store));
   return c.value === null ? null : { value: c.value, computedAt: now.toISOString(), stale: false };
@@ -198,6 +213,7 @@ export async function cachedMoneyAlerts(now: Date, mode: ServeMode = "stale-ok")
     "alerts",
     now,
     async () => {
+      const [{ loadForecast }, { loadBudgets }] = await Promise.all([forecastServer(), budgetsServer()]);
       const [f, b] = await Promise.all([loadForecast(now), loadBudgets(now)]);
       if (f.kind === "error" && b.kind === "error") return { value: null, store: [] };
       const buffer = f.kind === "ok" ? Number((f.drivers.find((d) => d.key === "settings")?.value as { bufferCents?: number } | undefined)?.bufferCents ?? 0) : 0;
@@ -240,10 +256,13 @@ export async function cachedRenewalsAhead(now: Date): Promise<RenewalsAhead | nu
  * outdated "nothing renews" is never the last word.
  */
 export async function cachedRenewalsAheadWithAge(now: Date, mode: ServeMode = "stale-ok"): Promise<Served<RenewalsAhead> | null> {
+  // The renewals route imports lib/procurement-renewals itself, so this resolves at once there.
+  const { parseRenewalsAhead, renewalsAhead } = await renewalsLib();
   return serveStoredWithAge<RenewalsAhead>(
     "renewals",
     now,
     async () => {
+      const { loadDetectedSubscriptions } = await recurringServer();
       const load = await loadDetectedSubscriptions(now);
       if (load.state === "error") return { value: null, store: [] };
       const value = renewalsAhead(load);
@@ -272,6 +291,7 @@ export async function cachedForecast(now: Date): Promise<ForecastLoad> {
     "forecast",
     now,
     async () => {
+      const { loadForecast } = await forecastServer();
       const f = await loadForecast(now);
       return { value: f, store: f.kind === "error" ? [] : [{ key: "forecast", body: f }] };
     },
@@ -290,6 +310,7 @@ export async function cachedBudgets(now: Date): Promise<BudgetsLoad> {
     "budgets",
     now,
     async () => {
+      const { loadBudgets } = await budgetsServer();
       const b = await loadBudgets(now);
       return { value: b, store: b.kind === "error" ? [] : [{ key: "budgets", body: b }] };
     },

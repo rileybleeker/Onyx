@@ -219,6 +219,7 @@ function harness({ readError = null, forecast = { kind: "empty" }, budgets = { k
       after: (fn) => queue.push(fn),
       NextResponse: { json: (body, init = {}) => ({ body, status: init.status ?? 200, headers: init.headers ?? {} }) },
     },
+    "@/lib/finance-service-client": { serviceClient: () => db.client },
     "@/lib/finance-ledger-server": { serviceClient: () => db.client },
     "@/lib/cash-forecast-server": { loadForecast: async () => { calls.forecast++; return typeof state.forecast === "function" ? state.forecast() : state.forecast; } },
     "@/lib/finance-budgets-server": { loadBudgets: async () => { calls.budgets++; return state.budgets; } },
@@ -256,6 +257,80 @@ test("first call computes inline and stores after the answer; the next call is s
   assert.equal(h.calls.forecast, 1);
   assert.equal((await h.S.cachedBudgets(addMs(NOW, 60_000))).kind, "ok");
   assert.equal(h.calls.budgets, 1);
+});
+
+// Speed (PERF-02): the computation modules are loaded only when something is computed, so a cold request answered
+// from the stored row does not parse the forecast engine, the budgets or the subscription detection first.
+const COMPUTE_MODULES = ["@/lib/cash-forecast-server", "@/lib/finance-budgets-server", "@/lib/procurement-recurring-server"];
+function watchLoads(stubs) {
+  const loaded = [];
+  for (const spec of COMPUTE_MODULES) {
+    const mod = stubs[spec];
+    Object.defineProperty(stubs, spec, { enumerable: true, configurable: true, get() { loaded.push(spec); return mod; } });
+  }
+  return loaded;
+}
+const storedRow = (key, body, over = {}) => ({ key, version: 1, et_date: TODAY, build: BUILD, computed_at: NOW.toISOString(), failed_at: null, body, ...over });
+
+test("a stored answer loads no computation module; a stale one loads them only for the refresh after the response", async () => {
+  const h = harness({ detected: { state: "empty" } });
+  const loaded = watchLoads(h.stubs);
+  h.db.rows.set("alerts", storedRow("alerts", { status: "ready", alerts: [] }));
+  h.db.rows.set("renewals", storedRow("renewals", { status: "empty" }));
+  const at = addMs(NOW, 60_000);
+  assert.deepEqual(await h.S.cachedMoneyAlerts(at), { status: "ready", alerts: [], asOf: NOW.toISOString() });
+  assert.deepEqual((await h.S.cachedRenewalsAheadWithAge(at, "stale-ok")).value, { status: "empty" });
+  assert.deepEqual(loaded, [], "fresh stored rows: nothing computed, no computation module loaded");
+  assert.deepEqual([h.calls.forecast, h.calls.budgets, h.calls.detected], [0, 0, 0]);
+
+  h.db.bump(); // an input table was written: both rows are stale
+  const stale = await h.S.cachedMoneyAlerts(at);
+  assert.equal(stale.updating, true, "the stored answer at once");
+  await h.S.cachedRenewalsAheadWithAge(at, "stale-ok");
+  assert.deepEqual(loaded, [], "still nothing loaded before the answers");
+  assert.equal(h.queue.length, 2);
+  await h.drain();
+  assert.deepEqual([...new Set(loaded)].sort(), [...COMPUTE_MODULES].sort(), "the refresh after the response loads them");
+  assert.deepEqual([h.calls.forecast, h.calls.budgets, h.calls.detected], [1, 1, 1]);
+});
+
+test("a computation module that fails to load answers like a failed computation; the stored row is kept and marked", async () => {
+  const h = harness();
+  h.db.rows.set("renewals", storedRow("renewals", { status: "empty" }));
+  h.db.bump();
+  Object.defineProperty(h.stubs, "@/lib/procurement-recurring-server", { enumerable: true, configurable: true, get() { throw new Error("chunk failed"); } });
+  const { value: served, lines } = await quiet(async () => {
+    const v = await h.S.cachedRenewalsAheadWithAge(addMs(NOW, 1_000), "stale-ok");
+    await h.drain();
+    return v;
+  });
+  assert.equal(served.stale, true, "the stored detection is answered");
+  assert.ok(h.db.rows.get("renewals").failed_at, "the failed refresh is remembered, so the next call computes first");
+  assert.ok(lines.every((l) => !/chunk failed/.test(l)), "only a code is logged");
+});
+
+test("nothing stored and the computation module fails to load: null (the route's 500 JSON), nothing stored, a code logged", async () => {
+  const h = harness();
+  Object.defineProperty(h.stubs, "@/lib/cash-forecast-server", { enumerable: true, configurable: true, get() { throw new Error("chunk failed"); } });
+  const { value, lines } = await quiet(() => h.S.cachedMoneyAlerts(NOW));
+  assert.equal(value, null);
+  assert.equal(h.queue.length, 0, "nothing scheduled to store");
+  assert.equal(h.db.rows.has("alerts"), false);
+  assert.ok(lines.some((l) => /compute failed alerts/.test(l)) && lines.every((l) => !/chunk failed/.test(l)), "only a code is logged");
+  const route = loadTs("app/api/finance/alerts/route.ts", h.stubs);
+  const res = await quiet(() => route.GET());
+  assert.deepEqual([res.value.status, res.value.body], [500, { status: "unavailable" }]);
+});
+
+test("source: the stored-result module imports the computations lazily and the small client module", () => {
+  const src = fs.readFileSync(path.join(SRC, "lib/finance-result-cache-server.ts"), "utf8");
+  for (const spec of [...COMPUTE_MODULES, "@/lib/procurement-renewals"]) {
+    const esc = spec.replace(/[/.-]/g, (c) => "\\" + c);
+    assert.doesNotMatch(src, new RegExp(`^import \\{[^}]*\\} from "${esc}"`, "m"), `${spec}: no value import at load`);
+    assert.match(src, new RegExp(`import\\("${esc}"\\)`), `${spec}: loaded with import()`);
+  }
+  assert.match(src, /from "@\/lib\/finance-service-client"/);
+  assert.doesNotMatch(src, /from "@\/lib\/finance-ledger-server"/, "the ledger arithmetic is not loaded for a stored answer");
 });
 
 test("after an input write: the stored answer comes back at once and is recomputed after the response", async () => {

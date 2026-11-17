@@ -1,6 +1,7 @@
 # Isolated multi-second slow views in the hourly speed runs (PERF-02, 2026-11-16)
 
-Status: **diagnosis only, no fix shipped.** The evidence rules out the suspected scheduled-job collisions and
+Status: **diagnosis only for the stalls below; a cold-start fix for the two Today finance routes followed
+(last section, 2026-11-17).** The evidence rules out the suspected scheduled-job collisions and
 locates the stall, but it does not prove its cause. Three candidates remain open (below): our own fan-out,
 shared-CPU throttling and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
 minute averages and cannot show a 2 s event. Read-only evidence: the
@@ -131,3 +132,47 @@ mounts) still lowers the burst size, but it does not remove the swap.
 * Cause 2 / memory: compute size Small (2 GB, about +$5 a month net; see the metrics section). Riley's decision: it changes the monthly cost.
 
 Neither loosens the budget or moves the perf schedule.
+
+## Run 43995593029 (after the Small compute move): cold paths, not stalls (2026-11-17)
+
+Five enforced breaches, all single calls of about 1.0-1.8 s; the median of the same endpoints over the last two
+runs is about 200 ms (p90 about 300 ms; 466 samples). Each breach sits on a cold path:
+
+| Breach | When | Cold path |
+|---|---|---|
+| Today cold data-ready 1143 ms, `/api/finance/alerts` 1033 ms, `/api/procurement/renewals/summary` 1021 ms | first page of the run, 25 min after the previous run | Vercel function cold start + first PostgREST requests |
+| `/supplements` warm data-ready 1759 ms, `/api/weight` 1084 ms | 01:34:2x | ba4af90b promoted to Production at 01:34:20 (inside the page's window) |
+| phone Today tap 4750 ms (observational) | 01:45:2x | 71c5cc79 promoted at 01:45:19 (inside the tap series; no long task, no reload) |
+
+* **Database time is not the cost.** `pg_stat_statements`: the finance result-cache read averages 0.6 ms
+  (max 7.8 ms), `ui_preferences` 0.1 ms, `weight_log` 0.1 ms, today's compound rollup uses its index (0.3 ms).
+  During both promotion windows the Supabase edge origin times stayed at a 20-60 ms median (max 433 ms).
+* **Cold PostgREST requests cost ~200-290 ms each.** In the Today cold second, the first wave of REST
+  requests from the functions had origin times of 185-285 ms; the same tables a second later took 25-55 ms.
+  The first middleware isolates also fetched the signing keys (`/.well-known/jwks.json`) at 270-290 ms (a
+  CDN miss; the warm fetch is 6 ms). Neither is code in this repo.
+* **The Vercel cold start is the rest, and it grows with the route's module graph.** `/api/ui/preferences`
+  (a one-row read with almost no imports) took 841 ms on the same cold view; the two finance routes, which
+  also read one row, took ~190 ms longer. Both loaded the forecast engine, the tax plan, the budgets and the
+  subscription detection at import time (26 modules, ~349 KB of source) although a stored answer needs none.
+
+**Fix shipped (claude/perf-03):** `lib/finance-result-cache-server.ts` loads the computations with
+`import()` only when it computes, and takes the service-role client from the new small
+`lib/finance-service-client.ts` (re-exported by `lib/finance-ledger-server.ts`, one client per instance).
+A stored answer now loads 7 modules / ~53 KB (alerts) and 10 / ~97 KB (renewals) instead of 26 / ~349 KB.
+Expected: the two finance routes' cold first call drops to about the `/api/ui/preferences` cold floor
+(~850 ms in this run), so Today cold data-ready lands under the budget; warm calls are unchanged (~200 ms).
+The next hourly runs confirm it: Today cold `/api/finance/alerts` and `/api/procurement/renewals/summary`
+at or below `/api/ui/preferences` cold in the same sample, on a run whose `deployed.start` equals `deployed.end`.
+
+**Not fixed here, with the reason:**
+
+* The remaining cold floor (~850 ms: middleware isolate + key fetch, function boot, first PostgREST
+  connections) is platform cost. Options, each needing a decision: keep functions warm after idle and after a
+  promotion (a post-deploy warm-up request per route; a workflow change), or verify tokens against keys
+  shipped with the build (no key fetch; a revoked key would then be accepted until the next deploy, which is a
+  security trade-off for Riley).
+* Breaches inside a promotion window measure the new deployment's cold start, not the page; the harness
+  already records `deployed.start` / `deployed.end` and the reviewer does not pool mixed revisions. The 4.75 s
+  phone Today tap is one of these (no long task, no reload, database fast), so it is not a router or
+  `ContinuousScroll` defect and nothing is handed to PR #376 for it.
