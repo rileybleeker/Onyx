@@ -157,13 +157,21 @@ function habitNameMap(rules: WindDownRule[], namesRes: { data: unknown }): Recor
   return habitNames;
 }
 
+/** The goal's rules when the page can return "ready" (no goal error, at least one version), else null. */
+type GoalRes = { data: unknown; error: unknown };
+function readyRules(rulesRes: GoalRes, pausesRes: GoalRes, namesRes: GoalRes): WindDownRule[] | null {
+  if (rulesRes.error || pausesRes.error || namesRes.error) return null;
+  const rules = ((rulesRes.data ?? []) as Row[]).map(ruleFromRow);
+  return rules.length ? rules : null;
+}
+
 /**
  * GET /api/sleep/winddown: everything Today and Log show, read-only. `not_connected` when the tables are not in
  * the database yet (sql/sleep_winddown.sql not applied), `not_set_up` before the first goal version.
  *
- * Every read starts as soon as what it needs is in hand: the day comes from one RPC; the goal, pauses, preference and
- * name map start at once; the starts and WHOOP need only the day, so they start with those; the answers need the goal
- * and the names, so they start when those land. The wait is the longest chain, not one round after another.
+ * The day comes from one RPC; the goal, pauses, preference and name map start at once. Only when the goal says the
+ * page is "ready" do the starts, WHOOP and answers start, together: the answers need the goal and the names, and the
+ * starts and WHOOP need the day. The other paths (not_connected, not_set_up, goal errors) never read them.
  */
 export async function readWindDown(db: WindDownDb, nowIso: string = new Date().toISOString()): Promise<WindDownPayload> {
   const todayP = behavioralToday(db);
@@ -174,24 +182,26 @@ export async function readWindDown(db: WindDownDb, nowIso: string = new Date().t
     db.from("ui_preferences").select("value").eq("key", WINDDOWN_PREF_KEY).maybeSingle(),
     db.from("habit_name_map").select("notion_page_id,habit_name"),
   ]);
-  const feedbackP = todayP.then((today: string) => Promise.all([
-    db.from("sleep_winddown_starts").select("night,started_at,local_time,tz,rule_id,habit_page_id").gte("night", addDays(today, -60)).order("night", { ascending: true }),
-    readSleepNights(db, today),
-  ]));
+  // Only the path that returns "ready" reads starts, WHOOP and answers; every other path returns or throws below, as before.
+  const feedbackP = goalP.then(([today, rulesRes, pausesRes, , namesRes]) => {
+    if (!readyRules(rulesRes, pausesRes, namesRes)) return null;
+    return Promise.all([
+      db.from("sleep_winddown_starts").select("night,started_at,local_time,tz,rule_id,habit_page_id").gte("night", addDays(today, -60)).order("night", { ascending: true }),
+      readSleepNights(db, today),
+    ]);
+  });
   // The answers are keyed by the habit's name in Notion, and a rename leaves the old name on earlier rows: read both
   // the names the goal versions stored and the names now in the map, in ONE read (the same rows two reads used to give).
   const answersP = goalP.then(([today, rulesRes, pausesRes, , namesRes]) => {
-    // Only the path that returns "ready" reads answers; every other path returns or throws below, as before.
-    if (rulesRes.error || pausesRes.error || namesRes.error) return null;
-    const rules = ((rulesRes.data ?? []) as Row[]).map(ruleFromRow);
-    if (!rules.length) return null;
+    const rules = readyRules(rulesRes, pausesRes, namesRes);
+    if (!rules) return null;
     const habitNames = habitNameMap(rules, namesRes);
     const first = rules[0].effectiveFrom;
     const from = first > addDays(today, -MAX_HISTORY_NIGHTS) ? first : addDays(today, -MAX_HISTORY_NIGHTS);
     const questions = Array.from(new Set(rules.flatMap((r) => [r.habitName, habitNames[r.habitPageId] || r.habitName])));
     return readAnswers(db, questions, from, today);
   });
-  const [[today, rulesRes, pausesRes, prefRes, namesRes], [startsRes, sleep], answers] = await Promise.all([goalP, feedbackP, answersP]);
+  const [[today, rulesRes, pausesRes, prefRes, namesRes], feedback, answers] = await Promise.all([goalP, feedbackP, answersP]);
 
   const base = { today, rules: [], pauses: [], answers: [], starts: [], habitNames: {}, sleep: { source: "WHOOP" as const, nights: [], failed: false }, asOf: nowIso };
   const hiddenValue = prefRes.error ? null : (prefRes.data as { value?: { hidden?: unknown } } | null)?.value;
@@ -204,8 +214,10 @@ export async function readWindDown(db: WindDownDb, nowIso: string = new Date().t
   const pauses = ((pausesRes.data ?? []) as Row[]).map(pauseFromRow);
   if (!rules.length) return { status: "not_set_up", hidden, ...base, pauses };
   if (namesRes.error) throw new WindDownReadError("habit_names", namesRes.error.code ?? null);
+  // Non-null here: feedbackP and answersP gate on the same checks as above (readyRules), and readAnswers throws rather than returning null.
+  if (!feedback) throw new WindDownReadError("starts");
+  const [startsRes, sleep] = feedback;
   if (startsRes.error) throw new WindDownReadError("starts", startsRes.error.code ?? null);
-  // Non-null here: answersP gates on the same checks as above, and readAnswers throws rather than returning null.
   if (!answers) throw new WindDownReadError("habit_answers");
   const starts: WindDownStart[] = ((startsRes.data ?? []) as Row[]).map((r) => ({
     night: s(r.night) ?? "", startedAt: s(r.started_at) ?? "", localTime: s(r.local_time) ?? "", tz: s(r.tz) ?? "", ruleId: n(r.rule_id),
