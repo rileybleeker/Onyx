@@ -210,8 +210,17 @@ async function writeProgressChecked(supabase: Supa, bookId: number): Promise<"ve
  * these (the obligation could not be stored and the line could not be checked), so a removal's cleanup row stays open.
  */
 export async function rewriteProgressNow(supabase: Supa, bookId: number): Promise<boolean> {
-  const owed = await addProgressOwed(supabase, bookId);
-  const held = typeof owed === "string" && owed !== "missing" ? owed : null;
+  // A write needs its obligation first (Codex review of PR 376): without a stored row, an older write landing last
+  // followed by a failed check would stay stale for good and nobody would know. A row that cannot be stored after a
+  // few tries means no write is made; false keeps a removal's cleanup row open, and the next write of the book
+  // (or the sweep, for its own rows) writes the line from the state then.
+  let owed = await addProgressOwed(supabase, bookId);
+  for (let attempt = 1; owed === null && attempt < 3; attempt++) {
+    await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * attempt));
+    owed = await addProgressOwed(supabase, bookId);
+  }
+  if (owed === null) return false;
+  const held = owed !== "missing" ? owed : null;
   const result = await writeProgressChecked(supabase, bookId).catch(() => "failed" as const);
   if (result === "verified") {
     if (held) await dropProgressOwed(supabase, [held]);
@@ -450,7 +459,11 @@ export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowM
     }
     const current = session.notion_block_id;
     if (current === null || (claim.replaces !== null && current === claim.replaces)) {
-      const base = supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", session.session_id);
+      const base = supabase
+        .from("reading_sessions")
+        .update({ notion_block_id: blockId })
+        .eq("session_id", session.session_id)
+        .eq("book_id", claim.bookId);
       const { data: adopted, error } = await (current === null ? base.is("notion_block_id", null) : base.eq("notion_block_id", current))
         .select(SESSION_COLS)
         .maybeSingle();
@@ -471,7 +484,13 @@ export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowM
       .eq("notion_block_id", blockId);
     if (error) return false;
   }
-  if (!session) await rewriteProgressNow(supabase, claim.bookId);
+  // The entry this one replaced (a move) is settled too before the claim goes: when its attach happened and the
+  // trash of the old entry failed, the session may be gone now, and nothing else knows the old entry. It is left
+  // alone while the session still holds it as its entry.
+  if (claim.replaces && claim.replaces !== blockId && (!session || session.notion_block_id !== claim.replaces)) {
+    if (!(await removeMirroredBlock(claim.replaces))) return false;
+  }
+  if (!session && !(await rewriteProgressNow(supabase, claim.bookId))) return false;
   return dropClaim(supabase, claim.claimId);
 }
 

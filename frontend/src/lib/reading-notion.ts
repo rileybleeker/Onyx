@@ -244,13 +244,22 @@ export function highlightMirrorDiffers(a: Highlight, b: Highlight): boolean {
   return JSON.stringify(highlightBlock(a)) !== JSON.stringify(highlightBlock(b));
 }
 
-/** Move a mirrored entry to Notion's trash (a session removed in Onyx, or moved to another book's page). */
+/**
+ * Move a mirrored entry to Notion's trash (a session removed in Onyx, or moved to another book's page). True only when
+ * the removal is POSITIVELY confirmed: the delete succeeded, or the block can still be read and is archived / in the
+ * trash. A 404 is NOT taken as "gone": Notion answers 404 for a page that was unshared from the integration too, so
+ * the cleanup stays owed (and retried) until the block can be seen archived (Codex review of PR 376).
+ */
 export async function removeMirroredBlock(blockId: string | null): Promise<boolean> {
   if (!blockId || !NOTION_API_KEY) return false;
   try {
     const res = await notion(`/blocks/${blockId}`, { method: "DELETE" });
-    // A block that is already gone counts as removed, so a replayed cleanup can finish.
-    return res.ok || res.status === 404;
+    if (res.ok) return true;
+    // Already trashed: Notion refuses the delete (400) but still returns the block, flagged archived.
+    const look = await notion(`/blocks/${blockId}`, { method: "GET" });
+    if (!look.ok) return false;
+    const b = (await look.json()) as { archived?: boolean; in_trash?: boolean };
+    return b.archived === true || b.in_trash === true;
   } catch (e) {
     console.error("reading-notion: removeMirroredBlock failed:", e);
     return false;
