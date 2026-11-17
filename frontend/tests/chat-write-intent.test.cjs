@@ -41,6 +41,11 @@ const sequence = (messages, tool, inputs) => {
 const ALLOWED = { allowed: true };
 const refused = (code) => ({ allowed: false, code, reason: intent.REFUSAL_TEXT[code] });
 
+/** A question-bank quiz the user asked for, one question asked with its label (Q1201), and the user's reply. */
+const BANK_QUIZ = (reply) => [user("Quiz me on chapter 3"), assistant("Question 1 (Q1201 · ch 3): What does the keeper ring when fog rolls in?"), user(reply)];
+/** The same quiz, with the user's words about the question just asked. */
+const BANK_FLAG = BANK_QUIZ;
+
 // [name, conversation, tool, input, expected]
 const MATRIX = [
   // Direct capture in one message keeps working.
@@ -60,6 +65,16 @@ const MATRIX = [
     assistant("Correct. Question 2: what sets the pace?"), user("The drum")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
   ["a quiz result the user states", [user("Record my synthetic quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 }, ALLOWED],
+  ["a complete quiz with unnumbered questions", [user("Quiz me on the synthetic book"), assistant("What limits output?"), user("The bottleneck"),
+    assistant("Correct. What sets the pace?"), user("The drum")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
+  ["the checkpoint the quiz request named", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, ALLOWED],
+  ["a review quiz", [user("Give me a review quiz"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, ALLOWED],
+  ["a new quiz after a cancelled one", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz"),
+    user("Quiz me again"), assistant("Question 1: what sets the pace?"), user("The drum")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, ALLOWED],
   ["a report with a plan after it", [user("I took 15 mg of Synthetic Focus at 8:30, will take the rest later")],
     "log_supplement_intake", { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] }, ALLOWED],
   ["a list continues the request", [user("Log Synthetic Calm and Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
@@ -260,6 +275,14 @@ const MATRIX = [
     "log_reading_session", { chapter_from: 3, chapter_through: 5, minutes: 30 }, ALLOWED],
   ["a chapter range with the middle left out", [user("I read chapters 3 through 5")],
     "log_reading_session", { chapter_through: 5 }, refused("not_named")],
+  ["a hostile chapter range is refused by its size before it is expanded", [user("I read chapter 4")],
+    "log_reading_session", { chapter_from: -1000000000, chapter_through: 4 }, refused("not_named")],
+  ["a hostile chapter range wider than what was named is refused", [user("I read chapters 3 and 4")],
+    "log_reading_session", { chapter_from: -5, chapter_through: 4 }, refused("not_named")],
+  ["a non-integer chapter endpoint is refused", [user("I read chapters 3 and 4")],
+    "log_reading_session", { chapter_from: 2.5, chapter_through: 4 }, refused("not_named")],
+  ["a zero chapter endpoint is refused", [user("I read chapter 4")],
+    "log_reading_session", { chapter_from: 0, chapter_through: 4 }, refused("not_named")],
   ["a quiz stopped with a request not to record", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz; don't record a score")],
     "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("contradicts")],
   ["a quiz stopped", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Cancel the quiz"),
@@ -268,6 +291,91 @@ const MATRIX = [
   ["don't log it refuses every write", [user("I took Synthetic Calm, don't log it")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
   ["a sleep question said for today, stored on last night", [user("I used my synthetic mouth tape today")],
     "mark_habit_complete", { habit: "Used synthetic mouth tape?" }, ALLOWED],
+
+  // Round 4 (quiz identity): a question that is not a quiz question (an offer, a summary, "anything else") never
+  // widens the quiz, and a reply to it — including "yes" — is never a quiz answer. Only the complete active quiz,
+  // with its questions recognized, answered, and checkpoint bound, may be scored, once.
+  ["a summary question after the quiz is not a quiz answer", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck"),
+    assistant("Would you like a summary?"), user("Yes")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 2 }, refused("quiz_not_answered")],
+  ["a stopped quiz stays closed after a later question", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz"),
+    assistant("Would you like a summary?"), user("Yes")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 3, total: 7 }, refused("quiz_cancelled")],
+  ["an anything-else after the quiz is not a quiz question", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck"),
+    assistant("Nice. Anything else?"), user("No")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_not_answered")],
+  ["a total that does not match the quiz questions asked", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck"),
+    assistant("Correct. Question 2: what sets the pace?"), user("The drum")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_score_invalid")],
+  ["another checkpoint than the quiz named", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch5", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
+  ["a chapter quiz recorded as a review", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
+  ["a checkpoint sent as a number", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: 4, score: 1, total: 1 }, refused("invalid_value")],
+
+  // Round 4 (action-bound record kind): the clause that carries the verb decides what is written. A record-shaped
+  // name inside another write (a playlist's name, a shopping-list item, a note's topic) authorizes nothing else.
+  ["a playlist request authorizes the playlist only", [user("Create a playlist called Synthetic Calm")],
+    "create_spotify_playlist", { name: "Synthetic Calm", track_ids: ["t1"] }, ALLOWED],
+  ["a playlist name never logs an intake", [user("Create a playlist called Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1 }, refused("not_named")],
+  ["a saved playlist name never logs an intake", [user("Save a playlist called Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm" }, refused("not_named")],
+  ["a shopping list item is not an intake", [user("Add Synthetic Milk to my shopping list")],
+    "log_supplement_intake", { product: "Synthetic Milk", amount: 1 }, refused("not_named")],
+  ["a shopping list item is not a stack", [user("Add Synthetic Milk to my shopping list")],
+    "log_supplement_stack", { stack: "Synthetic Milk" }, refused("not_named")],
+  ["a note about reading is not a reading session", [user("Save a note about reading chapter 4")],
+    "log_reading_session", { chapter_through: 4 }, refused("no_request")],
+  ["a note about reading is not a highlight", [user("Save a note about reading chapter 4")],
+    "add_book_highlight", { passage: "reading chapter 4" }, refused("no_request")],
+  ["a note taken after a reading report keeps the session", [user("I read chapter 4 and took a note")],
+    "log_reading_session", { chapter_through: 4 }, ALLOWED],
+  // Question-bank answers and flags (READ-QUIZ-01 S6): the reply to the question just asked (its label, Q<id>, is in
+  // the assistant's message right before it), and the user's own words about that question. Synthetic ids and text.
+  ["a bank answer to the question just asked", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, ALLOWED],
+  ["a bank answer that is a span of a longer reply", BANK_QUIZ("I think it is the fog bell, honestly"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "the fog bell", verdict: "partial", feedback: "Close." }, ALLOWED],
+  ["a bank answer for a question not just asked", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1300, version: 1, answer: "The fog bell", verdict: "correct" }, refused("question_not_asked")],
+  ["a bank answer when the question carried no label", [user("Quiz me"), assistant("What rings in the fog?"), user("The fog bell")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("question_not_asked")],
+  ["a bank answer with no quiz asked for", [user("The fog bell")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("quiz_not_asked")],
+  ["a bank answer nobody replied to", [user("Quiz me on chapter 3")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("quiz_not_answered")],
+  ["a bank answer that is not the user's words", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The foghorn at the cape", verdict: "correct" }, refused("not_your_words")],
+  ["a bank answer after the quiz was stopped", [user("Quiz me on chapter 3"), assistant("Question 1 (Q1201 · ch 3): What rings in the fog?"), user("Stop the quiz. The fog bell")],
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, refused("quiz_cancelled")],
+  ["a bank answer with the version sent as text", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: "2", answer: "The fog bell", verdict: "correct" }, refused("invalid_value")],
+  ["a bank answer with a grade the tool does not take", BANK_QUIZ("The fog bell"),
+    "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "excellent" }, refused("invalid_value")],
+  ["a flag: the user says the question is wrong", BANK_FLAG("That question is wrong, there is no fog bell"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the user says it is not in that chapter", BANK_FLAG("This question isn't in that chapter"),
+    "flag_reading_question", { question_id: 1201, kind: "not_in_chapter" }, ALLOWED],
+  ["a flag: the user names the question and says it is confusing", BANK_FLAG("Q1201 is really confusing"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the user has not read that chapter", BANK_FLAG("That question is from a chapter I haven't read"),
+    "flag_reading_question", { question_id: 1201, kind: "not_read_yet" }, ALLOWED],
+  ["a flag after pushback on the grade", BANK_FLAG("My answer was right, you graded it wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag of another kind than the user said", BANK_FLAG("That question is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag from a question, not a statement", BANK_FLAG("Is that question wrong?"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag the user asked not to make", BANK_FLAG("Don't flag it, the question is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("contradicts")],
+  ["a flag for a question that was not the one just asked", BANK_FLAG("That question is wrong"),
+    "flag_reading_question", { question_id: 1300, kind: "wrong" }, refused("question_not_asked")],
+  ["a flag with an id sent as text", BANK_FLAG("That question is wrong"),
+    "flag_reading_question", { question_id: "1201", kind: "wrong" }, refused("invalid_value")],
+  ["a flag of a kind the tool does not take", BANK_FLAG("That question is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "retire" }, refused("invalid_value")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -290,6 +398,12 @@ test("a playlist or a quiz result is granted once per message", () => {
   used.perTool.set("record_reading_quiz", 1);
   assert.deepEqual(decide([user("Make me a synthetic playlist")], "create_spotify_playlist", { name: "x", track_ids: ["a"] }, { used }), refused("once_per_request"));
   assert.deepEqual(decide([user("Quiz me")], "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 2 }, { used }), refused("once_per_request"));
+});
+
+test("a complete quiz with one finalization authorizes exactly one score", () => {
+  const messages = [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck")];
+  assert.deepEqual(sequence(messages, "record_reading_quiz",
+    [{ checkpoint: "ch1", score: 1, total: 1 }, { checkpoint: "ch1", score: 1, total: 1 }]), ["allowed", "once_per_request"]);
 });
 
 test("CHAT_WRITES=off keeps chat read-only; a missing or other value never turns writes off", () => {
@@ -322,6 +436,42 @@ test("every refusal reason fits on a receipt", () => {
   assert.equal(receipt.status, "not_saved");
   assert.equal(receipt.title, "Supplement intake not logged");
   assert.deepEqual(receipt.details, ["Synthetic Focus", intent.REFUSAL_TEXT.no_request]);
+});
+
+test("a granted write is consumed once: a second call for the same grant is refused whatever the model sends", () => {
+  // The same grant restated in the user's message is one write, not two SEC-04 operations.
+  assert.deepEqual(sequence([user("I took Synthetic Calm. I also had Synthetic Calm.")], "log_supplement_intake",
+    [{ product: "Synthetic Calm" }, { product: "Synthetic Calm" }]), ["allowed", "already_written"]);
+  // A changed optional argument (the date) does not mint a new grant from the same user action.
+  assert.deepEqual(sequence([user("I took 15 mg of Synthetic Focus at 8:30am today")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] },
+     { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"], date: DAY }]),
+    ["allowed", "already_written"]);
+  // The model's own shorter name for the record does not change the identity.
+  assert.deepEqual(sequence([user("Log synthetic magnesium glycinate")], "log_supplement_intake",
+    [{ product: "Synthetic Magnesium Glycinate" }, { product: "synthetic magnesium" }]), ["allowed", "already_written"]);
+  // A stack: once per granted stack; a different stack is its own grant.
+  assert.deepEqual(sequence([user("Log my synthetic evening stack and my synthetic morning stack")], "log_supplement_stack",
+    [{ stack: "synthetic evening" }, { stack: "synthetic evening" }, { stack: "synthetic morning" }]),
+    ["allowed", "already_written", "allowed"]);
+  // A habit reported twice in one message is one Yes.
+  assert.deepEqual(sequence([user("I meditated today, and I meditated again")], "mark_habit_complete",
+    [{ habit: "Meditated" }, { habit: "Meditated" }]), ["allowed", "already_written"]);
+  // A reading session: the same chapters restated are one session; another chapter range is another grant.
+  assert.deepEqual(sequence([user("I read chapter 4. I read chapter 4 again.")], "log_reading_session",
+    [{ chapter_through: 4 }, { chapter_through: 4 }]), ["allowed", "already_written"]);
+  assert.deepEqual(sequence([user("I read chapter 4. Then I read chapter 5.")], "log_reading_session",
+    [{ chapter_through: 4 }, { chapter_through: 5 }]), ["allowed", "allowed"]);
+  // Different stated arguments stay different grants: each stated time is its own write (the model must ask for
+  // both times of one action in one call, which time_omitted already forces).
+  assert.deepEqual(sequence([user("Log Synthetic Focus at 8 and log Synthetic Focus at noon")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", times: ["08:00"] }, { product: "Synthetic Focus", times: ["12:00"] }]),
+    ["allowed", "allowed"]);
+  // A fresh message (a retry of the request) builds a fresh set: the grant itself authorizes again, and the replay
+  // ledger (SEC-04) reconciles the repeated call rather than a consumed identity refusing it across requests.
+  const grant = intent.writeGrantFor([user("I took Synthetic Calm")]);
+  const freshUsed = intent.newWriteUsage();
+  assert.equal(intent.authorizeWrite(grant, "log_supplement_intake", { product: "Synthetic Calm" }, { requestDay: DAY, used: freshUsed, books: BOOKS, isSleepHabit }).allowed, true);
 });
 
 test("each action authorizes one write of each record it names: a repeat needs its own words", () => {
@@ -358,4 +508,28 @@ test("a retry is checked against the book its earlier try was pinned to (the rou
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: finished }), refused("not_named"));
   // With the pinned book (ChatLedger.storedContext book_id, mapped to its slug) it reaches the ledger.
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: BOOKS }), ALLOWED);
+});
+
+test("a bank answer or a flag is granted once per message", () => {
+  const used = intent.newWriteUsage();
+  used.perTool.set("record_reading_answer", 1);
+  used.perTool.set("flag_reading_question", 1);
+  assert.deepEqual(decide(BANK_QUIZ("The fog bell"), "record_reading_answer", { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" }, { used }), refused("once_per_request"));
+  assert.deepEqual(decide(BANK_FLAG("That question is wrong"), "flag_reading_question", { question_id: 1201, kind: "wrong" }, { used }), refused("once_per_request"));
+});
+
+test("the question just asked is read from the conversation only: an earlier question, or a label in the user's own reply, never binds an answer", () => {
+  const input = { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct" };
+  // The label is in an earlier assistant turn, not the one right before the reply.
+  const older = [user("Quiz me"), assistant("Question 1 (Q1201 · ch 3): What rings in the fog?"), user("The fog bell"), assistant("Right. Next: what sets the pace?"), user("The fog bell")];
+  assert.deepEqual(decide(older, "record_reading_answer", input), refused("question_not_asked"));
+  // The user typing a label cannot stand in for the assistant having asked it.
+  assert.deepEqual(decide([user("Quiz me"), assistant("What rings in the fog?"), user("Q1201: The fog bell")], "record_reading_answer", input), refused("question_not_asked"));
+  assert.deepEqual(intent.writeGrantFor(older).askedQuestions, []);
+  assert.deepEqual(intent.writeGrantFor(BANK_QUIZ("x")).askedQuestions, [1201]);
+});
+
+test("the free quiz's result and the bank answers do not authorize each other", () => {
+  assert.deepEqual(decide(BANK_QUIZ("The fog bell"), "record_reading_quiz", { checkpoint: "ch3", score: 1, total: 1 }), ALLOWED);
+  assert.deepEqual(decide([user("I got 1 out of 1 on the quiz")], "record_reading_answer", { question_id: 1201, version: 2, answer: "x", verdict: "correct" }), refused("quiz_not_asked"));
 });

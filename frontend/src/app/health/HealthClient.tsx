@@ -93,6 +93,10 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
   const itemsRef = useRef(items);
   const formRef = useRef(form);
   const inFlight = useRef(new Set<string>());
+  // Ids the server has confirmed (the load's rows, and every save that answered): until an id is confirmed the
+  // form's save is a create, so a create whose answer was lost is replayed with the same id (the route is idempotent
+  // on it) instead of silently becoming an update against an item the server never stored.
+  const confirmed = useRef<Set<string>>(new Set(initial.state === 'ready' ? initial.items.map(item => item.id) : []));
   const commit = (fn: (cur: CareItem[]) => CareItem[]) => { itemsRef.current = fn(itemsRef.current); setItems(itemsRef.current); };
   const setForm = (next: Form) => { formRef.current = next; setFormState(next); };
   // The item as it was when the form opened it (null for a new one): Undo takes the whole edit back to it.
@@ -128,6 +132,7 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
       const next: CareItem[] = [];
       for (const raw of list) { const parsed = parseCareItem(raw); if (parsed.ok) next.push(parsed.item); }
       commit(() => next);
+      confirmed.current = new Set(next.map(item => item.id));
       setUndo(null); setNotice(null); setLoad('ready');
     } catch {
       setLoad('failed');
@@ -181,7 +186,7 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
       const result = await sendOp(op);
       if (result.ok) {
         const saved = result.saved;
-        if (saved) commit(cur => putItem(cur, saved));
+        if (saved) { confirmed.current.add(id); commit(cur => putItem(cur, saved)); }
         if (undoable === 'autosave') setNotice(null);
         else {
           setUndo(undoable ? inverseOp(op, before) : null);
@@ -221,15 +226,18 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
     ready: formReady,
     save: async v => {
       const { id, ...fields } = v;
-      const exists = itemsRef.current.some(item => item.id === id);
-      const op: CareOp = exists ? { type: 'update', id, patch: fields } : { type: 'create', item: { id, ...fields, archived: false, completedOn: null } };
+      // A save is an update only once Onyx has confirmed the item (a loaded row, or a create it answered). Until
+      // then it stays a create: run() adds the item optimistically, so the list alone cannot say "exists" — a lost
+      // create must be replayed with the same id, and POST /api/care/items is idempotent on it.
+      const confirmedId = confirmed.current.has(id);
+      const op: CareOp = confirmedId ? { type: 'update', id, patch: fields } : { type: 'create', item: { id, ...fields, archived: false, completedOn: null } };
       // run() has either saved, or classified the failure: transient ones reach the scheduler as a
       // plain Error (it retries the same value with backoff), refusals as AutosaveRefused (stop, Retry).
       const outcome = await run(op, 'autosave');
       if (!outcome.ok) throw saveFailureError(outcome);
       // A create retried after a lost answer gets the stored row back (the route is idempotent on the id), which
       // may predate edits made since: send those as an update.
-      const stored = exists ? null : itemsRef.current.find(item => item.id === id);
+      const stored = confirmedId ? null : itemsRef.current.find(item => item.id === id);
       const stale = !!stored && (Object.keys(fields) as (keyof typeof fields)[]).some(key => JSON.stringify(stored[key]) !== JSON.stringify(fields[key]));
       if (stale) {
         const fix = await run({ type: 'update', id, patch: fields }, 'autosave');
@@ -294,6 +302,7 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
       const fresh: CareItem[] = [];
       for (const raw of data.items) { const parsed = parseCareItem(raw); if (parsed.ok) fresh.push(parsed.item); }
       commit(cur => fresh.reduce((list, item) => (inFlight.current.has(item.id) ? list : putItem(list, item)), cur));
+      for (const item of fresh) confirmed.current.add(item.id);
       try { localStorage.setItem(COPIED_KEY, new Date().toISOString()); } catch { /* the copy is idempotent, so being offered it again is harmless */ }
       setLocal({ state: 'copied', count: local.items.length });
       setNotice({ text: `Copied ${data.copied} item${data.copied === 1 ? '' : 's'} into Onyx${data.skipped ? ` (${data.skipped} already there)` : ''}.` });

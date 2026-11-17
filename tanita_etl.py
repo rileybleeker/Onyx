@@ -26,8 +26,12 @@ API notes (https://www.healthplanet.jp/apis/api.html — Japanese):
   - Token: POST /oauth/token, form params client_id/client_secret/
     redirect_uri/code/grant_type. access_token expires_in=2592000 (30 days).
     The refresh_token grant is UNDOCUMENTED but works; rotation behavior is
-    unconfirmed upstream, so both returned tokens are persisted on every
-    refresh, and we only refresh within 7 days of expiry (don't exercise an
+    unconfirmed upstream, so the refresh path is robust both ways
+    (merge_refresh_response): a returned refresh_token that is present AND
+    different replaces the stored one, a response that omits it (or echoes
+    the stored value) keeps the old one, an empty value never overwrites the
+    stored token, and a rejection raises TanitaAuthError -> failed heartbeat
+    + exit 1. We only refresh within 7 days of expiry (don't exercise an
     undocumented grant more than needed).
   - Data: GET /status/innerscan.json?access_token&date=1&from&to&tag.
     from/to are yyyyMMddHHmmss; spans >3 months are SILENTLY truncated (the
@@ -130,11 +134,14 @@ def log_sync(sb: Client, status: str, records: int, started_at: float, error: st
 # ---------------------------------------------------------------------------
 
 class TanitaAuthError(Exception):
-    """Raised when Health Planet refuses the stored refresh token (expired/revoked).
+    """Raised when Health Planet refuses the stored refresh token (expired/revoked)
+    or answers an unusable token response.
 
     Distinct from transient HTTP errors so the ETL can write an actionable
-    sync_log entry and exit 0 (no retry) instead of looping the cron on a
-    permanently-broken token.
+    sync_log entry (message names the recovery steps) and exit 1 — the Actions
+    run goes red until the token is re-bootstrapped, the same fail-loud
+    convention as whoop_etl.py / spotify_etl.py. A permanently-broken token is
+    fixed, not retried.
     """
 
 
@@ -164,6 +171,46 @@ def save_tokens(tokens: dict):
     log.info(f"Tanita tokens saved to {TANITA_TOKEN_FILE}")
 
 
+def merge_refresh_response(tokens: dict, response: object) -> tuple[dict, str]:
+    """Pure: merge a Health Planet token-endpoint response body into stored tokens.
+
+    The refresh_token grant is undocumented and rotation behavior is
+    unconfirmed upstream, so this is robust both ways:
+      - a returned refresh_token that is present AND different replaces the
+        stored one -> "rotated";
+      - a response that echoes the stored refresh_token keeps it -> "unchanged";
+      - a response that omits refresh_token (or answers None / an empty
+        string) keeps the stored one -> "missing": an empty value NEVER
+        overwrites the stored token.
+
+    Does not touch the input dict; returns (new_tokens, rotation). Raises
+    TanitaAuthError (carrying REAUTH_INSTRUCTIONS, never the response body —
+    it could quote credentials) when the response is an error body or carries
+    no usable access_token.
+    """
+    if not isinstance(response, dict):
+        raise TanitaAuthError(f"{REAUTH_INSTRUCTIONS} (token response was not a JSON object)")
+    if "error" in response:
+        # Health Planet error shapes are undocumented; the token endpoint can
+        # answer 200 with an error key. Echo the error name only, never the body.
+        raise TanitaAuthError(
+            f"{REAUTH_INSTRUCTIONS} (token endpoint error: {response.get('error')})"
+        )
+    access = response.get("access_token")
+    if not isinstance(access, str) or not access:
+        raise TanitaAuthError(f"{REAUTH_INSTRUCTIONS} (no access_token in the token response)")
+    out = dict(tokens)
+    out["access_token"] = access
+    out["expires_in"] = response.get("expires_in", 2592000)
+    new_refresh = response.get("refresh_token")
+    if isinstance(new_refresh, str) and new_refresh:
+        if new_refresh != tokens.get("refresh_token"):
+            out["refresh_token"] = new_refresh
+            return out, "rotated"
+        return out, "unchanged"
+    return out, "missing"
+
+
 def refresh_access_token(tokens: dict) -> dict:
     resp = httpx.post(
         HP_TOKEN_URL,
@@ -177,22 +224,14 @@ def refresh_access_token(tokens: dict) -> dict:
         timeout=30,
     )
     if resp.status_code in (400, 401):
-        raise TanitaAuthError(f"{REAUTH_INSTRUCTIONS} (HTTP {resp.status_code}: {resp.text})")
+        # Never echo the response body — it could quote credentials.
+        raise TanitaAuthError(f"{REAUTH_INSTRUCTIONS} (HTTP {resp.status_code})")
     resp.raise_for_status()
-    new = resp.json()
-    if "error" in new:
-        # Health Planet error shapes are undocumented; the token endpoint can
-        # return 200 with an error key.
-        raise TanitaAuthError(f"{REAUTH_INSTRUCTIONS} (token endpoint error: {new})")
-    tokens["access_token"] = new["access_token"]
-    tokens["expires_in"] = new.get("expires_in", 2592000)
-    tokens["obtained_at"] = int(time.time())
-    # Rotation behavior unconfirmed upstream — persist whatever comes back.
-    if new.get("refresh_token"):
-        tokens["refresh_token"] = new["refresh_token"]
-        log.info("Refresh token rotated; saving new value.")
-    save_tokens(tokens)
-    return tokens
+    new_tokens, rotation = merge_refresh_response(tokens, resp.json())
+    new_tokens["obtained_at"] = int(time.time())
+    save_tokens(new_tokens)
+    log.info(f"Token refresh complete (refresh_token: {rotation}).")
+    return new_tokens
 
 
 def ensure_fresh_tokens(tokens: dict) -> dict:
@@ -505,9 +544,11 @@ def run_etl(days: int = DEFAULT_DAYS):
     try:
         tokens = ensure_fresh_tokens(load_tokens())
     except TanitaAuthError as e:
+        # Rejected refresh token: actionable heartbeat, then a red run — the
+        # token is re-bootstrapped (--auth + upload), not retried.
         log.error(str(e))
         log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
-        sys.exit(0)
+        sys.exit(1)
     client = TanitaClient(tokens)
 
     try:
@@ -539,7 +580,7 @@ def run_etl(days: int = DEFAULT_DAYS):
         # Refresh token died mid-run (rare: reactive 401 refresh inside _request).
         log.error(str(e))
         log_sync(sb, status="failed", records=0, started_at=started, error=str(e))
-        sys.exit(0)
+        sys.exit(1)
     except Exception as e:
         log.exception("Tanita ETL failed")
         log_sync(sb, status="failed", records=0, started_at=started, error=str(e))

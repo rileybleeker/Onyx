@@ -319,9 +319,16 @@ export interface AttemptInput {
   version: number;
   round_key: string;
   round_date: string | null;
-  round_kind: AppRoundKind;
+  /** An app round; "chat" only from the chat route (an order answer, code-graded here like the app's). */
+  round_kind: AppRoundKind | "chat";
   /** Kept as given (no trim): a primary record of what was said. The option text after "Show choices"; the steps one per line. */
   answer: string;
+  /**
+   * The text the code grade reads when the reply cannot be graded as it was said (the chat's order answers: the
+   * numbers of the shuffled steps, or "no idea"). Only the grade uses it: `answer` is what is stored and hashed for the
+   * replay. Never set from a request body (parseAttemptBody does not read it).
+   */
+  grade_answer?: string;
   hinted: boolean;
   response_ms: number | null;
   quiz_key: string | null;
@@ -946,7 +953,7 @@ export async function recordAttempt(supabase: Supa, input: AttemptInput): Promis
     if (!first || !q || !format) return { status: 404, body: { error: "not_found" }, pendingKey: null };
     if (q.version !== input.version) return { status: 409, body: { error: "question_changed" }, pendingKey: null };
     if (input.hinted && format !== "cued") return { status: 400, body: { error: "bad_request" }, pendingKey: null };
-    const grade = gradeLocal(format, q.rubric, input.answer, input.hinted);
+    const grade = gradeLocal(format, q.rubric, input.grade_answer ?? input.answer, input.hinted);
     const base = {
       attempt_key: input.attempt_key,
       question_id: input.question_id,
@@ -1279,12 +1286,20 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
    * `sqlOutcome` is what pds.reading_bank_finish records when it differs from what the caller is told: a job whose
    * answer is no longer pending is finished 'done' there, because any other outcome counts a grade try and writes
    * the code into the (already graded or voided) answer's grade_error.
+   *
+   * A finish the database did not record is never reported as the requested outcome: an error answer, a refusal or a
+   * non-object answer (data.ok is not true), or a thrown call, means the job is still running until its lease runs out
+   * and is claimed again, so the run reports a retry with `finish_unrecorded` and `graded: false`, and nothing (a
+   * grade to count) is counted for a finish that never landed. Grade persistence is judged apart from it: the grade
+   * itself (pds.reading_bank_grade) may have been stored, so `graded` stays false even then — only a recorded finish,
+   * or an answer already settled before this run asked for a grade, reports graded.
    */
   const finish = async (outcome: GradeJobResult["outcome"], code: string | null, graded = false, sqlOutcome: GradeJobResult["outcome"] = outcome): Promise<GradeJobResult> => {
     const retryMinutes = GRADE_RETRY_MINUTES[Math.min(Math.max(fence.attempts, 1), GRADE_RETRY_MINUTES.length) - 1];
     const safeCode = code ? bankCode(code) : null;
+    let recorded = false;
     try {
-      await supabase.rpc("reading_bank_finish", {
+      const { data, error } = await supabase.rpc("reading_bank_finish", {
         p: {
           job_id: job.job_id,
           ...fence,
@@ -1295,9 +1310,11 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
           retry_minutes: sqlOutcome === "retry" ? retryMinutes : null,
         },
       });
+      recorded = !error && !!data && typeof data === "object" && (data as { ok?: unknown }).ok === true;
     } catch {
       /* the lease runs out and the next claim settles it */
     }
+    if (!recorded) return { outcome: "retry", code: bankCode("finish_unrecorded"), graded: false, cost_cents: Math.round(cost * 100) / 100 };
     return { outcome, code: safeCode, graded, cost_cents: Math.round(cost * 100) / 100 };
   };
 
@@ -1940,3 +1957,9 @@ export async function recordChatAnswer(
     return { ok: false, status: a.status, error: String(a.body.error) };
   }
 }
+
+/**
+ * For lib/reading-checkpoint-server.ts (READ-QUIZ-01 S5), the checkpoint quiz's round: the card mapping, the answered
+ * ideas and the error mapper stay the ones this file's own round uses.
+ */
+export { answerOf, answeredIdeaIds, cardOut };

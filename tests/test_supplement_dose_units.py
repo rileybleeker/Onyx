@@ -515,6 +515,61 @@ def test_a_warning_never_carries_data():
         assert text.startswith("Supplement dose-response not updated") and "synthetic" not in text.lower()
 
 
+# --- pivot_supplements: one feature column per (compound, unit class) ---
+
+def test_pivot_keeps_mass_and_literal_unit_rows_apart():
+    # One day, one compound: a 1 mg row and a 1 mL row. Two columns, no summed value of 2.
+    supp = frame([
+        row(0, "Synthetic Mineral", 1.0, unit_class="mass"),
+        row(0, "Synthetic Mineral", 1.0, unit_class="mL"),
+    ])
+    wide, start, unknown = h.pivot_supplements(supp)
+    assert list(wide.columns) == ["calendar_date", "supplement_synthetic_mineral_amount",
+                                 "supplement_synthetic_mineral_amount_ml"]
+    day = wide.iloc[0]
+    assert day["supplement_synthetic_mineral_amount"] == 1.0
+    assert day["supplement_synthetic_mineral_amount_ml"] == 1.0
+    assert start == DATES[0] and unknown == {}
+
+
+def test_pivot_marks_unknown_days_and_never_zeroes_them():
+    # An unreadable amount makes the compound's day unknown in every column it has
+    # (the same rule as the dose-response); an unknown-unit row does the same and
+    # produces no column of its own.
+    supp = frame([
+        row(0, "Synthetic Mineral", 1.0, unit_class="mass"),
+        row(1, "Synthetic Mineral", 2.0, unit_class="mass"),
+        row(1, "Synthetic Mineral", float("nan"), unit_class="mass"),
+        row(2, "Synthetic Tincture", 3.0, unit_class="mass"),
+        row(2, "Synthetic Tincture", 4.0, unit_class="unitless"),
+    ])
+    wide, _start, unknown = h.pivot_supplements(supp)
+    assert wide.loc[wide["calendar_date"] == DATES[1], "supplement_synthetic_mineral_amount"].isna().all()
+    assert unknown == {
+        "supplement_synthetic_mineral_amount": {DATES[1]},
+        "supplement_synthetic_tincture_amount": {DATES[2]},
+    }
+    assert not any(c.endswith("_amount_unitless") for c in wide.columns)
+
+
+def test_pivot_mass_only_matches_the_old_behaviour_exactly():
+    # (b) parity: a frame with only mass rows gives the same numbers and column
+    # names as the pre-change grouping (the unit_class column absent).
+    mass = frame(mass_series() + mass_series(group="Synthetic Tincture", unit_class="mass"))
+    old_input = mass.drop(columns=["unit_class", "source_units"])
+    old_wide, old_start, old_unknown = h.pivot_supplements(old_input)
+    new_wide, new_start, new_unknown = h.pivot_supplements(mass)
+    assert list(new_wide.columns) == list(old_wide.columns)
+    pd.testing.assert_frame_equal(new_wide, old_wide)
+    assert new_start == old_start and new_unknown == {} and old_unknown == {}
+    # A literal-unit-only compound keeps its own suffixed column and never
+    # touches the mass name.
+    only_ml = frame([row(d, "Synthetic Tincture", float(d + 1), unit_class="mL") for d in range(3)])
+    wide, _start, unknown = h.pivot_supplements(only_ml)
+    assert list(wide.columns) == ["calendar_date", "supplement_synthetic_tincture_amount_ml"]
+    assert unknown == {}
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

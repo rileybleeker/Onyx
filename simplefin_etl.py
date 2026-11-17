@@ -14,7 +14,9 @@ What a run does (one GET /accounts per run; SimpleFIN asks for <= 24 a day, the 
      else the account name) or creates one. An account that might be an existing one but cannot be matched
      uniquely is skipped and reported, never guessed: a wrong match would mix two accounts' rows.
   2. Transactions (posted only; pending are not requested) -> rows with the ledger's sign (expense-positive).
-     Investment accounts are balances-only, as they were under Rocket Money (trades and dividends are not spending).
+     Investment accounts are balances-only as far as spending goes (trades and dividends are not spending); since
+     2026-11-17 their positions go to pds.finance_holdings and their activity to pds.finance_investment_activity
+     (sql/finance_holdings.sql).
   3. Cutover from the Rocket Money history, per account: a row transacted more than OVERLAP_DAYS before the last
      Rocket Money row and posted by that date is dropped (that history already has it; a row posted after it may not
      be there, since Rocket Money skipped pending rows). Any other row is dropped only on identity evidence
@@ -415,6 +417,7 @@ class SfAccount:
     balance_at: Optional[datetime]
     transactions: list = field(default_factory=list)
     conn_id: str = ""
+    holdings: list = field(default_factory=list)
 
 
 def parse_accounts(body: dict) -> tuple[list[SfAccount], Counter]:
@@ -447,6 +450,7 @@ def parse_accounts(body: dict) -> tuple[list[SfAccount], Counter]:
             balance_at=bal_at,
             transactions=[t for t in (a.get("transactions") or []) if isinstance(t, dict)],
             conn_id=str(a.get("conn_id") or ""),
+            holdings=[h for h in (a.get("holdings") or []) if isinstance(h, dict)],
         ))
     return out, problems
 
@@ -1274,6 +1278,73 @@ def balance_row(acct: SfAccount, account_key: str, kind: Optional[str]) -> Optio
     }
 
 
+def to_number(value: Any) -> Optional[float]:
+    try:
+        d = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return float(d) if d.is_finite() else None
+
+
+def holding_rows(acct: SfAccount, account_key: str, seen_at: datetime) -> list[dict]:
+    """SimpleFIN holdings -> pds.finance_holdings rows. A holding without an id is left out; unreadable numbers are None."""
+    out: dict[str, dict] = {}
+    for h in acct.holdings:
+        hid = h.get("id")
+        if not hid:
+            continue
+        try:
+            created = utc_date(h.get("created"))
+        except (OverflowError, OSError, ValueError):
+            created = None
+        out[str(hid)] = {
+            "account_key": account_key,
+            "holding_id": str(hid)[:200],
+            "symbol": clean(h.get("symbol"), 40),
+            "description": clean(h.get("description")),
+            "shares": to_number(h.get("shares")),
+            "market_value_cents": to_cents(h.get("market_value")),
+            "cost_basis_cents": to_cents(h.get("cost_basis")),
+            "purchase_price": to_number(h.get("purchase_price")),
+            "currency": clean(h.get("currency"), 20) or acct.currency,
+            "created_at_source": datetime(created.year, created.month, created.day, tzinfo=timezone.utc).isoformat() if created else None,
+            "seen_at": seen_at.isoformat(),
+            "source": SOURCE,
+        }
+    return list(out.values())
+
+
+def activity_rows(acct: SfAccount, account_key: str, seen_at: datetime) -> list[dict]:
+    """Investment-account transactions -> pds.finance_investment_activity rows (SimpleFIN's sign: into the account is
+    positive). Pending and unreadable rows are left out, like the ledger's."""
+    out: dict[str, dict] = {}
+    for t in acct.transactions:
+        tid = t.get("id")
+        if not tid or t.get("pending") is True or str(t.get("posted") or "0") in ("0", ""):
+            continue
+        cents = to_cents(t.get("amount"))
+        try:
+            when = utc_date(t.get("transacted_at")) or utc_date(t.get("posted"))
+        except (OverflowError, OSError, ValueError):
+            when = None
+        if cents is None or when is None:
+            continue
+        key = txn_key(acct.id, str(tid))
+        description = clean(t.get("description"))
+        out[key] = {
+            "txn_key": key,
+            "account_key": account_key,
+            "txn_date": when.isoformat(),
+            "amount_cents": cents,
+            "currency": acct.currency,
+            "name": clean(t.get("payee")) or description or "Unknown",
+            "description": description,
+            "seen_at": seen_at.isoformat(),
+            "source": SOURCE,
+        }
+    return list(out.values())
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------------------------------------------
@@ -1366,6 +1437,14 @@ class Store:
         if rows:
             _t(self.supa, "finance_balance_snapshots").upsert(rows, on_conflict="account_key,captured_at").execute()
 
+    def upsert_holdings(self, rows: list[dict]) -> None:
+        for i in range(0, len(rows), CHUNK):
+            _t(self.supa, "finance_holdings").upsert(rows[i:i + CHUNK], on_conflict="account_key,holding_id").execute()
+
+    def upsert_activity(self, rows: list[dict]) -> None:
+        for i in range(0, len(rows), CHUNK):
+            _t(self.supa, "finance_investment_activity").upsert(rows[i:i + CHUNK], on_conflict="txn_key").execute()
+
     def cutover_decisions(self) -> dict[str, dict]:
         """The recorded cutover decisions, sf_txn_key -> {decision, history_txn_keys, review_state}; a small table
         (cutover-window rows only). Keys only: no amount, date or text is stored there."""
@@ -1441,6 +1520,8 @@ class Plan:
     skipped: Counter
     cutover: list = field(default_factory=list)   # CutoverDecision per SimpleFIN row near the cutover (keys only)
     saved: Optional[dict] = None                   # the decisions recorded before this run (None: the table is missing)
+    holdings: list = field(default_factory=list)   # pds.finance_holdings rows (investment accounts)
+    activity: list = field(default_factory=list)   # pds.finance_investment_activity rows
 
 
 def et_today(now: Optional[datetime] = None) -> date:
@@ -1459,6 +1540,8 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     account_types = {k: r.get("account_type") for k, r in by_key.items()}
 
     new_accounts, links, txns, balances, per_account = [], [], [], [], []
+    holdings, activity = [], []
+    seen_at = datetime.now(timezone.utc)
     dropped: Counter = Counter()
     skipped: Counter = Counter()
     decisions: list[CutoverDecision] = []
@@ -1536,6 +1619,9 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
             balances.append(bal)
         if is_balances_only(acct_type):
             line["balances_only"] = True
+            if acct_type == "Investment":
+                holdings.extend(holding_rows(a, key, seen_at))
+                activity.extend(activity_rows(a, key, seen_at))
             if acct_type in (None, "", "Unknown"):
                 notes["account_type_unset"] += 1
             per_account.append(line)
@@ -1555,7 +1641,7 @@ def build_plan(body: dict, store, today: date, days: int) -> Plan:
     learned = learn_categories(store.history_for_learning(today - timedelta(days=365 * LEARN_YEARS)))
     categories = assign_categories(txns, pool, learned, account_types)
     return Plan(matches, sf_accounts, new_accounts, links, txns, balances, notes, per_account, categories, dropped, skipped,
-                cutover=decisions, saved=saved)
+                cutover=decisions, saved=saved, holdings=holdings, activity=activity)
 
 
 def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[datetime] = None, out=print) -> int:
@@ -1587,6 +1673,7 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
             flag = f" | SimpleFIN issue: {', '.join(line['issues'])}" if line.get("issues") else ""
             out(f"  {line['institution']} | {line['name']} | last4 {line.get('mask') or '-'} | {line['action']}{why} | {what}{flag}")
         out(f"  transactions to write: {len(plan.transactions)}; balances: {len(plan.balances)}; new accounts: {len(plan.new_accounts)}")
+        out(f"  investment holdings: {len(plan.holdings)}; investment activity rows: {len(plan.activity)}")
         out(f"  categories: {dict(plan.categories)}; dropped: {dict(plan.dropped)}; not stored: {dict(plan.skipped)}")
         to_report = new_review_count(plan.cutover, plan.saved) if plan.cutover else len(review_pending(plan.saved))
         if plan.cutover:
@@ -1660,6 +1747,8 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
     except Exception as e:
         return fail("db_write_failed", safe_type_name(e), review_keys)
 
+    write_investments(store, plan, out)
+
     if review_keys:
         plan.notes["cutover_review"] = len(review_keys)
     note = format_notes(plan.notes)
@@ -1675,6 +1764,21 @@ def run(store, http, access_url: str, days: int, dry_run: bool, now: Optional[da
         out(f"  heartbeat codes: {note_codes_summary(plan.notes)}")
     mark_reported(store, review_keys, all(written), out)
     return 0
+
+
+def write_investments(store, plan: Plan, out=print) -> None:
+    """Positions and activity of the investment accounts. Never fails the run (the ledger and balances are already
+    written): tables not applied yet are skipped, any other error is logged as a type name only."""
+    if not plan.holdings and not plan.activity:
+        return
+    try:
+        store.upsert_holdings(plan.holdings)
+        store.upsert_activity(plan.activity)
+    except Exception as e:
+        why = "tables not applied, see sql/finance_holdings.sql" if is_missing_relation(e) else safe_type_name(e)
+        out(f"  investments: not written ({why})")
+        return
+    out(f"  investments: {len(plan.holdings)} holding(s), {len(plan.activity)} activity row(s)")
 
 
 def mark_reported(store, keys: list[str], written: bool, out=print) -> None:

@@ -150,6 +150,47 @@ test("target edits: a new version applies from its night; earlier nights keep th
   assert.equal(W.questionOf(rule(), { [ID_A]: "Renamed synthetic habit?" }), "Renamed synthetic habit?", "a rename in Notion follows");
 });
 
+test("habit binding: a start tapped under another habit is ignored; a same-habit target edit keeps it", () => {
+  const v2 = rule({ id: 2, effectiveFrom: day(-1), habitPageId: ID_B, habitName: HABIT_2, targetTime: "23:00" });
+  const rules = [v2, rule()];
+  const names = { [ID_A]: HABIT, [ID_B]: HABIT_2 };
+  // The goal now names habit B; a start tapped the night before under habit A never shows for it.
+  const switched = W.windDownProgress(payload({
+    rules, habitNames: names,
+    answers: [yes(-1, HABIT_2)],
+    starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A }],
+  }));
+  assert.equal(switched.tonight.start, null, "a start under another habit is not shown, judged or counted");
+  // The same habit with a new target time: the original start still applies (judged by its own version).
+  const v2same = rule({ id: 2, effectiveFrom: day(-1), targetTime: "23:00" });
+  const sameHabit = W.windDownProgress(payload({
+    rules: [v2same, rule()],
+    answers: [yes(-1)],
+    starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A }],
+  }));
+  assert.ok(sameHabit.tonight.start, "a same-habit target edit keeps the original start");
+  assert.equal(sameHabit.tonight.start.onTime, false, "judged by the version it was tapped under (22:40 vs that version's 22:30)");
+  // A start with no habit of its own is resolved from its rule version; an unknown one is never transferred.
+  const resolved = W.windDownProgress(payload({ answers: [yes(-1)], starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: null }] }));
+  assert.equal(resolved.tonight.start.onTime, false, "the start's own 22:30 version judges 22:40 late");
+  const unknown = W.windDownProgress(payload({ answers: [yes(-1)], starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: null, habitPageId: null }] }));
+  assert.equal(unknown.tonight.start, null, "a start with no habit and no rule version is never transferred to the current habit");
+  // A different-habit start never shadows a matching one for the same night.
+  const both = W.windDownProgress(payload({
+    rules, habitNames: names,
+    answers: [yes(-1, HABIT_2), yes(-1, HABIT)],
+    starts: [
+      { night: day(-1), startedAt: "", localTime: "23:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A },
+      { night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 2, habitPageId: ID_B },
+    ],
+  }));
+  assert.equal(switched.tonight.date, TODAY);
+  assert.equal(both.tonight.start.onTime, true, "the matching start (22:40 vs 23:00) wins, not the other habit's");
+  // The parser carries the habit through the payload.
+  const parsed = W.parseWindDownPayload(payload({ starts: [{ night: day(-1), startedAt: "x", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_B }] }));
+  assert.equal(parsed.starts[0].habitPageId, ID_B);
+});
+
 test("midnight and behavioral-day boundaries: evening order, on-time, and the target instant", () => {
   assert.equal(W.eveningMinutes("21:00"), 900);
   assert.equal(W.eveningMinutes("00:30"), 1110);
@@ -1020,7 +1061,7 @@ test("server read: the habit's own answers since the goal, the starts and WHOOP 
     ui_preferences: [{ key: W.WINDDOWN_PREF_KEY, value: { hidden: true } }],
     habit_name_map: [{ notion_page_id: ID_A, habit_name: HABIT }],
     habit_journal: journal,
-    sleep_winddown_starts: [{ night: day(-1), started_at: "2031-03-20T02:10:00Z", local_time: "22:10", tz: "America/New_York", rule_id: 1 }],
+    sleep_winddown_starts: [{ night: day(-1), started_at: "2031-03-20T02:10:00Z", local_time: "22:10", tz: "America/New_York", rule_id: 1, habit_page_id: ID_A }],
     whoop_sleep: [
       { onyx_behavioral_date: day(-1), start_time: "2031-03-20T03:40:00Z", end_time: "2031-03-20T11:00:00Z", timezone_offset: "-04:00", total_light_sleep_time_milli: 3 * 3600_000, total_slow_wave_sleep_time_milli: 3600_000, total_rem_sleep_time_milli: 3600_000 + 30 * 60_000, synced_at: "2031-03-20T12:00:00Z", is_nap: false, score_state: "SCORED" },
       { onyx_behavioral_date: day(-1), start_time: "2031-03-20T09:00:00Z", end_time: "2031-03-20T09:30:00Z", timezone_offset: "-04:00", total_light_sleep_time_milli: 0, total_slow_wave_sleep_time_milli: 0, total_rem_sleep_time_milli: 0, synced_at: "", is_nap: false, score_state: "SCORED" },
@@ -1032,6 +1073,7 @@ test("server read: the habit's own answers since the goal, the starts and WHOOP 
   assert.equal(p.answers.length, 19, "only the chosen habit, only since the goal started");
   assert.ok(p.answers.every((a) => a.question === HABIT && a.date >= "2031-03-01"));
   assert.equal(p.starts.length, 1);
+  assert.equal(p.starts[0].habitPageId, ID_A, "the start carries the habit it was tapped under");
   assert.equal(p.sleep.nights.length, 1, "the longest sleep of the night");
   assert.equal(p.sleep.nights[0].asleepMin, 330);
   assert.equal(p.sleep.nights[0].onset, "23:40");

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { lapseDelay } from "@/lib/today-lapse";
 import Link from "next/link";
 import styles from "./Today.module.css";
 import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, ListChecks, Mail, Package, RefreshCw, Wallet, X } from "lucide-react";
@@ -21,6 +22,8 @@ import { sameJson } from "@/lib/format";
 import { MONEY_FRESH_URL, MONEY_RECHECK_MS, MONEY_URL, moneyIncomplete, moneyNote, parseMoneyAnswer, showMoneyPanel, type MoneyView } from "@/lib/money-alerts-view";
 // Import-free too: the first load takes the reads the page's HTML already started (app/today/EarlyReads.tsx).
 import { earlyOr } from "@/lib/early-fetch";
+// Import-free too: "Practice · N ready" is the overview's own helper (bundled by name in the same test).
+import { practiceReady } from "@/lib/reading-practice-ready";
 // One card per area of the app under Today's own panels (loaded as its own chunk; components/overview/).
 import TodayOverview from "@/components/overview/TodayOverview";
 // Import-free too (bundled by name in the same test): the attention model (PROD-T04) and the quiet view settings,
@@ -36,6 +39,8 @@ import InfoHint from "@/components/InfoHint";
 import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
 // The wind-down streak (PROD-SLEEP-01, set up on Log): the same panel as on Log, and one quiet-view source once set up.
 import WindDownPanel, { useWindDownToday } from "@/components/sleep/WindDownPanel";
+import HomeResetPanel from "@/components/HomeResetPanel";
+import { useHomeResetToday } from "@/lib/use-home-reset";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -260,7 +265,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const [quietSave, setQuietSave] = useState<"idle" | "saving" | "failed">("idle");
   const quietHeading = useRef<HTMLHeadingElement>(null);
   // Bumped when a snooze ends or an item becomes due, so the quiet view renders again on time (no request).
-  const [, setLapseTick] = useState(0);
+  const [lapseTick, setLapseTick] = useState(0);
   const load = useCallback(() => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -491,6 +496,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // A sync that never ran, or whose heartbeat could not be read (lastSync null), is not a current answer either.
   const syncStale = !!email && syncLateness(lastSync, now.getTime(), LABEL_SYNC_STALE_MS);
   const book = reading.state === "ready" ? reading.value : null;
+  // Chapter questions ready for today's round (READ-QUIZ-01): from the overview's own summary, so no extra request; 0 while the bank is off or an older cached overview has none.
+  const practiceCount = practiceReady(book?.practice);
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
   // The package email check behind the summary is late or failing (an older answer without the field: not known yet,
   // and its fresh read is already running).
@@ -544,9 +551,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   }
   const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
   const windDown = useWindDownToday();
+  const homeReset = useHomeResetToday();
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
-  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, "reading", "check-in"]
+  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, homeReset.show ? "home-reset" : null, "reading", "check-in"]
     .filter((id): id is string => id !== null);
   const renderedParts = TODAY_HEAD_PARTS.concat(experiment.state === "error" || trial ? ["experiment"] : [], TODAY_MID_PARTS, lifeParts);
   const lifeW = lifeLayout(usePartOrder("/today", renderedParts), lifeParts);
@@ -607,10 +615,13 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // back on time even while Today stays open between refreshes. Only a render: nothing is read or written.
   const nextChange = selection?.nextChange ?? null;
   useEffect(() => {
-    if (nextChange === null) return undefined;
-    const timer = setTimeout(() => setLapseTick((n) => n + 1), Math.min(Math.max(0, nextChange - Date.now()) + 250, 6 * 3_600_000));
+    // `lapseTick` is a dependency so a capped wait re-arms: a lapse more than `LAPSE_CAP_MS` away fires at the cap,
+    // increments the tick, and this effect runs again to schedule the next capped wait until the real `nextChange`.
+    const delay = lapseDelay(nextChange);
+    if (delay === null) return undefined; // null nextChange, or nextChange already passed: nothing left to wait for.
+    const timer = setTimeout(() => setLapseTick((n) => n + 1), delay);
     return () => clearTimeout(timer);
-  }, [nextChange]);
+  }, [nextChange, lapseTick]);
   const statusOf = new Map<string, SourceStatus>((attention?.sources ?? []).map((st) => [st.source, st] as const));
   const sourceList = (list: SourceStatus[]) => list.map((st) => `${st.label} (${st.note})`).join("; ");
   // A time on another day than today names the day too ("Wed 6:00 AM").
@@ -1005,6 +1016,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       {windDown.show && <Part id="wind-down" title="Wind-down" width={lifeWidth("wind-down")}>
       <WindDownPanel surface="today" className={panelStyle} />
       </Part>}
+      {homeReset.show && <Part id="home-reset" title="Apartment reset" width={lifeWidth("home-reset")}>
+      <HomeResetPanel view={homeReset} now={now} className={panelStyle} titleClassName={titleStyle} />
+      </Part>}
       <Part id="reading" title="Keep reading" width={lifeWidth("reading")}>
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
         <div className="flex items-center gap-2"><BookOpen aria-hidden="true" className={iconStyle} />
@@ -1015,6 +1029,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         {reading.state === "ready" && (book ? <>
           <p className="mt-3 text-base font-medium text-text-primary">{book.book.title}</p>
           <p className="mt-1 text-sm text-text-secondary">{Number.isFinite(book.chaptersDone) && Number.isFinite(book.totalChapters) && book.totalChapters > 0 && book.chaptersDone >= 0 && book.chaptersDone <= book.totalChapters ? `${book.chaptersDone} of ${book.totalChapters} chapters recorded.` : "Chapter progress is not available."}</p>
+          {practiceCount > 0 && <p className="mt-1 text-sm"><Link href="/reading" className={linkStyle}>Practice · <span className="font-mono">{practiceCount}</span> ready</Link></p>}
           <p className="mt-1 text-xs text-text-secondary">Recorded progress may lag your latest reading.</p>
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>

@@ -1,11 +1,13 @@
 import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { loadLedger } from "@/lib/finance-ledger-server";
+import { loadInvestments } from "@/lib/finance-holdings-server";
 import { parseLedgerQuery } from "@/lib/finance-ledger";
 import { layoutCookieName, layoutFromCookie } from "@/lib/personalize-layout";
 import InfoHint from "@/components/InfoHint";
 import FinancialsClient from "./FinancialsClient";
 import LedgerView, { FreshnessLine } from "./LedgerView";
+import InvestmentsPanel from "./InvestmentsPanel";
 
 // Private financial data: rendered per request on the server, never ISR, never cached by the
 // CDN, and never fetched from the browser (the pds.finance_* tables are service-role only; the
@@ -23,7 +25,10 @@ export default async function FinancialsPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const now = new Date();
-  const load = await loadLedger(parseLedgerQuery(await searchParams), now);
+  const [load, investments] = await Promise.all([
+    loadLedger(parseLedgerQuery(await searchParams), now),
+    loadInvestments(now),
+  ]);
   // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
   const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/financials"))?.value);
 
@@ -68,6 +73,8 @@ export default async function FinancialsPage({
       )}
 
       {load.kind === "ok" && <LedgerView data={load.data} now={now} layout={layout} />}
+
+      <InvestmentsPanel load={investments} />
 
       <details className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
         <summary className="cursor-pointer text-[13px] font-medium">Preview a CSV</summary>

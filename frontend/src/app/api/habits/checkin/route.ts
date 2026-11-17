@@ -26,6 +26,8 @@ import {
   type CheckinSuggestion,
 } from "@/lib/checkin";
 import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-screen";
+import { pcActivityApplies, pcActivitySuggestions } from "@/lib/checkin-pc-activity";
+import { loadPcActivityDay } from "@/lib/checkin-pc-server";
 
 /**
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
@@ -105,6 +107,18 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
         if (error || count == null) return;
         const s = journaledSuggestion(date, today, count);
         if (s) out[Q_JOURNALED] = s;
+      })()
+    );
+  }
+
+  // PC activity (tools/pc_activity_logger): tooling minutes answer "BI/Python/AL/Excel"-style questions,
+  // late minutes a "Worked late" one. Yes only, complete days only, read server-side (service role).
+  if (pcActivityApplies(names)) {
+    tasks.push(
+      (async () => {
+        const day = await loadPcActivityDay(date);
+        if (!day) return;
+        Object.assign(out, pcActivitySuggestions(day, names));
       })()
     );
   }

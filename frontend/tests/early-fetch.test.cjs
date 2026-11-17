@@ -293,7 +293,7 @@ test("during a full page load every script runs, however late: it never depends 
   }
 });
 
-test("a script that runs twice in one load sends each read once; after the answer was taken, or once too old, it may start again", (t) => {
+test("a script that runs twice in one load sends each read once; a taken or claimed URL is never started again while fresh", (t) => {
   const calls = withWindow(t);
   const script = E.earlyFetchesScript(["/api/a", "/api/b"]);
   new Function(script)();
@@ -302,10 +302,45 @@ test("a script that runs twice in one load sends each read once; after the answe
   const first = global[E.EARLY_FETCH_KEY]["/api/a"].p;
   assert.equal(E.takeEarlyFetch("/api/a"), first, "the first answer is the one taken");
   new Function(script)();
-  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b", "/api/a"], "taken: started again; /api/b still pending");
+  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b"], "taken: the claim holds, /api/b still pending");
+  // A claim ages out like any entry: an old one no longer stops the script.
   global[E.EARLY_FETCH_KEY]["/api/b"].at = Date.now() - E.EARLY_FETCH_MAX_AGE_MS - 1;
   new Function(script)();
-  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b", "/api/a", "/api/b"], "too old: started again");
+  assert.deepEqual(calls.map((c) => c.url), ["/api/a", "/api/b", "/api/b"], "too old: started again");
+});
+
+// ---- Shared first-read ownership (OR-384): the client's take or fallback claims the URL -----------------------------
+
+test("the client falls back first, then the script runs: exactly one request in total", async (t) => {
+  const calls = withWindow(t);
+  const fallback = () => { calls.push({ url: "/api/x (client)", init: {} }); return Promise.resolve({ fallback: true }); };
+  assert.equal((await E.earlyOr("/api/x", fallback)).fallback, true);
+  assert.equal(calls.length, 1, "only the client's own fetch");
+  new Function(E.earlyFetchScript("/api/x"))();
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1, "a late script run (document still interactive) claims nothing new");
+});
+
+test("the script runs first, the client takes it: exactly one request", async (t) => {
+  const calls = withWindow(t);
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1);
+  const res = await E.earlyOr("/api/x", () => { calls.push({ url: "/api/x (client)", init: {} }); return Promise.resolve({ fallback: true }); });
+  assert.equal(res.url, "/api/x", "the early answer is used");
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1, "the take claims the URL; a later script run starts nothing");
+});
+
+test("a 401 answer is fetched again by the client, and the late script run still adds no third request", async (t) => {
+  const calls = withWindow(t);
+  global.fetch = (url, init) => { calls.push({ url, init }); return Promise.resolve({ ok: false, status: 401, redirected: false, url }); };
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 1);
+  const res = await E.earlyOr("/api/x", () => Promise.resolve({ ok: false, status: 401, redirected: false, url: "/api/x" }));
+  assert.equal(calls.length, 2, "the client refetches the sign-in failure itself");
+  new Function(E.earlyFetchScript("/api/x"))();
+  assert.equal(calls.length, 2, "no duplicate read from the late script");
+  assert.equal(res.status, 401);
 });
 
 test("earlyScriptSrc: a data: URL of only URL-safe characters that decodes to exactly the script, and runs", (t) => {
