@@ -77,6 +77,33 @@ the subject of PERF-01.
 * **An A/B on the same hour**: `/nutrition` with the continuous scroll on vs off
   (`sessionStorage["onyx.feed"] = "off"`). The harness is owned by PR #373 and was not changed here.
 
+## Instance metrics for the stall minutes (Supabase dashboard, read 2026-11-17)
+
+Read in the dashboard's Observability > Database charts and Settings > Infrastructure (no row data):
+
+* **Compute size Micro: 1 GB RAM, shared CPU.** The total-RAM line rose from ~0.4 GB to ~0.86 GB around
+  2026-11-11 (the Nano to Micro move).
+* **CPU was mostly idle at both stalls.** 21:33 UTC: idle 78.7 %, user 9.3 %, system 3.0 %, IOwait 6.7 %.
+  23:31 UTC showed the same small dip (idle about 75 %). There was no CPU saturation and no steal series near
+  100 % busy, so neither cause 1 nor cause 2 as stated above matches.
+* **Memory is the constraint.** Swap in use is about 450-650 MB all week, more than the ~400 MB "used" RAM.
+  Memory commitment is 1.83-2.0 GB against a ~1.9 GB limit and is flagged SEVERE by the dashboard. It has
+  risen steadily since 2026-11-11 and is at or over the limit on 2026-11-16. Swap rose by about 100 MB at
+  23:31.
+* **Disk IO balance is 44 %.** On Micro, swap paging spends the burst IO budget.
+* **Connections are 32 of 60.** PostgREST holds 21 idle connections; the rest is Realtime, exporter and
+  management. Postgres settings are the Micro defaults (shared_buffers 256 MB, work_mem 3.5 MB).
+
+**Revised reading:** the instance-wide ~2 s stall fits **memory pressure**: a burst of 40-60 queries on a
+1 GB box that is already about 500 MB into swap pages memory back in. That would explain why Auth's JWKS
+call slowed too, and why IOwait rises while CPU stays idle. A per-minute chart cannot show a 2 s event
+directly, so this is the strongest fit, not proof.
+
+**Fix:** compute size Small (2 GB RAM). About $15.04 a month against Micro's $9.81 (the Pro plan's $10
+compute credit covers Micro), so about +$5 a month. Applying it restarts the database for about 2 minutes.
+It needs Riley's yes because it changes the monthly bill. The cause-1 mitigation (staggered neighbour
+mounts) still lowers the burst size, but it does not remove the swap.
+
 ## Why this PR ships no fix
 
 * The two causes need different fixes, and the evidence above cannot tell them apart without the instance
@@ -93,6 +120,6 @@ the subject of PERF-01.
 * Cause 1: in `components/ContinuousScroll.tsx` (owned by PR #376), start a neighbour's mount only after the
   routed page's reads have settled and mount one neighbour at a time; the heaviest single read in the burst,
   `daily_micronutrient_totals` (~160 ms on every call), is a candidate for the matview treatment.
-* Cause 2: a compute size with dedicated CPU (Riley's decision: it changes the monthly cost).
+* Cause 2 / memory: compute size Small (2 GB, about +$5 a month net; see the metrics section). Riley's decision: it changes the monthly cost.
 
 Neither loosens the budget or moves the perf schedule.
