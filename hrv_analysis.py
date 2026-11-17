@@ -1639,7 +1639,7 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
     (hrv_alignment.py), so no re-keying.
 
     COMPLETENESS (same contract as frontend/src/lib/screen-time.ts and
-    experiment_adherence.settled_screen_minutes): a day counts only once a sync happened after
+    the N-of-1 adherence module's settled_screen_minutes): a day counts only once a sync happened after
     it ended (synced_at >= D + 1 day 06:00 ET) AND the view says the whole day is backed by a
     complete export (export_complete, PIPE-11: every chunk of an app run arrived and Apple's
     stream ended on its own). An upload the app's watchdog cut short, a missing chunk or an

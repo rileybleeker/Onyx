@@ -881,7 +881,8 @@ test('report: pooled table keeps revisions and harness versions apart and never 
   // A version 1 sample never had a fixed window (cadenceOf), so its row says so instead of "not recorded".
   assert.match(md, /\| \/sleep \| 1 \| full-load \| not recorded \/ CPU not recorded \| none: network-quiet spacing only \| not recorded \| 1 \| 3 \|.*no build recorded \(harness 1\): not pooled/);
   assert.match(md, /\| \/sleep \| 2 \| full-load \| 1280x720 \/ CPU 1x \| 6000 \(navigations 1-4 of each page\) \| aaaaaaa \| 2 \| 6 \|/, 'two runs of the same build and method pool to n=6');
-  const mixedRows = md.split('\n').filter((l) => l.includes('| mixed (deploy during the page) |'));
+  // Pooled-table rows only: each run's own scenario table also names its revision as mixed.
+  const mixedRows = md.split('\n').filter((l) => l.startsWith('| /sleep | 2 |') && l.includes('| mixed (deploy during the page) |'));
   assert.equal(mixedRows.length, 2, 'two runs that each spanned a deploy stay one row per run');
   for (const row of mixedRows) assert.match(row, /\| 1 \| 3 \|.*not bound to one build, not pooled/);
   assert.match(md, /\| unbound \(only one of the start \/ end reads succeeded\) \| 1 \| 3 \|.*only one \/api\/version read succeeded: not bound to one build, not pooled/,
