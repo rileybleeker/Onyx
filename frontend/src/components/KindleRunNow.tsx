@@ -67,7 +67,7 @@ export default function KindleRunNow({ onDone }: { onDone?: () => void }) {
       if (!alive.current) return;
       if (!res.ok || !body.request) {
         setBusy(false);
-        setView({ phase: "failed", tone: "error", final: true, text: body.error ? `Couldn't ask the PC: ${body.error}.` : "Couldn't ask the PC." });
+        setView({ phase: "failed", tone: "error", final: true, text: "Couldn't ask the PC. Try again." });
         return;
       }
       show(body.request);
