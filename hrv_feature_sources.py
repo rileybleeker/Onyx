@@ -364,6 +364,17 @@ def capture(supa, today: date, now: datetime | None = None, sources=None) -> dic
     return snapshot
 
 
+def mark_failed(snapshot: dict | None, names) -> None:
+    """Mark sources whose data this retrain could not use (a fail-open load or merge) as errored in
+    the snapshot about to be stored, so the detector treats them as unknown, never as consumed."""
+    if not snapshot:
+        return
+    for name in names:
+        entry = snapshot["sources"].get(name)
+        if entry is not None:
+            entry["error"] = "load_failed"
+
+
 def read_baseline(supa) -> tuple[dict | None, str | None, str | None]:
     """(lineage snapshot, its computed_at, error code). (None, None, None) = never stored."""
     try:

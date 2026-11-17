@@ -710,5 +710,22 @@ class RescoreActuals(unittest.TestCase):
             self.assertEqual(row[k], issued[k])
 
 
+class FailedLoadsAndSql(unittest.TestCase):
+    def test_mark_failed_turns_a_source_into_an_error_entry(self):
+        snap = {"sources": {"weather_daily": {"before": "2026-11-01", "rows": 3, "hash": "x"},
+                            "matrix": {"before": "2026-11-01", "rows": 9, "hash": "y"}}}
+        fs.mark_failed(snap, {"weather_daily", "not_a_source"})
+        self.assertEqual(snap["sources"]["weather_daily"]["error"], "load_failed")
+        self.assertNotIn("error", snap["sources"]["matrix"])
+        fs.mark_failed(None, {"weather_daily"})  # no snapshot: nothing to do, no error
+
+    def test_fingerprint_sql_builds_valid_aggregate_text(self):
+        import pathlib
+        text = (pathlib.Path(__file__).resolve().parent.parent / "sql" / "hrv_source_fingerprint.sql").read_text(encoding="utf-8")
+        self.assertIn("string_agg(s.h, '' ORDER BY s.h)", text)
+        self.assertNotIn("string_agg(s.h,  ORDER", text)
+        self.assertNotIn("DROP ", text.upper())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

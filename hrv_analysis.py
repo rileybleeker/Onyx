@@ -807,6 +807,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  whoop_cycles.step_count load failed ({e!r}); continuing without WHOOP steps")
+        LOAD_FAILURES.add("whoop_cycles")
         data["whoop_steps"] = pd.DataFrame()
 
     # Recovery per cycle, for the alignment guard (hrv_alignment.check_matrix_hrv).
@@ -950,6 +951,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
+        LOAD_FAILURES.add("delivery_daily")
         data["delivery"] = pd.DataFrame()
     # How far the receipt ETL has verifiably looked: the view has a row only on days WITH an
     # order, so "no row" after the last order is a true zero only if the ETL kept running.
@@ -1002,6 +1004,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  phone_usage_daily load failed ({e!r}); continuing without screen-time features")
+        LOAD_FAILURES.add("phone_usage_daily")
         data["screen"] = pd.DataFrame()
 
     # Air quality (pds.air_quality_daily, 2026-11-11): daily PM2.5 / US AQI per ET clock day from
@@ -1016,6 +1019,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  air_quality_daily load failed ({e!r}); continuing without air-quality features")
+        LOAD_FAILURES.add("air_quality_daily")
         data["air_quality"] = pd.DataFrame()
 
     # Weather (pds.weather_daily, 2026-11-13): daily outdoor weather per ET clock day from the
@@ -1029,6 +1033,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  weather_daily load failed ({e!r}); continuing without weather features")
+        LOAD_FAILURES.add("weather_daily")
         data["weather"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
@@ -1608,6 +1613,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Delivery feature merge failed ({e!r}); continuing without delivery features")
+        LOAD_FAILURES.add("delivery_daily")
         return df
 
 
@@ -1694,6 +1700,7 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")
+        LOAD_FAILURES.add("phone_usage_daily")
         return df
 
 
@@ -1747,6 +1754,7 @@ def merge_air_quality_features(df: pd.DataFrame, air: pd.DataFrame | None) -> pd
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Air-quality feature merge failed ({e!r}); continuing without air-quality features")
+        LOAD_FAILURES.add("air_quality_daily")
         return df
 
 
@@ -1853,6 +1861,7 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")
+        LOAD_FAILURES.add("weather_daily")
         return df
 
 
@@ -1921,6 +1930,7 @@ def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) ->
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  WHOOP steps merge failed ({e!r}); continuing without WHOOP steps")
+        LOAD_FAILURES.add("whoop_cycles")
         return df
 
 
@@ -6286,6 +6296,11 @@ def check_alignment(data: dict, df: pd.DataFrame) -> str | None:
     return None
 
 
+# Sources whose load or merge failed open this run: their stored baseline is marked unknown, so
+# the omitted history is never reported as consumed (hrv_feature_sources.mark_failed).
+LOAD_FAILURES: set[str] = set()
+
+
 def capture_source_lineage() -> dict | None:
     """Fingerprints of the HRV inputs' history (hrv_feature_sources.capture). Fail-open: a problem
     here never stops the retrain; the backfill check then sees no fresh baseline and says so."""
@@ -6478,6 +6493,7 @@ def main() -> str | None:
         dose_response=dose_response,
     )
     # Last, so it exists only when this run's results were stored (hrv_feature_sources.py).
+    feature_sources.mark_failed(source_lineage, LOAD_FAILURES)
     if feature_sources.store_baseline(supa, source_lineage, INPUT_DATA_HASH):
         log.info(f"    Upserted: {feature_sources.LINEAGE_RESULT_TYPE}/{feature_sources.LINEAGE_RESULT_KEY}")
     elif source_lineage:

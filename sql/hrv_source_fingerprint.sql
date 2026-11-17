@@ -103,8 +103,8 @@ BEGIN
     END IF;
 
     RETURN QUERY EXECUTE format(
-        'SELECT count(*)::bigint, md5(coalesce(string_agg(s.h,  ORDER BY s.h), )) '
-        'FROM (SELECT md5(ROW(%s)::text) AS h FROM %s t%s) s',
+        $q$SELECT count(*)::bigint, md5(coalesce(string_agg(s.h, '' ORDER BY s.h), ''))
+           FROM (SELECT md5(ROW(%s)::text) AS h FROM %s t%s) s$q$,
         v_cols, v_rel, v_where)
     USING p_before;
 END;
