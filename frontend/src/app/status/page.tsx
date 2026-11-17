@@ -434,6 +434,10 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
 }
 
 const STATUS_URL = "/api/status";
+// Today's prewarm sweep (components/AppData.tsx) fetches this answer into memory. On the first load of an in-app visit,
+// a copy at most this old is shown as it is and no second request is sent (the overview's freshness for this card is
+// 2 min too). The page's 60 s poll still fetches for itself, and "refreshed" shows the copy's own time.
+const STATUS_PREWARM_MAX_AGE_MS = 2 * 60_000;
 // The page's one read starts with the HTML instead of after the JavaScript and hydration (lib/early-fetch.ts; speed
 // budget, 2026-11-15: the cold first visit took 1022 ms in perf-timing run 43676849680). Same request as load()'s
 // own fetch (the browser's default cache mode: /api/status is edge-cached for 30 s; it answers `private, no-store`, so
@@ -471,6 +475,15 @@ function StatusView({ early }: { early: boolean }) {
   const firstLoad = useRef(early);
 
   const load = useCallback(async () => {
+    if (firstLoad.current) {
+      const at = clientCache.fetchedAt(STATUS_URL);
+      if (at !== undefined && Date.now() - at < STATUS_PREWARM_MAX_AGE_MS && clientCache.peek(STATUS_URL) !== undefined) {
+        firstLoad.current = false;
+        refreshedAtRef.current = new Date(at);
+        setLoading(false);
+        return;
+      }
+    }
     try {
       const get = () => fetch(STATUS_URL);
       const takeEarly = firstLoad.current;
