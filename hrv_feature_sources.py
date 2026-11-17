@@ -113,7 +113,7 @@ def _garmin(table: str, date_col: str = "calendar_date", moves_on: str = "insert
 
 
 def _whoop(table: str, date_col: str = "start_time") -> FeatureSource:
-    # updated_at is WHOOP's own last-change time (re-scores move it). Riley's activity tags
+    # updated_at is WHOOP's own last-change time (re-scores move it). manual activity tags
     # (is_sauna, split_labels, muscle_groups, is_excluded) do not: the fingerprint sees those.
     return FeatureSource(
         name=table, feeds=f"hrv_analysis.load_all_data: {table}",
