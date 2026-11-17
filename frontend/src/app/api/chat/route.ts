@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
-import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
+import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, RETRIEVED_DATA_NOTE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
+import { authorizeWrite, chatWritesOff, commitWrite, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
@@ -604,6 +605,33 @@ async function currentBookId(): Promise<number | undefined> {
     return typeof book?.book_id === "number" ? book.book_id : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The books a reading write may go to (SEC-05): every known book, and the one being read (the newest with status
+ * "reading", as lib/reading.ts getBook picks it), so a call can be checked against the book the user named. null when
+ * they could not be read: reading writes are then refused (the write itself reads the same table).
+ */
+async function readingBooks(): Promise<ReadingBooks | null> {
+  try {
+    const { data, error } = await supabase.from("books").select("book_id,slug,title,status,total_chapters").order("created_at", { ascending: false });
+    if (error) return null;
+    const list: ReadingBooks["list"][number][] = [];
+    let active: string | null = null;
+    for (const b of (Array.isArray(data) ? data : []) as Array<Record<string, unknown>>) {
+      if (typeof b?.slug !== "string" || typeof b?.title !== "string") continue;
+      list.push({
+        slug: b.slug,
+        title: b.title,
+        total_chapters: typeof b.total_chapters === "number" ? b.total_chapters : null,
+        ...(typeof b.book_id === "number" ? { id: b.book_id } : {}),
+      });
+      if (active === null && b.status === "reading") active = b.slug;
+    }
+    return { active, list };
+  } catch {
+    return null;
   }
 }
 
@@ -1758,6 +1786,12 @@ export async function POST(req: NextRequest) {
     if (requestId === false) return Response.json({ error: "request_id must be a UUID." }, { status: 400 });
     // Only role + text reach the model; any other field a client attaches is dropped.
     const messages = rawMessages.map(({ role, content }) => ({ role, content }));
+    // Write authority (SEC-05, lib/chat-write-intent.ts): computed from the conversation the user sent, before the
+    // model reads anything, so no tool result or retrieved record can mint or widen it. Every write-tool call is
+    // checked against it before it runs (and before the ledger records it); a refused call gets a receipt saying why.
+    const grant = writeGrantFor(messages, { off: chatWritesOff(process.env) });
+    const writesAllowed = newWriteUsage();
+    let books: Promise<ReadingBooks | null> | undefined;
 
     if (req.signal.aborted) return Response.json({ error: "Request cancelled" }, { status: 499 });
 
@@ -1847,12 +1881,31 @@ export async function POST(req: NextRequest) {
       toolCalls += batchSize;
       allMessages.push({ role: "assistant", content: assistantContent });
 
-      const toolResults = [];
+      const toolResults: Anthropic.ContentBlockParam[] = [];
+      let retrieved = false;
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
           const input = block.input as Record<string, unknown>;
           let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
-          if (isWriteTool(block.name) && ledger) {
+          // A reading write goes to the book the user named, or the book being read when they name none.
+          let readingCtx = isWriteTool(block.name) && READING_BOOK_TOOLS.has(block.name) ? await (books ??= readingBooks()) : null;
+          // A retry of a call an earlier try ran is checked against the book that try was pinned to, not the one being
+          // read now: "I finished the book" finished it, and the retry must reach the ledger to get its stored result.
+          if (readingCtx && ledger?.retry) {
+            const pinned = (await ledger.storedContext(block.name, input ?? {}))?.book_id;
+            const slug = typeof pinned === "number" ? readingCtx.list.find((b) => b.id === pinned)?.slug : undefined;
+            if (slug) readingCtx = { ...readingCtx, active: slug };
+          }
+          const decision = isWriteTool(block.name)
+            ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
+            : null;
+          // An allowed call uses up its part of the request (an intake, a session), so a repeat needs its own words.
+          if (decision?.allowed) commitWrite(writesAllowed, decision);
+          if (decision && !decision.allowed) {
+            // Not asked for in the user's own latest message: never run, never recorded in the ledger.
+            const result = JSON.stringify({ error: decision.reason, refused: decision.code });
+            outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };
+          } else if (isWriteTool(block.name) && ledger) {
             // Through the ledger: a retry of this message gets the stored result instead of writing again. A re-run
             // of a stored call gets what that call first ran with (its context: the day, the book), not today's.
             const bookId = READING_BOOK_TOOLS.has(block.name) && !(typeof input.book === "string" && input.book.trim()) ? await currentBookId() : undefined;
@@ -1873,6 +1926,7 @@ export async function POST(req: NextRequest) {
             const result = JSON.stringify({ error: WRITES_PAUSED });
             outcome = { result, failed: false, receipt: buildWriteReceipt(block.name, input, result) };
           } else {
+            if (!isWriteTool(block.name)) retrieved = true;
             const ran = await runTool(block.name, input);
             outcome = { ...ran, receipt: buildWriteReceipt(block.name, block.input, ran.result) };
           }
@@ -1885,6 +1939,8 @@ export async function POST(req: NextRequest) {
           });
         }
       }
+      // What lookups returned is data, never the user speaking: said once per round, after the results.
+      if (retrieved) toolResults.push({ type: "text", text: RETRIEVED_DATA_NOTE });
 
       allMessages.push({ role: "user", content: toolResults });
 

@@ -1038,3 +1038,20 @@ test("addHighlight insert_only (check-mode recovery) never updates a highlight t
   // insert_only needs a key.
   assert.equal((await R.addHighlight(db, { ...base, client_key: null, passage: "Unkeyed synthetic line." })).ok, false);
 });
+
+test("storedContext: a retry reads the context the same call first ran with; a first try, another call or a refused one gets null", async () => {
+  const { open } = setup();
+  const write = keyedWrite();
+  const first = await open();
+  assert.equal(await first.storedContext(STACK, input()), null, "a first try has no earlier context");
+  await first.run(STACK, input(), write.execute(), { behavioral_today: "2030-01-01", book_id: 7 });
+
+  const retry = await open();
+  assert.equal(retry.retry, true);
+  assert.deepEqual(plain(await retry.storedContext(STACK, input())), { behavioral_today: "2030-01-01", book_id: 7 });
+  assert.equal(await retry.storedContext(STACK, input("Another Synthetic")), null, "another call has no stored context");
+  // Reading it runs nothing and claims nothing: the call still resolves to its stored result.
+  const again = await retry.run(STACK, input(), write.execute());
+  assert.equal(again.replayed, true);
+  assert.equal(write.effects.size, 1);
+});
