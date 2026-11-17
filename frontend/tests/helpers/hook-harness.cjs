@@ -6,10 +6,44 @@
 // The first argument is a src path (its default export is mounted) or a factory `(load, hooks) => Component`, for a
 // small probe component around a real hook: `load(rel)` loads src modules with the same stubs and one module cache
 // as the rest of the mount, so the probe and the code it drives share every class and singleton.
+// React context works too (createContext / useContext, <Ctx.Provider value> and <Ctx value>; contextShim below), so a
+// hook that reads a context (lib/use-unsaved-work.ts reads lib/feed-scope.ts) runs as shipped; wrap the component
+// in a Provider (a probe) to give it a value, otherwise it reads the context's default.
 // `cache` (a Map, see load-ts.cjs) may arrive pre-seeded: a module registered under its src file (e.g. "lib/autosave.ts")
 // is what EVERY import of that file gets, whether written "@/lib/autosave" or "./autosave".
 const assert = require("node:assert/strict");
 const { loadTs } = require("./load-ts.cjs");
+
+const CONTEXT = Symbol.for("onyx.synthetic.context");
+/**
+ * React context for a hook shim with a depth-first renderer: `createContext` / `useContext` go into the hooks object,
+ * and `provide(node, render)` is called by the renderer on every element; it answers null for an element that is
+ * not a Provider, else renders its children with the Provider's value in force (the previous value is restored after,
+ * so a sibling outside the Provider reads the default again, as in React).
+ */
+function contextShim() {
+  return {
+    createContext(defaultValue) {
+      const context = { $$typeof: CONTEXT, current: defaultValue };
+      context.context = context; // React 19: <Ctx value>
+      context.Provider = { $$typeof: CONTEXT, context }; // <Ctx.Provider value>
+      context.Consumer = (props) => props.children(context.current);
+      return context;
+    },
+    useContext: (context) => context.current,
+    provide(node, render) {
+      const context = node?.type?.$$typeof === CONTEXT ? node.type.context : null;
+      if (!context) return null;
+      const prior = context.current;
+      context.current = node.props.value;
+      try {
+        return { rendered: render(node.props.children) };
+      } finally {
+        context.current = prior;
+      }
+    },
+  };
+}
 
 function mountClient(relPath, { props = {}, stubs = {}, cache = new Map() } = {}) {
   let ids = 0;
@@ -21,7 +55,10 @@ function mountClient(relPath, { props = {}, stubs = {}, cache = new Map() } = {}
   const frames = new Map();
   const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
   const slot = () => [frame.slots, frame.index++];
+  const context = contextShim();
   const hooks = {
+    createContext: context.createContext,
+    useContext: context.useContext,
     useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${ids++}:`; },
     useState(initialValue) {
       const [slots, i] = slot();
@@ -51,6 +88,8 @@ function mountClient(relPath, { props = {}, stubs = {}, cache = new Map() } = {}
     if (node == null || typeof node === "boolean") return null;
     if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
     if (typeof node !== "object") return node;
+    const provided = context.provide(node, (children) => expand(children, id));
+    if (provided) return provided.rendered;
     if (typeof node.type === "function") {
       const key = `${id}:${node.type.name}`;
       if (!frames.has(key)) frames.set(key, { slots: [], index: 0 });
@@ -124,4 +163,4 @@ function withGlobals(t, values) {
   }
 }
 
-module.exports = { mountClient, response, deferred, withGlobals };
+module.exports = { mountClient, contextShim, response, deferred, withGlobals };

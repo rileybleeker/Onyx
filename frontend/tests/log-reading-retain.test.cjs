@@ -21,6 +21,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { loadTs } = require("./helpers/load-ts.cjs");
+const { contextShim } = require("./helpers/hook-harness.cjs");
 
 // One copy of each shared module: loadTs has no module cache, and a second copy of lib/autosave.ts would give the
 // section its own AutosaveRefused class (the scheduler's instanceof check would not recognise it).
@@ -83,7 +84,11 @@ const R = { frames: new Map(), frame: null, dirty: true, mounted: false, gen: 0 
 const equal = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
 const slot = () => [R.frame.slots, R.frame.index++];
 let effects = [];
+// React context: the section is drawn inside the real lib/feed-scope.ts Provider, as ContinuousScroll draws it.
+const context = contextShim();
 const hooks = {
+  createContext: context.createContext,
+  useContext: context.useContext,
   useId() { const [slots, i] = slot(); return slots[i] ??= `:synthetic${i}:`; },
   useState(initialValue) {
     const [slots, i] = slot();
@@ -229,11 +234,13 @@ function setup(t) {
     Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
     t.after(() => (prior ? Object.defineProperty(globalThis, name, prior) : delete globalThis[name]));
   }
+  const feedScope = loadTs("lib/feed-scope.ts", { react: hooks });
   const stubs = {
     react: hooks,
     "lucide-react": { Check: () => null },
     "@/components/FeedContext": { useInFeed: () => true },
-    "@/lib/feed-scope": { useFeedScope: () => "/log" },
+    // The real module (its context is the one the Provider in flush() sets), so useUnsavedWork reports the scope.
+    "@/lib/feed-scope": feedScope,
     "@/lib/autosave": autosaveLib,
     "@/lib/unsaved-work": { ...unsavedLib, unsavedWork: work },
     "@/lib/autosave-retain": { ...retainLib, formRetainer: retainer },
@@ -264,6 +271,8 @@ function setup(t) {
     if (node == null || typeof node === "boolean") return null;
     if (Array.isArray(node)) return node.map((child, i) => expand(child, `${id}/${child?.key ?? i}`));
     if (typeof node !== "object") return node;
+    const provided = context.provide(node, (children) => expand(children, id));
+    if (provided) return provided.rendered;
     if (typeof node.type === "function") {
       const key = `${id}:${node.type.name}`;
       if (!R.frames.has(key)) R.frames.set(key, { slots: [], index: 0 });
@@ -278,7 +287,8 @@ function setup(t) {
       if (R.dirty && R.mounted) {
         R.dirty = false;
         effects = [];
-        tree = expand({ type: Section, props: {} });
+        // The Log page as the continuous scroll draws it below Today (components/ContinuousScroll.tsx).
+        tree = expand({ type: feedScope.FeedScopeContext.Provider, props: { value: "/log", children: { type: Section, props: {} } } });
         if (beforeEffects) {
           const between = beforeEffects;
           beforeEffects = null;
@@ -457,6 +467,7 @@ test("opening the section sends nothing, also after a long wait", async (t) => {
   await h.tick(120_000);
   assert.equal(h.calls.length, 0);
   assert.equal(h.work.has(), false, "an untouched form is not unsaved work");
+  assert.equal(h.work.hasIn("/log"), false, "and does not hold the Log page in the scroll");
   await h.unmount();
   assert.equal(h.retainer.size, 0, "nothing to keep");
 });
@@ -467,6 +478,8 @@ test("an incomplete entry survives the section being unmounted and comes back as
   await h.type("Minutes", "25");
   await h.type("Recall note", "Synthetic note, kept verbatim.");
   assert.match(h.text(), /Enter the chapter you read through to save\./, "the reason is shown next to the form");
+  assert.equal(h.work.hasIn("/log"), true, "unsaved work of the Log page: the scroll keeps that page mounted");
+  assert.equal(h.work.hasIn("/today"), false, "and of no other page");
   await h.unmount();
   assert.equal(h.calls.length, 0, "an incomplete entry is never sent");
   assert.equal(h.retainer.size, 1);
@@ -489,6 +502,7 @@ test("an incomplete entry survives the section being unmounted and comes back as
   assert.equal(body.recall, "Synthetic note, kept verbatim.");
   assert.match(h.text(), /Saved · \+10 XP/);
   assert.match(h.text(), /This session/);
+  assert.equal(h.work.hasIn("/log"), false, "saved: the scroll may drop the Log page again");
 });
 
 test("offline: a failed create keeps its client_key through an unmount, and Retry on the next mount creates it once", async (t) => {
