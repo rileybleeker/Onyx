@@ -44,6 +44,13 @@ export type InvestmentsLoad =
 
 const ACTIVITY_DAYS = 90;
 const ACTIVITY_PER_ACCOUNT = 15;
+/**
+ * Read-wide ceiling for the activity query, across all accounts. It is generous on purpose: the real bound is the
+ * per-account cap below, so one busy account cannot use up the read and push another account's rows off the page.
+ */
+const ACTIVITY_READ_LIMIT = 2000;
+/** Newest activity rows kept per account after the read (rows arrive newest first). Stops one account from crowding out others. */
+const ACTIVITY_KEEP_PER_ACCOUNT = 100;
 
 interface HoldingRow {
   account_key: string;
@@ -75,6 +82,18 @@ function num(v: number | string | null | undefined): number | null {
   if (v == null) return null;
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+/** Keeps, per account, the first `perAccount` rows in input order (the query orders newest first). */
+export function capActivityPerAccount(rows: ActivityRow[], perAccount: number): Map<string, ActivityRow[]> {
+  const out = new Map<string, ActivityRow[]>();
+  for (const r of rows) {
+    const list = out.get(r.account_key) ?? [];
+    if (list.length >= perAccount) continue;
+    list.push(r);
+    out.set(r.account_key, list);
+  }
+  return out;
 }
 
 /** Keeps, per account, only the positions of its newest run (a position that left the account keeps an older seen_at). */
@@ -111,7 +130,7 @@ export async function loadInvestments(now: Date = new Date()): Promise<Investmen
         .gte("txn_date", since)
         .order("txn_date", { ascending: false })
         .order("txn_key")
-        .limit(500),
+        .limit(ACTIVITY_READ_LIMIT),
       db.from("finance_accounts").select("account_key,institution,account_name,mask").eq("account_type", "Investment"),
     ]);
     for (const res of [h, a, acc]) {
@@ -121,11 +140,12 @@ export async function loadInvestments(now: Date = new Date()): Promise<Investmen
       }
     }
     const holdingsByAccount = currentHoldings((h.data ?? []) as unknown as HoldingRow[]);
-    const activity = (a.data ?? []) as unknown as ActivityRow[];
+    // Per-account bound applied after the read, so the shared read limit never decides which account is shown.
+    const activityByAccount = capActivityPerAccount((a.data ?? []) as unknown as ActivityRow[], ACTIVITY_KEEP_PER_ACCOUNT);
     const accounts: InvestmentAccount[] = [];
     for (const row of (acc.data ?? []) as unknown as AccountRow[]) {
       const hs = holdingsByAccount.get(row.account_key) ?? [];
-      const acts = activity.filter((r) => r.account_key === row.account_key).slice(0, ACTIVITY_PER_ACCOUNT);
+      const acts = (activityByAccount.get(row.account_key) ?? []).slice(0, ACTIVITY_PER_ACCOUNT);
       if (!hs.length && !acts.length) continue;
       accounts.push({
         accountKey: row.account_key,
