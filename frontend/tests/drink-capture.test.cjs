@@ -220,7 +220,7 @@ test("readiness: product + amount + Now saves; missing amount, unresolved produc
   assert.equal(C.itemSave(item({ timeMode: "manual", day: null, time: "09:00", whenIssue: C.WHEN_ISSUE.day }), ctx()).reason, C.WHEN_ISSUE.day, "an unusable said day never becomes today");
   assert.equal(C.itemSave(item(), ctx(check0, null)).ok, false);
   assert.equal(C.itemSave(item(), { ...ctx(), dayCheck: () => null }).ok, false);
-  assert.equal(C.itemSave(item(), { ...ctx(), blocked: "Drinks are not set up yet: the database migration is pending." }).ok, false);
+  assert.equal(C.itemSave(item(), { ...ctx(), blocked: "Drinks aren't available yet. Try again later. If this keeps happening, the drinks setup still needs to be finished." }).ok, false);
   assert.equal(C.afterWhenEdit(C.WHEN_ISSUE.both, "time"), C.WHEN_ISSUE.day);
   assert.equal(C.afterWhenEdit(C.WHEN_ISSUE.day, "time"), C.WHEN_ISSUE.day, "setting the time never resolves a bad day");
   assert.equal(C.afterWhenEdit(C.WHEN_ISSUE.day, "day"), null);
