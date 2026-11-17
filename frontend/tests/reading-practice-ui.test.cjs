@@ -2297,3 +2297,59 @@ test("closing while an answer is still on its way: the wait runs out, the reques
   assert.equal(r2.attempts()[0].body.attempt_key, r1.attempts()[0].body.attempt_key);
   assert.equal(r2.alerts().length, 0);
 });
+
+// Review RQS4-R1: only the newest round read may write the card and the cache. A slow GET from an earlier read (the
+// mount's, here) that lands after a newer one is dropped; the card on screen and the cached copy stay the newer ones.
+// The same-generation answer still applies.
+test("practice part: an older round read that lands after a newer one is dropped; the newer card and cache stay", async (t) => {
+  runnerProps.length = 0;
+  const win = fakeTarget();
+  const doc = fakeTarget({ visibilityState: "visible" });
+  let clock = 5_000_000;
+  const gates = [];
+  const p = mountPart(t, {
+    win,
+    doc,
+    now: () => clock,
+    roundAnswer: () => {
+      const g = deferred();
+      gates.push(g);
+      return g.promise;
+    },
+    bankAnswer: onBank,
+  });
+  const back = async () => {
+    doc.visibilityState = "hidden";
+    doc.fire("visibilitychange");
+    clock += 61_000;
+    doc.visibilityState = "visible";
+    doc.fire("visibilitychange");
+    await p.h.flush();
+  };
+  await p.h.flush(); // the mount's read (gates[0]) is on its way
+  await back(); // the newer read (gates[1]) after a return to the app
+  assert.equal(gates.length, 2);
+
+  const older = round([cued(1), cued(2)]);
+  const newer = round([cued(1, { card: { done: true } }), cued(2)]);
+  gates[1].resolve(response(newer)); // the newer read answers first
+  await p.h.flush();
+  assert.match(p.h.text(), /1 ready/);
+  assert.deepEqual(p.store[C.practiceUrl("synthetic-book")], newer);
+
+  gates[0].resolve(response(older)); // the older read lands last
+  await p.h.flush();
+  assert.match(p.h.text(), /1 ready/, "the older card does not replace the newer one");
+  assert.doesNotMatch(p.h.text(), /2 ready/);
+  assert.deepEqual(p.store[C.practiceUrl("synthetic-book")], newer, "the cache keeps the newer copy");
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined, "the newer read settled the check");
+
+  // Same generation: a read that is the newest one still applies.
+  await back();
+  assert.equal(gates.length, 3);
+  const third = round([cued(1), cued(2), cued(3)]);
+  gates[2].resolve(response(third));
+  await p.h.flush();
+  assert.match(p.h.text(), /3 ready/);
+  assert.deepEqual(p.store[C.practiceUrl("synthetic-book")], third);
+});
