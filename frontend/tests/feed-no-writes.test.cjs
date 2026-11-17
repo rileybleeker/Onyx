@@ -74,8 +74,9 @@ test("/reading Want to read: mounting (page or scroll) only reads the list; the 
   assert.ok(mount, "the list's mount effect is found");
   assert.ok(!/send\(|method:|retryPending|act\(/.test(mount[1]), "the mount effect writes nothing");
   assert.match(read("app/reading/ReadingClient.tsx"), /<ReadingList books=\{books\} onChanged=\{onListChanged\} \/>/);
-  // The warm-up list is GET-only (json = fetchJsonValue); it may carry other GETs after it (preferences, Practice).
-  assert.match(read("components/AppData.tsx"), /"\/reading": \(\) => \[json\("\/api\/reading"\), json\("\/api\/reading\/list"\)/);
+  // The warm-up list is GET-only (json = fetchJsonValue); it may carry other GETs after it (preferences, Practice),
+  // and the list entry may be wrapped with a skipOn (#706 skips it while /sleep is on screen; still a GET).
+  assert.match(read("components/AppData.tsx"), /"\/reading": \(\) => \[json\("\/api\/reading"\), (?:\{ \.\.\.)?json\("\/api\/reading\/list"\)/);
 });
 
 test("Personalize: a grid in the scroll never syncs its layout with the server or saves an edit", () => {
