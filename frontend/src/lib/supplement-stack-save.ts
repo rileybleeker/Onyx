@@ -217,7 +217,7 @@ export function stackSaveFailure(code: string | null | undefined): { status: num
     case "42883":
     case "42703":
     case "PGRST204":
-      return { status: 503, code: "not_set_up", error: "Saving stacks is not set up yet (database migration pending). Nothing was changed." };
+      return { status: 503, code: "not_set_up", error: "Saving stacks is not available yet. Nothing was changed." };
     default:
       // Not a refusal this file knows (a lost connection, a gateway timeout, an unexpected server error): the save may
       // have committed before the answer was lost. Retried with the same save id, which is then answered as a replay.
