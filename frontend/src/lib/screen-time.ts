@@ -3,19 +3,26 @@
  * the Onyx Screen Time app). Used by the /screen-time page.
  * No I/O here, so node --test can load it (tests/screen-time.test.cjs, synthetic rows only).
  *
- * Two readiness rules, both mirrored from the HRV pipeline (hrv_analysis.py:merge_screen_time_features):
- *   complete      a sync happened after the day ended (synced_at >= day + 1 at 06:00 ET). The app
- *                 syncs around 10 AM for the days before, so the newest day is usually partial.
- *   bedtimeReady  complete, the WHOOP main sleep that closes the day is scored, and the sync is at
- *                 least an hour past sleep onset (so the hour that straddles onset was fully sent).
- *                 Only then are the two sleep-anchored estimates shown or used.
+ * Readiness rules, all mirrored by the HRV pipeline (hrv_analysis.py:merge_screen_time_features) and the
+ * experiment adherence check (experiment_adherence.py:settled_screen_minutes):
+ *   complete          a sync happened after the day ended (synced_at >= day + 1 at 06:00 ET) AND the view says
+ *                     the whole day is backed by a complete export (export_complete, PIPE-11,
+ *                     sql/phone_usage_completeness.sql: every chunk of an app run arrived and Apple's stream
+ *                     ended on its own). A day from an app build that reports no completeness ("unknown") or
+ *                     from an export the watchdog cut short is never complete, whatever the upload time.
+ *   bedtimeReady      complete, the WHOOP main sleep that closes the day is scored, the sync is at least an hour
+ *                     past sleep onset, and the hour before onset is backed by a complete export
+ *                     (pre_sleep_complete). Only then is the last-hour estimate shown or used.
+ *   duringSleepReady  the same, with the sleep itself backed (during_sleep_complete), for the during-sleep estimate.
+ * A missing flag counts as not complete (an older database or an older cached answer).
  */
 
 /** Explicit column list for every read of pds.phone_usage_daily (never select "*"). */
 export const SCREEN_TIME_COLUMNS =
   "behavioral_date,total_minutes,late_night_minutes,after_midnight_minutes,pickups,notifications," +
   "apps_used,sleep_start,minutes_last_hour_before_sleep_est,minutes_during_sleep_est," +
-  "minutes_by_app,minutes_by_category,synced_at";
+  "minutes_by_app,minutes_by_category,synced_at," +
+  "export_complete,completeness,pre_sleep_complete,during_sleep_complete";
 
 export const DEFAULT_WINDOW_DAYS = 30;
 export const WINDOW_CHOICES = [14, 30, 90] as const;
@@ -24,6 +31,14 @@ const MAX_WINDOW_DAYS = 180;
 export const TOP_LIST_LIMIT = 10;
 /** Shown for apps Apple gave no category (the view stores them as "(none)"). */
 export const NO_CATEGORY_LABEL = "Uncategorised";
+
+/**
+ * complete  the day counts (see the rules above)
+ * partial   not complete, but sent by an app build that reports completeness: still syncing, a sync the
+ *           watchdog cut short, or a chunk that never arrived
+ * unknown   not complete and sent only by an app build that reports no completeness
+ */
+export type ScreenCompleteness = "complete" | "partial" | "unknown";
 
 export interface ScreenDay {
   date: string; // behavioral day, YYYY-MM-DD
@@ -40,7 +55,9 @@ export interface ScreenDay {
   byCategory: Record<string, number>;
   syncedAt: string | null;
   complete: boolean;
+  completeness: ScreenCompleteness;
   bedtimeReady: boolean;
+  duringSleepReady: boolean;
 }
 
 function num(v: unknown): number | null {
@@ -93,7 +110,10 @@ export function windowStart(now: Date, days: number): string {
   return addDays((stamp ?? now.toISOString()).slice(0, 10), -(days - 1));
 }
 
-/** A day is complete once a sync happened after it ended: synced_at >= day + 1 at 06:00 ET. */
+/**
+ * The upload-time half of the day rule: a sync happened after the day ended (synced_at >= day + 1 at 06:00 ET).
+ * Necessary, not sufficient: parseScreenRow also needs the view's export_complete.
+ */
 export function isDayComplete(date: string, syncedAt: string | null): boolean {
   if (!syncedAt) return false;
   const stamp = etHourStamp(syncedAt);
@@ -108,9 +128,17 @@ export function parseScreenRow(raw: unknown): ScreenDay | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
   const syncedAt = instant(r.synced_at);
   const sleepStart = instant(r.sleep_start);
-  const complete = isDayComplete(date, syncedAt);
-  const bedtimeReady =
+  // Only a literal true counts: absent, null or anything else is "not known to be complete".
+  const complete = isDayComplete(date, syncedAt) && r.export_complete === true;
+  const completeness: ScreenCompleteness = complete
+    ? "complete"
+    : r.completeness === "partial" || r.completeness === "complete"
+      ? "partial"
+      : "unknown";
+  const onsetSent =
     complete && sleepStart !== null && syncedAt !== null && Date.parse(syncedAt) >= Date.parse(sleepStart) + 3_600_000;
+  const bedtimeReady = onsetSent && r.pre_sleep_complete === true;
+  const duringSleepReady = onsetSent && r.during_sleep_complete === true;
   return {
     date,
     totalMin: num(r.total_minutes),
@@ -121,12 +149,14 @@ export function parseScreenRow(raw: unknown): ScreenDay | null {
     appsUsed: num(r.apps_used),
     sleepStart,
     lastHourBeforeSleepMin: bedtimeReady ? num(r.minutes_last_hour_before_sleep_est) : null,
-    duringSleepMin: bedtimeReady ? num(r.minutes_during_sleep_est) : null,
+    duringSleepMin: duringSleepReady ? num(r.minutes_during_sleep_est) : null,
     byApp: minutesMap(r.minutes_by_app),
     byCategory: minutesMap(r.minutes_by_category),
     syncedAt,
     complete,
+    completeness,
     bedtimeReady,
+    duringSleepReady,
   };
 }
 
@@ -154,7 +184,10 @@ function mean(values: Array<number | null>): number | null {
 
 export interface ScreenSummary {
   completeDays: number;
+  /** Not complete, from an app build that reports completeness (still syncing, cut short, chunk missing). */
   partialDays: number;
+  /** Not complete, from an app build that reports no completeness: never counted. */
+  unverifiedDays: number;
   avgTotalMin: number | null;
   avgLateNightMin: number | null;
   avgAfterMidnightMin: number | null;
@@ -170,9 +203,11 @@ export interface ScreenSummary {
 export function summarize(days: readonly ScreenDay[]): ScreenSummary {
   const done = days.filter((d) => d.complete);
   const bed = done.filter((d) => d.bedtimeReady && d.lastHourBeforeSleepMin !== null);
+  const unverified = days.filter((d) => !d.complete && d.completeness === "unknown").length;
   return {
     completeDays: done.length,
-    partialDays: days.length - done.length,
+    partialDays: days.length - done.length - unverified,
+    unverifiedDays: unverified,
     avgTotalMin: mean(done.map((d) => d.totalMin)),
     avgLateNightMin: mean(done.map((d) => d.lateNightMin)),
     avgAfterMidnightMin: mean(done.map((d) => d.afterMidnightMin)),
@@ -180,7 +215,7 @@ export function summarize(days: readonly ScreenDay[]): ScreenSummary {
     avgNotifications: mean(done.map((d) => d.notifications)),
     bedtimeDays: bed.length,
     avgLastHourBeforeSleepMin: mean(bed.map((d) => d.lastHourBeforeSleepMin)),
-    avgDuringSleepMin: mean(bed.map((d) => d.duringSleepMin)),
+    avgDuringSleepMin: mean(done.filter((d) => d.duringSleepReady).map((d) => d.duringSleepMin)),
   };
 }
 

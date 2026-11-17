@@ -996,7 +996,8 @@ def load_all_data() -> dict[str, pd.DataFrame]:
             "phone_usage_daily",
             select="behavioral_date,total_minutes,late_night_minutes,after_midnight_minutes,pickups,"
                    "notifications,minutes_by_category,minutes_last_hour_before_sleep_est,"
-                   "minutes_during_sleep_est,synced_at",
+                   "minutes_during_sleep_est,synced_at,sleep_start,"
+                   "export_complete,pre_sleep_complete,during_sleep_complete",
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  phone_usage_daily load failed ({e!r}); continuing without screen-time features")
@@ -1637,10 +1638,16 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
     ROW PLACEMENT: day D's use sits on row D, whose HRV is the sleep that closes day D
     (hrv_alignment.py), so no re-keying.
 
-    COMPLETENESS: the app syncs around 10 AM for the days before, so the newest day is often
-    partial. A day counts only once a sync happened after it ended (synced_at >= D + 1 day
-    06:00 ET); partial days stay NaN. Days the app never reported (before the first sync's
-    ~30-day backfill, or a gap) are NaN too, never zero: phone use is never truly zero.
+    COMPLETENESS (same contract as frontend/src/lib/screen-time.ts and
+    experiment_adherence.settled_screen_minutes): a day counts only once a sync happened after
+    it ended (synced_at >= D + 1 day 06:00 ET) AND the view says the whole day is backed by a
+    complete export (export_complete, PIPE-11: every chunk of an app run arrived and Apple's
+    stream ended on its own). An upload the app's watchdog cut short, a missing chunk or an
+    app build that reports no completeness leaves the day NaN, whatever the upload time. The
+    two sleep-anchored columns additionally need the scored sleep, a sync at least an hour past
+    its onset, and that window backed (pre_sleep_complete / during_sleep_complete); otherwise
+    they are NaN on an otherwise complete day. Only a literal True counts. Days the app never
+    reported (before the first sync's ~30-day backfill, or a gap) are NaN too, never zero.
 
     Kept out of the forecasting models (NOT_FORECAST_PREFIXES): the evening the forecast
     runs, today's use is not synced yet. Descriptive and causal analyses only; they switch
@@ -1656,8 +1663,23 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
         s = s.dropna(subset=["day"]).drop_duplicates("day")
         synced = pd.to_datetime(s["synced_at"], errors="coerce", utc=True)
         day_end = (s["day"] + pd.Timedelta(days=1, hours=6)).dt.tz_localize(ET_TZ)
-        s = s[(synced >= day_end).fillna(False)]
+
+        def flag(col: str) -> pd.Series:
+            # Only a literal True: a missing column, NULL or anything else is "not known complete".
+            if col not in s.columns:
+                return pd.Series(False, index=s.index)
+            return s[col].map(lambda v: v is True or v is np.True_)
+
+        s = s[(synced >= day_end).fillna(False) & flag("export_complete")]
+        synced = pd.to_datetime(s["synced_at"], errors="coerce", utc=True)
+        onset = pd.to_datetime(s["sleep_start"], errors="coerce", utc=True) if "sleep_start" in s.columns \
+            else pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns, UTC]")
+        onset_sent = (onset.notna() & (synced >= onset + pd.Timedelta(hours=1))).fillna(False)
         feats = {feat: pd.to_numeric(s[src], errors="coerce") for feat, src in SCREEN_COLS.items()}
+        feats["screen_last_hour_before_sleep_min"] = feats["screen_last_hour_before_sleep_min"].where(
+            onset_sent & flag("pre_sleep_complete"))
+        feats["screen_during_sleep_min"] = feats["screen_during_sleep_min"].where(
+            onset_sent & flag("during_sleep_complete"))
         feats["screen_social_min"] = s["minutes_by_category"].map(
             lambda c: float(c.get("Social", 0.0)) if isinstance(c, dict) else np.nan)
         f = pd.DataFrame(feats, index=s.index)
@@ -1667,7 +1689,7 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
             f[["calendar_date"] + cols], on="calendar_date", how="left")
         assert len(out) == len(df), "screen-time merge changed the row count"
         log.info(f"  Screen-time features: {int(out['screen_total_min'].notna().sum())} complete days "
-                 f"({len(screen) - len(s)} partial/undated day(s) left NaN)")
+                 f"({len(screen) - len(s)} partial, unverified or undated day(s) left NaN)")
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")

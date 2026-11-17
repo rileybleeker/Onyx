@@ -1,4 +1,6 @@
-"""merge_screen_time_features: same-row placement, partial days left NaN, no zero-fill, alignment rules.
+"""merge_screen_time_features: same-row placement, partial days left NaN, no zero-fill, alignment rules,
+and the export completeness contract (PIPE-11): a day or a sleep-anchored estimate counts only when the
+view's completeness flags are literally True. Synthetic rows only.
 
 Run: python tests/test_screen_time_features.py
 """
@@ -23,12 +25,18 @@ def _matrix():
     return pd.DataFrame({"calendar_date": days, "whoop_hrv_rmssd": np.arange(6.0)})
 
 
-def _row(day, total, synced, social=30.0):
-    return {"behavioral_date": day, "total_minutes": total, "late_night_minutes": 40.0,
-            "after_midnight_minutes": 10.0, "pickups": 50, "notifications": 60,
-            "minutes_by_category": {"Social": social, "Other": 5.0},
-            "minutes_last_hour_before_sleep_est": 20.0, "minutes_during_sleep_est": 3.0,
-            "synced_at": synced}
+def _row(day, total, synced, social=30.0, **over):
+    # Sleep onset 01:00 ET (06:00Z in January) the night that closes the day; a complete export
+    # backs the day and both sleep windows unless a test says otherwise.
+    onset = (pd.Timestamp(day) + pd.Timedelta(days=1, hours=6)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    row = {"behavioral_date": day, "total_minutes": total, "late_night_minutes": 40.0,
+           "after_midnight_minutes": 10.0, "pickups": 50, "notifications": 60,
+           "minutes_by_category": {"Social": social, "Other": 5.0},
+           "minutes_last_hour_before_sleep_est": 20.0, "minutes_during_sleep_est": 3.0,
+           "synced_at": synced, "sleep_start": onset,
+           "export_complete": True, "pre_sleep_complete": True, "during_sleep_complete": True}
+    row.update(over)
+    return row
 
 
 def _screen():
@@ -54,6 +62,65 @@ def test_same_row_and_completeness():
     # days the app never reported are NaN, never zero
     assert np.isnan(by.loc["2026-01-01", "screen_total_min"])
     assert np.isnan(by.loc["2026-01-06", "screen_total_min"])
+
+
+def test_completeness_flags_decide_not_the_upload_time():
+    """PIPE-11: every row below was synced the next morning, so the old time rule alone passes them."""
+    synced = "2026-01-03T15:00:00+00:00"
+    screen = pd.DataFrame([
+        _row("2026-01-02", 300.0, synced),                                   # complete
+        _row("2026-01-03", 120.0, "2026-01-04T15:00:00+00:00",               # older app build
+             export_complete=False, pre_sleep_complete=False, during_sleep_complete=False),
+        _row("2026-01-04", 200.0, "2026-01-05T15:00:00+00:00", export_complete=None),  # NULL in the view
+        _row("2026-01-05", 210.0, "2026-01-06T15:00:00+00:00", export_complete="true"),  # not a literal True
+    ])
+    by = h.merge_screen_time_features(_matrix(), screen).set_index("calendar_date")
+    assert by.loc["2026-01-02", "screen_total_min"] == 300.0
+    for day in ("2026-01-03", "2026-01-04", "2026-01-05"):
+        for col in (*h.SCREEN_COLS, "screen_social_min"):
+            assert np.isnan(by.loc[day, col]), f"{day} {col} must stay NaN"
+
+
+def test_missing_flag_column_means_nothing_is_complete():
+    screen = pd.DataFrame([_row("2026-01-02", 300.0, "2026-01-03T15:00:00+00:00")]).drop(
+        columns=["export_complete", "pre_sleep_complete", "during_sleep_complete"])
+    out = h.merge_screen_time_features(_matrix(), screen)
+    assert out["screen_total_min"].isna().all()
+
+
+def test_sleep_windows_are_gated_separately_and_never_zero_filled():
+    synced = "2026-01-03T15:00:00+00:00"
+    no_pre = pd.DataFrame([_row("2026-01-02", 300.0, synced, pre_sleep_complete=False,
+                                minutes_last_hour_before_sleep_est=0.0)])
+    by = h.merge_screen_time_features(_matrix(), no_pre).set_index("calendar_date")
+    assert by.loc["2026-01-02", "screen_total_min"] == 300.0, "the day itself is complete"
+    assert np.isnan(by.loc["2026-01-02", "screen_last_hour_before_sleep_min"]), "unknown, not 0"
+    assert by.loc["2026-01-02", "screen_during_sleep_min"] == 3.0
+
+    no_during = pd.DataFrame([_row("2026-01-02", 300.0, synced, during_sleep_complete=False)])
+    by = h.merge_screen_time_features(_matrix(), no_during).set_index("calendar_date")
+    assert by.loc["2026-01-02", "screen_last_hour_before_sleep_min"] == 20.0
+    assert np.isnan(by.loc["2026-01-02", "screen_during_sleep_min"])
+
+    # Synced less than an hour after sleep onset (onset 06:00Z, sync 06:30Z is before the day ended anyway,
+    # so use a late onset): the hour straddling onset may not have been sent.
+    late = pd.DataFrame([_row("2026-01-02", 300.0, "2026-01-03T15:00:00+00:00",
+                              sleep_start="2026-01-03T14:30:00+00:00")])
+    by = h.merge_screen_time_features(_matrix(), late).set_index("calendar_date")
+    assert np.isnan(by.loc["2026-01-02", "screen_last_hour_before_sleep_min"])
+    assert np.isnan(by.loc["2026-01-02", "screen_during_sleep_min"])
+
+    no_sleep = pd.DataFrame([_row("2026-01-02", 300.0, synced, sleep_start=None)])
+    by = h.merge_screen_time_features(_matrix(), no_sleep).set_index("calendar_date")
+    assert np.isnan(by.loc["2026-01-02", "screen_last_hour_before_sleep_min"])
+    assert by.loc["2026-01-02", "screen_total_min"] == 300.0
+
+
+def test_loader_selects_the_completeness_columns():
+    src = (Path(__file__).resolve().parent.parent / "hrv_analysis.py").read_text(encoding="utf-8")
+    block = src[src.index('"phone_usage_daily",'):src.index("phone_usage_daily load failed")]
+    for col in ("export_complete", "pre_sleep_complete", "during_sleep_complete", "sleep_start", "synced_at"):
+        assert col in block, col
 
 
 def test_alignment_rules():

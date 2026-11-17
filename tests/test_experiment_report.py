@@ -224,12 +224,14 @@ class FakeStore:
     def progress(self, as_of):
         return self.reports[("EXP-901", "progress", as_of.isoformat())]["payload"]
 
-    def add_screen(self, i, minutes, settled=True):
+    def add_screen(self, i, minutes, settled=True, verified=True):
         day = _day(i)
         synced = datetime(day.year, day.month, day.day, 14, tzinfo=timezone.utc) + timedelta(days=1 if settled else 0)
         sleep = datetime(day.year, day.month, day.day, 4, tzinfo=timezone.utc) + timedelta(days=1)
+        # verified: a complete export backs the day and the hour before onset (PIPE-11 flags of the view)
         self.screens.append({"behavioral_date": day.isoformat(), "sleep_start": sleep.isoformat(),
-                             "synced_at": synced.isoformat(), "minutes_last_hour_before_sleep_est": minutes})
+                             "synced_at": synced.isoformat(), "minutes_last_hour_before_sleep_est": minutes,
+                             "export_complete": verified, "pre_sleep_complete": verified})
 
 
 class FakePages:
@@ -301,6 +303,38 @@ def test_screen_minutes_count_only_once_settled():
     for hour_minute, expected in (((10, 59), None), ((11, 0), 2.5)):
         stamp = datetime(day.year, day.month, day.day, *hour_minute, tzinfo=timezone.utc) + timedelta(days=1)
         assert ad.settled_screen_minutes({**row, "synced_at": stamp.isoformat()}, day) == expected
+
+
+def test_unverified_screen_time_is_unknown_and_the_check_in_answer_stays_the_fallback():
+    """PIPE-11: an export the watchdog cut short (or an older app build) is never settled, even when
+    synced the next morning, so a 0 there is not adherence; the check-in answer decides, visibly."""
+    day = _day(3)
+    store = FakeStore(END)
+    store.add_screen(3, 0.0, verified=False)
+    row = store.screens[0]
+    assert ad.settled_screen_minutes(row, day) is None
+    assert ad.settled_screen_minutes({**row, "export_complete": True}, day) is None, "the hour before onset is not backed"
+    assert ad.settled_screen_minutes({**row, "pre_sleep_complete": True}, day) is None, "the day is not backed"
+    assert ad.settled_screen_minutes({**row, "export_complete": True, "pre_sleep_complete": True}, day) == 0.0
+    bare = {k: v for k, v in row.items() if k not in ("export_complete", "pre_sleep_complete")}
+    assert ad.settled_screen_minutes({**bare}, day) is None, "flags absent = not settled"
+    assert ad.settled_screen_minutes({**row, "export_complete": "true", "pre_sleep_complete": 1}, day) is None
+
+    rule = {"source": ad.SCREEN_SOURCE, "max": 5.0, "arm": "A"}
+    minutes = ad.settled_screen_minutes(row, day)
+    fallback = ad.resolve_day("A", rule, minutes, "no")
+    assert (fallback.adherent, fallback.basis, fallback.objective) == (False, "self_report", None)
+    unknown = ad.resolve_day("A", rule, minutes, None)
+    assert (unknown.adherent, unknown.basis) == (None, "none"), "missing coverage is unknown, never adherent"
+    summary = ad.summarize([fallback, unknown])
+    assert summary["days_self_report_only"] == 1 and summary["days_unknown"] == 1 and summary["days_objective"] == 0
+
+
+def test_report_reads_the_completeness_flags():
+    src = (Path(__file__).resolve().parent.parent / "experiment_report.py").read_text(encoding="utf-8")
+    block = src[src.index("def screen_rows"):src.index("def set_status")]
+    for col in ("export_complete", "pre_sleep_complete", "minutes_last_hour_before_sleep_est", "synced_at", "sleep_start"):
+        assert col in block, col
 
 
 def test_objective_decides_and_the_answer_is_fallback_or_confirmation():

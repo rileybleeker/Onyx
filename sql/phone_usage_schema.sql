@@ -115,6 +115,9 @@ GRANT ALL  ON pds.phone_usage_segments, pds.phone_usage_items TO service_role;
 -- next behavioral day, and about half of a typical night's sleep falls there.
 -- security_invoker: a plain view runs as its owner and would bypass the
 -- service-role-only RLS above.
+-- The live definition appends completeness columns: sql/phone_usage_completeness.sql
+-- (run it after this file; re-running this file alone then stops at the view,
+-- because a view cannot lose columns).
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW pds.phone_usage_daily WITH (security_invoker = true) AS
 WITH seg AS (

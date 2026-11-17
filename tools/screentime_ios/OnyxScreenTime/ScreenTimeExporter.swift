@@ -33,6 +33,13 @@ private actor SegmentStore {
     private(set) var deviceModel: String?
     private(set) var lastUpdate = Date()
     private(set) var finished = false
+    /// True only when Apple's stream ran to its natural end with no error. A stream that threw (after
+    /// any number of hours) is `finished` but never `endedCleanly`: its hours cannot be certified complete.
+    private(set) var endedCleanly = false
+    /// The EARLIEST last-update time Apple reported on any emission of the stream (DeviceActivityData
+    /// .lastUpdatedDate). Hours an earlier emission delivered and a later one did not re-send are only
+    /// as fresh as that earlier emission, so the earliest is the honest bound. nil = nothing reported.
+    private(set) var sourceUpdatedAt: Date?
     private(set) var failure: Error?
 
     func put(_ segment: UsageSegment) {
@@ -45,9 +52,14 @@ private actor SegmentStore {
         deviceModel = model
     }
 
+    func noteSource(updatedAt: Date) {
+        sourceUpdatedAt = sourceUpdatedAt.map { min($0, updatedAt) } ?? updatedAt
+    }
+
     func finish(_ error: Error?) {
         finished = true
         failure = error
+        endedCleanly = (error == nil)
     }
 
     var count: Int { byStart.count }
@@ -147,7 +159,10 @@ enum ScreenTimeExporter {
         }
         // Snapshot BEFORE cancelling: cancellation can end the stream, which
         // would flip `finished` and could still store a half-read hour.
-        let ended = await store.finished
+        // `ended` is read first and means "the stream ended by itself with no error": an error
+        // after some hours, a watchdog stop and a cancellation are all NOT an end (Onyx counts the
+        // run's hours as complete only when this is true).
+        let ended = await store.endedCleanly
         let segments = await store.segments
         let failure = await store.failure
         reader.cancel()
@@ -163,12 +178,19 @@ enum ScreenTimeExporter {
             segments: segments,
             deviceName: await store.deviceName,
             deviceModel: await store.deviceModel,
-            streamEnded: ended
+            streamEnded: ended,
+            streamFailed: failure != nil && !ended,
+            windowStart: firstDay,
+            windowEnd: now,
+            // Not the export time: a clean stream can be served from a cache last updated hours ago, and
+            // the hours after that are missing, not empty. No report at all certifies nothing.
+            sourceUpdatedAt: await store.sourceUpdatedAt ?? firstDay
         )
     }
 
     private static func ingest(_ data: DeviceActivityData, into store: SegmentStore) async {
         await store.setDevice(name: data.device.name, model: String(describing: data.device.model))
+        await store.noteSource(updatedAt: data.lastUpdatedDate)
 
         for await segment in data.activitySegments {
             var items: [String: UsageItem] = [:]
