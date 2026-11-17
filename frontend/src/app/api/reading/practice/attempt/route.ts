@@ -16,10 +16,10 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * Body: { attempt_key, question_id, version, round_key, round_date, round_kind: daily|extra|chapter|checkpoint,
  *         answer, hinted?, response_ms?, quiz_key? (checkpoint only) }
  *
- * One answer to a bank question (lib/reading-recall-server.ts recordAttempt): the question is re-read (the version
- * must be current), graded in code when it can be (a short answer, a choice after "Show choices", an order, "I don't
+ * One answer to a bank question (lib/reading-recall-server.ts recordAttempt): the question, the day and the idea's
+ * history are read in one snapshot (pds.reading_bank_attempt_context; the version must be current), graded in code when it can be (a short answer, a choice after "Show choices", an order, "I don't
  * know"; the same gradeLocal the browser ran, and the server's verdict wins) and stored with the replayed schedule in
- * ONE call of pds.reading_bank_attempt; anything else is stored pending and its grade job runs in after(), never
+ * ONE call of pds.reading_bank_attempt (two database requests per answer); anything else is stored pending and its grade job runs in after(), never
  * awaited. The same attempt_key with the same request answers the first receipt (`replayed: true`), also after the
  * question was re-versioned or retired since (the function looks the key up before it refuses a changed question);
  * another request under that key is 409 key_reused. Answers: 200 {success, attempt_key, grading_status, verdict, score,

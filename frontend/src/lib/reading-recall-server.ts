@@ -50,11 +50,12 @@ import { checkVoiceRequest } from "./checkin-voice";
  *   in memory; nothing is written. Each card carries its question with the rubric, the idea, its valid sources and
  *   the preview of each verdict (scheduleAfterGrade on the stored state: the commit's own replay, so preview = commit
  *   while the state is clean).
- * - recordAttempt: POST /api/reading/practice/attempt. Re-reads the question (the version must be current), grades in
- *   code when it can (gradeLocal, the same function the browser runs; the server's verdict wins), replays the schedule
- *   of every idea the answer moves (replayIdeaState over pds.reading_bank_events + the new answer) and calls
- *   pds.reading_bank_attempt once with the compare-and-set basis. `raced` re-reads and tries again (at most
- *   RACE_RETRIES more times). An answer code cannot judge is stored pending with a grade job; the route runs that job
+ * - recordAttempt: POST /api/reading/practice/attempt. ONE read (pds.reading_bank_attempt_context: the question, the
+ *   book's switch, the behavioral day, the idea state versions and the events, from one snapshot; the version must be
+ *   current), grades in code when it can (gradeLocal, the same function the browser runs; the server's verdict wins),
+ *   replays the schedule of every idea the answer moves (replayIdeaState over those events + the new answer) and
+ *   calls pds.reading_bank_attempt once with the compare-and-set basis: two requests per answer. `raced` re-reads
+ *   and tries again (at most RACE_RETRIES more times). An answer code cannot judge is stored pending with a grade job; the route runs that job
  *   in after() (claimAndRunGrade), never awaited by the answer.
  * - runGradeJob: one claimed grade job (the route's after(), and the worker's dispatch for step 'grade', S2): Sonnet
  *   5.5 at low effort through bankModelCall (no tools, GRADE_SCHEMA), the point marks validated in code, the score
@@ -415,8 +416,6 @@ interface QuestionRow {
   unlock_chapter: number | null;
   superseded_at: string | null;
   retired_at: string | null;
-  /** The idea's state_version, read with the question (undefined when it was not read). */
-  state_version?: number;
   /** Whether the question's book has the bank turned on (pds.reading_bank_deck's `enabled` rule). */
   enabled: boolean;
 }
@@ -429,28 +428,21 @@ const bankOn = (b: BankBookRow) => !!b && b.approved_at != null && b.paused_reas
 
 /**
  * One question version, with whether its book has the bank turned on (the book's reading_bank_books row rides in the
- * same statement). With `withState`, the idea's state_version rides along too, so it is read strictly before the
- * idea's events: a replay built on an older version can only fail the compare-and-set, never pass it. When the
- * embeds cannot be resolved the plain row is read instead, and the bank row on its own.
+ * same statement). When the embed cannot be resolved the plain row is read instead, and the bank row on its own.
+ * (The answer route does not use this: its one read is readAttemptContext.)
  */
-async function readQuestion(supabase: Supa, questionId: number, withState: boolean): Promise<QuestionRow | null> {
+async function readQuestion(supabase: Supa, questionId: number): Promise<QuestionRow | null> {
   const { data, error } = await supabase
     .from("reading_questions")
-    .select(`${QUESTION_COLS},${BANK_BOOK_EMBED}${withState ? ",reading_ideas(reading_idea_state(state_version))" : ""}`)
+    .select(`${QUESTION_COLS},${BANK_BOOK_EMBED}`)
     .eq("question_id", questionId)
     .maybeSingle();
   if (!error) {
     if (!data) return null;
-    const row = data as unknown as Omit<QuestionRow, "enabled"> & { reading_ideas?: unknown; books?: unknown };
+    const row = data as unknown as Omit<QuestionRow, "enabled"> & { books?: unknown };
     const book = one(row.books as { reading_bank_books?: unknown } | { reading_bank_books?: unknown }[] | null | undefined);
-    const out = { ...row, enabled: bankOn(one(book?.reading_bank_books as BankBookRow | BankBookRow[])) } as QuestionRow & { reading_ideas?: unknown; books?: unknown };
+    const out = { ...row, enabled: bankOn(one(book?.reading_bank_books as BankBookRow | BankBookRow[])) } as QuestionRow & { books?: unknown };
     delete out.books;
-    if (withState) {
-      const idea = one(row.reading_ideas as { reading_idea_state?: unknown } | { reading_idea_state?: unknown }[] | null | undefined);
-      const st = idea ? one(idea.reading_idea_state as { state_version?: unknown } | { state_version?: unknown }[] | null | undefined) : null;
-      out.state_version = idea ? num(st?.state_version, 0) : undefined;
-    }
-    delete out.reading_ideas;
     return out;
   }
   if (!["PGRST200", "PGRST201"].includes(String(error.code))) throw readFailed(error);
@@ -543,7 +535,13 @@ async function readEvents(supabase: Supa, bookId: number, ids: number[]): Promis
     return true;
   });
   if (total !== null && unique.length < total) throw refuse(500, "failed");
-  for (const r of unique) {
+  return eventsByIdea(unique);
+}
+
+/** Event rows grouped by idea, each list in the order the rows came (idea, time, attempt key). */
+function eventsByIdea(rows: EventRow[]): Map<number, BankEvent[]> {
+  const out = new Map<number, BankEvent[]>();
+  for (const r of rows) {
     const id = Number(r.idea_id);
     const list = out.get(id) ?? [];
     list.push({
@@ -560,6 +558,65 @@ async function readEvents(supabase: Supa, bookId: number, ids: number[]): Promis
     out.set(id, list);
   }
   return out;
+}
+
+/** Event rows pds.reading_bank_attempt_context returns at most (the paged reader's bound: 20 pages of 1000). */
+export const ATTEMPT_EVENTS_MAX = EVENTS_PAGE * EVENTS_MAX_PAGES;
+
+/** Everything an answer needs before its write, read in one snapshot (pds.reading_bank_attempt_context). */
+interface AttemptContext {
+  q: QuestionRow;
+  /** The behavioral day, from the same statement as the rest. */
+  today: string;
+  /** Whether an answer is stored under the attempt key already (a retry; read with the question). */
+  attemptStored: boolean;
+  /** The ideas the answer moves: the question's idea, or the ideas a chapter recall rubric lists. */
+  ids: number[];
+  /** state_version per idea (0 = no state row yet), read in the same snapshot as the events. */
+  versions: Map<number, number>;
+  events: Map<number, BankEvent[]>;
+}
+
+const numOrNull = (v: unknown): number | null => (v == null ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+
+/**
+ * The answer's one read: pds.reading_bank_attempt_context (sql/reading_bank_attempt_context.sql) answers the question
+ * version, whether its book is on, the behavioral day, the idea ids it moves, their state versions and their events
+ * from ONE statement, so the versions can never be newer than the events a replay is built on (a replay on an older
+ * version can only fail the write's compare-and-set). null = no such question.
+ *
+ * Every event row, or a refusal: the SQL returns the exact count next to the rows (and no rows at all above
+ * ATTEMPT_EVENTS_MAX), and a count that does not match what came back throws, so no schedule is written from part
+ * of a history. A function that is not applied yet is 503 bank_unavailable like the other bank functions.
+ */
+async function readAttemptContext(supabase: Supa, questionId: number, attemptKey: string): Promise<AttemptContext | null> {
+  const { data, error } = await supabase.rpc("reading_bank_attempt_context", { p_question: questionId, p_attempt: attemptKey });
+  if (error) throw readFailed(error);
+  if (data == null) return null;
+  if (!plainObject(data) || !plainObject(data.question) || !isYmd(data.today)) throw refuse(500, "failed");
+  const row = data.question;
+  const format = typeof row.format === "string" ? (row.format as BankFormat) : null;
+  const q: QuestionRow = {
+    question_id: num(row.question_id),
+    version: num(row.version),
+    book_id: num(row.book_id),
+    format,
+    prompt: typeof row.prompt === "string" ? row.prompt : "",
+    rubric: typeof row.rubric === "string" ? row.rubric : null,
+    idea_id: numOrNull(row.idea_id),
+    bank_chapter: numOrNull(row.bank_chapter),
+    unlock_chapter: numOrNull(row.unlock_chapter),
+    superseded_at: typeof row.superseded_at === "string" ? row.superseded_at : null,
+    retired_at: typeof row.retired_at === "string" ? row.retired_at : null,
+    enabled: data.enabled === true,
+  };
+  const ids = uniqueIds(Array.isArray(data.idea_ids) ? data.idea_ids : []);
+  const versions = new Map<number, number>();
+  const stored = plainObject(data.state_versions) ? data.state_versions : {};
+  for (const id of ids) versions.set(id, num(stored[String(id)], 0));
+  const rows = Array.isArray(data.events) ? (data.events as EventRow[]) : [];
+  if (num(data.events_total, -1) !== rows.length || rows.length > ATTEMPT_EVENTS_MAX) throw refuse(500, "failed");
+  return { q, today: data.today, attemptStored: data.attempt_stored === true, ids, versions, events: eventsByIdea(rows) };
 }
 
 type EventFor = (ideaId: number) => { verdict: Verdict; append?: Omit<BankEvent, "verdict"> } | null;
@@ -874,20 +931,21 @@ export type AttemptAnswer = BankAnswer & { /** Set when the answer was stored pe
  * question changed (a sync re-versioned the chapter recall, a flag retired it) gets its original receipt, never 409.
  * Only the version is checked here: a question_id is one immutable version, so another version is a malformed request.
  *
- * Database requests, in order: (1) the question, with its idea's state_version and the book's switch in the same read,
- * and the behavioral day, in parallel; (2) a code-graded answer only: the idea's events (one request under
- * EVENTS_PAGE rows); (3) pds.reading_bank_attempt. The version is read strictly BEFORE the events (a replay built on
- * an older version can only fail the compare-and-set, never pass it), so the events cannot ride the first read; a
- * model-graded answer needs neither the events nor a replay (its grade job writes the schedule), so it is two steps.
- * A single-statement snapshot of question + version + events (an SQL function) would make step 2 disappear.
+ * Database requests: TWO, in sequence, for every answer (the speed budget is one read plus one write): (1)
+ * pds.reading_bank_attempt_context, one statement that answers the question, the book's switch, the behavioral day,
+ * the ideas the answer moves with their state versions, and their events (a snapshot: the versions can never be
+ * newer than the events); (2) pds.reading_bank_attempt, which stores the answer and, for a code-graded one, the
+ * replayed schedule. A model-graded answer does not use the events (its grade job writes the schedule). Only a
+ * `raced` answer (another write moved a version between the two) reads the context again, at most RACE_RETRIES times.
  */
 export async function recordAttempt(supabase: Supa, input: AttemptInput): Promise<AttemptAnswer> {
   try {
-    const [q, today] = await Promise.all([readQuestion(supabase, input.question_id, true), dbToday(supabase)]);
-    if (!q || !q.format) return { status: 404, body: { error: "not_found" }, pendingKey: null };
+    const first = await readAttemptContext(supabase, input.question_id, input.attempt_key);
+    const q = first?.q;
+    const format = q?.format;
+    if (!first || !q || !format) return { status: 404, body: { error: "not_found" }, pendingKey: null };
     if (q.version !== input.version) return { status: 409, body: { error: "question_changed" }, pendingKey: null };
-    if (input.hinted && q.format !== "cued") return { status: 400, body: { error: "bad_request" }, pendingKey: null };
-    const format = q.format;
+    if (input.hinted && format !== "cued") return { status: 400, body: { error: "bad_request" }, pendingKey: null };
     const grade = gradeLocal(format, q.rubric, input.answer, input.hinted);
     const base = {
       attempt_key: input.attempt_key,
@@ -906,7 +964,7 @@ export async function recordAttempt(supabase: Supa, input: AttemptInput): Promis
     // stored while it was on still gets its receipt: pds.reading_bank_attempt looks the key up first and answers it
     // (or 409 key_reused) without grading anything, and its grade job is not run again from here.
     if (!q.enabled) {
-      if (!(await attemptStored(supabase, input.attempt_key))) return { status: 409, body: { error: "bank_off" }, pendingKey: null };
+      if (!first.attemptStored) return { status: 409, body: { error: "bank_off" }, pendingKey: null };
       const replay = await supabase.rpc("reading_bank_attempt", { p: base });
       const off = bankFailure(replay.data, replay.error);
       if (off) return { status: off.status, body: { error: off.error }, pendingKey: null };
@@ -916,22 +974,25 @@ export async function recordAttempt(supabase: Supa, input: AttemptInput): Promis
     let data: unknown = null;
     let error: DbError = null;
     let ids: number[] = [];
-    let date = today;
+    let date = first.today;
     if (grade.kind === "model") {
       ({ data, error } = await supabase.rpc("reading_bank_attempt", { p: base }));
     } else {
       const recall = format === "chapter_recall";
       const verdict = grade.verdict;
       const questionId = q.question_id;
-      const day = clampRoundDate(input.round_date, today);
-      date = day;
-      ids = recall ? rubricIdeaIds(q.rubric) : q.idea_id ? [q.idea_id] : [];
       const local = { verdict, score: grade.score };
-      let versions: Map<number, number> | null = !recall && q.idea_id && typeof q.state_version === "number" ? new Map([[q.idea_id, q.state_version]]) : null;
+      let ctx = first;
       for (let tries = 0; tries <= RACE_RETRIES; tries++) {
-        if (!versions) versions = await readVersions(supabase, ids);
-        const events = await readEvents(supabase, q.book_id, ids);
-        const states = computeStates(ids, versions, events, today, input.attempt_key, (id) => ({
+        if (tries > 0) {
+          const again = await readAttemptContext(supabase, input.question_id, input.attempt_key);
+          if (!again) throw refuse(404, "not_found");
+          ctx = again;
+        }
+        ids = ctx.ids;
+        const day = clampRoundDate(input.round_date, ctx.today);
+        date = day;
+        const states = computeStates(ids, ctx.versions, ctx.events, ctx.today, input.attempt_key, (id) => ({
           verdict: recall ? recallEventVerdict(verdict, null, id) : verdict,
           append: {
             attempt_key: input.attempt_key,
@@ -946,14 +1007,13 @@ export async function recordAttempt(supabase: Supa, input: AttemptInput): Promis
         }));
         ({ data, error } = await supabase.rpc("reading_bank_attempt", { p: { ...base, local, states } }));
         if (!isRaced(data, error)) break;
-        versions = null;
       }
     }
     const failed = bankFailure(data, error);
     if (failed) return { status: failed.status, body: { error: failed.error }, pendingKey: null };
     const r = data as Record<string, unknown>;
     // The day the SQL stored differs from the one the replay assumed only if the 06:00 rollover fell between the
-    // two reads: replay those ideas again from what is stored.
+    // two requests: replay those ideas again from what is stored.
     if (grade.kind !== "model" && r.replayed !== true && r.attempt_date !== date && ids.length) {
       await replayIdeas(supabase, ids, q.book_id).catch(() => undefined);
     }
@@ -1827,7 +1887,7 @@ export async function recordChatAnswer(
     }
     if (typeof input.answer !== "string" || !input.answer.trim() || input.answer.length > ANSWER_MAX) return { ok: false, status: 400, error: "bad_answer" };
     if (typeof input.tool_use_id !== "string" || !input.tool_use_id) return { ok: false, status: 400, error: "bad_request" };
-    const q = await readQuestion(supabase, input.question_id, false);
+    const q = await readQuestion(supabase, input.question_id);
     if (!q || !q.format) return { ok: false, status: 404, error: "not_found" };
     // Only the version here (a question_id is one immutable version); superseded, retired and locked are refused by
     // pds.reading_bank_attempt after it looked the key up, so a replayed tool call still gets its stored answer.

@@ -6,6 +6,8 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { createHash } = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const { loadTs } = require("./helpers/load-ts.cjs");
 
 const TODAY = "2031-03-10";
@@ -53,6 +55,10 @@ function makeDb() {
     // the count and the read), for pds.reading_bank_events paging.
     maxRows: null,
     countBias: 0,
+    // pds.reading_bank_attempt_context: an events_total that runs ahead of the rows it returned (events lost on the way),
+    // and a total above the function's bound (it then returns the count and no rows at all).
+    contextBias: 0,
+    contextOverBound: false,
     // true: the daily deck carries only due, new and answered-today ideas, as pds.reading_bank_deck picks them.
     deckPicks: false,
     rpc: [],
@@ -199,6 +205,26 @@ function fakeSupabase(db) {
       }
       // The function's ORDER BY: idea, answered_at, attempt key.
       return out.sort((x, y) => x.idea_id - y.idea_id || String(x.answered_at).localeCompare(String(y.answered_at)) || String(x.attempt_key).localeCompare(String(y.attempt_key)));
+    },
+    // pds.reading_bank_attempt_context (sql/reading_bank_attempt_context.sql): the answer's one read, as one object.
+    reading_bank_attempt_context: ({ p_question, p_attempt }) => {
+      const q = db.questions.get(Number(p_question));
+      if (!q) return null;
+      const ids = q.format === "chapter_recall" ? JSON.parse(q.rubric).ideas.map((i) => i.idea_id) : q.idea_id ? [q.idea_id] : [];
+      const events = rpcs.reading_bank_events({ p_ideas: ids });
+      return {
+        today: db.today,
+        question: {
+          question_id: q.question_id, version: q.version, book_id: q.book_id, format: q.format, prompt: q.prompt, rubric: q.rubric, idea_id: q.idea_id,
+          bank_chapter: q.bank_chapter, unlock_chapter: q.unlock_chapter, superseded_at: q.superseded_at, retired_at: q.retired_at,
+        },
+        enabled: db.enabled !== false,
+        idea_ids: ids,
+        state_versions: Object.fromEntries(ids.map((id) => [String(id), stateOf(id)?.state_version ?? 0])),
+        events_total: events.length + db.contextBias + (db.contextOverBound ? 20001 : 0),
+        events: db.contextOverBound ? [] : events,
+        attempt_stored: p_attempt != null && db.attempts.has(p_attempt),
+      };
     },
     reading_bank_attempt: ({ p }) => {
       const k = p.attempt_key;
@@ -664,30 +690,64 @@ test("a short answer is graded at once, with the schedule the preview showed (pr
   assert.deepEqual([ord.body.verdict, ord.body.score], ["partial", 0.6]);
 });
 
-test("an answer's database requests are bounded: one question read (its state version and the book's switch ride along), the day, at most one events request, one attempt RPC", async () => {
-  // Code-graded idea answer: [question + day in parallel] -> [events] -> [attempt]. The state version is read strictly
-  // before the events (it rides on the question read), which is what lets a stale replay only fail the compare-and-set;
-  // no separate state or version read, no paging for a short history.
+test("an answer is TWO database requests, one read and one write, however it is graded (READ-QUIZ-01 speed contract)", async () => {
+  // The read is pds.reading_bank_attempt_context: the question, the book's switch, the behavioral day, the idea state
+  // versions and the events of every idea the answer moves, from one statement. The write is pds.reading_bank_attempt.
+  // No table read, no separate day, version or events request, in sequence: read, then write.
+  const TWO = ["reading_bank_attempt_context", "reading_bank_attempt"];
+
+  // Code-graded idea answer.
   const db = makeDb();
   const r = load(db);
   const res = await r.attempt.POST(post(answer({ answer: "tide tables" })));
   assert.equal(res.body.grading_status, "graded");
-  assert.deepEqual(db.reads, ["reading_questions"], "one table read, no reading_idea_state read");
-  assert.deepEqual(
-    [...db.rpc].sort(),
-    ["behavioral_today_now", "reading_bank_attempt", "reading_bank_events"].sort(),
-    "the day, the events once, the attempt once",
-  );
-  assert.ok(db.rpc.indexOf("reading_bank_events") < db.rpc.indexOf("reading_bank_attempt"), "events before the write");
-  assert.ok(db.reads.length + db.rpc.length <= 4, "four requests at most, in three steps");
+  assert.deepEqual(db.reads, [], "no table read: nothing the answer needs is read by a second request");
+  assert.deepEqual(db.rpc, TWO, "the snapshot read, then the write, nothing else");
 
-  // Model-graded answer: no replay is needed at write time (the grade job writes the schedule), so no events request.
+  // Model-graded answer: the events are not used (its grade job writes the schedule), and it is still two requests.
   const db2 = makeDb();
   const r2 = load(db2);
   const typed = await r2.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
   assert.equal(typed.body.grading_status, "pending");
-  assert.deepEqual(db2.reads, ["reading_questions"]);
-  assert.deepEqual([...db2.rpc].sort(), ["behavioral_today_now", "reading_bank_attempt"].sort(), "the day and the attempt RPC: two steps");
+  assert.deepEqual(db2.reads, []);
+  assert.deepEqual(db2.rpc, TWO);
+
+  // A chapter recall (several ideas, their events in the same read).
+  const db3 = makeDb();
+  addRecall(db3, 1100, 1, [101, 102]);
+  const r3 = load(db3);
+  const recall = await r3.attempt.POST(post(answer({ question_id: 1100, answer: "I don't know" })));
+  assert.equal(recall.body.grading_status, "graded");
+  assert.deepEqual(db3.reads, []);
+  assert.deepEqual(db3.rpc, TWO);
+
+  // A retry of a stored answer (the receipt is replayed) and an answer for a book turned off: the same shape.
+  const body = answer();
+  const first = await r.attempt.POST(post(body));
+  db.rpc.length = 0;
+  const retry = await r.attempt.POST(post(body));
+  assert.equal(retry.body.replayed, true);
+  assert.deepEqual(db.rpc, TWO);
+  assert.deepEqual(db.reads, []);
+  db.enabled = false;
+  db.rpc.length = 0;
+  const off = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change" })));
+  assert.deepEqual([off.status, off.body], [409, { error: "bank_off" }]);
+  assert.deepEqual(db.rpc, ["reading_bank_attempt_context"], "refused after the one read: nothing written, no second look-up");
+  db.rpc.length = 0;
+  const offRetry = await r.attempt.POST(post(body));
+  assert.deepEqual([offRetry.status, offRetry.body.attempt_key], [200, first.body.attempt_key]);
+  assert.deepEqual(db.rpc, TWO, "the key was found in the same read, so the receipt costs one more request");
+  assert.deepEqual(db.reads, []);
+
+  // A refusal that needs no write is one request (404 question; question_changed by version).
+  db.enabled = true;
+  db.rpc.length = 0;
+  assert.equal((await r.attempt.POST(post(answer({ question_id: 999999 })))).status, 404);
+  assert.deepEqual(db.rpc, ["reading_bank_attempt_context"]);
+  db.rpc.length = 0;
+  assert.deepEqual((await r.attempt.POST(post(answer({ version: 2 })))).body, { error: "question_changed" });
+  assert.deepEqual(db.rpc, ["reading_bank_attempt_context"]);
 });
 
 test("the same attempt_key replays the same receipt; another payload under it is 409 key_reused", async () => {
@@ -712,6 +772,11 @@ test("raced: the schedule is re-read and sent again, at most RACE_RETRIES more t
   const ok = await r.attempt.POST(post(answer()));
   assert.equal(ok.status, 200);
   assert.equal(db.rpc.filter((n) => n === "reading_bank_attempt").length, 3);
+  assert.deepEqual(
+    db.rpc,
+    ["reading_bank_attempt_context", "reading_bank_attempt", "reading_bank_attempt_context", "reading_bank_attempt", "reading_bank_attempt_context", "reading_bank_attempt"],
+    "only a raced write reads the snapshot again",
+  );
   assert.equal(db.attempts.size, 1);
 
   const db2 = makeDb();
@@ -720,6 +785,8 @@ test("raced: the schedule is re-read and sent again, at most RACE_RETRIES more t
   const res = await r2.attempt.POST(post(answer()));
   assert.deepEqual([res.status, res.body.error], [409, "raced"]);
   assert.equal(db2.rpc.filter((n) => n === "reading_bank_attempt").length, r2.S.RACE_RETRIES + 1);
+  assert.equal(db2.rpc.filter((n) => n === "reading_bank_attempt_context").length, r2.S.RACE_RETRIES + 1, "one read per try, no other request");
+  assert.deepEqual(db2.reads, []);
   assert.equal(db2.attempts.size, 0, "nothing stored");
 });
 
@@ -1208,10 +1275,8 @@ test("a book turned off takes no new answers (nothing stored, no paid grade queu
   assert.equal(db.attempts.size, 1);
 });
 
-test("a replay reads every answer of an idea across pages; a history shorter than its count writes nothing", async () => {
-  const db = makeDb();
-  const r = load(db);
-  for (let n = 5; n >= 1; n--) {
+function addHistory(db, n) {
+  for (; n >= 1; n--) {
     const k = key();
     const day = addDays(TODAY, -3 * n);
     db.attempts.set(k, {
@@ -1220,18 +1285,86 @@ test("a replay reads every answer of an idea across pages; a history shorter tha
       ext_hash: "synthetic", grade_tries: 0, grade_error: null, feedback: null, rubric_hits: null, overridden_at: null, model_verdict: null,
     });
   }
-  db.maxRows = 2; // a project whose max rows is 2: every page holds at most two rows
+}
+
+test("an answer replays every earlier answer of its idea from the one snapshot read; a history that does not add up writes nothing", async () => {
+  const db = makeDb();
+  const r = load(db);
+  addHistory(db, 5);
+  db.maxRows = 2; // a row cap on table results does not apply to the snapshot (one JSON object, however long the history)
   const res = await r.attempt.POST(post(answer()));
   assert.equal(res.status, 200);
-  assert.equal(db.rpc.filter((n) => n === "reading_bank_events").length, 3, "three pages");
+  assert.deepEqual(db.rpc, ["reading_bank_attempt_context", "reading_bank_attempt"], "no pages: one read holds the whole history");
   assert.equal(db.states.get(101).review_count, 6, "all five earlier answers and this one were replayed");
-  // A count that runs ahead of the rows (one removed between the count and the read): the replay is refused.
-  db.countBias = 1;
+
+  // The snapshot's count runs ahead of the rows it returned (events lost on the way): refused, no write request at all.
+  db.contextBias = 1;
+  db.rpc.length = 0;
   const before = db.attempts.size;
   const short = await r.attempt.POST(post(answer({ question_id: 1005, answer: "fog bell" })));
   assert.deepEqual([short.status, short.body], [500, { error: "failed" }]);
+  assert.deepEqual(db.rpc, ["reading_bank_attempt_context"], "the write was never sent");
   assert.equal(db.attempts.size, before, "nothing stored");
   assert.equal(db.states.get(103), undefined, "no schedule written");
+
+  // A history above the function's bound comes back as a count with no rows: refused the same way, never replayed in part.
+  db.contextBias = 0;
+  db.contextOverBound = true;
+  db.rpc.length = 0;
+  const big = await r.attempt.POST(post(answer({ question_id: 1005, answer: "fog bell" })));
+  assert.deepEqual([big.status, big.body], [500, { error: "failed" }]);
+  assert.deepEqual(db.rpc, ["reading_bank_attempt_context"]);
+  assert.equal(db.states.get(103), undefined);
+  assert.equal(r.S.ATTEMPT_EVENTS_MAX, 20000, "the bound the SQL function keeps");
+
+  // The same refusal for a model-graded answer: the history it does not use still has to add up (one rule for every answer).
+  db.contextOverBound = false;
+  db.contextBias = 1;
+  db.rpc.length = 0;
+  const typed = await r.attempt.POST(post(answer({ question_id: 1004, answer: "The keeper logs each change before dawn" })));
+  assert.deepEqual([typed.status, typed.body], [500, { error: "failed" }]);
+  assert.equal(db.attempts.size, before);
+});
+
+test("the repair replay still reads a long history in pages and refuses one shorter than its count", async () => {
+  // replayIdeas (the flag repair, grade and Disagree paths) reads pds.reading_bank_events directly, in pages.
+  const db = makeDb();
+  const r = load(db);
+  addHistory(db, 5);
+  db.maxRows = 2; // every page holds at most two rows
+  const done = await r.S.replayIdeas(r.supabase, [101], BOOK);
+  assert.deepEqual(done, { written: 1, raced: false });
+  assert.equal(db.rpc.filter((n) => n === "reading_bank_events").length, 3, "three pages");
+  assert.equal(db.states.get(101).review_count, 5, "all five answers were replayed");
+  // A count that runs ahead of the rows (one removed between the count and the read): the replay is refused.
+  db.countBias = 1;
+  db.states.delete(101);
+  await assert.rejects(() => r.S.replayIdeas(r.supabase, [101], BOOK));
+  assert.equal(db.states.get(101), undefined, "no schedule written");
+});
+
+test("sql/reading_bank_attempt_context.sql: one read-only statement, service role only, with the bounds the server relies on", () => {
+  const sql = fs.readFileSync(path.join(__dirname, "..", "..", "sql", "reading_bank_attempt_context.sql"), "utf8");
+  const code = sql.replace(/--[^\n]*/g, "");
+  assert.match(code, /CREATE OR REPLACE FUNCTION pds\.reading_bank_attempt_context\(p_question BIGINT, p_attempt UUID DEFAULT NULL\)/);
+  assert.match(code, /LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_temp/, "one statement, one snapshot, no writes");
+  assert.ok(!/\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|PERFORM|pg_advisory)\b/i.test(code), "read only, and nothing the MCP would refuse");
+  assert.ok(!/\b(DROP|DELETE|TRUNCATE)\b/i.test(sql), "no destructive word anywhere in the file, comments included");
+  assert.match(code, /pds\.reading_bank_events\(q\.book_id, \(SELECT ids FROM ids\)\)/, "the events the replay is built on");
+  assert.match(code, /LEFT JOIN pds\.reading_idea_state s ON s\.idea_id = i\.id/);
+  assert.match(code, /pds\.behavioral_today_now\(\)/);
+  assert.match(code, /REVOKE ALL ON FUNCTION pds\.reading_bank_attempt_context\(bigint, uuid\) FROM PUBLIC, anon, authenticated;/);
+  assert.match(code, /GRANT EXECUTE ON FUNCTION pds\.reading_bank_attempt_context\(bigint, uuid\) TO service_role;/);
+  assert.ok(!/GRANT[^;]*\b(anon|authenticated|PUBLIC)\b/.test(code), "never granted to the browser's roles");
+  // The same book switch and rubric extraction as the deck / attempt functions, and the bound the server checks.
+  assert.match(code, /bb\.approved_at IS NOT NULL AND bb\.paused_reason IS DISTINCT FROM 'owner'/);
+  assert.match(code, /q\.rubric::jsonb->'ideas'/);
+  assert.match(code, /<= 20000/);
+  const { ATTEMPT_EVENTS_MAX } = load(makeDb()).S;
+  assert.equal(ATTEMPT_EVENTS_MAX, 20000);
+  for (const field of ["today", "question", "enabled", "idea_ids", "state_versions", "events_total", "events", "attempt_stored"]) {
+    assert.ok(code.includes(`'${field}'`), field);
+  }
 });
 
 /* ------------------------------------------------------------------ */
