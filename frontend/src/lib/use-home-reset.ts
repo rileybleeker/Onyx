@@ -181,16 +181,20 @@ function start() {
   try { hidden = localStorage.getItem(HIDE_KEY); } catch { /* ignore */ }
   const ops = readOps();
   emit({ ops, hiddenDay: hidden });
-  void loadHomeReset().then(() => flushHomeReset());
+  // These listeners outlive Today. They re-read the plan only while a card is mounted or a save is waiting; before,
+  // they also read it on /log and every other page once Today had been opened in the session.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") void (state.ops.length ? flushHomeReset() : loadHomeReset());
+    if (document.visibilityState === "visible" && (state.ops.length || listeners.size)) void flushHomeReset();
   });
-  window.addEventListener("online", () => void flushHomeReset());
+  window.addEventListener("online", () => { if (state.ops.length || listeners.size) void flushHomeReset(); });
 }
 
 function subscribe(l: () => void) {
+  const firstOnScreen = listeners.size === 0;
   listeners.add(l);
   start();
+  // The first card on screen reads the plan once. flushHomeReset sends any saved-later ops first and ends with the read.
+  if (firstOnScreen) void flushHomeReset();
   return () => { listeners.delete(l); };
 }
 const server: HomeResetSnapshot = { load: "loading", server: [], ops: [], saveError: null, saving: false, hiddenDay: null, items: [] };
