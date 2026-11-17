@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { Check } from "lucide-react";
-import { getJson } from "@/lib/reading-practice-client";
+import { getJson, sharedAttemptOutbox } from "@/lib/reading-practice-client";
 import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, parseCheckpoint, shortfallLine, type CheckpointData } from "@/lib/reading-map";
 import { AlertLine } from "./PracticeCards";
 
@@ -200,6 +200,7 @@ export default function CheckpointQuiz({
             round={data.round}
             mode="checkpoint"
             checkpoint={{ slug, chapter, key: checkpoint, quizKey: data.quizKey, size: data.size }}
+            outbox={sharedAttemptOutbox}
             onTally={readTally}
             onClose={(changed, _finished, settled) => leave(changed, settled)}
             onRecorded={(r) => {
