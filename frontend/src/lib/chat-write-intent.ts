@@ -1016,7 +1016,11 @@ function intentClauses(text: string): IntentClause[] {
         // An item left out of a request ("log X, not Y") is not to be logged, never a request to record a No.
         const prohibition = base.prohibition || (base.imperative && !base.negated && neg);
         const ambiguous = !prohibition && pol === "ambiguous";
-        if (argumentOnly(clause)) {
+        // A chapter number with a place or time after it continues the chapter list ("chapters 5 and 6 on my run"): it
+        // carries a chapter of the action before it, it does not start a new one.
+        const chapterTail = /^\d+\s+(?:on|at|in|during|while)\b/.test(clause)
+          && /\b(?:chapters?|ch|chap)\.?\s*\d/.test(out.filter((c) => c.action === action).map((c) => c.text).join("\n"));
+        if (argumentOnly(clause) || chapterTail) {
           if (!ambiguous && neg === base.actionNegated && action >= 0) {
             out.push({ text: clause, imperative: base.imperative, negated: neg, prohibition, ambiguous, verb: base.verb, action, chain: base.id, sentence: sentenceText });
           }
@@ -1411,16 +1415,18 @@ export function authorizeWrite(
       // Only the complete active quiz: recognized quiz questions exist, every one has an answer, and the score is
       // out of exactly those questions.
       if (q.asked < 1 || !q.answeredAll || total !== q.asked) return deny("quiz_score_invalid");
-      // A quiz whose request named no checkpoint is bound only by the checkpoint the latest message names itself. An
-      // earlier mention never binds it, and a checkpoint the message does not name is refused, not taken on trust.
-      if (q.checkpoint === null) {
-        const named = quizCheckpoint(maskQuotes(grant.latest));
-        if (named === null) return deny("not_named");
-        if (cp === null || cp.toLowerCase() !== named) return deny("quiz_checkpoint_mismatch");
-      }
     }
+    // The book check runs before the checkpoint one below: a quiz on another book is refused as that book, whatever
+    // checkpoint the latest message names.
     const bad = bookCheck(input, stated ? stated.text : grant.quiz.userText, ctx.books);
     if (bad) return deny(bad);
+    // A quiz whose request named no checkpoint is bound only by the checkpoint the latest message names itself. An
+    // earlier mention never binds it, and a checkpoint the message does not name is refused, not taken on trust.
+    if (!stated && q.checkpoint === null) {
+      const named = quizCheckpoint(maskQuotes(grant.latest));
+      if (named === null) return deny("not_named");
+      if (cp === null || cp.toLowerCase() !== named) return deny("quiz_checkpoint_mismatch");
+    }
     return allow(tool, null);
   }
 
