@@ -19,11 +19,14 @@
  *     is refused, and a statement whose polarity cannot be read ("I didn't skip X", "…without X") refuses it;
  *   - "don't log X" / "don't mark X" / "log Y, not X" is a request not to write X: it grants nothing (never a No) and
  *     refuses any write of X; "don't log it" refuses every write of the message;
- *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
- *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules, and one
- *     serving only when no other amount is stated), the clock times one to one (a time sent twice has to be said
- *     twice; every time said is sent), the chapters as chapter numbers and the minutes as a duration ("chapter 4
- *     for 12 minutes" never gives chapter 12); an amount or a time the action states cannot be left out;
+ *   - every argument is bound to THAT action, read from that action's own clauses (its clause plus the
+ *     argument-only clauses attached to it), never from another action's clause of the same list or sentence: the
+ *     amount with its unit kind exactly as lib/supplement-intake.ts reads it (servings, pills, a weight; "15 mg"
+ *     never becomes 15 servings, "2 servings" never 2 capsules, and one serving only when no other amount is
+ *     stated), the clock times one to one (a time sent twice has to be said twice; every time said is sent; a time
+ *     another action states never fits this one, except the one the list's last item shares with all of them), the
+ *     chapters as chapter numbers and the minutes as a duration ("chapter 4 for 12 minutes" never gives chapter
+ *     12); an amount or a time the action states cannot be left out;
  *   - the day the call would write (its date, or the tool's default when it sends none) has to be the day the action
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
@@ -1185,10 +1188,12 @@ export function authorizeWrite(
     for (const field of ["recall", "question", "medium", "book"]) if (notText(input[field])) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText));
     if (blocked) return deny(blocked);
-    const chains = [...new Map(done.filter((a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText)).map((a) => [a.chain, a])).values()];
-    if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
+    // Each reading action is checked against its own clause, never another action's of the same list ("chapter 3
+    // of this book and chapter 4 of that one" gives each chapter its own book).
+    const readings = done.filter((a) => READING.test(a.text) || FINISHED_BOOK.test(a.text));
+    if (readings.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
     let refusal: RefusalCode = "not_named";
-    for (const a of chains) {
+    for (const a of readings) {
       const r = readingSessionFits(a, input, grant, ctx);
       if (r) { refusal = r; continue; }
       const key = `${tool}|c${a.chain}`;
@@ -1291,8 +1296,9 @@ function dayFits(
 
 /**
  * The times an action states, and whether the call has to send all of them. Its own times, which it must send. With
- * none of its own, the times its list states: required when only the list's last item states them ("Log X and Y at
- * 9pm" is both at 9pm), otherwise allowed but not required ("Log X at 8 and Y" gives Y no time of its own).
+ * none of its own, the one time its list's LAST item states and shares with every item ("Log X and Y at 9pm" is
+ * both at 9pm). Nothing else: a time another action of the list states on its own ("Log X at 8 and Y") is that
+ * action's, never this one's, so this one sends no time at all.
  */
 function actionTimes(a: Action, actions: Action[]): { slots: Array<Set<string>>; required: boolean } {
   const own = clockSlots(a.text);
@@ -1303,7 +1309,7 @@ function actionTimes(a: Action, actions: Action[]): { slots: Array<Set<string>>;
     const shared = clockSlots(last.text);
     if (shared.length > 0) return { slots: shared, required: true };
   }
-  return { slots: clockSlots(a.chainText), required: false };
+  return { slots: [], required: false };
 }
 
 /** Whether the call's arguments are the ones action `a` states (null) or why not. */
@@ -1334,9 +1340,9 @@ function argumentsFit(
 }
 
 /**
- * Whether a reading session call fits reading action `a` (its list): the chapters are numbers said as chapters, the
- * minutes a duration said ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes), the day, the book, the
- * user's words.
+ * Whether a reading session call fits reading action `a`: the chapters are numbers said as chapters, the minutes a
+ * duration said ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes), the day, the book, the user's
+ * words — each read from that action's own clauses, never another action's of the same list.
  */
 function readingSessionFits(
   a: Action,
@@ -1344,8 +1350,8 @@ function readingSessionFits(
   grant: WriteGrant,
   ctx: { requestDay: string; books?: ReadingBooks | null },
 ): RefusalCode | null {
-  const text = a.chainText;
-  const book = bookCheck(input, a.sentence, ctx.books);
+  const text = a.text;
+  const book = bookCheck(input, a.text, ctx.books);
   if (book) return book;
   const chapters = chapterNumbers(text);
   const through = num(input.chapter_through);
