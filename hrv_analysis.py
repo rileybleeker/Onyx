@@ -1469,10 +1469,10 @@ def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     return pivot, label_map
 
 
-def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None, dict[str, set[str]]]:
     """Pivot per-compound supplement intake into per-compound dose columns.
 
-    Returns (wide_df, tracking_start) where:
+    Returns (wide_df, tracking_start, unknown_days) where:
       - wide_df has one row per calendar_date with columns:
             supplement_<compound>_amount  (sum across products that day)
         For dates within the tracking window where the compound wasn't taken,
@@ -1481,13 +1481,33 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
         distinguish "untracked" from "took zero".
       - tracking_start is the earliest calendar_date in the supplements data,
         used by callers to fill NaN → 0 only within the tracking window.
+      - unknown_days maps each supplement column to the set of dates whose
+        TOTAL is unknown and must stay NaN (never 0): a day with an intake in
+        the unknown unit class, or with an unreadable amount.
+
+    UNIT CLASSES (HIST-UNIT-01, mirroring supplement_dose_response_rows): when
+    the input carries a `unit_class` column, the grouping becomes
+    (calendar_date, ingredient_group, unit_class) and every (compound, unit
+    class) pair that occurs gets its OWN feature column, so a 1 mg tablet and
+    a 1 mL liquid of the same compound on one day are two columns — never one
+    summed amount of 2. The mass class ('mg', including IU-converted vitamins
+    A / D / E, which the rollup already converted) keeps the historical column
+    name supplement_<compound>_amount so existing feature names do not change;
+    every other class gets its own suffix (e.g. supplement_<compound>_amount_ml).
+    Rows of the unknown unit class (SUPPLEMENT_UNKNOWN_UNIT_CLASS) carry no
+    readable amount in any class, so they produce no column; instead they make
+    that compound's day unknown in every column it has (unknown_days), exactly
+    like a row whose total_amount is unreadable. Without a `unit_class` column
+    the previous behaviour is kept exactly: one column per compound, summed
+    across whatever rows exist, and unknown_days is empty.
 
     Caller is responsible for merging on calendar_date and applying the
-    tracking-window fillna(0). We keep that here at the matrix layer rather
+    tracking-window fillna(0), skipping the unknown_days so an unknown total is
+    never written as 0. We keep that here at the matrix layer rather
     than inside this function because the matrix has the full date spine.
     """
     if supplements is None or supplements.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, {}
 
     def clean_col(c: str) -> str:
         return ("supplement_" + str(c).lower()
@@ -1498,28 +1518,77 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
                 .replace(".", "").replace("&", "and")
                 .strip("_") + "_amount")
 
+    def col_name(group, unit_class) -> str:
+        base = clean_col(group)
+        if unit_class == SUPPLEMENT_MASS_CLASS:
+            return base
+        slug = "".join(ch for ch in str(unit_class).lower() if ch.isalnum())
+        return base[: -len("_amount")] + "_amount_" + slug if slug else base
+
+    def dedup_cleaned_names(wide: pd.DataFrame) -> pd.DataFrame:
+        # Distinct group (or group x unit class) values can collapse to the same
+        # cleaned column name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid"
+        # both -> alpha_lipoic_acid). Sum across the duplicates so downstream
+        # merges don't choke on non-unique columns.
+        if wide.columns.duplicated().any():
+            dups = wide.columns[wide.columns.duplicated()].unique().tolist()
+            log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
+            wide = wide.T.groupby(level=0).sum(min_count=1).T
+            # groupby on transposed loses calendar_date column ordering; restore
+            cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
+            wide = wide[cols]
+        return wide
+
     supp = supplements.copy().dropna(subset=["calendar_date", "ingredient_group"])
     supp["total_amount"] = pd.to_numeric(supp["total_amount"], errors="coerce")
     tracking_start = str(supp["calendar_date"].min())
+    unknown_days: dict[str, set[str]] = {}
 
-    grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
-                   .agg(total_amount=("total_amount", "sum")))
+    if "unit_class" not in supp.columns:
+        grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
+                       .agg(total_amount=("total_amount", "sum")))
+        wide = grouped.pivot_table(
+            index="calendar_date", columns="ingredient_group",
+            values="total_amount", aggfunc="sum",
+        ).reset_index()
+        wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
+        return dedup_cleaned_names(wide), tracking_start, unknown_days
+
+    supp["_unit_class"] = supplement_unit_classes(supp)
+    known = supp[supp["_unit_class"] != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+    # A day whose total is unknown in ANY class of a compound (an unreadable
+    # amount, or an intake in the unknown unit class) is unknown for the
+    # compound as a whole: excluded from every column that compound has, the
+    # same "other_days | unquantified_days" rule supplement_dose_response_rows
+    # applies to the primary class.
+    bad = supp["total_amount"].isna() | (supp["_unit_class"] == SUPPLEMENT_UNKNOWN_UNIT_CLASS)
+    classes_by_group = {g: set(grp["_unit_class"]) for g, grp in known.groupby("ingredient_group")}
+    for day, group in (supp.loc[bad, ["calendar_date", "ingredient_group"]]
+                       .drop_duplicates().itertuples(index=False)):
+        for unit_class in classes_by_group.get(group, set()):
+            unknown_days.setdefault(col_name(group, unit_class), set()).add(str(day))
+
+    if known.empty:
+        return pd.DataFrame(), tracking_start, unknown_days
+    grouped = (known.groupby(["calendar_date", "ingredient_group", "_unit_class"], as_index=False)
+                    ["total_amount"].sum(min_count=1))
+    # A day with any unknown row is unknown for the compound as a whole: its
+    # summed total (which would otherwise be the partial sum of the readable
+    # rows) becomes NaN, so neither the pivot nor the caller's 0-fill can turn
+    # it into a number.
+    bad_pairs = {(str(d), g) for d, g in
+                 zip(supp.loc[bad, "calendar_date"], supp.loc[bad, "ingredient_group"])}
+    grouped.loc[[(str(d), g) in bad_pairs for d, g in
+                 zip(grouped["calendar_date"], grouped["ingredient_group"])],
+                "total_amount"] = np.nan
+    grouped["_col"] = [col_name(g, c) for g, c in
+                       zip(grouped["ingredient_group"], grouped["_unit_class"])]
     wide = grouped.pivot_table(
-        index="calendar_date", columns="ingredient_group",
+        index="calendar_date", columns="_col",
         values="total_amount", aggfunc="sum",
     ).reset_index()
-    wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
-    # Distinct ingredient_group values can collapse to the same cleaned column
-    # name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid" both -> alpha_lipoic_acid).
-    # Sum across the duplicates so downstream merges don't choke on non-unique columns.
-    if wide.columns.duplicated().any():
-        dups = wide.columns[wide.columns.duplicated()].unique().tolist()
-        log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
-        wide = wide.T.groupby(level=0).sum(min_count=1).T
-        # groupby on transposed loses calendar_date column ordering; restore
-        cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
-        wide = wide[cols]
-    return wide, tracking_start
+    wide.columns = ["calendar_date"] + list(wide.columns[1:])
+    return dedup_cleaned_names(wide), tracking_start, unknown_days
 
 
 def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
@@ -2284,13 +2353,16 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     supp_tracking_start = None  # set below; referenced by the melatonin bridge
     supp_data = data.get("supplements")
     if supp_data is not None and not supp_data.empty:
-        sdf, supp_tracking_start = pivot_supplements(supp_data)
+        sdf, supp_tracking_start, supp_unknown_days = pivot_supplements(supp_data)
         if not sdf.empty:
             df = df.merge(sdf, on="calendar_date", how="left")
             supp_cols = [c for c in sdf.columns if c != "calendar_date"]
             in_window = df["calendar_date"] >= supp_tracking_start
             for col in supp_cols:
-                df.loc[in_window, col] = df.loc[in_window, col].fillna(0)
+                # A day whose total is unknown (unreadable amount, or an intake
+                # in the unknown unit class) stays NaN: never 0.
+                fillable = in_window & ~df["calendar_date"].isin(supp_unknown_days.get(col, set()))
+                df.loc[fillable, col] = df.loc[fillable, col].fillna(0)
             log.info(f"  Supplements pivoted: {len(supp_cols)} compound columns "
                      f"(tracking window from {supp_tracking_start})")
 
