@@ -2,6 +2,8 @@ import "server-only";
 import { createClient } from "@supabase/supabase-js";
 import {
   MARK_COLUMNS,
+  OPEN_ORDER_COLUMNS,
+  OPEN_STATUSES,
   ORDER_COLUMNS,
   ORDERS_WINDOW_DAYS,
   parseMarkRow,
@@ -37,12 +39,21 @@ export type OrdersLoad =
 
 const MISSING_TABLE = new Set(["42P01", "PGRST205"]);
 
-export async function loadOrders(now: Date = new Date()): Promise<OrdersLoad> {
+/**
+ * "all" (the /orders page): every order in the window with every column. "open" (the Today summary): only the
+ * orders that can need attention or be on the way, with the columns the summary reads (online-orders.ts
+ * OPEN_STATUSES). The summary's counts, top items and versions are the same under either scope.
+ */
+export type OrdersScope = "all" | "open";
+
+export async function loadOrders(now: Date = new Date(), scope: OrdersScope = "all"): Promise<OrdersLoad> {
   const db = ordersDb();
   const since = new Date(now.getTime() - ORDERS_WINDOW_DAYS * 86_400_000).toISOString();
+  const open = scope === "open";
+  const ordersQuery = db.from("online_orders").select(open ? OPEN_ORDER_COLUMNS : ORDER_COLUMNS)
+    .gte("last_event_at", since);
   const [ordersRes, marksRes, syncRes] = await Promise.all([
-    db.from("online_orders").select(ORDER_COLUMNS)
-      .gte("last_event_at", since)
+    (open ? ordersQuery.in("status", OPEN_STATUSES) : ordersQuery)
       .order("last_event_at", { ascending: false })
       .order("order_key", { ascending: true })
       .limit(1000),

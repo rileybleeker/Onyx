@@ -20,10 +20,11 @@ function groupVersion(list: readonly ClassifiedOrder[]): string {
 // orders behind the attention and arriving-today counts and lastSync is the package email check's last run
 // ({at, status}, never its error text; null when none could be read); {status: "not_connected"} until the tables exist.
 export async function GET() {
-  const data = await loadOrders();
+  // Speed (2026-11-17): reads only the open orders (scope "open"); the counts below are unchanged by that (see online-orders.ts).
+  const now = new Date();
+  const data = await loadOrders(now, "open");
   if (data.state === "error") return NextResponse.json({ error: "orders unavailable" }, { status: 500, headers: { "Cache-Control": "no-store" } });
   if (data.state === "not_connected") return NextResponse.json({ status: "not_connected" }, { headers: { "Cache-Control": "no-store" } });
-  const now = new Date();
   const g = groupOrders(data.orders, data.marks, now);
   const today = etDay(now);
   return NextResponse.json({

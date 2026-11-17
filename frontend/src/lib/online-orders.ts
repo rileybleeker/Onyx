@@ -84,6 +84,17 @@ export const ORDER_COLUMNS =
   "ordered_at,shipped_at,out_for_delivery_at,delivered_at,canceled_at,expected_date,last_event_at," +
   "confirms_delivery,ships_physically";
 export const MARK_COLUMNS = "alias_key,received_at,hidden,updated_at";
+/**
+ * What the Today summary reads (scope "open" of loadOrders): only orders that can need attention or be on the way.
+ * A delivered or canceled order is always closed, delivered or canceled in classifyOrder (a mark can only hide it
+ * or mark it arrived), and groupOrders counts attention and arriving orders alone, so leaving those rows out
+ * changes no count, no top item and no version. `tracking` is not read by the summary, so it is not selected.
+ */
+export const OPEN_STATUSES: OrderStatus[] = ["ordered", "shipped", "out_for_delivery"];
+export const OPEN_ORDER_COLUMNS =
+  "order_key,aliases,merchant_name,order_number,items,item_count,status,issue,partially_delivered," +
+  "ordered_at,shipped_at,out_for_delivery_at,delivered_at,canceled_at,expected_date,last_event_at," +
+  "confirms_delivery,ships_physically";
 /** How far back /orders reads (the longest window any rule below looks at, plus margin). */
 export const ORDERS_WINDOW_DAYS = 120;
 
