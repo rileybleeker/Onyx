@@ -25,11 +25,14 @@ import {
  *
  * Nothing here logs an answer: a failure logs an error code only.
  */
+// One client for the module (it holds no session and no data), so a request does not build a new one.
+const experimentsClient = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+  db: { schema: "pds" },
+  auth: { persistSession: false },
+});
+
 function serviceClient() {
-  return createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
-    db: { schema: "pds" },
-    auth: { persistSession: false },
-  });
+  return experimentsClient;
 }
 
 // PGRST202: the function is not in the schema cache, i.e. its SQL file was never applied.
