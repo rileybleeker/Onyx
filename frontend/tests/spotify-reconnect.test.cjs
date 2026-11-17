@@ -880,7 +880,8 @@ function statusDb(tokenData, spotifyBeat) {
     };
     return b;
   };
-  return { client: { from }, reads };
+  // /api/status also calls rpc("reading_bank_status") (READ-QUIZ-01 s2): answer "function missing" (not set up).
+  return { client: { from, rpc: () => Promise.resolve({ data: null, error: { code: "PGRST202" } }) }, reads };
 }
 
 async function statusWith(tokenData, beat) {

@@ -51,7 +51,7 @@ def _photo():
 
 
 def _merged(delivery=None, photo=None, matrix=None):
-    return h.merge_estimated_intake_features(matrix or _matrix(), delivery, photo) \
+    return h.merge_estimated_intake_features(matrix if matrix is not None else _matrix(), delivery, photo) \
             .set_index("calendar_date")
 
 

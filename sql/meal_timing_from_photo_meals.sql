@@ -29,7 +29,7 @@
 --   via LEFT JOIN pds.meal_timing_from_photo_meals mtpm
 --      ON mtpm.calendar_date = s.calendar_date
 --   and then drop + recreate the matview (+ unique index, service-role grants)
---   in the same migration. Never DROP VIEW ... CASCADE on the canonical view.
+--   in the same migration. Never drop the canonical view with CASCADE.
 --
 -- Additive only: CREATE OR REPLACE VIEW, no DROP statements. Nothing for the
 -- anon role. View written, not applied, not in matrix.
