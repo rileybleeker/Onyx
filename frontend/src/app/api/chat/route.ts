@@ -1508,7 +1508,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       .gte("behavioral_date", photoSinceStr)
       .order("behavioral_date", { ascending: false });
     if (MISSING_SCHEMA.has(meals.error?.code ?? "") || MISSING_SCHEMA.has(daily.error?.code ?? "")) {
-      return JSON.stringify({ meals: [], daily_totals: [], note: "Photo meals are not set up yet, so none exist." });
+      return JSON.stringify({ meals: [], daily_totals: [], note: "Photo meals aren't available yet, so none exist." });
     }
     if (meals.error) return JSON.stringify({ error: meals.error.message });
     if (daily.error) return JSON.stringify({ error: daily.error.message });
