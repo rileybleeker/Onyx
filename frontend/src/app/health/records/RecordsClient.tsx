@@ -108,7 +108,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
     mark(r.id, true);
     const a = await call('DELETE', `/api/medical/labs/${r.id}`);
     mark(r.id, false);
-    if (!a.ok) { setNotice({ text: `Could not remove the result: ${a.error}`, error: true }); return; }
+    if (!a.ok) { setNotice({ text: 'Could not remove the result. Try again.', error: true }); return; }
     setResults(cur => cur.filter(x => x.id !== r.id));
     if (editing === r.id) setEditing(null);
     setNotice(null);
@@ -128,7 +128,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
     mark(d.id, true);
     const a = await call('DELETE', `/api/medical/documents/${d.id}`);
     mark(d.id, false);
-    if (!a.ok) { setNotice({ text: `Could not remove the document: ${a.error}`, error: true }); return; }
+    if (!a.ok) { setNotice({ text: 'Could not remove the document. Try again.', error: true }); return; }
     setDocs(cur => cur.filter(x => x.id !== d.id));
     setNotice(null);
     setUndo({
