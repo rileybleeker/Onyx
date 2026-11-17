@@ -654,5 +654,7 @@ test("source: checkboxes with 44 px targets and visible focus; a tap writes noth
   // Opening and scrolling still write nothing: the writes are in handlers (and the Say it autosave), not in the mount effects.
   const route = fs.readFileSync(path.join(__dirname, "..", "src", "app/api/supplements/log-product/route.ts"), "utf8");
   assert.match(route, /export async function POST/);
-  assert.doesNotMatch(route, /event_key/, "the route is unchanged by the multi-select");
+  // The route (which since #530 accepts an optional event_key) is not changed by the multi-select: still one product per
+  // request. The section does not send an event_key: a lost answer is "not confirmed" and goes out only on Log again.
+  assert.doesNotMatch(src, /event_key/, "the multi-select sends no event_key; its replay safety is client-side");
 });
