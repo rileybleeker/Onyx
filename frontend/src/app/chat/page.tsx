@@ -15,7 +15,7 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
  * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
  * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. A send whose
  * answer never arrived is also remembered on this device until it is resolved (hash + id only, one key per send so
- * tabs never overwrite each other's, no expiry: lib/chat-contract.ts PENDING_SEND_KEY). When the same conversation is
+ * tabs never overwrite each other's, no expiry: lib/chat-contract.ts pendingSendKey). When the same conversation is
  * sent again after a reload or a closed tab, Riley chooses: retry that send (its id, so nothing is saved twice) or send
  * it as a new message (a new id; the earlier one is abandoned, then forgotten). A remembered send whose account Riley
  * has already seen and dismissed is resolved and never matches again. Which id a send uses: requestIdForSend.

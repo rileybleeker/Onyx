@@ -22,7 +22,7 @@ function compile(path, imports = {}, sandboxConsole = { error() {} }) {
     if (name === "@/lib/supabase-server") return signedIn;
     if (name === "node:crypto") return require("node:crypto");
     throw new Error(`Unexpected import: ${name}`);
-  }, Response, console: sandboxConsole, process: { env: {} }, crypto: globalThis.crypto, TextEncoder });
+  }, Response, console: sandboxConsole, process: { env: {} }, crypto: globalThis.crypto, TextEncoder, URL });
   return exports;
 }
 const contract = compile("../src/lib/chat-contract.ts");
@@ -893,7 +893,7 @@ test("eleven and more unanswered sends: after a reload the oldest conversation s
   assert.equal(w.effects.size, 11);
   // A reload: the store is read back, every send is still there.
   const reloaded = contract.readPendingSendStore(stored);
-  assert.deepEqual(reloaded.map((p) => p.id), sends.map((s) => s.id));
+  assert.deepEqual([...reloaded.map((p) => p.id)], sends.map((s) => s.id));
   // The oldest conversation sent again is recognised, so the page asks Retry or New instead of minting a new id.
   const oldest = sends[0];
   const match = contract.unresolvedPendingSend(reloaded, await contract.conversationKey(oldest.messages));
