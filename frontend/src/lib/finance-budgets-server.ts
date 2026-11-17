@@ -12,6 +12,10 @@ import { subscriptionViews, type SubscriptionView } from "@/lib/finance-subscrip
  * owner-only middleware). Explicit columns; logs carry error codes only, never rows.
  */
 const COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
+// Pages of the 400-day ledger read requested in the same round trip as the first page (fetchPaged `speculate`),
+// instead of one after another: the page count is only known from the first page's exact count. Same value as the
+// ledger's window read; a longer history just takes the remaining pages in the normal parallel step.
+const TXN_SPECULATE_PAGES = 3;
 
 export type BudgetsLoad =
   | { kind: "ok"; result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean; subscriptions: SubscriptionView[] }
@@ -24,7 +28,7 @@ export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: Bu
   // 400 days: budgets use about 7 months, subscription detection needs the year (annual renewals).
   const since = new Date(Date.parse(`${today}T00:00:00Z`) - 400 * 86_400_000).toISOString().slice(0, 10);
   const [rows, fixes, budgetsRes] = await Promise.all([
-    fetchPaged((f, t, c) => db.from("finance_transactions").select(COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40),
+    fetchPaged((f, t, c) => db.from("finance_transactions").select(COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40, TXN_SPECULATE_PAGES),
     loadCategoryFixes(db),
     db.from("finance_budgets").select("category,monthly_cents"),
   ]);
