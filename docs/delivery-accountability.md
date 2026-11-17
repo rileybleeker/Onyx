@@ -8,7 +8,7 @@ Keep these states separate and attach evidence to the same task and attempt:
 
 - **Launched:** authorized scope, acceptance criteria, task/attempt IDs, worktree, branch, owner, process/run reference and recovery checkpoint recorded. Launch is not completion.
 - **Code written:** actual changed files and commit/head identified; builder output retained as a claim to verify.
-- **Reviewed:** Codex inspected that exact diff, resolved concrete findings and recorded the reviewed revision. A new head requires renewed review and applicable checks.
+- **Reviewed:** before merge, the builder's in-workflow review (independent Claude reviewer, Codex CLI, PAL/OpenRouter on code only) found no unresolved blocker at that exact head. After deploy, Codex reviews the deployed revision and records findings; each confirmed finding becomes a follow-up fix PR (Riley, 2026-11-17: Codex never gates a merge). A new head requires renewed pre-merge review and applicable checks.
 - **Merged:** PR and exact merge commit recorded after authorized release gates. One owner performs the transition; another agent or merge train must not independently release the same worker branch.
 - **Deployed:** observed Production deployment identifies the merge revision, or a newer revision proved to contain it. Record which revision is actually served; do not substitute a queued build or another deployment's success.
 - **Verified:** task-specific acceptance observed on the serving revision. Relevant UI changes include authenticated Today, desktop and phone widths, and the changed interaction. A login health check or passing automated suite alone does not establish product acceptance. Missing access, device coverage or observations remain explicit gaps.
