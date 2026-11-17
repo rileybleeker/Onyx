@@ -462,6 +462,10 @@ function StatusView({ early }: { early: boolean }) {
   // True after a failed read (network error or a non-OK response). With no data, the page shows the load-error panel
   // instead of the healthy-looking summary (which would read "Active Errors: 0" for data that never arrived).
   const [loadFailed, setLoadFailed] = useState(false);
+  // True after a failed poll or refresh. With data already on screen, the page keeps that data and shows a notice with
+  // the time of the last successful refresh (refreshedAtRef) so a stale snapshot is visibly stale.
+  const [refreshFailed, setRefreshFailed] = useState(false);
+  // Time of the last successful refresh (lastOkAt).
   const refreshedAtRef = useRef<Date | null>(null);
   // The first load of a full page visit takes the GET the HTML started (once); later polls fetch for themselves.
   const firstLoad = useRef(early);
@@ -474,9 +478,11 @@ function StatusView({ early }: { early: boolean }) {
       const res = await (takeEarly ? earlyOr(STATUS_URL, get) : get());
       if (!res.ok) {
         setLoadFailed(true);
+        setRefreshFailed(true);
       } else {
         const fresh: StatusResponse = await res.json();
         setLoadFailed(false);
+        setRefreshFailed(false);
         clientCache.put(STATUS_URL, fresh);
         // Bail out of the commit when the poll returned the same payload
         // (perf round 3): fetchedAt is volatile — the server stamps it on
@@ -493,6 +499,7 @@ function StatusView({ early }: { early: boolean }) {
     } catch (e) {
       console.error("Failed to fetch status:", e);
       setLoadFailed(true);
+      setRefreshFailed(true);
     } finally {
       setLoading(false);
     }
@@ -632,6 +639,15 @@ function StatusView({ early }: { early: boolean }) {
           Refresh
         </button>
       </div>
+
+      {refreshFailed && data !== null && (
+        <div role="status" className="border border-amber-500/30 bg-amber-500/10 rounded-control p-3 mb-6">
+          <p className="text-[13px] text-amber-300">
+            Couldn&apos;t refresh just now.
+            {refreshedAtRef.current && <> Showing the status from {formatSyncTime(refreshedAtRef.current.toISOString())}.</>}
+          </p>
+        </div>
+      )}
 
       {/* Personalize: every banner, KPI tile, source card and the history table is its own part; parts move
           within their section and into any other section of the page. */}
