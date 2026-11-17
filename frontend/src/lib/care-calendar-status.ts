@@ -38,7 +38,7 @@ export type CareCalendarCard = {
 
 const LABEL = "Care Calendar";
 const DOC = "docs/health-google-calendar.md";
-const CATCH_UP = "the Care Calendar Catch-up workflow";
+const CATCH_UP = "the scheduled care calendar catch-up";
 
 /** The same test as googleConfig() in care-google-server.ts: both Google credentials are present. */
 export function careCalendarConfigured(env: Record<string, string | undefined>): boolean {
