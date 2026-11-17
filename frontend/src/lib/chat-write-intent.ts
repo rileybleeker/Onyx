@@ -227,6 +227,7 @@ export type RefusalCode =
   | "question_not_asked"
   | "flag_not_stated"
   | "quiz_checkpoint_mismatch"
+  | "quiz_checkpoint_unnamed"
   | "once_per_request";
 
 /** Why a call was refused (shown on its receipt and to the model). At most 240 characters each. */
@@ -255,6 +256,7 @@ export const REFUSAL_TEXT: Record<RefusalCode, string> = {
   question_not_asked: "Not recorded: this is not the question just asked. Onyx records an answer only for the question you were asked right before your reply (the one labelled with its Q number).",
   flag_not_stated: "Not flagged: your latest message does not say this question is wrong, unclear, not in that chapter, or from a chapter you have not read. Say which, about that question, to flag it.",
   quiz_checkpoint_mismatch: "Not recorded: this checkpoint is not the one the quiz you asked for was about. Say the checkpoint yourself to record it there.",
+  quiz_checkpoint_unnamed: "Not recorded: your message does not name the checkpoint this score is for. Name it, for example \"chapter 4 quiz: 4 out of 5\", and it will be recorded there.",
   once_per_request: "Not written: this can be done once per message, and it was already done for this one.",
 };
 
@@ -1431,7 +1433,16 @@ export function authorizeWrite(
     const cp = str(input.checkpoint);
     if (q.checkpoint !== null && (cp === null || cp.toLowerCase() !== q.checkpoint)) return deny("quiz_checkpoint_mismatch");
     const stated = done.find((a) => QUIZ_WORD.test(a.text) && numbersIn(a.text).has(score) && numbersIn(a.text).has(total));
-    if (!stated) {
+    if (stated) {
+      // A stated score is bound to the checkpoint of its own report (the message that states it), never to any other:
+      // the write must name that checkpoint. A report that names none is recorded only when the grant identifies one.
+      const reported = quizCheckpoint(stated.sentence);
+      if (reported !== null) {
+        if (cp === null || cp.toLowerCase() !== reported) return deny("quiz_checkpoint_mismatch");
+      } else if (q.checkpoint === null) {
+        return deny("quiz_checkpoint_unnamed");
+      }
+    } else {
       if (!q.requested) return deny("quiz_not_asked");
       if (q.cancelled) return deny("quiz_cancelled");
       if (q.recorded) return deny("quiz_already_recorded");

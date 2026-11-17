@@ -71,7 +71,7 @@ const MATRIX = [
   ["quiz the user asked for", [user("Quiz me on the synthetic book"), assistant("Question 1: what limits output?"), user("The bottleneck"),
     assistant("Correct. Question 2: what sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
-  ["a quiz result the user states", [user("Record my synthetic quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 }, ALLOWED],
+  ["a quiz result the user states, checkpoint named by the report", [user("Record my chapter 1 quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 }, ALLOWED],
   ["a complete quiz with unnumbered questions", [user("Quiz me on the synthetic book"), assistant("What limits output?"), user("The bottleneck"),
     assistant("Correct. What sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
@@ -381,6 +381,13 @@ const MATRIX = [
   ["a quiz result for a different quiz named in the latest message", [user("Quiz me"), assistant("Question 1: what limits output?"),
     user("The bottleneck, chapter 5")],
     "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
+  // Stated score (QUIZ-STATED-ID-1): the checkpoint is the one the same report names, never another one.
+  ["a stated score written to the checkpoint it names", [user("Record my chapter 4 quiz: 4 out of 5")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 4, total: 5 }, ALLOWED],
+  ["a stated score written to another checkpoint", [user("Record my chapter 4 quiz: 4 out of 5")],
+    "record_reading_quiz", { checkpoint: "ch7", score: 4, total: 5 }, refused("quiz_checkpoint_mismatch")],
+  ["a stated score that names no checkpoint asks for one", [user("I got 4 out of 5 on the quiz")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 4, total: 5 }, refused("quiz_checkpoint_unnamed")],
 
   // Round 4 (action-bound record kind): the clause that carries the verb decides what is written. A record-shaped
   // name inside another write (a playlist's name, a shopping-list item, a note's topic) authorizes nothing else.
