@@ -423,6 +423,8 @@ test("a cache read failure stops the call BEFORE any model spend", async () => {
   db.state.failRead.add("activity_tag_suggestions");
   const res = await suggest([w(row)]);
   assert.equal(res.status, 500);
+  assert.equal(res.body.error, "Couldn't suggest tags right now. Try again.");
+  assert.ok(!JSON.stringify(res.body).includes("read failed"), "raw database text must not reach the browser");
   assert.equal(model.calls.length, 0);
   assert.equal(model.constructed, 0);
 });
