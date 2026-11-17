@@ -270,7 +270,7 @@ export function chatWritesOff(env: Record<string, string | undefined>): boolean 
 const norm = (s: string) =>
   s.normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/[‘’ʼ]/g, "'").toLowerCase();
 
-const tokens = (s: string): string[] => norm(s).match(/[a-z0-9]+(?:'[a-z]+)?/g) ?? [];
+export const tokens = (s: string): string[] => norm(s).match(/[a-z0-9]+(?:'[a-z]+)?/g) ?? [];
 
 const own = <T>(table: Record<string, T>, key: string | undefined): T | undefined =>
   key !== undefined && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
@@ -337,13 +337,13 @@ function namedSpan(item: string, text: string, loose = false): [number, number] 
   return [Math.min(...near), Math.max(...near)];
 }
 
-const names = (item: string, text: string, loose = false) => namedSpan(item, text, loose) !== null;
+export const names =(item: string, text: string, loose = false) => namedSpan(item, text, loose) !== null;
 
 /** Text reduced to words: case, spacing and punctuation aside. */
-const flat = (s: string) => norm(s).replace(/[^a-z0-9']+/g, " ").trim();
+export const flat =(s: string) => norm(s).replace(/[^a-z0-9']+/g, " ").trim();
 
 /** `part` occurs word for word in `whole` (case, spacing and punctuation aside). */
-function verbatimIn(part: string, whole: string): boolean {
+export function verbatimIn(part: string, whole: string): boolean {
   const p = flat(part);
   return p.length > 0 && ` ${flat(whole)} `.includes(` ${p} `);
 }
@@ -355,7 +355,7 @@ const NUMBER_WORDS: Record<string, number> = {
   half: 0.5, a: 1, an: 1, single: 1, couple: 2, both: 2,
 };
 
-function numbersIn(text: string): Set<number> {
+export function numbersIn(text: string): Set<number> {
   const out = new Set<number>();
   for (const m of norm(text).matchAll(/(?<![a-z\d])\d+(?:\.\d+)?/g)) out.add(Number(m[0]));
   const words = tokens(text);
@@ -892,7 +892,7 @@ type Polarity = "pos" | "neg" | "ambiguous";
  * "I didn't skip it"; or "without" / "except" inside it, "I meditated without music"). Read from the clause before any
  * reason or circumstance (SUBORDINATE), never by counting negations over the whole clause.
  */
-function polarity(s: string): Polarity {
+export function polarity(s: string): Polarity {
   const main = mainPart(s).replace(NOT_NEGATION, " ");
   const strong = main.match(NEGATION)?.length ?? 0;
   const partial = main.match(PARTIAL_NEGATION)?.length ?? 0;
@@ -903,7 +903,7 @@ function polarity(s: string): Polarity {
 function mainPart(s: string): string {
   return s.split(SUBORDINATE)[0].trim();
 }
-const negated = (s: string) => polarity(s) !== "pos";
+export const negated = (s: string) => polarity(s) !== "pos";
 
 /** A clause that starts its own statement (a subject, a question word, another command): it does not continue a list. */
 const OWN_START =
