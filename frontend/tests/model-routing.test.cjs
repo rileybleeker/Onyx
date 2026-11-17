@@ -465,6 +465,12 @@ test("retryable statuses match the SDK's own rule", () => {
   for (const s of [400, 401, 403, 404, 413, 422, undefined, null, "500"]) assert.equal(R.isRetryableStatus(s), false, String(s));
 });
 
+test("unresolved creation: observed as unresolved and blocks cost promotion", () => {
+  assert.ok(R.PLAYLIST_CREATE_HARD_MS < 300_000 && R.PLAYLIST_CREATE_HARD_MS > R.PLAYLIST_REQUEST_BUDGET_MS + R.PLAYLIST_CREATE_GRACE_MS);
+  assert.equal(R.pilotCostEvidence([{ calls: 1, answered: 1, unresolved: true }]).complete, false);
+  assert.equal(R.pilotCostEvidence([{ calls: 1, answered: 1, unresolved: false }]).complete, true);
+});
+
 test("pilotCostEvidence: an arm's cost is computable only when every attempt reported usage", () => {
   assert.deepEqual(R.pilotCostEvidence([]), { attempts: 0, answered: 0, unpriced: 0, complete: true });
   assert.deepEqual(R.pilotCostEvidence([{ calls: 2, answered: 2 }, { calls: 1, answered: 1 }]), {

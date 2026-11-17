@@ -34,6 +34,7 @@ import {
   pilotObservation,
   PLAYLIST_CALL_TIMEOUT_MS,
   PLAYLIST_CREATE_GRACE_MS,
+  PLAYLIST_CREATE_HARD_MS,
   PLAYLIST_REQUEST_BUDGET_MS,
   retryAfterMs,
 } from "@/lib/model-routing";
@@ -237,6 +238,7 @@ export async function POST(req: NextRequest) {
   let attempts = 0;
   let observed = false;
   let finalResult: CreatePlaylistResult | null = null;
+  let unresolved = false;
   const observe = () => {
     if (observed) return;
     observed = true;
@@ -245,6 +247,7 @@ export async function POST(req: NextRequest) {
         usage,
         latencyMs: Date.now() - started,
         ok: finalResult != null,
+        unresolved,
         calls: attempts,
       }),
     );
@@ -335,14 +338,19 @@ export async function POST(req: NextRequest) {
     if (!creation) {
       if (stop.signal.aborted) return Promise.reject(new Error("Request time budget exceeded"));
       creationPending = true;
-      const write = createPlaylist(args);
+      let writeStarted = false;
+      const write = createPlaylist({ ...args, onWriteStart: () => (writeStarted = true) });
       creation = write;
       write
         .then(
           (r) => {
             finalResult = r;
           },
-          () => undefined,
+          () => {
+            // A failure before any Spotify write (empty tracks, token refresh) left nothing to
+            // protect: a corrected call may try again. A started write stays deduplicated.
+            if (!writeStarted && creation === write) creation = null;
+          },
         )
         .finally(() => {
           creationPending = false;
@@ -509,7 +517,15 @@ export async function POST(req: NextRequest) {
           // Outcome unknown: the response ends now and the creation is waited for (the function
           // is kept alive by `after`), so the request is observed with its real outcome.
           closeStream();
-          await creation?.catch(() => undefined);
+          // Bounded: past the hard end the request is observed as unresolved (cost and outcome
+          // unknown) instead of being lost when the function is terminated.
+          let hardTimer: ReturnType<typeof setTimeout> | undefined;
+          const hard = new Promise<"hard">((r) => {
+            hardTimer = setTimeout(() => r("hard"), Math.max(0, started + PLAYLIST_CREATE_HARD_MS - Date.now()));
+          });
+          const settled = await Promise.race([(creation ?? Promise.resolve()).then(() => "ok" as const, () => "ok" as const), hard]);
+          clearTimeout(hardTimer);
+          if (settled === "hard" && creationPending) unresolved = true;
         }
         // Every path observes once (the flag makes repeats no-ops), including a request whose
         // client disconnected or whose last event could not be sent.

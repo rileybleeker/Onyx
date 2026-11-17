@@ -167,7 +167,7 @@ export function pilotObservation(
   task: RoutedTask,
   choice: ModelChoice,
   pilot: PilotConfig | null,
-  o: { usage: UsageLike[]; latencyMs: number; ok: boolean; calls: number; units?: number; accepted?: number },
+  o: { usage: UsageLike[]; latencyMs: number; ok: boolean; calls: number; units?: number; accepted?: number; unresolved?: boolean },
 ): Record<string, string | number | boolean> | null {
   if (!pilot || !pilot.tasks.has(task)) return null;
   const sum = (k: keyof UsageLike) => o.usage.reduce((a, u) => a + (Number(u?.[k]) || 0), 0);
@@ -178,6 +178,7 @@ export function pilotObservation(
     model: choice.model,
     effort: choice.effort ?? "default",
     ok: o.ok,
+    unresolved: o.unresolved === true,
     calls: Math.max(0, Math.floor(o.calls)),
     answered: o.usage.length,
     unpriced: Math.max(0, Math.floor(o.calls) - o.usage.length),
@@ -197,7 +198,7 @@ export function pilotObservation(
  * attempt the cost criterion stays unmet until the window is reconciled with the provider's usage
  * report (docs/model-routing-pilot.md, "Evaluating").
  */
-export function pilotCostEvidence(lines: ReadonlyArray<{ calls?: unknown; answered?: unknown }>): {
+export function pilotCostEvidence(lines: ReadonlyArray<{ calls?: unknown; answered?: unknown; unresolved?: unknown }>): {
   attempts: number;
   answered: number;
   unpriced: number;
@@ -205,7 +206,10 @@ export function pilotCostEvidence(lines: ReadonlyArray<{ calls?: unknown; answer
 } {
   let attempts = 0;
   let answered = 0;
+  let unresolvedLines = 0;
   for (const l of lines) {
+    // A write still running when the request ended: its cost and outcome are unknown until reconciled.
+    if (l?.unresolved === true) unresolvedLines += 1;
     const c = Number(l?.calls);
     const a = Number(l?.answered);
     // A line without valid counts cannot be priced: count it as one unpriced attempt.
@@ -217,7 +221,7 @@ export function pilotCostEvidence(lines: ReadonlyArray<{ calls?: unknown; answer
     answered += a;
   }
   const unpriced = attempts - answered;
-  return { attempts, answered, unpriced, complete: unpriced === 0 };
+  return { attempts, answered, unpriced, complete: unpriced === 0 && unresolvedLines === 0 };
 }
 
 /** Retries a route makes itself (SDK retries off), the same number the SDK would make by default. */
@@ -236,6 +240,12 @@ export const PLAYLIST_REQUEST_BUDGET_MS = 280_000;
  * settles, never logged as not created while it may still land.
  */
 export const PLAYLIST_CREATE_GRACE_MS = 10_000;
+/**
+ * Hard end for waiting on a creation that never settles, measured from the request start (still
+ * under the platform's default function limit). Past it the request is observed as unresolved
+ * (cost and outcome unknown, blocks cost promotion until reconciled in the usage report).
+ */
+export const PLAYLIST_CREATE_HARD_MS = 295_000;
 
 /**
  * Thrown when one model attempt ran past its own deadline (the response body included: the SDK's
