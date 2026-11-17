@@ -119,7 +119,8 @@ export default function JournalPage() {
       })
       .catch((e) => {
         if ((e as Error).name === "AbortError") return;
-        setError(String(e));
+        console.error("Load journal:", e);
+        setError("Couldn't load your journal. Try again.");
       })
       .finally(() => setLoading(false));
 
@@ -158,7 +159,8 @@ export default function JournalPage() {
         setError(data.error);
       }
     } catch (e) {
-      setError(String(e));
+      console.error("Load journal entry:", e);
+      setError("Couldn't open that entry. Try again.");
     } finally {
       setLoadingFull(false);
     }

@@ -141,7 +141,8 @@ function useBuild(variant: BuildVariant) {
         }
       })
       .catch((e) => {
-        setReason(String(e));
+        console.error("Load install:", e);
+        setReason("Couldn't load the install. Try again.");
         setState("error");
       });
   }, [variant]);

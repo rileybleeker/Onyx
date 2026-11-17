@@ -93,7 +93,6 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
             setSubs(previous => [...previous, body.subscription as Subscription]); setSubNotice('Subscription saved. Nothing was contacted.'); form.reset(); setBusy(false); return;
           }
           if (body && body.setupPending === true) { setStore('pending'); failure = 'setup is pending'; }
-          else if (body && typeof body.error === 'string') failure = body.error;
         } catch { /* network failure: fall through to the in-memory add */ }
         setBusy(false);
         setSubs(previous => [...previous, sub]); setSubNotice(`Subscription added for this visit only (${failure}). Nothing was contacted.`); form.reset(); return;
