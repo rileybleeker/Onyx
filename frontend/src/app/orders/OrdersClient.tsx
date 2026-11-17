@@ -109,6 +109,7 @@ export default function OrdersClient({
     const o = c.order;
     const busy = saving.has(o.key);
     const links = o.tracking.map((t) => ({ t, href: trackingUrl(t) })).filter((x) => x.href);
+    const label = o.orderNumber ? `${o.merchant} order ${o.orderNumber}` : o.merchant;
     return (
       <li key={o.key} className="py-4">
         <p className="text-xs text-text-secondary">{o.merchant}{o.orderNumber ? ` · Order ${o.orderNumber}` : ""}</p>
@@ -123,13 +124,13 @@ export default function OrdersClient({
               </a>
             ))}
             {actions === "open" && <>
-              <button type="button" className={button} disabled={busy}
+              <button type="button" className={button} disabled={busy} aria-label={`Got it: ${label}`}
                 onClick={() => act(o.key, "received", `Marked ${o.merchant} as arrived.`)}>Got it</button>
-              <button type="button" className={button} disabled={busy}
+              <button type="button" className={button} disabled={busy} aria-label={`Hide ${label}`}
                 onClick={() => act(o.key, "hide", `Hid ${o.merchant}.`)}>Hide</button>
             </>}
             {actions === "undo" && (
-              <button type="button" className={button} disabled={busy} onClick={() => act(o.key, "undo", "")}>Undo</button>
+              <button type="button" className={button} disabled={busy} aria-label={`Undo ${label}`} onClick={() => act(o.key, "undo", "")}>Undo</button>
             )}
           </div>
         )}
