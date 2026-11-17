@@ -326,6 +326,30 @@ export default function SupplementsSection() {
     }
   }, [applyToday]);
 
+  /** Retry for the stacks area only: re-reads its own endpoint, leaves the other areas alone. */
+  const reloadStacks = useCallback(async () => {
+    try {
+      const v = await cachedJson<{ stacks: Stack[] }>(STACKS_URL, { check: checkStacks });
+      answered.current.stacks = true;
+      setStacks((prev) => (sameJson(prev, v.stacks) ? prev : v.stacks));
+      setStacksState("ready");
+    } catch {
+      setStacksState((s) => (s === "ready" ? s : "failed"));
+    }
+  }, []);
+
+  /** Retry for the products area only: re-reads its own endpoint, leaves the other areas alone. */
+  const reloadProducts = useCallback(async () => {
+    try {
+      const v = await cachedJson<{ products: Product[] }>(PRODUCTS_URL, { check: checkProducts });
+      answered.current.products = true;
+      setProducts((prev) => (sameJson(prev, v.products) ? prev : v.products));
+      setProductsState("ready");
+    } catch {
+      setProductsState((s) => (s === "ready" ? s : "failed"));
+    }
+  }, []);
+
   // The routed page's first reads take the GETs its HTML already started (lib/log-early.ts), once each.
   const routed = !useInFeed();
   const loadAll = useCallback(() => {
@@ -982,7 +1006,7 @@ export default function SupplementsSection() {
       ) : stacksState === "failed" ? (
         <div className="flex flex-wrap items-center gap-2">
           <p className="text-[13px] text-text-secondary">Couldn&apos;t load stacks.</p>
-          <button type="button" className={btn} onClick={() => { setStacksState("loading"); loadAll(); }}>Retry</button>
+          <button type="button" className={btn} onClick={() => { setStacksState("loading"); void reloadStacks(); }}>Retry</button>
         </div>
       ) : (
         <div className="space-y-2" aria-hidden>{[0, 1].map((i) => <div key={i} className="skeleton h-11 rounded-control" />)}</div>
@@ -1052,7 +1076,7 @@ export default function SupplementsSection() {
         ) : !products && productsState === "failed" ? (
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-[13px] text-text-secondary">Couldn&apos;t load your products.</p>
-            <button type="button" className={btn} onClick={() => { setProductsState("loading"); loadAll(); }}>Retry</button>
+            <button type="button" className={btn} onClick={() => { setProductsState("loading"); void reloadProducts(); }}>Retry</button>
           </div>
         ) : (
           <div className="flex flex-wrap gap-2" aria-hidden>{[0, 1, 2, 3].map((i) => <div key={i} className="skeleton h-11 w-28 rounded-control" />)}</div>
@@ -1237,7 +1261,7 @@ export default function SupplementsSection() {
         ) : todayState === "failed" ? (
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-[13px] text-text-secondary">Couldn&apos;t load today&apos;s intakes.</p>
-            <button type="button" className={btn} onClick={() => { setTodayState("loading"); loadAll(); }}>Retry</button>
+            <button type="button" className={btn} onClick={() => { setTodayState("loading"); void reloadToday(); }}>Retry</button>
           </div>
         ) : (
           <div className="skeleton h-11 rounded-control" aria-hidden />
