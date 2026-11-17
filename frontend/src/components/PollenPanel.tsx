@@ -103,7 +103,11 @@ export default function PollenPanel() {
 
   let body;
   if (load.s === "loading") {
-    body = <div className="animate-pulse rounded bg-surface-hover/40" style={{ minHeight: MIN_HEIGHT }} aria-label="Loading pollen" />;
+    body = (
+      <div role="status" className="animate-pulse rounded bg-surface-hover/40" style={{ minHeight: MIN_HEIGHT }}>
+        <span className="sr-only">Loading pollen</span>
+      </div>
+    );
   } else if (load.s === "not_connected") {
     body = <Note>Pollen isn&apos;t connected yet</Note>;
   } else if (load.s === "error") {
@@ -111,6 +115,11 @@ export default function PollenPanel() {
   } else {
     body = (
       <div style={{ minHeight: MIN_HEIGHT }}>
+        {newest && hasParts && (
+          <p className="sr-only">
+            Newest count on {newest.airDate}: tree {newest.tree ?? "n/a"}, grass {newest.grass ?? "n/a"}, weed {newest.weed ?? "n/a"}, mold {newest.mold ?? "n/a"}.
+          </p>
+        )}
         {newest && (
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 text-[12px] text-text-tertiary">
             <span>
