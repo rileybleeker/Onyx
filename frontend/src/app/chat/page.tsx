@@ -14,6 +14,9 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
 /** Thrown when the sign-in has lapsed; shown as this plain sentence. */
 const SESSION_EXPIRED_MESSAGE = "Your session may have expired. Sign in again.";
 
+/** The sign-in lapsed. Told apart by class in the send catch block, so no server or browser text is read there. */
+class SessionExpiredError extends Error {}
+
 /**
  * The send that failed: its text, its request id and where in the conversation it was sent. Sending the same text
  * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
@@ -287,7 +290,7 @@ export default function ChatPage() {
       // A first send refused before the route ran (or before its ledger) cannot have saved anything: not remembered.
       // A retry's refusal says nothing about what its earlier try saved, so a reused id stays remembered.
       if (!reusedId && (res.redirected || NEVER_RAN.has(res.status))) settlePendingSend(requestId);
-      if (res.redirected || res.status === 401) throw new Error(SESSION_EXPIRED_MESSAGE);
+      if (res.redirected || res.status === 401) throw new SessionExpiredError(SESSION_EXPIRED_MESSAGE);
       // The server no longer accepts this id for this message: the next send starts a new request.
       if (res.status === 409 && data?.code === "request_conflict") {
         staleId = true;
@@ -312,7 +315,7 @@ export default function ChatPage() {
           : "Your message is back in the composer. If it requested an action, check the relevant page before sending again.";
       // The raw error stays in the console; Riley sees one of three fixed sentences.
       console.error("Chat send failed:", err);
-      const reason = err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE
+      const reason = err instanceof SessionExpiredError
         ? SESSION_EXPIRED_MESSAGE
         : err instanceof TypeError
           ? "Onyx could not reach the server. Check your connection and try again."
