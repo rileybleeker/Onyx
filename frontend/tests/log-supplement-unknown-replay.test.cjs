@@ -101,6 +101,9 @@ test("source: the section replays a lost attempt from its stored values and gate
   assert.match(src, /times: a\.times, date: a\.date, event_key: a\.eventKey/, "the POST carries the attempt's own times, day and key");
   assert.match(src, /disabled=\{saving \|\| busy\[k\] \|\| o\?\.kind === "unconfirmed"\}/, "a lost item cannot be removed from the selection");
   assert.match(src, /disabled=\{batchBusy \|\| anyLost\}/, "Clear waits until no lost attempt is pending");
+  assert.match(src, /useState<Selection>\(\(\) => unconfirmedItems\)/, "an unconfirmed save survives a remount of the section");
+  assert.match(src, /disabled=\{batchBusy \|\| anyLost\} onChange=\{\(e\) => setDayChoice/, "the Day control is locked while a save is unconfirmed");
+  assert.match(src, /disabled=\{batchBusy \|\| anyLost \|\| times\.length >= 12\}/, "adding a time is locked while a save is unconfirmed");
   const lib = fs.readFileSync(path.join(__dirname, "..", "src", "lib", "log-supplement-multi.ts"), "utf8");
   assert.doesNotMatch(lib, /eventKeyFor/, "the old per-item key helper is gone");
 });
