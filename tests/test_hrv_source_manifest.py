@@ -132,11 +132,19 @@ class _Rpc:
         if self.db.rpc_missing:
             raise ApiError("PGRST202")
         rel = self.params["p_relation"]
+        if rel in self.db.missing_relations:
+            raise ApiError("42P01")
         if rel in self.db.fail_fp:
             raise ApiError(self.db.fail_fp[rel])
         excl = set(self.params.get("p_exclude") or [])
-        rows = [r for r in self.db.tables.get(rel, [])
-                if str(r.get(self.params["p_date_col"])) < str(self.params["p_before"])]
+        before = str(self.params["p_before"])
+        if self.params.get("p_date_col") is not None:
+            rows = [r for r in self.db.tables.get(rel, [])
+                    if str(r.get(self.params["p_date_col"])) < before]
+        else:  # rows linked to a historical parent row (the SQL function's link form)
+            keys = {p.get(self.params["p_parent_key"]) for p in self.db.tables.get(self.params["p_parent_relation"], [])
+                    if str(p.get(self.params["p_parent_date_col"])) < before}
+            rows = [r for r in self.db.tables.get(rel, []) if r.get(self.params["p_link_col"]) in keys]
         hashes = sorted(hashlib.md5(json.dumps({k: v for k, v in sorted(r.items()) if k not in excl
                                                 and not k.startswith("raw_")}, default=str).encode()).hexdigest()
                         for r in rows)
@@ -150,6 +158,7 @@ class FakeDb:
         self.rpc_calls: list = []
         self.fail: dict[str, str] = {}      # table -> error code raised on any read/write
         self.fail_fp: dict[str, str] = {}   # relation -> error code raised by the fingerprint
+        self.missing_relations: set[str] = set()  # the fingerprint answers 42P01 for these
         self.rpc_missing = False
 
     def schema(self, _name):
@@ -243,7 +252,8 @@ class ManifestCoverage(unittest.TestCase):
     def test_newer_inputs_are_registered(self):
         names = {s.name for s in fs.SOURCES}
         rels = fs.watched_relations()
-        for rel in ("supplement_intake", "supplement_intake_by_compound", "delivery_daily",
+        for rel in ("supplement_intake", "supplement_intake_by_compound", "supplement_intake_by_compound_mat",
+                    "supplement_products", "garmin_activity_laps", "delivery_daily",
                     "phone_usage_daily", "weather_daily", "air_quality_daily", "whoop_workouts",
                     "garmin_activities", "daily_health_matrix_behavioral", "habit_journal",
                     "cronometer_nutrition_daily"):
@@ -422,6 +432,113 @@ class UnknownIsNotNoChange(unittest.TestCase):
         self.assertIn("weather_daily/fingerprint:new_source", run(db, base).changed)
 
 
+LINKED = (
+    fs.FeatureSource(
+        name="garmin_activity_laps", feeds="test",
+        fingerprint=fs.Fingerprint("garmin_activity_laps", None,
+                                   link=fs.Link("activity_id", "garmin_activities", "activity_id",
+                                                "onyx_behavioral_date")),
+    ),
+    fs.FeatureSource(
+        name="supplement_products", feeds="test",
+        fingerprint=fs.Fingerprint("supplement_products", None, exclude=("fetched_at", "is_active"),
+                                   link=fs.Link("product_id", "supplement_intake", "product_id", "intake_date")),
+    ),
+    fs.FeatureSource(
+        name="supplement_rollup", feeds="test",
+        fingerprint=fs.Fingerprint("supplement_intake_by_compound", "calendar_date",
+                                   prefer=("supplement_intake_by_compound_mat",)),
+    ),
+)
+
+
+def linked_db() -> FakeDb:
+    db = FakeDb()
+    db.tables["garmin_activities"] = [
+        {"activity_id": 1, "onyx_behavioral_date": OLD},
+        {"activity_id": 2, "onyx_behavioral_date": "2026-11-19"},   # inside the settle window
+    ]
+    db.tables["garmin_activity_laps"] = [
+        {"activity_id": 1, "lap_index": 0, "avg_heart_rate": 150, "synced_at": "2026-11-02T00:00:00+00:00"},
+        {"activity_id": 2, "lap_index": 0, "avg_heart_rate": 160, "synced_at": "2026-11-19T20:00:00+00:00"},
+    ]
+    db.tables["supplement_intake"] = [
+        {"intake_id": 1, "intake_date": OLD, "product_id": "p-old", "doses": 1},
+        {"intake_id": 2, "intake_date": "2026-11-19", "product_id": "p-new", "doses": 1},
+    ]
+    db.tables["supplement_products"] = [
+        {"product_id": "p-old", "ingredients": [{"name": "Synthetic A", "quantity": None}],
+         "is_active": True, "fetched_at": "2026-10-01T00:00:00+00:00"},
+        {"product_id": "p-new", "ingredients": [{"name": "Synthetic B", "quantity": 5}],
+         "is_active": True, "fetched_at": "2026-11-19T00:00:00+00:00"},
+    ]
+    db.tables["supplement_intake_by_compound"] = [{"calendar_date": OLD, "ingredient_group": "A", "total_amount": 5}]
+    db.tables["supplement_intake_by_compound_mat"] = [{"calendar_date": OLD, "ingredient_group": "A", "total_amount": 5}]
+    db.tables["sync_log"] = []
+    return db
+
+
+class LinkedAndPreferred(unittest.TestCase):
+    def setUp(self):
+        self.db = linked_db()
+        self.base = baseline_for(self.db, sources=LINKED)
+
+    def detect(self):
+        return run(self.db, self.base, sources=LINKED)
+
+    def test_untouched_linked_sources_are_unchanged(self):
+        det = self.detect()
+        self.assertEqual((det.changed, det.unknown), ([], []))
+
+    def test_backfilled_lap_of_a_historical_activity_is_seen(self):
+        self.db.tables["garmin_activity_laps"].append(
+            {"activity_id": 1, "lap_index": 1, "avg_heart_rate": 155, "synced_at": "2026-11-19T22:00:00+00:00"})
+        self.assertIn("garmin_activity_laps/fingerprint", self.detect().changed)
+
+    def test_lap_of_a_recent_activity_is_not_history(self):
+        self.db.tables["garmin_activity_laps"][1]["avg_heart_rate"] = 170
+        self.assertEqual(self.detect().changed, [])
+
+    def test_unquantified_ingredient_edit_on_a_past_product_is_seen(self):
+        self.db.tables["supplement_products"][0]["ingredients"] = [{"name": "Synthetic A", "quantity": 3}]
+        self.assertIn("supplement_products/fingerprint", self.detect().changed)
+
+    def test_archiving_or_refetching_a_product_or_a_new_product_changes_nothing(self):
+        self.db.tables["supplement_products"][0]["is_active"] = False
+        self.db.tables["supplement_products"][0]["fetched_at"] = "2026-11-19T23:00:00+00:00"
+        self.db.tables["supplement_products"][1]["ingredients"] = []
+        self.db.tables["supplement_products"].append({"product_id": "p-unused", "ingredients": []})
+        self.assertEqual(self.detect().changed, [])
+
+    def test_the_rollup_fingerprint_reads_the_matview_the_pipeline_loads(self):
+        # A correction in the live view that the matview has not picked up yet is not trained yet:
+        # the baseline must not count it as consumed.
+        self.db.tables["supplement_intake_by_compound"][0]["total_amount"] = 9
+        self.assertEqual(self.detect().changed, [])
+        self.db.tables["supplement_intake_by_compound_mat"][0]["total_amount"] = 9   # refreshed
+        self.assertIn("supplement_rollup/fingerprint", self.detect().changed)
+        relations = [p["p_relation"] for _, p in self.db.rpc_calls]
+        self.assertNotIn("supplement_intake_by_compound", relations)
+
+    def test_rollup_falls_back_to_the_live_view_when_the_matview_is_missing(self):
+        db = linked_db()
+        db.missing_relations.add("supplement_intake_by_compound_mat")
+        base = baseline_for(db, sources=LINKED)
+        self.assertNotIn("error", base["sources"]["supplement_rollup"])
+        db.tables["supplement_intake_by_compound"][0]["total_amount"] = 9
+        det = run(db, base, sources=LINKED)
+        self.assertIn("supplement_rollup/fingerprint", det.changed)
+        self.assertEqual(det.unknown, [])
+
+    def test_link_arguments_are_sent_only_for_linked_sources(self):
+        self.db.rpc_calls.clear()
+        self.detect()
+        params = {p["p_relation"]: p for _, p in self.db.rpc_calls}
+        self.assertIsNone(params["garmin_activity_laps"]["p_date_col"])
+        self.assertEqual(params["garmin_activity_laps"]["p_parent_relation"], "garmin_activities")
+        self.assertNotIn("p_parent_relation", params["supplement_intake_by_compound_mat"])
+
+
 class Lineage(unittest.TestCase):
     def test_capture_returns_none_when_the_function_is_missing(self):
         db = seeded_db()
@@ -441,7 +558,8 @@ class Lineage(unittest.TestCase):
     def test_baseline_round_trip(self):
         db = seeded_db()
         snap = fs.capture(db, TODAY, sources=SMALL)
-        self.assertTrue(fs.store_baseline(db, snap))
+        self.assertTrue(fs.store_baseline(db, snap, "h" * 64))
+        self.assertEqual(db.tables["hrv_analysis_results"][0]["input_data_hash"], "h" * 64)
         got, at, err = fs.read_baseline(db)
         self.assertEqual((got, err), (snap, None))
         self.assertIsNotNone(at)
@@ -475,11 +593,12 @@ class BackfillCheckMain(unittest.TestCase):
         self.out = tempfile.NamedTemporaryFile("w+", delete=False, suffix=".txt")
         self.out.close()
         os.environ["GITHUB_OUTPUT"] = self.out.name
+        self._sources = bfc.sources.SOURCES   # bfc.sources is fs: save before patching
         bfc.sources.SOURCES = SMALL
 
     def tearDown(self):
         self.bfc.supa, self.bfc.log_sync, self.bfc.et_today = self._supa, self._log, self._today
-        self.bfc.sources.SOURCES = fs.SOURCES
+        self.bfc.sources.SOURCES = self._sources
         os.environ.pop("GITHUB_OUTPUT", None)
         os.unlink(self.out.name)
 
@@ -549,6 +668,13 @@ class RescoreActuals(unittest.TestCase):
         for u in updates:  # the issued forecast is never part of a write
             self.assertEqual(set(u), {"prediction_date", "model", "horizon_days", "model_version",
                                       "actual_hrv", "residual"})
+
+    def test_recent_night_without_hrv_keeps_its_actual_for_now(self):
+        rows = [self.row("2026-11-18", 55.0), self.row("2026-11-17", 54.0)]
+        updates, counts = self.hp.plan_actual_updates(
+            self.preds(rows), {"2026-11-18": None, "2026-11-17": None}, self.today, self.window)
+        self.assertEqual(counts["cleared"], 1)
+        self.assertEqual([u["prediction_date"] for u in updates], ["2026-11-17"])
 
     def test_inconsistent_residual_alone_is_rescored(self):
         rows = [self.row("2026-11-11", 60.0, residual=99.0)]

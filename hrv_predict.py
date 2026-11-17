@@ -466,6 +466,10 @@ def predict_tomorrow(model_bundle: dict, artifact_sha256: str | None = None) -> 
 RESCORE_WINDOW_DAYS = 35
 # The matrix holds HRV to 4 decimals; a difference below this is the same value.
 ACTUAL_TOLERANCE = 1e-3
+# A stored actual is cleared only when the matrix has had no HRV for that night for this many
+# days: a recent night can lose its HRV for a while (WHOOP re-scoring it, a sync gap), and clearing
+# then would drop it from the live metric until the next run fills it again.
+CLEAR_AFTER_DAYS = 3
 _PRED_KEY = ("prediction_date", "model", "horizon_days", "model_version")
 
 
@@ -486,7 +490,8 @@ def plan_actual_updates(preds: pd.DataFrame, matrix_hrv: dict, today: str,
     date missing from it is not judged. Only dates before `today` are eligible.
       * actual missing, matrix has it                -> fill  (any date, as before)
       * actual stored, matrix differs (rescored)     -> rescore (date >= rescore_from)
-      * actual stored, matrix row has no HRV now     -> clear (date >= rescore_from)
+      * actual stored, matrix row has no HRV now     -> clear (date >= rescore_from, and at least
+                                                        CLEAR_AFTER_DAYS old; a newer night keeps it)
       * actual unchanged but residual inconsistent   -> rescore the residual only
     Each write carries exactly the key + actual_hrv + residual: the issued forecast (predicted value,
     interval, created_at, model version, artifact) is never sent, so it never changes. Running it
@@ -496,6 +501,7 @@ def plan_actual_updates(preds: pd.DataFrame, matrix_hrv: dict, today: str,
     if preds is None or preds.empty:
         return updates, counts
     seen: set = set()
+    clear_before = (date.fromisoformat(str(today)[:10]) - timedelta(days=CLEAR_AFTER_DAYS - 1)).isoformat()
     for _, row in preds.iterrows():
         d = str(row["prediction_date"])
         key = (d, str(row["model"]), int(row["horizon_days"]), row.get("model_version"))
@@ -512,6 +518,8 @@ def plan_actual_updates(preds: pd.DataFrame, matrix_hrv: dict, today: str,
         elif d < rescore_from:
             continue
         elif current is None:
+            if d >= clear_before:
+                continue        # possibly a passing gap: keep the stored actual for now
             kind, actual = "cleared", None
         elif abs(current - stored) > ACTUAL_TOLERANCE:
             kind, actual = "rescored", current

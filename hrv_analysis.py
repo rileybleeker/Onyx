@@ -6478,7 +6478,7 @@ def main() -> str | None:
         dose_response=dose_response,
     )
     # Last, so it exists only when this run's results were stored (hrv_feature_sources.py).
-    if feature_sources.store_baseline(supa, source_lineage):
+    if feature_sources.store_baseline(supa, source_lineage, INPUT_DATA_HASH):
         log.info(f"    Upserted: {feature_sources.LINEAGE_RESULT_TYPE}/{feature_sources.LINEAGE_RESULT_KEY}")
     elif source_lineage:
         log.warning("    Source fingerprints not stored; the next backfill check treats the baseline as stale")

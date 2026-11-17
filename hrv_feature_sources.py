@@ -18,7 +18,12 @@ Three ways a change is seen, per source:
   3. Fingerprint: the row count + an md5 of the content of every row dated before the cutoff,
      computed by pds.hrv_source_fingerprint (sql/hrv_source_fingerprint.sql) and compared with the
      one the last retrain recorded. This is the one that sees edits on insert-only tables and
-     DELETES, without a trigger on any high-churn table.
+     DELETES, without a trigger on any high-churn table. A relation with no date of its own
+     (Garmin laps, supplement products) is fingerprinted through a Link: its rows tied to a
+     historical row of another relation. A fingerprint reads the relation the pipeline actually
+     LOADS ("prefer": a materialized copy first, the live view when the copy is missing or fails,
+     the loader's own order), so a correction counts as trained only once it reached what the
+     retrain loaded.
 
 A check that cannot be made (a read error, a missing baseline) is UNKNOWN, never "no change"
 (decide() below). Only names and error codes are reported; never a row, a count or a hash.
@@ -67,10 +72,24 @@ class RowScan:
 
 
 @dataclass(frozen=True)
+class Link:
+    """Rows of the fingerprinted relation whose key_col appears in parent_key of a parent row
+    dated (parent_date_col) before the cutoff."""
+    key_col: str
+    parent: str
+    parent_key: str
+    parent_date_col: str
+
+
+@dataclass(frozen=True)
 class Fingerprint:
     relation: str
-    date_col: str
+    date_col: str | None          # None: the rows are chosen by `link`
     exclude: tuple[str, ...] = ()
+    link: Link | None = None
+    # Relations tried before `relation`, in the loader's own order (e.g. a matview the pipeline
+    # prefers); any failure on one moves to the next, exactly as the loader falls back.
+    prefer: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +144,13 @@ SOURCES: tuple[FeatureSource, ...] = (
     _garmin("garmin_stress"),
     _garmin("garmin_training_status"),
     _garmin("garmin_activities", date_col="onyx_behavioral_date"),
+    # Laps have no date; garmin_etl.backfill_laps writes them without touching their activity.
+    FeatureSource(
+        name="garmin_activity_laps", feeds="hrv_analysis.load_all_data: garmin_activity_laps",
+        fingerprint=Fingerprint("garmin_activity_laps", None,
+                                link=Link("activity_id", "garmin_activities", "activity_id",
+                                          "onyx_behavioral_date")),
+    ),
     FeatureSource(
         name="eight_sleep_trends", feeds="hrv_analysis.load_all_data: eight_sleep_trends",
         scans=(RowScan("eight_sleep_trends", "calendar_date", "synced_at", "change"),),  # bump trigger
@@ -136,11 +162,28 @@ SOURCES: tuple[FeatureSource, ...] = (
         signal=("habit_journal", "backfill_signal"),
         fingerprint=Fingerprint("habit_journal", "cycle_date"),
     ),
+    # hrv_analysis.fetch_supplement_rollup reads the matview first (refreshed ~5 min after a write)
+    # and the live view when it is missing or fails: the fingerprint reads them in the same order.
     FeatureSource(
         name="supplement_rollup",
-        feeds="supplement_intake_by_compound (intakes x product ingredients; also the unquantified check)",
+        feeds="supplement_intake_by_compound(_mat) (intakes x product ingredients)",
+        fingerprint=Fingerprint("supplement_intake_by_compound", "calendar_date",
+                                prefer=("supplement_intake_by_compound_mat",)),
+    ),
+    # load_supplement_unquantified reads these two directly: an intake of a product whose label
+    # gives no readable amount is not in the rollup, so only these see it (edits and deletions).
+    FeatureSource(
+        name="supplement_intake",
+        feeds="hrv_analysis.load_supplement_unquantified: supplement_intake",
         scans=(RowScan("supplement_intake", "intake_date", "created_at", "insert"),),
-        fingerprint=Fingerprint("supplement_intake_by_compound", "calendar_date"),
+        fingerprint=Fingerprint("supplement_intake", "intake_date"),
+    ),
+    FeatureSource(
+        name="supplement_products",
+        feeds="hrv_analysis.load_supplement_unquantified: ingredients of products taken in the past",
+        # Archiving a product or refetching its label page changes no past intake.
+        fingerprint=Fingerprint("supplement_products", None, exclude=("fetched_at", "is_active"),
+                                link=Link("product_id", "supplement_intake", "product_id", "intake_date")),
     ),
     FeatureSource(name="melatonin_unified", feeds="melatonin_unified (journal + supplement bridge)",
                   fingerprint=Fingerprint("melatonin_unified", "calendar_date")),
@@ -175,8 +218,6 @@ SOURCES: tuple[FeatureSource, ...] = (
 UNWATCHED: dict[str, str] = {
     "cronometer_servings": "replaced by date on every import; its values reach the pipeline only through "
                            "the matrix (behavioral totals, caffeine), whose fingerprint sees them",
-    "supplement_products": "ingredient edits reach the pipeline through supplement_intake_by_compound",
-    "garmin_activity_laps": "no date column; lap fields change together with their activity",
     "whoop_body_measurements": "profile values with no day; every retrain reads the newest row",
     "delivery_email_log": "coverage of unread receipts, not values; it moves the zero-fill of the newest days",
     "spotify_daily_signature": "off unless ONYX_INCLUDE_SPOTIFY=1",
@@ -189,7 +230,6 @@ UNWATCHED: dict[str, str] = {
 # Relations hrv_analysis.py reads under another name than the one watched above.
 READ_ALIASES: dict[str, str] = {
     "journal": "habit_journal",                                        # view over habit_journal
-    "supplement_intake_by_compound_mat": "supplement_intake_by_compound",
 }
 
 
@@ -200,6 +240,7 @@ def watched_relations(sources=None) -> set[str]:
         out.update(scan.table for scan in src.scans)
         if src.fingerprint:
             out.add(src.fingerprint.relation)
+            out.update(src.fingerprint.prefer)
     return out
 
 
@@ -266,20 +307,34 @@ class FingerprintUnavailable(Exception):
     """pds.hrv_source_fingerprint is not installed (sql/hrv_source_fingerprint.sql not applied)."""
 
 
+def _fingerprint_params(fp: Fingerprint, relation: str, before: str) -> dict:
+    params = {
+        "p_relation": relation,
+        "p_date_col": fp.date_col,
+        "p_before": before,
+        "p_exclude": list(dict.fromkeys((*ALWAYS_EXCLUDE, *fp.exclude))),
+    }
+    if fp.link is not None:
+        params.update({"p_link_col": fp.link.key_col, "p_parent_relation": fp.link.parent,
+                       "p_parent_key": fp.link.parent_key, "p_parent_date_col": fp.link.parent_date_col})
+    return params
+
+
 def fingerprint(supa, fp: Fingerprint, before: str) -> dict:
     """{'row_count', 'fingerprint'}. Raises FingerprintUnavailable when the function is missing,
-    any other exception for a failed read."""
-    try:
-        resp = supa.schema("pds").rpc(FINGERPRINT_RPC, {
-            "p_relation": fp.relation,
-            "p_date_col": fp.date_col,
-            "p_before": before,
-            "p_exclude": list(dict.fromkeys((*ALWAYS_EXCLUDE, *fp.exclude))),
-        }).execute()
-    except Exception as e:  # noqa: BLE001
-        if error_code(e) in _MISSING_FUNCTION_CODES:
-            raise FingerprintUnavailable() from None
-        raise
+    any other exception for a failed read (of the last relation tried)."""
+    relations = (*fp.prefer, fp.relation)
+    resp = None
+    for i, relation in enumerate(relations):
+        try:
+            resp = supa.schema("pds").rpc(FINGERPRINT_RPC, _fingerprint_params(fp, relation, before)).execute()
+        except Exception as e:  # noqa: BLE001
+            if error_code(e) in _MISSING_FUNCTION_CODES:
+                raise FingerprintUnavailable() from None
+            if i < len(relations) - 1:
+                continue    # the loader falls back the same way on any error
+            raise
+        break
     data = resp.data
     row = data[0] if isinstance(data, list) and data else data
     if not isinstance(row, dict) or "fingerprint" not in row:
@@ -328,8 +383,9 @@ def read_baseline(supa) -> tuple[dict | None, str | None, str | None]:
     return snap, row.get("computed_at"), None
 
 
-def store_baseline(supa, snapshot: dict | None) -> bool:
-    """Store the snapshot a retrain trained on. Called only after the run's results are stored.
+def store_baseline(supa, snapshot: dict | None, input_data_hash: str | None = None) -> bool:
+    """Store the snapshot a retrain trained on. Called only after the run's results are stored;
+    carries the run's input_data_hash like the other hrv_analysis_results rows.
     Never raises; False when nothing was stored."""
     if not snapshot:
         return False
@@ -339,6 +395,7 @@ def store_baseline(supa, snapshot: dict | None) -> bool:
             "result_key": LINEAGE_RESULT_KEY,
             "result_json": snapshot,
             "computed_at": datetime.now(timezone.utc).isoformat(),
+            "input_data_hash": input_data_hash,
         }, on_conflict="result_type,result_key").execute()
     except Exception:  # noqa: BLE001
         return False
