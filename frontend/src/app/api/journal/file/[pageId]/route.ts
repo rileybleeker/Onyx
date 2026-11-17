@@ -58,7 +58,10 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ pa
   }
   const v = validateJournalUpdate(parsed);
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
-  if (!notionConfigured()) return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
+  if (!notionConfigured()) {
+    console.error("journal route: NOTION_API_KEY is not set");
+    return NextResponse.json({ error: "Journal isn't connected yet. Try again later." }, { status: 500 });
+  }
 
   try {
     const out = await updateJournalPage(pageId, v.input, inferJournalLabels);

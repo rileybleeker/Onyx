@@ -44,7 +44,10 @@ export async function POST(req: NextRequest) {
   }
   const v = validateJournalEntry(parsed, easternDate(new Date()));
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
-  if (!notionConfigured()) return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
+  if (!notionConfigured()) {
+    console.error("journal route: NOTION_API_KEY is not set");
+    return NextResponse.json({ error: "Journal isn't connected yet. Try again later." }, { status: 500 });
+  }
 
   try {
     // Already saved (a retry after a lost answer, or a second tap)? Return that entry.
