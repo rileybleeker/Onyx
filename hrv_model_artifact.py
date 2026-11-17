@@ -403,13 +403,22 @@ def serving_refusal(env: Mapping[str, str] | None = None) -> str | None:
     return None
 
 
+PUBLISHED_OUTCOMES = ("published", "already_published")
+
+
 def serving_report(loaded: LoadedArtifact, env: Mapping[str, str] | None = None) -> tuple[str, str | None]:
     """Heartbeat status + message for the artifact a forecast is made with.
 
     The workflow passes HRV_MODEL_REGISTRY (ok | not_applied | error), HRV_MODEL_SELECTED_SHA256,
-    HRV_MODEL_PINNED, HRV_MODEL_PIN_BLOCKED / HRV_MODEL_PIN_REASON and HRV_MODEL_RESTORED (the
-    exact-key restore hit). Outside the workflow none is set. Registry "error", a pin this code
-    cannot serve and a lost pinned artifact never get this far (serving_refusal)."""
+    HRV_MODEL_PINNED, HRV_MODEL_PIN_BLOCKED / HRV_MODEL_PIN_REASON, HRV_MODEL_RESTORED (the
+    exact-key restore hit) and HRV_MODEL_PUBLISH (published | already_published | not_published |
+    not_attempted: the outcome of publishing a model trained in this same run). Outside the
+    workflow none is set. Registry "error", a pin this code cannot serve and a lost pinned
+    artifact never get this far (serving_refusal).
+
+    A model trained in this same run is success only when HRV_MODEL_PUBLISH confirms its
+    publication: a failed or skipped publish leaves the registry unchanged, so the next run
+    serves the previous model while the forecast looked healthy."""
     env = os.environ if env is None else env
     sha = loaded.sha256[:12]
     registry = env.get("HRV_MODEL_REGISTRY", "")
@@ -434,7 +443,20 @@ def serving_report(loaded: LoadedArtifact, env: Mapping[str, str] | None = None)
         return "partial", f"Forecast made with artifact {sha}, not the selected {selected[:12]}."
     if registry == "ok":
         if trained_here:
-            return "success", None      # nothing compatible published yet: the missing-model path
+            published = env.get("HRV_MODEL_PUBLISH", "")
+            if published in PUBLISHED_OUTCOMES:
+                return "success", None  # trained in this run and its publication was confirmed
+            if published == "not_published":
+                return "partial", (f"Model artifact {sha} was trained in this run, but publishing it "
+                                   "failed or did not run; the forecast was made with it and the "
+                                   "next run serves the previous published model.")
+            if published == "not_attempted":
+                return "partial", (f"Forecast made with model artifact {sha}, trained in this run; "
+                                   "its publication was not attempted, so the next run serves the "
+                                   "previous published model.")
+            return "partial", (f"Forecast made with model artifact {sha}, trained in this run; its "
+                               f"publication was not confirmed (HRV_MODEL_PUBLISH is "
+                               f"{published!r}).")
         return "partial", f"Forecast made with artifact {sha}, which the registry did not select."
     return "success", None              # a run outside the workflow: the manifest checked out
 
@@ -747,6 +769,10 @@ def cmd_key(_args, db=None) -> int:
 
 
 def cmd_publish(args, db=None) -> int:
+    """'publish' also reports its outcome to $GITHUB_OUTPUT (publish=published|already_published|
+    not_published), so the workflow can pass it to the forecast step (HRV_MODEL_PUBLISH): a model
+    trained in the same run counts as success only when its publication was confirmed. A failed
+    publish writes no output; the workflow derives 'not_published' from the step outcome."""
     env = os.environ
     try:
         manifest = verify_local()
@@ -757,6 +783,7 @@ def cmd_publish(args, db=None) -> int:
         if env.get("GITHUB_REF") != DEFAULT_BRANCH_REF:
             log.warning(f"Artifact {sha} was trained on {env.get('GITHUB_REF')!r}, not master: not "
                         "published (its cache entry is visible to that branch only).")
+            _github_output({"publish": "not_published"})
             return 0
         if args.saved != "true":
             raise ArtifactError(f"Model not published: artifact {sha} trained, but it is not in the "
@@ -773,6 +800,7 @@ def cmd_publish(args, db=None) -> int:
         log.error(message)
         _report_unpublished(message, db)
         return 1
+    _github_output({"publish": outcome})
     log.info(f"Model artifact {sha} {outcome.replace('_', ' ')} (data through "
              f"{manifest['provenance'].get('data_cutoff')}).")
     return 0

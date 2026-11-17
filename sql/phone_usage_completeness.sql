@@ -41,6 +41,11 @@
 --     leaves the last verified snapshot exactly as it was. Uploads without
 --     `run` (every app build before this change) write as before and are
 --     never verified.
+--   * A complete run also RECONCILES the covered hour set: a verified hour inside
+--     its window up to its coverage end whose export lists no copy of that hour (the
+--     run owns none and staged none) is re-marked unverified, so its stale usage reads
+--     unknown again, never complete coverage. A snapshot written by a NEWER complete
+--     export is never rolled back by an older run.
 --   * pds.phone_usage_daily gains, at the end: hours_verified, export_complete,
 --     completeness ('complete' | 'partial' | 'unknown'), pre_sleep_complete,
 --     during_sleep_complete. Readers count a day or an estimate only when the
@@ -291,7 +296,7 @@ CREATE OR REPLACE TRIGGER phone_usage_items_guard
 --    (a complete run answers 'complete' again and changes nothing), one call per
 --    run at a time (advisory lock), and a run that is not complete changes no
 --    usage row. Answers {status, hours_verified, hours_replaced, items_removed,
---    chunks_received, chunk_count, coverage_end, staged_incomplete, already};
+--    hours_unmarked, chunks_received, chunk_count, coverage_end, staged_incomplete, already};
 --    status is one of 'unknown_run', 'inconsistent', 'stream_open', 'receiving',
 --    'complete'.
 --    An hour is verified when this run still owns it (last_run_id), it had ended
@@ -322,6 +327,16 @@ CREATE OR REPLACE TRIGGER phone_usage_items_guard
 --    and finds the hour verified by this very run, so it is ignored). Without this
 --    check the finalization skipped the emptied staged hour, deleted it and settled
 --    the run, and the repeat's items then had no staged hour to land in.
+--    RECONCILIATION RULE: a complete run also reconciles the covered hour set. Every
+--    verified hour inside its window up to its coverage end whose export lists no copy
+--    of that hour (the run owns none — last_run_id — and staged none) is re-marked
+--    unverified (verified_* cleared): the hour keeps its stored usage, but readers and
+--    pds.phone_usage_window_complete treat it as unknown again, so stale usage can no
+--    longer be summed as complete coverage. A snapshot written by a NEWER complete
+--    export (verified_export_at past this run's coverage end) is never rolled back by
+--    an older run. The hours it may unmark are locked by the same FOR UPDATE pass, in
+--    hour order, as the hours it verifies and replaces, so the reconciliation is atomic
+--    with the item guard's share locks and every other writer.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION pds.finalize_phone_usage_run(p_device TEXT, p_run_id UUID)
 RETURNS JSONB
@@ -337,6 +352,7 @@ DECLARE
     v_removed  INTEGER := 0;
     v_fix      TIMESTAMPTZ[] := ARRAY[]::timestamptz[];
     v_fixed    INTEGER := 0;
+    v_unmarked INTEGER := 0;
     v_cover    TIMESTAMPTZ;
     v_staged_incomplete INTEGER := 0;
 BEGIN
@@ -348,7 +364,7 @@ BEGIN
     SELECT * INTO v_prior FROM pds.phone_usage_sync_runs r WHERE r.device = p_device AND r.run_id = p_run_id;
     IF FOUND AND v_prior.status = 'complete' THEN
         RETURN jsonb_build_object('status', 'complete', 'hours_verified', v_prior.hours_verified, 'hours_replaced', 0,
-                                  'items_removed', 0, 'chunks_received', v_prior.chunks_received,
+                                  'items_removed', 0, 'hours_unmarked', 0, 'chunks_received', v_prior.chunks_received,
                                   'chunk_count', v_prior.chunk_count, 'coverage_end', v_prior.coverage_end,
                                   'staged_incomplete', 0, 'already', true);
     END IF;
@@ -377,7 +393,7 @@ BEGIN
 
     IF c.n = 0 THEN
         RETURN jsonb_build_object('status', 'unknown_run', 'hours_verified', 0, 'hours_replaced', 0, 'items_removed', 0,
-                                  'chunks_received', 0, 'chunk_count', NULL, 'coverage_end', NULL,
+                                  'hours_unmarked', 0, 'chunks_received', 0, 'chunk_count', NULL, 'coverage_end', NULL,
                                   'staged_incomplete', 0, 'already', false);
     END IF;
 
@@ -410,7 +426,12 @@ BEGIN
          WHERE s.device = p_device
            AND ((s.last_run_id = p_run_id AND s.verified_at IS NULL)
                 OR s.segment_start IN (SELECT h.segment_start FROM pds.phone_usage_pending_hours h
-                                        WHERE h.device = p_device AND h.run_id = p_run_id))
+                                        WHERE h.device = p_device AND h.run_id = p_run_id)
+                 -- Reconciliation: verified hours inside the run's coverage may be unmarked, so they
+                 -- are locked here too (same pass, same order) before anything is decided.
+                OR (s.verified_at IS NOT NULL
+                    AND s.segment_start >= c.window_start
+                    AND s.segment_end <= v_cover))
          ORDER BY s.segment_start
            FOR UPDATE;
 
@@ -512,6 +533,35 @@ BEGIN
             v_verified := v_verified + v_fixed;
         END IF;
 
+        -- RECONCILIATION of the covered hour set: a verified hour inside this run's window and coverage
+        -- end whose export lists no copy of it (the run owns none and staged none) is re-marked unverified,
+        -- so it reads unknown again and its stale usage is never summed as complete coverage. A snapshot
+        -- written by a NEWER complete export (verified_export_at past this run's coverage end) is never
+        -- rolled back. Runs before the staged-cleanup delete below, so an hour this run staged (listed)
+        -- but could not replace keeps its verification.
+        WITH omitted AS (
+            SELECT s.device, s.segment_start
+              FROM pds.phone_usage_segments s
+             WHERE s.device = p_device
+               AND s.verified_at IS NOT NULL
+               AND s.verified_run_id IS DISTINCT FROM p_run_id
+               AND COALESCE(s.verified_export_at, v_cover) <= v_cover
+               AND s.segment_start >= c.window_start
+               AND s.segment_end <= v_cover
+               AND s.last_run_id IS DISTINCT FROM p_run_id
+               AND NOT EXISTS (SELECT 1 FROM pds.phone_usage_pending_hours h
+                                WHERE h.device = p_device AND h.run_id = p_run_id
+                                  AND h.segment_start = s.segment_start)
+        ), unmarked AS (
+            UPDATE pds.phone_usage_segments s
+               SET verified_at = NULL, verified_run_id = NULL, verified_export_at = NULL
+              FROM omitted o
+             WHERE s.device = o.device AND s.segment_start = o.segment_start
+               AND s.verified_at IS NOT NULL
+            RETURNING 1
+        )
+        SELECT count(*) INTO v_unmarked FROM unmarked;
+
         -- The run is settled: its staged copies have done their job (an hour it could not replace keeps the
         -- snapshot), and copies of runs that never completed are removed after three days.
         DELETE FROM pds.phone_usage_pending_hours h WHERE h.device = p_device AND h.run_id = p_run_id;
@@ -543,7 +593,7 @@ BEGIN
         completed_at      = EXCLUDED.completed_at;
 
     RETURN jsonb_build_object('status', v_status, 'hours_verified', v_verified, 'hours_replaced', v_fixed,
-                              'items_removed', v_removed, 'chunks_received', c.chunks,
+                              'items_removed', v_removed, 'hours_unmarked', v_unmarked, 'chunks_received', c.chunks,
                               'chunk_count', c.chunk_count_max, 'coverage_end', v_cover,
                               'staged_incomplete', v_staged_incomplete, 'already', false);
 END;

@@ -99,9 +99,23 @@ export function sleepAnswerDate(today: string): string {
  * (The plain Eastern date would be a day ahead between midnight and 06:00 and turn "last night" into tonight.)
  */
 export function fallbackBehavioralToday(now: Date): string {
-  // Same rule as SQL ((ts AT TIME ZONE tz) - 6h)::date: take the Eastern WALL clock, then subtract 6 hours.
-  // (Subtracting from the instant first is an hour off on the two daylight-saving days.)
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(now);
+  return wallClockBehavioralDay(now, "America/New_York");
+}
+
+/**
+ * Behavioral day on this device's own clock (its time zone's wall clock minus 6 hours), or in `timeZone` when given.
+ * A phone's zone follows where Riley is, so a browser sees the day roll at 06:00 local while travelling, which the
+ * Eastern guess above misses (06:00 Pacific is 09:00 Eastern; PROD-T01). Browser use: on the server it is the server's
+ * zone. A guess like the one above, never a replacement for pds.behavioral_today_now().
+ */
+export function deviceBehavioralDay(now: Date, timeZone?: string): string {
+  return wallClockBehavioralDay(now, timeZone);
+}
+
+function wallClockBehavioralDay(now: Date, timeZone: string | undefined): string {
+  // Same rule as SQL ((ts AT TIME ZONE tz) - 6h)::date: take the WALL clock of the zone, then subtract 6 hours.
+  // (Subtracting from the instant first is an hour off on the two daylight-saving days.) No zone = the device's own.
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(now);
   const part = (type: string) => Number(parts.find((p) => p.type === type)?.value);
   return new Date(Date.UTC(part("year"), part("month") - 1, part("day"), part("hour") - 6)).toISOString().slice(0, 10);
 }
@@ -254,6 +268,76 @@ export function appHabitSuggestions(minutesByApp: Record<string, unknown> | null
     if (!names.has(habit)) continue;
     const m = Number(minutesByApp[bundleId]);
     if (Number.isFinite(m) && m >= APP_HABIT_MIN_MINUTES) out[habit] = { answer: "Yes", source: `Screen Time: ${Math.round(m)} min in ${label}` };
+  }
+  return out;
+}
+
+/**
+ * PC activity (tools/pc_activity_logger, pds.pc_activity_daily), 2026-11-17. Yes only: the logger runs on one
+ * PC while Riley is signed in, so no time there proves nothing (laptop elsewhere, work done on paper or a phone).
+ * Decisions (Riley asked for none of these to wait on him):
+ *  - "Worked late?" = at least PC_WORKED_LATE_MIN minutes from 21:00 on (the view's late window) in WORK programs
+ *    (Office, Power BI, Python, Outlook, Teams). A browser, chat app or VS Code is not counted: as likely personal use.
+ *  - "BI/Python/AL/Excel" = at least PC_SKILL_MIN minutes in Power BI Desktop, Excel or Python. VS Code ("code")
+ *    is deliberately NOT counted: it is also where Onyx itself is edited, so it would answer Yes every day, and
+ *    the logger cannot tell an AL project from a Python one without reading a title (which it never does).
+ * Program names are the executable names the logger stores (lower case, no .exe).
+ */
+export const PC_WORK_PROGRAMS: Readonly<Record<string, string>> = {
+  excel: "Excel",
+  pbidesktop: "Power BI",
+  python: "Python",
+  pythonw: "Python",
+  winword: "Word",
+  powerpnt: "PowerPoint",
+  outlook: "Outlook",
+  olk: "Outlook",
+  "ms-teams": "Teams",
+  teams: "Teams",
+};
+export const PC_SKILL_PROGRAMS: Readonly<Record<string, string>> = {
+  excel: "Excel",
+  pbidesktop: "Power BI",
+  python: "Python",
+  pythonw: "Python",
+};
+export const PC_WORKED_LATE_MIN = 30;
+export const PC_SKILL_MIN = 10;
+export const Q_WORKED_LATE = "Worked late?";
+export const Q_SKILLS = "BI/Python/AL/Excel";
+
+function pcMinutes(map: Record<string, unknown> | null | undefined, programs: Readonly<Record<string, string>>): { total: number; top: string | null } {
+  let total = 0;
+  let top: string | null = null;
+  let topMin = 0;
+  if (!map || typeof map !== "object") return { total, top };
+  for (const [app, label] of Object.entries(programs)) {
+    const m = Number(map[app]);
+    if (!Number.isFinite(m) || m <= 0) continue;
+    total += m;
+    if (m > topMin) {
+      topMin = m;
+      top = label;
+    }
+  }
+  return { total, top };
+}
+
+export function pcActivitySuggestions(
+  row: { minutes_by_app?: Record<string, unknown> | null; late_minutes_by_app?: Record<string, unknown> | null } | null | undefined,
+  names: ReadonlySet<string>
+): Record<string, CheckinSuggestion> {
+  const out: Record<string, CheckinSuggestion> = {};
+  if (!row) return out;
+  if (names.has(Q_WORKED_LATE)) {
+    const late = pcMinutes(row.late_minutes_by_app, PC_WORK_PROGRAMS);
+    if (late.total >= PC_WORKED_LATE_MIN) {
+      out[Q_WORKED_LATE] = { answer: "Yes", source: `PC activity: ${Math.round(late.total)} min in work programs from 9 PM (${PC_WORKED_LATE_MIN}+ min suggests Yes)` };
+    }
+  }
+  if (names.has(Q_SKILLS)) {
+    const skill = pcMinutes(row.minutes_by_app, PC_SKILL_PROGRAMS);
+    if (skill.total >= PC_SKILL_MIN) out[Q_SKILLS] = { answer: "Yes", source: `PC activity: ${Math.round(skill.total)} min in ${skill.top}` };
   }
   return out;
 }

@@ -584,8 +584,8 @@ export interface LogSessionInput {
   /**
    * Onyx Chat (SEC-04): the session must be stored WITH its key, because a retried chat message can only find it by
    * that key. A key that is not a UUID, or a key column that is missing, is then refused (SESSION_KEY_REQUIRED) and
-   * nothing is written, never a session without its key. Without it (the /log form) a missing column is still written
-   * without the key, as before sql/reading_sessions_client_key.sql existed.
+   * nothing is written, never a session without its key. A keyed create is never stored without its key for any
+   * caller (PR 376); without this flag a missing column is refused with the /log form's own text.
    */
   require_client_key?: boolean;
 }
@@ -602,16 +602,367 @@ export interface LogSessionResult {
   habitCreated: boolean | null;
   /** A retry of an earlier create (same client_key): the stored session, nothing written. */
   replayed: boolean;
+  /**
+   * The Notion work a keyed create stored in its own transaction (pds.create_reading_session; Codex review of PR 376,
+   * round 2 of T01-R14): the claim that owes the session's entry and the progress obligation of its book (null = none
+   * stored: no Notion page, a keyless create, or a replay, whose first create stored them and the sweep finishes).
+   */
+  mirrorClaimId: string | null;
+  progressOwedId: string | null;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * The client_key column is new (sql/reading_sessions_client_key.sql): until it is applied, keys are ignored.
- * Codes only: a unique violation (23505) also names the client_key index and must never read as "no column".
+ * The client_key column (sql/reading_sessions_client_key.sql, applied 2026-11-15). Without it a keyed create is
+ * refused (logSession) rather than stored without its key. Codes only: a unique violation (23505) also names the
+ * client_key index and must never read as "no column".
  */
 function missingColumn(error: { code?: string } | null | undefined): boolean {
   return !!error && (error.code === "42703" || error.code === "PGRST204");
+}
+
+/**
+ * Discarded entries (sql/reading_session_discards.sql, PROD-T01): a client_key whose entry was discarded can never
+ * create a session again. The insert trigger refuses one with this SQLSTATE; the POST route answers 409 with
+ * DISCARDED_ENTRY_ERROR, and the /log form then continues the entry under a new key.
+ */
+const DISCARDED_KEY_CODE = "OXR01";
+export const DISCARDED_ENTRY_ERROR = "This reading entry was discarded.";
+const DISCARD_UNAVAILABLE = "Removing a session isn't available until sql/reading_session_discards.sql is applied.";
+/** A keyed create needs pds.create_reading_session; without it the create is refused (503), never done in steps. */
+const KEYED_CREATE_UNAVAILABLE = "Reading sessions can't be saved here until sql/reading_session_discards.sql is applied.";
+
+/** sql/reading_session_discards.sql (or the client_key column it reads) is not applied yet. */
+function discardsMissing(error: { code?: string } | null | undefined): boolean {
+  return !!error && (["PGRST202", "42883", "42P01"].includes(String(error.code)) || missingColumn(error));
+}
+
+/**
+ * What a removal still owes outside the database (pds.reading_session_removals): the session's Notion entry to trash
+ * and the book page's progress line. `done` = the entry was trashed (mirror_done_at set); a removal whose answer was
+ * lost is found here by its retry and the route replays the cleanup (Codex review of PR 376).
+ */
+export interface RemovalCleanup {
+  sessionId: number;
+  bookId: number;
+  sessionDate: string | null;
+  notionBlockId: string | null;
+  unfinished: boolean;
+  done: boolean;
+}
+
+function cleanupOf(raw: unknown): RemovalCleanup | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const sessionId = Number(r.session_id);
+  const bookId = Number(r.book_id);
+  if (!Number.isFinite(sessionId) || !Number.isFinite(bookId)) return null;
+  return {
+    sessionId,
+    bookId,
+    sessionDate: typeof r.session_date === "string" ? r.session_date : null,
+    notionBlockId: typeof r.notion_block_id === "string" && r.notion_block_id ? r.notion_block_id : null,
+    unfinished: r.unfinished === true,
+    done: r.mirror_done_at !== null && r.mirror_done_at !== undefined,
+  };
+}
+
+const KINDLE_SESSION_CODE = "OXR02";
+const BOOK_MISSING_CODE = "OXR03";
+const BOOK_KEYS = BOOK_COLS.split(",").map((c) => c.trim());
+
+type RemovalOutcome =
+  | { kind: "removed"; session: ReadingSession; book: Book; unfinished: boolean; habitRemoved: boolean; cleanup: RemovalCleanup | null }
+  | { kind: "absent"; cleanup: RemovalCleanup | null }
+  | { kind: "failed"; status: number; error: string };
+
+/**
+ * One removal in ONE database call (pds.remove_reading_session, sql/reading_session_discards.sql): the key is recorded
+ * as discarded under its lock, then the session is deleted, the finish it caused and the habit Yes it made are taken
+ * back, and the Notion cleanup still owed is written down, all in one transaction. A removal whose answer is lost
+ * leaves nothing half done in the database, and its retry gets that cleanup row (`absent`). A missing function (the
+ * file not applied, or not yet in PostgREST's schema cache) is 503 and nothing is removed: there is no fallback to
+ * separate requests (Codex review of PR 376).
+ */
+async function removeSessionTx(
+  supabase: Supa,
+  by: { sessionId: number } | { clientKey: string },
+  habitCreatedOn: string | null,
+): Promise<RemovalOutcome> {
+  const { data, error } = await supabase.rpc("remove_reading_session", {
+    p_session_id: "sessionId" in by ? by.sessionId : null,
+    p_client_key: "clientKey" in by ? by.clientKey : null,
+    p_habit_created_on: habitCreatedOn,
+  });
+  if (error) {
+    if (error.code === KINDLE_SESSION_CODE) return { kind: "failed", status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
+    if (error.code === BOOK_MISSING_CODE) return { kind: "failed", status: 404, error: "The session's book no longer exists." };
+    if (discardsMissing(error)) return { kind: "failed", status: 503, error: DISCARD_UNAVAILABLE };
+    return { kind: "failed", status: 500, error: error.message };
+  }
+  return removalOutcomeOf(data);
+}
+
+const REMOVAL_UNCONFIRMED = "The removal was not confirmed. Try again.";
+
+/**
+ * Reads pds.remove_reading_session's answer (Codex T01-R8). Only an explicit outcome counts: `removed` must be a
+ * boolean; `removed: false` must carry its `removal` (null = nothing on record, else a well-formed cleanup row);
+ * `removed: true` must carry the session and its book with their ids. Anything else (null, {}, a missing or
+ * non-boolean `removed`, a malformed row) is "not confirmed" (500, retried): it is never read as "nothing stored",
+ * so a Discard never clears an entry whose removal was not confirmed. Exported for the tests.
+ */
+export function removalOutcomeOf(data: unknown): RemovalOutcome {
+  const unconfirmed: RemovalOutcome = { kind: "failed", status: 500, error: REMOVAL_UNCONFIRMED };
+  if (!data || typeof data !== "object" || Array.isArray(data)) return unconfirmed;
+  const out = data as { removed?: unknown; session?: unknown; book?: unknown; unfinished?: unknown; habit_removed?: unknown; removal?: unknown };
+  if (typeof out.removed !== "boolean" || !("removal" in out)) return unconfirmed;
+  if (out.removed === false) {
+    if (out.removal === null) return { kind: "absent", cleanup: null };
+    const cleanup = cleanupOf(out.removal);
+    return cleanup ? { kind: "absent", cleanup } : unconfirmed;
+  }
+  const isRow = (v: unknown, idKey: string): v is Record<string, unknown> =>
+    !!v && typeof v === "object" && !Array.isArray(v) && Number.isFinite(Number((v as Record<string, unknown>)[idKey])) && (v as Record<string, unknown>)[idKey] !== null;
+  const rawSession = out.session;
+  const rawBook = out.book;
+  if (!isRow(rawSession, "session_id") || !isRow(rawBook, "book_id")) return unconfirmed;
+  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, rawSession[k] ?? null])) as unknown as ReadingSession;
+  const book = Object.fromEntries(BOOK_KEYS.map((k) => [k, rawBook[k] ?? null])) as unknown as Book;
+  return { kind: "removed", session, book, unfinished: out.unfinished === true, habitRemoved: out.habit_removed === true, cleanup: cleanupOf(out.removal) };
+}
+
+/**
+ * The removal's Notion cleanup is done (its entry trashed, or it had none): a later retry replays nothing. Closed
+ * only for the work the caller actually did (Codex T01-R9): `blockId` is the Notion entry it trashed (null = it saw
+ * none), and the row is closed only while it still records that same entry. A create callback that recorded a late
+ * entry meanwhile (lib/reading-removal.ts trashLateBlock) changed the row's block id and reopened it, so a cleanup
+ * that started before that, with no entry or another one, leaves the new work open for its owner or the sweep.
+ */
+export async function markRemovalMirrored(supabase: Supa, sessionId: number, blockId: string | null): Promise<void> {
+  const base = supabase.from("reading_session_removals").update({ mirror_done_at: new Date().toISOString() }).eq("session_id", sessionId);
+  const { error } = await (blockId === null ? base.is("notion_block_id", null) : base.eq("notion_block_id", blockId));
+  if (error) console.error("reading: removal cleanup mark failed:", error.code ?? "unknown");
+}
+
+/**
+ * Reopens a removal's cleanup row (mirror_done_at back to NULL) so the sweep runs it again. Used by a worker whose
+ * progress write may have landed after another worker closed the row with a newer line (Codex review of PR 376,
+ * round 5): the stale line must not stay in Notion with the row closed. Replaying a cleanup is idempotent.
+ */
+export async function reopenRemovalCleanup(supabase: Supa, sessionId: number): Promise<boolean> {
+  const { error } = await supabase.from("reading_session_removals").update({ mirror_done_at: null }).eq("session_id", sessionId);
+  if (error) console.error("reading: removal cleanup reopen failed:", error.code ?? "unknown");
+  return !error;
+}
+
+const KEYED_CREATE_NEEDS_COLUMN = "Reading sessions can't be saved here until sql/reading_sessions_client_key.sql is applied.";
+const SESSION_KEYS = SESSION_COLS.split(",").map((c) => c.trim());
+
+/**
+ * The keyed create in one transaction (pds.create_reading_session, sql/reading_session_discards.sql): the session, the
+ * book's finish and the day's habit Yes. `unavailable` = that file is not applied (the caller then creates as before).
+ */
+async function createKeyedSession(
+  supabase: Supa,
+  key: string,
+  row: {
+    book_id: number;
+    session_date: string;
+    chapter_from: number | null;
+    chapter_through: number;
+    minutes: number | null;
+    medium: string | null;
+    recall: string | null;
+    question: string | null;
+    source: string;
+  },
+): Promise<
+  | {
+      kind: "created";
+      session: ReadingSession;
+      finished: boolean;
+      habit: { marked: boolean; created: boolean };
+      mirrorClaimId: string | null;
+      progressOwedId: string | null;
+    }
+  | { kind: "error"; error: { code?: string; message?: string } }
+  | { kind: "unavailable" }
+> {
+  const { data, error } = await supabase.rpc("create_reading_session", {
+    p_client_key: key,
+    p_book_id: row.book_id,
+    p_session_date: row.session_date,
+    p_chapter_from: row.chapter_from,
+    p_chapter_through: row.chapter_through,
+    p_minutes: row.minutes,
+    p_medium: row.medium,
+    p_recall: row.recall,
+    p_question: row.question,
+    p_source: row.source,
+  });
+  if (error) return ["PGRST202", "42883"].includes(String(error.code)) ? { kind: "unavailable" } : { kind: "error", error };
+  const out = (data ?? {}) as {
+    session?: Record<string, unknown>;
+    finished?: boolean;
+    habit_marked?: boolean;
+    habit_created?: boolean;
+    mirror_claim_id?: unknown;
+    progress_owed_id?: unknown;
+  };
+  if (!out.session || typeof out.session !== "object") return { kind: "error", error: { message: "The session was not returned." } };
+  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, out.session?.[k] ?? null])) as unknown as ReadingSession;
+  const uuidOrNull = (v: unknown): string | null => (typeof v === "string" && UUID_RE.test(v) ? v : null);
+  return {
+    kind: "created",
+    session,
+    finished: out.finished === true,
+    habit: { marked: out.habit_marked === true, created: out.habit_created === true },
+    mirrorClaimId: uuidOrNull(out.mirror_claim_id),
+    progressOwedId: uuidOrNull(out.progress_owed_id),
+  };
+}
+
+const MOVE_UNAVAILABLE = "Moving a session to another day or book isn't available until sql/reading_session_discards.sql is applied.";
+
+/**
+ * An edit of a session (pds.move_reading_session, sql/reading_session_discards.sql): its new values, the habit part
+ * of a move and the books' finish state in ONE transaction (Codex review of PR 376, rounds 2 and 4). The new day's
+ * habit is stamped and the old day's is settled from the habit row's own record, so the old day's Yes goes back also
+ * when the browser knows no habit day (a create whose answer was lost and replayed). The finish is decided from the
+ * row as it was under its lock, so an edit whose answer was lost leaves nothing for its retry to miss (the old book's
+ * finish used to be taken back in a later request, from values the retry no longer saw). A failed habit part rolls
+ * the edit back (500, the form retries). Without the function: 503 and nothing changed, never a move in separate
+ * requests (updateSession falls back for an edit that keeps the day and the book only).
+ */
+async function moveSessionTx(
+  supabase: Supa,
+  sessionId: number,
+  patch: {
+    book_id: number;
+    session_date: string;
+    chapter_from: number;
+    chapter_through: number;
+    minutes: number | null;
+    medium: string | null;
+    recall: string | null;
+    question: string | null;
+  },
+  habitCreatedOn: string | null,
+  editSeq: number | null,
+): Promise<
+  | ({ ok: true; session: ReadingSession; book: Book | null; finished: boolean; unfinished: boolean; marked: boolean; created: boolean } & EditMirrorWork)
+  | { ok: false; status: number; error: string }
+> {
+  const { data, error } = await supabase.rpc("move_reading_session", {
+    p_session_id: sessionId,
+    p_book_id: patch.book_id,
+    p_session_date: patch.session_date,
+    p_chapter_from: patch.chapter_from,
+    p_chapter_through: patch.chapter_through,
+    p_minutes: patch.minutes,
+    p_medium: patch.medium,
+    p_recall: patch.recall,
+    p_question: patch.question,
+    p_habit_created_on: habitCreatedOn,
+    p_edit_seq: editSeq,
+  });
+  if (error) {
+    if (error.code === KINDLE_SESSION_CODE) return { ok: false, status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
+    if (error.code === BOOK_MISSING_CODE) return { ok: false, status: 400, error: "No such book" };
+    if (discardsMissing(error)) return { ok: false, status: 503, error: MOVE_UNAVAILABLE };
+    return { ok: false, status: 500, error: error.message ?? "Couldn't move the session." };
+  }
+  const out = (data ?? null) as {
+    moved?: unknown;
+    stale?: unknown;
+    session?: unknown;
+    book?: unknown;
+    finished?: unknown;
+    unfinished?: unknown;
+    habit_marked?: unknown;
+    habit_created?: unknown;
+    mirror_claim_id?: unknown;
+    replaces_block_id?: unknown;
+    moved_book?: unknown;
+    entry_pending?: unknown;
+    progress_owed?: unknown;
+  } | null;
+  if (!out || typeof out !== "object" || typeof out.moved !== "boolean") return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
+  if (!out.moved) return { ok: false, status: 404, error: "That session no longer exists." };
+  if (out.stale === true) return { ok: false, status: 409, error: "A newer edit of this session was already saved." };
+  const raw = out.session;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
+  const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, (raw as Record<string, unknown>)[k] ?? null])) as unknown as ReadingSession;
+  const rawBook = out.book;
+  const book =
+    rawBook && typeof rawBook === "object" && !Array.isArray(rawBook) && Number.isFinite(Number((rawBook as Record<string, unknown>).book_id))
+      ? (Object.fromEntries(BOOK_KEYS.map((k) => [k, (rawBook as Record<string, unknown>)[k] ?? null])) as unknown as Book)
+      : null;
+  return {
+    ok: true,
+    session,
+    book,
+    finished: out.finished === true,
+    unfinished: out.unfinished === true,
+    marked: out.habit_marked === true,
+    created: out.habit_created === true,
+    ...editMirrorWork(out),
+  };
+}
+
+/**
+ * The Notion work an edit owes, stored by pds.move_reading_session in the edit's own transaction (Codex T01-R12,
+ * T01-R14): the route does it under these rows, and the sweep (lib/reading-removal.ts) finishes whatever the route
+ * could not, also when the route never ran its Notion step because the RPC's answer was lost.
+ */
+export interface EditMirrorWork {
+  /** The edit ran in pds.move_reading_session, so the fields below are what it stored (false: the plain-update fallback). */
+  mirrorStored: boolean;
+  /** The claim the route's entry work runs under: a move's new entry (owes it), or the rewrite of the session's entry. */
+  mirrorClaimId: string | null;
+  /**
+   * A move to another book: the entry its claim replaces, as the edit's transaction read it under the session's lock.
+   * The route uses this, never its own earlier read (Codex review of PR 376, round 2 of T01-R14): a create's callback
+   * can attach the entry between that read and the move, and a stale "no entry" made the new entry's conditional attach
+   * fail and dropped the move's claim, leaving the old entry on the old page and none on the new one.
+   */
+  mirrorReplaces: string | null;
+  /**
+   * Whether the edit's own transaction moved the session to another book, read under the session's lock. The route
+   * dispatches on this, never on the book it read before the edit: a concurrent edit can have changed the session's
+   * book in between, and a move treated as a plain refresh rewrote the old book's entry and dropped the move's claim.
+   * null = not stored by the RPC (the plain-update fallback).
+   */
+  movedBook: boolean | null;
+  /** A move's claim still owes the session's entry: nothing is rewritten now, that claim writes it from the session. */
+  entryPending: boolean;
+  /** One stored progress obligation per book whose page line this edit changed. */
+  progressOwed: { bookId: number; owedId: string }[];
+}
+
+const NO_MIRROR_WORK: EditMirrorWork = { mirrorStored: false, mirrorClaimId: null, mirrorReplaces: null, movedBook: null, entryPending: false, progressOwed: [] };
+
+function editMirrorWork(out: { mirror_claim_id?: unknown; replaces_block_id?: unknown; moved_book?: unknown; entry_pending?: unknown; progress_owed?: unknown }): EditMirrorWork {
+  const claim = typeof out.mirror_claim_id === "string" && UUID_RE.test(out.mirror_claim_id) ? out.mirror_claim_id : null;
+  const owed: { bookId: number; owedId: string }[] = [];
+  if (Array.isArray(out.progress_owed)) {
+    for (const o of out.progress_owed) {
+      if (!o || typeof o !== "object") continue;
+      const bookId = Number((o as Record<string, unknown>).book_id);
+      const owedId = (o as Record<string, unknown>).owed_id;
+      if (Number.isFinite(bookId) && typeof owedId === "string" && UUID_RE.test(owedId)) owed.push({ bookId, owedId });
+    }
+  }
+  const replaces = typeof out.replaces_block_id === "string" && out.replaces_block_id ? out.replaces_block_id : null;
+  return { mirrorStored: true, mirrorClaimId: claim, mirrorReplaces: replaces, movedBook: typeof out.moved_book === "boolean" ? out.moved_book : null, entryPending: out.entry_pending === true, progressOwed: owed };
+}
+
+/** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
+function isConfirmedRefusal(error: { code?: string }): boolean {
+  const code = String(error.code ?? "");
+  return /^(22|23|P0001)/.test(code) || code === "PGRST202" || code === "PGRST204";
 }
 
 async function sessionByClientKey(supabase: Supa, key: string): Promise<ReadingSession | null> {
@@ -631,9 +982,24 @@ async function furthestChapter(supabase: Supa, bookId: number, except: number | 
 const sessionXp = (through: number, prevMax: number, recall: string | null) =>
   Math.max(0, through - prevMax) * XP.perChapter + ((recall ?? "").length >= 40 ? XP.perRecall : 0);
 
-/** Stamp the book's habit Yes on `date`; `created` = no row for that day existed before. */
+/**
+ * Stamp the book's habit Yes on `date`; `created` = no row for that day existed before. Used by keyless creates (chat).
+ * Goes through pds.stamp_reading_habit (sql/reading_session_discards.sql), which records what the stamp did to the
+ * habit row in the same transaction, so whichever session of that day goes last takes the Yes back (Codex review of
+ * PR 376, round 2). Without that function (the file not applied yet) the plain upsert as before: a keyless create
+ * never needed the discard fence.
+ */
 async function stampHabit(supabase: Supa, book: Book, date: string): Promise<{ marked: boolean; created: boolean }> {
   if (!book.habit_name) return { marked: false, created: false };
+  const { data: stamped, error: rpcError } = await supabase.rpc("stamp_reading_habit", { p_cycle_date: date, p_question: book.habit_name });
+  if (!rpcError) {
+    const out = (stamped ?? {}) as { marked?: unknown; created?: unknown };
+    return { marked: out.marked === true, created: out.created === true };
+  }
+  if (!["PGRST202", "42883"].includes(String(rpcError.code))) {
+    console.error("reading: habit stamp failed:", rpcError.code ?? "unknown");
+    return { marked: false, created: false };
+  }
   const { data: had } = await supabase.from("habit_journal").select("answer").eq("cycle_date", date).eq("question", book.habit_name).maybeSingle();
   const { error } = await supabase
     .from("habit_journal")
@@ -646,28 +1012,6 @@ async function stampHabit(supabase: Supa, book: Book, date: string): Promise<{ m
 }
 
 /**
- * Take back a habit Yes a session made on `date` (the session moved to another day, or was removed): only when no
- * other session of a book with the same habit is on that day. A row the session did not create is never touched
- * (the caller decides that).
- */
-async function unstampHabitIfUnused(supabase: Supa, book: Book, date: string, exceptSession: number): Promise<boolean> {
-  if (!book.habit_name) return false;
-  const { data: sameHabit } = await supabase.from("books").select("book_id").eq("habit_name", book.habit_name);
-  const ids = new Set<number>([book.book_id, ...((sameHabit ?? []) as Array<{ book_id: number }>).map((b) => b.book_id)]);
-  const { data: others, error } = await supabase
-    .from("reading_sessions")
-    .select("session_id")
-    .eq("session_date", date)
-    .in("book_id", [...ids])
-    .neq("session_id", exceptSession)
-    .limit(1);
-  if (error || others?.length) return false;
-  const { error: dErr } = await supabase.from("habit_journal").delete().eq("cycle_date", date).eq("question", book.habit_name).eq("answer", "Yes");
-  if (dErr) console.error("reading: habit unstamp failed:", dErr.message);
-  return !dErr;
-}
-
-/**
  * The book was finished by `previous` (its day is the finish day and it reached the last chapter) and that session
  * no longer does (edited below the end, moved to another book, or removed): back to reading when no other session
  * reaches the last chapter.
@@ -677,17 +1021,27 @@ async function undoFinishIfOnlyThis(supabase: Supa, book: Book, previous: Readin
   if (book.status !== "finished" || !total || (previous.chapter_through ?? 0) < total || book.finished_on !== previous.session_date) return false;
   const { data: rest } = await supabase
     .from("reading_sessions")
-    .select("session_id")
+    .select("session_date")
     .eq("book_id", book.book_id)
     .gte("chapter_through", total)
     .neq("session_id", exceptSession)
+    .order("session_date", { ascending: true })
     .limit(1);
-  if (rest?.length) return false;
+  if (rest?.length) {
+    // Another session still reaches the last chapter: the finish day moves to the earliest of them, so removing the
+    // sessions oldest first cannot leave the book finished with nothing behind it (review of PR 376, round 3).
+    const next = (rest[0] as { session_date: string }).session_date;
+    if (next && next !== book.finished_on) await supabase.from("books").update({ finished_on: next }).eq("book_id", book.book_id);
+    return false;
+  }
   const { error } = await supabase.from("books").update({ status: "reading", finished_on: null }).eq("book_id", book.book_id);
   return !error;
 }
 
-export async function logSession(supabase: Supa, input: LogSessionInput): Promise<LogSessionResult | { ok: false; error: string }> {
+export async function logSession(
+  supabase: Supa,
+  input: LogSessionInput,
+): Promise<LogSessionResult | { ok: false; error: string; discarded?: true; unavailable?: true; retryable?: true }> {
   const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
   if (input.require_client_key && !key) return { ok: false, error: SESSION_KEY_REQUIRED };
   /** The stored session of an earlier create with this key, with its own book (`fallback` only if that cannot be read). */
@@ -705,6 +1059,8 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
       habitMarked: false,
       habitCreated: null,
       replayed: true,
+      mirrorClaimId: null,
+      progressOwedId: null,
     };
   };
   // A retried create answers its stored session BEFORE the book is resolved: the session it made may have finished
@@ -746,19 +1102,51 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     question: input.question?.trim() || null,
     source: input.source === "chat" ? "chat" : "manual",
   };
-  let { data, error } = await supabase.from("reading_sessions").insert(key ? { ...row, client_key: key } : row).select(SESSION_COLS).single();
-  if (error && key && error.code === "23505") {
-    // The same create arrived twice at once: the other one made the session.
-    const prior = await sessionByClientKey(supabase, key);
-    const replayed = prior ? await replay(prior, book) : null;
-    if (replayed) return replayed;
+  // A keyed create (the /log form's) runs as ONE database call: the session, the finish and the habit stamp commit
+  // together under the key's lock, so a Discard of the key sees all of them or none (Codex review T01-R4 of PR 376:
+  // with separate requests a Discard landing between them left a finished book or a habit Yes for a removed session).
+  if (key) {
+    const atomic = await createKeyedSession(supabase, key, row);
+    if (atomic.kind === "created") {
+      const { session, finished, habit, mirrorClaimId, progressOwedId } = atomic;
+      return {
+        ok: true,
+        book: { ...book, status: finished ? "finished" : book.status, finished_on: finished ? date : book.finished_on },
+        session,
+        xpGained: sessionXp(through, prevMax, row.recall),
+        finished,
+        habitMarked: habit.marked,
+        habitCreated: habit.created,
+        replayed: false,
+        mirrorClaimId,
+        progressOwedId,
+      };
+    }
+    if (atomic.kind === "error") {
+      const error = atomic.error;
+      if (error.code === "23505") {
+        // The same create arrived twice at once: the other one made the session.
+        const prior = await sessionByClientKey(supabase, key);
+        const replayed = prior ? await replay(prior, book) : null;
+        if (replayed) return replayed;
+      }
+      if (error.code === DISCARDED_KEY_CODE) return { ok: false, error: DISCARDED_ENTRY_ERROR, discarded: true };
+      // Onyx Chat (require_client_key) gets its own refusal text; nothing is stored either way.
+      if (missingColumn(error)) return { ok: false, error: input.require_client_key ? SESSION_KEY_REQUIRED : KEYED_CREATE_NEEDS_COLUMN };
+      const message = error.message ?? "Couldn't save the session.";
+      // Only a confirmed refusal (a constraint or a raised error) is a 4xx. A transport failure, a missing code, a
+      // connection / resource / shutdown / internal class or a lost response may have committed the create: the
+      // answer must be retryable (5xx) so the form's unknown-outcome handling replays the same key.
+      return isConfirmedRefusal(error) ? { ok: false, error: message } : { ok: false, error: message, retryable: true };
+    }
+    // atomic.kind === "unavailable": pds.create_reading_session is not there (the file not applied, or not yet in
+    // PostgREST's schema cache). The discard fence may be there all the same (a partly applied file, a stale cache),
+    // so the create is NOT done in separate requests, which a Discard could land between (Codex review of PR 376):
+    // 503, nothing stored, and the form retries.
+    return { ok: false, error: KEYED_CREATE_UNAVAILABLE, unavailable: true };
   }
-  if (error && key && missingColumn(error)) {
-    // The key column is not there: the insert above was refused, so nothing was written. Chat needs the key (a retry
-    // finds the session only by it): refused. Any other caller writes the session without the key, as before.
-    if (input.require_client_key) return { ok: false, error: SESSION_KEY_REQUIRED };
-    ({ data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single());
-  }
+  // Keyless creates only (callers that sent no key): a plain insert, then the finish and the habit stamp.
+  const { data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single();
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
 
@@ -784,6 +1172,8 @@ export async function logSession(supabase: Supa, input: LogSessionInput): Promis
     habitMarked: habit.marked,
     habitCreated: habit.created,
     replayed: false,
+    mirrorClaimId: null,
+    progressOwedId: null,
   };
 }
 
@@ -807,9 +1197,11 @@ export interface SessionUpdate {
    * when no other session is on it.
    */
   habit_created_on: string | null;
+  /** The form's own rising edit number: an edit older than the stored one is refused (Codex review of PR 376). */
+  edit_seq: number | null;
 }
 
-const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question", "habit_created_on"]);
+const SESSION_UPDATE_FIELDS = new Set(["book", "date", "chapter_through", "chapter_from", "minutes", "medium", "recall", "question", "habit_created_on", "edit_seq"]);
 const SESSION_TEXT_MAX = 20000;
 
 /** A real calendar date as YYYY-MM-DD, or null. */
@@ -846,6 +1238,8 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
   if (date === undefined) return { ok: false, error: "date must be YYYY-MM-DD" };
   const habitCreatedOn = ymdOrNull(b.habit_created_on);
   if (habitCreatedOn === undefined) return { ok: false, error: "habit_created_on must be YYYY-MM-DD" };
+  const editSeq = b.edit_seq === undefined || b.edit_seq === null ? null : b.edit_seq;
+  if (editSeq !== null && !(typeof editSeq === "number" && Number.isSafeInteger(editSeq) && editSeq > 0)) return { ok: false, error: "edit_seq must be a positive integer" };
   let medium: Medium | null = null;
   if (b.medium !== undefined && b.medium !== null && b.medium !== "") {
     if (typeof b.medium !== "string" || !["audio", "kindle", "paper", "other"].includes(b.medium)) return { ok: false, error: "medium must be audio, kindle, paper or other" };
@@ -866,11 +1260,11 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
     if (typeof b.book !== "string" || b.book.length > 200) return { ok: false, error: "book must be a slug" };
     book = b.book;
   }
-  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question, habit_created_on: habitCreatedOn } };
+  return { ok: true, input: { book, date, chapter_through: through, chapter_from: from, minutes, medium, recall, question, habit_created_on: habitCreatedOn, edit_seq: editSeq } };
 }
 
 export type SessionEditResult =
-  | {
+  | ({
       ok: true;
       book: Book;
       previousBook: Book;
@@ -883,7 +1277,7 @@ export type SessionEditResult =
       habitMarked: boolean;
       /** The day of the habit row this session made, after the edit (send it back with the next edit); null = none. */
       habitCreatedOn: string | null;
-    }
+    } & EditMirrorWork)
   | { ok: false; status: number; error: string };
 
 async function editableSession(
@@ -897,7 +1291,9 @@ async function editableSession(
   if (session.source !== "manual" && session.source !== "chat") {
     return { ok: false, status: 409, error: "Kindle sessions are written by the harvester and can't be edited here." };
   }
-  const { data: bookRow } = await supabase.from("books").select(BOOK_COLS).eq("book_id", session.book_id).maybeSingle();
+  // A failed read is an error, never "gone": a 404 tells the /log form the session is no longer stored (Codex T01-R5).
+  const { data: bookRow, error: bookErr } = await supabase.from("books").select(BOOK_COLS).eq("book_id", session.book_id).maybeSingle();
+  if (bookErr) return { ok: false, status: 500, error: bookErr.message };
   if (!bookRow) return { ok: false, status: 404, error: "The session's book no longer exists." };
   return { ok: true, session, book: bookRow as Book };
 }
@@ -910,9 +1306,11 @@ async function editableSession(
  *  - reaching the last chapter finishes the book; editing back below it (or moving the session to another book)
  *    sets a finish this session caused back to reading when no other session reaches the last chapter; a moved
  *    finishing session moves the finish day with it;
- *  - a new day (or book) stamps that book's habit Yes there; the old day's Yes is taken back only when this
- *    session made it (`habit_created_on`, which the server reported) and no other session of a book with the same
- *    habit is on that day. A row the session did not make (Riley's own answer) is never touched.
+ *  - a new day (or book) stamps that book's habit Yes there, and the old day's Yes is taken back when no other
+ *    session of a book with the same habit is on that day and reading made it (the habit row's own record in the
+ *    database, else `habit_created_on` for a session stamped before that record existed), in the same transaction
+ *    as the move (pds.move_reading_session). A row reading did not make, or one answered again since (Riley's own
+ *    answer), is never touched.
  */
 export async function updateSession(supabase: Supa, sessionId: number, input: SessionUpdate): Promise<SessionEditResult> {
   const cur = await editableSession(supabase, sessionId);
@@ -950,55 +1348,67 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
     recall: input.recall?.trim() || null,
     question: input.question?.trim() || null,
   };
-  const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
-  if (error) return { ok: false, status: 500, error: error.message };
-  const session = data as ReadingSession;
-
-  const xpGained = sessionXp(through, prevMax, patch.recall);
   const sameBook = book.book_id === previousBook.book_id;
-  const total = book.total_chapters;
-  const reachesEnd = !!total && through >= total;
+  const moved = date !== previous.session_date || !sameBook;
 
-  // Finished: set it, move it with its session, or take back the finish this session caused.
+  // Every edit is one transaction (pds.move_reading_session): the session, the habit part of a move (the new day
+  // stamped, the old day's Yes taken back from the habit row's own record when this was the last session there; Codex
+  // review of PR 376, round 2) and the finish of both books (round 4: done here in later requests, a move whose answer
+  // was lost left the old book finished for good, because its retry read the moved session as the "before").
+  const xpGained = sessionXp(through, prevMax, patch.recall);
+  let session: ReadingSession;
+  let habitMarked = false;
+  let habitCreatedOn = input.habit_created_on;
   let finished = false;
   let unfinished = false;
   let finishedOn = book.finished_on;
   let status = book.status;
-  if (reachesEnd && book.status !== "finished") {
-    await supabase.from("books").update({ status: "finished", finished_on: date }).eq("book_id", book.book_id);
-    finished = true;
-    status = "finished";
-    finishedOn = date;
-  } else if (
-    reachesEnd &&
-    sameBook &&
-    date !== previous.session_date &&
-    book.finished_on === previous.session_date &&
-    (previous.chapter_through ?? 0) >= (total ?? Infinity)
-  ) {
-    await supabase.from("books").update({ finished_on: date }).eq("book_id", book.book_id);
-    finishedOn = date;
-  }
-  if (!(sameBook && reachesEnd)) {
-    unfinished = await undoFinishIfOnlyThis(supabase, previousBook, previous, sessionId);
-    if (unfinished && sameBook) {
-      status = "reading";
-      finishedOn = null;
+  let mirrorWork: EditMirrorWork = NO_MIRROR_WORK;
+  const tx = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on, input.edit_seq);
+  if (tx.ok) {
+    session = tx.session;
+    mirrorWork = {
+      mirrorStored: tx.mirrorStored,
+      mirrorClaimId: tx.mirrorClaimId,
+      mirrorReplaces: tx.mirrorReplaces,
+      movedBook: tx.movedBook,
+      entryPending: tx.entryPending,
+      progressOwed: tx.progressOwed,
+    };
+    habitMarked = tx.marked;
+    finished = tx.finished;
+    unfinished = tx.unfinished;
+    if (tx.book) {
+      status = tx.book.status;
+      finishedOn = tx.book.finished_on;
     }
-  }
-
-  // The habit: stamp the new day; take back the old day's row only when this session made it.
-  let habitMarked = false;
-  let habitCreatedOn = input.habit_created_on;
-  const moved = date !== previous.session_date || !sameBook;
-  if (moved) {
-    const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
-    const stamp = await stampHabit(supabase, book, date);
-    habitMarked = stamp.marked;
-    if (!sameRow && input.habit_created_on && input.habit_created_on === previous.session_date) {
-      await unstampHabitIfUnused(supabase, previousBook, previous.session_date, sessionId);
+    if (moved) {
+      const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
+      habitCreatedOn = sameRow ? input.habit_created_on : tx.created ? date : null;
     }
-    habitCreatedOn = sameRow ? input.habit_created_on : stamp.created ? date : null;
+  } else if (moved || tx.status !== 503) {
+    return tx;
+  } else {
+    // sql/reading_session_discards.sql not applied yet: an edit that keeps the day and the book is the plain update
+    // and finish requests from before that file (a move is refused above).
+    const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
+    if (error) return { ok: false, status: 500, error: error.message };
+    session = data as ReadingSession;
+    const total = book.total_chapters;
+    const reachesEnd = !!total && through >= total;
+    if (reachesEnd && book.status !== "finished") {
+      await supabase.from("books").update({ status: "finished", finished_on: date }).eq("book_id", book.book_id);
+      finished = true;
+      status = "finished";
+      finishedOn = date;
+    }
+    if (!reachesEnd) {
+      unfinished = await undoFinishIfOnlyThis(supabase, previousBook, previous, sessionId);
+      if (unfinished) {
+        status = "reading";
+        finishedOn = null;
+      }
+    }
   }
 
   return {
@@ -1012,31 +1422,68 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
     unfinished,
     habitMarked,
     habitCreatedOn,
+    ...mirrorWork,
   };
 }
+
+/** The answer of a removal: what it removed, or (`removed: null`) that nothing of it is stored any more. */
+export type SessionRemoval =
+  | { ok: true; removed: ReadingSession; book: Book; unfinished: boolean; habitRemoved: boolean; cleanup: RemovalCleanup | null }
+  /**
+   * Nothing to remove. `cleanup` = an earlier removal of the same session (or key) whose answer may have been lost:
+   * the route replays the Notion cleanup it still owes (`done` false). Its database part already committed with it.
+   */
+  | { ok: true; removed: null; unfinished: boolean; cleanup: RemovalCleanup | null }
+  /**
+   * `gone` = the database said, inside the removal's transaction, that no such session exists and none of it is on
+   * record: the only failure the form may read as "already removed" (route code session_gone). Every other failure
+   * (a 404 for a missing book included, where the session is still stored) leaves the entry on screen.
+   */
+  | { ok: false; status: number; error: string; gone?: true };
 
 /**
  * Remove a manual or chat session (the autosaving form's "Remove this session"). A book this session finished
  * (finished on its day, and no other session reaches the last chapter) goes back to reading. The day's habit Yes
- * is taken back only when this session made it (`habitCreatedOn`) and no other session with the same habit is on
- * that day.
+ * is taken back only when reading made it and no other session with the same habit is on that day: the habit row's
+ * own record in the database decides (Codex T01-R7), else `habitCreatedOn`. All of it, and the session's client_key recorded as discarded (a create of that key still under way is
+ * then refused instead of bringing the session back, Codex T01-R6), is ONE transaction (pds.remove_reading_session):
+ * a removal whose answer is lost has removed everything or nothing, and its retry finds the cleanup row and gets
+ * `removed: null` with it, so the route still trashes the Notion entry (Codex review of PR 376).
+ * A session that is gone with no removal of it on record answers 404, as before. Without the function
+ * (sql/reading_session_discards.sql not applied, or not yet in PostgREST's schema cache): 503 and nothing removed,
+ * also for a session with no key; the form keeps it and retries.
  */
-export async function deleteSession(
-  supabase: Supa,
-  sessionId: number,
-  habitCreatedOn: string | null = null,
-): Promise<{ ok: true; book: Book; session: ReadingSession; unfinished: boolean; habitRemoved: boolean } | { ok: false; status: number; error: string }> {
-  const cur = await editableSession(supabase, sessionId);
-  if (!cur.ok) return cur;
-  const { session } = cur;
-  let book = cur.book;
-  const { error } = await supabase.from("reading_sessions").delete().eq("session_id", sessionId);
-  if (error) return { ok: false, status: 500, error: error.message };
+export async function deleteSession(supabase: Supa, sessionId: number, habitCreatedOn: string | null = null): Promise<SessionRemoval> {
+  const r = await removeSessionTx(supabase, { sessionId }, habitCreatedOn);
+  if (r.kind === "failed") return { ok: false, status: r.status, error: r.error };
+  if (r.kind === "removed") return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished, habitRemoved: r.habitRemoved, cleanup: r.cleanup };
+  if (!r.cleanup) return { ok: false, status: 404, error: "That session no longer exists.", gone: true };
+  return { ok: true, removed: null, unfinished: r.cleanup.unfinished, cleanup: r.cleanup };
+}
 
-  const unfinished = await undoFinishIfOnlyThis(supabase, book, session, sessionId);
-  if (unfinished) book = { ...book, status: "reading", finished_on: null };
-  const habitRemoved = habitCreatedOn !== null && habitCreatedOn === session.session_date ? await unstampHabitIfUnused(supabase, book, session.session_date, sessionId) : false;
-  return { ok: true, book, session, unfinished, habitRemoved };
+/**
+ * Discard of an autosaving /log entry whose create may have been stored although its answer never arrived (PROD-T01):
+ * one transaction (pds.remove_reading_session) records the key as discarded under the key's lock, so a create of it
+ * still running on the server either committed before (its session is found and removed here) or is refused after,
+ * and removes that session exactly like DELETE /api/reading/sessions/[id] (a finish it caused goes back to reading;
+ * the route trashes its Notion entry). Whether that create made the day's habit row is not taken from the browser
+ * (its answer was lost): the create wrote it down with the habit row (pds.reading_habit_provenance), and the
+ * removal takes back the Yes reading made (or gives back the answer it replaced) when this is the last session of
+ * that day, unless the row was answered again since (Codex T01-R7). A failed habit part fails the whole removal.
+ * The create side is one transaction too (pds.create_reading_session: session, finish and habit Yes together), so the
+ * session found here comes with every effect its create had, and none can follow after its removal (Codex T01-R4).
+ * `removed: null` = no session has this key (the database said so inside that transaction, never assumed from a
+ * 404) and none can be created with it any more: nothing of the entry is stored. `cleanup` then carries an earlier
+ * removal of the key whose Notion cleanup the route replays (a removal whose answer was lost, or one that raced this).
+ * When the removal cannot be recorded (sql/reading_session_discards.sql or the client_key column not applied: 503;
+ * a database failure: 500) the answer is an error, never "nothing stored": the form keeps the entry and retries.
+ */
+export async function deleteSessionByClientKey(supabase: Supa, clientKey: string): Promise<SessionRemoval> {
+  if (!UUID_RE.test(clientKey)) return { ok: false, status: 400, error: "client_key must be a UUID" };
+  const r = await removeSessionTx(supabase, { clientKey: clientKey.toLowerCase() }, null);
+  if (r.kind === "failed") return { ok: false, status: r.status, error: r.error };
+  if (r.kind === "removed") return { ok: true, removed: r.session, book: r.book, unfinished: r.unfinished, habitRemoved: r.habitRemoved, cleanup: r.cleanup };
+  return { ok: true, removed: null, unfinished: r.cleanup?.unfinished ?? false, cleanup: r.cleanup };
 }
 
 export interface AddHighlightInput {

@@ -103,6 +103,18 @@ test("sameBedSuggestion: a recorded night is Yes; a missing night is No only aft
   assert.equal(C.sameBedSuggestion(day, 3600, "2031-03-09"), null); // a short row: unclear, stays blank
 });
 
+test("pcActivitySuggestions: Yes only, work programs, VS Code and browsers never count", () => {
+  const names = new Set(["Worked late?", "BI/Python/AL/Excel"]);
+  const out = C.pcActivitySuggestions({ minutes_by_app: { excel: 12.4, code: 300, chrome: 90 }, late_minutes_by_app: { excel: 20, outlook: 15, chrome: 200 } }, names);
+  assert.equal(out["Worked late?"].answer, "Yes");
+  assert.equal(out["BI/Python/AL/Excel"].answer, "Yes");
+  assert.match(out["BI/Python/AL/Excel"].source, /Excel/);
+  const none = C.pcActivitySuggestions({ minutes_by_app: { code: 300, chrome: 90, pbidesktop: 9.9 }, late_minutes_by_app: { chrome: 200, excel: 29 } }, names);
+  assert.deepEqual(none, {});
+  assert.deepEqual(C.pcActivitySuggestions(null, names), {});
+  assert.deepEqual(C.pcActivitySuggestions({ minutes_by_app: { excel: 60 } }, new Set(["News"])), {});
+});
+
 test("appHabitSuggestions: Yes from 3 minutes in the app, never a No", () => {
   const names = new Set(["Duolingo Spanish", "Substack", "News"]);
   const out = C.appHabitSuggestions({ "com.duolingo.DuolingoMobile": 12.4, "com.substack.Substack": 0, "com.apple.news": 2.9 }, names);
@@ -182,6 +194,23 @@ test("fallbackBehavioralToday: Eastern time minus 6 hours", () => {
   // Spring-forward day (2027-03-14): 05:30 EDT is still the day before, 06:30 EDT is the new day
   assert.equal(C.fallbackBehavioralToday(new Date("2027-03-14T09:30:00Z")), "2027-03-13");
   assert.equal(C.fallbackBehavioralToday(new Date("2027-03-14T10:30:00Z")), "2027-03-14");
+});
+
+test("deviceBehavioralDay: the wall clock of the device's (or the given) zone minus 6 hours; Pacific rolls 3 h after Eastern", () => {
+  // 2031-04-10 12:00 UTC = 08:00 EDT (Eastern: the new day) = 05:00 PDT (Pacific: still the day before)
+  const early = new Date("2031-04-10T12:00:00Z");
+  assert.equal(C.fallbackBehavioralToday(early), "2031-04-10");
+  assert.equal(C.deviceBehavioralDay(early, "America/Los_Angeles"), "2031-04-09");
+  // 12:59 UTC = 05:59 PDT: still the day before; 13:00 UTC = 06:00 PDT: the new day
+  assert.equal(C.deviceBehavioralDay(new Date("2031-04-10T12:59:00Z"), "America/Los_Angeles"), "2031-04-09");
+  assert.equal(C.deviceBehavioralDay(new Date("2031-04-10T13:00:00Z"), "America/Los_Angeles"), "2031-04-10");
+  // Eastern zone: the same answer as fallbackBehavioralToday, also on the fall-back day
+  for (const iso of ["2031-03-05T10:59:00Z", "2031-03-05T11:00:00Z", "2026-11-01T10:30:00Z", "2026-11-01T11:00:00Z"]) {
+    assert.equal(C.deviceBehavioralDay(new Date(iso), "America/New_York"), C.fallbackBehavioralToday(new Date(iso)), iso);
+  }
+  // No zone: the device's own
+  const own = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  assert.equal(C.deviceBehavioralDay(early), C.deviceBehavioralDay(early, own));
 });
 
 test("sleepDateError: a Yes/No to a sleep question is refused for today or later, never for a past night", () => {

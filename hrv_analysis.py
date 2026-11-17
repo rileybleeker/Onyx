@@ -1047,6 +1047,26 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         LOAD_FAILURES.add("weather_daily")
         data["weather"] = pd.DataFrame()
 
+    # Estimated intake kcal (2026-11-16): Claude-estimated kcal from delivered restaurant orders
+    # (pds.delivery_nutrition_daily, delivery_item estimates) and photo-logged meals
+    # (pds.photo_meal_daily), merged into est_intake_kcal only on days with no Cronometer/MFP
+    # nutrition_calories (merge_estimated_intake_features). Loaded fail-open — estimates, and
+    # the photo table may not exist yet (PGRST205), so neither may sink the retrain.
+    for key, relation in (("delivery_nutrition", "delivery_nutrition_daily"),
+                          ("photo_nutrition", "photo_meal_daily")):
+        log.info(f"  Loading {relation} (estimated intake kcal)…")
+        try:
+            data[key] = fetch_all(relation, select="behavioral_date,est_kcal",
+                                  order="behavioral_date")
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", None)
+            if code in _MISSING_RELATION_CODES:
+                log.info(f"  {relation} not present yet; continuing without it")
+            else:
+                log.warning(f"  {relation} load failed ({e!r}); continuing without estimated intake")
+            LOAD_FAILURES.add(relation)
+            data[key] = pd.DataFrame()
+
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
     # topic_count) joined into the matrix per the audit's Finding #8. The textual
     # content + embedding stay out (handled by the chat tool, not HRV analysis).
@@ -1469,10 +1489,10 @@ def pivot_habits(journal: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     return pivot, label_map
 
 
-def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | None, dict[str, set[str]]]:
     """Pivot per-compound supplement intake into per-compound dose columns.
 
-    Returns (wide_df, tracking_start) where:
+    Returns (wide_df, tracking_start, unknown_days) where:
       - wide_df has one row per calendar_date with columns:
             supplement_<compound>_amount  (sum across products that day)
         For dates within the tracking window where the compound wasn't taken,
@@ -1481,13 +1501,33 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
         distinguish "untracked" from "took zero".
       - tracking_start is the earliest calendar_date in the supplements data,
         used by callers to fill NaN → 0 only within the tracking window.
+      - unknown_days maps each supplement column to the set of dates whose
+        TOTAL is unknown and must stay NaN (never 0): a day with an intake in
+        the unknown unit class, or with an unreadable amount.
+
+    UNIT CLASSES (HIST-UNIT-01, mirroring supplement_dose_response_rows): when
+    the input carries a `unit_class` column, the grouping becomes
+    (calendar_date, ingredient_group, unit_class) and every (compound, unit
+    class) pair that occurs gets its OWN feature column, so a 1 mg tablet and
+    a 1 mL liquid of the same compound on one day are two columns — never one
+    summed amount of 2. The mass class ('mg', including IU-converted vitamins
+    A / D / E, which the rollup already converted) keeps the historical column
+    name supplement_<compound>_amount so existing feature names do not change;
+    every other class gets its own suffix (e.g. supplement_<compound>_amount_ml).
+    Rows of the unknown unit class (SUPPLEMENT_UNKNOWN_UNIT_CLASS) carry no
+    readable amount in any class, so they produce no column; instead they make
+    that compound's day unknown in every column it has (unknown_days), exactly
+    like a row whose total_amount is unreadable. Without a `unit_class` column
+    the previous behaviour is kept exactly: one column per compound, summed
+    across whatever rows exist, and unknown_days is empty.
 
     Caller is responsible for merging on calendar_date and applying the
-    tracking-window fillna(0). We keep that here at the matrix layer rather
+    tracking-window fillna(0), skipping the unknown_days so an unknown total is
+    never written as 0. We keep that here at the matrix layer rather
     than inside this function because the matrix has the full date spine.
     """
     if supplements is None or supplements.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, {}
 
     def clean_col(c: str) -> str:
         return ("supplement_" + str(c).lower()
@@ -1498,28 +1538,77 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
                 .replace(".", "").replace("&", "and")
                 .strip("_") + "_amount")
 
+    def col_name(group, unit_class) -> str:
+        base = clean_col(group)
+        if unit_class == SUPPLEMENT_MASS_CLASS:
+            return base
+        slug = "".join(ch for ch in str(unit_class).lower() if ch.isalnum())
+        return base[: -len("_amount")] + "_amount_" + slug if slug else base
+
+    def dedup_cleaned_names(wide: pd.DataFrame) -> pd.DataFrame:
+        # Distinct group (or group x unit class) values can collapse to the same
+        # cleaned column name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid"
+        # both -> alpha_lipoic_acid). Sum across the duplicates so downstream
+        # merges don't choke on non-unique columns.
+        if wide.columns.duplicated().any():
+            dups = wide.columns[wide.columns.duplicated()].unique().tolist()
+            log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
+            wide = wide.T.groupby(level=0).sum(min_count=1).T
+            # groupby on transposed loses calendar_date column ordering; restore
+            cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
+            wide = wide[cols]
+        return wide
+
     supp = supplements.copy().dropna(subset=["calendar_date", "ingredient_group"])
     supp["total_amount"] = pd.to_numeric(supp["total_amount"], errors="coerce")
     tracking_start = str(supp["calendar_date"].min())
+    unknown_days: dict[str, set[str]] = {}
 
-    grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
-                   .agg(total_amount=("total_amount", "sum")))
+    if "unit_class" not in supp.columns:
+        grouped = (supp.groupby(["calendar_date", "ingredient_group"], as_index=False)
+                       .agg(total_amount=("total_amount", "sum")))
+        wide = grouped.pivot_table(
+            index="calendar_date", columns="ingredient_group",
+            values="total_amount", aggfunc="sum",
+        ).reset_index()
+        wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
+        return dedup_cleaned_names(wide), tracking_start, unknown_days
+
+    supp["_unit_class"] = supplement_unit_classes(supp)
+    known = supp[supp["_unit_class"] != SUPPLEMENT_UNKNOWN_UNIT_CLASS]
+    # A day whose total is unknown in ANY class of a compound (an unreadable
+    # amount, or an intake in the unknown unit class) is unknown for the
+    # compound as a whole: excluded from every column that compound has, the
+    # same "other_days | unquantified_days" rule supplement_dose_response_rows
+    # applies to the primary class.
+    bad = supp["total_amount"].isna() | (supp["_unit_class"] == SUPPLEMENT_UNKNOWN_UNIT_CLASS)
+    classes_by_group = {g: set(grp["_unit_class"]) for g, grp in known.groupby("ingredient_group")}
+    for day, group in (supp.loc[bad, ["calendar_date", "ingredient_group"]]
+                       .drop_duplicates().itertuples(index=False)):
+        for unit_class in classes_by_group.get(group, set()):
+            unknown_days.setdefault(col_name(group, unit_class), set()).add(str(day))
+
+    if known.empty:
+        return pd.DataFrame(), tracking_start, unknown_days
+    grouped = (known.groupby(["calendar_date", "ingredient_group", "_unit_class"], as_index=False)
+                    ["total_amount"].sum(min_count=1))
+    # A day with any unknown row is unknown for the compound as a whole: its
+    # summed total (which would otherwise be the partial sum of the readable
+    # rows) becomes NaN, so neither the pivot nor the caller's 0-fill can turn
+    # it into a number.
+    bad_pairs = {(str(d), g) for d, g in
+                 zip(supp.loc[bad, "calendar_date"], supp.loc[bad, "ingredient_group"])}
+    grouped.loc[[(str(d), g) in bad_pairs for d, g in
+                 zip(grouped["calendar_date"], grouped["ingredient_group"])],
+                "total_amount"] = np.nan
+    grouped["_col"] = [col_name(g, c) for g, c in
+                       zip(grouped["ingredient_group"], grouped["_unit_class"])]
     wide = grouped.pivot_table(
-        index="calendar_date", columns="ingredient_group",
+        index="calendar_date", columns="_col",
         values="total_amount", aggfunc="sum",
     ).reset_index()
-    wide.columns = ["calendar_date"] + [clean_col(c) for c in wide.columns[1:]]
-    # Distinct ingredient_group values can collapse to the same cleaned column
-    # name (e.g. "Alpha Lipoic Acid" and "Alpha-Lipoic Acid" both -> alpha_lipoic_acid).
-    # Sum across the duplicates so downstream merges don't choke on non-unique columns.
-    if wide.columns.duplicated().any():
-        dups = wide.columns[wide.columns.duplicated()].unique().tolist()
-        log.warning(f"  pivot_supplements: merging duplicate cleaned-col names: {dups}")
-        wide = wide.T.groupby(level=0).sum(min_count=1).T
-        # groupby on transposed loses calendar_date column ordering; restore
-        cols = ["calendar_date"] + [c for c in wide.columns if c != "calendar_date"]
-        wide = wide[cols]
-    return wide, tracking_start
+    wide.columns = ["calendar_date"] + list(wide.columns[1:])
+    return dedup_cleaned_names(wide), tracking_start, unknown_days
 
 
 def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
@@ -1628,8 +1717,72 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return df
 
 
+def merge_estimated_intake_features(df: pd.DataFrame, delivery_nutrition: pd.DataFrame | None,
+                                    photo_nutrition: pd.DataFrame | None) -> pd.DataFrame:
+    """Estimated kcal intake from Uber Eats dish estimates + photo-logged meals (2026-11-16).
+
+      est_intake_kcal   Claude-estimated kcal for the day: pds.delivery_nutrition_daily
+                        (delivered restaurant orders, quantity x per-dish estimate, portions and
+                        leftovers folded in) + pds.photo_meal_daily, summed. Estimates from dish
+                        names and photos — fine for big-vs-small days, not gram-level.
+
+    ROW PLACEMENT — behavioral day D sits on matrix row D, whose HRV is the sleep that closes
+    day D (hrv_alignment.py). Both views are already keyed on the behavioral date; no re-keying.
+
+    NO DOUBLE COUNT — the value is written ONLY on days where the Cronometer/MFP
+    nutrition_calories column is NaN (nothing logged in the primary nutrition source). A logged
+    day keeps est_intake_kcal NaN however much was estimated, so the two never sum.
+
+    NEVER ZERO-FILLED — a day with no estimated row is unknown, not 0: a no-delivery, no-photo
+    day could equally be an untracked eating day. Only days with at least one estimate carry a
+    value. Deliberately NOT a causal treatment: a median split would add a second calories
+    signal next to nutrition_calories in the nutrition FDR family (one signal per family, like
+    the Garmin-steps drop). Exploratory Spearman / SHAP only.
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): on the evening the forecast
+    runs, today's harvest may not have run and photos may not be logged yet, so the newest row
+    reads NaN where training rows read values.
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    if ((delivery_nutrition is None or delivery_nutrition.empty)
+            and (photo_nutrition is None or photo_nutrition.empty)):
+        return df
+    try:
+        kcal = None
+        for frame in (delivery_nutrition, photo_nutrition):
+            if frame is None or frame.empty or "behavioral_date" not in frame.columns:
+                continue
+            e = frame.copy()
+            e["day"] = pd.to_datetime(e["behavioral_date"], errors="coerce")
+            e = e.dropna(subset=["day"]).drop_duplicates("day")
+            s = pd.Series(pd.to_numeric(e["est_kcal"], errors="coerce").to_numpy(),
+                          index=e["day"]).dropna()
+            if s.empty:
+                continue
+            # both views are one row per day, so a day present in only one is that one's value
+            kcal = s if kcal is None else kcal.add(s, fill_value=0.0)
+        if kcal is None or kcal.empty:
+            return df
+        est = pd.DataFrame({"calendar_date": kcal.index.strftime("%Y-%m-%d"),
+                            "est_intake_kcal": kcal.to_numpy(dtype=float)})
+        out = df.drop(columns=["est_intake_kcal"], errors="ignore").merge(
+            est, on="calendar_date", how="left")
+        assert len(out) == len(df), "estimated-intake merge changed the row count"
+        if "nutrition_calories" in out.columns:
+            logged = pd.to_numeric(out["nutrition_calories"], errors="coerce").notna()
+            out.loc[logged, "est_intake_kcal"] = np.nan
+        log.info(f"  Estimated intake features: {int(out['est_intake_kcal'].notna().sum())} day(s) "
+                 f"with estimated kcal (days logged in Cronometer/MFP excluded)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Estimated-intake feature merge failed ({e!r}); continuing without it")
+        LOAD_FAILURES.update(("delivery_nutrition_daily", "photo_meal_daily"))
+        return df
+
+
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps", "est_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -2284,13 +2437,16 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     supp_tracking_start = None  # set below; referenced by the melatonin bridge
     supp_data = data.get("supplements")
     if supp_data is not None and not supp_data.empty:
-        sdf, supp_tracking_start = pivot_supplements(supp_data)
+        sdf, supp_tracking_start, supp_unknown_days = pivot_supplements(supp_data)
         if not sdf.empty:
             df = df.merge(sdf, on="calendar_date", how="left")
             supp_cols = [c for c in sdf.columns if c != "calendar_date"]
             in_window = df["calendar_date"] >= supp_tracking_start
             for col in supp_cols:
-                df.loc[in_window, col] = df.loc[in_window, col].fillna(0)
+                # A day whose total is unknown (unreadable amount, or an intake
+                # in the unknown unit class) stays NaN: never 0.
+                fillable = in_window & ~df["calendar_date"].isin(supp_unknown_days.get(col, set()))
+                df.loc[fillable, col] = df.loc[fillable, col].fillna(0)
             log.info(f"  Supplements pivoted: {len(supp_cols)} compound columns "
                      f"(tracking window from {supp_tracking_start})")
 
@@ -2522,6 +2678,8 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_air_quality_features(df, data.get("air_quality"))
     df = merge_weather_features(df, data.get("weather"))
     df = merge_whoop_steps_features(df, data.get("whoop_steps"))
+    df = merge_estimated_intake_features(df, data.get("delivery_nutrition"),
+                                          data.get("photo_nutrition"))
 
     # Cumulative effects of habit completion: 1-day lag for every habit so the
     # model can detect "did this habit yesterday → today's HRV" relationships

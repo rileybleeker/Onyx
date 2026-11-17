@@ -9,6 +9,9 @@ import {
   CHECKIN_MAX_DAYS_BACK,
   fallbackBehavioralToday,
   journaledSuggestion,
+  pcActivitySuggestions,
+  Q_SKILLS,
+  Q_WORKED_LATE,
   Q_JOURNALED,
   Q_SAME_BED,
   Q_SCREEN_IN_BED,
@@ -26,6 +29,8 @@ import {
   type CheckinSuggestion,
 } from "@/lib/checkin";
 import { CHECKIN_SCREEN_COLUMNS, settledLastHourMinutes } from "@/lib/checkin-screen";
+import { pcActivityApplies, pcActivitySuggestions } from "@/lib/checkin-pc-activity";
+import { loadPcActivityDay } from "@/lib/checkin-pc-server";
 
 /**
  * Daily habit check-in (2026-11-07). One screen, one write for a whole behavior day.
@@ -93,6 +98,18 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
     );
   }
 
+  // PC activity logger (Riley's PC): work-program minutes answer "Worked late?" and "BI/Python/AL/Excel" (Yes only).
+  // Fails open: the view may be missing or empty, and then nothing is suggested.
+  if (names.has(Q_WORKED_LATE) || names.has(Q_SKILLS)) {
+    tasks.push(
+      (async () => {
+        const { data, error } = await supabase.from("pc_activity_daily").select("minutes_by_app, late_minutes_by_app").eq("behavioral_date", date).maybeSingle();
+        if (error || !data) return;
+        Object.assign(out, pcActivitySuggestions(data as { minutes_by_app: Record<string, unknown> | null; late_minutes_by_app: Record<string, unknown> | null }, names));
+      })()
+    );
+  }
+
   // Notion journal: an entry on the day answers "Journaled your thoughts?".
   if (names.has(Q_JOURNALED)) {
     tasks.push(
@@ -105,6 +122,18 @@ async function suggestionsFor(date: string, today: string, names: Set<string>): 
         if (error || count == null) return;
         const s = journaledSuggestion(date, today, count);
         if (s) out[Q_JOURNALED] = s;
+      })()
+    );
+  }
+
+  // PC activity (tools/pc_activity_logger): tooling minutes answer "BI/Python/AL/Excel"-style questions,
+  // late minutes a "Worked late" one. Yes only, complete days only, read server-side (service role).
+  if (pcActivityApplies(names)) {
+    tasks.push(
+      (async () => {
+        const day = await loadPcActivityDay(date);
+        if (!day) return;
+        Object.assign(out, pcActivitySuggestions(day, names));
       })()
     );
   }

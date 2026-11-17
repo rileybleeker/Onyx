@@ -36,6 +36,11 @@
 --      NOT settle the run ('receiving', staged_incomplete > 0, nothing verified, replaced, removed or deleted);
 --      the repeat's items, acknowledgement and finalization then settle it with the corrected hour and the
 --      removed-item set (the interleaving the two-session procedure E runs for real)
+--  19. a complete run whose export OMITS a previously verified hour inside its coverage: that hour is re-marked
+--      unverified (hours_unmarked = 1), its stale usage stays stored but reads unknown (the day is 'partial', a
+--      window over the hour is not complete), and re-finalizing changes nothing ('already')
+--  20. a NEWER complete run's snapshot is not rolled back by an OLDER run that finalizes later and covers the
+--      same hour without listing it: the hour keeps the newer verification and its window still reads complete
 --
 -- Not scriptable in one transaction (run by hand on the branch with two sessions after the cases above pass):
 --  A. session 1: BEGIN; the upsert of case 13 for an hour that run X owns and has not verified, but with run Y;
@@ -90,6 +95,10 @@ DECLARE
     r_i     constant uuid := '00000000-0000-4000-8000-0000000c000e';
     r_j     constant uuid := '00000000-0000-4000-8000-0000000c000f';
     r_k     constant uuid := '00000000-0000-4000-8000-0000000c0010';
+    r_l     constant uuid := '00000000-0000-4000-8000-0000000c0011';
+    r_m     constant uuid := '00000000-0000-4000-8000-0000000c0012';
+    r_n     constant uuid := '00000000-0000-4000-8000-0000000c0013';
+    r_o     constant uuid := '00000000-0000-4000-8000-0000000c0014';
     wend2   constant timestamptz := '2001-02-05 15:30:00+00';   -- a later export, the next day
     ans   jsonb;
     v     numeric;
@@ -468,6 +477,89 @@ BEGIN
         RAISE EXCEPTION 'a repeat after the settlement staged or changed the hour';
     END IF;
 
+    -- 19. A complete run that OMITS a previously verified hour inside its coverage. Run r_l verifies hour
+    --     2001-05-03 12:00Z (whole hour, 600 s, export read 16:00Z). Run r_m, read a day later, covers the
+    --     same window but its export lists only hour 2001-05-04 12:00Z: the verified hour it omits must be
+    --     re-marked unverified so readers treat it (and its stale usage) as unknown, never complete.
+    INSERT INTO pds.phone_usage_segments (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-05-03 12:00:00+00', '2001-05-03 13:00:00+00', 600, now(), r_l, 0, '2001-05-03 16:00:00+00');
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_l, 0, 1, '2001-05-03 05:00:00+00', '2001-05-03 16:00:00+00', '2001-05-03 16:00:00+00', true, 1, 1,
+            '2001-05-03 12:00:00+00', '2001-05-03 13:00:00+00');
+    ans := pds.finalize_phone_usage_run(dev, r_l);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_verified')::int <> 1 OR (ans ->> 'hours_unmarked')::int <> 0 THEN
+        RAISE EXCEPTION 'omit setup: %', ans;
+    END IF;
+    IF (SELECT verified_at FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-05-03 12:00:00+00') IS NULL THEN
+        RAISE EXCEPTION 'omit setup: the first run did not verify the hour';
+    END IF;
+
+    -- Run r_m: window 2001-05-03 05:00Z to 2001-05-04 16:00Z, its export lists only the 05-04 hour.
+    INSERT INTO pds.phone_usage_segments (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-05-04 12:00:00+00', '2001-05-04 13:00:00+00', 60, now(), r_m, 0, '2001-05-04 16:00:00+00');
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_m, 0, 1, '2001-05-03 05:00:00+00', '2001-05-04 16:00:00+00', '2001-05-04 16:00:00+00', true, 1, 1,
+            '2001-05-04 12:00:00+00', '2001-05-04 13:00:00+00');
+    ans := pds.finalize_phone_usage_run(dev, r_m);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_verified')::int <> 1 OR (ans ->> 'hours_unmarked')::int <> 1 THEN
+        RAISE EXCEPTION 'omitted verified hour: %', ans;
+    END IF;
+    IF (SELECT verified_at FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-05-03 12:00:00+00') IS NOT NULL THEN
+        RAISE EXCEPTION 'an hour the export omitted stayed verified';
+    END IF;
+    IF (SELECT total_seconds FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-05-03 12:00:00+00') <> 600 THEN
+        RAISE EXCEPTION 'the unmarked hour lost its stored usage';
+    END IF;
+    IF pds.phone_usage_window_complete('2001-05-03 12:15:00+00', '2001-05-03 12:45:00+00') THEN
+        RAISE EXCEPTION 'a window over an unmarked omitted hour reads complete';
+    END IF;
+    IF (SELECT completeness FROM pds.phone_usage_daily WHERE behavioral_date = '2001-05-03') IS DISTINCT FROM 'partial'
+       OR (SELECT hours_verified FROM pds.phone_usage_daily WHERE behavioral_date = '2001-05-03') <> 0 THEN
+        RAISE EXCEPTION 'the day of an unmarked omitted hour still reads complete';
+    END IF;
+    -- Re-finalizing changes nothing (the reconciliation is idempotent with the settlement).
+    ans := pds.finalize_phone_usage_run(dev, r_m);
+    IF ans ->> 'status' <> 'complete' OR NOT (ans ->> 'already')::boolean OR (ans ->> 'hours_unmarked')::int <> 0 THEN
+        RAISE EXCEPTION 'omit repeat: %', ans;
+    END IF;
+    IF (SELECT verified_at FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-05-03 12:00:00+00') IS NOT NULL THEN
+        RAISE EXCEPTION 'a repeat re-verified the omitted hour';
+    END IF;
+
+    -- 20. A newer complete run's snapshot is not rolled back by an older run. Run r_n (export 2001-05-06 16:00Z)
+    --     verifies hour 2001-05-05 12:00Z. Run r_o (an export a day older, finalized later) covers that hour
+    --     with its window but lists only hour 2001-05-05 14:00Z: the newer verification must stand.
+    INSERT INTO pds.phone_usage_segments (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-05-05 12:00:00+00', '2001-05-05 13:00:00+00', 600, now(), r_n, 0, '2001-05-06 16:00:00+00');
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_n, 0, 1, '2001-05-05 05:00:00+00', '2001-05-06 16:00:00+00', '2001-05-06 16:00:00+00', true, 1, 1,
+            '2001-05-05 12:00:00+00', '2001-05-05 13:00:00+00');
+    ans := pds.finalize_phone_usage_run(dev, r_n);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_verified')::int <> 1 OR (ans ->> 'hours_unmarked')::int <> 0 THEN
+        RAISE EXCEPTION 'newer snapshot setup: %', ans;
+    END IF;
+
+    INSERT INTO pds.phone_usage_segments (device, segment_start, segment_end, total_seconds, synced_at, last_run_id, last_run_item_count, last_export_at)
+    VALUES (dev, '2001-05-05 14:00:00+00', '2001-05-05 15:00:00+00', 60, now(), r_o, 0, '2001-05-05 16:00:00+00');
+    INSERT INTO pds.phone_usage_sync_chunks (device, run_id, chunk_index, chunk_count, window_start, window_end, source_updated_at, stream_ended,
+                                             run_segment_count, segment_count, first_segment_start, last_segment_end)
+    VALUES (dev, r_o, 0, 1, '2001-05-05 05:00:00+00', '2001-05-05 16:00:00+00', '2001-05-05 16:00:00+00', true, 1, 1,
+            '2001-05-05 14:00:00+00', '2001-05-05 15:00:00+00');
+    ans := pds.finalize_phone_usage_run(dev, r_o);
+    IF ans ->> 'status' <> 'complete' OR (ans ->> 'hours_verified')::int <> 1 OR (ans ->> 'hours_unmarked')::int <> 0 THEN
+        RAISE EXCEPTION 'older run over a newer snapshot: %', ans;
+    END IF;
+    IF (SELECT verified_run_id FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-05-05 12:00:00+00') IS DISTINCT FROM r_n
+       OR (SELECT verified_export_at FROM pds.phone_usage_segments WHERE device = dev AND segment_start = '2001-05-05 12:00:00+00') IS DISTINCT FROM '2001-05-06 16:00:00+00' THEN
+        RAISE EXCEPTION 'an older run rolled back a newer complete run''s snapshot';
+    END IF;
+    IF NOT pds.phone_usage_window_complete('2001-05-05 12:15:00+00', '2001-05-05 12:45:00+00') THEN
+        RAISE EXCEPTION 'a window over the newer snapshot reads incomplete after the older run finalized';
+    END IF;
+
     -- 12. Browser roles cannot call the functions.
     EXECUTE 'SET LOCAL ROLE authenticated';
     BEGIN
@@ -485,7 +577,8 @@ BEGIN
         'verified_columns_guarded', true, 'window_check', true, 'browser_roles_refused', true,
         'later_complete_export_replaces_snapshot', true, 'later_incomplete_export_keeps_snapshot', true,
         'older_export_not_staged', true, 'stale_source_limits_coverage', true, 'legacy_item_refused', true,
-        'staged_replacement_not_settled_early', true, 'repeated_delivery_converges', true)::text, true);
+        'staged_replacement_not_settled_early', true, 'repeated_delivery_converges', true,
+        'omitted_verified_hour_unmarked', true, 'newer_snapshot_not_rolled_back', true)::text, true);
 END
 $check$;
 SELECT current_setting('onyx.phone_usage_completeness_verification')::jsonb AS verification;

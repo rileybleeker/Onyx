@@ -14,6 +14,8 @@ import { GONE, clientCache, fetchJsonValue } from "@/lib/client-cache";
 import { parseUiPref, uiPrefUrl } from "@/lib/ui-preferences";
 import { LAYOUT_DRAFT_EVENT, LAYOUT_DRAFT_REQUEST_EVENT, LAYOUT_EVENT, QUICK_ACCESS, type LayoutDraftDetail } from "@/lib/nav-areas";
 import { browserIdle } from "@/lib/warmup";
+import { FeedScopeContext } from "@/lib/feed-scope";
+import { unsavedWork } from "@/lib/unsaved-work";
 import PageSkeleton from "./PageSkeleton";
 import { InFeed, useSetActiveRoute } from "./FeedContext";
 
@@ -26,7 +28,10 @@ import { InFeed, useSetActiveRoute } from "./FeedContext";
  *   from their FeedSection (lib/feed-registry.ts), loaded and mounted one per idle frame, about 1.5 viewports
  *   before the scroll reaches them (below) or 1 viewport (above).
  * - Only the page in view, its neighbours and pages within 1.5 viewports are mounted; a page more than 3
- *   viewports away is replaced by a placeholder of its measured height.
+ *   viewports away is replaced by a placeholder of its measured height. Never a page holding unsaved work
+ *   (lib/unsaved-work.ts hasIn: a form drawn in it reports some, or text typed into one of its fields is not saved
+ *   yet): it stays mounted, with its entry, focus and pending retry, until that work is saved or discarded, and is
+ *   dropped then if it is still far away (PROD-T01).
  * - Nothing jumps: native scroll anchoring is off inside the scroll (Safari has none) and an element near the
  *   top of the screen is kept in place by hand whenever anything above it changes height.
  * - The page covering the middle of the screen is the active page: the address bar (history.replaceState,
@@ -223,7 +228,10 @@ const FeedPage = memo(function FeedPage({ route, label }: { route: string; label
   return (
     <InFeed>
       <SectionBoundary route={route} label={label}>
-        <Comp />
+        {/* Forms in the page report their unsaved work under its route, so the scroll keeps the page mounted. */}
+        <FeedScopeContext.Provider value={route}>
+          <Comp />
+        </FeedScopeContext.Provider>
       </SectionBoundary>
     </InFeed>
   );
@@ -505,7 +513,14 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
   const prune = useCallback(() => {
     const drop: string[] = [];
     mountedRef.current.forEach((route) => {
-      if (!routesRef.current.includes(route) || (!keep.current.has(route) && !wanted(route))) drop.push(route);
+      if (!routesRef.current.includes(route)) {
+        drop.push(route);
+        return;
+      }
+      if (keep.current.has(route) || wanted(route)) return;
+      // Unsaved work pins the page: unmounting it would throw away an entry not saved yet (or its retry).
+      if (unsavedWork.hasIn(route)) return;
+      drop.push(route);
     });
     if (!drop.length) return;
     for (const r of drop) mountedRef.current.delete(r);
@@ -666,6 +681,8 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
       correct();
     });
     observers.current = { middle: midObs, near: nearObs, keep: keepObs, ro };
+    // A pinned page's work was saved or discarded: drop it now if it is far away (bounded: only pinned pages wait).
+    const offWork = unsavedWork.subscribe(() => prune());
     els.current.forEach((el) => {
       midObs.observe(el);
       nearObs.observe(el);
@@ -703,6 +720,7 @@ export default function ContinuousScroll({ children }: { children: ReactNode }) 
     return () => {
       window.removeEventListener("scroll", onScroll);
       if (raf) cancelAnimationFrame(raf);
+      offWork();
       midObs.disconnect();
       nearObs.disconnect();
       keepObs.disconnect();

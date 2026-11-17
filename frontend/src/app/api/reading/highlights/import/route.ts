@@ -17,6 +17,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
   db: { schema: "pds" },
 });
 
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
+
 interface ImportItem {
   passage?: string;
   comment?: string | null;
@@ -218,6 +221,15 @@ export async function POST(req: NextRequest) {
       }
     });
   }
+
+  // The question bank (READ-QUIZ-01): a new position, chapter map or highlight may unlock a chapter or add evidence.
+  // Plans the book and runs its queued steps after the response; quiet while the book is off or the SQL is missing.
+  // (Loaded inside after(): the bank's Anthropic SDK graph stays out of this route's cold start.)
+  const kickBookId = book.book_id;
+  after(async () => {
+    const { kickBank } = await import("@/lib/reading-bank-server");
+    await kickBank(supabase, { bookId: kickBookId, reason: "kindle", requestStartedAt: startedAt.getTime() });
+  });
 
   if (body.harvest) {
     await heartbeat(

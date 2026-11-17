@@ -24,9 +24,12 @@
 --                                left out of every count, never counted won.
 --   pds.sleep_winddown_starts    when "Started wind-down" was tapped for a
 --                                night (server clock, local wall clock where
---                                Riley was, the rule in force): shown against
---                                the target time. Never written by a report
---                                made after the night.
+--                                Riley was, the rule in force, the habit that
+--                                rule named): shown against the target time.
+--                                A start is bound to the habit it was tapped
+--                                under: after the goal names another habit it
+--                                is ignored, never shown or judged. Never
+--                                written by a report made after the night.
 --   pds.sleep_winddown_ops       one row per tap (the id the screen made for
 --                                it): 'applied' with the answer given back, or
 --                                'cancelled' when Riley stopped a tap whose
@@ -96,6 +99,7 @@ CREATE TABLE IF NOT EXISTS pds.sleep_winddown_starts (
     local_time  TEXT NOT NULL CHECK (local_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'),
     tz          TEXT NOT NULL CHECK (length(tz) BETWEEN 1 AND 64),
     rule_id     BIGINT REFERENCES pds.sleep_winddown_rules (rule_id),
+    habit_page_id TEXT,                 -- the habit the goal named when the tap was made: a start never transfers to another habit
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -348,8 +352,8 @@ BEGIN
     -- replay of a tap that already landed, or a No corrected to Yes later, keeps what is there (never a made-up time).
     IF p_answer = 'Yes' AND p_night = v_today AND v_changed AND v_prior IS NULL THEN
         v_tz := COALESCE(pds.tz_for_instant(now()), 'America/New_York');
-        INSERT INTO pds.sleep_winddown_starts (night, started_at, local_time, tz, rule_id)
-        VALUES (p_night, now(), to_char(now() AT TIME ZONE v_tz, 'HH24:MI'), v_tz, r.rule_id)
+        INSERT INTO pds.sleep_winddown_starts (night, started_at, local_time, tz, rule_id, habit_page_id)
+        VALUES (p_night, now(), to_char(now() AT TIME ZONE v_tz, 'HH24:MI'), v_tz, r.rule_id, r.habit_page_id)
         ON CONFLICT (night) DO NOTHING;
     ELSIF p_answer IS DISTINCT FROM 'Yes' THEN
         DELETE FROM pds.sleep_winddown_starts WHERE night = p_night;

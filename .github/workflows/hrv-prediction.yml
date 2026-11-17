@@ -162,7 +162,11 @@ jobs:
 
       - name: Publish the new model
         # A failed publish leaves the registry unchanged and writes a partial HRV Retrain
-        # heartbeat; the forecast below still runs with the model trained here.
+        # heartbeat; the forecast below still runs with the model trained here, but its
+        # heartbeat can no longer say success: the publish step reports its outcome
+        # (publish=published|already_published|not_published), and the forecast step turns
+        # anything unconfirmed into HRV_MODEL_PUBLISH=not_published / not_attempted.
+        id: publish
         if: steps.trained.outcome == 'success'
         continue-on-error: true
         run: python hrv_model_artifact.py publish --saved "${{ steps.saved.outputs.cache-hit }}"
@@ -179,4 +183,8 @@ jobs:
           HRV_MODEL_PIN_BLOCKED: ${{ steps.select.outputs.pin_blocked }}
           HRV_MODEL_PIN_REASON: ${{ steps.select.outputs.pin_reason }}
           HRV_MODEL_RESTORED: ${{ steps.model-cache.outputs.cache-hit }}
+          # The publish step failed or wrote no output (continue-on-error) and a model was
+          # trained in this run -> not_published; no training -> not_attempted (the served
+          # model then came from the registry, which publishing cannot affect).
+          HRV_MODEL_PUBLISH: ${{ (steps.publish.outcome == 'success' && steps.publish.outputs.publish) || (steps.trained.outcome == 'success' && 'not_published') || 'not_attempted' }}
         run: python hrv_predict.py --predict

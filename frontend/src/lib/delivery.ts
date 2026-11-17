@@ -84,7 +84,9 @@ export interface HarvestOrder {
  * Riley ate, set by hand on /nutrition and /check-in), so the importer's ON CONFLICT DO UPDATE leaves a
  * set portion alone on every re-harvest. tests/delivery-portion.test.cjs asserts the key set.
  */
-export function buildOrderItemRows(orders: HarvestOrder[]) {
+export type ItemProvider = "uber_eats" | "gopuff";
+
+export function buildOrderItemRows(orders: HarvestOrder[], provider: ItemProvider = "uber_eats") {
   // Values come from Uber's JSON by way of the harvester: coerce them so one odd order
   // (a string price, a bad date) cannot make the whole upsert throw or store garbage.
   const cents = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) / 100 : null);
@@ -93,7 +95,8 @@ export function buildOrderItemRows(orders: HarvestOrder[]) {
   for (const o of orders) {
     if (!o || typeof o.uuid !== "string" || typeof o.store !== "string" || !o.uuid || !o.store.trim()) continue;
     const store = o.store.trim().slice(0, 200);
-    const kind = merchantKind(store);
+    // goPuff is a convenience store: its lines are facts only, never meals (queries read restaurant rows).
+    const kind: MerchantKind = provider === "gopuff" ? "store" : merchantKind(store);
     const items = Array.isArray(o.items) ? o.items : [];
     for (const [idx, it] of items.entries()) {
       if (!it || typeof it.title !== "string" || !it.title.trim()) continue;
@@ -101,7 +104,7 @@ export function buildOrderItemRows(orders: HarvestOrder[]) {
       const customizations = Array.isArray(it.customizations) ? it.customizations : [];
       const qty = typeof it.quantity === "number" && Number.isFinite(it.quantity) && it.quantity > 0 ? it.quantity : 1;
       rows.push({
-        provider: "uber_eats",
+        provider,
         order_uuid: o.uuid,
         item_key: typeof it.key === "string" && it.key ? it.key : `idx:${idx}`,
         store_name: store,
