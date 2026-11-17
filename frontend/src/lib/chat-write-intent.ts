@@ -1525,6 +1525,9 @@ function readingSessionFits(
   const through = num(input.chapter_through);
   const finished = FINISHED_BOOK.test(text);
   if (through == null) return "not_named";
+  // The endpoints are the call's own numbers: each has to be a whole chapter (an integer >= 1). A hostile or
+  // malformed endpoint (a float, a 0, a huge negative "from") is refused here, before anything is expanded.
+  if (!Number.isInteger(through) || through < 1) return "not_named";
   if (!chapters.has(through)) {
     // "I finished the book": the last chapter of the book written to, when it is known.
     const slug = str(input.book) ?? ctx.books?.active ?? null;
@@ -1532,13 +1535,18 @@ function readingSessionFits(
     if (!finished || total == null || through !== total) return "not_named";
   }
   const from = num(input.chapter_from);
+  if (from !== null && (!Number.isInteger(from) || from < 1)) return "not_named";
+  if (from !== null && from > through) return "not_named";
   if (chapters.size > 0) {
-    // The call must cover exactly the granted chapters: not a subset, not more.
-    if (from != null && from > through) return "not_named";
-    const covered = new Set<number>();
-    for (let c = from ?? through; c <= through; c++) covered.add(c);
-    if (covered.size !== chapters.size || [...chapters].some((c) => !covered.has(c))) return "not_named";
-  } else if (from != null && from !== through) {
+    // The call must cover exactly the granted chapters: not a subset, not more. Compared by endpoint and
+    // cardinality, never by expanding the call's range: the range written (chapter_from .. chapter_through, or
+    // the single chapter when no from is sent) has to be exactly the chapters the user granted. Counting it by
+    // subtraction first means a hostile range (e.g. from -1000000000 to a named chapter 4) is refused by its
+    // size before anything is enumerated, and the only values ever iterated are the user's own granted chapters.
+    const fromCh = from ?? through;
+    if (through - fromCh + 1 !== chapters.size) return "not_named";
+    for (const c of chapters) if (c < fromCh || c > through) return "not_named";
+  } else if (from !== null && from !== through) {
     return "not_named";
   }
   const minutes = num(input.minutes);
