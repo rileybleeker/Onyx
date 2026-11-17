@@ -730,7 +730,7 @@ class RecoveryTests(unittest.TestCase):
 
 class RunTests(unittest.TestCase):
     def test_heartbeat_status(self):
-        required = [(a, "pw") for a in u.REQUIRED_ACCOUNTS]
+        required = [(a, "pw") for a in ("first@example.com", "second@example.com")]
         self.assertEqual(run_with([FakeIMAP(), FakeIMAP()], required, FakeSupa())["status"], "success")
         one_failed = run_with([FakeIMAP(), FakeIMAP(fail_login=True)], required, FakeSupa())
         self.assertEqual(one_failed["status"], "partial")

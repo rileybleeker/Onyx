@@ -73,7 +73,26 @@ quiet_dependency_loggers()
 HEARTBEAT = HeartbeatGate()   # opened by main() only for a write-mode run
 
 # Uber receipts go to this mailbox; if it isn't configured the heartbeat says so.
-REQUIRED_ACCOUNTS = ("rileybleeklm@gmail.com",)
+REQUIRED_ACCOUNTS_ENV = "DELIVERY_REQUIRED_GMAIL_ACCOUNTS"
+
+
+def _required_accounts(raw: str | None = None) -> tuple[str, ...]:
+    """Required mailboxes from the repo secret (comma-separated, order kept). Unset gives ()."""
+    raw = os.environ.get(REQUIRED_ACCOUNTS_ENV, "") if raw is None else raw
+    return tuple(a.strip().lower() for a in raw.split(",") if a.strip())
+
+
+def _account_gap_notes(required: tuple[str, ...], configured: set[str]) -> list[str]:
+    """Heartbeat notes for a required mailbox not wired in, or an unset secret. Never an address."""
+    if not required:
+        return [f"{REQUIRED_ACCOUNTS_ENV} is not set"]
+    missing = [a for a in required if a not in configured]
+    if not missing:
+        return []
+    return [f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)"]
+
+
+REQUIRED_ACCOUNTS = _required_accounts()
 SENDER_DOMAIN = "uber.com"
 SUBJECT_RE = re.compile(r"\border with Uber Eats\b", re.I)
 SUBJECT_WHEN_RE = re.compile(r"Your (\w+day) (morning|afternoon|evening|night) order", re.I)
@@ -657,10 +676,10 @@ def main() -> int:
         if failures:
             status, notes = "partial", failures
         configured = {a.lower() for a, _ in accounts}
-        missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
-        if missing:
+        gaps = _account_gap_notes(REQUIRED_ACCOUNTS, configured)
+        if gaps:
             status = "partial"
-            notes.append(f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
+            notes.extend(gaps)
         if errors or unmatched:
             status = "partial"
             notes.append(f"{errors} error(s), {unmatched} unmatched receipt(s) — see pds.delivery_email_log")
