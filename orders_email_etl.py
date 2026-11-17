@@ -58,7 +58,8 @@ from email_log_safety import (
     HeartbeatGate, bounded_days, error_code, is_missing_table, log_failure, quiet_dependency_loggers,
 )
 from flights_email_etl import (
-    IMAP_HOST, REQUIRED_ACCOUNTS, _fetch_chunks, account_fingerprint, body_lines, decode_hdr, html_to_lines,
+    IMAP_HOST, REQUIRED_ACCOUNTS, _account_gap_notes, _fetch_chunks, account_fingerprint, body_lines, decode_hdr,
+    html_to_lines,
     imap_accounts, plain_to_lines, select_all_mail,
 )
 
@@ -1225,6 +1226,12 @@ def table_is_empty(supa: Any) -> bool:
     return not data
 
 
+def account_gap_notes(accounts: list[tuple[str, str]]) -> list[str]:
+    """Fail closed: an unset FLIGHTS_REQUIRED_GMAIL_ACCOUNTS (empty list) or a required mailbox not wired in
+    is a note, so the run is 'partial' and never a clean success."""
+    return _account_gap_notes(REQUIRED_ACCOUNTS, {a.strip().lower() for a, _ in accounts})
+
+
 def run(supa: Any, accounts: list[tuple[str, str]], days: Optional[int], reprocess: bool = False,
         dry_run: bool = False) -> tuple[str, int, Optional[str]]:
     """Returns (heartbeat status, records, error note)."""
@@ -1268,10 +1275,7 @@ def run(supa: Any, accounts: list[tuple[str, str]], days: Optional[int], reproce
         log.info(f"stored {len(new_rows)} email(s) ({parsed} order updates); {orders} order(s) after recompute")
     if errors:
         notes.append(f"{errors} email(s) failed to parse (pds.online_order_events parse_status='error')")
-    configured = {a.strip().lower() for a, _ in accounts}
-    missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
-    if missing:
-        notes.append(f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
+    notes.extend(account_gap_notes(accounts))
     status = "partial" if failures or notes else "success"
     return status, orders, ("; ".join(failures + notes) or None)
 

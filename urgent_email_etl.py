@@ -98,7 +98,7 @@ from zoneinfo import ZoneInfo
 from email_log_safety import HeartbeatGate, bounded_days, is_missing_table, log_failure, quiet_dependency_loggers
 # Shared IMAP / HTML plumbing (one implementation for every email ETL).
 from flights_email_etl import (
-    IMAP_HOST, REQUIRED_ACCOUNTS, account_fingerprint, body_lines, decode_hdr,
+    IMAP_HOST, REQUIRED_ACCOUNTS, _account_gap_notes, account_fingerprint, body_lines, decode_hdr,
     imap_accounts, select_all_mail_verified,
 )
 
@@ -775,6 +775,12 @@ def _account_notes(fp: str, stats: dict, rec: dict, dry_run: bool, refresh_limit
     return notes
 
 
+def account_gap_notes(accounts: list[tuple[str, str]]) -> list[str]:
+    """Fail closed: an unset FLIGHTS_REQUIRED_GMAIL_ACCOUNTS (empty list) or a required mailbox not wired in
+    is a note, so the run is 'partial' and never a clean success."""
+    return _account_gap_notes(REQUIRED_ACCOUNTS, {a.strip().lower() for a, _ in accounts})
+
+
 def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run: bool = False,
                  refresh_limit: int = MAX_MESSAGES, preview: bool = False) -> dict:
     """One run. Returns counts-only diagnostics: status, records, error note, window and per-account counts.
@@ -837,10 +843,7 @@ def run_detailed(supa: Any, accounts: list[tuple[str, str]], days: int, dry_run:
     if len(failures) == len(accounts):
         report["error"] = "; ".join(failures)
         return report
-    configured = {a.strip().lower() for a, _ in accounts}
-    missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
-    if missing:
-        notes.append(f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
+    notes.extend(account_gap_notes(accounts))
     report["status"] = "partial" if failures or notes else "success"
     report["error"] = "; ".join(failures + notes) or None
     return report

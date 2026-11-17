@@ -10,7 +10,7 @@ FlightReservation markup — this module parses their HTML/text instead.
 Reads EVERY configured Gmail account over IMAP (read-only: BODY.PEEK, the
 "[Gmail]/All Mail" folder so archived mail counts) and handles:
 
-    kind              subject (DeltaAirLines@t.delta.com / @g.delta.com)
+    kind              subject (DeltaAirLines sender on the t. and g. delta.com subdomains)
     receipt           "Your Flight Receipt - NAME DDMONYY"
     award_receipt     "Congrats On Your SkyMiles Award Trip"
     trip_details      "Your XXX > YYY Trip Details"            (~3 days before each direction)
