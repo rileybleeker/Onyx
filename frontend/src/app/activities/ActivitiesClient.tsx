@@ -950,7 +950,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
                       onClick={(e) => { e.stopPropagation(); deleteActivity(act); }}
                       disabled={deletingId === act.id}
                       className="ml-auto text-text-tertiary/60 hover:text-red-400 disabled:opacity-40 transition-colors text-[12px] px-1"
-                      title="Delete activity from Onyx (soft delete; ETL re-syncs won't bring it back)"
+                      title="Hide this activity from Onyx. A later sync from the source will not add it back."
                       aria-label="Delete activity"
                     >
                       ✕
