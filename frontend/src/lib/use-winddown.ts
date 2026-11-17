@@ -260,7 +260,7 @@ export function reloadWindDown(): Promise<void> {
  * One write. `check` throws unless a success answer is the server's own for this request: an expired session answers a
  * 200 sign-in page after a redirect, and that is neither a saved answer nor a reason to clear what was kept.
  */
-async function send(url: string, method: string, body: unknown, check?: (data: Record<string, unknown>) => void): Promise<Record<string, unknown>> {
+export async function send(url: string, method: string, body: unknown, check?: (data: Record<string, unknown>) => void): Promise<Record<string, unknown>> {
   const res = await fetch(url, { method, cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (sessionEnded(res)) {
     reportSessionEnded();
@@ -274,13 +274,17 @@ async function send(url: string, method: string, body: unknown, check?: (data: R
     check?.(data);
     return data;
   }
-  const message = data && typeof data.error === "string" ? data.error : "Not saved.";
+  // The server's sentence is never shown: it goes to the console, and the screen gets one of the fixed notices below.
+  const code = data && typeof data.code === "string" ? data.code : String(res.status);
+  console.error("Wind-down save not confirmed:", res.status, code, data && typeof data.error === "string" ? data.error : "");
   // A refusal is shown and not retried; a server error (and a timeout / rate limit) is retried.
   if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-    throw new WindDownRefused(message, data && typeof data.code === "string" ? data.code : String(res.status));
+    throw new WindDownRefused(REFUSED_NOTICE, code);
   }
-  throw new Error(message);
+  throw new Error(RETRY_NOTICE);
 }
+const REFUSED_NOTICE = "Not saved. Check the entry and try again.";
+const RETRY_NOTICE = "Not saved. Trying again.";
 const hasKey = (key: string) => (d: Record<string, unknown>) => {
   if (!d[key] || typeof d[key] !== "object") throw new Error("Couldn't confirm it was saved.");
 };
