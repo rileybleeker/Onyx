@@ -525,9 +525,12 @@ export interface StorePayload {
   chapter_hash: string;
   /** Required by the store: its receipt makes a repeated store of the same job a replay. */
   job_id: number | null;
+  /** The attempt number pds.reading_bank_claim answered: the store refuses (409 lease_lost / not_running) a run that no longer holds the lease. */
+  attempts: number;
   prompt_version: string;
   replace: boolean;
   status?: ChapterResult;
+  /** The chapter's rebuild count the job was planned for: the store refuses (409 stale_generation) an older one. */
   rebuilds: number;
   counts: { sources: number; ideas: number; questions: number; rejected: number };
   sources: StoreSource[];
@@ -641,6 +644,8 @@ export interface BuildInput {
   totalChapters: number;
   target: number;
   jobId: number | null;
+  /** The claim's attempt number (the job row's `attempts` as claimed). */
+  attempts: number;
   promptVersion: string;
   rebuilds: number;
   /** true for a build / rebuild; false for the highlights step (adds ideas, keeps the chapter status). */
@@ -859,6 +864,7 @@ export function validateBuild(input: BuildInput): BuildResult {
     chapter: input.chapter,
     chapter_hash: input.chapterHash,
     job_id: input.jobId,
+    attempts: input.attempts,
     prompt_version: input.promptVersion,
     replace: input.replace,
     rebuilds: input.rebuilds,
@@ -1067,7 +1073,7 @@ export const BANK_CODES: ReadonlySet<string> = new Set([
   "auth", "bad_request", "web_search_disabled", "failed", "budget", "monthly_cap", "uncertain", "schema_checks",
   "schema_missing", "lease_expired", "lease_lost", "not_running", "raced", "thin", "no_sources", "anchors_only", "ready",
   "no_citations", "store_failed", "verify_failed", "no_research", "invalidated", "already_graded", "cost_limit",
-  "chapter_changed", "highlight_changed", "job_mismatch", "not_pending", "question_changed", "superseded", "other",
+  "chapter_changed", "highlight_changed", "job_mismatch", "not_pending", "question_changed", "superseded", "stale_generation", "other",
 ]);
 
 /** A safe error / outcome code from BANK_CODES ("other" for anything else), never message text. */

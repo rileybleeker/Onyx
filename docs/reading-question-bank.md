@@ -161,7 +161,10 @@ highlights step links the new passage again or the idea has other evidence, and 
    `chapter_changed` before anything is written), each highlight source's passage hash (409 `highlight_changed` when
    the passage was edited since) and `seen`, every highlight the job sent to the model. A rebuild that kept no idea
    while the chapter has a working bank for this edition leaves that bank in place (a transient search failure must
-   not empty a chapter).
+   not empty a chapter). Like `finish` and `reserve`, the store is fenced: it needs the attempt number the claim
+   answered and a live lease (409 `not_running` / `lease_lost`), and refuses output planned for an older rebuild
+   count of its chapter (409 `stale_generation`), so a run that lost its lease can never replace what a newer run or
+   a rebuild stored. A repeated store of a job that has its receipt is still answered from the receipt.
 
 ## Planning and money
 
@@ -186,7 +189,10 @@ highlights step links the new passage again or the idea has other evidence, and 
   ran out (a crash, a function stopped at its time limit) most likely made a billed call that never reported: the
   next claim **charges its reservation** (to the job, this month's spend and the book) before offering the job again
   or failing it after 3 attempts, so neither cap leaks; the late finish of that run is refused. The claim answers
-  `headroom_cents`, the most the job may spend before a cap is reached.
+  `headroom_cents`, the most the job may spend before a cap is reached. A month's spend is read from each job's
+  `charged_at` (set whenever its cost grows), never from the queue's own `finished_at`, so queueing a skipped job
+  again cannot hide what it already cost; a job whose attempts span two months counts all its cost in the month of
+  its last charge (the safe side).
 - Money is checked before **every** request, the first one included. `requestBoundCents` is a conservative bound
   on one request: its whole `max_tokens` output and its prompt (about 2.5 characters a token, at the cache-write
   rate), at the dearer of the model's and `UNKNOWN_PRICE`, plus every allowed web search (1 cent and 8,000 result
@@ -230,7 +236,11 @@ highlights step links the new passage again or the idea has other evidence, and 
   left, so a full round never drops it.
 - **Local grade** (`gradeLocal`, the server re-grades with it): normalized short answers with accepted forms, token
   containment and typo tolerance; a right choice after "Show choices" is partly right (0.6); order with one
-  adjacent swap is partly right; "I don't know" is graded 0. A miss of 3 or more words goes to the model.
+  adjacent swap is partly right; "I don't know" is graded 0. A miss of 3 or more words goes to the model. A typo
+  is allowed only inside words of 6 or more letters (1 edit per 6 letters, and per 6 characters of the whole form),
+  with the same number of words: a number, a date or a short name must match exactly, so "march 1915", "18 percent"
+  and "john hill" are never graded right by code. Token containment also refuses a form with a number when the
+  answer holds another number.
 - **Model score**: explain = points (yes 1, partial 0.5) over their count, at most 0.39 when the `must` point is
   missed; chapter recall = (2 × core hits + supporting hits) / (2 × core + supporting). Score ≥ 0.8 right, ≥ 0.4
   partly right.
@@ -255,7 +265,10 @@ highlights step links the new passage again or the idea has other evidence, and 
   moves the idea to the end of the book (answers stay valid). Not read yet sets a hold (the overview carries the
   hold's flag key, so it can be restored although the held chapter's sheet is locked). Every state a flag marks
   dirty also moves `state_version` (`pds.reading_bank_touch_states`, which creates the row of an idea that has
-  none), so a replay computed before the flag cannot write back what it voided. A flag sent for an older version of
+  none), so a replay computed before the flag cannot write back what it voided. The ideas marked are read off the
+  voided answers themselves (`idea_id` and `covers`, over every version of the question), so an idea that an older
+  chapter recall rubric listed and the current one does not is replayed too. A "Not in this chapter" flag stays on
+  its chapter's sheet, with its Restore, although the idea now unlocks at the end of the book. A flag sent for an older version of
   a question acts on its current version; Restore of a chapter recall question is refused (`superseded`) once a
   rebuild gave the chapter another one.
 

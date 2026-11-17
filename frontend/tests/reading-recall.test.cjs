@@ -228,6 +228,26 @@ test("gradeLocal cued: normalization, accepted forms, token containment, typo to
   assert.deepEqual(R.gradeLocal("cued", JSON.stringify(cuedRubric), "keeper"), { kind: "graded", verdict: "correct", score: 1 }, "rubric as jsonb text");
 });
 
+test("gradeLocal cued: a wrong number, date or short name is never close enough; only longer words take a typo", () => {
+  const g = (answer, given) => R.gradeLocal("cued", { v: 1, format: "cued", answer, accept: [], explanation: "x" }, given);
+  const miss = { kind: "graded", verdict: "incorrect", score: 0 };
+  // One digit off is a different fact: never graded correct by code (a miss of 3+ words goes to the model, shorter is wrong).
+  assert.deepEqual(g("march 1914", "march 1915"), miss);
+  assert.deepEqual(g("17 percent", "18 percent"), miss);
+  assert.equal(g("march 1914", "March 1914").verdict, "correct", "the right number still matches");
+  assert.equal(g("march 1914", "in march 1914").verdict, "correct", "extra words around the right number");
+  assert.equal(g("17 percent", "about 17 percent").verdict, "correct", "filler around the right number is fine");
+  assert.deepEqual(g("17 percent", "18 percent or 17"), { kind: "model" }, "a second, different number in the answer is left to the model");
+  // A short name one letter off is another person.
+  assert.deepEqual(g("john mill", "john hill"), miss);
+  assert.equal(g("john mill", "John Mill").verdict, "correct");
+  // A word of 6+ letters keeps its typo; a short word next to it must still match exactly.
+  assert.equal(g("tide tables", "tide tablez").verdict, "correct");
+  assert.deepEqual(g("tide tables", "tode tables"), miss);
+  assert.equal(g("lighthouse keeper", "lighthouze keepar").verdict, "correct", "two typos inside 1 per 6 characters of the whole form");
+  assert.notEqual(g("lighthouse keeper", "lightmouze keepar").verdict, "correct", "two edits in one 10-letter word is over its budget");
+});
+
 test("gradeLocal: a hinted choice is partial when right; order swaps; I don't know", () => {
   const hint = { v: 1, format: "cued", answer: "tide tables", accept: [], options: ["Tide tables", "Gulls", "Waves", "Lamps"], correct: 0, explanation: "x" };
   assert.deepEqual(R.gradeLocal("cued", hint, "Tide tables", true), { kind: "graded", verdict: "partial", score: 0.6 });

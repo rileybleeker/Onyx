@@ -268,6 +268,33 @@ export type LocalGrade = { kind: "graded"; verdict: Verdict; score: number } | {
 
 const graded = (verdict: Verdict, score: number): LocalGrade => ({ kind: "graded", verdict, score });
 
+const hasDigit = (s: string): boolean => /\d/.test(s);
+const isLetters = (s: string): boolean => /^\p{L}+$/u.test(s);
+
+/**
+ * A typo of one normalized form: the same number of words, and only words of 6 or more letters may differ (by at
+ * most 1 edit per 6 letters, 1 per 6 characters of the form in all). A short word, a name under 6 letters and
+ * anything with a digit must match exactly, so a year, a count or a short name is never "close enough".
+ */
+function typoMatches(given: string, form: string): boolean {
+  const allowed = Math.floor(form.length / 6);
+  if (allowed < 1) return false;
+  const gt = given.split(" ");
+  const ft = form.split(" ");
+  if (gt.length !== ft.length) return false;
+  let used = 0;
+  for (let i = 0; i < ft.length; i++) {
+    if (gt[i] === ft[i]) continue;
+    if (ft[i].length < 6 || !isLetters(ft[i]) || !isLetters(gt[i])) return false;
+    const per = Math.floor(ft[i].length / 6);
+    const d = editDistance(gt[i], ft[i], per);
+    if (d > per) return false;
+    used += d;
+    if (used > allowed) return false;
+  }
+  return used > 0;
+}
+
 /** Whether a typed short answer matches the expected answer or an accepted form. */
 export function cuedMatches(rubric: Pick<CuedRubric, "answer" | "accept">, answer: string): boolean {
   const given = normalizeAnswer(answer);
@@ -277,11 +304,11 @@ export function cuedMatches(rubric: Pick<CuedRubric, "answer" | "accept">, answe
   for (const form of forms) {
     if (given === form) return true;
     const ft = form.split(" ");
-    // Every token of a 2+ token form is present and the answer is at most 4 tokens longer.
-    if (ft.length >= 2 && ft.every((t) => givenTokens.includes(t)) && givenTokens.length <= ft.length + 4) return true;
-    // A typo: edit distance at most 1 per 6 characters of the form.
-    const allowed = Math.floor(form.length / 6);
-    if (allowed >= 1 && editDistance(given, form, allowed) <= allowed) return true;
+    // Every token of a 2+ token form is present and the answer is at most 4 tokens longer. For a form with a
+    // number in it, any other number in the answer is a different fact: that is left to the model.
+    if (ft.length >= 2 && ft.every((t) => givenTokens.includes(t)) && givenTokens.length <= ft.length + 4
+        && (!hasDigit(form) || givenTokens.every((t) => !hasDigit(t) || ft.includes(t)))) return true;
+    if (typoMatches(given, form)) return true;
   }
   return false;
 }

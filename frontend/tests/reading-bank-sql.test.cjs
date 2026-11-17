@@ -276,6 +276,48 @@ test("the store is replay safe per job, bound to the planned edition, and keeps 
   assert.match(store, /INSERT INTO pds\.reading_bank_highlight_seen/);
 });
 
+test("the store is fenced like finish: live lease, the claim's attempt, and the chapter's rebuild generation", () => {
+  const store = fn(fnsMain, "pds.reading_bank_store").body;
+  assert.match(store, /v_att := NULLIF\(p->>'attempts', ''\)::int;/);
+  assert.match(store, /OR v_att IS NULL OR/, "attempts is required");
+  assert.match(store, /OR \(v_replace AND v_rebuild IS NULL\)/, "a replacing store names the generation it was planned for");
+  assert.match(store, /v_jobrow\.status <> 'running' OR v_jobrow\.lease_until IS NULL OR v_jobrow\.lease_until < NOW\(\)[\s\S]{0,120}'not_running'/);
+  assert.match(store, /IF v_att <> v_jobrow\.attempts THEN[\s\S]{0,120}'lease_lost'/);
+  assert.match(store, /v_rebuild < COALESCE\(\s*\(SELECT c\.rebuilds FROM pds\.reading_bank_chapters c[\s\S]{0,160}'stale_generation'/);
+  // A receipt replay needs no lease; every fence answers before the first write (nothing is retired by a stale run).
+  const at = (needle) => store.indexOf(needle);
+  assert.ok(at("store_receipt IS NOT NULL") < at("'not_running'"));
+  for (const code of ["'not_running'", "'lease_lost'", "'stale_generation'"]) {
+    assert.ok(at(code) > 0 && at(code) < at("SET status = 'retired'"), code);
+    assert.ok(at(code) < at("INSERT INTO pds.reading_bank_sources"), code);
+  }
+});
+
+test("a month's spend is read from charged_at, which only a charge sets, so a re-queued job keeps its earlier cost", () => {
+  assert.match(main, /charged_at\s+TIMESTAMPTZ,/);
+  for (const name of ["pds.reading_bank_claim", "pds.reading_bank_reserve", "pds.reading_bank_status"]) {
+    const body = fn(fnsMain, name).body;
+    assert.match(body, /sum\(cost_cents\)[^;]*charged_at >= \(date_trunc\('month'/, `${name} sums by charge time`);
+    assert.doesNotMatch(body, /finished_at >= \(date_trunc\('month'/, `${name} never by the queue's own time`);
+  }
+  assert.match(fn(fnsMain, "pds.reading_bank_claim").body, /charged_at = CASE WHEN reserved_cents > 0 THEN NOW\(\) ELSE charged_at END/);
+  assert.match(fn(fnsMain, "pds.reading_bank_finish").body, /charged_at = CASE WHEN v_cost > 0 THEN NOW\(\) ELSE charged_at END/);
+  // The re-queue clears the queue's times but touches neither the cost nor its date.
+  const enq = fn(fnsMain, "pds.reading_bank_enqueue").body;
+  const set = /SET status = 'queued'[^;]*/.exec(enq)?.[0] ?? "";
+  assert.ok(set && !/cost_cents|charged_at/.test(set));
+});
+
+test("a flag voids the ideas fed by every answer it invalidated, across question versions; a moved idea's flag stays listed", () => {
+  const flag = fn(fnsMain, "pds.reading_bank_flag").body;
+  assert.match(flag, /SELECT a\.idea_id FROM pds\.reading_question_attempts a WHERE a\.attempt_key = ANY\(v_hit\)/);
+  assert.match(flag, /SELECT unnest\(a\.covers\) FROM pds\.reading_question_attempts a WHERE a\.attempt_key = ANY\(v_hit\)/);
+  assert.ok(flag.indexOf("reading_bank_touch_states(v_ideas, true)", flag.indexOf("unnest(a.covers)")) > 0, "collected before the states are marked");
+  const chapter = fn(fnsMain, "pds.reading_bank_chapter").body;
+  assert.match(chapter, /f\.kind = 'not_in_chapter' AND COALESCE\(f\.prev_unlock, q\.bank_chapter\) <= \(SELECT through FROM t\)/);
+  assert.match(chapter, /q\.unlock_chapter <= \(SELECT through FROM t\)/, "other flags stay on the unlock gate");
+});
+
 test("the planner keys highlight freshness on content, never on updated_at", () => {
   const plan = fn(fnsMain, "pds.reading_bank_plan_input").body;
   assert.doesNotMatch(plan, /updated_at|changed_at/);

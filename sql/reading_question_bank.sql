@@ -185,6 +185,7 @@ CREATE TABLE IF NOT EXISTS pds.reading_bank_jobs (
     lease_until     TIMESTAMPTZ,
     reserved_cents  NUMERIC(10,2) NOT NULL DEFAULT 0,
     cost_cents      NUMERIC(10,2) NOT NULL DEFAULT 0 CHECK (cost_cents >= 0),
+    charged_at      TIMESTAMPTZ,  -- when cost_cents last grew: the month's spend is read from it, never from the queue's own times
     usage           JSONB,
     result          TEXT          CHECK (result IS NULL OR result IN ('ready', 'thin', 'anchors_only', 'no_sources')),
     counts          JSONB,
@@ -199,6 +200,8 @@ CREATE TABLE IF NOT EXISTS pds.reading_bank_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_claim ON pds.reading_bank_jobs (status, priority, created_at) WHERE status IN ('queued', 'running');
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_month ON pds.reading_bank_jobs (finished_at);
+ALTER TABLE pds.reading_bank_jobs ADD COLUMN IF NOT EXISTS charged_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_charged ON pds.reading_bank_jobs (charged_at) WHERE charged_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_book ON pds.reading_bank_jobs (book_id, step, chapter);
 
 -- 7. Flags on questions (replay safe by flag_key) -----------------------------------------------------------------
@@ -759,7 +762,8 @@ BEGIN
 END $fn$;
 
 -- 13a. Store one verified chapter batch atomically --------------------------------------------------------------
--- p: {book_id, chapter, chapter_hash, job_id, prompt_version, replace (bool), status?, rebuilds?, counts: {rejected},
+-- p: {book_id, chapter, chapter_hash, job_id, attempts, prompt_version, replace (bool), status?, rebuilds (required
+--     with replace), counts: {rejected},
 --     sources: [{ref, kind, url?, domain?, title?, cited_text?, highlight_id?, passage_sha?}],
 --     ideas: [{ref, unlock_chapter, kind, importance, title, statement, key_points, facts, origin, evidence: [ref],
 --              questions: [{format: 'cued'|'explain'|'order', prompt, rubric (jsonb)}]}],
@@ -770,6 +774,9 @@ END $fn$;
 -- inserted again. chapter_hash is required: the edition the job was planned for; when the table of contents
 -- changed since, the answer is 409 chapter_changed and nothing is written (the planner queues the new edition).
 -- A highlight source's passage_sha, when sent, must still be the passage's (409 highlight_changed otherwise).
+-- Only the run that holds the live lease stores: attempts is the attempt number the claim answered, and a job that
+-- is not running (409 not_running), whose attempt is not the current one (409 lease_lost) or that was planned for
+-- an older rebuild count of its chapter (409 stale_generation) writes nothing. A receipt replay needs no lease.
 -- replace = true (a build or a rebuild): the chapter's active ideas and their questions are retired first, and the
 -- chapter recall question gets a new T07 version when its rubric changed. A replace that kept no idea while the
 -- chapter has a working bank for this edition leaves that bank in place (a transient search failure must not
@@ -789,6 +796,7 @@ DECLARE
   v_book    BIGINT;
   v_ch      INTEGER;
   v_job     BIGINT;
+  v_att     INTEGER;
   v_rebuild INTEGER;
   v_replace BOOLEAN;
   v_keep    BOOLEAN := false;
@@ -817,12 +825,14 @@ BEGIN
     v_book := (p->>'book_id')::bigint;
     v_ch := (p->>'chapter')::int;
     v_job := NULLIF(p->>'job_id', '')::bigint;
+    v_att := NULLIF(p->>'attempts', '')::int;
     v_rebuild := NULLIF(p->>'rebuilds', '')::int;
     v_replace := COALESCE((p->>'replace')::boolean, false);
   EXCEPTION WHEN others THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END;
-  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR v_job IS NULL OR v_pv IS NULL OR btrim(v_pv) = ''
+  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR v_job IS NULL OR v_att IS NULL OR v_pv IS NULL OR btrim(v_pv) = ''
+     OR (v_replace AND v_rebuild IS NULL)
      OR v_chash IS NULL OR v_chash !~ '^[0-9a-f]{64}$'
      OR (p->'ideas' IS NOT NULL AND jsonb_typeof(p->'ideas') <> 'array')
      OR (p->'sources' IS NOT NULL AND jsonb_typeof(p->'sources') <> 'array')
@@ -840,6 +850,20 @@ BEGIN
   END IF;
   IF v_jobrow.store_receipt IS NOT NULL THEN
     RETURN v_jobrow.store_receipt || jsonb_build_object('replayed', true);
+  END IF;
+  -- Only the run that holds the live lease may store (as finish and reserve fence it): a worker whose lease ran
+  -- out has had its reservation charged and its job offered again, and a late store of its output must not
+  -- replace what a newer run or rebuild put there. attempts = the attempt number the claim answered.
+  IF v_jobrow.status <> 'running' OR v_jobrow.lease_until IS NULL OR v_jobrow.lease_until < NOW() THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running');
+  END IF;
+  IF v_att <> v_jobrow.attempts THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost');
+  END IF;
+  -- A rebuild asked for after this job was planned makes its output obsolete (new rebuild count, new job hashes).
+  IF v_rebuild IS NOT NULL AND v_rebuild < COALESCE(
+       (SELECT c.rebuilds FROM pds.reading_bank_chapters c WHERE c.book_id = v_book AND c.chapter = v_ch), 0) THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'stale_generation');
   END IF;
   v_hash := pds.reading_bank_chapter_hash(v_book, v_ch);
   IF v_chash <> v_hash THEN
@@ -1413,6 +1437,14 @@ BEGIN
       FROM (SELECT quiz_key, count(*)::int AS n FROM pds.reading_question_attempts
              WHERE attempt_key = ANY(v_hit) AND quiz_key IS NOT NULL GROUP BY quiz_key) x
      WHERE qz.op_key = x.quiz_key;
+    -- Every idea a voided answer fed, read off the answers themselves: they span every version of the question,
+    -- and an older chapter recall rubric may list ideas the current one no longer does. Their schedules and stages
+    -- were built partly on those answers, so each is marked for a replay.
+    SELECT COALESCE(array_agg(DISTINCT t.id), '{}') INTO v_ideas FROM (
+      SELECT unnest(v_ideas) AS id
+      UNION SELECT a.idea_id FROM pds.reading_question_attempts a WHERE a.attempt_key = ANY(v_hit) AND a.idea_id IS NOT NULL
+      UNION SELECT unnest(a.covers) FROM pds.reading_question_attempts a WHERE a.attempt_key = ANY(v_hit) AND a.covers IS NOT NULL
+    ) t WHERE t.id IS NOT NULL;
     PERFORM pds.reading_bank_touch_states(v_ideas, true);
     IF v_kind = 'wrong' AND v_q.idea_id IS NOT NULL THEN
       PERFORM pds.reading_bank_recall_refresh(v_q.book_id, v_q.bank_chapter, NULL, NULL, 'an idea was flagged wrong', false, false);
@@ -1729,7 +1761,11 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
                ORDER BY f.created_at DESC)
                FROM pds.reading_question_flags f JOIN pds.reading_questions q ON q.question_id = f.question_id
               WHERE q.book_id = p_book AND q.bank_chapter = p_chapter AND f.restored_at IS NULL
-                AND q.unlock_chapter <= (SELECT through FROM t)), '[]'::jsonb)
+                AND (q.unlock_chapter <= (SELECT through FROM t)
+                     -- "Not in this chapter" moved the idea's unlock to the end of the book, which would hide the flag
+                     -- (and its Restore) until the book is finished: it is listed by the unlock it was sent from. The
+                     -- prompt shown is the one Riley already saw when he flagged it.
+                     OR (f.kind = 'not_in_chapter' AND COALESCE(f.prev_unlock, q.bank_chapter) <= (SELECT through FROM t)))), '[]'::jsonb)
   ) END
 $fn$;
 
@@ -1750,7 +1786,7 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
                           AND c.quizzable_at < NOW() - interval '24 hours'),
     'pending_grades', (SELECT count(*) FROM pds.reading_question_attempts WHERE ext_hash IS NOT NULL AND grading_status = 'pending'),
     'month_cents',    (SELECT COALESCE(sum(cost_cents), 0) FROM pds.reading_bank_jobs
-                        WHERE finished_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')),
+                        WHERE charged_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')),
     'schema',         pds.reading_bank_schema_ok())
 $fn$;
 
@@ -1828,6 +1864,7 @@ BEGIN
    WHERE book_id = v_book AND status = 'queued' AND step <> 'grade'
      AND job_id IN (SELECT j::bigint FROM jsonb_array_elements_text(COALESCE(p->'skip_jobs', '[]'::jsonb)) j);
   -- A job skipped earlier (its chapter left the planning window, e.g. under a hold) is queued again when planned again.
+  -- Its cost_cents and charged_at stay as they were: what it already spent keeps counting in its month.
   INSERT INTO pds.reading_bank_jobs AS jb (book_id, step, chapter, input_hash, prompt_version, priority)
   SELECT v_book, j->>'step', (j->>'chapter')::int, j->>'input_hash', j->>'prompt_version', COALESCE((j->>'priority')::int, 100)
     FROM jsonb_array_elements(COALESCE(p->'jobs', '[]'::jsonb)) j
@@ -1873,7 +1910,8 @@ BEGIN
     UPDATE pds.reading_bank_jobs
        SET status = CASE WHEN v_exp.attempts >= 3 THEN 'failed' ELSE 'queued' END, error_code = 'lease_expired',
            lease_until = NULL, cost_cents = cost_cents + reserved_cents, reserved_cents = 0,
-           finished_at = NOW()   -- so the charge counts in this month's spend at once
+           charged_at = CASE WHEN reserved_cents > 0 THEN NOW() ELSE charged_at END,   -- the month's spend reads this
+           finished_at = NOW()
      WHERE job_id = v_exp.job_id;
     IF v_exp.step <> 'grade' AND v_exp.reserved_cents > 0 THEN
       UPDATE pds.reading_bank_books SET spent_cents = spent_cents + v_exp.reserved_cents, updated_at = NOW() WHERE book_id = v_exp.book_id;
@@ -1901,7 +1939,7 @@ BEGIN
    LIMIT 1 FOR UPDATE OF j SKIP LOCKED;
   IF NOT FOUND THEN RETURN jsonb_build_object('ok', true, 'job', NULL); END IF;
   v_est := GREATEST(COALESCE((p->'estimates'->>v_job.step)::numeric, 50), 0);
-  SELECT COALESCE(sum(cost_cents) FILTER (WHERE finished_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')), 0)
+  SELECT COALESCE(sum(cost_cents) FILTER (WHERE charged_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')), 0)
        + COALESCE(sum(reserved_cents) FILTER (WHERE status = 'running' AND lease_until >= NOW()), 0)
     INTO v_month FROM pds.reading_bank_jobs;
   IF v_month + v_est > v_capm THEN
@@ -1962,7 +2000,7 @@ BEGIN
   IF v_att <> v_job.attempts THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
   IF v_total <= v_job.reserved_cents THEN RETURN jsonb_build_object('ok', true, 'reserved_cents', v_job.reserved_cents); END IF;
   v_delta := v_total - v_job.reserved_cents;
-  SELECT COALESCE(sum(cost_cents) FILTER (WHERE finished_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')), 0)
+  SELECT COALESCE(sum(cost_cents) FILTER (WHERE charged_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')), 0)
        + COALESCE(sum(reserved_cents) FILTER (WHERE status = 'running' AND lease_until >= NOW()), 0)
     INTO v_month FROM pds.reading_bank_jobs;
   IF v_month + v_delta > v_capm THEN
@@ -2012,9 +2050,10 @@ BEGIN
     status = CASE v_out WHEN 'retry' THEN CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END ELSE v_out END,
     next_attempt_at = CASE WHEN v_out = 'retry' THEN NOW() + make_interval(mins => LEAST(GREATEST(COALESCE((p->>'retry_minutes')::int, 30), 1), 1440)) ELSE next_attempt_at END,
     lease_until = NULL, reserved_cents = 0, cost_cents = cost_cents + v_cost,
+    charged_at = CASE WHEN v_cost > 0 THEN NOW() ELSE charged_at END,   -- the month's spend reads this, whatever the outcome
     usage = COALESCE(p->'usage', usage), result = COALESCE(p->>'result', result), counts = COALESCE(p->'counts', counts),
     output = COALESCE(p->'output', output), error_code = p->>'error_code',
-    finished_at = NOW()   -- also for a retry, so its cost counts in this month's spend at once
+    finished_at = NOW()
    WHERE job_id = v_job.job_id RETURNING * INTO v_job;
   IF v_job.step <> 'grade' AND v_cost > 0 THEN
     UPDATE pds.reading_bank_books SET spent_cents = spent_cents + v_cost, updated_at = NOW() WHERE book_id = v_job.book_id;
