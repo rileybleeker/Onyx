@@ -23,6 +23,11 @@ export interface DataWarmer {
    * with the sweep's requests. The page itself still fetches the read on open.
    */
   intentOnly?: boolean;
+  /**
+   * Not warmed by the background sweep while the page on screen is one this read does not serve (its path, no query).
+   * Keeps a read that only other pages use out of a timed page's view. Intent warm-ups are not affected.
+   */
+  skipOn?: (page: string) => boolean;
 }
 
 export interface WarmTarget {
@@ -166,7 +171,7 @@ export function runWarmup(targets: WarmTarget[], deps: WarmupDeps, current: stri
       }
       let warmers: DataWarmer[] = [];
       try { warmers = target.data?.() ?? []; } catch { warmers = []; }
-      await warmData(deps, warmers.filter((w) => !w.intentOnly), false, alive);
+      await warmData(deps, warmers.filter((w) => !w.intentOnly && !w.skipOn?.(here ?? "")), false, alive);
       if (cancelled) return;
       await deps.wait(STEP_GAP_MS);
     }
