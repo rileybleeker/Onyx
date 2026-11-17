@@ -251,7 +251,7 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
   let attempts = 0;
   // One observation per request, written once the outcome is known: after the estimates are
   // stored, or with 0 accepted when the call, the reply or the save failed.
-  const observe = (accepted: number) =>
+  const observe = (accepted: number, unresolved = false) =>
     logPilotObservation(
       pilotObservation("delivery_estimate", choice, pilot, {
         usage: res ? [res.usage] : [],
@@ -259,6 +259,7 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
         ok: accepted === todo.length,
         units: todo.length,
         accepted,
+        unresolved,
         calls: attempts,
       }),
     );
@@ -332,7 +333,9 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
       .upsert(rows, { onConflict: "est_key", ignoreDuplicates: true })
       .abortSignal(deadline.signal);
     if (upErr) {
-      observe(0);
+      // An aborted or failed request may still have committed on the server: the stored result is
+      // unknown, so the observation is unresolved (blocks cost promotion) rather than a clean failure.
+      observe(0, true);
       throw new EstimateError(`delivery_item_nutrition upsert: ${upErr.message}`, picked.arm, picked.armOffset);
     }
   }

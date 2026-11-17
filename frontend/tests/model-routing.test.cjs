@@ -363,7 +363,7 @@ test("a failed estimate batch answers with its arm first, so the harvester can r
 test("a label read is accepted only with a product name and named ingredients", () => {
   const ok = { full_name: "Generic Magnesium", ingredients: [{ name: "Magnesium", quantity: 200 }] };
   assert.equal(LABEL.isUsableLabel(ok), true);
-  assert.equal(LABEL.isUsableLabel({ brand_name: "Generic", ingredients: [{ name: "X", quantity: null }] }), true);
+  assert.equal(LABEL.isUsableLabel({ brand_name: "Generic", ingredients: [{ name: "X", quantity: null }] }), false, "a brand alone is not a product: the form and save endpoint need full_name");
   for (const bad of [
     null,
     "text",
@@ -543,8 +543,18 @@ function stubSdk(script, seenOptions) {
           if (step === "timeout") throw new StubTimeoutError();
           // Headers arrived but the body never does: ends only when the call's signal aborts.
           if (step === "stall") {
+            // A referenced interval keeps the event loop alive until the abort lands (AbortSignal.timeout's
+            // own timer is unreferenced, so an isolated run could otherwise exit mid-fixture).
             return new Promise((_, reject) => {
-              options.signal.addEventListener("abort", () => reject(new Error("Request was aborted.")), { once: true });
+              const keepAlive = setInterval(() => {}, 1000);
+              options.signal.addEventListener(
+                "abort",
+                () => {
+                  clearInterval(keepAlive);
+                  reject(new Error("Request was aborted."));
+                },
+                { once: true },
+              );
             });
           }
           if (step === "http_529") throw new StubAPIError(529, "Overloaded");
