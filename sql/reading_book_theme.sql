@@ -44,7 +44,8 @@ COMMENT ON COLUMN pds.books.theme IS
 -- Titles of the book's active ideas that (a) unlock at or below the spoiler gate pds.reading_bank_quiz_through, (b) are of
 -- the current edition (chapter_hash), (c) still rest on valid evidence (pds.reading_bank_idea_supported) and (d) are
 -- supported by at least one of Riley's highlights whose passage is unchanged since the link was stored. Detail ideas
--- are left out. Chapter order, core ideas first, at most 40. [] while the book's questions are not turned on, so a
+-- are left out. Newest chapter first (the chapters being highlighted now are the ones worth tagging, and the cut
+-- of 40 keeps them), core ideas first within a chapter, at most 40. [] while the book's questions are not turned on, so a
 -- book with the bank off behaves as it did before. A locked chapter's idea never appears here.
 CREATE OR REPLACE FUNCTION pds.reading_bank_linked_idea_titles(p_slug TEXT DEFAULT NULL)
 RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
@@ -75,10 +76,10 @@ BEGIN
                      JOIN pds.reading_bank_sources src ON src.source_id = e.source_id AND src.kind = 'highlight'
                      JOIN pds.book_highlights h ON h.highlight_id = src.highlight_id
                     WHERE e.idea_id = i.idea_id AND NOT h.archived AND pds.reading_sha256(h.passage) = src.passage_sha)
-     ORDER BY i.chapter, tier, i.idea_id
+     ORDER BY i.chapter DESC, tier, i.idea_id
      LIMIT 40
   )
-  SELECT COALESCE(jsonb_agg(l.title ORDER BY l.chapter, l.tier, l.idea_id), '[]'::jsonb) INTO v_titles FROM linked l;
+  SELECT COALESCE(jsonb_agg(l.title ORDER BY l.chapter DESC, l.tier, l.idea_id), '[]'::jsonb) INTO v_titles FROM linked l;
   RETURN v_titles;
 END $fn$;
 

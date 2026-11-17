@@ -54,7 +54,7 @@ titles, concept tags, badge labels) is kept out of code. Code comments cite its 
 | `frontend/src/app/api/reading/bank/**` | Chapter map and estimate, approval, Build now / Rebuild, chapter sheet, inspection export (S2) |
 | `frontend/scripts/reading-bank-run.cjs`, `.github/workflows/reading-bank.yml` | The hourly worker and its workflow (S2, S2W) |
 | `frontend/src/lib/reading-recall-server.ts`, `frontend/src/app/api/reading/practice/**` | The practice API and grading: round, attempt, a round's attempts, override, flag, checkpoint (S3, S5) |
-| `frontend/src/app/reading/PracticePart.tsx`, `PracticeRunner.tsx`, `PracticeCards.tsx`, `BankApproval.tsx`, `frontend/src/lib/reading-practice-client.ts` | The practice screen, its runner and the approval card (S4) |
+| `frontend/src/app/reading/PracticePart.tsx`, `PracticeRunner.tsx`, `PracticeCards.tsx`, `BankApproval.tsx`, `frontend/src/lib/reading-practice-client.ts`, `frontend/src/lib/reading-practice-urls.ts` | The practice screen, its runner, the approval card, the client's GET / POST helpers and the one place that spells the practice URLs (S4) |
 | `frontend/src/app/api/chat/route.ts`, `frontend/src/lib/chat-receipts.ts` | Three question-bank chat tools; the reading sentence of the system prompt built from the active book (S6) |
 | `sql/reading_book_theme.sql`, `frontend/src/app/api/reading/idea-titles/route.ts` | A book's own flavour as data (`pds.books.theme`) and the linked idea titles for the concept picker (S7) |
 
@@ -81,6 +81,8 @@ titles, concept tags, badge labels) is kept out of code. Code comments cite its 
    after step 3 (the function is plpgsql, so its body is checked when it runs, not when it is created). Until it is
    applied the quest uses the generic level titles and badge labels, the concept picker lists no preset tags and no
    linked idea titles, and nothing else changes. Setting a book's theme is one `UPDATE` (see "A book's own flavour").
+   **The book already in use keeps its generic look until that `UPDATE` runs** (Riley's step 6 below): its own level
+   titles, concept tags and badge labels used to be in code and are not any more.
 
 Until step 3, every bank route answers 503 `bank_unavailable` and nothing is written; `/reading` behaves as before
 (the review card).
@@ -99,7 +101,11 @@ Until step 3, every bank route answers 503 `bank_unavailable` and nothing is wri
    keeps them).
 5. **The privacy tradeoff** in "Privacy and the public repo": book and chapter titles reach the web search provider,
    highlight passages and graded answers reach Anthropic, and comments, recall notes and other data never do.
-6. **A book's theme** (optional): one `UPDATE` per book, see "A book's own flavour".
+6. **Restore the book already in use** (once, right after the theme SQL is applied): until `UPDATE pds.books SET theme = ...`
+   runs for it, the quest shows the generic level ladder and badge labels and the highlight form offers no preset
+   concept tags. The values are Riley's own and are not in this repository (a test keeps them out); the statement is
+   run from the dashboard or sent through the Supabase MCP with the values supplied out of band, never committed.
+   A later book needs the same `UPDATE` only if Riley wants it themed; none is needed for the quest to work.
 
 ## Data model
 
@@ -619,9 +625,11 @@ UPDATE pds.books SET theme = '{"v": 1, "level_titles": ["Newcomer", "Keeper"], "
   one, and never changes what earns them. The two checkpoint badges are earned at the first and second checkpoint
   chapters (30% and 65% of the book).
 - **Validation:** the database allows an object of at most 6,000 characters. The app reads each part on its own
-  (`parseBookTheme`): text only (control characters out, whitespace collapsed, cut to the limits, repeats ignoring case
-  dropped), a part that is missing, of another type or empty falls back to its default, and a theme of another version
-  or one that is not an object is no theme. Everything is rendered as plain text, never as markup.
+  (`parseBookTheme`): text only (control characters out, whitespace collapsed, cut to the limits counting characters,
+  never splitting one), concepts with repeats ignoring case dropped, level titles kept exactly as listed (a ladder is
+  positional, so a repeated title stays and every later level keeps its place), a part that is missing, of another type
+  or empty falls back to its default, and a theme of another version or one that is not an object is no theme.
+  Everything is rendered as plain text, never as markup.
 - **The overview** carries the parsed theme as `overview.theme` (the raw column is not part of the book that goes to
   the browser) and applies it to the level and the badges before they leave the server. Reading the theme costs no
   request: the overview already reads the whole book row.
@@ -630,9 +638,14 @@ UPDATE pds.books SET theme = '{"v": 1, "level_titles": ["Newcomer", "Keeper"], "
   `GET /api/reading/idea-titles?book=` (owner session only, a plain read, `no-store`), answered by
   `pds.reading_bank_linked_idea_titles`: active ideas of the current edition at or below the spoiler gate with valid
   evidence, supported by at least one highlight whose passage is unchanged since the link was stored, detail ideas left
-  out, chapter order, core ideas first, at most 40. It returns `[]` while the book's questions are off, so a book with
-  the bank off behaves as before. The page asks only while the bank is on, keeps the answer for five minutes per book,
-  and treats any failure as no titles. A locked chapter's idea title never reaches the browser.
+  out, newest chapter first (so the cut of 40 keeps the chapters being highlighted now), core ideas first within a
+  chapter, at most 40. It returns `[]` while the book's questions are off, so a book with the bank off behaves as
+  before. The page asks only while the bank is on, and it follows the spoiler gate: the answer is a cached read like any
+  other (one key, the URL; memory only, gone on sign-out; shown at once and read again on every mount), any write to
+  the reading area (a "Not read yet" hold, a flag) drops it and reads it again, an answer to a read that started before
+  the write is thrown away, and the overview's own numbers moving (the gate, the stage counts) read it again too. A
+  read that fails or answers anything but 200 is no titles (stored as such, so a title that is gone cannot stay on
+  screen). A locked chapter's idea title never leaves the database.
 
 ## Speed and the client cache
 
@@ -663,8 +676,10 @@ UPDATE pds.books SET theme = '{"v": 1, "level_titles": ["Newcomer", "Keeper"], "
   parsed (a test pins the three members it reads). These are risk reductions, not legal clearance; the absolute rule is
   no decryption and no rendered text.
 - **Public repo:** prompts are generic, tests use an invented book, and no book, chapter, quote or personal detail goes
-  into code, tests, docs, logs, heartbeats or commit text. A test looks for the words that used to sit in code (as
+  into new code, tests, docs, logs, heartbeats or commit text. A test looks for the words that used to sit in code (as
   hashes) in the reading files. The level titles, concept tags and badge labels of a real book live only on its row.
+  Older mentions of the book in use that sit outside this feature (a search keyword on the navigation, a code comment
+  and an example in the chat's tool text) are being removed file by file as those files are touched.
 
 ## Rollback, measurement, non-goals
 

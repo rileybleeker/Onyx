@@ -310,23 +310,34 @@ export const CONCEPT_OPTIONS_MAX = 80;
 /** A fresh generic theme (what a book with no theme gets). */
 export const defaultBookTheme = (): BookTheme => ({ levelTitles: [...DEFAULT_LEVEL_TITLES], concepts: [], badgeLabels: {} });
 
-/** One short line of plain text: control characters out, whitespace collapsed, cut to `max`; null when nothing is left. */
+/**
+ * One short line of plain text: control characters out, whitespace collapsed, cut to `max` characters (counted as code
+ * points, so a surrogate pair is never split); null when nothing is left.
+ */
 function themeText(v: unknown, max: number): string | null {
   if (typeof v !== "string") return null;
-  const s = v.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max).trim();
-  return s ? s : null;
+  const s = v.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim();
+  const cut = s.length > max ? Array.from(s).slice(0, max).join("").trim() : s;
+  return cut ? cut : null;
 }
 
-/** A list of short strings: not-text entries dropped, cut to `max` characters, repeats (ignoring case) dropped, at most `count`. */
-function themeList(v: unknown, count: number, max: number): string[] {
+/**
+ * A list of short strings: not-text entries dropped, cut to `max` characters, at most `count`. With `distinct` (the
+ * default) repeats ignoring case are dropped too. A ladder passes false: its entries are positional (level n gets
+ * title n), so dropping a repeat would move every later level up by one.
+ */
+function themeList(v: unknown, count: number, max: number, distinct = true): string[] {
   if (!Array.isArray(v)) return [];
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of v) {
     const t = themeText(item, max);
     const k = t?.toLowerCase();
-    if (!t || !k || seen.has(k)) continue;
-    seen.add(k);
+    if (!t || !k) continue;
+    if (distinct) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+    }
     out.push(t);
     if (out.length >= count) break;
   }
@@ -338,10 +349,11 @@ function themeList(v: unknown, count: number, max: number): string[] {
  * Never throws and never returns a partial surprise: a field that is missing, of another type or empty falls back to
  * the generic default on its own (a bad badge label keeps that badge's default; a theme of another version, or a value
  * that is not an object, is no theme). Everything is plain text; the screens render it as text, never as markup.
+ * Level titles keep their order and their repeats (a ladder is positional); concepts drop repeats ignoring case.
  */
 export function parseBookTheme(raw: unknown): BookTheme {
   if (!isObject(raw) || (raw.v !== undefined && raw.v !== 1)) return defaultBookTheme();
-  const levelTitles = themeList(raw.level_titles, THEME_LIMITS.levelTitles, THEME_LIMITS.levelTitleChars);
+  const levelTitles = themeList(raw.level_titles, THEME_LIMITS.levelTitles, THEME_LIMITS.levelTitleChars, false);
   const badgeLabels: Record<string, string> = {};
   if (isObject(raw.badges)) {
     for (const key of BADGE_KEYS) {

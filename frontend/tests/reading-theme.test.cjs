@@ -107,6 +107,28 @@ test("theme text is one short plain line: control characters out, whitespace col
   assert.equal(R.parseBookTheme({ concepts: ["<b>Tides</b> & <script>x</script>"] }).concepts[0], "<b>Tides</b> & <script>x</script>");
 });
 
+test("a level ladder keeps its order and its repeats (level n gets title n); concepts still drop repeats", () => {
+  const t = R.parseBookTheme({ level_titles: ["Newcomer", "Keeper", "keeper", "Chief Keeper"], concepts: ["Tide tables", "tide TABLES"] });
+  assert.deepEqual(t.levelTitles, ["Newcomer", "Keeper", "keeper", "Chief Keeper"], "a repeated title stays, so no later level moves up");
+  assert.deepEqual(t.concepts, ["Tide tables"]);
+  // Entries that are not text or are blank are still skipped, and the cap of 12 counts what is kept.
+  assert.deepEqual(R.parseBookTheme({ level_titles: ["A", "", "A", null, "A"] }).levelTitles, ["A", "A", "A"]);
+});
+
+test("cutting a theme text to its limit counts characters and never splits one (a pair of UTF-16 units stays whole)", () => {
+  const lamp = String.fromCodePoint(0x1f526); // one character, two UTF-16 units
+  const t = R.parseBookTheme({ level_titles: [lamp.repeat(R.THEME_LIMITS.levelTitleChars + 5)], concepts: [lamp.repeat(100)], badges: { finisher: lamp.repeat(60) } });
+  assert.equal(t.levelTitles[0], lamp.repeat(R.THEME_LIMITS.levelTitleChars));
+  assert.equal(t.concepts[0], lamp.repeat(R.THEME_LIMITS.conceptChars));
+  assert.equal(t.badgeLabels.finisher, lamp.repeat(R.THEME_LIMITS.badgeChars));
+  const lone = (s) => Array.from(s).some((ch) => ch.length === 1 && ch.charCodeAt(0) >= 0xd800 && ch.charCodeAt(0) <= 0xdfff);
+  assert.equal([t.levelTitles[0], t.concepts[0], t.badgeLabels.finisher].some(lone), false, "no half of a pair is left at the cut");
+  assert.equal(R.parseIdeaTitles([lamp.repeat(200)]).some(lone), false);
+  // Text within the limit is untouched, and plain ASCII is cut exactly where it was.
+  assert.equal(R.parseBookTheme({ concepts: [`x${lamp}`] }).concepts[0], `x${lamp}`);
+  assert.equal(R.parseBookTheme({ concepts: ["y".repeat(100)] }).concepts[0].length, R.THEME_LIMITS.conceptChars);
+});
+
 /* ------------------------------------------------------------------ */
 /* The overview: level ladder and badges                                 */
 /* ------------------------------------------------------------------ */
@@ -271,13 +293,23 @@ test("the highlight form offers the theme's concepts plus the linked idea titles
   assert.match(src, /import \{[^}]*\bconceptOptions\b[^}]*\bparseIdeaTitles\b[^}]*\} from "@\/lib\/reading";/);
   assert.doesNotMatch(src, /\bCONCEPTS\b/, "no constant list of one book's concepts");
   assert.match(src, /conceptOptions\(o\.theme\?\.concepts, ideaTitles\)/);
-  assert.match(src, /useLinkedIdeaTitles\(o\.book\.slug, o\.practice\?\.enabled === true\)/, "nothing is read while the book's questions are off");
+  assert.match(src, /useLinkedIdeaTitles\(o\.book\.slug, o\.practice\?\.enabled === true, mapSignature\(o\.practice\)\)/, "nothing is read while the book's questions are off, and it reads again when the gate or the counts move");
   assert.match(src, /\{concepts\.map\(\(c\) => \(/);
   assert.match(src, /\/api\/reading\/idea-titles\?book=\$\{encodeURIComponent\(slug\)\}/);
   // The read is a GET through the shared helper (no side effect); the picker never writes it.
-  const hook = src.slice(src.indexOf("function useLinkedIdeaTitles"), src.indexOf("function useLinkedIdeaTitles") + 1200);
-  assert.match(hook, /getJson\(ideaTitlesUrl\(slug\)\)/);
+  const hook = src.slice(src.indexOf("function useLinkedIdeaTitles"), src.indexOf("const BurnupChart"));
+  assert.ok(hook.length > 200 && hook.length < 4000, "the slice is the hook and nothing else");
+  assert.match(hook, /getJsonShared\(url\)/, "the read at mount joins a read another part just started");
+  assert.match(hook, /getJson\(url\)/, "a read after a write is a plain GET, never joined");
   assert.doesNotMatch(hook, /method: "(POST|PUT|PATCH|DELETE)"|postJson/);
+  // Spoiler gate: a write to the reading area drops the cache entry, the hook reads again, and a read that started
+  // before the write cannot land after it (the effect's cleanup); a failed read is no titles, never a kept one.
+  assert.match(hook, /clientCache\.subscribe\(url, \(v\) => \{[^}]*v === undefined[^}]*setEpoch/s);
+  assert.match(hook, /if \(!live\) return;/);
+  assert.match(hook, /clientCache\.put\(url, \{ titles: next \}, \{ persist: false/, "memory only: never on the device");
+  assert.match(hook, /\[url, on, signature, epoch\]/, "the read repeats when the key, the bank switch, the overview's numbers or a write change");
+  assert.match(hook, /r\.status === 200/);
+  assert.doesNotMatch(src, /new Map<string, \{ at: number; titles/, "no module-level memo outlives a write, a sign-out or the gate");
   assert.equal(read("frontend/src/lib/reading.ts").includes("export const CONCEPTS"), false);
 });
 
@@ -308,6 +340,9 @@ test("the theme SQL is additive, shape-checked and service-role only, and its fu
   ]) {
     assert.ok(fn.includes(part), part);
   }
+  // Newest chapter first, so the cut of 40 keeps the chapters being highlighted now (and the answer follows the same order).
+  assert.match(fn, /ORDER BY i\.chapter DESC, tier, i\.idea_id\s+LIMIT 40/);
+  assert.match(fn, /jsonb_agg\(l\.title ORDER BY l\.chapter DESC, l\.tier, l\.idea_id\)/);
   assert.match(fn, /LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = pds, pg_temp/, "read-only; plpgsql so the file applies before the bank's tables exist");
   assert.doesNotMatch(fn, /\b(INSERT|UPDATE)\b/i, "reads only");
   assert.match(sql, /REVOKE ALL ON FUNCTION pds\.reading_bank_linked_idea_titles\(text\) FROM PUBLIC, anon, authenticated;/);
@@ -327,6 +362,7 @@ test("the theme SQL is additive, shape-checked and service-role only, and its fu
 // sha256 of the lower-case words that used to be code here (level titles, concept tags, two badge labels). The words are
 // not in this file: every phrase of up to 8 words in the reading files is hashed and looked up.
 const FORBIDDEN = new Set(`
+e7722eb5ff44160d298c4b0d4b0dacfaadf4be32a0ed36402f63dc993ac536ce
 3e867737c8d0e653bf38d4bf983e5e6fca795ebc129aa5e1c763c91422e95be5
 ba7ba2f0955147301663dc7e2b7f0fb0dad57b5a46786f1c335353cca093527f
 a3be111ce43e88091d819490d7ee50e6bac366af94aa51b93d81e6e77c8cf096
@@ -400,7 +436,9 @@ test("the reading files name no book: no level title, concept tag or badge label
   const reading = read("frontend/src/lib/reading.ts");
   assert.doesNotMatch(reading, /\bLEVEL_TITLES\b/);
   assert.doesNotMatch(reading, /\bCONCEPTS\b/);
-  assert.doesNotMatch(reading, /badge\("(herbie|bottleneck)"/, "badge keys name no character or concept either");
+  // The old badge keys (a character, a concept) are in the hash list above (a lone word is looked up too), and the keys in use are pinned to the generic list.
+  const keyed = [...reading.matchAll(/\bbadge\("([a-z0-9-]+)",/g)].map((m) => m[1]);
+  assert.deepEqual(keyed, [...R.BADGE_KEYS], "every badge is built under a generic key, in display order");
 });
 
 /* ------------------------------------------------------------------ */
@@ -412,6 +450,11 @@ test("the docs and AGENTS.md say where a book's flavour lives", () => {
   assert.match(doc, /pds\.books\.theme/);
   assert.match(doc, /sql\/reading_book_theme\.sql/);
   assert.match(doc, /GET \/api\/reading\/idea-titles/);
+  // The rollout names the one step that restores the book already in use (its words left the code), with the values kept out of the repo.
+  assert.match(doc, /\*\*Restore the book already in use\*\*/);
+  assert.match(doc, /supplied out of band, never committed/);
+  assert.match(doc, /reading-practice-urls\.ts/, "the files table lists every file of the feature");
+  assert.doesNotMatch(read("AGENTS.md"), /plant-themed/, "the level titles are no longer described as one book's");
   const agents = read("AGENTS.md");
   assert.match(agents, /docs\/reading-question-bank\.md/, "AGENTS.md points at the question bank's doc");
   assert.match(agents, /pds\.books\.theme/, "and says the book's flavour is data");
