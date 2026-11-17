@@ -1038,7 +1038,8 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       });
       return JSON.stringify({ success: true, ...result });
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
+      // Read the message by shape, not instanceof: an Error from another realm (tests run this file in a vm) is still one.
+      const message = typeof (e as { message?: unknown })?.message === "string" ? (e as { message: string }).message : String(e);
       // Only a failure from before Spotify was asked to create the playlist (bad arguments, no token, a 4xx on the
       // create call) is a clean "not created". Anything later, or a network error on the create call itself, may have
       // left a playlist on Spotify: report it as possibly done, so neither the model nor a retry creates a second one.

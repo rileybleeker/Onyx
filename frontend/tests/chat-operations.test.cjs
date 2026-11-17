@@ -63,6 +63,18 @@ function keyedWrite() {
   };
 }
 
+/** keyedWrite for log_supplement_intake: the same keyed effects, answered in that tool's shape (one entry logged). */
+function keyedIntakeWrite() {
+  const w = keyedWrite();
+  return {
+    ...w,
+    execute: (name) => async (opId) => {
+      const out = await w.execute(name)(opId);
+      return { ...out, result: JSON.stringify({ ...JSON.parse(out.result), product: name, logged: [{ time: "08:00" }] }) };
+    },
+  };
+}
+
 const STACK = "log_supplement_stack";
 const input = (stack = "synthetic morning") => ({ stack });
 
@@ -526,7 +538,7 @@ test("a retry whose earlier try wrote nothing (no rows, or refused ones only) ru
   const { db, store, open } = setup();
   await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
   await expireLeases(db);
-  const write = keyedWrite();
+  const write = keyedIntakeWrite();
   const retry = await open();
   assert.equal(retry.retry, true);
   assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).receipt.status, "saved");
@@ -853,7 +865,7 @@ test("a retry whose earlier calls were all refused runs a repeated call twice, a
   const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: INTAKE, ordinal: 1 }, ops.intentSha(INTAKE, { product: "synthetic a" }), { product: "synthetic a" });
   await store.finish(row, "refused", { error: "No product named that." }, null);
   await expireLeases(db);
-  const write = keyedWrite();
+  const write = keyedIntakeWrite();
   const retry = await open();
   assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).receipt.status, "saved");
   assert.equal((await retry.run(INTAKE, { product: "synthetic a" }, write.execute("A"))).receipt.status, "saved", "a second copy runs: nothing earlier was written");

@@ -79,8 +79,9 @@ function makeDb({ tz = 'America/New_York', failOn = null, seed = {} } = {}) {
     }
     exec() {
       db.calls.push(`${this.op}:${this.table}`);
-      const message = db.failOn && db.failOn(this.table, this.op);
-      if (message) return { data: null, error: { message } };
+      const failure = db.failOn && db.failOn(this.table, this.op);
+      // A string is an error without a code (a network failure: may have been written); an object can carry one.
+      if (failure) return { data: null, error: typeof failure === 'string' ? { message: failure } : failure };
       const rows = db.tables[this.table];
       assert.ok(rows, `unknown table ${this.table}`);
       let affected;
@@ -523,7 +524,7 @@ test('respond log: a stack already logged another way is reported, not duplicate
 test('respond log: a failed write puts the reminder back so the card can be tapped again', async () => {
   const db = await claimed(makeDb());
   let broken = true;
-  db.failOn = (table, op) => (broken && table === 'supplement_intake' && op === 'insert' ? 'insert failed' : null);
+  db.failOn = (table, op) => (broken && table === 'supplement_intake' && op === 'insert' ? { message: 'insert failed', code: '23514' } : null); // a check violation: refused, nothing written
   const first = await respond(db, LOG);
   assert.equal(first.httpStatus, 400);
   assert.equal(first.body.ok, false);
