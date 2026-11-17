@@ -20,10 +20,13 @@
  * - money is checked before EVERY request, the first included: requestBoundCents is a conservative bound on what
  *   the request can cost (its whole output at UNKNOWN_PRICE, its prompt at the cache-write rate, every allowed web
  *   search and fetch at full size); the request is sent only when the job's spend so far (priorCostCents + this
- *   call's) plus that bound stays within maxCostCents (the claim's headroom_cents), and, when `reserve` is given,
- *   only after the database raised the job's reservation to that total atomically (pds.reading_bank_reserve, which
- *   counts every other running job), so two jobs at once cannot spend the same headroom. A continuation re-sends
- *   everything so far, so its bound is at least what the previous turn cost. Otherwise: `cost_limit`, nothing sent;
+ *   call's) plus that bound can be reserved: with `reserve` (the worker) only after the database raised the job's
+ *   reservation to that total atomically (pds.reading_bank_reserve, which counts every other running job live and
+ *   pauses the book at its cap, so two jobs at once cannot spend the same headroom and a book that is out of money
+ *   is paused instead of failing quietly); without `reserve`, only when the total stays within maxCostCents (the
+ *   claim's headroom_cents), which is NOT consulted when `reserve` is given, because the claim's number is older
+ *   than the database's and a local refusal never reaches the pause. A continuation re-sends everything so far, so
+ *   its bound is at least what the previous turn cost. Otherwise: `cost_limit`, nothing sent;
  * - a failure that may have been billed without a usage report (timeout, connection, abort) says so
  *   (maybeBilled), so the worker charges the job's reservation instead of 0;
  * - errors leave as codes only: no prompt, book text or API message is ever returned or logged.
@@ -315,7 +318,8 @@ export interface BankCallSpec {
   maxContinuations?: number;
   /**
    * The most the JOB may have spent in all once a request is done (the claim's headroom_cents, which includes the
-   * job's reservation): a request whose bound (requestBoundCents) could pass it is not sent (`cost_limit`).
+   * job's reservation): a request whose bound (requestBoundCents) could pass it is not sent (`cost_limit`). Used only
+   * by a caller with no `reserve`; with `reserve` the database decides (and pauses the book at its cap).
    */
   maxCostCents?: number;
   /** What the job spent on earlier calls (a build's structure call, before its verify call). Default 0. */
@@ -416,7 +420,7 @@ export const messageText = (content: ContentBlockLike[]) =>
  * The whole call (continuations and the SDK's own retries) ends by one deadline (callDeadlineMs); no request is sent
  * with less than MIN_TURN_MS left. Before EVERY request (the first included) the job's possible total, priorCostCents
  * + this call so far + max(requestBoundCents, the last turn's cost: a continuation re-sends everything so far), must
- * fit maxCostCents and, when given, be reserved through `reserve`; otherwise `cost_limit` and nothing is sent.
+ * be reserved through `reserve` when it is given, else fit maxCostCents; otherwise `cost_limit` and nothing is sent.
  */
 export async function bankModelCall(client: BankClient, spec: BankCallSpec): Promise<BankCallResult> {
   const max = spec.maxContinuations ?? MAX_CONTINUATIONS;
@@ -443,7 +447,7 @@ export async function bankModelCall(client: BankClient, spec: BankCallSpec): Pro
       const messages: unknown[] = [{ role: "user", content: spec.user }];
       if (content.length) messages.push({ role: "assistant", content: [...content] });
       const total = Math.round((prior + cost + Math.max(requestBoundCents(spec, messages), lastTurnCost)) * 100) / 100;
-      if (cap !== null && total > cap) return fail("cost_limit");
+      if (!spec.reserve && cap !== null && total > cap) return fail("cost_limit");
       if (spec.reserve) {
         let reserved = false;
         try {

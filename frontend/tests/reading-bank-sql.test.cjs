@@ -83,6 +83,13 @@ test("the main file is additive: no destructive keyword anywhere, comments inclu
   assert.doesNotMatch(main, /\bCREATE\s+POLICY\b/i, "service role only: no policies");
 });
 
+test("no IF / ELSIF / WHILE condition starts with a bare CASE: PL/pgSQL ends the condition at the CASE's own THEN and the function would not create", () => {
+  for (const f of fnsMain.filter((x) => x.language === "plpgsql")) {
+    const code = f.body.replace(/--[^\n]*/g, "");
+    assert.doesNotMatch(code, /\b(IF|ELSIF|WHILE)\s+(NOT\s+)?CASE\b/i, `${f.name}: parenthesize the CASE`);
+  }
+});
+
 test("every new table: row level security on, revoked from PUBLIC / anon / authenticated, granted to service_role only", () => {
   const tables = [...main.matchAll(/CREATE TABLE IF NOT EXISTS pds\.(\w+)/g)].map((m) => m[1]);
   assert.equal(tables.length, 9);
@@ -282,7 +289,9 @@ test("the store is fenced like finish: live lease, the claim's attempt, and the 
   assert.match(store, /OR v_att IS NULL OR/, "attempts is required");
   assert.match(store, /OR \(v_replace AND v_rebuild IS NULL\)/, "a replacing store names the generation it was planned for");
   assert.match(store, /v_jobrow\.status <> 'running' OR v_jobrow\.lease_until IS NULL OR v_jobrow\.lease_until < NOW\(\)[\s\S]{0,120}'not_running'/);
-  assert.match(store, /IF v_att <> v_jobrow\.attempts THEN[\s\S]{0,120}'lease_lost'/);
+  assert.match(store, /IF v_att <> v_jobrow\.attempts OR v_seq <> v_jobrow\.claim_seq THEN[\s\S]{0,120}'lease_lost'/);
+  assert.match(store, /v_seq := NULLIF\(p->>'claim_seq', ''\)::bigint;/);
+  assert.match(store, /OR v_att IS NULL OR v_seq IS NULL OR/, "claim_seq is required too");
   assert.match(store, /v_rebuild < COALESCE\(\s*\(SELECT c\.rebuilds FROM pds\.reading_bank_chapters c[\s\S]{0,160}'stale_generation'/);
   // A receipt replay needs no lease; every fence answers before the first write (nothing is retired by a stale run).
   const at = (needle) => store.indexOf(needle);
@@ -332,8 +341,8 @@ test("the queue charges an expired lease's reservation and fences finish by atte
   assert.match(claim, /'headroom_cents'/);
   assert.doesNotMatch(claim, /j\.status = 'running' AND j\.lease_until < NOW\(\)\)/, "expired leases are settled first, never re-claimed as running");
   const finish = fn(fnsMain, "pds.reading_bank_finish").body;
-  assert.match(finish, /OR v_att IS NULL THEN/);
-  assert.match(finish, /IF v_att <> v_job\.attempts THEN/);
+  assert.match(finish, /OR v_att IS NULL OR v_seq IS NULL THEN/);
+  assert.match(finish, /IF v_att <> v_job\.attempts OR v_seq <> v_job\.claim_seq THEN/);
 });
 
 test("T07's own paths are fenced off bank rows (answers, grades, new versions)", () => {
@@ -381,11 +390,83 @@ test("reserve raises a running job's reservation only within both caps, under th
   const r = fn(fnsMain, "pds.reading_bank_reserve").body;
   const lock = r.indexOf("pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'))");
   assert.ok(lock > 0 && lock < r.indexOf("UPDATE pds.reading_bank_jobs SET reserved_cents"));
-  assert.match(r, /v_job\.status <> 'running' OR v_job\.lease_until < NOW\(\)/);
-  assert.match(r, /IF v_att <> v_job\.attempts THEN[\s\S]{0,80}'lease_lost'/);
+  assert.match(r, /v_job\.status <> 'running' OR v_job\.lease_until IS NULL OR v_job\.lease_until < NOW\(\)/);
+  assert.match(r, /IF v_att <> v_job\.attempts OR v_seq <> v_job\.claim_seq THEN[\s\S]{0,80}'lease_lost'/);
   assert.match(r, /v_month \+ v_delta > v_capm[\s\S]{0,120}'monthly_cap'/);
-  assert.match(r, /v_used \+ v_delta > v_cap[\s\S]{0,260}'budget'/);
-  assert.match(r, /sum\(reserved_cents\) FILTER \(WHERE status = 'running' AND lease_until >= NOW\(\)\)/, "every other running job's reservation counts");
+  assert.match(r, /v_used \+ v_delta > v_bk\.approved_cents[\s\S]{0,260}'budget'/);
+  assert.match(r, /sum\(reserved_cents\) FILTER \(WHERE status = 'running'\)/, "every other running job's reservation counts");
+});
+
+test("reserve counts a running job's reservation until its lease is settled, an expired one included", () => {
+  const r = fn(fnsMain, "pds.reading_bank_reserve").body;
+  // An expired lease is billed work that no claim has charged yet: it must not free its headroom to another job.
+  assert.doesNotMatch(r, /lease_until >= NOW\(\)/, "no sum drops a running job because its lease ran out");
+  assert.match(r, /sum\(r\.reserved_cents\) FROM pds\.reading_bank_jobs r\s+WHERE r\.book_id = v_bk\.book_id AND r\.status = 'running'\)/);
+  const claim = fn(fnsMain, "pds.reading_bank_claim").body;
+  assert.match(claim, /sum\(reserved_cents\) FILTER \(WHERE status = 'running'\)/);
+  assert.doesNotMatch(claim, /status = 'running' AND lease_until >= NOW\(\)/);
+  assert.match(claim, /sum\(r\.reserved_cents\) FROM pds\.reading_bank_jobs r\s+WHERE r\.book_id = b\.book_id AND r\.status = 'running'\)/);
+});
+
+test("reserve refuses a book that is off or paused before it looks at the money, even a request that needs no more", () => {
+  const r = fn(fnsMain, "pds.reading_bank_reserve").body;
+  assert.match(r, /IF v_job\.step <> 'grade' THEN\s+SELECT \* INTO v_bk FROM pds\.reading_bank_books WHERE book_id = v_job\.book_id FOR UPDATE;/, "grading is not tied to a book's approval");
+  const gate = r.indexOf("v_bk.approved_at IS NULL OR v_bk.paused_at IS NOT NULL");
+  assert.ok(gate > 0, "the book must be approved and not paused");
+  assert.ok(gate < r.indexOf("IF v_total <= v_job.reserved_cents THEN"), "checked before the early success for a total already reserved");
+  assert.ok(gate < r.indexOf("UPDATE pds.reading_bank_jobs SET reserved_cents"), "and before anything is reserved");
+  assert.match(r, /CASE WHEN v_bk\.paused_reason = 'budget' THEN 'budget' ELSE 'paused' END/);
+  // The lock order stays claim lock, then job row, then book row (as the claim takes them).
+  assert.ok(r.indexOf("pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'))") < r.indexOf("FROM pds.reading_bank_jobs WHERE job_id") && r.indexOf("FROM pds.reading_bank_jobs WHERE job_id") < r.indexOf("INTO v_bk"));
+});
+
+test("the queue fence is two numbers: attempts (a re-queue resets it) and claim_seq (never), both required by reserve, finish, store and the map write", () => {
+  assert.match(main, /claim_seq\s+BIGINT\s+NOT NULL DEFAULT 0,/);
+  assert.match(main, /ALTER TABLE pds\.reading_bank_jobs ADD COLUMN IF NOT EXISTS claim_seq BIGINT NOT NULL DEFAULT 0;/);
+  assert.match(fn(fnsMain, "pds.reading_bank_claim").body, /attempts = attempts \+ 1, claim_seq = claim_seq \+ 1,/);
+  const enq = fn(fnsMain, "pds.reading_bank_enqueue").body;
+  const set = /SET status = 'queued'[^;]*/.exec(enq)?.[0] ?? "";
+  assert.match(set, /attempts = 0/, "a re-queue gives the tries back");
+  assert.doesNotMatch(set, /claim_seq/, "and never touches the claim counter, so a worker from before can never match a later claim");
+  assert.deepEqual(fnsMain.filter((f) => /claim_seq\s*=\s*/.test(f.body)).map((f) => f.name), ["pds.reading_bank_claim"], "only the claim moves it, and only up");
+  for (const name of ["pds.reading_bank_reserve", "pds.reading_bank_finish", "pds.reading_bank_store", "pds.reading_bank_set_map"]) {
+    const body = fn(fnsMain, name).body;
+    assert.match(body, /v_seq := NULLIF\(p->>'claim_seq', ''\)::bigint;/, `${name} reads claim_seq`);
+    assert.match(body, /v_seq IS NULL/, `${name} requires it`);
+    assert.match(body, /v_seq <> v_job(row)?\.claim_seq/, `${name} compares it`);
+  }
+});
+
+test("the source map is written only by the run holding the map job's live lease, and only for the book's current table of contents", () => {
+  const m = fn(fnsMain, "pds.reading_bank_set_map").body;
+  for (const v of ["v_book", "v_jid", "v_att", "v_seq"]) assert.match(m, new RegExp(`${v} IS NULL`), `${v} is required`);
+  assert.match(m, /v_toc !~ '\^\[0-9a-f\]\{64\}\$'/);
+  const at = (needle) => m.indexOf(needle);
+  assert.ok(at("pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'))") > 0 && at("pg_advisory_xact_lock") < at("FROM pds.reading_bank_jobs WHERE job_id = v_jid FOR UPDATE"));
+  assert.match(m, /v_job\.book_id <> v_book OR v_job\.step <> 'map' THEN\s+RETURN jsonb_build_object\('ok', false, 'http', 409, 'code', 'job_mismatch'\)/);
+  assert.match(m, /v_job\.status <> 'running' OR v_job\.lease_until IS NULL OR v_job\.lease_until < NOW\(\) THEN\s+RETURN jsonb_build_object\('ok', false, 'http', 409, 'code', 'not_running'\)/);
+  assert.match(m, /IF v_att <> v_job\.attempts OR v_seq <> v_job\.claim_seq THEN\s+RETURN jsonb_build_object\('ok', false, 'http', 409, 'code', 'lease_lost'\)/);
+  assert.match(m, /v_toc IS NOT NULL AND v_toc <> pds\.reading_bank_toc_hash\(v_book\) THEN\s+RETURN jsonb_build_object\('ok', true, 'stored', false, 'code', 'toc_changed'\)/, "a stale table of contents stores nothing and costs no retry");
+  for (const code of ["'job_mismatch'", "'not_running'", "'lease_lost'", "'toc_changed'"]) assert.ok(at(code) > 0 && at(code) < at("UPDATE pds.reading_bank_books"), `${code} answers before the write`);
+  assert.match(m, /WHERE book_id = v_book;/, "the book the job belongs to, never another");
+});
+
+test("a refusal to spend is not a failed try: a cost-free retry with a cost-refusal code gives the try back", () => {
+  const f = fn(fnsMain, "pds.reading_bank_finish").body;
+  assert.match(f, /v_defer := v_out = 'retry' AND v_cost = 0 AND COALESCE\(p->>'error_code', ''\) IN \('cost_limit', 'monthly_cap', 'budget', 'paused'\);/);
+  assert.match(f, /CASE WHEN attempts >= 3 AND NOT v_defer THEN 'failed' ELSE 'queued' END/, "never failed by refusals");
+  assert.match(f, /attempts = CASE WHEN v_defer THEN GREATEST\(attempts - 1, 0\) ELSE attempts END/);
+  assert.match(f, /v_job\.step = 'grade' AND v_out <> 'done' AND NOT v_defer THEN/, "and not a grade try either");
+  // A retry that billed something still uses its try (a request that always stops half way cannot repeat for ever).
+  assert.match(f, /v_cost = 0/);
+});
+
+test("claim: the first request's bound, when sent, is the cap test (with the pause); the estimate is still what is reserved", () => {
+  const c = fn(fnsMain, "pds.reading_bank_claim").body;
+  assert.match(c, /v_need := GREATEST\(v_est, LEAST\(GREATEST\(COALESCE\(NULLIF\(p->'bounds'->>v_job\.step, ''\)::numeric, 0\), 0\), 100000\)\);/);
+  assert.match(c, /IF v_month \+ v_need > v_capm THEN\s+RETURN jsonb_build_object\('ok', true, 'job', NULL, 'code', 'monthly_cap'\)/);
+  assert.match(c, /v_used \+ v_need > v_cap THEN[\s\S]{0,260}paused_reason = 'budget'/);
+  assert.match(c, /reserved_cents = v_est\b/);
 });
 
 test("a failed job has a way back: web_search_disabled retried after 6 h, the map through the book-level Rebuild", () => {

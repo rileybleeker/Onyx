@@ -527,6 +527,8 @@ export interface StorePayload {
   job_id: number | null;
   /** The attempt number pds.reading_bank_claim answered: the store refuses (409 lease_lost / not_running) a run that no longer holds the lease. */
   attempts: number;
+  /** The claim's claim_seq (never reset, unlike attempts): required with attempts, so a run from an earlier claim can never match a later one. */
+  claim_seq: number;
   prompt_version: string;
   replace: boolean;
   status?: ChapterResult;
@@ -646,6 +648,8 @@ export interface BuildInput {
   jobId: number | null;
   /** The claim's attempt number (the job row's `attempts` as claimed). */
   attempts: number;
+  /** The claim's `claim_seq` (the job row's, as claimed): the second number of the fence, never reset by a re-queue. */
+  claimSeq: number;
   promptVersion: string;
   rebuilds: number;
   /** true for a build / rebuild; false for the highlights step (adds ideas, keeps the chapter status). */
@@ -865,6 +869,7 @@ export function validateBuild(input: BuildInput): BuildResult {
     chapter_hash: input.chapterHash,
     job_id: input.jobId,
     attempts: input.attempts,
+    claim_seq: input.claimSeq,
     prompt_version: input.promptVersion,
     replace: input.replace,
     rebuilds: input.rebuilds,
@@ -1073,7 +1078,8 @@ export const BANK_CODES: ReadonlySet<string> = new Set([
   "auth", "bad_request", "web_search_disabled", "failed", "budget", "monthly_cap", "uncertain", "schema_checks",
   "schema_missing", "lease_expired", "lease_lost", "not_running", "raced", "thin", "no_sources", "anchors_only", "ready",
   "no_citations", "store_failed", "verify_failed", "no_research", "invalidated", "already_graded", "cost_limit",
-  "chapter_changed", "highlight_changed", "job_mismatch", "not_pending", "question_changed", "superseded", "stale_generation", "other",
+  "chapter_changed", "highlight_changed", "job_mismatch", "not_pending", "question_changed", "superseded", "stale_generation",
+  "paused", "toc_changed", "other",
 ]);
 
 /** A safe error / outcome code from BANK_CODES ("other" for anything else), never message text. */

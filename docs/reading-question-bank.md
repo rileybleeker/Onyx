@@ -188,8 +188,18 @@ highlights step links the new passage again or the idea has other evidence, and 
   attempt number the claim answered, so a run whose lease ran out cannot finish another run's). A run whose lease
   ran out (a crash, a function stopped at its time limit) most likely made a billed call that never reported: the
   next claim **charges its reservation** (to the job, this month's spend and the book) before offering the job again
-  or failing it after 3 attempts, so neither cap leaks; the late finish of that run is refused. The claim answers
-  `headroom_cents`, the most the job may spend before a cap is reached. A month's spend is read from each job's
+  or failing it after 3 attempts, so neither cap leaks; the late finish of that run is refused. Until then an
+  expired lease's reservation still counts against both caps (`pds.reading_bank_reserve` counts every running
+  job), so a job that starts meanwhile cannot spend its headroom. The claim answers `headroom_cents`, the most the
+  job may spend before a cap is reached; when the worker also sends `bounds` (each step's first-request bound,
+  `requestBoundCents`, several times the estimate) it refuses with `monthly_cap` / `budget` (pausing the book) when
+  even that first request cannot fit, instead of claiming a job whose first request would be refused. A run is
+  fenced by two numbers the claim answers: `attempts` (the tries used, which a re-queue resets) and `claim_seq`
+  (one more with every claim, never reset). Reserve, finish, store and the source-map write
+  (`pds.reading_bank_set_map`, which also needs the book's own map job, running) require both, so a worker whose
+  lease ran out can never match a later claim, however often the job was re-queued in between. A map made for a
+  table of contents the book no longer has is not written (`toc_changed`; the planner maps the new one). A month's
+  spend is read from each job's
   `charged_at` (set whenever its cost grows), never from the queue's own `finished_at`, so queueing a skipped job
   again cannot hide what it already cost; a job whose attempts span two months counts all its cost in the month of
   its last charge (the safe side).
@@ -200,8 +210,11 @@ highlights step links the new passage again or the idea has other evidence, and 
   (`priorCostCents`, the earlier call of a two-call step, plus this call) plus that bound fits `maxCostCents`, and,
   with `reserve` (the worker passes `pds.reading_bank_reserve`), only after the database raised the job's
   reservation to that total under the claim lock, counting every other running job, so two jobs at once cannot
-  spend the same headroom (a refusal: `budget` pauses the book as the claim does, or `monthly_cap`). Otherwise
-  `cost_limit` and nothing is sent. A continuation's bound is at least what the previous turn cost (it re-sends
+  spend the same headroom (a refusal: `budget` pauses the book as the claim does, or `monthly_cap`; a book Riley
+  turned off or that is paused refuses every further request, `paused`). Otherwise `cost_limit` and nothing is sent.
+  The worker then finishes the job as `skipped` (the planner queues it again) or as a cost-free `retry` carrying
+  that code, which gives the try back (`pds.reading_bank_finish`): a refusal to spend never fails a job or its
+  chapter. A continuation's bound is at least what the previous turn cost (it re-sends
   everything). What the bound does not cover: the server tool loop re-reading earlier results within one request,
   and a refusal mid-stream followed by a fallback answer; the real usage is charged at finish either way.
 - Pricing a turn a server-side fallback served (a `fallback` content block, a `fallback_message` attempt in
@@ -215,8 +228,9 @@ highlights step links the new passage again or the idea has other evidence, and 
   Sonnet 5.5 $2 / $10, web search $10 per 1,000), errors as codes only. One deadline for the whole call (every
   continuation and SDK retry, through an abort signal): `timeoutMs`, else the step's `STEP_MAX_SECONDS` (`step`),
   never the SDK's 10 minutes, and never past `deadlineAt`: a step that makes two calls (map, build, highlights)
-  passes both the same `stepDeadlineAt(step, start)`, so the pair stays within the step's budget. `maxCostCents` (the claim's `headroom_cents`) stops a continuation that could pass it
-  (`cost_limit`). A timeout or dropped connection reports `maybeBilled`, and the worker then charges the job's
+  passes both the same `stepDeadlineAt(step, start)`, so the pair stays within the step's budget. `maxCostCents` (the claim's `headroom_cents`) is the gate of a caller with no
+  `reserve` (`cost_limit`); with `reserve` it is not consulted, because the database is live and is the only gate
+  that pauses the book. A timeout or dropped connection reports `maybeBilled`, and the worker then charges the job's
   reservation rather than 0. A re-claimed job whose `store_receipt` is set has stored already: the worker finishes
   it without a new model call.
 

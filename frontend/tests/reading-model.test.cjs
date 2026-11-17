@@ -218,6 +218,25 @@ test("reserve: called before every request with the job's possible total; a refu
   assert.deepEqual([t.code, threw.calls.length], ["cost_limit", 0]);
 });
 
+test("with reserve, maxCostCents is not consulted: the database decides (and is the only gate that pauses a book at its cap)", async () => {
+  const s = spec({ maxTokens: 32000, model: "claude-opus-5-5" });
+  const bound = M.requestBoundCents(s, [{ role: "user", content: s.user }]);
+  // A claim's headroom far under the request's bound would have refused it locally, before reserve ever ran.
+  const seen = [];
+  const sent = fakeClient([msg("end_turn")]);
+  const ok = await M.bankModelCall(sent.client, { ...s, maxCostCents: 1, reserve: async (t) => (seen.push(t), true) });
+  assert.equal(ok.ok, true, "reserve said yes, so the request goes out whatever the stale headroom says");
+  assert.deepEqual([seen.length, sent.calls.length], [1, 1]);
+  assert.ok(seen[0] >= bound - 0.01, "reserve is asked for the whole bound");
+  const refused = fakeClient([msg("end_turn")]);
+  const no = await M.bankModelCall(refused.client, { ...s, maxCostCents: 100000, reserve: async () => false });
+  assert.deepEqual([no.ok, no.code, refused.calls.length], [false, "cost_limit", 0], "reserve said no: nothing is sent");
+  // Without reserve the local check is still the gate.
+  const local = fakeClient([msg("end_turn")]);
+  const l = await M.bankModelCall(local.client, { ...s, maxCostCents: 1 });
+  assert.deepEqual([l.ok, l.code, local.calls.length], [false, "cost_limit", 0]);
+});
+
 test("deadlineAt: a step's two calls share one deadline; a passed deadline sends nothing", async () => {
   const B = loadTs("lib/reading-bank.ts");
   const now = 1_000_000;

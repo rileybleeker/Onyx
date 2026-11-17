@@ -32,6 +32,10 @@
 -- owner-readable table would let a signed-in browser read locked chapters through PostgREST).
 -- Every write function takes the advisory lock pds.reading_practice (questions, attempts, grades, flags, states)
 -- or pds.reading_bank_claim (queue, approval, source map) before writing.
+-- A queue run is fenced by TWO numbers from the claim's answer, and reserve, finish, store and the source-map write
+-- all need both: `attempts` (the tries a job has used; the planner's re-queue resets it, so a number can come round
+-- again) and `claim_seq` (one more with every claim and never reset, so a worker whose lease ran out can never match
+-- a later claim's number, whatever the job went through in between).
 -- ============================================================
 
 -- 1. Per-book state: Riley's approval (the spending cap), the source map, a "Not read yet" hold -------------------
@@ -180,7 +184,8 @@ CREATE TABLE IF NOT EXISTS pds.reading_bank_jobs (
     attempt_key     UUID          REFERENCES pds.reading_question_attempts(attempt_key),
     status          TEXT          NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'failed', 'skipped')),
     priority        INTEGER       NOT NULL DEFAULT 100,
-    attempts        SMALLINT      NOT NULL DEFAULT 0,
+    attempts        SMALLINT      NOT NULL DEFAULT 0,   -- tries used (a re-queue resets it); NOT the fence on its own
+    claim_seq       BIGINT        NOT NULL DEFAULT 0,   -- claims made, never reset: with attempts, the fence of a queue run
     next_attempt_at TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     lease_until     TIMESTAMPTZ,
     reserved_cents  NUMERIC(10,2) NOT NULL DEFAULT 0,
@@ -201,6 +206,7 @@ CREATE TABLE IF NOT EXISTS pds.reading_bank_jobs (
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_claim ON pds.reading_bank_jobs (status, priority, created_at) WHERE status IN ('queued', 'running');
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_month ON pds.reading_bank_jobs (finished_at);
 ALTER TABLE pds.reading_bank_jobs ADD COLUMN IF NOT EXISTS charged_at TIMESTAMPTZ;
+ALTER TABLE pds.reading_bank_jobs ADD COLUMN IF NOT EXISTS claim_seq BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_charged ON pds.reading_bank_jobs (charged_at) WHERE charged_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_reading_bank_jobs_book ON pds.reading_bank_jobs (book_id, step, chapter);
 
@@ -762,7 +768,7 @@ BEGIN
 END $fn$;
 
 -- 13a. Store one verified chapter batch atomically --------------------------------------------------------------
--- p: {book_id, chapter, chapter_hash, job_id, attempts, prompt_version, replace (bool), status?, rebuilds (required
+-- p: {book_id, chapter, chapter_hash, job_id, attempts, claim_seq, prompt_version, replace (bool), status?, rebuilds (required
 --     with replace), counts: {rejected},
 --     sources: [{ref, kind, url?, domain?, title?, cited_text?, highlight_id?, passage_sha?}],
 --     ideas: [{ref, unlock_chapter, kind, importance, title, statement, key_points, facts, origin, evidence: [ref],
@@ -774,9 +780,10 @@ END $fn$;
 -- inserted again. chapter_hash is required: the edition the job was planned for; when the table of contents
 -- changed since, the answer is 409 chapter_changed and nothing is written (the planner queues the new edition).
 -- A highlight source's passage_sha, when sent, must still be the passage's (409 highlight_changed otherwise).
--- Only the run that holds the live lease stores: attempts is the attempt number the claim answered, and a job that
--- is not running (409 not_running), whose attempt is not the current one (409 lease_lost) or that was planned for
--- an older rebuild count of its chapter (409 stale_generation) writes nothing. A receipt replay needs no lease.
+-- Only the run that holds the live lease stores: attempts and claim_seq (both required) are the numbers the claim
+-- answered, and a job that is not running (409 not_running), whose attempt or claim is not the current one (409
+-- lease_lost) or that was planned for an older rebuild count of its chapter (409 stale_generation) writes nothing.
+-- A receipt replay needs no lease.
 -- replace = true (a build or a rebuild): the chapter's active ideas and their questions are retired first, and the
 -- chapter recall question gets a new T07 version when its rubric changed. A replace that kept no idea while the
 -- chapter has a working bank for this edition leaves that bank in place (a transient search failure must not
@@ -797,6 +804,7 @@ DECLARE
   v_ch      INTEGER;
   v_job     BIGINT;
   v_att     INTEGER;
+  v_seq     BIGINT;
   v_rebuild INTEGER;
   v_replace BOOLEAN;
   v_keep    BOOLEAN := false;
@@ -826,12 +834,13 @@ BEGIN
     v_ch := (p->>'chapter')::int;
     v_job := NULLIF(p->>'job_id', '')::bigint;
     v_att := NULLIF(p->>'attempts', '')::int;
+    v_seq := NULLIF(p->>'claim_seq', '')::bigint;
     v_rebuild := NULLIF(p->>'rebuilds', '')::int;
     v_replace := COALESCE((p->>'replace')::boolean, false);
   EXCEPTION WHEN others THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END;
-  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR v_job IS NULL OR v_att IS NULL OR v_pv IS NULL OR btrim(v_pv) = ''
+  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR v_job IS NULL OR v_att IS NULL OR v_seq IS NULL OR v_pv IS NULL OR btrim(v_pv) = ''
      OR (v_replace AND v_rebuild IS NULL)
      OR v_chash IS NULL OR v_chash !~ '^[0-9a-f]{64}$'
      OR (p->'ideas' IS NOT NULL AND jsonb_typeof(p->'ideas') <> 'array')
@@ -853,11 +862,11 @@ BEGIN
   END IF;
   -- Only the run that holds the live lease may store (as finish and reserve fence it): a worker whose lease ran
   -- out has had its reservation charged and its job offered again, and a late store of its output must not
-  -- replace what a newer run or rebuild put there. attempts = the attempt number the claim answered.
+  -- replace what a newer run or rebuild put there. attempts + claim_seq = the numbers the claim answered.
   IF v_jobrow.status <> 'running' OR v_jobrow.lease_until IS NULL OR v_jobrow.lease_until < NOW() THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running');
   END IF;
-  IF v_att <> v_jobrow.attempts THEN
+  IF v_att <> v_jobrow.attempts OR v_seq <> v_jobrow.claim_seq THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost');
   END IF;
   -- A rebuild asked for after this job was planned makes its output obsolete (new rebuild count, new job hashes).
@@ -935,7 +944,8 @@ BEGIN
   ON CONFLICT (highlight_id, passage_sha) DO NOTHING;
 
   FOR v_idea IN SELECT * FROM jsonb_array_elements(COALESCE(p->'ideas', '[]'::jsonb)) LOOP
-    IF CASE WHEN jsonb_typeof(v_idea->'evidence') = 'array' THEN jsonb_array_length(v_idea->'evidence') = 0 ELSE true END THEN
+    -- (parenthesized: PL/pgSQL ends an IF condition at the first THEN outside parentheses, one inside a bare CASE included)
+    IF (CASE WHEN jsonb_typeof(v_idea->'evidence') = 'array' THEN jsonb_array_length(v_idea->'evidence') = 0 ELSE true END) THEN
       RAISE EXCEPTION USING ERRCODE = 'OXB03', MESSAGE = 'an idea needs at least one piece of evidence';
     END IF;
     IF EXISTS (SELECT 1 FROM jsonb_array_elements_text(v_idea->'evidence') e WHERE v_map->>e IS NULL) THEN
@@ -1841,6 +1851,8 @@ $fn$;
 -- that refusal is a 400 before any token, so the retry costs nothing while it is still off). Any other failure
 -- waits for Riley's Rebuild (a new rebuild count = a new job hash; for the source map, chapter 0's book-level
 -- Rebuild: pds.reading_bank_rebuild).
+-- A re-queue resets the tries used (attempts) and leaves claim_seq alone: a worker that held the job before can
+-- never match a later claim (see the header).
 -- Every call also brings the book's chapter recall rubrics in step with their ideas (pds.reading_bank_recall_sync).
 CREATE OR REPLACE FUNCTION pds.reading_bank_enqueue(p JSONB)
 RETURNS INTEGER LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
@@ -1877,8 +1889,13 @@ BEGIN
   RETURN v_n;
 END $fn$;
 
--- p: {lease_seconds, month_cap_cents, estimates: {step: cents}, job_id?, steps?: [step]}
+-- p: {lease_seconds, month_cap_cents, estimates: {step: cents}, bounds?: {step: cents}, job_id?, steps?: [step]}
 -- -> {ok, job, headroom_cents} (the claimed job, or null with code 'monthly_cap' | 'budget' when spending stops it)
+-- estimates = what a claimed job reserves up front. bounds (optional) = the most its FIRST model request can cost
+-- (lib/reading-model.ts requestBoundCents, which is several times the estimate): a job whose bound does not fit
+-- under a cap is refused here with the code, and the book pause, that pds.reading_bank_reserve would give it one
+-- request later, instead of being claimed, refused and finished. Without bounds the estimate is the test.
+-- Every claim makes claim_seq one larger (the answer's job row carries it with attempts).
 -- A running job whose lease ran out (a crash, a function stopped at its maxDuration) most likely made a billed
 -- call that never reported: its reservation is CHARGED (cost_cents, this month's spend and, for generation, the
 -- book's spent_cents) before the job is offered again, or failed after 3 attempts, so neither cap leaks. A late
@@ -1887,9 +1904,11 @@ END $fn$;
 -- the worker finishes it without a new model call.
 -- A queued grade job whose answer is no longer pending (graded inline by the chat tool, self graded, voided by a
 -- flag) is marked skipped and never claimed, so no model grade is paid for (and no answer sent) a second time.
+-- Every running job's reservation counts against both caps until its lease is settled here, an expired one included.
 -- headroom_cents = what the claimed job may spend in all, its reservation included, before a cap is reached (the
--- smaller of the monthly and, for generation, the book's): bankModelCall's maxCostCents, which stops continuing a
--- call (pause_turn) past it.
+-- smaller of the monthly and, for generation, the book's): bankModelCall's maxCostCents for a caller with no
+-- `reserve`. A worker that reserves leaves it out: pds.reading_bank_reserve counts every running job live and is the
+-- only gate that also pauses the book at its cap.
 CREATE OR REPLACE FUNCTION pds.reading_bank_claim(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
@@ -1900,6 +1919,7 @@ DECLARE
   v_lease INTEGER := LEAST(GREATEST(COALESCE(NULLIF(p->>'lease_seconds', '')::int, 300), 30), 1800);
   v_capm  NUMERIC := COALESCE(NULLIF(p->>'month_cap_cents', '')::numeric, 3000);
   v_est   NUMERIC;
+  v_need  NUMERIC;
   v_month NUMERIC;
   v_used  NUMERIC;
   v_cap   INTEGER;
@@ -1939,19 +1959,20 @@ BEGIN
    LIMIT 1 FOR UPDATE OF j SKIP LOCKED;
   IF NOT FOUND THEN RETURN jsonb_build_object('ok', true, 'job', NULL); END IF;
   v_est := GREATEST(COALESCE((p->'estimates'->>v_job.step)::numeric, 50), 0);
+  v_need := GREATEST(v_est, LEAST(GREATEST(COALESCE(NULLIF(p->'bounds'->>v_job.step, '')::numeric, 0), 0), 100000));
   SELECT COALESCE(sum(cost_cents) FILTER (WHERE charged_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')), 0)
-       + COALESCE(sum(reserved_cents) FILTER (WHERE status = 'running' AND lease_until >= NOW()), 0)
+       + COALESCE(sum(reserved_cents) FILTER (WHERE status = 'running'), 0)
     INTO v_month FROM pds.reading_bank_jobs;
-  IF v_month + v_est > v_capm THEN
+  IF v_month + v_need > v_capm THEN
     RETURN jsonb_build_object('ok', true, 'job', NULL, 'code', 'monthly_cap');
   END IF;
   v_head := v_capm - v_month;
   IF v_job.step <> 'grade' THEN
     SELECT b.spent_cents + COALESCE((SELECT sum(r.reserved_cents) FROM pds.reading_bank_jobs r
-                                      WHERE r.book_id = b.book_id AND r.status = 'running' AND r.lease_until >= NOW()), 0),
+                                      WHERE r.book_id = b.book_id AND r.status = 'running'), 0),
            b.approved_cents
       INTO v_used, v_cap FROM pds.reading_bank_books b WHERE b.book_id = v_job.book_id FOR UPDATE;
-    IF v_cap IS NULL OR v_used + v_est > v_cap THEN
+    IF v_cap IS NULL OR v_used + v_need > v_cap THEN
       UPDATE pds.reading_bank_books SET paused_at = NOW(), paused_reason = 'budget', updated_at = NOW()
        WHERE book_id = v_job.book_id AND paused_at IS NULL;
       RETURN jsonb_build_object('ok', true, 'job', NULL, 'code', 'budget', 'book_id', v_job.book_id);
@@ -1959,59 +1980,76 @@ BEGIN
     v_head := LEAST(v_head, v_cap - v_used);
   END IF;
   UPDATE pds.reading_bank_jobs
-     SET status = 'running', attempts = attempts + 1, started_at = NOW(),
+     SET status = 'running', attempts = attempts + 1, claim_seq = claim_seq + 1, started_at = NOW(),
          lease_until = NOW() + make_interval(secs => v_lease), reserved_cents = v_est
    WHERE job_id = v_job.job_id RETURNING * INTO v_job;
   RETURN jsonb_build_object('ok', true, 'job', to_jsonb(v_job), 'headroom_cents', GREATEST(v_head, v_est));
 END $fn$;
 
--- p: {job_id, attempts, total_cents, month_cap_cents}
+-- p: {job_id, attempts, claim_seq, total_cents, month_cap_cents}
 -- Before every model request (lib/reading-model.ts bankModelCall's `reserve`): raises the running job's reservation
 -- to total_cents, the most the job may have spent once that request is done (what it spent so far plus a
 -- conservative bound on the request), when both caps still allow it with every other running job's reservation
 -- counted, in one step under the claim lock. So two jobs that run at once cannot each spend the same headroom, and
 -- no request is sent that could pass a cap by more than its bound misjudges. A smaller total changes nothing.
+-- Every running job's reservation counts until the next claim settles its lease, an expired one included: an
+-- expired lease is billed work not yet charged, so it must not free its headroom to a job that starts meanwhile.
+-- A generation job also needs its book still ON: a book turned off by Riley (paused 'owner') or stopped at its cap
+-- (paused 'budget') refuses every further request, a total no larger than the reservation included, so turning a
+-- book off stops a job that already holds a claim at its next request.
 -- -> {ok, reserved_cents}, or {ok: false, code: 'monthly_cap' | 'budget' (the book is paused, as at claim) |
---    'not_running' | 'lease_lost'}: the worker then sends nothing and finishes the job as a retry.
+--    'paused' (the book is off) | 'not_running' | 'lease_lost'}: the worker then sends nothing and finishes the job
+--    as skipped (queued again when planned again) or as a retry carrying that code with no cost, which does not use
+--    up a try (reading_bank_finish).
 CREATE OR REPLACE FUNCTION pds.reading_bank_reserve(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
   v_job   pds.reading_bank_jobs%ROWTYPE;
+  v_bk    pds.reading_bank_books%ROWTYPE;
   v_total NUMERIC;
   v_att   INTEGER;
+  v_seq   BIGINT;
   v_capm  NUMERIC;
   v_delta NUMERIC;
   v_month NUMERIC;
   v_used  NUMERIC;
-  v_cap   INTEGER;
 BEGIN
   BEGIN
     v_total := round((p->>'total_cents')::numeric, 2);
     v_att := NULLIF(p->>'attempts', '')::int;
+    v_seq := NULLIF(p->>'claim_seq', '')::bigint;
     v_capm := COALESCE(NULLIF(p->>'month_cap_cents', '')::numeric, 3000);
   EXCEPTION WHEN others THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END;
-  IF v_total IS NULL OR v_total < 0 OR v_total > 100000 OR v_att IS NULL THEN
+  IF v_total IS NULL OR v_total < 0 OR v_total > 100000 OR v_att IS NULL OR v_seq IS NULL THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
   SELECT * INTO v_job FROM pds.reading_bank_jobs WHERE job_id = (p->>'job_id')::bigint FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('ok', false, 'http', 404, 'code', 'not_found'); END IF;
-  IF v_job.status <> 'running' OR v_job.lease_until < NOW() THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running'); END IF;
-  IF v_att <> v_job.attempts THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
+  IF v_job.status <> 'running' OR v_job.lease_until IS NULL OR v_job.lease_until < NOW() THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running');
+  END IF;
+  IF v_att <> v_job.attempts OR v_seq <> v_job.claim_seq THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
+  IF v_job.step <> 'grade' THEN
+    SELECT * INTO v_bk FROM pds.reading_bank_books WHERE book_id = v_job.book_id FOR UPDATE;
+    IF NOT FOUND OR v_bk.approved_at IS NULL OR v_bk.paused_at IS NOT NULL THEN
+      RETURN jsonb_build_object('ok', false, 'http', 409, 'book_id', v_job.book_id,
+                                'code', CASE WHEN v_bk.paused_reason = 'budget' THEN 'budget' ELSE 'paused' END);
+    END IF;
+  END IF;
   IF v_total <= v_job.reserved_cents THEN RETURN jsonb_build_object('ok', true, 'reserved_cents', v_job.reserved_cents); END IF;
   v_delta := v_total - v_job.reserved_cents;
   SELECT COALESCE(sum(cost_cents) FILTER (WHERE charged_at >= (date_trunc('month', NOW() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York')), 0)
-       + COALESCE(sum(reserved_cents) FILTER (WHERE status = 'running' AND lease_until >= NOW()), 0)
+       + COALESCE(sum(reserved_cents) FILTER (WHERE status = 'running'), 0)
     INTO v_month FROM pds.reading_bank_jobs;
   IF v_month + v_delta > v_capm THEN
     RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'monthly_cap');
   END IF;
   IF v_job.step <> 'grade' THEN
-    SELECT b.spent_cents + COALESCE((SELECT sum(r.reserved_cents) FROM pds.reading_bank_jobs r
-                                      WHERE r.book_id = b.book_id AND r.status = 'running' AND r.lease_until >= NOW()), 0),
-           b.approved_cents
-      INTO v_used, v_cap FROM pds.reading_bank_books b WHERE b.book_id = v_job.book_id FOR UPDATE;
-    IF v_cap IS NULL OR v_used + v_delta > v_cap THEN
+    SELECT v_bk.spent_cents + COALESCE((SELECT sum(r.reserved_cents) FROM pds.reading_bank_jobs r
+                                         WHERE r.book_id = v_bk.book_id AND r.status = 'running'), 0)
+      INTO v_used;
+    IF v_bk.approved_cents IS NULL OR v_used + v_delta > v_bk.approved_cents THEN
       UPDATE pds.reading_bank_books SET paused_at = NOW(), paused_reason = 'budget', updated_at = NOW()
        WHERE book_id = v_job.book_id AND paused_at IS NULL;
       RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'budget', 'book_id', v_job.book_id);
@@ -2021,33 +2059,43 @@ BEGIN
   RETURN jsonb_build_object('ok', true, 'reserved_cents', v_total);
 END $fn$;
 
--- p: {job_id, attempts, outcome: 'done'|'retry'|'failed'|'skipped', cost_cents, usage?, result?, counts?, output?,
---     error_code?, retry_minutes?}
--- attempts (required) = the attempt number the claim answered: a worker whose lease ran out answers 409
+-- p: {job_id, attempts, claim_seq, outcome: 'done'|'retry'|'failed'|'skipped', cost_cents, usage?, result?, counts?,
+--     output?, error_code?, retry_minutes?}
+-- attempts + claim_seq (both required) = the numbers the claim answered: a worker whose lease ran out answers 409
 -- not_running (its reservation was charged when the lease was settled) or, once another worker claimed the job
 -- again, 409 lease_lost, instead of finishing the other worker's run.
+-- A refusal to spend is not a failed try: a retry whose error_code is cost_limit, monthly_cap, budget or paused and
+-- whose cost_cents is 0 (nothing was billed, so nothing is lost by waiting) puts the job back in the queue and gives
+-- the try back, so no number of refusals ever fails the job or its chapter or counts as a grade try. The worker's
+-- other choice for such a refusal is 'skipped', which the planner queues again when it plans the job again. A retry
+-- that did bill something still uses up its try, so a request that always stops half way cannot repeat for ever.
 CREATE OR REPLACE FUNCTION pds.reading_bank_finish(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
 DECLARE
-  v_job  pds.reading_bank_jobs%ROWTYPE;
-  v_out  TEXT := p->>'outcome';
-  v_cost NUMERIC;
-  v_att  INTEGER;
+  v_job   pds.reading_bank_jobs%ROWTYPE;
+  v_out   TEXT := p->>'outcome';
+  v_cost  NUMERIC;
+  v_att   INTEGER;
+  v_seq   BIGINT;
+  v_defer BOOLEAN;
 BEGIN
   BEGIN
     v_cost := COALESCE((p->>'cost_cents')::numeric, 0);
     v_att := NULLIF(p->>'attempts', '')::int;
+    v_seq := NULLIF(p->>'claim_seq', '')::bigint;
   EXCEPTION WHEN others THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END;
-  IF v_out IS NULL OR v_out NOT IN ('done', 'retry', 'failed', 'skipped') OR v_cost < 0 OR v_att IS NULL THEN
+  IF v_out IS NULL OR v_out NOT IN ('done', 'retry', 'failed', 'skipped') OR v_cost < 0 OR v_att IS NULL OR v_seq IS NULL THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
   SELECT * INTO v_job FROM pds.reading_bank_jobs WHERE job_id = (p->>'job_id')::bigint FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('ok', false, 'http', 404, 'code', 'not_found'); END IF;
   IF v_job.status <> 'running' THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running'); END IF;
-  IF v_att <> v_job.attempts THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
+  IF v_att <> v_job.attempts OR v_seq <> v_job.claim_seq THEN RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost'); END IF;
+  v_defer := v_out = 'retry' AND v_cost = 0 AND COALESCE(p->>'error_code', '') IN ('cost_limit', 'monthly_cap', 'budget', 'paused');
   UPDATE pds.reading_bank_jobs SET
-    status = CASE v_out WHEN 'retry' THEN CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END ELSE v_out END,
+    status = CASE v_out WHEN 'retry' THEN CASE WHEN attempts >= 3 AND NOT v_defer THEN 'failed' ELSE 'queued' END ELSE v_out END,
+    attempts = CASE WHEN v_defer THEN GREATEST(attempts - 1, 0) ELSE attempts END,
     next_attempt_at = CASE WHEN v_out = 'retry' THEN NOW() + make_interval(mins => LEAST(GREATEST(COALESCE((p->>'retry_minutes')::int, 30), 1), 1440)) ELSE next_attempt_at END,
     lease_until = NULL, reserved_cents = 0, cost_cents = cost_cents + v_cost,
     charged_at = CASE WHEN v_cost > 0 THEN NOW() ELSE charged_at END,   -- the month's spend reads this, whatever the outcome
@@ -2058,7 +2106,7 @@ BEGIN
   IF v_job.step <> 'grade' AND v_cost > 0 THEN
     UPDATE pds.reading_bank_books SET spent_cents = spent_cents + v_cost, updated_at = NOW() WHERE book_id = v_job.book_id;
   END IF;
-  IF v_job.step = 'grade' AND v_out <> 'done' THEN
+  IF v_job.step = 'grade' AND v_out <> 'done' AND NOT v_defer THEN
     UPDATE pds.reading_question_attempts SET grade_tries = grade_tries + 1, grade_error = p->>'error_code'
      WHERE attempt_key = v_job.attempt_key;
   END IF;
@@ -2099,21 +2147,57 @@ BEGIN
   RETURN jsonb_build_object('ok', true, 'on', v_on, 'cap_cents', v_cap);
 END $fn$;
 
--- p: {book_id, mapping, narrative, source_chapter_count, map_urls, toc_hash}
+-- p: {job_id, attempts, claim_seq, book_id, mapping, narrative, source_chapter_count, map_urls, toc_hash}
+-- Only the run that holds the live lease of the book's map job writes the map (as reserve, finish and store fence it):
+-- the job must be the book's 'map' job, running with an unexpired lease and the attempt and claim the caller was
+-- given, otherwise 409 job_mismatch / not_running / lease_lost and nothing is written, so a worker that ran
+-- out of time can never overwrite what a later run mapped. A map made for a table of contents the book no longer has
+-- (toc_hash is not pds.reading_bank_toc_hash now) is not written either: the answer is {ok: true, stored: false,
+-- code: 'toc_changed'}, the planner then queues the map for the new table of contents (its hash names it), and the
+-- worker finishes the job as it would after a store, without a retry that would only repeat the stale result.
 CREATE OR REPLACE FUNCTION pds.reading_bank_set_map(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
+DECLARE
+  v_job  pds.reading_bank_jobs%ROWTYPE;
+  v_jid  BIGINT;
+  v_book BIGINT;
+  v_att  INTEGER;
+  v_seq  BIGINT;
+  v_toc  TEXT;
 BEGIN
-  IF COALESCE(p->>'mapping', '') NOT IN ('unknown', 'ok', 'uncertain')
-     OR (p->'map_urls' IS NOT NULL AND jsonb_typeof(p->'map_urls') <> 'array') THEN
+  BEGIN
+    v_jid := NULLIF(p->>'job_id', '')::bigint;
+    v_book := (p->>'book_id')::bigint;
+    v_att := NULLIF(p->>'attempts', '')::int;
+    v_seq := NULLIF(p->>'claim_seq', '')::bigint;
+    v_toc := NULLIF(p->>'toc_hash', '');
+  EXCEPTION WHEN others THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END;
+  IF v_book IS NULL OR v_jid IS NULL OR v_att IS NULL OR v_seq IS NULL
+     OR COALESCE(p->>'mapping', '') NOT IN ('unknown', 'ok', 'uncertain')
+     OR (p->'map_urls' IS NOT NULL AND jsonb_typeof(p->'map_urls') <> 'array')
+     OR (v_toc IS NOT NULL AND v_toc !~ '^[0-9a-f]{64}$') THEN
     RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
+  SELECT * INTO v_job FROM pds.reading_bank_jobs WHERE job_id = v_jid FOR UPDATE;
+  IF NOT FOUND OR v_job.book_id <> v_book OR v_job.step <> 'map' THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'job_mismatch');
+  END IF;
+  IF v_job.status <> 'running' OR v_job.lease_until IS NULL OR v_job.lease_until < NOW() THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'not_running');
+  END IF;
+  IF v_att <> v_job.attempts OR v_seq <> v_job.claim_seq THEN
+    RETURN jsonb_build_object('ok', false, 'http', 409, 'code', 'lease_lost');
+  END IF;
+  IF v_toc IS NOT NULL AND v_toc <> pds.reading_bank_toc_hash(v_book) THEN
+    RETURN jsonb_build_object('ok', true, 'stored', false, 'code', 'toc_changed');
+  END IF;
   UPDATE pds.reading_bank_books
      SET mapping = p->>'mapping', narrative = NULLIF(p->>'narrative', '')::boolean,
          source_chapter_count = NULLIF(p->>'source_chapter_count', '')::int,
-         map_urls = COALESCE(p->'map_urls', '[]'::jsonb), toc_hash = NULLIF(p->>'toc_hash', ''), updated_at = NOW()
-   WHERE book_id = (p->>'book_id')::bigint;
-  RETURN jsonb_build_object('ok', FOUND);
+         map_urls = COALESCE(p->'map_urls', '[]'::jsonb), toc_hash = v_toc, updated_at = NOW()
+   WHERE book_id = v_book;
+  RETURN jsonb_build_object('ok', FOUND, 'stored', FOUND);
 END $fn$;
 
 -- p: {book_id, chapter}. "Rebuild chapter": a new rebuild count makes new job hashes, so the planner queues a fresh

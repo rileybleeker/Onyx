@@ -50,7 +50,7 @@ const CH3 = B.chapterHash(3, "Synthetic chapter 3");
 const build = (ideas, o = {}) => {
   const structure = { ideas, highlight_links: [], rejected: 0 };
   return B.validateBuild({
-    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, attempts: 2, promptVersion: V, rebuilds: 0, replace: true,
+    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, attempts: 2, claimSeq: 7, promptVersion: V, rebuilds: 0, replace: true,
     structure, verify: o.verify ?? okVerify(structure), evidence: [E1, E2], highlights: [H5], existingTitles: [], ...o,
   });
 };
@@ -111,6 +111,7 @@ test("the store payload carries the planned edition, the job, and every highligh
   assert.equal(r.payload.chapter_hash, CH3, "the store refuses it when the table of contents changed since");
   assert.equal(r.payload.job_id, 91, "the store's receipt makes a repeated store a replay");
   assert.equal(r.payload.attempts, 2, "the claim's attempt number: the store refuses a run that no longer holds the lease");
+  assert.equal(r.payload.claim_seq, 7, "the claim's claim_seq, which a re-queue never resets: the second number of the fence");
   assert.deepEqual(r.payload.seen, [{ highlight_id: 5, passage_sha: sha(H5.passage) }], "seen even when no idea cites it");
   assert.doesNotMatch(JSON.stringify(r.payload.seen), /ledger is only/i, "a hash, never the passage");
 });
@@ -457,7 +458,7 @@ test("mergeHighlightLinks folds valid links into support before verify; validate
   assert.deepEqual(structure.ideas[0].support, ["E1"], "the input is not changed");
   // Unmerged: the link verify never saw is not evidence.
   const r = B.validateBuild({
-    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, attempts: 2, promptVersion: V, rebuilds: 0, replace: true,
+    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, attempts: 2, claimSeq: 7, promptVersion: V, rebuilds: 0, replace: true,
     structure, verify: okVerify(structure), evidence: [E1, E2], highlights: [H5], existingTitles: [],
   });
   assert.deepEqual(r.payload.ideas.map((i) => i.evidence), [["E1"], ["E2"]]);
@@ -469,7 +470,7 @@ test("a build with nothing to cite needs no model call and stores no_sources", (
   assert.equal(B.buildNeedsModel([E1], []), true);
   assert.equal(B.buildNeedsModel([], [H5]), true);
   const r = B.validateBuild({
-    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, attempts: 2, promptVersion: V, rebuilds: 0, replace: true,
+    bookId: 7, chapter: 3, chapterHash: CH3, totalChapters: 12, target: 4, jobId: 91, attempts: 2, claimSeq: 7, promptVersion: V, rebuilds: 0, replace: true,
     structure: B.EMPTY_STRUCTURE, verify: null, evidence: [], highlights: [], existingTitles: [],
   });
   assert.deepEqual([r.status, r.kept, r.payload.status, r.payload.ideas.length], ["no_sources", 0, "no_sources", 0]);
@@ -488,7 +489,7 @@ test("planBankJobs: a failed map is planned again only after a book-level Rebuil
 });
 
 test("the codes a skipped or refused job may carry are known codes", () => {
-  for (const c of ["not_pending", "question_changed", "superseded", "cost_limit", "stale_generation"]) assert.equal(B.bankCode(c), c);
+  for (const c of ["not_pending", "question_changed", "superseded", "cost_limit", "stale_generation", "paused", "toc_changed"]) assert.equal(B.bankCode(c), c);
 });
 
 /* ---------------- heartbeat ---------------- */
