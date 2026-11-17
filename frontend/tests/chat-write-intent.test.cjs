@@ -412,6 +412,21 @@ const MATRIX = [
     "flag_reading_question", { question_id: "1201", kind: "wrong" }, refused("invalid_value")],
   ["a flag of a kind the tool does not take", BANK_FLAG("That question is wrong"),
     "flag_reading_question", { question_id: 1201, kind: "retire" }, refused("invalid_value")],
+  // Subject, kind and target bound to one clause (RQS6-R1): a complaint and a target split across clauses never flag.
+  ["a flag: complaint and question in one clause, another clause after", BANK_FLAG("Q1201 is wrong, and the keeper rings at dawn"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the complaint is about the chapter part, the question is fine in another clause", BANK_FLAG("Q1201 is fine, but the chapter 3 part is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question is named in a clause with no complaint", BANK_FLAG("The chapter 3 part is wrong, and Q1201 is fine"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the complaint clause names another question", BANK_FLAG("Q1201 is fine, and Q1300 is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("question_not_asked")],
+  ["a flag: a hedge in the complaint clause", BANK_FLAG("Maybe Q1201 is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: a hedge in another clause does not block the complaint", BANK_FLAG("I'm not sure about the bell, but Q1201 is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: a don't-flag request after the complaint", BANK_FLAG("Q1201 is wrong, but don't flag it"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("contradicts")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {

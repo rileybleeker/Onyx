@@ -1145,9 +1145,14 @@ const FLAG_SUBJECT = /\b(?:question|q\d+|flag|this one|that one)\b/;
 /** A hedge: the user is not saying it, so nothing is flagged. */
 const FLAG_UNSURE = /\b(?:maybe|might|perhaps|possibly|not sure|i think|i guess|wonder|whether|could be)\b/;
 const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
+/** Splits a sentence into clauses: a comma, colon or joining word ("but", "and", "which") starts a new one. */
+const FLAG_CLAUSE = /[,:]|\b(?:but|and|or|although|though|while|whereas|however|which|because|so|except)\b/;
+/** The "Q<id>" labels a clause names (norm: lower case), each a positive safe integer. */
+const clauseLabels = (s: string): number[] =>
+  [...new Set([...s.matchAll(/\bq(\d{1,15})\b/g)].map((m) => Number(m[1])).filter((n) => Number.isSafeInteger(n) && n > 0))];
 /**
- * What the user has to say for each kind of flag, read from one sentence of the latest message (norm: lower case,
- * plain apostrophes). "wrong" and "unclear" are about the question, never "my answer was wrong" (the sentence also has
+ * What the user has to say for each kind of flag, read from one clause of the latest message (norm: lower case,
+ * plain apostrophes). "wrong" and "unclear" are about the question, never "my answer was wrong" (the clause also has
  * to be about the question, FLAG_SUBJECT) and never "not wrong" (the verb has to sit right before the word).
  */
 const FLAG_SAYS: Record<string, RegExp> = {
@@ -1413,14 +1418,21 @@ export function authorizeWrite(
     const masked = maskQuotes(grant.latest);
     const sentences = sentenceRanges(masked).map(([start, end, term]) => ({ s: norm(masked.slice(start, end)), term }));
     if (sentences.some(({ s }) => FLAG_NO.test(s))) return deny("contradicts");
-    const says = sentences.some(({ s, term }) => {
-      if (term === "?" || conditional(s) || FLAG_UNSURE.test(s) || !FLAG_SUBJECT.test(s) || !FLAG_SAYS[kind].test(s)) return false;
-      // "not wrong", "not unclear": the word itself is negated.
-      return !(kind === "wrong" || kind === "unclear") || !/\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(s);
-    });
-    if (!says) return deny("flag_not_stated");
-    const named = questionLabels(grant.latest);
-    if (!(named.length > 0 ? named : grant.askedQuestions).includes(qid)) return deny("question_not_asked");
+    // Each clause is judged on its own: its complaint (FLAG_SAYS), its subject (the question, FLAG_SUBJECT) and any
+    // "Q<id>" it names must all sit in that clause. A hedge or a "not wrong" in a clause disqualifies only that clause.
+    const hits: number[][] = [];
+    for (const { s, term } of sentences) {
+      if (term === "?" || conditional(s)) continue;
+      for (const clause of s.split(FLAG_CLAUSE)) {
+        if (!FLAG_SUBJECT.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
+        // "not wrong", "not unclear": the word itself is negated.
+        if ((kind === "wrong" || kind === "unclear") && /\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(clause)) continue;
+        hits.push(clauseLabels(clause));
+      }
+    }
+    if (hits.length === 0) return deny("flag_not_stated");
+    // The target is the "Q<id>" named in the same clause, or the question just asked when the clause names none.
+    if (!hits.some((labels) => (labels.length > 0 ? labels : grant.askedQuestions).includes(qid))) return deny("question_not_asked");
     return allow(tool, null);
   }
 
