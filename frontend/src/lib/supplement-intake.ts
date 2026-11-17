@@ -48,6 +48,9 @@ export interface LogIntakeInput {
   unit?: string | null;
   times?: string[] | null;
   date?: string | null;
+  /** A retried chat request's first instant (ISO) and behavioral day: an implicit clock time is stamped with them. */
+  now?: string | null;
+  today?: string | null;
   notes?: string | null;
   /**
    * Event identity (SEC-04, sql/chat_operations.sql): a UUID (the chat operation id). Every row of this log carries it
@@ -368,7 +371,8 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
   const dose = dosesFor(match, query, input.amount, input.unit);
   if ("error" in dose) return { ok: false, error: dose.error, product: label(match) };
 
-  const today = await behavioralToday(supabase);
+  // A retry passes the first try's day and instant, so an implicit clock time stays on the request's own day.
+  const today = input.today || (await behavioralToday(supabase));
   const intake_date = input.date || today;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(intake_date)) return { ok: false, error: "date must be YYYY-MM-DD" };
 
@@ -383,7 +387,7 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       stamps.push(instantOnBehavioralDay(intake_date, c.h, c.m, tz).toISOString());
     }
   } else {
-    stamps = [intake_date === today ? new Date().toISOString() : null];
+    stamps = [intake_date === today ? (input.now && Number.isFinite(Date.parse(input.now)) ? new Date(input.now).toISOString() : new Date().toISOString()) : null];
   }
 
   // A re-sent message must not double-log: skip a timed entry that already

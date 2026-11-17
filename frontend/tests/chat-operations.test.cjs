@@ -919,14 +919,14 @@ test("an abandon whose answer is lost or refused is a failure (the page keeps th
 test("a removal and a keyed insert of the same operation take one lock, so a removed write never comes back (SQL)", () => {
   const sql = require("node:fs").readFileSync(require("node:path").join(__dirname, "../../sql/chat_operations.sql"), "utf8");
   const lock = "pg_advisory_xact_lock(hashtextextended('pds.chat_operation:' || k::text, 0))";
-  const body = (fn) => new RegExp(`FUNCTION pds\.${fn}\(\)[\s\S]*?\$\$;`).exec(sql)?.[0] ?? "";
+  const body = (fn) => new RegExp(String.raw`FUNCTION pds\.${fn}\(\)[\s\S]*?\$\$;`).exec(sql)?.[0] ?? "";
   // The insert guard waits for a running removal of the key BEFORE it looks for the tombstone.
   const guard = body("chat_operation_not_removed");
   assert.ok(guard.includes(lock) && guard.indexOf(lock) < guard.indexOf("chat_operation_tombstones t"), "lock, then the tombstone check");
   // The removal takes it before the row goes (BEFORE DELETE), on both keyed tables.
   assert.ok(body("chat_operation_lock_removed").includes(lock));
   for (const table of ["supplement_intake", "reading_sessions"]) {
-    assert.match(sql, new RegExp(`TRIGGER ${table}_chat_lock\s+BEFORE DELETE ON pds\.${table}\s+FOR EACH ROW WHEN \(OLD\.client_(event_)?key IS NOT NULL\)\s+EXECUTE FUNCTION pds\.chat_operation_lock_removed`));
+    assert.match(sql, new RegExp(String.raw`TRIGGER ${table}_chat_lock\s+BEFORE DELETE ON pds\.${table}\s+FOR EACH ROW WHEN \(OLD\.client_(event_)?key IS NOT NULL\)\s+EXECUTE FUNCTION pds\.chat_operation_lock_removed`));
   }
   assert.ok(body("chat_operation_tombstone").includes(lock));
   assert.doesNotMatch(sql, /\bDROP\b/i, "applied through the Supabase MCP, which declines any DROP");

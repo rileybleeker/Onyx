@@ -528,6 +528,8 @@ const PLAYLIST_MAYBE_CREATED =
 interface OpContext {
   id: string;
   day: string;
+  /** The instant the request was first sent (ISO): an implicit "now" clock time of a write stays on it across retries. */
+  now?: string;
   /** The book being read when the operation first ran (a reading call that names no book): re-runs keep it. */
   bookId?: number;
   /** When the operation first ran (ISO): in check mode, a highlight changed since then may have been changed by it. */
@@ -1524,6 +1526,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       unit: (input.unit as string) || null,
       times: Array.isArray(input.times) ? (input.times as string[]) : null,
       date: (input.date as string) || pinnedDate(op),
+      ...(op?.now ? { now: op.now, today: op.day } : {}),
       ...(opId ? { event_key: opId } : {}),
     });
     const { ok, ...rest } = result;
@@ -1569,9 +1572,9 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       // A stack logged for an earlier day carries no clock time (same rule as
       // /supplements and log_supplement_intake): stamping "now" on a past day
       // gives it a next-day timestamp the caffeine timing layer has to quarantine.
-      const backdated = !!date && date !== (await behavioralToday(supabase));
+      const backdated = !!date && date !== (op?.now ? op.day : await behavioralToday(supabase));
       const event = opId ? { event_key: opId } : {};
-      result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...event });
+      result = await logStackIntake(supabase, match.stack_id, backdated ? { intake_date: date, intake_time: null, ...event } : { intake_date: date, ...(op?.now ? { intake_time: op.now } : {}), ...event });
     }
     // incomplete = the insert may have committed before its answer was lost: "check first", never "not logged".
     if (!result.ok) {
@@ -1798,6 +1801,7 @@ export async function POST(req: NextRequest) {
     // ledger write is sent as that day explicitly (pinnedDate), so a day boundary crossed later changes nothing.
     const pinned = ledger?.retry ? storedTemporal(ledger.requestContext) : null;
     const requestDay = pinned?.behavioral_today ?? bday;
+    const requestNow = pinned?.now ?? now.toISOString();
     const promptTz = pinned?.time_zone ?? tz;
     const localNow = (pinned ? new Date(pinned.now) : now).toLocaleString("en-US", {
       timeZone: promptTz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",
@@ -1857,11 +1861,12 @@ export async function POST(req: NextRequest) {
               (id, context, check) => runTool(block.name, input, {
                 id,
                 day: typeof context.behavioral_today === "string" ? context.behavioral_today : requestDay,
+                now: typeof context.now === "string" && Number.isFinite(Date.parse(context.now)) ? context.now : requestNow,
                 ...(typeof context.book_id === "number" ? { bookId: context.book_id } : {}),
                 ...(typeof context.started_at === "string" ? { startedAt: context.started_at } : {}),
                 ...(check ? { check: true } : {}),
               }),
-              { behavioral_today: requestDay, started_at: new Date().toISOString(), ...(bookId !== undefined ? { book_id: bookId } : {}) },
+              { behavioral_today: requestDay, now: requestNow, started_at: new Date().toISOString(), ...(bookId !== undefined ? { book_id: bookId } : {}) },
             );
           } else if (isWriteTool(block.name) && writesPaused) {
             const result = JSON.stringify({ error: WRITES_PAUSED });

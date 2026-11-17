@@ -50,7 +50,7 @@ function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite 
     "@/lib/steps": stepsLib,
     "@/lib/spotify-server": spotify,
     "@/lib/supplement-stacks": stacks,
-    "@/lib/supplement-intake": {currentTimeZone: async()=>"UTC", behavioralToday: async()=>today, logSupplementIntake: async(_client, input)=>{writes++; onWrite(writes); return typeof intake === "function" ? intake(input) : intake;}},
+    "@/lib/supplement-intake": {currentTimeZone: async()=>"UTC", behavioralToday: async()=>(typeof today === "function" ? today() : today), logSupplementIntake: async(_client, input)=>{writes++; onWrite(writes); return typeof intake === "function" ? intake(input) : intake;}},
     "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-practice": readingPractice,
     "@/lib/supabase-server": session,
   }, sandboxConsole);
@@ -1700,16 +1700,19 @@ test("a retry after the behavioral day rolled over answers and logs as of the fi
   assert.equal(db.rows("chat_requests")[0].context.behavioral_today, "2026-11-11");
   // The retry arrives after the day rolled over.
   const seen = [];
+  const seenNow = [];
   const retry = route(afterTool("log_supplement_intake", { product: "synthetic focus" }), {
     supabase: db,
     today: "2026-11-12",
-    intake: (input) => { seen.push(input.date); return { ok: true, product: "Acme Synthetic Focus", product_id: "custom_synthetic", intake_date: input.date, timezone: "UTC", doses_each: 1, logged: [{ intake_id: 1, time: null }] }; },
+    intake: (input) => { seen.push(input.date); seenNow.push(input.now); return { ok: true, product: "Acme Synthetic Focus", product_id: "custom_synthetic", intake_date: input.date, timezone: "UTC", doses_each: 1, logged: [{ intake_id: 1, time: null }] }; },
   });
   const out = await (await retry.post(body)).json();
   assert.match(retry.requests()[0].system, /retry of one first sent/);
   assert.match(retry.requests()[0].system, /2026-11-11/);
   assert.doesNotMatch(retry.requests()[0].system, /2026-11-12/);
   assert.deepEqual(seen, ["2026-11-11"], "an omitted date is the first try's day, sent explicitly");
+  assert.deepEqual(seenNow, [db.rows("chat_requests")[0].context.now], "an implicit clock time is the first try's instant");
+  assert.deepEqual(retry.requests().length > 0, true);
   assert.equal(db.rows("chat_operations")[0].context.behavioral_today, "2026-11-11");
   assert.ok(out.receipts.length > 0);
   // A first try is told the current time as before.
@@ -1733,7 +1736,7 @@ test("a request that crosses the behavioral-day boundary while the model runs wr
   const intakeRoute = route(afterTool("log_supplement_intake", { product: "synthetic focus" }), {
     supabase: ledgerDb({ rpc: { get behavioral_today_now() { return clock.day; } } }),
     onModelCall: roll,
-    today: "2026-11-12",
+    today: () => clock.day,
     intake: (input) => { seen.push(input.date); return { ok: true, product: "Acme Synthetic Focus", product_id: "custom_synthetic", intake_date: input.date, timezone: "UTC", doses_each: 1, logged: [{ intake_id: 1, time: null }] }; },
   });
   await intakeRoute.post({ request_id: "77777777-7777-4777-8777-777777777777", messages: [user("Log my synthetic focus capsule")] });
