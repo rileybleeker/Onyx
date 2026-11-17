@@ -152,6 +152,14 @@ export interface Checkpoint {
   reached: boolean; // chapter reached by any date
   onTime: boolean | null; // null until due or reached
   quiz: Quiz | null;
+  /**
+   * True when a NEWER quiz result exists for this checkpoint but was invalidated (one of its questions was corrected
+   * later), so the older counted result is shown instead. The UI says so next to the score; XP rules are unchanged
+   * (the invalidated result never earned XP). PR 362 follow-up.
+   */
+  correctedNewer: boolean;
+  /** The invalidated newer result that replaced the counted one, when correctedNewer (its score and date, for the notice). */
+  correctedNewerQuiz: { date: string; score: number; total: number } | null;
 }
 
 export interface Badge {
@@ -803,11 +811,32 @@ function computeCheckpoints(
     const onTime = reached ? reachedOn! <= due : today > due ? false : null;
     const key = checkpointKey(chapter);
     // Newest first (the read orders by taken_at desc): the newest result still counted, else the newest corrected one.
-    const quiz =
-      quizzes.find((q) => q.checkpoint === key && q.verification !== "invalidated") ??
-      quizzes.find((q) => q.checkpoint === key) ??
-      null;
-    return { key, chapter, due, reached, onTime, quiz };
+    // When a newer result for the key was invalidated (a question in it was corrected later) and an older counted result
+    // is shown instead, the checkpoint says so (correctedNewer) so the score change is not unexplained (PR 362 follow-up).
+    const keyQuizzes = quizzes.filter((q) => q.checkpoint === key);
+    let shown: Quiz | null = null;
+    let invalidatedNewer: Quiz | null = null;
+    for (const q of keyQuizzes) {
+      if (q.verification === "invalidated") {
+        // Only the newest invalidated result that sits BEFORE the counted one is the one being corrected away.
+        if (shown === null && invalidatedNewer === null) invalidatedNewer = q;
+        continue;
+      }
+      if (shown === null) shown = q;
+      else break;
+    }
+    const quiz = shown ?? keyQuizzes[0] ?? null;
+    const correctedNewer = !!(shown && invalidatedNewer);
+    return {
+      key,
+      chapter,
+      due,
+      reached,
+      onTime,
+      quiz,
+      correctedNewer,
+      correctedNewerQuiz: correctedNewer && invalidatedNewer ? { date: invalidatedNewer.quiz_date, score: invalidatedNewer.score, total: invalidatedNewer.total } : null,
+    };
   });
 }
 
@@ -2085,7 +2114,7 @@ export function summarizeForChat(o: ReadingOverview) {
     xp: o.xp,
     level: o.level,
     badges_earned: o.badges.filter((b) => b.earned).map((b) => b.label),
-    checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null })),
+    checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null, corrected_newer: c.correctedNewer, corrected_newer_quiz: c.correctedNewerQuiz })),
     // Chapter question bank, counts only (null while it is off): due / new ideas, the spoiler gate, stages, delayed recall.
     practice: o.practice?.enabled
       ? {
