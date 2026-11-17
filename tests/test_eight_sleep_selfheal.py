@@ -1040,6 +1040,51 @@ def test_upsert_requests_representation_and_counts_rows() -> None:
     assert es.upsert_to_supabase(SB(), "eight_sleep_trends", [], "x") == 0
 
 
+def test_intervals_fetch_failure_is_counted_and_marks_trends_partial() -> None:
+    """A raised /intervals fetch must be visible in the trends heartbeat.
+
+    Before the counter, the fetch failure was only a warning: trends
+    succeeded, the pairing guard saw no sessions (empty session_starts),
+    and the eight_sleep|trends heartbeat could read success while no
+    temperatures were paired. Synthetic data only.
+    """
+    class IntervalError(Exception):
+        pass
+
+    class FailingClient:
+        def get_intervals(self, _user_id):
+            raise IntervalError("synthetic failure text with no ids")
+
+        def get_trends(self, _user_id, _start, _end):
+            return []
+
+    stats = es.sync_user(FailingClient(), None, "u-synthetic", "left",
+                         date(2026, 11, 1), date(2026, 11, 7))
+    assert stats["intervals_fetch_failed"] == 1, stats
+    assert stats["records"] == 0
+    problems = es.trends_problems(0, stats, None)
+    assert problems, "an intervals fetch failure must mark the run partial"
+    assert any("intervals fetch failed" in p for p in problems), problems
+    # Summed across bed sides, as main() does
+    totals = es._new_sync_stats()
+    for k in totals:
+        totals[k] += stats.get(k, 0)
+    assert es.trends_problems(0, totals, None)
+
+    # A successful fetch (even with no data) reports nothing
+    class QuietClient:
+        def get_intervals(self, _user_id):
+            return []
+
+        def get_trends(self, _user_id, _start, _end):
+            return []
+
+    ok_stats = es.sync_user(QuietClient(), None, "u-synthetic",
+                            "right", date(2026, 11, 1), date(2026, 11, 7))
+    assert ok_stats["intervals_fetch_failed"] == 0, ok_stats
+    assert es.trends_problems(0, ok_stats, None) == []
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

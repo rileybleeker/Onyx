@@ -590,7 +590,8 @@ def _new_sync_stats() -> dict:
     return {"records": 0, "trend_chunks": 0, "trend_chunks_failed": 0,
             "intervals_matched": 0, "intervals_unmatched": 0,
             "intervals_without_id": 0, "interval_pairing_failed": 0,
-            "bed_tz_mismatch": 0, "bed_tz_unknown": 0}
+            "bed_tz_mismatch": 0, "bed_tz_unknown": 0,
+            "intervals_fetch_failed": 0}
 
 
 def sync_user(client: EightSleepClient, sb: Client, user_id: str,
@@ -613,7 +614,11 @@ def sync_user(client: EightSleepClient, sb: Client, user_id: str,
         intervals = client.get_intervals(user_id)
         log.info(f"  [{bed_side}] Got {len(intervals)} total intervals")
     except Exception as e:
-        log.warning(f"  [{bed_side}] Intervals fetch failed: {e}")
+        stats["intervals_fetch_failed"] += 1
+        # Type name only: the Actions log is public, and the message of a
+        # provider error can carry the user and session ids in its URL.
+        log.warning(f"  [{bed_side}] Intervals fetch failed "
+                    f"({type(e).__name__})")
         intervals = []
 
     interval_by_id: dict[str, dict] = {}
@@ -988,6 +993,13 @@ def trends_problems(errors: int, sync_totals: dict,
             "id, so their temps cannot be paired with a trend day; check the /intervals "
             "payload shape (the self-heal still fills NULL temps of past days by per-ID "
             "lookup)")
+    if sync_totals.get("intervals_fetch_failed"):
+        problems.append(
+            f"the /intervals fetch failed on "
+            f"{sync_totals['intervals_fetch_failed']} bed side(s), so no "
+            "temperatures were paired this run (trend rows were still "
+            "written); the self-heal still fills NULL temps of past days "
+            "by per-ID lookup")
     if sync_totals.get("interval_pairing_failed"):
         problems.append(
             f"no interval paired with a trend day by session id on "

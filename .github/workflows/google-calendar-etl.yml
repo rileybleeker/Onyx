@@ -59,6 +59,9 @@ jobs:
       - name: Sync calendar feeds (read-only GET, counts-only log)
         env:
           GOOGLE_CALENDAR_ICS_SECRET: ${{ secrets.GOOGLE_CALENDAR_ICS_SECRET }}
+          # Optional: iCloud via CalDAV ({account, username, password} with an APP-SPECIFIC password).
+          # Unset = no iCloud source. The script masks both values before its first request.
+          ICLOUD_CALDAV_SECRET: ${{ secrets.ICLOUD_CALDAV_SECRET }}
           # workflow_dispatch inputs, passed through the environment so they are never
           # interpolated into the shell command (and validated).
           WINDOW_DAYS: ${{ inputs.days }}

@@ -72,6 +72,41 @@ enum FocusHabitStorage {
     }
 }
 
+/// A short log of what each reconcile decided and who asked (the app, or the
+/// Device Activity monitor running with the app closed). It is the only evidence
+/// that the background path fired. Local to the App Group, never sent anywhere,
+/// holds only a time, a source label and "blocked" or "open".
+struct FocusEvent: Codable, Identifiable {
+    var id = UUID()
+    var at: Date
+    var source: String
+    var shielded: Bool
+}
+
+enum FocusEventLog {
+    static let keep = 30
+    static var file: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: FocusStorage.group)?.appendingPathComponent("focus-events.json")
+    }
+    static func load() -> [FocusEvent] {
+        guard let file, let data = try? Data(contentsOf: file),
+              let events = try? JSONDecoder().decode([FocusEvent].self, from: data) else { return [] }
+        return events
+    }
+    /// Best effort: a failed log write never changes enforcement. Call inside FocusStorage.withLock.
+    static func append(source: String, shielded: Bool) {
+        guard let file else { return }
+        var events = load()
+        // Foreground re-checks that change nothing would crowd the monitor lines out.
+        if source == "app", let last = events.last, last.source == "app", last.shielded == shielded { return }
+        events.append(FocusEvent(at: Date(), source: source, shielded: shielded))
+        if events.count > keep { events.removeFirst(events.count - keep) }
+        if let data = try? JSONEncoder().encode(events) {
+            try? data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        }
+    }
+}
+
 enum FocusFailure: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let value) = self { return value }; return nil }
@@ -84,20 +119,28 @@ enum FocusEnforcement {
     /// Removes only this feature's restrictions, never another application's.
     static func clear() { store.clearAllSettings() }
 
-    static func reconcile() {
+    /// `source` labels the caller in the event log ("app", "monitor start", "monitor end").
+    static func reconcile(source: String = "app") {
         do {
             try FocusStorage.withLock {
-                guard let config = try? FocusStorage.load() else { clear(); return }
-                apply(config)
+                guard let config = try? FocusStorage.load() else {
+                    clear()
+                    FocusEventLog.append(source: source, shielded: false)
+                    return
+                }
+                let shielded = apply(config)
+                FocusEventLog.append(source: source, shielded: shielded)
             }
         } catch { clear() }
     }
 
-    private static func apply(_ config: FocusConfiguration) {
+    /// Returns true when the shield was applied, false when it was cleared.
+    @discardableResult
+    private static func apply(_ config: FocusConfiguration) -> Bool {
         // Onyx habits come from the stored answer only: nothing here uses the network.
         guard config.validationError == nil,
               config.rule.shouldShield(at: Date(), calendar: .autoupdatingCurrent, onyx: FocusHabitStorage.load()) else {
-            clear(); return
+            clear(); return false
         }
         // Exceptions must also be subtracted from individually selected targets.
         let apps = config.blocked.applicationTokens.subtracting(config.allowed.applicationTokens)
@@ -106,6 +149,7 @@ enum FocusEnforcement {
         store.shield.webDomains = domains.isEmpty ? nil : domains
         store.shield.applicationCategories = config.blocked.categoryTokens.isEmpty ? nil : .specific(config.blocked.categoryTokens, except: config.allowed.applicationTokens)
         store.shield.webDomainCategories = config.blocked.categoryTokens.isEmpty ? nil : .specific(config.blocked.categoryTokens, except: config.allowed.webDomainTokens)
+        return true
     }
 
     @MainActor static func enable(_ draft: FocusConfiguration) throws {

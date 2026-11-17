@@ -1175,3 +1175,40 @@ test("forms that keep a button keep it on purpose", () => {
   // Planned items and goals have no update route; stream edits are three different actions on one date.
   assert.ok(has("app/financials/forecast/PlanConfig.tsx", "Stop from then"));
 });
+
+// ─── unsaved work in the continuous scroll (mounted) ─────────────────────────
+
+test("unsaved work: a form drawn in a page of the continuous scroll holds that page, the routed page's form none", async (t) => {
+  // The real lib/use-autosave.ts -> lib/use-unsaved-work.ts -> lib/feed-scope.ts chain, with the real context: one form
+  // inside the Provider ContinuousScroll puts around the Log page, one outside it (the routed page).
+  const api = {};
+  let work = null;
+  const probe = (load) => {
+    const { useAutosave } = load("lib/use-autosave.ts");
+    const { FeedScopeContext } = load("lib/feed-scope.ts");
+    work = load("lib/unsaved-work.ts").unsavedWork;
+    function ScopedForm({ name }) {
+      api[name] = useAutosave(`synthetic-${name}`, { save: async () => {}, delayMs: 500 }, "");
+      return null;
+    }
+    return function ScopeProbe() {
+      return [
+        jsx(FeedScopeContext.Provider, { value: "/log", children: jsx(ScopedForm, { name: "inFeed" }) }, "feed"),
+        jsx(ScopedForm, { name: "routed" }, "routed"),
+      ];
+    };
+  };
+  const h = await mountForm(t, probe);
+  assert.equal(work.has(), false, "nothing typed yet");
+  api.routed.change("synthetic words");
+  await h.flush();
+  assert.equal(work.has(), true, "the routed page's edit is unsaved work for the updater");
+  assert.equal(work.hasIn("/log"), false, "but holds no page of the scroll");
+  api.inFeed.change("synthetic words");
+  await h.flush();
+  assert.equal(work.hasIn("/log"), true, "the Log page's edit keeps that page mounted in the scroll");
+  assert.equal(work.hasIn("/today"), false, "and no other page");
+  await h.tick(500);
+  assert.equal(work.has(), false, "both saved");
+  assert.equal(work.hasIn("/log"), false, "the scroll may drop the Log page again");
+});

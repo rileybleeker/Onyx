@@ -74,3 +74,30 @@ test('failed-heartbeat acknowledgement is accepted', async () => {
   });
   assert.match(await vm.runInContext(postSource + '; post({error:"synthetic"})', context), /^200 /);
 });
+
+// READ-QUIZ-01 (docs/reading-question-bank.md): the harvester stays metadata-only. The question bank never reads the
+// book's text, so nothing rendered may be parsed or posted. Synthetic annotations only.
+test('the render tar is read for toc.json, location_map.json and metadata.json only', () => {
+  const calls = [...source.matchAll(/(?<!function\s)\btarJson\(([^)]*)\)/g)].map((m) => m[1].split(',').slice(1).join(',').trim());
+  assert.deepEqual(calls.sort(), ['"location_map.json"', '"metadata.json"', '"toc.json"']);
+  // Member bytes are decoded in exactly two places: the ustar header reader and tarJson's JSON.parse.
+  assert.equal((source.match(/\.data\.toString\(/g) ?? []).length, 1);
+  assert.equal(/members\.(filter|map|forEach)\(/.test(source), false, 'no other member is walked');
+  for (const ext of ['.html', '.xhtml', '.glyphs', '.fragments', 'page_data', '.svg']) assert.equal(source.includes(`"${ext}`) || source.includes(`'${ext}`), false, ext);
+});
+
+test('posted items carry annotation fields only, never a rendered-text field', () => {
+  const buildItems = source.match(/function buildItems\(annotations, pageAt\) \{[\s\S]*?\n\}/)[0];
+  const iso = source.match(/const iso = [^\n]*\n/)[0];
+  const context = vm.createContext({});
+  const items = vm.runInContext(`${iso}${buildItems}; buildItems([
+    { type: "kindle.highlight", context: "A synthetic highlighted line", start: 10, end: 40, modifiedTimestamp: 1900000000000, renderedText: "never" },
+    { type: "kindle.note", note: "A synthetic note", start: 20, end: 20, modifiedTimestamp: 1900000000000 },
+    { type: "kindle.note", note: "A synthetic standalone note", start: 900, modifiedTimestamp: 1900000000000 },
+  ], () => 5)`, context);
+  const allowed = ['passage', 'comment', 'position', 'position_end', 'page', 'location', 'highlighted_at', 'note_at'];
+  assert.equal(items.length, 2);
+  for (const item of items) assert.deepEqual(Object.keys(item).filter((k) => !allowed.includes(k)), []);
+  const post = source.match(/const result = await post\(\{([\s\S]*?)\}\);/)[1];
+  assert.deepEqual(post.split(',').map((s) => s.trim().split(':')[0]).filter(Boolean).sort(), ['asin', 'book', 'chapters', 'items', 'last_position', 'total_positions']);
+});

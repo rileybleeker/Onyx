@@ -7,6 +7,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
   db: { schema: "pds" },
 });
 
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
+
 /** GET /api/reading/highlights?book=<slug>&include_archived=1 */
 export async function GET(req: NextRequest) {
   const book = await getBook(supabase, req.nextUrl.searchParams.get("book"));
@@ -25,6 +28,7 @@ export async function GET(req: NextRequest) {
  * Idempotent on (book, passage). Mirrors to the Notion page after the response.
  */
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const result = await addHighlight(supabase, {
     slug: (body.book as string) || null,
@@ -48,6 +52,16 @@ export async function POST(req: NextRequest) {
       const { data: fresh } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("highlight_id", id).maybeSingle();
       const now = fresh as Highlight | null;
       if (now && !now.archived && highlightMirrorDiffers(result.highlight, now)) await updateMirroredHighlight({ ...now, notion_block_id: blockId });
+    });
+  }
+  // The question bank (READ-QUIZ-01): plan the book after the response. The highlights step itself waits for the
+  // Kindle import kick or the hourly worker (HIGHLIGHT_EDIT_STEPS): this form autosaves while Riley types.
+  // (Loaded inside after(): the bank's Anthropic SDK graph stays out of this route's cold start, GET included.)
+  if (result.created) {
+    const bookId = result.book.book_id;
+    after(async () => {
+      const { HIGHLIGHT_EDIT_STEPS, kickBank } = await import("@/lib/reading-bank-server");
+      await kickBank(supabase, { bookId, reason: "highlight", steps: HIGHLIGHT_EDIT_STEPS, requestStartedAt });
     });
   }
   return NextResponse.json({ success: true, created: result.created, highlight: result.highlight });
