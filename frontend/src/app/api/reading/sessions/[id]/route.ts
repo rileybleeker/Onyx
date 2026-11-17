@@ -1,9 +1,9 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
-import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull, type Book, type ReadingOverview } from "@/lib/reading";
-import { mirrorProgress, mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
-import { removalAnswer, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
+import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull } from "@/lib/reading";
+import { mirrorSession, removeMirroredBlock, updateMirroredSession } from "@/lib/reading-notion";
+import { removalAnswer, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
 import { SESSION_GONE_CODE } from "@/lib/reading-removal-receipt";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -55,15 +55,6 @@ function originRefused(req: NextRequest): { status: number; error: string } | nu
   return hosts.includes(o.host) ? null : { status: 403, error: "cross-origin request refused" };
 }
 
-function newestDate(o: ReadingOverview | null, fallback: string | null): string | null {
-  return o?.sessions?.[0]?.session_date ?? fallback;
-}
-
-async function refreshProgress(book: Book, fallbackDate: string | null): Promise<void> {
-  const o = await getOverview(supabase, book.slug).catch(() => null);
-  await mirrorProgress(book, o?.chaptersDone ?? 0, newestDate(o, fallbackDate));
-}
-
 export async function PATCH(req: NextRequest, ctx: Ctx) {
   const refused = checkVoiceRequest(req.headers, req.nextUrl.origin, MAX_BYTES);
   if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
@@ -90,11 +81,13 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
       await removeMirroredBlock(r.previous.notion_block_id);
       const blockId = await mirrorSession(r.book, r.session);
       await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", id);
-      await refreshProgress(r.previousBook, null);
+      await rewriteProgressNow(supabase, r.previousBook.book_id);
     } else if (r.session.notion_block_id) {
       await updateMirroredSession(r.session);
     }
-    await mirrorProgress(r.book, overview?.chaptersDone ?? r.session.chapter_through ?? 0, newestDate(overview, r.session.session_date));
+    // Written from the database as it is at write time and checked, with its own obligation until then (Codex review
+    // of PR 376, round 5): a line from the overview this request saw could land after a newer, checked one.
+    await rewriteProgressNow(supabase, r.book.book_id);
   });
 
   return NextResponse.json({

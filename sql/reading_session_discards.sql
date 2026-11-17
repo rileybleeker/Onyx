@@ -30,6 +30,14 @@
 --   pds.reading_session_removals          that cleanup ledger: a retried
 --                                         removal whose answer was lost
 --                                         replays it
+--   pds.reading_mirror_claims             a Notion session entry that may
+--                                         exist without the database knowing
+--                                         it yet: written before the entry is
+--                                         created, so a removed session's late
+--                                         entry is always found and trashed
+--   pds.reading_progress_owed             a book page progress line that may
+--                                         be stale: one row per writer, kept
+--                                         until that writer's line is checked
 --   pds.move_reading_session(...)         an edit of a session (a move to
 --                                         another day or book, or any other
 --                                         change), with the habit part of a
@@ -78,7 +86,7 @@
 -- (the plain update and finish requests from before it).
 --
 -- What is stored: a random UUID the browser made, session / book ids, the
--- session's day, a Notion block id, the habit's name with the answer and
+-- session's day, a Notion block id, a SHA-256 of a Notion entry's text, the habit's name with the answer and
 -- category reading replaced, a row version and times. No reading text. Service role
 -- only (RLS on, no policies, nothing for anon or the signed-in owner).
 --
@@ -145,6 +153,54 @@ GRANT SELECT, INSERT, UPDATE ON pds.reading_session_removals TO service_role;
 
 COMMENT ON TABLE pds.reading_session_removals IS
   'Removed /log Reading sessions whose Notion cleanup may still be owed (mirror_done_at NULL); replayed on a retried removal (PROD-T01).';
+
+-- A Notion session entry that may exist while no database row knows its block id (Codex review of PR 376, round 5).
+-- A create's callback writes the session's Notion entry after the response; a removal can land while it does, and
+-- the entry's block id then has to be recorded somewhere that outlives the session. Recording it AFTER the entry is
+-- created can fail (the database or the process going away in between), which left an entry nothing could find. So
+-- the callback writes a claim BEFORE it creates the entry: the session and book, the time, and a SHA-256 of the
+-- entry's text (`digest`), then the block id once Notion answers. lib/reading-removal.ts settles a claim: the block
+-- id goes onto the live session (or the entry is trashed when the session is gone), and a claim whose block id was
+-- never recorded is matched to the page's entry by its digest and creation time. A claim with no matching entry
+-- after 15 minutes is deleted too (the entry was never created). Rows are deleted once settled. Stored: ids, a time, a
+-- hash. No reading text.
+CREATE TABLE IF NOT EXISTS pds.reading_mirror_claims (
+    claim_id    uuid        PRIMARY KEY,
+    session_id  bigint      NOT NULL,
+    book_id     bigint      NOT NULL,
+    digest      text        NOT NULL,
+    block_id    text,
+    claimed_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reading_mirror_claims_claimed ON pds.reading_mirror_claims (claimed_at);
+
+ALTER TABLE pds.reading_mirror_claims ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON pds.reading_mirror_claims FROM anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON pds.reading_mirror_claims TO service_role;
+
+COMMENT ON TABLE pds.reading_mirror_claims IS
+  'Notion reading-session entries that may exist before their block id is stored on a session (PROD-T01); settled and deleted by lib/reading-removal.ts.';
+
+-- A book page progress line that may be stale (Codex review of PR 376, round 5). Notion keeps the last write and
+-- serverless instances share no lock, so two writers of one book's line can land in either order. Each writer adds a
+-- row here BEFORE it writes, and deletes its own row only once it read the book again after its write and found the
+-- state its line was written from (lib/reading-removal.ts rewriteProgressNow). A writer whose line may have landed
+-- last with an older state keeps its row, also when its process ends first; the sweep rewrites the line from the
+-- state then and deletes the row. One row per writer, never shared, so no writer can clear another's obligation.
+-- Stored: a random id, a book id and a time.
+CREATE TABLE IF NOT EXISTS pds.reading_progress_owed (
+    owed_id    uuid        PRIMARY KEY,
+    book_id    bigint      NOT NULL,
+    owed_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reading_progress_owed_at ON pds.reading_progress_owed (owed_at);
+
+ALTER TABLE pds.reading_progress_owed ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON pds.reading_progress_owed FROM anon, authenticated;
+GRANT SELECT, INSERT, DELETE ON pds.reading_progress_owed TO service_role;
+
+COMMENT ON TABLE pds.reading_progress_owed IS
+  'Reading book-page progress lines that may be stale, one row per writer until its line is verified (PROD-T01).';
 
 -- Who made the day's habit Yes (Codex T01-R7, and the round-2 review of PR 376). One row per habit row a reading
 -- stamp touched, keyed by the habit row itself (day, question), NOT by the session: several sessions of one day share

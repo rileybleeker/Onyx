@@ -271,6 +271,22 @@ BEGIN
     ASSERT (r->>'unfinished')::boolean AND r->'book'->>'status' = 'reading', 'below the end: back to reading';
     SELECT status INTO v_status FROM pds.books WHERE book_id = v_book2;
     ASSERT v_status = 'reading', 'stored so';
+
+    -- 20. The two Notion obligation tables (Codex review of PR 376, round 5) are service role only, and a claim and
+    --     an obligation outlive the session they are about.
+    ASSERT (SELECT relrowsecurity FROM pg_catalog.pg_class WHERE oid = 'pds.reading_mirror_claims'::regclass), 'RLS on the claims';
+    ASSERT (SELECT relrowsecurity FROM pg_catalog.pg_class WHERE oid = 'pds.reading_progress_owed'::regclass), 'RLS on the obligations';
+    ASSERT NOT has_table_privilege('anon', 'pds.reading_mirror_claims', 'SELECT'), 'anon cannot read claims';
+    ASSERT NOT has_table_privilege('authenticated', 'pds.reading_progress_owed', 'SELECT'), 'the signed-in owner cannot read obligations';
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000024', v_book, DATE '2030-03-03', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    v_sid := (r->'session'->>'session_id')::bigint;
+    INSERT INTO pds.reading_mirror_claims (claim_id, session_id, book_id, digest)
+    VALUES ('00000000-0000-4000-8000-000000000025', v_sid, v_book, 'synthetic-digest');
+    INSERT INTO pds.reading_progress_owed (owed_id, book_id) VALUES ('00000000-0000-4000-8000-000000000026', v_book);
+    r := pds.remove_reading_session(v_sid, NULL, NULL);
+    ASSERT (r->>'removed')::boolean, 'removed';
+    ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims WHERE claim_id = '00000000-0000-4000-8000-000000000025'), 'the claim stays for the sweep';
+    ASSERT EXISTS (SELECT 1 FROM pds.reading_progress_owed WHERE owed_id = '00000000-0000-4000-8000-000000000026'), 'the obligation stays';
 END $$;
 
 ROLLBACK;

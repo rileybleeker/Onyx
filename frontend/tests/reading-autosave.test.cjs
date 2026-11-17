@@ -120,7 +120,7 @@ test("parseSessionUpdate: strict body", () => {
 function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDiscards = false, discardError = null, booksReadError = false, settleError = null } = {}) {
   let keyLookups = 0;
   const tables = JSON.parse(JSON.stringify(seed));
-  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals", "reading_habit_provenance"]) tables[t] ??= [];
+  for (const t of ["books", "reading_sessions", "habit_journal", "reading_session_discards", "reading_session_removals", "reading_habit_provenance", "reading_mirror_claims", "reading_progress_owed"]) tables[t] ??= [];
   // The habit rows' versions (xmin in the database): every write to a row gives it a new one.
   const versions = new Map();
   let nextVersion = 1;
@@ -209,7 +209,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
     const rows = () => tables[table];
     const match = (r) =>
       st.filters.every(([k, op, v]) =>
-        op === "eq" ? r[k] === v : op === "neq" ? r[k] !== v : op === "gte" ? r[k] >= v : op === "in" ? v.includes(r[k]) : op === "is" ? (r[k] ?? null) === v : true,
+        op === "eq" ? r[k] === v : op === "neq" ? r[k] !== v : op === "gte" ? r[k] >= v : op === "lt" ? r[k] < v : op === "in" ? v.includes(r[k]) : op === "is" ? (r[k] ?? null) === v : true,
       );
     const run = () => {
       log.push({ table, op: st.op, payload: st.payload, filters: st.filters });
@@ -269,6 +269,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       neq(k, v) { st.filters.push([k, "neq", v]); return b; },
       is(k, v) { st.filters.push([k, "is", v]); return b; },
       gte(k, v) { st.filters.push([k, "gte", v]); return b; },
+      lt(k, v) { st.filters.push([k, "lt", v]); return b; },
       in(k, v) { st.filters.push([k, "in", v]); return b; },
       order(k, o) { st.order = { k, asc: o?.ascending !== false }; return b; },
       limit(n) { st.limit = n; return b; },
@@ -1049,7 +1050,15 @@ test("removal whose answer was lost: the database part committed whole, the retr
  * the database in the real module), so a test can change it between the cleanup's read and its write.
  */
 function removalWithNotion() {
-  const notion = { trashed: [], written: [], trash: async () => true, progress: async () => true, overview: async () => ({ chaptersDone: 3, sessions: [] }) };
+  const notion = {
+    trashed: [],
+    written: [],
+    updated: [],
+    trash: async () => true,
+    progress: async () => true,
+    overview: async () => ({ chaptersDone: 3, sessions: [] }),
+    found: async () => [],
+  };
   const RR = loadTs("lib/reading-removal.ts", {
     "./reading": { ...R, getOverview: async () => notion.overview() },
     "./reading-notion": {
@@ -1060,6 +1069,13 @@ function removalWithNotion() {
       mirrorProgress: async (_book, chaptersDone) => {
         notion.written.push(chaptersDone);
         return notion.progress(chaptersDone);
+      },
+      findSessionBlocksByDigest: async (pageId, digest, notBefore) => notion.found(pageId, digest, notBefore),
+      notionMirrorEnabled: () => true,
+      sessionBlockDigest: () => "digest-1",
+      updateMirroredSession: async (s) => {
+        notion.updated.push(s.notion_block_id);
+        return true;
       },
     },
   });
@@ -1144,7 +1160,7 @@ test("T01-R9: markRemovalMirrored closes only the entry the caller handled", asy
   assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null);
 });
 
-test("two removals of one book whose cleanups finish out of order: the older line written last leaves its row open, and the sweep writes the current line (Codex review of PR 376, round 4)", async () => {
+test("two removals of one book whose cleanups finish out of order: the older line written last is written again from the database, and both close (Codex review of PR 376, rounds 4 and 5)", async () => {
   const { RR, notion } = removalWithNotion();
   const db = fakeDb({
     books: [PAGED_BOOK],
@@ -1158,21 +1174,171 @@ test("two removals of one book whose cleanups finish out of order: the older lin
   notion.progress = (n) => (n === 5 ? gate.promise : Promise.resolve(true));
   const first = RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow({ session_id: 41 })) }, answerFor());
   await new Promise((r) => setImmediate(r));
-  // The second removal commits and its cleanup writes "3" and closes its row.
+  // The second removal commits and its cleanup writes "3", checks it and closes its row.
   chapters = 3;
   await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow({ session_id: 42 })) }, answerFor());
   const byId = (id) => db.tables.reading_session_removals.find((x) => x.session_id === id);
   assert.notEqual(byId(42).mirror_done_at, null, "its line matched the database after its write: done");
-  // The first one's older line now lands last. It reads the book again, sees it changed, and stays owed.
+  assert.equal(db.tables.reading_progress_owed.length, 1, "only the slow writer still owes the line");
+  // The first one's older line now lands last. It reads the book again, sees it changed, and writes the current line.
   gate.resolve(true);
   await first;
-  assert.deepEqual(notion.written, [5, 3], "the older line went out first and landed last");
-  assert.equal(byId(41).mirror_done_at, null, "not closed: its line may be the stale one on the page");
-  // The sweep's run writes the line from the database as it is now and closes it.
-  notion.progress = async () => true;
-  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(byId(41)) }, answerFor());
-  assert.equal(notion.written[notion.written.length - 1], 3, "the current line is written last");
+  assert.deepEqual(notion.written, [5, 3, 3], "the current line is written over the older one");
   assert.notEqual(byId(41).mirror_done_at, null);
+  assert.equal(db.tables.reading_progress_owed.length, 0, "every writer cleared its own obligation");
+});
+
+test("overlapping workers on one cleanup row: one closes it, the other's line may be stale and its process ends before checking; its obligation survives and the sweep writes the current line (Codex review of PR 376, round 5)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK], reading_session_removals: [removalRow()] });
+  let chapters = 5;
+  notion.overview = async () => ({ chaptersDone: chapters, sessions: [] });
+  // Worker A (the removal's own cleanup) read "5"; its write is slow.
+  const gate = deferred();
+  notion.progress = (n) => (n === 5 ? gate.promise : Promise.resolve(true));
+  const a = RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow()) }, answerFor());
+  await new Promise((r) => setImmediate(r));
+  // The book changes, and worker B (the sweep, on the same row) writes "3", checks it and closes the row.
+  chapters = 3;
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow()) }, answerFor());
+  assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null, "B closed the row");
+  // A's stale "5" lands last, and A can no longer check it: every later read fails (its process is going away).
+  notion.overview = async () => {
+    throw new Error("process gone");
+  };
+  gate.resolve(true);
+  await a;
+  assert.deepEqual(notion.written, [5, 3]);
+  assert.equal(db.tables.reading_progress_owed.length, 1, "A's own obligation is still stored: B could not clear it");
+  // Later the sweep finds the obligation (older than two minutes), writes the line from the database and clears it.
+  notion.overview = async () => ({ chaptersDone: chapters, sessions: [] });
+  for (const r of db.tables.reading_progress_owed) r.owed_at = new Date(Date.now() - 5 * 60_000).toISOString();
+  await RR.sweepPendingRemovals(db);
+  assert.deepEqual(notion.written, [5, 3, 3], "the current line is written last");
+  assert.equal(db.tables.reading_progress_owed.length, 0);
+});
+
+/** The fake database with one table that fails every call with `code`. */
+function failingTable(db, table, code) {
+  return {
+    ...db,
+    from(t) {
+      if (t !== table) return db.from(t);
+      const err = { data: null, error: { code, message: "refused" } };
+      const b = new Proxy({}, { get: (_o, k) => (k === "then" ? (res, rej) => Promise.resolve(err).then(res, rej) : () => b) });
+      return b;
+    },
+  };
+}
+
+test("a progress write that cannot be checked is owed durably, with no cleanup row (an edit's or a create's own write; Codex review of PR 376, round 5)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK] });
+  // The state changes during every write, so the line is never checked in this run.
+  let flip = 5;
+  notion.overview = async () => ({ chaptersDone: (flip = flip === 5 ? 4 : 5), sessions: [] });
+  assert.equal(await RR.rewriteProgressNow(db, PAGED_BOOK.book_id), true, "owed durably counts as handled");
+  assert.equal(db.tables.reading_progress_owed.length, 1, "the obligation stays for the sweep");
+  // Without the table (the SQL file not applied yet) the same write reports that nothing holds it.
+  assert.equal(await RR.rewriteProgressNow(failingTable(fakeDb({ books: [PAGED_BOOK] }), "reading_progress_owed", "PGRST205"), PAGED_BOOK.book_id), false);
+});
+
+/* ---------- Notion entries whose block id may not be stored (pds.reading_mirror_claims, round 5) ---------- */
+
+const claimRow = (over = {}) => ({ claim_id: "c-1", session_id: 41, book_id: 7, digest: "digest-1", block_id: null, claimed_at: "2026-11-15T20:00:00.000Z", ...over });
+const claimOf = (row) => ({ claimId: row.claim_id, sessionId: row.session_id, bookId: row.book_id, digest: row.digest, blockId: row.block_id, claimedAt: row.claimed_at });
+const AFTER_CLAIM = Date.parse("2026-11-15T20:05:00.000Z");
+
+test("a late entry that could be neither recorded nor trashed keeps its claim, and a later sweep (nothing in memory) trashes it (Codex review of PR 376, round 5)", async () => {
+  const { RR, notion } = removalWithNotion();
+  // The session is gone and its removal row closed; the create's callback holds a claim with the entry's block id.
+  const db = fakeDb({
+    books: [PAGED_BOOK],
+    reading_session_removals: [removalRow({ mirror_done_at: "2026-11-15T21:00:05Z" })],
+    reading_mirror_claims: [claimRow({ block_id: "blk-late" })],
+  });
+  // Recording the entry in the removal row fails, and so does every trash.
+  notion.trash = async () => false;
+test("the sweep gives up claims and progress obligations still open after a day, without touching Notion", async () => {
+  const { RR, notion } = removalWithNotion();
+  const dayAgo = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+  const db = fakeDb({
+    books: [PAGED_BOOK],
+    reading_mirror_claims: [claimRow({ claimed_at: dayAgo })],
+    reading_progress_owed: [{ owed_id: "o-1", book_id: 7, owed_at: dayAgo }],
+  });
+  await RR.sweepPendingRemovals(db);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+  assert.equal(db.tables.reading_progress_owed.length, 0);
+  assert.deepEqual([notion.trashed, notion.written], [[], []]);
+});
+
+
+  const late = await RR.trashLateBlock(failingTable(db, "reading_session_removals", "57014"), 41, "blk-late", async () => true);
+  assert.deepEqual([late.recorded, late.trashed], [false, false]);
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "nothing confirmed: the claim (with the block id) stays");
+  // A fresh module stands for a new process.
+  const { RR: later, notion: n2 } = removalWithNotion();
+  assert.equal(await later.settleMirrorClaim(db, claimOf(db.tables.reading_mirror_claims[0]), AFTER_CLAIM), true);
+  assert.deepEqual(n2.trashed, ["blk-late"], "the session is gone, so its entry is trashed");
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("a claim whose block id was never stored is matched by its digest: trashed for a removed session, adopted by a live one, dropped when no entry shows up", async () => {
+  const { RR, notion } = removalWithNotion();
+  // Removed session: the page's entry with the claim's digest that is no session's entry is trashed.
+  const gone = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 50, book_id: 7, notion_block_id: "blk-other" }], reading_mirror_claims: [claimRow()] });
+  notion.found = async (pageId, digest) => (pageId === "page-1" && digest === "digest-1" ? ["blk-other", "blk-late"] : []);
+  assert.equal(await RR.settleMirrorClaim(gone, claimOf(claimRow()), AFTER_CLAIM), true);
+  assert.deepEqual(notion.trashed, ["blk-late"], "another session's entry with the same text is never touched");
+  assert.equal(gone.tables.reading_mirror_claims.length, 0);
+  // Live session without an entry: the found entry becomes its entry and is brought up to date.
+  const live = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: null, session_date: "2026-11-15" }], reading_mirror_claims: [claimRow()] });
+  notion.found = async () => ["blk-new"];
+  notion.trashed.length = 0;
+  assert.equal(await RR.settleMirrorClaim(live, claimOf(claimRow()), AFTER_CLAIM), true);
+  assert.equal(live.tables.reading_sessions[0].notion_block_id, "blk-new");
+  assert.deepEqual(notion.updated, ["blk-new"]);
+  assert.deepEqual(notion.trashed, [], "a live session's entry is kept");
+  // Nothing found: kept for a while, dropped 15 minutes after the claim (no entry was created).
+  const none = fakeDb({ books: [PAGED_BOOK], reading_mirror_claims: [claimRow()] });
+  notion.found = async () => [];
+  assert.equal(await RR.settleMirrorClaim(none, claimOf(claimRow()), AFTER_CLAIM), false);
+  assert.equal(none.tables.reading_mirror_claims.length, 1);
+  assert.equal(await RR.settleMirrorClaim(none, claimOf(claimRow()), AFTER_CLAIM + 15 * 60_000), true);
+  assert.equal(none.tables.reading_mirror_claims.length, 0);
+  // The page could not be read: the claim stays, however old.
+  const unread = fakeDb({ books: [PAGED_BOOK], reading_mirror_claims: [claimRow()] });
+  notion.found = async () => null;
+  assert.equal(await RR.settleMirrorClaim(unread, claimOf(claimRow()), AFTER_CLAIM + 60 * 60_000), false);
+  assert.equal(unread.tables.reading_mirror_claims.length, 1);
+});
+
+test("a claim settles against its session: the session's own entry drops it, another entry makes this one a duplicate to trash", async () => {
+  const { RR, notion } = removalWithNotion();
+  const own = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: "blk-1" }], reading_mirror_claims: [claimRow({ block_id: "blk-1" })] });
+  assert.equal(await RR.settleMirrorClaim(own, claimOf(claimRow({ block_id: "blk-1" })), AFTER_CLAIM), true);
+  assert.deepEqual(notion.trashed, []);
+  const dup = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: "blk-2" }], reading_mirror_claims: [claimRow({ block_id: "blk-1" })] });
+  notion.trash = async () => false;
+  assert.equal(await RR.settleMirrorClaim(dup, claimOf(claimRow({ block_id: "blk-1" })), AFTER_CLAIM), false, "a failed trash keeps the claim");
+  assert.equal(dup.tables.reading_mirror_claims.length, 1);
+  notion.trash = async () => true;
+  assert.equal(await RR.settleMirrorClaim(dup, claimOf(claimRow({ block_id: "blk-1" })), AFTER_CLAIM), true);
+  assert.equal(dup.tables.reading_sessions[0].notion_block_id, "blk-2", "the session's own entry stays");
+});
+
+test("sessionBlockDigest is a SHA-256 of the entry's text (the block's plain text in Notion); the create stores the claim before the entry", () => {
+  const crypto = require("node:crypto");
+  const session = { session_id: 1, book_id: 7, session_date: "2030-01-02", chapter_from: 1, chapter_through: 2, minutes: 20, medium: "audio", recall: "Synthetic recall.", question: null, source: "manual", in_chapter: null };
+  const expected = crypto.createHash("sha256").update("2030-01-02 · ch 1–2 · 20 min · audio\nSynthetic recall.", "utf8").digest("hex");
+  assert.equal(N.sessionBlockDigest(session), expected);
+  assert.notEqual(N.sessionBlockDigest({ ...session, minutes: 21 }), expected);
+  const route = fs.readFileSync(path.join(SRC, "app/api/reading/sessions/route.ts"), "utf8");
+  const claimAt = route.indexOf("claimMirror(supabase, result.session)");
+  const mirrorAt = route.indexOf("mirrorSession(result.book, result.session)");
+  assert.ok(claimAt > 0 && mirrorAt > claimAt, "the claim is stored before the entry is created");
+  assert.match(route, /claim === null \? null : await mirrorSession/, "no claim stored, no entry");
 });
 
 test("a removal cleanup writes the progress line from the database at write time, not from the answer's overview (Codex review of PR 376, round 4)", async () => {

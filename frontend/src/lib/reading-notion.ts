@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Book, Highlight, ReadingSession } from "./reading";
 
 /**
@@ -19,6 +20,11 @@ import type { Book, Highlight, ReadingSession } from "./reading";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_VERSION = "2022-06-28";
+
+/** Whether the mirror can write at all (an API key is configured). */
+export function notionMirrorEnabled(): boolean {
+  return !!NOTION_API_KEY;
+}
 
 type RichText = Record<string, unknown>;
 interface NotionBlock {
@@ -132,6 +138,40 @@ function highlightBlock(h: Highlight): Record<string, unknown> {
   const meta = [h.chapter != null ? `ch ${h.chapter}` : null, h.location, h.concept, h.source !== "manual" ? h.source : null].filter(Boolean).join(" · ");
   if (meta) rich.push(text(`\n${meta}`, { code: true }));
   return { object: "block", type: "quote", quote: { rich_text: rich } };
+}
+
+/**
+ * A SHA-256 of the text a session's entry carries (exactly the rich-text contents sessionBlock sends, so the same as
+ * the block's plain text in Notion). Stored in pds.reading_mirror_claims before the entry is created, so an entry
+ * whose block id was never stored can still be found on the page (Codex review of PR 376, round 5). No reading text
+ * leaves this function.
+ */
+export function sessionBlockDigest(s: ReadingSession): string {
+  const rich = (sessionBlock(s).quote as { rich_text: Array<{ text: { content: string } }> }).rich_text;
+  return createHash("sha256").update(rich.map((r) => r.text.content).join(""), "utf8").digest("hex");
+}
+
+/**
+ * The page's session entries whose text has this digest and that were created at or after `notBefore` (Notion's
+ * created_time counts whole minutes, so one minute of slack is allowed), oldest first. null when the page could not
+ * be read. Only top-level quote blocks are looked at: that is where mirrorSession puts entries.
+ */
+export async function findSessionBlocksByDigest(pageId: string, digest: string, notBefore: string): Promise<string[] | null> {
+  if (!NOTION_API_KEY) return null;
+  try {
+    const since = Date.parse(notBefore) - 2 * 60_000;
+    const hits: Array<{ id: string; at: number }> = [];
+    for (const b of await listChildren(pageId)) {
+      if (b.type !== "quote" || b.archived === true || b.in_trash === true) continue;
+      const at = typeof b.created_time === "string" ? Date.parse(b.created_time) : NaN;
+      if (!Number.isFinite(at) || at < since) continue;
+      if (createHash("sha256").update(plainText(b), "utf8").digest("hex") === digest) hits.push({ id: b.id, at });
+    }
+    return hits.sort((a, b) => a.at - b.at).map((h) => h.id);
+  } catch (e) {
+    console.error("reading-notion: findSessionBlocksByDigest failed:", e instanceof Error ? e.name : "unknown");
+    return null;
+  }
 }
 
 /** Append a session entry under "Session log". Returns the new block id or null. */
