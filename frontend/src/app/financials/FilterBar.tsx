@@ -30,7 +30,7 @@ export default function FilterBar({ month, months, account, accounts, q, allMont
     <form ref={form} method="get" action="/financials" role="search" aria-label="Filter the ledger" className="flex flex-wrap items-end gap-3">
       <label className="text-[11px] uppercase tracking-[0.08em] text-text-tertiary">
         Month
-        <select name="month" defaultValue={month} onChange={submit} className={`${field} mt-1 block min-w-[9rem]`}>
+        <select name="month" defaultValue={month} onChange={submit} aria-label="Month" className={`${field} mt-1 block min-w-[9rem]`}>
           {months.map((m) => (
             <option key={m.value} value={m.value}>
               {m.label}
@@ -40,7 +40,7 @@ export default function FilterBar({ month, months, account, accounts, q, allMont
       </label>
       <label className="text-[11px] uppercase tracking-[0.08em] text-text-tertiary">
         Account
-        <select name="account" defaultValue={account} onChange={submit} className={`${field} mt-1 block min-w-[12rem] max-w-[18rem]`}>
+        <select name="account" defaultValue={account} onChange={submit} aria-label="Account" className={`${field} mt-1 block min-w-[12rem] max-w-[18rem]`}>
           <option value="">All accounts</option>
           {accounts.map((a) => (
             <option key={a.value} value={a.value}>

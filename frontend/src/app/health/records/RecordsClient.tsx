@@ -359,7 +359,7 @@ function LabEntryForm({ today, docs, series, onSaved }: { today: string; docs: M
         <datalist id="known-labs">{labs.map(l => <option key={l} value={l} />)}</datalist>
       </label>
       <label className="grid gap-1 text-sm">From document
-        <select className={field} value={documentId} onChange={e => setDocumentId(e.target.value)}>
+        <select className={field} value={documentId} onChange={e => setDocumentId(e.target.value)} aria-label="From document">
           <option value="">None</option>
           {docs.map(d => <option key={d.id} value={d.id}>{d.date} · {d.title}</option>)}
         </select>
@@ -576,7 +576,7 @@ function DocumentUpload({ today, onUploaded }: { today: string; onUploaded: (d: 
     <div className="grid gap-3 sm:grid-cols-2">
       <label className="grid gap-1 text-sm">Title<input className={field} maxLength={120} value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Annual blood work" /></label>
       <label className="grid gap-1 text-sm">Kind
-        <select className={field} value={kind} onChange={e => setKind(e.target.value as DocKind)}>
+        <select className={field} value={kind} onChange={e => setKind(e.target.value as DocKind)} aria-label="Kind">
           {DOC_KINDS.map(k => <option key={k} value={k}>{DOC_KIND_LABEL[k]}</option>)}
         </select>
       </label>

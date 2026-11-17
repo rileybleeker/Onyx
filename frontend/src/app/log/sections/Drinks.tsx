@@ -540,6 +540,7 @@ function DrinkItem({
                 <label className="sr-only" htmlFor={`drink-day-${key}`}>Day</label>
                 <select
                   id={`drink-day-${key}`}
+                  aria-label="Day"
                   value={needsDay ? item.day ?? "" : item.day ?? today ?? ""}
                   onChange={(e) => set({ day: e.target.value || null, fold: null, whenIssue: e.target.value ? afterWhenEdit(item.whenIssue, "day") : item.whenIssue })}
                   className="min-h-11 px-2 text-[16px] bg-surface-sunken border border-border-subtle rounded-control text-text-primary"
