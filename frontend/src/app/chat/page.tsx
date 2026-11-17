@@ -315,7 +315,7 @@ export default function ChatPage() {
       const reason = err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE
         ? SESSION_EXPIRED_MESSAGE
         : err instanceof TypeError
-          ? "Unable to connect to Onyx."
+          ? "Onyx could not reach the server. Check your connection and try again."
           : "Onyx could not finish this response.";
       setError(`${reason} ${next}`);
     } finally {
