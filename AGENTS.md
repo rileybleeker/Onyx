@@ -30,7 +30,7 @@ Files (`docs/agents/<name>.md`):
 - **devices**: Screen Time, PC and AI-usage loggers, desktop app, Focus
 - **frontend**: `frontend/` architecture, cache, scroll, theme, nav, speed, autosave, UI copy
 - **log-screen**: `/log`, where entries are made · **personalize** · **today** · **spotify**
-- **reading-journal**: `/reading`, Kindle, Notion journal
+- **reading-journal**: `/reading`, Kindle, Notion journal. The private question bank is described in `docs/reading-question-bank.md`. A book's own flavour is data on `pds.books.theme` (`sql/reading_book_theme.sql`), with the generic fallback when a book has none, never code.
 - **chat-agents**: `/chat`, `/agents`, `/nyc` · **status-page**: `/status`, new sources
 - **finance**: `/financials*`, SimpleFIN, taxes · **procurement** · **health-records**: `/health*`
 - **orientation**: layout, commands, env vars
