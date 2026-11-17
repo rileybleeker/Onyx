@@ -10,6 +10,7 @@ struct FocusSettingsView: View {
     @State private var showAllowed = false
     @State private var confirmEnable = false
     @State private var loaded = false
+    @State private var events: [FocusEvent] = []
     @ObservedObject private var habits = FocusHabitModel.shared
     @Environment(\.scenePhase) private var scenePhase
 
@@ -58,6 +59,22 @@ struct FocusSettingsView: View {
                 Button(habits.checking ? "Checking…" : "Check now") { Task { await habits.refresh() } }
                     .disabled(habits.checking)
                 Text("Choose the habits and the rule in Onyx on the web (the install page). A habit counts once it is answered Yes for the day. This phone only checks when this app is opened, when you tap Check now, or when the \"Check Onyx Focus habits\" shortcut runs: iOS does not let it check in the background, so open this app after finishing your habits. If a check fails (offline, token refused, server error), the unlock time alone decides, so a failed check never keeps apps blocked past that time.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Section("Enforcement log") {
+                if events.isEmpty {
+                    Text("Nothing logged yet.")
+                } else {
+                    ForEach(events.suffix(8).reversed()) { event in
+                        HStack {
+                            Text(event.at.formatted(date: .abbreviated, time: .standard))
+                            Spacer()
+                            Text("\(event.source): \(event.shielded ? "blocked" : "open")")
+                                .foregroundStyle(event.source.hasPrefix("monitor") ? Color.orange : Color.secondary)
+                        }
+                    }
+                }
+                Text("Lines starting with monitor ran while this app was closed, so they show the background unlock and the midnight block really happen. Stays on this phone.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Unlock rules") {
@@ -154,6 +171,7 @@ struct FocusSettingsView: View {
     private func reload() {
         do {
             config = try FocusStorage.load(); loaded = true
+            events = FocusEventLog.load()
             message = config.rule.enabled ? "Focus is enabled. \(preview)" : "Focus is off."
         } catch { loaded = false; message = error.localizedDescription }
     }
