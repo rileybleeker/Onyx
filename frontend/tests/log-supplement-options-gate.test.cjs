@@ -94,7 +94,7 @@ function mountSection(t, { cache = new Map(), answers = {}, post } = {}) {
       "@/lib/log-drafts": { useLogDrafts: () => ({ current: { draft: null, clear: () => {} } }) },
     },
   });
-  const options = () => h.find((n) => n.type === "button" && n.props.role === "radio");
+  const options = () => h.find((n) => n.type === "button" && n.props.role === "checkbox");
   const optionNames = () => options().map((n) => h.text(n));
   const field = (label) => h.find((n) => (n.type === "input" || n.type === "select") && n.props["aria-label"] === label)[0];
   return { ...h, calls, options, optionNames, field, fail };
@@ -134,18 +134,18 @@ test("gate: with both the today and stacks GETs failing, the options stay usable
   assert.doesNotMatch(h.text(), /Couldn't load supplements\./, "no whole-card failure");
   assert.match(h.text(), /Couldn't load stacks\./);
   assert.match(h.text(), /Couldn't load today's intakes\./);
-  // The picker still works end to end (a tap fills the form and writes nothing; Log is the only write).
+  // The picker still works end to end (a tap selects it and writes nothing; Log selected is the only write).
   const gamma = h.options().find((n) => h.text(n) === "Synthetic Gamma");
   assert.ok(gamma);
   gamma.props.onClick();
   await h.flush();
   assert.equal(h.options().find((n) => h.text(n) === "Synthetic Gamma").props["aria-checked"], true, "the picker accepts a tap");
-  assert.equal(h.field("Amount").props.value, "", "the form opens on a successful pick");
+  assert.equal(h.field("Amount for Synthetic Gamma").props.value, "", "the amount field opens on a successful pick");
   assert.equal(h.calls.writes.length, 0, "a tap still writes nothing");
 });
 
 test("gate: the stacks and today Retry buttons still reload their area after a failure", async (t) => {
-  // Round 1: stacks fails. Its Retry (the only one on screen) refetches everything and the row appears.
+  // Round 1: stacks and today both fail. The stacks Retry re-reads only the stacks endpoint; today keeps its own Retry.
   let stacksDown = true;
   let todayDown = true;
   const h = mountSection(t, {
@@ -160,15 +160,26 @@ test("gate: the stacks and today Retry buttons still reload their area after a f
   assert.match(h.text(), /Couldn't load stacks\./);
   stacksDown = false;
   todayDown = false;
+  const before = h.calls.gets.length;
   // The stacks area comes before "Log a product" / "Logged today", so its Retry is the first.
   h.click("Retry", 0);
   await h.flush();
+  assert.deepEqual(h.calls.gets.slice(before), [URL.stacks], "the stacks Retry re-reads only the stacks");
   assert.doesNotMatch(h.text(), /Couldn't load stacks\./);
   assert.match(h.text(), /Synthetic Night/, "the stack row appears after Retry");
   assert.ok(h.buttons("Log it").some((b) => !b.props.disabled), "the stack's Log it is usable");
+  assert.match(h.text(), /Couldn't load today's intakes\./, "the failed today area is not reloaded by the stacks Retry");
+  const todayBefore = h.calls.gets.length;
+  h.click("Retry", 0);
+  await h.flush();
+  assert.deepEqual(h.calls.gets.slice(todayBefore), [URL.today], "the today Retry re-reads only today");
+  assert.doesNotMatch(h.text(), /Couldn't load today's intakes\./);
+});
 
-  // Round 2: today only fails; its Retry (again the only one on screen) brings today's rows back.
-  todayDown = true;
+// Its own test (was round 2 of the test above): two mounts in one test restored the first mount's globals before the
+// second mount's unmount ran, so that unmount found no document.
+test("gate: with only today failing, its Retry brings today's rows back and writes nothing", async (t) => {
+  let todayDown = true;
   const h2 = mountSection(t, {
     answers: {
       [URL.products]: () => response({ products: FIVE }),

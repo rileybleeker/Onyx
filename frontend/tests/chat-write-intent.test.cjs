@@ -54,6 +54,13 @@ const MATRIX = [
   ["reported stack", [user("I took my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, ALLOWED],
   ["reported habit", [user("I meditated today")], "mark_habit_complete", { habit: "Meditated" }, ALLOWED],
   ["reported No", [user("I skipped Synthetic Stretching today")], "mark_habit_complete", { habit: "Synthetic Stretching", answer: "No" }, ALLOWED],
+  // Reported speech with no quotation marks names what someone else said: it never authorizes a write.
+  ["reported request, no quotes", [user("She said please log my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, refused("no_request")],
+  ["reported request, app, no quotes", [user("The app told me to mark my synthetic evening stack taken")], "log_supplement_stack", { stack: "synthetic evening" }, refused("no_request")],
+  ["reported record, note, no quotes", [user("My note says I took my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, refused("no_request")],
+  // Direct requests still grant.
+  ["direct request, log", [user("Log my synthetic evening stack")], "log_supplement_stack", { stack: "synthetic evening" }, ALLOWED],
+  ["direct request, please mark taken", [user("Please mark my synthetic evening stack taken")], "log_supplement_stack", { stack: "synthetic evening" }, ALLOWED],
   ["reading report", [user("Finished chapters 5 and 6 on my run")], "log_reading_session", { chapter_from: 5, chapter_through: 6 }, ALLOWED],
   ["explicit playlist", [user("Create a playlist for a focused afternoon")], "create_spotify_playlist", { name: "Synthetic Focus Mix", track_ids: ["t1"] }, ALLOWED],
   ["highlight in the user's words", [user("Save this quote: “The constraint sets the pace.” I like it")],
@@ -62,18 +69,18 @@ const MATRIX = [
   ["yes to the offer just made", [user("What could help me sleep?"), assistant("It may help. Want me to log Synthetic Calm at 10pm?"), user("Yes please")],
     "log_supplement_intake", { product: "Synthetic Calm", times: ["22:00"] }, ALLOWED],
   ["quiz the user asked for", [user("Quiz me on the synthetic book"), assistant("Question 1: what limits output?"), user("The bottleneck"),
-    assistant("Correct. Question 2: what sets the pace?"), user("The drum")],
+    assistant("Correct. Question 2: what sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
   ["a quiz result the user states", [user("Record my synthetic quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 }, ALLOWED],
   ["a complete quiz with unnumbered questions", [user("Quiz me on the synthetic book"), assistant("What limits output?"), user("The bottleneck"),
-    assistant("Correct. What sets the pace?"), user("The drum")],
+    assistant("Correct. What sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
   ["the checkpoint the quiz request named", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, ALLOWED],
   ["a review quiz", [user("Give me a review quiz"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, ALLOWED],
   ["a new quiz after a cancelled one", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz"),
-    user("Quiz me again"), assistant("Question 1: what sets the pace?"), user("The drum")],
+    user("Quiz me again"), assistant("Question 1: what sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, ALLOWED],
   ["a report with a plan after it", [user("I took 15 mg of Synthetic Focus at 8:30, will take the rest later")],
     "log_supplement_intake", { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] }, ALLOWED],
@@ -190,6 +197,18 @@ const MATRIX = [
   ["a day said before the request, no date sent", [user("Yesterday, I took Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("day_not_stated")],
   ["a reading day said, no date sent", [user("I read chapter 4 last night")], "log_reading_session", { chapter_through: 4 }, refused("day_not_stated")],
   ["yesterday for a habit that is not a sleep question", [user("I meditated")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-10" }, refused("day_not_stated")],
+  // SEC-05 overlap: "day before yesterday" is one phrase (its own day, not yesterday's too); a day phrase that is negated
+  // names no day; two different day phrases in one action's words refuse that action.
+  ["the day before yesterday, one phrase", [user("I took Synthetic Calm the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-09" }, ALLOWED],
+  ["the day before yesterday does not allow yesterday", [user("I took Synthetic Calm the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, refused("day_not_stated")],
+  ["yesterday, not the day before yesterday: yesterday allowed", [user("I took Synthetic Calm yesterday, not the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, ALLOWED],
+  ["yesterday, not the day before yesterday: the negated day refused", [user("I took Synthetic Calm yesterday, not the day before yesterday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-09" }, refused("day_not_stated")],
+  ["two day phrases in one action refuse it (stack)", [user("I took my synthetic evening stack for the day before yesterday and yesterday")], "log_supplement_stack", { stack: "synthetic evening", date: "2026-11-09" }, refused("day_not_stated")],
+  ["two day phrases in one action refuse it (the other date)", [user("I took my synthetic evening stack for the day before yesterday and yesterday")], "log_supplement_stack", { stack: "synthetic evening", date: "2026-11-10" }, refused("day_not_stated")],
+  ["two day phrases in one action refuse it (habit)", [user("I meditated the day before yesterday and yesterday")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-09" }, refused("day_not_stated")],
+  ["a habit on the day before yesterday, one phrase", [user("I meditated the day before yesterday")], "mark_habit_complete", { habit: "Meditated", date: "2026-11-09" }, ALLOWED],
+  ["a yesterday phrase with an unrelated record in the same message", [user("I took Synthetic Calm yesterday and meditated today")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-10" }, ALLOWED],
+  ["the same message, the unrelated record's day for the product", [user("I took Synthetic Calm yesterday and meditated today")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-11" }, refused("day_not_stated")],
   ["not a real day", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-02-30" }, refused("invalid_value")],
   ["an amount sent as text", [user("Log 40 g Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, refused("invalid_value")],
   ["an amount nobody said, sent as text", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: "40", unit: "g" }, refused("invalid_value")],
@@ -313,6 +332,10 @@ const MATRIX = [
     "log_supplement_intake", { product: "Synthetic Calm", amount: 5, unit: "mg" }, refused("amount_not_stated")],
   ["a grouped amount with another unit", [user("Log 5,000 mg of Synthetic Calm")],
     "log_supplement_intake", { product: "Synthetic Calm", amount: 5000, unit: "g" }, refused("amount_not_stated")],
+  ["a grouped amount of four digits stays one number", [user("Log 1,200 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1200, unit: "mg" }, ALLOWED],
+  ["a grouped amount of five digits stays one number", [user("Log 12,345 mg of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 12345, unit: "mg" }, ALLOWED],
   ["a comma and one or two digits is not a decimal", [user("Log 1,5 mg of Synthetic Calm")],
     "log_supplement_intake", { product: "Synthetic Calm", amount: 1.5, unit: "mg" }, refused("amount_not_stated")],
   ["a comma and two digits does not read as its first number", [user("Log 1,5 mg of Synthetic Calm")],
@@ -349,6 +372,15 @@ const MATRIX = [
     "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
   ["a checkpoint sent as a number", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: 4, score: 1, total: 1 }, refused("invalid_value")],
+  // Quiz result identity (unbound quiz: the request named no checkpoint): the latest message must name the checkpoint.
+  ["a quiz result bound by the latest message", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck, chapter 4")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, ALLOWED],
+  ["a quiz result bound only by an earlier mention", [user("Chapter 4 was synthetic"), assistant("Noted."), user("Quiz me"),
+    assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, refused("not_named")],
+  ["a quiz result for a different quiz named in the latest message", [user("Quiz me"), assistant("Question 1: what limits output?"),
+    user("The bottleneck, chapter 5")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
 
   // Round 4 (action-bound record kind): the clause that carries the verb decides what is written. A record-shaped
   // name inside another write (a playlist's name, a shopping-list item, a note's topic) authorizes nothing else.
@@ -412,6 +444,52 @@ const MATRIX = [
     "flag_reading_question", { question_id: "1201", kind: "wrong" }, refused("invalid_value")],
   ["a flag of a kind the tool does not take", BANK_FLAG("That question is wrong"),
     "flag_reading_question", { question_id: 1201, kind: "retire" }, refused("invalid_value")],
+  // Subject, kind and target bound to one clause (RQS6-R1): a complaint and a target split across clauses never flag.
+  ["a flag: complaint and question in one clause, another clause after", BANK_FLAG("Q1201 is wrong, and the keeper rings at dawn"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the complaint is about the chapter part, the question is fine in another clause", BANK_FLAG("Q1201 is fine, but the chapter 3 part is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: a grouped amount stays one clause, so the question still carries the complaint", BANK_FLAG("The question about 5,000 mg is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: a comma after a unit still splits, so the complaint loses the question", BANK_FLAG("Q1201 is fine on 2 mg, the 3 mg part is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question is named in a clause with no complaint", BANK_FLAG("The chapter 3 part is wrong, and Q1201 is fine"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the complaint clause names another question", BANK_FLAG("Q1201 is fine, and Q1300 is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("question_not_asked")],
+  ["a flag: a hedge in the complaint clause", BANK_FLAG("Maybe Q1201 is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: a hedge in another clause does not block the complaint", BANK_FLAG("I'm not sure about the bell, but Q1201 is wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: a complaint about the user's own answer to the question is not a question flag", BANK_FLAG("My answer to that one was wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the answer is wrong, a clause that continues the answer's clause is not a question flag", BANK_FLAG("I answered B, which is wrong for Q1201"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question about the chapter is unclear, in the same sentence as an answer", BANK_FLAG("I answered B, but the question about chapter 4 is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: a complaint about the question's wording flags it as unclear", BANK_FLAG("The wording of Q1201 is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  // A complaint about how the answer was marked or scored is not a complaint about the question (RQS7-R1).
+  ["a flag: my answer to the question was marked wrong", BANK_FLAG("My answer to Q1201 was marked wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the score on the question was wrong", BANK_FLAG("The score on Q1201 was wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question was wrong to mark me down", BANK_FLAG("Q1201 was wrong to mark me down"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question is unclear, and my answer was marked wrong in another clause", BANK_FLAG("Q1201 is unclear, and my answer was marked wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the question is named plainly as unclear", BANK_FLAG("Question 1201 is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the question is marked as wrong, which is a flag phrase", BANK_FLAG("Q1201 is marked as wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the question was marked as wrong", BANK_FLAG("Q1201 was marked as wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the question is marked as unclear, the same phrase as wrong", BANK_FLAG("Q1201 is marked as unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the score on the question was marked as unclear, which is marking", BANK_FLAG("The score on Q1201 was marked as unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, refused("flag_not_stated")],
+  ["a flag: my answer to the question was marked as unclear, which is the user's own answer", BANK_FLAG("My answer to Q1201 was marked as unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, refused("flag_not_stated")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -437,7 +515,7 @@ test("a playlist or a quiz result is granted once per message", () => {
 });
 
 test("a complete quiz with one finalization authorizes exactly one score", () => {
-  const messages = [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck")];
+  const messages = [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck, chapter 1")];
   assert.deepEqual(sequence(messages, "record_reading_quiz",
     [{ checkpoint: "ch1", score: 1, total: 1 }, { checkpoint: "ch1", score: 1, total: 1 }]), ["allowed", "once_per_request"]);
 });
@@ -490,6 +568,10 @@ test("a granted write is consumed once: a second call for the same grant is refu
   assert.deepEqual(sequence([user("Log my synthetic evening stack and my synthetic morning stack")], "log_supplement_stack",
     [{ stack: "synthetic evening" }, { stack: "synthetic evening" }, { stack: "synthetic morning" }]),
     ["allowed", "already_written", "allowed"]);
+  // A comma list of two items splits there: the thousands comma inside "1,000" does not, and "200 mg" is its own item.
+  assert.deepEqual(sequence([user("Log synthetic vitamin D 1,000 IU, synthetic magnesium 200 mg")], "log_supplement_intake",
+    [{ product: "Synthetic Vitamin D", amount: 1000, unit: "iu" }, { product: "Synthetic Magnesium", amount: 200, unit: "mg" }]),
+    ["allowed", "allowed"]);
   // A habit reported twice in one message is one Yes.
   assert.deepEqual(sequence([user("I meditated today, and I meditated again")], "mark_habit_complete",
     [{ habit: "Meditated" }, { habit: "Meditated" }]), ["allowed", "already_written"]);
@@ -544,6 +626,12 @@ test("a retry is checked against the book its earlier try was pinned to (the rou
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: finished }), refused("not_named"));
   // With the pinned book (ChatLedger.storedContext book_id, mapped to its slug) it reaches the ledger.
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: BOOKS }), ALLOWED);
+});
+
+test("a chapter range the user states is allowed whatever the book's total chapters", () => {
+  // The named range is checked against the words, not the book total: a 12-chapter book allows "chapters 5 and 6".
+  const twelve = { active: "synthetic-book", list: [{ slug: "synthetic-book", title: "Synthetic Book", total_chapters: 12 }, BOOKS.list[1]] };
+  assert.deepEqual(decide([user("Finished chapters 5 and 6 on my run")], "log_reading_session", { chapter_from: 5, chapter_through: 6 }, { books: twelve }), ALLOWED);
 });
 
 // The reservation lifecycle of an allowed call (the route reserves before the tool runs, then settles it on the

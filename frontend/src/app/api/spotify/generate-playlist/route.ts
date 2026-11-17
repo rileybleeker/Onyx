@@ -238,6 +238,9 @@ export async function POST(req: NextRequest) {
   let attempts = 0;
   let observed = false;
   let finalResult: CreatePlaylistResult | null = null;
+  // Set when any tool call fails. The model's closing text may quote the raw error, so it is then
+  // replaced by a fixed sentence.
+  let toolErrored = false;
   let unresolved = false;
   const observe = () => {
     if (observed) return;
@@ -517,8 +520,11 @@ export async function POST(req: NextRequest) {
               }
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);
+              console.error(`spotify/generate-playlist tool ${block.name} failed:`, msg);
+              toolErrored = true;
               resultStr = JSON.stringify({ error: msg });
-              summary = `Tool error: ${msg.slice(0, 120)}`;
+              // The summary is shown in the browser's live log, so it stays a fixed phrase.
+              summary = "Tool error";
             }
 
             send({ type: "tool_result", tool: block.name, summary });
@@ -540,7 +546,13 @@ export async function POST(req: NextRequest) {
           .map((b) => b.text.trim())
           .filter(Boolean)
           .join("\n");
-        if (finalText) {
+        if (toolErrored) {
+          // The model's text may quote the raw tool error, so only a fixed sentence is sent.
+          send({
+            type: "message",
+            text: "Something went wrong while building this playlist, so the details above may be incomplete. Try again.",
+          });
+        } else if (finalText) {
           send({ type: "message", text: finalText });
         }
 
@@ -551,7 +563,9 @@ export async function POST(req: NextRequest) {
         );
       } catch (e) {
         // A playlist already created counts as accepted even if a later call failed.
-        sendOutcome(e instanceof Error ? e.message : String(e));
+        // The detail (which may name database or provider internals) stays in server logs.
+        console.error("spotify/generate-playlist failed:", e);
+        sendOutcome("Couldn't build the playlist. Try again.");
       } finally {
         if (creationPending) {
           // Outcome unknown: the response ends now and the creation is waited for (the function

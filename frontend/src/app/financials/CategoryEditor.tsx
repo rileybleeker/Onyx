@@ -28,13 +28,17 @@ export default function CategoryEditor({
     setError(null);
     try {
       const res = await fetch("/api/finance/categories", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? `failed (${res.status})`);
+      // The server's error text is never shown: a failed response gets the fixed copy below.
+      if (!res.ok) {
+        setError("Not saved. Try again.");
+        return;
+      }
       setOpen(false);
       // A full reload (not router.refresh) so this also works where the app router is not mounted.
       if (onSaved) onSaved();
       else window.location.reload();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "failed");
+    } catch {
+      setError("Not saved. Check your connection and try again.");
     } finally {
       setBusy(false);
     }

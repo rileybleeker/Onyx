@@ -283,7 +283,8 @@ test("status thresholds: >36h degraded, >72h failed, either heartbeat can drag i
 test("a failed heartbeat shows the importer's own text, e.g. login required", () => {
   const c = card(beat(1, { status: "failed", error_message: "Login required: the Rocket Money session expired." }), beat(1));
   assert.equal(c.status, "failed");
-  assert.equal(c.errorMessage, "Login required: the Rocket Money session expired.");
+  assert.equal(c.errorMessage, "Rocket Money needs you to sign in again. Ask Claude to run the Rocket Money sign-in on your PC.");
+  assert.doesNotMatch(c.errorMessage, /node|\.mjs|--login|harvest/);
   assert.equal(card(beat(1), beat(1, { status: "error", error_message: "boom" })).status, "failed");
   assert.equal(card(beat(1, { status: "partial", error_message: "2 rows skipped" }), beat(1)).errorMessage, "2 rows skipped");
   // Text on a heartbeat that itself succeeded is not shown; a failure without text says so plainly.
@@ -317,7 +318,12 @@ test("keep-alive heartbeat: a failing visit newer than the imports drags the car
   assert.equal(S.financeLedgerCard(beat(1), beat(1), NOW.getTime(), K(3, { status: "failed", error_message: "x" })).status, "success");
   // an import failure keeps its own text first
   const login = S.financeLedgerCard(beat(5, { status: "failed", error_message: "login required: run node harvest.mjs --login" }), beat(5), NOW.getTime(), fail2);
-  assert.equal(login.errorMessage, "login required: run node harvest.mjs --login");
+  assert.equal(login.errorMessage, S.LEDGER_SIGN_IN_COPY);
+  assert.equal(login.errorMessage, "Rocket Money needs you to sign in again. Ask Claude to run the Rocket Money sign-in on your PC.");
+  assert.doesNotMatch(login.errorMessage, /node|\.mjs|--login|harvest/);
+  // a command-naming text from the importer is never shown; a plain text still is
+  assert.equal(card(beat(1, { status: "failed", error_message: "run node harvest.mjs" }), beat(1)).errorMessage, "The latest transactions import failed (no error text recorded).");
+  assert.equal(card(beat(1, { status: "failed", error_message: "Login required" }), beat(1)).errorMessage, S.LEDGER_SIGN_IN_COPY);
   // no import heartbeat at all: still unknown, a keep-alive alone says nothing about the ledger
   assert.equal(S.financeLedgerCard(null, null, NOW.getTime(), fail2).status, "unknown");
   // the records count is the imports' only
@@ -490,6 +496,6 @@ test("the old CSV preview stays reachable and the page links the ledger copy hon
   const page = read("app/financials/page.tsx");
   assert.match(page, /Preview a CSV/);
   assert.match(page, /<FinancialsClient embedded \/>/);
-  assert.match(page, /No ledger data yet - the harvester has not run\./);
+  assert.match(page, /No ledger data yet\. The bank import has not run\./);
   assert.match(page, /Couldn't load the ledger|load\.message/);
 });

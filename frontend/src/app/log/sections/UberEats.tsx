@@ -68,7 +68,8 @@ function useBehavioralToday(routed: boolean): string {
     const refresh = () => {
       const get = first ? logEarlyGet(BEHAVIORAL_TODAY_URL, routed) : undefined;
       first = false;
-      cachedJson(BEHAVIORAL_TODAY_URL, { get })
+      // A copy fetched in the last minute (the warm-up's or a hover's) is used as is; the day changes at most twice a day.
+      cachedJson(BEHAVIORAL_TODAY_URL, { get, freshMs: 60_000 })
         .then((raw) => {
           const t = behavioralTodayOf(raw);
           if (alive && t) setToday(t);

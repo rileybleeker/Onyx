@@ -383,11 +383,24 @@ function classifyFirstTry(status: number | null, body: unknown): AttemptOutcome 
  * SETTLE_MAX_MS wait running out, settles nothing about these requests (a failed fetch and a slow one look alike, and a
  * request on its way may still commit), so a reopened round must not ask the same question again under a new key. It
  * shows that card as "Not sure it saved" with Retry, which sends the SAME request. Only a conclusive answer (stored,
- * refused, left out) releases an entry.
+ * refused, left out) releases an entry, and so does a confirmed round read that shows the card stored under the
+ * entry's key (releaseStoredAttempts). Lifetime: an unknown entry is kept and re-sent with its own key until one of
+ * those happens; closing the screen, a hidden page or a failed send never removes it.
  */
 export type AttemptOutbox = Map<string, AttemptRequest>;
 /** The part's outbox; a runner mounted without one (a test) keeps its own. */
 export const sharedAttemptOutbox: AttemptOutbox = new Map();
+
+/**
+ * A confirmed round read that shows a card answered under a held request's own key: that answer is stored, so the
+ * request is released without another send. Only the card's own key counts; another answer stored for the question
+ * does not confirm this request.
+ */
+export function releaseStoredAttempts(outbox: AttemptOutbox, cards: readonly { done: boolean; attempt_key: string | null }[]): void {
+  for (const c of cards) {
+    if (c.done && c.attempt_key) outbox.delete(c.attempt_key.toLowerCase());
+  }
+}
 
 /** The unconfirmed request for this question in this round, or null (what a reopened runner takes the card from). */
 export function heldAttemptFor(outbox: AttemptOutbox, roundKey: string, question: { question_id: number; version: number } | null): AttemptRequest | null {

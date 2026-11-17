@@ -10,7 +10,7 @@ FlightReservation markup — this module parses their HTML/text instead.
 Reads EVERY configured Gmail account over IMAP (read-only: BODY.PEEK, the
 "[Gmail]/All Mail" folder so archived mail counts) and handles:
 
-    kind              subject (DeltaAirLines@t.delta.com / @g.delta.com)
+    kind              subject (DeltaAirLines sender on the t. and g. delta.com subdomains)
     receipt           "Your Flight Receipt - NAME DDMONYY"
     award_receipt     "Congrats On Your SkyMiles Award Trip"
     trip_details      "Your XXX > YYY Trip Details"            (~3 days before each direction)
@@ -81,7 +81,26 @@ IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com")
 # Both of Riley's Gmail accounts must be wired in (Riley, 2026-11-08). Any of
 # these missing from the IMAP_EMAIL* env pairs → the heartbeat is 'partial' and
 # names the account, so /status shows the gap instead of a quiet green card.
-REQUIRED_ACCOUNTS = ("rileybleeklm@gmail.com", "rileybleeker@gmail.com")
+REQUIRED_ACCOUNTS_ENV = "FLIGHTS_REQUIRED_GMAIL_ACCOUNTS"
+
+
+def _required_accounts(raw: str | None = None) -> tuple[str, ...]:
+    """Required mailboxes from the repo secret (comma-separated, order kept). Unset gives ()."""
+    raw = os.environ.get(REQUIRED_ACCOUNTS_ENV, "") if raw is None else raw
+    return tuple(a.strip().lower() for a in raw.split(",") if a.strip())
+
+
+def _account_gap_notes(required: tuple[str, ...], configured: set[str]) -> list[str]:
+    """Heartbeat notes for a required mailbox not wired in, or an unset secret. Never an address."""
+    if not required:
+        return [f"{REQUIRED_ACCOUNTS_ENV} is not set"]
+    missing = [a for a in required if a not in configured]
+    if not missing:
+        return []
+    return [f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)"]
+
+
+REQUIRED_ACCOUNTS = _required_accounts()
 SENDER_DOMAIN = "delta.com"
 DEFAULT_DAYS = 60
 
@@ -1259,10 +1278,10 @@ def main() -> int:
         if failures:
             status, notes = "partial", failures
         configured = {a.lower() for a, _ in accounts}
-        missing = [a for a in REQUIRED_ACCOUNTS if a not in configured]
-        if missing:
+        gaps = _account_gap_notes(REQUIRED_ACCOUNTS, configured)
+        if gaps:
             status = "partial"
-            notes.append(f"{len(missing)} Gmail account(s) not configured (add IMAP_EMAIL_n/IMAP_APP_PASSWORD_n secrets)")
+            notes.extend(gaps)
         if errors:
             status = "partial"
             notes.append(f"{errors} email(s) failed to parse — see pds.flight_email_log status='error'")

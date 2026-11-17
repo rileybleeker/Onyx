@@ -175,6 +175,21 @@ test('a refusal is shown and not retried until the value changes', async () => {
   assert.deepEqual(r.sent, ['good']);
 });
 
+test('describeError: the status shows its text, not the server words (default is the server words)', async () => {
+  const t = fakeTimers();
+  const r = recorder({ fail: () => new AutosaveRefused('synthetic server words') });
+  const s = new Autosaver({ save: r.save, timers: t, delayMs: 10, describeError: () => 'Plain fixed sentence.' });
+  s.change('a');
+  await t.advance(10);
+  assert.equal(s.state.status, 'error');
+  assert.equal(s.state.error, 'Plain fixed sentence.');
+  const t2 = fakeTimers();
+  const d = new Autosaver({ save: recorder({ fail: () => new AutosaveRefused('synthetic server words') }).save, timers: t2, delayMs: 10 });
+  d.change('b');
+  await t2.advance(10);
+  assert.equal(d.state.error, 'synthetic server words');
+});
+
 test('offline: retried with backoff until it goes through', async () => {
   const t = fakeTimers();
   let down = 2;

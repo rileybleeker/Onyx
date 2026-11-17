@@ -171,8 +171,9 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
 
   // The Environment part (PartGroup "environment" in HrvAnalysisClient.tsx): the Sweet Spot panel plus the PM2.5
   // and Weather panels, which fetch /api/air-quality and /api/weather themselves. Both syncs run every 3 h, so an
-  // error or empty note there is always a real break. Asserts presence of UI only, never values.
-  test("HRV Environment: PM2.5 and Weather charts draw; Sweet Spot renders", async ({
+  // error or empty note there is always a real break. The Pollen panel (/api/pollen) is held to the same bar.
+  // Asserts presence of UI only, never values.
+  test("HRV Environment: PM2.5, Weather and Pollen charts draw; Sweet Spot renders", async ({
     page,
   }) => {
     await gotoAuthed(page, "/analytics/hrv");
@@ -209,12 +210,31 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
       ).toBeVisible({ timeout: LOAD_TIMEOUT });
     }
 
-    // The panels' error/empty notes (AirQualityPanel.tsx, WeatherPanel.tsx; the apostrophe renders as a straight ').
+    // Pollen (Part id="pollen", PollenPanel.tsx): counts are stored daily, so the 1-year default range always has
+    // bars. Same card lookup; the marks check targets the bar shapes (a drawn bar is a <path> inside
+    // .recharts-bar-rectangle; a null-count day draws none). It waits out the loading skeleton, and the
+    // not-connected / error / empty-range notes replace the chart, so any of them fails here and below.
+    const pollenCard = page
+      .locator("div.bg-surface-card")
+      .filter({ has: page.getByRole("heading", { name: "Pollen", exact: true }) })
+      .last();
+    await pollenCard.scrollIntoViewIfNeeded({ timeout: LOAD_TIMEOUT });
+    await expect(pollenCard, "Pollen card did not render").toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(
+      pollenCard.locator("svg.recharts-surface .recharts-bar-rectangle path").first(),
+      "Pollen chart drew no bars"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // The panels' error/empty notes (AirQualityPanel.tsx, WeatherPanel.tsx, PollenPanel.tsx; the apostrophe
+    // renders as a straight ').
     for (const note of [
       "Couldn't load air quality",
       "No air-quality days yet",
       "Couldn't load weather",
       "No weather days yet",
+      "Pollen isn't connected yet",
+      "Couldn't load pollen",
+      "No pollen counts in this range",
     ]) {
       await expect(
         page.getByText(note),
@@ -414,7 +434,7 @@ const PAGES: SmokePage[] = [
     route: "/bland-altman",
     heading: "Bland-Altman Analysis",
     signal: "charts",
-    hardEmpty: ["No data available. Make sure your ETL pipelines have synced data."],
+    hardEmpty: ["No data available yet. Data shows up here after your health data has synced."],
   },
   {
     route: "/habits",
@@ -650,7 +670,7 @@ test.describe("/nyc apartment search", () => {
     await settle(page);
     await expect(page.getByText("NYC Apartment Search", { exact: true }).first()).toBeVisible({ timeout: LOAD_TIMEOUT });
     await expect(page.getByText("Couldn't load leads", { exact: false }), "Notion read failed on /nyc").toHaveCount(0);
-    await expect(page.getByText("No leads yet. nyc-scout fills this every morning."), "NYC Leads database is empty").toHaveCount(0);
+    await expect(page.getByText("No leads yet. New leads are added every morning."), "NYC Leads database is empty").toHaveCount(0);
 
     await page.getByRole("button", { name: "All incl. gone" }).click();
     await expect(page.locator('[data-testid="nyc-leads-table"] tbody tr').first()).toBeVisible({ timeout: LOAD_TIMEOUT });
@@ -747,7 +767,7 @@ test("/analytics/travel lists flights in the Flights card", async ({ page }) => 
     "/analytics/travel did not render its Travel Analysis heading"
   ).toBeVisible({ timeout: LOAD_TIMEOUT });
   await expect(
-    page.getByText("No flights parsed yet", { exact: false }),
+    page.getByText("No flights found yet", { exact: false }),
     "Flights card shows its empty state"
   ).toHaveCount(0);
   const flightsCard = page
@@ -895,7 +915,7 @@ test.describe("Capture carryovers — read-only opening", () => {
           }
           await settle(page); // allows delayed mount/autosave mistakes to reach the aborting guard
           ready = await panel.isVisible();
-          noLoadError = !(await panel.getByText(/Drinks are not set up yet|Couldn't load drinks|Your list isn't available yet|Couldn't load your list/).isVisible());
+          noLoadError = !(await panel.getByText(/Drinks are not set up yet|Drinks aren't available yet|Couldn't load drinks|Your list isn't available yet|Couldn't load your list/).isVisible());
           if (target === "reading") {
             // Compare private data inside the browser; only the boolean leaves this evaluation.
             listMatchesApi = await page.evaluate(async () => {

@@ -384,7 +384,8 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
       if (!res.ok) throw new Error(json.error ?? "Search failed");
       setSearchHits(json.hits ?? []);
     } catch (e) {
-      setSearchError(e instanceof Error ? e.message : String(e));
+      console.error("Supplement search:", e);
+      setSearchError("Couldn't search products. Try again.");
     } finally {
       setSearching(false);
     }
@@ -427,7 +428,8 @@ export default function SupplementsPage({ headingTestId = "page-heading" }: { he
       setConfirmHit(null);
       setConfirmDoses("1");
     } catch (e) {
-      setSearchError(e instanceof Error ? e.message : String(e));
+      console.error("Add supplement:", e);
+      setSearchError("Couldn't add that product. Try again.");
     } finally {
       setSeedingId(null);
     }

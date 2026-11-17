@@ -168,8 +168,8 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
         stop_reason: json.stop_reason,
       });
       setStep("review");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch {
+      setError("Couldn't read that label. Try again or enter it by hand.");
       setStep("upload");
     }
   }, []);
@@ -256,8 +256,8 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
       }
 
       await onSaved();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch {
+      setError("Couldn't save this supplement. Try again.");
     } finally {
       setSaving(false);
     }
@@ -459,6 +459,7 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
                     <select
                       value={ing.category ?? ""}
                       onChange={(e) => updateIngredient(idx, { category: e.target.value || null })}
+                      aria-label="Ingredient category"
                       className="px-2 py-1 text-[11px] font-mono bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none"
                     >
                       <option value="">category…</option>

@@ -1,4 +1,4 @@
-// Onyx goPuff item harvester — runs on Riley's PC (Task Scheduler), in an off-screen Chrome window.
+// Onyx goPuff item harvester — runs on the collector PC (Task Scheduler), in an off-screen Chrome window.
 //
 // goPuff has no API and no export for a customer's own orders. The signed-in web app does: its
 // orders page runs a GraphQL query named "OrdersByUserId" (found 2026-11-13). This script opens

@@ -50,7 +50,8 @@ export async function POST(req: NextRequest) {
     .select("intake_id")
     .single();
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("supplements/log-intake insert", error.message);
+    return NextResponse.json({ error: "Couldn't save that change. Try again." }, { status: 500 });
   }
   return NextResponse.json({ intake_id: data?.intake_id, ...row });
 }
@@ -94,7 +95,10 @@ export async function PATCH(req: NextRequest) {
     .eq("intake_id", body.intake_id)
     .select()
     .single();
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("supplements/log-intake update", error.message);
+    return NextResponse.json({ error: "Couldn't save that change. Try again." }, { status: 500 });
+  }
   return NextResponse.json(data);
 }
 
@@ -112,7 +116,8 @@ export async function DELETE(req: NextRequest) {
     .delete()
     .eq("intake_id", intake_id);
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("supplements/log-intake delete", error.message);
+    return NextResponse.json({ error: "Couldn't save that change. Try again." }, { status: 500 });
   }
   return NextResponse.json({ ok: true });
 }

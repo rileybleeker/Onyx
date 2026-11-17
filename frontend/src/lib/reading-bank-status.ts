@@ -137,7 +137,7 @@ export function readingBankCard(p: {
   const amber: string[] = [];
   if (hb?.status === "failed" || hb?.status === "error") red.push(hbMsg ? `Last run failed: ${hbMsg}` : "Last run failed.");
   if (n(c.lagging_24h)) red.push(`${plural(n(c.lagging_24h), "chapter")} waiting more than 24 h for questions.`);
-  if (queued && ageH > READING_BANK_FAILED_HOURS) red.push(`${plural(queued, "job")} queued and no run for ${Number.isFinite(ageH) ? `${Math.floor(ageH)} h` : "ever"}: check the Reading Question Bank workflow.`);
+  if (queued && ageH > READING_BANK_FAILED_HOURS) red.push(`${plural(queued, "job")} queued and no run for ${Number.isFinite(ageH) ? `${Math.floor(ageH)} h` : "ever"}: check that the scheduled Reading Question Bank run is still going.`);
   if (n(c.failed_24h)) red.push(`${plural(n(c.failed_24h), "job")} failed in the last 24 h: Rebuild on the chapter, or check Status history.`);
   if (pausedBudget) amber.push(`Paused · budget${pausedBudget > 1 ? ` (${plural(pausedBudget, "book")})` : ""}: Allow more on Reading.`);
   if (hb?.status === "partial") amber.push(hbMsg ? `Last run: ${hbMsg}` : "Last run was partial.");

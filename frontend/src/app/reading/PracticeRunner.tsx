@@ -27,6 +27,7 @@ import {
   POLL_FOR_MS,
   postJson,
   realTimers,
+  releaseStoredAttempts,
   resendAttempt,
   REVIEW_URL,
   roundAttemptsUrl,
@@ -227,6 +228,8 @@ function withHeldRequest(it: Item, req: AttemptRequest): Item {
 
 /** The round's cards as items, the ones with an unconfirmed request back as such (the first of them opens the runner). */
 function seedRound(round: PracticeRound, mode: PracticeRunnerProps["mode"], outbox: AttemptOutbox): { items: Record<string, Item>; order: string[]; held: string | null } {
+  // The round read is the server's word: a card it shows answered under a held key is stored, so that request is done.
+  releaseStoredAttempts(outbox, round.cards);
   const cards = startingCards(round, mode);
   const items: Record<string, Item> = {};
   for (const c of cards) {

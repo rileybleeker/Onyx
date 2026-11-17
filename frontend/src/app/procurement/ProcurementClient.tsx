@@ -20,7 +20,7 @@ const SUBSCRIPTIONS_API = '/api/procurement/subscriptions';
 const persistenceNote = {
   checking: 'Checking for saved subscriptions...',
   saved: 'Saved to your Onyx account. Synthetic demo rows are never saved.',
-  pending: 'Not saved yet - setup pending. The subscription table has not been created in Supabase, so this tracker works for this visit only and clears on reload.',
+  pending: 'Not saved yet: saving is not set up on this site, so this tracker works for this visit only and clears on reload.',
   unavailable: 'Saved subscriptions could not be loaded right now. This tracker works for this visit only and clears on reload.',
 } as const;
 const cycleLabel = { monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
@@ -37,6 +37,7 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [confirmingClear, setConfirmingClear] = useState(false);
   const [commitment, setCommitment] = useState<Draft['commitment']>('one-time');
   const [showList, setShowList] = useState(false);
   const [subs, setSubs] = useState<Subscription[]>([]);
@@ -93,7 +94,6 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
             setSubs(previous => [...previous, body.subscription as Subscription]); setSubNotice('Subscription saved. Nothing was contacted.'); form.reset(); setBusy(false); return;
           }
           if (body && body.setupPending === true) { setStore('pending'); failure = 'setup is pending'; }
-          else if (body && typeof body.error === 'string') failure = body.error;
         } catch { /* network failure: fall through to the in-memory add */ }
         setBusy(false);
         setSubs(previous => [...previous, sub]); setSubNotice(`Subscription added for this visit only (${failure}). Nothing was contacted.`); form.reset(); return;
@@ -112,8 +112,12 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
     }
     setSubs(previous => previous.filter(item => item !== sub)); setSubError(''); setSubNotice('Subscription removed from this list. Nothing was cancelled.');
   }
+  // Two-step clear: the first click only asks; the confirm button runs clearSubscriptions.
+  function askClearSubscriptions() { setConfirmingClear(true); setSubError(''); setSubNotice(''); }
   async function clearSubscriptions() {
-    if (store === 'saved' && subs.some(sub => sub.id !== undefined)) {
+    setConfirmingClear(false);
+    const archivesSaved = store === 'saved' && subs.some(sub => sub.id !== undefined);
+    if (archivesSaved) {
       setBusy(true);
       try {
         const res = await fetch(SUBSCRIPTIONS_API, { method: 'DELETE' });
@@ -121,7 +125,9 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
       } catch { setBusy(false); setSubError('Could not clear your saved list. Nothing was changed.'); setSubNotice(''); return; }
       setBusy(false);
     }
-    setSubs([]); setSubNotice('All tracked subscriptions cleared.'); setSubError('');
+    setSubs([]);
+    setSubNotice(archivesSaved ? 'Your saved subscription list was cleared. Nothing was cancelled with any provider.' : 'All tracked subscriptions cleared.');
+    setSubError('');
   }
   function loadSynthetic() {
     const room = MAX_SUBSCRIPTIONS - subs.length;
@@ -151,7 +157,7 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
       </PartGroup>
       <PartGroup id='about' title='About this page' gap={24}>
         <Part id='reads' title='What this page reads'>
-          <section className={card} aria-label="What this page reads"><h2 className="text-lg font-semibold">What this page reads</h2><p className="text-sm">Do not enter payment details, credentials, addresses, or sensitive information.</p><details className="group text-[12px] text-text-tertiary"><summary className="inline-flex min-h-11 cursor-pointer list-none items-center gap-1.5 rounded-control pr-2 hover:text-text-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">About this<span aria-hidden className="text-text-disabled transition-transform group-open:rotate-90">›</span></summary><div className="mb-2 space-y-2 leading-relaxed text-text-secondary"><p>Subscriptions, renewal dates and flags are worked out from your finance ledger (and, for use, your iPhone Screen Time data) by fixed rules, on the server, each time the page loads; purchase suggestions come the same way from the order history behind the Orders page. No merchant account is connected and no model reads your transactions. Onyx never buys, checks out or submits anything on a merchant site: it prepares lists and reminders for you to act on yourself. Order drafts stay in memory for this visit and disappear on reload; tracked subscriptions are saved to your Onyx account once the one-time Supabase setup has been applied (the note under Track subscriptions says which).</p><ul><li>Subscription providers: {CAPABILITIES.providers}</li><li>Orders: {CAPABILITIES.orders}</li><li>Recommendations: {CAPABILITIES.recommendations}</li><li>Tracking: {CAPABILITIES.tracking}</li><li>Reminders: {CAPABILITIES.reminders}</li></ul></div></details></section>
+          <section className={card} aria-label="What this page reads"><h2 className="text-lg font-semibold">What this page reads</h2><p className="text-sm">Do not enter payment details, credentials, addresses, or sensitive information.</p><details className="group text-[12px] text-text-tertiary"><summary className="inline-flex min-h-11 cursor-pointer list-none items-center gap-1.5 rounded-control pr-2 hover:text-text-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">About this<span aria-hidden className="text-text-disabled transition-transform group-open:rotate-90">›</span></summary><div className="mb-2 space-y-2 leading-relaxed text-text-secondary"><p>Subscriptions, renewal dates and flags are worked out from your finance ledger (and, for use, your iPhone Screen Time data) by fixed rules, on the server, each time the page loads; purchase suggestions come the same way from the order history behind the Orders page. No merchant account is connected and no model reads your transactions. Onyx never buys, checks out or submits anything on a merchant site: it prepares lists and reminders for you to act on yourself. Order drafts stay in memory for this visit and disappear on reload; tracked subscriptions are saved to your Onyx account once the one-time database setup has been applied (the note under Track subscriptions says which).</p><ul><li>Subscription providers: {CAPABILITIES.providers}</li><li>Orders: {CAPABILITIES.orders}</li><li>Recommendations: {CAPABILITIES.recommendations}</li><li>Tracking: {CAPABILITIES.tracking}</li><li>Reminders: {CAPABILITIES.reminders}</li></ul></div></details></section>
         </Part>
         <Part id='examples' title='Subscriptions' width='half'>
           <section className={card}><h2 className="text-xl font-semibold">Subscriptions</h2><p className="text-text-secondary">No provider is connected, so nothing is managed from here.</p><button className={button} onClick={() => setExamples(value => !value)}>{examples ? 'Hide synthetic examples' : 'Show synthetic examples'}</button>{examples && <div className="space-y-3"><p className="text-xs uppercase">Synthetic examples, not your subscriptions</p>{EXAMPLES.map(example => <article className="border-t border-border-subtle pt-3" key={example.name}><h3>{example.name}</h3><p>{money(example.monthlyCents)} / month, illustrative</p><p className="text-sm text-text-secondary">{example.note}</p></article>)}</div>}<button className={button} disabled>Manage with provider (unavailable)</button></section>
@@ -165,7 +171,7 @@ export default function ProcurementClient({ detected, advice, reorder, feed = fa
           <section className={card}><h2 className="text-xl font-semibold">Track subscriptions</h2><p className="text-sm text-text-secondary" data-testid="procurement-persistence" data-state={store}>{persistenceNote[store]}</p>
             <form onSubmit={addSubscription} className="grid md:grid-cols-2 gap-4"><label>Subscription name<input className={field} name="subName" required maxLength={80}/></label><label>Price per cycle (USD)<input className={field} name="subAmount" inputMode="decimal" required placeholder="0.00"/></label><label>Billing cycle<select className={field} name="subCycle" defaultValue="monthly"><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option></select></label><label>Next renewal date<input className={field} name="subRenews" type="date" required/></label><button className={button} type="submit" disabled={busy}>Add subscription</button></form>
             {subError && <p role="alert" className="text-red-400">{subError}</p>}<p role="status">{subNotice}</p>
-            <div className="flex flex-wrap gap-3"><button className={button} onClick={loadSynthetic}>Load synthetic demo subscriptions</button><button className={button} disabled={!subs.length || busy} onClick={clearSubscriptions}>Clear subscriptions</button></div>
+            <div className="flex flex-wrap gap-3"><button className={button} onClick={loadSynthetic}>Load synthetic demo subscriptions</button>{confirmingClear ? <><button className={button} disabled={busy} onClick={clearSubscriptions}>{store === 'saved' ? 'Yes, clear the saved list' : 'Yes, clear the list'}</button><button className={button} disabled={busy} onClick={() => setConfirmingClear(false)}>Cancel</button></> : <button className={button} disabled={!subs.length || busy} onClick={askClearSubscriptions}>Clear subscriptions</button>}</div>
             {summary ? <div className="space-y-4">
               <p>About {money(summary.monthlyCents)} / month, {money(summary.annualCents)} / year across {summary.count} tracked subscription{summary.count === 1 ? '' : 's'}.</p>
               <ul className="space-y-3">{summary.renewals.map((r, position) => <li className="border-t border-border-subtle pt-3 flex flex-wrap gap-3 justify-between" key={r.index}><div><h3>{r.sub.name}</h3><p className="text-sm">{money(r.sub.cents)} / {cycleLabel[r.sub.cycle]} · renews {formatDate(r.nextOn)} ({relative(r.daysAway)})</p></div><button className={button} disabled={busy} onClick={() => removeSubscription(r.sub)}>Remove subscription {position + 1}</button></li>)}</ul>

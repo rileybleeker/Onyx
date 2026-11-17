@@ -99,6 +99,20 @@ test('a failing fetch or prefetch does not stop the warm-up', async () => {
   assert.deepEqual(log, ['register k:a', 'fetch k:a', 'route /b']);
 });
 
+test('a read skipOn a page is left out of the sweep there, and still warmed on other pages and on intent', async () => {
+  const warmers = () => [
+    { key: 'k:shared', fetch: async () => 1 },
+    { key: 'k:skip', fetch: async () => 2, skipOn: (page) => page.startsWith('/financials') },
+  ];
+  const targets = [{ href: '/today', prefetch: 'full', data: warmers }];
+  const onFinance = harness();
+  await runWarmup(targets, onFinance.deps, '/financials/forecast?x=1').done;
+  assert.deepEqual(onFinance.log, ['route /today full', 'register k:shared', 'fetch k:shared'], 'skipOn leaves the read out on a finance page');
+  const onOther = harness();
+  await runWarmup(targets, onOther.deps, '/log').done;
+  assert.ok(onOther.log.includes('fetch k:skip'), 'the read is warmed on a page that does not skip it');
+});
+
 test('intent (hover, focus, pointer-down) warms that page at once; nav links switch off viewport prefetch', async () => {
   const { deps, log } = harness();
   configureWarmup(deps, [{ href: '/check-in', prefetch: 'full', data: () => [{ key: '/api/habits/checkin', fetch: async () => ({}) }] }, { href: '/orders', prefetch: 'auto' }]);
@@ -130,6 +144,12 @@ test("the app warm-up list: /log warms the Supplements history read the section 
   // The warm-up's /log entry reads the SAME constant as the section, so the one-key-per-GET cache key matches.
   assert.match(app, /json\(LOG_SUPPLEMENTS_HISTORY_URL\)/, 'AppData /log warms the history via the constant');
   assert.ok(/LOG_SUPPLEMENTS_HISTORY_URL[^}]*\} from "@\/lib\/log-early"/.test(app), 'the constant is imported from lib/log-early');
+  // The sweep leaves this read out while /check-in is on screen, and keeps it on /log.
+  const entry = /\{ \.\.\.json\(LOG_SUPPLEMENTS_HISTORY_URL\), skipOn: (\(page(?:: string)?\) => [^}]+?) \}/.exec(app);
+  assert.ok(entry, 'the history warmer has a skipOn rule');
+  const skipOnCheckIn = new Function(`return ${entry[1].replace(': string', '')}`)();
+  for (const page of ['/check-in', '/check-in/x']) assert.equal(skipOnCheckIn(page), true, page);
+  for (const page of ['/log', '/log/sections', '/today', '/check-inbox']) assert.equal(skipOnCheckIn(page), false, page);
 });
 
 test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step and on intent', async () => {
@@ -143,4 +163,17 @@ test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step 
   await new Promise((r) => setImmediate(r));
   assert.equal(loads, 2);
   configureWarmup(null);
+});
+
+test('the agents inbox and thread warmers skip the Log, Sleep, Nutrition and Analytics sweep, and keep Today and Agents', () => {
+  const app = src('components', 'AppData.tsx');
+  const line = /const skipOnAgentsSweep = (\(page: string\) => [^\n]+);/.exec(app);
+  assert.ok(line, 'one shared predicate in AppData.tsx');
+  const skipOnAgentsSweep = new Function(`return ${line[1].replace(': string', '')}`)();
+  for (const page of ['/log', '/log/sections', '/sleep', '/sleep/winddown', '/nutrition', '/analytics', '/analytics/hrv']) assert.equal(skipOnAgentsSweep(page), true, page);
+  for (const page of ['/today', '/agents', '/agents/x', '/logbook', '/financials/forecast']) assert.equal(skipOnAgentsSweep(page), false, page);
+  // One inbox warmer object for Today and Agents: it keeps the Financials skip and adds the sweep pages.
+  assert.match(app, /const inboxWarmer: DataWarmer = \{\s*key: CACHE_KEYS\.agentsInbox,\s*fetch: \(\) => agentsApi\.inbox\(\),\s*skipOn: \(page\) => page === "\/financials" \|\| page\.startsWith\("\/financials\/"\) \|\| skipOnAgentsSweep\(page\),\s*\};/, 'inbox warmer skips Financials and the sweep pages');
+  assert.match(app, /\.\.\.threads\.map\(\(thread\) => \(\{ key: CACHE_KEYS\.agentsThread\(thread\), fetch: \(\) => agentsApi\.messages\(\{ thread, limit: 60 \}\), skipOn: skipOnAgentsSweep \}\)\)/, 'thread warmers skip the sweep pages');
+  assert.ok(/\/\/ The inbox feeds Today/.test(app) && /return \[\s*inboxWarmer,/.test(app), 'Today and Agents still list the same inbox warmer');
 });

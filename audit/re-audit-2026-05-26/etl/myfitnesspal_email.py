@@ -13,7 +13,7 @@ Usage:
 Setup:
     1. Open MyFitnessPal app → More → Settings → Export Data → Nutrition
     2. MFP emails you a CSV (or ZIP) at the address on your MFP account
-    3. Forward that email to your Onyx inbox (rileybleekeronyx@gmail.com), OR
+    3. Forward that email to your Onyx inbox, OR
        configure MFP to use the same email address
     4. Run this script — or let GitHub Actions pick it up automatically
 

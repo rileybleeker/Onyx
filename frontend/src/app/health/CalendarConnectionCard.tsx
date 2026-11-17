@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import { GOOGLE_AUTH_URL, NOT_CONNECTED, type CalendarStatus, type CalendarSyncSummary } from '@/lib/care-google';
 import InfoHint from '@/components/InfoHint';
+import { syncErrorSentence } from './calendar-sync-copy';
 
 const button = 'rounded-lg border border-border-default px-3 py-2 text-sm hover:bg-surface-hover disabled:opacity-50';
 
@@ -16,9 +17,9 @@ function ago(iso: string, now: number): string {
 function syncText(sync: CalendarSyncSummary, now: number): string {
   const when = ago(sync.at, now);
   if (sync.ok) return `Last sync ${when}: ${sync.created} added, ${sync.updated} changed, ${sync.removed} taken off, ${sync.unchanged} already up to date.`;
-  if (sync.error === 'google_auth') return `Last sync ${when} failed: Google no longer accepts Onyx's access. Disconnect, then connect again.`;
-  if (sync.error === 'calendar_missing') return `Last sync ${when} failed: the calendar Onyx created is gone from Google. Disconnect, then connect again to make a new one.`;
-  return `Last sync ${when} did not finish (${sync.failed} item${sync.failed === 1 ? '' : 's'} failed${sync.error ? `, ${sync.error}` : ''}). It is retried on the next change or with Sync now.`;
+  const reason = syncErrorSentence(sync.error);
+  if (reason) return `Last sync ${when} failed. ${reason}`;
+  return `Last sync ${when} did not finish (${sync.failed} item${sync.failed === 1 ? '' : 's'} failed). It is retried on the next change or with Sync now.`;
 }
 
 // Google Calendar connection for /health. Not connected is the default and what every failure
@@ -36,10 +37,9 @@ export default function CalendarConnectionCard({ initial }: { initial?: Calendar
     const q = new URLSearchParams(window.location.search);
     const result = q.get('calendar');
     if (!result) return;
-    const reason = (q.get('reason') || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 60);
     if (result === 'connected') setMessage({ text: 'Google Calendar is connected. The first sync runs in the background; press Sync now to see its result.' });
     else if (result === 'denied') setMessage({ text: 'The Google sign-in was cancelled. Nothing was connected.' });
-    else setMessage({ text: `Could not connect Google Calendar${reason ? ` (${reason})` : ''}. Nothing was connected.`, error: true });
+    else setMessage({ text: 'Could not connect Google Calendar. Nothing was connected. Try again.', error: true });
     q.delete('calendar'); q.delete('reason');
     const rest = q.toString();
     window.history.replaceState(null, '', window.location.pathname + (rest ? `?${rest}` : ''));

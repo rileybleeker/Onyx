@@ -5,6 +5,7 @@ import { WINDOW_CHOICES, formatMinutes, type TopEntry } from "@/lib/screen-time"
 import type { ScreenTimeViewData } from "@/lib/screen-time-view";
 import { DailyTotalChart, LateNightChart, PickupsChart, SleepOnsetChart } from "./ScreenTimeCharts";
 import InfoHint from "@/components/InfoHint";
+import RetryButton from "./RetryButton";
 import { PartGrid, type PartSpec } from "@/components/personalize/PartGrid";
 import type { PageLayout } from "@/lib/personalize-layout";
 
@@ -183,6 +184,8 @@ export default function ScreenTimeView({
   feed = false,
   onWindow,
   busy = false,
+  onRetry,
+  refreshOnRetry = false,
   layout,
 }: {
   /** null: the scroll's section is still waiting for its first answer (the loading line shows). */
@@ -194,6 +197,10 @@ export default function ScreenTimeView({
   onWindow?: (days: number) => void;
   /** Scroll section only: the answer for the picked window has not arrived yet. */
   busy?: boolean;
+  /** Scroll section only: the error alert's "Try again" calls this (the section starts a new read). */
+  onRetry?: () => void;
+  /** Routed page only: the error alert's "Try again" re-renders the server page (router.refresh). */
+  refreshOnRetry?: boolean;
   /** Routed page only: the saved Personalize layout read from the page's cookie. */
   layout?: PageLayout;
 }) {
@@ -251,6 +258,11 @@ export default function ScreenTimeView({
           <h2 className="font-semibold text-red-300">Couldn&apos;t load Screen Time.</h2>
           <p className="mt-1 text-[13px] text-text-secondary">{data.hint}</p>
           <p className="mt-1 text-[12px] text-text-tertiary">This is a failed query, not a day without phone use.</p>
+          {(onRetry || refreshOnRetry) && (
+            <div className="mt-3">
+              <RetryButton onRetry={onRetry} />
+            </div>
+          )}
         </section>
       )}
 

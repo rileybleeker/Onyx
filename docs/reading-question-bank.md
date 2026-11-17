@@ -354,7 +354,7 @@ when the book is finished; its ideas unlock at the end of the book.
   while the SQL is missing or the book is off.
 - The attempt route's `after()` claims only its own grade job and runs it.
 - **The hourly worker** (`frontend/scripts/reading-bank-run.cjs`, run by `.github/workflows/reading-bank.yml` at :17
-  so work continues while Riley's PC is off; it loads `lib/reading-bank-server.ts` the way `cash-forecast-snapshot.cjs`
+  so work continues while the collector PC is off; it loads `lib/reading-bank-server.ts` the way `cash-forecast-snapshot.cjs`
   loads its module): it plans every turned-on book, grades answers still pending after 2 minutes (20 at most),
   generates for up to 10 minutes (each step gets twice its time), repairs dirty schedules, and once a day clears raw
   answers older than `READING_BANK_CLEAR_ANSWERS_DAYS` (180 by default, 0 keeps them) through T07's

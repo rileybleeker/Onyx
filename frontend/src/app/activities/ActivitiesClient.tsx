@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { AreaChart, Area, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { getActivities, getDailySummaries, getWorkouts, getWhoopWorkouts, getWhoopCycles, getHeartRateData, getRunningRecoveryContext, getActivityLaps, rangeDays, rangeLabel } from "@/lib/queries";
 import { formatDuration, formatShortDuration, formatDistance, formatPace, formatDate, sameJson } from "@/lib/format";
+import { rangeStatus } from "@/lib/range-load";
 import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import StatCard from "@/components/StatCard";
@@ -417,6 +418,14 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
   const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Inline failure for a row action (delete or tag save), shown on that row where the user clicked.
+  // Cleared by the next action on any row, or after a few seconds. Replaces the blocking browser popup.
+  const [rowError, setRowError] = useState<{ id: string; kind: "delete" | "tags"; text: string } | null>(null);
+  useEffect(() => {
+    if (!rowError) return;
+    const t = setTimeout(() => setRowError(null), 5000);
+    return () => clearTimeout(t);
+  }, [rowError]);
   // LLM-proposed tags for untagged strength rows, keyed by row id ("whoop:<id>"). Never part of the
   // ISR prefetch: they load after the list has painted (effect below) and degrade to nothing on
   // any failure. The entry doubles as the draft - toggling a ghost chip edits it in place.
@@ -514,9 +523,10 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   async function deleteActivity(act: ActivityRow) {
     const sourceId = act.id.split(":")[1];
     const label = `${act.name} (${new Date(act.display_time).toLocaleDateString()})`;
-    if (!confirm(`Delete this activity from Onyx?\n\n${label}\n\nIt will be hidden from all charts and HRV analytics. Re-syncs won't bring it back. You can restore it by clearing is_excluded in the DB.`)) {
+    if (!confirm(`Delete this activity from Onyx?\n\n${label}\n\nIt will be hidden from all charts and HRV analytics. A later sync will not bring it back.`)) {
       return;
     }
+    setRowError(null);
     setDeletingId(act.id);
     const before = rows;
     setRows((prev) => prev.filter((r) => r.id !== act.id));
@@ -530,7 +540,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     } catch (e) {
       setRows(before);
       console.error("Delete activity:", e);
-      alert(`Failed to delete: ${e instanceof Error ? e.message : String(e)}`);
+      setRowError({ id: act.id, kind: "delete", text: "Couldn't delete. Try again." });
     } finally {
       setDeletingId(null);
     }
@@ -554,6 +564,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     if (next.split_labels !== undefined) prevValues.split_labels = act.split_labels;
     if (next.muscle_groups !== undefined) prevValues.muscle_groups = act.muscle_groups;
     if (next.is_sauna !== undefined) prevValues.is_sauna = act.is_sauna;
+    setRowError(null);
     setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...next } : r)));
     try {
       const res = await fetch("/api/activities/categorize", {
@@ -566,7 +577,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     } catch (e) {
       setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...prevValues } : r)));
       console.error("Categorize activity:", e);
-      alert(`Failed to save tags: ${e instanceof Error ? e.message : String(e)}`);
+      setRowError({ id: act.id, kind: "tags", text: "Couldn't save the tags. Try again." });
       return false;
     }
   }
@@ -721,6 +732,10 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   }));
   const shownRange = rangeView.shown; // labels describe the rows on screen
   const rangeNote = shownRange === "1d" ? "today" : `${rangeLabel(shownRange)} avg`;
+  // A failed load leaves rows empty, which must not read as "no activities". Show the banner's failure copy
+  // and Retry in the list instead. Rows from an earlier successful range still show, as before.
+  const listFailure = rows.length === 0 ? rangeStatus(rangeView, rangeLabel) : null;
+  const listFailed = listFailure?.tone === "error";
 
   if (loading) {
     return (
@@ -868,7 +883,14 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
 
       <PartGroup id="section-sessions" title="Sessions">
       <Part id="activity-list" title="Activity list">
-      {rows.length === 0 ? (
+      {listFailed ? (
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <p role="alert" className="text-down font-medium">{listFailure?.text}</p>
+          <button type="button" onClick={retryRange} className="min-h-11 px-2 mt-2 font-medium text-accent hover:underline">
+            Retry
+          </button>
+        </div>
+      ) : rows.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <svg className="w-10 h-10 text-text-tertiary mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
@@ -938,13 +960,16 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
                       onClick={(e) => { e.stopPropagation(); deleteActivity(act); }}
                       disabled={deletingId === act.id}
                       className="ml-auto text-text-tertiary/60 hover:text-red-400 disabled:opacity-40 transition-colors text-[12px] px-1"
-                      title="Delete activity from Onyx (soft delete; ETL re-syncs won't bring it back)"
+                      title="Hide this activity from Onyx. A later sync from the source will not add it back."
                       aria-label="Delete activity"
                     >
                       ✕
                     </button>
                   </div>
                   <p className="text-text-primary font-medium mt-1 truncate">{act.name}</p>
+                  {rowError?.id === act.id && rowError.kind === "delete" && (
+                    <p role="alert" className="text-[11px] text-red-400 mt-1">{rowError.text}</p>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
@@ -1104,6 +1129,10 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
                     </button>
                   </div>
                 </div>
+              )}
+
+              {rowError?.id === act.id && rowError.kind === "tags" && (
+                <p role="alert" className="px-4 pb-3 text-[11px] text-red-400">{rowError.text}</p>
               )}
 
               {canExpand && isExpanded && (

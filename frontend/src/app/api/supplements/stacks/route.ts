@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { parseStackSave, saveStack } from "@/lib/supplement-stack-save";
+import { type MissingColumnMemo, STACK_READ_STEPS, nextMemo, startStep } from "@/lib/supplement-stack-read-plan";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
   { db: { schema: "pds" } },
 );
+
+/** Optional columns the last successful GET read found missing (see lib/supplement-stack-read-plan.ts). */
+let missingMemo: MissingColumnMemo = null;
 
 /**
  * GET /api/supplements/stacks?include_archived=1
@@ -21,13 +25,18 @@ export async function GET(req: NextRequest) {
   // FKs supplement_stack_item.stack_id and .product_id) instead of three round trips in a row.
   // `version` (sql/supplement_stack_atomic_save.sql) is what the editor sends back with each save; a database
   // without that column yet (42703, code only) is read without it, and the editor then saves without a version.
-  const read = (withVersion: boolean) => {
+  // `ingredient_count` (sql/supplement_product_ingredient_count.sql, 2026-11-17) is the number the picker shows; it
+  // is read instead of the whole `ingredients` array, which was sent across the wire only to be counted. Without
+  // that column (42703) the array is read and counted here, as before.
+  const read = (withVersion: boolean, withCount: boolean) => {
     let sq = supabase
       .from("supplement_stack")
       .select(
         "stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at," +
           (withVersion ? "version," : "") +
-          "supplement_stack_item(item_id,product_id,doses,sort_order,supplement_products(brand_name,full_name,serving_size,serving_unit,ingredients,is_active))",
+          "supplement_stack_item(item_id,product_id,doses,sort_order,supplement_products(brand_name,full_name,serving_size,serving_unit," +
+          (withCount ? "ingredient_count" : "ingredients") +
+          ",is_active))",
       );
     if (!includeArchived) sq = sq.eq("is_active", true);
     return sq
@@ -35,11 +44,25 @@ export async function GET(req: NextRequest) {
       .order("created_at", { ascending: false })
       .order("sort_order", { referencedTable: "supplement_stack_item", ascending: true });
   };
-  let { data: stacks, error: stacksErr } = await read(true);
-  if (stacksErr && stacksErr.code === "42703") ({ data: stacks, error: stacksErr } = await read(false));
-  if (stacksErr) return NextResponse.json({ error: stacksErr.message }, { status: 500 });
+  // Start at the step the memo predicts (a column found missing within the last 10 minutes is not selected again).
+  const now = Date.now();
+  const start = startStep(missingMemo, now);
+  let idx = start;
+  const readStep = (i: number) => read(STACK_READ_STEPS[i][0], STACK_READ_STEPS[i][1]);
+  let res = await readStep(idx);
+  // Each 42703 step drops one optional column (version, then ingredient_count) until the read goes through.
+  while (res.error?.code === "42703" && idx < STACK_READ_STEPS.length - 1) {
+    idx += 1;
+    res = await readStep(idx);
+  }
+  if (!res.error) missingMemo = nextMemo(missingMemo, start, idx, now);
+  const { data: stacks, error: stacksErr } = res;
+  if (stacksErr) {
+    console.error("supplements/stacks read", stacksErr.message);
+    return NextResponse.json({ error: "Couldn't load your supplements. Try again." }, { status: 500 });
+  }
 
-  type Product = { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredients: unknown; is_active: boolean };
+  type Product = { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredients?: unknown; ingredient_count?: number | null; is_active: boolean };
   type Item = { item_id: number; product_id: string; doses: number; sort_order: number; supplement_products: Product | Product[] | null };
   type Stack = { stack_id: number; supplement_stack_item: Item[] | null } & Record<string, unknown>;
 
@@ -55,7 +78,8 @@ export async function GET(req: NextRequest) {
         full_name: p?.full_name ?? null,
         serving_size: p?.serving_size ?? null,
         serving_unit: p?.serving_unit ?? null,
-        ingredient_count: Array.isArray(p?.ingredients) ? (p?.ingredients as unknown[]).length : 0,
+        ingredient_count:
+          p?.ingredient_count ?? (Array.isArray(p?.ingredients) ? (p?.ingredients as unknown[]).length : 0),
         product_active: p?.is_active ?? true,
       };
     });
@@ -111,13 +135,16 @@ export async function POST(req: NextRequest) {
  * omitted leaves it alone). `items`, when present, is the COMPLETE list and replaces the old one in the same
  * transaction ([] clears the stack on purpose; anything that is not a valid array is refused with 400 and nothing
  * changes). The save is refused with 409 { code: "stale" } when the stack changed since expected_version, unless the
- * change was this editor's own unanswered save (after_save_ids). A body without expected_version (a tab running the
- * previous build) is refused with 409 { code: "reload" } and changes nothing; an exact resend of a save that already
- * went through (same save_id) is still answered as a replay.
+ * change was this editor's own unanswered save (after_save_ids). An update with save_id but no expected_version is
+ * refused with 409 { code: "reload" } before anything is written, even an exact resend. An update with neither (a tab
+ * running the previous build) is refused with 409 { code: "reload" } by the database and changes nothing.
  */
 export async function PATCH(req: NextRequest) {
   const parsed = parseStackSave(await readBody(req), "update");
-  if (!parsed.ok) return NextResponse.json({ error: parsed.error, code: "invalid" }, { status: 400 });
+  if (!parsed.ok) {
+    const reload = parsed.code === "reload";
+    return NextResponse.json({ error: parsed.error, code: reload ? "reload" : "invalid" }, { status: reload ? 409 : 400 });
+  }
   const r = await saveStack(supabase, parsed.value);
   return NextResponse.json(r.body, { status: r.status });
 }
@@ -136,6 +163,9 @@ export async function DELETE(req: NextRequest) {
     .from("supplement_stack")
     .update({ is_active: false, updated_at: new Date().toISOString() })
     .eq("stack_id", stack_id);
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("supplements/stacks delete", error.message);
+    return NextResponse.json({ error: "Couldn't save that change. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ ok: true, stack_id });
 }

@@ -1103,7 +1103,7 @@ export interface BankRunSummary {
   failed: number;
   /** Claimed steps that finished done. */
   done: number;
-  /** Claimed steps that ended retry or failed (refusals included). */
+  /** Claimed steps that ended retry or failed (refusals and web-search-off failures excluded: partial codes, see recordOutcome). */
   unfinished: number;
   codes: string[];
 }
@@ -1118,6 +1118,9 @@ export const PARTIAL_CODES = new Set(["budget", "monthly_cap", "uncertain", "sch
  */
 export function bankHeartbeatStatus(s: BankRunSummary): "success" | "partial" | "failed" {
   const n = (x: unknown) => Math.max(0, Math.trunc(Number(x) || 0));
+  // An unconfirmed finish (no answer, and the job's row no longer carries the claim): the queue may hold the job done,
+  // so the run is partial, never failed, unless a step actually failed.
+  if (n(s.failed) === 0 && s.codes.some((c) => bankCode(c) === "finish_unconfirmed")) return "partial";
   if (n(s.failed) > 0 || n(s.unfinished) > 0) return n(s.done) > 0 ? "partial" : "failed";
   if (s.codes.some((c) => PARTIAL_CODES.has(bankCode(c)))) return "partial";
   if (s.chapters.some((c) => c.result === "thin" || c.result === "no_sources")) return "partial";

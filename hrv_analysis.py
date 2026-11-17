@@ -383,7 +383,7 @@ FEATURE_LABELS: dict[str, str] = {
     "max_stress_level": "Peak Stress Level",
     "high_stress_duration_min": "High Stress Duration (min)",
     "pct_high_stress": "High Stress % of Day",
-    "stress_ratio": "High/Low Stress Ratio",
+    "stress_ratio": "High-to-Low Stress Ratio",
     "body_battery_highest": "Peak Body Battery",
     "body_battery_lowest": "Lowest Body Battery",
     "body_battery_charged": "Body Battery Charged",
@@ -400,7 +400,7 @@ FEATURE_LABELS: dict[str, str] = {
     "hrv_factor": "HRV Readiness Factor",
     "acute_training_load": "Acute Training Load",
     "chronic_training_load": "Chronic Training Load",
-    "atl_ctl_ratio": "Training Load Ratio (ATL/CTL)",
+    "atl_ctl_ratio": "Training Load Ratio (ATL:CTL)",
     "rolling_7d_training_load": "7-Day Rolling Training Load",
     "last_workout_end_to_sleep_min": "Minutes from Last Workout to Bedtime",
     "last_workout_whoop_strain": "Last Workout's WHOOP Strain (0-21)",
@@ -1663,9 +1663,11 @@ def pivot_supplements(supplements: pd.DataFrame) -> tuple[pd.DataFrame, str | No
                 "total_amount"] = np.nan
     grouped["_col"] = [col_name(g, c) for g, c in
                        zip(grouped["ingredient_group"], grouped["_unit_class"])]
+    # sum(min_count=1): a cell whose inputs are all NaN (an unknown day) stays
+    # NaN; a plain sum would turn it into 0.0. A real recorded 0 still sums to 0.
     wide = grouped.pivot_table(
         index="calendar_date", columns="_col",
-        values="total_amount", aggfunc="sum",
+        values="total_amount", aggfunc=lambda s: s.sum(min_count=1),
     ).reset_index()
     wide.columns = ["calendar_date"] + list(wide.columns[1:])
     return dedup_cleaned_names(wide), tracking_start, unknown_days

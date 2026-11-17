@@ -434,6 +434,10 @@ function RefreshedLabel({ refreshedAtRef }: { refreshedAtRef: RefObject<Date | n
 }
 
 const STATUS_URL = "/api/status";
+// Today's prewarm sweep (components/AppData.tsx) fetches this answer into memory. On the first load of an in-app visit,
+// a copy at most this old is shown as it is and no second request is sent (the overview's freshness for this card is
+// 2 min too). The page's 60 s poll still fetches for itself, and "refreshed" shows the copy's own time.
+const STATUS_PREWARM_MAX_AGE_MS = 2 * 60_000;
 // The page's one read starts with the HTML instead of after the JavaScript and hydration (lib/early-fetch.ts; speed
 // budget, 2026-11-15: the cold first visit took 1022 ms in perf-timing run 43676849680). Same request as load()'s
 // own fetch (the browser's default cache mode: /api/status is edge-cached for 30 s; it answers `private, no-store`, so
@@ -459,18 +463,39 @@ function StatusView({ early }: { early: boolean }) {
   // carries heartbeat error text, so it is a memory-only key (lib/client-cache.ts isSensitiveKey).
   const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
   const [loading, setLoading] = useState(() => data === null);
+  // True after a failed read (network error or a non-OK response). With no data, the page shows the load-error panel
+  // instead of the healthy-looking summary (which would read "Active Errors: 0" for data that never arrived).
+  const [loadFailed, setLoadFailed] = useState(false);
+  // True after a failed poll or refresh. With data already on screen, the page keeps that data and shows a notice with
+  // the time of the last successful refresh (refreshedAtRef) so a stale snapshot is visibly stale.
+  const [refreshFailed, setRefreshFailed] = useState(false);
+  // Time of the last successful refresh (lastOkAt).
   const refreshedAtRef = useRef<Date | null>(null);
   // The first load of a full page visit takes the GET the HTML started (once); later polls fetch for themselves.
   const firstLoad = useRef(early);
 
   const load = useCallback(async () => {
+    if (firstLoad.current) {
+      const at = clientCache.fetchedAt(STATUS_URL);
+      if (at !== undefined && Date.now() - at < STATUS_PREWARM_MAX_AGE_MS && clientCache.peek(STATUS_URL) !== undefined) {
+        firstLoad.current = false;
+        refreshedAtRef.current = new Date(at);
+        setLoading(false);
+        return;
+      }
+    }
     try {
       const get = () => fetch(STATUS_URL);
       const takeEarly = firstLoad.current;
       firstLoad.current = false;
       const res = await (takeEarly ? earlyOr(STATUS_URL, get) : get());
-      if (res.ok) {
+      if (!res.ok) {
+        setLoadFailed(true);
+        setRefreshFailed(true);
+      } else {
         const fresh: StatusResponse = await res.json();
+        setLoadFailed(false);
+        setRefreshFailed(false);
         clientCache.put(STATUS_URL, fresh);
         // Bail out of the commit when the poll returned the same payload
         // (perf round 3): fetchedAt is volatile — the server stamps it on
@@ -486,6 +511,8 @@ function StatusView({ early }: { early: boolean }) {
       }
     } catch (e) {
       console.error("Failed to fetch status:", e);
+      setLoadFailed(true);
+      setRefreshFailed(true);
     } finally {
       setLoading(false);
     }
@@ -533,6 +560,23 @@ function StatusView({ early }: { early: boolean }) {
               </div>
             </div>
           ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (loadFailed && data === null) {
+    return (
+      <div className="space-y-6">
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">System Status</h2>
+        <div role="alert" className="border border-red-500/30 bg-red-500/10 rounded-control p-4 flex items-center justify-between gap-4">
+          <p className="text-[13px] font-medium text-red-300">Could not load status. Try again.</p>
+          <button
+            onClick={load}
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-control hover:bg-white/10 transition-colors"
+          >
+            Retry
+          </button>
         </div>
       </div>
     );
@@ -608,6 +652,15 @@ function StatusView({ early }: { early: boolean }) {
           Refresh
         </button>
       </div>
+
+      {refreshFailed && data !== null && (
+        <div role="status" className="border border-amber-500/30 bg-amber-500/10 rounded-control p-3 mb-6">
+          <p className="text-[13px] text-amber-300">
+            Couldn&apos;t refresh just now.
+            {refreshedAtRef.current && <> Showing the status from {formatSyncTime(refreshedAtRef.current.toISOString())}.</>}
+          </p>
+        </div>
+      )}
 
       {/* Personalize: every banner, KPI tile, source card and the history table is its own part; parts move
           within their section and into any other section of the page. */}

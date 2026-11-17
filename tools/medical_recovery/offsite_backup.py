@@ -1,6 +1,6 @@
 """Encrypted off-site backup of /health/records, and its restore drill (SEC-06, option A).
 
-docs/medical-records-recovery.md sections 4 and 9. Runs on Riley's PC (weekly Task Scheduler job,
+docs/medical-records-recovery.md sections 4 and 9. Runs on the collector PC (weekly Task Scheduler job,
 register-task.ps1); standard-library Python plus the `age` command-line tool (X25519 public-key encryption).
 
   backup   Reads, read-only with the service role (~/.onyx_supabase_secret), every column of
@@ -787,11 +787,14 @@ def write_pack(stream: BinaryIO, snap: Snapshot, target: rc.Target, now: datetim
         inv = rc.Inventory(documents=snap.tables.get("medical_documents", []), labs=snap.tables.get("lab_results", []),
                            objects={p: v for p, v in snap.objects.items() if p in opened}, opened=opened)
         recovery = rc.build_manifest(inv, now)
-        if rc.manifest_problem(recovery) is None:
+        refusal = rc.manifest_problem(recovery)
+        if refusal is None:
             _add(tar, "recovery-manifest.json", _dump(recovery), mtime)
             manifest["recovery_manifest"] = True
         elif inv.documents or inv.labs or opened:
             snap.problem("recovery_manifest_refused")
+            # Only the rule name (text before the first colon), never the rest: the message may carry values.
+            manifest["recovery_manifest_refusal"] = str(refusal).split(":", 1)[0][:200]
         manifest["problems"] = list(snap.problems)
         _add(tar, "manifest.json", _dump(manifest), mtime)  # last: a pack is a restore point once this is in
     return manifest

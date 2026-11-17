@@ -1508,7 +1508,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       .gte("behavioral_date", photoSinceStr)
       .order("behavioral_date", { ascending: false });
     if (MISSING_SCHEMA.has(meals.error?.code ?? "") || MISSING_SCHEMA.has(daily.error?.code ?? "")) {
-      return JSON.stringify({ meals: [], daily_totals: [], note: "Photo meals are not set up yet, so none exist." });
+      return JSON.stringify({ meals: [], daily_totals: [], note: "Photo meals aren't available yet, so none exist." });
     }
     if (meals.error) return JSON.stringify({ error: meals.error.message });
     if (daily.error) return JSON.stringify({ error: daily.error.message });
@@ -2158,7 +2158,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         verdict: stored.grading_status === "graded" ? stored.verdict : null,
         grading_status: stored.grading_status,
         replayed: true,
-        // The same grading detail the first grading returned (recordOrderAnswer): an order answer was graded by Onyx.
+        // The same grading detail the first grading returned when it graded the order answer: an order answer was graded by Onyx.
         ...(stored.format === "order" ? { graded_by: "onyx" } : {}),
       });
     }

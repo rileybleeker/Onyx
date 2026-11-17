@@ -47,12 +47,37 @@ function localDay(d: Date): string {
 // response must never replace a confirmed answer).
 const windDownWarmer = (): DataWarmer => ({ key: "/api/sleep/winddown", fetch: () => import("@/lib/use-winddown").then((m) => m.warmWindDownRead()) });
 
-const inboxWarmer: DataWarmer = { key: CACHE_KEYS.agentsInbox, fetch: () => agentsApi.inbox() };
+// Pages whose screens show no agent cards or threads: the sweep leaves the inbox and thread reads to the other pages.
+// Grep (2026-11-17): no file in frontend/src reads agentsInbox / agentsThread, agentsApi.inbox or agentsApi.messages
+// under app/log, app/sleep, app/nutrition or app/analytics; the readers are AgentsInbox, AgentsChat, TodayClient,
+// overview/sources, AppData and the nav badge in MobileNav (memory-only peek).
+const skipOnAgentsSweep = (page: string) => ["/log", "/sleep", "/nutrition", "/analytics"].some((p) => page === p || page.startsWith(p + "/"));
+
+// The inbox feeds Today's cards, the Agents screen and the nav badge (MobileNav reads the in-memory copy, never fetches).
+// No Financials page uses it, and its request is slow on some runs (perf-timing 2026-11-17: 1082 ms in the forecast
+// view). Log, Sleep, Nutrition and Analytics do not use it either: perf-timing run 44126056400 (2026-11-17) had it at
+// 1343 ms (/log cold), 1408 ms (/sleep cold) and 1137 ms (/nutrition cold). So the sweep leaves it to the other pages
+// and to its next run. Today and Agents keep warming it.
+const inboxWarmer: DataWarmer = {
+  key: CACHE_KEYS.agentsInbox,
+  fetch: () => agentsApi.inbox(),
+  skipOn: (page) => page === "/financials" || page.startsWith("/financials/") || skipOnAgentsSweep(page),
+};
+
+// The Reading reads the sweep runs from /reading's warmer. /sleep shows none of them, and they compete with its own
+// reads (perf-timing run 44114214710, 2026-11-17: bank 1117 ms and 1137 ms, list 1055 ms and 1160 ms on /sleep), so
+// the sweep leaves them out while /sleep is on screen. Their next run on another page still warms them.
+const skipOnSleep = (page: string) => page === "/sleep" || page.startsWith("/sleep/");
 
 /** /reading's Practice part reads (READ-QUIZ-01) for the active book, once the cached overview names it. */
 function readingPracticeWarmers(): DataWarmer[] {
   const slug = readingSlugOf(clientCache.peek("/api/reading"));
-  return slug ? [json(practiceUrl(slug)), json(bankUrl(slug))] : [];
+  return slug
+    ? [
+        { ...json(practiceUrl(slug)), skipOn: skipOnSleep },
+        { ...json(bankUrl(slug)), skipOn: skipOnSleep },
+      ]
+    : [];
 }
 
 function logUberEatsWarmers(): DataWarmer[] {
@@ -78,10 +103,11 @@ const DATA: Record<string, () => DataWarmer[]> = {
     return [
       inboxWarmer,
       json("/api/reading"),
-      json("/api/urgent-email"),
-      json(`/api/calendar/events?from=${localDay(today)}&to=${localDay(tomorrow)}`),
-      json("/api/orders/summary"),
-      json("/api/procurement/renewals/summary"),
+      // Not read on any Financials page: skipped during the sweep there (its forecast reads are already slow).
+      { ...json("/api/urgent-email"), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
+      { ...json(`/api/calendar/events?from=${localDay(today)}&to=${localDay(tomorrow)}`), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
+      { ...json("/api/orders/summary"), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
+      { ...json("/api/procurement/renewals/summary"), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
       json("/api/finance/alerts"),
       // The wind-down panel (components/sleep/WindDownPanel, opt-in): GET only, same key as its store.
       windDownWarmer(),
@@ -94,13 +120,17 @@ const DATA: Record<string, () => DataWarmer[]> = {
   "/log": () => [
     json("/api/habits/checkin"),
     json(journalTodayUrl(new Date())),
-    json("/api/weight?days=365"),
+    // Weight is shown only on /log (and the Weight section's undo reads this window): warmed on intent, not by the
+    // sweep, so the sweep's visits to other pages (e.g. /supplements) do not fetch it.
+    { ...json("/api/weight?days=365"), intentOnly: true },
     json("/api/reading"),
     json("/api/supplements/today"),
     json("/api/supplements/stacks"),
     json("/api/supplements/products"),
     // The Supplements section's product options history (most used first; lib/log-early.ts LOG_SUPPLEMENTS_HISTORY_URL).
-    json(LOG_SUPPLEMENTS_HISTORY_URL),
+    // Left out while /check-in is on screen: that page does not read it, and its sweep competed with the page's reads
+    // (perf-timing run 44148312755, 2026-11-17: "/check-in (in-app): /api/supplements/history took 1735 ms").
+    { ...json(LOG_SUPPLEMENTS_HISTORY_URL), skipOn: (page) => page === "/check-in" || page.startsWith("/check-in/") },
     // Wind-down (app/log/sections/WindDown.tsx): GET only, same key as the store (lib/use-winddown.ts).
     windDownWarmer(),
     // Drinks (app/log/sections/Drinks.tsx): behavioral today's drinks and what is already logged that day. GET only.
@@ -115,7 +145,9 @@ const DATA: Record<string, () => DataWarmer[]> = {
       : [];
     return [
       inboxWarmer,
-      ...threads.map((thread) => ({ key: CACHE_KEYS.agentsThread(thread), fetch: () => agentsApi.messages({ thread, limit: 60 }) })),
+      // The thread reads are left out of the sweep on the same pages as the inbox (perf-timing run 44126056400: the
+      // first thread read on /analytics/hrv took 2721 ms cold).
+      ...threads.map((thread) => ({ key: CACHE_KEYS.agentsThread(thread), fetch: () => agentsApi.messages({ thread, limit: 60 }), skipOn: skipOnAgentsSweep })),
     ];
   },
   "/habits": () => [
@@ -128,7 +160,7 @@ const DATA: Record<string, () => DataWarmer[]> = {
   // (READ-QUIZ-01: today's round and the bank's state, both GET only and side-effect free) for the active book, under
   // the same URLs the part reads (app/reading/PracticePart.tsx); the book comes from the cached /api/reading answer.
   // The pacing choices (PROD-T06) are one more GET under the same key the Your pace card reads.
-  "/reading": () => [json("/api/reading"), json("/api/reading/list"), json("/api/ui/preferences?key=reading.pacing")].concat(readingPracticeWarmers()),
+  "/reading": () => [json("/api/reading"), { ...json("/api/reading/list"), skipOn: skipOnSleep }, json("/api/ui/preferences?key=reading.pacing")].concat(readingPracticeWarmers()),
   "/status": () => [json("/api/status")],
 };
 

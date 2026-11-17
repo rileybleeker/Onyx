@@ -12,6 +12,10 @@ import { subscriptionViews, type SubscriptionView } from "@/lib/finance-subscrip
  * owner-only middleware). Explicit columns; logs carry error codes only, never rows.
  */
 const COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
+// Pages of the 400-day ledger read requested in the same round trip as the first page (fetchPaged `speculate`),
+// instead of one after another: the page count is only known from the first page's exact count. Same value as the
+// ledger's window read; a longer history just takes the remaining pages in the normal parallel step.
+const TXN_SPECULATE_PAGES = 3;
 
 export type BudgetsLoad =
   | { kind: "ok"; result: BudgetsResult; categories: string[]; rules: { merchantKey: string; category: string }[]; setupPending: boolean; subscriptions: SubscriptionView[] }
@@ -24,7 +28,7 @@ export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: Bu
   // 400 days: budgets use about 7 months, subscription detection needs the year (annual renewals).
   const since = new Date(Date.parse(`${today}T00:00:00Z`) - 400 * 86_400_000).toISOString().slice(0, 10);
   const [rows, fixes, budgetsRes] = await Promise.all([
-    fetchPaged((f, t, c) => db.from("finance_transactions").select(COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40),
+    fetchPaged((f, t, c) => db.from("finance_transactions").select(COLS, c ? { count: "exact" } : undefined).gte("txn_date", since).order("txn_date", { ascending: true }).order("txn_key", { ascending: true }).range(f, t), 40, TXN_SPECULATE_PAGES),
     loadCategoryFixes(db),
     db.from("finance_budgets").select("category,monthly_cents"),
   ]);
@@ -53,7 +57,29 @@ export async function loadBudgetData(now: Date = new Date()): Promise<{ txns: Bu
   return { txns, budgets, today, rules: [...fixes.rules.entries()].map(([merchantKey, category]) => ({ merchantKey, category })), setupPending: !!budgetsRes.error };
 }
 
+/**
+ * Longest the budgets load may take before it answers with its error state. The Supabase reads have no timeout of
+ * their own, so a read that never returns would leave the page on its loading state forever (the page and the
+ * page-data route both wait for this). Below the function's own time limit, so the error is ours, not the platform's.
+ */
+const LOAD_LIMIT_MS = 8_000;
+
 export async function loadBudgets(now: Date = new Date()): Promise<BudgetsLoad> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<BudgetsLoad>((resolve) => {
+    timer = setTimeout(() => {
+      console.error("budgets load failed: timeout");
+      resolve({ kind: "error", code: "timeout" });
+    }, LOAD_LIMIT_MS);
+  });
+  try {
+    return await Promise.race([readBudgets(now), limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readBudgets(now: Date): Promise<BudgetsLoad> {
   try {
     // The cancel marks are read at the same time as the ledger (one round trip, not two in a row).
     const marksRead = Promise.resolve(serviceClient().from("finance_cancel_marks").select("sub_id,marked_on"));

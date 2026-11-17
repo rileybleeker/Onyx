@@ -27,6 +27,7 @@ import {
   type SheetIdea,
   type SheetState,
 } from "@/lib/reading-map";
+import { sharedAttemptOutbox } from "@/lib/reading-practice-client";
 import { AlertLine } from "./PracticeCards";
 
 const PracticeRunner = dynamic(() => import("./PracticeRunner"), { ssr: false, loading: () => <div className="h-[320px]" aria-hidden="true" /> });
@@ -411,6 +412,7 @@ export default function ChapterSheet({ slug, chapter, title, perChapterCents, on
             round={practice}
             mode="chapter"
             closeRef={runnerClose}
+            outbox={sharedAttemptOutbox}
             onClose={(didChange, _finished, settled) => {
               setPractice(null);
               if (didChange) changed.current = true;

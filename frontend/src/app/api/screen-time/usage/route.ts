@@ -340,7 +340,8 @@ export async function GET() {
       .limit(24),
   ]);
   if (daily.error || hours.error) {
-    return NextResponse.json({ error: (daily.error ?? hours.error)!.message }, { status: 500 });
+    console.error("screen-time/usage read", (daily.error ?? hours.error)!.message);
+    return NextResponse.json({ error: "Couldn't load your screen time. Try again." }, { status: 500 });
   }
   return NextResponse.json({ daily: daily.data, hours: hours.data });
 }

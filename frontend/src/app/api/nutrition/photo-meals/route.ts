@@ -54,7 +54,7 @@ async function photoOnly<R extends { error: { code?: string } | null }>(run: (pi
 
 function dbError(code: string | undefined, what: string) {
   const known = photoMealErrorMessage(code);
-  if (known) return NextResponse.json({ error: known.error }, { status: known.status });
+  if (known) return NextResponse.json({ error: known.error, ...(known.code ? { code: known.code } : {}) }, { status: known.status });
   console.error(`photo meal ${what} failed:`, code);
   return NextResponse.json({ error: "could not save" }, { status: 500 });
 }

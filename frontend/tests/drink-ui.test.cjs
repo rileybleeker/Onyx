@@ -99,6 +99,17 @@ test("Drinks: missing schema is a concrete error and blocks saving; Saved only a
   assert.match(src, /const settled = !!ack && item\.hold == null && \(saver\.state\.status === "idle" \|\| saver\.state\.status === "saved"\);/);
 });
 
+test("Drinks: a failed save shows fixed copy keyed on status; server error text is never rendered", () => {
+  const src = read("app/log/sections/Drinks.tsx");
+  assert.doesNotMatch(src, /setErr\(typeof r\.json\.error/);
+  assert.match(src, /setErr\(saveFailureText\(r\.status, r\.json\)\);/);
+  assert.match(src, /"Sign in again to keep saving drinks\."/);
+  assert.match(src, /"This drink changed somewhere else\. Refresh to see the latest\."/);
+  assert.match(src, /"Could not save this drink\. Try again in a moment\."/);
+  assert.match(src, /"Could not save this drink\. Try again\."/);
+  assert.match(src, /setErr\("Couldn't reach Onyx\."\);/);
+});
+
 test("both pages refresh after a drink write; known zero-kcal drinks stay listed", () => {
   assert.match(read("app/nutrition/NutritionClient.tsx"), /useEffect\(\(\) => onDrinkChange\(\(\) => \{\s*setDrinkReload\(\(n\) => n \+ 1\);\s*refreshNutritionSilently\(\);/);
   assert.match(read("app/caffeine/CaffeineClient.tsx"), /useEffect\(\(\) => onDrinkChange\(\(\) => setReload\(\(n\) => n \+ 1\)\), \[\]\);/);

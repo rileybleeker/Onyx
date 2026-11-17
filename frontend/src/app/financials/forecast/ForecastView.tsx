@@ -68,14 +68,14 @@ function useCheckClock(results: readonly ({ eligibility?: unknown } | null | und
   return now;
 }
 
+// Returns null on success, else the fixed copy to show. The server's error text is never shown.
 async function send(url: string, method: string, body?: unknown): Promise<string | null> {
   try {
     const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
     if (res.ok) return null;
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
-    return j.error ?? `failed (${res.status})`;
+    return "Not saved. Try again.";
   } catch {
-    return "network error";
+    return "Not saved. Check your connection and try again.";
   }
 }
 
@@ -176,7 +176,7 @@ export default function ForecastView({
   return (
     <div className="space-y-6">
       {setupPending && <p className="text-[13px] text-mid">Planned items could not be read; showing the forecast from your history only.</p>}
-      {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
+      {error && <p role="alert" className="text-[13px] text-down">{error}</p>}
 
       {/* Personalize: every tile, chart and card is its own part; parts move within and between the sections below. */}
       <PartGrid page="/financials/forecast" title="Cash forecast" initial={layout}>
@@ -549,12 +549,12 @@ function PlannedItems({ items, statuses, busy, run, accountOptions }: { items: P
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <input className={input} placeholder="What (e.g. Movers)" value={label} onChange={(e) => setLabel(e.target.value)} maxLength={120} />
         <input className={input} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-        <select className={input} value={dir} onChange={(e) => setDir(e.target.value as "in" | "out")}>
+        <select className={input} value={dir} onChange={(e) => setDir(e.target.value as "in" | "out")} aria-label="Direction">
           <option value="out">money out</option>
           <option value="in">money in</option>
         </select>
         <input className={`${input} w-28`} placeholder="$ amount" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} />
-        <select className={input} value={certainty} onChange={(e) => setCertainty(e.target.value)}>
+        <select className={input} value={certainty} onChange={(e) => setCertainty(e.target.value)} aria-label="Certainty">
           <option value="confirmed">confirmed</option>
           <option value="likely">likely</option>
           <option value="possible">possible</option>

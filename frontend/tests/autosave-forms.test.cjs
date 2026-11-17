@@ -185,7 +185,11 @@ function stackServer(seed = []) {
         return response({ error: `Synthetic server: no ${call.method} ${call.url}` }, 404);
       }
       const parsed = STACK_SAVE.parseStackSave(call.body, call.method === "POST" ? "create" : "update");
-      if (!parsed.ok) return response({ error: parsed.error, code: "invalid" }, 400);
+      if (!parsed.ok) {
+        // Same mapping as the route (app/api/supplements/stacks/route.ts): a "reload" refusal is a 409, anything else a 400.
+        const reload = parsed.code === "reload";
+        return response({ error: parsed.error, code: reload ? "reload" : "invalid" }, reload ? 409 : 400);
+      }
       const quiet = console.error;
       console.error = () => {}; // saveStack logs a refusal's code; the tests read the answer instead
       try {
@@ -753,7 +757,8 @@ test("overall budget: a refused budget is shown and not retried on its own", asy
   change(h.field(), "3200");
   await h.flush();
   await h.tick(1200);
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Not saved\. Try again\./, "the fixed sentence is shown, not the server's text");
+  assert.doesNotMatch(h.text(), /Synthetic refusal/);
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1);
 });
@@ -1174,8 +1179,11 @@ test("Say it suggestions save on their own in Supplements and Uber Eats (each tr
   assert.equal(exclusions.length, 1, "a suggestion already logged is filtered out of the list");
   const supButtons = F.jsxElements(sup).filter((e) => e.tag === "LogSaveButton");
   assert.ok(supButtons.some((b) => F.buttonLabels(b).includes("Retry")), "a failed suggestion offers Retry");
-  // "Log a product" keeps its Log tap on purpose: logging a dose is the action itself.
-  assert.ok(supButtons.some((b) => F.buttonLabels(b).includes("Log") && b.attrs.onClick?.expr && F.hasCall(b.attrs.onClick.expr, "onLogProduct")));
+  // "Log a product" keeps its tap on purpose, now as "Log selected (N)" (a plain button, several products at once):
+  // logging the chosen doses is the action itself, and a half-chosen selection must never reach the supplement log.
+  const logSelected = F.jsxElements(sup).filter((e) => e.tag === "button" && F.buttonLabels(e).some((l) => l.startsWith("Log selected")));
+  assert.equal(logSelected.length, 1, "one Log selected button");
+  assert.ok(logSelected[0].attrs.onClick?.expr && F.hasCall(logSelected[0].attrs.onClick.expr, "onLogSelected"));
   const ue = F.parseFile("app/log/sections/UberEats.tsx");
   assert.ok(F.inOrder(ue, (s) => F.hasCall(s, "attempted.current.add"), (s) => F.hasCall(s, "saveRef.current")), "each suggestion is marked tried before it is sent");
   assert.ok(F.jsxElements(ue).some((e) => e.tag === "LogSaveButton" && F.buttonLabels(e).includes("Retry")));

@@ -220,7 +220,7 @@ test("readiness: product + amount + Now saves; missing amount, unresolved produc
   assert.equal(C.itemSave(item({ timeMode: "manual", day: null, time: "09:00", whenIssue: C.WHEN_ISSUE.day }), ctx()).reason, C.WHEN_ISSUE.day, "an unusable said day never becomes today");
   assert.equal(C.itemSave(item(), ctx(check0, null)).ok, false);
   assert.equal(C.itemSave(item(), { ...ctx(), dayCheck: () => null }).ok, false);
-  assert.equal(C.itemSave(item(), { ...ctx(), blocked: "Drinks are not set up yet: the database migration is pending." }).ok, false);
+  assert.equal(C.itemSave(item(), { ...ctx(), blocked: "Drinks aren't available yet. Try again later. If this keeps happening, the drinks setup still needs to be finished." }).ok, false);
   assert.equal(C.afterWhenEdit(C.WHEN_ISSUE.both, "time"), C.WHEN_ISSUE.day);
   assert.equal(C.afterWhenEdit(C.WHEN_ISSUE.day, "time"), C.WHEN_ISSUE.day, "setting the time never resolves a bad day");
   assert.equal(C.afterWhenEdit(C.WHEN_ISSUE.day, "day"), null);
@@ -584,7 +584,9 @@ test("route: guards, other-kind keys, missing migration, turned off", async () =
   const M = loadRoute(m);
   const res = await M.POST(req({ ...create, client_key: K2 }));
   assert.equal(res.status, 503);
-  assert.match(res.body.error, /migration is pending/);
+  assert.equal(res.body.code, "unavailable");
+  assert.match(res.body.error, /aren't available yet/);
+  assert.doesNotMatch(res.body.error, /migration/, "no database jargon in the copy (#647/#654)");
   assert.equal((await get(M, "")).status, 503);
   m.fail = { "insert:photo_meals": "OXD00" };
   assert.match((await M.POST(req({ ...create, client_key: K3 }))).body.error, /turned off/);

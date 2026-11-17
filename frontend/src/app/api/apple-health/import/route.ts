@@ -130,7 +130,7 @@ export async function POST(req: NextRequest) {
     const message = e instanceof Error ? e.message : String(e);
     console.error("apple-health import write failed:", message);
     await heartbeat(startedAt, "failed", 0, message);
-    return NextResponse.json({ error: message, logged: true }, { status: 500 });
+    return NextResponse.json({ error: "Couldn't save the Health import. Try again.", logged: true }, { status: 500 });
   }
 }
 

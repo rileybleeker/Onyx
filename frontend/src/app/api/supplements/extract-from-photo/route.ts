@@ -355,12 +355,9 @@ export async function POST(req: NextRequest) {
       parsed = extractJson(textBlock.text) as ExtractedShape;
     } catch (e) {
       observe(false);
+      console.error("[supplements/extract-from-photo parse]", e instanceof Error ? e.message : String(e), textBlock.text.slice(0, 500));
       return NextResponse.json(
-        {
-          error: "Could not parse Claude response as JSON",
-          detail: e instanceof Error ? e.message : String(e),
-          raw: textBlock.text.slice(0, 500),
-        },
+        { error: "Couldn't read that photo. Try again." },
         { status: 502 },
       );
     }
@@ -382,8 +379,9 @@ export async function POST(req: NextRequest) {
     });
   } catch (e) {
     observe(false);
+    console.error("[supplements/extract-from-photo]", e instanceof Error ? e.message : String(e));
     return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
+      { error: "Couldn't read that photo. Try again." },
       { status: 502 },
     );
   }

@@ -205,6 +205,15 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   // ─── Weight state ───
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
   const [weightLoading, setWeightLoading] = useState(true);
+  const [weightError, setWeightError] = useState(false);
+  // Inline failure for deleting a weight entry, shown under the Recent entries list. Cleared by the
+  // next delete or after a few seconds. Replaces the blocking browser popup.
+  const [weightActionError, setWeightActionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!weightActionError) return;
+    const t = setTimeout(() => setWeightActionError(null), 5000);
+    return () => clearTimeout(t);
+  }, [weightActionError]);
   // /nutrition?log=photo (Log > Meal photo): the photo logger first.
   // /nutrition?log=weight (an older shortcut): weight is entered on Log now, so the routed page forwards there.
   const logParam = useSearchParams().get("log");
@@ -392,10 +401,13 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
     setWeightLoading(true);
     try {
       const res = await fetch(`/api/weight?days=${Math.max(rangeDays(range), 90)}`);
+      if (!res.ok) throw new Error(`Weight load failed: HTTP ${res.status}`);
       const json = await res.json();
       setWeightRows((json.rows ?? []) as WeightRow[]);
+      setWeightError(false);
     } catch (e) {
       console.error("Weight load:", e);
+      setWeightError(true);
     } finally {
       setWeightLoading(false);
     }
@@ -405,13 +417,14 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
 
   async function deleteWeight(log_date: string) {
     if (!confirm(`Delete weight entry for ${log_date}?`)) return;
+    setWeightActionError(null);
     try {
       const res = await fetch(`/api/weight?log_date=${log_date}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
       await loadWeight();
     } catch (e) {
       console.error("Delete weight:", e);
-      alert(e instanceof Error ? e.message : String(e));
+      setWeightActionError("Couldn't delete that weight entry. Try again.");
     }
   }
 
@@ -1031,6 +1044,18 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
           >
             {weightLoading ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">Loading…</p>
+            ) : weightError ? (
+              <div className="py-6 text-center">
+                <p className="text-[11px] text-text-tertiary font-mono mb-2">
+                  Couldn&apos;t load your weight history. Try again in a moment.
+                </p>
+                <button
+                  onClick={() => { void loadWeight(); }}
+                  className="text-accent text-sm hover:underline"
+                >
+                  Retry
+                </button>
+              </div>
             ) : weightChartData.length === 0 ? (
               <p className="text-[11px] text-text-tertiary font-mono py-6 text-center">
                 No entries yet. Log your first weight above to start the trend.
@@ -1097,6 +1122,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
                   </div>
                 ))}
               </div>
+              {weightActionError && (
+                <p role="alert" className="text-[11px] text-red-400 mt-2">{weightActionError}</p>
+              )}
             </ChartCard>
           </Part>
         )}

@@ -480,6 +480,6 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error("activity tag suggestions failed:", msg);
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return NextResponse.json({ error: "Couldn't suggest tags right now. Try again." }, { status: 500 });
   }
 }

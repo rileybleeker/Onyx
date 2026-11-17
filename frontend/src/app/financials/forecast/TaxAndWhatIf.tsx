@@ -112,7 +112,7 @@ export function WhatIfPanel({ params, accounts, saved, busy, run }: { params: Sc
         {field("401(k) / pre-tax ($/yr)", "preTax", "0")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Extra card payment
-          <select className={input} value={f.payoffCard} onChange={set("payoffCard")}>
+          <select className={input} value={f.payoffCard} onChange={set("payoffCard")} aria-label="Extra card payment">
             <option value="">(card)</option>
             {cards.map((a) => (
               <option key={a.account_key} value={a.account_key}>
@@ -477,7 +477,7 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
         {field("NC rate (%)", "ncRate", "text", "w-20", "3.99")}
         <label className="flex flex-col gap-1 text-[12px] text-text-secondary">
           Employer withholds state tax for
-          <select className={input} value={f.withholds} onChange={set("withholds")}>
+          <select className={input} value={f.withholds} onChange={set("withholds")} aria-label="Employer withholds state tax for">
             <option value="NC">North Carolina</option>
             <option value="none">no state</option>
           </select>
@@ -493,9 +493,9 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
       <p className="mt-3 text-[12px] text-text-secondary">One-off pay (gross; a January &quot;bonus&quot; here replaces that year&apos;s generated bonus):</p>
       {oneOffs.map((o, i) => (
         <div key={i} className="mt-1 flex flex-wrap items-center gap-2">
-          <input className={`${input} w-40`} value={o.label} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, label: e.target.value } : x)))} />
-          <input className={input} type="date" value={o.date} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, date: e.target.value } : x)))} />
-          <input className={`${input} w-28`} value={o.gross} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, gross: e.target.value } : x)))} />
+          <input aria-label="One-off pay label" className={`${input} w-40`} value={o.label} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, label: e.target.value } : x)))} />
+          <input aria-label="One-off pay date" className={input} type="date" value={o.date} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, date: e.target.value } : x)))} />
+          <input aria-label="One-off pay gross" className={`${input} w-28`} value={o.gross} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, gross: e.target.value } : x)))} />
           <button className="text-[12px] text-text-tertiary hover:text-down" onClick={() => setOneOffs((xs) => xs.filter((_, k) => k !== i))}>
             remove
           </button>
@@ -509,15 +509,15 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
       </div>
       <p className="mt-4 text-[12px] text-text-secondary">Record an estimated payment you made:</p>
       <div className="mt-1 flex flex-wrap items-center gap-2">
-        <select className={input} value={est.jur} onChange={(e) => setEst((x) => ({ ...x, jur: e.target.value as Jur }))}>
+        <select aria-label="Estimated tax jurisdiction" className={input} value={est.jur} onChange={(e) => setEst((x) => ({ ...x, jur: e.target.value as Jur }))}>
           {JURS.map((j) => (
             <option key={j} value={j}>
               {j}
             </option>
           ))}
         </select>
-        <input className={input} type="date" value={est.date} onChange={(e) => setEst((x) => ({ ...x, date: e.target.value }))} />
-        <input className={`${input} w-28`} placeholder="$ amount" value={est.amount} onChange={(e) => setEst((x) => ({ ...x, amount: e.target.value }))} />
+        <input aria-label="Estimated tax date" className={input} type="date" value={est.date} onChange={(e) => setEst((x) => ({ ...x, date: e.target.value }))} />
+        <input aria-label="Estimated tax amount" className={`${input} w-28`} placeholder="$ amount" value={est.amount} onChange={(e) => setEst((x) => ({ ...x, amount: e.target.value }))} />
         <button
           className={button}
           disabled={busy || !profile || !est.date || !(dollars(est.amount) ?? 0)}

@@ -11,9 +11,9 @@ export async function GET(req: NextRequest) {
     const tracks = await searchTracks(q, Number.isFinite(limit) ? limit : 20);
     return NextResponse.json({ tracks });
   } catch (err) {
-    console.error("Spotify search route error:", err);
+    console.error("GET /api/spotify/search failed:", err);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Internal error" },
+      { error: "Couldn't search Spotify. Try again." },
       { status: 500 }
     );
   }

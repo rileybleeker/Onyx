@@ -1,5 +1,5 @@
 // Run: node --test tests/youtube-status.test.cjs
-// YouTube watch history (tools/youtube_history on Riley's PC): the /status card is wired in the three places
+// YouTube watch history (tools/youtube_history on the collector PC): the /status card is wired in the three places
 // AGENTS.md names and reads the heartbeat only (never rows of pds.youtube_watch_events). Static checks.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");

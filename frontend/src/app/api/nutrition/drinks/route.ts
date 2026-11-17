@@ -70,9 +70,9 @@ const MISSING = new Set(["PGRST205", "42P01", "42703", "PGRST204"]);
 const json = (body: unknown, status = 200) => NextResponse.json(body, { status, headers: NO_STORE });
 
 function dbError(code: string | undefined, what: string) {
-  if (code && MISSING.has(code)) return json({ error: "Drinks are not set up yet: the database migration is pending.", code: "unavailable" }, 503);
+  if (code && MISSING.has(code)) return json({ error: "Drinks aren't available yet. Try again later.", code: "unavailable" }, 503);
   if (code === "OXD00") return json({ error: "Drink capture is turned off.", code: "unavailable" }, 503);
-  if (code === "OXP01") return json({ error: "That time has not happened yet." }, 409);
+  if (code === "OXP01") return json({ error: "That time has not happened yet.", code: "future" }, 409);
   if (code === "OXD01" || code === "22023") return json({ error: "That time does not fit its day or time zone." }, 400);
   if (code === "OXD03") return json({ error: "This drink was removed.", code: "removed" }, 410);
   if (code === "23514") return json({ error: "A number is out of range." }, 400);
@@ -231,6 +231,21 @@ async function overlapVerified(day: string, product: DrinkProduct): Promise<bool
 const overlapRefused = () =>
   json({ error: "Already counted needs a Cronometer entry with known nutrition and caffeine on that day.", code: "overlap_unverified" }, 409);
 
+/** One behavioral day's reads: the drinks (not removed) and the entries that look like the same drink. */
+function readDrinkDay(day: string) {
+  return Promise.all([
+    supabase
+      .from("photo_meals")
+      .select(DRINK_COLUMNS)
+      .eq("capture_kind", "drink")
+      .is("deleted_at", null)
+      .eq("eaten_date", day)
+      .order("eaten_at", { ascending: true })
+      .order("meal_id", { ascending: true }),
+    overlapCandidates(day),
+  ]);
+}
+
 // ---- GET ------------------------------------------------------------------------------------------------------
 
 export async function GET(req: NextRequest) {
@@ -245,24 +260,20 @@ export async function GET(req: NextRequest) {
     return json({ status: "found", record: toDrinkRecord(cur.row) });
   }
 
-  const today = await behavioralToday();
+  // Speed (2026-11-17): with no ?day= (the /log and Nutrition loads) the day's reads start on the Eastern-rule guess
+  // while behavioral_today_now() answers, and are kept only when the RPC agrees (as in /api/supplements/today).
   const dayParam = req.nextUrl.searchParams.get("day");
+  const guess = dayParam == null ? fallbackBehavioralToday(Date.now()) : null;
+  const speculative = guess ? readDrinkDay(guess) : null;
+  speculative?.catch(() => {});
+
+  const today = await behavioralToday();
   const day = dayParam ?? today;
   if (!isYmd(day) || day > shiftYmd(today, 1) || day < shiftYmd(today, -DRINK_DAYS_BACK)) {
     return json({ error: `day must be YYYY-MM-DD from ${DRINK_DAYS_BACK} days ago to today` }, 400);
   }
 
-  const [drinks, overlap] = await Promise.all([
-    supabase
-      .from("photo_meals")
-      .select(DRINK_COLUMNS)
-      .eq("capture_kind", "drink")
-      .is("deleted_at", null)
-      .eq("eaten_date", day)
-      .order("eaten_at", { ascending: true })
-      .order("meal_id", { ascending: true }),
-    overlapCandidates(day),
-  ]);
+  const [drinks, overlap] = speculative && day === guess ? await speculative : await readDrinkDay(day);
   if (drinks.error) return dbError(drinks.error.code, "read");
 
   return json({

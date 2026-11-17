@@ -58,9 +58,6 @@ from retry_helper import retry_http
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
@@ -551,7 +548,9 @@ def fetch_audio_features_reccobeats(track_ids: list[str]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def get_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Read at call time, not import time, so importing this module (e.g. in offline
+    # unit tests) does not require Supabase credentials. Missing vars still raise KeyError.
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
 
 def get_high_water_mark(sb: Client) -> int | None:

@@ -1,7 +1,7 @@
 // "Run now" for the Kindle harvester (2026-11-16). Import-free so tests can bundle it by name.
 //
 // Event driven: POST /api/kindle/run inserts a row into pds.pc_run_requests, Supabase Realtime
-// pushes it to the idle listener on Riley's PC (tools/kindle_harvest/run-listener.mjs), which
+// pushes it to the idle listener on the collector PC (tools/kindle_harvest/run-listener.mjs), which
 // starts the "Onyx Kindle Harvest" scheduled task and writes its answer back on the row. The
 // button reads that row (GET /api/kindle/run?id=…) while it waits. Nothing on the PC polls.
 
@@ -94,12 +94,12 @@ export type RunView = { phase: RunPhase; text: string; tone: "neutral" | "ok" | 
 
 const EXIT_TEXT: Record<number, string> = {
   1: "The harvest finished with an error. The card shows what it reported.",
-  2: "Amazon signed the harvester out. On the PC run: node harvest.mjs --login (in tools\\kindle_harvest).",
-  3: "The PC has no Onyx token (~/.onyx_ci_token), so nothing was sent.",
+  2: "Amazon needs you to sign in again. Sign in on the PC that runs the Kindle sync, then press Run now.",
+  3: "The PC isn't set up to send to Onyx yet, so nothing was sent.",
 };
 
 const DETAIL_TEXT: Record<string, string> = {
-  task_missing: "The \"Onyx Kindle Harvest\" task is missing on the PC. Run tools\\kindle_harvest\\register-task.ps1.",
+  task_missing: "The scheduled job that runs the Kindle sync is missing on the PC, so it can't start. It needs to be set up on the PC again.",
   did_not_start: "The PC answered but Windows did not start the harvest task.",
   timeout: "The harvest was still running after 25 minutes; Windows stops it at 20, so check the card.",
   task_query_failed: "The PC answered but could not read the harvest task's state.",

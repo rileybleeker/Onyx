@@ -1,6 +1,7 @@
 "use client";
 
 import { writeFeedSeed } from "@/lib/feed-seed";
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -149,6 +150,9 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
   const [sonic, setSonic] = useState<SonicProfile>(initial?.dashboard.sonic ?? null);
   const [genres, setGenres] = useState<TopGenres>(initial?.dashboard.topGenres ?? []);
   const [loading, setLoading] = useState(!initial);
+  // A failed page load shows an alert (never the "no plays yet" bootstrap text); Retry bumps retryCount.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
   const [range, setRange] = useState<SpotifyRange>("30d");
   const firstRunWithInitial = useRef(!!initial);
 
@@ -158,6 +162,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
   const [ledger, setLedger] = useState<SpotifyLedgerRow[]>([]);
   const [ledgerTotal, setLedgerTotal] = useState(0);
   const [ledgerLoading, setLedgerLoading] = useState(true);
+  const [ledgerFailed, setLedgerFailed] = useState(false);
+  const [ledgerRetry, setLedgerRetry] = useState(0);
 
   // Create-playlist modal state (existing: top-tracks one-click flow)
   const [modalOpen, setModalOpen] = useState(false);
@@ -201,7 +207,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
       if (!resp.ok) throw new Error(json.error ?? `HTTP ${resp.status}`);
       setCreateResult(json);
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
+      console.error("Create playlist:", e);
+      setCreateError("Couldn't create the playlist. Try again.");
     } finally {
       setCreating(false);
     }
@@ -288,7 +295,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
         }
       }
     } catch (e) {
-      setGenError(e instanceof Error ? e.message : String(e));
+      console.error("Generate playlist:", e);
+      setGenError("Couldn't generate the playlist. Try again.");
     } finally {
       setGenRunning(false);
     }
@@ -306,7 +314,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
     } else if (evt.type === "done") {
       setGenResult(evt.result as GenResult);
     } else if (evt.type === "error") {
-      setGenError(String(evt.message ?? "Unknown error"));
+      console.error("Generate playlist:", evt.message);
+      setGenError("Couldn't generate the playlist. Try again.");
     }
   }
 
@@ -324,6 +333,7 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
     const silent = firstRunWithInitial.current;
     firstRunWithInitial.current = false;
     if (!silent) setLoading(true);
+    setLoadFailed(false);
     Promise.all([
       // One shared fetch of the range's plays + artist genres + track
       // features, computing all 8 aggregates — replaces 8 independent
@@ -350,25 +360,38 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
         setSonic((prev) => (sameJson(prev, dash.sonic) ? prev : dash.sonic));
         setGenres((prev) => (sameJson(prev, dash.topGenres) ? prev : dash.topGenres));
       })
-      .catch((err) => console.error("Spotify page load:", err))
+      .catch((err) => {
+        console.error("Spotify page load:", err);
+        if (!cancelled) setLoadFailed(true);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     // Reset ledger to page 0 whenever the range changes
     setLedgerPage(0);
     return () => { cancelled = true; };
-  }, [range]);
+  }, [range, retryCount]);
 
   useEffect(() => {
+    let cancelled = false;
     setLedgerLoading(true);
+    setLedgerFailed(false);
     getSpotifyLedger(range, ledgerPage, LEDGER_PER_PAGE)
       .then(({ rows, totalCount }) => {
+        if (cancelled) return;
         setLedger(rows);
         setLedgerTotal(totalCount);
       })
-      .catch((err) => console.error("Spotify ledger:", err))
-      .finally(() => setLedgerLoading(false));
-  }, [range, ledgerPage]);
+      .catch((err) => {
+        if (cancelled) return;
+        console.error("Spotify ledger:", err);
+        setLedgerFailed(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLedgerLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [range, ledgerPage, ledgerRetry]);
 
   const hasData = (kpis?.totalPlays ?? 0) > 0;
 
@@ -727,19 +750,31 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
         <p className="text-[12px] text-text-tertiary font-mono">Loading…</p>
       )}
 
-      {!loading && !hasData && (
+      {!loading && loadFailed && (
+        <div role="alert" className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">
+          <h2 className="text-[15px] font-semibold text-text-primary">Couldn&apos;t load Spotify</h2>
+          <p className="text-[13px] text-text-secondary mt-2">Couldn&apos;t load your Spotify data. Try again.</p>
+          <button
+            type="button"
+            onClick={() => setRetryCount((c) => c + 1)}
+            className="mt-4 rounded-full border border-border-default px-4 py-1.5 text-[13px] text-text-primary hover:bg-surface-hover"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!loading && !loadFailed && !hasData && (
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">
           <p className="text-[13px] text-text-secondary">No Spotify plays in the database yet.</p>
-          <p className="text-[11px] text-text-tertiary mt-2 font-mono">
-            Run the OAuth bootstrap: <code>python spotify_etl.py --auth</code>
-          </p>
-          <p className="text-[11px] text-text-tertiary mt-1 font-mono">
-            Then: <code>python ci_token_helper.py upload spotify</code>, then <code>python spotify_etl.py</code>
+          <p className="text-[11px] text-text-tertiary mt-2">
+            Plays appear here after the first Spotify sync. If nothing shows after a day, check the{" "}
+            <Link href="/status" className="underline">Status page</Link>.
           </p>
         </div>
       )}
 
-      {!loading && hasData && (
+      {!loading && !loadFailed && hasData && (
         // Personalize: every KPI tile, chart and list is its own part, in four sections; a part moves within its
         // section or into another. Header, range filter, modals and the loading / empty states stay fixed.
         <PartGrid page="/spotify" title="Spotify">
@@ -1111,13 +1146,42 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
             {ledgerLoading && ledger.length === 0 && (
               <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">Loading…</p>
             )}
-            {!ledgerLoading && ledger.length === 0 && (
+            {!ledgerLoading && ledger.length === 0 && ledgerFailed && (
+              <div className="py-8 text-center">
+                <p className="text-[11px] text-text-tertiary font-mono">Couldn&apos;t load the plays list. Try again.</p>
+                <button
+                  type="button"
+                  onClick={() => setLedgerRetry((c) => c + 1)}
+                  className="mt-3 rounded-full border border-border-default px-3 py-1 text-[12px] text-text-primary hover:bg-surface-hover"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+            {!ledgerLoading && ledger.length === 0 && !ledgerFailed && (
               <p className="text-[11px] text-text-tertiary font-mono py-8 text-center">
                 No plays in this range.
               </p>
             )}
             {ledger.length > 0 && (
               <>
+                {ledgerFailed && (
+                  <div
+                    role="alert"
+                    className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-control border border-border-default px-3 py-2"
+                  >
+                    <p className="text-[12px] text-text-secondary">
+                      Couldn&apos;t load that page of plays. Showing the last page that loaded.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setLedgerRetry((c) => c + 1)}
+                      className="rounded-full border border-border-default px-3 py-1 text-[12px] text-text-primary hover:bg-surface-hover"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
                 <div className="overflow-x-auto -mx-1">
                   <table className="w-full text-[12px] font-mono">
                     <thead>

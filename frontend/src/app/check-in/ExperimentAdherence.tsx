@@ -64,7 +64,6 @@ export default function ExperimentAdherence({ date, when }: { date: string; when
       const json: unknown = await res.json().catch(() => null);
       if (seq.current !== current) return;
       const body = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
-      const message = typeof body.error === "string" ? body.error : null;
       const state = res.status === 409 ? body.state : json;
       if (res.ok && isAdherenceDay(state) && state.status === "open") {
         setDay(state);
@@ -73,9 +72,9 @@ export default function ExperimentAdherence({ date, when }: { date: string; when
       } else if (res.status === 409 && isAdherenceDay(state)) {
         // The day closed meanwhile (06:00 the day after, or the trial was paused): show its real state.
         setDay(state);
-        setError(message ?? "There is no trial question to answer for this day.");
+        setError("There is no trial question to answer for this day.");
       } else {
-        setError(message ?? `Couldn't save the answer (${res.status}). Try again.`);
+        setError("Couldn't save the answer. Try again.");
       }
     } catch {
       if (seq.current === current) setError("Couldn't reach Onyx. Try again.");
@@ -141,10 +140,10 @@ export default function ExperimentAdherence({ date, when }: { date: string; when
               Save note
             </button>
           )}
-          {saving ? <span className="text-text-tertiary">Saving…</span>
-            : error ? <span className="text-down">{error}</span>
-            : saved ? <span className="text-text-secondary inline-flex items-center gap-1"><Check className="w-3.5 h-3.5 text-up" /> Saved</span>
-            : !day.answer ? <span className="text-text-tertiary">Saved as you tap.</span>
+          {saving ? <span role="status" className="text-text-tertiary">Saving…</span>
+            : error ? <span role="alert" className="text-down">{error}</span>
+            : saved ? <span role="status" className="text-text-secondary inline-flex items-center gap-1"><Check className="w-3.5 h-3.5 text-up" /> Saved</span>
+            : !day.answer ? <span role="status" className="text-text-tertiary">Saved as you tap.</span>
             : null}
         </div>
       </div>

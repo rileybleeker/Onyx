@@ -46,7 +46,11 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     revalidatePath("/nyc");
     return NextResponse.json({ lead });
   } catch (e) {
-    const message = (e as Error).message;
-    return NextResponse.json({ error: message }, { status: message.includes("not in the NYC Leads") ? 403 : 502 });
+    const notInDatabase = ((e as Error).message ?? "").includes("not in the NYC Leads");
+    console.error("nyc lead patch failed:", e);
+    return NextResponse.json(
+      { error: notInDatabase ? "This page is not in the NYC Leads database." : "Couldn't save this lead. Try again." },
+      { status: notInDatabase ? 403 : 502 },
+    );
   }
 }

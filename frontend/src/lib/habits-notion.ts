@@ -20,8 +20,21 @@ export class NotionHabitsError extends Error {
   }
 }
 
+/** Plain copy for the not-connected case; the setting name is logged where it is raised. */
+export const HABITS_NOT_CONNECTED_COPY = "Habits isn't connected yet. Try again later.";
+/** Plain copy for any other Notion failure. The routes send this instead of Notion's text. */
+export const HABITS_UNREACHABLE_COPY = "Habits aren't reachable right now. Try again.";
+
+/** The copy a route may send for a NotionHabitsError: the not-connected copy (already plain), else the unreachable copy. */
+export function habitsUnreachableCopy(e: NotionHabitsError): string {
+  return e.message === HABITS_NOT_CONNECTED_COPY ? HABITS_NOT_CONNECTED_COPY : HABITS_UNREACHABLE_COPY;
+}
+
 export async function fetchActiveHabits(): Promise<NotionHabit[]> {
-  if (!NOTION_API_KEY) throw new NotionHabitsError("NOTION_API_KEY not configured", 500, "");
+  if (!NOTION_API_KEY) {
+    console.error("habits: NOTION_API_KEY is not set");
+    throw new NotionHabitsError(HABITS_NOT_CONNECTED_COPY, 500, "");
+  }
 
   const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_HABITS_DB}/query`, {
     method: "POST",

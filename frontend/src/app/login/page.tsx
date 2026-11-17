@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createSupabaseBrowser } from "@/lib/supabase-browser";
+import { loginErrorCopy } from "@/lib/login-errors";
 
 type Mode = "password" | "magic";
 
@@ -28,7 +29,7 @@ export default function LoginPage() {
         password,
       });
       if (authError) {
-        setError(authError.message);
+        setError(loginErrorCopy(authError));
         setLoading(false);
         return;
       }
@@ -47,7 +48,7 @@ export default function LoginPage() {
       },
     });
     if (authError) {
-      setError(authError.message);
+      setError(loginErrorCopy(authError));
     } else {
       setSent(true);
     }

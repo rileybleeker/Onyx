@@ -83,15 +83,16 @@ function Strip({ p }: { p: WindDownProgress }) {
   );
 }
 
-function SaveLine({ s, p }: { s: WindDownSnapshot; p: WindDownProgress }) {
+export function SaveLine({ s, p }: { s: WindDownSnapshot; p: WindDownProgress }) {
   const st = s.saver;
   if (st.status === "saving") return <p role="status" className="mt-2 text-[12px] text-text-tertiary">Saving…</p>;
   if (st.status === "cancelling") return <p role="status" className="mt-2 text-[12px] text-text-tertiary">Checking whether it was saved…</p>;
   if (st.status === "retrying") {
     // The tap was sent and never answered: it may already be saved. Cancel asks the server and shows what it holds.
+    // (Fixed copy only: st.error can carry the server's sentence, so it is never shown here.)
     return (
       <div role="status" className="mt-2 flex flex-wrap items-center gap-x-2 text-[12px] text-mid">
-        <span>Not confirmed yet: {st.error} It may already be saved. Trying again.</span>
+        <span>Not confirmed yet. It may already be saved. Trying again.</span>
         <button type="button" onClick={retryNow} className={textButton}>Retry now</button>
         <button type="button" onClick={dismissTap} className={textButton}>Cancel and check</button>
       </div>

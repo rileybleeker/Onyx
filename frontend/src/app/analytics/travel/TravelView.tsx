@@ -109,7 +109,7 @@ export default function TravelView({ data, headingTestId }: { data: TravelPageDa
               source="DELTA EMAIL"
             >
               {flights.length === 0 ? (
-                <p className="text-sm text-text-tertiary py-6 text-center">No flights parsed yet — the Flights Email ETL runs every 3 hours.</p>
+                <p className="text-sm text-text-tertiary py-6 text-center">No flights found yet. New flight emails are checked every 3 hours.</p>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
@@ -176,6 +176,9 @@ export default function TravelView({ data, headingTestId }: { data: TravelPageDa
             title: "All trips",
             node: (
             <ChartCard title="All trips" subtitle="Auto-segmented from pds.trips">
+              {trips.length === 0 ? (
+                <p className="text-sm text-text-tertiary py-6 text-center">No trips found yet. Trips appear here once location data covers a stay away from home.</p>
+              ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -204,6 +207,7 @@ export default function TravelView({ data, headingTestId }: { data: TravelPageDa
                   </tbody>
                 </table>
               </div>
+              )}
             </ChartCard>
             ),
           },

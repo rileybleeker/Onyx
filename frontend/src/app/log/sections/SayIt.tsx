@@ -116,7 +116,8 @@ export default function SayItSection() {
       });
       const json = (await res.json().catch(() => null)) as (LogVoiceResult & { unavailable?: string[]; failed?: boolean; error?: string }) | null;
       if (!res.ok || !json || json.failed || !Array.isArray(json.supplements) || !Array.isArray(json.ubereats)) {
-        const message = !res.ok && json?.error ? `Couldn't read that: ${json.error}` : "Couldn't read that for the journal, supplements, Uber Eats, weight and reading. Try again.";
+        if (!res.ok && json?.error) console.error("log voice failed:", res.status, json.error);
+        const message = !res.ok && json?.error ? "Couldn't read that. Try again." : "Couldn't read that for the journal, supplements, Uber Eats, weight and reading. Try again.";
         // A "journal:" note needs no model: its entry (the words after the prefix, verbatim) is still offered.
         if (!offerPrefixedJournal(words, message)) show({ kind: "error", message });
         return;

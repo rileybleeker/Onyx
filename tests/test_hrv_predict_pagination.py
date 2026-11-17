@@ -26,17 +26,37 @@ with mock.patch("supabase.create_client", return_value=mock.Mock()):
     import hrv_predict  # noqa: E402
 
 
+class UpsertQuery:
+    """The chain returned by upsert(): .execute() records the payload and its on_conflict,
+    like the production call table(...).upsert(rows, on_conflict=...).execute()."""
+
+    def __init__(self, sink, table, payload, on_conflict):
+        self._sink = sink
+        self._table = table
+        self._payload = list(payload)
+        self._on_conflict = on_conflict
+
+    def execute(self):
+        self._sink.append({"table": self._table, "on_conflict": self._on_conflict,
+                           "rows": self._payload})
+        resp = mock.Mock()
+        resp.data = self._payload
+        return resp
+
+
 class FakeQuery:
-    """Mimics the supabase-py query builder just enough for fetch_all.
+    """Mimics the supabase-py query builder just enough for fetch_all and backfill_actuals.
 
     Records .order()/.range() calls; serves pages from `rows`. When `unstable` is
     True and no order was requested, the rows are re-shuffled for every call, so
     offset paging loses or repeats rows exactly like an ORDER-BY-less PostgREST."""
 
-    def __init__(self, rows, chunk_rows, unstable):
+    def __init__(self, table, rows, chunk_rows, unstable, upserts):
+        self._table = table
         self._rows = list(rows)
         self._chunk = chunk_rows
         self._unstable = unstable
+        self._upserts = upserts
         self._filters = []
         self._order = []
         self._range = None
@@ -69,6 +89,9 @@ class FakeQuery:
         self._range = (start, end)
         return self
 
+    def upsert(self, payload, on_conflict=None, **_kwargs):
+        return UpsertQuery(self._upserts, self._table, payload, on_conflict)
+
     def execute(self):
         self.calls.append({"order": list(self._order), "range": self._range})
         if self._order:
@@ -84,7 +107,9 @@ class FakeQuery:
             elif op == "eq":
                 rows = [r for r in rows if r.get(col) == val]
             elif op == "is_":
-                rows = [r for r in rows if (r.get(col) is None) == (val is None)]
+                # PostgREST is.null: hrv_predict passes the string "null" (or Python None)
+                want_null = val is None or val == "null"
+                rows = [r for r in rows if (r.get(col) is None) == want_null]
         start, end = self._range
         batch = rows[start:end + 1]
         resp = mock.Mock()
@@ -98,12 +123,14 @@ class FakeSupabase:
         self.chunk_rows = chunk_rows
         self.unstable = unstable
         self.queries = []
+        self.upserts = []
 
     def schema(self, _schema):
         return self
 
     def from_(self, table):
-        q = FakeQuery(self.tables.get(table, []), self.chunk_rows, self.unstable)
+        q = FakeQuery(table, self.tables.get(table, []), self.chunk_rows, self.unstable,
+                      self.upserts)
         self.queries.append(q)
         return q
 
@@ -137,20 +164,38 @@ class FetchAllOrdering(unittest.TestCase):
         with mock.patch.object(hrv_predict, "supa", supa):
             df = hrv_predict.fetch_all("daily_health_matrix_behavioral",
                                        select="calendar_date,whoop_hrv_rmssd",
-                                       order=["calendar_date"])
+                                       chunk=10, order=["calendar_date"])
         self.assertEqual(len(df), 25)
         self.assertEqual(sorted(df["calendar_date"]), sorted(r["calendar_date"] for r in rows))
 
     def test_unstable_read_without_order_is_detectable(self):
-        # Sanity check of the harness itself: without an order the unstable fake
-        # loses/duplicates rows, which is the bug this change fixes.
+        # Harness check. fetch_all pages by its own `chunk` (default 1000), so pass chunk=10 to get
+        # pages of 10, 10, 5; the unstable fake always returns 25 rows here,
+        # so a row COUNT cannot detect the instability; the detector compares the dates
+        # themselves. Seeded so the shuffles are reproducible.
+        random.seed(20261117)
         rows = make_matrix_rows(25)
+        expected = sorted(r["calendar_date"] for r in rows)
+
         supa = FakeSupabase({"daily_health_matrix_behavioral": rows},
                             chunk_rows=10, unstable=True)
         with mock.patch.object(hrv_predict, "supa", supa):
-            df = hrv_predict.fetch_all("daily_health_matrix_behavioral",
-                                       select="calendar_date,whoop_hrv_rmssd")
-        self.assertNotEqual(len(df), 25)
+            unordered = hrv_predict.fetch_all("daily_health_matrix_behavioral",
+                                              select="calendar_date,whoop_hrv_rmssd",
+                                              chunk=10)
+        # Detector: an unordered paged read is unstable when it loses or repeats a date.
+        self.assertNotEqual(sorted(unordered["calendar_date"]), expected,
+                            "a paged read without an ORDER BY must be flagged (rows lost or repeated)")
+
+        # The same data read with the explicit order is not flagged.
+        supa = FakeSupabase({"daily_health_matrix_behavioral": rows},
+                            chunk_rows=10, unstable=True)
+        with mock.patch.object(hrv_predict, "supa", supa):
+            ordered = hrv_predict.fetch_all("daily_health_matrix_behavioral",
+                                            select="calendar_date,whoop_hrv_rmssd",
+                                            chunk=10, order=["calendar_date"])
+        self.assertEqual(sorted(ordered["calendar_date"]), expected,
+                         "a paged read with an explicit order must not be flagged")
 
 
 class BackfillDoesNotClearSkippedNight(unittest.TestCase):
@@ -163,29 +208,16 @@ class BackfillDoesNotClearSkippedNight(unittest.TestCase):
             "hrv_predictions": pred_rows,
         }
         supa = FakeSupabase(tables, chunk_rows=chunk_rows, unstable=True)
-        upserted = []
-
-        class UpsertQuery:
-            def __init__(self, payload):
-                self.payload = payload
-
-            def execute(self):
-                upserted.extend(self.payload)
-
-        class UpsertSupa(FakeSupabase):
-            def upsert(self, payload, on_conflict=None):
-                return UpsertQuery(payload)
-
-        supa_up = UpsertSupa(tables, chunk_rows=chunk_rows, unstable=True)
-        with mock.patch.object(hrv_predict, "supa", supa_up), \
+        with mock.patch.object(hrv_predict, "supa", supa), \
              mock.patch.object(hrv_predict, "et_today", lambda: date(2026, 1, 26)):
             hrv_predict.backfill_actuals()
-        return upserted
+        # every upsert the backfill made: {"table", "on_conflict", "rows"}
+        return supa.upserts
 
     def test_recent_night_survives_paged_matrix_read(self):
         today = date(2026, 1, 26)
-        matrix = make_matrix_rows(25)  # 2026-01-02 .. 2026-01-26, one per night
-        recent_night = matrix[20]["calendar_date"]  # 2026-01-22, well inside both windows
+        matrix = make_matrix_rows(25)  # 2026-01-01 .. 2026-01-25, one per night
+        recent_night = matrix[20]["calendar_date"]  # 2026-01-21, well inside both windows
         # A stored forecast for that night whose actual is already correct…
         pred = {
             "prediction_date": recent_night,
@@ -207,7 +239,12 @@ class BackfillDoesNotClearSkippedNight(unittest.TestCase):
             "actual_hrv": None,
             "residual": None,
         }
-        upserted = self._run_backfill(matrix, [pred, old_pred], chunk_rows=10)
+        upserts = self._run_backfill(matrix, [pred, old_pred], chunk_rows=10)
+        self.assertTrue(upserts, "the NULL forecast should have been written back")
+        for u in upserts:
+            self.assertEqual(u["table"], "hrv_predictions")
+            self.assertEqual(u["on_conflict"], ",".join(hrv_predict._PRED_KEY))
+        upserted = [row for u in upserts for row in u["rows"]]
         self.assertTrue(any(r["prediction_date"] == matrix[0]["calendar_date"] for r in upserted),
                         "the older NULL forecast should have been filled from the matrix")
         for row in upserted:

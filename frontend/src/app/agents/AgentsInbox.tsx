@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Bell, BellOff, CheckCheck, ChevronLeft, ChevronRight, Share, SquarePen, X } from "lucide-react";
@@ -68,6 +68,7 @@ function threadHref(thread: string, opts: { messageId?: number; reply?: string }
 function UnreadCard({ item, sent, onSend, onClear }: { item: Extract<InboxItem, { kind: "card" }>; sent: string | undefined; onSend: (text: string) => void; onClear: () => void }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
   const { card } = item;
   return (
     <div className="mx-3 rounded-[16px] bg-surface-card border border-border-default overflow-hidden">
@@ -91,8 +92,19 @@ function UnreadCard({ item, sent, onSend, onClear }: { item: Extract<InboxItem, 
           <X className="w-4 h-4" />
         </button>
       </div>
-      <div className="px-4 pt-2 pb-3" onClick={() => setExpanded((e) => !e)}>
+      <div id={bodyId} className="px-4 pt-2" onClick={() => setExpanded((e) => !e)}>
         <CardBody card={card} clamp={!expanded} />
+      </div>
+      <div className="px-4 pt-1 pb-3">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={bodyId}
+          onClick={() => setExpanded((e) => !e)}
+          className="text-[13px] text-accent font-medium"
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
       </div>
       <CardButtons
         card={card}

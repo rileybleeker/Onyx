@@ -57,7 +57,9 @@ export async function GET(req: NextRequest) {
 
   const { data, error } = await q;
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    // The real error stays on the server; the caller gets fixed plain copy only.
+    console.error("[journal-list] query failed", error.message);
+    return NextResponse.json({ error: "Couldn't load your journal. Try again." }, { status: 500 });
   }
 
   const entries = (data || []).map((row) => ({

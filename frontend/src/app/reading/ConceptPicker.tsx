@@ -107,6 +107,7 @@ export default function ConceptPicker({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
+      aria-label="Concept"
     >
       <option value="">Concept (optional)</option>
       {kept && <option value={value}>{value}</option>}

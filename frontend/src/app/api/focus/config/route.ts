@@ -34,7 +34,7 @@ async function describe(config: FocusUnlockConfig) {
 function failed(e: unknown) {
   const step = e instanceof FocusUnlockError ? e.step : "unexpected";
   console.error("focus config failed:", step);
-  return NextResponse.json({ error: "could not load or save the Focus settings", step }, { status: 500, headers: noStore });
+  return NextResponse.json({ error: "could not load or save the Focus settings" }, { status: 500, headers: noStore });
 }
 
 export async function GET() {

@@ -129,7 +129,11 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
   const [hrvPairs, setHrvPairs] = useState<CaffeineHrvPair[]>(initial?.hrvPairs ?? []);
   const [quality, setQuality] = useState<CaffeineQualityFlag[]>(initial?.quality ?? []);
   const [loading, setLoading] = useState(!initial);
+  // Set when the last load failed, so a failure is not shown as "no data".
+  const [loadError, setLoadError] = useState(false);
   const firstRunWithInitial = useRef(!!initial);
+  // Set by the Retry button: the next run shows the skeleton instead of running silently.
+  const retryRequested = useRef(false);
   // A drink saved, edited or undone on Log (lib/drink-capture.ts) changes the live caffeine views: read them again
   // silently while this page is mounted (also inside the continuous scroll).
   const [reload, setReload] = useState(0);
@@ -142,12 +146,14 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
     // committing stale state.
     let cancelled = false;
     // Silent too for a drink-change refresh (the charts stay while the new numbers load).
-    const silent = firstRunWithInitial.current || reload > 0;
+    const silent = !retryRequested.current && (firstRunWithInitial.current || reload > 0);
     firstRunWithInitial.current = false;
+    retryRequested.current = false;
     if (!silent) setLoading(true);
     Promise.all([getCaffeineDaily(windowDays), getCaffeineHrvPairs(hrvDays), getCaffeineDataQuality(qualityDays)])
       .then(([d, p, q]) => {
         if (cancelled) return;
+        setLoadError(false);
         // The default windows also seed this page in the continuous scroll (lib/feed-seed.ts).
         if (windowDays === DEFAULT_DAYS) writeFeedSeed("/caffeine", { daily: d, hrvPairs: p, quality: q });
         // sameJson bail-out: the silent revalidation's data is usually
@@ -157,12 +163,21 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
         setHrvPairs((prev) => (sameJson(prev, p) ? prev : p));
         setQuality((prev) => (sameJson(prev, q) ? prev : q));
       })
-      .catch((err) => console.error("Caffeine page load:", err))
+      .catch((err) => {
+        console.error("Caffeine page load:", err);
+        if (!cancelled) setLoadError(true);
+      })
       .finally(() => {
         if (!cancelled && !silent) setLoading(false);
       });
     return () => { cancelled = true; };
   }, [windowDays, hrvDays, qualityDays, reload]);
+
+  const retryLoad = () => {
+    retryRequested.current = true;
+    setLoadError(false);
+    setReload((n) => n + 1);
+  };
 
   // ─── KPI derivations ────────────────────────────────────────────────────
   const latest = daily[daily.length - 1];
@@ -284,6 +299,17 @@ export default function CaffeinePage({ initial: initialProp, headingTestId = "pa
             ))}
           </div>
           <div className="h-[320px] bg-surface-card border border-border-subtle rounded-control animate-pulse" />
+        </div>
+      ) : daily.length === 0 && loadError ? (
+        <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">
+          <p className="text-[13px] text-text-secondary">Could not load caffeine data.</p>
+          <button
+            type="button"
+            onClick={retryLoad}
+            className="mt-4 min-h-11 rounded-control border border-border-subtle px-4 text-[13px] text-text-primary hover:bg-surface-hover focus-visible:outline-2 focus-visible:outline-accent"
+          >
+            Retry
+          </button>
         </div>
       ) : daily.length === 0 ? (
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">

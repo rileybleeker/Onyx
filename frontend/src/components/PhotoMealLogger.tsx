@@ -96,11 +96,6 @@ async function toJpegBase64(file: File): Promise<string> {
   }
 }
 
-async function errorOf(res: Response, fallback: string): Promise<string> {
-  const j = await res.json().catch(() => null);
-  return typeof j?.error === "string" ? j.error : `${fallback} (${res.status}).`;
-}
-
 const inputCls =
   "min-h-11 px-2 text-[16px] md:text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40";
 
@@ -188,7 +183,7 @@ export default function PhotoMealLogger({
         body: JSON.stringify({ image_base64: image, media_type: "image/jpeg" }),
       });
       if (!res.ok) {
-        setError(await errorOf(res, "The estimate failed"));
+        setError("Couldn't estimate this photo. Try again.");
         setPhase("idle");
         return;
       }
@@ -276,7 +271,7 @@ export default function PhotoMealLogger({
         body: JSON.stringify(parsed.value),
       });
       if (!res.ok) {
-        setError(`Not saved: ${await errorOf(res, "Save failed")}`);
+        setError("Couldn't save the meal. Try again.");
         setPhase("review");
         return;
       }
@@ -329,7 +324,7 @@ export default function PhotoMealLogger({
 
       {phase === "estimating" && (
         <div className="flex items-center gap-3">
-          {preview && <img src={preview} alt="" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
+          {preview && <img src={preview} alt="Selected meal photo, ready to log" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
           <p className="text-[12px] font-mono text-text-tertiary" role="status">Estimating…</p>
         </div>
       )}
@@ -337,7 +332,7 @@ export default function PhotoMealLogger({
       {(phase === "review" || phase === "saving") && (
         <div className="space-y-3">
           <div className="flex items-center gap-3">
-            {preview && <img src={preview} alt="" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
+            {preview && <img src={preview} alt="Selected meal photo, ready to log" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
             <div className="text-[12px] text-text-tertiary">
               <div className="text-[15px] font-mono text-text-primary">{totals.kcal} kcal</div>
               <div className="font-mono">

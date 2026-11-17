@@ -65,11 +65,11 @@ const CADENCE: Record<string, string> = {
   reading: "Manual",
   procurement: "Manual",
   photo_meals: "Manual (a plate photo on /nutrition)",
-  kindle:"Every 3h (Riley's PC, while logged on)",
+  kindle:"Every 3h (the collector PC, while logged on)",
   // Question bank generator (READ-QUIZ-01): kicked after each Kindle import and each reading write, plus the hourly
   // Reading Question Bank workflow (frontend/scripts/reading-bank-run.cjs) while Riley's PC is off.
   reading_bank: "With each Kindle harvest + hourly",
-  amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
+  amazon_orders: "Every 3h with the Kindle harvest (the collector PC)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
   tanita: "Daily 10am + 1:30pm ET",
@@ -86,14 +86,14 @@ const CADENCE: Record<string, string> = {
   phone_messages: "Event driven (iPhone automation pushes each new text)",
   google_calendar: "Hourly :55",
   care_calendar: "After each /health change + every 6h :20 catch-up",
-  ubereats: "Every 6h (Riley's PC, while logged on)",
-  gopuff: "Every 6h (Riley's PC, while logged on)",
-  pc_activity: "Hourly (Riley's PC, while signed in)",
+  ubereats: "Every 6h (the collector PC, while logged on)",
+  gopuff: "Every 6h (the collector PC, while logged on)",
+  pc_activity: "Hourly (the collector PC, while signed in)",
   uber_rides: "On demand (Uber privacy download, imported by hand)",
-  ai_usage: "Every 3h (Riley's PC, while signed in)",
+  ai_usage: "Every 3h (the collector PC, while signed in)",
   apple_health: "When the Onyx app is opened on the iPhone (Shortcuts automation)",
-  youtube: "Daily look on Riley's PC; new data every 2 months (scheduled Google Takeout)",
-  medical_backup: "Weekly (Riley's PC, while signed in)",
+  youtube: "Daily look on the collector PC; new data every 2 months (scheduled Google Takeout)",
+  medical_backup: "Weekly (the collector PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
   // pg_cron refresh of pds.daily_health_matrix_behavioral_mat (the matview
@@ -858,7 +858,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Experiment Report workflow has not reported."
+            ?? (!entry ? "No run yet. The Experiment Report has not reported."
               : ageHours > 30 ? `No trial report run for ${ageHours}h (daily at 15:00 UTC).` : null),
           cadence: CADENCE.experiments,
           integrationMethod: METHOD.experiments.method,
@@ -965,7 +965,7 @@ export async function GET() {
           daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
-          errorMessage: (entry?.error_message as string) ?? (entry && ageH > 15 * 24 ? `No forecast snapshot for ${Math.floor(ageH / 24)} days - check cash-forecast-snapshot.yml.` : null),
+          errorMessage: (entry?.error_message as string) ?? (entry && ageH > 15 * 24 ? `No forecast snapshot for ${Math.floor(ageH / 24)} days - the weekly snapshot job has not run. Check the Actions tab on GitHub for the cash forecast snapshot job.` : null),
           cadence: CADENCE.cash_forecast,
           integrationMethod: METHOD.cash_forecast.method,
           methodLabel: METHOD.cash_forecast.label,
@@ -1071,7 +1071,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Kindle harvester's Amazon pass has not reported." : null),
+            ?? (!entry ? "No run yet. The Kindle Amazon order check has not reported." : null),
           cadence: CADENCE.amazon_orders,
           integrationMethod: METHOD.amazon_orders.method,
           methodLabel: METHOD.amazon_orders.label,
@@ -1166,7 +1166,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Online Orders Email workflow has not reported." : ageH > 12 ? `No run for ${Math.floor(ageH)}h - check the Online Orders Email workflow.` : null),
+            ?? (!entry ? "No run yet. The Online Orders check has not reported." : ageH > 12 ? `No run for ${Math.floor(ageH)}h. The Online Orders check may need a look.` : null),
           cadence: CADENCE.online_orders,
           integrationMethod: METHOD.online_orders.method,
           methodLabel: METHOD.online_orders.label,
@@ -1296,9 +1296,9 @@ export async function GET() {
             ?? (countStale ? `No new count since ${pollenLatest} (${countLag} days). The station skips weekends and holidays.` : null)
             ?? (entry ? null
               : pollenPending
-                ? "pds.pollen_daily is missing - apply sql/pollen_schema.sql, then add the Pollen ETL workflow (YAML in the roadmap row)."
+                ? "pds.pollen_daily is missing. Next: apply sql/pollen_schema.sql. Then set up the Pollen import."
                 : pollenRes.error?.message
-                  ?? "No run yet - add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
+                  ?? "No run yet. The Pollen import has not been set up yet."),
           cadence: CADENCE.pollen,
           integrationMethod: METHOD.pollen.method,
           methodLabel: METHOD.pollen.label,
@@ -1377,7 +1377,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No import yet - apply sql/uber_rides_schema.sql, request the download at myprivacy.uber.com, then run uber_rides_import.py --apply on it." : null),
+            ?? (!entry ? "No import yet. Next: apply sql/uber_rides_schema.sql. Then request the download at myprivacy.uber.com and run uber_rides_import.py --apply on it." : null),
           cadence: CADENCE.uber_rides,
           integrationMethod: METHOD.uber_rides.method,
           methodLabel: METHOD.uber_rides.label,
@@ -1435,7 +1435,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No upload yet - apply sql/pc_activity_schema.sql, then run tools/pc_activity_logger/register-task.ps1 on the PC." : null),
+            ?? (!entry ? "No upload yet. Next: apply sql/pc_activity_schema.sql. Then run tools/pc_activity_logger/register-task.ps1 on the PC." : null),
           cadence: CADENCE.pc_activity,
           integrationMethod: METHOD.pc_activity.method,
           methodLabel: METHOD.pc_activity.label,
@@ -1465,7 +1465,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No upload yet - apply sql/ai_tool_usage_schema.sql, then run tools/ai_usage_harvest/register-task.ps1 on the PC." : null),
+            ?? (!entry ? "No upload yet. Next: apply sql/ai_tool_usage_schema.sql. Then run tools/ai_usage_harvest/register-task.ps1 on the PC." : null),
           cadence: CADENCE.ai_usage,
           integrationMethod: METHOD.ai_usage.method,
           methodLabel: METHOD.ai_usage.label,
@@ -1495,7 +1495,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No upload yet - apply sql/apple_health_schema.sql, install the HealthKit build from /install, allow Health access in the app and add the Shortcuts automation (tools/screentime_ios/README.md)." : null),
+            ?? (!entry ? "No upload yet. Next: apply sql/apple_health_schema.sql. Then install the HealthKit build from /install, allow Health access in the app, and add the Shortcuts automation (tools/screentime_ios/README.md)." : null),
           cadence: CADENCE.apple_health,
           integrationMethod: METHOD.apple_health.method,
           methodLabel: METHOD.apple_health.label,
@@ -1524,7 +1524,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - apply sql/youtube_watch_history_schema.sql, run tools/youtube_history/register-task.ps1 and set up the scheduled Takeout (docs/youtube-watch-history.md)." : null),
+            ?? (!entry ? "No run yet. Next: apply sql/youtube_watch_history_schema.sql. Then run tools/youtube_history/register-task.ps1 and set up the scheduled Takeout (docs/youtube-watch-history.md)." : null),
           cadence: CADENCE.youtube,
           integrationMethod: METHOD.youtube.method,
           methodLabel: METHOD.youtube.label,
@@ -1676,7 +1676,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - the Google Calendar ETL workflow has not reported." : ageH > 8 ? `No run for ${Math.floor(ageH)}h - check the Google Calendar ETL workflow.` : null),
+            ?? (!entry ? "No run yet. The Google Calendar sync has not reported." : ageH > 8 ? `No run for ${Math.floor(ageH)}h. The Google Calendar sync may need a look.` : null),
           cadence: CADENCE.google_calendar,
           integrationMethod: METHOD.google_calendar.method,
           methodLabel: METHOD.google_calendar.label,

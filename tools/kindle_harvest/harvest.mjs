@@ -1,4 +1,4 @@
-// Kindle → Onyx harvester. Runs on Riley's PC on a schedule (Task Scheduler), not in the cloud,
+// Kindle → Onyx harvester. Runs on the collector PC on a schedule (Task Scheduler), not in the cloud,
 // the same way browse-proxy/local/harvest.mjs does for StreetEasy.
 //
 // v2 (2026-11-08): reads the Kindle for Web READER (read.amazon.com/?asin=…) instead of scraping

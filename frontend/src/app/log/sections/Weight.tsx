@@ -106,7 +106,8 @@ export default function WeightSection() {
   const routed = !useInFeed();
   const load = useCallback(() => {
     setLoadFailed(false);
-    cachedJson(WEIGHT_URL, { check: checkWeight, get: logEarlyGet(WEIGHT_URL, routed) })
+    // A copy the warm-up or a hover fetched in the last minute is shown as is: no second GET on the same visit.
+    cachedJson(WEIGHT_URL, { check: checkWeight, get: logEarlyGet(WEIGHT_URL, routed), freshMs: 60_000 })
       .then(show)
       .catch(() => { if (alive.current) setLoadFailed(true); });
   }, [show, routed]);

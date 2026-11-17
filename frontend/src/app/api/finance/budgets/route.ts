@@ -30,6 +30,6 @@ export async function PUT(req: NextRequest) {
   try {
     return (await saveBudget(category, cents as number | null)) ? answer({ ok: true }) : answer({ error: "could not save" }, 500);
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
 }

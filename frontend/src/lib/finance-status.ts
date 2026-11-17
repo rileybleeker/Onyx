@@ -8,8 +8,10 @@ import { ingestionHeartbeatStatus, type HealthStatus } from "@/lib/status-freshn
  * by the freshness line at the top of /financials, so both always agree.
  *
  * Thresholds: a heartbeat older than 36 h is degraded, older than 72 h is failed; a failed or
- * 'error' heartbeat is failed immediately and its own error text (for example a "login required"
- * message from the harvester) is shown as is. Pure: no network, no clock unless passed.
+ * 'error' heartbeat is failed immediately and its own error text is shown as is, except two cases:
+ * a "login required" text (the old harvester's sign-in expiry) becomes plain words telling Riley what to
+ * do, and any text naming a command ("node " or ".mjs") becomes the generic failure copy. Pure: no network,
+ * no clock unless passed.
  *
  * Keep-alive visits (the harvester opens the app every 2 hours between imports to hold the sign-in)
  * write a third heartbeat, data_type 'keepalive': success, partial on the first failed visit in a
@@ -57,7 +59,7 @@ export const SIMPLEFIN_NOTES: Readonly<Record<string, string>> = {
   account_unmatched: "an account was not imported: it could not be matched uniquely to a ledger account (run simplefin_etl.py --dry-run locally)",
   account_type_unset: "a new account is balances-only until its finance_accounts.account_type is set",
   cutover_review: "rows near the Rocket Money cutover were kept though a same-amount Rocket Money row is near: check for duplicates (simplefin_etl.py --dry-run locally)",
-  cutover_provenance_unsaved: "the cutover match record table is missing or out of date (apply sql/finance_cutover_matches.sql); nothing was written, the next run retries",
+  cutover_provenance_unsaved: "the cutover match record table is missing or out of date. Next: apply sql/finance_cutover_matches.sql. Until then nothing is written; the next run retries.",
 };
 export const SIMPLEFIN_NOTE_LIMIT = 300;
 const SIMPLEFIN_MAX_COUNT = 9999;
@@ -139,6 +141,17 @@ function keepaliveStatus(keepalive: Entry, imports: Entry[]): HealthStatus | nul
   return null;
 }
 
+/** Shown when the old harvester's sign-in has expired (its text starts "login required"). */
+export const LEDGER_SIGN_IN_COPY =
+  "Rocket Money needs you to sign in again. Ask Claude to run the Rocket Money sign-in on your PC.";
+
+/** A heartbeat's own error text -> the words the card shows (see the header comment). */
+function plainLedgerError(raw: string, name: string): string {
+  if (/^login required/i.test(raw)) return LEDGER_SIGN_IN_COPY;
+  if (/node |\.mjs/.test(raw)) return `The latest ${name} import failed (no error text recorded).`;
+  return raw;
+}
+
 export function financeLedgerCard(
   transactions: Entry,
   balances: Entry,
@@ -175,7 +188,10 @@ export function financeLedgerCard(
   let errorMessage: string | null = null;
   for (const wantStatus of ["failed", "partial"] as const) {
     for (const p of ranked) {
-      if (p.status === wantStatus && p.entry) errorMessage ??= text(p.entry.error_message, textLimit);
+      if (p.status === wantStatus && p.entry) {
+        const raw = text(p.entry.error_message, textLimit);
+        if (raw) errorMessage ??= plainLedgerError(raw, p.name);
+      }
     }
   }
   if (!errorMessage && status !== "success" && status !== "unknown") {

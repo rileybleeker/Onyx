@@ -39,7 +39,9 @@ export async function POST(req: NextRequest) {
     .update({ is_excluded: excluded })
     .eq(pk, id)
     .select(pk)
-    .single();
+    // maybeSingle (not single): a zero-match UPDATE returns {data:null,error:null}
+    // so the 404 below is reachable — single() would surface a cryptic PGRST116 500.
+    .maybeSingle();
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });

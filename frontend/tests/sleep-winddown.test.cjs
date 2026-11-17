@@ -154,13 +154,15 @@ test("habit binding: a start tapped under another habit is ignored; a same-habit
   const v2 = rule({ id: 2, effectiveFrom: day(-1), habitPageId: ID_B, habitName: HABIT_2, targetTime: "23:00" });
   const rules = [v2, rule()];
   const names = { [ID_A]: HABIT, [ID_B]: HABIT_2 };
+  // Every start here is tapped on the night before (day(-1)), so read that night, not tonight (tonight is today).
+  const nightOf = (p) => p.window.items.find((i) => i.kind === "night" && i.night.date === day(-1)).night;
   // The goal now names habit B; a start tapped the night before under habit A never shows for it.
   const switched = W.windDownProgress(payload({
     rules, habitNames: names,
     answers: [yes(-1, HABIT_2)],
     starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A }],
   }));
-  assert.equal(switched.tonight.start, null, "a start under another habit is not shown, judged or counted");
+  assert.equal(nightOf(switched).start, null, "a start under another habit is not shown, judged or counted");
   // The same habit with a new target time: the original start still applies (judged by its own version).
   const v2same = rule({ id: 2, effectiveFrom: day(-1), targetTime: "23:00" });
   const sameHabit = W.windDownProgress(payload({
@@ -168,13 +170,13 @@ test("habit binding: a start tapped under another habit is ignored; a same-habit
     answers: [yes(-1)],
     starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A }],
   }));
-  assert.ok(sameHabit.tonight.start, "a same-habit target edit keeps the original start");
-  assert.equal(sameHabit.tonight.start.onTime, false, "judged by the version it was tapped under (22:40 vs that version's 22:30)");
+  assert.ok(nightOf(sameHabit).start, "a same-habit target edit keeps the original start");
+  assert.equal(nightOf(sameHabit).start.onTime, false,"judged by the version it was tapped under (22:40 vs that version's 22:30)");
   // A start with no habit of its own is resolved from its rule version; an unknown one is never transferred.
   const resolved = W.windDownProgress(payload({ answers: [yes(-1)], starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: null }] }));
-  assert.equal(resolved.tonight.start.onTime, false, "the start's own 22:30 version judges 22:40 late");
+  assert.equal(nightOf(resolved).start.onTime, false,"the start's own 22:30 version judges 22:40 late");
   const unknown = W.windDownProgress(payload({ answers: [yes(-1)], starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: null, habitPageId: null }] }));
-  assert.equal(unknown.tonight.start, null, "a start with no habit and no rule version is never transferred to the current habit");
+  assert.equal(nightOf(unknown).start, null,"a start with no habit and no rule version is never transferred to the current habit");
   // A different-habit start never shadows a matching one for the same night.
   const both = W.windDownProgress(payload({
     rules, habitNames: names,
@@ -185,7 +187,7 @@ test("habit binding: a start tapped under another habit is ignored; a same-habit
     ],
   }));
   assert.equal(switched.tonight.date, TODAY);
-  assert.equal(both.tonight.start.onTime, true, "the matching start (22:40 vs 23:00) wins, not the other habit's");
+  assert.equal(nightOf(both).start.onTime, true,"the matching start (22:40 vs 23:00) wins, not the other habit's");
   // The parser carries the habit through the payload.
   const parsed = W.parseWindDownPayload(payload({ starts: [{ night: day(-1), startedAt: "x", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_B }] }));
   assert.equal(parsed.starts[0].habitPageId, ID_B);
@@ -1084,6 +1086,23 @@ test("server read: the habit's own answers since the goal, the starts and WHOOP 
   assert.ok(!db.calls.some((c) => c.ops.some(([op]) => ["insert", "upsert", "update", "delete"].includes(op))), "the read writes nothing");
 });
 
+test("server read: the answers and the WHOOP feedback are read only once the goal is set up", async () => {
+  const db = fakeDb({ sleep_winddown_rules: [], sleep_winddown_pauses: [], habit_journal: [], whoop_sleep: [], sleep_winddown_starts: [] });
+  const p = await S.readWindDown(db);
+  assert.equal(p.status, "not_set_up");
+  assert.ok(!db.calls.some((c) => c.table === "habit_journal"), "no answers before a goal exists");
+  assert.ok(!db.calls.some((c) => c.table === "sleep_winddown_starts"), "no starts before a goal exists");
+  assert.ok(!db.calls.some((c) => c.table === "whoop_sleep"), "no WHOOP read before a goal exists");
+  const missing = fakeDb({}, { fail: { sleep_winddown_rules: "PGRST205" } });
+  assert.equal((await S.readWindDown(missing)).status, "not_connected");
+  assert.ok(!missing.calls.some((c) => ["sleep_winddown_starts", "whoop_sleep", "habit_journal"].includes(c.table)), "not_connected reads no starts, WHOOP or answers");
+  const db2 = fakeDb({ sleep_winddown_rules: [RULE_ROW], sleep_winddown_pauses: [], habit_name_map: [{ notion_page_id: ID_A, habit_name: HABIT }], habit_journal: [], whoop_sleep: [], sleep_winddown_starts: [] });
+  const p2 = await S.readWindDown(db2);
+  assert.equal(p2.status, "ready");
+  assert.equal(db2.calls.filter((c) => c.table === "whoop_sleep").length, 1, "WHOOP is read once");
+  assert.equal(db2.calls.filter((c) => c.table === "sleep_winddown_starts").length, 1, "the starts are read once");
+});
+
 test("server read: after a rename in Notion the answers are read under the habit's current name", async () => {
   const db = fakeDb({
     sleep_winddown_rules: [RULE_ROW], sleep_winddown_pauses: [],
@@ -1092,7 +1111,8 @@ test("server read: after a rename in Notion the answers are read under the habit
   });
   const p = await S.readWindDown(db);
   assert.deepEqual(p.answers.map((a) => a.question), ["Renamed synthetic routine?"]);
-  assert.equal(db.calls.filter((c) => c.table === "habit_journal").length, 2, "one read under the stored name, one under the new name");
+  assert.equal(db.calls.filter((c) => c.table === "habit_journal").length, 1, "one read covers the stored name and the new name");
+  assert.equal(db.calls.filter((c) => c.table === "habit_name_map").length, 1, "the name map is read once");
   assert.equal(W.windDownProgress(p).question, "Renamed synthetic routine?");
 });
 
@@ -1117,4 +1137,41 @@ test("sleep feedback: onset spread across midnight, freshness, and it never chan
   assert.equal(f.newestSync, "2031-03-20T12:00:00Z");
   assert.deepEqual(W.windDownProgress(p), W.windDownProgress(payload({})), "sleep data never marks a night");
   assert.equal(W.durationLabel(330), "5 h 30 min");
+});
+
+test("a refused save shows fixed copy on screen, never the server's sentence (the sentence goes to the console only)", async () => {
+  const SERVER = "Synthetic server sentence: the night was changed elsewhere.";
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const realFetch = globalThis.fetch;
+  const realError = console.error;
+  const logged = [];
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: SERVER, code: "x" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    const UW = loadTs("lib/use-winddown.ts", {
+      "@/lib/client-cache": { GONE: Symbol("gone"), clientCache: {}, fetchJsonValue: async () => null, reportSessionEnded() {}, sessionEnded: () => false },
+      "@/lib/unsaved-work": { unsavedWork: { setDirty() {} } },
+      "@/lib/ui-preferences": { UI_PREFS_PATH: "/api/ui-preferences" },
+      "@/lib/sleep-winddown": W,
+    });
+    const P = loadTs("components/sleep/WindDownPanel.tsx", {
+      "next/link": () => null,
+      "lucide-react": { Check: () => null, CircleDashed: () => null, CircleQuestionMark: () => null, Moon: () => null, Pause: () => null, X: () => null },
+      "@/lib/sleep-winddown": W,
+      "@/lib/use-winddown": UW,
+    });
+    const saver = new W.WindDownSaver({ send: (i) => UW.send("/api/sleep/winddown/night", "POST", { night: i.night }) });
+    saver.submit(intent());
+    await flush();
+    await flush();
+    assert.equal(saver.current.status, "refused");
+    const html = renderToStaticMarkup(React.createElement(P.SaveLine, { s: { saver: saver.current, last: null, notice: null }, p: {} }));
+    assert.ok(html.includes("Not saved. Check the entry and try again."), html);
+    assert.ok(!html.includes("Synthetic server sentence"), "the server's sentence is not on screen");
+    assert.ok(logged.some((l) => l.includes(SERVER)), "the raw sentence is still logged for debugging");
+  } finally {
+    globalThis.fetch = realFetch;
+    console.error = realError;
+  }
 });

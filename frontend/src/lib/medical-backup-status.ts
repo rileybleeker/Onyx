@@ -1,5 +1,5 @@
 // The /status card for the encrypted off-site backup of /health/records (tools/medical_recovery/
-// offsite_backup.py on Riley's PC, weekly, docs/medical-records-recovery.md section 9). Pure: no I/O,
+// offsite_backup.py on the collector PC, weekly, docs/medical-records-recovery.md section 9). Pure: no I/O,
 // no imports, so /api/status and the tests use it as is.
 //
 // What it reads: the newest pds.sync_log row with source "backup", data_type "medical_records". The job
@@ -44,7 +44,7 @@ export function backupCode(value: unknown): string | null {
 export function backupCodeMessage(code: string): string {
   if (code === "age_missing") return "The age tool is not installed on the PC (age_missing): winget install FiloSottile.age.";
   if (code === "recipient_missing" || code === "recipient_invalid")
-    return `No usable backup public key on the PC (${code}): run python ${TOOL} keygen.`;
+    return `No usable backup key is set up on the PC (${code}). Finish the backup key setup on the PC, then check again.`;
   if (code === "key_missing") return "No service-role key on the PC (key_missing): restore ~/.onyx_supabase_secret.";
   if (code === "read_denied") return "Supabase refused the read (read_denied): check the service-role key in ~/.onyx_supabase_secret.";
   if (code.startsWith("read_failed")) return `Supabase could not be read (${code}); the next run retries.`;
@@ -96,7 +96,7 @@ export function medicalBackupCard({ entry, nowMs }: { entry: BackupHeartbeat | n
   };
   if (!entry || !start || !Number.isFinite(startMs)) {
     return { ...base, status: "unknown",
-      errorMessage: `No backup yet - run python ${TOOL} keygen, then tools/medical_recovery/register-task.ps1 on the PC.` };
+      errorMessage: "No backup yet. Finish the backup setup on the PC, then check again." };
   }
   if (raw === "failed") {
     return { ...base, status: "failed", errorMessage: code ? backupCodeMessage(code) : "The last backup failed." };

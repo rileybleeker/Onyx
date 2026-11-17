@@ -63,3 +63,5 @@ jobs:
           IMAP_APP_PASSWORD_4: ${{ secrets.IMAP_APP_PASSWORD_4 }}
           IMAP_EMAIL_5: ${{ secrets.IMAP_EMAIL_5 }}
           IMAP_APP_PASSWORD_5: ${{ secrets.IMAP_APP_PASSWORD_5 }}
+          # Read by orders_email_etl via flights_email_etl. Unset → the heartbeat is 'partial' and says so.
+          FLIGHTS_REQUIRED_GMAIL_ACCOUNTS: ${{ secrets.FLIGHTS_REQUIRED_GMAIL_ACCOUNTS }}

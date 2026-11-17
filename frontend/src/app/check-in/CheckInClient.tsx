@@ -149,8 +149,11 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const params = useSearchParams();
   const [feedDate, setFeedDate] = useState<string | null>(null);
   const requested = feed ? feedDate : params.get("date");
+  // The day the screen shows (kept by showDate): a day switch whose save failed puts the URL back on it.
+  const shownDate = useRef<string | null>(requested);
   // Switch the day being checked in (null = the server's today).
   const showDate = useCallback((date: string | null) => {
+    shownDate.current = date;
     if (feed) setFeedDate(date);
     else router.replace(date ? `/check-in?date=${date}` : "/check-in", { scroll: false });
   }, [feed, router]);
@@ -207,6 +210,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const lastLoad = useRef(0);
   const savingRef = useRef(false);
   const deferredLoad = useRef<{ date: string | null } | null>(null);
+  const skipRevertFlush = useRef(false);
 
   const loadSeq = useRef(0);
   // Set once a GET answered: a cached copy is shown only before that.
@@ -246,8 +250,22 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   }, [drafts]);
 
   const load = useCallback(async (date: string | null, afterSave = false) => {
+    // The load that puts the URL back on the shown day (below) must not save the failed tap again: its retry timer
+    // (autosave backoff) sends it. Taken once, by that load only.
+    const afterRevert = skipRevertFlush.current;
+    skipRevertFlush.current = false;
     // A tap still waiting to be saved goes first, under the day it was made on: the GET below replaces the screen.
-    if (!afterSave) await autosaveRef.current.flush().catch(() => {});
+    // If that save failed (or was refused) and this load would switch to another day, the screen stays on its day
+    // with the draft and the save-failed line (Retry) shown; nothing is replaced. A same-day refresh (resume, clock
+    // check) still goes on to the GET, so an authoritative refusal (400/401/403) or a new day is still noticed.
+    if (!afterSave && !afterRevert && !(await autosaveRef.current.flush().catch(() => false)) && date !== shownDate.current) {
+      // Back/forward may already have moved the URL to the other day: put it back on the day still on screen.
+      // A retry is armed for the failed save: the URL change reloads this day, and that load must not resend it at once.
+      // Live, not `state`: this render's copy still says "saving" until React re-renders after the failure.
+      skipRevertFlush.current = autosaveRef.current.retryArmed();
+      showDate(shownDate.current);
+      return;
+    }
     // Back/forward can change the URL while a save runs. Finish the dated save first.
     if (savingRef.current && !afterSave) {
       deferredLoad.current = { date };
@@ -274,7 +292,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
           clientCache.remove(url); // the server refused it: never show that cached copy again
         }
         setRefreshFailed(true);
-        setError(json.error || `Couldn't load the check-in (${res.status}).`);
+        setError(`Couldn't load the check-in (${res.status}).`);
         return;
       }
       const payload = json as CheckinPayload;
@@ -457,8 +475,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       });
       if (!res.ok) {
         const json = await res.json().catch(() => ({}));
-        if (res.status === 409 && json.stale) throw new StaleDayError(json.error || "A new day started since this page loaded.");
-        const message = json.error || `Save failed (${res.status}). Your answers are still here.`;
+        if (res.status === 409 && json.stale) throw new StaleDayError("A new day started since this page loaded. Reload the page to continue.");
+        const message = `Save failed (${res.status}). Your answers are still here.`;
         // A refusal (bad date, a sleep answer for tonight) is not retried until the next tap; an outage is.
         if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw new AutosaveRefused(message);
         throw new Error(message);
@@ -682,7 +700,7 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json || typeof json !== "object" || !("url" in json)) {
-        setJournal((cur) => cur && { ...cur, status: "draft", error: json?.error || `Couldn't save the journal entry (${res.status}). It is still here.` });
+        setJournal((cur) => cur && { ...cur, status: "draft", error: `Couldn't save the journal entry (${res.status}). It is still here.` });
         return;
       }
       setJournal((cur) => cur && { ...cur, status: "saved", url: typeof json.url === "string" ? json.url : null, existing: !!json.existing });
@@ -693,9 +711,10 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   };
 
   // A tap still waiting is saved under its own day before the tab changes (the cached copy of the next day must
-  // not be drawn under it).
+  // not be drawn under it). If that save fails, the tab does not change: the draft stays with its day and the
+  // save-failed line (Retry) shows.
   const goTo = (date: string) => {
-    void autosaveRef.current.flush().catch(() => {}).then(() => showDate(date));
+    void autosaveRef.current.flush().catch(() => false).then((saved) => { if (saved) showDate(date); });
   };
 
   const reviewDraft = (entry: DatedDraft) => {

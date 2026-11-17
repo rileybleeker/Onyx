@@ -49,6 +49,9 @@ const LIST_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,cu
 const HEARTBEAT_COLS = "status,sync_start,records_synced,duration_seconds,error_message";
 const PAGE = 1000; // PostgREST's default max rows per request
 const MAX_WINDOW_PAGES = 40; // 40k rows of window; beyond that the page says so
+// The 12-month window is read with its next 3 pages in the same round trip (up to 4,000 rows in one round trip;
+// fetchPaged uses them only when the first page is full). Same rows, same order as the step-based read.
+const WINDOW_SPECULATE_PAGES = 3;
 
 // The shapes this module returns live in finance-ledger-types.ts (types only), so client code can name them
 // without importing this server module.
@@ -85,7 +88,19 @@ type PageResult = { data: unknown[] | null; error: PgErr | null; count: number |
 export async function fetchPaged(
   build: (from: number, to: number, withCount: boolean) => PromiseLike<PageResult>,
   maxPages: number,
+  speculate = 0,
 ): Promise<{ rows: unknown[]; truncated: boolean }> {
+  // `speculate` (opt-in): the next `speculate` pages are also requested in the same round trip as the first one, at the
+  // offsets a full page would use. They are used only when the first page came back full (PAGE rows); otherwise they are
+  // dropped and the step-based reads below run as before. Reads of up to 1 + speculate full pages take one round trip.
+  type Ahead = { ok: true; res: PageResult } | { ok: false; err: unknown };
+  const ahead: Promise<Ahead>[] = Array.from({ length: speculate }, (_, i) => {
+    const from = (i + 1) * PAGE;
+    return Promise.resolve(build(from, from + PAGE - 1, false)).then(
+      (res): Ahead => ({ ok: true, res }),
+      (err: unknown): Ahead => ({ ok: false, err }),
+    );
+  });
   const first = check(await build(0, PAGE - 1, true));
   const rows: unknown[] = [...(first.data ?? [])];
   const step = rows.length;
@@ -102,13 +117,18 @@ export async function fetchPaged(
   }
 
   const needed = Math.ceil(total / step);
-  const starts = Array.from({ length: Math.min(needed, maxPages) - 1 }, (_, i) => (i + 1) * step);
+  const later = Math.min(needed, maxPages) - 1;
+  // Rows removed since the count: PostgREST answers a range past the end with 416 (PGRST103) -> no rows.
+  const rowsOf = (res: PageResult) => (res.error?.code === "PGRST103" ? [] : (check(res).data ?? []));
   const pages = await Promise.all(
-    starts.map(async (from) => {
-      const res = await build(from, from + step - 1, false);
-      // Rows removed since the count: PostgREST answers a range past the end with 416 (PGRST103).
-      if (res.error?.code === "PGRST103") return [];
-      return check(res).data ?? [];
+    Array.from({ length: later }, async (_, i) => {
+      const from = (i + 1) * step;
+      if (step === PAGE && i < ahead.length) {
+        const got = await ahead[i];
+        if (!got.ok) throw got.err;
+        return rowsOf(got.res);
+      }
+      return rowsOf(await build(from, from + step - 1, false));
     }),
   );
   for (const got of pages) rows.push(...got);
@@ -227,7 +247,7 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
         .lt("txn_date", windowEnd);
       if (account) qb = qb.eq("account_key", account);
       return qb.order("txn_date", { ascending: false }).order("txn_key", { ascending: true }).range(from, to);
-    }, MAX_WINDOW_PAGES);
+    }, MAX_WINDOW_PAGES, WINDOW_SPECULATE_PAGES);
 
     const listRead = readList(db, { ...query, month, account }, accounts, fixes);
     const [balanceReadRows, windowRaw, list] = await Promise.all([Promise.all(balanceReads), windowRead, listRead]);

@@ -626,7 +626,7 @@ test("the reading files name no book: no level title, concept tag or badge label
 /* Docs                                                                 */
 /* ------------------------------------------------------------------ */
 
-test("the docs and AGENTS.md say where a book's flavour lives", () => {
+test("the docs and the reading domain file say where a book's flavour lives", () => {
   const doc = read("docs/reading-question-bank.md");
   assert.match(doc, /pds\.books\.theme/);
   assert.match(doc, /sql\/reading_book_theme\.sql/);
@@ -636,8 +636,9 @@ test("the docs and AGENTS.md say where a book's flavour lives", () => {
   assert.match(doc, /supplied out of band, never committed/);
   assert.match(doc, /reading-practice-urls\.ts/, "the files table lists every file of the feature");
   assert.doesNotMatch(read("AGENTS.md"), /plant-themed/, "the level titles are no longer described as one book's");
-  const agents = read("AGENTS.md");
-  assert.match(agents, /docs\/reading-question-bank\.md/, "AGENTS.md points at the question bank's doc");
+  // AGENTS.md now holds only the cross-cutting rules; the reading rules live in its domain file.
+  const agents = read("docs/agents/reading-journal.md");
+  assert.match(agents, /docs\/reading-question-bank\.md/, "the reading domain file points at the question bank's doc");
   assert.match(agents, /pds\.books\.theme/, "and says the book's flavour is data");
   assert.match(agents, /sql\/reading_book_theme\.sql/);
 });

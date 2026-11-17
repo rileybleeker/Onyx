@@ -2224,6 +2224,52 @@ test("held requests: matched by round, question and version only; a conclusive a
   assert.equal(outbox.size, 0, "the receipt released it");
 });
 
+test("held requests, lifetime: an unknown answer is kept after close and retried under its own key; a proof refusal releases it", async (t) => {
+  const outbox = new Map();
+  const req = { attempt_key: "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b", question_id: 101, version: 1, round_key: ROUND_KEY, round_date: TODAY, round_kind: "daily", answer: "alpha 1", hinted: false, response_ms: 5 };
+  outbox.set(req.attempt_key, req);
+  const sentKeys = [];
+  let reply = "offline";
+  withGlobals(t, {
+    fetch: async (url, init) => {
+      if (url === C.ATTEMPT_URL) sentKeys.push(JSON.parse(init.body).attempt_key);
+      if (reply === "offline") throw new TypeError("offline");
+      return reply;
+    },
+  });
+  // The screen closed: nothing removes the entry, and a send without an answer keeps it too.
+  assert.equal((await C.resendAttempt(outbox, req, true)).kind, "unknown");
+  assert.equal(outbox.get(req.attempt_key), req, "kept after close");
+  assert.equal((await C.resendAttempt(outbox, req)).kind, "unknown");
+  assert.equal(outbox.size, 1, "still unknown: kept");
+  assert.deepEqual(sentKeys, [req.attempt_key, req.attempt_key], "every retry is the same attempt_key");
+  // A refusal that proves nothing was stored (the quiz is closed) is conclusive: the entry goes.
+  reply = response({ error: "quiz_closed" }, 409);
+  assert.equal((await C.resendAttempt(outbox, req)).kind, "refused");
+  assert.equal(outbox.size, 0, "a proof refusal releases it");
+});
+
+test("held requests, lifetime: a confirmed round read showing the card stored under the held key releases it; another stored key does not", async (t) => {
+  const held = cued(2);
+  const req = { attempt_key: "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c", question_id: held.question.question_id, version: held.question.version, round_key: ROUND_KEY, round_date: TODAY, round_kind: "daily", answer: "alpha 2", hinted: false, response_ms: 5 };
+  const otherKey = "0d0d0d0d-0d0d-4d0d-8d0d-0d0d0d0d0d0d";
+
+  const outbox = new Map([[req.attempt_key, req]]);
+  C.releaseStoredAttempts(outbox, [{ done: true, attempt_key: otherKey }, { done: false, attempt_key: req.attempt_key }]);
+  assert.equal(outbox.size, 1, "another stored key, or an open card, confirms nothing");
+  C.releaseStoredAttempts(outbox, [{ done: true, attempt_key: req.attempt_key.toUpperCase() }]);
+  assert.equal(outbox.size, 0, "the card stored under the held key releases it");
+
+  // The runner: the round read shows card 2 answered under the held key, so it is not offered as unconfirmed.
+  const outbox2 = new Map([[req.attempt_key, req]]);
+  const done2 = { ...held, done: true, attempt_key: req.attempt_key };
+  const r = mountRunner(t, { cards: [cued(1), done2], outbox: outbox2 });
+  await r.h.flush();
+  assert.equal(outbox2.size, 0, "the confirmed read released the request");
+  assert.equal(r.alerts().filter((a) => /Not sure it saved/.test(a)).length, 0);
+  assert.equal(r.attempts().length, 0, "nothing is sent");
+});
+
 test("closing with an unconfirmed answer keeps its request: the reopened round shows that card as 'not sure' first, and Retry sends the SAME request (never a new key)", async (t) => {
   const outbox = new Map();
   const cards = [cued(1), cued(2)];
@@ -2296,4 +2342,60 @@ test("closing while an answer is still on its way: the wait runs out, the reques
   assert.equal(r2.attempts().length, 1);
   assert.equal(r2.attempts()[0].body.attempt_key, r1.attempts()[0].body.attempt_key);
   assert.equal(r2.alerts().length, 0);
+});
+
+// Review RQS4-R1: only the newest round read may write the card and the cache. A slow GET from an earlier read (the
+// mount's, here) that lands after a newer one is dropped; the card on screen and the cached copy stay the newer ones.
+// The same-generation answer still applies.
+test("practice part: an older round read that lands after a newer one is dropped; the newer card and cache stay", async (t) => {
+  runnerProps.length = 0;
+  const win = fakeTarget();
+  const doc = fakeTarget({ visibilityState: "visible" });
+  let clock = 5_000_000;
+  const gates = [];
+  const p = mountPart(t, {
+    win,
+    doc,
+    now: () => clock,
+    roundAnswer: () => {
+      const g = deferred();
+      gates.push(g);
+      return g.promise;
+    },
+    bankAnswer: onBank,
+  });
+  const back = async () => {
+    doc.visibilityState = "hidden";
+    doc.fire("visibilitychange");
+    clock += 61_000;
+    doc.visibilityState = "visible";
+    doc.fire("visibilitychange");
+    await p.h.flush();
+  };
+  await p.h.flush(); // the mount's read (gates[0]) is on its way
+  await back(); // the newer read (gates[1]) after a return to the app
+  assert.equal(gates.length, 2);
+
+  const older = round([cued(1), cued(2)]);
+  const newer = round([cued(1, { card: { done: true } }), cued(2)]);
+  gates[1].resolve(response(newer)); // the newer read answers first
+  await p.h.flush();
+  assert.match(p.h.text(), /1 ready/);
+  assert.deepEqual(p.store[C.practiceUrl("synthetic-book")], newer);
+
+  gates[0].resolve(response(older)); // the older read lands last
+  await p.h.flush();
+  assert.match(p.h.text(), /1 ready/, "the older card does not replace the newer one");
+  assert.doesNotMatch(p.h.text(), /2 ready/);
+  assert.deepEqual(p.store[C.practiceUrl("synthetic-book")], newer, "the cache keeps the newer copy");
+  assert.equal(p.h.button("Start").props["aria-disabled"], undefined, "the newer read settled the check");
+
+  // Same generation: a read that is the newest one still applies.
+  await back();
+  assert.equal(gates.length, 3);
+  const third = round([cued(1), cued(2), cued(3)]);
+  gates[2].resolve(response(third));
+  await p.h.flush();
+  assert.match(p.h.text(), /3 ready/);
+  assert.deepEqual(p.store[C.practiceUrl("synthetic-book")], third);
 });

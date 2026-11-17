@@ -12,7 +12,10 @@ const MISSING_TABLE_CODES = new Set(["PGRST205", "42P01"]);
 function db() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) return null;
+  if (!url || !key) {
+    console.error("kindle run: Supabase URL or service key is not set");
+    return null;
+  }
   return createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
 }
 
@@ -24,7 +27,7 @@ function failed(code: string | undefined, what: string) {
 
 /**
  * POST /api/kindle/run   body {}
- * Asks Riley's PC to run the Kindle harvester now. Owner session only (middleware; NOT in the CI
+ * Asks the collector PC to run the Kindle harvester now. Owner session only (middleware; NOT in the CI
  * carve-out), same-origin JSON, at most 256 bytes. Writes one pds.pc_run_requests row, which
  * Supabase Realtime pushes to the idle listener on the PC; a press while the newest request is still
  * unanswered (< 2 min) or still running (< 25 min) returns that request instead of a second row.
@@ -42,7 +45,7 @@ export async function POST(req: NextRequest) {
   if (!parsed.ok) return answer({ error: parsed.error }, parsed.error === "body too large" ? 413 : 400);
 
   const client = db();
-  if (!client) return answer({ error: "Run now is not configured" }, 503);
+  if (!client) return answer({ error: "Run now isn't available right now. Try again later." }, 503);
 
   const latest = await client
     .from("pc_run_requests")
@@ -64,7 +67,7 @@ export async function GET(req: NextRequest) {
   const id = req.nextUrl.searchParams.get("id");
   if (!isRunId(id)) return answer({ error: "id must be a request id" }, 400);
   const client = db();
-  if (!client) return answer({ error: "Run now is not configured" }, 503);
+  if (!client) return answer({ error: "Run now isn't available right now. Try again later." }, 503);
   const { data, error } = await client.from("pc_run_requests").select(RUN_REQUEST_COLS).eq("id", id).maybeSingle();
   if (error) return failed(error.code, "read");
   if (!data) return answer({ error: "not found" }, 404);

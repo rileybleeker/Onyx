@@ -319,7 +319,8 @@ test("client: a refused save is shown, not retried by itself, and Retry sends it
   const h = await mount(t, { onPost: async () => refuse ? response({ error: "Synthetic refusal" }, 400) : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
   await h.tick();
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Save failed \(400\)\. Your answers are still here\./);
+  assert.doesNotMatch(h.text(), /Synthetic refusal/, "the server's own error text is never shown");
   await h.tick(120_000);
   assert.equal(h.posts.length, 1, "a refusal waits for Riley");
   refuse = false;
@@ -333,7 +334,8 @@ test("client: an outage is retried on its own", async (t) => {
   const h = await mount(t, { onPost: async () => down ? response({ error: "Synthetic outage" }, 503) : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
   await h.tick();
-  assert.match(h.text(), /Not saved: Synthetic outage Trying again…/);
+  assert.match(h.text(), /Not saved: Save failed \(503\)\. Your answers are still here\. Trying again…/);
+  assert.doesNotMatch(h.text(), /Synthetic outage/, "the server's own error text is never shown");
   down = false;
   await h.tick(2000);
   assert.equal(h.posts.length, 2);
@@ -434,7 +436,8 @@ test("client: ordinary night failure retains pending answers without resubmittin
   h.click(`${DAY}: yes`); await h.flush();
   h.click(`${SLEEP}: no`); await h.flush();
   await h.tick();
-  assert.match(h.text(), /Synthetic save failure/);
+  assert.match(h.text(), /Not saved: Save failed \(500\)\. Your answers are still here\./);
+  assert.doesNotMatch(h.text(), /Synthetic save failure/, "the server's own error text is never shown");
   assert.equal(h.storage.values.has(dayKey("2031-03-05")), false);
   assert.ok(h.storage.values.has(nightKey("2031-03-04")));
   h.click("Retry"); await h.flush();
@@ -519,7 +522,8 @@ for (const failure of ["network", "server"]) {
     assert.match(h.text(), /2031-03-04/, "the retained night also identifies its original date");
     assert.doesNotMatch(h.text(), /Last night|Daytime · Today/, "a failed clock refresh must not assert current relative labels");
     assert.doesNotMatch(h.text(), /Review preserved answers/);
-    assert.match(h.text(), failure === "network" ? /Couldn't reach Onyx/ : /Synthetic reload outage/);
+    assert.match(h.text(), failure === "network" ? /Couldn't reach Onyx/ : /Couldn't load the check-in \(500\)\./);
+    assert.doesNotMatch(h.text(), /Synthetic reload outage/, "the server's own error text is never shown");
     h.click(`${DAY}: no`); await h.flush();
     assert.equal(h.button(`${DAY}: no`).props["aria-pressed"], true);
     assert.deepEqual(JSON.parse(h.storage.values.get(dayKey("2031-03-05"))), { [DAY]: { a: "No", base: "Yes" } });
@@ -541,7 +545,8 @@ for (const status of [400, 401, 403]) {
     await h.resume(); // tries the save once more first (it fails again), then the refused GET
     assert.equal(h.hasButton(`${DAY}: yes`), false);
     assert.equal(h.hasButton("Save now"), false);
-    assert.match(h.text(), /Synthetic date or session refusal/);
+    assert.ok(h.text().includes(`Couldn't load the check-in (${status}).`), "the fixed refusal sentence, not the server's text");
+    assert.doesNotMatch(h.text(), /Synthetic date or session refusal/, "the server's own error text is never shown");
     assert.match(h.text(), /Review preserved answers/);
     assert.match(h.text(), /Daytime 2031-03-05/);
     assert.equal(h.posts.length, 2, "both attempts failed; nothing was stored");
@@ -559,10 +564,19 @@ for (const stale of [false, true]) {
     if (stale) h.setPage(page("2031-03-06"));
     pending.resolve(response(stale ? { stale: true } : { error: "Synthetic save failure that must stay visible" }, stale ? 409 : 500));
     await h.flush();
-    assert.match(h.text(), stale ? /A new day started.*Unsaved answers are preserved/ : /Synthetic save failure that must stay visible/);
-    assert.match(h.text(), /Daytime 2031-03-05/);
+    assert.match(h.text(), stale ? /A new day started.*Unsaved answers are preserved/ : /Not saved: Save failed \(500\)\. Your answers are still here\./);
+    if (!stale) assert.doesNotMatch(h.text(), /Synthetic save failure that must stay visible/, "the server's own error text is never shown");
+    // A failed save stops the switch (#608): the day stays on screen under its normal label. A stale-day rejection
+    // still turns the form into the dated review.
+    assert.match(h.text(), stale ? /Daytime 2031-03-05/ : /Daytime · TodayWed, Mar 5/);
     assert.equal(h.posts.length, 1);
     assert.equal(h.hasButton("Save now"), false, "unreviewed drafts never follow navigation into a save");
+    if (!stale) {
+      // The day switch that was put back must not resend the failed save at once; its backoff retry sends it later.
+      await h.tick(2000);
+      assert.equal(h.posts.length, 2, "the failed save is retried after its backoff");
+      assert.deepEqual(h.posts[1], h.posts[0], "the retry carries the same answers under the same day");
+    }
   });
 }
 
@@ -625,6 +639,18 @@ test("client: a transient failed day switch keeps the old date explicit and cann
   await h.tick(60_000);
   assert.equal(h.posts.length, 1);
   assert.equal(h.storage.values.has(dayKey("2031-03-04")), false);
+});
+
+test("client: a day switch whose pending save is refused stays on the day, keeps the draft and shows the reason", async (t) => {
+  const h = await mount(t, { onPost: async () => response({ error: "Synthetic refusal" }, 400) });
+  h.click(`${DAY}: yes`); await h.flush();
+  h.navigate("2031-03-04"); await h.flush(); // the waiting tap is saved first; the refusal stops the switch
+  assert.equal(h.gets.includes("2031-03-04"), false, "the other day is never fetched, so it never replaces the screen");
+  assert.match(h.text(), /Daytime · TodayWed, Mar 5/, "the screen still shows the day the answer belongs to");
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "the unsaved answer is still on screen");
+  assert.match(h.text(), /Not saved: Save failed \(400\)\. Your answers are still here\./);
+  assert.equal(h.posts.length, 1, "a refusal is not retried by the switch");
+  assert.ok(h.button("Retry"), "Retry is offered");
 });
 
 test("client: a voice fill that answers late keeps the taps and clears made while it was read", async (t) => {
@@ -739,7 +765,8 @@ test("client: the journal draft needs a mood and a topic, and a refused save kee
   assert.equal(written.length, 1);
   assert.equal(written[0].mood, "neutral");
   assert.deepEqual(written[0].topics, ["reflection"]);
-  assert.match(h.text(), /Synthetic Notion refusal/);
+  assert.match(h.text(), /Couldn't save the journal entry \(502\)\. It is still here\./);
+  assert.doesNotMatch(h.text(), /Synthetic Notion refusal/, "the server's own error text is never shown");
   assert.equal(h.button("Save to journal").props.disabled, false, "still there to try again");
 });
 

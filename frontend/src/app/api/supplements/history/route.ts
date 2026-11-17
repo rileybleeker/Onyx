@@ -34,7 +34,10 @@ export async function GET(req: NextRequest) {
     .order("intake_time", { ascending: false, nullsFirst: false })
     .range(from, to);
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[supplements/history query]", error.message);
+    return NextResponse.json({ error: "Couldn't load your supplements. Try again." }, { status: 500 });
+  }
 
   type Embedded = { brand_name: string | null; full_name: string | null } | { brand_name: string | null; full_name: string | null }[] | null;
   const rows = (data ?? []).map((row) => {

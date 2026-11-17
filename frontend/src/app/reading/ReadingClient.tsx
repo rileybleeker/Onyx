@@ -36,6 +36,19 @@ const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
+const HIGHLIGHT_REMOVED_COPY = "That highlight was removed elsewhere. Retry saves it again.";
+
+/**
+ * The status line text for a failed highlight save: fixed plain copy, never the server's words. The raw error goes to
+ * the console only, so a developer still sees it.
+ */
+function highlightSaveMessage(e: unknown): string {
+  if (e instanceof AutosaveRefused && e.message === HIGHLIGHT_REMOVED_COPY) return HIGHLIGHT_REMOVED_COPY;
+  console.error("Highlight save failed:", e);
+  if (e instanceof AutosaveRefused) return "This highlight could not be saved as written. Your text is still here. Check it and try again.";
+  return "Could not save this highlight. Your text is still here. Try again.";
+}
+
 /**
  * /reading — the reading quest (2026-11-07).
  *
@@ -113,7 +126,8 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
         if (json.overview && !which) setSlug(json.overview.book.slug);
         return true;
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Couldn't load");
+        console.error("Reading load failed:", e);
+        setError("Couldn't load your reading. Try again.");
         // The Review card's Refresh keeps its card blocked and says so (ReviewCard.tsx).
         return false;
       } finally {
@@ -194,7 +208,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       <div className="max-w-3xl">
         <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-red-400">{error}</p>
-        <p className="mt-1 text-[12px] text-text-tertiary">If this is a fresh deploy, apply sql/reading_schema.sql in Supabase first.</p>
+        <p className="mt-1 text-[12px] text-text-tertiary">Reading could not load. Try again in a moment.</p>
         <div className="mt-5">{wantList}</div>
       </div>
     );
@@ -233,6 +247,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
               load(e.target.value);
             }}
             className="bg-surface-card border border-border-subtle rounded-control text-[12px] px-2 py-1.5 text-text-secondary"
+            aria-label="Switch book"
           >
             {questBooks.map((b) => (
               <option key={b.slug} value={b.slug}>
@@ -611,6 +626,7 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
     delayMs: 1500,
     ready: (v) => v.reason,
     same: sameReadingValue,
+    describeError: highlightSaveMessage,
     save: async (v, { keepalive }) => {
       if (!v.body) return;
       const hl = hlRef.current;
@@ -648,8 +664,9 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
         await saveRequest(`/api/reading/highlights/${hl.id}`, { method: "PATCH", body, keepalive });
       } catch (e) {
         if (e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+          console.error("Highlight was removed elsewhere:", e.message);
           if (hlRef.current?.id === hl.id) setHighlight(null);
-          throw new AutosaveRefused("That highlight was removed elsewhere. Retry saves it again.");
+          throw new AutosaveRefused(HIGHLIGHT_REMOVED_COPY);
         }
         throw e;
       }
@@ -690,7 +707,8 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       startNew();
       onSaved();
     } catch (e) {
-      onError(e instanceof Error ? `Couldn't remove the highlight: ${e.message}` : "Couldn't remove the highlight");
+      console.error("Highlight removal failed:", e);
+      onError("Couldn't remove the highlight. Try again.");
     } finally {
       if (alive.current) setRemoving(false);
     }
@@ -705,7 +723,8 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       if (!res.ok) throw new Error(json.error || "failed");
       setPreview({ format: json.format, count: json.count });
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't parse");
+      console.error("Highlight preview failed:", e);
+      onError("Couldn't read that text. Try again.");
     } finally {
       setSaving(false);
     }
@@ -721,7 +740,8 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
       setPreview(null);
       onAdded(json.created ?? 0);
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Import failed");
+      console.error("Highlight import failed:", e);
+      onError("Import failed. Try again.");
     } finally {
       setSaving(false);
     }
@@ -908,6 +928,9 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
   const [open, setOpen] = useState(true);
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
+  // savingId drives the disabled state; the ref guards against a second call before React re-renders.
+  const [savingId, setSavingId] = useState<number | null>(null);
+  const savingRef = useRef<number | null>(null);
   const groups = useMemo(() => {
     const m = new Map<string, Highlight[]>();
     for (const h of o.highlights) {
@@ -918,13 +941,20 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
   }, [o.highlights]);
 
   const saveComment = async (h: Highlight) => {
+    if (savingRef.current === h.highlight_id) return;
+    savingRef.current = h.highlight_id;
+    setSavingId(h.highlight_id);
     try {
       const res = await fetch(`/api/reading/highlights/${h.highlight_id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ comment: draft }) });
       if (!res.ok) throw new Error((await res.json()).error || "failed");
       setEditing(null);
       onChanged();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't save");
+      console.error("Highlight comment save failed:", e);
+      onError("Couldn't save the comment. Try again.");
+    } finally {
+      savingRef.current = null;
+      setSavingId(null);
     }
   };
   const archive = async (h: Highlight) => {
@@ -933,7 +963,8 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
       if (!res.ok) throw new Error((await res.json()).error || "failed");
       onChanged();
     } catch (e) {
-      onError(e instanceof Error ? e.message : "Couldn't archive");
+      console.error("Highlight archive failed:", e);
+      onError("Couldn't remove the highlight. Try again.");
     }
   };
 
@@ -958,11 +989,25 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
                     <p className="text-[13px] text-text-primary leading-relaxed">&ldquo;{h.passage}&rdquo;</p>
                     {editing === h.highlight_id ? (
                       <div className="mt-1.5 flex gap-2">
-                        <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} className="flex-1 bg-white/[0.03] border border-border-subtle rounded-control px-2 py-1 text-[13px] italic text-text-primary" />
-                        <button onClick={() => saveComment(h)} className="h-8 w-8 rounded-control border border-accent/60 text-accent inline-flex items-center justify-center">
+                        <input
+                          autoFocus
+                          value={draft}
+                          onChange={(e) => setDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") saveComment(h);
+                            else if (e.key === "Escape") setEditing(null);
+                          }}
+                          className="flex-1 bg-white/[0.03] border border-border-subtle rounded-control px-2 py-1 text-[13px] italic text-text-primary"
+                        />
+                        <button
+                          onClick={() => saveComment(h)}
+                          disabled={savingId === h.highlight_id}
+                          aria-label="Save comment"
+                          className="h-8 w-8 rounded-control border border-accent/60 text-accent inline-flex items-center justify-center disabled:opacity-50"
+                        >
                           <Check className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => setEditing(null)} className="h-8 w-8 rounded-control border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
+                        <button onClick={() => setEditing(null)} aria-label="Cancel comment" className="h-8 w-8 rounded-control border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </div>

@@ -1,4 +1,4 @@
-// Onyx Rocket Money harvester: runs on Riley's PC (Task Scheduler "Onyx Rocket Money Harvest", every 2 hours).
+// Onyx Rocket Money harvester: runs on the collector PC (Task Scheduler "Onyx Rocket Money Harvest", every 2 hours).
 //
 // What it does: opens app.rocketmoney.com in a dedicated, already signed-in Chrome profile and READS the
 // responses the web app itself loads for the Net Worth and Settings > Accounts pages (account list, last

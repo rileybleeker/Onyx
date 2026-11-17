@@ -70,12 +70,13 @@ test("/reading Want to read: mounting (page or scroll) only reads the list; the 
   const list = read("app/reading/ReadingList.tsx");
   // The only POST is inside `send`, which is called from taps and the autosave of typed words.
   assert.equal((list.match(/method: "POST"/g) || []).length, 1);
-  const mount = /\/\/ Mount: read only\.[^\n]*\n\s*useEffect\(\(\) => \{([\s\S]*?)\n  \}, \[/.exec(list);
+  const mount = /\/\/ Mount: read only\.[^\n]*(?:\n\s*\/\/[^\n]*)*\n\s*useEffect\(\(\) => \{([\s\S]*?)\n  \}, \[/.exec(list);
   assert.ok(mount, "the list's mount effect is found");
   assert.ok(!/send\(|method:|retryPending|act\(/.test(mount[1]), "the mount effect writes nothing");
   assert.match(read("app/reading/ReadingClient.tsx"), /<ReadingList books=\{books\} onChanged=\{onListChanged\} \/>/);
-  // The warm-up list is GET-only (json = fetchJsonValue); it may carry other GETs after it (preferences, Practice).
-  assert.match(read("components/AppData.tsx"), /"\/reading": \(\) => \[json\("\/api\/reading"\), json\("\/api\/reading\/list"\)/);
+  // The warm-up list is GET-only (json = fetchJsonValue). It may carry a skipOn flag (the /sleep skip, wrapped as { ...json(...), skipOn })
+  // and other GETs after it (preferences, Practice).
+  assert.match(read("components/AppData.tsx"), /"\/reading": \(\) => \[json\("\/api\/reading"\), (?:\{ \.\.\.)?json\("\/api\/reading\/list"\)/);
 });
 
 test("Personalize: a grid in the scroll never syncs its layout with the server or saves an edit", () => {

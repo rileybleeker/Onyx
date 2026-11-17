@@ -38,7 +38,7 @@ export type CareCalendarCard = {
 
 const LABEL = "Care Calendar";
 const DOC = "docs/health-google-calendar.md";
-const CATCH_UP = "the Care Calendar Catch-up workflow";
+const CATCH_UP = "the scheduled care calendar catch-up";
 
 /** The same test as googleConfig() in care-google-server.ts: both Google credentials are present. */
 export function careCalendarConfigured(env: Record<string, string | undefined>): boolean {
@@ -87,7 +87,7 @@ export function careCalendarCard(p: {
   }
   if (p.readError) {
     const c = code(p.readError.code);
-    if (c === "PGRST205" || c === "42P01") return { ...base, errorMessage: "Sync table missing: apply sql/care_calendar_sync_schema.sql." };
+    if (c === "PGRST205" || c === "42P01") return { ...base, errorMessage: "Sync table missing. Next: apply sql/care_calendar_sync_schema.sql." };
     return { ...base, status: "failed", errorMessage: `Could not read the sync state (${c}).` };
   }
   const row = p.row;

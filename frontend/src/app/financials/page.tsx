@@ -25,12 +25,14 @@ export default async function FinancialsPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const now = new Date();
+  // Search params and cookies are read together; both reads are in-request, not database round trips.
+  const [params, cookieStore] = await Promise.all([searchParams, cookies()]);
   const [load, investments] = await Promise.all([
-    loadLedger(parseLedgerQuery(await searchParams), now),
+    loadLedger(parseLedgerQuery(params), now),
     loadInvestments(now),
   ]);
   // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
-  const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/financials"))?.value);
+  const layout = layoutFromCookie(cookieStore.get(layoutCookieName("/financials"))?.value);
 
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-4 md:p-8">
@@ -62,8 +64,8 @@ export default async function FinancialsPage({
         <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
           <p className="font-semibold">
             {load.freshness
-              ? "No ledger data yet - the harvester has run but imported nothing."
-              : "No ledger data yet - the harvester has not run."}
+              ? "No ledger data yet. The bank import ran but found no transactions."
+              : "No ledger data yet. The bank import has not run."}
           </p>
           <p className="mt-2 text-[13px] text-text-secondary">They appear after the first SimpleFIN import.</p>
           <div className="mt-3">

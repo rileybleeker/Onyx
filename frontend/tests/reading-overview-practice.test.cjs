@@ -186,7 +186,8 @@ test("summarizeForChat carries the practice counts only, and null while the bank
   assert.deepEqual(Object.keys(on.practice).sort(), ["due", "new_ready", "quiz_through", "recall_21d", "recall_7d", "stages"]);
   assert.equal(on.practice.due, 5);
   assert.deepEqual(on.practice.recall_7d, { n: 23, right: 18 });
-  assert.doesNotMatch(JSON.stringify(on.practice), /xp|days|chapters|spent|approved/);
+  // Match JSON keys/strings, not substrings: the stage "explained" contains "xp".
+  assert.doesNotMatch(JSON.stringify(on.practice), /"(?:xp|days|chapters|spent|approved)\w*"/);
   assert.equal(R.summarizeForChat(overview(null)).practice, null);
   assert.equal(R.summarizeForChat(overview(R.parsePracticeSummary(summaryRaw({ enabled: false })))).practice, null);
 });
@@ -1248,7 +1249,7 @@ test("the sheet: recalled count, ideas with stage words, no statement before an 
   assert.match(s.h.text(), /Which lamp burns longest\?/);
   assert.match(s.h.text(s.h.find((n) => n.props["data-testid"] === "sheet-built")[0]), /Built Mar 9 · prompt bank-test\.1/);
   const dialog = s.h.find((n) => n.props.role === "dialog")[0];
-  assert.equal(dialog.props["aria-modal"], true);
+  assert.equal(dialog.props["aria-modal"], "true", "written as the string attribute, like the other dialogs (ChapterSheet.tsx aria-modal=\"true\")");
   assert.equal(s.calls.filter((c) => c.method !== "GET").length, 0, "opening writes nothing");
   assert.equal(s.calls.length, 1);
 });

@@ -28,7 +28,7 @@ export async function PUT(req: NextRequest) {
   try {
     known = await knownAccountKeys();
   } catch {
-    return answer({ error: "saving is not configured" }, 503);
+    return answer({ error: "Saving is not available right now. Nothing was changed." }, 503);
   }
   // {key: 'safe-to-move', account, leaveOut}: one account's change, applied with a compare-and-swap (applyLeaveOut).
   const change = parseLeaveOutChange(body, known);

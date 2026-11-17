@@ -51,7 +51,7 @@ jobs:
           sudo xcode-select -s "$NEWEST"
           xcodebuild -version
 
-      # Same key as screentime-ios.yml (~/.onyx-ios-signing/onyx_dev.key on Riley's PC).
+      # Same key as screentime-ios.yml (~/.onyx-ios-signing/onyx_dev.key on the signing PC).
       - name: Prepare signing key
         env:
           IOS_DEV_KEY_B64: ${{ secrets.IOS_DEV_KEY_B64 }}

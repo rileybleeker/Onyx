@@ -114,34 +114,48 @@ export default function PracticePart({
     };
   }, []);
 
-  const loadRound = useCallback(async (): Promise<PracticeRound | null> => {
-    const r = await getJson(roundUrl);
-    if (!alive.current) return null;
-    if (r.status === 200) {
-      const parsed = parseRound(r.body);
-      if (parsed) {
-        clientCache.put(roundUrl, r.body);
-        setRound((prev) => (sameJson(prev, parsed) ? prev : parsed));
-        setAvail("ok");
-        setLoadFailed(false);
-        setConfirmed(true);
-        return parsed;
+  // Each read takes the next generation. Only the newest read may write state or cache: an older answer that lands
+  // later (a slow GET from an earlier mount, day or book) is dropped, and its caller gets the newest read's result.
+  const roundGen = useRef(0);
+  const roundLatest = useRef<Promise<PracticeRound | null> | null>(null);
+  const bankGen = useRef(0);
+
+  const loadRound = useCallback((): Promise<PracticeRound | null> => {
+    const gen = ++roundGen.current;
+    const read = (async (): Promise<PracticeRound | null> => {
+      const r = await getJson(roundUrl);
+      if (!alive.current) return null;
+      if (gen !== roundGen.current) return (await roundLatest.current) ?? null;
+      if (r.status === 200) {
+        const parsed = parseRound(r.body);
+        if (parsed) {
+          clientCache.put(roundUrl, r.body);
+          setRound((prev) => (sameJson(prev, parsed) ? prev : parsed));
+          setAvail("ok");
+          setLoadFailed(false);
+          setConfirmed(true);
+          return parsed;
+        }
       }
-    }
-    if (r.status === 503 || r.status === 404) {
-      clientCache.remove(roundUrl);
-      setRound(null);
-      setAvail("off");
+      if (r.status === 503 || r.status === 404) {
+        clientCache.remove(roundUrl);
+        setRound(null);
+        setAvail("off");
+        return null;
+      }
+      setConfirmed(false);
+      setLoadFailed(true);
       return null;
-    }
-    setConfirmed(false);
-    setLoadFailed(true);
-    return null;
+    })();
+    roundLatest.current = read;
+    return read;
   }, [roundUrl]);
 
   const loadBank = useCallback(async () => {
+    const gen = ++bankGen.current;
     const r = await getJson(bUrl);
     if (!alive.current) return;
+    if (gen !== bankGen.current) return;
     if (r.status === 200) {
       const parsed = parseBank(r.body);
       if (parsed) {

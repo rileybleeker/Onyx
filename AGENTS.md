@@ -15,25 +15,9 @@ Onyx is Riley's personal health-data platform: root-level Python ETL scripts loa
 
 Read the file below for the paths you touch, and its source. Dated notes, counts and schedules there are history: the source wins; if they disagree, raise it. Path table, old `AGENTS.md "<name>"` citations and edits to the old file: [docs/agents/README.md](docs/agents/README.md). Change a rule in its file; a new section needs an index row (`tests/test_agents_docs.py`).
 
-Files (`docs/agents/<name>.md`):
+Files (`docs/agents/<name>.md`; what each covers is under [Domain file topics](docs/agents/README.md#domain-file-topics)):
 
-- **ops-ci**: tests, CI, workflows, tokens, releases, backlog
-- **database**: `sql/`, ETL writes, time zones, matrix views
-- **access-and-auth**: `middleware.ts`, auth, `isCiRoute()`, grants
-- **hrv-pipeline**: `hrv_*.py`, `causal_inference.py`, `/analytics/hrv`
-- **experiments**: `experiment_*.py`
-- **habits-checkin**: habits, `/check-in`, WHOOP journal
-- **nutrition**: Cronometer, meals, caffeine, Uber Eats, photo meals
-- **supplements**: products, intake, stacks, reminders
-- **wearables-environment**: Garmin, Eight Sleep, WHOOP steps, Tanita, activities, air, weather, pollen
-- **email-calendar-sources**: flights, online orders, Google Calendar feeds
-- **devices**: Screen Time, PC and AI-usage loggers, desktop app, Focus
-- **frontend**: `frontend/` architecture, cache, scroll, theme, nav, speed, autosave, UI copy
-- **log-screen**: `/log`, where entries are made · **personalize** · **today** · **spotify**
-- **reading-journal**: `/reading`, Kindle, Notion journal
-- **chat-agents**: `/chat`, `/agents`, `/nyc` · **status-page**: `/status`, new sources
-- **finance**: `/financials*`, SimpleFIN, taxes · **procurement** · **health-records**: `/health*`
-- **orientation**: layout, commands, env vars
+**ops-ci** · **database** · **access-and-auth** · **hrv-pipeline** · **experiments** · **habits-checkin** · **nutrition** · **supplements** · **wearables-environment** · **email-calendar-sources** · **devices** · **frontend** · **log-screen** · **personalize** · **today** · **spotify** · **reading-journal** · **chat-agents** · **status-page** · **finance** · **procurement** · **health-records** · **orientation**
 
 ## Delivery accountability (Riley, 2026-11-15)
 

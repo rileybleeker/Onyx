@@ -5,7 +5,7 @@
 -- Uber Eats web app does: POST https://www.ubereats.com/_p/api/getPastOrdersV1
 -- returns, per order, the store, exact completion time and every cart item
 -- (title, quantity, price, customizations). tools/ubereats_harvest/harvest.mjs
--- reads that from a signed-in Chrome profile on Riley's PC and posts it to
+-- reads that from a signed-in Chrome profile on the collector PC and posts it to
 -- /api/delivery/items/import, which writes these tables.
 --
 --   pds.delivery_order_items      one row per cart line (FACTS only)

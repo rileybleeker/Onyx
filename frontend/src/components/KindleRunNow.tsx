@@ -5,7 +5,7 @@ import { Check, TriangleAlert, LoaderCircle, Play } from "lucide-react";
 import { KINDLE_RUN_URL, runView, type RunRequest, type RunView } from "@/lib/kindle-run";
 
 // "Run now" on the /status Kindle card (2026-11-16). The press writes one request row; Supabase
-// Realtime pushes it to the idle listener on Riley's PC, which starts the scheduled harvest task and
+// Realtime pushes it to the idle listener on the collector PC, which starts the scheduled harvest task and
 // writes back. This component only reads that row while it waits (every 2 s until the PC answers,
 // then every 5 s until the run ends). It never writes on mount or on scroll: only the tap does.
 
@@ -67,7 +67,7 @@ export default function KindleRunNow({ onDone }: { onDone?: () => void }) {
       if (!alive.current) return;
       if (!res.ok || !body.request) {
         setBusy(false);
-        setView({ phase: "failed", tone: "error", final: true, text: body.error ? `Couldn't ask the PC: ${body.error}.` : "Couldn't ask the PC." });
+        setView({ phase: "failed", tone: "error", final: true, text: "Couldn't ask the PC. Try again." });
         return;
       }
       show(body.request);

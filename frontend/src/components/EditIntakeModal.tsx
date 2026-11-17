@@ -133,10 +133,10 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
       const res = await fetch(`/api/supplements/log-intake?intake_id=${intake.intake_id}`, {
         method: "DELETE",
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error("delete failed");
       onSaved();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch {
+      setError("Couldn't delete this entry. Try again.");
     } finally {
       setDeleting(false);
     }

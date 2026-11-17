@@ -108,7 +108,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
     mark(r.id, true);
     const a = await call('DELETE', `/api/medical/labs/${r.id}`);
     mark(r.id, false);
-    if (!a.ok) { setNotice({ text: `Could not remove the result: ${a.error}`, error: true }); return; }
+    if (!a.ok) { console.error('remove lab result failed:', a.error); setNotice({ text: "Couldn't remove that result. Try again.", error: true }); return; }
     setResults(cur => cur.filter(x => x.id !== r.id));
     if (editing === r.id) setEditing(null);
     setNotice(null);
@@ -117,7 +117,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
       run: async () => {
         const back = await call('PATCH', `/api/medical/labs/${r.id}`, { removed: false });
         const restored = back.ok ? rowFromApiLab(back.data.result) : null;
-        if (!restored) { setNotice({ text: `Could not bring it back: ${back.ok ? 'unexpected answer' : back.error}`, error: true }); return; }
+        if (!restored) { console.error('restore lab result failed:', back.ok ? 'unexpected answer' : back.error); setNotice({ text: "Couldn't bring it back. Try again.", error: true }); return; }
         setResults(cur => [...cur.filter(x => x.id !== restored.id), restored]);
         setNotice({ text: 'Brought back.' });
       },
@@ -128,7 +128,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
     mark(d.id, true);
     const a = await call('DELETE', `/api/medical/documents/${d.id}`);
     mark(d.id, false);
-    if (!a.ok) { setNotice({ text: `Could not remove the document: ${a.error}`, error: true }); return; }
+    if (!a.ok) { console.error('remove medical document failed:', a.error); setNotice({ text: "Couldn't remove that document. Try again.", error: true }); return; }
     setDocs(cur => cur.filter(x => x.id !== d.id));
     setNotice(null);
     setUndo({
@@ -136,7 +136,7 @@ export default function RecordsClient({ documents, labs, headingTestId = 'page-h
       run: async () => {
         const back = await call('PATCH', `/api/medical/documents/${d.id}`, { removed: false });
         const restored = back.ok ? rowFromApiDoc(back.data.document) : null;
-        if (!restored) { setNotice({ text: `Could not bring it back: ${back.ok ? 'unexpected answer' : back.error}`, error: true }); return; }
+        if (!restored) { console.error('restore medical document failed:', back.ok ? 'unexpected answer' : back.error); setNotice({ text: "Couldn't bring it back. Try again.", error: true }); return; }
         setDocs(cur => [...cur.filter(x => x.id !== restored.id), restored]);
         setNotice({ text: 'Brought back.' });
       },
@@ -335,7 +335,7 @@ function LabEntryForm({ today, docs, series, onSaved }: { today: string; docs: M
     const a = await call('POST', '/api/medical/labs', { results: out });
     setSaving(false);
     const saved = a.ok && Array.isArray(a.data.results) ? a.data.results.map(rowFromApiLab).filter((r): r is LabResult => r !== null) : null;
-    if (!a.ok || !saved) { setError(`Not saved: ${a.ok ? 'unexpected answer' : a.error}`); return; }
+    if (!a.ok || !saved) { setError('The lab results were not saved. Check the values and try again.'); return; }
     onSaved(saved);
     setRows([blankRow(), blankRow(), blankRow()]);
   }
@@ -359,7 +359,7 @@ function LabEntryForm({ today, docs, series, onSaved }: { today: string; docs: M
         <datalist id="known-labs">{labs.map(l => <option key={l} value={l} />)}</datalist>
       </label>
       <label className="grid gap-1 text-sm">From document
-        <select className={field} value={documentId} onChange={e => setDocumentId(e.target.value)}>
+        <select className={field} value={documentId} onChange={e => setDocumentId(e.target.value)} aria-label="From document">
           <option value="">None</option>
           {docs.map(d => <option key={d.id} value={d.id}>{d.date} · {d.title}</option>)}
         </select>
@@ -541,7 +541,7 @@ function DocumentUpload({ today, onUploaded }: { today: string; onUploaded: (d: 
     });
     const ticket = start.ok ? (start.data.upload as { path?: unknown; token?: unknown } | undefined) : undefined;
     if (!start.ok || typeof ticket?.path !== 'string' || typeof ticket?.token !== 'string') {
-      setPhase('idle'); setError(`Not uploaded: ${start.ok ? 'unexpected answer' : start.error}`); return;
+      setPhase('idle'); setError('The file was not uploaded. Try again.'); return;
     }
     setPhase('uploading');
     // Straight to the private bucket with the one-time token (Vercel would cap a file sent
@@ -560,7 +560,7 @@ function DocumentUpload({ today, onUploaded }: { today: string; onUploaded: (d: 
     const done = await call('POST', `/api/medical/documents/${id}/complete`);
     setPhase('idle');
     const doc = done.ok ? rowFromApiDoc(done.data.document) : null;
-    if (!doc) { setError(uploadFailed ? 'The file did not upload. Check the connection and try again.' : `Not finished: ${done.ok ? 'unexpected answer' : done.error}`); return; }
+    if (!doc) { setError(uploadFailed ? 'The file did not upload. Check the connection and try again.' : 'The upload did not finish. Try again.'); return; }
     onUploaded(doc);
     setFile(null); setTitle(''); setProvider(''); setNotes('');
     if (input.current) input.current.value = '';
@@ -576,7 +576,7 @@ function DocumentUpload({ today, onUploaded }: { today: string; onUploaded: (d: 
     <div className="grid gap-3 sm:grid-cols-2">
       <label className="grid gap-1 text-sm">Title<input className={field} maxLength={120} value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Annual blood work" /></label>
       <label className="grid gap-1 text-sm">Kind
-        <select className={field} value={kind} onChange={e => setKind(e.target.value as DocKind)}>
+        <select className={field} value={kind} onChange={e => setKind(e.target.value as DocKind)} aria-label="Kind">
           {DOC_KINDS.map(k => <option key={k} value={k}>{DOC_KIND_LABEL[k]}</option>)}
         </select>
       </label>

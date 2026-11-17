@@ -64,12 +64,20 @@ test('what the button says, from asking to done', () => {
   assert.match(runView(row({ ...picked, outcome: 'already_running' }), 5000).text, /already running/);
   const done = runView(row({ ...picked, outcome: 'started', finished_at: new Date(NOW).toISOString(), exit_code: 0 }), 90_000);
   assert.deepEqual([done.phase, done.tone, done.final], ['done', 'ok', true]);
-  assert.match(runView(row({ ...picked, outcome: 'started', finished_at: new Date(NOW).toISOString(), exit_code: 2 }), 90_000).text, /--login/);
-  assert.match(runView(row({ ...picked, outcome: 'failed', detail: 'task_missing' }), 3000).text, /register-task\.ps1/);
+  assert.match(runView(row({ ...picked, outcome: 'started', finished_at: new Date(NOW).toISOString(), exit_code: 2 }), 90_000).text, /sign in again/);
+  assert.doesNotMatch(runView(row({ ...picked, outcome: 'started', finished_at: new Date(NOW).toISOString(), exit_code: 2 }), 90_000).text, /node |\\|\.mjs|\.ps1/);
+  assert.match(runView(row({ ...picked, outcome: 'failed', detail: 'task_missing' }), 3000).text, /scheduled job/);
+  assert.doesNotMatch(runView(row({ ...picked, outcome: 'failed', detail: 'task_missing' }), 3000).text, /\\|\.ps1/);
   assert.match(runView(row({ ...picked, outcome: 'started', finished_at: new Date(NOW).toISOString(), detail: 'task_result_800710e0' }), 3000).text, /task_result_800710e0/);
 });
 
 test('the route is not a CI route', () => {
   const mw = src('middleware.ts');
   assert.doesNotMatch(mw, /\/api\/kindle/);
+});
+
+test('the failed branch of the Run now button never echoes server text', () => {
+  const component = src('components', 'KindleRunNow.tsx');
+  assert.doesNotMatch(component, /\$\{body\.error\}/);
+  assert.match(component, /Couldn't ask the PC\. Try again\./);
 });

@@ -36,7 +36,7 @@ turned down while it runs, but treat the whole transcript as private anyway
 
 Credentials (every mode): importing eight_sleep_etl needs SUPABASE_URL,
 SUPABASE_SERVICE_ROLE_KEY, EIGHTSLEEP_EMAIL and EIGHTSLEEP_PASSWORD in the
-environment or a .env. Riley's PC has no .env and the Eight Sleep login is
+environment or a .env. the collector PC has no .env and the Eight Sleep login is
 held only as GitHub Actions secrets, so there the script stops with a
 KeyError before it reads anything. Run --compare only in a shell session that
 holds those variables for that session (never saved to a file in the repo or

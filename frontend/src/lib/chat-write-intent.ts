@@ -298,7 +298,7 @@ const significant = (s: string) => tokens(s).filter((w) => !STOP.has(w) && !GENE
 /** A light stem: "meditated", "meditating", "meditation" and "meditate" share a prefix. */
 function stem(w: string): string {
   const base = w.replace(/'s$/, "");
-  for (const suffix of ["ation", "ing", "ed", "es", "s", "e"]) {
+  for (const suffix of ["ation", "ating", "ated", "ates", "ate", "ing", "ed", "es", "s", "e"]) {
     if (base.length - suffix.length >= 4 && base.endsWith(suffix)) return base.slice(0, -suffix.length);
   }
   return base;
@@ -651,18 +651,34 @@ const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "
 const MONTH = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
+/** The day set of an action whose own words name two different days: it matches no real day, so every day check refuses it. */
+const AMBIGUOUS_DAY = "ambiguous";
+
+/** A day the text negates: "not the day before yesterday", "rather than yesterday", "instead of today". It names no day. */
+const NEGATED_DAY =
+  /\b(?:not|rather than|instead of|except)\s+(?:(?:on|the|for)\s+)*(?:day before yesterday|day before|yesterday|last night|today|tonight|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/g;
+
 /**
- * The days a text names, resolved against the request day: "today" / "this morning" is that day, "yesterday" the day
- * before it, "Tuesday" the last Tuesday, "Nov 9" the last Nov 9 on or before it, "3 days ago" three days before it.
+ * The day phrases a text names, resolved against the request day, one set of days per phrase: "today" / "this morning"
+ * is that day, "yesterday" the day before it, "day before yesterday" two days before it, "Tuesday" the last Tuesday,
+ * "Nov 9" the last Nov 9 on or before it, "3 days ago" three days before it. "day before yesterday" is one phrase (its
+ * "yesterday" and "the day before" do not count again); a negated day names none.
  */
-function statedDays(text: string, requestDay: string): Set<string> {
-  const out = new Set<string>();
+function statedDayPhrases(text: string, requestDay: string): Array<Set<string>> {
+  const phrases: Array<Set<string>> = [];
   const base = Date.parse(`${requestDay}T12:00:00Z`);
-  if (!Number.isFinite(base)) return out;
+  if (!Number.isFinite(base)) return phrases;
   const daysBack = (n: number) => new Date(base - n * 86_400_000);
   const iso = (d: Date) => d.toISOString().slice(0, 10);
+  /** One phrase and the days it names (a phrase that names no day adds nothing). */
+  const phrase = (days: Array<string | null>) => {
+    const set = new Set(days.filter((d): d is string => d !== null));
+    if (set.size > 0) phrases.push(set);
+  };
   const back = (from: number, to: number, keep: (d: Date) => boolean = () => true) => {
-    for (let n = from; n <= to; n++) if (keep(daysBack(n))) out.add(iso(daysBack(n)));
+    const days: string[] = [];
+    for (let n = from; n <= to; n++) if (keep(daysBack(n))) days.push(iso(daysBack(n)));
+    phrase(days);
   };
   const ymd = (y: number, m: number, d: number): string | null => {
     const dt = new Date(Date.UTC(y, m - 1, d, 12));
@@ -673,13 +689,14 @@ function statedDays(text: string, requestDay: string): Set<string> {
   /** The month / day on or before the request day (this year, else last year). */
   const latest = (m: number, d: number) => {
     const c = ymd(year, m, d);
-    const pick = c && c <= requestDay ? c : ymd(year - 1, m, d);
-    if (pick) out.add(pick);
+    phrase([c && c <= requestDay ? c : ymd(year - 1, m, d)]);
   };
-  const t = norm(text);
+  const blankOut = (m: string) => " ".repeat(m.length);
+  let t = norm(text).replace(NEGATED_DAY, blankOut);
+  if (/\bday before yesterday\b/.test(t)) back(2, 2);
+  t = t.replace(/\bday before yesterday\b/g, blankOut);
   if (/\b(?:today|tonight|this (?:morning|afternoon|evening)|earlier today)\b/.test(t)) back(0, 0);
   if (/\b(?:yesterday|last night)\b/.test(t)) back(1, 1);
-  if (/\bday before yesterday\b/.test(t)) back(2, 2);
   if (/\bthe (?:night|day) before\b/.test(t)) back(1, 2);
   for (const m of t.matchAll(/\b(\d{1,2}|[a-z]+) days? ago\b/g)) {
     const n = /^\d+$/.test(m[1]) ? Number(m[1]) : own(NUMBER_WORDS, m[1]);
@@ -694,24 +711,19 @@ function statedDays(text: string, requestDay: string): Set<string> {
   });
   for (const m of t.matchAll(new RegExp(`\\b${MONTH}\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, "g"))) latest(MONTHS.indexOf(m[1].slice(0, 3)) + 1, Number(m[2]));
   for (const m of t.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}\\b`, "g"))) latest(MONTHS.indexOf(m[2].slice(0, 3)) + 1, Number(m[1]));
-  for (const m of t.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
-    const d = ymd(Number(m[1]), Number(m[2]), Number(m[3]));
-    if (d) out.add(d);
-  }
+  for (const m of t.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) phrase([ymd(Number(m[1]), Number(m[2]), Number(m[3]))]);
   for (const m of t.matchAll(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2}|\d{4}))?\b/g)) {
     if (m[3]) {
       const y = Number(m[3]) < 100 ? 2000 + Number(m[3]) : Number(m[3]);
-      const d = ymd(y, Number(m[1]), Number(m[2]));
-      if (d) out.add(d);
+      phrase([ymd(y, Number(m[1]), Number(m[2]))]);
     } else latest(Number(m[1]), Number(m[2]));
   }
   for (const m of t.matchAll(/\bthe (\d{1,2})(?:st|nd|rd|th)\b/g)) {
     const d = Number(m[1]);
     const c = ymd(year, month, d);
-    const pick = c && c <= requestDay ? c : month === 1 ? ymd(year - 1, 12, d) : ymd(year, month - 1, d);
-    if (pick) out.add(pick);
+    phrase([c && c <= requestDay ? c : month === 1 ? ymd(year - 1, 12, d) : ymd(year, month - 1, d)]);
   }
-  return out;
+  return phrases;
 }
 
 /** The day before a YYYY-MM-DD date. */
@@ -875,6 +887,20 @@ function reportVerb(s: string): string | null {
   return first && first !== "did" && PAST.test(first) ? first : null;
 }
 
+/** Verbs that introduce what someone else said or wrote: "she said…", "the app told me…", "my note says…". */
+const REPORT_FRAME = new Set(["said", "says", "told", "tells", "wrote", "writes", "asked", "asks", "reminded", "reminds", "noted"]);
+
+/**
+ * A clause that reports someone else's words without quotation marks ("she said please log it", "the app told me to
+ * mark it done", "my note says log two"): it is not the user's request, whatever it contains. The words before the
+ * frame name the reporter; an "I" before it means the user is speaking ("I said log it"), so it is not reported speech.
+ */
+function reportedSpeech(s: string): boolean {
+  const words = tokens(s);
+  const frame = words.findIndex((w) => REPORT_FRAME.has(w));
+  return frame >= 0 && !words.slice(0, frame).some((w) => w === "i" || w === "i've" || w === "ive");
+}
+
 /** Words that say something was not done. */
 const NEGATION =
   /\b(?:not|no|never|none|nothing|didn't|didnt|don't|dont|doesn't|haven't|havent|hasn't|hadn't|wasn't|weren't|won't|wont|isn't|aren't|can't|cannot|couldn't|skipped|skip|skipping|forgot|forget|missed|miss)\b/g;
@@ -951,19 +977,23 @@ function intentClauses(text: string): IntentClause[] {
   let action = -1;
   let chains = -1;
   for (const [start, end, term] of sentenceRanges(masked)) {
-    const sentence = norm(masked.slice(start, end)).replace(/(\d):(\d)/g, "$1\u0001$2");
-    const sentenceText = sentence.replace(/\u0001/g, ":");
-    if (conditional(sentence)) { chain = null; lastChain = null; continue; }
+    // A colon inside a time ("8:30") and a comma inside a thousands group ("5,000", "1,250,000") are masked so they
+    // never split the clause; the marks are restored before the clause text is read.
+    const sentence = norm(masked.slice(start, end)).replace(/(\d):(\d)/g, "$1\u0001$2").replace(/(\d),(?=\d{3}(?!\d))/g, "$1\u0002");
+    const sentenceText = sentence.replace(/\u0001/g, ":").replace(/\u0002/g, ",");
+    if (conditional(sentence.replace(/\u0002/g, ","))) { chain = null; lastChain = null; continue; }
     let afterColon = false;
     const parts = sentence.split(CLAUSE_SEP);
     for (let k = 0; k < parts.length; k++) {
       if (k % 2 === 1) { if (parts[k].includes(":")) afterColon = true; continue; }
-      const whole = parts[k].replace(/\u0001/g, ":").replace(/^[\s,:;\-–—*•]+/, "").trim();
+      const whole = parts[k].replace(/\u0001/g, ":").replace(/\u0002/g, ",").replace(/^[\s,:;\-–—*•]+/, "").trim();
       if (!whole) continue;
       // The action is what the clause says before any reason or circumstance ("…because I forgot"): only that part
       // gives its polarity, names its record and carries its arguments. A clause that is only a reason ends the list.
       const clause = mainPart(whole);
       if (!clause) { chain = null; continue; }
+      // Someone else's words, unquoted ("she said please log it"): neither a request nor a report by the user.
+      if (reportedSpeech(clause)) { chain = null; continue; }
       const pol = polarity(clause);
       const negMatch = afterColon ? null : NEG_IMPERATIVE.exec(clause);
       const posMatch = afterColon || negMatch ? null : IMPERATIVE.exec(clause);
@@ -988,7 +1018,11 @@ function intentClauses(text: string): IntentClause[] {
         // An item left out of a request ("log X, not Y") is not to be logged, never a request to record a No.
         const prohibition = base.prohibition || (base.imperative && !base.negated && neg);
         const ambiguous = !prohibition && pol === "ambiguous";
-        if (argumentOnly(clause)) {
+        // A chapter number with a place or time after it continues the chapter list ("chapters 5 and 6 on my run"): it
+        // carries a chapter of the action before it, it does not start a new one.
+        const chapterTail = /^\d+\s+(?:on|at|in|during|while)\b/.test(clause)
+          && /\b(?:chapters?|ch|chap)\.?\s*\d/.test(out.filter((c) => c.action === action).map((c) => c.text).join("\n"));
+        if (argumentOnly(clause) || chapterTail) {
           if (!ambiguous && neg === base.actionNegated && action >= 0) {
             out.push({ text: clause, imperative: base.imperative, negated: neg, prohibition, ambiguous, verb: base.verb, action, chain: base.id, sentence: sentenceText });
           }
@@ -1144,18 +1178,45 @@ const FLAG_NO = /\b(?:don't|dont|do not|never|no need to|don't need to|dont need
 const FLAG_SUBJECT = /\b(?:question|q\d+|flag|this one|that one)\b/;
 /** A hedge: the user is not saying it, so nothing is flagged. */
 const FLAG_UNSURE = /\b(?:maybe|might|perhaps|possibly|not sure|i think|i guess|wonder|whether|could be)\b/;
+/**
+ * The clause is about the user's own answer, reply or typing ("my answer to that one", "I typed 4", "the reply was
+ * wrong"), not the question. "answer key" is the question's, so it does not count. Such a clause never flags
+ * (RQS6-R1): a complaint about the answer is not a complaint about the question.
+ */
+const FLAG_OWN = /\b(?:my|mine)\b|\bi\s+(?:typed|said|wrote|put|picked|chose|answered|entered|guessed|gave|meant|selected)\b|\b(?:answer|answers|reply|replies|response|guess|pick)\b(?!\s+key\b)/;
+/**
+ * The clause is about how the answer was marked or scored ("the score on Q4 was wrong", "Q4 was wrong to mark me down",
+ * "question 4 was marked wrong", "Q4 was graded unfairly"). A complaint about the marking is not a complaint about the
+ * question, so it never flags (RQS7-R1). "marked as wrong" is a flag phrase, so "marked" followed by "as" does not count.
+ */
+const FLAG_MARKING = /\b(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|points?|penali[sz]\w*|dock(?:ed|ing|s)?|deduct\w*|unfair\w*|credit|(?:marked|marking|marks?)\s+me\b|(?:marked|marking|marks)\b(?!\s+as\b))/;
 const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
 /**
- * What the user has to say for each kind of flag, read from one sentence of the latest message (norm: lower case,
- * plain apostrophes). "wrong" and "unclear" are about the question, never "my answer was wrong" (the sentence also has
+ * Splits a sentence into clauses: a comma, colon or joining word ("but", "and", "which") starts a new one. The joiner is
+ * kept (capture group), so a clause can be read with the word that joined it.
+ */
+const FLAG_CLAUSE = /([,:]|\b(?:but|and|or|although|though|while|whereas|however|which|because|so|except)\b)/;
+/** A joiner that starts an unrelated statement: a clause after it never continues the clause before it. */
+const FLAG_CONTRAST = /^(?:but|although|though|while|whereas|however|except)$/;
+/**
+ * A clause that continues the one before it with a pronoun ("which is wrong", "it was wrong", "that's wrong"), not with
+ * its own subject. "that question…" and "this one…" name the question, so they do not continue.
+ */
+const FLAG_REFERS_BACK = /^\s*(?:which|that|it|its|they|those|this)\b(?!\s+(?:question|one|q\d))/;
+/** The "Q<id>" labels a clause names (norm: lower case), each a positive safe integer. */
+const clauseLabels = (s: string): number[] =>
+  [...new Set([...s.matchAll(/\bq(\d{1,15})\b/g)].map((m) => Number(m[1])).filter((n) => Number.isSafeInteger(n) && n > 0))];
+/**
+ * What the user has to say for each kind of flag, read from one clause of the latest message (norm: lower case,
+ * plain apostrophes). "wrong" and "unclear" are about the question, never "my answer was wrong" (the clause also has
  * to be about the question, FLAG_SUBJECT) and never "not wrong" (the verb has to sit right before the word).
  */
 const FLAG_SAYS: Record<string, RegExp> = {
   wrong: new RegExp(
-    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:wrong|incorrect|false|inaccurate|mistaken|an error)\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:wrong|incorrect|inaccurate)\\b`,
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:wrong|incorrect|false|inaccurate|mistaken|an error)\\b|\\b(?:flag|report|mark|marked)\\b[^.!?\\n]*\\bas\\s+(?:wrong|incorrect|inaccurate)\\b`,
   ),
   unclear: new RegExp(
-    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:unclear|confusing|ambiguous|vague|poorly worded|badly worded|nonsense)\\b|\\b(?:makes?|made) no sense\\b|\\b(?:doesn't|does not|didn't|did not) make (?:any )?sense\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:unclear|confusing|ambiguous|vague)\\b`,
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:unclear|confusing|ambiguous|vague|poorly worded|badly worded|nonsense)\\b|\\b(?:makes?|made) no sense\\b|\\b(?:doesn't|does not|didn't|did not) make (?:any )?sense\\b|\\b(?:flag|report|mark|marked)\\b[^.!?\\n]*\\bas\\s+(?:unclear|confusing|ambiguous|vague)\\b`,
   ),
   not_in_chapter:
     /\b(?:not|isn't|wasn't|aren't)\s+(?:in|from|part of|covered in|about)\s+(?:this|that|the|that same)\s+chapter\b|\bnot (?:in|from) (?:chapter|ch\.?)\s*\d+\b|\bwrong chapter\b|\bfrom (?:another|a different|the wrong) chapter\b/,
@@ -1287,12 +1348,17 @@ const num = (v: unknown): number | null => (typeof v === "number" && Number.isFi
 
 /**
  * The days an action allows: the days it names, else the days its list names, else its sentence's, else none (the
- * caller's default: today, or last night for a sleep question).
+ * caller's default: today, or last night for a sleep question). One day from its own words: when the words that name
+ * the action's day name two different days ("yesterday … the day before yesterday"), the action allows neither, so
+ * every day check refuses it instead of guessing.
  */
 function allowedDays(a: Action, requestDay: string): Set<string> {
   for (const text of [a.text, a.chainText, a.sentence]) {
-    const days = statedDays(text, requestDay);
-    if (days.size > 0) return days;
+    const phrases = statedDayPhrases(text, requestDay);
+    if (phrases.length === 0) continue;
+    const key = (s: Set<string>) => [...s].sort().join(",");
+    if (phrases.some((p) => key(p) !== key(phrases[0]))) return new Set([AMBIGUOUS_DAY]);
+    return phrases[0];
   }
   return new Set();
 }
@@ -1374,8 +1440,17 @@ export function authorizeWrite(
       // out of exactly those questions.
       if (q.asked < 1 || !q.answeredAll || total !== q.asked) return deny("quiz_score_invalid");
     }
+    // The book check runs before the checkpoint one below: a quiz on another book is refused as that book, whatever
+    // checkpoint the latest message names.
     const bad = bookCheck(input, stated ? stated.text : grant.quiz.userText, ctx.books);
     if (bad) return deny(bad);
+    // A quiz whose request named no checkpoint is bound only by the checkpoint the latest message names itself. An
+    // earlier mention never binds it, and a checkpoint the message does not name is refused, not taken on trust.
+    if (!stated && q.checkpoint === null) {
+      const named = quizCheckpoint(maskQuotes(grant.latest));
+      if (named === null) return deny("not_named");
+      if (cp === null || cp.toLowerCase() !== named) return deny("quiz_checkpoint_mismatch");
+    }
     return allow(tool, null);
   }
 
@@ -1411,16 +1486,39 @@ export function authorizeWrite(
     if (!kind || !Object.prototype.hasOwnProperty.call(FLAG_SAYS, kind)) return deny("invalid_value");
     if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
     const masked = maskQuotes(grant.latest);
-    const sentences = sentenceRanges(masked).map(([start, end, term]) => ({ s: norm(masked.slice(start, end)), term }));
-    if (sentences.some(({ s }) => FLAG_NO.test(s))) return deny("contradicts");
-    const says = sentences.some(({ s, term }) => {
-      if (term === "?" || conditional(s) || FLAG_UNSURE.test(s) || !FLAG_SUBJECT.test(s) || !FLAG_SAYS[kind].test(s)) return false;
-      // "not wrong", "not unclear": the word itself is negated.
-      return !(kind === "wrong" || kind === "unclear") || !/\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(s);
+    // A comma inside a thousands group ("5,000") is masked (\u0002) before the clause split, as in the write path, so it
+    // never splits a clause; the mark is restored to a comma before the clause text is tested.
+    const sentences = sentenceRanges(masked).map(([start, end, term]) => {
+      const marked = norm(masked.slice(start, end)).replace(/(\d),(?=\d{3}(?!\d))/g, "$1\u0002");
+      return { s: marked.replace(/\u0002/g, ","), marked, term };
     });
-    if (!says) return deny("flag_not_stated");
-    const named = questionLabels(grant.latest);
-    if (!(named.length > 0 ? named : grant.askedQuestions).includes(qid)) return deny("question_not_asked");
+    if (sentences.some(({ s }) => FLAG_NO.test(s))) return deny("contradicts");
+    // Each clause is judged on its own: its complaint (FLAG_SAYS), its subject (the question, FLAG_SUBJECT) and any
+    // "Q<id>" it names must all sit in that clause. A hedge or a "not wrong" in a clause disqualifies only that clause.
+    const hits: number[][] = [];
+    for (const { s, marked, term } of sentences) {
+      if (term === "?" || conditional(s)) continue;
+      // The split keeps each joiner at the odd positions, so pieces[k] is a clause and pieces[k - 1] the word before it.
+      const pieces = marked.split(FLAG_CLAUSE);
+      let answerCarried = false;
+      for (let k = 0; k < pieces.length; k += 2) {
+        const joiner = k > 0 ? (pieces[k - 1] ?? "").trim() : "";
+        if (FLAG_CONTRAST.test(joiner)) answerCarried = false;
+        const clause = (pieces[k] ?? "").replace(/\u0002/g, ",");
+        if (clause.trim() === "") continue;
+        // "I answered B, which is wrong for question 3": the clause that continues the answer's clause is about the answer
+        // too, so it never flags (RQS6-R1). Its subject is the answer, not the question it names.
+        if (answerCarried && (joiner === "which" || FLAG_REFERS_BACK.test(clause))) continue;
+        answerCarried = FLAG_OWN.test(clause);
+        if (!FLAG_SUBJECT.test(clause) || FLAG_OWN.test(clause) || FLAG_MARKING.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
+        // "not wrong", "not unclear": the word itself is negated.
+        if ((kind === "wrong" || kind === "unclear") && /\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(clause)) continue;
+        hits.push(clauseLabels(clause));
+      }
+    }
+    if (hits.length === 0) return deny("flag_not_stated");
+    // The target is the "Q<id>" named in the same clause, or the question just asked when the clause names none.
+    if (!hits.some((labels) => (labels.length > 0 ? labels : grant.askedQuestions).includes(qid))) return deny("question_not_asked");
     return allow(tool, null);
   }
 

@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
   try {
     db = serviceClient();
   } catch {
-    return answer({ ok: false, error: "not configured" }, 503);
+    return answer({ ok: false, error: "Saving is not available right now. Nothing was changed." }, 503);
   }
   try {
     return answer(await runRenewalClaim(db, () => loadDetectedSubscriptions(now)));
