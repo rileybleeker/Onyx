@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { parseStackSave, saveStack } from "@/lib/supplement-stack-save";
+import { type MissingColumnMemo, STACK_READ_STEPS, nextMemo, startStep } from "@/lib/supplement-stack-read-plan";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
   { db: { schema: "pds" } },
 );
+
+/** Optional columns the last successful GET read found missing (see lib/supplement-stack-read-plan.ts). */
+let missingMemo: MissingColumnMemo = null;
 
 /**
  * GET /api/supplements/stacks?include_archived=1
@@ -40,12 +44,18 @@ export async function GET(req: NextRequest) {
       .order("created_at", { ascending: false })
       .order("sort_order", { referencedTable: "supplement_stack_item", ascending: true });
   };
-  let res = await read(true, true);
+  // Start at the step the memo predicts (a column found missing within the last 10 minutes is not selected again).
+  const now = Date.now();
+  const start = startStep(missingMemo, now);
+  let idx = start;
+  const readStep = (i: number) => read(STACK_READ_STEPS[i][0], STACK_READ_STEPS[i][1]);
+  let res = await readStep(idx);
   // Each 42703 step drops one optional column (version, then ingredient_count) until the read goes through.
-  for (const [withVersion, withCount] of [[false, true], [true, false], [false, false]] as const) {
-    if (res.error?.code !== "42703") break;
-    res = await read(withVersion, withCount);
+  while (res.error?.code === "42703" && idx < STACK_READ_STEPS.length - 1) {
+    idx += 1;
+    res = await readStep(idx);
   }
+  if (!res.error) missingMemo = nextMemo(missingMemo, start, idx, now);
   const { data: stacks, error: stacksErr } = res;
   if (stacksErr) return NextResponse.json({ error: stacksErr.message }, { status: 500 });
 
