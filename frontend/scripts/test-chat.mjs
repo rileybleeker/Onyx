@@ -242,7 +242,7 @@ test("query_photo_meals returns per-meal rows with items and daily totals, and f
   const result2=JSON.parse(r2.requests()[1].messages.at(-1).content[0].content);
   assert.deepEqual(result2.meals,[]);
   assert.deepEqual(result2.daily_totals,[]);
-  assert.match(result2.note,/not set up yet/);
+  assert.match(result2.note,/aren't available yet/);
   assert.doesNotMatch(JSON.stringify(result2),/synthetic detail/);
 
   // The description carries the counting rule so the model never double-counts.
