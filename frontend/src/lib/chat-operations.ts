@@ -29,8 +29,8 @@
  * re-run of the same call confirms it; and a keyed re-run of an unconfirmed call only reads back what its key holds
  * when any other call, of an earlier try or of this one, wrote or may have written.
  *
- * The operation id is passed into the write (supplement event key, reading client_key, highlight client_key, playlist
- * audit key), so a write that happened before the ledger could record it is found again rather than repeated. When
+ * The operation id is passed into the write (supplement event key, reading client_key, highlight client_key, quiz
+ * op_key, playlist audit key), so a write that happened before the ledger could record it is found again rather than repeated. When
  * Riley removed such a write afterwards, the removal leaves a tombstone (sql/chat_operations.sql) and the re-run
  * answers `removed_since` (settled as done, never written again) instead of writing it a second time. What the call depended
  * on when it first ran is stored with it (`context`: the behavioral day, the book being read) and a re-run uses that,
@@ -56,8 +56,7 @@
  *
  * Known gaps (follow-ups): a playlist created on Spotify whose audit row could not be written stays "unknown" (no
  * read-only Spotify lookup yet); a Notion entry (or habit Yes, or book finish) the earlier call never made stays
- * missing, named on the receipt for Riley to check; a quiz result has no operation key yet (PR #362 adds one), so a
- * quiz left pending is never confirmed and stays "check this"; a call the earlier try never reached (it died after
+ * missing, named on the receipt for Riley to check; a call the earlier try never reached (it died after
  * another call wrote) is refused on the retry and must be sent as a new message; the ledger keeps tool inputs and
  * results with no retention window yet; a request with no request_id (a page loaded before this change) still runs
  * its writes without the ledger, as before.
@@ -107,7 +106,14 @@ export interface LedgerStore {
    * "busy" = another try of it holds the lease; "conflict" = seen with another conversation. "new" and "retry" give
    * this try (attempt_id) the lease.
    */
-  claimRequest(owner_id: string, request_id: string, conversation_sha: string, attempt_id: string): Promise<RequestClaim>;
+  claimRequest(
+    owner_id: string, request_id: string, conversation_sha: string, attempt_id: string, context?: OperationContext | null,
+  ): Promise<RequestClaim>;
+  /**
+   * The request context the FIRST try stored with the row (claimRequest "new"): the local time, its time zone and
+   * the behavioral day. null = none stored (a row from before the column). Throws Ledger* errors.
+   */
+  requestContext(owner_id: string, request_id: string): Promise<OperationContext | null>;
   /** Give the lease back (only while attempt_id still holds it). */
   releaseRequest(owner_id: string, request_id: string, attempt_id: string): Promise<void>;
   /** The request's row, or null when this id was never seen for this owner. */
@@ -213,15 +219,18 @@ export const conversationSha = (messages: ReadonlyArray<{ role: string; content:
 
 /**
  * Write tools whose write carries the operation id as its own key (a supplement intake, a stack log, a reading
- * session): re-run under the same id, the write finds what an earlier try wrote and never happens twice. When any
- * other call (of an earlier try, or of this try) also wrote or may have written, the re-run is in CHECK mode: it only
- * reads back what its key holds and never writes, because a write that never happened would now be a new write next
- * to that other one (possibly the same thing in another form: a stack whose products were then logged one by one).
+ * session, a quiz result): re-run under the same id, the write finds what an earlier try wrote and never happens
+ * twice. When any other call (of an earlier try, or of this try) also wrote or may have written, the re-run is in
+ * CHECK mode: it only reads back what its key holds and never writes, because a write that never happened would now
+ * be a new write next to that other one (possibly the same thing in another form: a stack whose products were then
+ * logged one by one).
  */
 export const RERUN_SAFE: ReadonlySet<string> = new Set([
   "log_supplement_intake",
   "log_supplement_stack",
   "log_reading_session",
+  // The operation id is the quiz's op_key (pds.reading_record_quiz): the same key answers the stored receipt.
+  "record_reading_quiz",
 ]);
 
 /**
@@ -235,7 +244,7 @@ export const RERUN_SAFE: ReadonlySet<string> = new Set([
  * and otherwise unconfirmed.
  */
 export const CHECK_ON_RERUN: ReadonlySet<string> = new Set(["mark_habit_complete", "add_book_highlight"]);
-// Every other write tool (quiz result, Spotify playlist, and any future write tool until it is added above) is never
+// Every other write tool (Spotify playlist, and any future write tool until it is added above) is never
 // re-run by a retry: it is looked up read-only (reconcilers) or reported as unconfirmed.
 
 export const REPLAY_NOTE =
@@ -294,6 +303,11 @@ export interface LedgerOptions {
   requestId: string;
   /** This request id was seen before (a retry). */
   retry: boolean;
+  /**
+   * What the request ran with (its time, time zone and behavioral day): on a first try the values it was given, on a
+   * retry the ones the first try stored. null = a retry of a row that stored none (from before the column).
+   */
+  requestContext?: OperationContext | null;
   /** This try's lease on the request (openLedger sets it; release() gives it back). */
   attemptId?: string;
   buildReceipt: ReceiptBuilder;
@@ -374,6 +388,8 @@ export type Execute = (opId: string, context: OperationContext, check: boolean) 
 
 export class ChatLedger {
   readonly retry: boolean;
+  /** See LedgerOptions.requestContext. */
+  readonly requestContext: OperationContext | null;
   private readonly opts: LedgerOptions;
   /** First try: the n-th call of each tool, the place its row takes. */
   private readonly ordinals = new Map<string, number>();
@@ -406,6 +422,7 @@ export class ChatLedger {
   constructor(opts: LedgerOptions) {
     this.opts = opts;
     this.retry = opts.retry;
+    this.requestContext = opts.requestContext ?? null;
   }
 
   private report(stage: string, e: unknown) {
@@ -762,10 +779,15 @@ export async function openLedger(
 ): Promise<OpenedLedger> {
   const attemptId = randomUUID();
   try {
-    const claim = await store.claimRequest(opts.ownerId, opts.requestId, opts.conversationSha, attemptId);
+    const claim = await store.claimRequest(opts.ownerId, opts.requestId, opts.conversationSha, attemptId, opts.requestContext ?? null);
     if (claim === "conflict") return { kind: "conflict" };
     if (claim === "busy") return { kind: "busy" };
-    return { kind: "ledger", ledger: new ChatLedger({ ...opts, store, retry: claim === "retry", attemptId }) };
+    const retry = claim === "retry";
+    // A retry runs with what the FIRST try ran with (its local time and behavioral day), never this moment's: a first
+    // try that stopped before any operation was recorded leaves nothing else to pin, and a retry after midnight /
+    // 06:00 must not log "today" on the next day. Unreadable: the ledger fails (writes pause), never a fresh day.
+    const requestContext = retry ? await store.requestContext(opts.ownerId, opts.requestId) : opts.requestContext ?? null;
+    return { kind: "ledger", ledger: new ChatLedger({ ...opts, store, retry, attemptId, requestContext }) };
   } catch (e) {
     if (e instanceof LedgerUnavailable) return { kind: "unavailable", code: e.code };
     return { kind: "failed", code: errorCode(e) };
@@ -865,8 +887,11 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
   const requests = () => supabase.from("chat_requests");
   const leaseUntil = () => new Date(Date.now() + REQUEST_LEASE_MS).toISOString();
   return {
-    async claimRequest(owner_id, request_id, conversation_sha, attempt_id) {
-      const { error } = await requests().insert({ owner_id, request_id, conversation_sha, lease_id: attempt_id, lease_until: leaseUntil() });
+    async claimRequest(owner_id, request_id, conversation_sha, attempt_id, context) {
+      // The context goes in with the row (one insert): a first try that stops right after it still leaves it pinned.
+      const { error } = await requests().insert({
+        owner_id, request_id, conversation_sha, lease_id: attempt_id, lease_until: leaseUntil(), context: context ?? null,
+      });
       if (!error) return "new";
       if (error.code !== "23505") fail(error);
       const { data, error: readError } = await requests()
@@ -908,6 +933,13 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
         .eq("request_id", request_id)
         .eq("lease_id", attempt_id);
       if (error) fail(error);
+    },
+
+    async requestContext(owner_id, request_id) {
+      const { data, error } = await requests().select("context").eq("owner_id", owner_id).eq("request_id", request_id).maybeSingle();
+      if (error) fail(error);
+      if (!data) fail({ code: "missing_request" });
+      return asObject((data as { context?: unknown }).context);
     },
 
     async getRequest(owner_id, request_id) {
@@ -1016,9 +1048,8 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
 /**
  * Read-only lookups for the write tools that are never re-run. Exactly one matching row counts; two is ambiguous.
  * A playlist is found by its audit key (pds.spotify_playlists.client_key = the operation id, set by createPlaylist).
- * A quiz result has no operation key yet, so there is deliberately no lookup for it: a match by book, checkpoint,
- * score and time could take a later attempt for this one. A quiz left pending stays "check this" until the quiz write
- * carries the operation id (PR #362's op_key) and is read back by it.
+ * A quiz result is not here: it is re-run under its op_key (RERUN_SAFE), never matched by book, checkpoint, score
+ * or time (a match like that could take a later attempt for this one).
  */
 export function supabaseReconcilers(supabase: Pds): Partial<Record<string, Reconciler>> {
   return {

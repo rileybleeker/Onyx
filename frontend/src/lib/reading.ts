@@ -1060,12 +1060,22 @@ export interface AddHighlightInput {
    * one it updates), so a retried chat message finds the highlight its earlier try made, even after an edit.
    */
   client_key?: string | null;
+  /**
+   * Insert only (the chat replay's check-mode recovery, SEC-04): never update a highlight that already has this
+   * passage. The row is created by one insert that the (book_id, passage) and client_key unique indexes make atomic;
+   * when another write got there first the existing highlight is left exactly as it is and returned as `conflict`
+   * (or as this call's own highlight when it carries this client_key). Requires a client_key.
+   */
+  insert_only?: boolean;
 }
+
+/** addHighlight with insert_only met a highlight that has this passage and is not this call's own: nothing changed. */
+export const HIGHLIGHT_EXISTS = "a highlight with this passage already exists, so nothing was changed";
 
 export async function addHighlight(
   supabase: Supa,
   input: AddHighlightInput,
-): Promise<{ ok: true; book: Book; highlight: Highlight; created: boolean } | { ok: false; error: string }> {
+): Promise<{ ok: true; book: Book; highlight: Highlight; created: boolean; readBack?: true } | { ok: false; error: string }> {
   const book = input.book_id
     ? ((await supabase.from("books").select(BOOK_COLS).eq("book_id", input.book_id).maybeSingle()).data as Book | null)
     : await getBook(supabase, input.slug ?? null);
@@ -1090,6 +1100,24 @@ export async function addHighlight(
     ...(input.highlighted_at ? { highlighted_at: input.highlighted_at } : {}),
     ...(input.note_at ? { note_at: input.note_at } : {}),
   };
+
+  const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
+  // A key that was given but is not a UUID is refused, never dropped (the highlight would then be unkeyed).
+  if (!key && input.client_key != null && input.client_key !== "") return { ok: false, error: "client_key must be a UUID" };
+
+  if (input.insert_only) {
+    // No read first and no update: a highlight written between a read and a write would otherwise be overwritten.
+    // A unique violation means another write holds this passage (or this key) now; it is read back, never changed.
+    if (!key) return { ok: false, error: "client_key must be a UUID" };
+    const { data, error } = await supabase.from("book_highlights").insert({ ...row, client_key: key }).select(HIGHLIGHT_COLS).single();
+    if (!error) return { ok: true, book, highlight: data as Highlight, created: true };
+    if (error.code !== "23505") return { ok: false, error: error.message };
+    const { data: own, error: ownError } = await supabase.from("book_highlights").select(HIGHLIGHT_COLS).eq("client_key", key).maybeSingle();
+    if (ownError) return { ok: false, error: ownError.message };
+    // This call's own key: a copy of this same call wrote it (created by this operation, not by this insert).
+    if (own) return { ok: true, book, highlight: own as Highlight, created: true, readBack: true };
+    return { ok: false, error: HIGHLIGHT_EXISTS };
+  }
 
   // Idempotent on (book_id, passage): a re-import updates comment/chapter/concept/position only when provided.
   const { data: existing } = await supabase
@@ -1117,9 +1145,6 @@ export async function addHighlight(
     return { ok: true, book, highlight: existing as Highlight, created: false };
   }
 
-  const key = typeof input.client_key === "string" && UUID_RE.test(input.client_key) ? input.client_key.toLowerCase() : null;
-  // A key that was given but is not a UUID is refused, never dropped (the highlight would then be unkeyed).
-  if (!key && input.client_key != null && input.client_key !== "") return { ok: false, error: "client_key must be a UUID" };
   const { data, error } = await supabase.from("book_highlights").insert(key ? { ...row, client_key: key } : row).select(HIGHLIGHT_COLS).single();
   if (error) return { ok: false, error: error.message };
   return { ok: true, book, highlight: data as Highlight, created: true };

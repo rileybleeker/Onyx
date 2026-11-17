@@ -10,7 +10,7 @@ import { searchTracks, createPlaylist } from "@/lib/spotify-server";
 import { logStackIntake, stackEventReplay, type LogStackResult } from "@/lib/supplement-stacks";
 import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, sleepDateError } from "@/lib/checkin";
 import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
-import { BOOK_COLS, HIGHLIGHT_COLS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
+import { BOOK_COLS, HIGHLIGHT_COLS, HIGHLIGHT_EXISTS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
 import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
@@ -518,18 +518,11 @@ const PLAYLIST_MAYBE_CREATED =
   "Spotify may have created the playlist before this failed, possibly without all its tracks. Do not create it again: tell the user to check Spotify first.";
 
 /**
- * recordQuiz refusals from before anything was written. Any other error came from the insert, whose answer may have
- * been lost after it committed (supabase-js reports a network failure as an error, not a throw).
- */
-const QUIZ_NOT_RECORDED = /^(No active book found|score must be between 0 and total|checkpoint is required)/;
-const QUIZ_MAYBE_RECORDED =
-  "The database did not confirm this quiz result, and it may have been recorded anyway. Do not record it again: tell the user to check /reading first.";
-
-/**
  * A write-tool call that runs through the replay ledger (lib/chat-operations.ts), when the request carries a
- * request_id. `id` = the operation id: the supplement, stack, reading and playlist writes use it as their own key, so
- * a retry that re-runs the tool finds what an earlier try already wrote. `day` = the behavioral day the operation
- * first ran on, `today` = this request's: a re-run on a later day keeps an omitted date on the first day.
+ * request_id. `id` = the operation id: the supplement, stack, reading, quiz and playlist writes use it as their own
+ * key, so a retry that re-runs the tool finds what an earlier try already wrote. `day` = the behavioral day the
+ * operation first ran on (a new operation of a retry: the day the request was first sent), `today` = this moment's:
+ * a re-run on a later day keeps an omitted date on the first day.
  */
 interface OpContext {
   id: string;
@@ -733,6 +726,49 @@ function highlightMatches(h: Highlight, call: HighlightCall): boolean {
   if (chapter !== null && chapter !== h.chapter) return false;
   return true;
 }
+
+interface StoredQuiz {
+  quiz_id: number;
+  checkpoint: string;
+  score: number;
+  total: number;
+  quiz_date: string;
+  passed: boolean;
+}
+
+/**
+ * The quiz result stored under this operation key (pds.reading_practice_ops, written in the same transaction as the
+ * quiz row), read only: "none" = nothing was stored under it; "error" = it cannot be read (unknown, never "none").
+ */
+async function quizByKey(opId: string): Promise<StoredQuiz | "none" | "error"> {
+  const { data, error } = await supabase.from("reading_practice_ops").select("kind, result").eq("op_key", opId.toLowerCase()).maybeSingle();
+  if (error) return "error";
+  if (!data) return "none";
+  const row = data as { kind?: unknown; result?: Record<string, unknown> | null };
+  const r = row.result ?? {};
+  // A review grade under this key (never written by chat) or a receipt without its numbers: cannot be told.
+  if (row.kind !== "quiz" || !Number.isFinite(Number(r.quiz_id))) return "error";
+  return {
+    quiz_id: Number(r.quiz_id),
+    checkpoint: String(r.checkpoint ?? ""),
+    score: Number(r.score),
+    total: Number(r.total),
+    quiz_date: String(r.quiz_date ?? ""),
+    passed: r.passed === true,
+  };
+}
+
+/** The tool's answer for a quiz result; `replayed` = recorded by an earlier try, nothing recorded now. */
+const quizReply = (q: StoredQuiz, replayed: boolean): string =>
+  JSON.stringify({
+    success: true,
+    passed: q.passed,
+    score: `${q.score}/${q.total}`,
+    checkpoint: q.checkpoint,
+    quiz_date: q.quiz_date,
+    quiz_id: q.quiz_id,
+    ...(replayed ? { replayed: true } : {}),
+  });
 
 /**
  * The reading session written under this operation id: its book, "none" (nothing under the key), "missing" (the key
@@ -1386,6 +1422,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       }
     }
     let checked: { book: Book; highlight: Highlight } | null = null;
+    let insertOnly = false;
     if (op?.check) {
       // No highlight carries this operation's key, so the earlier try created none. It may still have changed one that
       // already had this passage (addHighlight then updates it), and Riley may have edited that one since: addHighlight
@@ -1401,20 +1438,54 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         checked = { book: found.book, highlight: found.highlight };
       } else if ((await highlightsChangedSince(found.book.book_id, op.startedAt)) !== false) {
         return JSON.stringify({ error: HIGHLIGHT_UNCONFIRMED, incomplete: true, uncertain: true });
+      } else {
+        // Nothing to confirm and nothing the earlier try could have changed: the highlight is created now, but only
+        // by one insert (never addHighlight's update of an existing passage). A highlight with this passage written
+        // between the reads above and that insert (by Riley, the Kindle harvester or anything else) is left exactly
+        // as it is: confirmed when it is what the call asked for, otherwise unconfirmed.
+        insertOnly = true;
       }
     }
     if (checked) return highlightReply(checked.book, checked.highlight, { created: false, replayed: true, mirrorNow: false });
     // The operation id goes on a highlight this call creates (lib/reading.ts addHighlight), so a retry finds it.
-    const result = await addHighlight(supabase, { ...highlightInput, ...(opId ? { client_key: opId } : {}) });
+    const result = await addHighlight(supabase, { ...highlightInput, ...(opId ? { client_key: opId } : {}), ...(insertOnly ? { insert_only: true } : {}) });
+    if (!result.ok && result.error === HIGHLIGHT_EXISTS) {
+      // insert_only lost the race to another write of this passage: read it, never change it.
+      const now = await highlightFor(highlightInput);
+      if (now !== "no_book" && now !== "no_passage" && now !== "error" && now.highlight && highlightMatches(now.highlight, highlightInput)) {
+        return highlightReply(now.book, now.highlight, { created: false, replayed: true, mirrorNow: false });
+      }
+      return JSON.stringify({ error: HIGHLIGHT_UNCONFIRMED, incomplete: true, uncertain: true });
+    }
     if (!result.ok) {
       // A refusal wrote nothing; a failed write may have committed, so the model and the receipt must not read it as
       // "not saved" (a retry then finds it by its key, or re-runs it in check mode, which never overwrites).
       return JSON.stringify(HIGHLIGHT_NOT_WRITTEN.test(result.error) ? { error: result.error } : { error: HIGHLIGHT_MAYBE_WRITTEN, incomplete: true });
     }
+    if (result.readBack) {
+      // A copy of this same call wrote it: reported, its Notion entry not made now (that copy may have made it).
+      return highlightReply(result.book, result.highlight, {
+        created: true,
+        replayed: true,
+        mirrorNow: false,
+        unconfirmed: result.highlight.notion_block_id ? [] : [NOTION_UNCONFIRMED],
+      });
+    }
     return highlightReply(result.book, result.highlight, { created: result.created, replayed: false, mirrorNow: result.created });
   }
 
   if (name === "record_reading_quiz") {
+    // The operation id is the quiz's op_key (lib/reading.ts recordQuiz, sql/reading_practice_receipts.sql): the RPC
+    // stores the result and its receipt in one transaction, and the same key answers that receipt again, so a re-run
+    // after a lost answer never records a second attempt. The day is always the operation's own (sent on the first
+    // run too), so a re-run after midnight carries the same payload and gets the stored receipt, not key_reused.
+    if (op?.check && opId) {
+      // Another call of this request wrote, or may have: only read back what this key stored, never record now.
+      const stored = await quizByKey(opId);
+      if (stored === "error") return keyedUnconfirmed(name);
+      if (stored === "none") return keyedUnconfirmed(name);
+      return quizReply(stored, true);
+    }
     const result = await recordQuiz(supabase, {
       ...pinnedBook(op, input),
       slug: (input.book as string) || null,
@@ -1422,14 +1493,16 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
       score: Number(input.score),
       total: Number(input.total),
       notes: (input.notes as string) || null,
+      ...(op ? { date: op.day, op_key: opId } : {}),
     });
-    // A 500 may have committed (the answer was lost): never "not recorded" then (lib/reading-practice.ts).
+    // A 500 may have committed (the answer was lost): never "not recorded" then (lib/reading-practice.ts). A retry
+    // re-runs it under the same op_key, which answers the stored receipt if it did.
     if (!result.ok) {
       return JSON.stringify(failureMayHaveWritten(result)
         ? { error: "Onyx could not confirm this quiz result and it may have been recorded. Do not record it again: tell the user to check /reading first.", incomplete: true }
         : { error: result.error });
     }
-    return JSON.stringify({ success: true, passed: result.passed, score: `${result.quiz.score}/${result.quiz.total}`, checkpoint: result.quiz.checkpoint, quiz_date: result.quiz.quiz_date, quiz_id: result.quiz.quiz_id });
+    return quizReply({ quiz_id: result.quiz.quiz_id, checkpoint: result.quiz.checkpoint, score: result.quiz.score, total: result.quiz.total, quiz_date: result.quiz.quiz_date, passed: result.passed }, result.replayed);
   }
 
   if (name === "log_supplement_intake") {
@@ -1581,17 +1654,40 @@ async function sessionOwnerId(): Promise<string | null> {
 async function openRequestLedger(
   requestId: string,
   messages: ReadonlyArray<{ role: string; content: string }>,
+  temporal: Promise<RequestTemporal>,
 ): Promise<OpenedLedger> {
-  const ownerId = await sessionOwnerId();
+  const [ownerId, requestContext] = await Promise.all([sessionOwnerId(), temporal]);
   if (!ownerId) return { kind: "failed", code: "no_owner" };
   return openLedger(supabaseLedgerStore(supabase), {
     ownerId,
     requestId,
     conversationSha: conversationSha(messages),
+    // Stored with the request on its first try; a retry gets the first try's back (ledger.requestContext).
+    requestContext: { ...requestContext },
     buildReceipt: buildWriteReceipt,
     reconcilers: supabaseReconcilers(supabase),
     onError: logLedger,
   });
+}
+
+/**
+ * When and where a request runs: the instant (ISO), the time zone and the behavioral day. A retry of a recorded
+ * request uses the first try's (SEC-04), so its prompt and every write default stay on the day it was first sent.
+ */
+interface RequestTemporal {
+  now: string;
+  time_zone: string;
+  behavioral_today: string;
+}
+
+/** The first try's temporal context stored on the request row, when it is complete; null otherwise. */
+function storedTemporal(ctx: Record<string, unknown> | null | undefined): RequestTemporal | null {
+  if (!ctx) return null;
+  const { now, time_zone, behavioral_today } = ctx;
+  if (typeof now !== "string" || !Number.isFinite(Date.parse(now))) return null;
+  if (typeof time_zone !== "string" || !time_zone) return null;
+  if (typeof behavioral_today !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(behavioral_today)) return null;
+  return { now, time_zone, behavioral_today };
 }
 
 /** Ledger problems are logged by stage and database code only. */
@@ -1655,15 +1751,21 @@ export async function POST(req: NextRequest) {
 
     // The model has no clock of its own: tell it the local time and the
     // behavioral day so "today", "yesterday" and "this morning" resolve.
-    // The request is recorded in the replay ledger at the same time (one insert; nothing is added to the wait).
+    // The request is recorded in the replay ledger with them (one insert, made once the time zone, the behavioral day
+    // and the owner check are in: one database round trip after the slowest of the three).
     const now = new Date();
-    // Kept so the lease is given back in `finally` even when the other two reads fail.
-    opening = requestId ? openRequestLedger(requestId, messages) : null;
-    const [opened, tz, bday] = await Promise.all([
-      opening ?? Promise.resolve(null),
-      currentTimeZone(supabase, now),
-      behavioralToday(supabase),
-    ]);
+    const tzRead = currentTimeZone(supabase, now);
+    const bdayRead = behavioralToday(supabase);
+    // Kept so the lease is given back in `finally` even when the other two reads fail. The request row is written
+    // with this try's time, time zone and behavioral day (a retry reads the first try's back).
+    opening = requestId
+      ? openRequestLedger(
+          requestId,
+          messages,
+          Promise.all([tzRead, bdayRead]).then(([t, b]) => ({ now: now.toISOString(), time_zone: t, behavioral_today: b })),
+        )
+      : null;
+    const [opened, tz, bday] = await Promise.all([opening ?? Promise.resolve(null), tzRead, bdayRead]);
     if (opened?.kind === "conflict") {
       return Response.json({ error: "This retry does not match the message it was first sent with, so nothing was run. Send your message again.", code: "request_conflict" }, { status: 409 });
     }
@@ -1683,10 +1785,18 @@ export async function POST(req: NextRequest) {
       // and a later "log it" is not taken as the first time.
       earlierUnconfirmed = true;
     }
-    const localNow = now.toLocaleString("en-US", {
-      timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",
+    // A retry answers as of when the message was FIRST sent: its prompt time and behavioral day, and the day every new
+    // operation defaults to (an operation stored by an earlier try keeps its own context). `bday` stays this moment's
+    // behavioral day, so a write default that differs from it is sent as an explicit date (pinnedDate).
+    const pinned = ledger?.retry ? storedTemporal(ledger.requestContext) : null;
+    const requestDay = pinned?.behavioral_today ?? bday;
+    const promptTz = pinned?.time_zone ?? tz;
+    const localNow = (pinned ? new Date(pinned.now) : now).toLocaleString("en-US", {
+      timeZone: promptTz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit",
     });
-    const systemPrompt = `${SYSTEM_PROMPT}\n\nCurrent local time: ${localNow} (${tz}). Current behavioral day ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${bday}.`;
+    const systemPrompt = pinned
+      ? `${SYSTEM_PROMPT}\n\nThis message is a retry of one first sent at ${localNow} (${promptTz}); answer as of then. Behavioral day it was sent on ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${requestDay}.`
+      : `${SYSTEM_PROMPT}\n\nCurrent local time: ${localNow} (${tz}). Current behavioral day ("today" for logging; it runs until the user sleeps, so it can lag the calendar date after midnight): ${bday}.`;
 
     // Initial Claude call with tools
     let response = await anthropic.messages.create({
@@ -1738,13 +1848,13 @@ export async function POST(req: NextRequest) {
               input,
               (id, context, check) => runTool(block.name, input, {
                 id,
-                day: typeof context.behavioral_today === "string" ? context.behavioral_today : bday,
+                day: typeof context.behavioral_today === "string" ? context.behavioral_today : requestDay,
                 today: bday,
                 ...(typeof context.book_id === "number" ? { bookId: context.book_id } : {}),
                 ...(typeof context.started_at === "string" ? { startedAt: context.started_at } : {}),
                 ...(check ? { check: true } : {}),
               }),
-              { behavioral_today: bday, started_at: new Date().toISOString(), ...(bookId !== undefined ? { book_id: bookId } : {}) },
+              { behavioral_today: requestDay, started_at: new Date().toISOString(), ...(bookId !== undefined ? { book_id: bookId } : {}) },
             );
           } else if (isWriteTool(block.name) && writesPaused) {
             const result = JSON.stringify({ error: WRITES_PAUSED });

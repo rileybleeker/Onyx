@@ -738,11 +738,11 @@ test("a malformed request_id is a 400 before the model runs; a failed owner chec
 
 test("a quiz insert whose answer was lost is reported as possibly recorded; a refusal stays not recorded", async () => {
   const quiz = afterTool("record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 });
-  const lost = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) } });
+  const lost = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
   const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz")] })).json();
   assert.equal(lostBody.receipts[0].status, "unknown");
   assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/, "the database text is not passed on");
-  const refused = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, error: "score must be between 0 and total" }) } });
+  const refused = route(quiz, { reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
   assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz")] })).json()).receipts[0].status, "not_saved");
 });
 
@@ -1008,16 +1008,26 @@ test("a session an earlier try wrote is only read on the retry: a habit answer c
   assert.equal(db.rows("chat_operations")[0].status, "done");
 });
 
+const HIGHLIGHT_EXISTS = "a highlight with this passage already exists, so nothing was changed";
 /** Like lib/reading.ts addHighlight: one highlight per book + passage, a given comment is written over the stored one
- * (which moves updated_at), and the client_key (the operation id) goes on a highlight it CREATES. */
-function highlightLibrary(db, { current = () => 9, seen = [] } = {}) {
+ * (which moves updated_at), and the client_key (the operation id) goes on a highlight it CREATES. insert_only never
+ * updates: a highlight that has the passage (and is not this key's) answers HIGHLIGHT_EXISTS, untouched.
+ * `beforeWrite` runs between the route's reads and the write (a concurrent write landing in between). */
+function highlightLibrary(db, { current = () => 9, seen = [], insertOnly = [], beforeWrite = async () => {} } = {}) {
   return {
+    HIGHLIGHT_EXISTS,
     getBook: async () => db.rows("books").find((b) => b.book_id === current()) ?? null,
     addHighlight: async (_client, input) => {
       seen.push(input.book_id);
+      insertOnly.push(input.insert_only === true);
+      await beforeWrite(input);
       const book = db.rows("books").find((b) => b.book_id === input.book_id);
       const passage = input.passage.trim();
       const existing = db.rows("book_highlights").find((h) => h.book_id === input.book_id && h.passage === passage);
+      if (input.insert_only && existing) {
+        if (existing.client_key && existing.client_key === input.client_key) return { ok: true, book, highlight: existing, created: true, readBack: true };
+        return { ok: false, error: HIGHLIGHT_EXISTS };
+      }
       if (existing) {
         if (input.comment && input.comment !== existing.comment) {
           await db.from("book_highlights").update({ comment: input.comment, updated_at: new Date().toISOString() }).eq("highlight_id", existing.highlight_id);
@@ -1133,7 +1143,9 @@ test("a highlight the earlier try may have changed is never written over an edit
   const call3 = { passage: "A third synthetic line." };
   const firstThird = await (await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: lostBeforeWrite, readingNotion }).post(third)).json();
   assert.equal(firstThird.receipts[0].status, "unknown");
-  await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: highlightLibrary(fresh, { seen: freshSeen }), readingNotion }).post(third);
+  const freshInsertOnly = [];
+  await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: highlightLibrary(fresh, { seen: freshSeen, insertOnly: freshInsertOnly }), readingNotion }).post(third);
+  assert.deepEqual(freshInsertOnly, [true], "the check-mode re-run creates it by insert only");
   assert.equal(fresh.rows("book_highlights").filter((h) => h.passage === "A third synthetic line.").length, 1);
   await route(afterTool("add_book_highlight", call3), { supabase: fresh, reading: highlightLibrary(fresh, { seen: freshSeen }), readingNotion }).post(third);
   assert.equal(fresh.rows("book_highlights").length, 1, "the next retry replays it");
@@ -1595,4 +1607,102 @@ test("in one message, a product asked for after a stack that could not be confir
   assert.equal(refused.error, operations.UNSETTLED_ERROR);
   assert.equal(out.receipts.find((x) => x.tool === "log_supplement_intake").status, "not_saved");
   assert.equal(out.receipts.find((x) => x.tool === "log_supplement_stack").status, "unknown");
+});
+
+test("a check-mode highlight recovery never updates a highlight written between its reads and its insert (SEC04-R9)", async () => {
+  // First try: the write failed before reaching the database (unknown); no highlight has the passage yet.
+  const db = ledgerDb({ tables: { books: highlightBooks() } });
+  const readingNotion = { mirrorHighlight: async () => "synthetic-block" };
+  const lost = { ...highlightLibrary(db), addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
+  const call = { passage: "A raced synthetic line.", comment: "Note from chat." };
+  const body = { request_id: RID, messages: [user("Save a raced synthetic line")] };
+  assert.equal((await (await route(afterTool("add_book_highlight", call), { supabase: db, reading: lost, readingNotion }).post(body)).json()).receipts[0].status, "unknown");
+  // Retry: the check reads find nothing, then Riley's own highlight of the same passage lands before the insert.
+  const insertOnly = [];
+  const reading = highlightLibrary(db, {
+    insertOnly,
+    beforeWrite: async () => {
+      const at = new Date().toISOString();
+      db.seed("book_highlights", [{ highlight_id: 1, book_id: 9, passage: "A raced synthetic line.", comment: "An earlier own note.", chapter: 3, concept: null, archived: false, next_review: "2026-11-12", notion_block_id: null, client_key: null, created_at: at, updated_at: at }]);
+    },
+  });
+  const retry = await (await route(afterTool("add_book_highlight", call), { supabase: db, reading, readingNotion }).post(body)).json();
+  assert.deepEqual(insertOnly, [true], "the recovery runs insert-only");
+  assert.equal(db.rows("book_highlights").length, 1);
+  assert.equal(db.rows("book_highlights")[0].comment, "An earlier own note.", "the concurrent highlight is left as it is");
+  assert.equal(db.rows("book_highlights")[0].chapter, 3);
+  assert.equal(retry.receipts[0].status, "unknown", "not the call's highlight: unconfirmed, nothing changed");
+
+  // The same race where the concurrent highlight is exactly what the call asked for: confirmed, still unchanged.
+  const db2 = ledgerDb({ tables: { books: highlightBooks() } });
+  const lost2 = { ...highlightLibrary(db2), addHighlight: async () => ({ ok: false, error: "TypeError: fetch failed (synthetic)" }) };
+  const body2 = { request_id: "88888888-8888-4888-8888-888888888888", messages: [user("Save a matching synthetic line")] };
+  const call2 = { passage: "A matching synthetic line.", comment: "Same note." };
+  await route(afterTool("add_book_highlight", call2), { supabase: db2, reading: lost2, readingNotion }).post(body2);
+  const reading2 = highlightLibrary(db2, {
+    beforeWrite: async () => {
+      const at = new Date().toISOString();
+      db2.seed("book_highlights", [{ highlight_id: 1, book_id: 9, passage: "A matching synthetic line.", comment: "Same note.", chapter: null, concept: null, archived: false, next_review: "2026-11-12", notion_block_id: "b", client_key: null, created_at: at, updated_at: at }]);
+    },
+  });
+  const confirmed = await (await route(afterTool("add_book_highlight", call2), { supabase: db2, reading: reading2, readingNotion }).post(body2)).json();
+  assert.equal(db2.rows("book_highlights").length, 1);
+  assert.equal(confirmed.receipts[0].status, "unchanged");
+});
+
+test("a retry after the behavioral day rolled over answers and logs as of the first try, also when it recorded nothing (SEC04-R8)", async () => {
+  const db = ledgerDb();
+  const body = { request_id: RID, messages: [user("Log my synthetic focus capsule")] };
+  // The first try dies in the model call, before any operation is recorded.
+  const first = route([], { supabase: db, today: "2026-11-11", onModelCall: () => { throw new Error("synthetic model failure"); } });
+  assert.equal((await first.post(body)).status, 500);
+  assert.equal(db.rows("chat_operations").length, 0);
+  assert.equal(db.rows("chat_requests")[0].context.behavioral_today, "2026-11-11");
+  // The retry arrives after the day rolled over.
+  const seen = [];
+  const retry = route(afterTool("log_supplement_intake", { product: "synthetic focus" }), {
+    supabase: db,
+    today: "2026-11-12",
+    intake: (input) => { seen.push(input.date); return { ok: true, product: "Acme Synthetic Focus", product_id: "custom_synthetic", intake_date: input.date, timezone: "UTC", doses_each: 1, logged: [{ intake_id: 1, time: null }] }; },
+  });
+  const out = await (await retry.post(body)).json();
+  assert.match(retry.requests()[0].system, /retry of one first sent/);
+  assert.match(retry.requests()[0].system, /2026-11-11/);
+  assert.doesNotMatch(retry.requests()[0].system, /2026-11-12/);
+  assert.deepEqual(seen, ["2026-11-11"], "an omitted date is the first try's day, sent explicitly");
+  assert.equal(db.rows("chat_operations")[0].context.behavioral_today, "2026-11-11");
+  assert.ok(out.receipts.length > 0);
+  // A first try is told the current time as before.
+  const fresh = route([], { supabase: ledgerDb(), today: "2026-11-12" });
+  await fresh.post({ request_id: "99999999-9999-4999-8999-999999999999", messages: [user("Hello")] });
+  assert.match(fresh.requests()[0].system, /Current behavioral day[^\n]*2026-11-12/);
+});
+
+test("a quiz result runs under its operation key with the operation's day, and a retry gets the stored receipt", async () => {
+  const state = { failFinish: true };
+  const db = ledgerDb({ tables: { books: highlightBooks() }, fail: finishFails(state) });
+  const stored = new Map();
+  const calls = [];
+  const reading = {
+    getBook: async () => db.rows("books")[0],
+    recordQuiz: async (_client, input) => {
+      calls.push({ op_key: input.op_key, date: input.date });
+      const prior = stored.get(input.op_key);
+      if (prior) return { ...prior, replayed: true };
+      const result = { ok: true, passed: true, replayed: false, op_key: input.op_key, quiz: { quiz_id: 7, book_id: 9, checkpoint: "ch12", score: 4, total: 5, notes: null, quiz_date: input.date } };
+      stored.set(input.op_key, result);
+      return result;
+    },
+  };
+  const call = { checkpoint: "ch12", score: 4, total: 5 };
+  const body = { request_id: RID, messages: [user("Record my synthetic quiz")] };
+  await route(afterTool("record_reading_quiz", call), { supabase: db, reading, today: "2026-11-11" }).post(body);
+  const op = db.rows("chat_operations")[0];
+  assert.equal(op.status, "pending", "the answer was lost before the ledger recorded it");
+  state.failFinish = false;
+  const retry = await (await route(afterTool("record_reading_quiz", call), { supabase: db, reading, today: "2026-11-12" }).post(body)).json();
+  assert.deepEqual(calls, [{ op_key: op.op_id, date: "2026-11-11" }, { op_key: op.op_id, date: "2026-11-11" }], "same key, same day: the RPC answers its stored receipt");
+  assert.equal(stored.size, 1, "recorded once");
+  assert.equal(retry.receipts[0].status, "unchanged");
+  assert.equal(db.rows("chat_operations")[0].status, "done");
 });

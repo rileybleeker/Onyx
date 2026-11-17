@@ -330,7 +330,7 @@ test("a playlist left unconfirmed is looked up read-only and never created again
   assert.equal(creates, 1);
 });
 
-test("a quiz result left pending is never confirmed by a lookalike row and never recorded twice", async () => {
+test("a quiz result left pending is re-run under its own operation key, read back only when another call wrote", async () => {
   const { db, store, open } = setup({
     tables: { books: [{ book_id: 3, slug: "synthetic-book", status: "reading", created_at: "2029-06-01T00:00:00.000Z" }] },
   });
@@ -339,17 +339,55 @@ test("a quiz result left pending is never confirmed by a lookalike row and never
   await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
   const { row } = await store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call, { book_id: 3 });
   await expireLeases(db);
-  let records = 0;
-  const record = async () => { records++; return { failed: false, result: JSON.stringify({ success: true }) }; };
-  const reconcilers = ops.supabaseReconcilers(db);
-  assert.equal(reconcilers.record_reading_quiz, undefined, "no approximate quiz lookup until the quiz write carries the operation id");
-  // A row for the same book, checkpoint and score taken after the operation began may be a LATER attempt: not proof.
+  assert.equal(ops.supabaseReconcilers(db).record_reading_quiz, undefined, "never matched by book, checkpoint, score or time");
+  // A lookalike row is not proof; the quiz write itself answers by its op_key (the RPC's stored receipt).
   db.seed("reading_quizzes", [{ quiz_id: 9, book_id: 3, checkpoint: "ch12", score: 4, total: 5, quiz_date: "2030-01-01", taken_at: row.created_at }]);
-  const unsure = await (await open({ reconcilers })).run(QUIZ, call, record);
-  assert.equal(records, 0, "never recorded again");
-  assert.equal(unsure.receipt.status, "unknown");
-  assert.equal(JSON.parse(unsure.result).uncertain, true);
-  assert.equal(db.rows("chat_operations")[0].status, "pending", "still unconfirmed, never certified done");
+  const runs = [];
+  const record = async (opId, _context, check) => {
+    runs.push({ opId, check });
+    return { failed: false, result: JSON.stringify({ success: true, passed: true, score: "4/5", checkpoint: "ch12", quiz_date: "2030-01-01", quiz_id: 9, replayed: true }) };
+  };
+  const out = await (await open()).run(QUIZ, call, record);
+  assert.deepEqual(runs, [{ opId: row.op_id, check: false }], "re-run under the same key, a write allowed (nothing else was written)");
+  assert.equal(out.replayed, true);
+  assert.equal(out.receipt.status, "unchanged");
+  assert.equal(db.rows("chat_operations")[0].status, "done");
+
+  // Another call of the earlier try wrote too: the quiz re-run only reads back what its key holds.
+  const other = setup();
+  await other.store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID());
+  const quizRow = (await other.store.claim({ owner_id: OWNER, request_id: REQUEST, tool: QUIZ, ordinal: 1 }, ops.intentSha(QUIZ, call), call, {})).row;
+  const stackRow = (await other.store.claim({ owner_id: OWNER, request_id: REQUEST, tool: STACK, ordinal: 1 }, ops.intentSha(STACK, input()), input(), {})).row;
+  await other.store.finish(stackRow, "done", { success: true }, null);
+  await expireLeases(other.db);
+  const checks = [];
+  await (await other.open()).run(QUIZ, call, async (opId, _context, check) => {
+    checks.push({ opId, check });
+    return { failed: false, result: JSON.stringify({ error: ops.uncertainText(QUIZ), incomplete: true, uncertain: true }) };
+  });
+  assert.deepEqual(checks, [{ opId: quizRow.op_id, check: true }]);
+});
+
+test("the first try's request context is stored with the request row and handed to every retry", async () => {
+  const { db, store } = setup();
+  const context = { now: "2030-01-01T04:59:00.000Z", time_zone: "UTC", behavioral_today: "2029-12-31" };
+  const base = { ownerId: OWNER, requestId: REQUEST, conversationSha: CONVERSATION, buildReceipt: receipts.buildWriteReceipt };
+  const first = await ops.openLedger(store, { ...base, requestContext: context });
+  assert.equal(first.kind, "ledger");
+  assert.equal(first.ledger.retry, false);
+  assert.deepEqual(plain(first.ledger.requestContext), context);
+  assert.deepEqual(plain(db.rows("chat_requests")[0].context), context, "written with the row, in the same insert");
+  await first.ledger.release();
+  // The retry brings this moment's context; the stored one wins.
+  const later = { now: "2030-01-01T12:00:00.000Z", time_zone: "UTC", behavioral_today: "2030-01-01" };
+  const retry = await ops.openLedger(store, { ...base, requestContext: later });
+  assert.equal(retry.ledger.retry, true);
+  assert.deepEqual(plain(retry.ledger.requestContext), context);
+  assert.deepEqual(plain(db.rows("chat_requests")[0].context), context, "never overwritten by a retry");
+  await retry.ledger.release();
+  // A context that cannot be read fails the ledger (writes pause), never a fresh day.
+  db.setFailure(({ table, op }) => (table === "chat_requests" && op === "select" ? { code: "08006" } : null));
+  assert.deepEqual(plain(await ops.openLedger(store, { ...base, requestContext: later })), { kind: "failed", code: "08006" });
 });
 
 test("a ledger that cannot record the call refuses the write instead of running it unrecorded", async () => {
@@ -373,7 +411,7 @@ test("missing ledger tables are reported as unavailable (the route then runs as 
 
 test("only keyed write tools are re-run; habit and highlight re-run in check mode; every other write tool is looked up", () => {
   for (const tool of receipts.WRITE_TOOLS) {
-    const keyed = ["log_supplement_intake", "log_supplement_stack", "log_reading_session"].includes(tool);
+    const keyed = ["log_supplement_intake", "log_supplement_stack", "log_reading_session", "record_reading_quiz"].includes(tool);
     const checked = ["mark_habit_complete", "add_book_highlight"].includes(tool);
     assert.equal(ops.RERUN_SAFE.has(tool), keyed, tool);
     assert.equal(ops.CHECK_ON_RERUN.has(tool), checked, tool);
@@ -955,4 +993,36 @@ test("a listing that cannot reach the row count fails closed: no new write, the 
   assert.equal(await retry.earlierReceipts(), null, "unknown, never 'nothing was saved'");
   assert.deepEqual(errors.at(-1), ["list", "list_incomplete"]);
   assert.equal((await ops.requestOutcome(store, OWNER, REQUEST, receipts.buildWriteReceipt)).status, "failed");
+});
+
+test("addHighlight insert_only (check-mode recovery) never updates a highlight that already has the passage", async () => {
+  const R = loadTs("lib/reading.ts");
+  const KEY = "22222222-2222-4222-8222-222222222222";
+  const at = "2030-01-01T00:00:00.000Z";
+  const db = createFakePostgrest({
+    unique: { book_highlights: [["book_id", "passage"], ["client_key"]] },
+    defaults: { book_highlights: (now, seq) => ({ highlight_id: seq, archived: false, notion_block_id: null, created_at: now(), updated_at: now() }) },
+    tables: {
+      books: [{ book_id: 3, slug: "synthetic-book", status: "reading" }],
+      book_highlights: [{ highlight_id: 100, book_id: 3, passage: "A synthetic line.", comment: "An earlier note.", chapter: 2, concept: null, archived: false, client_key: null, created_at: at, updated_at: at }],
+    },
+  });
+  const base = { book_id: 3, comment: "Chat note.", chapter: 5, date: "2030-01-01", client_key: KEY, insert_only: true };
+  const clash = await R.addHighlight(db, { ...base, passage: "A synthetic line." });
+  assert.deepEqual(plain(clash), { ok: false, error: R.HIGHLIGHT_EXISTS });
+  const kept = db.rows("book_highlights").find((h) => h.highlight_id === 100);
+  assert.equal(kept.comment, "An earlier note.");
+  assert.equal(kept.chapter, 2);
+  // No highlight has the passage: created by one insert, with the key.
+  const made = await R.addHighlight(db, { ...base, passage: "A new synthetic line." });
+  assert.equal(made.ok, true);
+  assert.equal(made.created, true);
+  assert.equal(db.rows("book_highlights").find((h) => h.passage === "A new synthetic line.").client_key, KEY);
+  // The same key again (a copy of this call): its own highlight is read back, never written twice.
+  const again = await R.addHighlight(db, { ...base, passage: "Yet another synthetic line." });
+  assert.equal(again.ok, true);
+  assert.equal(again.readBack, true);
+  assert.equal(db.rows("book_highlights").length, 2);
+  // insert_only needs a key.
+  assert.equal((await R.addHighlight(db, { ...base, client_key: null, passage: "Unkeyed synthetic line." })).ok, false);
 });

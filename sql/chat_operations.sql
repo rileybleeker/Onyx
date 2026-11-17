@@ -19,7 +19,9 @@
 --                         unexpired lease is refused (409) before the model
 --                         runs. The lease (6 min) is longer than the route's
 --                         maxDuration (300 s), so no try outlives it; a try
---                         gives it back when it ends.
+--                         gives it back when it ends. context: the first
+--                         try's local time, time zone and behavioral day; a
+--                         retry answers and logs as of then.
 --   pds.chat_operations   one row per write-tool call of a request, keyed by
 --                         (owner, request_id, tool, n-th call of that tool):
 --                         the call's canonical input and its hash, a status
@@ -39,8 +41,9 @@
 --                         written, anything. A Spotify playlist is never
 --                         re-run: it is looked up read-only in
 --                         pds.spotify_playlists by its client_key. A quiz
---                         result is never re-run and has no lookup yet (no
---                         operation key): it stays "check this".
+--                         result is re-run under its op_key
+--                         (sql/reading_practice_receipts.sql), which answers
+--                         the stored receipt instead of recording it again.
 --   pds.chat_operation_tombstones
 --                         one row per operation whose keyed supplement intake
 --                         or reading session was removed after it was saved
@@ -89,6 +92,7 @@ CREATE TABLE IF NOT EXISTS pds.chat_requests (
     last_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     lease_id          UUID,
     lease_until       TIMESTAMPTZ,
+    context           JSONB,
     PRIMARY KEY (owner_id, request_id)
 );
 
@@ -116,6 +120,10 @@ CREATE TABLE IF NOT EXISTS pds.chat_operations (
 ALTER TABLE pds.chat_operations ADD COLUMN IF NOT EXISTS context JSONB;
 ALTER TABLE pds.chat_requests   ADD COLUMN IF NOT EXISTS lease_id    UUID;
 ALTER TABLE pds.chat_requests   ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
+-- What the first try of the request ran with ({now, time_zone, behavioral_today}), written with the row: a retry
+-- uses it for its prompt and for every new operation's default day, so a first try that stopped before any
+-- operation was recorded cannot move "today" to the next day on a retry after midnight / 06:00.
+ALTER TABLE pds.chat_requests   ADD COLUMN IF NOT EXISTS context     JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_chat_operations_request
     ON pds.chat_operations (owner_id, request_id, created_at);
