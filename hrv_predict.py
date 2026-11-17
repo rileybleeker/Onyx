@@ -79,6 +79,10 @@ ROLLING_WINDOW_DAYS = 30
 # A separate label keeps both rows without changing the key. Readers: the /analytics/hrv
 # page (frontend/src/lib/queries-hrv.ts LIVE_METRICS_SUFFIX) and check_drift() below.
 LIVE_METRICS_SUFFIX = "_live_rolling"
+# A model's live accuracy is published only from this many scored live forecasts.
+MIN_LIVE_FORECASTS = 5
+# Models whose live forecasts are scored ('<model>_live_rolling' rows).
+LIVE_MODELS = ("xgboost", "sarimax", "prophet")
 # The first live forecast made by the same-night code (hrv_alignment.py, PR #5) was
 # created 2026-11-11 01:06 ET; the last one made by the old code at 00:05 ET that day
 # (prediction_date 2026-11-12, model_version '2026-11-11_v1', so the version date alone
@@ -613,23 +617,50 @@ def recompute_rolling_metrics() -> list[dict]:
         filters=[("prediction_date", "gte", window_start), ("horizon_days", "eq", 1)],
     )
     live = select_live_forecasts(preds)
+    rows = []
     if live.empty:
         log.info("  No scored live forecasts since the alignment cutover yet.")
-        return []
-
-    rows = []
-    for model_name, sub in live.groupby("model", sort=True):
-        if len(sub) >= 5:
+    for model_name, sub in (live.groupby("model", sort=True) if not live.empty else ()):
+        if len(sub) >= MIN_LIVE_FORECASTS:
             rows.append(live_metrics_row(sub, str(model_name), today_str))
         else:
-            log.info(f"  {model_name}: {len(sub)} scored live forecast(s), need 5 — skipped")
+            log.info(f"  {model_name}: {len(sub)} scored live forecast(s), need {MIN_LIVE_FORECASTS} — skipped")
 
     if rows:
         supa.schema("pds").from_("hrv_model_metrics").upsert(
             _clean_for_json(rows), on_conflict="eval_date,model,horizon_days"
         ).execute()
         log.info(f"  Updated live metrics for {len(rows)} models (last {ROLLING_WINDOW_DAYS} days).")
+    models = set(LIVE_MODELS)
+    if not preds.empty and "model" in preds:
+        models |= {str(m) for m in preds["model"].dropna().unique()}
+    invalidate_stale_live_metrics({live_metrics_model(m) for m in models}, {r["model"] for r in rows})
     return rows
+
+
+def invalidate_stale_live_metrics(candidates: set[str], current: set[str]) -> list[str]:
+    """Remove the live rows of every model that no longer has MIN_LIVE_FORECASTS scored forecasts.
+
+    The page and check_drift read a model's NEWEST '<model>_live_rolling' row. When backfill_actuals
+    clears corrected actuals (or the window slides past old forecasts) and a model drops below the
+    minimum, no new row is written, so the previous one, computed from actuals that are no longer
+    true, would stay published and keep feeding the drift check. Its older rows would take its place
+    if only the newest were removed, so all of them go: they are derived numbers, recomputed from
+    hrv_predictions as soon as the model has enough scored forecasts again.
+
+    `candidates` = live labels of every model that writes forecasts (LIVE_MODELS plus any model in
+    this run's window), `current` = the labels this run wrote. One bounded delete, no listing read
+    (a list of every live row would be cut at PostgREST's row cap). Returns the labels asked to go."""
+    stale = sorted(set(candidates) - set(current))
+    if not stale:
+        return []
+    resp = (supa.schema("pds").from_("hrv_model_metrics").delete()
+            .in_("model", stale).eq("horizon_days", 1).execute())
+    removed = len(resp.data or [])
+    if removed:
+        log.info(f"  Removed {removed} stale live metrics row(s): model below {MIN_LIVE_FORECASTS} "
+                 "scored live forecasts")
+    return stale
 
 
 def latest_live_mae(model: str = "xgboost") -> float | None:

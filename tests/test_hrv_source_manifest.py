@@ -253,7 +253,7 @@ class ManifestCoverage(unittest.TestCase):
         names = {s.name for s in fs.SOURCES}
         rels = fs.watched_relations()
         for rel in ("supplement_intake", "supplement_intake_by_compound", "supplement_intake_by_compound_mat",
-                    "supplement_products", "garmin_activity_laps", "delivery_daily",
+                    "supplement_products", "garmin_activity_laps", "delivery_daily", "delivery_email_log",
                     "phone_usage_daily", "weather_daily", "air_quality_daily", "whoop_workouts",
                     "garmin_activities", "daily_health_matrix_behavioral", "habit_journal",
                     "cronometer_nutrition_daily"):
@@ -266,6 +266,19 @@ class ManifestCoverage(unittest.TestCase):
             self.assertTrue(src.fingerprint or src.signal, f"{src.name}: no deletion signal")
             for scan in src.scans:
                 self.assertIn(scan.moves_on, ("change", "insert"))
+
+    def test_receipt_coverage_hashes_only_what_the_pipeline_reads(self):
+        # Codex PIPE-09 round 3: a historical receipt that parses later moves a day between 0 and
+        # unknown without changing delivery_daily, so the ledger is watched on its own; a --reprocess
+        # that only restamps the parser's bookkeeping must not count as a change.
+        by = {s.name: s for s in fs.SOURCES}
+        fp = by["delivery_email_log"].fingerprint
+        self.assertEqual((fp.relation, fp.date_col), ("delivery_email_log", "received_at"))
+        for col in ("processed_at", "error", "subject", "merchant_name", "account"):
+            self.assertIn(col, fp.exclude)
+        for col in ("message_id", "received_at", "status"):
+            self.assertNotIn(col, fp.exclude)
+        self.assertNotIn("delivery_email_log", fs.UNWATCHED)
 
     def test_rolling_window_etls_settle_past_their_window(self):
         by = {s.name: s for s in fs.SOURCES}
@@ -768,7 +781,7 @@ class FailedLoadsAndSql(unittest.TestCase):
         loader = src[src.index("def load_supplement_unquantified("):src.index("def supplement_unit_classes(")]
         self.assertIn("update(SUPPLEMENT_UNQUANTIFIED_SOURCES)", loader)
         coverage = src[src.index("delivery coverage load failed") - 600:src.index("delivery coverage load failed")]
-        self.assertIn('LOAD_FAILURES.add("delivery_daily")', coverage)
+        self.assertIn('LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))', coverage)
 
     def test_fingerprint_sql_builds_valid_aggregate_text(self):
         import pathlib

@@ -951,7 +951,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
-        LOAD_FAILURES.add("delivery_daily")
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         data["delivery"] = pd.DataFrame()
     # How far the receipt ETL has verifiably looked: the view has a row only on days WITH an
     # order, so "no row" after the last order is a true zero only if the ETL kept running.
@@ -989,8 +989,9 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         data["delivery_covered_through"] = None
         data["delivery_unread_days"] = []
         # The fallback zero-fills fewer days than the full read would; when the coverage reads
-        # recover, delivery_daily's own fingerprint does not move, so it must not be certified.
-        LOAD_FAILURES.add("delivery_daily")
+        # recover, neither delivery_daily's nor delivery_email_log's fingerprint moves, so neither
+        # may be certified.
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
 
     # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11): Apple's own Screen Time
@@ -1616,7 +1617,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Delivery feature merge failed ({e!r}); continuing without delivery features")
-        LOAD_FAILURES.add("delivery_daily")
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         return df
 
 

@@ -192,6 +192,17 @@ SOURCES: tuple[FeatureSource, ...] = (
     FeatureSource(name="delivery_daily",
                   feeds="delivery_daily (Uber Eats receipts, portions eaten, leftovers)",
                   fingerprint=Fingerprint("delivery_daily", "behavioral_date")),
+    # hrv_analysis.load_all_data reads the receipts NOT parsed ('unmatched' / 'error'): their day and
+    # the day before are never zero-filled. A historical receipt that parses later (or fails on a
+    # --reprocess) turns delivery features between 0 and unknown without changing delivery_daily, so
+    # its coverage is fingerprinted on its own. Only identity, receive time and status reach the
+    # pipeline; the parser's own bookkeeping columns are not hashed (a --reprocess restamps them).
+    FeatureSource(
+        name="delivery_email_log", feeds="delivery_email_log (unread receipts: days not zero-filled)",
+        fingerprint=Fingerprint("delivery_email_log", "received_at",
+                                exclude=("processed_at", "error", "subject", "kind", "merchant_name",
+                                         "account")),
+    ),
     # The phone syncs once a day and may resend the last days; a day is final a week later.
     FeatureSource(name="phone_usage_daily", feeds="phone_usage_daily (Screen Time app)", settle_days=8,
                   fingerprint=Fingerprint("phone_usage_daily", "behavioral_date")),
@@ -219,9 +230,9 @@ UNWATCHED: dict[str, str] = {
     "cronometer_servings": "replaced by date on every import; its values reach the pipeline only through "
                            "the matrix (behavioral totals, caffeine), whose fingerprint sees them",
     "whoop_body_measurements": "profile values with no day; every retrain reads the newest row",
-    "delivery_email_log": "coverage of unread receipts, not values; it moves the zero-fill of the newest days",
     "spotify_daily_signature": "off unless ONYX_INCLUDE_SPOTIFY=1",
-    "sync_log": "heartbeats read for delivery coverage, not values (same role as delivery_email_log)",
+    "sync_log": "heartbeats read for delivery coverage, not values: they move only the zero-fill of the "
+                "newest, not yet settled days",
     "user_tz_log": "a new time zone row re-dates only rows written after it; a re-derived row is an update "
                    "the sources above see",
 }

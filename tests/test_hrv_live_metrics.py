@@ -43,9 +43,16 @@ class _Query:
         self._limit: int | None = None
         self._range: tuple | None = None
         self._upsert: tuple | None = None
+        self._delete = False
 
     def select(self, *_a, **_k):
         return self
+
+    def delete(self):
+        self._delete = True; return self
+
+    def in_(self, col, vals):
+        self.filters.append((col, lambda v, x=tuple(vals): v in x)); return self
 
     def eq(self, col, val):
         self.filters.append((col, lambda v, x=val: v == x)); return self
@@ -84,6 +91,12 @@ class _Query:
                 else:
                     hit.update(r)  # merge-duplicates: unsent columns keep their old values
             return _Resp(rows)
+        if self._delete:
+            table = self.db.tables.get(self.table, [])
+            gone = [r for r in table if all(f(r.get(c)) for c, f in self.filters)]
+            self.db.tables[self.table] = [r for r in table if r not in gone]
+            self.db.deletes.append((self.table, len(gone)))
+            return _Resp([dict(r) for r in gone])
         out = [r for r in self.db.tables.get(self.table, [])
                if all(f(r.get(c)) for c, f in self.filters)]
         if self._order:
@@ -101,6 +114,7 @@ class FakeDb:
     def __init__(self):
         self.tables: dict[str, list[dict]] = {}
         self.upserts: list = []
+        self.deletes: list = []
 
     def schema(self, _name):
         return self
@@ -208,6 +222,31 @@ class RecomputeRollingMetrics(unittest.TestCase):
         self.db.tables["hrv_predictions"] = _live_week()[:4]
         self.assertEqual(hp.recompute_rolling_metrics(), [])
         self.assertEqual(self.db.upserts, [])
+
+    def test_dropping_below_five_removes_the_stale_live_rows(self):
+        # Codex PIPE-09 round 3: corrected actuals were cleared and only 4 scored forecasts are left.
+        # The rows computed before the correction must not stay the newest (page + drift check).
+        backtest = {"eval_date": "2026-11-19", "model": "xgboost", "horizon_days": 1, "mae": 24.0,
+                    "model_version": "backtest_initial"}
+        self.db.tables["hrv_model_metrics"] = [
+            dict(backtest),
+            {"eval_date": "2026-11-18", "model": "xgboost_live_rolling", "horizon_days": 1, "mae": 31.0},
+            {"eval_date": "2026-11-19", "model": "xgboost_live_rolling", "horizon_days": 1, "mae": 30.0},
+            {"eval_date": "2026-11-19", "model": "sarimax_live_rolling", "horizon_days": 1, "mae": 9.0},
+        ]
+        self.db.tables["hrv_predictions"] = _live_week()[:4]
+        self.assertEqual(hp.recompute_rolling_metrics(), [])
+        self.assertIsNone(hp.latest_live_mae("xgboost"))
+        left = {(m["eval_date"], m["model"]) for m in self.db.tables["hrv_model_metrics"]}
+        self.assertEqual(left, {("2026-11-19", "xgboost")}, "the backtest row stays, every live row goes")
+
+    def test_enough_forecasts_keep_their_live_row(self):
+        self.db.tables["hrv_predictions"] = _live_week()
+        hp.recompute_rolling_metrics()
+        self.assertEqual(hp.latest_live_mae("xgboost"),
+                         sum(abs(i - 10) for i in range(7)) / 7)
+        models = {m["model"] for m in self.db.tables["hrv_model_metrics"]}
+        self.assertEqual(models, {"xgboost_live_rolling"})
 
 
 class CheckDrift(unittest.TestCase):

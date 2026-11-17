@@ -476,6 +476,10 @@ export async function GET() {
         ["experiments", "report"],
         // Pollen ETL (twice a day): a 19 h gap between runs, far outside the shared window.
         ["pollen", "daily"],
+        // HRV retrain detector (hrv_backfill_check.py, hourly): its own read so an unresolved
+        // "GUARD hrv_backfill_detection:" row keeps the HRV Retrain card partial even after newer
+        // jobs push it out of the shared window (e.g. the detector stopped running).
+        ["hrv_analysis", "backfill_check"],
       ].map(async ([source, dataType]) => {
         const { data, error } = await supabase.from("sync_log").select(SYNC_LOG_COLS)
           .eq("source", source).eq("data_type", dataType)
