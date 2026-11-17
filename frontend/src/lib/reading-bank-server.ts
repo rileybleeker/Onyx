@@ -528,7 +528,7 @@ const stepMs = (step: BankStep, scale: number) => stepBudgetMs(step, scale);
  * with no usage report). The claim's headroom is not used as a separate pre-check: a request it would stop is one
  * the reservation also refuses, and only the reservation pauses the book, so the card can say "Paused · budget".
  */
-class JobRun {
+export class JobRun {
   cost = 0;
   usage: UsageTotals = { ...ZERO_USAGE };
   reserved: number;
@@ -639,9 +639,22 @@ class JobRun {
    */
   private async recordedStatus(outcome: StepOutcome["outcome"]): Promise<string | null> {
     try {
-      const { data, error } = await this.supabase.from("reading_bank_jobs").select("status,attempts,error_code").eq("job_id", this.job.job_id).limit(1);
-      const row = (data as { status?: unknown; attempts?: unknown; error_code?: unknown }[] | null)?.[0];
-      if (error || !row || Number(row.attempts) !== this.job.attempts || row.error_code === "lease_expired") return null;
+      // The fence of this claim: job_id, attempts and claim_seq (claim_seq never resets, so a later claim never matches).
+      const { data, error } = await this.supabase
+        .from("reading_bank_jobs")
+        .select("status,attempts,claim_seq,error_code")
+        .eq("job_id", this.job.job_id)
+        .eq("attempts", this.job.attempts)
+        .eq("claim_seq", this.job.claim_seq)
+        .limit(1);
+      const row = (data as { status?: unknown; attempts?: unknown; claim_seq?: unknown; error_code?: unknown }[] | null)?.[0];
+      if (
+        error ||
+        !row ||
+        Number(row.attempts) !== this.job.attempts ||
+        Number(row.claim_seq) !== this.job.claim_seq ||
+        row.error_code === "lease_expired"
+      ) return null;
       const status = String(row.status ?? "");
       return (outcome === "retry" ? status === "queued" || status === "failed" : status === outcome) ? status : null;
     } catch {
