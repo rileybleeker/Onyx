@@ -1,0 +1,79 @@
+{
+  "_about": "Synthetic comparison cases for the model routing pilot (OPS-MODEL-01, docs/model-routing-pilot.md). Generic dish, label and prompt text written for this file: no orders, products, listening history or other personal data. Run both arms (BASELINE and CANDIDATE in src/lib/model-routing.ts) on every case and score each against the pass rule of its task. Nothing here is run by the test suite against a model; tests/model-routing.test.cjs only checks the file's shape.",
+  "version": 1,
+  "delivery_estimate": {
+    "pass_rule": "kcal inside [kcal_min, kcal_max] and kind equal for at least 90% of cases; every kind equal",
+    "cases": [
+      { "id": "d01", "store": "Generic Burger Bar", "item": "Double cheeseburger", "customizations": "Add bacon", "kind": "food", "kcal_min": 750, "kcal_max": 1300 },
+      { "id": "d02", "store": "Generic Burger Bar", "item": "Large fries", "kind": "food", "kcal_min": 400, "kcal_max": 600 },
+      { "id": "d03", "store": "Generic Pizza Co", "item": "Large pepperoni pizza (8 slices)", "kind": "food", "kcal_min": 2000, "kcal_max": 3200 },
+      { "id": "d04", "store": "Generic Thai Kitchen", "item": "Chicken pad thai", "kind": "food", "kcal_min": 700, "kcal_max": 1200 },
+      { "id": "d05", "store": "Generic Salad Shop", "item": "Garden salad", "customizations": "Dressing on the side", "kind": "food", "kcal_min": 100, "kcal_max": 450 },
+      { "id": "d06", "store": "Generic Burrito Place", "item": "Steak burrito", "customizations": "Rice, beans, cheese, sour cream", "kind": "food", "kcal_min": 900, "kcal_max": 1400 },
+      { "id": "d07", "store": "Generic Sushi Bar", "item": "California roll (8 pieces)", "kind": "food", "kcal_min": 250, "kcal_max": 450 },
+      { "id": "d08", "store": "Generic Cafe", "item": "Large iced latte", "customizations": "Whole milk", "kind": "drink", "kcal_min": 150, "kcal_max": 320 },
+      { "id": "d09", "store": "Generic Cafe", "item": "Bottled water", "kind": "drink", "kcal_min": 0, "kcal_max": 5 },
+      { "id": "d10", "store": "Generic Wing Shop", "item": "10 bone-in wings", "customizations": "Buffalo sauce, ranch", "kind": "food", "kcal_min": 900, "kcal_max": 1500 },
+      { "id": "d11", "store": "Generic Corner Market", "item": "Paper towels, 2 rolls", "kind": "non_food", "kcal_min": 0, "kcal_max": 0 },
+      { "id": "d12", "store": "Generic Bar & Grill", "item": "Pint of lager", "kind": "alcohol", "kcal_min": 150, "kcal_max": 260 }
+    ]
+  },
+  "supplement_photo": {
+    "pass_rule": "every ingredient name, amount and unit read exactly; serving size and unit exact",
+    "render": "Each case is drawn as a plain black-on-white Supplement Facts panel image at evaluation time (the panel text below is the whole label).",
+    "cases": [
+      {
+        "id": "s01",
+        "panel": "Supplement Facts | Serving Size 1 Capsule | Vitamin D3 (as cholecalciferol) 50 mcg | Other ingredients: rice flour, gelatin capsule",
+        "serving_size": 1, "serving_unit": "Capsule",
+        "ingredients": [{ "name": "Vitamin D3", "quantity": 50, "unit": "mcg" }]
+      },
+      {
+        "id": "s02",
+        "panel": "Supplement Facts | Serving Size 2 Tablets | Magnesium (as magnesium glycinate) 200 mg | Zinc (as zinc citrate) 15 mg",
+        "serving_size": 2, "serving_unit": "Tablets",
+        "ingredients": [{ "name": "Magnesium", "quantity": 200, "unit": "mg" }, { "name": "Zinc", "quantity": 15, "unit": "mg" }]
+      },
+      {
+        "id": "s03",
+        "panel": "Supplement Facts | Serving Size 1 Scoop (5 g) | Creatine Monohydrate 5 g",
+        "serving_size": 1, "serving_unit": "Scoop",
+        "ingredients": [{ "name": "Creatine Monohydrate", "quantity": 5, "unit": "g" }]
+      },
+      {
+        "id": "s04",
+        "panel": "Supplement Facts | Serving Size 1 Softgel | Fish Oil 1000 mg | EPA 300 mg | DHA 200 mg",
+        "serving_size": 1, "serving_unit": "Softgel",
+        "ingredients": [{ "name": "Fish Oil", "quantity": 1000, "unit": "mg" }, { "name": "EPA", "quantity": 300, "unit": "mg" }, { "name": "DHA", "quantity": 200, "unit": "mg" }]
+      },
+      {
+        "id": "s05",
+        "panel": "Supplement Facts | Serving Size 1 Capsule | L-Theanine 200 mg | Caffeine (natural) 100 mg",
+        "serving_size": 1, "serving_unit": "Capsule",
+        "ingredients": [{ "name": "L-Theanine", "quantity": 200, "unit": "mg" }, { "name": "Caffeine", "quantity": 100, "unit": "mg" }]
+      }
+    ]
+  },
+  "playlist_measurement": {
+    "about": "Scripted provider attempts for one playlist request, run through the real POST /api/spotify/generate-playlist route with a stub SDK (tests/model-routing.test.cjs). Each attempt is 'answer_tool' (a create_spotify_playlist tool call), 'answer_end' (end_turn), 'timeout' (connection timeout, no usage), 'http_529' (overloaded, no usage) or 'http_400' (not retryable). Usage per answered attempt is input 100 / output 20.",
+    "evaluation_rule": "Cost per accepted result is computed from logged tokens only when pilotCostEvidence(lines).complete is true for both arms; any unpriced attempt leaves the cost criterion unmet until the window is reconciled with the provider's usage report.",
+    "cases": [
+      { "id": "m01", "attempts": ["answer_tool", "answer_end"], "expect": { "ok": true, "calls": 2, "answered": 2, "unpriced": 0, "input_tokens": 200, "cost_complete": true } },
+      { "id": "m02", "attempts": ["timeout", "answer_tool", "answer_end"], "expect": { "ok": true, "calls": 3, "answered": 2, "unpriced": 1, "input_tokens": 200, "cost_complete": false } },
+      { "id": "m03", "attempts": ["http_529", "http_529", "http_529"], "expect": { "ok": false, "calls": 3, "answered": 0, "unpriced": 3, "input_tokens": 0, "cost_complete": false } },
+      { "id": "m04", "attempts": ["http_400"], "expect": { "ok": false, "calls": 1, "answered": 0, "unpriced": 1, "input_tokens": 0, "cost_complete": false } },
+      { "id": "m05", "attempts": ["answer_tool", "timeout", "timeout", "timeout"], "expect": { "ok": true, "calls": 4, "answered": 1, "unpriced": 3, "input_tokens": 100, "cost_complete": false } }
+    ]
+  },
+  "playlist": {
+    "pass_rule": "a playlist is created within MAX_ITERATIONS, only the source pool's tools are called, track count between 10 and 50",
+    "note": "Run against a stub catalog (generic track ids and audio features), never the real listening history or a real Spotify account.",
+    "cases": [
+      { "id": "p01", "prompt": "Upbeat songs for a morning run", "source_pool": "discovery", "vibes": ["energetic"] },
+      { "id": "p02", "prompt": "Calm instrumental music for reading", "source_pool": "history", "vibes": ["calm"] },
+      { "id": "p03", "prompt": "A mix of old favourites and new finds for a dinner party", "source_pool": "mix", "vibes": ["warm"] },
+      { "id": "p04", "prompt": "", "source_pool": "discovery", "genres": ["jazz"], "era": "1960s" },
+      { "id": "p05", "prompt": "Late-night drive, moody and slow", "source_pool": "mix", "vibes": ["moody"] }
+    ]
+  }
+}

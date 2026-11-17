@@ -161,7 +161,8 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
         ingredients: (p.ingredients ?? []).map(ingredientToDraftRow),
       });
       setExtractionMeta({
-        model: "claude-sonnet-5-5",
+        model: typeof json.model === "string" ? json.model : "claude-sonnet-5-5",
+        model_effort: typeof json.model_effort === "string" ? json.model_effort : "default",
         usage: json.usage,
         reference_size: json.reference_size,
         stop_reason: json.stop_reason,

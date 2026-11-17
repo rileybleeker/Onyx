@@ -284,6 +284,13 @@ export interface CreatePlaylistArgs {
    * chat message can find the playlist it already created instead of making a second one.
    */
   clientKey?: string;
+  /** Called just before the first Spotify write; a failure before it means no playlist exists. */
+  onWriteStart?: () => void;
+  /**
+   * Called once Spotify has confirmed the playlist exists (before tracks are added), so a caller
+   * whose creation fails later knows which playlist was left behind instead of guessing.
+   */
+  onCreated?: (p: { playlist_id: string; spotify_url: string }) => void;
 }
 
 export interface CreatePlaylistResult {
@@ -326,6 +333,7 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
     if (e instanceof Error && /^Spotify /.test(e.message)) throw e;
     throw new Error("Spotify token refresh failed (network)");
   }
+  args.onWriteStart?.();
 
   // 1. Create the playlist for the current user.
   //    Spotify's Feb 2026 migration removed POST /users/{user_id}/playlists;
@@ -345,6 +353,7 @@ export async function createPlaylist(args: CreatePlaylistArgs): Promise<CreatePl
   const playlist = await createResp.json();
   const playlistId = playlist.id as string;
   const spotifyUrl = (playlist.external_urls?.spotify as string) ?? `https://open.spotify.com/playlist/${playlistId}`;
+  args.onCreated?.({ playlist_id: playlistId, spotify_url: spotifyUrl });
 
   const audit = {
     playlist_id: playlistId,
