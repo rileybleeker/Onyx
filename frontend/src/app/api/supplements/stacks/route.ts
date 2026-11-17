@@ -21,13 +21,18 @@ export async function GET(req: NextRequest) {
   // FKs supplement_stack_item.stack_id and .product_id) instead of three round trips in a row.
   // `version` (sql/supplement_stack_atomic_save.sql) is what the editor sends back with each save; a database
   // without that column yet (42703, code only) is read without it, and the editor then saves without a version.
-  const read = (withVersion: boolean) => {
+  // `ingredient_count` (sql/supplement_product_ingredient_count.sql, 2026-11-17) is the number the picker shows; it
+  // is read instead of the whole `ingredients` array, which was sent across the wire only to be counted. Without
+  // that column (42703) the array is read and counted here, as before.
+  const read = (withVersion: boolean, withCount: boolean) => {
     let sq = supabase
       .from("supplement_stack")
       .select(
         "stack_id,name,description,remind_time,is_active,sort_order,created_at,updated_at," +
           (withVersion ? "version," : "") +
-          "supplement_stack_item(item_id,product_id,doses,sort_order,supplement_products(brand_name,full_name,serving_size,serving_unit,ingredients,is_active))",
+          "supplement_stack_item(item_id,product_id,doses,sort_order,supplement_products(brand_name,full_name,serving_size,serving_unit," +
+          (withCount ? "ingredient_count" : "ingredients") +
+          ",is_active))",
       );
     if (!includeArchived) sq = sq.eq("is_active", true);
     return sq
@@ -35,11 +40,16 @@ export async function GET(req: NextRequest) {
       .order("created_at", { ascending: false })
       .order("sort_order", { referencedTable: "supplement_stack_item", ascending: true });
   };
-  let { data: stacks, error: stacksErr } = await read(true);
-  if (stacksErr && stacksErr.code === "42703") ({ data: stacks, error: stacksErr } = await read(false));
+  let res = await read(true, true);
+  // Each 42703 step drops one optional column (version, then ingredient_count) until the read goes through.
+  for (const [withVersion, withCount] of [[false, true], [true, false], [false, false]] as const) {
+    if (res.error?.code !== "42703") break;
+    res = await read(withVersion, withCount);
+  }
+  const { data: stacks, error: stacksErr } = res;
   if (stacksErr) return NextResponse.json({ error: stacksErr.message }, { status: 500 });
 
-  type Product = { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredients: unknown; is_active: boolean };
+  type Product = { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredients?: unknown; ingredient_count?: number | null; is_active: boolean };
   type Item = { item_id: number; product_id: string; doses: number; sort_order: number; supplement_products: Product | Product[] | null };
   type Stack = { stack_id: number; supplement_stack_item: Item[] | null } & Record<string, unknown>;
 
@@ -55,7 +65,8 @@ export async function GET(req: NextRequest) {
         full_name: p?.full_name ?? null,
         serving_size: p?.serving_size ?? null,
         serving_unit: p?.serving_unit ?? null,
-        ingredient_count: Array.isArray(p?.ingredients) ? (p?.ingredients as unknown[]).length : 0,
+        ingredient_count:
+          p?.ingredient_count ?? (Array.isArray(p?.ingredients) ? (p?.ingredients as unknown[]).length : 0),
         product_active: p?.is_active ?? true,
       };
     });
