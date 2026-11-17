@@ -12,11 +12,16 @@ const MAX_BODY_BYTES = 2048;
 const MAX_TIMES = 12;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const EVENT_KEY_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * POST /api/supplements/log-product
  * Body: { product_id?: string, product?: string, amount?: number|null, unit?: string|null,
- *         times?: "HH:MM"[], date?: "YYYY-MM-DD"|null }
+ *         times?: "HH:MM"[], date?: "YYYY-MM-DD"|null, event_key?: UUID }
+ *
+ * event_key (optional): the caller's own UUID for this log. It becomes the write's client_event_key (the same
+ * scheme as the chat tool: every row carries the key and its place in the set), so a retry with the same key
+ * returns the stored rows with replayed: true instead of writing again. Not a UUID = 400.
  *
  * The /log Supplements section's "log a product" row: one product with an amount and clock times, through the
  * SAME function as the chat tool log_supplement_intake (lib/supplement-intake.ts logSupplementIntake), so the
@@ -75,6 +80,13 @@ export async function POST(req: NextRequest) {
     if (typeof b.date !== "string" || !DATE_RE.test(b.date)) return NextResponse.json({ ok: false, error: "date must be YYYY-MM-DD" }, { status: 400 });
     date = b.date;
   }
+  let eventKey: string | null = null;
+  if (b.event_key !== undefined && b.event_key !== null) {
+    if (typeof b.event_key !== "string" || !EVENT_KEY_RE.test(b.event_key)) {
+      return NextResponse.json({ ok: false, error: "event_key must be a UUID" }, { status: 400 });
+    }
+    eventKey = b.event_key.toLowerCase();
+  }
 
   try {
     const result = await logSupplementIntake(supabase, {
@@ -85,6 +97,7 @@ export async function POST(req: NextRequest) {
       times,
       date,
       notes: "Logged from /log",
+      event_key: eventKey,
     });
     return NextResponse.json(result, { status: result.ok ? 200 : 400 });
   } catch (e) {
