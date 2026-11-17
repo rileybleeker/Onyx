@@ -1122,10 +1122,12 @@ export async function readHealthMatrix(sinceStr: string): Promise<Record<string,
   // live view — this page is pure ETL history, staleness is invisible.
   // Paged via .range(): the matrix is at 850+ rows (one/day) and the ALL
   // range would silently truncate at PostgREST's 1000-row cap in ~5 months.
-  // The first page carries count:"exact" and the other pages run in PARALLEL
-  // (the getHabitJournal pattern), so this one /api/derived call stays one
-  // round trip deep as history grows; a page that still comes back full (no
-  // count, or rows added by a refresh in between) is followed serially.
+  // The first page carries count:"exact" (the getHabitJournal pattern), so a
+  // read of at most one page is one request. The remaining pages are requested
+  // together only after that count is known, so a read of more than one page
+  // takes two request rounds as history grows; a page that still comes back
+  // full (no count, or rows added by a refresh in between) is followed one at
+  // a time.
   // onyx_behavioral_date is unique in the matview, so the order is total.
   const PAGE = 1000;
   const page = (fromIdx: number, withCount: boolean) =>

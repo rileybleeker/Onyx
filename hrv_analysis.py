@@ -1022,6 +1022,26 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         LOAD_FAILURES.add("phone_usage_daily")
         data["screen"] = pd.DataFrame()
 
+    # PC activity (pds.pc_activity_daily, 2026-11-14): coarse active-minute totals per
+    # behavioral day from the local logger (tools/pc_activity_logger). Service-role-only
+    # view; loaded fail-open like screen time — a missing relation (PGRST205 before the
+    # schema is applied) must never sink the retrain.
+    log.info("  Loading pc_activity_daily (PC activity)…")
+    try:
+        data["pc_activity"] = fetch_all(
+            "pc_activity_daily",
+            select="behavioral_date,active_minutes,late_active_minutes,synced_at",
+            order="behavioral_date",
+        )
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "code", None)
+        if code in _MISSING_RELATION_CODES:
+            log.info("  pc_activity_daily not present yet; continuing without it")
+        else:
+            log.warning(f"  pc_activity_daily load failed ({e!r}); continuing without PC-activity features")
+        LOAD_FAILURES.add("pc_activity_daily")
+        data["pc_activity"] = pd.DataFrame()
+
     # Air quality (pds.air_quality_daily, 2026-11-11): daily PM2.5 / US AQI per ET clock day from
     # the keyless Open-Meteo Air Quality API (air_quality_etl.py). Loaded fail-open: a brand-new
     # source (the table may not exist yet) must never sink the retrain.
@@ -1786,7 +1806,7 @@ def merge_estimated_intake_features(df: pd.DataFrame, delivery_nutrition: pd.Dat
 
 
 # Families whose newest day is not known when the evening forecast runs.
-NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "aqi_", "wx_", "whoop_steps", "est_")
+NOT_FORECAST_PREFIXES = ("delivery_", "screen_", "pc_", "aqi_", "wx_", "whoop_steps", "est_")
 
 SCREEN_COLS = {
     # feature column                     <- pds.phone_usage_daily column
@@ -1869,6 +1889,68 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")
         LOAD_FAILURES.add("phone_usage_daily")
+        return df
+
+
+PC_ACTIVITY_COLS = {
+    # feature column  <- pds.pc_activity_daily column
+    "pc_active_min": "active_minutes",        # total active minutes of the behavioral day
+    "pc_late_min":   "late_active_minutes",   # active minutes in hours starting 21:00-05:59 local
+}
+
+
+def merge_pc_activity_features(df: pd.DataFrame, pc: pd.DataFrame | None) -> pd.DataFrame:
+    """Windows PC activity from pds.pc_activity_daily (tools/pc_activity_logger, one row
+    per behavioral day; a day the logger never ran has no row).
+
+      pc_active_min  active minutes of the day (input within the last 3 minutes)
+      pc_late_min    active minutes in hours starting 21:00-05:59 local (the view's
+                     late_active_minutes)
+
+    Only the two coarse totals — deliberately NO per-program columns (pc_activity_apps
+    holds executable names; privacy: the pipeline never features a program).
+
+    ROW PLACEMENT: day D's PC use sits on row D, whose HRV is the sleep that closes
+    day D (hrv_alignment.py), so no re-keying.
+
+    COMPLETENESS: a day counts only once the hourly upsert synced at least an hour
+    after the day ended (synced_at >= D + 1 day at 07:00 ET, the 06:00 behavioral-day
+    end + 1 h) — like the iPhone Screen Time contract, so the hour the upload would
+    touch is over first. The day's partial or unsynced rows are NaN, never zero. Days
+    the logger never ran (before its first run, a gap, the PC being off) are NaN too,
+    never zero: absence is "unknown", not "no use".
+
+    Kept out of the forecasting models (NOT_FORECAST_PREFIXES): on the evening the
+    forecast runs, today's hours are not uploaded yet. Descriptive and causal analyses
+    only; they switch themselves on as days accrue (Spearman >= 20 days, causal
+    MIN_CONTINUOUS_N).
+
+    Fail-open: any problem logs a warning and returns df untouched.
+    """
+    cols = list(PC_ACTIVITY_COLS)
+    if pc is None or pc.empty:
+        return df
+    try:
+        p = pc.copy()
+        p["day"] = pd.to_datetime(p["behavioral_date"], errors="coerce")
+        p = p.dropna(subset=["day"]).drop_duplicates("day")
+        synced = pd.to_datetime(p["synced_at"], errors="coerce", utc=True)
+        # The day ends at 06:00 ET the next morning (the −6 h behavioral rule); count it
+        # once a sync landed at least an hour past that.
+        day_end_plus_1h = (p["day"] + pd.Timedelta(days=1, hours=7)).dt.tz_localize(ET_TZ)
+        p = p[(synced >= day_end_plus_1h).fillna(False)]
+        f = pd.DataFrame({feat: pd.to_numeric(p[src], errors="coerce")
+                          for feat, src in PC_ACTIVITY_COLS.items()}, index=p.index)
+        f["calendar_date"] = p["day"].dt.strftime("%Y-%m-%d")
+        out = df.drop(columns=cols, errors="ignore").merge(
+            f[["calendar_date"] + cols], on="calendar_date", how="left")
+        assert len(out) == len(df), "pc-activity merge changed the row count"
+        log.info(f"  PC-activity features: {int(out['pc_active_min'].notna().sum())} complete days "
+                 f"({len(pc) - len(p)} partial, unsynced or undated day(s) left NaN)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  PC-activity feature merge failed ({e!r}); continuing without PC-activity features")
+        LOAD_FAILURES.add("pc_activity_daily")
         return df
 
 
@@ -2699,6 +2781,7 @@ def build_feature_matrix(data: dict) -> pd.DataFrame:
     df = merge_delivery_features(df, data.get("delivery"), data.get("delivery_covered_through"),
                                  data.get("delivery_unread_days"))
     df = merge_screen_time_features(df, data.get("screen"))
+    df = merge_pc_activity_features(df, data.get("pc_activity"))
     df = merge_air_quality_features(df, data.get("air_quality"))
     df = merge_weather_features(df, data.get("weather"))
     df = merge_whoop_steps_features(df, data.get("whoop_steps"))

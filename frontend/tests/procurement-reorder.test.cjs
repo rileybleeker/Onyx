@@ -72,6 +72,24 @@ test("orders within three days of each other are one occasion", () => {
   assert.deepEqual(suggest([order("Demo Tea", 12), order("Demo Tea", 10), order("Demo Tea", 8)]).suggestions, []);
 });
 
+test("orders exactly three days apart are still one occasion; four days apart are two", () => {
+  // MERGE_DAYS boundary: <= 3 days merges (split shipment), 4 days is a real gap.
+  const three = only([order("Demo Tea", 93), order("Demo Tea", 90), order("Demo Tea", 60), order("Demo Tea", 30)]);
+  assert.equal(three.purchases, 3, "93 and 90 are 3 days apart: one occasion");
+  const four = only([order("Demo Tea", 94), order("Demo Tea", 90), order("Demo Tea", 60), order("Demo Tea", 30)]);
+  assert.equal(four.purchases, 4, "94 and 90 are 4 days apart: two occasions");
+});
+
+test("a canceled order between valid ones never distorts the interval or the occasion count", () => {
+  const valid = [order("Demo Coffee", 90), order("Demo Coffee", 60), order("Demo Coffee", 30)];
+  const withCanceled = [...valid.slice(0, 2), order("Demo Coffee", 45, { status: "canceled" }), valid[2]];
+  const clean = only(valid);
+  const mixed = only(withCanceled);
+  assert.equal(mixed.purchases, clean.purchases, "the canceled order adds no occasion");
+  assert.equal(mixed.intervalDays, clean.intervalDays, "the canceled order does not shift the median gap");
+  assert.equal(mixed.lastOrdered, clean.lastOrdered);
+});
+
 test("an item listed twice in one order counts once", () => {
   const orders = [order(["Demo Tea", "demo tea"], 90), order("Demo Tea", 60), order("Demo Tea", 30)];
   assert.equal(only(orders).purchases, 3);
@@ -205,6 +223,8 @@ test("the card makes no request and links nowhere; the code calls no model and h
   const card = fs.readFileSync(path.join(SRC, "app/procurement/ReorderSuggestions.tsx"), "utf8");
   assert.doesNotMatch(card, /\bfetch\(|https?:\/\/|<a\b|href=|<Link\b|<button\b|<form\b|onClick/, "no request, link, button or form");
   assert.doesNotMatch(card, /add to cart|checkout|buy now|place order/i);
+  // The card is a client component: it must never pull the service-role loader.
+  assert.doesNotMatch(card, /procurement-reorder-server/, "the client card never imports the server loader");
   for (const file of ["lib/procurement-reorder.ts", "lib/procurement-reorder-server.ts"]) {
     const src = fs.readFileSync(path.join(SRC, file), "utf8");
     assert.doesNotMatch(src, /anthropic-ai|openai|@ai-sdk|messages\.create|\bfetch\(|https?:\/\//, file);

@@ -44,9 +44,14 @@
  *     known book refuses a call that would write to the book being read;
  *   - text stored as the user's words (a recall note, a question, a passage, a comment) has to be a verbatim span of
  *     the user's words (case, spacing and punctuation aside), so a negation cannot be dropped or added;
- *   - a playlist only on an explicit request (never a report), a quiz result only for a quiz the user asked for and
- *     answered (score within the questions asked and answered, not stopped, not already recorded) or that the user
- *     states, each at most once per request, and never after "don't record a score";
+ *   - a playlist only on an explicit request (never a report), a quiz result only for the active quiz the user asked
+ *     for: the request opens it, each question the assistant asks has to be a quiz question (not an offer, not
+ *     "want a summary?"), a cancel ("stop the quiz") closes it for good, the one finalization — the user's last answer
+ *     that answers every question asked — authorizes exactly one score out of exactly those questions, with the
+ *     checkpoint the conversation bound (a different one is refused) and the book check; anything that cannot be
+ *     established (no recognized question, an unanswered one, a later unrelated question) fails closed. A score the
+ *     user states themselves ("I got 4 out of 5") is recorded without a quiz, each at most once per request, and never
+ *     after "don't record a score".
  *   - a question-bank answer (record_reading_answer) only inside a quiz the user asked for and did not stop, when the
  *     latest message is the reply to the question just asked (the assistant's message right before it carries that
  *     question's label, "Q<id>"), with the answer a verbatim span of that reply, once per message; a question flag
@@ -80,20 +85,24 @@ interface IntentClause {
 
 /** What the conversation says about a reading quiz. */
 interface QuizState {
-  /** A user message asked for a quiz ("quiz me", "give me a quiz"), not negated, not a plan. */
+  /** A user message asked for a quiz ("quiz me", "give me a quiz"), not negated, not a plan: it opens the active quiz. */
   requested: boolean;
-  /** Questions the assistant asked since that request. */
+  /** Quiz questions the assistant asked since that request (not offers, not questions about the quiz itself). */
   asked: number;
-  /** User messages since that request that answer a question the assistant asked right before them. */
+  /** User messages since that request that answer a quiz question the assistant asked right before them. */
   answers: number;
-  /** An assistant turn since that request already reported the result as recorded. */
+  /** Every quiz question asked has an answer (the quiz is complete). */
+  answeredAll: boolean;
+  /** An assistant turn since that request already reported the result as recorded: the quiz is closed. */
   recorded: boolean;
-  /** The latest message answers a question the assistant asked right before it, inside that quiz. */
+  /** The latest message answers a quiz question the assistant asked right before it: the quiz's one finalization. */
   answering: boolean;
   /** The latest message is a user message after the request, right after an assistant message (a reply to it). */
   follows: boolean;
   /** A user message since the request stopped the quiz or asked not to record it ("stop the quiz", "don't save it"). */
   cancelled: boolean;
+  /** The checkpoint the conversation bound the quiz to ("ch4", "review"), or null when none was named. */
+  checkpoint: string | null;
   /** The user's own words since the request (masked), where a book the quiz names has to appear. */
   userText: string;
 }
@@ -175,6 +184,7 @@ export type RefusalCode =
   | "quiz_score_invalid"
   | "question_not_asked"
   | "flag_not_stated"
+  | "quiz_checkpoint_mismatch"
   | "once_per_request";
 
 /** Why a call was refused (shown on its receipt and to the model). At most 240 characters each. */
@@ -202,6 +212,7 @@ export const REFUSAL_TEXT: Record<RefusalCode, string> = {
   quiz_score_invalid: "Not recorded: this score does not fit the quiz questions asked and answered in this conversation.",
   question_not_asked: "Not recorded: this is not the question just asked. Onyx records an answer only for the question you were asked right before your reply (the one labelled with its Q number).",
   flag_not_stated: "Not flagged: your latest message does not say this question is wrong, unclear, not in that chapter, or from a chapter you have not read. Say which, about that question, to flag it.",
+  quiz_checkpoint_mismatch: "Not recorded: this checkpoint is not the one the quiz you asked for was about. Say the checkpoint yourself to record it there.",
   once_per_request: "Not written: this can be done once per message, and it was already done for this one.",
 };
 
@@ -988,24 +999,67 @@ const QUIZ_CANCEL =
 const QUIZ_NO_RECORD =
   /\b(?:don't|dont|do not|never|no need to)\s+(?:bother\s+)?(?:record|save|log|track|keep|store|recording|saving|logging)\b/;
 
-const asksQuestion = (m: IntentMessage | undefined) =>
-  m?.role === "assistant" && sentenceRanges(maskQuotes(m.content)).some(([, , term]) => term === "?");
+/**
+ * A question about the quiz itself rather than the book: an offer to write, to continue, to summarize, to go over the
+ * answers ("Want a summary?", "Ready for the next one?"). It is not a quiz question, and a reply to it — including a
+ * "yes" — is never a quiz answer.
+ */
+const QUIZ_META_QUESTION =
+  /\b(?:would you like|do you want|want (?:a|an|another|more|to|me|it|the|that)|shall i|should i|may i|shall we|anything else|ready for|ready to|makes sense|make sense|clear so far|next question|another question|one more|continue|keep going|carry on|summar\w|recap|tl;dr|care for)\b/;
+
+/**
+ * The quiz questions one assistant message asked: its question sentences that are not about the quiz itself (not an
+ * offer to write, not "want a summary?"). A question that cannot be recognized as a quiz question is not one, so a
+ * later unrelated question never widens the quiz, and a reply to it never counts as a quiz answer (fail closed).
+ */
+function quizQuestions(content: string): number {
+  const masked = maskQuotes(content);
+  let n = 0;
+  for (const [start, end, term] of sentenceRanges(masked)) {
+    if (term !== "?") continue;
+    const s = norm(masked.slice(start, end));
+    if (WRITE_OFFER.test(s) || QUIZ_META_QUESTION.test(s) || conditional(s)) continue;
+    n++;
+  }
+  return n;
+}
+
+/** The quiz questions of the assistant message right before index `i`, or 0 when there is no assistant message there. */
+const quizQuestionsBefore = (messages: ReadonlyArray<IntentMessage>, i: number): number =>
+  i > 0 && messages[i - 1]?.role === "assistant" ? quizQuestions(messages[i - 1].content) : 0;
+
+/**
+ * The checkpoint a quiz text binds the quiz to: "quiz me on chapter 4" / "checkpoint 12" / "ch 3" → "ch4" / "ch12" /
+ * "ch3", "review" → "review"; null when the text names none. Only the request and the assistant's quiz turns bind it
+ * (the quiz's authors), never the user's answers.
+ */
+function quizCheckpoint(text: string): string | null {
+  const t = norm(text);
+  const m = /\b(?:checkpoint|chapter)\s+(?:number\s+)?(?:ch\s*)?(\d+)\b/.exec(t) ?? /\bch\s*(\d+)\b/.exec(t);
+  if (m) return `ch${Number(m[1])}`;
+  return /\breview\b/.test(t) ? "review" : null;
+}
 
 function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
   let request = -1;
+  let requestSentence = "";
   for (let i = messages.length - 1; i >= 0 && request < 0; i--) {
     if (messages[i].role !== "user") continue;
     const masked = maskQuotes(messages[i].content);
     for (const [start, end] of sentenceRanges(masked)) {
       const s = norm(masked.slice(start, end));
-      if (QUIZ_REQUEST.test(s) && !negated(s) && !HEDGED_REQUEST.test(s) && !conditional(s)) { request = i; break; }
+      if (QUIZ_REQUEST.test(s) && !negated(s) && !HEDGED_REQUEST.test(s) && !conditional(s)) { request = i; requestSentence = s; break; }
     }
   }
-  if (request < 0) return { requested: false, asked: 0, answers: 0, recorded: false, answering: false, follows: false, cancelled: false, userText: "" };
+  const empty: QuizState =
+    { requested: false, asked: 0, answers: 0, answeredAll: false, recorded: false, answering: false, follows: false, cancelled: false, checkpoint: null, userText: "" };
+  if (request < 0) return empty;
   let asked = 0;
   let answers = 0;
   let recorded = false;
   let cancelled = false;
+  // The active quiz is bound to the checkpoint its request (or the assistant's quiz turns) names, if any.
+  let checkpoint = quizCheckpoint(requestSentence);
   const userText: string[] = [];
   for (let i = request; i < messages.length; i++) {
     const m = messages[i];
@@ -1013,23 +1067,25 @@ function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
       const masked = maskQuotes(m.content);
       userText.push(masked);
       if (i > request) {
-        // "Stop the quiz", "don't record it", "no more questions": the quiz records nothing from here on.
+        // "Stop the quiz", "don't record it", "no more questions": the quiz is closed permanently from here on.
         for (const [start, end] of sentenceRanges(masked)) {
           const s = norm(masked.slice(start, end));
           if (QUIZ_CANCEL.test(s) || QUIZ_NO_RECORD.test(s) || (QUIZ_REQUEST.test(s) && negated(s))) cancelled = true;
         }
-        if (asksQuestion(messages[i - 1])) answers++;
+        if (quizQuestionsBefore(messages, i) > 0) answers++;
       }
       continue;
     }
-    asked += sentenceRanges(maskQuotes(m.content)).filter(([, , term]) => term === "?").length;
+    asked += quizQuestions(m.content);
     const t = norm(m.content);
     if (/\b(?:recorded|saved|logged)\b/.test(t) && /\b(?:quiz|score|checkpoint)\b/.test(t)) recorded = true;
+    if (checkpoint === null) checkpoint = quizCheckpoint(t);
   }
   const n = messages.length;
-  const answering = n - 2 > request && messages[n - 1]?.role === "user" && asksQuestion(messages[n - 2]);
+  const answering = n - 2 > request && messages[n - 1]?.role === "user" && quizQuestionsBefore(messages, n - 1) > 0;
+  // The latest message replies to an assistant message after the request (a question-bank answer needs only this).
   const follows = n - 1 > request && messages[n - 1]?.role === "user" && messages[n - 2]?.role === "assistant";
-  return { requested: true, asked, answers, recorded, answering, follows, cancelled, userText: userText.join("\n") };
+  return { requested: true, asked, answers, answeredAll: answers >= asked, recorded, answering, follows, cancelled, checkpoint, userText: userText.join("\n") };
 }
 
 /** The question numbers a message labels, "(Q1234 · ch 3)": the question-bank questions it asks. */
@@ -1246,10 +1302,12 @@ export function authorizeWrite(
   // "Don't log it" / "don't save that": nothing in this message is written.
   if (actions.some(refusesAll)) return deny("contradicts");
 
-  // A quiz result: either the user states it ("I got 4 out of 5 on the quiz"), or it closes a quiz the user asked
-  // for and answered, with no more questions than were asked and answered, not stopped and not recorded already.
+  // A quiz result: either the user states it ("I got 4 out of 5 on the quiz"), or it closes the active quiz the user
+  // asked for — every quiz question asked was answered, this last answer is the one finalization, the score is out of
+  // exactly those questions, the checkpoint matches the one the conversation bound, and the quiz was not stopped and
+  // not recorded already. Anything that cannot be established from the conversation fails closed.
   if (tool === "record_reading_quiz") {
-    if (notNumber(input.score) || notNumber(input.total) || notText(input.book)) return deny("invalid_value");
+    if (notNumber(input.score) || notNumber(input.total) || notText(input.book) || notText(input.checkpoint)) return deny("invalid_value");
     const score = num(input.score), total = num(input.total);
     if (score == null || total == null || !Number.isInteger(score) || !Number.isInteger(total) || total < 1 || score < 0 || score > total) {
       return deny("quiz_score_invalid");
@@ -1257,14 +1315,19 @@ export function authorizeWrite(
     if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
     // "Don't record a score", "the quiz, not recorded".
     if (actions.some((a) => a.prohibition && QUIZ_WORD.test(a.text))) return deny("contradicts");
+    const q = grant.quiz;
+    // The quiz is bound to the checkpoint it named: a call recording another one is refused.
+    const cp = str(input.checkpoint);
+    if (q.checkpoint !== null && (cp === null || cp.toLowerCase() !== q.checkpoint)) return deny("quiz_checkpoint_mismatch");
     const stated = done.find((a) => QUIZ_WORD.test(a.text) && numbersIn(a.text).has(score) && numbersIn(a.text).has(total));
     if (!stated) {
-      const q = grant.quiz;
       if (!q.requested) return deny("quiz_not_asked");
       if (q.cancelled) return deny("quiz_cancelled");
       if (q.recorded) return deny("quiz_already_recorded");
       if (!q.answering) return deny("quiz_not_answered");
-      if (total > q.asked || total > q.answers) return deny("quiz_score_invalid");
+      // Only the complete active quiz: recognized quiz questions exist, every one has an answer, and the score is
+      // out of exactly those questions.
+      if (q.asked < 1 || !q.answeredAll || total !== q.asked) return deny("quiz_score_invalid");
     }
     const bad = bookCheck(input, stated ? stated.text : grant.quiz.userText, ctx.books);
     if (bad) return deny(bad);
@@ -1557,6 +1620,9 @@ function readingSessionFits(
   const through = num(input.chapter_through);
   const finished = FINISHED_BOOK.test(text);
   if (through == null) return "not_named";
+  // The endpoints are the call's own numbers: each has to be a whole chapter (an integer >= 1). A hostile or
+  // malformed endpoint (a float, a 0, a huge negative "from") is refused here, before anything is expanded.
+  if (!Number.isInteger(through) || through < 1) return "not_named";
   if (!chapters.has(through)) {
     // "I finished the book": the last chapter of the book written to, when it is known.
     const slug = str(input.book) ?? ctx.books?.active ?? null;
@@ -1564,13 +1630,18 @@ function readingSessionFits(
     if (!finished || total == null || through !== total) return "not_named";
   }
   const from = num(input.chapter_from);
+  if (from !== null && (!Number.isInteger(from) || from < 1)) return "not_named";
+  if (from !== null && from > through) return "not_named";
   if (chapters.size > 0) {
-    // The call must cover exactly the granted chapters: not a subset, not more.
-    if (from != null && from > through) return "not_named";
-    const covered = new Set<number>();
-    for (let c = from ?? through; c <= through; c++) covered.add(c);
-    if (covered.size !== chapters.size || [...chapters].some((c) => !covered.has(c))) return "not_named";
-  } else if (from != null && from !== through) {
+    // The call must cover exactly the granted chapters: not a subset, not more. Compared by endpoint and
+    // cardinality, never by expanding the call's range: the range written (chapter_from .. chapter_through, or
+    // the single chapter when no from is sent) has to be exactly the chapters the user granted. Counting it by
+    // subtraction first means a hostile range (e.g. from -1000000000 to a named chapter 4) is refused by its
+    // size before anything is enumerated, and the only values ever iterated are the user's own granted chapters.
+    const fromCh = from ?? through;
+    if (through - fromCh + 1 !== chapters.size) return "not_named";
+    for (const c of chapters) if (c < fromCh || c > through) return "not_named";
+  } else if (from !== null && from !== through) {
     return "not_named";
   }
   const minutes = num(input.minutes);

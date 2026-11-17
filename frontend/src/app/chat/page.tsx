@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, conversationKey, earlierOutcomeUnknown, forgetPendingSend, newRequestId, readPendingSendStore, requestIdForSend, storePendingSend, unresolvedPendingSend, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, WRITE_FORWARD_GATE_MESSAGE, conversationKey, earlierOutcomeUnknown, forgetPendingSend, newRequestId, readPendingSendStore, requestIdForSend, storePendingSend, unresolvedPendingSend, writeForwardGate, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
+import { writeGrantFor } from "@/lib/chat-write-intent";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
 
@@ -33,13 +34,21 @@ function readPendingSends(): PendingSend[] {
   }
 }
 
-/** Remember a send before it goes out (its own key only: another tab's sends are never touched). */
-function rememberSend(send: PendingSend) {
+/** Remember a send before it goes out (its own key only: another tab's sends are never touched). Reports whether the record is kept. */
+function rememberSend(send: PendingSend): boolean {
   try {
     storePendingSend(window.localStorage, send);
+    return true;
   } catch {
-    /* storage full or blocked: the in-memory retry still works */
+    /* storage full or blocked: the record is not kept */
+    return false;
   }
+}
+
+/** Whether sending this conversation could end in a chat write (a write request or report, a confirmation, or an active quiz). */
+function couldWrite(messages: ReadonlyArray<{ role: "user" | "assistant"; content: string }>): boolean {
+  const grant = writeGrantFor(messages);
+  return grant.clauses.length > 0 || grant.confirmed || grant.quiz.requested;
 }
 
 /** An answer (or a definite refusal) arrived for this request: it is resolved, forget it (its own key only). */
@@ -226,6 +235,19 @@ export default function ChatPage() {
     recoveryId.current = null;
     recoveryQueue.current = [];
     setRecovery(null);
+    // A write-capable send must first keep its recovery record on this device (its request id, under its own key), so a
+    // reload that lost its answer recognises the same send and never sends it twice (SEC-04). If this device cannot
+    // keep that record right now (no conversation hash, or storage full or blocked), do not send it: show one short
+    // line, and it can be sent again once there is space or in a normal window. Read-only questions may still be sent,
+    // and they too keep their record when the storage works, exactly as before.
+    if (!requestId) requestId = newRequestId();
+    const stored = conv ? rememberSend({ conv, id: requestId, at: Date.now() }) : false;
+    const gate = writeForwardGate(couldWrite(updated), stored);
+    if (!gate.ok) {
+      sending.current = false;
+      setError(WRITE_FORWARD_GATE_MESSAGE);
+      return;
+    }
     setPending(text);
     setInput("");
     setError(null);
@@ -234,8 +256,6 @@ export default function ChatPage() {
     let safe = replaySafe;
     let staleId = false;
     try {
-      if (!requestId) requestId = newRequestId();
-      if (conv) rememberSend({ conv, id: requestId, at: Date.now() });
       // "Send as a new message" over a remembered send: abandon that one on the server, so a late arrival of it runs
       // nothing, and forget it only once that is recorded. Arrived first (running / settled) or not checkable: it
       // stays remembered next to this one, so its account is still shown after a reload.

@@ -4,6 +4,7 @@ import { getNycScoutFreshness } from "@/lib/nyc";
 import { staleCheckNote, swrCacheTimed } from "@/lib/swr-cache";
 import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
+import { getPhoneMessagesStatusCard } from "@/lib/phone-messages-status";
 import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
@@ -48,6 +49,8 @@ const CADENCE: Record<string, string> = {
   cronometer: "Daily 10:30pm + 11am ET",
   // Predict: every hourly ETL + 23:50 ET (DST-gated).
   hrv_analysis: "Predict: hourly + 23:50 ET",
+  // Preprocessing fill check: written by the predict job (deduped to ~every 12 h while unchanged).
+  preprocessing: "With the HRV predict job (hourly + 23:50 ET)",
   // Retrain: hourly conditional on backfill detection + daily 12:00 UTC
   // unconditional safety-net. Tracked separately because the predict path
   // can stay green while the retrain crashes silently (the model is cached).
@@ -80,6 +83,7 @@ const CADENCE: Record<string, string> = {
   renewal_reminders: "Worker poll, hourly; a card up to 3 days before a renewal",
   cash_forecast: "Weekly, Monday 12:30 UTC (forecast snapshot)",
   urgent_email: "Hourly :15 (both Gmail accounts)",
+  phone_messages: "Event driven (iPhone automation pushes each new text)",
   google_calendar: "Hourly :55",
   care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
@@ -87,6 +91,7 @@ const CADENCE: Record<string, string> = {
   pc_activity: "Hourly (Riley's PC, while signed in)",
   uber_rides: "On demand (Uber privacy download, imported by hand)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
+  apple_health: "When the Onyx app is opened on the iPhone (Shortcuts automation)",
   youtube: "Daily look on Riley's PC; new data every 2 months (scheduled Google Takeout)",
   medical_backup: "Weekly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
@@ -118,6 +123,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   cronometer:     { method: "automated",      label: "Web export ETL" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   hrv_retrain:    { method: "automated",      label: "Model retrain" },
+  preprocessing:  { method: "automated",      label: "Model forecast check" },
   experiments:    { method: "automated",      label: "Trial report" },
   spotify:        { method: "automated",      label: "API ETL" },
   reccobeats:     { method: "automated",      label: "API ETL" },
@@ -142,6 +148,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   renewal_reminders: { method: "automated", label: "Worker push cards" },
   cash_forecast:  { method: "automated",      label: "Snapshot job" },
   urgent_email:   { method: "automated",      label: "IMAP label reader" },
+  phone_messages: { method: "semi-automated", label: "iPhone Shortcuts push" },
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
@@ -149,6 +156,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   uber_rides:     { method: "manual",         label: "Privacy download import" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
+  apple_health:   { method: "automated",      label: "iPhone app (HealthKit)" },
   youtube:        { method: "semi-automated", label: "Scheduled Takeout in OneDrive" },
   medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
@@ -320,6 +328,8 @@ export async function GET() {
       .eq("source", "finance_forecast").eq("data_type", "snapshot").order("sync_start", { ascending: false }).limit(1).then((res) => res);
     // Urgent email labels (urgent_email_etl.py, hourly): heartbeat age, own limit-1 query.
     const urgentEmailCardPromise = getUrgentEmailStatusCard(supabase);
+    // iPhone Messages push (Shortcuts automation, event driven): newest push heartbeat only.
+    const phoneMessagesCardPromise = getPhoneMessagesStatusCard(supabase);
     // Google Calendar WRITE side (care items -> the "Onyx care" calendar): the one sync-state row,
     // which holds timestamps, counts and a short code only (never pds.ci_tokens, never an item).
     // Inert until set up: without the two Google variables nothing is read, as in care-google-server.ts.
@@ -359,7 +369,7 @@ export async function GET() {
       ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, hrvPreprocessingSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -479,6 +489,14 @@ export async function GET() {
       // skipped. Deduped, so its newest row can fall out of the 100-row window — own read.
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_predict").eq("data_type", "model_artifact")
         .order("sync_start", { ascending: false }).limit(1),
+      // HRV forecast preprocessing fill (hrv_predict|preprocessing, PIPE-07): the predict job
+      // heartbeats whether the served model was trained with the current sparse-feature fill
+      // (success = moved back onto it; partial = an older, unstamped pickle is being served;
+      // failed = an unknown fill version (GUARD model_preprocessing:)). Same 12 h dedupe rule as
+      // the model-artifact heartbeat, so its newest row can fall out of the 100-row window —
+      // own read.
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_predict").eq("data_type", "preprocessing")
+        .order("sync_start", { ascending: false }).limit(1),
       // Supplement stack reminders: the sms-reminders Worker polls /api/supplements/reminders/claim
       // and each poll (throttled to ~1/h when nothing is due) writes a heartbeat. Dedicated fetch so
       // a Worker that stops polling reads red instead of "unknown" once the row leaves the window.
@@ -506,6 +524,8 @@ export async function GET() {
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
         ["uber_rides", "import"],
+        // Apple Health upload from the iPhone app (runs when the app is opened): its own read.
+        ["apple_health", "samples"],
         // YouTube watch history importer (Riley's PC, one heartbeat a day).
         ["youtube", "history"],
         // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
@@ -626,6 +646,7 @@ export async function GET() {
     const renewalRemindersRes = await renewalRemindersPromise;
     const cashForecastRes = await cashForecastPromise;
     const urgentEmailCard = await urgentEmailCardPromise;
+    const phoneMessagesCard = await phoneMessagesCardPromise;
     const pollenRes = await pollenLatestPromise;
     const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
     const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
@@ -786,6 +807,37 @@ export async function GET() {
           cadence: CADENCE.hrv_retrain,
           integrationMethod: METHOD.hrv_retrain.method,
           methodLabel: METHOD.hrv_retrain.label,
+        };
+      })(),
+      // HRV forecast preprocessing fill (hrv_predict|preprocessing, PIPE-07): whether the served
+      // model was trained with the current sparse-feature fill. A heartbeat-driven status card —
+      // the newest row's status is the card's (partial = Degraded, failed = Error); no row yet =
+      // Unknown. The card repeats only the heartbeat's own message, never model internals.
+      preprocessing: (() => {
+        const entry = (hrvPreprocessingSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? latestBySrcType["hrv_predict|preprocessing"] ?? null;
+        const lastSync = (entry?.sync_start as string) ?? null;
+        const ageH = lastSync ? (Date.now() - new Date(lastSync).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed"
+            ? "failed"
+            : entry.status === "partial"
+              ? "partial"
+              : "success";
+        return {
+          label: "HRV Forecast Fill",
+          lastSync,
+          status,
+          latestDataDate: lastSync ? lastSync.slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the HRV predict job has not reported its preprocessing fill." : null),
+          cadence: CADENCE.preprocessing,
+          integrationMethod: METHOD.preprocessing.method,
+          methodLabel: METHOD.preprocessing.label,
         };
       })(),
       // N-of-1 trial report job (experiment_report.py). Heartbeat only: no report row, arm or result is
@@ -1419,6 +1471,36 @@ export async function GET() {
           methodLabel: METHOD.ai_usage.label,
         };
       })(),
+      // Apple Health from the Onyx iPhone app (tools/screentime_ios, HealthKit -> /api/apple-health/import):
+      // steps, walking metrics, headphone level, mindful minutes, other apps' workouts, State of Mind.
+      // HealthKit is readable only while the phone is unlocked, so a Shortcuts "when Onyx is opened"
+      // automation runs the sync; a quiet stretch is normal. Heartbeat only (no health rows are read here).
+      // 'partial' = the phone lacks Health permission for some metrics. >36h degraded, >96h or a failed row red.
+      apple_health: (() => {
+        const entry = latestBySrcType["apple_health|samples"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 96
+            ? "failed"
+            : entry.status === "partial" || ageH > 36
+              ? "partial"
+              : "success";
+        return {
+          label: "Apple Health",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No upload yet - apply sql/apple_health_schema.sql, install the HealthKit build from /install, allow Health access in the app and add the Shortcuts automation (tools/screentime_ios/README.md)." : null),
+          cadence: CADENCE.apple_health,
+          integrationMethod: METHOD.apple_health.method,
+          methodLabel: METHOD.apple_health.label,
+        };
+      })(),
       // YouTube watch history (tools/youtube_history on Riley's PC): a daily look for a new scheduled Google
       // Takeout export in OneDrive, upserted to pds.youtube_watch_events. Heartbeat only (no rows are read
       // here). Daily run on a PC that may be off: >50h degraded, >96h or a failed row red; the importer's own
@@ -1636,6 +1718,13 @@ export async function GET() {
         cadence: CADENCE.urgent_email,
         integrationMethod: METHOD.urgent_email.method,
         methodLabel: METHOD.urgent_email.label,
+      },
+      // iPhone Messages: texts pushed by a Shortcuts automation (no iOS inbox API). Heartbeat only.
+      phone_messages: {
+        ...phoneMessagesCard,
+        cadence: CADENCE.phone_messages,
+        integrationMethod: METHOD.phone_messages.method,
+        methodLabel: METHOD.phone_messages.label,
       },
     };
 

@@ -2,10 +2,11 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { backoffMs, joinMessage, heartbeatMessage, parseFrame, runResult } from './run-listener.mjs';
+import { backoffMs, joinMessage, heartbeatMessage, parseFrame, runResult, createPatchWriter } from './run-listener.mjs';
 
 const T0 = Date.parse('2030-03-05T15:00:00Z');
 const iso = (ms) => new Date(ms).toISOString();
+const noSleep = () => Promise.resolve();
 
 test('join subscribes to INSERTs on pds.pc_run_requests only', () => {
   const m = joinMessage('7');
@@ -44,6 +45,62 @@ test('run result: still running, finished with an exit code, never started', () 
   assert.deepEqual(runResult({ state: 'Ready', lastRun: iso(T0 - 600e3), last: 0 }, T0, 'already_running', 4), { done: true, exit_code: 0, detail: null });
   // A Task Scheduler code that is not a process exit code.
   assert.deepEqual(runResult({ state: 'Ready', lastRun: iso(T0), last: 2147946720 }, T0, 'started', 2), { done: true, exit_code: null, detail: 'task_result_800710e0' });
+});
+
+test('patch writer: a PATCH that fails every attempt is queued, then a later drain retries and lands it once the REST layer recovers', async () => {
+  let calls = 0;
+  // Fail the first 4 attempts (the initial write), then succeed like the recovered REST layer.
+  const fakeRest = async () => (++calls > 4 ? { ok: true, status: 200 } : { ok: false, status: 503 });
+  const logs = [];
+  const w = createPatchWriter(fakeRest, { log: (s) => logs.push(s), sleep: noSleep });
+  const landed = await w.write(['id-1'], { outcome: 'started' });
+  assert.equal(landed, false, 'first write fails all 4 attempts');
+  assert.equal(w.pending.length, 1, 'failed write is kept for a later retry');
+  assert.deepEqual(w.pending[0].ids, ['id-1']);
+  assert.deepEqual(w.pending[0].fields, { outcome: 'started' });
+  assert.equal(calls, 4, 'the failed write went through the backoff retries');
+
+  await w.drain();
+  assert.equal(calls, 5, 'drain makes one more attempt');
+  assert.equal(w.pending.length, 0, 'entry is dropped only after a PATCH succeeds');
+});
+
+test('patch writer: a write that succeeds immediately is not queued', async () => {
+  const fakeRest = async () => ({ ok: true, status: 200 });
+  const w = createPatchWriter(fakeRest, { sleep: noSleep });
+  assert.equal(await w.write([], {}), true);
+  assert.equal(w.pending.length, 0);
+});
+
+test('patch writer: the list is capped and an overflow drops the oldest with a logged count', async () => {
+  const fail = async () => ({ ok: false, status: 500 });
+  const logs = [];
+  const w = createPatchWriter(fail, { limit: 2, log: (s) => logs.push(s), sleep: noSleep });
+  await w.write(['a'], {});
+  await w.write(['b'], {});
+  await w.write(['c'], {}); // over the cap: oldest ('a') is dropped, 'b' + 'c' stay
+  assert.equal(w.pending.length, 2);
+  assert.deepEqual(w.pending.map((e) => e.ids), [['b'], ['c']]);
+  assert.match(logs.join('\n'), /pending-writes: dropped 1 \(2 left\)/);
+});
+
+test('patch writer: drain re-runs a whole failed batch once the REST layer recovers', async () => {
+  let calls = 0;
+  const w = createPatchWriter(async () => (++calls > 3 ? { ok: true, status: 200 } : { ok: false, status: 503 }), { sleep: noSleep });
+  assert.equal(await w.write(['x'], { a: 1 }), false);
+  assert.equal(await w.write(['y'], { b: 2 }), false);
+  assert.equal(w.pending.length, 2);
+  await w.drain(); // the REST layer has recovered: both are retried in order and land
+  assert.equal(w.pending.length, 0);
+  assert.equal(calls, 10);
+});
+
+test('patch writer logs only the status code or network error, never an id or secret', () => {
+  const src = readFileSync(new URL('./run-listener.mjs', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf('export function createPatchWriter'), src.indexOf('const patchWriter'));
+  for (const hit of block.matchAll(/logFn\(`([^`]+)`\)/g)) {
+    assert.doesNotMatch(hit[1], /id|KEY|apikey|token/i, hit[1]);
+  }
 });
 
 test('the listener never logs the key or the websocket URL', () => {
