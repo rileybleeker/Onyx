@@ -620,6 +620,12 @@ test("a retry is checked against the book its earlier try was pinned to (the rou
   assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: BOOKS }), ALLOWED);
 });
 
+test("a chapter range the user states is allowed whatever the book's total chapters", () => {
+  // The named range is checked against the words, not the book total: a 12-chapter book allows "chapters 5 and 6".
+  const twelve = { active: "synthetic-book", list: [{ slug: "synthetic-book", title: "Synthetic Book", total_chapters: 12 }, BOOKS.list[1]] };
+  assert.deepEqual(decide([user("Finished chapters 5 and 6 on my run")], "log_reading_session", { chapter_from: 5, chapter_through: 6 }, { books: twelve }), ALLOWED);
+});
+
 // The reservation lifecycle of an allowed call (the route reserves before the tool runs, then settles it on the
 // answer): reserved before execution, kept on a success (the completed write) or an uncertain answer, released only
 // by a definitive refusal, so a corrected call may run and a retry reconciles instead of executing again.
