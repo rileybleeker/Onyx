@@ -283,7 +283,8 @@ test("status thresholds: >36h degraded, >72h failed, either heartbeat can drag i
 test("a failed heartbeat shows the importer's own text, e.g. login required", () => {
   const c = card(beat(1, { status: "failed", error_message: "Login required: the Rocket Money session expired." }), beat(1));
   assert.equal(c.status, "failed");
-  assert.equal(c.errorMessage, "Login required: the Rocket Money session expired.");
+  assert.equal(c.errorMessage, "Rocket Money needs you to sign in again. Ask Claude to run the Rocket Money sign-in on your PC.");
+  assert.doesNotMatch(c.errorMessage, /node|\.mjs|--login|harvest/);
   assert.equal(card(beat(1), beat(1, { status: "error", error_message: "boom" })).status, "failed");
   assert.equal(card(beat(1, { status: "partial", error_message: "2 rows skipped" }), beat(1)).errorMessage, "2 rows skipped");
   // Text on a heartbeat that itself succeeded is not shown; a failure without text says so plainly.
