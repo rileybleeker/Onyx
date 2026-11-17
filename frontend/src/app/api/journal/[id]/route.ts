@@ -26,7 +26,11 @@ export async function GET(
     .eq("archived", false)
     .maybeSingle();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    // The real error stays on the server; the caller gets fixed plain copy only.
+    console.error("[journal-entry-get] query failed", error.message);
+    return NextResponse.json({ error: "Couldn't load that entry. Try again." }, { status: 500 });
+  }
   if (!data) return NextResponse.json({ error: "not found" }, { status: 404 });
 
   return NextResponse.json({ entry: data });
