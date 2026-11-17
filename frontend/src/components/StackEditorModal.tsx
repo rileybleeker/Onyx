@@ -423,6 +423,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
           <select
             value={addProductId}
             onChange={(e) => addItem(e.target.value)}
+            aria-label="Add a product"
             disabled={locked || available.length === 0}
             className="flex-1 px-3 py-2 text-[12px] bg-black/40 border border-border-subtle rounded-control text-text-primary focus:border-accent/50 outline-none disabled:opacity-50"
           >
