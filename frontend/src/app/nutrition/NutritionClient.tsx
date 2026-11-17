@@ -206,6 +206,14 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
   const [weightRows, setWeightRows] = useState<WeightRow[]>([]);
   const [weightLoading, setWeightLoading] = useState(true);
   const [weightError, setWeightError] = useState(false);
+  // Inline failure for deleting a weight entry, shown under the Recent entries list. Cleared by the
+  // next delete or after a few seconds. Replaces the blocking browser popup.
+  const [weightActionError, setWeightActionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!weightActionError) return;
+    const t = setTimeout(() => setWeightActionError(null), 5000);
+    return () => clearTimeout(t);
+  }, [weightActionError]);
   // /nutrition?log=photo (Log > Meal photo): the photo logger first.
   // /nutrition?log=weight (an older shortcut): weight is entered on Log now, so the routed page forwards there.
   const logParam = useSearchParams().get("log");
@@ -409,13 +417,14 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
 
   async function deleteWeight(log_date: string) {
     if (!confirm(`Delete weight entry for ${log_date}?`)) return;
+    setWeightActionError(null);
     try {
       const res = await fetch(`/api/weight?log_date=${log_date}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
       await loadWeight();
     } catch (e) {
       console.error("Delete weight:", e);
-      alert("Couldn't delete that weight entry. Try again.");
+      setWeightActionError("Couldn't delete that weight entry. Try again.");
     }
   }
 
@@ -1113,6 +1122,9 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
                   </div>
                 ))}
               </div>
+              {weightActionError && (
+                <p role="alert" className="text-[11px] text-red-400 mt-2">{weightActionError}</p>
+              )}
             </ChartCard>
           </Part>
         )}
