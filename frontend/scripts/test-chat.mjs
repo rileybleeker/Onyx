@@ -40,7 +40,31 @@ test("accepts ordinary text conversation and rejects malformed/tool-injected his
     assert.equal(contract.validateChatMessages(input), false);
   }
 });
-function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite = () => {}, intake = { ok: true }, stacks = {}, reading = {}, readingNotion = {}, spotify = {}, today = "2026-11-11", sandboxConsole, session = signedIn } = {}) {
+/**
+ * A stand-in for lib/reading-removal.ts built on a test's readingNotion mock: placeEntry writes the entry
+ * (mirrorSession) and stores its block id on the session, as the real placeEntry does once it attaches; the claim and
+ * sweep rules themselves are covered by tests/reading-autosave.test.cjs. `calls` records what the route asked for.
+ */
+function removalOf(readingNotion = {}, calls = [], over = {}) {
+  return {
+    createEntryClaimOf: async () => null,
+    placeEntry: async (client, book, session, replaces, claim) => {
+      calls.push({ fn: "placeEntry", replaces, claim: claim ?? null });
+      const blockId = readingNotion.mirrorSession ? await readingNotion.mirrorSession(book, session, claim ?? null) : null;
+      if (!blockId) return { kind: "none" };
+      await client.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", session.session_id);
+      return { kind: "attached", blockId };
+    },
+    discardEntry: async () => {},
+    rewriteProgressNow: async (_client, bookId, owedId) => {
+      calls.push({ fn: "rewriteProgressNow", bookId, owedId });
+      if (readingNotion.mirrorProgress) await readingNotion.mirrorProgress({ book_id: bookId }, null, null);
+      return true;
+    },
+    ...over,
+  };
+}
+function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite = () => {}, intake = { ok: true }, stacks = {}, reading = {}, readingNotion = {}, readingRemoval = null, spotify = {}, today = "2026-11-11", sandboxConsole, session = signedIn } = {}) {
   let calls = 0, writes = 0; const requests = [];
   class Anthropic { messages = { create: async (body) => { calls++; requests.push(JSON.parse(JSON.stringify(body))); onModelCall(calls); return responses[Math.min(calls-1,responses.length-1)] ?? { stop_reason:"end_turn",content:[{type:"text",text:"A general answer"}] }; } }; }
   const exports = compile("../src/app/api/chat/route.ts", {
@@ -52,7 +76,7 @@ function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite 
     "@/lib/spotify-server": spotify,
     "@/lib/supplement-stacks": stacks,
     "@/lib/supplement-intake": {currentTimeZone: async()=>"UTC", behavioralToday: async()=>(typeof today === "function" ? today() : today), logSupplementIntake: async(_client, input)=>{writes++; onWrite(writes); return typeof intake === "function" ? intake(input) : intake;}},
-    "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-practice": readingPractice,
+    "@/lib/reading": reading, "@/lib/reading-notion": readingNotion, "@/lib/reading-removal": readingRemoval ?? removalOf(readingNotion), "@/lib/reading-practice": readingPractice,
     "@/lib/supabase-server": session,
   }, sandboxConsole);
   return {post: body => exports.POST({json:async()=>body,signal:new AbortController().signal}), raw:exports.POST, calls:()=>calls,writes:()=>writes,requests:()=>requests};
@@ -179,7 +203,7 @@ test("a health data question still runs its tool and returns the result to the m
 });
 test("unexpected failures return a generic error without leaking details",async()=>{
   class Boom { messages = { create: async () => { throw new Error("secret upstream detail"); } }; }
-  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-practice":readingPractice});
+  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-removal":{},"@/lib/reading-practice":readingPractice});
   const response=await exports.POST({json:async()=>({messages:[user("Explain")]}),signal:new AbortController().signal});
   assert.equal(response.status,500);
   assert.doesNotMatch(JSON.stringify(await response.json()),/secret upstream detail/);
@@ -201,7 +225,7 @@ test("suggestions never create a playlist: only an explicit request does",async(
 test("server logs only the error class and status, never the message, while the client gets generic text",async()=>{
   const logged=[];
   class Boom { messages = { create: async () => { const e=new Error("secret upstream detail with user text: my private note"); e.name="APIError"; e.status=529; throw e; } }; }
-  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-practice":readingPractice},{error:(...args)=>logged.push(args)});
+  const exports=compile("../src/app/api/chat/route.ts",{"@anthropic-ai/sdk":Boom,"@supabase/supabase-js":{createClient:()=>({})},"@/lib/chat-contract":contract,"@/lib/chat-receipts":receiptsLib,"@/lib/steps":stepsLib,"@/lib/spotify-server":{},"@/lib/supplement-stacks":{},"@/lib/supplement-intake":{currentTimeZone:async()=>"UTC",behavioralToday:async()=>"2026-11-11"},"@/lib/reading":{},"@/lib/reading-notion":{},"@/lib/reading-removal":{},"@/lib/reading-practice":readingPractice},{error:(...args)=>logged.push(args)});
   const response=await exports.POST({json:async()=>({messages:[user("my private note")]}),signal:new AbortController().signal});
   assert.equal(response.status,500);
   assert.match((await response.json()).error,/Unable to finish this request/);
@@ -473,7 +497,7 @@ test("when a request stops after a write, the error response still carries the r
   // A failure in the model call after the write: generic error text, receipt kept.
   let calls = 0;
   class FailsSecond { messages = { create: async () => { if (++calls === 1) return { stop_reason: "tool_use", content: [toolUse("log_supplement_intake", { product: "Synthetic Focus" })] }; throw new Error("upstream"); } }; }
-  const exports = compile("../src/app/api/chat/route.ts", { "@anthropic-ai/sdk": FailsSecond, "@supabase/supabase-js": { createClient: () => ({}) }, "@/lib/chat-contract": contract, "@/lib/chat-receipts": receiptsLib, "@/lib/steps": stepsLib, "@/lib/spotify-server": {}, "@/lib/supplement-stacks": {}, "@/lib/supplement-intake": { currentTimeZone: async () => "UTC", behavioralToday: async () => "2026-11-11", logSupplementIntake: async () => intake }, "@/lib/reading": {}, "@/lib/reading-notion": {}, "@/lib/reading-practice": readingPractice });
+  const exports = compile("../src/app/api/chat/route.ts", { "@anthropic-ai/sdk": FailsSecond, "@supabase/supabase-js": { createClient: () => ({}) }, "@/lib/chat-contract": contract, "@/lib/chat-receipts": receiptsLib, "@/lib/steps": stepsLib, "@/lib/spotify-server": {}, "@/lib/supplement-stacks": {}, "@/lib/supplement-intake": { currentTimeZone: async () => "UTC", behavioralToday: async () => "2026-11-11", logSupplementIntake: async () => intake }, "@/lib/reading": {}, "@/lib/reading-notion": {}, "@/lib/reading-removal": {}, "@/lib/reading-practice": readingPractice });
   const failed = await exports.POST({ json: async () => ({ messages: [user("Log Synthetic Focus")] }), signal: new AbortController().signal });
   assert.equal(failed.status, 500);
   const failedBody = await failed.json();
@@ -975,6 +999,48 @@ test("a reading session whose insert committed but lost its answer is found by i
   assert.deepEqual(db.rows("habit_journal").map((h) => [h.cycle_date, h.question, h.answer]), [["2026-11-11", "Read synthetic", "Yes"]]);
   assert.equal(mirrors, 1);
   assert.equal(db.rows("reading_sessions")[0].notion_block_id, "synthetic-block");
+});
+
+test("Onyx Chat's reading entry and progress line go through the stored claim and obligation; a replay never writes an unclaimed entry or an untracked line (PR 376, round 3)", async () => {
+  const book = { book_id: 4, slug: "synthetic-book", title: "Synthetic Book", habit_name: null, total_chapters: 20, status: "reading", finished_on: null };
+  const row = (over = {}) => ({ session_id: 1, book_id: 4, session_date: "2026-11-11", chapter_from: 1, chapter_through: 2, minutes: null, medium: "paper", recall: null, notion_block_id: null, ...over });
+  // A fresh keyed create: the entry is written under the claim the create stored, the line under its obligation.
+  {
+    const calls = [];
+    const reading = {
+      logSession: async () => ({ ok: true, book, session: row(), xpGained: 20, finished: false, habitMarked: false, habitCreated: false, replayed: false, mirrorClaimId: "claim-synthetic", progressOwedId: "owed-synthetic" }),
+      getOverview: async () => null,
+    };
+    await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: fakeSupabase(), reading, readingRemoval: removalOf({}, calls) }).post({ messages: [user("I read chapters 1 and 2 on paper")] });
+    assert.deepEqual(calls, [
+      { fn: "placeEntry", replaces: null, claim: "claim-synthetic" },
+      { fn: "rewriteProgressNow", bookId: 4, owedId: "owed-synthetic" },
+    ]);
+  }
+  // This call's own insert, answer lost: the stored claim is looked up. Found = written under it; none = placeEntry
+  // stores one first (no claim argument); the lookup failed = no entry now (the sweep writes the claim, if any).
+  for (const [lookup, expected] of [["claim-found", [{ fn: "placeEntry", replaces: null, claim: "claim-found" }]], [null, [{ fn: "placeEntry", replaces: null, claim: null }]], ["error", []]]) {
+    const db = ledgerDb({ tables: { habit_journal: [], books: [{ book_id: 4, status: "reading" }] } });
+    const calls = [];
+    const looked = [];
+    let n = 0;
+    const reading = {
+      logSession: async (_client, input) => {
+        if (++n === 1) {
+          db.seed("reading_sessions", [{ session_id: 1, book_id: 4, client_key: input.client_key }]);
+          return { ok: false, error: "TypeError: fetch failed (synthetic)" };
+        }
+        // A replay carries no stored claim or obligation of its own (the replay mirrors nothing).
+        return { ok: true, book, session: row(), xpGained: 20, finished: false, habitMarked: false, habitCreated: null, replayed: true };
+      },
+      getOverview: async () => null,
+    };
+    const readingRemoval = removalOf({}, calls, { createEntryClaimOf: async (_c, sessionId, bookId) => { looked.push([sessionId, bookId]); return lookup; } });
+    await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingRemoval }).post({ request_id: RID, messages: [user("I read chapters 1 and 2 on paper")] });
+    assert.deepEqual(looked, [[1, 4]], String(lookup));
+    assert.deepEqual(calls.filter((c) => c.fn === "placeEntry"), expected, String(lookup));
+    assert.deepEqual(calls.filter((c) => c.fn === "rewriteProgressNow"), [{ fn: "rewriteProgressNow", bookId: 4, owedId: null }], "no stored obligation: rewriteProgressNow stores its own before it writes");
+  }
 });
 
 test("a replayed session never overrides an answer given since, and a lost answer with no row found reads 'check this'", async () => {
