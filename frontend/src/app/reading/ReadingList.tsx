@@ -9,9 +9,11 @@ import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import type { Book } from "@/lib/reading";
 import {
+  LIST_LOCAL_KEY,
   LIST_URL,
   acknowledgement,
   applyAnswer,
+  clearPending,
   draftBaseline,
   draftSettled,
   editDraft,
@@ -22,19 +24,19 @@ import {
   newOpKey,
   nextSend,
   normalizeIdentifier,
+  putDraft,
   readLocal,
   recordPending,
+  removePending,
   safeStorage,
   takeSaved,
-  withDraft,
-  withoutPending,
-  writeLocal,
   type Body,
   type Draft,
   type DuplicateCandidate,
   type Fields,
   type ListItem,
   type ListLocal,
+  type LocalWrite,
   type Resolve,
 } from "@/lib/reading-list";
 
@@ -88,11 +90,14 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
   const onChangedRef = useRef(onChanged);
   onChangedRef.current = onChanged;
 
-  /** Keep the device copy in step; false = it could not be written (callers must not send). */
-  const persist = useCallback((next: ListLocal): boolean => {
-    localRef.current = next;
-    setLocal(next);
-    return writeLocal(safeStorage(), next);
+  /** Keep this tab's in-memory copy + UI in step with a merged write result; false = it could not be written. */
+  const applyLocal = useCallback((r: LocalWrite): r is { ok: true; local: ListLocal } => {
+    if (r.ok) {
+      localRef.current = r.local;
+      setLocal(r.local);
+      return true;
+    }
+    return false;
   }, []);
 
   const applyItems = useCallback((next: ListItem[]) => {
@@ -115,12 +120,23 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
   }, [applyItems]);
 
   // Mount: read only. The device copy (unsaved words, unconfirmed changes) is shown, never sent from here.
+  // The 'storage' event (fires in every OTHER tab) re-reads the shared key, so a pending operation or draft
+  // another tab recorded shows up here too and this tab's copy never writes over it.
   useEffect(() => {
     const l = readLocal(safeStorage());
     localRef.current = l;
     setLocal(l);
     setEditing(Object.fromEntries(Object.keys(l.edits).map((k) => [Number(k), true])));
     void loadList();
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === LIST_LOCAL_KEY) {
+        const fresh = readLocal(safeStorage());
+        localRef.current = fresh;
+        setLocal(fresh);
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, [loadList]);
 
   /** One request, in order with every other one. Throws when the outcome is unknown (network, 5xx). */
@@ -147,8 +163,8 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
 
   /** A box's draft into the device copy; false = not kept. */
   const persistDraft = useCallback(
-    (which: "add" | number, d: Draft | null) => persist(withDraft(localRef.current, which, d && !draftSettled(d) ? d : null)),
-    [persist],
+    (which: "add" | number, d: Draft | null) => applyLocal(putDraft(safeStorage(), which, d && !draftSettled(d) ? d : null)),
+    [applyLocal],
   );
 
   /** A tapped action (move, remove, restore, start): recorded on the device first, or not sent at all. */
@@ -159,12 +175,11 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
       setRowMsg({ id: item.book_id, text: listErrorText(rec.reason) });
       return null;
     }
-    localRef.current = rec.local;
-    setLocal(rec.local);
+    applyLocal(rec);
     setBusy(item.book_id);
     try {
       const a = await send(body);
-      persist(withoutPending(localRef.current, body.op_key));
+      applyLocal(removePending(safeStorage(), body.op_key));
       if (a.status !== 200) {
         if (a.json.error === "changed") void loadList();
         setRowMsg({ id: item.book_id, text: listErrorText(a.json.error as string) });
@@ -202,9 +217,12 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
   const retryPending = async () => {
     for (const p of [...localRef.current.pending]) {
       try {
-        if (!writeLocal(safeStorage(), localRef.current)) throw new Error(listErrorText("storage"));
+        // Fail closed: the exact body is (still) on this device before it leaves, merged with other tabs' copies.
+        const rec = recordPending(safeStorage(), localRef.current, p.body, Date.now());
+        if (!rec.ok) throw new Error(listErrorText(rec.reason));
+        applyLocal(rec);
         const a = await send(p.body);
-        persist(withoutPending(localRef.current, p.body.op_key));
+        applyLocal(removePending(safeStorage(), p.body.op_key));
         if (a.status !== 200) setRowMsg({ id: Number(p.body.book_id ?? 0), text: listErrorText(a.json.error as string) });
         else applyAck(p.body, a.json);
       } catch {
@@ -212,7 +230,7 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
       }
     }
   };
-  const dismissPending = () => persist({ ...localRef.current, pending: [] });
+  const dismissPending = () => applyLocal(clearPending(safeStorage()));
 
   const titleOf = (id: number) => books.find((b) => b.book_id === id)?.title ?? items?.find((i) => i.book_id === id)?.title ?? null;
   const pendingCount = local?.pending.length ?? 0;
