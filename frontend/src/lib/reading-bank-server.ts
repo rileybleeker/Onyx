@@ -432,6 +432,19 @@ export function planForBook(input: PlanInput, promptVersion: string): Plan {
   return plan;
 }
 
+/**
+ * The plan input as pds.reading_bank_rebuild will leave it: the chapter's rebuild count one higher (chapter 0 also
+ * the book-level map count). A Rebuild plans from this, so the call that raises the count queues the jobs of the
+ * new count in the same transaction (the count and its jobs are never visible apart).
+ */
+export function withRebuild(input: PlanInput, chapter: number): PlanInput {
+  const has = input.bank.some((b) => b.chapter === chapter);
+  const bank = has
+    ? input.bank.map((b) => (b.chapter === chapter ? { ...b, rebuilds: b.rebuilds + 1 } : b))
+    : [...input.bank, { chapter, status: "pending", chapter_hash: null, rebuilds: 1, built_rebuilds: 0, built_at: null, quizzable_since: null }];
+  return { ...input, bank, map_rebuilds: chapter === 0 ? Math.max(0, Math.trunc(Number(input.map_rebuilds) || 0)) + 1 : input.map_rebuilds };
+}
+
 /** Plan one book and enqueue its jobs. A book that is off is not enqueued (nothing to do, nothing written). */
 export async function planBook(supabase: Supa, bookId: number): Promise<PlanResult> {
   const { input, error } = await readPlanInput(supabase, bookId);
@@ -1725,9 +1738,11 @@ export async function setApproval(supabase: Supa, input: ApprovalInput): Promise
  * POST /api/reading/bank/run: "Build now" (plan + enqueue) and "Rebuild chapter" (the rebuild counter first: new job
  * hashes, so a fresh research + build is queued; chapter 0 or none = the source map and the whole-book build).
  * A rebuild is counted once per round of work: while the chapter's research or build (for chapter 0, the map or the
- * whole-book build) is still queued or running, another Rebuild (a double tap, a retry after a lost answer) answers the
- * same 202 with `pending: true` and does not count again, which would make the first rebuild's jobs obsolete and pay
- * for its research and build twice.
+ * whole-book build) is still queued or running, or another Rebuild was counted since this request read the count,
+ * the request answers the same 202 with `pending: true` and does not count again, which would make the first
+ * rebuild's jobs obsolete and pay for its research and build twice. The decision, the count and the queueing of the
+ * new count's jobs happen in one transaction under the claim lock (pds.reading_bank_rebuild), so overlapping taps
+ * cannot both count.
  * Answers 202 at once; the work runs in after() (kickBookId).
  */
 export async function requestRun(supabase: Supa, input: RunInput): Promise<BankAnswer & { kickBookId: number | null }> {
@@ -1740,25 +1755,21 @@ export async function requestRun(supabase: Supa, input: RunInput): Promise<BankA
   let pending = false;
   if (input.rebuild) {
     const chapter = input.chapter ?? 0;
-    const { data: open, error: e0 } = await supabase
-      .from("reading_bank_jobs")
-      .select("job_id")
-      .eq("book_id", row.book_id)
-      .eq("chapter", chapter)
-      .in("step", chapter === 0 ? ["map", "build"] : ["research", "build"])
-      .in("status", ["queued", "running"])
-      .limit(1);
+    const { input: before, error: e0 } = await readPlanInput(supabase, row.book_id);
     if (e0) {
       const f = bankFailure(null, e0)!;
       return { ...fail(f.status, f.error), kickBookId: null };
     }
-    if (((open ?? []) as unknown[]).length) pending = true;
-    else {
-      const { data, error } = await supabase.rpc("reading_bank_rebuild", { p: { book_id: row.book_id, chapter } });
-      const f = bankFailure(data, error);
-      if (f) return { ...fail(f.status, f.error), kickBookId: null };
-      rebuilds = num((data as { rebuilds?: unknown }).rebuilds, 0);
-    }
+    if (!before) return { ...fail(404, "book_not_found"), kickBookId: null };
+    // The count, the pending check and the enqueue of the new count's jobs are ONE call under the claim lock
+    // (pds.reading_bank_rebuild): a check made here, before the call, would let two overlapping taps both pass it.
+    const expected = before.bank.find((b) => b.chapter === chapter)?.rebuilds ?? 0;
+    const rebuildPlan = planForBook(withRebuild(before, chapter), BANK_PROMPT_VERSION);
+    const { data, error } = await supabase.rpc("reading_bank_rebuild", { p: { book_id: row.book_id, chapter, expected, plan: rebuildPlan } });
+    const f = bankFailure(data, error);
+    if (f) return { ...fail(f.status, f.error), kickBookId: null };
+    if ((data as { pending?: unknown }).pending === true) pending = true;
+    else rebuilds = num((data as { rebuilds?: unknown }).rebuilds, 0);
   }
   const plan = await planBook(supabase, row.book_id);
   if (!plan.ok) return { ...fail(plan.code === "schema_missing" ? 503 : 500, plan.code === "schema_missing" ? "bank_unavailable" : "failed"), kickBookId: null };

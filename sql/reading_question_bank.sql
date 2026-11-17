@@ -2203,23 +2203,50 @@ BEGIN
   RETURN jsonb_build_object('ok', FOUND, 'stored', FOUND);
 END $fn$;
 
--- p: {book_id, chapter}. "Rebuild chapter": a new rebuild count makes new job hashes, so the planner queues a fresh
--- research + build; the stored ideas stay served until the rebuilt batch replaces them. Chapter 0 (or no chapter)
--- is the book level: it also counts a map rebuild (part of the map job's hash), so a source map that failed
--- (refusal, bad output, an expired lease, web search off) is tried again, and the whole-book build with it.
+-- p: {book_id, chapter, expected?, plan?}. "Rebuild chapter": a new rebuild count makes new job hashes, so the planner
+-- queues a fresh research + build; the stored ideas stay served until the rebuilt batch replaces them. Chapter 0
+-- (or no chapter) is the book level: it also counts a map rebuild (part of the map job's hash), so a source map that
+-- failed (refusal, bad output, an expired lease, web search off) is tried again, and the whole-book build with it.
+-- A rebuild is counted ONCE per round of work, decided and written under the claim lock in this one call:
+--   * while the chapter's research or build (chapter 0: the map or the whole-book build) is queued or running, or
+--   * when `expected` (the rebuild count the caller read before planning) no longer equals the stored count, because
+--     another Rebuild was counted in between,
+-- nothing is counted and the answer is {pending: true}. Counting needs no separate check beforehand: two overlapping
+-- taps both reach this lock, the first counts, the second finds its jobs queued (or the count moved) and does not,
+-- which would make the first one's jobs obsolete and pay for research and build twice.
+-- `plan` (what the planner would queue once the count is one higher: lib/reading-bank-server.ts planForBook) is
+-- enqueued in the same transaction, so there is no moment with the count raised and its jobs not yet queued, in which
+-- a third tap would count again. Without `plan` only the counter moves (a caller that plans afterwards).
+-- -> {ok, pending, chapter, rebuilds, map_rebuilds, enqueued}
 CREATE OR REPLACE FUNCTION pds.reading_bank_rebuild(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = pds, pg_temp AS $fn$
-DECLARE v_book BIGINT; v_ch INTEGER; v_n INTEGER; v_m INTEGER;
+DECLARE
+  v_book BIGINT; v_ch INTEGER; v_exp INTEGER; v_plan_book BIGINT;
+  v_cur INTEGER; v_n INTEGER; v_m INTEGER; v_enq INTEGER;
+  v_has_plan BOOLEAN := p->'plan' IS NOT NULL AND jsonb_typeof(p->'plan') <> 'null';
 BEGIN
   BEGIN
     v_book := (p->>'book_id')::bigint;
     v_ch := COALESCE(NULLIF(p->>'chapter', '')::int, 0);
+    v_exp := NULLIF(p->>'expected', '')::int;
+    v_plan_book := CASE WHEN v_has_plan AND jsonb_typeof(p->'plan') = 'object' THEN NULLIF(p->'plan'->>'book_id', '')::bigint END;
   EXCEPTION WHEN others THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END;
-  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 THEN RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request'); END IF;
+  IF v_book IS NULL OR v_ch IS NULL OR v_ch < 0 OR (v_exp IS NOT NULL AND v_exp < 0)
+     OR (v_has_plan AND v_plan_book IS DISTINCT FROM v_book) THEN
+    RETURN jsonb_build_object('ok', false, 'http', 400, 'code', 'bad_request');
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pds.books WHERE book_id = v_book) THEN
     RETURN jsonb_build_object('ok', false, 'http', 404, 'code', 'book_not_found');
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'));
+  SELECT c.rebuilds INTO v_cur FROM pds.reading_bank_chapters c WHERE c.book_id = v_book AND c.chapter = v_ch;
+  v_cur := COALESCE(v_cur, 0);
+  IF (v_exp IS NOT NULL AND v_exp <> v_cur)
+     OR EXISTS (SELECT 1 FROM pds.reading_bank_jobs j
+                 WHERE j.book_id = v_book AND j.chapter = v_ch AND j.status IN ('queued', 'running')
+                   AND j.step = ANY (CASE WHEN v_ch = 0 THEN ARRAY['map', 'build'] ELSE ARRAY['research', 'build'] END)) THEN
+    RETURN jsonb_build_object('ok', true, 'pending', true, 'chapter', v_ch, 'rebuilds', v_cur);
+  END IF;
   INSERT INTO pds.reading_bank_chapters AS c (book_id, chapter, rebuilds) VALUES (v_book, v_ch, 1)
   ON CONFLICT (book_id, chapter) DO UPDATE SET rebuilds = c.rebuilds + 1
   RETURNING rebuilds INTO v_n;
@@ -2228,7 +2255,9 @@ BEGIN
     ON CONFLICT (book_id) DO UPDATE SET map_rebuilds = b.map_rebuilds + 1, updated_at = NOW()
     RETURNING map_rebuilds INTO v_m;
   END IF;
-  RETURN jsonb_build_object('ok', true, 'chapter', v_ch, 'rebuilds', v_n, 'map_rebuilds', v_m);
+  -- The claim lock is held by this transaction already; taking it again inside the enqueue is allowed.
+  IF v_has_plan THEN v_enq := pds.reading_bank_enqueue(p->'plan'); END IF;
+  RETURN jsonb_build_object('ok', true, 'pending', false, 'chapter', v_ch, 'rebuilds', v_n, 'map_rebuilds', v_m, 'enqueued', v_enq);
 END $fn$;
 
 -- 25. Access: every table and function is service_role only ----------------------------------------------------------

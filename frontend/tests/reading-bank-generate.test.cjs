@@ -108,7 +108,7 @@ function addJob(db, j) {
 
 function rpcs(db) {
   const book = () => db.bb;
-  return {
+  const R = {
     reading_bank_schema_ok: () => ({ all_ok: db.schema === "ok", source_kind_idea: db.schema === "ok", grader_local: db.schema === "ok", idea_source_branch: true, export_gate: true }),
     reading_bank_plan_input: ({ p_book }) => (p_book === BOOK ? planInput(db) : null),
     reading_bank_book_id: () => BOOK,
@@ -267,15 +267,22 @@ function rpcs(db) {
       db.bb = { ...(db.bb ?? {}), approved_at: p.on ? "2031-03-10T15:00:00Z" : db.bb?.approved_at ?? null, approved_cents: p.on ? p.cap_cents : db.bb?.approved_cents ?? null, paused_at: p.on ? null : "x", paused_reason: p.on ? null : "owner", spent_cents: db.bb?.spent_cents ?? 0 };
       return { ok: true, on: p.on, cap_cents: p.cap_cents };
     },
+    // pds.reading_bank_rebuild: decided, counted and enqueued in one call (the claim lock makes it atomic; here one
+    // synchronous step does).
     reading_bank_rebuild: ({ p }) => {
       const c = db.chapters.get(p.chapter) ?? { status: "pending", rebuilds: 0, built_rebuilds: 0 };
+      const steps = p.chapter === 0 ? ["map", "build"] : ["research", "build"];
+      const open = db.jobs.some((j) => j.chapter === p.chapter && steps.includes(j.step) && ["queued", "running"].includes(j.status));
+      if (open || (p.expected != null && p.expected !== (c.rebuilds ?? 0))) return { ok: true, pending: true, chapter: p.chapter, rebuilds: c.rebuilds ?? 0 };
       c.rebuilds = (c.rebuilds ?? 0) + 1;
       db.chapters.set(p.chapter, c);
       if (p.chapter === 0) db.bb.map_rebuilds = (db.bb.map_rebuilds ?? 0) + 1;
-      return { ok: true, chapter: p.chapter, rebuilds: c.rebuilds };
+      const enqueued = p.plan ? R.reading_bank_enqueue({ p: p.plan }) : undefined;
+      return { ok: true, pending: false, chapter: p.chapter, rebuilds: c.rebuilds, map_rebuilds: p.chapter === 0 ? db.bb.map_rebuilds : null, enqueued };
     },
     reading_clear_question_answers: ({ p_days }) => (db.cleared.push(p_days), 3),
   };
+  return R;
 }
 
 const MISSING = { code: "PGRST202", message: "function not found" };
@@ -1209,6 +1216,77 @@ test("run: 409 bank_off for a book that is off; a rebuild bumps the counter and 
   assert.equal(off.status, 409);
   assert.equal(off.body.error, "bank_off");
   assert.equal((await route.POST(req({ chapter: -1 }))).status, 400);
+});
+
+test("run: overlapping Rebuild taps count once: the pending check, the count and the new jobs are one call", async () => {
+  // Both requests read the plan input before either has written anything, as two function instances would.
+  const db = makeDb();
+  seedBuilt(db);
+  const env = load(db);
+  const route = loadTs("app/api/reading/bank/run/route.ts", env.stubs);
+  const [a, b] = await Promise.all([route.POST(req({ chapter: 2, rebuild: true })), route.POST(req({ chapter: 2, rebuild: true }))]);
+  assert.deepEqual([a.status, b.status], [202, 202]);
+  assert.deepEqual([a.body.pending, b.body.pending].sort(), [false, true], "one tap counts, the other is told it is pending");
+  assert.equal(db.chapters.get(2).rebuilds, 1, "counted once: the first tap's jobs stay current");
+  const research = db.jobs.filter((j) => j.step === "research" && j.chapter === 2);
+  assert.equal(research.length, 1, "one research job, paid for once");
+  assert.equal(research[0].input_hash, B.researchInputHash(P.BANK_PROMPT_VERSION, chHash(db, 2), db.bb.map_urls, 1), "and it is the hash of the new count");
+  assert.equal(db.jobs.filter((j) => j.status === "skipped").length, 0, "no job of the first tap was made obsolete");
+  // A third tap once more (the jobs are queued now): still pending, still not counted.
+  assert.equal((await route.POST(req({ chapter: 2, rebuild: true }))).body.pending, true);
+  assert.equal(db.chapters.get(2).rebuilds, 1);
+
+  // The book-level Rebuild (the source map and the whole-book build) the same.
+  const db0 = makeDb();
+  seedBuilt(db0);
+  const env0 = load(db0);
+  const route0 = loadTs("app/api/reading/bank/run/route.ts", env0.stubs);
+  const [c, d] = await Promise.all([route0.POST(req({ rebuild: true })), route0.POST(req({ rebuild: true }))]);
+  assert.deepEqual([c.body.pending, d.body.pending].sort(), [false, true]);
+  assert.equal(db0.bb.map_rebuilds, 1);
+  assert.equal(db0.chapters.get(0).rebuilds, 1);
+  assert.equal(db0.jobs.filter((j) => j.step === "map").length, 1);
+});
+
+test("run: a Rebuild that read the count before another one was counted does not count again, even with no job open", async () => {
+  const db = makeDb();
+  seedBuilt(db);
+  const env = load(db);
+  const route = loadTs("app/api/reading/bank/run/route.ts", env.stubs);
+  const real = env.supabase.rpc;
+  let raced = false;
+  env.supabase.rpc = (name, args) => {
+    if (name === "reading_bank_rebuild" && !raced) {
+      raced = true;
+      db.chapters.get(2).rebuilds = 1; // another tap was counted, and its work already finished: nothing is open
+    }
+    return real(name, args);
+  };
+  const r = await route.POST(req({ chapter: 2, rebuild: true }));
+  assert.equal(r.status, 202);
+  assert.equal(r.body.pending, true);
+  assert.equal(r.body.rebuilds, null);
+  assert.equal(db.chapters.get(2).rebuilds, 1, "not raised to 2");
+  assert.equal(db.jobs.filter((j) => j.step === "research" && j.chapter === 2 && j.status === "queued").length, 1, "the planner after it queues what the stored count needs");
+});
+
+test("withRebuild: the plan made from it is the plan the planner makes once the count really is one higher", () => {
+  const v = P.BANK_PROMPT_VERSION;
+  for (const chapter of [2, 0]) {
+    const db = makeDb();
+    seedBuilt(db);
+    const env = load(db);
+    const input = planInput(db);
+    const snapshot = structuredClone(input);
+    const simulated = env.S.planForBook(env.S.withRebuild(input, chapter), v);
+    assert.deepEqual(input, snapshot, "the input read is not changed");
+    assert.ok(simulated.jobs.length >= 1, "a Rebuild always has something to queue");
+    const c = db.chapters.get(chapter) ?? { status: "pending", rebuilds: 0, built_rebuilds: 0 };
+    c.rebuilds += 1;
+    db.chapters.set(chapter, c);
+    if (chapter === 0) db.bb.map_rebuilds += 1;
+    assert.deepEqual(simulated, env.S.planForBook(planInput(db), v), `chapter ${chapter}`);
+  }
 });
 
 test("chapter sheet: a chapter above the spoiler gate is 404 locked; GETs write nothing", async () => {

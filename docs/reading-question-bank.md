@@ -178,7 +178,10 @@ highlights step links the new passage again or the idea has other evidence, and 
   finished. Queued jobs no longer planned are skipped (and queued again if planned again later).
 - A failed job keeps its input hash, so it is not planned again until Riley's **Rebuild** changes it: the
   chapter's rebuild count, or for the source map the book-level count (`pds.reading_bank_rebuild` with chapter 0 or
-  none bumps `map_rebuilds`, part of the map hash, and chapter 0's own count). A job that failed with
+  none bumps `map_rebuilds`, part of the map hash, and chapter 0's own count). A Rebuild is counted once per round
+  of work, decided in the same database call that counts it and queues the new count's jobs, under the claim lock: a
+  second tap that arrives while the chapter's research or build is queued or running, or after another tap changed
+  the count, is answered `pending` and counts nothing (so two overlapping taps never pay for the work twice). A job that failed with
   `web_search_disabled` is queued again by the enqueue itself 6 hours later (that refusal is a 400 before any
   token, so trying again costs nothing until Riley turns web search on in the Console).
 - Estimate: 20¢ + 37¢ per chapter (40 chapters ≈ $15). Riley's one tap per book approves the cap: estimate × 1.25,
