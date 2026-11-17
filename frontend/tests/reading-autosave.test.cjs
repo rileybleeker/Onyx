@@ -77,7 +77,7 @@ test("newClientKey is a UUID v4; ownRetriedHighlight adopts only this form's own
 test("parseSessionUpdate: strict body", () => {
   const ok = R.parseSessionUpdate({ chapter_through: 5, chapter_from: 4, minutes: "30", medium: "paper", recall: " kept ", date: "2026-11-14", book: "example-book", habit_created_on: "2026-11-14" });
   assert.equal(ok.ok, true);
-  assert.deepEqual(ok.input, { book: "example-book", date: "2026-11-14", chapter_through: 5, chapter_from: 4, minutes: 30, medium: "paper", recall: " kept ", question: null, habit_created_on: "2026-11-14" });
+  assert.deepEqual(ok.input, { book: "example-book", date: "2026-11-14", chapter_through: 5, chapter_from: 4, minutes: 30, medium: "paper", recall: " kept ", question: null, habit_created_on: "2026-11-14", edit_seq: null });
   const nulls = R.parseSessionUpdate({ chapter_through: 5, date: null, book: null, habit_created_on: null });
   assert.equal(nulls.input.date, null);
   assert.equal(nulls.input.habit_created_on, null);
