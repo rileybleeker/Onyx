@@ -14,7 +14,6 @@ import {
   LOG_SUPPLEMENTS_TODAY_URL,
   logEarlyGet,
 } from "@/lib/log-early";
-import { logEach, type ItemResult } from "@/lib/log-supplement-batch";
 import {
   filterOptions,
   keepOrder,
@@ -25,6 +24,29 @@ import {
   visibleOptions,
   type UsageRow,
 } from "@/lib/log-supplement-options";
+import {
+  addWithDose,
+  beginSend,
+  countToLog,
+  EMPTY_SELECTION,
+  isConfirmed,
+  isSaving,
+  keepLogged,
+  LOG_CONCURRENCY,
+  outcomeFromAnswer,
+  parseAmount,
+  runPool,
+  sendable,
+  setItemDose,
+  settle,
+  summarize,
+  summaryText,
+  toggleItem,
+  undone,
+  type Answer,
+  type Outcome,
+  type Selection,
+} from "@/lib/log-supplement-multi";
 import { DraftMark, LogCard, LogSaveButton } from "./ui";
 
 /**
@@ -33,18 +55,23 @@ import { DraftMark, LogCard, LogSaveButton } from "./ui";
  *     /api/supplements/stacks/log with only the stack id (the server stamps behavioral today + now, like the
  *     /agents card); Skip only for a reminder card still open (status "prompted" in pds.supplement_stack_reminder),
  *     through POST /api/supplements/reminders/respond. Undo deletes that stack's rows for the day.
- *   - Log a product: check one or more of the /supplements products (listed without typing, most used first, the order
- *     fixed while the section is mounted, the search box filters them; lib/log-supplement-options.ts). Each checked
- *     product has its own amount and unit; clock times and day are shared. "Log selected (N)" writes the products one
- *     at a time (lib/log-supplement-batch.ts logEach), each through POST /api/supplements/log-product, which runs the
- *     chat tool's logSupplementIntake (lib/supplement-intake.ts), so amounts, times, the awake tail and the no-time
- *     rule are the same as "log 15 mg of X at 8:30" in chat. A logged product is unchecked; a failed one stays checked
- *     with its error and its own Retry. Filtering never unchecks anything.
+ *   - Log a product: tap the /supplements products to select SEVERAL (checkboxes; listed without typing, most used
+ *     first, the order fixed while the section is mounted, the search box filters them and never clears a
+ *     selection; lib/log-supplement-options.ts). Each selected product has its own amount + unit; the clock times and
+ *     the day are shared. One button, "Log selected (N)", sends one POST /api/supplements/log-product per product
+ *     (a small pool, never a new write route), which runs the chat tool's logSupplementIntake
+ *     (lib/supplement-intake.ts), so amounts, times, the awake tail, the no-time rule and the duplicate skip are the
+ *     same as "log 15 mg of X at 8:30" in chat. Each product then shows its own outcome (Saved + Undo / Already
+ *     logged / Not saved + Retry / Not confirmed). The selection state and the rules about what may be sent again
+ *     are pure, in lib/log-supplement-multi.ts: a confirmed item is never sent twice; an item whose answer was lost is
+ *     "not confirmed", not saved, and goes out again only on its own "Log again" tap.
  *   - Logged today: single products logged on behavioral today, each with Undo (DELETE /api/supplements/log-intake).
  * Say it drafts (useLogDrafts("supplements")) are listed marked "from what you said" and logged on their own 0.8 s
- * later (autosave; each row then has Undo); a failed one stays listed with Edit and Retry. "Log a product" keeps its
- * Log tap: logging a dose is the action itself, like a stack's Log it. Nothing is written on open or on scroll. Reads: the client cache first (same keys as
- * /supplements and the warm-up), then the server.
+ * later (autosave; each row then has Undo); a failed one stays listed with Edit (which selects that product with its
+ * amount and unit and fills the shared times and day) and Retry. "Log selected" is an explicit button on purpose
+ * (AGENTS.md "Input saves itself" exception): the tap IS the logging, like a stack's Log it, and a half-chosen
+ * selection must never reach the supplement log. Nothing is written on open or on scroll. Reads: the client cache
+ * first (same keys as /supplements and the warm-up), then the server.
  */
 
 // Say it drafts this page already logged, for the page's life (module memory, like the drafts themselves): the
@@ -69,6 +96,7 @@ const HISTORY_URL = LOG_SUPPLEMENTS_HISTORY_URL;
  * local look, in case the persisted store is slow to open.
  */
 const LOCAL_WAIT_MS = 150;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 interface Intake {
   intake_id: number;
@@ -176,9 +204,6 @@ function dayLabel(date: string | null, today: string | null): string {
   const [y, m, d] = date.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
 }
-/** The chat tool's errors end with a hint for the model ("Ask which one."); on screen the form is the answer. */
-const screenError = (msg: string) => msg.replace(/\s*Ask (how many servings were taken|which one)\.?$/, "");
-
 /** Matching active stack for a draft: its id, else its name (exact, then contained). */
 function findStack(stacks: Stack[], d: { stack_id: number | null; name: string }): Stack | undefined {
   if (d.stack_id != null) return stacks.find((s) => s.stack_id === d.stack_id);
@@ -231,10 +256,10 @@ const btn =
   "min-h-11 px-3 rounded-control border border-border-subtle bg-white/[0.03] hover:bg-white/[0.06] text-[13px] text-text-secondary disabled:opacity-50 transition-colors";
 const btnAccent =
   "min-h-11 px-4 rounded-full bg-accent text-on-accent text-[13px] font-semibold disabled:opacity-40 transition-opacity";
-// An option of "Log a product": 44 px, wraps on a phone (long names are cut with the full name in the title),
-// selected = accent border and fill plus a check (Instrument theme), visible keyboard focus.
+// An option of "Log a product" (a checkbox): 44 px both ways, wraps on a phone (long names are cut with the full name
+// in the title), selected = accent border and fill plus a check (Instrument theme), visible keyboard focus.
 const pill =
-  "inline-flex max-w-full min-h-11 items-center gap-1.5 rounded-control border px-3 text-left text-[13px] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent";
+  "inline-flex max-w-full min-h-11 min-w-11 items-center gap-1.5 rounded-control border px-3 text-left text-[13px] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent";
 const pillOn = "border-accent bg-accent/15 text-text-primary";
 const pillOff = "border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-hover";
 // Focus shows the accent border, as on Weight and Reading (a grey border change was too faint to see).
@@ -522,15 +547,10 @@ export default function SupplementsSection() {
   // ---- log a product ----
 
   const [query, setQuery] = useState("");
-  // The checked products, in the order they were checked: each with its own amount and unit ("" = one serving, the
-  // placeholder). `sentTimes` is set on the first send and reused by every retry, so a retry of a dose that did land
-  // before its answer was lost is recognised by the server as already logged (the same time, not a new "now").
-  interface Pick { amount: string; unit: string; sentTimes?: string[] }
-  const [checked, setChecked] = useState<Map<string, Pick>>(() => new Map());
-  const [results, setResults] = useState<Map<string, ItemResult>>(() => new Map());
-  const [saving, setSaving] = useState<Set<string>>(() => new Set());
-  const [batchBusy, setBatchBusy] = useState(false);
-  const batchRef = useRef(false); // a synchronous guard: one batch at a time
+  // The selected products, each with its own amount + unit and, once sent, its outcome (lib/log-supplement-multi.ts).
+  // Only the selection holds them: filtering the options never touches it.
+  const [selection, setSelection] = useState<Selection>(EMPTY_SELECTION);
+  // Shared by every selected product that is still to be logged.
   const [times, setTimes] = useState<string[]>([]);
   const [dayChoice, setDayChoice] = useState<string>("today"); // "today" | "yesterday" | YYYY-MM-DD
   const [formFromDraft, setFormFromDraft] = useState(false);
@@ -571,15 +591,40 @@ export default function SupplementsSection() {
   const optionOrder = useMemo(() => keepOrder(ordered, frozenOrder), [ordered, frozenOrder]);
   const matches = useMemo(() => filterOptions(optionOrder, query), [optionOrder, query]);
   const labels = useMemo(() => optionLabels(products ?? []), [products]);
-  // The checkboxes below are the real controls: Tab moves between them, Space checks one (no roving focus).
-  const { shown: shownOptions, more: moreOptions } = visibleOptions(matches, showAllOptions, null);
+  const selectedIds = selection.map((i) => i.productId);
+  const selectedSet = new Set(selectedIds);
+  // A selected option further down the list stays on screen, so it can be unticked in place.
+  const { shown: shownOptions, more: moreOptions } = visibleOptions(matches, showAllOptions, selectedIds);
   const formDate = dayChoice === "today" ? null : dayChoice === "yesterday" ? (day ? addDays(day, -1) : null) : dayChoice;
+  const productById = useMemo(() => new Map((products ?? []).map((p) => [p.product_id, p])), [products]);
+  const nameOf = (id: string) => labels.get(id) ?? (productById.has(id) ? productLabel(productById.get(id)!) : "Product");
+  const batchBusy = selection.some((i) => isSaving(i.outcome));
+  const toLog = countToLog(selection);
+  const summaryLine = summaryText(summarize(selection));
+  const allConfirmed = selection.length > 0 && selection.every((i) => isConfirmed(i.outcome));
 
-  /** Empty the selection and the shared day and times; `keepFilter`: leave the search box as it is. */
+  // After the first tap the selection below the options is scrolled into view (on a phone a long list can push it off
+  // screen).
+  const formRef = useRef<HTMLDivElement | null>(null);
+  const scrollToForm = useRef(false);
+  useEffect(() => {
+    if (selection.length === 0 || !scrollToForm.current) return;
+    scrollToForm.current = false;
+    formRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [selection.length]);
+
+  const sending = useRef(false);
+
+  /** Tap on an option: select it (one serving) or unselect it. State only: "Log selected" is the write. */
+  function onToggleOption(p: Product) {
+    setFormError(null);
+    if (selection.length === 0) scrollToForm.current = true;
+    setSelection((s) => toggleItem(s, p.product_id));
+  }
+
+  /** Empty the selection, the shared times and day, and the search box. */
   function clearSelection() {
-    if (batchRef.current) return;
-    setChecked(new Map());
-    setResults(new Map());
+    setSelection(EMPTY_SELECTION);
     setQuery("");
     setFilterOpen(false);
     setTimes([]);
@@ -588,44 +633,16 @@ export default function SupplementsSection() {
     setFormError(null);
   }
 
-  /** Check or uncheck a product (its amount and unit start empty and as one serving). Filtering never does this. */
-  function toggleProduct(p: Product, on: boolean) {
-    setFormError(null);
-    setChecked((m) => {
-      const n = new Map(m);
-      if (on) n.set(p.product_id, { amount: "", unit: "serving" });
-      else n.delete(p.product_id);
-      return n;
-    });
-    if (on) {
-      // A new check starts a fresh attempt: an old "logged" mark for this product goes.
-      setResults((r) => {
-        if (!r.has(p.product_id)) return r;
-        const n = new Map(r);
-        n.delete(p.product_id);
-        return n;
-      });
-    }
-  }
-
-  function setPick(id: string, patch: Partial<Pick>) {
-    setChecked((m) => {
-      const cur = m.get(id);
-      if (!cur) return m;
-      const n = new Map(m);
-      n.set(id, { ...cur, ...patch });
-      return n;
-    });
-  }
-
-  /** One product write through the chat tool's rules. Returns an error message, or null when saved. `quiet`: no receipt. */
-  async function logProduct(args: {
+  /** One product through the route (the chat tool's rules). The outcome says what is known; rows just written go on
+   *  screen; no re-read (the caller re-reads once). Never throws: a request that failed is "not confirmed". */
+  async function sendProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
-  }, quiet = false): Promise<string | null> {
-    if (args.date && day && args.date > day) return "That day has not started yet";
+  }): Promise<Outcome> {
+    if (args.date && day && args.date > day) return { kind: "refused", error: "That day has not started yet" };
     writeSeq.current += 1;
+    let answer: Answer | null;
     try {
-      const r = await postJson("/api/supplements/log-product", {
+      answer = await postJson("/api/supplements/log-product", {
         product_id: args.product_id ?? undefined,
         product: args.name,
         amount: args.amount,
@@ -633,104 +650,105 @@ export default function SupplementsSection() {
         times: args.times,
         date: args.date,
       });
-      if (!r.ok || r.json.ok !== true) {
-        const msg = typeof r.json.error === "string" ? screenError(r.json.error) : `Not saved (${r.status})`;
-        const cands = Array.isArray(r.json.candidates) && r.json.candidates.length > 1 && r.json.candidates.length <= 6
-          ? ` (${(r.json.candidates as string[]).join(", ")})`
-          : "";
-        return msg + cands;
-      }
-      const logged = Array.isArray(r.json.logged) ? (r.json.logged as { intake_id: number; time: string | null }[]) : [];
-      const label = typeof r.json.product === "string" ? r.json.product : args.name;
-      const doses = Number(r.json.doses_each ?? 1);
-      if (r.json.intake_date === day && logged.length) {
-        setExtraRows((l) => [...logged.map((x) => ({ intake_id: x.intake_id, label, time: x.time, doses })), ...l]);
-      }
-      const skipped = Array.isArray(r.json.skipped_duplicates) ? r.json.skipped_duplicates.length : 0;
-      const when = r.json.intake_date === day ? "" : `, ${dayLabel(String(r.json.intake_date), day)}`;
-      if (!quiet) {
-        showReceipt(
-          `Saved ${label}${logged.length > 1 ? `, ${logged.length} times` : ""}${when}` +
-            (skipped ? ` (${skipped} already logged)` : ""),
-        );
-      }
-      return null;
     } catch {
-      return "No answer from Onyx";
-    } finally {
-      void reloadToday();
+      answer = null;
     }
+    const outcome = outcomeFromAnswer(answer, args.name);
+    if (outcome.kind === "saved" && outcome.intakeDate === day) {
+      setExtraRows((l) => [...outcome.logged.map((x) => ({ intake_id: x.intake_id, label: outcome.label, time: x.time, doses: outcome.doses })), ...l]);
+    }
+    return outcome;
+  }
+
+  /** A Say it suggestion: one product through the same route. Returns an error message, or null when saved (or there). */
+  async function logProduct(args: {
+    product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
+  }): Promise<string | null> {
+    const outcome = await sendProduct(args);
+    void reloadToday();
+    if (outcome.kind === "saved" || outcome.kind === "already") {
+      const when = outcome.intakeDate && outcome.intakeDate !== day ? `, ${dayLabel(outcome.intakeDate, day)}` : "";
+      const n = outcome.kind === "saved" ? outcome.logged.length : 0;
+      showReceipt(`Saved ${outcome.label}${n > 1 ? `, ${n} times` : ""}${when}` + (outcome.skipped ? ` (${outcome.skipped} already logged)` : ""));
+      return null;
+    }
+    if (outcome.kind === "unconfirmed") return `Not confirmed: ${outcome.error}. It may be saved, check Logged today.`;
+    return outcome.kind === "refused" ? outcome.error : "Not saved";
   }
 
   /**
-   * Log the given checked products (the button: all of them; a Retry: one). Each is written on its own through
-   * logProduct, in order, by logEach; a product that logs is unchecked, one that fails stays checked with its error.
-   * A product already logged is never sent again. The shared day and times apply to all; a dose with no time and
-   * today's day gets this moment's time, which then stays with the product for any retry (see Pick.sentTimes).
+   * "Log selected (N)", and one item's own Retry / Log again (`only`). One request per product to the existing route,
+   * through a small pool. What may be sent is decided by lib/log-supplement-multi.ts `sendable`: never an item already
+   * confirmed saved, never one whose answer is still out, and an item whose answer was lost only through its own
+   * "Log again". An explicit button on purpose (AGENTS.md "Input saves itself" exception): the tap IS the logging, as
+   * with a stack's Log it, and a half-chosen selection must never reach the supplement log.
    */
-  async function submit(ids: string[]) {
-    if (batchRef.current) return;
-    const todo = ids.filter((id) => checked.has(id) && results.get(id)?.status !== "logged");
-    if (todo.length === 0) return;
+  async function onLogSelected(only?: readonly string[]) {
+    // Also a ref, not only the state: a second tap that lands before the screen has re-rendered must not send the
+    // same products again (an untimed "now" dose is not caught by the route's duplicate skip).
+    if (batchBusy || sending.current) return;
+    sending.current = true;
+    try {
+      await logBatch(only);
+    } finally {
+      sending.current = false;
+    }
+  }
+
+  async function logBatch(only?: readonly string[]) {
+    const targets = sendable(selection, { only, includeUnconfirmed: !!only });
+    if (targets.length === 0) return;
     const clean = times.map((t) => t.slice(0, 5));
-    if (clean.some((t) => !/^([01]\d|2[0-3]):[0-5]\d$/.test(t))) {
+    if (clean.some((t) => !TIME_RE.test(t))) {
       setFormError("Fill in or remove the empty time");
       return;
     }
-    const items: { key: string; name: string; amount: number | null; unit: string; times: string[] }[] = [];
-    for (const id of todo) {
-      const pk = checked.get(id)!;
-      const p = products?.find((x) => x.product_id === id);
-      const name = p ? productLabel(p) : "Product";
-      const amt = pk.amount.trim() === "" ? null : Number(pk.amount);
-      if (amt != null && (!Number.isFinite(amt) || amt <= 0)) {
-        setFormError(`${name}: amount must be a positive number`);
-        return;
-      }
-      const todayDose = formDate == null || formDate === day;
-      const sent = pk.sentTimes ?? (clean.length ? clean : todayDose ? [nowHHMM()] : []);
-      items.push({ key: id, name, amount: amt, unit: pk.unit, times: sent });
+    if (formDate && day && formDate > day) {
+      setFormError("That day has not started yet");
+      return;
     }
-
-    batchRef.current = true;
-    setBatchBusy(true);
     setFormError(null);
-    setSaving(new Set(todo));
-    // Remember the times this attempt sends, so a retry sends the same ones.
-    setChecked((m) => {
-      const n = new Map(m);
-      for (const it of items) {
-        const cur = n.get(it.key);
-        if (cur && !cur.sentTimes) n.set(it.key, { ...cur, sentTimes: it.times });
-      }
-      return n;
-    });
-    try {
-      const done = await logEach(
-        items,
-        (it) => logProduct({ product_id: it.key, name: it.name, amount: it.amount, unit: it.amount == null ? null : it.unit, times: it.times, date: formDate }, true),
-        results,
-        (key, r) => setResults((prev) => new Map(prev).set(key, r)),
-      );
-      const loggedKeys = items.filter((it) => done.get(it.key)?.status === "logged").map((it) => it.key);
-      setChecked((m) => {
-        const n = new Map(m);
-        loggedKeys.forEach((k) => n.delete(k));
-        return n;
-      });
-      setResults((prev) => {
-        const n = new Map(prev);
-        for (const it of items) {
-          const r = done.get(it.key);
-          if (r) n.set(it.key, r);
-        }
-        return n;
-      });
-    } finally {
-      setSaving(new Set());
-      batchRef.current = false;
-      setBatchBusy(false);
+    const bad = new Map<string, string>();
+    const ready: { id: string; name: string; amount: number | null; unit: string }[] = [];
+    for (const item of targets) {
+      const amount = parseAmount(item.amount);
+      if (amount === "invalid") bad.set(item.productId, "Amount must be a positive number");
+      else ready.push({ id: item.productId, name: nameOf(item.productId), amount, unit: item.unit });
     }
+    setSelection((s) => beginSend(s, ready.map((r) => r.id), bad));
+    if (ready.length === 0) return;
+    await runPool(ready, LOG_CONCURRENCY, async (r) => {
+      let outcome: Outcome;
+      try {
+        outcome = await sendProduct({ product_id: r.id, name: r.name, amount: r.amount, unit: r.unit, times: clean, date: formDate });
+      } catch {
+        outcome = { kind: "unconfirmed", error: "No answer from Onyx" };
+      }
+      setSelection((s) => settle(s, r.id, outcome));
+    });
+    void reloadToday();
+  }
+
+  /** Undo one saved item: removes the rows it wrote (DELETE /api/supplements/log-intake), then it is waiting again. */
+  async function onUndoItem(productId: string) {
+    const item = selection.find((i) => i.productId === productId);
+    if (!item || item.outcome?.kind !== "saved") return;
+    const ids = item.outcome.logged.map((l) => l.intake_id);
+    const k = `multi:${productId}`;
+    setBusyKey(k, true);
+    setErr(k, null);
+    writeSeq.current += 1;
+    setHidden((h) => { const n = new Set(h); ids.forEach((id) => n.add(id)); return n; });
+    const failed = await deleteIntakes(ids);
+    if (failed.length) {
+      setHidden((h) => { const n = new Set(h); failed.forEach((id) => n.delete(id)); return n; });
+      setErr(k, `Not removed: ${failed.length} of ${ids.length}`);
+      setSelection((s) => keepLogged(s, productId, failed));
+    } else {
+      setSelection((s) => undone(s, productId));
+    }
+    setBusyKey(k, false);
+    void reloadToday();
   }
 
   // ---- Say it drafts ----
@@ -762,23 +780,29 @@ export default function SupplementsSection() {
     else setSuggestions({ ...suggestions, items: left });
   }
 
-  /** Move a product suggestion into the form (only on Riley's tap, so it never replaces something typed). */
+  /** Move a product suggestion into the selection (only on Riley's tap, so it never replaces something typed): the
+   *  product is selected with the suggested amount and unit, and the shared times and day take what it said (a
+   *  suggestion that said none leaves the ones already chosen). A name that matches no single product goes into the
+   *  search box instead. */
   function editSuggestion(s: Suggestion) {
     if (s.item.kind !== "product") return;
     const d = s.item;
     const match = d.product_id
       ? products?.find((p) => p.product_id === d.product_id) ?? null
       : (() => { const m = searchProducts(products ?? [], d.name); return m.length === 1 ? m[0] : null; })();
-    // The product is checked with the draft's amount and unit; the day and times are shared, so they take the draft's.
     if (match) {
-      setChecked((m) => new Map(m).set(match.product_id, { amount: d.amount != null ? String(d.amount) : "", unit: d.amount != null && d.unit ? d.unit : "serving" }));
-      setResults((r) => { const n = new Map(r); n.delete(match.product_id); return n; });
+      setSelection((cur) => addWithDose(cur, match.product_id, {
+        amount: d.amount != null ? String(d.amount) : "",
+        unit: d.amount != null && d.unit ? d.unit : "serving",
+      }));
     }
     setQuery(match ? "" : d.name);
-    setTimes(d.times);
-    setDayChoice(!d.date || d.date === day ? "today" : day && d.date === addDays(day, -1) ? "yesterday" : d.date);
+    if (d.times.length > 0 || selection.length === 0) setTimes(d.times);
+    const dayOfDraft = !d.date || d.date === day ? "today" : day && d.date === addDays(day, -1) ? "yesterday" : d.date;
+    if (dayOfDraft !== "today" || selection.length === 0) setDayChoice(dayOfDraft);
     setFormFromDraft(true);
     setFormError(null);
+    scrollToForm.current = true;
     dropSuggestion(s.key);
   }
 
@@ -959,7 +983,7 @@ export default function SupplementsSection() {
         <div className="space-y-2" aria-hidden>{[0, 1].map((i) => <div key={i} className="skeleton h-11 rounded-control" />)}</div>
       )}
 
-      {/* Log a product */}
+      {/* Log a product: select several, each with its own amount; shared times and day; one button */}
       <div className="mt-4">
         <div className="mb-2 flex items-center gap-2">
           <h3 className="text-[13px] font-medium text-text-secondary">Log a product</h3>
@@ -981,21 +1005,21 @@ export default function SupplementsSection() {
               <>
                 <div role="group" aria-label="Your supplements" className="flex flex-wrap gap-2">
                   {shownOptions.map((p) => {
-                    const on = checked.has(p.product_id);
+                    const on = selectedSet.has(p.product_id);
                     const label = labels.get(p.product_id) ?? productLabel(p);
-                    const logged = !on && results.get(p.product_id)?.status === "logged";
                     return (
-                      <label key={p.product_id} title={label} className={`${pill} ${on ? pillOn : pillOff}`}>
-                        <input
-                          type="checkbox"
-                          checked={on}
-                          disabled={batchBusy}
-                          onChange={(e) => toggleProduct(p, e.target.checked)}
-                          className="h-4 w-4 shrink-0 accent-accent"
-                        />
+                      <button
+                        key={p.product_id}
+                        type="button"
+                        role="checkbox"
+                        aria-checked={on}
+                        title={label}
+                        onClick={() => onToggleOption(p)}
+                        className={`${pill} ${on ? pillOn : pillOff}`}
+                      >
+                        {on && <Check className="w-4 h-4 shrink-0" aria-hidden />}
                         <span className="min-w-0 truncate">{label}</span>
-                        {logged && <Check className="w-4 h-4 shrink-0 text-up" aria-label="logged" />}
-                      </label>
+                      </button>
                     );
                   })}
                 </div>
@@ -1028,109 +1052,153 @@ export default function SupplementsSection() {
         ) : (
           <div className="flex flex-wrap gap-2" aria-hidden>{[0, 1, 2, 3].map((i) => <div key={i} className="skeleton h-11 w-28 rounded-control" />)}</div>
         )}
-        {/* The checked products: each with its own amount and unit; a failed one keeps its error and its own Retry */}
-        {checked.size === 0 ? (
-          <p className="mt-3 text-[13px] text-text-tertiary">Nothing selected</p>
-        ) : (
-          <ul aria-label="Selected supplements" className="mt-3 space-y-3">
-            {[...checked.entries()].map(([id, pk]) => {
-              const p = products?.find((x) => x.product_id === id) ?? null;
-              const label = p ? labels.get(id) ?? productLabel(p) : "Product";
-              const units = unitOptions(p);
-              const r = results.get(id);
-              const isSaving = saving.has(id);
-              return (
-                <li key={id} className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="min-w-0 flex-1 basis-40 truncate text-[14px] text-text-primary" title={label}>{label}</span>
-                    <input
-                      type="number"
-                      inputMode="decimal"
-                      min="0"
-                      step="any"
-                      value={pk.amount}
-                      disabled={isSaving || batchBusy}
-                      onChange={(e) => setPick(id, { amount: e.target.value })}
-                      placeholder="1"
-                      aria-label={`Amount of ${label}`}
-                      className={`${input} w-24`}
-                    />
-                    <select
-                      value={pk.unit}
-                      disabled={isSaving || batchBusy}
-                      onChange={(e) => setPick(id, { unit: e.target.value })}
-                      aria-label={`Unit of ${label}`}
-                      className={`${input} min-w-0 flex-1 bg-surface-card`}
-                    >
-                      {units.map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
-                      {!units.some((u) => u.value === pk.unit) && <option value={pk.unit}>{pk.unit}</option>}
-                    </select>
-                    {isSaving && <span role="status" className="text-[12px] text-text-tertiary">Saving…</span>}
-                    {r?.status === "failed" && !isSaving && (
-                      <button type="button" className={btn} disabled={batchBusy} onClick={() => void submit([id])}>Retry</button>
+        {selection.length > 0 && (
+          // Every selected product is listed here, whatever the search box shows: filtering hides options, never a pick.
+          <div ref={formRef} className="mt-3 space-y-3">
+            <ul aria-label="Selected supplements" className="rounded-control border border-border-subtle divide-y divide-border-subtle">
+              {selection.map((item) => {
+                const name = nameOf(item.productId);
+                const o = item.outcome;
+                const k = `multi:${item.productId}`;
+                const editing = !o || o.kind === "refused";
+                const product = productById.get(item.productId) ?? null;
+                const saving = isSaving(o);
+                return (
+                  <li key={item.productId} className="px-3 py-2">
+                    <div className="flex items-start gap-2">
+                      <div className="min-w-0 flex-1 py-1">
+                        <div className="text-[14px] text-text-primary truncate" title={name}>{name}</div>
+                        {saving && <div className="text-[12px] text-text-tertiary">Saving…</div>}
+                        {o?.kind === "saved" && (
+                          <div className="inline-flex items-center gap-1 text-[12px] text-up">
+                            <Check className="w-4 h-4" aria-hidden />
+                            Saved
+                            {o.logged.length > 1 ? `, ${o.logged.length} times` : o.logged[0]?.time ? ` ${o.logged[0].time}` : ""}
+                            {o.doses !== 1 ? ` · ×${Math.round(o.doses * 100) / 100}` : ""}
+                            {o.skipped ? ` (${o.skipped} already logged)` : ""}
+                            {o.intakeDate && o.intakeDate !== day ? `, ${dayLabel(o.intakeDate, day)}` : ""}
+                          </div>
+                        )}
+                        {o?.kind === "already" && (
+                          <div className="text-[12px] text-text-secondary">
+                            Already logged{o.intakeDate && o.intakeDate !== day ? `, ${dayLabel(o.intakeDate, day)}` : ""}: nothing new was added
+                          </div>
+                        )}
+                        {o?.kind === "refused" && <div role="alert" className="text-[12px] text-down">Not saved: {o.error}</div>}
+                        {o?.kind === "unconfirmed" && (
+                          <div role="alert" className="text-[12px] text-down">
+                            Not confirmed: {o.error}. It may be saved, so check Logged today before logging it again.
+                          </div>
+                        )}
+                        {rowError[k] && <div role="alert" className="text-[12px] text-down">{rowError[k]}</div>}
+                      </div>
+                      {o?.kind === "saved" && (
+                        <button type="button" aria-label={`Undo ${name}`} className={btn} disabled={busy[k]} onClick={() => void onUndoItem(item.productId)}>
+                          {busy[k] ? "Removing…" : "Undo"}
+                        </button>
+                      )}
+                      {o?.kind === "refused" && (
+                        <button type="button" aria-label={`Retry ${name}`} className={btn} disabled={batchBusy} onClick={() => void onLogSelected([item.productId])}>
+                          Retry
+                        </button>
+                      )}
+                      {o?.kind === "unconfirmed" && (
+                        <button type="button" aria-label={`Log ${name} again`} className={btn} disabled={batchBusy} onClick={() => void onLogSelected([item.productId])}>
+                          Log again
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        aria-label={`Remove ${name} from the selection`}
+                        className={`${btn} min-w-11 px-2`}
+                        disabled={saving || busy[k]}
+                        onClick={() => setSelection((s) => toggleItem(s, item.productId))}
+                      >
+                        <X className="w-4 h-4" aria-hidden />
+                      </button>
+                    </div>
+                    {editing && (
+                      <div className="mt-1 flex flex-wrap gap-2">
+                        <input
+                          type="number"
+                          inputMode="decimal"
+                          min="0"
+                          step="any"
+                          value={item.amount}
+                          onChange={(e) => { const v = e.target.value; setSelection((s) => setItemDose(s, item.productId, { amount: v })); }}
+                          placeholder="1"
+                          aria-label={`Amount for ${name}`}
+                          className={`${input} w-24`}
+                        />
+                        <select
+                          value={item.unit}
+                          onChange={(e) => { const v = e.target.value; setSelection((s) => setItemDose(s, item.productId, { unit: v })); }}
+                          aria-label={`Unit for ${name}`}
+                          className={`${input} min-w-0 flex-1 bg-surface-card`}
+                        >
+                          {unitOptions(product).map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
+                          {!unitOptions(product).some((u) => u.value === item.unit) && <option value={item.unit}>{item.unit}</option>}
+                        </select>
+                      </div>
                     )}
-                  </div>
-                  {r?.status === "failed" && !isSaving && <p role="alert" className="text-[12px] text-down">{r.error}</p>}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          {checked.size > 0 && (
-            <>
-              {times.length === 0 && (
-                <span className="text-[13px] text-text-tertiary">{formDate && formDate !== day ? "No time" : "Now"}</span>
-              )}
-              {times.map((t, i) => (
-                <span key={i} className="inline-flex items-center gap-1">
-                  <input
-                    type="time"
-                    value={t}
-                    onChange={(e) => setTimes((l) => l.map((x, j) => (j === i ? e.target.value : x)))}
-                    aria-label={`Time ${i + 1}`}
-                    className={`${input} w-32`}
-                  />
-                  <button type="button" aria-label={`Remove time ${i + 1}`} className={`${btn} px-2`} onClick={() => setTimes((l) => l.filter((_, j) => j !== i))}>
-                    <X className="w-4 h-4" aria-hidden />
+                  </li>
+                );
+              })}
+            </ul>
+            {!allConfirmed && (
+              <>
+                <div className="flex flex-wrap items-center gap-2">
+                  {times.length === 0 && (
+                    <span className="text-[13px] text-text-tertiary">{formDate && formDate !== day ? "No time" : "Now"}</span>
+                  )}
+                  {times.map((t, i) => (
+                    <span key={i} className="inline-flex items-center gap-1">
+                      <input
+                        type="time"
+                        value={t}
+                        disabled={batchBusy}
+                        onChange={(e) => setTimes((l) => l.map((x, j) => (j === i ? e.target.value : x)))}
+                        aria-label={`Time ${i + 1}`}
+                        className={`${input} w-32`}
+                      />
+                      <button type="button" aria-label={`Remove time ${i + 1}`} className={`${btn} min-w-11 px-2`} disabled={batchBusy} onClick={() => setTimes((l) => l.filter((_, j) => j !== i))}>
+                        <X className="w-4 h-4" aria-hidden />
+                      </button>
+                    </span>
+                  ))}
+                  <button type="button" className={`${btn} inline-flex items-center gap-1`} disabled={batchBusy || times.length >= 12} onClick={() => setTimes((l) => [...l, nowHHMM()])}>
+                    <Plus className="w-4 h-4" aria-hidden />
+                    Time
                   </button>
-                </span>
-              ))}
-              <button type="button" className={`${btn} inline-flex items-center gap-1`} disabled={times.length >= 12 || batchBusy} onClick={() => setTimes((l) => [...l, nowHHMM()])}>
-                <Plus className="w-4 h-4" aria-hidden />
-                Time
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select value={dayChoice} disabled={batchBusy} onChange={(e) => setDayChoice(e.target.value)} aria-label="Day" className={`${input} bg-surface-card`}>
+                    <option value="today">Today</option>
+                    <option value="yesterday">Yesterday</option>
+                    {dayChoice !== "today" && dayChoice !== "yesterday" && <option value={dayChoice}>{dayLabel(dayChoice, day)}</option>}
+                  </select>
+                  <span className="text-[12px] text-text-tertiary">Times and day apply to every product above that is not saved yet</span>
+                </div>
+              </>
+            )}
+            {summaryLine && <p role="status" className="text-[13px] text-text-secondary">{summaryLine}</p>}
+            <div className="flex flex-wrap items-center gap-2">
+              {/* An explicit button on purpose (AGENTS.md "Input saves itself" exception): the tap IS the logging. */}
+              {!allConfirmed && (
+                <button
+                  type="button"
+                  className="min-h-11 px-5 rounded-full text-[14px] font-semibold bg-accent text-on-accent disabled:opacity-40 transition-opacity"
+                  disabled={batchBusy || toLog === 0}
+                  onClick={() => void onLogSelected()}
+                >
+                  {batchBusy ? "Saving…" : <>Log selected ({toLog})</>}
+                </button>
+              )}
+              <button type="button" className="min-h-11 px-2 text-[13px] text-text-secondary hover:text-text-primary disabled:opacity-50" disabled={batchBusy} onClick={clearSelection}>
+                {allConfirmed ? "Done" : "Clear"}
               </button>
-            </>
-          )}
-          <select value={dayChoice} disabled={batchBusy} onChange={(e) => setDayChoice(e.target.value)} aria-label="Day" className={`${input} bg-surface-card`}>
-            <option value="today">Today</option>
-            <option value="yesterday">Yesterday</option>
-            {dayChoice !== "today" && dayChoice !== "yesterday" && <option value={dayChoice}>{dayLabel(dayChoice, day)}</option>}
-          </select>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button type="button" className={btnAccent} disabled={checked.size === 0 || batchBusy} onClick={() => void submit([...checked.keys()])}>
-            {`Log selected (${checked.size})`}
-          </button>
-          {checked.size > 0 && (
-            <button type="button" className="min-h-11 px-2 text-[13px] text-text-secondary hover:text-text-primary disabled:opacity-50" disabled={batchBusy} onClick={clearSelection}>
-              Clear
-            </button>
-          )}
-        </div>
-        {/* Logged in this visit: unchecked, with a check mark (Undo is on the Logged today list below) */}
-        {[...results.entries()].some(([, r]) => r.status === "logged") && (
-          <ul aria-label="Logged" className="mt-3 space-y-1">
-            {[...results.entries()].filter(([, r]) => r.status === "logged").map(([id]) => {
-              const p = products?.find((x) => x.product_id === id) ?? null;
-              return (
-                <li key={id} className="flex items-center gap-2 text-[13px] text-up">
-                  <Check className="w-4 h-4 shrink-0" aria-hidden />
-                  <span className="min-w-0 truncate">{p ? labels.get(id) ?? productLabel(p) : "Product"}</span>
-                </li>
-              );
-            })}
-          </ul>
+            </div>
+          </div>
         )}
         {formError && <p role="alert" className="mt-2 text-[13px] text-down">{formError}</p>}
         {receipt && <p role="status" className="mt-2 text-[13px] text-up">{receipt}</p>}

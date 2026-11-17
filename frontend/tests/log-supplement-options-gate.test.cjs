@@ -94,7 +94,7 @@ function mountSection(t, { cache = new Map(), answers = {}, post } = {}) {
       "@/lib/log-drafts": { useLogDrafts: () => ({ current: { draft: null, clear: () => {} } }) },
     },
   });
-  const options = () => h.find((n) => n.type === "button" && n.props.role === "radio");
+  const options = () => h.find((n) => n.type === "button" && n.props.role === "checkbox");
   const optionNames = () => options().map((n) => h.text(n));
   const field = (label) => h.find((n) => (n.type === "input" || n.type === "select") && n.props["aria-label"] === label)[0];
   return { ...h, calls, options, optionNames, field, fail };
@@ -134,13 +134,13 @@ test("gate: with both the today and stacks GETs failing, the options stay usable
   assert.doesNotMatch(h.text(), /Couldn't load supplements\./, "no whole-card failure");
   assert.match(h.text(), /Couldn't load stacks\./);
   assert.match(h.text(), /Couldn't load today's intakes\./);
-  // The picker still works end to end (a tap fills the form and writes nothing; Log is the only write).
+  // The picker still works end to end (a tap selects it and writes nothing; Log selected is the only write).
   const gamma = h.options().find((n) => h.text(n) === "Synthetic Gamma");
   assert.ok(gamma);
   gamma.props.onClick();
   await h.flush();
   assert.equal(h.options().find((n) => h.text(n) === "Synthetic Gamma").props["aria-checked"], true, "the picker accepts a tap");
-  assert.equal(h.field("Amount").props.value, "", "the form opens on a successful pick");
+  assert.equal(h.field("Amount for Synthetic Gamma").props.value, "", "the amount field opens on a successful pick");
   assert.equal(h.calls.writes.length, 0, "a tap still writes nothing");
 });
 

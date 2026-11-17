@@ -1174,8 +1174,11 @@ test("Say it suggestions save on their own in Supplements and Uber Eats (each tr
   assert.equal(exclusions.length, 1, "a suggestion already logged is filtered out of the list");
   const supButtons = F.jsxElements(sup).filter((e) => e.tag === "LogSaveButton");
   assert.ok(supButtons.some((b) => F.buttonLabels(b).includes("Retry")), "a failed suggestion offers Retry");
-  // "Log a product" keeps its Log tap on purpose: logging a dose is the action itself.
-  assert.ok(supButtons.some((b) => F.buttonLabels(b).includes("Log") && b.attrs.onClick?.expr && F.hasCall(b.attrs.onClick.expr, "onLogProduct")));
+  // "Log a product" keeps its tap on purpose, now as "Log selected (N)" (a plain button, several products at once):
+  // logging the chosen doses is the action itself, and a half-chosen selection must never reach the supplement log.
+  const logSelected = F.jsxElements(sup).filter((e) => e.tag === "button" && F.buttonLabels(e).some((l) => l.startsWith("Log selected")));
+  assert.equal(logSelected.length, 1, "one Log selected button");
+  assert.ok(logSelected[0].attrs.onClick?.expr && F.hasCall(logSelected[0].attrs.onClick.expr, "onLogSelected"));
   const ue = F.parseFile("app/log/sections/UberEats.tsx");
   assert.ok(F.inOrder(ue, (s) => F.hasCall(s, "attempted.current.add"), (s) => F.hasCall(s, "saveRef.current")), "each suggestion is marked tried before it is sent");
   assert.ok(F.jsxElements(ue).some((e) => e.tag === "LogSaveButton" && F.buttonLabels(e).includes("Retry")));
