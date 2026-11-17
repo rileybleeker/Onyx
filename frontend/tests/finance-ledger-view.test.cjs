@@ -95,7 +95,7 @@ test("net worth: liabilities subtract, unclassified is surfaced not counted, sta
   assert.match(out, /Not counted in net worth until the source labels them/);
   assert.match(out, /••0000/);
   assert.match(out, /Bank sync \(SimpleFIN\):/);
-  assert.match(out, /Login required/, "a failed heartbeat shows its own text");
+  assert.match(out, /Rocket Money needs you to sign in again/, "a sign-in-expired heartbeat shows plain words");
 });
 
 test("cashflow: refunds are money in, card payments are not spending, excluded rows are labelled", () => {
@@ -186,7 +186,7 @@ test("page states: empty ledger, query failure and data are three different thin
     freshness: S.financeLedgerCard(beat(1, { status: "failed", error_message: "Login required" }), null, NOW.getTime()),
   });
   assert.match(ranButEmpty, /The bank import ran but found no transactions\./);
-  assert.match(ranButEmpty, /Login required/);
+  assert.match(ranButEmpty, /Rocket Money needs you to sign in again/);
 
   const failed = await renderPage({ kind: "error", message: "Couldn't load the ledger.", hint: "The database query failed (code 57014). Try again in a moment." });
   assert.match(failed, /role="alert"/);
