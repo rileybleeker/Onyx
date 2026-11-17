@@ -89,6 +89,7 @@ const CADENCE: Record<string, string> = {
   pc_activity: "Hourly (Riley's PC, while signed in)",
   uber_rides: "On demand (Uber privacy download, imported by hand)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
+  apple_health: "When the Onyx app is opened on the iPhone (Shortcuts automation)",
   youtube: "Daily look on Riley's PC; new data every 2 months (scheduled Google Takeout)",
   medical_backup: "Weekly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
@@ -152,6 +153,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   uber_rides:     { method: "manual",         label: "Privacy download import" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
+  apple_health:   { method: "automated",      label: "iPhone app (HealthKit)" },
   youtube:        { method: "semi-automated", label: "Scheduled Takeout in OneDrive" },
   medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
@@ -511,6 +513,8 @@ export async function GET() {
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
         ["uber_rides", "import"],
+        // Apple Health upload from the iPhone app (runs when the app is opened): its own read.
+        ["apple_health", "samples"],
         // YouTube watch history importer (Riley's PC, one heartbeat a day).
         ["youtube", "history"],
         // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
@@ -1423,6 +1427,36 @@ export async function GET() {
           cadence: CADENCE.ai_usage,
           integrationMethod: METHOD.ai_usage.method,
           methodLabel: METHOD.ai_usage.label,
+        };
+      })(),
+      // Apple Health from the Onyx iPhone app (tools/screentime_ios, HealthKit -> /api/apple-health/import):
+      // steps, walking metrics, headphone level, mindful minutes, other apps' workouts, State of Mind.
+      // HealthKit is readable only while the phone is unlocked, so a Shortcuts "when Onyx is opened"
+      // automation runs the sync; a quiet stretch is normal. Heartbeat only (no health rows are read here).
+      // 'partial' = the phone lacks Health permission for some metrics. >36h degraded, >96h or a failed row red.
+      apple_health: (() => {
+        const entry = latestBySrcType["apple_health|samples"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 96
+            ? "failed"
+            : entry.status === "partial" || ageH > 36
+              ? "partial"
+              : "success";
+        return {
+          label: "Apple Health",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No upload yet - apply sql/apple_health_schema.sql, install the HealthKit build from /install, allow Health access in the app and add the Shortcuts automation (tools/screentime_ios/README.md)." : null),
+          cadence: CADENCE.apple_health,
+          integrationMethod: METHOD.apple_health.method,
+          methodLabel: METHOD.apple_health.label,
         };
       })(),
       // YouTube watch history (tools/youtube_history on Riley's PC): a daily look for a new scheduled Google
