@@ -1176,6 +1176,12 @@ const FLAG_NO = /\b(?:don't|dont|do not|never|no need to|don't need to|dont need
 const FLAG_SUBJECT = /\b(?:question|q\d+|flag|this one|that one)\b/;
 /** A hedge: the user is not saying it, so nothing is flagged. */
 const FLAG_UNSURE = /\b(?:maybe|might|perhaps|possibly|not sure|i think|i guess|wonder|whether|could be)\b/;
+/**
+ * The clause is about the user's own answer, reply or typing ("my answer to that one", "I typed 4", "the reply was
+ * wrong"), not the question. "answer key" is the question's, so it does not count. Such a clause never flags
+ * (RQS6-R1): a complaint about the answer is not a complaint about the question.
+ */
+const FLAG_OWN = /\b(?:my|mine)\b|\bi\s+(?:typed|said|wrote|put|picked|chose|answered|entered|guessed|gave|meant|selected)\b|\b(?:answer|answers|reply|replies|response|guess|pick)\b(?!\s+key\b)/;
 const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
 /** Splits a sentence into clauses: a comma, colon or joining word ("but", "and", "which") starts a new one. */
 const FLAG_CLAUSE = /[,:]|\b(?:but|and|or|although|though|while|whereas|however|which|because|so|except)\b/;
@@ -1470,7 +1476,7 @@ export function authorizeWrite(
     for (const { s, term } of sentences) {
       if (term === "?" || conditional(s)) continue;
       for (const clause of s.split(FLAG_CLAUSE)) {
-        if (!FLAG_SUBJECT.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
+        if (!FLAG_SUBJECT.test(clause) || FLAG_OWN.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
         // "not wrong", "not unclear": the word itself is negated.
         if ((kind === "wrong" || kind === "unclear") && /\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(clause)) continue;
         hits.push(clauseLabels(clause));

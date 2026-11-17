@@ -453,8 +453,10 @@ const MATRIX = [
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
   ["a flag: a hedge in another clause does not block the complaint", BANK_FLAG("I'm not sure about the bell, but Q1201 is wrong"),
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
-  ["a flag: a don't-flag request after the complaint", BANK_FLAG("Q1201 is wrong, but don't flag it"),
-    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("contradicts")],
+  ["a flag: a complaint about the user's own answer to the question is not a question flag", BANK_FLAG("My answer to that one was wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: a complaint about the question's wording flags it as unclear", BANK_FLAG("The wording of Q1201 is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
