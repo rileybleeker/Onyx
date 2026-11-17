@@ -47,13 +47,21 @@ function localDay(d: Date): string {
 // response must never replace a confirmed answer).
 const windDownWarmer = (): DataWarmer => ({ key: "/api/sleep/winddown", fetch: () => import("@/lib/use-winddown").then((m) => m.warmWindDownRead()) });
 
-// The inbox feeds Today's cards, the Agents screen and the nav badge (which also keeps its last count on the device).
+// Pages whose screens show no agent cards or threads: the sweep leaves the inbox and thread reads to the other pages.
+// Grep (2026-11-17): no file in frontend/src reads agentsInbox / agentsThread, agentsApi.inbox or agentsApi.messages
+// under app/log, app/sleep, app/nutrition or app/analytics; the readers are AgentsInbox, AgentsChat, TodayClient,
+// overview/sources, AppData and the nav badge in MobileNav (memory-only peek).
+const skipOnAgentsSweep = (page: string) => ["/log", "/sleep", "/nutrition", "/analytics"].some((p) => page === p || page.startsWith(p + "/"));
+
+// The inbox feeds Today's cards, the Agents screen and the nav badge (MobileNav reads the in-memory copy, never fetches).
 // No Financials page uses it, and its request is slow on some runs (perf-timing 2026-11-17: 1082 ms in the forecast
-// view), so the sweep leaves it to the other pages and to its next run.
+// view). Log, Sleep, Nutrition and Analytics do not use it either: perf-timing run 44126056400 (2026-11-17) had it at
+// 1343 ms (/log cold), 1408 ms (/sleep cold) and 1137 ms (/nutrition cold). So the sweep leaves it to the other pages
+// and to its next run. Today and Agents keep warming it.
 const inboxWarmer: DataWarmer = {
   key: CACHE_KEYS.agentsInbox,
   fetch: () => agentsApi.inbox(),
-  skipOn: (page) => page === "/financials" || page.startsWith("/financials/"),
+  skipOn: (page) => page === "/financials" || page.startsWith("/financials/") || skipOnAgentsSweep(page),
 };
 
 // The Reading reads the sweep runs from /reading's warmer. /sleep shows none of them, and they compete with its own
@@ -135,7 +143,9 @@ const DATA: Record<string, () => DataWarmer[]> = {
       : [];
     return [
       inboxWarmer,
-      ...threads.map((thread) => ({ key: CACHE_KEYS.agentsThread(thread), fetch: () => agentsApi.messages({ thread, limit: 60 }) })),
+      // The thread reads are left out of the sweep on the same pages as the inbox (perf-timing run 44126056400: the
+      // first thread read on /analytics/hrv took 2721 ms cold).
+      ...threads.map((thread) => ({ key: CACHE_KEYS.agentsThread(thread), fetch: () => agentsApi.messages({ thread, limit: 60 }), skipOn: skipOnAgentsSweep })),
     ];
   },
   "/habits": () => [

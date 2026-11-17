@@ -158,3 +158,16 @@ test('a page\'s client chunk (dynamic ssr:false) is loaded in its own idle step 
   assert.equal(loads, 2);
   configureWarmup(null);
 });
+
+test('the agents inbox and thread warmers skip the Log, Sleep, Nutrition and Analytics sweep, and keep Today and Agents', () => {
+  const app = src('components', 'AppData.tsx');
+  const line = /const skipOnAgentsSweep = (\(page: string\) => [^\n]+);/.exec(app);
+  assert.ok(line, 'one shared predicate in AppData.tsx');
+  const skipOnAgentsSweep = new Function(`return ${line[1].replace(': string', '')}`)();
+  for (const page of ['/log', '/log/sections', '/sleep', '/sleep/winddown', '/nutrition', '/analytics', '/analytics/hrv']) assert.equal(skipOnAgentsSweep(page), true, page);
+  for (const page of ['/today', '/agents', '/agents/x', '/logbook', '/financials/forecast']) assert.equal(skipOnAgentsSweep(page), false, page);
+  // One inbox warmer object for Today and Agents: it keeps the Financials skip and adds the sweep pages.
+  assert.match(app, /const inboxWarmer: DataWarmer = \{\s*key: CACHE_KEYS\.agentsInbox,\s*fetch: \(\) => agentsApi\.inbox\(\),\s*skipOn: \(page\) => page === "\/financials" \|\| page\.startsWith\("\/financials\/"\) \|\| skipOnAgentsSweep\(page\),\s*\};/, 'inbox warmer skips Financials and the sweep pages');
+  assert.match(app, /\.\.\.threads\.map\(\(thread\) => \(\{ key: CACHE_KEYS\.agentsThread\(thread\), fetch: \(\) => agentsApi\.messages\(\{ thread, limit: 60 \}\), skipOn: skipOnAgentsSweep \}\)\)/, 'thread warmers skip the sweep pages');
+  assert.ok(/\/\/ The inbox feeds Today/.test(app) && /return \[\s*inboxWarmer,/.test(app), 'Today and Agents still list the same inbox warmer');
+});
