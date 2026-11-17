@@ -11,7 +11,8 @@ export async function GET() {
   try {
     return NextResponse.json({ books: await listBooks(supabase) });
   } catch (e) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : "failed" }, { status: 500 });
+    console.error("reading/books GET", e instanceof Error ? e.message : "unknown error");
+    return NextResponse.json({ error: "Couldn't load your books. Try again." }, { status: 500 });
   }
 }
 
@@ -44,6 +45,9 @@ export async function POST(req: NextRequest) {
     status: "reading",
   };
   const { data, error } = await supabase.from("books").insert(row).select(BOOK_COLS).single();
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("reading/books POST", error.message);
+    return NextResponse.json({ error: "Couldn't save that book. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ success: true, book: data });
 }
