@@ -171,8 +171,9 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
 
   // The Environment part (PartGroup "environment" in HrvAnalysisClient.tsx): the Sweet Spot panel plus the PM2.5
   // and Weather panels, which fetch /api/air-quality and /api/weather themselves. Both syncs run every 3 h, so an
-  // error or empty note there is always a real break. Asserts presence of UI only, never values.
-  test("HRV Environment: PM2.5 and Weather charts draw; Sweet Spot renders", async ({
+  // error or empty note there is always a real break. The Pollen panel (/api/pollen) is held to the same bar.
+  // Asserts presence of UI only, never values.
+  test("HRV Environment: PM2.5, Weather and Pollen charts draw; Sweet Spot renders", async ({
     page,
   }) => {
     await gotoAuthed(page, "/analytics/hrv");
@@ -209,12 +210,31 @@ test.describe("HRV analytics — JSONB-parse regression tripwire", () => {
       ).toBeVisible({ timeout: LOAD_TIMEOUT });
     }
 
-    // The panels' error/empty notes (AirQualityPanel.tsx, WeatherPanel.tsx; the apostrophe renders as a straight ').
+    // Pollen (Part id="pollen", PollenPanel.tsx): counts are stored daily, so the 1-year default range always has
+    // bars. Same card lookup; the marks check targets the bar shapes (a drawn bar is a <path> inside
+    // .recharts-bar-rectangle; a null-count day draws none). It waits out the loading skeleton, and the
+    // not-connected / error / empty-range notes replace the chart, so any of them fails here and below.
+    const pollenCard = page
+      .locator("div.bg-surface-card")
+      .filter({ has: page.getByRole("heading", { name: "Pollen", exact: true }) })
+      .last();
+    await pollenCard.scrollIntoViewIfNeeded({ timeout: LOAD_TIMEOUT });
+    await expect(pollenCard, "Pollen card did not render").toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(
+      pollenCard.locator("svg.recharts-surface .recharts-bar-rectangle path").first(),
+      "Pollen chart drew no bars"
+    ).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // The panels' error/empty notes (AirQualityPanel.tsx, WeatherPanel.tsx, PollenPanel.tsx; the apostrophe
+    // renders as a straight ').
     for (const note of [
       "Couldn't load air quality",
       "No air-quality days yet",
       "Couldn't load weather",
       "No weather days yet",
+      "Pollen isn't connected yet",
+      "Couldn't load pollen",
+      "No pollen counts in this range",
     ]) {
       await expect(
         page.getByText(note),
