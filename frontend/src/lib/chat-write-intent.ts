@@ -1191,8 +1191,18 @@ const FLAG_OWN = /\b(?:my|mine)\b|\bi\s+(?:typed|said|wrote|put|picked|chose|ans
  */
 const FLAG_MARKING = /\b(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|points?|penali[sz]\w*|dock(?:ed|ing|s)?|deduct\w*|unfair\w*|credit|(?:marked|marking|marks?)\s+me\b|(?:marked|marking|marks)\b(?!\s+as\b))/;
 const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
-/** Splits a sentence into clauses: a comma, colon or joining word ("but", "and", "which") starts a new one. */
-const FLAG_CLAUSE = /[,:]|\b(?:but|and|or|although|though|while|whereas|however|which|because|so|except)\b/;
+/**
+ * Splits a sentence into clauses: a comma, colon or joining word ("but", "and", "which") starts a new one. The joiner is
+ * kept (capture group), so a clause can be read with the word that joined it.
+ */
+const FLAG_CLAUSE = /([,:]|\b(?:but|and|or|although|though|while|whereas|however|which|because|so|except)\b)/;
+/** A joiner that starts an unrelated statement: a clause after it never continues the clause before it. */
+const FLAG_CONTRAST = /^(?:but|although|though|while|whereas|however|except)$/;
+/**
+ * A clause that continues the one before it with a pronoun ("which is wrong", "it was wrong", "that's wrong"), not with
+ * its own subject. "that question…" and "this one…" name the question, so they do not continue.
+ */
+const FLAG_REFERS_BACK = /^\s*(?:which|that|it|its|they|those|this)\b(?!\s+(?:question|one|q\d))/;
 /** The "Q<id>" labels a clause names (norm: lower case), each a positive safe integer. */
 const clauseLabels = (s: string): number[] =>
   [...new Set([...s.matchAll(/\bq(\d{1,15})\b/g)].map((m) => Number(m[1])).filter((n) => Number.isSafeInteger(n) && n > 0))];
@@ -1488,8 +1498,18 @@ export function authorizeWrite(
     const hits: number[][] = [];
     for (const { s, marked, term } of sentences) {
       if (term === "?" || conditional(s)) continue;
-      for (const rawClause of marked.split(FLAG_CLAUSE)) {
-        const clause = rawClause.replace(/\u0002/g, ",");
+      // The split keeps each joiner at the odd positions, so pieces[k] is a clause and pieces[k - 1] the word before it.
+      const pieces = marked.split(FLAG_CLAUSE);
+      let answerCarried = false;
+      for (let k = 0; k < pieces.length; k += 2) {
+        const joiner = k > 0 ? (pieces[k - 1] ?? "").trim() : "";
+        if (FLAG_CONTRAST.test(joiner)) answerCarried = false;
+        const clause = (pieces[k] ?? "").replace(/\u0002/g, ",");
+        if (clause.trim() === "") continue;
+        // "I answered B, which is wrong for question 3": the clause that continues the answer's clause is about the answer
+        // too, so it never flags (RQS6-R1). Its subject is the answer, not the question it names.
+        if (answerCarried && (joiner === "which" || FLAG_REFERS_BACK.test(clause))) continue;
+        answerCarried = FLAG_OWN.test(clause);
         if (!FLAG_SUBJECT.test(clause) || FLAG_OWN.test(clause) || FLAG_MARKING.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
         // "not wrong", "not unclear": the word itself is negated.
         if ((kind === "wrong" || kind === "unclear") && /\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(clause)) continue;

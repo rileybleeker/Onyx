@@ -463,6 +463,10 @@ const MATRIX = [
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
   ["a flag: a complaint about the user's own answer to the question is not a question flag", BANK_FLAG("My answer to that one was wrong"),
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the answer is wrong, a clause that continues the answer's clause is not a question flag", BANK_FLAG("I answered B, which is wrong for Q1201"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question about the chapter is unclear, in the same sentence as an answer", BANK_FLAG("I answered B, but the question about chapter 4 is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
   ["a flag: a complaint about the question's wording flags it as unclear", BANK_FLAG("The wording of Q1201 is unclear"),
     "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
   // A complaint about how the answer was marked or scored is not a complaint about the question (RQS7-R1).
