@@ -164,12 +164,13 @@ class FetchAllOrdering(unittest.TestCase):
         with mock.patch.object(hrv_predict, "supa", supa):
             df = hrv_predict.fetch_all("daily_health_matrix_behavioral",
                                        select="calendar_date,whoop_hrv_rmssd",
-                                       order=["calendar_date"])
+                                       chunk=10, order=["calendar_date"])
         self.assertEqual(len(df), 25)
         self.assertEqual(sorted(df["calendar_date"]), sorted(r["calendar_date"] for r in rows))
 
     def test_unstable_read_without_order_is_detectable(self):
-        # Harness check. The unstable fake always returns 25 rows here (pages of 10, 10, 5),
+        # Harness check. fetch_all pages by its own `chunk` (default 1000), so pass chunk=10 to get
+        # pages of 10, 10, 5; the unstable fake always returns 25 rows here,
         # so a row COUNT cannot detect the instability; the detector compares the dates
         # themselves. Seeded so the shuffles are reproducible.
         random.seed(20261117)
@@ -180,7 +181,8 @@ class FetchAllOrdering(unittest.TestCase):
                             chunk_rows=10, unstable=True)
         with mock.patch.object(hrv_predict, "supa", supa):
             unordered = hrv_predict.fetch_all("daily_health_matrix_behavioral",
-                                              select="calendar_date,whoop_hrv_rmssd")
+                                              select="calendar_date,whoop_hrv_rmssd",
+                                              chunk=10)
         # Detector: an unordered paged read is unstable when it loses or repeats a date.
         self.assertNotEqual(sorted(unordered["calendar_date"]), expected,
                             "a paged read without an ORDER BY must be flagged (rows lost or repeated)")
@@ -191,7 +193,7 @@ class FetchAllOrdering(unittest.TestCase):
         with mock.patch.object(hrv_predict, "supa", supa):
             ordered = hrv_predict.fetch_all("daily_health_matrix_behavioral",
                                             select="calendar_date,whoop_hrv_rmssd",
-                                            order=["calendar_date"])
+                                            chunk=10, order=["calendar_date"])
         self.assertEqual(sorted(ordered["calendar_date"]), expected,
                          "a paged read with an explicit order must not be flagged")
 

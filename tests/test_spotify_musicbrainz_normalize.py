@@ -71,7 +71,7 @@ class TestNormalizeArtistName(unittest.TestCase):
 
 
 class TestFetchMusicbrainzTags(unittest.TestCase):
-    def _client_with(self, **responses):
+    def _client(self, **responses):
         return FakeClient({q: FakeResponse(payload=p) for q, p in responses.items()})
 
     def test_direct_match_returns_tags(self):
