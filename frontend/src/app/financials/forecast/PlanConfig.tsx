@@ -314,8 +314,8 @@ function StreamRow({ s, adj, today, busy, run }: { s: DetectedStream; adj: Recor
       </button>
       {open && (
         <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-text-secondary">
-          from <input className={input} type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
-          amount $<input className={`${input} w-24`} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" />
+          from <input className={input} type="date" value={from} onChange={(e) => setFrom(e.target.value)} aria-label={`Adjustment start date for ${s.label}`} />
+          amount $<input className={`${input} w-24`} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" aria-label={`Adjustment amount for ${s.label}`} />
           <button className={button} disabled={busy || !from} onClick={() => run(() => put(`adjust:${s.id}`, { from, amountCents: sign * Math.round((Number(amount.replace(/[$,\s]/g, "")) || 0) * 100) }))}>
             Set amount
           </button>
