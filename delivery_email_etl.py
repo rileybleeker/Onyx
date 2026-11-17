@@ -5,7 +5,7 @@ Uber has no API for a customer's own order history (and the claude.ai Uber
 Eats connector only searches restaurants), so the receipt email is the only
 automatic record of a delivery order. This module reads every configured
 Gmail account over IMAP (read-only, All Mail — same plumbing as
-flights_email_etl.py) and parses the receipts from noreply@uber.com:
+flights_email_etl.py) and parses the receipts from Uber's no-reply sender:
 
     subject   "[Personal] Your Monday evening order with Uber Eats"
 
