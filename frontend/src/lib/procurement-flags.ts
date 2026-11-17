@@ -167,6 +167,8 @@ export interface UsageItem {
 export interface UsageTotals {
   daysCovered: number;
   items: UsageItem[];
+  /** False when the Screen Time export did not completely cover the window: hours then read as unverified. */
+  windowComplete?: boolean;
 }
 export type UsageNote =
   | { state: "known"; minutes: number; matched: string[]; basis: "service list" | "name match"; daysCovered: number }
@@ -210,6 +212,9 @@ function siteMatches(identifier: string, site: string): boolean {
 /** How much one subscription was used on the iPhone, or why that is unknown. Never a guess. */
 export function usageFor(merchant: string, service: ServiceEntry | null, usage: UsageTotals | null): UsageNote {
   if (!usage) return { state: "unknown", why: "Screen Time data is not available" };
+  if (usage.windowComplete === false) {
+    return { state: "unknown", why: "the Screen Time export for the window is not complete" };
+  }
   if (usage.daysCovered < MIN_USAGE_DAYS) {
     return { state: "unknown", why: `Screen Time covers only ${usage.daysCovered} of the last ${USAGE_WINDOW_DAYS} days` };
   }

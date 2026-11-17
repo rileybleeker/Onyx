@@ -9,6 +9,18 @@ const supabase = createClient(
 
 const SNIPPET_LEN = 400;
 
+// Edge-cache (same pattern as /api/status, perf 2026-06-10/11): the journal
+// only changes via the hourly Notion sync at :35, so a 5-min CDN snapshot
+// (+5-min SWR) is far inside the data cadence. That rule is in
+// Vercel-CDN-Cache-Control, which Vercel consumes and never forwards. The
+// browser gets `private, no-store`: the answer carries journal titles, moods
+// and snippets, so it is never written to the device's HTTP cache, where
+// sign-out could not clear it.
+const JOURNAL_LIST_CACHE_HEADERS = {
+  "Cache-Control": "private, no-store",
+  "Vercel-CDN-Cache-Control": "max-age=300, stale-while-revalidate=300",
+};
+
 /**
  * GET /api/journal/list
  * Query params:
@@ -55,12 +67,8 @@ export async function GET(req: NextRequest) {
     truncated: (row.content_md ?? "").length > SNIPPET_LEN,
   }));
 
-  // Edge-cache (same pattern as /api/status, perf 2026-06-10/11): the journal
-  // only changes via the hourly Notion sync at :35, so a 5-min CDN snapshot
-  // (+5-min SWR) is far inside the data cadence. Read-only route — no
-  // write-coupled freshness concern.
   return NextResponse.json(
     { entries },
-    { headers: { "Cache-Control": "public, s-maxage=300, stale-while-revalidate=300" } }
+    { headers: JOURNAL_LIST_CACHE_HEADERS }
   );
 }

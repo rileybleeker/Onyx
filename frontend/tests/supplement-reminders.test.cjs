@@ -19,6 +19,7 @@ execFileSync(process.execPath, [
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2022', '--skipLibCheck', '--strict',
 ], { cwd: frontend });
 const lib = require(path.join(output, 'supplement-reminders.js'));
+const stacks = require(path.join(output, 'supplement-stacks.js'));
 
 // ---------------------------------------------------------------------------
 // In-memory stand-in for the pds-scoped Supabase client
@@ -521,14 +522,16 @@ test('respond log: a stack already logged another way is reported, not duplicate
   assert.equal(reminders(db)[0].status, 'logged');
 });
 
-test('respond log: a failed write puts the reminder back so the card can be tapped again', async () => {
+test('respond log: a definite refusal (check violation) says not saved, puts the reminder back and a retry logs', async () => {
   const db = await claimed(makeDb());
   let broken = true;
-  db.failOn = (table, op) => (broken && table === 'supplement_intake' && op === 'insert' ? { message: 'insert failed', code: '23514' } : null); // a check violation: refused, nothing written
+  // 23514 = check_violation, class 23: on write-outcome.ts's refusal allowlist, so the writer returns
+  // the database's own message — a proven "not saved".
+  db.failOn = (table, op) => (broken && table === 'supplement_intake' && op === 'insert' ? { message: 'insert failed', code: '23514' } : null);
   const first = await respond(db, LOG);
   assert.equal(first.httpStatus, 400);
   assert.equal(first.body.ok, false);
-  assert.match(first.body.error, /insert failed/);
+  assert.equal(first.body.error, 'insert failed');
   assert.equal(reminders(db)[0].status, 'prompted');
   assert.equal(reminders(db)[0].responded_at, null);
   assert.equal(intakeRows(db, 4).length, 0);
@@ -537,6 +540,22 @@ test('respond log: a failed write puts the reminder back so the card can be tapp
   const retry = await respond(db, LOG);
   assert.equal(retry.body.status, 'logged');
   assert.equal(intakeRows(db, 4).length, 2);
+});
+
+test('respond log: an unconfirmed outcome (connection lost) says it may be saved and settles nothing', async () => {
+  const db = await claimed(makeDb());
+  // 08006 = connection_failure, class 08: not on the refusal allowlist, so the outcome is unknown —
+  // the writer must answer the conservative "may have been saved anyway" message, never "not saved".
+  db.failOn = (table, op) => (table === 'supplement_intake' && op === 'insert' ? { message: 'connection lost', code: '08006' } : null);
+  const res = await respond(db, LOG);
+  assert.equal(res.httpStatus, 400);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error, stacks.STACK_MAYBE_LOGGED);
+  assert.match(res.body.error, /may have been saved anyway/);
+  assert.match(res.body.error, /Do not log it again/);
+  assert.equal(reminders(db)[0].status, 'prompted', 'not marked skipped or logged');
+  assert.equal(reminders(db)[0].responded_at, null);
+  assert.equal(intakeRows(db, 4).length, 0);
 });
 
 test('respond log: an archived stack cannot be logged and its reminder is left alone', async () => {

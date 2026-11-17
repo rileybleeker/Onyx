@@ -172,7 +172,7 @@ export async function readWindDown(db: WindDownDb, nowIso: string = new Date().t
   const storedQuestions = Array.from(new Set(rules.map((r) => r.habitName)));
   const [namesRes, startsRes, sleep, storedAnswers] = await Promise.all([
     db.from("habit_name_map").select("notion_page_id,habit_name").in("notion_page_id", pageIds),
-    db.from("sleep_winddown_starts").select("night,started_at,local_time,tz,rule_id").gte("night", addDays(today, -60)).order("night", { ascending: true }),
+    db.from("sleep_winddown_starts").select("night,started_at,local_time,tz,rule_id,habit_page_id").gte("night", addDays(today, -60)).order("night", { ascending: true }),
     readSleepNights(db, today),
     readAnswers(db, storedQuestions, from, today),
   ]);
@@ -190,6 +190,7 @@ export async function readWindDown(db: WindDownDb, nowIso: string = new Date().t
   if (startsRes.error) throw new WindDownReadError("starts", startsRes.error.code ?? null);
   const starts: WindDownStart[] = ((startsRes.data ?? []) as Row[]).map((r) => ({
     night: s(r.night) ?? "", startedAt: s(r.started_at) ?? "", localTime: s(r.local_time) ?? "", tz: s(r.tz) ?? "", ruleId: n(r.rule_id),
+    habitPageId: s(r.habit_page_id),
   }));
   return { status: "ready", today, hidden, rules, pauses, answers, starts, habitNames, sleep: { source: "WHOOP", ...sleep }, asOf: nowIso };
 }

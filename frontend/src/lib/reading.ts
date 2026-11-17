@@ -21,6 +21,8 @@ import { quizVerification, type QuizVerification } from "@/lib/reading-questions
  *
  * Everything gamified (XP, level, streak, pace, badges, checkpoints) is DERIVED
  * here from the raw rows — nothing is stored, so the rules can change freely.
+ * A book's own flavour (level titles, concept tags, badge labels) is data on its
+ * row (pds.books.theme, sql/reading_book_theme.sql), never code: this repo is public.
  * The Supabase client passed in MUST be scoped to schema "pds" (service role).
  */
 
@@ -133,7 +135,9 @@ export interface Quiz {
 // consumers unnoticed). Every column of each table, checked against
 // information_schema on 2026-11-14: these rows go out whole in /api/reading
 // responses and chat tool results, so nothing is dropped. If the schema adds a
-// column a consumer needs, append it here (and to the interface above).
+// column a consumer needs, append it here (and to the interface above). `books.theme` (sql/reading_book_theme.sql) is
+// deliberately NOT listed: it is read through OVERVIEW_SELECT's `*` and parsed into overview.theme, so a book read
+// never fails while that column is not applied yet.
 export const BOOK_COLS =
   "book_id, slug, title, author, total_chapters, start_date, target_date, status, finished_on, notion_page_id, habit_name, created_at, updated_at, asin, last_position, last_position_at, total_positions";
 export const SESSION_COLS =
@@ -148,6 +152,14 @@ export interface Checkpoint {
   reached: boolean; // chapter reached by any date
   onTime: boolean | null; // null until due or reached
   quiz: Quiz | null;
+  /**
+   * True when a NEWER quiz result exists for this checkpoint but was invalidated (one of its questions was corrected
+   * later), so the older counted result is shown instead. The UI says so next to the score; XP rules are unchanged
+   * (the invalidated result never earned XP). PR 362 follow-up.
+   */
+  correctedNewer: boolean;
+  /** The invalidated newer result that replaced the counted one, when correctedNewer (its score and date, for the notice). */
+  correctedNewerQuiz: { date: string; score: number; total: number } | null;
 }
 
 export interface Badge {
@@ -163,9 +175,45 @@ export interface XpBreakdown {
   recalls: number;
   highlights: number;
   reviews: number;
+  /** Chapter question practice (READ-QUIZ-01): the day's first counted answers, checkpoint answers excluded. */
+  practice: number;
   quizzes: number;
   checkpoints: number;
   total: number;
+}
+
+/**
+ * The question bank's summary for the overview (pds.reading_bank_summary, READ-QUIZ-01): counts and schedules only,
+ * never a question, an idea or an answer. null in the overview when the bank's SQL is not applied (the page then shows
+ * the Review card as before).
+ */
+export interface PracticeSummary {
+  /** The book the summary is about (the overview ignores one that is not its own book). */
+  bookId: number;
+  enabled: boolean;
+  /** "owner" = turned off by Riley, "budget" = paused at the spending cap. */
+  pausedReason: "owner" | "budget" | null;
+  mapping: "unknown" | "ok" | "uncertain";
+  approvedCents: number | null;
+  spentCents: number;
+  /** The highest chapter that may be quizzed (the spoiler gate). */
+  quizThrough: number;
+  /** Ideas due today, and ideas never asked yet, among the unlocked ones. */
+  due: number;
+  newReady: number;
+  /** Ideas by stage (detail ideas left out): New, Seen, Recalled, Explained, Kept. */
+  stages: { new: number; seen: number; recalled: number; explained: number; kept: number };
+  /** Answers right when the idea was last answered right 7 to 20 days earlier / 21 days or more earlier. */
+  recall7d: { n: number; right: number };
+  recall21d: { n: number; right: number };
+  chapters: { chapter: number; status: string; ideas: number | null; questions: number | null; sources: number | null }[];
+  /** Answers voided by a correction, and answers still waiting for a model grade. */
+  voided: number;
+  pending: number;
+  /** The first counted answer of each idea and day, by verdict (checkpoint answers excluded): practice XP. */
+  counted: { correct: number; partial: number };
+  /** Behavioral days with such an answer: a practice day counts as a review day. */
+  days: string[];
 }
 
 export interface ReadingOverview {
@@ -187,7 +235,15 @@ export interface ReadingOverview {
   xp: XpBreakdown;
   level: { n: number; title: string; intoLevel: number; perLevel: number };
   badges: Badge[];
+  /**
+   * The book's own flavour (pds.books.theme, generic defaults when none): level and badge labels are already applied
+   * above; the concept tags are what the highlight form offers. An overview cached before the theme existed has no
+   * `theme`; readers use `conceptOptions`, which tolerates that.
+   */
+  theme: BookTheme;
   checkpoints: Checkpoint[];
+  /** The chapter question bank's numbers; null while it is not set up (READ-QUIZ-01). */
+  practice: PracticeSummary | null;
   sessions: ReadingSession[]; // newest first
   highlights: Highlight[]; // newest first
   dueReviews: Highlight[]; // due today, oldest due first (max 5)
@@ -209,37 +265,142 @@ export const XP = {
   perRecall: 20, // a session with a from-memory recall note (>= 40 chars)
   perHighlightWithComment: 5,
   perHighlightBare: 2,
-  perReviewDay: 15, // a day on which at least one review was graded
+  perReviewDay: 15, // a day on which at least one review was graded, or one chapter question was answered
+  perPracticeCorrect: 2, // chapter questions: the day's first counted answer of an idea
+  perPracticePartial: 1,
   perQuizPoint: 10, // per correct answer
   perCheckpointOnTime: 50,
   perLevel: 100,
 } as const;
 
-const LEVEL_TITLES = [
-  "Plant Visitor",
-  "Expediter",
-  "Shift Supervisor",
-  "Line Manager",
-  "Bottleneck Hunter",
-  "Flow Engineer",
-  "Plant Manager",
-  "Division Lead",
-  "Jonah",
-];
+/* ------------------------------------------------------------------ */
+/* Book theme (pds.books.theme)                                         */
+/* ------------------------------------------------------------------ */
 
-/** Default concept tags for the TOC -> BC mapping. The UI offers these plus free text. */
-export const CONCEPTS = [
-  "The goal of a plant",
-  "Throughput / Inventory / Operating Expense",
-  "Dependent events + statistical fluctuations",
-  "Bottleneck / capacity-constrained resource",
-  "Balanced-plant fallacy",
-  "Utilizing vs activating",
-  "Process batch vs transfer batch",
-  "Drum, buffer, rope",
-  "Cost accounting vs throughput accounting",
-  "Five focusing steps",
-];
+/**
+ * The flavour of one book, kept as data on its row instead of in code (READ-QUIZ-01 D24: this repo is public and
+ * names no book). Three things can be themed: the level ladder, the concept tags offered on a highlight, and the
+ * labels of the badges. A book with no theme (or an unreadable one) gets the generic defaults below, so the quest
+ * works for any book. The column is written by hand (sql/reading_book_theme.sql explains the shape); nothing in the
+ * app writes it.
+ */
+export interface BookTheme {
+  /** Level 1 first; the last title serves every level beyond the list. */
+  levelTitles: string[];
+  /** Concept tags offered on the highlight form (the titles of linked question-bank ideas are added to them). */
+  concepts: string[];
+  /** Badge labels by badge key (BADGE_KEYS); a badge with no entry keeps its generic label. */
+  badgeLabels: Record<string, string>;
+}
+
+export const DEFAULT_LEVEL_TITLES: readonly string[] = ["Newcomer", "Reader", "Regular", "Student", "Analyst", "Scholar", "Specialist", "Expert", "Master"];
+
+/** Badge keys in display order, with their generic labels. A theme may rename any of them, never add one. */
+export const DEFAULT_BADGE_LABELS: Readonly<Record<string, string>> = {
+  "first-session": "First Session",
+  "checkpoint-1": "First Checkpoint",
+  "checkpoint-2": "Second Checkpoint",
+  finisher: "Finisher",
+  "streak-7": "Seven Straight",
+  scribe: "Scribe",
+  reviewer: "Reviewer",
+  "quiz-master": "Quiz Master",
+  "on-pace": "On Pace",
+  runner: "Runner's Ear",
+};
+export const BADGE_KEYS: readonly string[] = Object.keys(DEFAULT_BADGE_LABELS);
+
+/** Limits applied when a theme is read (the database allows 6,000 characters of JSON in all). */
+export const THEME_LIMITS = { levelTitles: 12, levelTitleChars: 40, concepts: 40, conceptChars: 80, badgeChars: 40 } as const;
+/** The concept picker never lists more than this (theme concepts first, then linked idea titles). */
+export const CONCEPT_OPTIONS_MAX = 80;
+
+/** A fresh generic theme (what a book with no theme gets). */
+export const defaultBookTheme = (): BookTheme => ({ levelTitles: [...DEFAULT_LEVEL_TITLES], concepts: [], badgeLabels: {} });
+
+/**
+ * One short line of plain text: control characters out, whitespace collapsed, cut to `max` characters (counted as code
+ * points, so a surrogate pair is never split); null when nothing is left.
+ */
+function themeText(v: unknown, max: number): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim();
+  const cut = s.length > max ? Array.from(s).slice(0, max).join("").trim() : s;
+  return cut ? cut : null;
+}
+
+/**
+ * A list of short strings: not-text entries dropped, cut to `max` characters, at most `count`. With `distinct` (the
+ * default) repeats ignoring case are dropped too. A ladder passes false: its entries are positional (level n gets
+ * title n), so dropping a repeat would move every later level up by one.
+ */
+function themeList(v: unknown, count: number, max: number, distinct = true): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of v) {
+    const t = themeText(item, max);
+    const k = t?.toLowerCase();
+    if (!t || !k) continue;
+    if (distinct) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+    }
+    out.push(t);
+    if (out.length >= count) break;
+  }
+  return out;
+}
+
+/**
+ * pds.books.theme as the app uses it. `{ v?: 1, level_titles?: string[], concepts?: string[], badges?: { [badge key]: label } }`.
+ * Never throws and never returns a partial surprise: a field that is missing, of another type or empty falls back to
+ * the generic default on its own (a bad badge label keeps that badge's default; a theme of another version, or a value
+ * that is not an object, is no theme). Everything is plain text; the screens render it as text, never as markup.
+ * Level titles keep their order and their repeats (a ladder is positional); concepts drop repeats ignoring case.
+ */
+export function parseBookTheme(raw: unknown): BookTheme {
+  if (!isObject(raw) || (raw.v !== undefined && raw.v !== 1)) return defaultBookTheme();
+  const levelTitles = themeList(raw.level_titles, THEME_LIMITS.levelTitles, THEME_LIMITS.levelTitleChars, false);
+  const badgeLabels: Record<string, string> = {};
+  if (isObject(raw.badges)) {
+    for (const key of BADGE_KEYS) {
+      const label = themeText(raw.badges[key], THEME_LIMITS.badgeChars);
+      if (label) badgeLabels[key] = label;
+    }
+  }
+  return {
+    levelTitles: levelTitles.length ? levelTitles : [...DEFAULT_LEVEL_TITLES],
+    concepts: themeList(raw.concepts, THEME_LIMITS.concepts, THEME_LIMITS.conceptChars),
+    badgeLabels,
+  };
+}
+
+/**
+ * The concept tags the highlight form offers: the theme's own, then the titles of the question-bank ideas Riley's
+ * highlights are linked to (lib/reading.ts getLinkedIdeaTitles), repeats ignoring case dropped, at most
+ * CONCEPT_OPTIONS_MAX. Tolerates an overview cached before the theme existed (no theme: no theme concepts).
+ */
+export function conceptOptions(themeConcepts: readonly string[] | null | undefined, ideaTitles: readonly string[] | null | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const list of [themeConcepts, ideaTitles]) {
+    for (const item of Array.isArray(list) ? list : []) {
+      const t = themeText(item, THEME_LIMITS.conceptChars);
+      const k = t?.toLowerCase();
+      if (!t || !k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(t);
+      if (out.length >= CONCEPT_OPTIONS_MAX) return out;
+    }
+  }
+  return out;
+}
+
+/** The linked-idea titles the SQL function answers (a JSON array of strings): cleaned like theme concepts, at most 40. */
+export function parseIdeaTitles(raw: unknown): string[] {
+  return themeList(raw, 40, 90);
+}
 
 /* ------------------------------------------------------------------ */
 /* Date helpers (all YYYY-MM-DD strings, UTC-anchored arithmetic)       */
@@ -294,6 +455,8 @@ const OVERVIEW_SELECT =
   "*, reading_sessions(*), book_highlights(*, reading_reviews(review_id,highlight_id,review_date,grade)), reading_quizzes(*), book_chapters(chapter,start_position,end_position,start_page,end_page)";
 
 type OverviewRow = Book & {
+  /** pds.books.theme: only there once sql/reading_book_theme.sql is applied (the `*` select carries it then). */
+  theme?: unknown;
   reading_sessions?: ReadingSession[] | null;
   book_highlights?: (Highlight & { reading_reviews?: Review[] | null })[] | null;
   reading_quizzes?: Quiz[] | null;
@@ -314,12 +477,15 @@ export async function getOverview(supabase: Supa, slug?: string | null): Promise
     .order("start_position", { referencedTable: "book_chapters" })
     .order("created_at", { ascending: false })
     .limit(1);
-  const [{ data, error }, today] = await Promise.all([bookQuery, behavioralToday(supabase)]);
+  // The question bank's summary rides in the same round trip (one RPC, resolved server side by the same slug rule);
+  // it fails open to null, so a missing function or a failed read never costs the overview (READ-QUIZ-01).
+  const [{ data, error }, today, practice] = await Promise.all([bookQuery, behavioralToday(supabase), readPracticeSummary(supabase, slug ?? null)]);
   if (error) throw new Error(error.message);
   const row = (data?.[0] as OverviewRow | undefined) ?? null;
   if (!row) return null;
 
-  const { reading_sessions, book_highlights, reading_quizzes, book_chapters, ...book } = row;
+  // The raw theme column is read into the overview's own `theme` (validated, with defaults) and kept off the book.
+  const { reading_sessions, book_highlights, reading_quizzes, book_chapters, theme: rawTheme, ...book } = row;
   const sessions = reading_sessions ?? [];
   const reviews: Review[] = [];
   const highlights = (book_highlights ?? []).map(({ reading_reviews, ...h }) => {
@@ -329,8 +495,98 @@ export async function getOverview(supabase: Supa, slug?: string | null): Promise
   const quizzes = reading_quizzes ?? [];
   const chapters = book_chapters ?? [];
 
-  return computeOverview({ book: book as Book, today, sessions, highlights, reviews, quizzes, chapters });
+  return computeOverview({ book: book as Book, today, sessions, highlights, reviews, quizzes, chapters, practice, theme: parseBookTheme(rawTheme) });
 }
+
+/* ------------------------------------------------------------------ */
+/* The question bank's summary (pds.reading_bank_summary)               */
+/* ------------------------------------------------------------------ */
+
+const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+const count = (v: unknown): number => {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : 0;
+};
+const countOrNull = (v: unknown): number | null => (v == null ? null : count(v));
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The summary function's answer as the overview carries it, or null when it is not one (a missing book, another
+ * shape, an error body). Counts are clamped to whole numbers >= 0 and the dates must be days, so a malformed answer
+ * can never turn into a wrong XP figure.
+ */
+export function parsePracticeSummary(raw: unknown): PracticeSummary | null {
+  if (!isObject(raw) || typeof raw.book_id !== "number") return null;
+  const stages = isObject(raw.stages) ? raw.stages : {};
+  const ratio = (v: unknown) => {
+    const o = isObject(v) ? v : {};
+    const n = count(o.n);
+    return { n, right: Math.min(n, count(o.right)) };
+  };
+  const xp = isObject(raw.xp) ? raw.xp : {};
+  return {
+    bookId: raw.book_id,
+    enabled: raw.enabled === true,
+    pausedReason: raw.paused_reason === "owner" || raw.paused_reason === "budget" ? raw.paused_reason : null,
+    mapping: raw.mapping === "ok" || raw.mapping === "uncertain" ? raw.mapping : "unknown",
+    approvedCents: countOrNull(raw.approved_cents),
+    spentCents: Math.max(0, Math.round(Number(raw.spent_cents) || 0)),
+    quizThrough: count(raw.quiz_through),
+    due: count(raw.due),
+    newReady: count(raw.new_ready),
+    stages: { new: count(stages.new), seen: count(stages.seen), recalled: count(stages.recalled), explained: count(stages.explained), kept: count(stages.kept) },
+    recall7d: ratio(raw.recall_7d),
+    recall21d: ratio(raw.recall_21d),
+    chapters: (Array.isArray(raw.chapters) ? raw.chapters : [])
+      .filter((c): c is Record<string, unknown> => isObject(c) && typeof c.chapter === "number")
+      .map((c) => ({
+        chapter: c.chapter as number,
+        status: typeof c.status === "string" ? c.status : "pending",
+        ideas: countOrNull(c.ideas),
+        questions: countOrNull(c.questions),
+        sources: countOrNull(c.sources),
+      })),
+    voided: count(raw.voided),
+    pending: count(raw.pending),
+    counted: { correct: count(xp.correct), partial: count(xp.partial) },
+    days: [...new Set((Array.isArray(raw.practice_days) ? raw.practice_days : []).filter((d): d is string => typeof d === "string" && YMD_RE.test(d)))],
+  };
+}
+
+/** One RPC; any failure (function not applied yet, network, malformed answer) is "no summary", never an error. */
+async function readPracticeSummary(supabase: Supa, slug: string | null): Promise<PracticeSummary | null> {
+  try {
+    const { data, error } = await supabase.rpc("reading_bank_summary", { p_slug: slug });
+    if (error) return null;
+    return parsePracticeSummary(data);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The titles of the question-bank ideas Riley's highlights are linked to, for the highlight form's concept picker
+ * (GET /api/reading/idea-titles; sql/reading_book_theme.sql pds.reading_bank_linked_idea_titles). The database applies
+ * the spoiler gate, the edition check and the valid-evidence rule, and answers [] while the book's bank is off, so
+ * nothing locked leaves it. Read on demand, never inside the overview (which stays at the book, today and the
+ * summary). Any failure (the function not applied yet, an error, another shape) is no titles, never an error.
+ */
+export async function getLinkedIdeaTitles(supabase: Supa, slug: string | null): Promise<string[]> {
+  try {
+    const { data, error } = await supabase.rpc("reading_bank_linked_idea_titles", { p_slug: slug });
+    if (error) return [];
+    return parseIdeaTitles(data);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Chapter questions ready for today's round, for Today's one-line "Practice · 6 ready": ideas due plus ideas never
+ * asked yet, at most a round (8). 0 while the bank is off, so Today shows nothing then. Defined in an import-free file
+ * that Today imports too (lib/reading-practice-ready.ts), so the two cannot drift.
+ */
+export { practiceReady, PRACTICE_ROUND_SIZE } from "@/lib/reading-practice-ready";
 
 /* ------------------------------------------------------------------ */
 /* Derivations                                                          */
@@ -344,8 +600,15 @@ export function computeOverview(input: {
   reviews: Review[];
   quizzes: Quiz[];
   chapters?: ChapterSpan[];
+  /** pds.reading_bank_summary parsed (getOverview); absent or null = the question bank is not set up. */
+  practice?: PracticeSummary | null;
+  /** pds.books.theme parsed (parseBookTheme); absent = the generic defaults. */
+  theme?: BookTheme | null;
 }): ReadingOverview {
   const { book, today, sessions, highlights, reviews } = input;
+  const theme = input.theme ?? defaultBookTheme();
+  // The summary is resolved by slug in the database, the book by its own query: one about another book is not used.
+  const practice = input.practice && input.practice.bookId === book.book_id ? input.practice : null;
   // Every result stays listed with its verification; one whose question was corrected later earns nothing.
   const quizzes = input.quizzes.map((q) => ({ ...q, verification: quizVerification(q) }));
   const countedQuizzes = quizzes.filter((q) => q.verification !== "invalidated");
@@ -389,6 +652,9 @@ export function computeOverview(input: {
   // XP
   const recallSessions = sessions.filter((s) => (s.recall ?? "").trim().length >= 40).length;
   const reviewDays = new Set(reviews.map((r) => r.review_date));
+  // A day with a chapter question answered is a review day too: one day, never two (READ-QUIZ-01).
+  const practiceDays = new Set(practice?.days ?? []);
+  const activeReviewDays = new Set([...reviewDays, ...practiceDays]);
   const reviewsToday = reviews.filter((r) => r.review_date === today).length;
   const quizPoints = countedQuizzes.reduce((a, q) => a + q.score, 0);
   const checkpoints = computeCheckpoints(book, sessions, quizzes, today, start, target);
@@ -397,21 +663,22 @@ export function computeOverview(input: {
     chapters: chaptersDone * XP.perChapter,
     recalls: recallSessions * XP.perRecall,
     highlights: highlights.reduce((a, h) => a + ((h.comment ?? "").trim() ? XP.perHighlightWithComment : XP.perHighlightBare), 0),
-    reviews: reviewDays.size * XP.perReviewDay,
+    reviews: activeReviewDays.size * XP.perReviewDay,
+    practice: (practice?.counted.correct ?? 0) * XP.perPracticeCorrect + (practice?.counted.partial ?? 0) * XP.perPracticePartial,
     quizzes: quizPoints * XP.perQuizPoint,
     checkpoints: onTimeCheckpoints * XP.perCheckpointOnTime,
     total: 0,
   };
-  xp.total = xp.chapters + xp.recalls + xp.highlights + xp.reviews + xp.quizzes + xp.checkpoints;
+  xp.total = xp.chapters + xp.recalls + xp.highlights + xp.reviews + xp.practice + xp.quizzes + xp.checkpoints;
   const levelN = Math.floor(xp.total / XP.perLevel) + 1;
   const level = {
     n: levelN,
-    title: LEVEL_TITLES[Math.min(LEVEL_TITLES.length - 1, levelN - 1)],
+    title: theme.levelTitles[Math.min(theme.levelTitles.length - 1, levelN - 1)] ?? DEFAULT_LEVEL_TITLES[0],
     intoLevel: xp.total % XP.perLevel,
     perLevel: XP.perLevel,
   };
 
-  const badges = computeBadges({ book, sessions, highlights, reviews, quizzes: countedQuizzes, checkpoints, chaptersDone, totalChapters, best });
+  const badges = computeBadges({ book, sessions, highlights, reviews, practiceDays: [...practiceDays], quizzes: countedQuizzes, checkpoints, chaptersDone, totalChapters, best, theme });
 
   // Burn-up series: one point per day from start to target.
   const burnup: ReadingOverview["burnup"] = [];
@@ -471,7 +738,9 @@ export function computeOverview(input: {
     xp,
     level,
     badges,
+    theme,
     checkpoints,
+    practice,
     sessions,
     highlights,
     dueReviews,
@@ -482,6 +751,40 @@ export function computeOverview(input: {
     position,
     chapters,
   };
+}
+
+/**
+ * The three checkpoints sit at 30% / 65% / 100% of the book (for 40 chapters: 12, 26, 40). One list for the overview,
+ * the in-app checkpoint quiz and its server (lib/reading-checkpoint.ts), so they can never disagree.
+ */
+export const CHECKPOINT_FRACTIONS = [0.3, 0.65, 1] as const;
+/** A checkpoint quiz asks this many questions, one per idea, and passes at CHECKPOINT_PASS. */
+export const CHECKPOINT_SIZE = 10;
+export const CHECKPOINT_PASS = 0.8;
+export const checkpointChapters = (total: number): number[] => (total > 0 ? CHECKPOINT_FRACTIONS.map((f) => Math.round(total * f)) : []);
+export const checkpointKey = (chapter: number) => `ch${chapter}`;
+/** First chapter of the act a checkpoint closes: the chapter after the previous checkpoint (1 for the first). */
+export function checkpointActStart(total: number, chapter: number): number {
+  const earlier = checkpointChapters(total).filter((c) => c < chapter);
+  return earlier.length ? Math.max(...earlier) + 1 : 1;
+}
+
+/**
+ * Whether the checkpoint tile offers "Start checkpoint": the bank is on, the checkpoint chapter is quizzable (the
+ * spoiler gate), the chapters up to it hold enough ideas for a quiz of CHECKPOINT_SIZE questions, and the checkpoint
+ * has no passed quiz and none recorded today (a quiz key is one per day). The idea count is the summary's, an
+ * estimate: the server counts the ideas not asked in the last 7 days and says so when too few are left.
+ */
+export function checkpointOffer(o: Pick<ReadingOverview, "practice" | "today">, c: Checkpoint): boolean {
+  const p = o.practice;
+  if (!p?.enabled || p.quizThrough < c.chapter) return false;
+  const q = c.quiz;
+  if (q && q.verification !== "invalidated") {
+    if (q.total > 0 && q.score / q.total >= CHECKPOINT_PASS) return false;
+    if (q.quiz_date === o.today) return false;
+  }
+  const ideas = p.chapters.filter((x) => x.chapter >= 1 && x.chapter <= c.chapter).reduce((n, x) => n + (x.ideas ?? 0), 0);
+  return ideas >= CHECKPOINT_SIZE;
 }
 
 function computeCheckpoints(
@@ -496,8 +799,7 @@ function computeCheckpoints(
   if (!total) return [];
   const totalDays = Math.max(1, daysBetween(start, target));
   // 30% / 65% / 100% of the book. For 40 chapters: 12, 26, 40.
-  const fractions = [0.3, 0.65, 1];
-  return fractions.map((f) => {
+  return CHECKPOINT_FRACTIONS.map((f) => {
     const chapter = Math.round(total * f);
     const due = f === 1 ? target : addDays(start, Math.round(totalDays * f) - 1);
     // First date the chapter was reached.
@@ -507,13 +809,34 @@ function computeCheckpoints(
       .sort()[0];
     const reached = !!reachedOn;
     const onTime = reached ? reachedOn! <= due : today > due ? false : null;
-    const key = `ch${chapter}`;
+    const key = checkpointKey(chapter);
     // Newest first (the read orders by taken_at desc): the newest result still counted, else the newest corrected one.
-    const quiz =
-      quizzes.find((q) => q.checkpoint === key && q.verification !== "invalidated") ??
-      quizzes.find((q) => q.checkpoint === key) ??
-      null;
-    return { key, chapter, due, reached, onTime, quiz };
+    // When a newer result for the key was invalidated (a question in it was corrected later) and an older counted result
+    // is shown instead, the checkpoint says so (correctedNewer) so the score change is not unexplained (PR 362 follow-up).
+    const keyQuizzes = quizzes.filter((q) => q.checkpoint === key);
+    let shown: Quiz | null = null;
+    let invalidatedNewer: Quiz | null = null;
+    for (const q of keyQuizzes) {
+      if (q.verification === "invalidated") {
+        // Only the newest invalidated result that sits BEFORE the counted one is the one being corrected away.
+        if (shown === null && invalidatedNewer === null) invalidatedNewer = q;
+        continue;
+      }
+      if (shown === null) shown = q;
+      else break;
+    }
+    const quiz = shown ?? keyQuizzes[0] ?? null;
+    const correctedNewer = !!(shown && invalidatedNewer);
+    return {
+      key,
+      chapter,
+      due,
+      reached,
+      onTime,
+      quiz,
+      correctedNewer,
+      correctedNewerQuiz: correctedNewer && invalidatedNewer ? { date: invalidatedNewer.quiz_date, score: invalidatedNewer.score, total: invalidatedNewer.total } : null,
+    };
   });
 }
 
@@ -522,41 +845,50 @@ function computeBadges(ctx: {
   sessions: ReadingSession[];
   highlights: Highlight[];
   reviews: Review[];
+  /** Days a chapter question was answered: they join the review days for the Reviewer badge. */
+  practiceDays?: string[];
   quizzes: Quiz[];
   checkpoints: Checkpoint[];
   chaptersDone: number;
   totalChapters: number;
   best: number;
+  /** The book's theme: it may rename a badge (DEFAULT_BADGE_LABELS holds the generic labels). */
+  theme?: BookTheme;
 }): Badge[] {
   const { sessions, highlights, reviews, quizzes, checkpoints, chaptersDone, totalChapters, best } = ctx;
+  const labels = ctx.theme?.badgeLabels ?? {};
   const firstSession = [...sessions].sort((a, b) => (a.session_date < b.session_date ? -1 : 1))[0];
   const earliest = (pred: (s: ReadingSession) => boolean) =>
     [...sessions].filter(pred).map((s) => s.session_date).sort()[0] ?? null;
   const cps = checkpoints;
+  // A book with no chapter count has no checkpoints: those two badges stay unearned (never a made-up chapter number).
+  const cp1 = cps[0]?.chapter ?? null;
+  const cp2 = cps[1]?.chapter ?? null;
   const commented = highlights.filter((h) => (h.comment ?? "").trim());
-  const reviewDays = [...new Set(reviews.map((r) => r.review_date))].sort();
+  const reviewDays = [...new Set([...reviews.map((r) => r.review_date), ...(ctx.practiceDays ?? [])])].sort();
   const passedQuizzes = quizzes.filter((q) => q.total > 0 && q.score / q.total >= 0.8);
   const audioSessions = sessions.filter((s) => s.medium === "audio");
 
-  const badge = (key: string, label: string, description: string, earnedOn: string | null): Badge => ({
+  // The label is the theme's when it names one, else the generic default (the keys name no book).
+  const badge = (key: string, description: string, earnedOn: string | null): Badge => ({
     key,
-    label,
+    label: labels[key] ?? DEFAULT_BADGE_LABELS[key] ?? key,
     description,
     earned: !!earnedOn,
     earnedOn,
   });
 
   return [
-    badge("first-session", "First Shift", "Log your first session", firstSession?.session_date ?? null),
-    badge("herbie", "Found Herbie", `Reach chapter ${cps[0]?.chapter ?? 12}`, earliest((s) => (s.chapter_through ?? 0) >= (cps[0]?.chapter ?? 12))),
-    badge("bottleneck", "Bottleneck Hunter", `Reach chapter ${cps[1]?.chapter ?? 26}`, earliest((s) => (s.chapter_through ?? 0) >= (cps[1]?.chapter ?? 26))),
-    badge("finisher", "Finisher", "Reach the last chapter", totalChapters && chaptersDone >= totalChapters ? earliest((s) => (s.chapter_through ?? 0) >= totalChapters) : null),
-    badge("streak-7", "Seven Straight", "A 7-day session streak", best >= 7 ? "✓" : null),
-    badge("scribe", "Scribe", "10 highlights with a comment", commented.length >= 10 ? commented.map((h) => h.created_at.slice(0, 10)).sort()[9] : null),
-    badge("reviewer", "Reviewer", "Grade highlights on 5 different days", reviewDays.length >= 5 ? reviewDays[4] : null),
-    badge("quiz-master", "Quiz Master", "Score 80%+ on a checkpoint quiz", passedQuizzes.length ? passedQuizzes.map((q) => q.quiz_date).sort()[0] : null),
-    badge("on-pace", "On Pace", "Hit every checkpoint on time", cps.length && cps.every((c) => c.reached && c.onTime) ? cps[cps.length - 1].due : null),
-    badge("runner", "Runner's Ear", "5 audio sessions", audioSessions.length >= 5 ? audioSessions.map((s) => s.session_date).sort()[4] : null),
+    badge("first-session", "Log your first session", firstSession?.session_date ?? null),
+    badge("checkpoint-1", cp1 === null ? "Reach the first checkpoint" : `Reach chapter ${cp1}`, cp1 === null ? null : earliest((s) => (s.chapter_through ?? 0) >= cp1)),
+    badge("checkpoint-2", cp2 === null ? "Reach the second checkpoint" : `Reach chapter ${cp2}`, cp2 === null ? null : earliest((s) => (s.chapter_through ?? 0) >= cp2)),
+    badge("finisher", "Reach the last chapter", totalChapters && chaptersDone >= totalChapters ? earliest((s) => (s.chapter_through ?? 0) >= totalChapters) : null),
+    badge("streak-7", "A 7-day session streak", best >= 7 ? "✓" : null),
+    badge("scribe", "10 highlights with a comment", commented.length >= 10 ? commented.map((h) => h.created_at.slice(0, 10)).sort()[9] : null),
+    badge("reviewer", "Practice on 5 different days", reviewDays.length >= 5 ? reviewDays[4] : null),
+    badge("quiz-master", "Score 80%+ on a checkpoint quiz", passedQuizzes.length ? passedQuizzes.map((q) => q.quiz_date).sort()[0] : null),
+    badge("on-pace", "Hit every checkpoint on time", cps.length && cps.every((c) => c.reached && c.onTime) ? cps[cps.length - 1].due : null),
+    badge("runner", "5 audio sessions", audioSessions.length >= 5 ? audioSessions.map((s) => s.session_date).sort()[4] : null),
   ];
 }
 
@@ -1782,7 +2114,18 @@ export function summarizeForChat(o: ReadingOverview) {
     xp: o.xp,
     level: o.level,
     badges_earned: o.badges.filter((b) => b.earned).map((b) => b.label),
-    checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null })),
+    checkpoints: o.checkpoints.map((c) => ({ key: c.key, chapter: c.chapter, due: c.due, reached: c.reached, on_time: c.onTime, quiz: c.quiz ? `${c.quiz.score}/${c.quiz.total}` : null, corrected_newer: c.correctedNewer, corrected_newer_quiz: c.correctedNewerQuiz })),
+    // Chapter question bank, counts only (null while it is off): due / new ideas, the spoiler gate, stages, delayed recall.
+    practice: o.practice?.enabled
+      ? {
+          due: o.practice.due,
+          new_ready: o.practice.newReady,
+          quiz_through: o.practice.quizThrough,
+          stages: o.practice.stages,
+          recall_7d: o.practice.recall7d,
+          recall_21d: o.practice.recall21d,
+        }
+      : null,
     position: o.position,
     recent_sessions: o.sessions.slice(0, 10).map((s) => ({
       id: s.session_id,

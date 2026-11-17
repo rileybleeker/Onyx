@@ -122,6 +122,17 @@ Code: `FocusCore/Sources/FocusCore/OnyxHabits.swift` (pure rule, parsing;
 shortcut action), `frontend/src/lib/focus-unlock.ts` (same decision table in
 TypeScript, `frontend/tests/focus-unlock.test.cjs`).
 
+## Enforcement log (2026-11-17)
+
+The Focus screen has an "Enforcement log" section: the last decisions of
+`FocusEnforcement.reconcile`, each with its time, who ran it (app foreground,
+`monitor start` at 00:00, `monitor end` at the unlock time) and the result
+(blocked / open). Lines starting with `monitor` ran with the app closed, so they
+are the phone's own proof that the background re-block and unlock fire. Stored
+in `focus-events.json` in the App Group (30 entries, local only, nothing sent).
+Reading the morning test: after noon, open the Focus screen and look for
+`monitor end: open` at the unlock time and `monitor start: blocked` at 00:00.
+
 ## Build and test
 
 `cd FocusCore && swift test` tests the pure policy, noon boundary, all AND/OR

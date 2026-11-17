@@ -16,7 +16,12 @@ It replaced the Rocket Money browser harvester, whose web sign-in expired within
 | Apple Card | Yes, but "Updated Monthly" (statement level) |
 | Apple Cash | Not offered (Apple exposes it only on the iPhone, via FinanceKit) |
 
-Investment accounts (Fidelity, the Wells Fargo brokerage) are stored as balances only, as before.
+Investment accounts (Fidelity, the Wells Fargo brokerage) never enter the spending ledger (trades and dividends are not
+spending). Trial result 2026-11-17: SimpleFIN returns Fidelity with balances, positions (symbol, description, shares,
+market value, cost basis, purchase price) and activity as plain rows (amount, description, payee, dates; no quantity or
+price per trade). Since then each run also writes positions to `pds.finance_holdings` and activity to
+`pds.finance_investment_activity` (`sql/finance_holdings.sql`, service-role only), shown in the Investments panel on
+`/financials`. A failed or unapplied write of these never fails the run; the log says so by type name only.
 
 ## One-time setup (Riley)
 

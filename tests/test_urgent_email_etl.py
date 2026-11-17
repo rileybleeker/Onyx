@@ -191,6 +191,10 @@ class FakeQuery:
         self.filters.append(("lt", col, val))
         return self
 
+    def gt(self, col, val):
+        self.filters.append(("gt", col, val))
+        return self
+
     def in_(self, col, vals):
         self.filters.append(("in", col, list(vals)))
         return self
@@ -207,6 +211,8 @@ class FakeQuery:
             if op == "eq" and row.get(col) != val:
                 return False
             if op == "lt" and not (row.get(col) is not None and row[col] < val):
+                return False
+            if op == "gt" and not (row.get(col) is not None and row[col] > val):
                 return False
             if op == "in" and row.get(col) not in val:
                 return False
@@ -643,6 +649,83 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual([c[2] for c in searches], ["X-GM-RAW", "X-GM-LABELS", "X-GM-LABELS", "X-GM-LABELS", "X-GM-LABELS"])
         self.assertTrue(all("SINCE" in c for c in searches[1:3]), "fallback window search is dated")
         self.assertTrue(all("SINCE" not in c for c in searches[3:]), "membership search has no date limit")
+
+
+class RecoveryTests(unittest.TestCase):
+    """A row cleared by mistake (labeled=False but the label is still in Gmail) is re-labelled only by a
+    COMPLETE membership, bounded per run and resumable across runs."""
+
+    def test_recovery_relabels_a_row_cleared_by_mistake(self):
+        # 1001 carries the label in Gmail (all-age membership) but is outside the refresh window.
+        messages = {b"1001": msg(1001, ["Agent/Action"]), b"1002": msg(1002, ["Agent/Action"])}
+        supa = FakeSupa([stored(ACCT_A, "synthetic-1001@example.org", GM(1001), labeled=False)])
+        r = run_with([FakeIMAP(messages=messages, window=[b"1002"])], [(ACCT_A, "pw")], supa)
+        rec = r["accounts"][0]["reconcile"]
+        self.assertEqual(rec["recovered"], 1)
+        row = supa.row(ACCT_A, "synthetic-1001@example.org")
+        self.assertTrue(row["labeled"])
+        self.assertNotEqual(row["synced_at"], OLD_SEEN, "re-labelled with this run's synced_at")
+        labelled_updates = [op for op in supa.ops("update") if op[2].get("labeled") is True]
+        self.assertTrue(labelled_updates)
+        _, _, _, filters = labelled_updates[0]
+        self.assertIn(("eq", "labeled", False), filters, "recovery never touches a row not read labeled=False")
+
+    def test_recovery_needs_a_complete_membership_never_a_window_read(self):
+        cases = [dict(all_mail=False), dict(membership_status="NO"), dict(membership_malformed=True)]
+        for kw in cases:
+            with self.subTest(kw=repr(kw)):
+                supa = FakeSupa([stored(ACCT_A, "synthetic-1001@example.org", GM(1001), labeled=False)])
+                fake = FakeIMAP(messages={b"1001": msg(1001, ["Agent/Action"])}, **kw)
+                r = run_with([fake], [(ACCT_A, "pw")], supa)
+                self.assertFalse(supa.row(ACCT_A, "synthetic-1001@example.org")["labeled"],
+                                 "unknown membership: nothing is recovered")
+                self.assertEqual(r["accounts"][0]["reconcile"]["recovered"], 0)
+                self.assertEqual([op for op in supa.ops("update") if op[2].get("labeled") is True], [],
+                                 "no re-label from an unknown membership")
+
+    def test_recovery_is_capped_per_run(self):
+        n, cap = 5, 2
+        u.MAX_RECOVER = cap
+        try:
+            messages = {str(2000 + i).encode(): msg(2000 + i, ["Agent/Action"]) for i in range(1, n + 1)}
+            supa = FakeSupa([stored(ACCT_A, f"synthetic-{2000 + i}@example.org", GM(2000 + i), labeled=False)
+                             for i in range(1, n + 1)])
+            r = run_with([FakeIMAP(messages=messages, window=[])], [(ACCT_A, "pw")], supa)
+        finally:
+            u.MAX_RECOVER = 100
+        self.assertEqual(r["accounts"][0]["reconcile"]["recovered"], cap)
+        for i in range(1, n + 1):
+            labelled = supa.row(ACCT_A, f"synthetic-{2000 + i}@example.org")["labeled"]
+            self.assertEqual(labelled, i <= cap, f"only the first {cap} in message_id order are recovered")
+
+    def test_recovery_is_resumable_across_runs(self):
+        cap = 2
+        u.MAX_RECOVER = cap
+        try:
+            messages = {str(2000 + i).encode(): msg(2000 + i, ["Agent/Action"]) for i in range(1, 5)}
+            supa = FakeSupa([stored(ACCT_A, f"synthetic-{2000 + i}@example.org", GM(2000 + i), labeled=False)
+                             for i in range(1, 5)])
+            r1 = run_with([FakeIMAP(messages=messages, window=[])], [(ACCT_A, "pw")], supa)
+            r2 = run_with([FakeIMAP(messages=messages, window=[])], [(ACCT_A, "pw")], supa)
+        finally:
+            u.MAX_RECOVER = 100
+        self.assertEqual(r1["accounts"][0]["reconcile"]["recovered"], cap, "run 1 recovers the cap")
+        self.assertEqual(r2["accounts"][0]["reconcile"]["recovered"], cap, "run 2 resumes and recovers the rest")
+        for i in range(1, 5):
+            self.assertTrue(supa.row(ACCT_A, f"synthetic-{2000 + i}@example.org")["labeled"],
+                            f"every row recovered across the two runs ({i})")
+
+    def test_recovery_skips_rows_without_a_gmail_id_or_not_in_membership(self):
+        messages = {b"4001": msg(4001, ["Agent/Action"])}
+        supa = FakeSupa([stored(ACCT_A, "legacy@example.org", None, labeled=False),   # no gmail id to reconcile by
+                         stored(ACCT_A, "elsewhere@example.org", GM(4002), labeled=False)],  # not in the membership
+                        )
+        r = run_with([FakeIMAP(messages=messages, window=[])], [(ACCT_A, "pw")], supa)
+        self.assertEqual(r["accounts"][0]["reconcile"]["recovered"], 0)
+        self.assertFalse(supa.row(ACCT_A, "legacy@example.org")["labeled"])
+        self.assertFalse(supa.row(ACCT_A, "elsewhere@example.org")["labeled"])
+        self.assertEqual([op for op in supa.ops("update") if op[2].get("labeled") is True], [],
+                         "a membership-absent row is never re-labelled")
 
 
 class RunTests(unittest.TestCase):
