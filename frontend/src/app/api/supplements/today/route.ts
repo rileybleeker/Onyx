@@ -66,8 +66,14 @@ export async function GET() {
 
   const [intakesRes, compoundsRes, remindersRes] = today === guess ? await speculative : await readDay(today);
 
-  if (intakesRes.error) return NextResponse.json({ error: intakesRes.error.message }, { status: 500 });
-  if (compoundsRes.error) return NextResponse.json({ error: compoundsRes.error.message }, { status: 500 });
+  if (intakesRes.error) {
+    console.error("supplements/today intakes read", intakesRes.error.message);
+    return NextResponse.json({ error: "Couldn't load your supplements. Try again." }, { status: 500 });
+  }
+  if (compoundsRes.error) {
+    console.error("supplements/today compounds read", compoundsRes.error.message);
+    return NextResponse.json({ error: "Couldn't load your supplements. Try again." }, { status: 500 });
+  }
 
   type EmbeddedProduct = { brand_name: string | null; full_name: string | null; ingredients?: unknown };
   type Embedded = EmbeddedProduct | EmbeddedProduct[] | null;

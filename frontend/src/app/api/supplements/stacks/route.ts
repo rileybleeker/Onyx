@@ -57,7 +57,10 @@ export async function GET(req: NextRequest) {
   }
   if (!res.error) missingMemo = nextMemo(missingMemo, start, idx, now);
   const { data: stacks, error: stacksErr } = res;
-  if (stacksErr) return NextResponse.json({ error: stacksErr.message }, { status: 500 });
+  if (stacksErr) {
+    console.error("supplements/stacks read", stacksErr.message);
+    return NextResponse.json({ error: "Couldn't load your supplements. Try again." }, { status: 500 });
+  }
 
   type Product = { brand_name: string | null; full_name: string | null; serving_size: number | null; serving_unit: string | null; ingredients?: unknown; ingredient_count?: number | null; is_active: boolean };
   type Item = { item_id: number; product_id: string; doses: number; sort_order: number; supplement_products: Product | Product[] | null };
@@ -160,6 +163,9 @@ export async function DELETE(req: NextRequest) {
     .from("supplement_stack")
     .update({ is_active: false, updated_at: new Date().toISOString() })
     .eq("stack_id", stack_id);
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("supplements/stacks delete", error.message);
+    return NextResponse.json({ error: "Couldn't save that change. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ ok: true, stack_id });
 }

@@ -22,7 +22,8 @@ export async function GET(req: NextRequest) {
   if (!includeArchived) q = q.eq("is_active", true);
   const { data, error } = await q.order("brand_name", { ascending: true });
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("supplements/products read", error.message);
+    return NextResponse.json({ error: "Couldn't load your supplements. Try again." }, { status: 500 });
   }
   // Trim ingredients to just count + categories for list view payload size.
   const rows = (data ?? []).map((r) => {
@@ -69,6 +70,9 @@ export async function PATCH(req: NextRequest) {
     .from("supplement_products")
     .update({ is_active })
     .eq("product_id", product_id);
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("supplements/products update", error.message);
+    return NextResponse.json({ error: "Couldn't save that change. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ ok: true, product_id, is_active });
 }
