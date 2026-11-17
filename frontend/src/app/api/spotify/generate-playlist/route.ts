@@ -517,8 +517,10 @@ export async function POST(req: NextRequest) {
               }
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);
+              console.error(`spotify/generate-playlist tool ${block.name} failed:`, msg);
               resultStr = JSON.stringify({ error: msg });
-              summary = `Tool error: ${msg.slice(0, 120)}`;
+              // The summary is shown in the browser's live log, so it stays a fixed phrase.
+              summary = "Tool error";
             }
 
             send({ type: "tool_result", tool: block.name, summary });
@@ -551,7 +553,9 @@ export async function POST(req: NextRequest) {
         );
       } catch (e) {
         // A playlist already created counts as accepted even if a later call failed.
-        sendOutcome(e instanceof Error ? e.message : String(e));
+        // The detail (which may name database or provider internals) stays in server logs.
+        console.error("spotify/generate-playlist failed:", e);
+        sendOutcome("Couldn't build the playlist. Try again.");
       } finally {
         if (creationPending) {
           // Outcome unknown: the response ends now and the creation is waited for (the function
