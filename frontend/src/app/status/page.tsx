@@ -53,6 +53,7 @@ const SOURCE_BADGE: Record<string, string> = {
   ubereats: "UBER EATS",
   pc_activity: "PC",
   ai_usage: "PC",
+  medical_backup: "PC",
   nyc_scout: "AGENT",
   simplefin: "SIMPLEFIN",
   matrix_mat: "DB",
@@ -95,6 +96,7 @@ const SOURCE_BADGE_COLOR: Record<string, string> = {
   ubereats: "text-emerald-400/70",
   pc_activity: "text-slate-300",
   ai_usage: "text-violet-300",
+  medical_backup: "text-emerald-300",
   nyc_scout: "text-sky-400",
   simplefin: "text-lime-400",
   matrix_mat: "text-cyan-400/70",
@@ -168,6 +170,7 @@ const SOURCE_ORDER = [
   "ubereats",
   "pc_activity",
   "ai_usage",
+  "medical_backup",
   "nyc_scout",
   "simplefin",
   "matrix_mat",
@@ -335,6 +338,7 @@ const HISTORY_SOURCE_LABELS: Record<string, string> = {
   ubereats: "Uber Eats Items",
   pc_activity: "PC Activity",
   ai_usage: "AI Tool Usage",
+  backup: "Medical Backup",
   rocketmoney: "Rocket Money",
   simplefin: "SimpleFIN",
   matrix_mat: "Matrix Matview",
@@ -372,6 +376,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   balances: "Balances",
   keepalive: "Keep-alive",
   snapshot: "Snapshot",
+  medical_records: "Medical Records",
 };
 
 // "refreshed Xm ago" label, isolated from the page render cycle (perf round
