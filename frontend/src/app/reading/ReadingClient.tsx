@@ -6,7 +6,7 @@ import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CHECKPOINT_SIZE, CONCEPTS, checkpointOffer, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { CHECKPOINT_SIZE, checkpointOffer, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
@@ -14,7 +14,7 @@ import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightVa
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
 import { getJson } from "@/lib/reading-practice-client";
-import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, parseCheckpoint } from "@/lib/reading-map";
+import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, mapSignature, parseCheckpoint } from "@/lib/reading-map";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
 import ReadingList from "./ReadingList";
@@ -23,6 +23,7 @@ import PracticePart from "./PracticePart";
 import RetrievalSession from "./RetrievalSession";
 import ChapterMap from "./ChapterMap";
 import CheckpointQuiz from "./CheckpointQuiz";
+import ConceptPicker from "./ConceptPicker";
 
 /**
  * Which checkpoints held answers without a result, as last read, kept for the session (memory only, one entry per book
@@ -730,22 +731,18 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
               placeholder="ch."
               className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
             />
-            <select
+            {/* The concept tags: the book's own (pds.books.theme, none by default) plus the titles of its linked ideas. */}
+            <ConceptPicker
+              slug={o.book.slug}
+              on={o.practice?.enabled === true}
+              signature={mapSignature(o.practice)}
+              themeConcepts={o.theme?.concepts}
               value={concept}
-              onChange={(e) => {
-                setConcept(e.target.value);
-                commit({ concept: e.target.value });
+              onChange={(v) => {
+                setConcept(v);
+                commit({ concept: v });
               }}
-              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
-            >
-              <option value="">Concept (optional)</option>
-              {CONCEPTS.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-              <option value="__custom">Other…</option>
-            </select>
+            />
           </div>
           {concept === "__custom" && (
             <input
