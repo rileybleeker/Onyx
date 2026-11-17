@@ -895,7 +895,7 @@ test.describe("Capture carryovers — read-only opening", () => {
           }
           await settle(page); // allows delayed mount/autosave mistakes to reach the aborting guard
           ready = await panel.isVisible();
-          noLoadError = !(await panel.getByText(/Drinks are not set up yet|Couldn't load drinks|Your list isn't available yet|Couldn't load your list/).isVisible());
+          noLoadError = !(await panel.getByText(/Drinks are not set up yet|Drinks aren't available yet|Couldn't load drinks|Your list isn't available yet|Couldn't load your list/).isVisible());
           if (target === "reading") {
             // Compare private data inside the browser; only the boolean leaves this evaluation.
             listMatchesApi = await page.evaluate(async () => {

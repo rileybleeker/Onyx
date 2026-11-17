@@ -80,7 +80,7 @@ function checkDay(raw: unknown) {
 
 const SERVING_CHOICES = [0.5, 1, 1.5, 2, 3];
 const UNCHECKED_NAMES: Record<string, string> = { cronometer: "Cronometer", supplements: "supplements", delivery: "Uber Eats" };
-const UNAVAILABLE = "Drinks are not set up yet: the database migration is pending.";
+const UNAVAILABLE = "Drinks aren't available yet. Try again later. If this keeps happening, the drinks setup still needs to be finished.";
 
 /** What a logged entry counts in, so the choice offered is truthful. */
 function countsIn(o: OverlapCandidate): string {
