@@ -446,6 +446,24 @@ export class ChatLedger {
       : this.runFirst(tool, input, sha, intent, execute, context);
   }
 
+  /**
+   * A retry: the context an earlier try stored with this same call (same tool and arguments) when it ran, or null (a
+   * first try, no such call, a call that was refused, or the rows could not be read). Read-only; never throws. Lets the
+   * caller check a retried call against what it first ran with (the book it was pinned to), not this moment's state.
+   */
+  async storedContext(tool: string, input: unknown): Promise<OperationContext | null> {
+    if (!this.retry) return null;
+    const sha = intentSha(tool, input ?? {});
+    try {
+      const rows = await this.opts.store.listForRequest(this.opts.ownerId, this.opts.requestId);
+      const row = rows.filter((r) => r.tool === tool && r.intent_sha === sha && r.status !== "refused").sort((a, b) => a.ordinal - b.ordinal)[0];
+      return row ? asObject(row.context) ?? null : null;
+    } catch (e) {
+      this.report("list", e);
+      return null;
+    }
+  }
+
   /** Give the request's lease back so the next try of it can run. Never throws. */
   async release(): Promise<void> {
     if (!this.opts.attemptId) return;

@@ -197,6 +197,46 @@ const MATRIX = [
     "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_not_asked")],
   ["a quiz on another book", [user("Quiz me on Other Synthetic"), assistant("Question 1: who runs the plant?"), user("Alex")],
     "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("other_book")],
+
+  // Round 3 (Codex review of the round 2 head): each of these was allowed at round 2.
+  ["a record that is only the topic", [user("I read about Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("not_named")],
+  ["a report verb that is not an intake", [user("I ordered Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("not_named")],
+  ["a habit that is only the topic", [user("I read about Synthetic Stretching")], "mark_habit_complete", { habit: "Synthetic Stretching" }, refused("not_named")],
+  ["a request not to mark is never a No", [user("Don't mark Synthetic Stretching")], "mark_habit_complete", { habit: "Synthetic Stretching", answer: "No" }, refused("contradicts")],
+  ["a request not to mark is never a Yes", [user("Don't mark Synthetic Stretching")], "mark_habit_complete", { habit: "Synthetic Stretching" }, refused("contradicts")],
+  ["an item left out of a request is never a No", [user("Mark Meditated, not Synthetic Stretching")],
+    "mark_habit_complete", { habit: "Synthetic Stretching", answer: "No" }, refused("contradicts")],
+  ["a skipped habit in a report is still a No", [user("I meditated, not Synthetic Stretching")],
+    "mark_habit_complete", { habit: "Synthetic Stretching", answer: "No" }, ALLOWED],
+  ["a reason with a negation does not flip the action", [user("I didn't take Synthetic Calm because I forgot")],
+    "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
+  ["a reason with a negation keeps the action done", [user("I took Synthetic Calm because I couldn't sleep")],
+    "log_supplement_intake", { product: "Synthetic Calm" }, ALLOWED],
+  ["two negations are unclear", [user("I didn't skip Synthetic Stretching")], "mark_habit_complete", { habit: "Synthetic Stretching" }, refused("unclear")],
+  ["two negations are unclear for a No too", [user("I didn't skip Synthetic Stretching")],
+    "mark_habit_complete", { habit: "Synthetic Stretching", answer: "No" }, refused("unclear")],
+  ["one serving sent for a stated dose", [user("Log 30 mg Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 1, unit: "serving" }, refused("amount_not_stated")],
+  ["one serving for a bare number of servings", [user("I took 2 Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 1 }, refused("amount_not_stated")],
+  ["a bare number of servings left out", [user("I took 2 Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("amount_omitted")],
+  ["one serving with no amount stated", [user("Log Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 1, unit: "serving" }, ALLOWED],
+  ["a number in the name is not an amount", [user("Log my Synthetic Omega 3")], "log_supplement_intake", { product: "Synthetic Omega 3" }, ALLOWED],
+  ["a time sent twice, said once", [user("Log Synthetic Calm at 8")], "log_supplement_intake", { product: "Synthetic Calm", times: ["08:00", "08:00"] }, refused("time_not_stated")],
+  ["a time sent twice, said twice", [user("Log Synthetic Calm at 8 and again at 8pm")],
+    "log_supplement_intake", { product: "Synthetic Calm", times: ["08:00", "20:00"] }, ALLOWED],
+  ["one of two stated times left out", [user("Log Synthetic Calm at 8 and noon")], "log_supplement_intake", { product: "Synthetic Calm", times: ["08:00"] }, refused("time_omitted")],
+  ["a time shared by the list, left out", [user("Log Synthetic Calm and Synthetic Focus at 9pm")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("time_omitted")],
+  ["minutes sent as the chapter", [user("I read chapter 4 for 12 minutes")], "log_reading_session", { chapter_through: 12, minutes: 4 }, refused("not_named")],
+  ["the chapter sent as minutes", [user("I read chapter 4 for 12 minutes")], "log_reading_session", { chapter_through: 4, minutes: 4 }, refused("amount_not_stated")],
+  ["chapter and minutes each in their place", [user("I read chapter 4 for 12 minutes")], "log_reading_session", { chapter_through: 4, minutes: 12 }, ALLOWED],
+  ["an hour of reading", [user("I read chapters 3 and 4 for an hour")], "log_reading_session", { chapter_from: 3, chapter_through: 4, minutes: 60 }, ALLOWED],
+  ["a quiz stopped with a request not to record", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz; don't record a score")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("contradicts")],
+  ["a quiz stopped", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Cancel the quiz"),
+    assistant("Okay. Want to know anything else?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("quiz_cancelled")],
+  ["don't log it refuses every write", [user("I took Synthetic Calm, don't log it")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
+  ["a sleep question said for today, stored on last night", [user("I used my synthetic mouth tape today")],
+    "mark_habit_complete", { habit: "Used synthetic mouth tape?" }, ALLOWED],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -278,4 +318,13 @@ test("a reading write is refused when the books could not be read", () => {
   assert.deepEqual(decide([user("I read chapter 4")], "log_reading_session", { chapter_through: 4 }, { books: null }), refused("book_unknown"));
   // Other writes do not need the books.
   assert.deepEqual(decide([user("Log my Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm" }, { books: null }), ALLOWED);
+});
+
+test("a retry is checked against the book its earlier try was pinned to (the route passes it as the book being read)", () => {
+  // The first try finished the book, so no book is being read any more: checked against now, the retry is refused
+  // before the ledger can answer it from the stored result.
+  const finished = { active: null, list: BOOKS.list };
+  assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: finished }), refused("not_named"));
+  // With the pinned book (ChatLedger.storedContext book_id, mapped to its slug) it reaches the ledger.
+  assert.deepEqual(decide([user("I finished the book")], "log_reading_session", { chapter_through: 20 }, { books: BOOKS }), ALLOWED);
 });

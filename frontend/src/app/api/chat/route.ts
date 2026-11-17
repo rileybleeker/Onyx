@@ -615,13 +615,18 @@ async function currentBookId(): Promise<number | undefined> {
  */
 async function readingBooks(): Promise<ReadingBooks | null> {
   try {
-    const { data, error } = await supabase.from("books").select("slug,title,status,total_chapters").order("created_at", { ascending: false });
+    const { data, error } = await supabase.from("books").select("book_id,slug,title,status,total_chapters").order("created_at", { ascending: false });
     if (error) return null;
     const list: ReadingBooks["list"][number][] = [];
     let active: string | null = null;
     for (const b of (Array.isArray(data) ? data : []) as Array<Record<string, unknown>>) {
       if (typeof b?.slug !== "string" || typeof b?.title !== "string") continue;
-      list.push({ slug: b.slug, title: b.title, total_chapters: typeof b.total_chapters === "number" ? b.total_chapters : null });
+      list.push({
+        slug: b.slug,
+        title: b.title,
+        total_chapters: typeof b.total_chapters === "number" ? b.total_chapters : null,
+        ...(typeof b.book_id === "number" ? { id: b.book_id } : {}),
+      });
       if (active === null && b.status === "reading") active = b.slug;
     }
     return { active, list };
@@ -1883,7 +1888,14 @@ export async function POST(req: NextRequest) {
           const input = block.input as Record<string, unknown>;
           let outcome: { result: string; failed: boolean; receipt: WriteReceipt | null };
           // A reading write goes to the book the user named, or the book being read when they name none.
-          const readingCtx = isWriteTool(block.name) && READING_BOOK_TOOLS.has(block.name) ? await (books ??= readingBooks()) : null;
+          let readingCtx = isWriteTool(block.name) && READING_BOOK_TOOLS.has(block.name) ? await (books ??= readingBooks()) : null;
+          // A retry of a call an earlier try ran is checked against the book that try was pinned to, not the one being
+          // read now: "I finished the book" finished it, and the retry must reach the ledger to get its stored result.
+          if (readingCtx && ledger?.retry) {
+            const pinned = (await ledger.storedContext(block.name, input ?? {}))?.book_id;
+            const slug = typeof pinned === "number" ? readingCtx.list.find((b) => b.id === pinned)?.slug : undefined;
+            if (slug) readingCtx = { ...readingCtx, active: slug };
+          }
           const decision = isWriteTool(block.name)
             ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
             : null;

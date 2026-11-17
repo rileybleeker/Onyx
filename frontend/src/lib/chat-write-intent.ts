@@ -10,13 +10,20 @@
  *
  * The latest message is read as a list of ACTIONS. An action is one thing the user asks for or reports ("log 15 mg of
  * X at 8:30", "I skipped Y"), in a clause that is not a question, a condition ("if I take…"), a plan, a hedge or quoted
- * text, with the argument-only clauses that follow it ("…and noon"). Each write call has to match one action:
- *   - the action names the call's record (product, stack, habit), with the same polarity: "I skipped X" allows the
- *     answer No for X and nothing that says X was done, "I didn't take X" / "don't log X" logs nothing for X, and a
- *     record named both ways is refused;
+ * text, with the argument-only clauses that follow it ("…and noon"). A reason or circumstance ("…because I forgot",
+ * "…since I couldn't sleep") is not part of the action. Each write call has to match one action:
+ *   - the action names the call's record (product, stack, habit) as its object (not "I read about X"), with a verb
+ *     that fits the write ("log"/"record"/"mark"… or "took"/"had" for an intake; "I bought X" logs nothing), and the
+ *     same polarity, read from the action's own clause (never by counting negations): "I skipped X" allows the
+ *     answer No for X and nothing that says X was done, "I didn't take X" logs nothing for X, a record named both ways
+ *     is refused, and a statement whose polarity cannot be read ("I didn't skip X", "…without X") refuses it;
+ *   - "don't log X" / "don't mark X" / "log Y, not X" is a request not to write X: it grants nothing (never a No) and
+ *     refuses any write of X; "don't log it" refuses every write of the message;
  *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
- *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules), the clock
- *     times, the chapters and minutes; an amount or a time the action states cannot be left out;
+ *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules, and one
+ *     serving only when no other amount is stated), the clock times one to one (a time sent twice has to be said
+ *     twice; every time said is sent), the chapters as chapter numbers and the minutes as a duration ("chapter 4
+ *     for 12 minutes" never gives chapter 12); an amount or a time the action states cannot be left out;
  *   - the day the call would write (its date, or the tool's default when it sends none) has to be the day the action
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
@@ -27,8 +34,8 @@
  *   - text stored as the user's words (a recall note, a question, a passage, a comment) has to be a verbatim span of
  *     the user's words (case, spacing and punctuation aside), so a negation cannot be dropped or added;
  *   - a playlist only on an explicit request (never a report), a quiz result only for a quiz the user asked for and
- *     answered (score within the questions asked and answered, not already recorded) or that the user states, each at
- *     most once per request.
+ *     answered (score within the questions asked and answered, not stopped, not already recorded) or that the user
+ *     states, each at most once per request, and never after "don't record a score".
  * Quoted text is someone else's words and grants nothing: "double quotes" and curly quotes (also over several lines;
  * an opening quote that is never closed masks the rest), block quotes (with their continuation lines), fenced code
  * blocks and inline code. A refused call never runs; its receipt says why. Pure and import-free (types only), so it
@@ -44,7 +51,15 @@ export interface IntentMessage { role: "user" | "assistant"; content: string }
  * `action`: the action it belongs to (a clause naming a record and the argument-only clauses after it share one).
  * `chain`: the request or report it continues (a list is one chain). `sentence`: its masked sentence.
  */
-interface IntentClause { text: string; imperative: boolean; negated: boolean; action: number; chain: number; sentence: string }
+interface IntentClause {
+  text: string; imperative: boolean; negated: boolean; action: number; chain: number; sentence: string;
+  /** A request NOT to write ("don't log X", "do not mark Y"): grants nothing and refuses any write of what it names. */
+  prohibition: boolean;
+  /** Its polarity cannot be read (two negations, "without…"): refuses any write of what it names. */
+  ambiguous: boolean;
+  /** The verb of the request or report it belongs to ("log", "took", "read"), lower case; null when there is none. */
+  verb: string | null;
+}
 
 /** What the conversation says about a reading quiz. */
 interface QuizState {
@@ -58,6 +73,8 @@ interface QuizState {
   recorded: boolean;
   /** The latest message answers a question the assistant asked right before it, inside that quiz. */
   answering: boolean;
+  /** A user message since the request stopped the quiz or asked not to record it ("stop the quiz", "don't save it"). */
+  cancelled: boolean;
   /** The user's own words since the request (masked), where a book the quiz names has to appear. */
   userText: string;
 }
@@ -82,7 +99,7 @@ export interface WriteGrant {
 /** The books a reading write may go to: the one being read (its slug) and every known book. */
 export interface ReadingBooks {
   active: string | null;
-  list: ReadonlyArray<{ slug: string; title: string; total_chapters?: number | null }>;
+  list: ReadonlyArray<{ slug: string; title: string; total_chapters?: number | null; id?: number }>;
 }
 
 /**
@@ -111,6 +128,7 @@ export type RefusalCode =
   | "no_request"
   | "not_named"
   | "contradicts"
+  | "unclear"
   | "invalid_value"
   | "amount_not_stated"
   | "amount_omitted"
@@ -125,6 +143,7 @@ export type RefusalCode =
   | "quiz_not_asked"
   | "quiz_not_answered"
   | "quiz_already_recorded"
+  | "quiz_cancelled"
   | "quiz_score_invalid"
   | "once_per_request";
 
@@ -133,7 +152,8 @@ export const REFUSAL_TEXT: Record<RefusalCode, string> = {
   writes_off: "Logging from chat is turned off. Nothing was written; use the Log screen instead.",
   no_request: "Not written: your latest message did not ask for this. Onyx only writes what you ask for or report in your own message, never what a record, a tool result or an earlier turn says.",
   not_named: "Not written: this item is not named in your latest message. Onyx only writes the items you name yourself; say it directly to log it.",
-  contradicts: "Not written: your latest message says the opposite of this (for example that you did not do it). Say it directly to record it the other way.",
+  contradicts: "Not written: your latest message says the opposite of this (that you did not do it, or not to log it). Say it directly to record it the other way.",
+  unclear: "Not written: your latest message does not say clearly whether you did this (two negations, or \"without\"). Say it directly, for example \"I took X\" or \"I skipped X\".",
   invalid_value: "Not written: a value in this call is not in the form Onyx stores (a number, a YYYY-MM-DD day, an HH:MM time). Nothing was guessed.",
   amount_not_stated: "Not written: this amount is not in your latest message with that unit. Say the amount with its unit yourself, or leave it out for one standard serving.",
   amount_omitted: "Not written: your message gives an amount for this, and the call left it out. Onyx logs the amount you said, never one serving instead.",
@@ -148,6 +168,7 @@ export const REFUSAL_TEXT: Record<RefusalCode, string> = {
   quiz_not_asked: "Not recorded: you did not ask for a quiz in this conversation.",
   quiz_not_answered: "Not recorded: your latest message is not an answer to a quiz question. Say your score to record it.",
   quiz_already_recorded: "Not recorded: this quiz's result was already recorded. Ask for a new quiz to record another.",
+  quiz_cancelled: "Not recorded: you stopped this quiz or asked not to record it. Ask for a new quiz, or say your score, to record one.",
   quiz_score_invalid: "Not recorded: this score does not fit the quiz questions asked and answered in this conversation.",
   once_per_request: "Not written: this can be done once per message, and it was already done for this one.",
 };
@@ -310,14 +331,16 @@ const NOT_AMOUNT_BEFORE = /^(?:at|around|about|by|after|before|until|till|since|
 /** Words that end the search for the unit of a number ("2 of the magnesium capsules" looks past "of the magnesium"). */
 const UNIT_SEARCH_STOP = /^(?:and|or|but|then|plus|at|with|around|by|before|after|on|yesterday|today|tonight|this|last)$/;
 
-interface Quantity { value: number; unit: string | null }
+interface Quantity { value: number; unit: string | null; word: string }
 
 /**
  * The amounts a text states, each with the unit said after it ("15 mg", "2 capsules", "2 magnesium capsules", "half a
  * tablet"). A number glued into a word ("B12", "D3", "5-HTP" stays "5" with no unit) is not read as a unit amount.
  */
 function quantities(text: string): Quantity[] {
-  const toks = norm(text).match(/[a-z]+\d[a-z\d]*|\d+(?:\.\d+)?|[a-z]+(?:'[a-z]+)?|:/g) ?? [];
+  // A written date ("2026-11-10", "11/10") is a day, never amounts.
+  const dateless = norm(text).replace(/\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, " ");
+  const toks = dateless.match(/[a-z]+\d[a-z\d]*|\d+(?:\.\d+)?|[a-z]+(?:'[a-z]+)?|:/g) ?? [];
   const out: Quantity[] = [];
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
@@ -338,7 +361,7 @@ function quantities(text: string): Quantity[] {
       if (kind) { unit = kind; break; }
     }
     if (unit === null && prev !== undefined && NOT_AMOUNT_BEFORE.test(prev)) continue;
-    out.push({ value, unit });
+    out.push({ value, unit, word: t });
   }
   return out;
 }
@@ -347,53 +370,148 @@ function quantities(text: string): Quantity[] {
  * `amount` of `unit` (as a tool call sends them) was stated in `text` with the same unit kind. A number said with no
  * unit is a number of servings ("I took 2 Synthetic Calm"). One serving needs no words (it is what no amount logs).
  */
-function amountStated(amount: number, unit: string | null, text: string): boolean {
+function amountStated(amount: number, unit: string | null, text: string, record: string): boolean {
   const kind = callUnit(unit);
-  if (amount === 1 && kind === "serving") return true;
+  // One serving is what no amount logs: it needs no words, unless the text states another amount ("30 mg").
+  if (amount === 1 && kind === "serving") return !statesAmount(text, record);
   return quantities(text).some((q) => q.value === amount && (q.unit ?? "serving") === kind);
 }
 
-/** The text states an amount with a unit (an amount the call may not leave out). One serving said in words is none. */
-const statesAmount = (text: string) => quantities(text).some((q) => q.unit !== null && !(q.unit === "serving" && q.value === 1));
+/**
+ * The text states an amount for `record` that a call may not leave out or replace with one serving: a number with a
+ * unit ("30 mg", "2 capsules"), or a bare number of servings ("2 Synthetic Calm"). One serving said in words is none,
+ * a word like "both" is no amount, and a number that is part of the record's own name ("Omega 3") is not an amount.
+ */
+function statesAmount(text: string, record: string): boolean {
+  const inName = numbersIn(record);
+  return quantities(text).some((q) => {
+    if ((q.unit === null || q.unit === "serving") && q.value === 1) return false;
+    if (q.unit !== null) return true;
+    return !/^(?:a|an|single|both|couple)$/.test(q.word) && !inName.has(q.value);
+  });
+}
 
 // --- Clock times -----------------------------------------------------------------------------------------------
 
 const UNIT_AFTER = /^\s*(?:mg|mcg|g|iu|ml|%|min|mins|minutes?|hours?|capsules?|tablets?|pills?|scoops?|servings?|caps?|tabs?|chapters?)\b/;
 
-/** The clock times a text states, as "H:MM" (24 h; both readings when no am / pm was said) or "H:*" for an hour alone. */
-function clockTimes(text: string): Set<string> {
-  const out = new Set<string>();
-  const add = (h: number, mm: string, meridiem: string | null) => {
-    if (!Number.isInteger(h) || h < 0 || h > 23) return;
+/**
+ * The clock times a text states, one entry per time said (in the order said), each with its readings as "H:MM"
+ * (24 h; both readings when no am / pm was said) or "H:*" for an hour alone. A time is read once even when two
+ * patterns match it ("at 8 pm").
+ */
+function clockSlots(text: string): Array<Set<string>> {
+  const found: Array<{ from: number; to: number; readings: Set<string> }> = [];
+  const reading = (h: number, mm: string, meridiem: string | null): Set<string> => {
+    const out = new Set<string>();
+    if (!Number.isInteger(h) || h < 0 || h > 23) return out;
     if (meridiem) {
       const pm = meridiem.startsWith("p");
-      if (h < 1 || h > 12) return;
+      if (h < 1 || h > 12) return out;
       out.add(`${(h % 12) + (pm ? 12 : 0)}:${mm}`);
     } else {
       out.add(`${h}:${mm}`);
       if (h >= 1 && h < 12) out.add(`${h + 12}:${mm}`);
       if (h === 12) out.add(`0:${mm}`);
     }
+    return out;
+  };
+  const push = (m: RegExpMatchArray, readings: Set<string>) => {
+    const from = m.index ?? 0, to = from + m[0].length;
+    if (readings.size === 0 || found.some((f) => from < f.to && f.from < to)) return;
+    found.push({ from, to, readings });
   };
   const t = norm(text);
-  for (const m of t.matchAll(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)(?![a-z])/g)) add(Number(m[1]), m[2] ?? "*", m[3]);
-  for (const m of t.matchAll(/\b(\d{1,2}):(\d{2})\b(?!\s*(?:a\.?m|p\.?m))/g)) add(Number(m[1]), m[2], null);
+  for (const m of t.matchAll(/\bhalf past (\d{1,2})(?:\s*(a\.?m\.?|p\.?m\.?)(?![a-z]))?/g)) push(m, reading(Number(m[1]), "30", m[2] ?? null));
+  for (const m of t.matchAll(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)(?![a-z])/g)) push(m, reading(Number(m[1]), m[2] ?? "*", m[3]));
+  for (const m of t.matchAll(/\b(\d{1,2}):(\d{2})\b(?!\s*(?:a\.?m|p\.?m))/g)) push(m, reading(Number(m[1]), m[2], null));
   for (const m of t.matchAll(/\b(?:at|around|about|by|before|after)\s+(\d{1,2})\b(?![:.]\d)/g)) {
-    if (!UNIT_AFTER.test(t.slice((m.index ?? 0) + m[0].length))) add(Number(m[1]), "*", null);
+    if (!UNIT_AFTER.test(t.slice((m.index ?? 0) + m[0].length))) push(m, reading(Number(m[1]), "*", null));
   }
-  for (const m of t.matchAll(/\b(\d{1,2})\s*o'clock\b/g)) add(Number(m[1]), "*", null);
-  for (const m of t.matchAll(/\bhalf past (\d{1,2})\b/g)) add(Number(m[1]), "30", null);
-  if (/\b(?:noon|midday)\b/.test(t)) out.add("12:*");
-  if (/\bmidnight\b/.test(t)) out.add("0:*");
-  return out;
+  for (const m of t.matchAll(/\b(\d{1,2})\s*o'clock\b/g)) push(m, reading(Number(m[1]), "*", null));
+  for (const m of t.matchAll(/\b(?:noon|midday)\b/g)) push(m, new Set(["12:*"]));
+  for (const m of t.matchAll(/\bmidnight\b/g)) push(m, new Set(["0:*"]));
+  return found.sort((a, b) => a.from - b.from).map((f) => f.readings);
 }
 
-/** A "HH:MM" time the model sends was stated: the same hour (and minutes, when they were said). */
-function timeStated(time: string, clock: Set<string>): boolean {
+/** A "HH:MM" time the model sends is one reading of a stated time: the same hour (and minutes, when they were said). */
+function timeFits(time: string, readings: Set<string>): boolean {
   const m = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
   if (!m) return false;
   const h = Number(m[1]);
-  return clock.has(`${h}:${m[2]}`) || clock.has(`${h}:*`);
+  return readings.has(`${h}:${m[2]}`) || readings.has(`${h}:*`);
+}
+
+/**
+ * The call's times matched one to one to the times stated: each call time to its own stated time (two copies of one
+ * time need it said twice). `all`: every stated time has to be used (none left out). Small inputs: plain search.
+ */
+function timesMatch(times: string[], slots: Array<Set<string>>, all: boolean): boolean {
+  if (times.length > slots.length || (all && times.length !== slots.length)) return false;
+  const used = new Array<boolean>(slots.length).fill(false);
+  const place = (i: number): boolean => {
+    if (i === times.length) return true;
+    for (let k = 0; k < slots.length; k++) {
+      if (used[k] || !timeFits(times[i], slots[k])) continue;
+      used[k] = true;
+      if (place(i + 1)) return true;
+      used[k] = false;
+    }
+    return false;
+  };
+  return place(0);
+}
+
+// --- Chapters and minutes --------------------------------------------------------------------------------------
+
+/** A number word that can be a chapter ("four"), not one that only means a count ("a", "both"). */
+const chapterNumber = (w: string): number | undefined => {
+  if (/^\d+$/.test(w)) return Number(w);
+  const n = own(NUMBER_WORDS, w);
+  return n !== undefined && Number.isInteger(n) && n >= 1 && !/^(?:a|an|single|both|couple)$/.test(w) ? n : undefined;
+};
+
+/** The chapter numbers a text states: "chapter 4", "chapters 3 and 4", "ch. 5-7", "chapters three through five". */
+function chapterNumbers(text: string): Set<number> {
+  const out = new Set<number>();
+  // A line break joins the clauses of one list ("chapters 3" / "4 for an hour" from "chapters 3 and 4 for an hour").
+  const toks = norm(text).match(/\d+|[a-z]+(?:'[a-z]+)?|[-–&,\n]/g) ?? [];
+  for (let i = 0; i < toks.length; i++) {
+    if (!/^(?:chapters?|ch|chap)$/.test(toks[i])) continue;
+    let expectNumber = true;
+    for (let j = i + 1; j < toks.length; j++) {
+      const w = toks[j];
+      const n = expectNumber ? chapterNumber(w) : undefined;
+      if (n !== undefined) { out.add(n); expectNumber = false; continue; }
+      if (!expectNumber && /^(?:and|to|through|thru|or|-|–|&|,|\n)$/.test(w)) { expectNumber = true; continue; }
+      break;
+    }
+  }
+  return out;
+}
+
+/** The durations a text states, in minutes: "40 minutes", "an hour", "1.5 hours", "half an hour", "twenty five min". */
+function minuteValues(text: string): Set<number> {
+  const out = new Set<number>();
+  const t = norm(text);
+  if (/\bhalf (?:an )?hour\b/.test(t)) out.add(30);
+  if (/\b(?:an|one) hour and a half\b/.test(t)) out.add(90);
+  for (const m of t.matchAll(/\b(\d+(?:\.\d+)?|[a-z]+(?: [a-z]+)?)\s*-?\s*(min|mins|minutes?|hours?|hrs?)\b/g)) {
+    const words = m[1].split(" ");
+    // "half an hour" and "an hour and a half" are read above, never as one hour.
+    if (words.includes("half") || /^\s+and a half\b/.test(t.slice((m.index ?? 0) + m[0].length))) continue;
+    let n: number | undefined;
+    if (/^\d/.test(m[1])) n = Number(m[1]);
+    else {
+      // "twenty five", or the last word alone ("read for forty minutes").
+      const first = own(NUMBER_WORDS, words[0]), second = own(NUMBER_WORDS, words[1]);
+      if (words.length === 2 && first !== undefined && second !== undefined && first >= 20 && first % 10 === 0 && second < 10) n = first + second;
+      else n = own(NUMBER_WORDS, words[words.length - 1]);
+    }
+    if (n === undefined || !(n > 0)) continue;
+    out.add(/^h/.test(m[2]) ? n * 60 : n);
+  }
+  return out;
 }
 
 // --- Days ------------------------------------------------------------------------------------------------------
@@ -584,7 +702,7 @@ const NEG_IMPERATIVE = new RegExp(`^(?:please\\s+|and\\s+|but\\s+|actually[\\s,]
 
 /** Verbs that report something the user did. */
 const PAST =
-  /^(took|had|did|didn't|didnt|read|ran|wore|ate|drank|slept|went|got|swam|rode|kept|made|put|skipped|finished|completed|listened|meditated|journaled|journalled|stretched|exercised|walked|used|wrote|studied|practiced|practised|played|lifted|trained|done|used|forgot)$/;
+  /^(took|had|did|didn't|didnt|read|ran|wore|ate|drank|slept|went|got|swam|rode|kept|made|put|skipped|finished|completed|listened|meditated|journaled|journalled|stretched|exercised|walked|used|wrote|studied|practiced|practised|played|lifted|trained|done|used|forgot|taken)$/;
 
 /** Marks a report clause as planned, uncertain or a question: never a report. */
 const HYPOTHETICAL =
@@ -604,8 +722,9 @@ function conditional(s: string): boolean {
   return false;
 }
 
-function isReport(s: string): boolean {
-  if (HYPOTHETICAL.test(s)) return false;
+/** The verb of a clause that reports something the user did ("took", "meditated", "didn't"), or null: not a report. */
+function reportVerb(s: string): string | null {
+  if (HYPOTHETICAL.test(s)) return null;
   const words = tokens(s);
   // "I took…", "I've just finished…", "today I meditated…"
   for (let i = 0; i < words.length; i++) {
@@ -613,20 +732,46 @@ function isReport(s: string): boolean {
     let j = i + 1;
     while (["just", "already", "also", "have", "finally", "actually", "really"].includes(words[j])) j++;
     const verb = words[j];
-    if (verb && (PAST.test(verb) || (verb.length > 4 && verb.endsWith("ed")))) return true;
-    if (verb === "did" && words[j + 1] === "not") return true;
+    if (verb && (PAST.test(verb) || (verb.length > 4 && verb.endsWith("ed")))) return verb;
+    if (verb === "did" && words[j + 1] === "not") return "did";
   }
   // Elliptical: "Finished chapters 3 and 4", "Took my evening stack".
   const first = words[0];
-  return !!first && first !== "did" && PAST.test(first);
+  return first && first !== "did" && PAST.test(first) ? first : null;
 }
 
-/** Words that say something was not done. An even count cancels out ("I didn't skip it"). */
+/** Words that say something was not done. */
 const NEGATION =
-  /\b(?:not|no|never|none|nothing|didn't|didnt|don't|dont|doesn't|haven't|havent|hasn't|hadn't|wasn't|weren't|won't|wont|isn't|aren't|can't|cannot|couldn't|skipped|skip|skipping|forgot|forget|missed|miss|without|neither|nor|except|excluding|minus)\b/g;
+  /\b(?:not|no|never|none|nothing|didn't|didnt|don't|dont|doesn't|haven't|havent|hasn't|hadn't|wasn't|weren't|won't|wont|isn't|aren't|can't|cannot|couldn't|skipped|skip|skipping|forgot|forget|missed|miss)\b/g;
+/** Words that leave part of a statement out; only a clause that starts with one ("not X", "except X") reads as a No. */
+const PARTIAL_NEGATION = /\b(?:without|neither|nor|except|excluding|minus)\b/g;
 /** Phrases with "no" that do not say anything was not done. */
 const NOT_NEGATION = /\bno (?:rush|worries|problem|problems|hurry|biggie|pressure)\b/g;
-const negated = (s: string) => (s.replace(NOT_NEGATION, " ").match(NEGATION)?.length ?? 0) % 2 === 1;
+/**
+ * The words after these give a reason or a circumstance ("…because I forgot", "…since I couldn't sleep"): they are
+ * not the action, so they never change its polarity, name its record or carry its arguments.
+ */
+const SUBORDINATE = /\b(?:because|since|cause|cuz|cos|though|although|while|whereas|so that)\b/;
+
+type Polarity = "pos" | "neg" | "ambiguous";
+
+/**
+ * What a clause says about its action: done ("pos"), not done ("neg"), or not clear ("ambiguous": two negations,
+ * "I didn't skip it"; or "without" / "except" inside it, "I meditated without music"). Read from the clause before any
+ * reason or circumstance (SUBORDINATE), never by counting negations over the whole clause.
+ */
+function polarity(s: string): Polarity {
+  const main = mainPart(s).replace(NOT_NEGATION, " ");
+  const strong = main.match(NEGATION)?.length ?? 0;
+  const partial = main.match(PARTIAL_NEGATION)?.length ?? 0;
+  if (partial > 0) return partial === 1 && strong === 0 && EXCLUDES.test(main) ? "neg" : "ambiguous";
+  return strong === 0 ? "pos" : strong === 1 ? "neg" : "ambiguous";
+}
+/** The clause up to its first reason or circumstance: the part that states the action. */
+function mainPart(s: string): string {
+  return s.split(SUBORDINATE)[0].trim();
+}
+const negated = (s: string) => polarity(s) !== "pos";
 
 /** A clause that starts its own statement (a subject, a question word, another command): it does not continue a list. */
 const OWN_START =
@@ -644,7 +789,7 @@ const CLAUSE_SEP = /(\s*,\s*|\s*:\s*|\s+(?:and|but|then|plus)\s+)/;
 
 /** Words that only carry an argument (a time, a day, an amount, a chapter), never a record. */
 const ARGUMENT_WORD =
-  /^(?:\d+(?:\.\d+)?|\d+(?:st|nd|rd|th)|am|pm|a|p|m|noon|midday|midnight|o'clock|half|past|quarter|at|around|about|by|before|after|on|the|this|last|of|ago|again|too|yesterday|today|tonight|morning|afternoon|evening|night|day|days|week|weeks|weekend|for|min|mins|minutes?|hours?|hrs?|chapters?|ch|pages?|through|thru|to|and|or|st|nd|rd|th|another|more|each|other|earlier|later)$/;
+  /^(?:\d+(?:\.\d+)?|\d+(?:st|nd|rd|th|am|pm)|am|pm|a|p|m|noon|midday|midnight|o'clock|half|past|quarter|at|around|about|by|before|after|on|the|this|last|of|ago|again|too|yesterday|today|tonight|morning|afternoon|evening|night|day|days|week|weeks|weekend|for|min|mins|minutes?|hours?|hrs?|chapters?|ch|pages?|through|thru|to|and|or|st|nd|rd|th|another|more|each|other|earlier|later)$/;
 
 /** The clause only carries arguments of the action before it ("…and noon", "…and 4", "40 minutes"). */
 function argumentOnly(clause: string): boolean {
@@ -665,7 +810,7 @@ function argumentOnly(clause: string): boolean {
 function intentClauses(text: string): IntentClause[] {
   const masked = maskQuotes(text);
   const out: IntentClause[] = [];
-  type Chain = { imperative: boolean; negated: boolean; id: number; actionNegated: boolean };
+  type Chain = { imperative: boolean; negated: boolean; prohibition: boolean; verb: string | null; id: number; actionNegated: boolean };
   let chain: Chain | null = null;
   let lastChain: Chain | null = null;
   let action = -1;
@@ -678,29 +823,43 @@ function intentClauses(text: string): IntentClause[] {
     const parts = sentence.split(CLAUSE_SEP);
     for (let k = 0; k < parts.length; k++) {
       if (k % 2 === 1) { if (parts[k].includes(":")) afterColon = true; continue; }
-      const clause = parts[k].replace(/\u0001/g, ":").replace(/^[\s,:;\-–—*•]+/, "").trim();
-      if (!clause) continue;
-      const negRequest = !afterColon && NEG_IMPERATIVE.test(clause);
-      const imperative = negRequest || (!afterColon && IMPERATIVE.test(clause));
+      const whole = parts[k].replace(/\u0001/g, ":").replace(/^[\s,:;\-–—*•]+/, "").trim();
+      if (!whole) continue;
+      // The action is what the clause says before any reason or circumstance ("…because I forgot"): only that part
+      // gives its polarity, names its record and carries its arguments. A clause that is only a reason ends the list.
+      const clause = mainPart(whole);
+      if (!clause) { chain = null; continue; }
+      const pol = polarity(clause);
+      const negMatch = afterColon ? null : NEG_IMPERATIVE.exec(clause);
+      const posMatch = afterColon || negMatch ? null : IMPERATIVE.exec(clause);
+      const imperative = negMatch !== null || posMatch !== null;
       // A report phrased as a question ("I had two coffees, is that why…?") is a question, not a logging request.
-      const report = !imperative && term !== "?" && isReport(clause);
-      if (imperative || report) {
-        if (imperative && !negRequest && HEDGED_REQUEST.test(clause)) { chain = null; continue; }
-        const neg = negRequest || negated(clause);
-        chain = { imperative, negated: neg, id: ++chains, actionNegated: neg };
-        out.push({ text: clause, imperative, negated: neg, action: ++action, chain: chain.id, sentence: sentenceText });
+      const reported = !imperative && term !== "?" ? reportVerb(clause) : null;
+      if (imperative || reported) {
+        if (posMatch && HEDGED_REQUEST.test(clause)) { chain = null; continue; }
+        // "Don't log X" asks for nothing and refuses X; "mark X as not done" asks for a No.
+        const prohibition = negMatch !== null;
+        const verb = negMatch?.[1] ?? posMatch?.[1] ?? reported;
+        const neg = prohibition || pol !== "pos";
+        chain = { imperative, negated: neg, prohibition, verb, id: ++chains, actionNegated: neg };
+        out.push({ text: clause, imperative, negated: neg, prohibition, ambiguous: !prohibition && pol === "ambiguous", verb, action: ++action, chain: chain.id, sentence: sentenceText });
         continue;
       }
       // "Not Synthetic Focus though." after a list in the sentence before it.
       const base: Chain | null = chain ?? (k === 0 && lastChain && EXCLUDES.test(clause) ? lastChain : null);
       if (base && !OWN_START.test(clause) && !HYPOTHETICAL.test(clause) && !HAS_VERB.test(clause)) {
         chain = base;
-        const neg = base.negated || negated(clause);
+        const neg = base.negated || pol !== "pos";
+        // An item left out of a request ("log X, not Y") is not to be logged, never a request to record a No.
+        const prohibition = base.prohibition || (base.imperative && !base.negated && neg);
+        const ambiguous = !prohibition && pol === "ambiguous";
         if (argumentOnly(clause)) {
-          if (neg === base.actionNegated && action >= 0) out.push({ text: clause, imperative: base.imperative, negated: neg, action, chain: base.id, sentence: sentenceText });
+          if (!ambiguous && neg === base.actionNegated && action >= 0) {
+            out.push({ text: clause, imperative: base.imperative, negated: neg, prohibition, ambiguous, verb: base.verb, action, chain: base.id, sentence: sentenceText });
+          }
         } else {
           base.actionNegated = neg;
-          out.push({ text: clause, imperative: base.imperative, negated: neg, action: ++action, chain: base.id, sentence: sentenceText });
+          out.push({ text: clause, imperative: base.imperative, negated: neg, prohibition, ambiguous, verb: base.verb, action: ++action, chain: base.id, sentence: sentenceText });
         }
       } else {
         chain = null;
@@ -733,13 +892,22 @@ function acceptedOffer(text: string): IntentClause | null {
   const [start, end] = questions[0];
   const offer = norm(masked.slice(start, end));
   if (!WRITE_OFFER.test(offer) || conditional(offer)) return null;
-  return { text: offer, imperative: true, negated: negated(offer), action: 0, chain: 0, sentence: offer };
+  const pol = polarity(offer);
+  const verb = new RegExp(`\\b${WRITE_VERB}\\b`).exec(offer)?.[1] ?? null;
+  return { text: offer, imperative: true, negated: pol !== "pos", prohibition: false, ambiguous: pol === "ambiguous", verb, action: 0, chain: 0, sentence: offer };
 }
 
 // --- Quiz ------------------------------------------------------------------------------------------------------
 
 /** "Quiz me", "test me", "give me a quiz", "let's do a checkpoint quiz". */
 const QUIZ_REQUEST = /\b(?:quiz|test) me\b|\b(?:give|run|start|do|begin|ask)\b[^.?!\n]*\bquiz\b|\bquiz time\b/;
+
+/** Stopping a quiz: "stop the quiz", "cancel this", "forget it", "no more questions". */
+const QUIZ_CANCEL =
+  /\b(?:stop|cancel|end|quit|abort|skip|drop)\b[^.?!\n;]*\b(?:quiz|test)\b|\b(?:stop|cancel|quit|abort|forget|drop)\s+(?:about\s+)?(?:it|this|that)\b|\bno more (?:quiz|quizzes|questions)\b/;
+/** Asking not to record a result: "don't record a score", "do not save it", "no need to log it". */
+const QUIZ_NO_RECORD =
+  /\b(?:don't|dont|do not|never|no need to)\s+(?:bother\s+)?(?:record|save|log|track|keep|store|recording|saving|logging)\b/;
 
 const asksQuestion = (m: IntentMessage | undefined) =>
   m?.role === "assistant" && sentenceRanges(maskQuotes(m.content)).some(([, , term]) => term === "?");
@@ -754,16 +922,25 @@ function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
       if (QUIZ_REQUEST.test(s) && !negated(s) && !HEDGED_REQUEST.test(s) && !conditional(s)) { request = i; break; }
     }
   }
-  if (request < 0) return { requested: false, asked: 0, answers: 0, recorded: false, answering: false, userText: "" };
+  if (request < 0) return { requested: false, asked: 0, answers: 0, recorded: false, answering: false, cancelled: false, userText: "" };
   let asked = 0;
   let answers = 0;
   let recorded = false;
+  let cancelled = false;
   const userText: string[] = [];
   for (let i = request; i < messages.length; i++) {
     const m = messages[i];
     if (m.role === "user") {
-      userText.push(maskQuotes(m.content));
-      if (i > request && asksQuestion(messages[i - 1])) answers++;
+      const masked = maskQuotes(m.content);
+      userText.push(masked);
+      if (i > request) {
+        // "Stop the quiz", "don't record it", "no more questions": the quiz records nothing from here on.
+        for (const [start, end] of sentenceRanges(masked)) {
+          const s = norm(masked.slice(start, end));
+          if (QUIZ_CANCEL.test(s) || QUIZ_NO_RECORD.test(s) || (QUIZ_REQUEST.test(s) && negated(s))) cancelled = true;
+        }
+        if (asksQuestion(messages[i - 1])) answers++;
+      }
       continue;
     }
     asked += sentenceRanges(maskQuotes(m.content)).filter(([, , term]) => term === "?").length;
@@ -772,7 +949,7 @@ function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
   }
   const n = messages.length;
   const answering = n - 2 > request && messages[n - 1]?.role === "user" && asksQuestion(messages[n - 2]);
-  return { requested: true, asked, answers, recorded, answering, userText: userText.join("\n") };
+  return { requested: true, asked, answers, recorded, answering, cancelled, userText: userText.join("\n") };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -801,7 +978,10 @@ export function writeGrantFor(messages: ReadonlyArray<IntentMessage>, opts: { of
 }
 
 /** One action of the grant: its clauses' text, the text of its chain (same polarity) and of its sentences. */
-interface Action { id: number; chain: number; negated: boolean; imperative: boolean; text: string; chainText: string; sentence: string }
+interface Action {
+  id: number; chain: number; negated: boolean; imperative: boolean; prohibition: boolean; ambiguous: boolean; verb: string | null;
+  text: string; chainText: string; sentence: string;
+}
 
 function actionsOf(grant: WriteGrant): Action[] {
   const byId = new Map<number, IntentClause[]>();
@@ -813,6 +993,9 @@ function actionsOf(grant: WriteGrant): Action[] {
       chain: first.chain,
       negated: first.negated,
       imperative: first.imperative,
+      prohibition: first.prohibition,
+      ambiguous: first.ambiguous,
+      verb: first.verb,
       text: cs.map((c) => c.text).join("\n"),
       chainText: grant.clauses.filter((c) => c.chain === first.chain && c.negated === first.negated).map((c) => c.text).join("\n"),
       sentence: [...new Set(grant.clauses.filter((c) => c.chain === first.chain).map((c) => c.sentence))].join("\n"),
@@ -827,7 +1010,52 @@ const READING = /\b(read|reading|listened|listening|chapters?|book|audiobook|ses
 const FINISHED_BOOK = /\b(finished|completed|done with)\b[^.!?\n]*\bbook\b/;
 const HIGHLIGHT = /\b(highlight|quote|passage|line|excerpt|save|keep|note)\b/;
 const PLAYLIST_VERB = /\b(create|make|build|generate|save|start|put together|turn)\b/;
-const QUIZ_WORD = /\b(quiz|score|checkpoint)\b/;
+const QUIZ_WORD = /\b(quiz|score|checkpoint|result)\b/;
+
+/** The request verbs that ask to record a supplement, a stack or a habit (never "create", "make", "highlight"). */
+const RECORD_REQUEST = /^(?:log|record|mark|save|add|track|enter)$/;
+/** The report verbs that say a supplement or a stack was taken ("I read about X" or "I bought X" says no such thing). */
+const INTAKE_REPORT =
+  /^(?:took|taken|had|used|drank|ate|did|didn't|didnt|finished|completed|swallowed|popped|chewed|skipped|forgot|missed)$/;
+/** Report verbs that are about a habit, not doing it ("I read about meditation", "I bought a yoga mat"). */
+const MENTION_REPORT =
+  /^(?:bought|ordered|researched|heard|learned|learnt|saw|found|asked|talked|discussed|looked|watched|mentioned|considered|searched|googled|wondered|noticed|wanted)$/;
+
+/** Whether the action's verb asks for or reports this tool's write (an intake is taken, a habit is done). */
+function verbFits(tool: WriteToolName, a: Action): boolean {
+  const verb = a.verb ?? "";
+  if (a.imperative) return RECORD_REQUEST.test(verb);
+  if (tool === "log_supplement_intake" || tool === "log_supplement_stack") return INTAKE_REPORT.test(verb);
+  if (tool === "mark_habit_complete") return !MENTION_REPORT.test(verb);
+  return false;
+}
+
+/** The record is the topic of the action, not its object: "…about X", "…regarding X". */
+function topicOnly(a: Action, span: [number, number]): boolean {
+  const toks = tokens(a.text);
+  for (let i = span[0] - 1; i >= 0 && i >= span[0] - 4; i--) {
+    const w = toks[i];
+    if (/^(?:about|regarding|concerning|re)$/.test(w)) return true;
+    if (!/^(?:the|my|a|an|some|your|this|that|new|whole)$/.test(w)) return false;
+  }
+  return false;
+}
+
+/** A request not to write that names nothing but "it" / "that" / "anything": it refuses every write of the message. */
+function refusesAll(a: Action): boolean {
+  if (!a.prohibition) return false;
+  const words = tokens(a.text);
+  const rest = words.filter((w) => !STOP.has(w) && !GENERIC.has(w) && !RECORD_REQUEST.test(w)
+    && !/^(?:don't|dont|do|not|never|no|need|to|please|but|actually|anything|everything|any|bother)$/.test(w));
+  return rest.length === 0 && words.some((w) => /^(?:it|that|this|them|those|these|anything|everything)$/.test(w));
+}
+
+/** The refusal of a request not to write ("contradicts") or an unclear statement ("unclear") that `hit` matches. */
+function blockedBy(actions: Action[], hit: (a: Action) => boolean): RefusalCode | null {
+  if (actions.some((a) => a.prohibition && hit(a))) return "contradicts";
+  if (actions.some((a) => a.ambiguous && hit(a))) return "unclear";
+  return null;
+}
 
 /** A present value that is not a string (a field the tool reads as text). */
 const notText = (v: unknown) => v !== undefined && v !== null && typeof v !== "string";
@@ -874,8 +1102,9 @@ function bookCheck(input: Record<string, unknown>, text: string, books: ReadingB
 /**
  * Whether one write-tool call may run. `used` is what this request was already allowed (commitWrite records each
  * allowed call); `requestDay` is the behavioral day the request runs on; `books` the books a reading write may go to
- * (null when they could not be read: reading writes are refused); `isSleepHabit` says which habits are sleep
- * questions (stored on last night when no date is sent).
+ * (null when they could not be read: reading writes are refused; on a retry the caller passes the book the earlier try
+ * of the same call was pinned to as the one being read); `isSleepHabit` says which habits are sleep questions (stored
+ * on last night when no date is sent).
  */
 export function authorizeWrite(
   grant: WriteGrant,
@@ -885,15 +1114,20 @@ export function authorizeWrite(
 ): WriteDecision {
   if (grant.off) return deny("writes_off");
   const actions = actionsOf(grant);
-  const done = actions.filter((a) => !a.negated);
-  const notDone = actions.filter((a) => a.negated);
+  // Reports and requests that grant something. A request not to write ("don't log X") and a statement whose polarity
+  // cannot be read grant nothing; they refuse what they name.
+  const done = actions.filter((a) => !a.negated && !a.prohibition && !a.ambiguous);
+  const notDone = actions.filter((a) => a.negated && !a.prohibition && !a.ambiguous);
   const fresh = (key: string) => !ctx.used.consumed.has(key);
 
   // Values the tool reads: a date has to be a real day, numbers numbers, text text. Nothing is coerced.
   if (notText(input.date) || (typeof input.date === "string" && input.date.trim() && !isDay(input.date.trim()))) return deny("invalid_value");
 
+  // "Don't log it" / "don't save that": nothing in this message is written.
+  if (actions.some(refusesAll)) return deny("contradicts");
+
   // A quiz result: either the user states it ("I got 4 out of 5 on the quiz"), or it closes a quiz the user asked
-  // for and answered, with no more questions than were asked and answered, and not recorded already.
+  // for and answered, with no more questions than were asked and answered, not stopped and not recorded already.
   if (tool === "record_reading_quiz") {
     if (notNumber(input.score) || notNumber(input.total) || notText(input.book)) return deny("invalid_value");
     const score = num(input.score), total = num(input.total);
@@ -901,10 +1135,13 @@ export function authorizeWrite(
       return deny("quiz_score_invalid");
     }
     if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
+    // "Don't record a score", "the quiz, not recorded".
+    if (actions.some((a) => a.prohibition && QUIZ_WORD.test(a.text))) return deny("contradicts");
     const stated = done.find((a) => QUIZ_WORD.test(a.text) && numbersIn(a.text).has(score) && numbersIn(a.text).has(total));
     if (!stated) {
       const q = grant.quiz;
       if (!q.requested) return deny("quiz_not_asked");
+      if (q.cancelled) return deny("quiz_cancelled");
       if (q.recorded) return deny("quiz_already_recorded");
       if (!q.answering) return deny("quiz_not_answered");
       if (total > q.asked || total > q.answers) return deny("quiz_score_invalid");
@@ -917,6 +1154,8 @@ export function authorizeWrite(
   if (actions.length === 0) return deny("no_request");
 
   if (tool === "create_spotify_playlist") {
+    const blocked = blockedBy(actions, (a) => /\bplaylists?\b/.test(a.text));
+    if (blocked) return deny(blocked);
     const asked = done.filter((a) => a.imperative).map((a) => a.text).join("\n");
     if (!/\bplaylists?\b/.test(asked) || !PLAYLIST_VERB.test(asked)) return deny("playlist_not_requested");
     if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
@@ -925,6 +1164,8 @@ export function authorizeWrite(
 
   if (tool === "add_book_highlight") {
     if (notText(input.passage) || notText(input.comment) || notNumber(input.chapter) || notText(input.book)) return deny("invalid_value");
+    const blocked = blockedBy(actions, (a) => HIGHLIGHT.test(a.text));
+    if (blocked) return deny(blocked);
     const asked = done.filter((a) => HIGHLIGHT.test(a.text));
     if (asked.length === 0) return deny("no_request");
     const passage = str(input.passage);
@@ -932,7 +1173,7 @@ export function authorizeWrite(
     const comment = str(input.comment);
     if (comment && !verbatimIn(comment, grant.ownWords)) return deny("not_your_words");
     const chapter = num(input.chapter);
-    if (chapter != null && !asked.some((a) => numbersIn(a.chainText).has(chapter))) return deny("not_named");
+    if (chapter != null && !asked.some((a) => chapterNumbers(a.chainText).has(chapter))) return deny("not_named");
     const bad = bookCheck(input, asked.map((a) => a.sentence).join("\n"), ctx.books);
     if (bad) return deny(bad);
     const key = `${tool}|${flat(passage)}`;
@@ -942,6 +1183,8 @@ export function authorizeWrite(
   if (tool === "log_reading_session") {
     for (const field of ["chapter_through", "chapter_from", "minutes"]) if (notNumber(input[field])) return deny("invalid_value");
     for (const field of ["recall", "question", "medium", "book"]) if (notText(input[field])) return deny("invalid_value");
+    const blocked = blockedBy(actions, (a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText));
+    if (blocked) return deny(blocked);
     const chains = [...new Map(done.filter((a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText)).map((a) => [a.chain, a])).values()];
     if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
     let refusal: RefusalCode = "not_named";
@@ -988,16 +1231,25 @@ export function authorizeWrite(
     }
     return namedSpan(record!, a.text, loose);
   };
+  // "Don't mark X" / "log Y, not X" refuses any write of X (a Yes or a No); so does a statement about X whose polarity
+  // cannot be read ("I didn't skip X").
+  const blocked = blockedBy(actions, (a) => span(a) !== null);
+  if (blocked) return deny(blocked);
   // "I skipped X" / "mark X as not done" is a No for X, never a Yes; "I did X" is a Yes, never a No. A record named
   // both ways ("log X… actually don't log X") is refused.
   const [same, opposite] = answerNo ? [notDone, done] : [done, notDone];
-  const candidates = same.filter((a) => span(a) !== null);
   if (opposite.some((a) => span(a) !== null)) return deny("contradicts");
+  // The action has to name the record as its object ("I read about X" names X as a topic), with a verb that asks for
+  // or reports this kind of write ("I took X" logs an intake; "I bought X" does not).
+  const candidates = same.filter((a) => {
+    const at = span(a);
+    return at !== null && !topicOnly(a, at) && verbFits(tool, a);
+  });
   if (candidates.length === 0) return deny("not_named");
 
   let refusal: RefusalCode = "not_named";
   for (const a of candidates) {
-    const r = argumentsFit(tool, a, input, record, ctx);
+    const r = argumentsFit(tool, a, actions, input, record, ctx);
     if (r) { refusal = r; continue; }
     const [from, to] = span(a)!;
     const prefix = `${tool}|a${a.id}|`;
@@ -1022,40 +1274,70 @@ function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, recor
 }
 
 /** The day check: the day the call writes is one the action names, or the default day when it names none. */
-function dayFits(day: string, a: Action, tool: WriteToolName, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): boolean {
+function dayFits(
+  day: string, a: Action, tool: WriteToolName, record: string, input: Record<string, unknown>,
+  ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean },
+): boolean {
+  const sleepDefault = tool === "mark_habit_complete" && !!ctx.isSleepHabit?.(record) && !str(input.date);
   const days = allowedDays(a, ctx.requestDay);
+  // A sleep question sent with no date is stored on last night (the night that closed yesterday), which is what "I
+  // wore my mask today" or "last night" means; any other day named refuses it.
+  if (sleepDefault) return days.size === 0 || days.has(day) || days.has(ctx.requestDay);
   if (days.size > 0) return days.has(day);
-  // No day named: today, or last night for a sleep question (it describes the night that closed yesterday).
+  // No day named: today, or last night for a sleep question.
   if (day === ctx.requestDay) return true;
   return tool === "mark_habit_complete" && !!ctx.isSleepHabit?.(record) && day === dayBefore(ctx.requestDay);
+}
+
+/**
+ * The times an action states, and whether the call has to send all of them. Its own times, which it must send. With
+ * none of its own, the times its list states: required when only the list's last item states them ("Log X and Y at
+ * 9pm" is both at 9pm), otherwise allowed but not required ("Log X at 8 and Y" gives Y no time of its own).
+ */
+function actionTimes(a: Action, actions: Action[]): { slots: Array<Set<string>>; required: boolean } {
+  const own = clockSlots(a.text);
+  if (own.length > 0) return { slots: own, required: true };
+  const list = actions.filter((b) => b.chain === a.chain && b.negated === a.negated && !b.prohibition && !b.ambiguous);
+  const last = list.reduce<Action | null>((m, b) => (m === null || b.id > m.id ? b : m), null);
+  if (last && last.id !== a.id && list.every((b) => b.id === last.id || clockSlots(b.text).length === 0)) {
+    const shared = clockSlots(last.text);
+    if (shared.length > 0) return { slots: shared, required: true };
+  }
+  return { slots: clockSlots(a.chainText), required: false };
 }
 
 /** Whether the call's arguments are the ones action `a` states (null) or why not. */
 function argumentsFit(
   tool: WriteToolName,
   a: Action,
+  actions: Action[],
   input: Record<string, unknown>,
   record: string,
   ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean },
 ): RefusalCode | null {
-  if (!dayFits(effectiveDay(tool, input, record, ctx), a, tool, record, ctx)) return "day_not_stated";
+  if (!dayFits(effectiveDay(tool, input, record, ctx), a, tool, record, input, ctx)) return "day_not_stated";
   if (tool !== "log_supplement_intake") return null;
 
-  // The amount, in the unit kind the intake would be counted in, stated in this action (never another item's).
+  // The amount, in the unit kind the intake would be counted in, stated in this action (never another item's). One
+  // serving, sent or left out, only when the action states no other amount.
   const amount = num(input.amount);
-  if (amount != null && !amountStated(amount, str(input.unit), a.text)) return "amount_not_stated";
-  if (amount == null && statesAmount(a.text)) return "amount_omitted";
+  if (amount != null && !amountStated(amount, str(input.unit), a.text, record)) return "amount_not_stated";
+  if (amount == null && statesAmount(a.text, record)) return "amount_omitted";
 
-  // The times: stated in this action, or, when it states none, in its list ("Log X and Y at 9pm").
-  const stated = clockTimes(a.text);
-  const clock = stated.size > 0 ? stated : clockTimes(a.chainText);
+  // The times, one to one: each time sent is a time said (said twice to be sent twice), and every time the action
+  // states is sent (no intake of "at 8 and noon" left out).
+  const { slots, required } = actionTimes(a, actions);
   const times = Array.isArray(input.times) ? (input.times as string[]) : [];
-  for (const t of times) if (!timeStated(t, clock)) return "time_not_stated";
-  if (times.length === 0 && stated.size > 0) return "time_omitted";
+  if (!timesMatch(times, slots, false)) return "time_not_stated";
+  if (required && times.length < slots.length) return "time_omitted";
   return null;
 }
 
-/** Whether a reading session call fits reading action `a` (its list): chapters, minutes, day, book, the user's words. */
+/**
+ * Whether a reading session call fits reading action `a` (its list): the chapters are numbers said as chapters, the
+ * minutes a duration said ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes), the day, the book, the
+ * user's words.
+ */
 function readingSessionFits(
   a: Action,
   input: Record<string, unknown>,
@@ -1065,20 +1347,20 @@ function readingSessionFits(
   const text = a.chainText;
   const book = bookCheck(input, a.sentence, ctx.books);
   if (book) return book;
-  const numbers = numbersIn(text);
+  const chapters = chapterNumbers(text);
   const through = num(input.chapter_through);
   const finished = FINISHED_BOOK.test(text);
   if (through == null) return "not_named";
-  if (!numbers.has(through)) {
+  if (!chapters.has(through)) {
     // "I finished the book": the last chapter of the book written to, when it is known.
     const slug = str(input.book) ?? ctx.books?.active ?? null;
     const total = ctx.books?.list.find((b) => b.slug === slug)?.total_chapters;
     if (!finished || total == null || through !== total) return "not_named";
   }
   const from = num(input.chapter_from);
-  if (from != null && from !== through && !numbers.has(from)) return "not_named";
+  if (from != null && from !== through && !chapters.has(from)) return "not_named";
   const minutes = num(input.minutes);
-  if (minutes != null && !numbers.has(minutes) && !numbers.has(minutes / 60)) return "amount_not_stated";
+  if (minutes != null && !minuteValues(text).has(minutes)) return "amount_not_stated";
   const day = str(input.date) ?? ctx.requestDay;
   const days = allowedDays(a, ctx.requestDay);
   if (days.size > 0 ? !days.has(day) : day !== ctx.requestDay) return "day_not_stated";
