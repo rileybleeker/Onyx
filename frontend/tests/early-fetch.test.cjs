@@ -336,7 +336,8 @@ test("a 401 answer is fetched again by the client, and the late script run still
   global.fetch = (url, init) => { calls.push({ url, init }); return Promise.resolve({ ok: false, status: 401, redirected: false, url }); };
   new Function(E.earlyFetchScript("/api/x"))();
   assert.equal(calls.length, 1);
-  const res = await E.earlyOr("/api/x", () => Promise.resolve({ ok: false, status: 401, redirected: false, url: "/api/x" }));
+  // The client's own fetch (the fallback) is what sends the second request, as in the real pages.
+  const res = await E.earlyOr("/api/x", () => { global.fetch("/api/x", { cache: "no-store" }); return Promise.resolve({ ok: false, status: 401, redirected: false, url: "/api/x" }); });
   assert.equal(calls.length, 2, "the client refetches the sign-in failure itself");
   new Function(E.earlyFetchScript("/api/x"))();
   assert.equal(calls.length, 2, "no duplicate read from the late script");
