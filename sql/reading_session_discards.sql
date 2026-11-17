@@ -1,6 +1,9 @@
 -- ============================================================
 -- Onyx — discarded reading entries (2026-11-16, PROD-T01)
 -- ============================================================
+-- Removing the retired 10-argument overload of pds.move_reading_session is a
+-- separate, manual, reviewed step that the owner runs by hand, not part of this
+-- migration.
 -- The /log Reading form creates its session with POST /api/reading/sessions
 -- carrying a client_key (sql/reading_sessions_client_key.sql). When that
 -- create's answer is lost the browser cannot tell whether the session was
@@ -681,12 +684,11 @@ $$;
 -- replaces_block_id, entry_pending, progress_owed: [{book_id, owed_id}]}. Raises OXR02 for a Kindle session and OXR03 when the target
 -- book does not exist.
 -- Edit order (Codex review of PR 376): the row lock serializes two edits but not their order, so an edit whose
--- connection dropped and which kept running could commit after a newer, acknowledged one and overwrite it. Each
+-- connection failed and which kept running could commit after a newer, acknowledged one and overwrite it. Each
 -- edit now carries p_edit_seq (the form's own, always rising), the newest is stored on the row, and an edit with a
--- lower number than the stored one is refused as stale (nothing written). The old 10-argument form is dropped so
--- a call cannot reach it.
+-- lower number than the stored one is refused as stale (nothing written). The old 10-argument form is retired and
+-- is not created by this file, so a call cannot reach it.
 ALTER TABLE pds.reading_sessions ADD COLUMN IF NOT EXISTS edit_seq bigint;
-DROP FUNCTION IF EXISTS pds.move_reading_session(bigint, bigint, date, integer, integer, integer, text, text, text, date);
 
 CREATE OR REPLACE FUNCTION pds.move_reading_session(
     p_session_id       bigint,
