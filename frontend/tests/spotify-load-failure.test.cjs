@@ -1,7 +1,7 @@
 // Run: node --test tests/spotify-load-failure.test.cjs
 // A failed Spotify read is not an empty install (2026-11-17): the page-load and ledger failures set flags the UI
-// shows (an alert with Retry, and a ledger message with Retry). The bootstrap commands show only after a successful
-// load that returned zero plays. Static source checks, offline.
+// shows (an alert with Retry, and a ledger message with Retry). The empty-state text shows only after a successful
+// load that returned zero plays (since #639 it is plain words, no developer commands). Static source checks, offline.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -20,16 +20,17 @@ test("page-load failure sets loadFailed (guarded by cancelled) and keeps the con
   assert.match(src, /\}, \[range, retryCount\]\);/);
 });
 
-test("the alert replaces charts and the empty panel; bootstrap text only after a successful zero-play load", () => {
+test("the alert replaces charts and the empty panel; empty-state text only after a successful zero-play load", () => {
   assert.match(src, /\{!loading && loadFailed && \(\s*<div role="alert"/);
   assert.match(src, /Couldn&apos;t load Spotify/);
   assert.match(src, /Couldn&apos;t load your Spotify data\. Try again\./);
   assert.match(src, /\{!loading && !loadFailed && hasData && \(/);
   assert.match(src, /\{!loading && !loadFailed && !hasData && \(/);
-  // The bootstrap text sits after the guard that requires !loadFailed.
+  // The empty-state text sits after the guard that requires !loadFailed, and names no developer command (#639).
   const guard = src.indexOf("{!loading && !loadFailed && !hasData && (");
-  const bootstrap = src.indexOf("python spotify_etl.py --auth");
-  assert.ok(guard > 0 && bootstrap > guard, "bootstrap commands are behind the !loadFailed guard");
+  const emptyText = src.indexOf("Plays appear here after the first Spotify sync.");
+  assert.ok(guard > 0 && emptyText > guard, "the empty-state text is behind the !loadFailed guard");
+  assert.doesNotMatch(src, /spotify_etl\.py --auth/);
 });
 
 test("Retry re-runs the page-load effect for the current range", () => {
