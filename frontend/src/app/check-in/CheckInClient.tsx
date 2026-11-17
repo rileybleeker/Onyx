@@ -261,7 +261,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
     if (!afterSave && !afterRevert && !(await autosaveRef.current.flush().catch(() => false)) && date !== shownDate.current) {
       // Back/forward may already have moved the URL to the other day: put it back on the day still on screen.
       // A retry is armed for the failed save: the URL change reloads this day, and that load must not resend it at once.
-      skipRevertFlush.current = autosaveRef.current.state.retrying;
+      // Live, not `state`: this render's copy still says "saving" until React re-renders after the failure.
+      skipRevertFlush.current = autosaveRef.current.retryArmed();
       showDate(shownDate.current);
       return;
     }
