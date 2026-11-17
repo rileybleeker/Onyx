@@ -207,7 +207,7 @@ export default function SayItSection() {
         rows={3}
         aria-label="Say it"
         placeholder="Took my morning stack at 8, ate half the burrito, weighed 182, read two chapters…"
-        className="w-full min-h-24 rounded-control border border-border-subtle bg-transparent p-3 text-[16px] leading-snug text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent/40"
+        className="w-full min-h-24 rounded-control border border-border-subtle bg-transparent p-3 text-[16px] leading-snug text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent"
       />
       <div className="mt-2 flex items-center gap-3">
         <button
