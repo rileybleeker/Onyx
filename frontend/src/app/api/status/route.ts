@@ -77,6 +77,7 @@ const CADENCE: Record<string, string> = {
   ubereats: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
+  youtube: "Daily look on Riley's PC; new data every 2 months (scheduled Google Takeout)",
   medical_backup: "Weekly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
@@ -135,6 +136,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
+  youtube:        { method: "semi-automated", label: "Scheduled Takeout in OneDrive" },
   medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   simplefin:      { method: "automated",      label: "Bank feed API" },
@@ -475,6 +477,8 @@ export async function GET() {
         ["pc_activity", "usage"],
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
+        // YouTube watch history importer (Riley's PC, one heartbeat a day).
+        ["youtube", "history"],
         // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
         ["backup", "medical_records"],
         // N-of-1 trial report job: one heartbeat a day.
@@ -1308,6 +1312,35 @@ export async function GET() {
           cadence: CADENCE.ai_usage,
           integrationMethod: METHOD.ai_usage.method,
           methodLabel: METHOD.ai_usage.label,
+        };
+      })(),
+      // YouTube watch history (tools/youtube_history on Riley's PC): a daily look for a new scheduled Google
+      // Takeout export in OneDrive, upserted to pds.youtube_watch_events. Heartbeat only (no rows are read
+      // here). Daily run on a PC that may be off: >50h degraded, >96h or a failed row red; the importer's own
+      // 'partial' covers "no export yet" and "the yearly schedule has ended".
+      youtube: (() => {
+        const entry = latestBySrcType["youtube|history"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 96
+            ? "failed"
+            : entry.status === "partial" || ageH > 50
+              ? "partial"
+              : "success";
+        return {
+          label: "YouTube History",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - apply sql/youtube_watch_history_schema.sql, run tools/youtube_history/register-task.ps1 and set up the scheduled Takeout (docs/youtube-watch-history.md)." : null),
+          cadence: CADENCE.youtube,
+          integrationMethod: METHOD.youtube.method,
+          methodLabel: METHOD.youtube.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone
