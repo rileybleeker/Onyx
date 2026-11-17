@@ -90,7 +90,7 @@ function bookRow(over = {}) {
     ],
     book_highlights: [
       { highlight_id: 12, book_id: 7, passage: "second", comment: null, chapter: 2, ease: "2.6", next_review: "2026-11-20", archived: false, created_at: "2026-11-10T01:00:00Z",
-        reading_reviews: [{ review_id: 5, highlight_id: 12, review_date: TODAY, grade: "good" }, { review_id: 4, highlight_id: 12, review_date: "2026-11-08", grade: "hard" }] },
+        reading_reviews: [{ review_date: TODAY }, { review_date: "2026-11-08" }] },
       { highlight_id: 11, book_id: 7, passage: "first", comment: null, chapter: 1, ease: "2.5", next_review: "2026-11-20", archived: false, created_at: "2026-11-09T01:00:00Z", reading_reviews: null },
     ],
     reading_quizzes: [],
@@ -135,7 +135,7 @@ test("reading overview: one embedded books request with every child ordered and 
   assert.equal(db.maxInFlight(), 3, "the three requests are in flight together");
   const p = books[0].url.searchParams;
   const select = p.get("select").replace(/\s/g, "");
-  for (const rel of ["reading_sessions(*)", "book_highlights(*,reading_reviews(review_id,highlight_id,review_date,grade))", "reading_quizzes(*)", "book_chapters("]) {
+  for (const rel of ["reading_sessions(*)", "book_highlights(*,reading_reviews(review_date))", "reading_quizzes(*)", "book_chapters("]) {
     assert.ok(select.includes(rel), rel);
   }
   assert.equal(p.get("status"), "eq.reading");
