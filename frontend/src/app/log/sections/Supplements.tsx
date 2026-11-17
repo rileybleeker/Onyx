@@ -27,6 +27,7 @@ import {
 import {
   addWithDose,
   beginSend,
+  type Attempt,
   countToLog,
   EMPTY_SELECTION,
   isConfirmed,
@@ -35,7 +36,7 @@ import {
   LOG_CONCURRENCY,
   outcomeFromAnswer,
   parseAmount,
-  eventKeyFor,
+  attemptFor,
   runPool,
   sendable,
   setItemDose,
@@ -625,6 +626,8 @@ export default function SupplementsSection() {
   const productById = useMemo(() => new Map((products ?? []).map((p) => [p.product_id, p])), [products]);
   const nameOf = (id: string) => labels.get(id) ?? (productById.has(id) ? productLabel(productById.get(id)!) : "Product");
   const batchBusy = selection.some((i) => isSaving(i.outcome));
+  // A product whose answer was lost stays selected until its "Log again" settles it (its replay must keep its key).
+  const anyLost = selection.some((i) => i.outcome?.kind === "unconfirmed");
   const toLog = countToLog(selection);
   const summaryLine = summaryText(summarize(selection));
   const allConfirmed = selection.length > 0 && selection.every((i) => isConfirmed(i.outcome));
@@ -663,7 +666,7 @@ export default function SupplementsSection() {
    *  screen; no re-read (the caller re-reads once). Never throws: a request that failed is "not confirmed". */
   async function sendProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
-    /** The multi-select's per-product event_key (see lib/log-supplement-multi.ts `eventKeyFor`). Omitted = unkeyed. */
+    /** The multi-select's per-product event_key (see lib/log-supplement-multi.ts `attemptFor`). Omitted = unkeyed. */
     event_key?: string;
   }): Promise<Outcome> {
     if (args.date && day && args.date > day) return { kind: "refused", error: "That day has not started yet" };
@@ -728,28 +731,35 @@ export default function SupplementsSection() {
     const targets = sendable(selection, { only, includeUnconfirmed: !!only });
     if (targets.length === 0) return;
     const clean = times.map((t) => t.slice(0, 5));
-    if (clean.some((t) => !TIME_RE.test(t))) {
+    // A replay carries the times and day it was first sent with (its attempt), so only a new send checks the shared fields.
+    const hasNewSend = targets.some((t) => !t.attempt?.lost);
+    if (hasNewSend && clean.some((t) => !TIME_RE.test(t))) {
       setFormError("Fill in or remove the empty time");
       return;
     }
-    if (formDate && day && formDate > day) {
+    if (hasNewSend && formDate && day && formDate > day) {
       setFormError("That day has not started yet");
       return;
     }
     setFormError(null);
     const bad = new Map<string, string>();
-    const ready: { id: string; name: string; amount: number | null; unit: string; eventKey: string }[] = [];
+    const ready: { id: string; name: string; attempt: Attempt }[] = [];
     for (const item of targets) {
       const amount = parseAmount(item.amount);
-      if (amount === "invalid") bad.set(item.productId, "Amount must be a positive number");
-      else ready.push({ id: item.productId, name: nameOf(item.productId), amount, unit: item.unit, eventKey: eventKeyFor(item, () => crypto.randomUUID()) });
+      if (amount === "invalid" && !item.attempt?.lost) {
+        bad.set(item.productId, "Amount must be a positive number");
+        continue;
+      }
+      const payload = { amount: amount === "invalid" ? null : amount, unit: item.unit, times: clean, date: formDate };
+      ready.push({ id: item.productId, name: nameOf(item.productId), attempt: attemptFor(item, payload, () => crypto.randomUUID()) });
     }
-    setSelection((s) => beginSend(s, ready.map((r) => r.id), bad, new Map(ready.map((r) => [r.id, r.eventKey]))));
+    setSelection((s) => beginSend(s, ready.map((r) => r.id), bad, new Map(ready.map((r) => [r.id, r.attempt]))));
     if (ready.length === 0) return;
     await runPool(ready, LOG_CONCURRENCY, async (r) => {
       let outcome: Outcome;
+      const a = r.attempt;
       try {
-        outcome = await sendProduct({ product_id: r.id, name: r.name, amount: r.amount, unit: r.unit, times: clean, date: formDate, event_key: r.eventKey });
+        outcome = await sendProduct({ product_id: r.id, name: r.name, amount: a.amount, unit: a.unit, times: a.times, date: a.date, event_key: a.eventKey });
       } catch {
         outcome = { kind: "unconfirmed", error: "No answer from Onyx" };
       }
@@ -1140,7 +1150,7 @@ export default function SupplementsSection() {
                         type="button"
                         aria-label={`Remove ${name} from the selection`}
                         className={`${btn} min-w-11 px-2`}
-                        disabled={saving || busy[k]}
+                        disabled={saving || busy[k] || o?.kind === "unconfirmed"}
                         onClick={() => setSelection((s) => toggleItem(s, item.productId))}
                       >
                         <X className="w-4 h-4" aria-hidden />
@@ -1223,7 +1233,7 @@ export default function SupplementsSection() {
                   {batchBusy ? "Saving…" : <>Log selected ({toLog})</>}
                 </button>
               )}
-              <button type="button" className="min-h-11 px-2 text-[13px] text-text-secondary hover:text-text-primary disabled:opacity-50" disabled={batchBusy} onClick={clearSelection}>
+              <button type="button" className="min-h-11 px-2 text-[13px] text-text-secondary hover:text-text-primary disabled:opacity-50" disabled={batchBusy || anyLost} onClick={clearSelection}>
                 {allConfirmed ? "Done" : "Clear"}
               </button>
             </div>
