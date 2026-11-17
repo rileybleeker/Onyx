@@ -305,6 +305,9 @@ export default function ReadingSection() {
       kept.editSeq = Math.max(kept.editSeq + 1, Date.now());
       return { ...v.body, habit_created_on: kept.habitCreatedOn, edit_seq: kept.editSeq };
     };
+    // The draft whose values this save sends (the create and any replay PATCH both send v.body): only it is cleared
+    // below, so a newer draft applied while a request was out (its values not sent) stays pending and is sent again.
+    const sentDraft = kept.pendingDraft;
     let json: Record<string, unknown>;
     try {
       if (id === null) {
@@ -368,13 +371,22 @@ export default function ReadingSection() {
         // values on screen now are written onto it.
         json = await send(readingSaveTarget("sessions", session.session_id).url, "PATCH", patchBody());
         if (cancelled()) return;
+        // The PATCH must confirm the stored session exactly as the create's answer did; an unconfirming body leaves
+        // the entry unsaved (retried) and its draft uncleared.
+        const patched = json.session as ReadingSession | undefined;
+        if (!patched || typeof patched.session_id !== "number" || patched.session_id !== session.session_id) {
+          throw new Error("The save was not confirmed. Retrying.");
+        }
       }
     }
     if (typeof json.habit_created_on === "string" || json.habit_created_on === null) kept.habitCreatedOn = (json.habit_created_on as string | null) ?? null;
     setSaved({ xp: Number(json.xp_gained) || 0, finished: !!json.finished });
     showOverview(json.overview as ReadingOverview | null | undefined);
-    const savedDraft = kept.pendingDraft;
-    if (savedDraft !== null) {
+    const savedDraft = sentDraft;
+    // Only the draft whose values this save sent is cleared. If the form changed while a request was out (a newer
+    // draft applied, or new values entered), those newer values are not saved yet: they stay pending (the autosaver
+    // already queued them and sends them again) and their draft is not cleared here.
+    if (savedDraft !== null && kept.pendingDraft === savedDraft) {
       kept.pendingDraft = null; // first: dropping it from the store must not read as "dismissed before saving"
       clear(savedDraft);
     }

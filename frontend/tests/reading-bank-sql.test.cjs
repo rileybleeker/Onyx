@@ -334,6 +334,14 @@ test("the planner keys highlight freshness on content, never on updated_at", () 
   assert.match(plan, /src\.passage_sha = x\.sha/);
 });
 
+test("a Kindle note with no highlight under it (highlighted_at NULL, note_at set) is a comment: not offered, not evidence, not marked seen", () => {
+  const plan = fn(fnsMain, "pds.reading_bank_plan_input").body;
+  assert.match(plan, /NOT \(h\.highlighted_at IS NULL AND h\.note_at IS NOT NULL\)/, "the planner's highlight list");
+  const store = fn(fnsMain, "pds.reading_bank_store").body;
+  assert.match(store, /NOT \(h\.highlighted_at IS NULL AND h\.note_at IS NOT NULL\)/, "a highlight source must not be a standalone note");
+  assert.match(store, /NOT \(h2\.highlighted_at IS NULL AND h2\.note_at IS NOT NULL\)/, "the seen fallback");
+});
+
 test("the queue charges an expired lease's reservation and fences finish by attempt", () => {
   const claim = fn(fnsMain, "pds.reading_bank_claim").body;
   assert.match(claim, /cost_cents = cost_cents \+ reserved_cents/);
@@ -477,6 +485,20 @@ test("a failed job has a way back: web_search_disabled retried after 6 h, the ma
   assert.match(rb, /IF v_ch = 0 THEN[\s\S]*map_rebuilds = b\.map_rebuilds \+ 1/);
   assert.match(fn(fnsMain, "pds.reading_bank_plan_input").body, /'map_rebuilds', COALESCE\(\(SELECT map_rebuilds FROM bb\), 0\)/);
   assert.match(main, /map_rebuilds\s+INTEGER\s+NOT NULL DEFAULT 0/);
+});
+
+test("a Rebuild is decided, counted and enqueued in one call under the claim lock (two overlapping taps cannot both count)", () => {
+  const rb = fn(fnsMain, "pds.reading_bank_rebuild").body;
+  const lock = rb.indexOf("pg_advisory_xact_lock(hashtext('pds.reading_bank_claim'))");
+  const pending = rb.indexOf("'pending', true");
+  const count = rb.indexOf("INSERT INTO pds.reading_bank_chapters AS c");
+  const enqueue = rb.indexOf("pds.reading_bank_enqueue(p->'plan')");
+  assert.ok(lock > 0 && lock < pending && pending < count && count < enqueue, "lock, then the pending check, then the count, then the enqueue");
+  assert.match(rb, /SELECT c\.rebuilds INTO v_cur FROM pds\.reading_bank_chapters c WHERE c\.book_id = v_book AND c\.chapter = v_ch;/, "the stored count is read after the lock");
+  assert.match(rb, /v_exp IS NOT NULL AND v_exp <> v_cur/, "a count that moved since the caller read it is not counted again");
+  assert.match(rb, /j\.status IN \('queued', 'running'\)\s+AND j\.step = ANY \(CASE WHEN v_ch = 0 THEN ARRAY\['map', 'build'\] ELSE ARRAY\['research', 'build'\] END\)/, "open work of the chapter (the map and the whole-book build for chapter 0)");
+  assert.match(rb, /IF v_has_plan THEN v_enq := pds\.reading_bank_enqueue\(p->'plan'\)/);
+  assert.match(rb, /v_has_plan AND v_plan_book IS DISTINCT FROM v_book/, "a plan for another book is refused");
 });
 
 test("the recall rubric follows its ideas: every store refreshes it, the sync re-versions a stale one without voiding answers", () => {

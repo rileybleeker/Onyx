@@ -17,25 +17,47 @@
  *     same polarity, read from the action's own clause (never by counting negations): "I skipped X" allows the
  *     answer No for X and nothing that says X was done, "I didn't take X" logs nothing for X, a record named both ways
  *     is refused, and a statement whose polarity cannot be read ("I didn't skip X", "…without X") refuses it;
+ *   - the kind of write is bound to the clause that carries the verb: a clause that writes something else (a
+ *     playlist, a shopping-list item, a note about a topic) names no record, whatever record-shaped name it
+ *     contains ("create a playlist called Synthetic Calm" authorizes the playlist, never an intake of a product
+ *     named Synthetic Calm);
  *   - "don't log X" / "don't mark X" / "log Y, not X" is a request not to write X: it grants nothing (never a No) and
  *     refuses any write of X; "don't log it" refuses every write of the message;
  *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
  *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules, and one
  *     serving only when no other amount is stated), the clock times one to one (a time sent twice has to be said
- *     twice; every time said is sent), the chapters as chapter numbers and the minutes as a duration ("chapter 4
- *     for 12 minutes" never gives chapter 12); an amount or a time the action states cannot be left out;
+ *     twice; every time said is sent), the chapters as chapter numbers covering exactly the chapters named (both of
+ *     "chapters 3 and 4", every chapter of "ch. 5-7") and the minutes as a duration ("chapter 4 for 12 minutes"
+ *     never gives chapter 12, and a stated duration is never dropped from the call); an amount or a time the action
+ *     states cannot be left out;
  *   - the day the call would write (its date, or the tool's default when it sends none) has to be the day the action
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
  *   - each action authorizes one write of each record: a repeated intake needs its own words ("…at 8 and again at 9"
- *     is one call with two times, or two actions);
+ *     is one call with two times, or two actions). Each granted write is consumed once per request under a canonical
+ *     identity — the tool, the record as the user's own words name it, and the day, amount, times, chapters or answer
+ *     the user's action itself states, never the call's arguments — so a second call for the same grant, in whatever
+ *     form the model sends it (a changed optional argument, another name for the same record, a restatement in the
+ *     user's message), is refused; a retry of the whole message starts with a fresh set here and reconciles through
+ *     the replay ledger (SEC-04), which mints no new action either;
  *   - a reading write goes to the book the user named, or the book being read when the user names none; naming another
  *     known book refuses a call that would write to the book being read;
  *   - text stored as the user's words (a recall note, a question, a passage, a comment) has to be a verbatim span of
  *     the user's words (case, spacing and punctuation aside), so a negation cannot be dropped or added;
- *   - a playlist only on an explicit request (never a report), a quiz result only for a quiz the user asked for and
- *     answered (score within the questions asked and answered, not stopped, not already recorded) or that the user
- *     states, each at most once per request, and never after "don't record a score".
+ *   - a playlist only on an explicit request (never a report), a quiz result only for the active quiz the user asked
+ *     for: the request opens it, each question the assistant asks has to be a quiz question (not an offer, not
+ *     "want a summary?"), a cancel ("stop the quiz") closes it for good, the one finalization — the user's last answer
+ *     that answers every question asked — authorizes exactly one score out of exactly those questions, with the
+ *     checkpoint the conversation bound (a different one is refused) and the book check; anything that cannot be
+ *     established (no recognized question, an unanswered one, a later unrelated question) fails closed. A score the
+ *     user states themselves ("I got 4 out of 5") is recorded without a quiz, each at most once per request, and never
+ *     after "don't record a score".
+ *   - a question-bank answer (record_reading_answer) only inside a quiz the user asked for and did not stop, when the
+ *     latest message is the reply to the question just asked (the assistant's message right before it carries that
+ *     question's label, "Q<id>"), with the answer a verbatim span of that reply, once per message; a question flag
+ *     (flag_reading_question) only when the latest message itself says that question is wrong / unclear / not in that
+ *     chapter / from a chapter not read yet, the kind the call sends, about the question just asked (or one the message
+ *     names as "Q<id>"), never after "don't flag", once per message.
  * Quoted text is someone else's words and grants nothing: "double quotes" and curly quotes (also over several lines;
  * an opening quote that is never closed masks the rest), block quotes (with their continuation lines), fenced code
  * blocks and inline code. A refused call never runs; its receipt says why. Pure and import-free (types only), so it
@@ -63,18 +85,24 @@ interface IntentClause {
 
 /** What the conversation says about a reading quiz. */
 interface QuizState {
-  /** A user message asked for a quiz ("quiz me", "give me a quiz"), not negated, not a plan. */
+  /** A user message asked for a quiz ("quiz me", "give me a quiz"), not negated, not a plan: it opens the active quiz. */
   requested: boolean;
-  /** Questions the assistant asked since that request. */
+  /** Quiz questions the assistant asked since that request (not offers, not questions about the quiz itself). */
   asked: number;
-  /** User messages since that request that answer a question the assistant asked right before them. */
+  /** User messages since that request that answer a quiz question the assistant asked right before them. */
   answers: number;
-  /** An assistant turn since that request already reported the result as recorded. */
+  /** Every quiz question asked has an answer (the quiz is complete). */
+  answeredAll: boolean;
+  /** An assistant turn since that request already reported the result as recorded: the quiz is closed. */
   recorded: boolean;
-  /** The latest message answers a question the assistant asked right before it, inside that quiz. */
+  /** The latest message answers a quiz question the assistant asked right before it: the quiz's one finalization. */
   answering: boolean;
+  /** The latest message is a user message after the request, right after an assistant message (a reply to it). */
+  follows: boolean;
   /** A user message since the request stopped the quiz or asked not to record it ("stop the quiz", "don't save it"). */
   cancelled: boolean;
+  /** The checkpoint the conversation bound the quiz to ("ch4", "review"), or null when none was named. */
+  checkpoint: string | null;
   /** The user's own words since the request (masked), where a book the quiz names has to appear. */
   userText: string;
 }
@@ -94,6 +122,11 @@ export interface WriteGrant {
   /** The latest message is a short "yes" to the one write offer the assistant made right before it. */
   confirmed: boolean;
   quiz: QuizState;
+  /**
+   * The question-bank questions the assistant's message right before the latest one labels ("Q1234"): the question
+   * just asked. Read from the conversation only, never a tool result. Empty when that message labels none.
+   */
+  askedQuestions: number[];
 }
 
 /** The books a reading write may go to: the one being read (its slug) and every known book. */
@@ -103,13 +136,16 @@ export interface ReadingBooks {
 }
 
 /**
- * What this request has already been allowed: calls per tool, and the actions (each authorizes one write of each
- * record it names). Made with newWriteUsage(). The caller settles each allowed call around its execution:
- * commitWrite() RESERVES it before the tool runs; afterwards a definitive refusal (releaseWrite(), nothing was
- * written) hands the action back so a corrected call in the same request may run, while a success keeps the
- * reservation as the completed write. An uncertain result (a timeout, a network error, a lost answer) also keeps
- * the reservation: a repeat in this request is refused, and a retry of the message reconciles through the SEC-04
- * ledger under the same operation key instead of executing again.
+ * What this request has already been allowed: calls per tool, and the granted writes already consumed (each user
+ * action authorizes one write of each record it names). Made with newWriteUsage(). A consumed key is the granted
+ * write's canonical identity — the tool, the record as the user's own words name it, and the arguments the user's
+ * action states — never the model's call arguments, so a repeated or varied call for the same grant maps to it and
+ * is refused. The caller settles each allowed call around its execution: commitWrite() RESERVES it before the tool
+ * runs; afterwards a definitive refusal (releaseWrite(), nothing was written) hands the action back so a corrected
+ * call in the same request may run, while a success keeps the reservation as the completed write. An uncertain
+ * result (a timeout, a network error, a lost answer) also keeps the reservation: a repeat in this request is
+ * refused, and a retry of the message reconciles through the SEC-04 ledger under the same operation key instead of
+ * executing again. Per request only: a retry of the whole message builds a fresh set.
  */
 export interface WriteUsage { perTool: Map<string, number>; consumed: Set<string> }
 
@@ -186,6 +222,9 @@ export type RefusalCode =
   | "quiz_already_recorded"
   | "quiz_cancelled"
   | "quiz_score_invalid"
+  | "question_not_asked"
+  | "flag_not_stated"
+  | "quiz_checkpoint_mismatch"
   | "once_per_request";
 
 /** Why a call was refused (shown on its receipt and to the model). At most 240 characters each. */
@@ -211,6 +250,9 @@ export const REFUSAL_TEXT: Record<RefusalCode, string> = {
   quiz_already_recorded: "Not recorded: this quiz's result was already recorded. Ask for a new quiz to record another.",
   quiz_cancelled: "Not recorded: you stopped this quiz or asked not to record it. Ask for a new quiz, or say your score, to record one.",
   quiz_score_invalid: "Not recorded: this score does not fit the quiz questions asked and answered in this conversation.",
+  question_not_asked: "Not recorded: this is not the question just asked. Onyx records an answer only for the question you were asked right before your reply (the one labelled with its Q number).",
+  flag_not_stated: "Not flagged: your latest message does not say this question is wrong, unclear, not in that chapter, or from a chapter you have not read. Say which, about that question, to flag it.",
+  quiz_checkpoint_mismatch: "Not recorded: this checkpoint is not the one the quiz you asked for was about. Say the checkpoint yourself to record it there.",
   once_per_request: "Not written: this can be done once per message, and it was already done for this one.",
 };
 
@@ -371,6 +413,8 @@ const NOT_AMOUNT_AFTER = /^(?:min|mins|minutes?|hours?|hrs?|h|days?|weeks?|month
 const NOT_AMOUNT_BEFORE = /^(?:at|around|about|by|after|before|until|till|since|from|to|chapter|chapters|ch|page|pages|jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)$/;
 /** Words that end the search for the unit of a number ("2 of the magnesium capsules" looks past "of the magnesium"). */
 const UNIT_SEARCH_STOP = /^(?:and|or|but|then|plus|at|with|around|by|before|after|on|yesterday|today|tonight|this|last)$/;
+/** Fraction words whose article ("half a tablet") is part of the fraction, never a second amount. */
+const FRACTION_WORDS = new Set(["half", "quarter", "third"]);
 
 interface Quantity { value: number; unit: string | null; word: string }
 
@@ -390,6 +434,13 @@ function quantities(text: string): Quantity[] {
     const prev = toks[i - 1], next = toks[i + 1];
     if (prev === ":" || next === ":") continue; // 8:30
     if ((next === "a" || next === "p") && toks[i + 2] === "m") continue; // 8 a.m.
+    // The bare article is the number one only when it directly precedes a unit or noun, and never inside a
+    // fraction phrase: in "half a tablet" the article belongs to the fraction (one amount of 0.5), so it is
+    // not a second quantity of one.
+    if (t === "a" || t === "an") {
+      if (prev !== undefined && FRACTION_WORDS.has(prev)) continue;
+      if (next === undefined || NOT_AMOUNT_AFTER.test(next) || UNIT_SEARCH_STOP.test(next) || next === ":") continue;
+    }
     // "half a tablet"
     let j = i + 1;
     if (t === "half" && (toks[j] === "a" || toks[j] === "an")) j += 1;
@@ -531,6 +582,40 @@ function chapterNumbers(text: string): Set<number> {
   return out;
 }
 
+/**
+ * The chapters a reading action grants, with ranges expanded: "chapter 4" {4}, "chapters 3 and 4" {3, 4},
+ * "ch. 5-7" / "chapters three through five" {5, 6, 7}. A call must cover exactly this set.
+ */
+function grantedChapters(text: string): Set<number> {
+  const out = new Set<number>();
+  const toks = norm(text).match(/\d+|[a-z]+(?:'[a-z]+)?|[-–&,\n]/g) ?? [];
+  for (let i = 0; i < toks.length; i++) {
+    if (!/^(?:chapters?|ch|chap)$/.test(toks[i])) continue;
+    let expectNumber = true;
+    let prev: number | undefined;
+    let range = false;
+    for (let j = i + 1; j < toks.length; j++) {
+      const w = toks[j];
+      const n = expectNumber ? chapterNumber(w) : undefined;
+      if (n !== undefined) {
+        if (range && prev !== undefined && n > prev) for (let c = prev; c <= n; c++) out.add(c);
+        else out.add(n);
+        prev = n;
+        range = false;
+        expectNumber = false;
+        continue;
+      }
+      if (!expectNumber && /^(?:and|to|through|thru|or|-|–|&|,|\n)$/.test(w)) {
+        range = /^(?:to|through|thru|-|–)$/.test(w);
+        expectNumber = true;
+        continue;
+      }
+      break;
+    }
+  }
+  return out;
+}
+
 /** The durations a text states, in minutes: "40 minutes", "an hour", "1.5 hours", "half an hour", "twenty five min". */
 function minuteValues(text: string): Set<number> {
   const out = new Set<number>();
@@ -644,8 +729,10 @@ function isDay(v: string): boolean {
 /**
  * The text with quoted spans masked out (same length, so positions line up). Someone else's words, never a request:
  * fenced code blocks (``` or ~~~, to the closing fence or the end), inline code, block quotes ("> …" and the lines
- * that continue them up to a blank line, as Markdown shows them), "double quotes" and curly quotes, also over
- * several lines. An opening quote or fence that is never closed masks everything after it (fail closed).
+ * that continue them up to a blank line, as Markdown shows them), "double quotes", curly quotes and 'straight single
+ * quotes', also over several lines. An opening single quote sits at the start or after whitespace or an opening
+ * bracket and closes at a quote that ends a word, so the apostrophe inside "don't" is never one. An opening quote or
+ * fence that is never closed masks everything after it (fail closed).
  */
 function maskQuotes(text: string): string {
   const chars = text.split("");
@@ -691,10 +778,12 @@ function maskQuotes(text: string): string {
     let close: number | null = null;
     if (c === '"') close = s.indexOf('"', i + 1);
     else if (c === "“") close = s.indexOf("”", i + 1);
-    else if (c === "‘" && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
-      // An opening single quote closes at a ’ that ends a word (not the apostrophe inside "don’t").
+    else if ((c === "‘" || c === "'") && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
+      // An opening single quote (curly or straight) closes at the same quote that ends a word
+      // (not the apostrophe inside "don’t" / "don't").
+      const closer = c === "‘" ? /’(?![a-z])/i : /'(?![a-z])/i;
       const rest = s.slice(i + 1);
-      const m = /’(?![a-z])/i.exec(rest);
+      const m = closer.exec(rest);
       close = m ? i + 1 + (m.index ?? 0) : -1;
     } else continue;
     const to = close === null || close < 0 ? s.length : close + 1;
@@ -950,24 +1039,67 @@ const QUIZ_CANCEL =
 const QUIZ_NO_RECORD =
   /\b(?:don't|dont|do not|never|no need to)\s+(?:bother\s+)?(?:record|save|log|track|keep|store|recording|saving|logging)\b/;
 
-const asksQuestion = (m: IntentMessage | undefined) =>
-  m?.role === "assistant" && sentenceRanges(maskQuotes(m.content)).some(([, , term]) => term === "?");
+/**
+ * A question about the quiz itself rather than the book: an offer to write, to continue, to summarize, to go over the
+ * answers ("Want a summary?", "Ready for the next one?"). It is not a quiz question, and a reply to it — including a
+ * "yes" — is never a quiz answer.
+ */
+const QUIZ_META_QUESTION =
+  /\b(?:would you like|do you want|want (?:a|an|another|more|to|me|it|the|that)|shall i|should i|may i|shall we|anything else|ready for|ready to|makes sense|make sense|clear so far|next question|another question|one more|continue|keep going|carry on|summar\w|recap|tl;dr|care for)\b/;
+
+/**
+ * The quiz questions one assistant message asked: its question sentences that are not about the quiz itself (not an
+ * offer to write, not "want a summary?"). A question that cannot be recognized as a quiz question is not one, so a
+ * later unrelated question never widens the quiz, and a reply to it never counts as a quiz answer (fail closed).
+ */
+function quizQuestions(content: string): number {
+  const masked = maskQuotes(content);
+  let n = 0;
+  for (const [start, end, term] of sentenceRanges(masked)) {
+    if (term !== "?") continue;
+    const s = norm(masked.slice(start, end));
+    if (WRITE_OFFER.test(s) || QUIZ_META_QUESTION.test(s) || conditional(s)) continue;
+    n++;
+  }
+  return n;
+}
+
+/** The quiz questions of the assistant message right before index `i`, or 0 when there is no assistant message there. */
+const quizQuestionsBefore = (messages: ReadonlyArray<IntentMessage>, i: number): number =>
+  i > 0 && messages[i - 1]?.role === "assistant" ? quizQuestions(messages[i - 1].content) : 0;
+
+/**
+ * The checkpoint a quiz text binds the quiz to: "quiz me on chapter 4" / "checkpoint 12" / "ch 3" → "ch4" / "ch12" /
+ * "ch3", "review" → "review"; null when the text names none. Only the request and the assistant's quiz turns bind it
+ * (the quiz's authors), never the user's answers.
+ */
+function quizCheckpoint(text: string): string | null {
+  const t = norm(text);
+  const m = /\b(?:checkpoint|chapter)\s+(?:number\s+)?(?:ch\s*)?(\d+)\b/.exec(t) ?? /\bch\s*(\d+)\b/.exec(t);
+  if (m) return `ch${Number(m[1])}`;
+  return /\breview\b/.test(t) ? "review" : null;
+}
 
 function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
   let request = -1;
+  let requestSentence = "";
   for (let i = messages.length - 1; i >= 0 && request < 0; i--) {
     if (messages[i].role !== "user") continue;
     const masked = maskQuotes(messages[i].content);
     for (const [start, end] of sentenceRanges(masked)) {
       const s = norm(masked.slice(start, end));
-      if (QUIZ_REQUEST.test(s) && !negated(s) && !HEDGED_REQUEST.test(s) && !conditional(s)) { request = i; break; }
+      if (QUIZ_REQUEST.test(s) && !negated(s) && !HEDGED_REQUEST.test(s) && !conditional(s)) { request = i; requestSentence = s; break; }
     }
   }
-  if (request < 0) return { requested: false, asked: 0, answers: 0, recorded: false, answering: false, cancelled: false, userText: "" };
+  const empty: QuizState =
+    { requested: false, asked: 0, answers: 0, answeredAll: false, recorded: false, answering: false, follows: false, cancelled: false, checkpoint: null, userText: "" };
+  if (request < 0) return empty;
   let asked = 0;
   let answers = 0;
   let recorded = false;
   let cancelled = false;
+  // The active quiz is bound to the checkpoint its request (or the assistant's quiz turns) names, if any.
+  let checkpoint = quizCheckpoint(requestSentence);
   const userText: string[] = [];
   for (let i = request; i < messages.length; i++) {
     const m = messages[i];
@@ -975,23 +1107,56 @@ function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
       const masked = maskQuotes(m.content);
       userText.push(masked);
       if (i > request) {
-        // "Stop the quiz", "don't record it", "no more questions": the quiz records nothing from here on.
+        // "Stop the quiz", "don't record it", "no more questions": the quiz is closed permanently from here on.
         for (const [start, end] of sentenceRanges(masked)) {
           const s = norm(masked.slice(start, end));
           if (QUIZ_CANCEL.test(s) || QUIZ_NO_RECORD.test(s) || (QUIZ_REQUEST.test(s) && negated(s))) cancelled = true;
         }
-        if (asksQuestion(messages[i - 1])) answers++;
+        if (quizQuestionsBefore(messages, i) > 0) answers++;
       }
       continue;
     }
-    asked += sentenceRanges(maskQuotes(m.content)).filter(([, , term]) => term === "?").length;
+    asked += quizQuestions(m.content);
     const t = norm(m.content);
     if (/\b(?:recorded|saved|logged)\b/.test(t) && /\b(?:quiz|score|checkpoint)\b/.test(t)) recorded = true;
+    if (checkpoint === null) checkpoint = quizCheckpoint(t);
   }
   const n = messages.length;
-  const answering = n - 2 > request && messages[n - 1]?.role === "user" && asksQuestion(messages[n - 2]);
-  return { requested: true, asked, answers, recorded, answering, cancelled, userText: userText.join("\n") };
+  const answering = n - 2 > request && messages[n - 1]?.role === "user" && quizQuestionsBefore(messages, n - 1) > 0;
+  // The latest message replies to an assistant message after the request (a question-bank answer needs only this).
+  const follows = n - 1 > request && messages[n - 1]?.role === "user" && messages[n - 2]?.role === "assistant";
+  return { requested: true, asked, answers, answeredAll: answers >= asked, recorded, answering, follows, cancelled, checkpoint, userText: userText.join("\n") };
 }
+
+/** The question numbers a message labels, "(Q1234 · ch 3)": the question-bank questions it asks. */
+function questionLabels(text: string): number[] {
+  return [...new Set([...text.matchAll(/\bQ(\d{1,15})\b/g)].map((m) => Number(m[1])).filter((n) => Number.isSafeInteger(n) && n > 0))];
+}
+
+/** A request not to flag: "don't flag it", "no need to report that question". */
+const FLAG_NO = /\b(?:don't|dont|do not|never|no need to|don't need to|dont need to)\s+(?:bother\s+)?(?:flag|report|retire|mark)\b/;
+/** The sentence is about the question or the flag itself ("this question…", "Q12…", "flag it…", "that one…"). */
+const FLAG_SUBJECT = /\b(?:question|q\d+|flag|this one|that one)\b/;
+/** A hedge: the user is not saying it, so nothing is flagged. */
+const FLAG_UNSURE = /\b(?:maybe|might|perhaps|possibly|not sure|i think|i guess|wonder|whether|could be)\b/;
+const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
+/**
+ * What the user has to say for each kind of flag, read from one sentence of the latest message (norm: lower case,
+ * plain apostrophes). "wrong" and "unclear" are about the question, never "my answer was wrong" (the sentence also has
+ * to be about the question, FLAG_SUBJECT) and never "not wrong" (the verb has to sit right before the word).
+ */
+const FLAG_SAYS: Record<string, RegExp> = {
+  wrong: new RegExp(
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:wrong|incorrect|false|inaccurate|mistaken|an error)\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:wrong|incorrect|inaccurate)\\b`,
+  ),
+  unclear: new RegExp(
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:unclear|confusing|ambiguous|vague|poorly worded|badly worded|nonsense)\\b|\\b(?:makes?|made) no sense\\b|\\b(?:doesn't|does not|didn't|did not) make (?:any )?sense\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:unclear|confusing|ambiguous|vague)\\b`,
+  ),
+  not_in_chapter:
+    /\b(?:not|isn't|wasn't|aren't)\s+(?:in|from|part of|covered in|about)\s+(?:this|that|the|that same)\s+chapter\b|\bnot (?:in|from) (?:chapter|ch\.?)\s*\d+\b|\bwrong chapter\b|\bfrom (?:another|a different|the wrong) chapter\b/,
+  not_read_yet:
+    /\b(?:haven't|have not|hasn't|didn't|did not|not)\s+(?:read|got to|gotten to|reached|finished)\s+(?:that|this|the|it|chapter|ch\.?)\b|\bnot read (?:that|this|it|the chapter)?\s*yet\b|\bfrom a chapter i (?:haven't|have not|didn't|did not) (?:read|reach|get to)\b|\b(?:later|future|upcoming) chapter\b/,
+};
 
 // ---------------------------------------------------------------------------------------------------------------
 // The grant
@@ -1015,6 +1180,7 @@ export function writeGrantFor(messages: ReadonlyArray<IntentMessage>, opts: { of
     clauses: offer ? [offer] : latest ? intentClauses(latest) : [],
     confirmed,
     quiz: quizState(messages),
+    askedQuestions: questionLabels(messages.length > 1 && messages[messages.length - 2].role === "assistant" ? messages[messages.length - 2].content : ""),
   };
 }
 
@@ -1052,6 +1218,15 @@ const FINISHED_BOOK = /\b(finished|completed|done with)\b[^.!?\n]*\bbook\b/;
 const HIGHLIGHT = /\b(highlight|quote|passage|line|excerpt|save|keep|note)\b/;
 const PLAYLIST_VERB = /\b(create|make|build|generate|save|start|put together|turn)\b/;
 const QUIZ_WORD = /\b(quiz|score|checkpoint|result)\b/;
+/**
+ * The words of another thing a clause writes: a playlist, a list the user shops from, a cart, a note, a journal.
+ * The kind of a write is read from the clause that carries its verb, so a clause with one of these ("add X to my
+ * shopping list", "save a note about reading chapter 4", "save a playlist called X") writes that thing, not a
+ * record: a record-shaped name in it (the playlist's name, the list item) authorizes no record write, highlight or
+ * reading session, however well it matches one.
+ */
+const OTHER_WRITE =
+  /\b(?:playlists?|(?:shopping|wish|watch)[ -]?lists?|carts?|baskets?|notes?|journals?)\b/;
 
 /** The request verbs that ask to record a supplement, a stack or a habit (never "create", "make", "highlight"). */
 const RECORD_REQUEST = /^(?:log|record|mark|save|add|track|enter)$/;
@@ -1167,10 +1342,12 @@ export function authorizeWrite(
   // "Don't log it" / "don't save that": nothing in this message is written.
   if (actions.some(refusesAll)) return deny("contradicts");
 
-  // A quiz result: either the user states it ("I got 4 out of 5 on the quiz"), or it closes a quiz the user asked
-  // for and answered, with no more questions than were asked and answered, not stopped and not recorded already.
+  // A quiz result: either the user states it ("I got 4 out of 5 on the quiz"), or it closes the active quiz the user
+  // asked for — every quiz question asked was answered, this last answer is the one finalization, the score is out of
+  // exactly those questions, the checkpoint matches the one the conversation bound, and the quiz was not stopped and
+  // not recorded already. Anything that cannot be established from the conversation fails closed.
   if (tool === "record_reading_quiz") {
-    if (notNumber(input.score) || notNumber(input.total) || notText(input.book)) return deny("invalid_value");
+    if (notNumber(input.score) || notNumber(input.total) || notText(input.book) || notText(input.checkpoint)) return deny("invalid_value");
     const score = num(input.score), total = num(input.total);
     if (score == null || total == null || !Number.isInteger(score) || !Number.isInteger(total) || total < 1 || score < 0 || score > total) {
       return deny("quiz_score_invalid");
@@ -1178,17 +1355,67 @@ export function authorizeWrite(
     if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
     // "Don't record a score", "the quiz, not recorded".
     if (actions.some((a) => a.prohibition && QUIZ_WORD.test(a.text))) return deny("contradicts");
+    const q = grant.quiz;
+    // The quiz is bound to the checkpoint it named: a call recording another one is refused.
+    const cp = str(input.checkpoint);
+    if (q.checkpoint !== null && (cp === null || cp.toLowerCase() !== q.checkpoint)) return deny("quiz_checkpoint_mismatch");
     const stated = done.find((a) => QUIZ_WORD.test(a.text) && numbersIn(a.text).has(score) && numbersIn(a.text).has(total));
     if (!stated) {
-      const q = grant.quiz;
       if (!q.requested) return deny("quiz_not_asked");
       if (q.cancelled) return deny("quiz_cancelled");
       if (q.recorded) return deny("quiz_already_recorded");
       if (!q.answering) return deny("quiz_not_answered");
-      if (total > q.asked || total > q.answers) return deny("quiz_score_invalid");
+      // Only the complete active quiz: recognized quiz questions exist, every one has an answer, and the score is
+      // out of exactly those questions.
+      if (q.asked < 1 || !q.answeredAll || total !== q.asked) return deny("quiz_score_invalid");
     }
     const bad = bookCheck(input, stated ? stated.text : grant.quiz.userText, ctx.books);
     if (bad) return deny(bad);
+    return allow(tool, null);
+  }
+
+  // One answer to a question-bank question (READ-QUIZ-01): only inside a quiz the user asked for and did not stop, when
+  // the latest message is the reply to the question the assistant asked right before it (that message carries the
+  // question's label, "Q<id>", so a made-up id or an earlier question is refused), the answer a verbatim span of that
+  // reply, once per message. The grade is the model's judgement; the answer itself is only ever the user's own words.
+  if (tool === "record_reading_answer") {
+    if (notNumber(input.question_id) || notNumber(input.version) || notText(input.answer) || notText(input.verdict) || notText(input.feedback)) return deny("invalid_value");
+    const qid = num(input.question_id), version = num(input.version);
+    if (qid == null || version == null || !Number.isInteger(qid) || !Number.isInteger(version) || qid < 1 || version < 1) return deny("invalid_value");
+    if (input.verdict !== "correct" && input.verdict !== "partial" && input.verdict !== "incorrect") return deny("invalid_value");
+    const answer = str(input.answer);
+    if (!answer) return deny("invalid_value");
+    if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
+    const q = grant.quiz;
+    if (!q.requested) return deny("quiz_not_asked");
+    if (q.cancelled) return deny("quiz_cancelled");
+    if (!q.follows) return deny("quiz_not_answered");
+    if (!grant.askedQuestions.includes(qid)) return deny("question_not_asked");
+    if (!verbatimIn(answer, grant.latest)) return deny("not_your_words");
+    return allow(tool, null);
+  }
+
+  // A question flag: the user's own latest message says that question is wrong / unclear / not in that chapter / from a
+  // chapter not read yet, in the kind the call sends, about the question just asked (or one the message names as
+  // "Q<id>"). "My answer was wrong", a question ("is it wrong?"), a condition and "don't flag it" flag nothing.
+  if (tool === "flag_reading_question") {
+    if (notNumber(input.question_id) || notText(input.kind)) return deny("invalid_value");
+    const qid = num(input.question_id);
+    if (qid == null || !Number.isInteger(qid) || qid < 1) return deny("invalid_value");
+    const kind = str(input.kind);
+    if (!kind || !Object.prototype.hasOwnProperty.call(FLAG_SAYS, kind)) return deny("invalid_value");
+    if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
+    const masked = maskQuotes(grant.latest);
+    const sentences = sentenceRanges(masked).map(([start, end, term]) => ({ s: norm(masked.slice(start, end)), term }));
+    if (sentences.some(({ s }) => FLAG_NO.test(s))) return deny("contradicts");
+    const says = sentences.some(({ s, term }) => {
+      if (term === "?" || conditional(s) || FLAG_UNSURE.test(s) || !FLAG_SUBJECT.test(s) || !FLAG_SAYS[kind].test(s)) return false;
+      // "not wrong", "not unclear": the word itself is negated.
+      return !(kind === "wrong" || kind === "unclear") || !/\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(s);
+    });
+    if (!says) return deny("flag_not_stated");
+    const named = questionLabels(grant.latest);
+    if (!(named.length > 0 ? named : grant.askedQuestions).includes(qid)) return deny("question_not_asked");
     return allow(tool, null);
   }
 
@@ -1207,7 +1434,7 @@ export function authorizeWrite(
     if (notText(input.passage) || notText(input.comment) || notNumber(input.chapter) || notText(input.book)) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => HIGHLIGHT.test(a.text));
     if (blocked) return deny(blocked);
-    const asked = done.filter((a) => HIGHLIGHT.test(a.text));
+    const asked = done.filter((a) => HIGHLIGHT.test(a.text) && !OTHER_WRITE.test(a.text));
     if (asked.length === 0) return deny("no_request");
     const passage = str(input.passage);
     if (!passage || significant(passage).length === 0 || !verbatimIn(passage, grant.ownWords)) return deny("not_your_words");
@@ -1226,13 +1453,29 @@ export function authorizeWrite(
     for (const field of ["recall", "question", "medium", "book"]) if (notText(input[field])) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText));
     if (blocked) return deny(blocked);
-    const chains = [...new Map(done.filter((a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText)).map((a) => [a.chain, a])).values()];
+    // The kind of write is read from the clause that carries the verb (the chain's first): a chain that starts by
+    // writing something else ("save a note about reading chapter 4") is not a reading report, however well its
+    // words match one. A later item that only writes a note ("…and took a note") does not un-read the chain.
+    const firstOfChain = new Map<number, Action>();
+    for (const a of done) if (!firstOfChain.has(a.chain)) firstOfChain.set(a.chain, a);
+    const chains = [...new Map(done.filter((a) => !OTHER_WRITE.test(firstOfChain.get(a.chain)!.text) && (READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText))).map((a) => [a.chain, a])).values()];
     if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
+    // The granted session's canonical identity: the book the grant binds (the one the user names — bookCheck refuses
+    // any other — else the one being read), the day, the chapters and the minutes the user's own action states, never
+    // the call's arguments, so a repeated or varied call for the same session is refused and another chapter range
+    // or day is another session.
+    const sessionIdentity = (a: Action): string => {
+      const days = [...allowedDays(a, ctx.requestDay)].sort();
+      const chapters = [...chapterNumbers(a.chainText)].sort((x, y) => x - y).join(",");
+      const minutes = [...minuteValues(a.chainText)].sort((x, y) => x - y).join(",");
+      const book = str(input.book) ?? ctx.books?.active ?? "";
+      return [tool, book, days.length > 0 ? days.join(",") : ctx.requestDay, chapters, minutes].join("|");
+    };
     let refusal: RefusalCode = "not_named";
     for (const a of chains) {
       const r = readingSessionFits(a, input, grant, ctx);
       if (r) { refusal = r; continue; }
-      const key = `${tool}|c${a.chain}`;
+      const key = sessionIdentity(a);
       if (!fresh(key)) { refusal = "already_written"; continue; }
       return allow(tool, key);
     }
@@ -1284,34 +1527,58 @@ export function authorizeWrite(
   // or reports this kind of write ("I took X" logs an intake; "I bought X" does not).
   const candidates = same.filter((a) => {
     const at = span(a);
-    return at !== null && !topicOnly(a, at) && verbFits(tool, a);
+    return at !== null && !topicOnly(a, at) && !OTHER_WRITE.test(a.text) && verbFits(tool, a);
   });
   if (candidates.length === 0) return deny("not_named");
 
+  // The granted write's canonical identity: the tool, the record as the user's own words name it, and the arguments
+  // the user's action itself states — the day (the days it names, else the default), the amounts with their unit kind
+  // and the clock times (an intake), a habit's answer. Never the call's arguments, so a second call for the same
+  // grant is refused whatever the model sends (a changed optional argument cannot mint a new write), two actions
+  // that grant the same write are one, and actions with different stated arguments remain one write each. Per request
+  // only; a retry of the whole message starts fresh here and reconciles through the replay ledger (SEC-04).
+  const mention = (a: Action): string => {
+    const at = span(a)!;
+    const toks = tokens(a.text);
+    // A word continues the record's mention when it is part of its name, not an argument or glue: "synthetic
+    // magnesium" and "synthetic magnesium glycinate" are the mention "synthetic magnesium glycinate".
+    const word = (w: string) =>
+      !STOP.has(w) && !GENERIC.has(w) && (!ARGUMENT_WORD.test(w) || /^\d+(?:\.\d+)?$/.test(w));
+    let [from, to] = at;
+    while (from > 0 && word(toks[from - 1])) from -= 1;
+    while (to + 1 < toks.length && word(toks[to + 1])) to += 1;
+    return flat(toks.slice(from, to + 1).join(" "));
+  };
+  const grantIdentity = (a: Action): string => {
+    const days = [...allowedDays(a, ctx.requestDay)].sort();
+    const parts = [tool, mention(a), days.length > 0 ? days.join(",") : defaultDay(tool, record!, ctx)];
+    if (tool === "log_supplement_intake") {
+      parts.push(quantities(a.text).map((q) => `${q.value}:${q.unit ?? "serving"}`).sort().join(";"));
+      parts.push(actionTimes(a, actions).slots.map((s) => [...s].sort().join("/")).join(";"));
+    }
+    if (tool === "mark_habit_complete") parts.push(a.negated ? "no" : "yes");
+    return parts.join("|");
+  };
   let refusal: RefusalCode = "not_named";
   for (const a of candidates) {
     const r = argumentsFit(tool, a, actions, input, record, ctx);
     if (r) { refusal = r; continue; }
-    const [from, to] = span(a)!;
-    const prefix = `${tool}|a${a.id}|`;
-    // The words this call names were already used by an allowed call of this action: the same record again.
-    const taken = [...ctx.used.consumed].some((k) => {
-      if (!k.startsWith(prefix)) return false;
-      const [f, t] = k.slice(prefix.length).split("-").map(Number);
-      return f <= to && from <= t;
-    });
-    if (taken) { refusal = "already_written"; continue; }
-    return allow(tool, `${prefix}${from}-${to}`);
+    const key = grantIdentity(a);
+    if (!fresh(key)) { refusal = "already_written"; continue; }
+    return allow(tool, key);
   }
   return deny(refusal);
 }
 
-/** The day a call writes, when it sends none: today, or last night for a sleep question (lib/checkin sleepAnswerDate). */
-function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
-  const date = str(input.date);
-  if (date) return date;
+/** The day a grant names none: today, or last night for a sleep question (lib/checkin sleepAnswerDate). */
+function defaultDay(tool: WriteToolName, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
   if (tool === "mark_habit_complete" && ctx.isSleepHabit?.(record)) return dayBefore(ctx.requestDay) ?? ctx.requestDay;
   return ctx.requestDay;
+}
+
+/** The day a call writes, when it sends none: the grant's default day. */
+function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
+  return str(input.date) ?? defaultDay(tool, record, ctx);
 }
 
 /** The day check: the day the call writes is one the action names, or the default day when it names none. */
@@ -1375,9 +1642,10 @@ function argumentsFit(
 }
 
 /**
- * Whether a reading session call fits reading action `a` (its list): the chapters are numbers said as chapters, the
- * minutes a duration said ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes), the day, the book, the
- * user's words.
+ * Whether a reading session call fits reading action `a` (its list): the call covers EXACTLY the chapters the action
+ * grants (both of "chapters 3 and 4", every chapter of "ch. 5-7"), the minutes are the duration said and are sent
+ * when one is stated ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes, and never drops the 12), the
+ * day, the book, the user's words.
  */
 function readingSessionFits(
   a: Action,
@@ -1388,10 +1656,13 @@ function readingSessionFits(
   const text = a.chainText;
   const book = bookCheck(input, a.sentence, ctx.books);
   if (book) return book;
-  const chapters = chapterNumbers(text);
+  const chapters = grantedChapters(text);
   const through = num(input.chapter_through);
   const finished = FINISHED_BOOK.test(text);
   if (through == null) return "not_named";
+  // The endpoints are the call's own numbers: each has to be a whole chapter (an integer >= 1). A hostile or
+  // malformed endpoint (a float, a 0, a huge negative "from") is refused here, before anything is expanded.
+  if (!Number.isInteger(through) || through < 1) return "not_named";
   if (!chapters.has(through)) {
     // "I finished the book": the last chapter of the book written to, when it is known.
     const slug = str(input.book) ?? ctx.books?.active ?? null;
@@ -1399,9 +1670,27 @@ function readingSessionFits(
     if (!finished || total == null || through !== total) return "not_named";
   }
   const from = num(input.chapter_from);
-  if (from != null && from !== through && !chapters.has(from)) return "not_named";
+  if (from !== null && (!Number.isInteger(from) || from < 1)) return "not_named";
+  if (from !== null && from > through) return "not_named";
+  if (chapters.size > 0) {
+    // The call must cover exactly the granted chapters: not a subset, not more. Compared by endpoint and
+    // cardinality, never by expanding the call's range: the range written (chapter_from .. chapter_through, or
+    // the single chapter when no from is sent) has to be exactly the chapters the user granted. Counting it by
+    // subtraction first means a hostile range (e.g. from -1000000000 to a named chapter 4) is refused by its
+    // size before anything is enumerated, and the only values ever iterated are the user's own granted chapters.
+    const fromCh = from ?? through;
+    if (through - fromCh + 1 !== chapters.size) return "not_named";
+    for (const c of chapters) if (c < fromCh || c > through) return "not_named";
+  } else if (from !== null && from !== through) {
+    return "not_named";
+  }
   const minutes = num(input.minutes);
-  if (minutes != null && !minuteValues(text).has(minutes)) return "amount_not_stated";
+  const statedMinutes = minuteValues(text);
+  if (statedMinutes.size > 0) {
+    if (minutes == null || !statedMinutes.has(minutes)) return "amount_not_stated";
+  } else if (minutes != null) {
+    return "amount_not_stated";
+  }
   const day = str(input.date) ?? ctx.requestDay;
   const days = allowedDays(a, ctx.requestDay);
   if (days.size > 0 ? !days.has(day) : day !== ctx.requestDay) return "day_not_stated";

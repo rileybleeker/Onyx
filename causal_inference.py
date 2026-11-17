@@ -541,6 +541,12 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("screen_after_midnight_min",         "behavior", "Phone use after midnight above median",   "min"),
     ("screen_last_hour_before_sleep_min", "behavior", "Phone use in the last hour before sleep above median", "min"),
     ("screen_social_min",                 "behavior", "Social-app minutes above median",         "min"),
+    # Windows PC activity (pds.pc_activity_daily via tools/pc_activity_logger, 2026-11-16).
+    # Only the coarse late total: evening PC use is the candidate sleep disruptor, and
+    # per-program columns are deliberately absent (privacy: the pipeline never features
+    # a program). Days the logger never ran are NaN, so these sit in dropped_low_n until
+    # MIN_CONTINUOUS_N complete days accrue, then enter the FDR family on their own.
+    ("pc_late_min",                       "behavior", "PC active minutes after 9 PM above median", "min"),
     ("screen_pickups",                    "behavior", "Phone pickups above median",              None),
     # Outdoor air quality (pds.air_quality_daily via air_quality_etl.py, 2026-11-11): mean PM2.5
     # of the ET clock day that precedes the sleep (same row, hrv_alignment.py). Exogenous (weather,
@@ -565,6 +571,15 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     ("wx_apparent_temp_max",              "behavior", "Feels-like high above median",            "°C"),
     ("wx_sunshine_hours",                 "behavior", "Sunshine hours above median",             "h"),
     ("wx_night_temp_mean",                "behavior", "Outdoor temperature during sleep above median", "°C"),
+    # Pollen (pds.pollen_daily via pollen_etl.py, 2026-11-17): total count published for the
+    # day before the sleep (moved one day earlier by date in
+    # hrv_analysis.merge_pollen_features, the same -1 move as wx_night_temp_mean). EXPLORATORY
+    # for the same reason as the weather treatments: there is NO seasonal adjustment in this
+    # layer, and pollen is almost pure season (Atlanta's tree season runs late Feb-May), so
+    # the median split is close to "peak season vs off season" and an effect can be season,
+    # not pollen. Family 'behavior' with the common lag-1 confounders only. Atlanta only; the
+    # series ends at the NYC move.
+    ("pollen_total",                      "behavior", "Pollen count above median",               "grains/m³"),
     ("meal_eating_window_hours",      "nutrition", "Eating window above median",               "h"),
     ("meal_last_hour",                "nutrition", "Last meal clock hour above median",        "ET hr"),
     ("meal_first_hour",               "nutrition", "First meal clock hour above median",       "ET hr"),

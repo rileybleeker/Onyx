@@ -21,8 +21,8 @@ import type { DetectedSubscription } from "@/lib/procurement-recurring";
  * (no flag is raised from missing data), and without the dismissals table every flag shows.
  */
 
-const SEGMENT_COLS = "segment_start";
-const ITEM_COLS = "kind,identifier,seconds";
+const SEGMENT_COLS = "segment_start,verified_at";
+const ITEM_COLS = "segment_start,kind,identifier,seconds";
 const DISMISSAL_COLS = "sub_id,flag_key";
 const MAX_PAGES = 20;
 const MISSING_TABLE = new Set(["42P01", "PGRST205"]);
@@ -34,11 +34,19 @@ const errorCode = (e: unknown): string => (e instanceof LedgerQueryError && e.co
 /** iPhone usage per app / site over the last 30 days, or null when it cannot be read. */
 export async function loadUsageTotals(db: Db, now: Date): Promise<UsageTotals | null> {
   const since = new Date(now.getTime() - USAGE_WINDOW_DAYS * DAY_MS).toISOString();
+  const to = now.toISOString();
   try {
+    // Window completeness first: an unverified or partial window must read as unknown, never zero.
+    const { data: complete, error: windowError } = await db.rpc("phone_usage_window_complete", { p_from: since, p_to: to });
+    if (windowError || complete !== true) {
+      if (windowError) console.error("[/procurement] screen time window check failed", errorCode(windowError));
+      return { daysCovered: 0, items: [], windowComplete: false };
+    }
     const [segments, items] = await Promise.all([
       fetchPaged(
         (from, to) =>
           db.from("phone_usage_segments").select(SEGMENT_COLS, { count: "exact" }).gte("segment_start", since)
+            .not("verified_at", "is", null)
             .order("segment_start", { ascending: true }).range(from, to),
         MAX_PAGES,
       ),
@@ -52,13 +60,23 @@ export async function loadUsageTotals(db: Db, now: Date): Promise<UsageTotals | 
     ]);
     // A cut-off read would under-count minutes and could raise a false "no recent use": treat it as unknown.
     if (segments.truncated || items.truncated) return null;
-    // Days with any reported hour. UTC days are close enough for "is the window covered".
+    // Only hours whose segment row is verified are trustworthy; items are trusted when their hour is.
+    const verifiedHours = new Set<string>();
     const days = new Set<string>();
     for (const row of segments.rows) {
-      const start = (row as { segment_start?: unknown } | null)?.segment_start;
-      if (typeof start === "string" && start.length >= 10) days.add(start.slice(0, 10));
+      const r = row as { segment_start?: unknown; verified_at?: unknown } | null;
+      if (!r || r.verified_at == null) continue;
+      const start = r.segment_start;
+      if (typeof start === "string" && start.length >= 10) {
+        verifiedHours.add(start);
+        days.add(start.slice(0, 10));
+      }
     }
-    return sumUsage(items.rows, days.size);
+    const verifiedItems = items.rows.filter((raw) => {
+      const start = (raw as { segment_start?: unknown } | null)?.segment_start;
+      return typeof start === "string" && verifiedHours.has(start);
+    });
+    return { ...sumUsage(verifiedItems, days.size), windowComplete: true };
   } catch (e) {
     console.error("[/procurement] screen time read failed", errorCode(e));
     return null;
