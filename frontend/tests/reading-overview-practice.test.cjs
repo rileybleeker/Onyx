@@ -1248,7 +1248,7 @@ test("the sheet: recalled count, ideas with stage words, no statement before an 
   assert.match(s.h.text(), /Which lamp burns longest\?/);
   assert.match(s.h.text(s.h.find((n) => n.props["data-testid"] === "sheet-built")[0]), /Built Mar 9 · prompt bank-test\.1/);
   const dialog = s.h.find((n) => n.props.role === "dialog")[0];
-  assert.equal(dialog.props["aria-modal"], true);
+  assert.equal(dialog.props["aria-modal"], "true", "written as the string attribute, like the other dialogs (ChapterSheet.tsx aria-modal=\"true\")");
   assert.equal(s.calls.filter((c) => c.method !== "GET").length, 0, "opening writes nothing");
   assert.equal(s.calls.length, 1);
 });
