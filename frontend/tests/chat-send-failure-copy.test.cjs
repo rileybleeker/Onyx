@@ -21,7 +21,9 @@ test("the send failure catch block exists and shows the failure line", () => {
 
 test("the failure line never renders server or browser error text", () => {
   assert.doesNotMatch(catchBlock, /data\??\.error/, "data.error is not rendered in the catch block");
-  assert.doesNotMatch(catchBlock, /error\.message|err\.message/, "error.message is not rendered in the catch block");
+  // Comparing the message to the fixed session copy (`err.message === SESSION_EXPIRED_MESSAGE`) picks a fixed copy and
+  // renders nothing of the error; any other use of the message is still refused.
+  assert.doesNotMatch(catchBlock, /\b(?:error|err)\.message(?!\s*===\s*SESSION_EXPIRED_MESSAGE\b)/, "error.message is not rendered in the catch block");
   // The reason is chosen from fixed copies only.
   assert.match(catchBlock, /const reason = /);
 });
