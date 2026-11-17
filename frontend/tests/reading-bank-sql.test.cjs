@@ -469,6 +469,28 @@ test("a refusal to spend is not a failed try: a cost-free retry with a cost-refu
   assert.match(f, /v_cost = 0/);
 });
 
+test("the finish readback in lib/reading-bank-finish.ts mirrors this SQL: the deferral codes, the stored status, the settlement's code and fence", () => {
+  const { loadTs } = require("./helpers/load-ts.cjs");
+  const F = loadTs("lib/reading-bank-finish.ts");
+  const f = fn(fnsMain, "pds.reading_bank_finish").body;
+  // The codes that give a try back are the ones finishDefers knows (and it knows no others).
+  const codes = /COALESCE\(p->>'error_code', ''\) IN \(([^)]*)\)/.exec(f)[1].split(",").map((s) => s.trim().replace(/'/g, ""));
+  assert.ok(codes.length >= 4);
+  for (const c of codes) assert.equal(F.finishDefers({ outcome: "retry", cost_cents: 0, error_code: c }), true, c);
+  assert.equal(F.finishDefers({ outcome: "retry", cost_cents: 0, error_code: "timeout" }), false);
+  // The answer carries the status the row was left in (a retry at the third attempt is failed): what the workers reconcile.
+  assert.match(f, /RETURN jsonb_build_object\('ok', true, 'status', v_job\.status\);/);
+  assert.match(f, /status = CASE v_out WHEN 'retry' THEN CASE WHEN attempts >= 3 AND NOT v_defer THEN 'failed' ELSE 'queued' END ELSE v_out END/);
+  assert.match(f, /error_code = p->>'error_code'/, "a finish stores the code it was sent: the readback compares it");
+  assert.doesNotMatch(f, /claim_seq\s*=/, "a finish never changes claim_seq: the fence still names the claim after it");
+  // A lease settlement writes lease_expired, leaves attempts and claim_seq alone and only touches a running job.
+  const claim = fn(fnsMain, "pds.reading_bank_claim").body;
+  const settle = claim.slice(claim.indexOf("FOR v_exp IN"), claim.indexOf("END LOOP"));
+  assert.match(settle, /WHERE j\.status = 'running' AND j\.lease_until < NOW\(\)/);
+  assert.match(settle, /error_code = 'lease_expired'/);
+  assert.doesNotMatch(settle, /claim_seq|attempts\s*=/, "a settlement keeps the fence: the readback tells it from a finish by its code");
+});
+
 test("claim: the first request's bound, when sent, is the cap test (with the pause); the estimate is still what is reserved", () => {
   const c = fn(fnsMain, "pds.reading_bank_claim").body;
   assert.match(c, /v_need := GREATEST\(v_est, LEAST\(GREATEST\(COALESCE\(NULLIF\(p->'bounds'->>v_job\.step, ''\)::numeric, 0\), 0\), 100000\)\);/);
