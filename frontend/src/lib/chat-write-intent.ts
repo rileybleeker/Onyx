@@ -337,13 +337,13 @@ function namedSpan(item: string, text: string, loose = false): [number, number] 
   return [Math.min(...near), Math.max(...near)];
 }
 
-export export const names = (item: string, text: string, loose = false) => namedSpan(item, text, loose) !== null;
+export const names =(item: string, text: string, loose = false) => namedSpan(item, text, loose) !== null;
 
 /** Text reduced to words: case, spacing and punctuation aside. */
-export export const flat = (s: string) => norm(s).replace(/[^a-z0-9']+/g, " ").trim();
+export const flat =(s: string) => norm(s).replace(/[^a-z0-9']+/g, " ").trim();
 
 /** `part` occurs word for word in `whole` (case, spacing and punctuation aside). */
-export export function verbatimIn(part: string, whole: string): boolean {
+export function verbatimIn(part: string, whole: string): boolean {
   const p = flat(part);
   return p.length > 0 && ` ${flat(whole)} `.includes(` ${p} `);
 }
