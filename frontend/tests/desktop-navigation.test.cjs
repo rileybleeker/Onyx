@@ -60,6 +60,8 @@ const sidebarModule = load('src/components/Sidebar.tsx', {
   },
 });
 const Sidebar = sidebarModule.default;
+// The skip link's target resolver and handler (AppShell renders the link; these live in a shared module).
+const skipModule = load('src/lib/skip-to-page.ts');
 const render = () => renderToStaticMarkup(React.createElement(Sidebar));
 // Link destinations only: React 19's server render also emits <link rel="preload" href> for the sidebar logo.
 // Every page is rendered in Quick access AND in its section (for the pre-paint script); the copy that is not shown
@@ -143,17 +145,25 @@ test('the wordmark is not a heading: each page title is the page\'s only h1', ()
   assert.ok(html.includes('Onyx</p>'), 'wordmark still shown');
   assert.doesNotMatch(html, /<h[1-6]\b/, 'no heading in the side panel');
 });
-test('"Skip to page content" is the first link and only shows on focus', () => {
+// The skip link is rendered by AppShell at every width (outside the max-md:hidden side panel), never by Sidebar.
+test('"Skip to page content" is not inside the side panel and is rendered once, by AppShell, at every width', () => {
   const html = render();
-  const skip = html.indexOf('Skip to page content');
-  assert.ok(skip > 0, 'skip link present');
-  assert.ok(skip < html.indexOf('Search…'), 'before the search button');
-  assert.ok(skip < html.indexOf('href="/today"'), 'before every page link');
-  const tag = html.slice(html.lastIndexOf('<a', skip), skip);
-  assert.match(tag, /class="sr-only focus:not-sr-only /);
+  assert.equal(html.indexOf('Skip to page content'), -1, 'not rendered by Sidebar');
+  const shellSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'AppShell.tsx'), 'utf8');
+  const linkSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'SkipToPageLink.tsx'), 'utf8');
+  assert.equal(shellSrc.split('<SkipToPageLink />').length - 1, 2, 'one render in each full layout (/agents and the main layout)');
+  assert.doesNotMatch(shellSrc, /<SkipToPageLink \/>[\s\S]*<aside/, 'no aside before the link in the main layout');
+  assert.match(linkSrc, /sr-only focus:not-sr-only /);
+  assert.doesNotMatch(linkSrc, /max-md:hidden|md:hidden|hidden md/, 'the link itself is never hidden below 768 px');
+  // The link comes before the side panel in both layouts, so it is the first focusable element.
+  const sidebarIdx = shellSrc.indexOf('<Sidebar />');
+  const linkIdx = shellSrc.indexOf('<SkipToPageLink />');
+  assert.ok(linkIdx > 0 && linkIdx < sidebarIdx, 'the link is rendered before the side panel');
+  const sidebarSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'Sidebar.tsx'), 'utf8');
+  assert.match(sidebarSrc, /<aside data-side-panel="" className="[^"]*max-md:hidden/, 'the side panel is still hidden below 768 px');
 });
 test('the skip link targets the opened page title, then the page, then <main>', () => {
-  const { pageContentTarget } = sidebarModule;
+  const { pageContentTarget } = skipModule;
   // Synthetic stand-ins for the DOM: the routed page is the scroll root's div child; neighbours are sections.
   const node = (name, kids = {}) => ({ name, querySelector: (sel) => kids[sel] ?? null });
   const heading = node('heading');
@@ -168,14 +178,14 @@ test('the skip link targets the opened page title, then the page, then <main>', 
   // /agents is drawn without <main>: its title, else the screen after the side panel (review round 1).
   const title = node('agents h1');
   const screen = node('agents screen');
-  assert.equal(pageContentTarget(docWith({ h1: title, [sidebarModule.AFTER_SIDE_PANEL]: screen })), title, 'no <main>: the h1');
-  assert.equal(pageContentTarget(docWith({ [sidebarModule.AFTER_SIDE_PANEL]: screen })), screen, 'no title: what follows the side panel');
+  assert.equal(pageContentTarget(docWith({ h1: title, [skipModule.AFTER_SIDE_PANEL]: screen })), title, 'no <main>: the h1');
+  assert.equal(pageContentTarget(docWith({ [skipModule.AFTER_SIDE_PANEL]: screen })), screen, 'no title: what follows the side panel');
   assert.equal(pageContentTarget(docWith({ h1: title, main })), main, '<main> first when there is one');
   assert.equal(pageContentTarget(docWith({})), null, 'nothing to skip to');
 });
 // Review round 2 (2026-11-16): the page in view, not always the routed one, when the continuous scroll has moved on.
 test('the skip link targets the page in view of the continuous scroll', () => {
-  const { pageContentTarget } = sidebarModule;
+  const { pageContentTarget } = skipModule;
   const page = (route, kids = {}) => ({ route, getAttribute: (a) => (a === 'data-feed-route' ? route : null), querySelector: (sel) => kids[sel] ?? null });
   const TITLE = '[data-testid="page-heading"], [data-testid="feed-page-heading"]';
   const routedTitle = { name: 'routed title' };
@@ -195,16 +205,18 @@ test('the skip link targets the page in view of the continuous scroll', () => {
   assert.equal(pageContentTarget(doc, null), routedTitle, 'no page in view given');
 });
 test('the skip link never falls through to the browser jump, and the side panel is marked for the fallback', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'Sidebar.tsx'), 'utf8');
-  const body = src.slice(src.indexOf('function skipToPage'), src.indexOf('export default function Sidebar'));
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'skip-to-page.ts'), 'utf8');
+  const body = src.slice(src.indexOf('export function skipToPage'));
   assert.ok(body.indexOf('event.preventDefault()') >= 0 && body.indexOf('event.preventDefault()') < body.indexOf('if (!target) return'), 'prevented before the target check');
   // A tabindex the link adds goes again on blur (left in place, a click on the page's text would focus the page).
   const added = body.indexOf('target.setAttribute("tabindex", "-1");');
   const removed = body.indexOf('target.addEventListener("blur", () => target.removeAttribute("tabindex"), { once: true });');
   assert.ok(added > 0 && removed > added && removed < body.indexOf('target.focus('), 'tabindex removed on blur when the link added it');
-  assert.match(src, /onClick=\{\(e\) => skipToPage\(e, current\)\}/, 'the page in view');
-  assert.match(src, /<aside data-side-panel=""/);
-  assert.match(sidebarModule.AFTER_SIDE_PANEL, /^\[data-side-panel\] ~ /);
+  const linkSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'SkipToPageLink.tsx'), 'utf8');
+  assert.match(linkSrc, /onClick=\{\(e\) => skipToPage\(e, current\)\}/, 'the page in view');
+  const sidebarSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'Sidebar.tsx'), 'utf8');
+  assert.match(sidebarSrc, /<aside data-side-panel=""/);
+  assert.match(skipModule.AFTER_SIDE_PANEL, /^\[data-side-panel\] ~ /);
 });
 // CI's offline stage has no browser installed. Opt in after installing Playwright:
 // RUN_DESKTOP_LAYOUT=1 node --test tests/desktop-navigation.test.cjs

@@ -10,6 +10,7 @@ import UpdateChecker from "./UpdateChecker";
 import PersonalizeHost from "./personalize/PersonalizeHost";
 import ContinuousScroll from "./ContinuousScroll";
 import { ActiveRouteProvider } from "./FeedContext";
+import SkipToPageLink from "./SkipToPageLink";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -26,6 +27,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     // AppData is first in both layouts so moving to and from /agents keeps it mounted.
     return (
       <ActiveRouteProvider>
+        {/* First in the Tab order, outside the side panel, at every width (see SkipToPageLink). */}
+        <SkipToPageLink />
         <AppData />
         <Sidebar />
         {children}
@@ -41,6 +44,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // provider lets the sidebar, tab bar and palette follow the page in view.
   return (
     <ActiveRouteProvider>
+      {/* First in the Tab order, outside the side panel, at every width (see SkipToPageLink). */}
+      <SkipToPageLink />
       <AppData />
       <Sidebar />
       <main className="md:ml-[220px] min-h-screen">
