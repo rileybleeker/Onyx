@@ -188,7 +188,8 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
       applyAck(body, a.json);
       return a.json;
     } catch (e) {
-      setRowMsg({ id: item.book_id, text: e instanceof Error && e.message ? e.message : listErrorText(null), retry: body });
+      console.error("reading list save failed:", e);
+      setRowMsg({ id: item.book_id, text: e instanceof AutosaveRefused && e.message ? e.message : listErrorText(null), retry: body });
       return null;
     } finally {
       setBusy(null);
