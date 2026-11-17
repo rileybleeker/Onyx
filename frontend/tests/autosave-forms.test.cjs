@@ -434,6 +434,52 @@ test("stack editor: after a create, Close and another new stack make a second st
   assert.deepEqual(server.stacks.map((s) => [s.stack_id, s.version, s.name]), [[41, 1, "Synthetic stack A"], [42, 1, "Synthetic stack B"]], "two stacks, each written once");
 });
 
+test("stack editor: a stack loaded without a version, changed by another editor, is never saved with the old description or products", async (t) => {
+  // Editor B loaded stack 7 before versions existed (version null). Editor A then changed its description and products
+  // (version 3 -> 4). B edits only the name: its form still holds the old description and products, so nothing may be
+  // sent (a PATCH with those values and the new version would silently overwrite A's change). B sees the conflict.
+  const server = stackServer([{ stack_id: 7, version: 3, description: "Original description", items: [{ product_id: "synthetic-product-1", doses: 1 }] }]);
+  const answer = async (call) => {
+    if (call.method === "GET") return response({ stacks: server.stacks.map((s) => ({ stack_id: s.stack_id, version: s.version })) });
+    return server.answer(call);
+  };
+  const aSave = await server.answer({
+    url: "/api/supplements/stacks",
+    method: "PATCH",
+    body: {
+      stack_id: 7,
+      name: "Synthetic stack",
+      description: "Editor A description",
+      remind_time: null,
+      items: [{ product_id: "synthetic-product-1", doses: 1 }, { product_id: "synthetic-product-2", doses: 2 }],
+      save_id: "00000000-0000-4000-8000-0000000000a1",
+      expected_version: 3,
+      after_save_ids: [],
+    },
+  });
+  assert.equal(aSave.status, 200, "editor A's change is saved");
+  assert.deepEqual([server.stacks[0].version, server.stacks[0].description], [4, "Editor A description"]);
+  const h = await mountStack(t, {
+    stack: { ...SAVED_STACK, description: "Original description", version: null },
+    answer,
+  });
+  change(one(h, STACK_NAME, "the name field"), "Synthetic stack, renamed by B");
+  await h.flush();
+  await h.tick(60_000);
+  assert.ok(h.net.calls.some((c) => c.method === "GET"), "the latest version was read before the save");
+  assert.deepEqual(h.net.writes(), [], "no PATCH: B's stale description and products are not sent");
+  assert.match(h.text(), /This stack was changed somewhere else/, "the conflict is shown");
+  assert.match(h.text(), /Load the latest version/, "the editor offers the latest version");
+  assert.deepEqual([server.stacks[0].version, server.stacks[0].description], [4, "Editor A description"], "A's change is untouched");
+  change(one(h, STACK_NAME, "the name field"), "Synthetic stack, renamed again");
+  await h.flush();
+  await h.tick(60_000);
+  assert.equal(h.net.writes().length, 0, "locked after the conflict: nothing more is sent");
+  h.click("Load the latest version");
+  await h.flush();
+  assert.deepEqual(h.events, { closed: 0, saved: 1 }, "the stacks are read again, the refused change is let go");
+});
+
 // ─── supplement intake editor (mounted) ──────────────────────────────────────
 
 const INTAKE = { intake_id: 501, intake_date: "2031-03-04", intake_time: null, doses: 1, notes: null, brand_name: "Synthetic Brand", full_name: "Synthetic capsule" };
