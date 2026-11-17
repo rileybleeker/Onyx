@@ -51,6 +51,8 @@ DECLARE
     v_parent regclass;
     v_cols   text;
     v_where  text := '';
+    v_n      int;
+    v_ok     boolean;
 BEGIN
     IF v_rel IS NULL THEN
         RAISE EXCEPTION USING ERRCODE = '42P01', MESSAGE = 'hrv_source_fingerprint: unknown relation';
@@ -91,11 +93,12 @@ BEGIN
         IF p_link_col IS NULL OR p_parent_key IS NULL OR p_parent_date_col IS NULL THEN
             RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'hrv_source_fingerprint: incomplete link';
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = v_rel AND a.attname = p_link_col
-                          AND a.attnum > 0 AND NOT a.attisdropped)
-           OR (SELECT count(*) FROM pg_attribute a WHERE a.attrelid = v_parent
-                  AND a.attname IN (p_parent_key, p_parent_date_col) AND a.attnum > 0 AND NOT a.attisdropped)
-              < CASE WHEN p_parent_key = p_parent_date_col THEN 1 ELSE 2 END THEN
+        SELECT count(*) INTO v_n FROM pg_attribute a
+         WHERE a.attrelid = v_parent AND a.attname IN (p_parent_key, p_parent_date_col)
+           AND a.attnum > 0 AND NOT a.attisdropped;
+        v_ok := EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = v_rel AND a.attname = p_link_col
+                          AND a.attnum > 0 AND NOT a.attisdropped);
+        IF NOT v_ok OR v_n < (CASE WHEN p_parent_key = p_parent_date_col THEN 1 ELSE 2 END) THEN
             RAISE EXCEPTION USING ERRCODE = '42703', MESSAGE = 'hrv_source_fingerprint: unknown link column';
         END IF;
         v_where := format(' WHERE t.%I IN (SELECT p.%I FROM %s p WHERE p.%I < $1)',
