@@ -418,6 +418,14 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
   // Requested vs shown range (components/RangeLoadStatus.tsx, Codex #191 UI 4): labels use the shown one.
   const { range, attempt, view: rangeView, selected: selectedRange, begin: beginRange, finish: finishRange, retry: retryRange, select: selectRange } = useRangeLoad("30d");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Inline failure for a row action (delete or tag save), shown on that row where the user clicked.
+  // Cleared by the next action on any row, or after a few seconds. Replaces the blocking browser popup.
+  const [rowError, setRowError] = useState<{ id: string; kind: "delete" | "tags"; text: string } | null>(null);
+  useEffect(() => {
+    if (!rowError) return;
+    const t = setTimeout(() => setRowError(null), 5000);
+    return () => clearTimeout(t);
+  }, [rowError]);
   // LLM-proposed tags for untagged strength rows, keyed by row id ("whoop:<id>"). Never part of the
   // ISR prefetch: they load after the list has painted (effect below) and degrade to nothing on
   // any failure. The entry doubles as the draft - toggling a ghost chip edits it in place.
@@ -518,6 +526,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     if (!confirm(`Delete this activity from Onyx?\n\n${label}\n\nIt will be hidden from all charts and HRV analytics. Re-syncs won't bring it back. You can restore it by clearing is_excluded in the DB.`)) {
       return;
     }
+    setRowError(null);
     setDeletingId(act.id);
     const before = rows;
     setRows((prev) => prev.filter((r) => r.id !== act.id));
@@ -531,7 +540,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     } catch (e) {
       setRows(before);
       console.error("Delete activity:", e);
-      alert("Couldn't delete. Try again.");
+      setRowError({ id: act.id, kind: "delete", text: "Couldn't delete. Try again." });
     } finally {
       setDeletingId(null);
     }
@@ -555,6 +564,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     if (next.split_labels !== undefined) prevValues.split_labels = act.split_labels;
     if (next.muscle_groups !== undefined) prevValues.muscle_groups = act.muscle_groups;
     if (next.is_sauna !== undefined) prevValues.is_sauna = act.is_sauna;
+    setRowError(null);
     setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...next } : r)));
     try {
       const res = await fetch("/api/activities/categorize", {
@@ -567,7 +577,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     } catch (e) {
       setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...prevValues } : r)));
       console.error("Categorize activity:", e);
-      alert("Couldn't save the tags. Try again.");
+      setRowError({ id: act.id, kind: "tags", text: "Couldn't save the tags. Try again." });
       return false;
     }
   }
@@ -957,6 +967,9 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
                     </button>
                   </div>
                   <p className="text-text-primary font-medium mt-1 truncate">{act.name}</p>
+                  {rowError?.id === act.id && rowError.kind === "delete" && (
+                    <p role="alert" className="text-[11px] text-red-400 mt-1">{rowError.text}</p>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
@@ -1116,6 +1129,10 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
                     </button>
                   </div>
                 </div>
+              )}
+
+              {rowError?.id === act.id && rowError.kind === "tags" && (
+                <p role="alert" className="px-4 pb-3 text-[11px] text-red-400">{rowError.text}</p>
               )}
 
               {canExpand && isExpanded && (
