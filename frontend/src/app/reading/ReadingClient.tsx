@@ -247,6 +247,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
               load(e.target.value);
             }}
             className="bg-surface-card border border-border-subtle rounded-control text-[12px] px-2 py-1.5 text-text-secondary"
+            aria-label="Switch book"
           >
             {questBooks.map((b) => (
               <option key={b.slug} value={b.slug}>

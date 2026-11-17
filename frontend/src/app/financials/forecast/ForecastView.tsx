@@ -549,12 +549,12 @@ function PlannedItems({ items, statuses, busy, run, accountOptions }: { items: P
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <input className={input} placeholder="What (e.g. Movers)" value={label} onChange={(e) => setLabel(e.target.value)} maxLength={120} />
         <input className={input} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-        <select className={input} value={dir} onChange={(e) => setDir(e.target.value as "in" | "out")}>
+        <select className={input} value={dir} onChange={(e) => setDir(e.target.value as "in" | "out")} aria-label="Direction">
           <option value="out">money out</option>
           <option value="in">money in</option>
         </select>
         <input className={`${input} w-28`} placeholder="$ amount" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} />
-        <select className={input} value={certainty} onChange={(e) => setCertainty(e.target.value)}>
+        <select className={input} value={certainty} onChange={(e) => setCertainty(e.target.value)} aria-label="Certainty">
           <option value="confirmed">confirmed</option>
           <option value="likely">likely</option>
           <option value="possible">possible</option>

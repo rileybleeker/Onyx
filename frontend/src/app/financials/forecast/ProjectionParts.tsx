@@ -220,7 +220,7 @@ export function GoalsSection({ goals, accounts, busy, run }: { goals: GoalView[]
         <input className={inputCls} placeholder="Goal (e.g. NYC move fund)" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} />
         <input className={`${inputCls} w-28`} placeholder="$ target" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} />
         <input className={inputCls} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-        <select className={inputCls} value={account} onChange={(e) => setAccount(e.target.value)}>
+        <select className={inputCls} value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
           <option value="">Checking + savings</option>
           {options.map((a) => (
             <option key={a.account_key} value={a.account_key}>
