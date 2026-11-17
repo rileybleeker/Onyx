@@ -134,9 +134,42 @@ install over USB with `pymobiledevice3 apps install <file>` (it also prints the
 phone's real error). `pymobiledevice3 amfi reveal-developer-mode` shows the
 Developer Mode switch if it never appears.
 
+## Apple Health (added 2026-11-17)
+
+The same app also reads Apple Health and sends it to `POST /api/apple-health/import`
+(tables `pds.apple_health_*`, `sql/apple_health_schema.sql`, applied). HealthKit is
+readable only by code on the iPhone and **never while the phone is locked**, so it
+cannot ride the locked daily Screen Time automation: the app syncs itself whenever it
+comes to the foreground (at most every 30 minutes, after Health was set up once), and
+the Shortcuts action **Sync Apple Health to Onyx** does the same for a "when Onyx is
+opened" automation. Read: steps, walking + running distance, flights, walking speed,
+walking steadiness, headphone audio level, mindful minutes, workouts written by other
+apps (Strava / Peloton "send to Health"), State of Mind. Not read: heart rate, HRV,
+sleep (copies of WHOOP / Garmin / Eight Sleep), locations, routes, raw samples. Health
+Records / lab results are NOT included (they need the Clinical Health Records
+entitlement and a connected provider; roadmap row).
+
+One-time steps that stay with Riley (they need the Apple login or the phone in hand):
+
+1. Developer portal, Identifiers, `com.rileybleeker.onyxscreentime`: tick **HealthKit**.
+2. Profiles: delete and re-create the iOS App Development profile for that App ID (same
+   certificate and iPhone), download it, set `IOS_PROFILE_B64` (command above).
+3. `gh workflow run screentime-ios.yml`. The log says "building with the HealthKit
+   entitlement" (a profile without HealthKit still builds the old Screen Time-only app and
+   prints a warning). Install the new build from `/install`.
+4. Open the app, tap **Allow Health and sync to Onyx**, turn on the metrics in the system
+   sheet. HealthKit never says whether read access was refused: a metric left off just has
+   no rows. `/status` card **Apple Health** turns green on the first upload.
+5. Optional: Shortcuts, Automation, "When app is opened" Onyx, action **Sync Apple Health
+   to Onyx** (the app already syncs itself when opened; this also covers a quick open).
+
+The Focus build (`project-focus.yml`) compiles none of the Health code.
+
 ## Files
 
 - `project.yml` — XcodeGen spec; the `.xcodeproj` is generated in CI.
+- `project-health.yml` — project.yml + the HealthKit entitlement (used when the profile has it).
+- `OnyxScreenTime/HealthSync.swift` — HealthKit read + upload (`#if !ONYX_FOCUS`).
 - `OnyxScreenTime/` — the app (SwiftUI, App Intent, exporter, Keychain token).
 - `ci/asc_signing.py` — App Store Connect API path for certificate + profile.
 - `ci/focus_signing_check.py` — profile and signed-bundle gates for the Focus

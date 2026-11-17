@@ -1,0 +1,11 @@
+# Adds the HealthKit entitlement to the Onyx Screen Time app. Used only when the provisioning
+# profile carries it (the App ID needs HealthKit ticked in the developer portal, then a new profile);
+# the signed workflow picks this spec or plain project.yml after reading the profile, so a profile
+# without HealthKit keeps producing the same working Screen Time build (Health sync then reports
+# "missing entitlement" and says so in the app). The Swift code compiles either way.
+include: project.yml
+targets:
+  OnyxScreenTime:
+    entitlements:
+      properties:
+        com.apple.developer.healthkit: true
