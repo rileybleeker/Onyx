@@ -219,6 +219,26 @@ export function forgetPendingSend(store: PendingSendStore, id: string) {
   store.removeItem(pendingSendKey(id));
 }
 
+/** Shown when a write-capable send could not keep its recovery record on this device, so it was not sent. */
+export const WRITE_FORWARD_GATE_MESSAGE =
+  "Not sent: this device could not keep the record that stops a lost reply from ever being sent twice. Make space and send it again, or send it from a normal window.";
+
+export type WriteForwardGate = { ok: true; message: null } | { ok: false; message: string };
+
+/**
+ * Whether a send may go out, and (when not) the one short line to show. A send whose conversation could write must
+ * first keep its recovery record on this device (its request id, under its own key), so a reload that lost its answer
+ * recognises the same send and never sends it twice (SEC-04). `stored` must be true exactly when that record is kept
+ * (there is a conversation hash on this device AND the store accepted the write); when it is not, the send is refused
+ * with WRITE_FORWARD_GATE_MESSAGE, so it can be sent again once there is space or from a normal window rather than
+ * risking a double write. A read-only question (writeCapable false) may always be sent, whether or not a record was
+ * kept. Pure and import-free, so it runs in the node tests.
+ */
+export function writeForwardGate(writeCapable: boolean, stored: boolean): WriteForwardGate {
+  if (writeCapable && !stored) return { ok: false, message: WRITE_FORWARD_GATE_MESSAGE };
+  return { ok: true, message: null };
+}
+
 /**
  * Whether an answer leaves what this request id may already have saved UNKNOWN, so the page keeps the send remembered
  * (not settled) and says so, until its account can be read back (after a reload, GET /api/chat/operations). The
