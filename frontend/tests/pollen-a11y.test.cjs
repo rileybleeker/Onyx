@@ -18,6 +18,11 @@ test("chart summary is visually hidden and only rendered when the newest count h
   assert.match(src, /Newest count on \{newest\.airDate\}/);
 });
 
+test("panel reuses a copy fetched in the last 5 minutes (freshMs) instead of a GET on every visit", () => {
+  assert.match(src, /const POLLEN_FRESH_MS = 5 \* 60_000;/);
+  assert.match(src, /cachedJson\(POLLEN_URL, \{ check: checkAnswer, freshMs: POLLEN_FRESH_MS \}\)/);
+});
+
 test("chart summary builds only from the newest count's tree, grass, weed and mold levels", () => {
   const m = src.match(/<p className="sr-only">([\s\S]*?)<\/p>/);
   assert.ok(m, "summary paragraph exists");
