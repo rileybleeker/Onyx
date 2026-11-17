@@ -9,6 +9,28 @@ The root [AGENTS.md](../../AGENTS.md) holds the rules for every task. The files 
 
 Last reviewed 2026-11-16. Whoever adds or moves a section updates this index in the same commit.
 
+## Domain file topics
+
+The root's "Find your domain rules" list names each file in `docs/agents/`. What each one covers (moved from the root list on 2026-11-17):
+
+- **ops-ci**: tests, CI, workflows, tokens, releases, backlog
+- **database**: `sql/`, ETL writes, time zones, matrix views
+- **access-and-auth**: `middleware.ts`, auth, `isCiRoute()`, grants
+- **hrv-pipeline**: `hrv_*.py`, `causal_inference.py`, `/analytics/hrv`
+- **experiments**: `experiment_*.py`
+- **habits-checkin**: habits, `/check-in`, WHOOP journal
+- **nutrition**: Cronometer, meals, caffeine, Uber Eats, photo meals
+- **supplements**: products, intake, stacks, reminders
+- **wearables-environment**: Garmin, Eight Sleep, WHOOP steps, Tanita, activities, air, weather, pollen
+- **email-calendar-sources**: flights, online orders, Google Calendar feeds
+- **devices**: Screen Time, PC and AI-usage loggers, desktop app, Focus
+- **frontend**: `frontend/` architecture, cache, scroll, theme, nav, speed, autosave, UI copy
+- **log-screen**: `/log`, where entries are made · **personalize** · **today** · **spotify**
+- **reading-journal**: `/reading`, Kindle, Notion journal. The private question bank is described in `docs/reading-question-bank.md`. A book's own flavour is data on `pds.books.theme` (`sql/reading_book_theme.sql`), with the generic fallback when a book has none, never code.
+- **chat-agents**: `/chat`, `/agents`, `/nyc` · **status-page**: `/status`, new sources
+- **finance**: `/financials*`, SimpleFIN, taxes · **procurement** · **health-records**: `/health*`
+- **orientation**: layout, commands, env vars
+
 ## By path
 
 Paths under `app/`, `lib/` and `components/` are in `frontend/src/`.
