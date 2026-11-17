@@ -582,6 +582,99 @@ test("mapVerdict: count and title checks; unknown counts are uncertain", () => {
   assert.equal(env.S.titlesMatch("Chapter IV. Fog Over the Bay", "Fog Over the Bay"), true, "a Roman numeral prefix is removed");
 });
 
+/* mapUrls: the research step's URL list (a spending and safety guard). Invented hosts and pages only. */
+const webSrc = (url, title = "Chapter guide") => ({ url, domain: new URL(url).hostname, title, cited_text: "A cited sentence." });
+const mapSrc = (url, scope = "whole_book") => ({ url, scope });
+const pageUrl = (n) => `${GUIDE}/page-${n}`;
+
+test("mapUrls: never more than MAP_URLS_MAX (8) pages, even with many cited whole-book pages", () => {
+  const env = load(makeDb());
+  const cited = Array.from({ length: 12 }, (_, i) => webSrc(pageUrl(i + 1)));
+  const map = { narrative: false, chapter_count: 4, chapters: [], sources: cited.map((s) => mapSrc(s.url)) };
+  assert.equal(env.S.MAP_URLS_MAX, 8);
+  const out = env.S.mapUrls(map, cited);
+  assert.equal(out.length, 8);
+  assert.deepEqual(out, cited.slice(0, 8).map((s) => s.url), "the first eight in map order");
+  assert.equal(new Set(out).size, out.length, "no duplicates");
+});
+
+test("mapUrls: per-chapter scope sources come before whole-book ones, and survive the 8-cap", () => {
+  const env = load(makeDb());
+  const whole = Array.from({ length: 10 }, (_, i) => webSrc(pageUrl(`w${i + 1}`)));
+  const perChapter = [webSrc(pageUrl("c1")), webSrc(pageUrl("c2"))];
+  const cited = [...whole, ...perChapter];
+  // Whole-book pages listed first in the map; the per-chapter guides come last and must still lead the list.
+  const map = {
+    narrative: false,
+    chapter_count: 4,
+    chapters: [],
+    sources: [...whole.map((s) => mapSrc(s.url)), ...perChapter.map((s) => mapSrc(s.url, "per_chapter"))],
+  };
+  const out = env.S.mapUrls(map, cited);
+  assert.equal(out.length, 8);
+  assert.deepEqual(out.slice(0, 2), perChapter.map((s) => s.url), "per-chapter guides first, in map order");
+  assert.deepEqual(out.slice(2), whole.slice(0, 6).map((s) => s.url), "then whole-book pages in map order");
+
+  const mixed = {
+    narrative: false,
+    chapter_count: 4,
+    chapters: [],
+    sources: [mapSrc(pageUrl("w1")), mapSrc(pageUrl("c1"), "per_chapter"), mapSrc(pageUrl("w2")), mapSrc(pageUrl("c2"), "per_chapter")],
+  };
+  const mixedOut = env.S.mapUrls(mixed, [webSrc(pageUrl("w1")), webSrc(pageUrl("w2")), webSrc(pageUrl("c1")), webSrc(pageUrl("c2"))]);
+  assert.deepEqual(mixedOut, [pageUrl("c1"), pageUrl("c2"), pageUrl("w1"), pageUrl("w2")]);
+});
+
+test("mapUrls: a blocked page is never included (blocked host, or a piracy title), and a URL the map cited but the search did not is never added", () => {
+  const env = load(makeDb());
+  const cited = [
+    webSrc("https://libgen.rs/book/ledger", "Chapter guide"),
+    webSrc(pageUrl("ok-1")),
+    webSrc(pageUrl("title-blocked"), "Full text of the lighthouse ledger"),
+    webSrc(pageUrl("ok-2")),
+  ];
+  const map = {
+    narrative: false,
+    chapter_count: 4,
+    chapters: [],
+    sources: [
+      mapSrc("https://libgen.rs/book/ledger", "per_chapter"),
+      mapSrc(pageUrl("title-blocked"), "per_chapter"),
+      mapSrc(pageUrl("not-cited"), "per_chapter"),
+      mapSrc(pageUrl("ok-1")),
+      mapSrc(pageUrl("ok-2")),
+    ],
+  };
+  const out = env.S.mapUrls(map, cited);
+  assert.deepEqual(out, [pageUrl("ok-1"), pageUrl("ok-2")]);
+  assert.equal(out.some((u) => u.includes("libgen.rs") || u.includes("title-blocked") || u.includes("not-cited")), false);
+});
+
+test("mapUrls: with no usable second call (null or no matching sources), the cited pages are used, blocked ones still out", () => {
+  const env = load(makeDb());
+  const cited = [webSrc(pageUrl("a")), webSrc("https://libgen.rs/book/ledger"), webSrc(pageUrl("b"))];
+  const expected = [pageUrl("a"), pageUrl("b")];
+  assert.deepEqual(env.S.mapUrls(null, cited), expected, "no map at all");
+  assert.deepEqual(
+    env.S.mapUrls({ narrative: false, chapter_count: 0, chapters: [], sources: [] }, cited),
+    expected,
+    "a map that lists no sources",
+  );
+  assert.deepEqual(
+    env.S.mapUrls({ narrative: false, chapter_count: 0, chapters: [], sources: [mapSrc(pageUrl("elsewhere"))] }, cited),
+    expected,
+    "a map whose sources were never cited",
+  );
+  assert.deepEqual(env.S.mapUrls(null, []), [], "nothing cited, nothing to research");
+});
+
+test("mapUrls: a cited page the second call did not re-list is left out when another page matches", () => {
+  const env = load(makeDb());
+  const cited = [webSrc(pageUrl("listed")), webSrc(pageUrl("unlisted"))];
+  const map = { narrative: false, chapter_count: 4, chapters: [], sources: [mapSrc(pageUrl("listed"), "per_chapter")] };
+  assert.deepEqual(env.S.mapUrls(map, cited), [pageUrl("listed")], "a matching source wins; the unlisted page is left out");
+});
+
 test("mapVerdict: the 70% title share sits at the boundary, counts only titled chapters, and counts alone decide when nothing is titled", () => {
   const env = load(makeDb());
   // One-word titles never match each other, so the number of matching chapters is exact.
