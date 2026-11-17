@@ -40,8 +40,13 @@ test("parsePcActivityRow: a sync before the day ended leaves the day incomplete 
   assert.equal(day({ synced_at: "2031-03-06T05:00:00-05:00" }).dayComplete, false);
   assert.equal(day({ synced_at: "2031-03-06T06:00:00-05:00" }).dayComplete, true);
   assert.equal(day({ synced_at: null }).dayComplete, false);
-  // 06:00 ET wall clock in the other DST phase (March = EDT, so 06:00 local = 10:00 UTC) still counts.
-  assert.equal(day({ synced_at: "2031-03-06T06:00:00-04:00" }).dayComplete, true);
+  // DST: 2031 switches to EDT on March 9, so on March 6 -04:00 is 05:00 ET (not complete). In summer
+  // (EDT) 06:00 ET is 10:00 UTC, which is -04:00 on the wall clock, and still counts.
+  assert.equal(day({ synced_at: "2031-03-06T06:00:00-04:00" }).dayComplete, false);
+  assert.equal(
+    P.parsePcActivityRow({ behavioral_date: "2031-07-05", synced_at: "2031-07-06T06:00:00-04:00" }).dayComplete,
+    true,
+  );
 });
 
 test("parsePcActivityRow: byApp keeps only positive finite minutes", () => {
@@ -66,7 +71,7 @@ test("pcActivityApplies: tooling and worked-late questions, nothing else", () =>
 
 test("a tooling question is Yes at 20+ minutes of a mapped program (code / python)", () => {
   const s = P.pcActivitySuggestions(day(), new Set([Q_TOOLS]));
-  assert.deepEqual(s, { [Q_TOOLS]: { answer: "Yes", source: "PC activity: 34 min in Python, AL" } });
+  assert.deepEqual(s, { [Q_TOOLS]: { answer: "Yes", source: "PC activity: 34 min in Python, 34 min in AL" } });
 });
 
 test("excel and pbidesktop answer through their own words", () => {
