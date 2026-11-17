@@ -66,6 +66,9 @@ export function removalReceipt(
   }
   if (res.status === 404 && "sessionId" in target && body?.code === SESSION_GONE_CODE) return { kind: "confirmed", overview: undefined };
   const error = typeof body?.error === "string" && body.error ? body.error : `${label} failed (${res.status}).`;
+  // A 404 is the route's own answer only with its JSON `error` (e.g. a missing book). Any other 404 (an HTML page,
+  // a framework or proxy 404) is not a refusal by the route: it is unconfirmed, so the entry stays and is retried.
+  if (res.status === 404 && typeof body?.error !== "string") return unconfirmed("foreign 404");
   if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) return { kind: "refused", error };
   return { kind: "unconfirmed", error };
 }
