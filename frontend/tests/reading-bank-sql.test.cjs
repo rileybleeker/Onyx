@@ -436,7 +436,8 @@ test("the queue fence is two numbers: attempts (a re-queue resets it) and claim_
   const set = /SET status = 'queued'[^;]*/.exec(enq)?.[0] ?? "";
   assert.match(set, /attempts = 0/, "a re-queue gives the tries back");
   assert.doesNotMatch(set, /claim_seq/, "and never touches the claim counter, so a worker from before can never match a later claim");
-  assert.deepEqual(fnsMain.filter((f) => /claim_seq\s*=\s*/.test(f.body)).map((f) => f.name), ["pds.reading_bank_claim"], "only the claim moves it, and only up");
+  // SQL comments are stripped first: store's comment mentions "claim_seq = the numbers", which is not an assignment.
+  assert.deepEqual(fnsMain.filter((f) => /claim_seq\s*=\s*/.test(f.body.replace(/--[^\n]*/g, ""))).map((f) => f.name), ["pds.reading_bank_claim"], "only the claim moves it, and only up");
   for (const name of ["pds.reading_bank_reserve", "pds.reading_bank_finish", "pds.reading_bank_store", "pds.reading_bank_set_map"]) {
     const body = fn(fnsMain, name).body;
     assert.match(body, /v_seq := NULLIF\(p->>'claim_seq', ''\)::bigint;/, `${name} reads claim_seq`);

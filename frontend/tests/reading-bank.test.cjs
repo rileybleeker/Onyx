@@ -660,7 +660,12 @@ test("finish_unconfirmed and finish_unrecorded are known codes; a claimed step t
   assert.equal(B.bankCode("finish_unrecorded"), "finish_unrecorded");
   // A finish that is not recorded or not confirmed is a retry (lost), so it counts as an unfinished step.
   const lost = { chapters: [], graded: 0, failed: 0, done: 0, unfinished: 1, codes: ["finish_unconfirmed"] };
-  assert.equal(B.bankHeartbeatStatus(lost), "failed", "claimed, none done");
+  // An unconfirmed finish with no failed step is partial, never failed (the queue may hold the job done; #599).
+  assert.equal(B.bankHeartbeatStatus(lost), "partial", "unconfirmed, none done: partial, never a clean run");
   assert.equal(B.bankHeartbeatStatus({ ...lost, done: 1 }), "partial");
+  // A recorded-as-not finish with no failed step is failed when none finished done: never success.
+  assert.equal(B.bankHeartbeatStatus({ ...lost, codes: ["finish_unrecorded"] }), "failed", "unrecorded, none done");
+  // A step that actually failed still makes the run failed.
+  assert.equal(B.bankHeartbeatStatus({ ...lost, failed: 1 }), "failed", "a failed step, none done");
   assert.match(B.bankHeartbeatMessage(lost), /codes finish_unconfirmed/);
 });

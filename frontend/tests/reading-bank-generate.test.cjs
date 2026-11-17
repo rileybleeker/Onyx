@@ -1666,9 +1666,10 @@ test("a requeued job keeps its charge in the month's spend: pds.reading_bank_enq
   const update = /ON CONFLICT \(book_id, step, chapter, input_hash\) DO UPDATE\s+SET ([^;]*?)\s+WHERE jb\.status = 'skipped'/.exec(body);
   assert.ok(update, "the requeue clause is found");
   assert.match(update[1], /status = 'queued'/);
-  assert.doesNotMatch(update[1], /finished_at/, "this month's spend is summed over jobs by finished_at: a requeued job with a charge must stay in it");
-  // Every charge is dated by the same column, so a requeue that cleared it would lower the month's spend.
-  assert.match(sql, /sum\(cost_cents\) FILTER \(WHERE finished_at >= \(date_trunc\('month'/);
+  assert.doesNotMatch(update[1], /finished_at/, "the requeue leaves the job's finish time alone, as the SQL comment says");
+  // The month's spend is summed by charged_at (the charge's own time, set only by a charge), which a requeue never touches.
+  assert.doesNotMatch(update[1], /charged_at|cost_cents/, "a requeued job keeps its charge and its charge date");
+  assert.match(sql, /sum\(cost_cents\) FILTER \(WHERE charged_at >= \(date_trunc\('month'/);
 });
 
 test("the write routes kick in after(), each with maxDuration 300; the session PATCH only when the chapter reached changed", () => {
