@@ -48,7 +48,10 @@ export async function POST(req: NextRequest) {
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
   const known = parseKnownSha((parsed as { known_sha?: unknown }).known_sha);
   if (!known) return NextResponse.json({ error: "known_sha must be a list of SHA-256 hex strings" }, { status: 400 });
-  if (!notionConfigured()) return NextResponse.json({ error: "NOTION_API_KEY not configured" }, { status: 500 });
+  if (!notionConfigured()) {
+    console.error("journal route: NOTION_API_KEY is not set");
+    return NextResponse.json({ error: "Journal isn't connected yet. Try again later." }, { status: 500 });
+  }
   const input = v.input;
 
   // The retry check and the labels run side by side: a retry is rare, so the common save does not wait twice.
