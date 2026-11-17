@@ -421,8 +421,12 @@ def test_the_aa_check_protocol_file_registers_once_seeded():
     protocol = ed.parse_protocol(raw.encode())
     assert protocol["id"] == path.stem == "EXP-900" and ed.trial_kind(protocol) == ed.KIND_AA
     start = ed._as_date(protocol["start"])
-    assert "seed_sha256" in _problems(raw, today=start - timedelta(days=1)), "not seeded yet: the placeholder is refused"
-    seeded = raw.replace("seed_sha256: paste-the-value-printed-by-the-seed-step", f"seed_sha256: {GOLDEN_COMMITMENT}")
+    # The file carries its real commitment once seeded (commit 6cb04984), so rebuild both states from it:
+    # the unseeded placeholder must be refused, and a golden commitment must validate.
+    commitment_line = re.compile(r"seed_sha256: (?:paste-the-value-printed-by-the-seed-step|[0-9a-f]{64})")
+    unseeded = commitment_line.sub("seed_sha256: paste-the-value-printed-by-the-seed-step", raw)
+    assert "seed_sha256" in _problems(unseeded, today=start - timedelta(days=1)), "not seeded yet: the placeholder is refused"
+    seeded = commitment_line.sub(f"seed_sha256: {GOLDEN_COMMITMENT}", raw)
     fields = _validate(seeded, today=start - timedelta(days=1), seed_sha256=GOLDEN_COMMITMENT)
     assert (fields["n_blocks"], fields["n_days"], fields["washout_days"]) == (7, 28, 0), "four weeks"
     assert fields["planned_end"] == (start + timedelta(days=27)).isoformat()
