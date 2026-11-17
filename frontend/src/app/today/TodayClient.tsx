@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { lapseDelay } from "@/lib/today-lapse";
 import Link from "next/link";
 import styles from "./Today.module.css";
 import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, ListChecks, Mail, Package, RefreshCw, Wallet, X } from "lucide-react";
@@ -264,7 +265,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const [quietSave, setQuietSave] = useState<"idle" | "saving" | "failed">("idle");
   const quietHeading = useRef<HTMLHeadingElement>(null);
   // Bumped when a snooze ends or an item becomes due, so the quiet view renders again on time (no request).
-  const [, setLapseTick] = useState(0);
+  const [lapseTick, setLapseTick] = useState(0);
   const load = useCallback(() => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -614,10 +615,13 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // back on time even while Today stays open between refreshes. Only a render: nothing is read or written.
   const nextChange = selection?.nextChange ?? null;
   useEffect(() => {
-    if (nextChange === null) return undefined;
-    const timer = setTimeout(() => setLapseTick((n) => n + 1), Math.min(Math.max(0, nextChange - Date.now()) + 250, 6 * 3_600_000));
+    // `lapseTick` is a dependency so a capped wait re-arms: a lapse more than `LAPSE_CAP_MS` away fires at the cap,
+    // increments the tick, and this effect runs again to schedule the next capped wait until the real `nextChange`.
+    const delay = lapseDelay(nextChange);
+    if (delay === null) return undefined; // null nextChange, or nextChange already passed: nothing left to wait for.
+    const timer = setTimeout(() => setLapseTick((n) => n + 1), delay);
     return () => clearTimeout(timer);
-  }, [nextChange]);
+  }, [nextChange, lapseTick]);
   const statusOf = new Map<string, SourceStatus>((attention?.sources ?? []).map((st) => [st.source, st] as const));
   const sourceList = (list: SourceStatus[]) => list.map((st) => `${st.label} (${st.note})`).join("; ");
   // A time on another day than today names the day too ("Wed 6:00 AM").
