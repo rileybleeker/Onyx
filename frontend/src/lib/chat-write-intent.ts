@@ -304,14 +304,14 @@ function stem(w: string): string {
   return base;
 }
 
+/**
+ * The same whole word: equal, or the same stem ("calms" / "calm", "journals" / "journal", "meditated" / "meditation").
+ * Never a longer word that starts with it: "Calm" is not "Calmly", "focus" is not "focusrin".
+ */
 function sameWord(a: string, b: string): boolean {
   if (a === b) return true;
   if (/\d/.test(a) || /\d/.test(b)) return false;
-  const sa = stem(a), sb = stem(b);
-  if (sa === sb) return true;
-  const [short, long] = sa.length <= sb.length ? [sa, sb] : [sb, sa];
-  // A word form ("meditat" / "meditation"), not another word that starts the same ("focus" / "focusrin").
-  return short.length >= 4 && long.length - short.length <= 3 && long.startsWith(short);
+  return stem(a) === stem(b);
 }
 
 /**
