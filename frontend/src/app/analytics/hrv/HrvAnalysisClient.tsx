@@ -15,6 +15,7 @@ import RangeFilter from "@/components/RangeFilter";
 import RangeLoadStatus, { useRangeLoad } from "@/components/RangeLoadStatus";
 import KpiTile from "@/components/KpiTile";
 import MetricRing from "@/components/MetricRing";
+import PollenPanel from "@/components/PollenPanel";
 import SectionHeader from "@/components/SectionHeader";
 import WeatherPanel from "@/components/WeatherPanel";
 import { sameJson } from "@/lib/format";
@@ -2500,6 +2501,13 @@ export default function HrvAnalysisPage({ initial, headingTestId = "page-heading
       {/* Weather panel: same pattern, fetches /api/weather itself (pds.weather_daily, service-role table). */}
       <DeferredMount minHeight={500}>
         <WeatherPanel />
+      </DeferredMount>
+      </Part>
+
+      <Part id="pollen" title="Pollen">
+      {/* Pollen panel: same pattern, fetches /api/pollen itself (pds.pollen_daily, service-role table). */}
+      <DeferredMount minHeight={420}>
+        <PollenPanel />
       </DeferredMount>
       </Part>
       </PartGroup>
