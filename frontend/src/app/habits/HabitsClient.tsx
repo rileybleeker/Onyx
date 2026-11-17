@@ -6,6 +6,7 @@ import { getHabitJournal, getHabitMetadataHistory, rangeDays, rangeLabel, type R
 import { axisTick, gridStyle, chartTooltip, chartColors as C } from "@/lib/chart-theme";
 import { formatDate, sameJson } from "@/lib/format";
 import { CACHE_KEYS, clientCache, fetchJsonValue } from "@/lib/client-cache";
+import { WINDDOWN_SAVED_EVENT } from "@/lib/sleep-winddown";
 import StatCard from "@/components/StatCard";
 import MetricRing from "@/components/MetricRing";
 import ChartCard from "@/components/ChartCard";
@@ -269,6 +270,19 @@ export default function HabitsPage({ headingTestId = "page-heading" }: { heading
   useEffect(() => {
     if (!loading) clientCache.put(CACHE_KEYS.habitsJournal, journal);
   }, [journal, loading]);
+
+  // The wind-down button (Today, Log) writes one of these habits' answers: show it here without a reload. A tap of
+  // this page still in flight keeps its optimistic value (the re-read runs only while none is pending).
+  const togglingRef = useRef(toggling);
+  useEffect(() => { togglingRef.current = toggling; }, [toggling]);
+  useEffect(() => {
+    const onWindDownSaved = () => {
+      if (togglingRef.current.size > 0) return;
+      void readJournal().then((j) => { if (togglingRef.current.size === 0) setJournal(keep(j ?? [])); }).catch(() => {});
+    };
+    window.addEventListener(WINDDOWN_SAVED_EVENT, onWindDownSaved);
+    return () => window.removeEventListener(WINDDOWN_SAVED_EVENT, onWindDownSaved);
+  }, []);
 
   // Tri-state lookup of "habitName|date" → explicit answer. completionSet
   // stays Yes-only on purpose: every KPI, rate, and streak treats explicit

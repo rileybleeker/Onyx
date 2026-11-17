@@ -50,6 +50,9 @@ component = component.replace(/require\("@\/components\/personalize\/PartGrid"\)
   '({__esModule:true,Part:({children})=>React.createElement(React.Fragment,null,children),PartGrid:({children})=>React.createElement("div",{className:"pz-grid"},children),usePartOrder:(page,ids)=>ids.slice()})');
 // The "i" note (components/InfoHint, closed by default) holds no text this file checks.
 component = component.replace(/require\("@\/components\/InfoHint"\)/g, '({__esModule:true,default:()=>null})');
+// The wind-down streak (components/sleep/WindDownPanel, tested in frontend/tests/sleep-winddown.test.cjs) is opt-in
+// and reads its own endpoint: here it is not set up, so Today renders and requests exactly what it did before.
+component = component.replace(/require\("@\/components\/sleep\/WindDownPanel"\)/g, '({__esModule:true,default:()=>null,useWindDownToday:()=>({show:false,source:null})})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },

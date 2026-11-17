@@ -91,15 +91,18 @@ export function writeInvalidates(path: string): string[] {
   if (NO_INVALIDATE.includes(path)) return [];
   // A /habits tap: that page keeps its own cached journal in step (a 365-day re-read per tap would be waste);
   // the check-in screen and the habit list still re-read.
-  if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list"];
+  if (path === "/api/habits/complete") return ["/api/habits/checkin", "/api/habits/list", "/api/sleep/winddown"];
   // Chat write tools log habits, supplements, reading and playlists.
-  if (path === "/api/chat") return ["/api/habits", "habits:", "/api/supplements", "/api/reading", "/api/delivery"];
+  if (path === "/api/chat") return ["/api/habits", "habits:", "/api/supplements", "/api/reading", "/api/delivery", "/api/sleep/winddown"];
   const m = /^\/api\/([^/?#]+)/.exec(path);
   if (!m) return [];
   const area = m[1];
   const out = [`/api/${area}`, `${area}:`];
   // A check-in or habit write also changes what Today and the delivery portions show.
-  if (area === "habits") out.push("/api/delivery");
+  if (area === "habits") out.push("/api/delivery", "/api/sleep/winddown");
+  // A wind-down NIGHT answer (or a cancel that found it had landed) IS the chosen habit's answer (PROD-SLEEP-01): the check-in and /habits go stale too
+  // (a goal or pause change touches no habit row).
+  if (path === "/api/sleep/winddown/night" || path === "/api/sleep/winddown/cancel") out.push("/api/habits", "habits:");
   if (area === "delivery") out.push("/api/habits/checkin");
   // A drink capture (one row) counts in Nutrition AND Caffeine: both areas' entries (and feed seeds) go stale.
   if (path === "/api/nutrition/drinks" || path.startsWith("/api/nutrition/drinks/")) out.push("/api/caffeine", "caffeine:");
@@ -221,6 +224,7 @@ export class ClientCache {
   private flushing: Promise<void> = Promise.resolve();
   /** Bumped by wipe(): async work started before a wipe never writes after it. */
   private generation = 0;
+  private wipeListeners = new Set<() => void>();
   private readyResolved = false;
   private resolveReady!: () => void;
   private readyPromise: Promise<void>;
@@ -587,9 +591,19 @@ export class ClientCache {
     await backend.writeScope(next).catch(() => {});
   }
 
+  /**
+   * Run `listener` (synchronously, first thing) whenever wipe() runs: sign-out, a 401, a redirect to sign-in. For a
+   * module that keeps private data or a pending write of its own outside this cache and must drop it with the session.
+   */
+  onWipe(listener: () => void): () => void {
+    this.wipeListeners.add(listener);
+    return () => { this.wipeListeners.delete(listener); };
+  }
+
   /** Forget everything: memory, queued writes and the whole persisted store. Persistence stays off until attach(). */
   async wipe(): Promise<void> {
     this.generation++;
+    for (const fn of Array.from(this.wipeListeners)) { try { fn(); } catch { /* a listener never stops a wipe */ } }
     const backend = this.backend;
     const keys = this.keys();
     this.backend = null;
