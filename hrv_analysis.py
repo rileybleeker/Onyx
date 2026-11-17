@@ -103,6 +103,7 @@ except ImportError:
 import hashlib
 
 import hrv_alignment as al
+import hrv_column_guard
 import hrv_feature_sources as feature_sources
 import hrv_model_artifact as model_artifact
 
@@ -168,6 +169,9 @@ def et_today() -> date:
 
 MODEL_VERSION = f"{et_today().isoformat()}_behavioral_v1"
 TARGET = al.TARGET  # whoop_hrv_rmssd; outcome alignment lives in hrv_alignment.py
+# The outcome must be the WHOOP column itself — never a blend with the Garmin /
+# Eight Sleep HRV columns (hrv_column_guard, AGENTS.md "not interchangeable").
+hrv_column_guard.assert_target_is_whoop(TARGET)
 
 # Stage-1 BH-FDR threshold for promoting features to Stage 2 partial correlations.
 FDR_Q_THRESHOLD = 0.05
