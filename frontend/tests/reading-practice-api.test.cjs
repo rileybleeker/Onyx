@@ -59,6 +59,8 @@ function makeDb() {
     reads: [],
     finished: [],
     reserves: [],
+    reserveCalls: [],
+    finishCalls: [],
     nextJob: 1,
   };
   const idea = (idea_id, chapter, importance, o = {}) =>
@@ -228,7 +230,7 @@ function fakeSupabase(db) {
       } else {
         for (const id of need) bump(id);
         const job_id = db.nextJob++;
-        db.jobs.set(job_id, { job_id, book_id: BOOK, step: "grade", attempt_key: k, status: "queued", attempts: 0, reserved_cents: 0, cost_cents: 0, grade_inline: !!p.grade_inline });
+        db.jobs.set(job_id, { job_id, book_id: BOOK, step: "grade", attempt_key: k, status: "queued", attempts: 0, claim_seq: 0, reserved_cents: 0, cost_cents: 0, grade_inline: !!p.grade_inline });
       }
       return { ...receipt(k), replayed: false };
     },
@@ -309,15 +311,28 @@ function fakeSupabase(db) {
       if (db.claimCode) return { ok: true, job: null, code: db.claimCode }; // monthly cap reached: nothing claimed
       const job = db.jobs.get(p.job_id);
       if (!job || job.status !== "queued") return { ok: true, job: null };
-      Object.assign(job, { status: "running", attempts: job.attempts + 1, reserved_cents: p.estimates.grade });
+      Object.assign(job, { status: "running", attempts: job.attempts + 1, claim_seq: job.claim_seq + 1, reserved_cents: p.estimates.grade });
       return { ok: true, job: { ...job }, headroom_cents: 500 };
     },
+    // pds.reading_bank_reserve / pds.reading_bank_finish: the fence of a queue run is attempts + claim_seq, both required
+    // (400 without), 409 lease_lost when another claim happened since, 409 not_running when the job is not running.
     reading_bank_reserve: ({ p }) => {
+      db.reserveCalls.push(p);
+      const job = db.jobs.get(p.job_id);
+      if (!Number.isInteger(p.attempts) || !Number.isInteger(p.claim_seq)) return refuse(400, "bad_request");
+      if (!job) return refuse(404, "not_found");
+      if (job.status !== "running") return refuse(409, "not_running");
+      if (p.attempts !== job.attempts || p.claim_seq !== job.claim_seq) return refuse(409, "lease_lost");
       db.reserves.push(p);
       return { ok: true, reserved_cents: p.total_cents };
     },
     reading_bank_finish: ({ p }) => {
+      db.finishCalls.push(p);
       const job = db.jobs.get(p.job_id);
+      if (!Number.isInteger(p.attempts) || !Number.isInteger(p.claim_seq)) return refuse(400, "bad_request");
+      if (!job) return refuse(404, "not_found");
+      if (job.status !== "running") return refuse(409, "not_running");
+      if (p.attempts !== job.attempts || p.claim_seq !== job.claim_seq) return refuse(409, "lease_lost");
       db.finished.push(p);
       job.status = p.outcome === "retry" ? (job.attempts >= 3 ? "failed" : "queued") : p.outcome;
       job.cost_cents += p.cost_cents;
@@ -649,6 +664,32 @@ test("a short answer is graded at once, with the schedule the preview showed (pr
   assert.deepEqual([ord.body.verdict, ord.body.score], ["partial", 0.6]);
 });
 
+test("an answer's database requests are bounded: one question read (its state version and the book's switch ride along), the day, at most one events request, one attempt RPC", async () => {
+  // Code-graded idea answer: [question + day in parallel] -> [events] -> [attempt]. The state version is read strictly
+  // before the events (it rides on the question read), which is what lets a stale replay only fail the compare-and-set;
+  // no separate state or version read, no paging for a short history.
+  const db = makeDb();
+  const r = load(db);
+  const res = await r.attempt.POST(post(answer({ answer: "tide tables" })));
+  assert.equal(res.body.grading_status, "graded");
+  assert.deepEqual(db.reads, ["reading_questions"], "one table read, no reading_idea_state read");
+  assert.deepEqual(
+    [...db.rpc].sort(),
+    ["behavioral_today_now", "reading_bank_attempt", "reading_bank_events"].sort(),
+    "the day, the events once, the attempt once",
+  );
+  assert.ok(db.rpc.indexOf("reading_bank_events") < db.rpc.indexOf("reading_bank_attempt"), "events before the write");
+  assert.ok(db.reads.length + db.rpc.length <= 4, "four requests at most, in three steps");
+
+  // Model-graded answer: no replay is needed at write time (the grade job writes the schedule), so no events request.
+  const db2 = makeDb();
+  const r2 = load(db2);
+  const typed = await r2.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  assert.equal(typed.body.grading_status, "pending");
+  assert.deepEqual(db2.reads, ["reading_questions"]);
+  assert.deepEqual([...db2.rpc].sort(), ["behavioral_today_now", "reading_bank_attempt"].sort(), "the day and the attempt RPC: two steps");
+});
+
 test("the same attempt_key replays the same receipt; another payload under it is 409 key_reused", async () => {
   const db = makeDb();
   const r = load(db);
@@ -860,8 +901,8 @@ test("runGradeJob with a bare job row (no claim headroom) still grades: the rese
   const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
   const k = res.body.attempt_key;
   const job = [...db.jobs.values()][0];
-  Object.assign(job, { status: "running", attempts: 1, reserved_cents: 1 }); // as the claim left it: the 1-cent grade estimate
-  const bare = { job_id: job.job_id, book_id: BOOK, step: "grade", attempt_key: k, attempts: 1, reserved_cents: 1 };
+  Object.assign(job, { status: "running", attempts: 1, claim_seq: 1, reserved_cents: 1 }); // as the claim left it: the 1-cent grade estimate
+  const bare = { job_id: job.job_id, book_id: BOOK, step: "grade", attempt_key: k, attempts: 1, claim_seq: 1, reserved_cents: 1 };
   assert.equal(r.S.claimHeadroom(bare), null);
   assert.equal(r.S.claimHeadroom({ job: bare, headroom_cents: "250" }), 250);
   const out = await r.S.runGradeJob(r.supabase, bare, { client: model.client });
@@ -870,6 +911,54 @@ test("runGradeJob with a bare job row (no claim headroom) still grades: the rese
   assert.ok(db.reserves[0].total_cents > 1, "the request's bound is above the estimate: it was reserved, not refused as cost_limit");
   assert.deepEqual([db.attempts.get(k).grading_status, db.attempts.get(k).verdict], ["graded", "correct"]);
   assert.deepEqual([...r.S.GRADE_RETRY_MINUTES], [5, 30], "two retries; the third failed try fails the job (pds.reading_bank_finish)");
+});
+
+test("a claimed grade job sends the claim's fence (attempts + claim_seq) to both the reserve and the finish; a job row without it runs nothing", async () => {
+  const db = makeDb();
+  const model = fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "yes" }], wrong_claims: [], feedback: "Right." }));
+  const r = load(db, model);
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const k = res.body.attempt_key;
+  const job = [...db.jobs.values()][0];
+  // Claimed twice before (a lease that ran out): attempts and claim_seq are numbers the claim answers, never guessed.
+  Object.assign(job, { attempts: 1, claim_seq: 4 });
+  const out = await r.S.claimAndRunGrade(r.supabase, k, { client: model.client });
+  assert.deepEqual([out.outcome, out.graded], ["done", true]);
+  assert.equal(db.reserveCalls.length, 1);
+  assert.deepEqual([db.reserveCalls[0].attempts, db.reserveCalls[0].claim_seq], [2, 5], "reserve carries the claim's pair");
+  assert.equal(db.finishCalls.length, 1);
+  assert.deepEqual([db.finishCalls[0].attempts, db.finishCalls[0].claim_seq], [2, 5], "finish carries the same pair");
+  assert.equal(job.status, "done", "finished through the fence, not left running");
+
+  // A job row from before the fence (no claim_seq): the SQL would answer 400 to both calls, so nothing is sent or spent.
+  const db2 = makeDb();
+  const model2 = fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }], wrong_claims: [], feedback: "ok" }));
+  const r2 = load(db2, model2);
+  const res2 = await r2.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const job2 = [...db2.jobs.values()][0];
+  Object.assign(job2, { status: "running", attempts: 1, claim_seq: 1 });
+  const noSeq = { job_id: job2.job_id, book_id: BOOK, step: "grade", attempt_key: res2.body.attempt_key, attempts: 1, reserved_cents: 1 };
+  const refused = await r2.S.runGradeJob(r2.supabase, noSeq, { client: model2.client });
+  assert.deepEqual([refused.outcome, refused.code, refused.graded, refused.cost_cents], ["failed", "bad_request", false, 0]);
+  assert.equal(model2.calls.length, 0, "no model call");
+  assert.deepEqual([db2.reserveCalls.length, db2.finishCalls.length], [0, 0], "no reserve and no finish without the fence");
+  assert.equal(db2.attempts.get(res2.body.attempt_key).grading_status, "pending");
+});
+
+test("a grade job whose lease was taken over (another claim since) is refused by the fence: no model call, nothing finished", async () => {
+  const db = makeDb();
+  const model = fakeModel(modelReply({ points: [{ id: "p1", hit: "yes" }], wrong_claims: [], feedback: "ok" }));
+  const r = load(db, model);
+  const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+  const job = [...db.jobs.values()][0];
+  Object.assign(job, { status: "running", attempts: 2, claim_seq: 2, reserved_cents: 1 });
+  // The worker holds the first claim's numbers; the job was claimed again since.
+  const stale = { job_id: job.job_id, book_id: BOOK, step: "grade", attempt_key: res.body.attempt_key, attempts: 1, claim_seq: 1, reserved_cents: 1 };
+  const out = await r.S.runGradeJob(r.supabase, stale, { client: model.client });
+  assert.equal(model.calls.length, 0, "the reserve answered lease_lost: nothing was sent to the model");
+  assert.equal(out.outcome, "retry");
+  assert.equal(db.finished.length, 0, "the other worker's run is not finished by this one");
+  assert.equal(job.status, "running");
 });
 
 test("a chapter recall answer is graded per idea: a covered core idea counts, a missed one comes back as due tomorrow", async () => {

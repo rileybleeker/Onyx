@@ -873,6 +873,13 @@ export type AttemptAnswer = BankAnswer & { /** Set when the answer was stored pe
  * pds.reading_bank_attempt alone, AFTER it looked the attempt key up: a retry of an answer that was stored before its
  * question changed (a sync re-versioned the chapter recall, a flag retired it) gets its original receipt, never 409.
  * Only the version is checked here: a question_id is one immutable version, so another version is a malformed request.
+ *
+ * Database requests, in order: (1) the question, with its idea's state_version and the book's switch in the same read,
+ * and the behavioral day, in parallel; (2) a code-graded answer only: the idea's events (one request under
+ * EVENTS_PAGE rows); (3) pds.reading_bank_attempt. The version is read strictly BEFORE the events (a replay built on
+ * an older version can only fail the compare-and-set, never pass it), so the events cannot ride the first read; a
+ * model-graded answer needs neither the events nor a replay (its grade job writes the schedule), so it is two steps.
+ * A single-statement snapshot of question + version + events (an SQL function) would make step 2 disappear.
  */
 export async function recordAttempt(supabase: Supa, input: AttemptInput): Promise<AttemptAnswer> {
   try {
@@ -965,8 +972,14 @@ export interface ClaimedGradeJob {
   book_id: number;
   step: string;
   attempt_key: string | null;
-  /** The attempt number the claim answered (pds.reading_bank_finish refuses another). */
+  /** The attempt number the claim answered (pds.reading_bank_reserve and pds.reading_bank_finish refuse another). */
   attempts: number;
+  /**
+   * The claim's claim_seq (one more with every claim, never reset). With `attempts` it is the fence of a queue run:
+   * pds.reading_bank_reserve and pds.reading_bank_finish both require the pair and answer 400 without it, 409
+   * lease_lost when another worker claimed the job since. The claim's job row carries it (it is to_jsonb of the row).
+   */
+  claim_seq: number;
   reserved_cents?: number | string | null;
 }
 export interface GradeJobOptions {
@@ -1176,11 +1189,15 @@ export function claimHeadroom(claimed: GradeJobClaim): number | null {
  * The model is asked only when the answer is still pending; its marks are checked in code, the score and verdict
  * are computed here (lib/reading-recall.ts), and the grade is written with the replayed schedule. Money: every
  * request is reserved first (pds.reading_bank_reserve, which checks the monthly cap atomically against every
- * running reservation), and with the claim's answer the call is also bounded by its headroom_cents. A bare job row
- * carries no headroom (its reserved_cents is only the claim's estimate, well below one grade request's bound), so
- * then the reservation alone bounds the call. A call that may have been billed without a usage report is charged
+ * running reservation); the claim's headroom_cents is passed along too, and where the model call takes a reserve the
+ * database's answer is the one that decides. A bare job row carries no headroom (its reserved_cents is only the
+ * claim's estimate, well below one grade request's bound), so then the reservation alone bounds the call. A call that may have been billed without a usage report is charged
  * its reservation. Failures retry after 5 and 30 minutes (a malformed answer once), then fail (GRADE_RETRY_MINUTES):
  * the answer stays pending with its grade_error, and "Grade it yourself" is offered. Nothing here logs text.
+ *
+ * The claim's job row carries the fence of the run, `attempts` + `claim_seq`; both go to pds.reading_bank_reserve and
+ * pds.reading_bank_finish, which answer 400 without them and 409 lease_lost once another worker claimed the job. A
+ * job row without both numbers is not run at all (nothing is sent to the model or finished).
  */
 export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: GradeJobOptions = {}): Promise<GradeJobResult> {
   const job: ClaimedGradeJob = "job" in claimed && plainObject(claimed.job) ? (claimed.job as ClaimedGradeJob) : (claimed as ClaimedGradeJob);
@@ -1188,6 +1205,15 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
   let reserved = num(job.reserved_cents, STEP_ESTIMATE_CENTS.grade);
   let usage: unknown = null;
   let cost = 0;
+  // The fence the claim answered. Without both numbers neither pds.reading_bank_reserve nor pds.reading_bank_finish
+  // accepts this run (400), so nothing is sent to the model and nothing is finished: the lease runs out and the next
+  // claim settles the job.
+  const attemptsNo = Number(job.attempts);
+  const claimSeq = Number(job.claim_seq);
+  if (!Number.isInteger(attemptsNo) || attemptsNo < 1 || !Number.isInteger(claimSeq) || claimSeq < 1) {
+    return { outcome: "failed", code: "bad_request", graded: false, cost_cents: 0 };
+  }
+  const fence = { attempts: attemptsNo, claim_seq: claimSeq };
 
   /**
    * `sqlOutcome` is what pds.reading_bank_finish records when it differs from what the caller is told: a job whose
@@ -1195,14 +1221,13 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
    * the code into the (already graded or voided) answer's grade_error.
    */
   const finish = async (outcome: GradeJobResult["outcome"], code: string | null, graded = false, sqlOutcome: GradeJobResult["outcome"] = outcome): Promise<GradeJobResult> => {
-    const attempts = num(job.attempts, 1);
-    const retryMinutes = GRADE_RETRY_MINUTES[Math.min(Math.max(attempts, 1), GRADE_RETRY_MINUTES.length) - 1];
+    const retryMinutes = GRADE_RETRY_MINUTES[Math.min(Math.max(fence.attempts, 1), GRADE_RETRY_MINUTES.length) - 1];
     const safeCode = code ? bankCode(code) : null;
     try {
       await supabase.rpc("reading_bank_finish", {
         p: {
           job_id: job.job_id,
-          attempts,
+          ...fence,
           outcome: sqlOutcome,
           cost_cents: Math.round(cost * 100) / 100,
           usage,
@@ -1248,7 +1273,7 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
       ...(headroom === null ? {} : { maxCostCents: headroom }),
       reserve: async (total) => {
         const { data, error } = await supabase.rpc("reading_bank_reserve", {
-          p: { job_id: job.job_id, attempts: job.attempts, total_cents: total, month_cap_cents: monthCap(opts) },
+          p: { job_id: job.job_id, ...fence, total_cents: total, month_cap_cents: monthCap(opts) },
         });
         if (error || !plainObject(data) || data.ok !== true) return false;
         reserved = Math.max(reserved, num(data.reserved_cents, total));
@@ -1259,12 +1284,12 @@ export async function runGradeJob(supabase: Supa, claimed: GradeJobClaim, opts: 
     if (!call.ok) {
       cost = call.maybeBilled ? Math.max(call.costCents, reserved) : call.costCents;
       if (call.code === "refusal") return await finish("failed", "refusal");
-      if (call.retryable && !(call.code === "bad_output" && num(job.attempts, 1) >= 2)) return await finish("retry", call.code);
+      if (call.retryable && !(call.code === "bad_output" && fence.attempts >= 2)) return await finish("retry", call.code);
       return await finish("failed", call.code);
     }
     cost = call.costCents;
     const parsed = parseGradeOutput(call.json, inputs.points.map((p) => p.id));
-    if (!parsed) return await finish(num(job.attempts, 1) >= 2 ? "failed" : "retry", "bad_output");
+    if (!parsed) return await finish(fence.attempts >= 2 ? "failed" : "retry", "bad_output");
     const score = inputs.score(parsed.hits);
     const verdict = verdictFromScore(score);
 
