@@ -1,5 +1,5 @@
 // The /status card for the encrypted off-site backup of /health/records (tools/medical_recovery/
-// offsite_backup.py on Riley's PC, weekly, docs/medical-records-recovery.md section 9). Pure: no I/O,
+// offsite_backup.py on the collector PC, weekly, docs/medical-records-recovery.md section 9). Pure: no I/O,
 // no imports, so /api/status and the tests use it as is.
 //
 // What it reads: the newest pds.sync_log row with source "backup", data_type "medical_records". The job

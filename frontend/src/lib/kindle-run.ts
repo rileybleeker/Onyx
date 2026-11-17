@@ -1,7 +1,7 @@
 // "Run now" for the Kindle harvester (2026-11-16). Import-free so tests can bundle it by name.
 //
 // Event driven: POST /api/kindle/run inserts a row into pds.pc_run_requests, Supabase Realtime
-// pushes it to the idle listener on Riley's PC (tools/kindle_harvest/run-listener.mjs), which
+// pushes it to the idle listener on the collector PC (tools/kindle_harvest/run-listener.mjs), which
 // starts the "Onyx Kindle Harvest" scheduled task and writes its answer back on the row. The
 // button reads that row (GET /api/kindle/run?id=…) while it waits. Nothing on the PC polls.
 
