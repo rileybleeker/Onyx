@@ -20,8 +20,38 @@ const UNREACHABLE: ScreenTimeViewData = { kind: "error", hint: "Onyx could not b
 
 export default function ScreenTimeFeedSection() {
   const [days, setDays] = useState<number>(DEFAULT_WINDOW_DAYS);
+  // "Try again" bumps this: the reader remounts, so a new request starts for the same window.
+  const [attempt, setAttempt] = useState(0);
+  return (
+    <ScreenTimeReader
+      key={attempt}
+      days={days}
+      onWindow={setDays}
+      onRetry={() => setAttempt((n) => n + 1)}
+    />
+  );
+}
+
+function ScreenTimeReader({
+  days,
+  onWindow,
+  onRetry,
+}: {
+  days: number;
+  onWindow: (days: number) => void;
+  onRetry: () => void;
+}) {
   const { data, failed } = useServerPageData(url(days), readScreenTimeViewData, complete);
   // The previous window's numbers stay up, dimmed, until the picked window's answer arrives.
   const busy = data !== null && data.kind !== "error" && data.windowDays !== days;
-  return <ScreenTimeView data={data ?? (failed ? UNREACHABLE : null)} windowDays={days} feed onWindow={setDays} busy={busy} />;
+  return (
+    <ScreenTimeView
+      data={data ?? (failed ? UNREACHABLE : null)}
+      windowDays={days}
+      feed
+      onWindow={onWindow}
+      busy={busy}
+      onRetry={onRetry}
+    />
+  );
 }

@@ -26,5 +26,5 @@ export default async function ScreenTimePage({
   const load = await loadScreenTime(windowDays);
   // Personalize: the saved layout rides in a cookie scoped to this page, so the server renders it as is.
   const layout = layoutFromCookie((await cookies()).get(layoutCookieName("/screen-time"))?.value);
-  return <ScreenTimeView data={screenTimeViewData(load)} windowDays={windowDays} layout={layout} />;
+  return <ScreenTimeView data={screenTimeViewData(load)} windowDays={windowDays} refreshOnRetry layout={layout} />;
 }
