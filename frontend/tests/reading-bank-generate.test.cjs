@@ -555,6 +555,7 @@ test("map: two calls (web tools, then JSON without tools), only cited URLs kept,
   assert.deepEqual([c1.role, c2.role], ["map1", "map2"]);
   assert.deepEqual(c1.params.tools.map((t) => [t.type, t.max_uses]), [["web_search_20260209", 6], ["web_fetch_20260209", 3]]);
   assert.equal(c1.params.tools[1].max_content_tokens, 12000);
+  assert.deepEqual(c1.params.tools.map((t) => t.allowed_callers), [["direct"], ["direct"]], "searches and fetches are direct calls, so the answer carries citations");
   assert.equal(c2.params.tools, undefined, "the JSON call has no tools");
   assert.equal(c2.params.output_config.format.type, "json_schema");
   assert.equal(db.bb.mapping, "ok");

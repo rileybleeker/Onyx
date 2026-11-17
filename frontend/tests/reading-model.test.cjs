@@ -48,6 +48,9 @@ test("the request: server-side fallback beta + fallbacks default, explicit effor
   assert.deepEqual(p.tools.map((t) => [t.type, t.name, t.max_uses]), [["web_search_20260209", "web_search", 2], ["web_fetch_20260209", "web_fetch", 2]]);
   assert.deepEqual(p.tools[1].citations, { enabled: true });
   assert.equal(p.tools[1].max_content_tokens, 12000);
+  // The _20260209 tools default to running from code execution (dynamic filtering), and an answer built from code
+  // output carries no citations at all (map stored no_sources, 2026-11-17): both are called directly.
+  assert.deepEqual(p.tools.map((t) => t.allowed_callers), [["direct"], ["direct"]], "no dynamic filtering: citations need direct calls");
   assert.ok(p.tools.every((t) => t.blocked_domains.length > 0 && t.blocked_domains.length <= 64));
   assert.equal(calls[0].options.timeout, 120000);
   assert.equal(typeof calls[0].options.signal?.aborted, "boolean", "one abort signal bounds the whole call, SDK retries included");

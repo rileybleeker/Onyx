@@ -319,7 +319,11 @@ every input hash. Every model call goes through `bankModelCall` ("Planning and m
 | `grade` | Sonnet 5.5 (low) | none | one mark per rubric point (see "Practice API and grading") |
 
 Citations cannot be combined with a structured-output format, so `research` is a plain-text call and the structured
-steps run without citations. Web-enabled calls receive public book details only; highlight passages go only to the
+steps run without citations. Both web tools are called **directly** (`allowed_callers: ["direct"]`, `webSearchTool` /
+`webFetchTool` in `lib/reading-model.ts`): the `_20260209` versions default to running from code execution (dynamic
+filtering), and then the model reads only what its code prints, so its answer carries no citations and the step stores
+`no_sources` (map, 2026-11-17: 6 searches, 1 text block, 0 sources). With direct calls the same request returned cited
+text blocks (`web_search_result_location`). Web-enabled calls receive public book details only; highlight passages go only to the
 tool-less structure, highlights and verify calls; comments, recall notes and answers never reach a generation call.
 
 The **mapping check**: when the map step finds a chapter count other than `books.total_chapters`, or titles that match

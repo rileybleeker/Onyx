@@ -228,11 +228,22 @@ export function requestBoundCents(spec: Pick<BankCallSpec, "model" | "system" | 
 /* Tools                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * `allowed_callers: ["direct"]` on BOTH tools is load-bearing. The `_20260209` versions default to
+ * `["code_execution_20260120"]` (dynamic filtering): the model then runs its searches and fetches from a code
+ * execution container and reads only what its code prints, so the results never reach it as search / document
+ * blocks and its final text carries NO citations. The bank's evidence is exactly those API citations (citedNotes),
+ * so without this pin every map / research answer reads as uncited and is stored as `no_sources` (seen on
+ * 2026-11-17: 6 searches, 1 text block, 0 sources). "direct" makes the model call the tools itself, which is what
+ * produces the `web_search_result_location` / document citations. It also leaves the code execution container (and
+ * the ZDR exclusion that comes with dynamic filtering) out of the request.
+ */
 export interface WebSearchTool {
   type: "web_search_20260209";
   name: "web_search";
   max_uses: number;
   blocked_domains: string[];
+  allowed_callers: ["direct"];
 }
 export interface WebFetchTool {
   type: "web_fetch_20260209";
@@ -241,6 +252,7 @@ export interface WebFetchTool {
   blocked_domains: string[];
   citations: { enabled: true };
   max_content_tokens: number;
+  allowed_callers: ["direct"];
 }
 export type BankTool = WebSearchTool | WebFetchTool;
 
@@ -249,6 +261,7 @@ export const webSearchTool = (maxUses: number): WebSearchTool => ({
   name: "web_search",
   max_uses: Math.max(1, Math.trunc(maxUses)),
   blocked_domains: [...BLOCKED_DOMAINS].slice(0, 64),
+  allowed_callers: ["direct"],
 });
 export const webFetchTool = (maxUses: number, maxContentTokens = 12000): WebFetchTool => ({
   type: "web_fetch_20260209",
@@ -257,6 +270,7 @@ export const webFetchTool = (maxUses: number, maxContentTokens = 12000): WebFetc
   blocked_domains: [...BLOCKED_DOMAINS].slice(0, 64),
   citations: { enabled: true },
   max_content_tokens: maxContentTokens,
+  allowed_callers: ["direct"],
 });
 
 /* ------------------------------------------------------------------ */

@@ -446,6 +446,48 @@ test("citedNotes: the copy guard drops a note (and an UNSURE note) that repeats 
   assert.equal(r.sources.length, 1, "the citation itself is still evidence");
 });
 
+// The two answer shapes the API gives for a map / research call (block order and field names as observed from
+// web_search_20260209 on 2026-11-17; every string here is synthetic).
+const SEARCH_RESULT = (url, title) => ({ type: "web_search_result", url, title, encrypted_content: "x", page_age: "May 1, 2024" });
+const SEARCH_CITE = (url, title, cited_text) => ({ type: "web_search_result_location", url, title, encrypted_index: "x", cited_text });
+
+test("citedNotes, a direct web search answer: cited fragments become notes and sources, uncited connectors and a blocked host are dropped", () => {
+  const content = [
+    { type: "server_tool_use", id: "srvtoolu_s1", name: "web_search", input: { query: "lighthouse ledger chapter summaries" } },
+    { type: "web_search_tool_result", tool_use_id: "srvtoolu_s1", caller: { type: "direct" }, content: [SEARCH_RESULT("https://guides.example.org/ledger", "Ledger guide"), SEARCH_RESULT("https://reviews.example.net/ledger", "Review")] },
+    { type: "text", text: "Here is what the sources say:" },
+    { type: "text", text: "the keeper logs every passing ship", citations: [SEARCH_CITE("https://guides.example.org/ledger", "Ledger guide", "Chapter one: the keeper logs each ship that passes the lamp.")] },
+    { type: "text", text: ", and " },
+    { type: "text", text: "the book has twelve chapters", citations: [SEARCH_CITE("https://guides.example.org/ledger", "Ledger guide", "Twelve short chapters."), SEARCH_CITE("https://reviews.example.net/ledger", "Review", "It runs to twelve chapters in all.")] },
+    { type: "text", text: "." },
+    { type: "text", text: "a copy site lists them too", citations: [SEARCH_CITE("https://libgen.rs/ledger", "Ledger", "copied")] },
+    { type: "text", text: "UNSURE: whether the epilogue is numbered." },
+  ];
+  const r = B.citedNotes(content);
+  assert.deepEqual(r.notes.map((n) => [n.text, n.sources]), [["the keeper logs every passing ship", [0]], ["the book has twelve chapters", [1, 2]]]);
+  assert.deepEqual(r.sources.map((s) => s.domain), ["example.org", "example.org", "example.net"]);
+  assert.equal(r.dropped, 4, "the opener, the two connectors and the blocked-host note");
+  assert.match(r.unsure, /^UNSURE:/);
+  assert.deepEqual(r.tool_errors, []);
+});
+
+test("citedNotes, a web search run from code execution (dynamic filtering) carries no citations: that is why both tools pin allowed_callers direct", () => {
+  const caller = { type: "code_execution_20260120", tool_id: "srvtoolu_c1" };
+  const content = [
+    { type: "server_tool_use", id: "srvtoolu_c1", name: "code_execution", input: { code: "print(web_search(query='x'))" } },
+    { type: "server_tool_use", id: "srvtoolu_s1", name: "web_search", input: { query: "lighthouse ledger chapter summaries" }, caller },
+    { type: "web_search_tool_result", tool_use_id: "srvtoolu_s1", caller, content: [SEARCH_RESULT("https://guides.example.org/ledger", "Ledger guide")] },
+    { type: "code_execution_tool_result", tool_use_id: "srvtoolu_c1", content: { type: "code_execution_result", stdout: "Ledger guide: twelve chapters", stderr: "", return_code: 0, content: [] } },
+    { type: "thinking", thinking: "", signature: "x" },
+    { type: "text", text: "The sources describe twelve short chapters about a keeper who logs ships." },
+    { type: "text", text: "The guide and the review agree on the order." },
+  ];
+  const r = B.citedNotes(content);
+  assert.equal(r.sources.length, 0, "the answer read the results through code, so the API attached nothing to its text");
+  assert.equal(r.notes.length, 0);
+  assert.equal(r.dropped, 2);
+});
+
 test("mergeHighlightLinks folds valid links into support before verify; validateBuild never reads highlight_links", () => {
   const structure = {
     ideas: [idea({ support: ["E1"] }), idea({ title: "Other idea", support: ["E2"] })],
