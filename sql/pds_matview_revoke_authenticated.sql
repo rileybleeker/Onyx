@@ -108,8 +108,9 @@ BEGIN
             RAISE EXCEPTION 'service_role cannot read pds.%; the facade would break; review before applying', mat_name;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_index i
-                       WHERE i.indrelid = rel AND i.indisunique AND i.indpred IS NULL) THEN
-            RAISE EXCEPTION 'pds.% has no unique non-partial index; review before applying', mat_name;
+                       WHERE i.indrelid = rel AND i.indisunique AND i.indpred IS NULL
+                         AND i.indexprs IS NULL AND i.indisvalid AND i.indisready) THEN
+            RAISE EXCEPTION 'pds.% has no usable unique non-partial index; review before applying', mat_name;
         END IF;
         six := six || rel;
     END LOOP;

@@ -7,6 +7,8 @@ import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
 import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
+import { readingBankCard, type ReadingBankHeartbeat, type ReadingBankStatusCounts } from "@/lib/reading-bank-status";
+import { monthlyCapCents } from "@/lib/reading-bank";
 import { medicalBackupCard, type BackupHeartbeat } from "@/lib/medical-backup-status";
 
 const supabase = createClient(
@@ -31,6 +33,8 @@ export interface SourceStatus {
   methodLabel: string;
   /** Spotify card only, from day 165 after the authorization: the date (YYYY-MM-DD, ET) to reconnect by. */
   reconnectBy?: string | null;
+  /** Extra detail rows (Reading Questions: this month's model spend against the cap). Counts and amounts only. */
+  extraRows?: { label: string; value: string }[];
 }
 
 // Human-readable sync cadence per source. "Manual" means user-triggered;
@@ -58,6 +62,9 @@ const CADENCE: Record<string, string> = {
   procurement: "Manual",
   photo_meals: "Manual (a plate photo on /nutrition)",
   kindle:"Every 3h (Riley's PC, while logged on)",
+  // Question bank generator (READ-QUIZ-01): kicked after each Kindle import and each reading write, plus the hourly
+  // Reading Question Bank workflow (frontend/scripts/reading-bank-run.cjs) while Riley's PC is off.
+  reading_bank: "With each Kindle harvest + hourly",
   amazon_orders: "Every 3h with the Kindle harvest (Riley's PC)",
   screen_usage: "Daily (iPhone Shortcuts automation)",
   notion_journal: "Hourly :35",
@@ -75,9 +82,11 @@ const CADENCE: Record<string, string> = {
   google_calendar: "Hourly :55",
   care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (Riley's PC, while logged on)",
+  gopuff: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
   uber_rides: "On demand (Uber privacy download, imported by hand)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
+  youtube: "Daily look on Riley's PC; new data every 2 months (scheduled Google Takeout)",
   medical_backup: "Weekly (Riley's PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
@@ -117,6 +126,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   procurement:    { method: "manual",         label: "Manual entry" },
   photo_meals:    { method: "manual",         label: "Photo + Claude estimate" },
   kindle:         { method: "automated",      label: "Local Chrome harvest" },
+  reading_bank:   { method: "automated",      label: "Claude + web sources" },
   amazon_orders:  { method: "automated",      label: "Local Chrome harvest" },
   screen_usage:   { method: "automated",      label: "iPhone app export" },
   notion_journal: { method: "automated",      label: "Notion sync" },
@@ -134,9 +144,11 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
+  gopuff:         { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   uber_rides:     { method: "manual",         label: "Privacy download import" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
+  youtube:        { method: "semi-automated", label: "Scheduled Takeout in OneDrive" },
   medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   simplefin:      { method: "automated",      label: "Bank feed API" },
@@ -311,6 +323,14 @@ export async function GET() {
     // which holds timestamps, counts and a short code only (never pds.ci_tokens, never an item).
     // Inert until set up: without the two Google variables nothing is read, as in care-google-server.ts.
     const careCalendarIsSetUp = careCalendarConfigured(process.env);
+    // Reading question bank (READ-QUIZ-01): its own limit-1 heartbeat read (hourly at most, so the shared window can
+    // lose it) and pds.reading_bank_status() (counts only: books turned on, queued / failed jobs, chapters waiting,
+    // this month's spend, the schema checks). A missing function (SQL not applied) is shown as "not set up".
+    const readingBankPromise = Promise.all([
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "reading_bank").eq("data_type", "generate")
+        .order("sync_start", { ascending: false }).limit(1).then((res) => res),
+      supabase.rpc("reading_bank_status").then((res) => res),
+    ]);
     const careCalendarPromise = careCalendarIsSetUp
       ? supabase.from("care_calendar_sync").select(CARE_CALENDAR_SYNC_COLUMNS).eq("id", 1).limit(1).then((res) => res)
       : Promise.resolve(null);
@@ -338,7 +358,7 @@ export async function GET() {
       ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -442,6 +462,8 @@ export async function GET() {
       // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "ubereats").eq("data_type", "items")
         .order("sync_start", { ascending: false }).limit(1),
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "gopuff").eq("data_type", "items")
+        .order("sync_start", { ascending: false }).limit(1),
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "kindle").eq("data_type", "highlights")
         .order("sync_start", { ascending: false }).limit(1),
       // Onyx Screen Time iPhone app: one heartbeat a day, so it also needs its own fetch.
@@ -478,6 +500,8 @@ export async function GET() {
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
         ["uber_rides", "import"],
+        // YouTube watch history importer (Riley's PC, one heartbeat a day).
+        ["youtube", "history"],
         // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
         ["backup", "medical_records"],
         // N-of-1 trial report job: one heartbeat a day.
@@ -600,6 +624,7 @@ export async function GET() {
     const pollenPending = pollenRes.error?.code === "PGRST205" || pollenRes.error?.code === "42P01";
     const pollenLatest = (pollenRes.data?.[0]?.count_date as string | undefined) ?? null;
     const careCalendarRes = await careCalendarPromise;
+    const [readingBankHbRes, readingBankStatusRes] = await readingBankPromise;
 
     const sources: Record<string, SourceStatus> = {
       garmin: {
@@ -940,6 +965,22 @@ export async function GET() {
           methodLabel: METHOD.kindle.label,
         };
       })(),
+      // Reading question bank generator (READ-QUIZ-01, lib/reading-bank-status.ts): unknown while off or not set up;
+      // red on a failed run, a chapter waiting > 24 h, jobs queued with no run for 24 h, or a failed job in 24 h;
+      // degraded on a partial run, a chapter waiting > 6 h, jobs queued and no run for 3 h, or T07's checks not
+      // widened. Shows this month's model spend against the cap. Counts and codes only.
+      reading_bank: {
+        ...readingBankCard({
+          heartbeat: ((readingBankHbRes.data?.[0] as ReadingBankHeartbeat | undefined) ?? (latestBySrcType["reading_bank|generate"] as ReadingBankHeartbeat | undefined) ?? null),
+          counts: (readingBankStatusRes.data as ReadingBankStatusCounts | null) ?? null,
+          countsError: readingBankStatusRes.error ? { code: readingBankStatusRes.error.code ?? null } : null,
+          monthCapCents: monthlyCapCents(process.env.READING_BANK_MONTHLY_CAP_CENTS),
+          nowMs: Date.now(),
+        }),
+        cadence: CADENCE.reading_bank,
+        integrationMethod: METHOD.reading_bank.method,
+        methodLabel: METHOD.reading_bank.label,
+      },
       // Personal Amazon orders (tools/kindle_harvest/amazon-orders.mjs): the Kindle harvester's
       // 3-hourly pass on Riley's PC reads the "Your Orders" list and posts to
       // /api/orders/amazon/import, which writes an amazon|orders heartbeat on every call. PC-bound,
@@ -1275,6 +1316,35 @@ export async function GET() {
           methodLabel: METHOD.uber_rides.label,
         };
       })(),
+      // goPuff item harvester (tools/gopuff_harvest/harvest.mjs on Riley's PC): same shape and
+      // thresholds as the Uber Eats card. 'failed' usually means the goPuff session expired (phone +
+      // SMS sign-in on the harvester profile) or the page's response format changed (--probe).
+      gopuff: (() => {
+        const entry = latestBySrcType["gopuff|items"]
+          ?? (gopuffSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 48
+            ? "failed"
+            : entry.status === "partial" || ageH > 18
+              ? "partial"
+              : "success";
+        return {
+          label: "goPuff Items",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string) ?? null,
+          cadence: CADENCE.gopuff,
+          integrationMethod: METHOD.gopuff.method,
+          methodLabel: METHOD.gopuff.label,
+        };
+      })(),
       // PC activity logger (tools/pc_activity_logger on Riley's PC): active / idle time per
       // hour + the foreground program's name, upserted hourly to pds.pc_activity_hours/apps with
       // a pc_activity|usage heartbeat per upload. It only runs while Riley is signed in to the PC,
@@ -1332,6 +1402,35 @@ export async function GET() {
           cadence: CADENCE.ai_usage,
           integrationMethod: METHOD.ai_usage.method,
           methodLabel: METHOD.ai_usage.label,
+        };
+      })(),
+      // YouTube watch history (tools/youtube_history on Riley's PC): a daily look for a new scheduled Google
+      // Takeout export in OneDrive, upserted to pds.youtube_watch_events. Heartbeat only (no rows are read
+      // here). Daily run on a PC that may be off: >50h degraded, >96h or a failed row red; the importer's own
+      // 'partial' covers "no export yet" and "the yearly schedule has ended".
+      youtube: (() => {
+        const entry = latestBySrcType["youtube|history"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 96
+            ? "failed"
+            : entry.status === "partial" || ageH > 50
+              ? "partial"
+              : "success";
+        return {
+          label: "YouTube History",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - apply sql/youtube_watch_history_schema.sql, run tools/youtube_history/register-task.ps1 and set up the scheduled Takeout (docs/youtube-watch-history.md)." : null),
+          cadence: CADENCE.youtube,
+          integrationMethod: METHOD.youtube.method,
+          methodLabel: METHOD.youtube.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone

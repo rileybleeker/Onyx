@@ -20,6 +20,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env
   db: { schema: "pds" },
 });
 
+/** The question bank's kick (READ-QUIZ-01) runs after the response: up to 240 s of generation. */
+export const maxDuration = 300;
+
 /**
  * PATCH  /api/reading/sessions/[id]  Body: { chapter_through, chapter_from?, minutes?, medium?, recall?, question?,
  *                                            date?, book?, habit_created_on? }   (date / book absent or null = keep)
@@ -66,6 +69,7 @@ function originRefused(req: NextRequest): { status: number; error: string } | nu
 }
 
 export async function PATCH(req: NextRequest, ctx: Ctx) {
+  const requestStartedAt = Date.now();
   const refused = checkVoiceRequest(req.headers, req.nextUrl.origin, MAX_BYTES);
   if (refused) return NextResponse.json({ error: refused.error }, { status: refused.status });
   const id = sessionIdOf((await ctx.params).id);
@@ -134,6 +138,16 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
     }
     await sweepPendingRemovals(supabase);
   });
+
+  // The question bank (READ-QUIZ-01): only when the chapter reached (or the book) changed, which can move the
+  // quizzable chapter; plan and build after the response.
+  if (r.session.chapter_through !== r.previous.chapter_through || r.book.book_id !== r.previousBook.book_id) {
+    const bookIds = [...new Set([r.book.book_id, r.previousBook.book_id])];
+    after(async () => {
+      const { kickBank } = await import("@/lib/reading-bank-server"); // inside after(): keeps the SDK graph out of the cold start
+      for (const bookId of bookIds) await kickBank(supabase, { bookId, reason: "session", requestStartedAt });
+    });
+  }
 
   return NextResponse.json({
     success: true,

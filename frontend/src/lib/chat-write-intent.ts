@@ -330,6 +330,8 @@ const NOT_AMOUNT_AFTER = /^(?:min|mins|minutes?|hours?|hrs?|h|days?|weeks?|month
 const NOT_AMOUNT_BEFORE = /^(?:at|around|about|by|after|before|until|till|since|from|to|chapter|chapters|ch|page|pages|jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)$/;
 /** Words that end the search for the unit of a number ("2 of the magnesium capsules" looks past "of the magnesium"). */
 const UNIT_SEARCH_STOP = /^(?:and|or|but|then|plus|at|with|around|by|before|after|on|yesterday|today|tonight|this|last)$/;
+/** Fraction words whose article ("half a tablet") is part of the fraction, never a second amount. */
+const FRACTION_WORDS = new Set(["half", "quarter", "third"]);
 
 interface Quantity { value: number; unit: string | null; word: string }
 
@@ -349,6 +351,13 @@ function quantities(text: string): Quantity[] {
     const prev = toks[i - 1], next = toks[i + 1];
     if (prev === ":" || next === ":") continue; // 8:30
     if ((next === "a" || next === "p") && toks[i + 2] === "m") continue; // 8 a.m.
+    // The bare article is the number one only when it directly precedes a unit or noun, and never inside a
+    // fraction phrase: in "half a tablet" the article belongs to the fraction (one amount of 0.5), so it is
+    // not a second quantity of one.
+    if (t === "a" || t === "an") {
+      if (prev !== undefined && FRACTION_WORDS.has(prev)) continue;
+      if (next === undefined || NOT_AMOUNT_AFTER.test(next) || UNIT_SEARCH_STOP.test(next) || next === ":") continue;
+    }
     // "half a tablet"
     let j = i + 1;
     if (t === "half" && (toks[j] === "a" || toks[j] === "an")) j += 1;
@@ -603,8 +612,10 @@ function isDay(v: string): boolean {
 /**
  * The text with quoted spans masked out (same length, so positions line up). Someone else's words, never a request:
  * fenced code blocks (``` or ~~~, to the closing fence or the end), inline code, block quotes ("> …" and the lines
- * that continue them up to a blank line, as Markdown shows them), "double quotes" and curly quotes, also over
- * several lines. An opening quote or fence that is never closed masks everything after it (fail closed).
+ * that continue them up to a blank line, as Markdown shows them), "double quotes", curly quotes and 'straight single
+ * quotes', also over several lines. An opening single quote sits at the start or after whitespace or an opening
+ * bracket and closes at a quote that ends a word, so the apostrophe inside "don't" is never one. An opening quote or
+ * fence that is never closed masks everything after it (fail closed).
  */
 function maskQuotes(text: string): string {
   const chars = text.split("");
@@ -650,10 +661,12 @@ function maskQuotes(text: string): string {
     let close: number | null = null;
     if (c === '"') close = s.indexOf('"', i + 1);
     else if (c === "“") close = s.indexOf("”", i + 1);
-    else if (c === "‘" && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
-      // An opening single quote closes at a ’ that ends a word (not the apostrophe inside "don’t").
+    else if ((c === "‘" || c === "'") && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
+      // An opening single quote (curly or straight) closes at the same quote that ends a word
+      // (not the apostrophe inside "don’t" / "don't").
+      const closer = c === "‘" ? /’(?![a-z])/i : /'(?![a-z])/i;
       const rest = s.slice(i + 1);
-      const m = /’(?![a-z])/i.exec(rest);
+      const m = closer.exec(rest);
       close = m ? i + 1 + (m.index ?? 0) : -1;
     } else continue;
     const to = close === null || close < 0 ? s.length : close + 1;

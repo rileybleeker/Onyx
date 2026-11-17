@@ -123,6 +123,33 @@ test("writes must be same-origin JSON within the size cap", () => {
   assert.equal(L.utf8Bytes("é😀"), 6);
 });
 
+// ---------- transient vs refused save failures ----------
+
+test("only failures worth retrying are transient", () => {
+  // No answer at all (offline, request timed out): retry the same value.
+  assert.equal(L.isTransientSaveFailure(null), true);
+  for (const status of [408, 429, 500, 502, 503, 504]) {
+    assert.equal(L.isTransientSaveFailure(status), true, String(status));
+  }
+  // A 4xx the server meant (validation, auth, conflict) cannot succeed on retry; a malformed 200
+  // (a code bug, not a lost request) must not be retried either.
+  for (const status of [400, 401, 403, 404, 409, 413, 415, 200]) {
+    assert.equal(L.isTransientSaveFailure(status), false, String(status));
+  }
+});
+
+test("the form's autosave retries transient failures and stops only on refusals", () => {
+  // The old bug: run() returned false for every failure and the autosave save turned any false into
+  // AutosaveRefused, so an offline form waited for a manual Retry. The wiring must classify instead.
+  const src = read(SRC, "app/health/HealthClient.tsx");
+  assert.match(src, /isTransientSaveFailure/, "the form classifies failures through the shared rule");
+  assert.match(src, /outcome\.transient \? new Error\(/, "a transient failure reaches the scheduler as a plain Error (retried)");
+  assert.match(src, /: new AutosaveRefused\(/, "a refusal reaches it as AutosaveRefused (stops at Retry)");
+  // The failure path itself: a transient failure of the form's own save must NOT revert the item.
+  assert.match(src, /if \(!\(transient && undoable === 'autosave'\)\)/);
+  assert.ok(!/if \(!\(await run\(op, 'autosave'\)\)\)/.test(src), "run's outcome is classified, not flattened to a boolean");
+});
+
 // ---------- optimistic list helpers ----------
 
 test("a change shows at once, reverts on failure, and can be undone", () => {

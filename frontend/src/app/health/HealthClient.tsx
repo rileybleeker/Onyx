@@ -6,7 +6,7 @@ import {
   type CareItem, type CareKind, type LocalCopyState,
   careStatus, compareSchedule, completionChange, formatTime, itemInZone, localCopyState, monthGrid, sampleItems, todayLocal, validDate, validTime, validTimeZone,
 } from '@/lib/care-planner';
-import { MAX_CARE_ITEMS, MAX_NOTES, type CareOp, type CarePatch, applyOp, inverseOp, opId, opRequest, parseCareItem, putItem, revertOp } from '@/lib/care-items';
+import { MAX_CARE_ITEMS, MAX_NOTES, type CareOp, type CarePatch, applyOp, inverseOp, isTransientSaveFailure, opId, opRequest, parseCareItem, putItem, revertOp } from '@/lib/care-items';
 import type { CareLoad } from '@/lib/care-items-server';
 import type { CalendarStatus } from '@/lib/care-google';
 import { CareCalendar, DueSoon } from './CareCalendar';
@@ -135,36 +135,68 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
   }
 
   // One change to one item: shown at once, sent to Onyx, and taken back if Onyx does not confirm it.
+  // A save's outcome: ok, or why it failed and whether it is transient (retryable with the same value).
+  type SaveOutcome = { ok: true } | { ok: false; transient: boolean; message: string };
+
+  /** The request an op makes, classified instead of thrown: ok, or a failure with its HTTP status
+   *  (null = no answer at all: the network was unreachable or the request timed out) and a message. */
+  async function sendOp(op: CareOp): Promise<{ ok: true; saved: CareItem | null } | { ok: false; status: number | null; message: string }> {
+    const request = opRequest(op);
+    try {
+      const res = await fetch(request.path, {
+        method: request.method,
+        ...(request.body === null ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request.body) }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { error?: unknown };
+        const message = typeof body.error === 'string' && body.error ? body.error : `Save failed (${res.status}).`;
+        return { ok: false, status: res.status, message };
+      }
+      if (op.type === 'remove') return { ok: true, saved: null };
+      const saved = parseCareItem(((await res.json()) as { item?: unknown }).item);
+      if (!saved.ok) return { ok: false, status: res.status, message: "Onyx's answer could not be read." };
+      return { ok: true, saved: saved.item };
+    } catch {
+      return { ok: false, status: null, message: "Couldn't reach Onyx." };
+    }
+  }
+
+  /** The error the autosave scheduler sees for a failed save: a transient failure is a plain Error so
+   *  the Autosaver retries it with backoff; a refusal becomes AutosaveRefused and stops at Retry. */
+  const saveFailureError = (outcome: { transient: boolean; message: string }): Error =>
+    outcome.transient ? new Error(outcome.message) : new AutosaveRefused(outcome.message);
+
   // mode "autosave": the form's own save, which sets Undo itself (for the whole edit, see autosave below).
-  async function run(op: CareOp, undoable: boolean | 'autosave' = true): Promise<boolean> {
+  // A failure is classified: transient ones (offline, timeout, 5xx, 429) are retried by the autosave
+  // scheduler with the same value, so the optimistic change stays; refusals (a 4xx the server meant)
+  // take the change back and wait for a new value.
+  async function run(op: CareOp, undoable: boolean | 'autosave' = true): Promise<SaveOutcome> {
     const id = opId(op);
-    if (inFlight.current.has(id)) return false;
+    if (inFlight.current.has(id)) return { ok: false, transient: true, message: 'Still saving this item.' };
     inFlight.current.add(id);
     const before = itemsRef.current.find(item => item.id === id) ?? null;
     commit(cur => applyOp(cur, op));
     setBusy(cur => new Set(cur).add(id));
     try {
-      const request = opRequest(op);
-      const res = await fetch(request.path, {
-        method: request.method,
-        ...(request.body === null ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request.body) }),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      if (op.type !== 'remove') {
-        const saved = parseCareItem(((await res.json()) as { item?: unknown }).item);
-        if (!saved.ok) throw new Error('shape');
-        commit(cur => putItem(cur, saved.item));
+      const result = await sendOp(op);
+      if (result.ok) {
+        const saved = result.saved;
+        if (saved) commit(cur => putItem(cur, saved));
+        if (undoable === 'autosave') setNotice(null);
+        else {
+          setUndo(undoable ? inverseOp(op, before) : null);
+          setNotice(undoable ? null : { text: 'Undone.' });
+        }
+        return { ok: true };
       }
-      if (undoable === 'autosave') setNotice(null);
-      else {
-        setUndo(undoable ? inverseOp(op, before) : null);
-        setNotice(undoable ? null : { text: 'Undone.' });
+      const transient = isTransientSaveFailure(result.status);
+      // A transient failure of the form's own save is retried with the same value, so the change is
+      // kept on screen; everything else (a refusal, or a direct tap with no retry behind it) reverts.
+      if (!(transient && undoable === 'autosave')) {
+        commit(cur => revertOp(cur, op, before));
+        setNotice({ text: "Couldn't save that to Onyx, so it was not changed. Try again.", error: true });
       }
-      return true;
-    } catch {
-      commit(cur => revertOp(cur, op, before));
-      setNotice({ text: "Couldn't save that to Onyx, so it was not changed. Try again.", error: true });
-      return false;
+      return { ok: false, transient, message: result.message };
     } finally {
       inFlight.current.delete(id);
       setBusy(cur => { const next = new Set(cur); next.delete(id); return next; });
@@ -191,13 +223,18 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
       const { id, ...fields } = v;
       const exists = itemsRef.current.some(item => item.id === id);
       const op: CareOp = exists ? { type: 'update', id, patch: fields } : { type: 'create', item: { id, ...fields, archived: false, completedOn: null } };
-      // run() has already taken the change back and said so; Retry (or the next change) sends it again.
-      if (!(await run(op, 'autosave'))) throw new AutosaveRefused("Couldn't save that to Onyx.");
+      // run() has either saved, or classified the failure: transient ones reach the scheduler as a
+      // plain Error (it retries the same value with backoff), refusals as AutosaveRefused (stop, Retry).
+      const outcome = await run(op, 'autosave');
+      if (!outcome.ok) throw saveFailureError(outcome);
       // A create retried after a lost answer gets the stored row back (the route is idempotent on the id), which
       // may predate edits made since: send those as an update.
       const stored = exists ? null : itemsRef.current.find(item => item.id === id);
       const stale = !!stored && (Object.keys(fields) as (keyof typeof fields)[]).some(key => JSON.stringify(stored[key]) !== JSON.stringify(fields[key]));
-      if (stale && !(await run({ type: 'update', id, patch: fields }, 'autosave'))) throw new AutosaveRefused("Couldn't save that to Onyx.");
+      if (stale) {
+        const fix = await run({ type: 'update', id, patch: fields }, 'autosave');
+        if (!fix.ok) throw saveFailureError(fix);
+      }
       const before = sessionBefore.current;
       setUndo(before ? inverseOp({ type: 'update', id, patch: fields }, before) : { type: 'remove', id });
       if (formRef.current.id === id && !formRef.current.editing) setForm({ ...formRef.current, editing: id });
