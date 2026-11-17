@@ -82,6 +82,10 @@ import { DraftMark, LogCard, LogSaveButton } from "./ui";
 // same suggestion twice. A draft is auto-saved once; what failed stays listed with Retry.
 const triedDrafts = new Set<number>();
 const loggedItems = new Map<number, Set<number>>(); // draft id -> indexes of items already logged
+// The products whose save is NOT confirmed (their attempt keeps its key and payload, lib/log-supplement-multi.ts). Kept
+// for the page's life, like the drafts above: if the section unmounts while a save is unknown, the next mount shows it
+// again with "Log again" (same key), so a fresh tap can never write the same untimed dose a second time.
+let unconfirmedItems: Selection = [];
 
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
@@ -576,7 +580,10 @@ export default function SupplementsSection() {
   const [query, setQuery] = useState("");
   // The selected products, each with its own amount + unit and, once sent, its outcome (lib/log-supplement-multi.ts).
   // Only the selection holds them: filtering the options never touches it.
-  const [selection, setSelection] = useState<Selection>(EMPTY_SELECTION);
+  const [selection, setSelection] = useState<Selection>(() => unconfirmedItems);
+  useEffect(() => {
+    unconfirmedItems = selection.filter((i) => i.outcome?.kind === "unconfirmed");
+  }, [selection]);
   // Shared by every selected product that is still to be logged.
   const [times, setTimes] = useState<string[]>([]);
   const [dayChoice, setDayChoice] = useState<string>("today"); // "today" | "yesterday" | YYYY-MM-DD
@@ -1195,28 +1202,32 @@ export default function SupplementsSection() {
                       <input
                         type="time"
                         value={t}
-                        disabled={batchBusy}
+                        disabled={batchBusy || anyLost}
                         onChange={(e) => setTimes((l) => l.map((x, j) => (j === i ? e.target.value : x)))}
                         aria-label={`Time ${i + 1}`}
                         className={`${input} w-32`}
                       />
-                      <button type="button" aria-label={`Remove time ${i + 1}`} className={`${btn} min-w-11 px-2`} disabled={batchBusy} onClick={() => setTimes((l) => l.filter((_, j) => j !== i))}>
+                      <button type="button" aria-label={`Remove time ${i + 1}`} className={`${btn} min-w-11 px-2`} disabled={batchBusy || anyLost} onClick={() => setTimes((l) => l.filter((_, j) => j !== i))}>
                         <X className="w-4 h-4" aria-hidden />
                       </button>
                     </span>
                   ))}
-                  <button type="button" className={`${btn} inline-flex items-center gap-1`} disabled={batchBusy || times.length >= 12} onClick={() => setTimes((l) => [...l, nowHHMM()])}>
+                  <button type="button" className={`${btn} inline-flex items-center gap-1`} disabled={batchBusy || anyLost || times.length >= 12} onClick={() => setTimes((l) => [...l, nowHHMM()])}>
                     <Plus className="w-4 h-4" aria-hidden />
                     Time
                   </button>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <select value={dayChoice} disabled={batchBusy} onChange={(e) => setDayChoice(e.target.value)} aria-label="Day" className={`${input} bg-surface-card`}>
+                  <select value={dayChoice} disabled={batchBusy || anyLost} onChange={(e) => setDayChoice(e.target.value)} aria-label="Day" className={`${input} bg-surface-card`}>
                     <option value="today">Today</option>
                     <option value="yesterday">Yesterday</option>
                     {dayChoice !== "today" && dayChoice !== "yesterday" && <option value={dayChoice}>{dayLabel(dayChoice, day)}</option>}
                   </select>
-                  <span className="text-[12px] text-text-tertiary">Times and day apply to every product above that is not saved yet</span>
+                  <span className="text-[12px] text-text-tertiary">
+                    {anyLost
+                      ? "Locked while a save is not confirmed: Log again repeats it as it was sent"
+                      : "Times and day apply to every product above that is not saved yet"}
+                  </span>
                 </div>
               </>
             )}
