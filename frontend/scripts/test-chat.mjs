@@ -1073,7 +1073,7 @@ test("Onyx Chat's reading entry and progress line go through the stored claim an
       logSession: async () => ({ ok: true, book, session: row(), xpGained: 20, finished: false, habitMarked: false, habitCreated: false, replayed: false, mirrorClaimId: "claim-synthetic", progressOwedId: "owed-synthetic" }),
       getOverview: async () => null,
     };
-    await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: fakeSupabase(), reading, readingRemoval: removalOf({}, calls) }).post({ messages: [user("I read chapters 1 and 2 on paper")] });
+    await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2, medium: "paper" }), { supabase: fakeSupabase(), reading, readingRemoval: removalOf({}, calls) }).post({ messages: [user("I read chapters 1 and 2 on paper")] });
     assert.deepEqual(calls, [
       { fn: "placeEntry", replaces: null, claim: "claim-synthetic" },
       { fn: "rewriteProgressNow", bookId: 4, owedId: "owed-synthetic" },
@@ -1098,7 +1098,7 @@ test("Onyx Chat's reading entry and progress line go through the stored claim an
       getOverview: async () => null,
     };
     const readingRemoval = removalOf({}, calls, { createEntryClaimOf: async (_c, sessionId, bookId) => { looked.push([sessionId, bookId]); return lookup; } });
-    await route(afterTool("log_reading_session", { chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingRemoval }).post({ request_id: RID, messages: [user("I read chapters 1 and 2 on paper")] });
+    await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2, medium: "paper" }), { supabase: db, reading, readingRemoval }).post({ request_id: RID, messages: [user("I read chapters 1 and 2 on paper")] });
     assert.deepEqual(looked, [[1, 4]], String(lookup));
     assert.deepEqual(calls.filter((c) => c.fn === "placeEntry"), expected, String(lookup));
     assert.deepEqual(calls.filter((c) => c.fn === "rewriteProgressNow"), [{ fn: "rewriteProgressNow", bookId: 4, owedId: null }], "no stored obligation: rewriteProgressNow stores its own before it writes");
