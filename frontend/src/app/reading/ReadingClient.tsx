@@ -502,6 +502,14 @@ function CheckpointTile({ c, offer, pendingRecord, onStart }: { c: ReadingOvervi
           "no quiz yet"
         )}
       </div>
+      {/* A newer quiz for this checkpoint was corrected later, so an older counted result is shown instead: say so,
+          or the score change looks unexplained (PR 362 follow-up). Plain text, never color alone. */}
+      {c.correctedNewer && (
+        <div className="mt-1 text-[11px] leading-snug text-text-tertiary">
+          A newer quiz was corrected, so this earlier result is shown
+          {c.correctedNewerQuiz ? ` (${c.correctedNewerQuiz.score}/${c.correctedNewerQuiz.total} · ${fmtDate(c.correctedNewerQuiz.date)})` : ""}.
+        </div>
+      )}
       {/* The quiz in the app (READ-QUIZ-01): offered once the book's questions are on and the chapter is quizzable. */}
       {(offer || pendingRecord) && (
         <button
