@@ -140,10 +140,10 @@ export default function ExperimentAdherence({ date, when }: { date: string; when
               Save note
             </button>
           )}
-          {saving ? <span className="text-text-tertiary">Saving…</span>
-            : error ? <span className="text-down">{error}</span>
-            : saved ? <span className="text-text-secondary inline-flex items-center gap-1"><Check className="w-3.5 h-3.5 text-up" /> Saved</span>
-            : !day.answer ? <span className="text-text-tertiary">Saved as you tap.</span>
+          {saving ? <span role="status" className="text-text-tertiary">Saving…</span>
+            : error ? <span role="alert" className="text-down">{error}</span>
+            : saved ? <span role="status" className="text-text-secondary inline-flex items-center gap-1"><Check className="w-3.5 h-3.5 text-up" /> Saved</span>
+            : !day.answer ? <span role="status" className="text-text-tertiary">Saved as you tap.</span>
             : null}
         </div>
       </div>
