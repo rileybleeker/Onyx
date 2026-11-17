@@ -2,8 +2,7 @@ import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { checkVoiceRequest } from "@/lib/checkin-voice";
 import { deleteSession, getOverview, parseSessionUpdate, updateSession, ymdOrNull } from "@/lib/reading";
-import { sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
-import { discardEntry, placeEntry, removalAnswer, retireEntry, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
+import { discardEntry, placeEntry, refreshEntry, removalAnswer, retireEntry, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals } from "@/lib/reading-removal";
 import { SESSION_GONE_CODE } from "@/lib/reading-removal-receipt";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -82,16 +81,18 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
       // trashed (lib/reading-removal.ts placeEntry; Codex review of PR 376, round 6): a removal, another move or a
       // create callback that lands meanwhile, or a failure in between, leaves no entry nothing knows.
       const old = r.previous.notion_block_id ?? null;
+      // An edit that ran while the entry was written updated the old entry, not this one: placeEntry catches the new
+      // one up under its claim, which goes only once that rewrite is confirmed (Codex T01-R11, round 2).
       const placed = await placeEntry(supabase, r.book, r.session, old);
-      // An edit that ran while the entry was written updated the old entry, not this one.
-      if (placed.kind === "attached" && sessionMirrorDiffers(r.session, placed.row)) await updateMirroredSession(placed.row);
       // Removed meanwhile: its removal's cleanup row holds the old entry; the new one is trashed here (or by its claim).
-      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+      if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
       // No entry could be written on the new page: the old one comes off the old book's page all the same.
       else if (placed.kind === "none" && old) await retireEntry(supabase, id, r.previousBook.book_id, old);
       await rewriteProgressNow(supabase, r.previousBook.book_id);
     } else if (r.session.notion_block_id) {
-      await updateMirroredSession(r.session);
+      // Under its own claim until the rewrite is confirmed (lib/reading-removal.ts refreshEntry; Codex T01-R11, round
+      // 2): a failed rewrite, or one that landed after a newer edit's, is finished by the sweep.
+      await refreshEntry(supabase, r.session);
     }
     // Written from the database as it is at write time and checked, with its own obligation until then (Codex review
     // of PR 376, round 5): a line from the overview this request saw could land after a newer, checked one.

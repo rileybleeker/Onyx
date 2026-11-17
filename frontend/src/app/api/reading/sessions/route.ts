@@ -1,7 +1,6 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { BOOK_COLS, deleteSessionByClientKey, getOverview, logSession, type Book, type Medium } from "@/lib/reading";
-import { sessionMirrorDiffers, updateMirroredSession } from "@/lib/reading-notion";
 import { discardEntry, dropClaim, placeEntry, removalAnswer, rewriteProgressNow, runRemovalCleanup, sweepPendingRemovals, trashLateBlock } from "@/lib/reading-removal";
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -62,12 +61,10 @@ export async function POST(req: NextRequest) {
     // attached only while the session is still on this book with no entry (lib/reading-removal.ts placeEntry): an
     // entry whose block id cannot be recorded afterwards (a removal landed, then the database or this process failed)
     // is still found by its marker and settled by the sweep. No claim stored, no entry.
+    // An edit that ran while the entry was written is caught up inside placeEntry, under the entry's claim (the claim
+    // goes only once that rewrite is confirmed, Codex T01-R11 round 2).
     const placed = await placeEntry(supabase, result.book, result.session, null);
-    if (placed.kind === "attached") {
-      // The autosaving forms may edit the session while its entry is being written: an edit that ran before the block
-      // id was stored could not update the entry, so the attached row is compared with what was written.
-      if (sessionMirrorDiffers(result.session, placed.row)) await updateMirroredSession(placed.row);
-    } else if (placed.kind === "gone") {
+    if (placed.kind === "gone") {
       // A removal that ran meanwhile found no block id in its cleanup row: record this one there first (so a retried
       // removal owes it), then trash it and rewrite the progress line. The claim goes only once the entry is trashed.
       const late = await trashLateBlock(supabase, id, placed.blockId, rewriteProgress);

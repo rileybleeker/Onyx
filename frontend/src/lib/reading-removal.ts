@@ -20,6 +20,7 @@ import {
   refreshMirroredSession,
   removeMirroredBlock,
   sessionMirrorDiffers,
+  updateMirroredSession,
 } from "./reading-notion";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -327,15 +328,25 @@ export async function dropClaim(supabase: Supa, claimId: string): Promise<boolea
   return !error;
 }
 
-/** A claim the sweep could not settle waits for its next try (doubling delay, never given up). */
-async function deferClaim(supabase: Supa, claim: MirrorClaim): Promise<void> {
+/**
+ * A sweep takes a due claim for itself before it settles it (Codex review of PR 376, T01-R11 round 2): one conditional
+ * update moves the claim's next try out by its doubling delay (at least 15 minutes, longer than any server function
+ * runs) only while the claim still has the try count this sweep read. Exactly one of two sweeps that found the same
+ * claim wins; the other leaves it alone, so no sweep can write an older entry after another sweep confirmed a newer one
+ * and dropped the claim. The winner's claim is already deferred: a settlement that fails (or a process that ends) needs
+ * nothing more, and the claim is tried again once the delay is over. Never given up for its age.
+ */
+async function leaseClaim(supabase: Supa, claim: MirrorClaim): Promise<boolean> {
   const next = claim.attempts + 1;
   if (next >= LONG_OPEN_ATTEMPTS) console.error("reading: mirror claim still open after tries:", next);
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("reading_mirror_claims")
     .update({ attempts: next, next_try_at: dueAt(next) })
-    .eq("claim_id", claim.claimId);
-  if (error) console.error("reading: mirror claim not deferred:", error.code ?? "unknown");
+    .eq("claim_id", claim.claimId)
+    .eq("attempts", claim.attempts)
+    .select("claim_id");
+  if (error) console.error("reading: mirror claim not taken:", error.code ?? "unknown");
+  return !error && Array.isArray(data) && data.length === 1;
 }
 
 /** No entry with the claim's marker this long after the claim: none was created (Notion's listing caught up long before). */
@@ -370,7 +381,7 @@ export async function placeEntry(supabase: Supa, book: Book, session: ReadingSes
   const own = claim === "missing" ? null : claim;
   const blockId = await mirrorSession(book, session, own?.claimId ?? null);
   if (!blockId) return { kind: "none" };
-  if (own) await recordClaimBlock(supabase, own.claimId, blockId);
+  const recorded = own ? await recordClaimBlock(supabase, own.claimId, blockId) : false;
   const base = supabase
     .from("reading_sessions")
     .update({ notion_block_id: blockId })
@@ -382,7 +393,20 @@ export async function placeEntry(supabase: Supa, book: Book, session: ReadingSes
   if (error) return { kind: "unknown", blockId };
   const attached = async (row: ReadingSession): Promise<Placement> => {
     const oldGone = !replaces || replaces === blockId || (await trashWithRetry(replaces));
-    if (own && oldGone) await dropClaim(supabase, own.claimId);
+    // The autosaving forms may edit the session while its entry is written: an edit that ran before the block id was
+    // stored could not update the entry, so the attached row is compared with what was written.
+    const stale = sessionMirrorDiffers(session, row);
+    if (!own) {
+      // No claims table yet (the SQL file not applied): the catch-up is best effort, as before it.
+      if (stale) await updateMirroredSession(row);
+    } else if (recorded) {
+      // The claim goes only once the catch-up rewrite is confirmed (Codex T01-R11, round 2): a failed or overtaken
+      // rewrite keeps it, and the sweep (which then finds the session holding this entry) rewrites it again.
+      const fresh = !stale || (await refreshClaimEntry(supabase, row));
+      if (oldGone && fresh) await dropClaim(supabase, own.claimId);
+    }
+    // Block id not stored on the claim: the marker is the entry's only identity, and a rewrite now would drop it
+    // (T01-R10). The claim stays; the sweep finds the entry by its marker, stores the id, then rewrites it.
     return { kind: "attached", blockId, row };
   };
   if (data) return attached(data as ReadingSession);
@@ -420,6 +444,25 @@ export async function retireEntry(supabase: Supa, sessionId: number, oldBookId: 
   // Not known whether it was detached: the claim settles it (the session is on another book, so it is trashed).
   if (error) return;
   await discardEntry(supabase, blockId, claim === "missing" ? null : claim.claimId);
+}
+
+/**
+ * Rewrites a session's entry after an edit, as durable work (Codex T01-R11, round 2): a claim on the entry is stored
+ * BEFORE the rewrite, and it goes only once the rewrite is confirmed (refreshClaimEntry: the session read again still
+ * holds this entry and renders the same entry). Each writer has its own claim, so when two edits' rewrites land in
+ * the wrong order, the one whose older entry landed last cannot confirm it and its claim makes the sweep rewrite the
+ * entry from the session as it is then. A failed rewrite is kept the same way. Without the claims table (the SQL file
+ * not applied) or when no claim can be stored, the rewrite is made best effort, as before.
+ */
+export async function refreshEntry(supabase: Supa, session: ReadingSession): Promise<void> {
+  const blockId = session.notion_block_id;
+  if (!blockId || !notionMirrorEnabled()) return;
+  const claim = await claimMirror(supabase, session.session_id, session.book_id, null, blockId);
+  if (claim === "missing" || claim === null) {
+    await updateMirroredSession(session);
+    return;
+  }
+  if (await refreshClaimEntry(supabase, session)) await dropClaim(supabase, claim.claimId);
 }
 
 /**
@@ -614,8 +657,9 @@ const SWEEP_LIMIT = 5;
  * already runs after() calls this: removal rows open for two minutes, claims and obligations once due (retryDelayMs:
  * never while their writer may still run, then with a doubling delay; nothing is given up), at most five of each kind
  * (progress lines: five books), at most once a minute per server instance. Trashing a block twice and writing a
- * checked line twice are harmless, attaches are conditional, and a sweep that writes a progress line holds its own
- * obligation while it does, so two sweeps meeting do no damage. It writes only to Notion and to these rows (and an
+ * checked line twice are harmless, attaches are conditional, a claim is settled only by the sweep that took it
+ * (leaseClaim), and a sweep that writes a progress line holds its own obligation while it does, so two sweeps meeting
+ * do no damage. It writes only to Notion and to these rows (and an
  * entry's block id onto its session); it never changes reading data. Never throws.
  */
 export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
@@ -665,8 +709,9 @@ export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
           claimedAt: String(c.claimed_at),
           attempts: Number(c.attempts) || 0,
         };
+        // Taken by another sweep that found it too: that one settles it.
+        if (!(await leaseClaim(supabase, claim))) continue;
         if (await settleMirrorClaim(supabase, claim, now).catch(() => false)) done++;
-        else await deferClaim(supabase, claim);
       }
     }
 

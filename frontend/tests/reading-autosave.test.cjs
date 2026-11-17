@@ -1408,6 +1408,131 @@ test("T01-R11: a failed refresh of an adopted entry keeps the claim, and the alr
   assert.equal(await RR.settleMirrorClaim(archived, claimOf(claim), AFTER_CLAIM), true);
 });
 
+/**
+ * The fake database where one write on one table fails with `code` (the others work): `op` = "update" | "delete" |
+ * "insert" (any other value: no write fails). A plain select of `table` answers `selectRows` instead when given (a
+ * sweep that read the table before another one changed it).
+ */
+function failingOp(db, table, op, code, selectRows = null) {
+  return {
+    ...db,
+    from(t) {
+      const real = db.from(t);
+      if (t !== table) return real;
+      let write = null;
+      const proxy = new Proxy(real, {
+        get(o, k) {
+          if (k === "then") {
+            if (write === op) return (res, rej) => Promise.resolve({ data: null, error: { code, message: "refused" } }).then(res, rej);
+            if (!write && selectRows) return (res, rej) => Promise.resolve({ data: JSON.parse(JSON.stringify(selectRows)), error: null }).then(res, rej);
+            return o.then.bind(o);
+          }
+          if (k === "single" || k === "maybeSingle") {
+            return () => (write === op ? Promise.resolve({ data: null, error: { code, message: "refused" } }) : o[k]());
+          }
+          return (...args) => {
+            if (["update", "delete", "insert", "upsert"].includes(k)) write = k;
+            o[k](...args);
+            return proxy;
+          };
+        },
+      });
+      return proxy;
+    },
+  };
+}
+
+test("T01-R11 round 2: an edit made while a new entry was written is caught up inside placeEntry, and the claim stays until that rewrite is confirmed", async () => {
+  const { RR, notion } = removalWithNotion();
+  const written = { session_id: 41, book_id: 7, notion_block_id: null, session_date: "2026-11-15", minutes: 20 };
+  // The form saved 35 minutes while the entry (20 minutes) was being written.
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ ...written, minutes: 35 }] });
+  notion.refresh = async () => "failed";
+  const placed = await RR.placeEntry(db, PAGED_BOOK, written, null);
+  assert.equal(placed.kind, "attached");
+  assert.deepEqual(notion.updated, ["blk-new"], "the catch-up rewrite was tried");
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "a failed catch-up keeps the claim");
+  assert.equal(db.tables.reading_mirror_claims[0].block_id, "blk-new", "with the entry's id, so the sweep needs no marker");
+  // The sweep finds the session holding this entry and rewrites it until confirmed.
+  notion.refresh = async () => "updated";
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(db.tables.reading_mirror_claims[0]), Date.now()), true);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+  // Not edited meanwhile: nothing to catch up, the claim goes at once.
+  const { RR: R2, notion: n2 } = removalWithNotion();
+  const plain = fakeDb({ books: [PAGED_BOOK], reading_sessions: [written] });
+  assert.equal((await R2.placeEntry(plain, PAGED_BOOK, written, null)).kind, "attached");
+  assert.deepEqual(n2.updated, []);
+  assert.equal(plain.tables.reading_mirror_claims.length, 0);
+  // Edited again while the catch-up rewrite ran: that rewrite is from an older state, so the claim stays.
+  const { RR: R3, notion: n3 } = removalWithNotion();
+  const raced = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ ...written, minutes: 35 }] });
+  n3.refresh = async () => {
+    raced.tables.reading_sessions[0].minutes = 50;
+    return "updated";
+  };
+  await R3.placeEntry(raced, PAGED_BOOK, written, null);
+  assert.equal(raced.tables.reading_mirror_claims.length, 1);
+});
+
+test("T01-R10/R11 round 2: when the new entry's id cannot be stored on its claim, nothing rewrites it (the marker stays its identity) and the claim is left for the sweep", async () => {
+  const { RR, notion } = removalWithNotion();
+  const written = { session_id: 41, book_id: 7, notion_block_id: null, session_date: "2026-11-15", minutes: 20 };
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ ...written, minutes: 35 }] });
+  const placed = await RR.placeEntry(failingOp(db, "reading_mirror_claims", "update", "57014"), PAGED_BOOK, written, null);
+  assert.equal(placed.kind, "attached");
+  assert.deepEqual(notion.updated, [], "no rewrite while only the marker identifies the entry");
+  assert.equal(db.tables.reading_mirror_claims.length, 1);
+  assert.equal(db.tables.reading_mirror_claims[0].block_id, null);
+  // The sweep finds it by its marker, stores the id, then rewrites it.
+  const marker = db.tables.reading_mirror_claims[0].claim_id;
+  notion.found = async (_pageId, m) => (m === marker ? ["blk-new"] : []);
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(db.tables.reading_mirror_claims[0]), Date.now()), true);
+  assert.deepEqual(notion.updated, ["blk-new"]);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("T01-R11 round 2: an edit's rewrite of the entry runs under its own claim; failed, or landed after a newer edit's, it is finished by the sweep", async () => {
+  const { RR, notion } = removalWithNotion();
+  const edited = { session_id: 41, book_id: 7, notion_block_id: "blk-1", session_date: "2026-11-15", minutes: 30 };
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [edited] });
+  notion.refresh = async () => "failed";
+  await RR.refreshEntry(db, edited);
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "a failed rewrite is kept as durable work");
+  assert.deepEqual([db.tables.reading_mirror_claims[0].block_id, db.tables.reading_mirror_claims[0].book_id], ["blk-1", 7]);
+  notion.refresh = async () => "updated";
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(db.tables.reading_mirror_claims[0]), Date.now()), true);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+  // Two edits whose rewrites land in the wrong order: the newer one (45) confirms and drops its own claim; the older
+  // one (30) lands last, cannot confirm, and keeps its claim for the sweep.
+  const newer = { ...edited, minutes: 45 };
+  const db2 = fakeDb({ books: [PAGED_BOOK], reading_sessions: [newer] });
+  await RR.refreshEntry(db2, newer);
+  assert.equal(db2.tables.reading_mirror_claims.length, 0);
+  await RR.refreshEntry(db2, edited);
+  assert.equal(db2.tables.reading_mirror_claims.length, 1, "the older rewrite is owed again");
+});
+
+test("T01-R11 round 2: two sweeps that found the same claim: only the one that takes it settles it, so no older rewrite lands after a confirmed one with nothing owed", async () => {
+  const { RR: A, notion: nA } = removalWithNotion();
+  const { RR: B, notion: nB } = removalWithNotion();
+  const due = new Date(Date.now() - 60_000).toISOString();
+  const row = claimRow({ block_id: "blk-1", next_try_at: due });
+  const db = fakeDb({ books: [PAGED_BOOK], reading_sessions: [{ session_id: 41, book_id: 7, notion_block_id: "blk-1", session_date: "2026-11-15", minutes: 20 }], reading_mirror_claims: [row] });
+  const gate = deferred();
+  nA.refresh = () => gate.promise;
+  const a = A.sweepPendingRemovals(db);
+  while (!nA.updated.length) await new Promise((r) => setImmediate(r));
+  assert.equal(db.tables.reading_mirror_claims[0].attempts, 1, "A took the claim before settling it");
+  // B read the claim before A took it (it still sees 0 tries): its conditional take fails and it leaves the claim alone.
+  await B.sweepPendingRemovals(failingOp(db, "reading_mirror_claims", "none", "none", [row]));
+  assert.deepEqual(nB.updated, [], "B never rewrites the entry");
+  assert.deepEqual(nB.trashed, []);
+  assert.equal(db.tables.reading_mirror_claims.length, 1);
+  gate.resolve("updated");
+  await a;
+  assert.equal(db.tables.reading_mirror_claims.length, 0, "A confirmed its rewrite and dropped the claim");
+});
+
 test("an entry carries its claim's marker, read back from either rich-text form; the session routes write every new entry through placeEntry, claim first (Codex review of PR 376, round 6)", () => {
   const marked = (link) => ({ type: "quote", quote: { rich_text: [{ type: "text", text: { content: "2030-01-02 · ch 1–2" } }, link] } });
   assert.equal(N.entryMarker(marked({ type: "text", text: { content: "​", link: { url: "https://onyx.invalid/reading-entry/abc-1" } } })), "abc-1");
@@ -1421,6 +1546,8 @@ test("an entry carries its claim's marker, read back from either rich-text form;
   assert.match(post, /placeEntry\(supabase, other as Book, placed\.row, null\)/, "the create's catch-up after a move is claimed too");
   assert.match(patch, /placeEntry\(supabase, r\.book, r\.session, old\)/, "a move's new entry is claimed and replaces the old one");
   for (const src of [post, patch]) assert.doesNotMatch(src, /mirrorSession\(/, "no entry is written outside placeEntry");
+  for (const src of [post, patch]) assert.doesNotMatch(src, /updateMirroredSession\(/, "no entry is rewritten without a claim (T01-R11, round 2)");
+  assert.match(patch, /await refreshEntry\(supabase, r\.session\)/, "an edit's rewrite runs under its own claim");
   const lib = readSrc("lib/reading-removal.ts");
   const fn = lib.slice(lib.indexOf("export async function placeEntry"), lib.indexOf("export async function discardEntry"));
   assert.ok(fn.indexOf("claimMirror(") > 0 && fn.indexOf("mirrorSession(") > fn.indexOf("claimMirror("), "the claim is stored before the entry");
@@ -1460,7 +1587,9 @@ test("a move's new entry for a session removed meanwhile is reported gone and tr
   const { RR: later, notion: n2 } = removalWithNotion();
   const row = db.tables.reading_mirror_claims[0];
   assert.equal(await later.settleMirrorClaim(db, claimOf(row), Date.now()), true);
-  assert.deepEqual(n2.trashed, ["blk-moved"]);
+  // Both go before the claim does: the new entry nothing keeps, and the old one it replaced (the session is gone).
+  assert.deepEqual(n2.trashed, ["blk-moved", "blk-old"]);
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
   // A database failure on the attach: not known whether it attached, so the claim stays and the sweep adopts it.
   const db2 = fakeDb({ books: [PAGED_BOOK, PAGED_BOOK2], reading_sessions: [movedSession()] });
   const unknown = await RR.placeEntry(failingTable(db2, "reading_sessions", "57014"), PAGED_BOOK2, movedSession(), "blk-old");
@@ -1469,6 +1598,7 @@ test("a move's new entry for a session removed meanwhile is reported gone and tr
   assert.deepEqual([claim.block_id, claim.replaces_block_id], ["blk-moved", "blk-old"]);
   n2.trashed.length = 0;
   assert.equal(await later.settleMirrorClaim(db2, claimOf(claim), Date.now()), true);
+  assert.equal(db2.tables.reading_mirror_claims.length, 0);
   assert.equal(db2.tables.reading_sessions[0].notion_block_id, "blk-moved", "adopted over the entry it replaces");
   assert.deepEqual(n2.trashed, ["blk-old"]);
 });
