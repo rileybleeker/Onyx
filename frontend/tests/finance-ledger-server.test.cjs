@@ -362,3 +362,33 @@ test("category fixes are read in pages: a server row cap still returns every fix
   assert.equal(cut.rules.size, 2_000, "what was read is still used");
   assert.equal(cut.overrides.size, 10);
 });
+
+test("speculative window paging (fetchPaged speculate) returns the same rows, in the same order, as the step-based read", async () => {
+  const S = load(makeDb(base));
+  // A stand-in for a PostgREST range read over rows sorted by a unique key; maxRows = the server's row cap.
+  const rowsOf = (n) => Array.from({ length: n }, (_, i) => ({ txn_key: `k${String(i).padStart(6, "0")}` }));
+  const build = (rows, maxRows, calls) => (from, to, withCount) => {
+    calls.push([from, to, withCount]);
+    if (from >= rows.length && rows.length > 0) return Promise.resolve({ data: null, error: { code: "PGRST103", message: "range" }, count: null });
+    return Promise.resolve({ data: rows.slice(from, Math.min(to + 1, from + maxRows)), error: null, count: withCount ? rows.length : null });
+  };
+  const keys = (r) => r.rows.map((x) => x.txn_key);
+  for (const [n, maxRows] of [[0, 1000], [1, 1000], [999, 1000], [1000, 1000], [2_500, 1000], [4_000, 1000], [4_500, 1000], [2_500, 100]]) {
+    const rows = rowsOf(n);
+    const plain = await S.fetchPaged(build(rows, maxRows, []), 40);
+    const spec = await S.fetchPaged(build(rows, maxRows, []), 40, 3);
+    assert.deepEqual(keys(spec), keys(plain), `n=${n} cap=${maxRows}`);
+    assert.equal(keys(spec).length, n, "every row, once");
+    assert.equal(spec.truncated, plain.truncated);
+  }
+  // A read past the first 3 extra pages still reads the rest in step-based pages.
+  const big = rowsOf(4_500);
+  const calls = [];
+  const r = await S.fetchPaged(build(big, 1000, calls), 40, 3);
+  assert.equal(r.rows.length, 4_500);
+  assert.equal(calls.filter(([, , c]) => c).length, 1, "only the first page asks for the count");
+  // Capped at maxPages: reported as truncated, with the pages read so far.
+  const capped = await S.fetchPaged(build(rowsOf(5_000), 1000, []), 2, 3);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.rows.length, 2_000);
+});
