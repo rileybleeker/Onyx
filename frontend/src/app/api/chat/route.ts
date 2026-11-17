@@ -2158,7 +2158,7 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         verdict: stored.grading_status === "graded" ? stored.verdict : null,
         grading_status: stored.grading_status,
         replayed: true,
-        // The same grading detail the first grading returned (recordOrderAnswer): an order answer was graded by Onyx.
+        // The same grading detail the first grading returned when it graded the order answer: an order answer was graded by Onyx.
         ...(stored.format === "order" ? { graded_by: "onyx" } : {}),
       });
     }
