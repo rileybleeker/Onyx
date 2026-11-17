@@ -293,6 +293,42 @@ test("every refusal reason fits on a receipt", () => {
   assert.deepEqual(receipt.details, ["Synthetic Focus", intent.REFUSAL_TEXT.no_request]);
 });
 
+test("a granted write is consumed once: a second call for the same grant is refused whatever the model sends", () => {
+  // The same grant restated in the user's message is one write, not two SEC-04 operations.
+  assert.deepEqual(sequence([user("I took Synthetic Calm. I also had Synthetic Calm.")], "log_supplement_intake",
+    [{ product: "Synthetic Calm" }, { product: "Synthetic Calm" }]), ["allowed", "already_written"]);
+  // A changed optional argument (the date) does not mint a new grant from the same user action.
+  assert.deepEqual(sequence([user("I took 15 mg of Synthetic Focus at 8:30am today")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] },
+     { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"], date: DAY }]),
+    ["allowed", "already_written"]);
+  // The model's own shorter name for the record does not change the identity.
+  assert.deepEqual(sequence([user("Log synthetic magnesium glycinate")], "log_supplement_intake",
+    [{ product: "Synthetic Magnesium Glycinate" }, { product: "synthetic magnesium" }]), ["allowed", "already_written"]);
+  // A stack: once per granted stack; a different stack is its own grant.
+  assert.deepEqual(sequence([user("Log my synthetic evening stack and my synthetic morning stack")], "log_supplement_stack",
+    [{ stack: "synthetic evening" }, { stack: "synthetic evening" }, { stack: "synthetic morning" }]),
+    ["allowed", "already_written", "allowed"]);
+  // A habit reported twice in one message is one Yes.
+  assert.deepEqual(sequence([user("I meditated today, and I meditated again")], "mark_habit_complete",
+    [{ habit: "Meditated" }, { habit: "Meditated" }]), ["allowed", "already_written"]);
+  // A reading session: the same chapters restated are one session; another chapter range is another grant.
+  assert.deepEqual(sequence([user("I read chapter 4. I read chapter 4 again.")], "log_reading_session",
+    [{ chapter_through: 4 }, { chapter_through: 4 }]), ["allowed", "already_written"]);
+  assert.deepEqual(sequence([user("I read chapter 4. Then I read chapter 5.")], "log_reading_session",
+    [{ chapter_through: 4 }, { chapter_through: 5 }]), ["allowed", "allowed"]);
+  // Different stated arguments stay different grants: each stated time is its own write (the model must ask for
+  // both times of one action in one call, which time_omitted already forces).
+  assert.deepEqual(sequence([user("Log Synthetic Focus at 8 and log Synthetic Focus at noon")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", times: ["08:00"] }, { product: "Synthetic Focus", times: ["12:00"] }]),
+    ["allowed", "allowed"]);
+  // A fresh message (a retry of the request) builds a fresh set: the grant itself authorizes again, and the replay
+  // ledger (SEC-04) reconciles the repeated call rather than a consumed identity refusing it across requests.
+  const grant = intent.writeGrantFor([user("I took Synthetic Calm")]);
+  const freshUsed = intent.newWriteUsage();
+  assert.equal(intent.authorizeWrite(grant, "log_supplement_intake", { product: "Synthetic Calm" }, { requestDay: DAY, used: freshUsed, books: BOOKS, isSleepHabit }).allowed, true);
+});
+
 test("each action authorizes one write of each record it names: a repeat needs its own words", () => {
   assert.deepEqual(sequence([user("Log Synthetic Focus or Synthetic Calm")], "log_supplement_intake",
     [{ product: "Synthetic Focus" }, { product: "Synthetic Calm" }, { product: "Synthetic Focus" }]), ["allowed", "allowed", "already_written"]);

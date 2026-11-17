@@ -1923,7 +1923,11 @@ export async function POST(req: NextRequest) {
           const decision = isWriteTool(block.name)
             ? authorizeWrite(grant, block.name, input ?? {}, { requestDay, used: writesAllowed, books: readingCtx, isSleepHabit: (h) => SLEEP_QUESTIONS.has(h) })
             : null;
-          // An allowed call uses up its part of the request (an intake, a session), so a repeat needs its own words.
+          // An allowed call consumes the granted action's canonical identity (the tool, the record as the user's
+          // words name it, the arguments the user's action states — lib/chat-write-intent.ts), so a second call for
+          // the same grant in this request is refused with a receipt whatever arguments the model sends. A retry of
+          // the whole message builds a fresh set here and reconciles through the SEC-04 ledger, which mints no new
+          // action either; nothing here persists across requests.
           if (decision?.allowed) commitWrite(writesAllowed, decision);
           if (decision && !decision.allowed) {
             // Not asked for in the user's own latest message: never run, never recorded in the ledger.
