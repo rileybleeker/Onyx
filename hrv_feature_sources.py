@@ -194,6 +194,12 @@ SOURCES: tuple[FeatureSource, ...] = (
     FeatureSource(name="delivery_daily",
                   feeds="delivery_daily (Uber Eats receipts, portions eaten, leftovers)",
                   fingerprint=Fingerprint("delivery_daily", "behavioral_date")),
+    # Photo-logged meals (plate photos on /nutrition). eaten_at / kcal only reach the pipeline;
+    # the pipeline loads only those columns plus capture_kind / deleted_at for routing.
+    FeatureSource(name="photo_meals",
+                  feeds="photo_meals (photo-logged meals: photo_*)",
+                  fingerprint=Fingerprint("photo_meals", "eaten_date",
+                                          exclude=("created_at", "updated_at"))),
     # hrv_analysis.load_all_data reads the receipts NOT parsed ('unmatched' / 'error'): their day and
     # the day before are never zero-filled. A historical receipt that parses later (or fails on a
     # --reprocess) turns delivery features between 0 and unknown without changing delivery_daily, so
