@@ -56,7 +56,7 @@ Rules the ETL follows (since 2026-11-16):
 
 ## Evidence
 
-Checked read-only against the live schema, trigger definitions and the provider payload shape on 2026-11-16. The observations from Riley's own rows are kept privately, outside this repository; only schema and source facts are listed here.
+Checked read-only against the live schema, trigger definitions and the provider payload shape on 2026-11-16. The observations from the owner's own rows are kept privately, outside this repository; only schema and source facts are listed here.
 
 - **Live trigger.** `eight_sleep_trends_set_onyx_dates` runs `pds.set_onyx_dates_calendar_passthrough()` on `INSERT` and `UPDATE OF calendar_date`. The table has **no `start_time` column**. The ETL comment that said "the DB trigger on `eight_sleep_trends.start_time` corrects travel days downstream" was false, and so was ADR-0001's "Phase 1 ships using cycle-anchor for Eight Sleep".
 - **Provider day = wake-up date.** The payload's `day` is the local date of the night's `sleepEnd` / `presenceEnd`, not the date the session starts: a bedtime before local midnight starts on the previous date. Matching the UTC date of the start can look right for late bedtimes; it is not the rule.
@@ -95,17 +95,17 @@ Sleep values for that night (unknown, not zero). The return night (in bed 23:00 
 up 07:00 on 09-12) is dated 2026-09-12 in the bed's zone. Before 2026-11-16 its interval,
 keyed by its start date, could create a temperature-only row on 2026-09-11, the away night.
 
-**F. Wearer's zone differs from the bed's while in the bed.** `user_tz_log` still names the
-trip's zone after landing; Riley sleeps at home. The bed's zone dates the night; nothing in
-the ETL reads the log.
+**F. Wearer's zone differs from the bed's while in the bed.** A wearer who is at home while
+`user_tz_log` still names the trip's zone after landing. The bed's zone dates the night;
+nothing in the ETL reads the log.
 
 **G. Relocated bed.** A move within Eastern time (for example to New York) changes nothing.
 If the Pod moves to another UTC offset, say Pacific, days sliced in Eastern can be wrong near
 local midnight: an evening nap ending 22:30 PDT on 2026-10-05 ends 01:30 EDT on 10-06. Set
 `EIGHTSLEEP_TIMEZONE` to the new zone from the move on. The scheduled run sets it in
-`.github/workflows/eight-sleep-etl.yml` (a protected path, so Riley changes it; it is neither a
-secret nor a repository variable); a local run takes it from the shell for that session (the PC
-has no `.env`; see the credentials note in the Affected-history plan). Until then, if the
+`.github/workflows/eight-sleep-etl.yml` (a protected path, so the owner changes it; it is neither a
+secret nor a repository variable); a local run takes it from the shell for that session (the
+local machine has no `.env`; see the credentials note in the Affected-history plan). Until then, if the
 session `timezone` field reflects the Pod, each run is `partial` with the GUARD line (and for
 up to a week after the change, while nights from before the move are still in the 7-day
 window). Changing the variable is not free: the next routine runs ask the provider to re-slice
@@ -165,7 +165,7 @@ date the `/intervals` list returned last.
 
 ## Affected-history plan (not run)
 
-1. Read-only comparison, a later step (not part of this change; Riley decides when it runs):
+1. Read-only comparison, a later step (not part of this change; the owner decides when it runs):
    `python eight_sleep_temp_backfill.py --compare`. It pages through every row of the table,
    looks up each stored row's main session (one call per distinct session, at most 1000 unless
    `--max-lookups N` raises it) and prints counts only: `scanned`, `truncated`, `rows`, `same`,
@@ -176,20 +176,20 @@ date the `/intervals` list returned last.
    starts again from the newest row, so an identical re-run repeats the same capped lookups:
    when `over_cap` is not 0, re-run with `--max-lookups` at least `lookups + over_cap` (the
    command prints that number).
-   - **It needs credentials that are not on Riley's PC.** `eight_sleep_etl` reads
+   - **It needs credentials that are not on the operator's machine.** `eight_sleep_etl` reads
      `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `EIGHTSLEEP_EMAIL` and `EIGHTSLEEP_PASSWORD`
      (and `EIGHTSLEEP_CLIENT_ID` / `EIGHTSLEEP_CLIENT_SECRET` when set) from the environment or a
-     `.env` as soon as it is imported. The PC has no `.env` and the Eight Sleep login is held
-     only as GitHub Actions secrets, so on the PC as it is the command stops with a `KeyError`
+     `.env` as soon as it is imported. The machine has no `.env` and the Eight Sleep login is held
+     only as GitHub Actions secrets, so on the machine as it is the command stops with a `KeyError`
      before it reads anything. The route is one PowerShell session that holds those variables
      for that session only: the service-role key read from `~/.onyx_supabase_secret`, the Eight
-     Sleep login typed in by Riley from where Riley keeps it. Never write them to a file in this
+     Sleep login typed in by the operator from where the operator keeps it. Never write them to a file in this
      repository or under OneDrive, and never paste them into a chat.
    - **No Actions route.** A `workflow_dispatch` input on `eight-sleep-etl.yml` would reuse the
      existing secrets, but `.github/**` is a protected path and the Actions log is public: the
-     counts (`differ` above all) are aggregates of Riley's own nights, so they must not be
+     counts (`differ` above all) are aggregates of the wearer's own nights, so they must not be
      printed there. Such a route would need to keep its counts out of the log; it is not built.
-   - **Owner and receipt.** Riley runs it, or decides who runs it with the credentials. The
+   - **Owner and receipt.** The owner runs it, or decides who runs it with the credentials. The
      receipt is the one counts line, recorded privately in the Notes of the HIST-ETL-01
      roadmap row, never in this repository, a PR or a public log. Provider and HTTP logging is
      turned down while it runs, but treat the whole transcript as private: a crash traceback
@@ -206,9 +206,9 @@ date the `/intervals` list returned last.
    `differ = 0` **and** `not_verifiable = 0`. `complete = True` with `differ = 0` but
    `not_verifiable > 0` means only "no difference among the rows that could be checked": report
    it that way, with the `not_verifiable` count as unresolved, and the claim stays open for those
-   rows (Riley decides whether that is enough). `complete = False` means re-run with a larger
+   rows (the owner decides whether that is enough). `complete = False` means re-run with a larger
    `--max-lookups` when `over_cap` is the reason, re-run later when `failed` is, or report the
-   result as incomplete. `differ > 0`: Riley decides. A correction is a separate, reviewed,
+   result as incomplete. `differ > 0`: the owner decides. A correction is a separate, reviewed,
    reversible one-off: save each affected row's current `(calendar_date, bed_side,
    median_bed_temp, median_room_temp)` to a private file first, then write the main session's
    medians to those rows only. `calendar_date` never changes. The matview refresh and the next
