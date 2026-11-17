@@ -769,7 +769,7 @@ test("the /status card: unknown until connected, then the last sync's result and
   );
   // Age: degraded after 14 h, red after 30 h without any sync (the 6-hourly catch-up stopped).
   assert.deepEqual([13, 15, 29, 31, 60].map((h) => card({}, { last_sync_at: ago(h) }).status), ["success", "partial", "partial", "failed", "failed"]);
-  assert.equal(card({}, { last_sync_at: ago(31) }).errorMessage, "No sync for 31h: check the Care Calendar Catch-up workflow.");
+  assert.equal(card({}, { last_sync_at: ago(31) }).errorMessage, "No sync for 31h: check the scheduled care calendar catch-up.");
   assert.equal(card({}, { last_sync_at: ago(60) }).daysLag, 2);
 
   // A failed run is red at once, with what to do.

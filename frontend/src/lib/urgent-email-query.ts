@@ -236,7 +236,7 @@ export async function getUrgentEmailStatusCard(client: Supa, now: Date = new Dat
     durationSeconds: entry?.duration_seconds ?? null,
     errorMessage: error?.message
       ?? entry?.error_message
-      ?? (entry && ageH > 8 ? `No label sync for ${Math.floor(ageH)}h - check the Urgent Email Labels workflow.` : null),
+      ?? (entry && ageH > 8 ? `No label sync for ${Math.floor(ageH)}h - check that the scheduled Urgent Email Labels run is still going.` : null),
   };
 }
 
