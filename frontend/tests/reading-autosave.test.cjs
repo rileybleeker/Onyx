@@ -562,7 +562,8 @@ test("logSession with require_client_key (Onyx Chat) never writes a session with
   assert.equal(r.ok, false);
   assert.equal(r.error, R.SESSION_KEY_REQUIRED);
   assert.equal(db.tables.reading_sessions.length, 0);
-  assert.equal(db.log.filter((c) => c.table === "reading_sessions" && c.op === "insert").length, 1, "one keyed insert, no unkeyed second one");
+  assert.equal(db.log.filter((c) => c.table === "reading_sessions" && c.op === "rpc").length, 1, "one keyed create (create_reading_session), no second attempt");
+  assert.equal(db.log.filter((c) => c.table === "reading_sessions" && c.op === "insert").length, 0, "no unkeyed insert of the session");
   // A key that is not a UUID is refused too, before anything is read or written.
   const bad = fakeDb({ books: [BOOK] });
   const refused = await R.logSession(bad, create({ client_key: "not-a-uuid", require_client_key: true }));
