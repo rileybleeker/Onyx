@@ -22,8 +22,10 @@
  *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
  *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules, and one
  *     serving only when no other amount is stated), the clock times one to one (a time sent twice has to be said
- *     twice; every time said is sent), the chapters as chapter numbers and the minutes as a duration ("chapter 4
- *     for 12 minutes" never gives chapter 12); an amount or a time the action states cannot be left out;
+ *     twice; every time said is sent), the chapters as chapter numbers covering exactly the chapters named (both of
+ *     "chapters 3 and 4", every chapter of "ch. 5-7") and the minutes as a duration ("chapter 4 for 12 minutes"
+ *     never gives chapter 12, and a stated duration is never dropped from the call); an amount or a time the action
+ *     states cannot be left out;
  *   - the day the call would write (its date, or the tool's default when it sends none) has to be the day the action
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
@@ -484,6 +486,40 @@ function chapterNumbers(text: string): Set<number> {
       const n = expectNumber ? chapterNumber(w) : undefined;
       if (n !== undefined) { out.add(n); expectNumber = false; continue; }
       if (!expectNumber && /^(?:and|to|through|thru|or|-|–|&|,|\n)$/.test(w)) { expectNumber = true; continue; }
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * The chapters a reading action grants, with ranges expanded: "chapter 4" {4}, "chapters 3 and 4" {3, 4},
+ * "ch. 5-7" / "chapters three through five" {5, 6, 7}. A call must cover exactly this set.
+ */
+function grantedChapters(text: string): Set<number> {
+  const out = new Set<number>();
+  const toks = norm(text).match(/\d+|[a-z]+(?:'[a-z]+)?|[-–&,\n]/g) ?? [];
+  for (let i = 0; i < toks.length; i++) {
+    if (!/^(?:chapters?|ch|chap)$/.test(toks[i])) continue;
+    let expectNumber = true;
+    let prev: number | undefined;
+    let range = false;
+    for (let j = i + 1; j < toks.length; j++) {
+      const w = toks[j];
+      const n = expectNumber ? chapterNumber(w) : undefined;
+      if (n !== undefined) {
+        if (range && prev !== undefined && n > prev) for (let c = prev; c <= n; c++) out.add(c);
+        else out.add(n);
+        prev = n;
+        range = false;
+        expectNumber = false;
+        continue;
+      }
+      if (!expectNumber && /^(?:and|to|through|thru|or|-|–|&|,|\n)$/.test(w)) {
+        range = /^(?:to|through|thru|-|–)$/.test(w);
+        expectNumber = true;
+        continue;
+      }
       break;
     }
   }
@@ -1334,9 +1370,10 @@ function argumentsFit(
 }
 
 /**
- * Whether a reading session call fits reading action `a` (its list): the chapters are numbers said as chapters, the
- * minutes a duration said ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes), the day, the book, the
- * user's words.
+ * Whether a reading session call fits reading action `a` (its list): the call covers EXACTLY the chapters the action
+ * grants (both of "chapters 3 and 4", every chapter of "ch. 5-7"), the minutes are the duration said and are sent
+ * when one is stated ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes, and never drops the 12), the
+ * day, the book, the user's words.
  */
 function readingSessionFits(
   a: Action,
@@ -1347,7 +1384,7 @@ function readingSessionFits(
   const text = a.chainText;
   const book = bookCheck(input, a.sentence, ctx.books);
   if (book) return book;
-  const chapters = chapterNumbers(text);
+  const chapters = grantedChapters(text);
   const through = num(input.chapter_through);
   const finished = FINISHED_BOOK.test(text);
   if (through == null) return "not_named";
@@ -1358,9 +1395,22 @@ function readingSessionFits(
     if (!finished || total == null || through !== total) return "not_named";
   }
   const from = num(input.chapter_from);
-  if (from != null && from !== through && !chapters.has(from)) return "not_named";
+  if (chapters.size > 0) {
+    // The call must cover exactly the granted chapters: not a subset, not more.
+    if (from != null && from > through) return "not_named";
+    const covered = new Set<number>();
+    for (let c = from ?? through; c <= through; c++) covered.add(c);
+    if (covered.size !== chapters.size || [...chapters].some((c) => !covered.has(c))) return "not_named";
+  } else if (from != null && from !== through) {
+    return "not_named";
+  }
   const minutes = num(input.minutes);
-  if (minutes != null && !minuteValues(text).has(minutes)) return "amount_not_stated";
+  const statedMinutes = minuteValues(text);
+  if (statedMinutes.size > 0) {
+    if (minutes == null || !statedMinutes.has(minutes)) return "amount_not_stated";
+  } else if (minutes != null) {
+    return "amount_not_stated";
+  }
   const day = str(input.date) ?? ctx.requestDay;
   const days = allowedDays(a, ctx.requestDay);
   if (days.size > 0 ? !days.has(day) : day !== ctx.requestDay) return "day_not_stated";
