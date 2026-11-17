@@ -92,7 +92,14 @@ test("events card: not synced yet, checking, unreachable and failing are differe
   assert.match(unreachable, />couldn&#x27;t be checked</);
   const failing = card(view({ lastSync: sync(30, "failed", "calendar 'main' (acct one): HTTP 404"), calendars: [{ account: "acct one", calendar: "main", events: 3 }] }));
   assert.match(failing, /Google Calendar: <span class="text-down">sync failing<\/span>/);
-  assert.match(failing, /Last sync 30 min ago \(that run: failed\)\. calendar &#x27;main&#x27; \(acct one\): HTTP 404/);
+  assert.match(failing, /Last sync 30 min ago \(that run: failed\)\.</);
+  assert.doesNotMatch(failing, /HTTP 404/, "the stored free-text error is never shown");
+  const authLost = card(view({ lastSync: sync(30, "failed", "google_auth"), calendars: [] }));
+  assert.match(authLost, /Google no longer accepts Onyx&#x27;s access\. Disconnect, then connect again\./);
+  assert.doesNotMatch(authLost, /google_auth/);
+  const calMissing = card(view({ lastSync: sync(30, "failed", "calendar_missing"), calendars: [] }));
+  assert.match(calMissing, /The calendar Onyx created is gone from Google\. Disconnect, then connect again to make a new one\./);
+  assert.doesNotMatch(calMissing, /calendar_missing/);
   assert.match(failing, />3 events</, "the last good copy is still listed");
   const late = card(view({ lastSync: sync(200), calendars: [] }));
   assert.match(late, /running late/);

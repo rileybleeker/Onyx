@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import { GOOGLE_AUTH_URL, NOT_CONNECTED, type CalendarStatus, type CalendarSyncSummary } from '@/lib/care-google';
 import InfoHint from '@/components/InfoHint';
+import { syncErrorSentence } from './calendar-sync-copy';
 
 const button = 'rounded-lg border border-border-default px-3 py-2 text-sm hover:bg-surface-hover disabled:opacity-50';
 
@@ -16,8 +17,8 @@ function ago(iso: string, now: number): string {
 function syncText(sync: CalendarSyncSummary, now: number): string {
   const when = ago(sync.at, now);
   if (sync.ok) return `Last sync ${when}: ${sync.created} added, ${sync.updated} changed, ${sync.removed} taken off, ${sync.unchanged} already up to date.`;
-  if (sync.error === 'google_auth') return `Last sync ${when} failed: Google no longer accepts Onyx's access. Disconnect, then connect again.`;
-  if (sync.error === 'calendar_missing') return `Last sync ${when} failed: the calendar Onyx created is gone from Google. Disconnect, then connect again to make a new one.`;
+  const reason = syncErrorSentence(sync.error);
+  if (reason) return `Last sync ${when} failed. ${reason}`;
   return `Last sync ${when} did not finish (${sync.failed} item${sync.failed === 1 ? '' : 's'} failed). It is retried on the next change or with Sync now.`;
 }
 
