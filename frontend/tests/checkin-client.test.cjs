@@ -566,7 +566,9 @@ for (const stale of [false, true]) {
     await h.flush();
     assert.match(h.text(), stale ? /A new day started.*Unsaved answers are preserved/ : /Not saved: Save failed \(500\)\. Your answers are still here\./);
     if (!stale) assert.doesNotMatch(h.text(), /Synthetic save failure that must stay visible/, "the server's own error text is never shown");
-    assert.match(h.text(), /Daytime 2031-03-05/);
+    // A failed save stops the switch (#608): the day stays on screen under its normal label. A stale-day rejection
+    // still turns the form into the dated review.
+    assert.match(h.text(), stale ? /Daytime 2031-03-05/ : /Daytime · TodayWed, Mar 5/);
     assert.equal(h.posts.length, 1);
     assert.equal(h.hasButton("Save now"), false, "unreviewed drafts never follow navigation into a save");
   });
@@ -638,7 +640,7 @@ test("client: a day switch whose pending save is refused stays on the day, keeps
   h.click(`${DAY}: yes`); await h.flush();
   h.navigate("2031-03-04"); await h.flush(); // the waiting tap is saved first; the refusal stops the switch
   assert.equal(h.gets.includes("2031-03-04"), false, "the other day is never fetched, so it never replaces the screen");
-  assert.match(h.text(), /2031-03-05/);
+  assert.match(h.text(), /Daytime · TodayWed, Mar 5/, "the screen still shows the day the answer belongs to");
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "the unsaved answer is still on screen");
   assert.match(h.text(), /Not saved: Save failed \(400\)\. Your answers are still here\./);
   assert.equal(h.posts.length, 1, "a refusal is not retried by the switch");

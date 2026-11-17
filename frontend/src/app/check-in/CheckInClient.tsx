@@ -250,11 +250,12 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
 
   const load = useCallback(async (date: string | null, afterSave = false) => {
     // A tap still waiting to be saved goes first, under the day it was made on: the GET below replaces the screen.
-    // If that save failed (or was refused), the screen stays on its day with the draft and the save-failed line
-    // (Retry) shown; nothing is replaced.
-    if (!afterSave && !(await autosaveRef.current.flush().catch(() => false))) {
+    // If that save failed (or was refused) and this load would switch to another day, the screen stays on its day
+    // with the draft and the save-failed line (Retry) shown; nothing is replaced. A same-day refresh (resume, clock
+    // check) still goes on to the GET, so an authoritative refusal (400/401/403) or a new day is still noticed.
+    if (!afterSave && !(await autosaveRef.current.flush().catch(() => false)) && date !== shownDate.current) {
       // Back/forward may already have moved the URL to the other day: put it back on the day still on screen.
-      if (date !== shownDate.current) showDate(shownDate.current);
+      showDate(shownDate.current);
       return;
     }
     // Back/forward can change the URL while a save runs. Finish the dated save first.
