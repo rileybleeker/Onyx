@@ -154,13 +154,15 @@ test("habit binding: a start tapped under another habit is ignored; a same-habit
   const v2 = rule({ id: 2, effectiveFrom: day(-1), habitPageId: ID_B, habitName: HABIT_2, targetTime: "23:00" });
   const rules = [v2, rule()];
   const names = { [ID_A]: HABIT, [ID_B]: HABIT_2 };
+  // Every start here is tapped on the night before (day(-1)), so read that night, not tonight (tonight is today).
+  const nightOf = (p) => p.window.items.find((i) => i.kind === "night" && i.night.date === day(-1)).night;
   // The goal now names habit B; a start tapped the night before under habit A never shows for it.
   const switched = W.windDownProgress(payload({
     rules, habitNames: names,
     answers: [yes(-1, HABIT_2)],
     starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A }],
   }));
-  assert.equal(switched.tonight.start, null, "a start under another habit is not shown, judged or counted");
+  assert.equal(nightOf(switched).start, null, "a start under another habit is not shown, judged or counted");
   // The same habit with a new target time: the original start still applies (judged by its own version).
   const v2same = rule({ id: 2, effectiveFrom: day(-1), targetTime: "23:00" });
   const sameHabit = W.windDownProgress(payload({
@@ -168,13 +170,13 @@ test("habit binding: a start tapped under another habit is ignored; a same-habit
     answers: [yes(-1)],
     starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_A }],
   }));
-  assert.ok(sameHabit.tonight.start, "a same-habit target edit keeps the original start");
-  assert.equal(sameHabit.tonight.start.onTime, false, "judged by the version it was tapped under (22:40 vs that version's 22:30)");
+  assert.ok(nightOf(sameHabit).start, "a same-habit target edit keeps the original start");
+  assert.equal(nightOf(sameHabit).start.onTime, false,"judged by the version it was tapped under (22:40 vs that version's 22:30)");
   // A start with no habit of its own is resolved from its rule version; an unknown one is never transferred.
   const resolved = W.windDownProgress(payload({ answers: [yes(-1)], starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: null }] }));
-  assert.equal(resolved.tonight.start.onTime, false, "the start's own 22:30 version judges 22:40 late");
+  assert.equal(nightOf(resolved).start.onTime, false,"the start's own 22:30 version judges 22:40 late");
   const unknown = W.windDownProgress(payload({ answers: [yes(-1)], starts: [{ night: day(-1), startedAt: "", localTime: "22:40", tz: "America/New_York", ruleId: null, habitPageId: null }] }));
-  assert.equal(unknown.tonight.start, null, "a start with no habit and no rule version is never transferred to the current habit");
+  assert.equal(nightOf(unknown).start, null,"a start with no habit and no rule version is never transferred to the current habit");
   // A different-habit start never shadows a matching one for the same night.
   const both = W.windDownProgress(payload({
     rules, habitNames: names,
@@ -185,7 +187,7 @@ test("habit binding: a start tapped under another habit is ignored; a same-habit
     ],
   }));
   assert.equal(switched.tonight.date, TODAY);
-  assert.equal(both.tonight.start.onTime, true, "the matching start (22:40 vs 23:00) wins, not the other habit's");
+  assert.equal(nightOf(both).start.onTime, true,"the matching start (22:40 vs 23:00) wins, not the other habit's");
   // The parser carries the habit through the payload.
   const parsed = W.parseWindDownPayload(payload({ starts: [{ night: day(-1), startedAt: "x", localTime: "22:40", tz: "America/New_York", ruleId: 1, habitPageId: ID_B }] }));
   assert.equal(parsed.starts[0].habitPageId, ID_B);
