@@ -582,6 +582,33 @@ test("mapVerdict: count and title checks; unknown counts are uncertain", () => {
   assert.equal(env.S.titlesMatch("Chapter IV. Fog Over the Bay", "Fog Over the Bay"), true, "a Roman numeral prefix is removed");
 });
 
+test("mapVerdict: the 70% title share sits at the boundary, counts only titled chapters, and counts alone decide when nothing is titled", () => {
+  const env = load(makeDb());
+  // One-word titles never match each other, so the number of matching chapters is exact.
+  const WORDS = ["Anchor", "Beacon", "Compass", "Dune", "Ember", "Fathom", "Gull", "Harbor", "Isle", "Jetty"];
+  const map = (titles, count = 10) => ({ narrative: false, chapter_count: count, chapters: titles.map((t, i) => ({ chapter: i + 1, title: t })), sources: [] });
+  // The first k chapters keep their title; the rest get a title that matches nothing.
+  const withMatches = (k, count) => map(WORDS.map((w, i) => (i < k ? w : "Zephyr")), count);
+  const titled = (n) => ({ total_chapters: 10, chapters: WORDS.map((w, i) => ({ chapter: i + 1, title: i < n ? w : "" })) });
+
+  // Exactly 70% (7 of 10) is not "fewer than 70%", so it is ok; 6 of 10 is under the line.
+  assert.equal(env.S.mapVerdict(withMatches(7), titled(10)), "ok", "7 of 10 is exactly 70%");
+  assert.equal(env.S.mapVerdict(withMatches(6), titled(10)), "uncertain", "6 of 10 is under 70%");
+  assert.equal(env.S.mapVerdict(withMatches(8), titled(10)), "ok", "comfortably above 70%");
+  assert.equal(env.S.mapVerdict(withMatches(10, 9), titled(10)), "uncertain", "all titles match but the count is off");
+
+  // Only the 7 chapters with a table of contents title are counted: 6 of 7 is about 86%, 4 of 7 about 57%.
+  assert.equal(env.S.mapVerdict(withMatches(6), titled(7)), "ok", "6 of the 7 titled chapters match");
+  assert.equal(env.S.mapVerdict(withMatches(4), titled(7)), "uncertain", "4 of the 7 titled chapters match");
+
+  // No chapter has a title to compare: only the count decides.
+  assert.equal(env.S.mapVerdict(withMatches(0), titled(0)), "ok", "no titles and equal counts");
+  assert.equal(env.S.mapVerdict(withMatches(0, 9), titled(0)), "uncertain", "no titles and a different count");
+
+  // An unknown total is uncertain whatever the map says.
+  assert.equal(env.S.mapVerdict(withMatches(10), { total_chapters: NaN, chapters: [] }), "uncertain", "NaN total");
+});
+
 test("titlesMatch removes a chapter / part prefix only when the next word is a number, not an ordinary word that looks like one", () => {
   const env = load(makeDb());
   // "Book Value" must keep "book": with the old pattern it became "alue", which sits inside "value chains".
