@@ -509,7 +509,7 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
       </div>
       <p className="mt-4 text-[12px] text-text-secondary">Record an estimated payment you made:</p>
       <div className="mt-1 flex flex-wrap items-center gap-2">
-        <select className={input} value={est.jur} onChange={(e) => setEst((x) => ({ ...x, jur: e.target.value as Jur }))}>
+        <select aria-label="Estimated tax jurisdiction" className={input} value={est.jur} onChange={(e) => setEst((x) => ({ ...x, jur: e.target.value as Jur }))}>
           {JURS.map((j) => (
             <option key={j} value={j}>
               {j}
