@@ -36,6 +36,8 @@ import InfoHint from "@/components/InfoHint";
 import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
 // The wind-down streak (PROD-SLEEP-01, set up on Log): the same panel as on Log, and one quiet-view source once set up.
 import WindDownPanel, { useWindDownToday } from "@/components/sleep/WindDownPanel";
+import HomeResetPanel from "@/components/HomeResetPanel";
+import { useHomeResetToday } from "@/lib/use-home-reset";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -544,9 +546,10 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   }
   const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
   const windDown = useWindDownToday();
+  const homeReset = useHomeResetToday();
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
-  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, "reading", "check-in"]
+  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, homeReset.show ? "home-reset" : null, "reading", "check-in"]
     .filter((id): id is string => id !== null);
   const renderedParts = TODAY_HEAD_PARTS.concat(experiment.state === "error" || trial ? ["experiment"] : [], TODAY_MID_PARTS, lifeParts);
   const lifeW = lifeLayout(usePartOrder("/today", renderedParts), lifeParts);
@@ -1004,6 +1007,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       </Part>}
       {windDown.show && <Part id="wind-down" title="Wind-down" width={lifeWidth("wind-down")}>
       <WindDownPanel surface="today" className={panelStyle} />
+      </Part>}
+      {homeReset.show && <Part id="home-reset" title="Apartment reset" width={lifeWidth("home-reset")}>
+      <HomeResetPanel view={homeReset} now={now} className={panelStyle} titleClassName={titleStyle} />
       </Part>}
       <Part id="reading" title="Keep reading" width={lifeWidth("reading")}>
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>

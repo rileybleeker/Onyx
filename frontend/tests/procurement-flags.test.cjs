@@ -265,17 +265,22 @@ test("the PATCH body is exactly {sub, flag, dismissed}", () => {
 });
 
 // ─── server: Screen Time read, dismissals, save ──────────────────────────────────────────────
-function server({ segments = [], items = [], truncated = false, fail = null, dismissals = { data: [], error: null }, upsert = { error: null }, configured = true }) {
+function server({ segments = [], items = [], truncated = false, fail = null, windowComplete = true, windowError = null, dismissals = { data: [], error: null }, upsert = { error: null }, configured = true }) {
   class LedgerQueryError extends Error {
     constructor(code) { super(code ?? "query failed"); this.code = code; }
   }
   const logged = [];
   const calls = { tables: [], upserts: [] };
   const db = {
+    rpc(name, params) {
+      calls.rpc = { name, params };
+      if (windowError) return Promise.resolve({ data: null, error: { code: windowError, message: "missing" } });
+      return Promise.resolve({ data: windowComplete, error: null });
+    },
     from(table) {
       calls.tables.push(table);
       const b = {
-        select() { return b; }, gte() { return b; }, eq() { return b; }, order() { return b; }, range() { return b; },
+        select() { return b; }, gte() { return b; }, not() { return b; }, eq() { return b; }, order() { return b; }, range() { return b; },
         limit() { return Promise.resolve(dismissals); },
         upsert(row, opts) { calls.upserts.push({ table, row, opts }); return Promise.resolve(upsert); },
         table,
@@ -303,11 +308,11 @@ function server({ segments = [], items = [], truncated = false, fail = null, dis
   };
   return { mod, db, calls, logged, wrap };
 }
-const hours = (days) => Array.from({ length: days }, (_, d) => ({ segment_start: `2030-05-${String(17 + d).padStart(2, "0")}T14:00:00+00:00` }))
+const hours = (days, verified = true) => Array.from({ length: days }, (_, d) => ({ segment_start: `2030-05-${String(17 + d).padStart(2, "0")}T14:00:00+00:00`, verified_at: verified ? "2030-06-15T00:00:00Z" : null }))
   .map((r) => (r.segment_start.startsWith("2030-05-3") && Number(r.segment_start.slice(8, 10)) > 31 ? null : r)).filter(Boolean);
 
 test("server: usage totals carry the days covered; a failed or cut-off read is unknown, not zero", async () => {
-  const s = server({ segments: [...hours(12), ...hours(12)], items: [{ kind: "app", identifier: "com.demoflix.ios", seconds: 1200 }] });
+  const s = server({ segments: [...hours(12), ...hours(12)], items: [{ segment_start: "2030-05-17T14:00:00+00:00", kind: "app", identifier: "com.demoflix.ios", seconds: 1200 }] });
   const totals = await s.wrap(() => s.mod.loadUsageTotals(s.db, new Date(`${TODAY}T12:00:00Z`)));
   assert.equal(totals.daysCovered, 12, "two hours on one day count as one day");
   assert.equal(totals.items[0].minutes, 20);
@@ -319,6 +324,48 @@ test("server: usage totals carry the days covered; a failed or cut-off read is u
   assert.equal(await broken.wrap(() => broken.mod.loadUsageTotals(broken.db, new Date())), null);
   assert.equal(broken.logged.length, 1);
   assert.match(broken.logged[0], /42501/);
+});
+
+test("server: an incomplete or unverifiable Screen Time window is unknown, never zero minutes", async () => {
+  // windowComplete=false: no flag may be raised from a window the export did not fully cover.
+  const incomplete = server({ windowComplete: false, segments: hours(30), items: [{ segment_start: "2030-05-17T14:00:00+00:00", kind: "app", identifier: "com.demoflix.ios", seconds: 0 }] });
+  const totals = await incomplete.wrap(() => incomplete.mod.loadUsageTotals(incomplete.db, new Date(`${TODAY}T12:00:00Z`)));
+  assert.equal(totals.windowComplete, false);
+  assert.deepEqual([totals.daysCovered, totals.items.length], [0, 0]);
+
+  // the RPC missing / failing is just as unknown: the flag must not fire from unreadable data.
+  const noRpc = server({ windowError: "PGRST202" });
+  assert.equal((await noRpc.wrap(() => noRpc.mod.loadUsageTotals(noRpc.db, new Date(`${TODAY}T12:00:00Z`)))).windowComplete, false);
+  assert.equal(noRpc.logged.length, 1);
+
+  // the pure rule: windowComplete=false answers unknown even with plenty of covered days.
+  const out = F.buildAdvice(detect(monthly("Demoflix", 1500)), { daysCovered: 30, items: [app("com.demoflix.ios", 0)], windowComplete: false });
+  assert.equal(out[0].usage.state, "unknown");
+  assert.equal(out[0].flags.filter((f) => f.kind === "no_recent_use").length, 0, "no flag from an incomplete window");
+  assert.match(F.usageLine(out[0].usage), /^iPhone use: unknown/);
+
+  // unverified segment hours do not count as coverage or usage.
+  const unverified = hours(12, false).map((r) => ({ ...r, segment_start: r.segment_start.replace("14:00:00", "15:00:00") }));
+  const mixed = server({ segments: [...hours(12), ...unverified], items: [
+    { segment_start: "2030-05-17T14:00:00+00:00", kind: "app", identifier: "com.demoflix.ios", seconds: 600 },
+    { segment_start: "2030-05-17T15:00:00+00:00", kind: "app", identifier: "com.demoflix.ios", seconds: 600 },
+  ] });
+  const totals2 = await mixed.wrap(() => mixed.mod.loadUsageTotals(mixed.db, new Date(`${TODAY}T12:00:00Z`)));
+  assert.equal(totals2.daysCovered, 12, "only verified hours count as days of data");
+  assert.equal(totals2.items[0].minutes, 10, "an item whose hour is unverified is dropped");
+});
+
+test("server: a verified window with low minutes still flags no_recent_use", async () => {
+  // 22 distinct verified days: May 17-31 plus June 1-6 (the fixed hours() helper caps at 12).
+  const days22 = Array.from({ length: 15 }, (_, d) => ({ segment_start: `2030-05-${String(17 + d).padStart(2, "0")}T14:00:00+00:00`, verified_at: "2030-06-15T00:00:00Z" }))
+    .concat(Array.from({ length: 7 }, (_, d) => ({ segment_start: `2030-06-0${d + 1}T14:00:00+00:00`, verified_at: "2030-06-15T00:00:00Z" })));
+  const s = server({ segments: days22, items: [{ segment_start: "2030-05-17T14:00:00+00:00", kind: "app", identifier: "com.demoflix.ios", seconds: 240 }] });
+  const totals = await s.wrap(() => s.mod.loadUsageTotals(s.db, new Date(`${TODAY}T12:00:00Z`)));
+  assert.equal(totals.windowComplete, true);
+  assert.ok(totals.daysCovered >= 20, "enough days of data");
+  const out = F.buildAdvice(detect(monthly("Demoflix", 1500)), totals);
+  assert.equal(out[0].usage.state, "known");
+  assert.deepEqual(kinds(out[0]), ["no_recent_use"], "a verified window with under 10 minutes still flags");
 });
 
 test("server: advice is built from the usage and the stored dismissals; missing pieces fail open honestly", async () => {

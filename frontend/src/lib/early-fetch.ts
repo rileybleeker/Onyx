@@ -27,7 +27,10 @@ export const EARLY_FETCH_MAX_AGE_MS = 10_000;
 
 interface EarlyFetch {
   at: number;
-  p: Promise<Response>;
+  /** null on a claim: the client already took this URL or fetched it for itself. */
+  p: Promise<Response> | null;
+  /** true when `at` marks the moment the client consumed this URL, not the moment a read started. */
+  claimed?: boolean;
 }
 type EarlyFetches = Record<string, EarlyFetch | undefined>;
 
@@ -44,7 +47,10 @@ function initText(init: EarlyInit = {}): string {
 /**
  * The start of every early-fetch script: `m` is the map of started GETs (URL -> {at, p}) and `go(url, init)` starts
  * one, unless the same URL was started and not yet taken within EARLY_FETCH_MAX_AGE_MS (a script that runs twice in
- * one page load never sends a read twice or orphans the first answer). Plain ES5, never throws.
+ * one page load never sends a read twice or orphans the first answer). A claim the client wrote ({at, p: null}) counts
+ * as a fresh entry too: the client took the URL or fetched it for itself, so a script that runs later (the document is
+ * still "interactive" while the page's own fetch went out first) starts nothing and no duplicate read is orphaned.
+ * Plain ES5, never throws.
  */
 export function earlyFetchPrelude(): string {
   const k = JSON.stringify(EARLY_FETCH_KEY);
@@ -96,14 +102,24 @@ export function earlyFetchesScript(paths: readonly string[], init?: EarlyInit): 
   return earlyFetchWrap(`var o=${initText(init)},l=${JSON.stringify(paths)};for(var i=0;i<l.length;i++)go(l[i],o);`);
 }
 
-/** The early response for `url`, once; null when there is none or it is too old. */
+/**
+ * The early response for `url`, once; null when there is none or it is too old. Taking the URL (or finding nothing,
+ * which is the client's fallback path in earlyOr) writes a claim into the map — "consumed by the client at time T" —
+ * so a head script that runs later (the document can still be "interactive" after React has already rendered and
+ * fetched) does not start the same URL again and orphan a duplicate read. The claim ages out with
+ * EARLY_FETCH_MAX_AGE_MS like any entry.
+ */
 export function takeEarlyFetch(url: string, now = Date.now()): Promise<Response> | null {
   if (typeof window === "undefined") return null;
-  const m = (window as unknown as Record<string, EarlyFetches | undefined>)[EARLY_FETCH_KEY];
-  if (!m || typeof m !== "object") return null;
+  const w = window as unknown as Record<string, EarlyFetches | undefined>;
+  let m = w[EARLY_FETCH_KEY];
+  if (!m || typeof m !== "object") {
+    m = {};
+    w[EARLY_FETCH_KEY] = m;
+  }
   const e = m[url];
-  delete m[url];
-  if (!e) return null;
+  m[url] = { at: now, p: null, claimed: true };
+  if (!e || !e.p) return null;
   if (!(now - e.at < EARLY_FETCH_MAX_AGE_MS)) {
     // Unused: let it finish quietly.
     e.p.catch(() => {});

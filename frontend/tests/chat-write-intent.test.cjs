@@ -75,6 +75,12 @@ const MATRIX = [
   ["a list continues the request", [user("Log Synthetic Calm and Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
   ["a named weekday", [user("I took Synthetic Calm on Monday")], "log_supplement_intake", { product: "Synthetic Calm", date: "2026-11-09" }, ALLOWED],
   ["a count amount", [user("I took 2 capsules of Synthetic Calm")], "log_supplement_intake", { product: "Synthetic Calm", amount: 2, unit: "capsule" }, ALLOWED],
+  ["half a tablet is one amount", [user("I took half a tablet of Synthetic Calm at 8am")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 0.5, unit: "tablet", times: ["08:00"] }, ALLOWED],
+  ["the article in half a tablet is not a second amount", [user("I took half a tablet of Synthetic Calm at 8am")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1, unit: "tablet", times: ["08:00"] }, refused("amount_not_stated")],
+  ["a tablet said with the article is one tablet", [user("I took a tablet of Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1, unit: "tablet" }, ALLOWED],
   ["the book being read", [user("I read chapter 4")], "log_reading_session", { chapter_through: 4, book: "synthetic-book" }, ALLOWED],
   ["a book the user named", [user("I read chapter 4 of Other Synthetic")], "log_reading_session", { chapter_through: 4, book: "other-synthetic" }, ALLOWED],
   ["a recall word for word", [user("I read chapter 4. The constraint did not move.")],
@@ -192,6 +198,15 @@ const MATRIX = [
   ["a quote over two lines", [user('My note says "hello\nlog Synthetic Focus"')], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
   ["a quote that is never closed", [user('My note: "log Synthetic Focus\nlog it')], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
   ["a curly quote over two lines", [user("\u201chello\nlog Synthetic Focus\u201d")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a straight single-quoted record", [user("My journal says 'log Synthetic Focus at 9am'. What does that mean?")],
+    "log_supplement_intake", { product: "Synthetic Focus", times: ["09:00"] }, refused("no_request")],
+  ["a straight single quote over two lines", [user("My note says 'hello\nlog Synthetic Focus'")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["a straight single quote that is never closed", [user("My journal says 'log Synthetic Focus at 9am and log it tonight")],
+    "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
+  ["an apostrophe word and an apostrophe name still parse", [user("I don't usually take it, but I took Riley's Synthetic Focus today")],
+    "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
+  ["a curly single-quoted record", [user("My journal says \u2018log Synthetic Focus at 9am\u2019. What does that mean?")],
+    "log_supplement_intake", { product: "Synthetic Focus", times: ["09:00"] }, refused("no_request")],
   ["a block quote's continuation line", [user("> my note\nlog Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, refused("no_request")],
   ["a request after a block quote and a blank line", [user("> my note\n\nlog Synthetic Focus")], "log_supplement_intake", { product: "Synthetic Focus" }, ALLOWED],
   ["a request taken back", [user("Log Synthetic Calm. Actually don't log Synthetic Calm.")], "log_supplement_intake", { product: "Synthetic Calm" }, refused("contradicts")],
@@ -239,6 +254,22 @@ const MATRIX = [
   ["the chapter sent as minutes", [user("I read chapter 4 for 12 minutes")], "log_reading_session", { chapter_through: 4, minutes: 4 }, refused("amount_not_stated")],
   ["chapter and minutes each in their place", [user("I read chapter 4 for 12 minutes")], "log_reading_session", { chapter_through: 4, minutes: 12 }, ALLOWED],
   ["an hour of reading", [user("I read chapters 3 and 4 for an hour")], "log_reading_session", { chapter_from: 3, chapter_through: 4, minutes: 60 }, ALLOWED],
+  ["chapters 3 and 4 with the minutes, both covered", [user("I read chapters 3 and 4 for 12 minutes")],
+    "log_reading_session", { chapter_from: 3, chapter_through: 4, minutes: 12 }, ALLOWED],
+  ["chapters 3 and 4, only chapter 3 written", [user("I read chapters 3 and 4 for 12 minutes")],
+    "log_reading_session", { chapter_from: 3, chapter_through: 3, minutes: 12 }, refused("not_named")],
+  ["chapters 3 and 4, only the last chapter written", [user("I read chapters 3 and 4 for 12 minutes")],
+    "log_reading_session", { chapter_through: 4 }, refused("not_named")],
+  ["chapters 3 and 4, more chapters than said", [user("I read chapters 3 and 4 for 12 minutes")],
+    "log_reading_session", { chapter_from: 2, chapter_through: 4, minutes: 12 }, refused("not_named")],
+  ["a stated duration dropped from the call", [user("I read chapters 3 and 4 for 12 minutes")],
+    "log_reading_session", { chapter_from: 3, chapter_through: 4 }, refused("amount_not_stated")],
+  ["a stated duration dropped from a single-chapter call", [user("I read chapter 4 for 12 minutes")],
+    "log_reading_session", { chapter_through: 4 }, refused("amount_not_stated")],
+  ["a chapter range expands to every chapter", [user("I read chapters 3 to 5 for 30 minutes")],
+    "log_reading_session", { chapter_from: 3, chapter_through: 5, minutes: 30 }, ALLOWED],
+  ["a chapter range with the middle left out", [user("I read chapters 3 through 5")],
+    "log_reading_session", { chapter_through: 5 }, refused("not_named")],
   ["a quiz stopped with a request not to record", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz; don't record a score")],
     "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, refused("contradicts")],
   ["a quiz stopped", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Cancel the quiz"),
@@ -269,6 +300,25 @@ const MATRIX = [
     "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
   ["a checkpoint sent as a number", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: 4, score: 1, total: 1 }, refused("invalid_value")],
+
+  // Round 4 (action-bound record kind): the clause that carries the verb decides what is written. A record-shaped
+  // name inside another write (a playlist's name, a shopping-list item, a note's topic) authorizes nothing else.
+  ["a playlist request authorizes the playlist only", [user("Create a playlist called Synthetic Calm")],
+    "create_spotify_playlist", { name: "Synthetic Calm", track_ids: ["t1"] }, ALLOWED],
+  ["a playlist name never logs an intake", [user("Create a playlist called Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm", amount: 1 }, refused("not_named")],
+  ["a saved playlist name never logs an intake", [user("Save a playlist called Synthetic Calm")],
+    "log_supplement_intake", { product: "Synthetic Calm" }, refused("not_named")],
+  ["a shopping list item is not an intake", [user("Add Synthetic Milk to my shopping list")],
+    "log_supplement_intake", { product: "Synthetic Milk", amount: 1 }, refused("not_named")],
+  ["a shopping list item is not a stack", [user("Add Synthetic Milk to my shopping list")],
+    "log_supplement_stack", { stack: "Synthetic Milk" }, refused("not_named")],
+  ["a note about reading is not a reading session", [user("Save a note about reading chapter 4")],
+    "log_reading_session", { chapter_through: 4 }, refused("no_request")],
+  ["a note about reading is not a highlight", [user("Save a note about reading chapter 4")],
+    "add_book_highlight", { passage: "reading chapter 4" }, refused("no_request")],
+  ["a note taken after a reading report keeps the session", [user("I read chapter 4 and took a note")],
+    "log_reading_session", { chapter_through: 4 }, ALLOWED],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
@@ -329,6 +379,42 @@ test("every refusal reason fits on a receipt", () => {
   assert.equal(receipt.status, "not_saved");
   assert.equal(receipt.title, "Supplement intake not logged");
   assert.deepEqual(receipt.details, ["Synthetic Focus", intent.REFUSAL_TEXT.no_request]);
+});
+
+test("a granted write is consumed once: a second call for the same grant is refused whatever the model sends", () => {
+  // The same grant restated in the user's message is one write, not two SEC-04 operations.
+  assert.deepEqual(sequence([user("I took Synthetic Calm. I also had Synthetic Calm.")], "log_supplement_intake",
+    [{ product: "Synthetic Calm" }, { product: "Synthetic Calm" }]), ["allowed", "already_written"]);
+  // A changed optional argument (the date) does not mint a new grant from the same user action.
+  assert.deepEqual(sequence([user("I took 15 mg of Synthetic Focus at 8:30am today")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] },
+     { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"], date: DAY }]),
+    ["allowed", "already_written"]);
+  // The model's own shorter name for the record does not change the identity.
+  assert.deepEqual(sequence([user("Log synthetic magnesium glycinate")], "log_supplement_intake",
+    [{ product: "Synthetic Magnesium Glycinate" }, { product: "synthetic magnesium" }]), ["allowed", "already_written"]);
+  // A stack: once per granted stack; a different stack is its own grant.
+  assert.deepEqual(sequence([user("Log my synthetic evening stack and my synthetic morning stack")], "log_supplement_stack",
+    [{ stack: "synthetic evening" }, { stack: "synthetic evening" }, { stack: "synthetic morning" }]),
+    ["allowed", "already_written", "allowed"]);
+  // A habit reported twice in one message is one Yes.
+  assert.deepEqual(sequence([user("I meditated today, and I meditated again")], "mark_habit_complete",
+    [{ habit: "Meditated" }, { habit: "Meditated" }]), ["allowed", "already_written"]);
+  // A reading session: the same chapters restated are one session; another chapter range is another grant.
+  assert.deepEqual(sequence([user("I read chapter 4. I read chapter 4 again.")], "log_reading_session",
+    [{ chapter_through: 4 }, { chapter_through: 4 }]), ["allowed", "already_written"]);
+  assert.deepEqual(sequence([user("I read chapter 4. Then I read chapter 5.")], "log_reading_session",
+    [{ chapter_through: 4 }, { chapter_through: 5 }]), ["allowed", "allowed"]);
+  // Different stated arguments stay different grants: each stated time is its own write (the model must ask for
+  // both times of one action in one call, which time_omitted already forces).
+  assert.deepEqual(sequence([user("Log Synthetic Focus at 8 and log Synthetic Focus at noon")], "log_supplement_intake",
+    [{ product: "Synthetic Focus", times: ["08:00"] }, { product: "Synthetic Focus", times: ["12:00"] }]),
+    ["allowed", "allowed"]);
+  // A fresh message (a retry of the request) builds a fresh set: the grant itself authorizes again, and the replay
+  // ledger (SEC-04) reconciles the repeated call rather than a consumed identity refusing it across requests.
+  const grant = intent.writeGrantFor([user("I took Synthetic Calm")]);
+  const freshUsed = intent.newWriteUsage();
+  assert.equal(intent.authorizeWrite(grant, "log_supplement_intake", { product: "Synthetic Calm" }, { requestDay: DAY, used: freshUsed, books: BOOKS, isSleepHabit }).allowed, true);
 });
 
 test("each action authorizes one write of each record it names: a repeat needs its own words", () => {

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
-import { buildOrderItemRows, customizationsText, type HarvestOrder, type ItemCustomization } from "@/lib/delivery";
+import { buildOrderItemRows, customizationsText, type HarvestOrder, type ItemCustomization, type ItemProvider } from "@/lib/delivery";
+import { estimateQuality } from "@/lib/delivery-estimate-quality";
 import {
   attemptTimeoutMs,
   callWithCountedRetries,
@@ -25,7 +26,7 @@ import {
 //   { orders: [...] }      upsert cart lines into pds.delivery_order_items
 //   { estimate: true }     estimate nutrition for up to BATCH not-yet-estimated dishes
 //                          (one Claude call) → pds.delivery_item_nutrition; returns `remaining`
-//   { done: true, ... }    write the ubereats|items heartbeat for the run
+//   { done: true, ... }    write the ubereats|items heartbeat for the run (gopuff|items when provider is 'gopuff')
 //   { error: "..." }       harvester-side failure (signed out, blocked) → failed heartbeat
 // The harvester calls `estimate` in a loop until remaining is 0, so no single
 // request has to outlive the function time limit.
@@ -41,6 +42,8 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const BATCH = 25;
 
 interface Body {
+  /** Which harvester is posting: 'gopuff' (tools/gopuff_harvest) or, when absent, Uber Eats. Chooses the provider of the rows and the heartbeat source. */
+  provider?: string;
   /** Retry only the dishes of this arm (named in a failed batch's answer); offset then counts within it. */
   arm?: Arm;
   orders?: HarvestOrder[];
@@ -119,15 +122,20 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
+  if (body.provider !== undefined && body.provider !== "gopuff" && body.provider !== "uber_eats") {
+    return NextResponse.json({ error: "unknown provider" }, { status: 400 });
+  }
+  const provider: ItemProvider = body.provider === "gopuff" ? "gopuff" : "uber_eats";
+
   if (body.error) {
-    await heartbeat(startedAt, "failed", 0, String(body.error).slice(0, 500));
+    await heartbeat(provider, startedAt, "failed", 0, String(body.error).slice(0, 500));
     return NextResponse.json({ heartbeat: "failed", error: body.error });
   }
 
   try {
     if (body.orders) {
       if (!Array.isArray(body.orders)) return NextResponse.json({ error: "orders must be an array" }, { status: 400 });
-      return NextResponse.json(await importOrders(body.orders));
+      return NextResponse.json(await importOrders(body.orders, provider));
     }
     if (body.estimate) {
       const only = body.arm === "baseline" || body.arm === "pilot" ? body.arm : undefined;
@@ -145,6 +153,7 @@ export async function POST(req: NextRequest) {
       const why = s.estimateError ? `; last estimator error: ${String(s.estimateError).slice(0, 300)}` : "";
       const status = left > 0 ? "partial" : "success";
       await heartbeat(
+        provider,
         startedAt,
         status,
         Number.isFinite(Number(s.items)) ? Number(s.items) : 0,
@@ -174,10 +183,10 @@ class EstimateError extends Error {
   }
 }
 
-async function importOrders(orders: HarvestOrder[]) {
+async function importOrders(orders: HarvestOrder[], provider: ItemProvider) {
   // eaten_fraction is deliberately absent from these rows (see buildOrderItemRows), so the upsert
   // never resets a portion Riley set on /nutrition or /check-in.
-  const rows = buildOrderItemRows(orders);
+  const rows = buildOrderItemRows(orders, provider);
   for (let i = 0; i < rows.length; i += 500) {
     const { error } = await supabase
       .from("delivery_order_items")
@@ -309,6 +318,11 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
     const src = todo[e.id];
     if (!src || used.has(e.id)) continue; // id out of range, or returned twice
     used.add(e.id);
+    // Quality gate (lib/delivery-estimate-quality.ts): an estimate that fails a rule is never
+    // stored, and is not counted as accepted, so the pilot's cost gate sees it like any other
+    // failed result (the harvester retries the dish one at a time, as with a model failure).
+    const quality = estimateQuality(e);
+    if (!quality.usable) continue;
     const zero = e.kind === "non_food";
     rows.push({
       est_key: src.est_key,
@@ -343,10 +357,10 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
   return { estimated: rows.length, remaining: Math.max(0, (count ?? todo.length) - rows.length) };
 }
 
-async function heartbeat(startedAt: Date, status: "success" | "partial" | "failed", records: number, error: string | null) {
+async function heartbeat(provider: ItemProvider, startedAt: Date, status: "success" | "partial" | "failed", records: number, error: string | null) {
   const end = new Date();
   const { error: e } = await supabase.from("sync_log").insert({
-    source: "ubereats",
+    source: provider === "gopuff" ? "gopuff" : "ubereats",
     data_type: "items",
     status,
     records_synced: records,
@@ -355,5 +369,5 @@ async function heartbeat(startedAt: Date, status: "success" | "partial" | "faile
     duration_seconds: Math.max(0, Math.round((end.getTime() - startedAt.getTime()) / 1000)),
     error_message: error,
   });
-  if (e) console.error("ubereats heartbeat failed:", e.message);
+  if (e) console.error(`${provider} heartbeat failed:`, e.message);
 }

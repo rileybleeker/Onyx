@@ -17,6 +17,9 @@ Usage:
 
 Configuration: GOOGLE_CALENDAR_ICS_SECRET = a JSON list of
     [{"account": "<label>", "calendar": "<label>", "url": "https://.../basic.ics"}, ...]
+Optional second source, iCloud over CalDAV (caldav_source.py): ICLOUD_CALDAV_SECRET =
+    {"account": "<label>", "username": "<apple id>", "password": "<app-specific password>"}
+Every event calendar in the account is discovered and synced as account/<calendar name>.
 `account` and `calendar` are short labels Riley picks (letters, digits, space,
 _ . -), shown on /health and Today. They are not addresses.
 
@@ -83,6 +86,7 @@ import httpx
 import icalendar
 import recurring_ical_events
 
+import caldav_source
 from sync_log_helper import log_sync as _shared_log_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -568,22 +572,51 @@ def purge_unconfigured(sb, feeds: list[Feed]) -> None:
 
 
 def run(sb, feeds: list[Feed], days: int = DEFAULT_WINDOW_DAYS, dry_run: bool = False,
-        allow_large_removal: bool = False, today: date | None = None) -> tuple[str, int, str | None]:
-    """Sync every feed. Returns (heartbeat status, events written, note). Database errors propagate."""
+        allow_large_removal: bool = False, today: date | None = None,
+        caldav_sources: list | None = None) -> tuple[str, int, str | None]:
+    """Sync every feed (and every iCloud calendar of `caldav_sources`). Returns (heartbeat status,
+    events written, note). Database errors propagate."""
     today = today or et_today()
     win_start, win_end = window_bounds(today, days)
     stamp = datetime.now(UTC).isoformat()
     failures: list[str] = []
     notes: list[str] = []
     total = 0
-    log.info(f"{len(feeds)} calendar feed(s), window {win_start} -> {win_end}")
+    caldav_by_feed: dict[int, caldav_source.CaldavCalendar] = {}
+    all_feeds: list[Feed] = list(feeds)
+    discovery_failures = 0
     with httpx.Client(timeout=FETCH_TIMEOUT_S, follow_redirects=True) as client:
-        for n, feed in enumerate(feeds, start=1):
-            tag = f"calendar {n}/{len(feeds)}"                      # public logs: position only
-            name = f"calendar '{feed.calendar}' ({feed.account})"    # heartbeat (owner-only): the label
+        for source in caldav_sources or []:
             try:
-                rows, stats = expand_events(fetch_feed(client, feed.url), feed.account, feed.calendar, win_start, win_end)
-            except FeedError as exc:
+                found = caldav_source.discover_calendars(client, source)
+            except caldav_source.CaldavError as exc:
+                discovery_failures += 1
+                log.error(f"iCloud account: discovery failed - {exc}")
+                failures.append(f"iCloud account '{source.account}': {exc}")   # heartbeat is owner-only
+                continue
+            for cal in found:
+                feed = Feed(account=cal.account, calendar=cal.calendar, url=cal.href)
+                caldav_by_feed[id(feed)] = cal
+                all_feeds.append(feed)
+        log.info(f"{len(all_feeds)} calendar feed(s), window {win_start} -> {win_end}")
+        units = len(all_feeds) + discovery_failures
+        seen_pairs: set[tuple[str, str]] = set()
+        for n, feed in enumerate(all_feeds, start=1):
+            tag = f"calendar {n}/{len(all_feeds)}"                  # public logs: position only
+            name = f"calendar '{feed.calendar}' ({feed.account})"    # heartbeat (owner-only): the label
+            pair = (feed.account.lower(), feed.calendar.lower())
+            if pair in seen_pairs:
+                failures.append(f"{name}: another calendar already uses this account + calendar label")
+                log.error(f"{tag}: failed - duplicate label")
+                continue
+            seen_pairs.add(pair)
+            try:
+                if id(feed) in caldav_by_feed:
+                    text = caldav_source.fetch_calendar_ics(client, caldav_by_feed[id(feed)], win_start, win_end)
+                else:
+                    text = fetch_feed(client, feed.url)
+                rows, stats = expand_events(text, feed.account, feed.calendar, win_start, win_end)
+            except (FeedError, caldav_source.CaldavError) as exc:
                 log.error(f"{tag}: failed - {exc}")
                 failures.append(f"{name}: {exc}")
                 continue                                             # never reconcile a failed calendar
@@ -607,8 +640,8 @@ def run(sb, feeds: list[Feed], days: int = DEFAULT_WINDOW_DAYS, dry_run: bool = 
                      f"{stats['first_date'] or '-'} -> {stats['last_date'] or '-'}"
                      + ("" if dry_run else f", {removed} removed"))
     if not dry_run and not failures:
-        purge_unconfigured(sb, feeds)
-    if failures and len(failures) == len(feeds):
+        purge_unconfigured(sb, all_feeds)
+    if failures and len(failures) == units:
         return "failed", 0, "; ".join(failures)
     status = "partial" if failures or notes else "success"
     return status, total, ("; ".join(failures + notes) or None)
@@ -650,19 +683,28 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             log_sync(get_supabase(), "failed", 0, started, error=str(exc))
         return 1
+    try:
+        icloud = caldav_source.parse_caldav_secret(os.environ.get(caldav_source.ENV_NAME))
+    except caldav_source.CaldavConfigError as exc:
+        log.error(str(exc))
+        if not args.dry_run:
+            log_sync(get_supabase(), "failed", 0, started, error=str(exc))
+        return 1
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        for value in mask_values(feeds):       # GitHub only masks a secret's whole value, not the URLs inside it
+        # GitHub only masks a secret's whole value, not the URLs / fields inside it
+        for value in mask_values(feeds) + caldav_source.mask_values(icloud):
             print(f"::add-mask::{value}", flush=True)
 
     if args.dry_run:
-        status, total, _ = run(None, feeds, args.days, dry_run=True)
+        status, total, _ = run(None, feeds, args.days, dry_run=True, caldav_sources=icloud)
         log.info(f"Dry run: {status}, {total} event(s) would be written")
         return 0 if status != "failed" else 1
 
     sb = get_supabase()
     window = window_bounds(et_today(), args.days)
     try:
-        status, total, note = run(sb, feeds, args.days, allow_large_removal=args.allow_large_removal)
+        status, total, note = run(sb, feeds, args.days, allow_large_removal=args.allow_large_removal,
+                                  caldav_sources=icloud)
     except Exception as exc:  # noqa: BLE001 - a database error: heartbeat without row content, then fail the job
         message = safe_db_error(exc)
         log.error(message)

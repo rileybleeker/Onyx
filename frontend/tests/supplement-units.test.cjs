@@ -55,8 +55,8 @@ test("lib: unit labels keep the literal unit of unconverted rows and record IU p
 });
 
 test("lib: unquantified ingredients follow the view's own filter and are listed apart", () => {
-  for (const q of [0, 5, 0.25, "5", "0.5"]) assert.equal(units.isQuantified(q), true, `quantified: ${q}`);
-  for (const q of [null, undefined, "", " 5", "1,000", "<1", "blend", -1, Number.NaN, true, {}]) {
+  for (const q of [0, 5, 0.25, "5", "0.5", "10", ".5"]) assert.equal(units.isQuantified(q), true, `quantified: ${q}`);
+  for (const q of [null, undefined, "", " 5", "1,000", "<1", "blend", -1, Number.NaN, true, {}, "1.2.3", "1..", ".5.5", "."]) {
     assert.equal(units.isQuantified(q), false, `not quantified: ${String(q)}`);
   }
   const list = units.unquantifiedIngredients([
@@ -70,6 +70,21 @@ test("lib: unquantified ingredients follow the view's own filter and are listed 
     { name: "Synthetic Herb", label: "blend", product_count: 2 },
   ]);
   assert.deepEqual(units.unquantifiedIngredients([]), []);
+});
+
+test("lib: the quantity filter is strict (one dot at most) and identical in SQL and TypeScript", () => {
+  // '1.2.3' passed the old character-set filter ('^[0-9.]+$') and blew up the ::numeric cast in the view.
+  for (const q of ["10", "0.5", ".5"]) assert.equal(units.isQuantified(q), true, `quantified: ${q}`);
+  for (const q of ["1.2.3", "1..", ".5.5", "."]) assert.equal(units.isQuantified(q), false, `not quantified: ${q}`);
+  // The view's own filter (sql/supplement_quantity_strict.sql) and isQuantified must stay one regex.
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const pattern = String.raw`^[0-9]*\.?[0-9]+$`;
+  const sql = fs.readFileSync(path.join(__dirname, "..", "..", "sql", "supplement_quantity_strict.sql"), "utf8");
+  const ts = fs.readFileSync(path.join(__dirname, "..", "src", "lib", "supplement-units.ts"), "utf8");
+  assert.ok(sql.includes(`'${pattern}'`), "the migration carries the strict regex");
+  assert.ok(ts.includes(`/${pattern}/`), "isQuantified carries the same regex");
+  assert.ok(!ts.includes("/^[0-9.]+$/"), "the loose character-set filter is gone from TypeScript");
 });
 
 test("lib: dose-response coverage says which compounds have no estimate and why", () => {

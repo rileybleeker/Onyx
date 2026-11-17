@@ -17,18 +17,29 @@
  *     same polarity, read from the action's own clause (never by counting negations): "I skipped X" allows the
  *     answer No for X and nothing that says X was done, "I didn't take X" logs nothing for X, a record named both ways
  *     is refused, and a statement whose polarity cannot be read ("I didn't skip X", "…without X") refuses it;
+ *   - the kind of write is bound to the clause that carries the verb: a clause that writes something else (a
+ *     playlist, a shopping-list item, a note about a topic) names no record, whatever record-shaped name it
+ *     contains ("create a playlist called Synthetic Calm" authorizes the playlist, never an intake of a product
+ *     named Synthetic Calm);
  *   - "don't log X" / "don't mark X" / "log Y, not X" is a request not to write X: it grants nothing (never a No) and
  *     refuses any write of X; "don't log it" refuses every write of the message;
  *   - every argument is bound to THAT action: the amount with its unit kind exactly as lib/supplement-intake.ts reads
  *     it (servings, pills, a weight; "15 mg" never becomes 15 servings, "2 servings" never 2 capsules, and one
  *     serving only when no other amount is stated), the clock times one to one (a time sent twice has to be said
- *     twice; every time said is sent), the chapters as chapter numbers and the minutes as a duration ("chapter 4
- *     for 12 minutes" never gives chapter 12); an amount or a time the action states cannot be left out;
+ *     twice; every time said is sent), the chapters as chapter numbers covering exactly the chapters named (both of
+ *     "chapters 3 and 4", every chapter of "ch. 5-7") and the minutes as a duration ("chapter 4 for 12 minutes"
+ *     never gives chapter 12, and a stated duration is never dropped from the call); an amount or a time the action
+ *     states cannot be left out;
  *   - the day the call would write (its date, or the tool's default when it sends none) has to be the day the action
  *     names (else its list, else its sentence), or today when none is named: "yesterday" with no date is refused;
  *   - the values have the type the tool reads: a number that arrives as a string is refused, never coerced;
  *   - each action authorizes one write of each record: a repeated intake needs its own words ("…at 8 and again at 9"
- *     is one call with two times, or two actions);
+ *     is one call with two times, or two actions). Each granted write is consumed once per request under a canonical
+ *     identity — the tool, the record as the user's own words name it, and the day, amount, times, chapters or answer
+ *     the user's action itself states, never the call's arguments — so a second call for the same grant, in whatever
+ *     form the model sends it (a changed optional argument, another name for the same record, a restatement in the
+ *     user's message), is refused; a retry of the whole message starts with a fresh set here and reconciles through
+ *     the replay ledger (SEC-04), which mints no new action either;
  *   - a reading write goes to the book the user named, or the book being read when the user names none; naming another
  *     known book refuses a call that would write to the book being read;
  *   - text stored as the user's words (a recall note, a question, a passage, a comment) has to be a verbatim span of
@@ -112,8 +123,12 @@ export interface ReadingBooks {
 }
 
 /**
- * What this request has already been allowed: calls per tool, and the actions (each authorizes one write of each
- * record it names). Made with newWriteUsage(); the caller records every allowed call with commitWrite().
+ * What this request has already been allowed: calls per tool, and the granted writes already consumed (each user
+ * action authorizes one write of each record it names). Made with newWriteUsage(); the caller records every allowed
+ * call with commitWrite(). A consumed key is the granted write's canonical identity — the tool, the record as the
+ * user's own words name it, and the arguments the user's action states — never the model's call arguments, so a
+ * repeated or varied call for the same grant maps to it and is refused. Per request only: a retry of the whole
+ * message builds a fresh set and reconciles through the replay ledger (SEC-04) instead.
  */
 export interface WriteUsage { perTool: Map<string, number>; consumed: Set<string> }
 
@@ -341,6 +356,8 @@ const NOT_AMOUNT_AFTER = /^(?:min|mins|minutes?|hours?|hrs?|h|days?|weeks?|month
 const NOT_AMOUNT_BEFORE = /^(?:at|around|about|by|after|before|until|till|since|from|to|chapter|chapters|ch|page|pages|jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)$/;
 /** Words that end the search for the unit of a number ("2 of the magnesium capsules" looks past "of the magnesium"). */
 const UNIT_SEARCH_STOP = /^(?:and|or|but|then|plus|at|with|around|by|before|after|on|yesterday|today|tonight|this|last)$/;
+/** Fraction words whose article ("half a tablet") is part of the fraction, never a second amount. */
+const FRACTION_WORDS = new Set(["half", "quarter", "third"]);
 
 interface Quantity { value: number; unit: string | null; word: string }
 
@@ -360,6 +377,13 @@ function quantities(text: string): Quantity[] {
     const prev = toks[i - 1], next = toks[i + 1];
     if (prev === ":" || next === ":") continue; // 8:30
     if ((next === "a" || next === "p") && toks[i + 2] === "m") continue; // 8 a.m.
+    // The bare article is the number one only when it directly precedes a unit or noun, and never inside a
+    // fraction phrase: in "half a tablet" the article belongs to the fraction (one amount of 0.5), so it is
+    // not a second quantity of one.
+    if (t === "a" || t === "an") {
+      if (prev !== undefined && FRACTION_WORDS.has(prev)) continue;
+      if (next === undefined || NOT_AMOUNT_AFTER.test(next) || UNIT_SEARCH_STOP.test(next) || next === ":") continue;
+    }
     // "half a tablet"
     let j = i + 1;
     if (t === "half" && (toks[j] === "a" || toks[j] === "an")) j += 1;
@@ -501,6 +525,40 @@ function chapterNumbers(text: string): Set<number> {
   return out;
 }
 
+/**
+ * The chapters a reading action grants, with ranges expanded: "chapter 4" {4}, "chapters 3 and 4" {3, 4},
+ * "ch. 5-7" / "chapters three through five" {5, 6, 7}. A call must cover exactly this set.
+ */
+function grantedChapters(text: string): Set<number> {
+  const out = new Set<number>();
+  const toks = norm(text).match(/\d+|[a-z]+(?:'[a-z]+)?|[-–&,\n]/g) ?? [];
+  for (let i = 0; i < toks.length; i++) {
+    if (!/^(?:chapters?|ch|chap)$/.test(toks[i])) continue;
+    let expectNumber = true;
+    let prev: number | undefined;
+    let range = false;
+    for (let j = i + 1; j < toks.length; j++) {
+      const w = toks[j];
+      const n = expectNumber ? chapterNumber(w) : undefined;
+      if (n !== undefined) {
+        if (range && prev !== undefined && n > prev) for (let c = prev; c <= n; c++) out.add(c);
+        else out.add(n);
+        prev = n;
+        range = false;
+        expectNumber = false;
+        continue;
+      }
+      if (!expectNumber && /^(?:and|to|through|thru|or|-|–|&|,|\n)$/.test(w)) {
+        range = /^(?:to|through|thru|-|–)$/.test(w);
+        expectNumber = true;
+        continue;
+      }
+      break;
+    }
+  }
+  return out;
+}
+
 /** The durations a text states, in minutes: "40 minutes", "an hour", "1.5 hours", "half an hour", "twenty five min". */
 function minuteValues(text: string): Set<number> {
   const out = new Set<number>();
@@ -614,8 +672,10 @@ function isDay(v: string): boolean {
 /**
  * The text with quoted spans masked out (same length, so positions line up). Someone else's words, never a request:
  * fenced code blocks (``` or ~~~, to the closing fence or the end), inline code, block quotes ("> …" and the lines
- * that continue them up to a blank line, as Markdown shows them), "double quotes" and curly quotes, also over
- * several lines. An opening quote or fence that is never closed masks everything after it (fail closed).
+ * that continue them up to a blank line, as Markdown shows them), "double quotes", curly quotes and 'straight single
+ * quotes', also over several lines. An opening single quote sits at the start or after whitespace or an opening
+ * bracket and closes at a quote that ends a word, so the apostrophe inside "don't" is never one. An opening quote or
+ * fence that is never closed masks everything after it (fail closed).
  */
 function maskQuotes(text: string): string {
   const chars = text.split("");
@@ -661,10 +721,12 @@ function maskQuotes(text: string): string {
     let close: number | null = null;
     if (c === '"') close = s.indexOf('"', i + 1);
     else if (c === "“") close = s.indexOf("”", i + 1);
-    else if (c === "‘" && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
-      // An opening single quote closes at a ’ that ends a word (not the apostrophe inside "don’t").
+    else if ((c === "‘" || c === "'") && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
+      // An opening single quote (curly or straight) closes at the same quote that ends a word
+      // (not the apostrophe inside "don’t" / "don't").
+      const closer = c === "‘" ? /’(?![a-z])/i : /'(?![a-z])/i;
       const rest = s.slice(i + 1);
-      const m = /’(?![a-z])/i.exec(rest);
+      const m = closer.exec(rest);
       close = m ? i + 1 + (m.index ?? 0) : -1;
     } else continue;
     const to = close === null || close < 0 ? s.length : close + 1;
@@ -1066,6 +1128,15 @@ const FINISHED_BOOK = /\b(finished|completed|done with)\b[^.!?\n]*\bbook\b/;
 const HIGHLIGHT = /\b(highlight|quote|passage|line|excerpt|save|keep|note)\b/;
 const PLAYLIST_VERB = /\b(create|make|build|generate|save|start|put together|turn)\b/;
 const QUIZ_WORD = /\b(quiz|score|checkpoint|result)\b/;
+/**
+ * The words of another thing a clause writes: a playlist, a list the user shops from, a cart, a note, a journal.
+ * The kind of a write is read from the clause that carries its verb, so a clause with one of these ("add X to my
+ * shopping list", "save a note about reading chapter 4", "save a playlist called X") writes that thing, not a
+ * record: a record-shaped name in it (the playlist's name, the list item) authorizes no record write, highlight or
+ * reading session, however well it matches one.
+ */
+const OTHER_WRITE =
+  /\b(?:playlists?|(?:shopping|wish|watch)[ -]?lists?|carts?|baskets?|notes?|journals?)\b/;
 
 /** The request verbs that ask to record a supplement, a stack or a habit (never "create", "make", "highlight"). */
 const RECORD_REQUEST = /^(?:log|record|mark|save|add|track|enter)$/;
@@ -1228,7 +1299,7 @@ export function authorizeWrite(
     if (notText(input.passage) || notText(input.comment) || notNumber(input.chapter) || notText(input.book)) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => HIGHLIGHT.test(a.text));
     if (blocked) return deny(blocked);
-    const asked = done.filter((a) => HIGHLIGHT.test(a.text));
+    const asked = done.filter((a) => HIGHLIGHT.test(a.text) && !OTHER_WRITE.test(a.text));
     if (asked.length === 0) return deny("no_request");
     const passage = str(input.passage);
     if (!passage || significant(passage).length === 0 || !verbatimIn(passage, grant.ownWords)) return deny("not_your_words");
@@ -1247,13 +1318,29 @@ export function authorizeWrite(
     for (const field of ["recall", "question", "medium", "book"]) if (notText(input[field])) return deny("invalid_value");
     const blocked = blockedBy(actions, (a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText));
     if (blocked) return deny(blocked);
-    const chains = [...new Map(done.filter((a) => READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText)).map((a) => [a.chain, a])).values()];
+    // The kind of write is read from the clause that carries the verb (the chain's first): a chain that starts by
+    // writing something else ("save a note about reading chapter 4") is not a reading report, however well its
+    // words match one. A later item that only writes a note ("…and took a note") does not un-read the chain.
+    const firstOfChain = new Map<number, Action>();
+    for (const a of done) if (!firstOfChain.has(a.chain)) firstOfChain.set(a.chain, a);
+    const chains = [...new Map(done.filter((a) => !OTHER_WRITE.test(firstOfChain.get(a.chain)!.text) && (READING.test(a.chainText) || FINISHED_BOOK.test(a.chainText))).map((a) => [a.chain, a])).values()];
     if (chains.length === 0) return deny(notDone.some((a) => READING.test(a.chainText)) ? "contradicts" : "no_request");
+    // The granted session's canonical identity: the book the grant binds (the one the user names — bookCheck refuses
+    // any other — else the one being read), the day, the chapters and the minutes the user's own action states, never
+    // the call's arguments, so a repeated or varied call for the same session is refused and another chapter range
+    // or day is another session.
+    const sessionIdentity = (a: Action): string => {
+      const days = [...allowedDays(a, ctx.requestDay)].sort();
+      const chapters = [...chapterNumbers(a.chainText)].sort((x, y) => x - y).join(",");
+      const minutes = [...minuteValues(a.chainText)].sort((x, y) => x - y).join(",");
+      const book = str(input.book) ?? ctx.books?.active ?? "";
+      return [tool, book, days.length > 0 ? days.join(",") : ctx.requestDay, chapters, minutes].join("|");
+    };
     let refusal: RefusalCode = "not_named";
     for (const a of chains) {
       const r = readingSessionFits(a, input, grant, ctx);
       if (r) { refusal = r; continue; }
-      const key = `${tool}|c${a.chain}`;
+      const key = sessionIdentity(a);
       if (!fresh(key)) { refusal = "already_written"; continue; }
       return allow(tool, key);
     }
@@ -1305,34 +1392,58 @@ export function authorizeWrite(
   // or reports this kind of write ("I took X" logs an intake; "I bought X" does not).
   const candidates = same.filter((a) => {
     const at = span(a);
-    return at !== null && !topicOnly(a, at) && verbFits(tool, a);
+    return at !== null && !topicOnly(a, at) && !OTHER_WRITE.test(a.text) && verbFits(tool, a);
   });
   if (candidates.length === 0) return deny("not_named");
 
+  // The granted write's canonical identity: the tool, the record as the user's own words name it, and the arguments
+  // the user's action itself states — the day (the days it names, else the default), the amounts with their unit kind
+  // and the clock times (an intake), a habit's answer. Never the call's arguments, so a second call for the same
+  // grant is refused whatever the model sends (a changed optional argument cannot mint a new write), two actions
+  // that grant the same write are one, and actions with different stated arguments remain one write each. Per request
+  // only; a retry of the whole message starts fresh here and reconciles through the replay ledger (SEC-04).
+  const mention = (a: Action): string => {
+    const at = span(a)!;
+    const toks = tokens(a.text);
+    // A word continues the record's mention when it is part of its name, not an argument or glue: "synthetic
+    // magnesium" and "synthetic magnesium glycinate" are the mention "synthetic magnesium glycinate".
+    const word = (w: string) =>
+      !STOP.has(w) && !GENERIC.has(w) && (!ARGUMENT_WORD.test(w) || /^\d+(?:\.\d+)?$/.test(w));
+    let [from, to] = at;
+    while (from > 0 && word(toks[from - 1])) from -= 1;
+    while (to + 1 < toks.length && word(toks[to + 1])) to += 1;
+    return flat(toks.slice(from, to + 1).join(" "));
+  };
+  const grantIdentity = (a: Action): string => {
+    const days = [...allowedDays(a, ctx.requestDay)].sort();
+    const parts = [tool, mention(a), days.length > 0 ? days.join(",") : defaultDay(tool, record!, ctx)];
+    if (tool === "log_supplement_intake") {
+      parts.push(quantities(a.text).map((q) => `${q.value}:${q.unit ?? "serving"}`).sort().join(";"));
+      parts.push(actionTimes(a, actions).slots.map((s) => [...s].sort().join("/")).join(";"));
+    }
+    if (tool === "mark_habit_complete") parts.push(a.negated ? "no" : "yes");
+    return parts.join("|");
+  };
   let refusal: RefusalCode = "not_named";
   for (const a of candidates) {
     const r = argumentsFit(tool, a, actions, input, record, ctx);
     if (r) { refusal = r; continue; }
-    const [from, to] = span(a)!;
-    const prefix = `${tool}|a${a.id}|`;
-    // The words this call names were already used by an allowed call of this action: the same record again.
-    const taken = [...ctx.used.consumed].some((k) => {
-      if (!k.startsWith(prefix)) return false;
-      const [f, t] = k.slice(prefix.length).split("-").map(Number);
-      return f <= to && from <= t;
-    });
-    if (taken) { refusal = "already_written"; continue; }
-    return allow(tool, `${prefix}${from}-${to}`);
+    const key = grantIdentity(a);
+    if (!fresh(key)) { refusal = "already_written"; continue; }
+    return allow(tool, key);
   }
   return deny(refusal);
 }
 
-/** The day a call writes, when it sends none: today, or last night for a sleep question (lib/checkin sleepAnswerDate). */
-function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
-  const date = str(input.date);
-  if (date) return date;
+/** The day a grant names none: today, or last night for a sleep question (lib/checkin sleepAnswerDate). */
+function defaultDay(tool: WriteToolName, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
   if (tool === "mark_habit_complete" && ctx.isSleepHabit?.(record)) return dayBefore(ctx.requestDay) ?? ctx.requestDay;
   return ctx.requestDay;
+}
+
+/** The day a call writes, when it sends none: the grant's default day. */
+function effectiveDay(tool: WriteToolName, input: Record<string, unknown>, record: string, ctx: { requestDay: string; isSleepHabit?: (habit: string) => boolean }): string {
+  return str(input.date) ?? defaultDay(tool, record, ctx);
 }
 
 /** The day check: the day the call writes is one the action names, or the default day when it names none. */
@@ -1396,9 +1507,10 @@ function argumentsFit(
 }
 
 /**
- * Whether a reading session call fits reading action `a` (its list): the chapters are numbers said as chapters, the
- * minutes a duration said ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes), the day, the book, the
- * user's words.
+ * Whether a reading session call fits reading action `a` (its list): the call covers EXACTLY the chapters the action
+ * grants (both of "chapters 3 and 4", every chapter of "ch. 5-7"), the minutes are the duration said and are sent
+ * when one is stated ("chapter 4 for 12 minutes" never gives chapter 12 or 4 minutes, and never drops the 12), the
+ * day, the book, the user's words.
  */
 function readingSessionFits(
   a: Action,
@@ -1409,7 +1521,7 @@ function readingSessionFits(
   const text = a.chainText;
   const book = bookCheck(input, a.sentence, ctx.books);
   if (book) return book;
-  const chapters = chapterNumbers(text);
+  const chapters = grantedChapters(text);
   const through = num(input.chapter_through);
   const finished = FINISHED_BOOK.test(text);
   if (through == null) return "not_named";
@@ -1420,9 +1532,22 @@ function readingSessionFits(
     if (!finished || total == null || through !== total) return "not_named";
   }
   const from = num(input.chapter_from);
-  if (from != null && from !== through && !chapters.has(from)) return "not_named";
+  if (chapters.size > 0) {
+    // The call must cover exactly the granted chapters: not a subset, not more.
+    if (from != null && from > through) return "not_named";
+    const covered = new Set<number>();
+    for (let c = from ?? through; c <= through; c++) covered.add(c);
+    if (covered.size !== chapters.size || [...chapters].some((c) => !covered.has(c))) return "not_named";
+  } else if (from != null && from !== through) {
+    return "not_named";
+  }
   const minutes = num(input.minutes);
-  if (minutes != null && !minuteValues(text).has(minutes)) return "amount_not_stated";
+  const statedMinutes = minuteValues(text);
+  if (statedMinutes.size > 0) {
+    if (minutes == null || !statedMinutes.has(minutes)) return "amount_not_stated";
+  } else if (minutes != null) {
+    return "amount_not_stated";
+  }
   const day = str(input.date) ?? ctx.requestDay;
   const days = allowedDays(a, ctx.requestDay);
   if (days.size > 0 ? !days.has(day) : day !== ctx.requestDay) return "day_not_stated";

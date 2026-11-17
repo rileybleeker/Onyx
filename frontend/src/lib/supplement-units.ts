@@ -76,10 +76,13 @@ export function compoundUnitLabel(c: CompoundIdentity & { source_units?: unknown
   return { unit: cls, converted: false, note: "not in mg", title: `Amount in ${cls} as on the label: not converted to mg and not added to an mg row` };
 }
 
-/** The view's own filter: an ingredient counts only when its quantity reads as digits and dots. */
+/**
+ * The view's own filter: an ingredient counts only when its quantity reads as a plain number —
+ * at least one digit and at most one dot ('10', '0.5', '.5'), never '1.2.3' (sql/supplement_quantity_strict.sql).
+ */
 export function isQuantified(q: unknown): boolean {
   if (typeof q === "number") return Number.isFinite(q) && q >= 0;
-  return typeof q === "string" && /^[0-9.]+$/.test(q);
+  return typeof q === "string" && /^[0-9]*\.?[0-9]+$/.test(q);
 }
 
 export interface UnquantifiedIngredient {

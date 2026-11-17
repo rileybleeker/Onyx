@@ -63,8 +63,9 @@ BEGIN
             RAISE EXCEPTION 'Browser role still holds a privilege on %', relation_name;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = relation_name::regclass
-                       AND i.indisunique AND i.indpred IS NULL) THEN
-            RAISE EXCEPTION 'Unique non-partial index missing on %', relation_name;
+                       AND i.indisunique AND i.indpred IS NULL
+                       AND i.indexprs IS NULL AND i.indisvalid AND i.indisready) THEN
+            RAISE EXCEPTION 'Usable unique non-partial index missing on %', relation_name;
         END IF;
         IF NOT (SELECT c.relispopulated FROM pg_class c WHERE c.oid = relation_name::regclass) THEN
             RAISE EXCEPTION 'Not populated (the facade read would fail): %', relation_name;
