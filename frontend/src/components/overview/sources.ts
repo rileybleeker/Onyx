@@ -27,6 +27,8 @@ export interface OverviewSource {
   persist?: boolean;
   /** Today's own panels already load this key on open: the card waits briefly for that answer first. */
   today?: boolean;
+  /** Warmed only on intent (hover/press on the page link), not by the background sweep (lib/warmup.ts intentOnly). */
+  intentOnly?: boolean;
 }
 
 const MIN = 60_000;
@@ -59,7 +61,7 @@ export function cardSources(id: string): OverviewSource[] {
       return [
         { key: "nutrition:overview-days", fetch: () => queries().then(async (q) => ({ rows: await q.getNutrition(8) })), check: CHECKS.rows, freshMs: 5 * MIN },
         // The URL /nutrition reads at its default range, so both share one cache entry.
-        { key: "/api/weight?days=90", fetch: json("/api/weight?days=90"), check: CHECKS.rows, freshMs: 5 * MIN },
+        { key: "/api/weight?days=90", fetch: json("/api/weight?days=90"), check: CHECKS.rows, freshMs: 5 * MIN, intentOnly: true },
         { key: "caffeine:overview-days", fetch: () => queries().then(async (q) => ({ rows: await q.getCaffeineDaily(8) })), check: CHECKS.rows, freshMs: 5 * MIN },
       ];
     case "supplements":
@@ -130,13 +132,13 @@ export function cachedVisibleCards(): string[] {
  * by rule (lib/client-cache.ts isSensitiveKey: /api/status, the agents inbox, ...) may still be warmed: the cache
  * never writes them to the device. Long freshness: the cards revalidate when they come into view.
  */
-export function overviewWarmers(): { key: string; fetch: () => Promise<unknown>; freshMs: number }[] {
-  const out: { key: string; fetch: () => Promise<unknown>; freshMs: number }[] = [];
+export function overviewWarmers(): { key: string; fetch: () => Promise<unknown>; freshMs: number; intentOnly?: boolean }[] {
+  const out: { key: string; fetch: () => Promise<unknown>; freshMs: number; intentOnly?: boolean }[] = [];
   for (const id of cachedVisibleCards()) {
     for (const s of cardSources(id)) {
       // The warm-up stores with the default persistence, so `persist: false` sources are left to the card itself.
       if (s.today || s.persist === false || out.some((w) => w.key === s.key)) continue;
-      out.push({ key: s.key, fetch: checkedFetch(s), freshMs: Math.max(s.freshMs, 10 * MIN) });
+      out.push({ key: s.key, fetch: checkedFetch(s), freshMs: Math.max(s.freshMs, 10 * MIN), intentOnly: s.intentOnly });
     }
   }
   return out;
