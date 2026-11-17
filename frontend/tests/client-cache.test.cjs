@@ -618,3 +618,32 @@ test('a wipe in the middle of a sweep ends the sweep without touching the store 
   await assert.doesNotReject(sweeping);
   assert.equal(backend.scope, writesBefore, 'no scope written after the wipe');
 });
+
+test('freshMs: a copy fetched within the window is reused with no GET; an older or invalidated copy is fetched again', async (t) => {
+  const c = clock();
+  const cache = makeCache(c);
+  const prior = globalThis.fetch;
+  t.after(() => { globalThis.fetch = prior; });
+  const url = '/api/weight?days=365';
+  let gets = 0;
+  globalThis.fetch = async () => { gets++; return { ok: true, status: 200, json: async () => ({ rows: [{ log_date: '2031-02-01', weight_kg: 80 }] }) }; };
+  const answer = { rows: [{ log_date: '2031-02-01', weight_kg: 80 }] };
+
+  assert.deepEqual(await cachedJson(url, { cache, freshMs: 60_000 }), answer);
+  assert.equal(gets, 1);
+
+  c.advance(30_000);
+  assert.deepEqual(await cachedJson(url, { cache, freshMs: 60_000 }), answer);
+  assert.equal(gets, 1, 'a fresh copy makes no request');
+
+  await cachedJson(url, { cache });
+  assert.equal(gets, 2, 'without freshMs the read still revalidates');
+
+  c.advance(61_000);
+  await cachedJson(url, { cache, freshMs: 60_000 });
+  assert.equal(gets, 3, 'an older copy is fetched again');
+
+  cache.remove([url]);
+  await cachedJson(url, { cache, freshMs: 60_000 });
+  assert.equal(gets, 4, 'an invalidated entry is never reused');
+});
