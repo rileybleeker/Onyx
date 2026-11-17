@@ -79,6 +79,8 @@ export default function JournalPage() {
   const [entries, setEntries] = useState<JournalEntryListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Failure opening one entry. Kept apart from `error` so the list stays visible.
+  const [entryError, setEntryError] = useState<string | null>(null);
 
   const [moodFilter, setMoodFilter] = useState<Mood | null>(null);
   const [topicFilter, setTopicFilter] = useState<string | null>(null);
@@ -136,6 +138,7 @@ export default function JournalPage() {
   }, [entries]);
 
   async function toggleExpand(id: string) {
+    setEntryError(null);
     if (expanded === id) {
       setExpanded(null);
       setFullEntry(null);
@@ -158,11 +161,11 @@ export default function JournalPage() {
         setFullEntry(data.entry);
       } else if (data.error) {
         console.error("Load journal entry:", data.error);
-        setError("Couldn't load that entry. Try again.");
+        setEntryError("Couldn't load that entry. Try again.");
       }
     } catch (e) {
       console.error("Load journal entry:", e);
-      setError("Couldn't open that entry. Try again.");
+      setEntryError("Couldn't open that entry. Try again.");
     } finally {
       setLoadingFull(false);
     }
@@ -184,7 +187,7 @@ export default function JournalPage() {
 
       {/* Personalize: the filter bar and the entry list are parts (no extra heading on screen). */}
       {!hydrated ? (
-        <div className="text-text-tertiary text-sm">Loading…</div>
+        <div role="status" className="text-text-tertiary text-sm">Loading…</div>
       ) : (
       <PartGrid page="/journal" title="Journal">
       <PartGroup id="section-journal" title="Journal entries">
@@ -195,6 +198,7 @@ export default function JournalPage() {
           <span className="text-[11px] text-text-tertiary uppercase tracking-wider">Mood</span>
           <button
             onClick={() => setMoodFilter(null)}
+            aria-pressed={moodFilter === null}
             className={`text-[12px] px-2 py-1 rounded border transition-colors ${
               moodFilter === null
                 ? "bg-white/10 text-text-primary border-border-subtle"
@@ -207,6 +211,7 @@ export default function JournalPage() {
             <button
               key={m}
               onClick={() => setMoodFilter(moodFilter === m ? null : m)}
+              aria-pressed={moodFilter === m}
               className={`text-[12px] px-2 py-1 rounded border transition-colors ${
                 moodFilter === m
                   ? MOOD_BADGE[m]
@@ -223,6 +228,7 @@ export default function JournalPage() {
             <span className="text-[11px] text-text-tertiary uppercase tracking-wider">Topic</span>
             <button
               onClick={() => setTopicFilter(null)}
+              aria-pressed={topicFilter === null}
               className={`text-[12px] px-2 py-1 rounded border transition-colors ${
                 topicFilter === null
                   ? "bg-white/10 text-text-primary border-border-subtle"
@@ -235,6 +241,7 @@ export default function JournalPage() {
               <button
                 key={t}
                 onClick={() => setTopicFilter(topicFilter === t ? null : t)}
+                aria-pressed={topicFilter === t}
                 className={`text-[12px] px-2 py-1 rounded border transition-colors ${
                   topicFilter === t
                     ? "bg-accent/10 text-accent border-accent/30"
@@ -253,15 +260,17 @@ export default function JournalPage() {
       {/* Entry list */}
       <Part id="entries" title="Entries">
       {loading ? (
-        <div className="text-text-tertiary text-sm">Loading…</div>
+        <div role="status" className="text-text-tertiary text-sm">Loading…</div>
       ) : error ? (
-        <div className="text-down text-sm">Error: {error}</div>
+        <div role="alert" className="text-down text-sm">Error: {error}</div>
       ) : entries.length === 0 ? (
         <div className="text-text-tertiary text-sm">No entries match these filters.</div>
       ) : (
         <ul className="space-y-2">
           {entries.map((e) => {
             const isOpen = expanded === e.notion_page_id;
+            // Valid HTML id: keep letters, digits, hyphens and underscores only.
+            const panelId = `journal-entry-${e.notion_page_id.replace(/[^A-Za-z0-9_-]/g, "")}`;
             return (
               <li
                 key={e.notion_page_id}
@@ -269,6 +278,8 @@ export default function JournalPage() {
               >
                 <button
                   onClick={() => toggleExpand(e.notion_page_id)}
+                  aria-expanded={isOpen}
+                  aria-controls={panelId}
                   className="w-full text-left px-4 py-3 hover:bg-white/[0.02] transition-colors"
                 >
                   <div className="flex items-baseline gap-3 flex-wrap">
@@ -317,13 +328,15 @@ export default function JournalPage() {
                 </button>
 
                 {isOpen && (
-                  <div className="px-4 pb-4 border-t border-border-subtle pt-3 bg-black/10">
+                  <div id={panelId} className="px-4 pb-4 border-t border-border-subtle pt-3 bg-black/10">
                     {loadingFull ? (
-                      <div className="text-text-tertiary text-sm">Loading full entry…</div>
+                      <div role="status" className="text-text-tertiary text-sm">Loading full entry…</div>
                     ) : fullEntry ? (
                       <div className="text-[14px] text-text-secondary leading-relaxed whitespace-pre-wrap">
                         {fullEntry.content_md}
                       </div>
+                    ) : entryError ? (
+                      <div role="alert" className="text-down text-sm">{entryError}</div>
                     ) : (
                       <div className="text-text-tertiary text-sm">No content.</div>
                     )}

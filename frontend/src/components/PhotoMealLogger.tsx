@@ -96,11 +96,6 @@ async function toJpegBase64(file: File): Promise<string> {
   }
 }
 
-async function errorOf(res: Response, fallback: string): Promise<string> {
-  const j = await res.json().catch(() => null);
-  return typeof j?.error === "string" ? j.error : `${fallback} (${res.status}).`;
-}
-
 const inputCls =
   "min-h-11 px-2 text-[16px] md:text-[13px] bg-black/30 border border-border-subtle rounded-control text-text-primary focus:border-accent/40 outline-none disabled:opacity-40";
 
@@ -188,7 +183,7 @@ export default function PhotoMealLogger({
         body: JSON.stringify({ image_base64: image, media_type: "image/jpeg" }),
       });
       if (!res.ok) {
-        setError(await errorOf(res, "The estimate failed"));
+        setError("Couldn't estimate this photo. Try again.");
         setPhase("idle");
         return;
       }
@@ -276,7 +271,7 @@ export default function PhotoMealLogger({
         body: JSON.stringify(parsed.value),
       });
       if (!res.ok) {
-        setError(`Not saved: ${await errorOf(res, "Save failed")}`);
+        setError("Couldn't save the meal. Try again.");
         setPhase("review");
         return;
       }
