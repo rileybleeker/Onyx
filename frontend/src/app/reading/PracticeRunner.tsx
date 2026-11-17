@@ -60,7 +60,9 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  *   anything is pending, for up to a minute. The next card never waits for a model grade.
  * - One request at a time; a card stays on failure. "Not sure it saved" offers Retry, which sends the SAME request
  *   (same attempt_key), so a lost answer is answered from its receipt. A refusal stored nothing: the answer can be
- *   changed and checked again. Typed answers live in memory only; unconfirmed requests are re-sent with keepalive
+ *   changed and checked again, except a refusal of a RETRY that names no reason (session, origin, size, rate limit),
+ *   which proves nothing about the earlier try and stays "not sure" with the same key (a highlight grade and a
+ *   Disagree behave the same). Typed answers live in memory only; unconfirmed requests are re-sent with keepalive
  *   when the page hides. Nothing is written to disk.
  * - Skip for now stores nothing and moves the card to the end (a second Skip takes it out of today's round). An
  *   incorrect answer brings the idea back once at the end with another variant ("Again"; it never moves the
@@ -78,6 +80,9 @@ import { AlertLine, AnswerBox, CardChips, ChoiceList, CoveredList, KeyPoints, Or
  * - "Not read yet" hides the held chapter and every later one at once, stored answers included: they leave the
  *   summary's list, the opened results and the chapter recall's Covered / Missed, because their prompts, answers
  *   and sources now state what Riley said he has not read (the counts stay; the answers are still valid).
+ * - "Not in this chapter" locks its idea the same way once it is sent (the server moves the idea and every question of
+ *   it to the end of the book): its answered cards leave the summary's list and the opened results, and a chapter
+ *   recall answer that listed the idea leaves with its Covered / Missed lists; the round is re-read.
  * - Keys only act from inside the runner (or with nothing focused) and never on an event another widget handled;
  *   Esc only with focus inside.
  * - The verdict is announced once (aria-live polite) as a word; every verdict on screen is an icon plus a word.
@@ -168,6 +173,12 @@ const typedUnsent = (it: Item) => answerable(it) && it.card.kind !== "highlight"
 const tooLong = (it: Item) => showsTextBox(it) && it.answer.length > ANSWER_MAX_CHARS;
 
 type Results = Record<string, AttemptResult>;
+
+/** A chapter recall card whose question lists this idea (the question the server re-versions when the idea moves or goes). */
+function recallListsIdea(it: Item, ideaId: number): boolean {
+  const rub = it.question ? parseRubric(it.question.rubric) : null;
+  return rub?.format === "chapter_recall" && rub.ideas.some((i) => i.idea_id === ideaId);
+}
 
 /** A stored answer a sent Wrong / Unclear flag voided: marked here at once, and read back as invalidated. */
 function isVoided(it: Item, results: Results, voided: ReadonlySet<string>): boolean {
@@ -334,6 +345,10 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
           holdGate(f);
           void reconcile();
         }
+        if (f.kind === "not_in_chapter") {
+          lockIdea(f);
+          void reconcile();
+        }
       },
     });
   }
@@ -368,6 +383,29 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     const keys = all
       .filter((x) => x.card.kind !== "highlight" && (x.card.key === flagged?.card.key || (from !== null && x.card.chapter !== null && (x.card.chapter >= from || x.card.chapter === 0))))
       .map((x) => x.card.key);
+    gateCards(keys);
+  }
+
+  /**
+   * A "Not in this chapter" the server confirmed moved the idea (and every question of it) to the end of the book,
+   * so its prompts, reference answers and sources are locked until the book is finished, and the chapter recall
+   * questions that list it were re-versioned without it. The answers stay valid (the counts stay), but their cards
+   * leave the summary's list and the opened results like a held chapter's, and a chapter recall answer that listed
+   * the idea leaves the Covered / Missed lists with it (the server hides that attempt too). An unanswered card of
+   * the idea is already off screen (the flag's own cards), and an unanswered recall card is left to the re-read.
+   */
+  function lockIdea(f: HeldFlag) {
+    const all = Object.values(itemsRef.current);
+    const ideaId = all.find((x) => x.question?.question_id === f.question_id)?.card.idea?.idea_id ?? null;
+    if (ideaId === null) return;
+    const keys = all
+      .filter((x) => x.card.kind !== "highlight" && (x.card.idea?.idea_id === ideaId || (x.card.kind === "chapter_recall" && x.stored && recallListsIdea(x, ideaId))))
+      .map((x) => x.card.key);
+    gateCards(keys);
+  }
+
+  /** Put these cards (by card key) behind the gate: nothing of them stays on screen, whatever their answers' state. */
+  function gateCards(keys: string[]) {
     if (!keys.length) return;
     const set = new Set(keys);
     gatedRef.current = new Set([...gatedRef.current, ...set]);
@@ -663,6 +701,9 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
   }
 
   async function send(key: string, req: AttemptRequest) {
+    // A request still in the outbox was sent before without a confirmed answer, so it may be stored already: a
+    // refusal of this retry that proves nothing (session, origin, size, rate limit) must not free its key.
+    const retried = outbox.current.has(req.attempt_key);
     busy.current = true;
     outbox.current.set(req.attempt_key, req);
     inflightKeys.current.add(req.attempt_key);
@@ -670,7 +711,7 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     inflightKeys.current.delete(req.attempt_key);
     busy.current = false;
     if (!alive.current) return;
-    const out = classifyAttemptAnswer(status, body);
+    const out = classifyAttemptAnswer(status, body, retried);
     if (out.kind === "saved") {
       outbox.current.delete(req.attempt_key);
       changed.current = true;
@@ -753,13 +794,15 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     const h = it?.card.highlight;
     if (!it || !h || busy.current || !(answerable(it) || it.phase === "unknown")) return;
     const attempt = attemptFor(it.review, { highlight_id: h.highlight_id, review_count: h.review_count }, g);
+    // This tap reuses the key of a try whose answer never came: a refusal of it settles nothing about that try.
+    const retried = it.review !== null && it.review.op_key === attempt.op_key;
     patch(key, { phase: "saving", review: attempt, message: null });
     setFocus("next");
     busy.current = true;
     const { status, body } = await track(postJson(REVIEW_URL, attempt));
     busy.current = false;
     if (!alive.current) return;
-    const out = classifyReviewAnswer(status, body);
+    const out = classifyReviewAnswer(status, body, retried);
     const b = (body ?? {}) as { interval_days?: unknown; next_review?: unknown };
     if (out.kind === "saved") {
       changed.current = true;
@@ -879,12 +922,14 @@ export default function PracticeRunner({ round, mode, onClose, onMore, onReread,
     const it = itemsRef.current[key];
     const k = it ? attemptKeyOf(it) : null;
     if (!it || !k || busy.current || it.change?.status === "saved" || it.change?.status === "saving") return;
+    // An earlier try of this change whose outcome is not known may be stored: a refusal that names no reason is not proof.
+    const retried = it.change?.status === "unknown";
     patch(key, { change: { mode, verdict, status: "saving" } });
     busy.current = true;
     const r = await track(postJson(overrideUrl(k), mode === "override" ? { verdict } : { self_grade: verdict }));
     busy.current = false;
     if (!alive.current) return;
-    const out = classifyOverrideAnswer(r.status, r.body);
+    const out = classifyOverrideAnswer(r.status, r.body, retried);
     if (out.kind === "saved") {
       changed.current = true;
       // The committed grade and schedule: "Next: ..." and the summary's next due read this receipt from now on.

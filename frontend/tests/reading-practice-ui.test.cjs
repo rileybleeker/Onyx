@@ -9,7 +9,9 @@
 // an approval or Turn off whose outcome is unknown says "Not sure" and re-reads; × and Esc ask before a typed answer
 // is dropped; an over-long answer waits; a flag on its way is re-sent with keepalive; "Not read yet" takes the held
 // chapter's answered cards off the summary; a chapter recall graded on the spot still reads its Covered / Missed; Start
-// waits until the round was read again.
+// waits until the round was read again. Review round 3: a retry refused before the receipt lookup (a session, origin or
+// rate-limit refusal) stays "not sure" under the same key, for an answer, a highlight grade and Disagree; "Not in this
+// chapter" locks its idea like "Not read yet" locks a chapter (summary, opened results, chapter recall lists).
 // Synthetic data only (invented prompts and answers); no network, no storage.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -1224,6 +1226,232 @@ test("grading a chapter recall answer yourself reads its Covered / Missed lists 
   await r.h.flush();
   assert.match(r.h.text(), /Covered\s*2/, "the lists are read once the grade is saved (the poll had stopped)");
   assert.doesNotMatch(r.h.text(), /Missed/);
+});
+
+test("a retry refused before the receipt lookup stays 'not sure' under the same key: the answer is never re-sent under a new key", async (t) => {
+  const cards = [cued(1), cued(2)];
+  // The first try may have been stored (its answer was lost); the retry is then refused by the session check (401)
+  // before the receipt is looked up, which proves nothing about the first try.
+  const r = mountRunner(t, {
+    cards,
+    answer: (b, n) => {
+      if (n === 1) throw new TypeError("offline");
+      if (n === 2) return response({ error: "unauthorized" }, 401);
+      return response(serverReceipt(cards, b, { replayed: true }));
+    },
+  });
+  await r.h.flush();
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  assert.match(r.alerts()[0], /Not sure it saved: No answer from Onyx/);
+  r.h.click("Retry");
+  await r.h.flush();
+  assert.equal(r.attempts().length, 2);
+  assert.match(r.alerts()[0], /Not sure it saved: Onyx refused this retry/, "not 'Not saved', not 'Nothing was saved'");
+  assert.doesNotMatch(r.alerts()[0], /Nothing was saved/);
+  assert.equal(r.h.buttons("Retry").length, 1, "Retry stays");
+  assert.equal(r.h.button("Next").props["aria-disabled"], true);
+  r.h.click("Retry");
+  await r.h.flush();
+  assert.equal(r.attempts().length, 3);
+  assert.deepEqual(r.attempts()[2].body, r.attempts()[0].body, "every try is the same request: the same attempt_key");
+  assert.equal(new Set(r.attempts().map((a) => a.body.attempt_key)).size, 1);
+  assert.equal(r.alerts().length, 0);
+  assert.equal(r.h.button("Next").props["aria-disabled"], undefined, "the receipt settled it");
+});
+
+test("a first try refused by the session check stored nothing: the answer is checked again under a new key", async (t) => {
+  const cards = [cued(1), cued(2)];
+  const r = mountRunner(t, { cards, answer: (b, n) => (n === 1 ? response({ error: "unauthorized" }, 401) : response(serverReceipt(cards, b))) });
+  await r.h.flush();
+  typeAnswer(r.h, "alpha 1");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  assert.match(r.alerts()[0], /Not saved: Onyx refused this answer\. Nothing was saved\./, "no earlier try exists, so this one is proof");
+  assert.equal(r.h.buttons("Retry").length, 0);
+  typeAnswer(r.h, "alpha 1 ");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  assert.notEqual(r.attempts()[1].body.attempt_key, r.attempts()[0].body.attempt_key);
+});
+
+test("a lost first try, then bank_off on its retry: the route looks the key up first, so nothing was stored (proof, \"Not saved\")", async (t) => {
+  const cards = [cued(1), cued(2)];
+  const r2 = mountRunner(t, {
+    cards,
+    answer: (b, n) => {
+      if (n === 1) throw new TypeError("offline");
+      return response({ error: "bank_off" }, 409);
+    },
+  });
+  await r2.h.flush();
+  typeAnswer(r2.h, "alpha 1");
+  await r2.h.flush();
+  r2.h.click("Check");
+  await r2.h.flush();
+  r2.h.click("Retry");
+  await r2.h.flush();
+  assert.match(r2.alerts()[0], /Not saved: Questions are off for this book\. Nothing was saved\./);
+  assert.equal(r2.h.buttons("Retry").length, 0);
+});
+
+test("a highlight grade retried after a lost answer and refused before the receipt keeps its op_key and 'not sure'", async (t) => {
+  const r = mountRunner(t, {
+    cards: [highlightCard(7), cued(2)],
+    review: (b, n) => {
+      if (n === 1) throw new TypeError("offline");
+      if (n === 2) return response({ error: "unauthorized" }, 401);
+      return response({ success: true, xp_gained: 15, next_review: "2026-03-11", interval_days: 1, op_key: b.op_key, replayed: true });
+    },
+  });
+  await r.h.flush();
+  r.h.click("Say what this means, then reveal your note");
+  await r.h.flush();
+  r.h.click("Good, next review in 1 day");
+  await r.h.flush();
+  assert.match(r.alerts()[0], /Not sure it saved/);
+  r.h.click("Retry");
+  await r.h.flush();
+  assert.match(r.alerts()[0], /Not sure it saved/, "a refused retry is not 'Not saved'");
+  assert.equal(r.h.buttons("Retry").length, 1);
+  r.h.click("Retry");
+  await r.h.flush();
+  const sent = r.calls.filter((c) => c.url === C.REVIEW_URL);
+  assert.equal(sent.length, 3);
+  assert.equal(new Set(sent.map((c) => c.body.op_key)).size, 1, "one op_key throughout");
+  assert.match(r.h.text(), /Saved · next in 1 day/);
+});
+
+test("a first highlight grade the session check refused stored nothing: 'Not saved', and another tap takes a new op_key", async (t) => {
+  const r = mountRunner(t, {
+    cards: [highlightCard(7), cued(2)],
+    review: (b, n) => (n === 1 ? response({ error: "unauthorized" }, 401) : response({ success: true, xp_gained: 15, next_review: "2026-03-11", interval_days: 1, op_key: b.op_key, replayed: false })),
+  });
+  await r.h.flush();
+  r.h.click("Say what this means, then reveal your note");
+  await r.h.flush();
+  r.h.click("Good, next review in 1 day");
+  await r.h.flush();
+  assert.match(r.alerts()[0], /Not saved/);
+  r.h.click("Good, next review in 1 day");
+  await r.h.flush();
+  const sent = r.calls.filter((c) => c.url === C.REVIEW_URL);
+  assert.equal(sent.length, 2);
+  assert.notEqual(sent[1].body.op_key, sent[0].body.op_key);
+});
+
+test("Not in this chapter locks its idea once sent: the answered card leaves the summary, and a chapter recall that listed the idea leaves with its Covered / Missed lists; other ideas stay", async (t) => {
+  let reread = 0;
+  // Idea 51 sits in the chapter recall's rubric (see recallCard); idea 60 does not.
+  const cards = [cued(51, { chapter: 2, again: false }), cued(60, { chapter: 2, again: false }), recallCard(2)];
+  const r = mountRunner(t, {
+    cards,
+    onReread: async () => {
+      reread += 1;
+      return round([cards[1]]);
+    },
+    poll: () => {
+      const recall = r.attempts().find((a) => a.body.question_id === 902);
+      return response({
+        round_key: ROUND_KEY,
+        attempts: recall
+          ? [{ attempt_key: recall.body.attempt_key, question_id: 902, grading_status: "graded", verdict: "dont_know", score: 0, hinted: false, feedback: null, rubric_hits: null, grader: "local", overridden: false, grade_error: null, overridable: false, self_gradable: false, covered_ideas: recallIdeas("dont_know") }]
+          : [],
+      });
+    },
+  });
+  await r.h.flush();
+  typeAnswer(r.h, "alpha 51");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  assert.match(r.h.text(), /Right/);
+  await menu(r.h, "Not in this chapter");
+  assert.match(r.h.text(), /Synthetic prompt 60\?/, "flagging from the result screen moves on");
+  typeAnswer(r.h, "alpha 60");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Next");
+  await r.h.flush();
+  assert.match(r.h.text(), /What do you remember of chapter 2\?/);
+  r.h.click("I don't know");
+  await r.h.flush();
+  assert.match(r.h.text(), /Missed\s*2/, "the recall answer lists the idea that is about to move");
+  r.h.click("Next");
+  await r.h.flush();
+  const before = r.h.text();
+  assert.match(before, /Round done/);
+  assert.match(before, /3 of 3/);
+  assert.match(before, /Synthetic prompt 51\?/, "still listed while the flag is held");
+  assert.equal(r.flagsSent().length, 0);
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent()[0].body.kind, "not_in_chapter");
+  assert.equal(r.flagsSent()[0].body.question_id, 151);
+  assert.equal(reread, 1, "the round is read again once it is sent");
+  const text = r.h.text();
+  assert.match(text, /Round done/);
+  assert.match(text, /Synthetic prompt 60\?/, "an idea that did not move stays listed");
+  for (const locked of [/Synthetic prompt 51\?/, /What do you remember of chapter 2\?/, /Synthetic statement 5[12]\./, /Missed/, /Covered/]) assert.doesNotMatch(text, locked);
+  assert.equal(r.h.find((n) => n.type === "button" && /Synthetic prompt 51\?|What do you remember/.test(r.h.text(n))).length, 0, "neither locked answer can be opened again");
+  assert.match(text, /3 of 3/, "the answers are still valid, so their counts stay");
+});
+
+test("Not in this chapter on an idea no chapter recall lists takes only that idea's answered cards off the summary", async (t) => {
+  const cards = [cued(61, { chapter: 2, again: false }), cued(62, { chapter: 2, again: false }), cued(63, { chapter: 3, again: false })];
+  const r = mountRunner(t, { cards, onReread: async () => round([cards[2]]) });
+  await r.h.flush();
+  for (const n of [61, 62]) {
+    typeAnswer(r.h, "alpha " + n);
+    await r.h.flush();
+    r.h.click("Check");
+    await r.h.flush();
+    if (n === 61) await menu(r.h, "Not in this chapter");
+    else {
+      r.h.click("Next");
+      await r.h.flush();
+    }
+  }
+  assert.match(r.h.text(), /Synthetic prompt 63\?/);
+  await r.timers.advance(C.FLAG_HOLD_MS, r.h);
+  assert.equal(r.flagsSent()[0].body.kind, "not_in_chapter");
+  typeAnswer(r.h, "alpha 63");
+  await r.h.flush();
+  r.h.click("Check");
+  await r.h.flush();
+  r.h.click("Next");
+  await r.h.flush();
+  const text = r.h.text();
+  assert.match(text, /3 of 3/);
+  assert.doesNotMatch(text, /Synthetic prompt 61\?/);
+  assert.match(text, /Synthetic prompt 62\?/);
+  assert.match(text, /Synthetic prompt 63\?/);
+});
+
+test("a retry's refusal that names no reason is 'not sure'; a named reason is proof; a first try is proof either way; Disagree behaves the same", () => {
+  // classifyAttemptAnswer(status, body, retry)
+  for (const [status, body] of [[401, { error: "unauthorized" }], [403, { error: "forbidden" }], [413, { error: "bad_request" }], [400, { error: "bad_request" }], [429, {}], [400, null]]) {
+    assert.equal(C.classifyAttemptAnswer(status, body).kind, "refused", "a first try: refused " + status);
+    assert.equal(C.classifyAttemptAnswer(status, body, true).kind, "unknown", "a retry: not sure " + status);
+  }
+  for (const [status, code] of [[409, "key_reused"], [400, "bad_answer"], [400, "states_missing"], [409, "bank_off"], [409, "quiz_closed"], [409, "already_answered"], [409, "quiz_other_book"]]) {
+    assert.equal(C.classifyAttemptAnswer(status, { error: code }, true).kind, "refused", "a retry: proof " + code);
+  }
+  for (const [status, code] of [[409, "question_changed"], [409, "retired"], [409, "locked"], [404, "not_found"]]) {
+    assert.equal(C.classifyAttemptAnswer(status, { error: code }, true).kind, "stale", "a retry: left out " + code);
+  }
+  const ok = { success: true, attempt_key: "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a", grading_status: "graded", verdict: "correct", score: 1, attempt_date: TODAY, next_review: "2026-03-11" };
+  assert.equal(C.classifyAttemptAnswer(200, ok, true).kind, "saved");
+  assert.equal(C.classifyAttemptAnswer(null, null, true).kind, "unknown");
+  assert.match(C.classifyAttemptAnswer(401, {}, true).message, /refused this retry/);
+  // classifyOverrideAnswer(status, body, retry)
+  assert.equal(C.classifyOverrideAnswer(401, { error: "unauthorized" }).kind, "refused");
+  assert.equal(C.classifyOverrideAnswer(401, { error: "unauthorized" }, true).kind, "unknown");
+  assert.equal(C.classifyOverrideAnswer(409, { error: "already_overridden" }, true).kind, "refused", "a named reason stays");
 });
 
 /* ------------------------------------------------------------------ */

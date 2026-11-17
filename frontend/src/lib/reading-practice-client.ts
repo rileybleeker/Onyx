@@ -325,8 +325,32 @@ export function parseReceipt(body: unknown): AttemptReceipt | null {
 
 const STALE_CODES = new Set(["question_changed", "retired", "superseded", "chapter_changed", "source_not_permitted"]);
 
-/** What the attempt route's answer means. `status` null = no answer at all (offline, timeout, the page went away). */
-export function classifyAttemptAnswer(status: number | null, body: unknown): AttemptOutcome {
+/**
+ * The codes the attempt route answers only once the key's receipt was looked up (or that the same body always gets):
+ * a stored request would have been answered its receipt instead, so one of them on a retry proves the earlier try
+ * stored nothing. Anything else on a retry (a session, origin, size or rate-limit refusal, a bad_request, a body with
+ * no code: all answered before the receipt is read) proves nothing about it.
+ */
+const PROVES_NOT_STORED = new Set(["key_reused", "bad_answer", "states_missing", "bank_off", "quiz_closed", "already_answered", "quiz_other_book"]);
+
+/**
+ * What the attempt route's answer means. `status` null = no answer at all (offline, timeout, the page went away).
+ *
+ * `retry`: this request reuses the key of an earlier try whose answer never came, so that try may have been stored.
+ * A refusal that does not prove otherwise (PROVES_NOT_STORED) stays "not sure": the card keeps its request and key,
+ * and only a receipt (a later Retry) settles it. Calling it "Nothing was saved" would let the next Check send the
+ * answer again under a new key, and a stored answer would count twice.
+ */
+export function classifyAttemptAnswer(status: number | null, body: unknown, retry = false): AttemptOutcome {
+  const out = classifyFirstTry(status, body);
+  if (retry && out.kind === "refused") {
+    const code = isObj(body) && typeof body.error === "string" ? body.error : "";
+    if (!PROVES_NOT_STORED.has(code)) return { kind: "unknown", message: "Onyx refused this retry, so the earlier try may be saved. Retry again." };
+  }
+  return out;
+}
+
+function classifyFirstTry(status: number | null, body: unknown): AttemptOutcome {
   if (status === null) return { kind: "unknown", message: "No answer from Onyx, so this answer may not be saved." };
   const code = isObj(body) && typeof body.error === "string" ? body.error : "";
   if (status >= 200 && status < 300) {
@@ -355,8 +379,12 @@ export function classifyAttemptAnswer(status: number | null, body: unknown): Att
 
 export type SmallOutcome<T> = { kind: "saved"; value: T } | { kind: "unknown"; message: string } | { kind: "refused"; message: string };
 
-/** Disagree (Correct / Partly / Missed, once) and "Grade it yourself". The same request replays its receipt. */
-export function classifyOverrideAnswer(status: number | null, body: unknown): SmallOutcome<AttemptReceipt> {
+/**
+ * Disagree (Correct / Partly / Missed, once) and "Grade it yourself". The same request replays its receipt.
+ * `retry`: an earlier try of this change never got an answer, so a refusal that names no reason (session, origin,
+ * size, rate limit) does not prove it stored nothing: "not sure", never "Nothing was saved".
+ */
+export function classifyOverrideAnswer(status: number | null, body: unknown, retry = false): SmallOutcome<AttemptReceipt> {
   if (status === null) return { kind: "unknown", message: "No answer from Onyx, so this may not be saved." };
   const code = isObj(body) && typeof body.error === "string" ? body.error : "";
   if (status >= 200 && status < 300) {
@@ -369,6 +397,7 @@ export function classifyOverrideAnswer(status: number | null, body: unknown): Sm
   if (status === 409 && code === "already_graded") return { kind: "refused", message: "Onyx graded it meanwhile." };
   if (status === 409 && code === "quiz_closed") return { kind: "refused", message: "The quiz result is recorded, so this grade stays." };
   if (status === 503 || status >= 500) return { kind: "unknown", message: "Onyx couldn't confirm the save." };
+  if (retry) return { kind: "unknown", message: "Onyx refused this retry, so the earlier try is still unconfirmed." };
   return { kind: "refused", message: "Onyx refused this change. Nothing was saved." };
 }
 
