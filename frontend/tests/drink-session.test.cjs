@@ -183,10 +183,27 @@ test("a removed drink is never resurrected by a late save", async () => {
 test("503 (not set up / turned off) is a definite refusal: not pending, shown, nothing saved", async () => {
   const { srv } = fresh();
   S.drinkSession.adopt(item());
-  const call503 = async (m, b) => { srv.log.push({ method: m, body: b }); return { ok: false, status: 503, json: { error: "Drinks are not set up yet: the database migration is pending." } }; };
+  const call503 = async (m, b) => { srv.log.push({ method: m, body: b }); return { ok: false, status: 503, json: { error: "Drinks are not set up yet: the database migration is pending.", code: "unavailable" } }; };
   await assert.rejects(S.saveDrinkWith(call503, save()), (e) => e instanceof AutosaveRefused && /migration is pending/.test(e.message));
   assert.equal(S.drinkSession.get(KEY).pending, null);
   assert.equal(S.drinkSession.ack(KEY), undefined, "never Saved");
+});
+
+test("autosave failures show fixed copy, not raw server text or the status number", async () => {
+  const { srv } = fresh();
+  S.drinkSession.adopt(item());
+  const leaky = (status, json) => async (m, b) => { srv.log.push({ method: m, body: b }); return { ok: false, status, json }; };
+  // A 500 with server text is retried (Error), and its text is not shown.
+  const e500 = await S.saveDrinkWith(leaky(500, { error: "relation pds.x does not exist" }), save()).catch((e) => e);
+  assert.ok(e500 instanceof Error && !(e500 instanceof AutosaveRefused));
+  assert.equal(e500.message, "Could not save the drink. Try again.");
+  // An unknown 404 is refused with fixed copy, not "drink not found".
+  const e404 = await S.saveDrinkWith(leaky(404, { error: "drink not found" }), save()).catch((e) => e);
+  assert.ok(e404 instanceof AutosaveRefused);
+  assert.equal(e404.message, "Could not save the drink. Try again.");
+  // A time problem keeps the app's own sentence for its fixed code.
+  const eTime = await S.saveDrinkWith(leaky(400, { error: "x", code: "future" }), save()).catch((e) => e);
+  assert.equal(eTime.message, C.TIME_PROBLEM_TEXT.future);
 });
 
 function reload(storage) {
