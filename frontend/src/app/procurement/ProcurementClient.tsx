@@ -20,7 +20,7 @@ const SUBSCRIPTIONS_API = '/api/procurement/subscriptions';
 const persistenceNote = {
   checking: 'Checking for saved subscriptions...',
   saved: 'Saved to your Onyx account. Synthetic demo rows are never saved.',
-  pending: 'Not saved yet - setup pending. The subscription table has not been created in Supabase, so this tracker works for this visit only and clears on reload.',
+  pending: 'Not saved yet: saving is not set up on this site, so this tracker works for this visit only and clears on reload.',
   unavailable: 'Saved subscriptions could not be loaded right now. This tracker works for this visit only and clears on reload.',
 } as const;
 const cycleLabel = { monthly: 'month', quarterly: 'quarter', annual: 'year' } as const;
