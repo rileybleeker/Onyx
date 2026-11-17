@@ -387,7 +387,10 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
     if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
     return atomically(() => ({ data: stampTx(a.p_cycle_date, a.p_question), error: null }));
   };
-  /** pds.move_reading_session: the session's new values, the new day's stamp and the old day's settle, one transaction. */
+  /**
+   * pds.move_reading_session: every edit in one transaction: the session's new values, the books' finish (from the row
+   * as it was), and for a move the new day's stamp and the old day's settle.
+   */
   const move = async (a) => {
     log.push({ table: "move_reading_session", op: "rpc", payload: { session_id: a.p_session_id } });
     if (noDiscards) return { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
@@ -398,7 +401,10 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       const oldBook = tables.books.find((x) => x.book_id === row.book_id);
       const newBook = tables.books.find((x) => x.book_id === a.p_book_id);
       if (!newBook) return { data: null, error: { code: "OXR03", message: "no such book" } };
+      const prev = { ...row };
       const oldDate = row.session_date;
+      const sameBook = row.book_id === a.p_book_id;
+      const moved = oldDate !== a.p_session_date || !sameBook;
       Object.assign(row, {
         book_id: a.p_book_id,
         session_date: a.p_session_date,
@@ -409,10 +415,32 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
         recall: a.p_recall,
         question: a.p_question,
       });
-      const stamp = newBook.habit_name ? stampTx(a.p_session_date, newBook.habit_name) : { marked: false, created: false };
-      const settled = oldBook?.habit_name ? settleTx(oldDate, oldBook.habit_name, a.p_habit_created_on) : { removed: false, restored: false };
+      const earliestFinishing = (b) =>
+        tables.reading_sessions.filter((s) => s.book_id === b.book_id && s.chapter_through >= b.total_chapters).map((s) => s.session_date).sort()[0] ?? null;
+      const reaches = newBook.total_chapters > 0 && a.p_chapter_through >= newBook.total_chapters;
+      let finished = false;
+      let unfinished = false;
+      if (reaches && newBook.status !== "finished") {
+        Object.assign(newBook, { status: "finished", finished_on: a.p_session_date });
+        finished = true;
+      } else if (reaches && sameBook && oldDate !== a.p_session_date && newBook.finished_on === oldDate && (prev.chapter_through ?? 0) >= newBook.total_chapters) {
+        const next = earliestFinishing(newBook);
+        if (next && next !== newBook.finished_on) newBook.finished_on = next;
+      }
+      if (
+        !(sameBook && reaches) && oldBook && oldBook.status === "finished" && oldBook.total_chapters > 0 &&
+        (prev.chapter_through ?? 0) >= oldBook.total_chapters && oldBook.finished_on === oldDate
+      ) {
+        const next = earliestFinishing(oldBook);
+        if (next === null) {
+          Object.assign(oldBook, { status: "reading", finished_on: null });
+          unfinished = true;
+        } else if (next !== oldBook.finished_on) oldBook.finished_on = next;
+      }
+      const stamp = moved && newBook.habit_name ? stampTx(a.p_session_date, newBook.habit_name) : { marked: false, created: false };
+      const settled = moved && oldBook?.habit_name ? settleTx(oldDate, oldBook.habit_name, a.p_habit_created_on) : { removed: false, restored: false };
       return {
-        data: JSON.parse(JSON.stringify({ moved: true, session: row, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored })),
+        data: JSON.parse(JSON.stringify({ moved: true, session: row, book: newBook, finished, unfinished, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored })),
         error: null,
       };
     });
@@ -860,6 +888,61 @@ test("a move: the habit part failing rolls the whole move back; without the SQL 
   assert.equal((await R.updateSession(gone, 41, upd({ date: "2026-11-13" }))).status, 404);
 });
 
+test("an edit whose answer was lost after it committed: the retry leaves no finish behind (Codex review of PR 376, round 4)", async () => {
+  // The answer of the edit's transaction is lost on the way back (it committed); the route answers an error and the
+  // form sends the same values again.
+  const loseNextEditAnswer = (db) => {
+    const realRpc = db.rpc;
+    let lose = true;
+    db.rpc = async (name, args) => {
+      const out = await realRpc(name, args);
+      if (name === "move_reading_session" && lose) {
+        lose = false;
+        return { data: null, error: { code: "08006", message: "connection lost" } };
+      }
+      return out;
+    };
+  };
+  const OTHER = { ...BOOK, book_id: 8, slug: "other-book", habit_name: null };
+  // A finishing session moved to another book: the first book goes back to reading in the same transaction.
+  const finished = { ...BOOK, status: "finished", finished_on: "2026-11-15" };
+  const toOther = fakeDb({ books: [finished, OTHER], reading_sessions: [session({ chapter_through: 12 })] });
+  loseNextEditAnswer(toOther);
+  const lost = await R.updateSession(toOther, 41, upd({ book: "other-book", chapter_through: 5 }));
+  assert.equal(lost.ok, false, "the route answers an error");
+  assert.equal(toOther.tables.books[0].status, "reading", "but the finish went back with the move itself");
+  const retry = await R.updateSession(toOther, 41, upd({ book: "other-book", chapter_through: 5 }));
+  assert.equal(retry.ok, true);
+  assert.equal(toOther.tables.books[0].status, "reading");
+  assert.equal(toOther.tables.books[0].finished_on, null);
+  // A finishing session moved to another day of its book: the finish day follows in the same transaction.
+  const day = fakeDb({ books: [finished], reading_sessions: [session({ chapter_through: 12 })] });
+  loseNextEditAnswer(day);
+  assert.equal((await R.updateSession(day, 41, upd({ chapter_through: 12, date: "2026-11-14" }))).ok, false);
+  assert.equal(day.tables.books[0].finished_on, "2026-11-14");
+  assert.equal((await R.updateSession(day, 41, upd({ chapter_through: 12, date: "2026-11-14" }))).ok, true);
+  assert.equal(day.tables.books[0].finished_on, "2026-11-14");
+  // An edit below the last chapter on the same day: the finish it caused went back with the edit.
+  const below = fakeDb({ books: [finished], reading_sessions: [session({ chapter_through: 12 })] });
+  loseNextEditAnswer(below);
+  assert.equal((await R.updateSession(below, 41, upd({ chapter_through: 11 }))).ok, false);
+  assert.equal(below.tables.books[0].status, "reading");
+  const again = await R.updateSession(below, 41, upd({ chapter_through: 11 }));
+  assert.equal(again.ok, true);
+  assert.equal(again.book.status, "reading", "the answer reads the book as it is");
+  assert.equal(below.log.filter((l) => l.table === "books" && l.op === "update").length, 0, "no finish request outside the transaction");
+});
+
+test("an edit that keeps the day and the book has no habit part, and is one database call", async () => {
+  const db = fakeDb({ books: [BOOK], reading_sessions: [session({})], habit_journal: [yes("2026-11-15")] });
+  const r = await R.updateSession(db, 41, upd({ chapter_through: 6, habit_created_on: "2026-11-15" }));
+  assert.equal(r.ok, true);
+  assert.equal(r.habitMarked, false);
+  assert.equal(r.habitCreatedOn, "2026-11-15", "the habit day stays as it was");
+  assert.deepEqual(db.tables.habit_journal, [yes("2026-11-15")]);
+  assert.equal(db.log.filter((l) => l.table === "move_reading_session").length, 1);
+});
+
 test("a removal whose habit part fails rolls back whole and is reported, never 'removed' with a Yes left (Codex review of PR 376, round 2)", async () => {
   const db = fakeDb({ books: [BOOK] }, { settleError: "P0001" });
   await R.logSession(db, create({ date: "2026-11-15" }));
@@ -960,16 +1043,24 @@ test("removal whose answer was lost: the database part committed whole, the retr
 
 /* ---------- Notion cleanup completion races (Codex T01-R9) ---------- */
 
-/** reading-removal.ts with a controllable Notion: `trash(id)` and `progress()` answer what the test says. */
+/**
+ * reading-removal.ts with a controllable Notion: `trash(id)` and `progress(chaptersDone)` answer what the test says;
+ * `written` lists the progress lines written (chapters done). The book's overview is `notion.overview()` (read from
+ * the database in the real module), so a test can change it between the cleanup's read and its write.
+ */
 function removalWithNotion() {
-  const notion = { trashed: [], trash: async () => true, progress: async () => true };
+  const notion = { trashed: [], written: [], trash: async () => true, progress: async () => true, overview: async () => ({ chaptersDone: 3, sessions: [] }) };
   const RR = loadTs("lib/reading-removal.ts", {
+    "./reading": { ...R, getOverview: async () => notion.overview() },
     "./reading-notion": {
       removeMirroredBlock: async (id) => {
         notion.trashed.push(id);
         return notion.trash(id);
       },
-      mirrorProgress: async () => notion.progress(),
+      mirrorProgress: async (_book, chaptersDone) => {
+        notion.written.push(chaptersDone);
+        return notion.progress(chaptersDone);
+      },
     },
   });
   return { RR, notion };
@@ -1050,6 +1141,47 @@ test("T01-R9: markRemovalMirrored closes only the entry the caller handled", asy
   await R.markRemovalMirrored(db, 41, "blk-old");
   assert.equal(db.tables.reading_session_removals[0].mirror_done_at, null, "nor does a run that handled another entry");
   await R.markRemovalMirrored(db, 41, "blk-new");
+  assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null);
+});
+
+test("two removals of one book whose cleanups finish out of order: the older line written last leaves its row open, and the sweep writes the current line (Codex review of PR 376, round 4)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({
+    books: [PAGED_BOOK],
+    reading_session_removals: [removalRow({ session_id: 41 }), removalRow({ session_id: 42, client_key: null })],
+  });
+  // The database as it is: after the first removal 5 chapters are done; after the second, 3.
+  let chapters = 5;
+  notion.overview = async () => ({ chaptersDone: chapters, sessions: [] });
+  // The first removal's cleanup read "5" and its Notion write is slow.
+  const gate = deferred();
+  notion.progress = (n) => (n === 5 ? gate.promise : Promise.resolve(true));
+  const first = RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow({ session_id: 41 })) }, answerFor());
+  await new Promise((r) => setImmediate(r));
+  // The second removal commits and its cleanup writes "3" and closes its row.
+  chapters = 3;
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow({ session_id: 42 })) }, answerFor());
+  const byId = (id) => db.tables.reading_session_removals.find((x) => x.session_id === id);
+  assert.notEqual(byId(42).mirror_done_at, null, "its line matched the database after its write: done");
+  // The first one's older line now lands last. It reads the book again, sees it changed, and stays owed.
+  gate.resolve(true);
+  await first;
+  assert.deepEqual(notion.written, [5, 3], "the older line went out first and landed last");
+  assert.equal(byId(41).mirror_done_at, null, "not closed: its line may be the stale one on the page");
+  // The sweep's run writes the line from the database as it is now and closes it.
+  notion.progress = async () => true;
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(byId(41)) }, answerFor());
+  assert.equal(notion.written[notion.written.length - 1], 3, "the current line is written last");
+  assert.notEqual(byId(41).mirror_done_at, null);
+});
+
+test("a removal cleanup writes the progress line from the database at write time, not from the answer's overview (Codex review of PR 376, round 4)", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [PAGED_BOOK], reading_session_removals: [removalRow()] });
+  notion.overview = async () => ({ chaptersDone: 2, sessions: [] });
+  const stale = { ...answerFor(), overview: { chaptersDone: 9, sessions: [] } };
+  await RR.runRemovalCleanup(db, { ok: true, removed: null, unfinished: false, cleanup: cleanupOf(removalRow()) }, stale);
+  assert.deepEqual(notion.written, [2]);
   assert.notEqual(db.tables.reading_session_removals[0].mirror_done_at, null);
 });
 

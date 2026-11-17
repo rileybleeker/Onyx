@@ -787,11 +787,14 @@ async function createKeyedSession(
 const MOVE_UNAVAILABLE = "Moving a session to another day or book isn't available until sql/reading_session_discards.sql is applied.";
 
 /**
- * A session moved to another day or book (pds.move_reading_session, sql/reading_session_discards.sql): its new values
- * and the habit part of the move in ONE transaction (Codex review of PR 376, round 2). The new day's habit is stamped
- * and the old day's is settled from the habit row's own record, so the old day's Yes goes back also when the browser
- * knows no habit day (a create whose answer was lost and replayed). A failed habit part rolls the move back (500, the
- * form retries). Without the function: 503 and nothing moved, never a move in separate requests.
+ * An edit of a session (pds.move_reading_session, sql/reading_session_discards.sql): its new values, the habit part
+ * of a move and the books' finish state in ONE transaction (Codex review of PR 376, rounds 2 and 4). The new day's
+ * habit is stamped and the old day's is settled from the habit row's own record, so the old day's Yes goes back also
+ * when the browser knows no habit day (a create whose answer was lost and replayed). The finish is decided from the
+ * row as it was under its lock, so an edit whose answer was lost leaves nothing for its retry to miss (the old book's
+ * finish used to be taken back in a later request, from values the retry no longer saw). A failed habit part rolls
+ * the edit back (500, the form retries). Without the function: 503 and nothing changed, never a move in separate
+ * requests (updateSession falls back for an edit that keeps the day and the book only).
  */
 async function moveSessionTx(
   supabase: Supa,
@@ -808,7 +811,7 @@ async function moveSessionTx(
   },
   habitCreatedOn: string | null,
 ): Promise<
-  | { ok: true; session: ReadingSession; marked: boolean; created: boolean }
+  | { ok: true; session: ReadingSession; book: Book | null; finished: boolean; unfinished: boolean; marked: boolean; created: boolean }
   | { ok: false; status: number; error: string }
 > {
   const { data, error } = await supabase.rpc("move_reading_session", {
@@ -829,13 +832,26 @@ async function moveSessionTx(
     if (discardsMissing(error)) return { ok: false, status: 503, error: MOVE_UNAVAILABLE };
     return { ok: false, status: 500, error: error.message ?? "Couldn't move the session." };
   }
-  const out = (data ?? null) as { moved?: unknown; session?: unknown; habit_marked?: unknown; habit_created?: unknown } | null;
+  const out = (data ?? null) as { moved?: unknown; session?: unknown; book?: unknown; finished?: unknown; unfinished?: unknown; habit_marked?: unknown; habit_created?: unknown } | null;
   if (!out || typeof out !== "object" || typeof out.moved !== "boolean") return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
   if (!out.moved) return { ok: false, status: 404, error: "That session no longer exists." };
   const raw = out.session;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
   const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, (raw as Record<string, unknown>)[k] ?? null])) as unknown as ReadingSession;
-  return { ok: true, session, marked: out.habit_marked === true, created: out.habit_created === true };
+  const rawBook = out.book;
+  const book =
+    rawBook && typeof rawBook === "object" && !Array.isArray(rawBook) && Number.isFinite(Number((rawBook as Record<string, unknown>).book_id))
+      ? (Object.fromEntries(BOOK_KEYS.map((k) => [k, (rawBook as Record<string, unknown>)[k] ?? null])) as unknown as Book)
+      : null;
+  return {
+    ok: true,
+    session,
+    book,
+    finished: out.finished === true,
+    unfinished: out.unfinished === true,
+    marked: out.habit_marked === true,
+    created: out.habit_created === true,
+  };
 }
 
 /** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
@@ -1219,55 +1235,54 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
   const sameBook = book.book_id === previousBook.book_id;
   const moved = date !== previous.session_date || !sameBook;
 
-  // A move (another day or book) writes the session together with its habit part in one transaction: the new day is
-  // stamped, and the old day's Yes is taken back from the habit row's own record when this was the last session there
-  // (Codex review of PR 376, round 2: before, a move after a replayed create, whose answer carried no habit day, left
-  // the old day's Yes behind). Any other edit is a plain update of the session.
+  // Every edit is one transaction (pds.move_reading_session): the session, the habit part of a move (the new day
+  // stamped, the old day's Yes taken back from the habit row's own record when this was the last session there; Codex
+  // review of PR 376, round 2) and the finish of both books (round 4: done here in later requests, a move whose answer
+  // was lost left the old book finished for good, because its retry read the moved session as the "before").
+  const xpGained = sessionXp(through, prevMax, patch.recall);
   let session: ReadingSession;
   let habitMarked = false;
   let habitCreatedOn = input.habit_created_on;
-  if (moved) {
-    const mv = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on);
-    if (!mv.ok) return mv;
-    session = mv.session;
-    habitMarked = mv.marked;
-    const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
-    habitCreatedOn = sameRow ? input.habit_created_on : mv.created ? date : null;
-  } else {
-    const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
-    if (error) return { ok: false, status: 500, error: error.message };
-    session = data as ReadingSession;
-  }
-
-  const xpGained = sessionXp(through, prevMax, patch.recall);
-  const total = book.total_chapters;
-  const reachesEnd = !!total && through >= total;
-
-  // Finished: set it, move it with its session, or take back the finish this session caused.
   let finished = false;
   let unfinished = false;
   let finishedOn = book.finished_on;
   let status = book.status;
-  if (reachesEnd && book.status !== "finished") {
-    await supabase.from("books").update({ status: "finished", finished_on: date }).eq("book_id", book.book_id);
-    finished = true;
-    status = "finished";
-    finishedOn = date;
-  } else if (
-    reachesEnd &&
-    sameBook &&
-    date !== previous.session_date &&
-    book.finished_on === previous.session_date &&
-    (previous.chapter_through ?? 0) >= (total ?? Infinity)
-  ) {
-    await supabase.from("books").update({ finished_on: date }).eq("book_id", book.book_id);
-    finishedOn = date;
-  }
-  if (!(sameBook && reachesEnd)) {
-    unfinished = await undoFinishIfOnlyThis(supabase, previousBook, previous, sessionId);
-    if (unfinished && sameBook) {
-      status = "reading";
-      finishedOn = null;
+  const tx = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on);
+  if (tx.ok) {
+    session = tx.session;
+    habitMarked = tx.marked;
+    finished = tx.finished;
+    unfinished = tx.unfinished;
+    if (tx.book) {
+      status = tx.book.status;
+      finishedOn = tx.book.finished_on;
+    }
+    if (moved) {
+      const sameRow = book.habit_name === previousBook.habit_name && date === previous.session_date;
+      habitCreatedOn = sameRow ? input.habit_created_on : tx.created ? date : null;
+    }
+  } else if (moved || tx.status !== 503) {
+    return tx;
+  } else {
+    // sql/reading_session_discards.sql not applied yet: an edit that keeps the day and the book is the plain update
+    // and finish requests from before that file (a move is refused above).
+    const { data, error } = await supabase.from("reading_sessions").update(patch).eq("session_id", sessionId).select(SESSION_COLS).single();
+    if (error) return { ok: false, status: 500, error: error.message };
+    session = data as ReadingSession;
+    const total = book.total_chapters;
+    const reachesEnd = !!total && through >= total;
+    if (reachesEnd && book.status !== "finished") {
+      await supabase.from("books").update({ status: "finished", finished_on: date }).eq("book_id", book.book_id);
+      finished = true;
+      status = "finished";
+      finishedOn = date;
+    }
+    if (!reachesEnd) {
+      unfinished = await undoFinishIfOnlyThis(supabase, previousBook, previous, sessionId);
+      if (unfinished) {
+        status = "reading";
+        finishedOn = null;
+      }
     }
   }
 

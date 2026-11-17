@@ -161,8 +161,15 @@ type ReadingFormData = {
   discarding: boolean;
   /** The Say it draft the discarded entry was made from: dropped from the store with it. */
   discardDraft: number | null;
-  /** The last save was a discard the server confirmed: the status line says "Discarded". */
+  /** The last save was a discard the server confirmed: the status line says "Discarded" (or "Removed"). */
   discarded: boolean;
+  /**
+   * The DISCARD being saved (or just confirmed) is "Remove this session": the status line says Removing / Not removed /
+   * Removed. Remove goes through the same retained saver as Discard (Codex review of PR 376, round 4): until the server
+   * confirms the removal the entry stays unsaved work, so a failed or malformed answer keeps its session id, key and
+   * Retry also across an unmount.
+   */
+  removal: boolean;
   /**
    * The book on screen when this entry was started (when the form has no book of its own). A restored entry, or a
    * later edit of the session it made, stays with that book even if the current book changes meanwhile.
@@ -249,6 +256,7 @@ const newReadingData = (): ReadingFormData => ({
   discarding: false,
   discardDraft: null,
   discarded: false,
+  removal: false,
   entryBook: null,
   entryStarted: false,
   entrySent: false,
@@ -378,7 +386,7 @@ export default function ReadingSection() {
       // Only the removal's own receipt lets the entry go (Codex T01-R8): 200 naming this session id or this key (or
       // 404 "session_gone" for an id). An empty, malformed or redirected answer is retried and the entry, its draft
       // and its key stay. A refusal is shown and not retried.
-      const reply = await readRemovalReply(res, id !== null ? { sessionId: id } : { clientKey: kept.clientKey });
+      const reply = await readRemovalReply(res, id !== null ? { sessionId: id } : { clientKey: kept.clientKey }, kept.removal ? "Removing the session" : undefined);
       if (cancelled()) return;
       if (reply.kind === "refused") throw new AutosaveRefused(reply.error);
       if (reply.kind === "unconfirmed") throw new Error(reply.error);
@@ -395,8 +403,10 @@ export default function ReadingSection() {
     setSaved(null);
     if (kept.discarding) {
       const words = kept.discardDraft;
+      const removal = kept.removal;
       forgetEntry();
       kept.discarded = true;
+      kept.removal = removal;
       if (words !== null) clear(words);
     }
     showOverview(overview);
@@ -432,8 +442,6 @@ export default function ReadingSection() {
   const [sessionId, setSessionIdState] = useState<number | null>(() => kept.sessionId);
   const [saved, setSavedState] = useState<SavedInfo>(() => kept.saved);
   const [heldDraft, setHeldDraftState] = useState(() => kept.heldDraft);
-  const [removing, setRemoving] = useState(false);
-  const [removeError, setRemoveError] = useState<string | null>(null);
   const { draft, clear } = useLogDrafts("reading");
   // The status line under the form: the fields point at it while it says why the entry is not saved.
   const statusId = `log-reading-status${useId().replace(/:/g, "")}`;
@@ -545,11 +553,12 @@ export default function ReadingSection() {
   /** The form changed by Riley or his Say it words: show it and hand it to the autosaver. */
   const commit = (next: Form) => {
     setForm(next);
-    setRemoveError(null);
-    // Any change continues the entry: a discard still waiting or out no longer drops it (DISCARD is replaced).
+    // Any change continues the entry: a discard (or removal) still waiting or out no longer drops it (DISCARD is
+    // replaced).
     kept.discarding = false;
     kept.discardDraft = null;
     kept.discarded = false;
+    kept.removal = false;
     const cur = overviewRef.current;
     const anyBook = !!next.book && next.book !== cur?.book.slug;
     if (kept.sessionId === null && !anyBook && !kept.touched.date && isBlankSession(next, { medium: DEFAULT_MEDIUM })) {
@@ -624,6 +633,7 @@ export default function ReadingSection() {
     kept.discarding = false;
     kept.discardDraft = null;
     kept.discarded = false;
+    kept.removal = false;
     kept.entryBook = null;
     kept.entryStarted = false;
     kept.entrySent = false;
@@ -638,7 +648,6 @@ export default function ReadingSection() {
   /** Start the next session: the one on screen is kept as saved. */
   const startNew = useCallback(() => {
     forgetEntry();
-    setRemoveError(null);
     autosave.reset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autosave.reset, kept]);
@@ -660,10 +669,10 @@ export default function ReadingSection() {
       if (words !== null) clear(words);
       return;
     }
-    setRemoveError(null);
     kept.discarding = true;
     kept.discardDraft = words;
     kept.discarded = false;
+    kept.removal = false;
     autosave.change(DISCARD);
     void autosave.retry(); // at once; also after a refused discard, which change() alone would leave as it was
   };
@@ -732,33 +741,31 @@ export default function ReadingSection() {
     clear(draft?.id);
   };
 
-  const removeSession = async () => {
-    const id = kept.sessionId;
-    if (id === null || removing) return;
-    autosave.reset(); // an edit still waiting belongs to the session being removed
-    setRemoving(true);
-    setRemoveError(null);
-    try {
-      const day = kept.habitCreatedOn;
-      const res = await fetch(`/api/reading/sessions/${id}${day ? `?habit_created_on=${encodeURIComponent(day)}` : ""}`, { method: "DELETE" });
-      // Only the removal's own receipt (200 naming this id, or 404 "session_gone") clears the form (Codex T01-R8).
-      const reply = await readRemovalReply(res, { sessionId: id }, "Removing the session");
-      if (reply.kind !== "confirmed") throw new Error(reply.error);
-      if (!alive.current) return;
-      startNew();
-      showOverview(reply.overview);
-    } catch (e) {
-      if (alive.current) setRemoveError(`Couldn't remove the session: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      if (alive.current) setRemoving(false);
-    }
+  /**
+   * Remove the session this form made. Saved through the retained autosaver like Discard (DISCARD, removed by its id in
+   * discardStored), never as a request on the side (Codex review of PR 376, round 4): before, the saver was reset
+   * first, so a failed or malformed DELETE answer left a form the saver counted as clean, and an unmount then dropped
+   * the session id, the key and the Retry. Now an edit still waiting is replaced by the removal (it belongs to the
+   * session being removed, so it is never sent), the entry stays unsaved work until the route's own receipt arrives
+   * (retried, also while the section is away), and only then does the form start fresh. Pressed again after a failure
+   * it tries again at once.
+   */
+  const removeSession = () => {
+    if (kept.sessionId === null) return;
+    kept.discarding = true;
+    kept.discardDraft = null;
+    kept.discarded = false;
+    kept.removal = true;
+    autosave.change(DISCARD);
+    void autosave.retry(); // at once; also after a failed removal, which change() alone would leave as it was
   };
 
   const marked = (field: Field) => !!fromDraft?.fields[field];
   const anyMarked = !!fromDraft && Object.values(fromDraft.fields).some(Boolean);
   const draftUnused = !!draft && (!fromDraft || fromDraft.id !== draft.id || !anyMarked);
   const st = autosave.state.status;
-  const busy = st === "saving" || removing;
+  const busy = st === "saving";
+  const removing = st === "saving" && kept.discarding && kept.removal;
 
   // An entry this form still holds (not saved yet, or the session it made) stays on screen with its fields, reason
   // and Retry also when there is no book in progress any more (the book was finished or set aside elsewhere) or the
@@ -805,11 +812,17 @@ export default function ReadingSection() {
   const day = form.date || today;
   const anyTouched = Object.values(kept.touched).some(Boolean) || anyMarked;
   const describedBy = (st === "incomplete" && anyTouched) || st === "error" ? statusId : undefined;
-  const savedText = kept.discarded ? "Discarded" : `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
+  const savedText = kept.discarded ? (kept.removal ? "Removed" : "Discarded") : `Saved${saved?.finished ? " · book finished" : ""}${saved?.xp ? ` · +${saved.xp} XP` : ""}`;
   // A failure of the save on screen: a refusal reads "Not saved:" (the server answered), anything else may have gone
   // through ("Not confirmed:"); a failed discard says so instead.
   const errorLabel =
-    st !== "error" ? undefined : kept.discarding ? (kept.unconfirmed ? "Discard not confirmed:" : "Not discarded:") : kept.unconfirmed ? "Not confirmed:" : undefined;
+    st !== "error"
+      ? undefined
+      : kept.discarding
+        ? kept.removal
+          ? kept.unconfirmed ? "Removal not confirmed:" : "Not removed:"
+          : kept.unconfirmed ? "Discard not confirmed:" : "Not discarded:"
+        : kept.unconfirmed ? "Not confirmed:" : undefined;
 
   const inputCls =
     "mt-1 w-full min-h-11 px-3 text-[16px] font-mono tabular-nums bg-surface-sunken border border-border-subtle rounded-control text-text-primary placeholder:text-text-tertiary/60 focus:border-accent/60 outline-none";
@@ -1000,7 +1013,7 @@ export default function ReadingSection() {
               savedText={savedText}
               showIncomplete={anyTouched}
               errorLabel={errorLabel}
-              savingText={kept.discarding ? "Discarding…" : undefined}
+              savingText={kept.discarding ? (kept.removal ? "Removing…" : "Discarding…") : undefined}
             />
           </span>
           {sessionId === null && !o && (
@@ -1019,7 +1032,7 @@ export default function ReadingSection() {
               <button
                 type="button"
                 {...keepsFocus}
-                onClick={() => void removeSession()}
+                onClick={removeSession}
                 disabled={busy}
                 className="min-h-11 px-2 text-[12px] text-text-tertiary hover:text-down underline underline-offset-2 disabled:opacity-40"
               >
@@ -1037,20 +1050,6 @@ export default function ReadingSection() {
             </span>
           )}
         </div>
-        {removeError && (
-          <div className="mt-2 flex flex-wrap items-center gap-x-2 text-[13px] text-down">
-            <p role="alert">{removeError}</p>
-            <button
-              type="button"
-              {...keepsFocus}
-              onClick={() => void removeSession()}
-              disabled={busy}
-              className="min-h-11 px-1 text-text-secondary hover:text-text-primary underline underline-offset-2 disabled:opacity-40"
-            >
-              Retry
-            </button>
-          </div>
-        )}
       </form>
     </LogCard>
   );

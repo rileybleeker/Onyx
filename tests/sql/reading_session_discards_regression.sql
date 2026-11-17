@@ -35,6 +35,7 @@ DECLARE
     k2 uuid := '00000000-0000-4000-8000-000000000002';
     k3 uuid := '00000000-0000-4000-8000-000000000003';
     v_book bigint;
+    v_book2 bigint;
     r jsonb;
     v_status text;
     v_cat text;
@@ -245,6 +246,31 @@ BEGIN
     r := pds.remove_reading_session(NULL, '00000000-0000-4000-8000-000000000022', NULL);
     SELECT answer INTO v_status FROM pds.habit_journal WHERE cycle_date = DATE '2030-02-10' AND question = 'SQL regression habit?';
     ASSERT v_status = 'No', 'the earlier answer comes back';
+
+    -- 19. An edit takes back the finish it no longer holds in its own transaction, so a retry of a call whose answer
+    --     was lost (the same values again) finds nothing left to change (Codex review of PR 376, round 4).
+    INSERT INTO pds.books (slug, title, total_chapters, status)
+    VALUES ('sql-regression-edit-book-a', 'Synthetic', 3, 'reading') RETURNING book_id INTO v_book;
+    INSERT INTO pds.books (slug, title, total_chapters, status)
+    VALUES ('sql-regression-edit-book-b', 'Synthetic', 3, 'reading') RETURNING book_id INTO v_book2;
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000023', v_book, DATE '2030-03-01', 1, 3, NULL, NULL, NULL, NULL, 'manual');
+    v_sid := (r->'session'->>'session_id')::bigint;
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-01', 1, 2, NULL, NULL, NULL, NULL, NULL);
+    ASSERT (r->>'unfinished')::boolean, 'moved to another book below its end: the first book is unfinished';
+    SELECT status INTO v_status FROM pds.books WHERE book_id = v_book;
+    ASSERT v_status = 'reading', 'in the same call';
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-01', 1, 2, NULL, NULL, NULL, NULL, NULL);
+    ASSERT NOT (r->>'unfinished')::boolean AND NOT (r->>'finished')::boolean, 'the replay changes nothing';
+    -- The same session reaching the last chapter of its new book finishes that one, moving it a day moves the finish
+    -- day, and editing it below the end on that day takes the finish back.
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-01', 1, 3, NULL, NULL, NULL, NULL, NULL);
+    ASSERT (r->>'finished')::boolean AND r->'book'->>'status' = 'finished', 'finished in the edit';
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-02', 1, 3, NULL, NULL, NULL, NULL, NULL);
+    ASSERT (SELECT finished_on FROM pds.books WHERE book_id = v_book2) = DATE '2030-03-02', 'the finish day followed';
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-02', 1, 2, NULL, NULL, NULL, NULL, NULL);
+    ASSERT (r->>'unfinished')::boolean AND r->'book'->>'status' = 'reading', 'below the end: back to reading';
+    SELECT status INTO v_status FROM pds.books WHERE book_id = v_book2;
+    ASSERT v_status = 'reading', 'stored so';
 END $$;
 
 ROLLBACK;

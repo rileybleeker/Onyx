@@ -927,11 +927,47 @@ test("Remove this session answered by a 404 page that is not the route's own: th
   assert.equal(h.rows.size, 1);
   h.deleteMode = "foreign404";
   await h.click("Remove this session");
-  assert.match(h.text(), /Couldn't remove the session: /);
+  assert.match(h.text(), /Removal not confirmed: /);
   assert.equal(h.value("Through ch."), "5", "not cleared on an answer that proves nothing");
   h.deleteMode = "up";
   await h.click("Remove this session"); // the session is gone already: the route's own 404 confirms it
   assert.equal(h.value("Through ch."), "", "cleared once the route says the session is gone");
+  assert.match(h.text(), /Removed/);
+});
+
+test("Remove whose answer failed, then the section unmounted and mounted again: the session, its key and the retry stay (Codex review of PR 376, round 4)", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1);
+  const kept = h.retainer.find("log-reading").data;
+  const id = kept.sessionId;
+  const key = kept.clientKey;
+  assert.ok(id !== null);
+
+  for (const broken of ["lost", "malformed"]) {
+    h.deleteMode = broken; // the server may or may not have removed it; nothing on screen can tell
+    await h.click("Remove this session");
+    assert.match(h.text(), /Removal not confirmed: /, broken);
+    assert.equal(h.work.has(), true, `${broken}: still unsaved work, never a clean form`);
+  }
+  await h.unmount();
+  assert.equal(h.retainer.size, 1, "the entry is kept past the unmount");
+  assert.equal(h.work.has(), true);
+  const away = h.retainer.find("log-reading").data;
+  assert.equal(away.sessionId, id, "the session id survives");
+  assert.equal(away.clientKey, key, "and its key");
+
+  await h.mount();
+  assert.equal(h.value("Through ch."), "5", "the session is still on screen");
+  assert.match(h.text(), /Removal not confirmed: /, "with the failure and its Retry");
+  h.deleteMode = "up";
+  await h.tick(60_000); // the saver's retry gets the route's own receipt (a 404 session_gone once it was removed)
+  assert.ok(h.deletes().every((c) => c.url.startsWith(`/api/reading/sessions/${id}`)), "every retry names the same session");
+  assert.equal(h.value("Through ch."), "", "gone only once confirmed");
+  assert.equal(h.work.has(), false);
+  assert.equal(h.posts().length, 1, "nothing created again");
 });
 
 test("lost create answer, then the form emptied: the stored session is removed by its key, never left behind under a clean form", async (t) => {

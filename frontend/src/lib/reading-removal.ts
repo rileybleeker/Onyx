@@ -49,35 +49,71 @@ export async function removalAnswer(supabase: Supa, r: Extract<SessionRemoval, {
  * rewrite leaves the row open, so the next retry of the same removal tries again. Steps that are not owed count as
  * done: no Notion entry, a book that no longer exists, a book without a Notion page. A create's own after() still
  * writing the entry when the session went trashes it once it sees the row gone (app/api/reading/sessions/route.ts).
+ * The progress line is written from the book as it is when the write happens (rewriteProgressNow), never from the
+ * overview the response was built with: two removals of one book whose cleanups ran out of order used to write the
+ * older one's line last and close both rows (Codex review of PR 376, round 4).
  */
 export async function runRemovalCleanup(supabase: Supa, r: Extract<SessionRemoval, { ok: true }>, answer: RemovalAnswer): Promise<void> {
-  const { book, bookUnread, overview } = answer;
+  const { book, bookUnread } = answer;
   const blockId = r.cleanup?.notionBlockId ?? r.removed?.notion_block_id ?? null;
   const trashed = !blockId || (await removeMirroredBlock(blockId));
   let progressDone: boolean;
   if (bookUnread) progressDone = false;
   else if (!book || !book.notion_page_id) progressDone = true;
-  else if (!overview) progressDone = false;
-  else progressDone = await mirrorProgress(book, overview.chaptersDone ?? 0, overview.sessions?.[0]?.session_date ?? null);
+  else progressDone = await rewriteProgressNow(supabase, book.book_id);
   const sessionId = r.cleanup?.sessionId ?? null;
   // Closed only while the row still records the entry this run handled (Codex T01-R9): a late entry a create
   // callback recorded meanwhile stays owed.
   if (trashed && progressDone && sessionId !== null) await markRemovalMirrored(supabase, sessionId, blockId);
 }
 
+/** What the book page's progress line is written from, and a fingerprint of it (everything mirrorProgress reads). */
+type ProgressState =
+  | { kind: "failed" }
+  | { kind: "none" } // the book no longer exists, or has no Notion page: nothing to write
+  | { kind: "ok"; book: Book; chaptersDone: number; lastSessionDate: string | null; fingerprint: string };
+
+async function progressState(supabase: Supa, bookId: number): Promise<ProgressState> {
+  const { data, error } = await supabase.from("books").select(BOOK_COLS).eq("book_id", bookId).maybeSingle();
+  if (error) return { kind: "failed" };
+  const book = (data as Book | null) ?? null;
+  if (!book || !book.notion_page_id) return { kind: "none" };
+  const current = await getOverview(supabase, book.slug).catch(() => null);
+  if (!current) return { kind: "failed" };
+  const chaptersDone = current.chaptersDone ?? 0;
+  const lastSessionDate = current.sessions?.[0]?.session_date ?? null;
+  const fingerprint = JSON.stringify([
+    book.notion_page_id,
+    book.total_chapters ?? null,
+    book.status ?? null,
+    book.finished_on ?? null,
+    book.target_date ?? null,
+    chaptersDone,
+    lastSessionDate,
+  ]);
+  return { kind: "ok", book, chaptersDone, lastSessionDate, fingerprint };
+}
+
 /**
  * The book page's progress line, rewritten from the database as it is NOW (review of PR 376, round 3). True when it
  * was rewritten or is not owed (the book no longer exists, or has no Notion page); false when the book could not be
  * read, its overview could not be computed, or the rewrite failed.
+ * Also false when the book changed while the line was being written (Codex review of PR 376, round 4): Notion keeps
+ * the last write, and serverless instances share no lock, so two writers of one book (two removals, or a removal and
+ * a create's callback) can land in either order. Each writer therefore reads the book again after its write; a
+ * writer whose line no longer matches the database may have landed last with an older line, so its cleanup stays
+ * open and the sweep writes the line again later from the state then. The writer whose line matched closes its own
+ * work; whichever write lands last, the one that may be stale is always left owed, so the line converges.
  */
 export async function rewriteProgressNow(supabase: Supa, bookId: number): Promise<boolean> {
-  const { data, error } = await supabase.from("books").select(BOOK_COLS).eq("book_id", bookId).maybeSingle();
-  if (error) return false;
-  const book = (data as Book | null) ?? null;
-  if (!book || !book.notion_page_id) return true;
-  const current = await getOverview(supabase, book.slug).catch(() => null);
-  if (!current) return false;
-  return mirrorProgress(book, current.chaptersDone ?? 0, current.sessions?.[0]?.session_date ?? null);
+  const before = await progressState(supabase, bookId);
+  if (before.kind === "failed") return false;
+  if (before.kind === "none") return true;
+  const wrote = await mirrorProgress(before.book, before.chaptersDone, before.lastSessionDate);
+  if (!wrote) return false;
+  const after = await progressState(supabase, bookId);
+  if (after.kind === "none") return true;
+  return after.kind === "ok" && after.fingerprint === before.fingerprint;
 }
 
 /**

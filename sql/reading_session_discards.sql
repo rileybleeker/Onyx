@@ -30,9 +30,11 @@
 --   pds.reading_session_removals          that cleanup ledger: a retried
 --                                         removal whose answer was lost
 --                                         replays it
---   pds.move_reading_session(...)         an edit that moves a session to
---                                         another day or book, with the habit
---                                         part of the move, in ONE transaction
+--   pds.move_reading_session(...)         an edit of a session (a move to
+--                                         another day or book, or any other
+--                                         change), with the habit part of a
+--                                         move and the book finish it changes,
+--                                         in ONE transaction
 --   pds.reading_habit_provenance          what reading stamps did to a day's
 --                                         habit row (whether they made it, the
 --                                         answer they replaced, the row version
@@ -71,7 +73,9 @@
 --
 -- lib/reading.ts does not fall back to separate requests when a function of
 -- this file is missing (or not yet in PostgREST's schema cache): a keyed
--- create, every removal and every move answer 503 and the form retries.
+-- create, every removal and every move answer 503 and the form retries. Only
+-- an edit that keeps the session's day and book still works without this file
+-- (the plain update and finish requests from before it).
 --
 -- What is stored: a random UUID the browser made, session / book ids, the
 -- session's day, a Notion block id, the habit's name with the answer and
@@ -533,16 +537,26 @@ BEGIN
 END;
 $$;
 
--- An edit that moves a manual or chat session to another day or book (PATCH /api/reading/sessions/[id]): the
--- session's new values and the habit part of the move in ONE transaction (Codex review of PR 376, round 2). The new
--- day's habit is stamped (best-effort, as on a create) and the old day's is settled (pds.settle_reading_habit: from
--- the habit row's own record, so a session whose create answer was lost and replayed, which the browser knows no
--- habit_created_on for, still takes its old day's Yes back). A failed settle rolls the whole move back, so the
--- session never sits on its new day with the old day's Yes left behind and nothing to retry. The book's finish
--- follows in lib/reading.ts as for any edit.
--- Answers {moved: false} when the session no longer exists, else {moved: true, session, habit_marked,
--- habit_created, habit_removed, habit_restored}. Raises OXR02 for a Kindle session and OXR03 when the target book
--- does not exist.
+-- An edit of a manual or chat session (PATCH /api/reading/sessions/[id]): the session's new values, the habit part of
+-- a move and the books' finish state in ONE transaction (Codex review of PR 376, rounds 2 and 4).
+--  * A move (another day or book): the new day's habit is stamped (best-effort, as on a create) and the old day's is
+--    settled (pds.settle_reading_habit: from the habit row's own record, so a session whose create answer was lost
+--    and replayed, which the browser knows no habit_created_on for, still takes its old day's Yes back). A failed
+--    settle rolls the whole edit back, so the session never sits on its new day with the old day's Yes left behind.
+--    An edit that keeps the day and the book has no habit part.
+--  * The finish, by the same rules as lib/reading.ts (logSession) and pds.remove_reading_session: reaching the last
+--    chapter of a book not finished finishes it on the session's day; a finishing session moved to another day of the
+--    same book moves the finish day (to the earliest session that reaches the last chapter); a finish this session
+--    caused (the book's finish day is its old day and it reached the last chapter) that it no longer holds (edited
+--    below the end, or moved to another book) goes back to reading, or to the earliest other finishing session's day.
+--    These used to be separate requests after the move, from the values the route had read before it: a move whose
+--    answer was lost committed, and its retry read the moved session as "before" and never took back the old book's
+--    finish. Done here, from the row as it was under its lock, a retry finds nothing left to change.
+-- Locks: the session row, then both books' rows (lower id first), then the habit rows (fixed order): the same order
+-- as pds.remove_reading_session (session, book, habit row), so an edit and a removal cannot wait on each other.
+-- Answers {moved: false} when the session no longer exists, else {moved: true, session, book (the session's book
+-- after the edit), finished, unfinished, habit_marked, habit_created, habit_removed, habit_restored}. Raises OXR02 for
+-- a Kindle session and OXR03 when the target book does not exist.
 CREATE OR REPLACE FUNCTION pds.move_reading_session(
     p_session_id       bigint,
     p_book_id          bigint,
@@ -561,47 +575,65 @@ VOLATILE
 SET search_path = ''
 AS $$
 DECLARE
-    v_row       pds.reading_sessions%ROWTYPE;
-    v_old_date  date;
-    v_old_habit text;
-    v_new_habit text;
-    v_old_lock  text;
-    v_new_lock  text;
-    v_stamp     jsonb;
-    v_settle    jsonb;
-    v_marked    boolean := false;
-    v_created   boolean := false;
-    v_removed   boolean := false;
-    v_restored  boolean := false;
+    v_row        pds.reading_sessions%ROWTYPE;
+    v_prev       pds.reading_sessions%ROWTYPE;
+    v_old_book   pds.books%ROWTYPE;
+    v_new_book   pds.books%ROWTYPE;
+    v_moved      boolean;
+    v_same_book  boolean;
+    v_reaches    boolean;
+    v_next       date;
+    v_old_date   date;
+    v_old_habit  text;
+    v_new_habit  text;
+    v_old_lock   text;
+    v_new_lock   text;
+    v_stamp      jsonb;
+    v_settle     jsonb;
+    v_finished   boolean := false;
+    v_unfinished boolean := false;
+    v_marked     boolean := false;
+    v_created    boolean := false;
+    v_removed    boolean := false;
+    v_restored   boolean := false;
 BEGIN
     IF p_session_id IS NULL OR p_book_id IS NULL OR p_session_date IS NULL THEN
         RAISE EXCEPTION 'session_id, book_id and session_date are required' USING ERRCODE = '22023';
     END IF;
 
-    SELECT * INTO v_row FROM pds.reading_sessions AS s WHERE s.session_id = p_session_id FOR UPDATE;
+    SELECT * INTO v_prev FROM pds.reading_sessions AS s WHERE s.session_id = p_session_id FOR UPDATE;
     IF NOT FOUND THEN
         RETURN pg_catalog.jsonb_build_object('moved', false);
     END IF;
-    IF v_row.source IS DISTINCT FROM 'manual' AND v_row.source IS DISTINCT FROM 'chat' THEN
+    IF v_prev.source IS DISTINCT FROM 'manual' AND v_prev.source IS DISTINCT FROM 'chat' THEN
         RAISE EXCEPTION 'Kindle sessions are written by the harvester' USING ERRCODE = 'OXR02';
     END IF;
 
-    v_old_date := v_row.session_date;
-    SELECT b.habit_name INTO v_old_habit FROM pds.books AS b WHERE b.book_id = v_row.book_id;
-    SELECT b.habit_name INTO v_new_habit FROM pds.books AS b WHERE b.book_id = p_book_id;
+    -- Both books' rows, lower id first, before any habit lock.
+    PERFORM 1 FROM pds.books AS b WHERE b.book_id IN (v_prev.book_id, p_book_id) ORDER BY b.book_id FOR UPDATE;
+    SELECT * INTO v_new_book FROM pds.books AS b WHERE b.book_id = p_book_id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'no such book' USING ERRCODE = 'OXR03';
     END IF;
+    SELECT * INTO v_old_book FROM pds.books AS b WHERE b.book_id = v_prev.book_id;
+
+    v_old_date := v_prev.session_date;
+    v_same_book := v_prev.book_id = p_book_id;
+    v_moved := v_old_date IS DISTINCT FROM p_session_date OR NOT v_same_book;
+    v_old_habit := v_old_book.habit_name;
+    v_new_habit := v_new_book.habit_name;
 
     -- Both habit rows' locks in one fixed order, so two moves crossing the same days cannot wait on each other.
-    IF v_old_habit IS NOT NULL THEN v_old_lock := v_old_date::text || ':' || v_old_habit; END IF;
-    IF v_new_habit IS NOT NULL THEN v_new_lock := p_session_date::text || ':' || v_new_habit; END IF;
-    IF v_old_lock IS NOT NULL AND v_new_lock IS NOT NULL AND v_new_lock < v_old_lock THEN
-        PERFORM pds.reading_habit_lock(p_session_date, v_new_habit);
-        PERFORM pds.reading_habit_lock(v_old_date, v_old_habit);
-    ELSE
-        IF v_old_lock IS NOT NULL THEN PERFORM pds.reading_habit_lock(v_old_date, v_old_habit); END IF;
-        IF v_new_lock IS NOT NULL THEN PERFORM pds.reading_habit_lock(p_session_date, v_new_habit); END IF;
+    IF v_moved THEN
+        IF v_old_habit IS NOT NULL THEN v_old_lock := v_old_date::text || ':' || v_old_habit; END IF;
+        IF v_new_habit IS NOT NULL THEN v_new_lock := p_session_date::text || ':' || v_new_habit; END IF;
+        IF v_old_lock IS NOT NULL AND v_new_lock IS NOT NULL AND v_new_lock < v_old_lock THEN
+            PERFORM pds.reading_habit_lock(p_session_date, v_new_habit);
+            PERFORM pds.reading_habit_lock(v_old_date, v_old_habit);
+        ELSE
+            IF v_old_lock IS NOT NULL THEN PERFORM pds.reading_habit_lock(v_old_date, v_old_habit); END IF;
+            IF v_new_lock IS NOT NULL THEN PERFORM pds.reading_habit_lock(p_session_date, v_new_habit); END IF;
+        END IF;
     END IF;
 
     UPDATE pds.reading_sessions AS s
@@ -611,7 +643,51 @@ BEGIN
      WHERE s.session_id = p_session_id
     RETURNING * INTO v_row;
 
-    IF v_new_habit IS NOT NULL THEN
+    -- The finish of the session's book now.
+    v_reaches := COALESCE(v_new_book.total_chapters, 0) > 0 AND p_chapter_through >= v_new_book.total_chapters;
+    IF v_reaches AND v_new_book.status IS DISTINCT FROM 'finished' THEN
+        UPDATE pds.books AS b SET status = 'finished', finished_on = p_session_date WHERE b.book_id = p_book_id;
+        v_finished := true;
+        v_new_book.status := 'finished';
+        v_new_book.finished_on := p_session_date;
+    ELSIF v_reaches AND v_same_book AND v_old_date IS DISTINCT FROM p_session_date
+          AND v_new_book.finished_on = v_old_date
+          AND COALESCE(v_prev.chapter_through, 0) >= v_new_book.total_chapters THEN
+        -- The finishing session moved within its book: the finish day follows, to the earliest finishing session.
+        SELECT pg_catalog.min(s.session_date) INTO v_next FROM pds.reading_sessions AS s
+         WHERE s.book_id = p_book_id AND s.chapter_through >= v_new_book.total_chapters;
+        IF v_next IS NOT NULL AND v_next IS DISTINCT FROM v_new_book.finished_on THEN
+            UPDATE pds.books AS b SET finished_on = v_next WHERE b.book_id = p_book_id;
+            v_new_book.finished_on := v_next;
+        END IF;
+    END IF;
+
+    -- The finish this session caused on its old book, when it no longer holds it (the session is already written
+    -- above, so it counts below only if it still reaches the last chapter of that book).
+    IF NOT (v_same_book AND v_reaches)
+       AND v_old_book.book_id IS NOT NULL
+       AND v_old_book.status = 'finished'
+       AND COALESCE(v_old_book.total_chapters, 0) > 0
+       AND COALESCE(v_prev.chapter_through, 0) >= v_old_book.total_chapters
+       AND v_old_book.finished_on = v_old_date THEN
+        SELECT pg_catalog.min(s.session_date) INTO v_next FROM pds.reading_sessions AS s
+         WHERE s.book_id = v_old_book.book_id AND s.chapter_through >= v_old_book.total_chapters;
+        IF v_next IS NULL THEN
+            UPDATE pds.books AS b SET status = 'reading', finished_on = NULL WHERE b.book_id = v_old_book.book_id;
+            v_unfinished := true;
+            v_old_book.status := 'reading';
+            v_old_book.finished_on := NULL;
+        ELSIF v_next IS DISTINCT FROM v_old_book.finished_on THEN
+            UPDATE pds.books AS b SET finished_on = v_next WHERE b.book_id = v_old_book.book_id;
+            v_old_book.finished_on := v_next;
+        END IF;
+        IF v_same_book THEN
+            v_new_book.status := v_old_book.status;
+            v_new_book.finished_on := v_old_book.finished_on;
+        END IF;
+    END IF;
+
+    IF v_moved AND v_new_habit IS NOT NULL THEN
         BEGIN
             v_stamp := pds.stamp_reading_habit(p_session_date, v_new_habit);
             v_marked := COALESCE((v_stamp ->> 'marked')::boolean, false);
@@ -623,8 +699,8 @@ BEGIN
     END IF;
 
     -- The day the session left (a no-op while it, or another session, is still on that day and habit). No exception
-    -- block: a failure rolls the move back.
-    IF v_old_habit IS NOT NULL THEN
+    -- block: a failure rolls the whole edit back, the finish part included.
+    IF v_moved AND v_old_habit IS NOT NULL THEN
         v_settle := pds.settle_reading_habit(v_old_date, v_old_habit, p_habit_created_on);
         v_removed := COALESCE((v_settle ->> 'removed')::boolean, false);
         v_restored := COALESCE((v_settle ->> 'restored')::boolean, false);
@@ -633,6 +709,9 @@ BEGIN
     RETURN pg_catalog.jsonb_build_object(
         'moved', true,
         'session', pg_catalog.to_jsonb(v_row),
+        'book', pg_catalog.to_jsonb(v_new_book),
+        'finished', v_finished,
+        'unfinished', v_unfinished,
         'habit_marked', v_marked,
         'habit_created', v_created,
         'habit_removed', v_removed,
