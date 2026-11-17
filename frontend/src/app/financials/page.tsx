@@ -64,8 +64,8 @@ export default async function FinancialsPage({
         <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
           <p className="font-semibold">
             {load.freshness
-              ? "No ledger data yet - the harvester has run but imported nothing."
-              : "No ledger data yet - the harvester has not run."}
+              ? "No ledger data yet. The bank import ran but found no transactions."
+              : "No ledger data yet. The bank import has not run."}
           </p>
           <p className="mt-2 text-[13px] text-text-secondary">They appear after the first SimpleFIN import.</p>
           <div className="mt-3">
