@@ -183,8 +183,8 @@ test("a removed drink is never resurrected by a late save", async () => {
 test("503 (not set up / turned off) is a definite refusal: not pending, shown, nothing saved", async () => {
   const { srv } = fresh();
   S.drinkSession.adopt(item());
-  const call503 = async (m, b) => { srv.log.push({ method: m, body: b }); return { ok: false, status: 503, json: { error: "Drinks are not set up yet: the database migration is pending.", code: "unavailable" } }; };
-  await assert.rejects(S.saveDrinkWith(call503, save()), (e) => e instanceof AutosaveRefused && /migration is pending/.test(e.message));
+  const call503 = async (m, b) => { srv.log.push({ method: m, body: b }); return { ok: false, status: 503, json: { error: "Drinks aren't available yet. Try again later.", code: "unavailable" } }; };
+  await assert.rejects(S.saveDrinkWith(call503, save()), (e) => e instanceof AutosaveRefused && /aren't available yet/.test(e.message));
   assert.equal(S.drinkSession.get(KEY).pending, null);
   assert.equal(S.drinkSession.ack(KEY), undefined, "never Saved");
 });

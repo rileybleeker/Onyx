@@ -70,7 +70,7 @@ const MISSING = new Set(["PGRST205", "42P01", "42703", "PGRST204"]);
 const json = (body: unknown, status = 200) => NextResponse.json(body, { status, headers: NO_STORE });
 
 function dbError(code: string | undefined, what: string) {
-  if (code && MISSING.has(code)) return json({ error: "Drinks are not set up yet: the database migration is pending.", code: "unavailable" }, 503);
+  if (code && MISSING.has(code)) return json({ error: "Drinks aren't available yet. Try again later.", code: "unavailable" }, 503);
   if (code === "OXD00") return json({ error: "Drink capture is turned off.", code: "unavailable" }, 503);
   if (code === "OXP01") return json({ error: "That time has not happened yet.", code: "future" }, 409);
   if (code === "OXD01" || code === "22023") return json({ error: "That time does not fit its day or time zone." }, 400);
