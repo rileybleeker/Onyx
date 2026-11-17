@@ -1,6 +1,7 @@
 "use client";
 
 import { writeFeedSeed } from "@/lib/feed-seed";
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -766,11 +767,9 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
       {!loading && !loadFailed && !hasData && (
         <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-8 text-center">
           <p className="text-[13px] text-text-secondary">No Spotify plays in the database yet.</p>
-          <p className="text-[11px] text-text-tertiary mt-2 font-mono">
-            Run the OAuth bootstrap: <code>python spotify_etl.py --auth</code>
-          </p>
-          <p className="text-[11px] text-text-tertiary mt-1 font-mono">
-            Then: <code>python ci_token_helper.py upload spotify</code>, then <code>python spotify_etl.py</code>
+          <p className="text-[11px] text-text-tertiary mt-2">
+            Plays appear here after the first Spotify sync. If nothing shows after a day, check the{" "}
+            <Link href="/status" className="underline">Status page</Link>.
           </p>
         </div>
       )}
