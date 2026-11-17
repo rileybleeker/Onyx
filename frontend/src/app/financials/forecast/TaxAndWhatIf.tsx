@@ -493,9 +493,9 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
       <p className="mt-3 text-[12px] text-text-secondary">One-off pay (gross; a January &quot;bonus&quot; here replaces that year&apos;s generated bonus):</p>
       {oneOffs.map((o, i) => (
         <div key={i} className="mt-1 flex flex-wrap items-center gap-2">
-          <input className={`${input} w-40`} value={o.label} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, label: e.target.value } : x)))} />
-          <input className={input} type="date" value={o.date} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, date: e.target.value } : x)))} />
-          <input className={`${input} w-28`} value={o.gross} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, gross: e.target.value } : x)))} />
+          <input aria-label="One-off pay label" className={`${input} w-40`} value={o.label} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, label: e.target.value } : x)))} />
+          <input aria-label="One-off pay date" className={input} type="date" value={o.date} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, date: e.target.value } : x)))} />
+          <input aria-label="One-off pay gross" className={`${input} w-28`} value={o.gross} onChange={(e) => setOneOffs((xs) => xs.map((x, k) => (k === i ? { ...x, gross: e.target.value } : x)))} />
           <button className="text-[12px] text-text-tertiary hover:text-down" onClick={() => setOneOffs((xs) => xs.filter((_, k) => k !== i))}>
             remove
           </button>
@@ -516,8 +516,8 @@ function TaxProfileForm({ profile, busy, run }: { profile: TaxProfile | null; bu
             </option>
           ))}
         </select>
-        <input className={input} type="date" value={est.date} onChange={(e) => setEst((x) => ({ ...x, date: e.target.value }))} />
-        <input className={`${input} w-28`} placeholder="$ amount" value={est.amount} onChange={(e) => setEst((x) => ({ ...x, amount: e.target.value }))} />
+        <input aria-label="Estimated tax date" className={input} type="date" value={est.date} onChange={(e) => setEst((x) => ({ ...x, date: e.target.value }))} />
+        <input aria-label="Estimated tax amount" className={`${input} w-28`} placeholder="$ amount" value={est.amount} onChange={(e) => setEst((x) => ({ ...x, amount: e.target.value }))} />
         <button
           className={button}
           disabled={busy || !profile || !est.date || !(dollars(est.amount) ?? 0)}
