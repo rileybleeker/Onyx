@@ -4,10 +4,13 @@
  * The list is pds.books rows with status 'queued' that are not taken off the list (sql/reading_want_list.sql).
  * Every change is ONE operation with a UUID `op_key`. The exact body is written to this device BEFORE it is sent
  * (fail closed: when the device cannot keep it, nothing is sent), and a send whose answer was lost is retried with
- * the SAME body. The server applies each change atomically through pds.reading_list_apply and records it in
- * pds.reading_list_ops: the same key with the same payload is answered from the record; the same key with another
- * payload is refused (`key_reused`). Edits carry the version the editor started from; a newer version on the server
- * is a conflict Riley resolves, never a silent overwrite.
+ * the SAME body. The device copy lives under ONE localStorage key shared by every open tab: each write re-reads the
+ * stored value and applies a single mutation (recordPending / removePending / putDraft / clearPending), so a
+ * pending operation or draft recorded by another tab is kept until the server answers it. The server applies each
+ * change atomically through pds.reading_list_apply and records it in pds.reading_list_ops: the same key with the
+ * same payload is answered from the record; the same key with another payload is refused (`key_reused`). Edits
+ * carry the version the editor started from; a newer version on the server is a conflict Riley resolves, never a
+ * silent overwrite.
  */
 
 export const LIST_URL = "/api/reading/list";
@@ -517,8 +520,26 @@ export function writeLocal(storage: StorageLike | null | undefined, value: ListL
 }
 
 /**
- * Record a row action before it leaves (pure + one write). Refused when the device cannot keep it (`storage`) or
- * MAX_PENDING unconfirmed actions are already waiting (`full`); no recorded action is ever dropped to make room.
+ * A single change expressed over the CURRENTLY STORED device copy (read right before the write) instead of over
+ * this tab's in-memory copy, which may be stale until a window 'storage' event arrives. Two tabs share the one key:
+ * re-reading + applying a small mutation is what keeps a pending operation or draft recorded by the other tab from
+ * being erased by this tab's write. The write is still fail-closed: `{ok:false, reason:"storage"}` when it could
+ * not be kept, and the caller must not send anything then. (localStorage gives no cross-tab atomicity, so two tabs
+ * writing in the same instant can still last-write-win; the storage event below re-syncs them right after.)
+ */
+export type LocalWrite = { ok: true; local: ListLocal } | { ok: false; reason: "storage" };
+
+function mergeWrite(storage: StorageLike | null | undefined, mutate: (stored: ListLocal) => ListLocal): LocalWrite {
+  if (!storage) return { ok: false, reason: "storage" };
+  const stored = readLocal(storage);
+  const next = mutate(stored);
+  return writeLocal(storage, next) ? { ok: true, local: next } : { ok: false, reason: "storage" };
+}
+
+/**
+ * Record a row action before it leaves. Refused when the device cannot keep it (`storage`) or MAX_PENDING
+ * unconfirmed actions are already waiting (`full`); no recorded action is ever dropped to make room. The pending
+ * list is read from the stored copy, so an action recorded by another tab is kept alongside this one.
  */
 export function recordPending(
   storage: StorageLike | null | undefined,
@@ -526,17 +547,34 @@ export function recordPending(
   body: Body,
   now: number,
 ): { ok: true; local: ListLocal } | { ok: false; reason: "storage" | "full" } {
-  if (local.pending.some((p) => p.body.op_key === body.op_key)) {
-    return writeLocal(storage, local) ? { ok: true, local } : { ok: false, reason: "storage" };
+  if (!storage) return { ok: false, reason: "storage" };
+  const stored = readLocal(storage);
+  if (stored.pending.some((p) => p.body.op_key === body.op_key)) {
+    return writeLocal(storage, stored) ? { ok: true, local: stored } : { ok: false, reason: "storage" };
   }
-  if (local.pending.length >= MAX_PENDING) return { ok: false, reason: "full" };
-  const next = { ...local, pending: [...local.pending, { body, at: now }] };
+  if (stored.pending.length >= MAX_PENDING) return { ok: false, reason: "full" };
+  const next = { ...stored, pending: [...stored.pending, { body, at: now }] };
   return writeLocal(storage, next) ? { ok: true, local: next } : { ok: false, reason: "storage" };
 }
 
-/** Drop a row action once the server answered it (applied, replayed or refused). */
+/** Drop a row action once the server answered it (applied, replayed or refused). Pure; see removePending. */
 export function withoutPending(local: ListLocal, opKey: string): ListLocal {
   return { ...local, pending: local.pending.filter((p) => p.body.op_key !== opKey) };
+}
+
+/** Drop ONE answered operation's key from the stored copy (only that key; another tab's keys stay). */
+export function removePending(storage: StorageLike | null | undefined, opKey: string): LocalWrite {
+  return mergeWrite(storage, (stored) => withoutPending(stored, opKey));
+}
+
+/** Set or clear ONE box's draft in the stored copy (other tabs' drafts and pending actions stay). */
+export function putDraft(storage: StorageLike | null | undefined, which: "add" | number, d: Draft | null): LocalWrite {
+  return mergeWrite(storage, (stored) => withDraft(stored, which, d));
+}
+
+/** Riley dismissed the waiting changes: clear the pending list (drafts stay; a merge, not a blind overwrite). */
+export function clearPending(storage: StorageLike | null | undefined): LocalWrite {
+  return mergeWrite(storage, (stored) => ({ ...stored, pending: [] }));
 }
 
 /** A box's draft in the device copy (null = remove it). */

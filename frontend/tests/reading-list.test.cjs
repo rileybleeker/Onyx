@@ -104,6 +104,37 @@ test('replayed removed create is held instead of claiming it is on the list',()=
   assert.equal(r.draft.fields.title,'Synthetic');
 });
 
+test('cross-tab device copy: another tab writing its own change keeps a recorded pending action and draft',()=>{
+  // Two in-memory StorageLike objects over ONE backing store simulate two open tabs sharing the one key.
+  const map=new Map();
+  const tab=()=>({getItem:k=>map.get(k)??null,setItem:(k,v)=>map.set(k,v),removeItem:k=>map.delete(k)});
+  const tabA=tab(),tabB=tab();
+  const opA={op:'remove',op_key:key(),book_id:7,expected_version:1};
+  const opB={op:'move',op_key:key(),book_id:7,direction:'up',expected_order:[7]};
+  // Tab A has an unsent row editor for another book and records a row action before sending it.
+  const draftA=L.editDraft(item({book_id:9,title:'Synthetic Nine'}));
+  draftA.fields.author='Synthetic retained author';
+  assert.equal(L.putDraft(tabA,9,draftA).ok,true);
+  const aRec=L.recordPending(tabA,L.emptyLocal(),opA,1);
+  assert.equal(aRec.ok,true);
+  // Tab B writes its own change from an empty copy: A's pending op and draft must survive.
+  const bRec=L.recordPending(tabB,L.emptyLocal(),opB,2);
+  assert.equal(bRec.ok,true);
+  const shared=L.readLocal(tabA);
+  assert.deepEqual(shared.pending.map(p=>p.body.op_key),[opA.op_key,opB.op_key]);
+  assert.equal(shared.edits['9'].fields.author,'Synthetic retained author');
+  // Answering A's operation removes only A's op_key; B's op and A's draft stay.
+  const done=L.removePending(tabA,opA.op_key);
+  assert.equal(done.ok,true);
+  assert.deepEqual(done.local.pending.map(p=>p.body.op_key),[opB.op_key]);
+  assert.equal(done.local.edits['9'].fields.author,'Synthetic retained author');
+  // A draft write from A (clearing a different book) does not erase B's pending op either.
+  const cleared=L.putDraft(tabA,9,null);
+  assert.equal(cleared.ok,true);
+  assert.deepEqual(cleared.local.pending.map(p=>p.body.op_key),[opB.op_key]);
+  assert.equal(cleared.local.pending[0].body.op_key,opB.op_key);
+});
+
 test('duplicate decision is a new payload and operation key after a definite refusal',()=>{
   const first=L.nextSend({...L.newDraft(),fields:{title:'Synthetic',author:'',edition:''}},key);
   const refused=L.applyAnswer(first.draft,first.body,409,{error:'duplicate',candidates:[],distinct_allowed:true});
