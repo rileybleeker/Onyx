@@ -1099,15 +1099,26 @@ export interface ChapterRunCount {
 export interface BankRunSummary {
   chapters: ChapterRunCount[];
   graded: number;
+  /** Run-level failures and failed steps (refusals excluded from step failures, see recordOutcome). */
   failed: number;
+  /** Claimed steps that finished done. */
+  done: number;
+  /** Claimed steps that ended retry or failed (refusals included). */
+  unfinished: number;
   codes: string[];
 }
 
 /** Codes that make the heartbeat partial (a job that failed in the run makes it failed). */
 export const PARTIAL_CODES = new Set(["budget", "monthly_cap", "uncertain", "schema_checks", "refusal", "thin", "no_sources", "web_search_disabled"]);
 
+/**
+ * success: no claimed step ended retry / failed (and no partial code or thin chapter).
+ * partial: some step ended retry / failed, and at least one step finished done.
+ * failed:  steps were claimed (or the run itself failed) and none finished done.
+ */
 export function bankHeartbeatStatus(s: BankRunSummary): "success" | "partial" | "failed" {
-  if (s.failed > 0) return "failed";
+  const n = (x: unknown) => Math.max(0, Math.trunc(Number(x) || 0));
+  if (n(s.failed) > 0 || n(s.unfinished) > 0) return n(s.done) > 0 ? "partial" : "failed";
   if (s.codes.some((c) => PARTIAL_CODES.has(bankCode(c)))) return "partial";
   if (s.chapters.some((c) => c.result === "thin" || c.result === "no_sources")) return "partial";
   return "success";
@@ -1121,6 +1132,7 @@ export function bankHeartbeatMessage(s: BankRunSummary): string {
   );
   if (n(s.graded)) parts.push(`graded ${n(s.graded)}`);
   if (n(s.failed)) parts.push(`failed ${n(s.failed)}`);
+  if (n(s.unfinished)) parts.push(`unfinished ${n(s.unfinished)}`);
   const codes = [...new Set(s.codes.map(bankCode))];
   if (codes.length) parts.push(`codes ${codes.join(" ")}`);
   const msg = parts.join("; ") || "nothing to do";
