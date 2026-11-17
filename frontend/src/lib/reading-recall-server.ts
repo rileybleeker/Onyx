@@ -319,9 +319,16 @@ export interface AttemptInput {
   version: number;
   round_key: string;
   round_date: string | null;
-  round_kind: AppRoundKind;
+  /** An app round; "chat" only from the chat route (an order answer, code-graded here like the app's). */
+  round_kind: AppRoundKind | "chat";
   /** Kept as given (no trim): a primary record of what was said. The option text after "Show choices"; the steps one per line. */
   answer: string;
+  /**
+   * The text the code grade reads when the reply cannot be graded as it was said (the chat's order answers: the
+   * numbers of the shuffled steps, or "no idea"). Only the grade uses it: `answer` is what is stored and hashed for the
+   * replay. Never set from a request body (parseAttemptBody does not read it).
+   */
+  grade_answer?: string;
   hinted: boolean;
   response_ms: number | null;
   quiz_key: string | null;
@@ -946,7 +953,7 @@ export async function recordAttempt(supabase: Supa, input: AttemptInput): Promis
     if (!first || !q || !format) return { status: 404, body: { error: "not_found" }, pendingKey: null };
     if (q.version !== input.version) return { status: 409, body: { error: "question_changed" }, pendingKey: null };
     if (input.hinted && format !== "cued") return { status: 400, body: { error: "bad_request" }, pendingKey: null };
-    const grade = gradeLocal(format, q.rubric, input.answer, input.hinted);
+    const grade = gradeLocal(format, q.rubric, input.grade_answer ?? input.answer, input.hinted);
     const base = {
       attempt_key: input.attempt_key,
       question_id: input.question_id,

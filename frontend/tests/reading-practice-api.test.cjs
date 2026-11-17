@@ -1278,6 +1278,35 @@ test("chat: questions come through the same gate; a recorded answer is graded at
   assert.equal(r.S.chatAttemptKey("toolu_synthetic_1"), one.attempt_key);
 });
 
+test("recordAttempt stores the reply as given and grades grade_answer when there is one (the chat's order answers); a request body cannot set it", async () => {
+  const db = makeDb();
+  const r = load(db);
+  const reply = "3 1 2 (not sure about the middle)";
+  const input = {
+    attempt_key: key(), question_id: 1003, version: 1, round_key: key(), round_date: null, round_kind: "chat",
+    answer: reply, grade_answer: "Light the lamp
+Watch the bay
+Write the entry", hinted: false, response_ms: null, quiz_key: null,
+  };
+  const res = await r.S.recordAttempt(r.supabase, input);
+  assert.deepEqual([res.status, res.body.verdict, res.body.grading_status], [200, "correct", "graded"]);
+  assert.equal(db.attempts.get(input.attempt_key).answer, reply, "the reply is what is stored, not the text the grade read");
+  // The same call replays; the same order in other words under the key is another request.
+  const again = await r.S.recordAttempt(r.supabase, input);
+  assert.deepEqual([again.status, again.body.replayed], [200, true]);
+  const other = await r.S.recordAttempt(r.supabase, { ...input, answer: "3, 1, 2" });
+  assert.deepEqual([other.status, other.body.error], [409, "key_reused"]);
+  assert.equal(db.attempts.size, 1);
+  // Without grade_answer the reply itself is graded (a reply that is not the steps one per line is incorrect).
+  const plain = await r.S.recordAttempt(r.supabase, { ...input, attempt_key: key(), round_key: key(), grade_answer: undefined });
+  assert.deepEqual([plain.status, plain.body.verdict], [200, "incorrect"]);
+  // The HTTP body never carries it.
+  const viaRoute = await r.attempt.POST(post(answer({ question_id: 1003, answer: reply, grade_answer: "Light the lamp
+Watch the bay
+Write the entry" })));
+  assert.equal(viaRoute.status, 400);
+});
+
 test("chat weak mode finds a lapsed idea scheduled for a later day, through the chapter's gated deck", async () => {
   const db = makeDb();
   db.deckPicks = true;

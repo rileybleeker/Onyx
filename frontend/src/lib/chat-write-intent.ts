@@ -52,6 +52,12 @@
  *     established (no recognized question, an unanswered one, a later unrelated question) fails closed. A score the
  *     user states themselves ("I got 4 out of 5") is recorded without a quiz, each at most once per request, and never
  *     after "don't record a score".
+ *   - a question-bank answer (record_reading_answer) only inside a quiz the user asked for and did not stop, when the
+ *     latest message is the reply to the question just asked (the assistant's message right before it carries that
+ *     question's label, "Q<id>"), with the answer a verbatim span of that reply, once per message; a question flag
+ *     (flag_reading_question) only when the latest message itself says that question is wrong / unclear / not in that
+ *     chapter / from a chapter not read yet, the kind the call sends, about the question just asked (or one the message
+ *     names as "Q<id>"), never after "don't flag", once per message.
  * Quoted text is someone else's words and grants nothing: "double quotes" and curly quotes (also over several lines;
  * an opening quote that is never closed masks the rest), block quotes (with their continuation lines), fenced code
  * blocks and inline code. A refused call never runs; its receipt says why. Pure and import-free (types only), so it
@@ -91,6 +97,8 @@ interface QuizState {
   recorded: boolean;
   /** The latest message answers a quiz question the assistant asked right before it: the quiz's one finalization. */
   answering: boolean;
+  /** The latest message is a user message after the request, right after an assistant message (a reply to it). */
+  follows: boolean;
   /** A user message since the request stopped the quiz or asked not to record it ("stop the quiz", "don't save it"). */
   cancelled: boolean;
   /** The checkpoint the conversation bound the quiz to ("ch4", "review"), or null when none was named. */
@@ -114,6 +122,11 @@ export interface WriteGrant {
   /** The latest message is a short "yes" to the one write offer the assistant made right before it. */
   confirmed: boolean;
   quiz: QuizState;
+  /**
+   * The question-bank questions the assistant's message right before the latest one labels ("Q1234"): the question
+   * just asked. Read from the conversation only, never a tool result. Empty when that message labels none.
+   */
+  askedQuestions: number[];
 }
 
 /** The books a reading write may go to: the one being read (its slug) and every known book. */
@@ -169,6 +182,8 @@ export type RefusalCode =
   | "quiz_already_recorded"
   | "quiz_cancelled"
   | "quiz_score_invalid"
+  | "question_not_asked"
+  | "flag_not_stated"
   | "quiz_checkpoint_mismatch"
   | "once_per_request";
 
@@ -195,6 +210,8 @@ export const REFUSAL_TEXT: Record<RefusalCode, string> = {
   quiz_already_recorded: "Not recorded: this quiz's result was already recorded. Ask for a new quiz to record another.",
   quiz_cancelled: "Not recorded: you stopped this quiz or asked not to record it. Ask for a new quiz, or say your score, to record one.",
   quiz_score_invalid: "Not recorded: this score does not fit the quiz questions asked and answered in this conversation.",
+  question_not_asked: "Not recorded: this is not the question just asked. Onyx records an answer only for the question you were asked right before your reply (the one labelled with its Q number).",
+  flag_not_stated: "Not flagged: your latest message does not say this question is wrong, unclear, not in that chapter, or from a chapter you have not read. Say which, about that question, to flag it.",
   quiz_checkpoint_mismatch: "Not recorded: this checkpoint is not the one the quiz you asked for was about. Say the checkpoint yourself to record it there.",
   once_per_request: "Not written: this can be done once per message, and it was already done for this one.",
 };
@@ -1035,7 +1052,7 @@ function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
     }
   }
   const empty: QuizState =
-    { requested: false, asked: 0, answers: 0, answeredAll: false, recorded: false, answering: false, cancelled: false, checkpoint: null, userText: "" };
+    { requested: false, asked: 0, answers: 0, answeredAll: false, recorded: false, answering: false, follows: false, cancelled: false, checkpoint: null, userText: "" };
   if (request < 0) return empty;
   let asked = 0;
   let answers = 0;
@@ -1066,8 +1083,40 @@ function quizState(messages: ReadonlyArray<IntentMessage>): QuizState {
   }
   const n = messages.length;
   const answering = n - 2 > request && messages[n - 1]?.role === "user" && quizQuestionsBefore(messages, n - 1) > 0;
-  return { requested: true, asked, answers, answeredAll: answers >= asked, recorded, answering, cancelled, checkpoint, userText: userText.join("\n") };
+  // The latest message replies to an assistant message after the request (a question-bank answer needs only this).
+  const follows = n - 1 > request && messages[n - 1]?.role === "user" && messages[n - 2]?.role === "assistant";
+  return { requested: true, asked, answers, answeredAll: answers >= asked, recorded, answering, follows, cancelled, checkpoint, userText: userText.join("\n") };
 }
+
+/** The question numbers a message labels, "(Q1234 · ch 3)": the question-bank questions it asks. */
+function questionLabels(text: string): number[] {
+  return [...new Set([...text.matchAll(/\bQ(\d{1,15})\b/g)].map((m) => Number(m[1])).filter((n) => Number.isSafeInteger(n) && n > 0))];
+}
+
+/** A request not to flag: "don't flag it", "no need to report that question". */
+const FLAG_NO = /\b(?:don't|dont|do not|never|no need to|don't need to|dont need to)\s+(?:bother\s+)?(?:flag|report|retire|mark)\b/;
+/** The sentence is about the question or the flag itself ("this question…", "Q12…", "flag it…", "that one…"). */
+const FLAG_SUBJECT = /\b(?:question|q\d+|flag|this one|that one)\b/;
+/** A hedge: the user is not saying it, so nothing is flagged. */
+const FLAG_UNSURE = /\b(?:maybe|might|perhaps|possibly|not sure|i think|i guess|wonder|whether|could be)\b/;
+const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
+/**
+ * What the user has to say for each kind of flag, read from one sentence of the latest message (norm: lower case,
+ * plain apostrophes). "wrong" and "unclear" are about the question, never "my answer was wrong" (the sentence also has
+ * to be about the question, FLAG_SUBJECT) and never "not wrong" (the verb has to sit right before the word).
+ */
+const FLAG_SAYS: Record<string, RegExp> = {
+  wrong: new RegExp(
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:wrong|incorrect|false|inaccurate|mistaken|an error)\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:wrong|incorrect|inaccurate)\\b`,
+  ),
+  unclear: new RegExp(
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:unclear|confusing|ambiguous|vague|poorly worded|badly worded|nonsense)\\b|\\b(?:makes?|made) no sense\\b|\\b(?:doesn't|does not|didn't|did not) make (?:any )?sense\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:unclear|confusing|ambiguous|vague)\\b`,
+  ),
+  not_in_chapter:
+    /\b(?:not|isn't|wasn't|aren't)\s+(?:in|from|part of|covered in|about)\s+(?:this|that|the|that same)\s+chapter\b|\bnot (?:in|from) (?:chapter|ch\.?)\s*\d+\b|\bwrong chapter\b|\bfrom (?:another|a different|the wrong) chapter\b/,
+  not_read_yet:
+    /\b(?:haven't|have not|hasn't|didn't|did not|not)\s+(?:read|got to|gotten to|reached|finished)\s+(?:that|this|the|it|chapter|ch\.?)\b|\bnot read (?:that|this|it|the chapter)?\s*yet\b|\bfrom a chapter i (?:haven't|have not|didn't|did not) (?:read|reach|get to)\b|\b(?:later|future|upcoming) chapter\b/,
+};
 
 // ---------------------------------------------------------------------------------------------------------------
 // The grant
@@ -1091,6 +1140,7 @@ export function writeGrantFor(messages: ReadonlyArray<IntentMessage>, opts: { of
     clauses: offer ? [offer] : latest ? intentClauses(latest) : [],
     confirmed,
     quiz: quizState(messages),
+    askedQuestions: questionLabels(messages.length > 1 && messages[messages.length - 2].role === "assistant" ? messages[messages.length - 2].content : ""),
   };
 }
 
@@ -1281,6 +1331,51 @@ export function authorizeWrite(
     }
     const bad = bookCheck(input, stated ? stated.text : grant.quiz.userText, ctx.books);
     if (bad) return deny(bad);
+    return allow(tool, null);
+  }
+
+  // One answer to a question-bank question (READ-QUIZ-01): only inside a quiz the user asked for and did not stop, when
+  // the latest message is the reply to the question the assistant asked right before it (that message carries the
+  // question's label, "Q<id>", so a made-up id or an earlier question is refused), the answer a verbatim span of that
+  // reply, once per message. The grade is the model's judgement; the answer itself is only ever the user's own words.
+  if (tool === "record_reading_answer") {
+    if (notNumber(input.question_id) || notNumber(input.version) || notText(input.answer) || notText(input.verdict) || notText(input.feedback)) return deny("invalid_value");
+    const qid = num(input.question_id), version = num(input.version);
+    if (qid == null || version == null || !Number.isInteger(qid) || !Number.isInteger(version) || qid < 1 || version < 1) return deny("invalid_value");
+    if (input.verdict !== "correct" && input.verdict !== "partial" && input.verdict !== "incorrect") return deny("invalid_value");
+    const answer = str(input.answer);
+    if (!answer) return deny("invalid_value");
+    if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
+    const q = grant.quiz;
+    if (!q.requested) return deny("quiz_not_asked");
+    if (q.cancelled) return deny("quiz_cancelled");
+    if (!q.follows) return deny("quiz_not_answered");
+    if (!grant.askedQuestions.includes(qid)) return deny("question_not_asked");
+    if (!verbatimIn(answer, grant.latest)) return deny("not_your_words");
+    return allow(tool, null);
+  }
+
+  // A question flag: the user's own latest message says that question is wrong / unclear / not in that chapter / from a
+  // chapter not read yet, in the kind the call sends, about the question just asked (or one the message names as
+  // "Q<id>"). "My answer was wrong", a question ("is it wrong?"), a condition and "don't flag it" flag nothing.
+  if (tool === "flag_reading_question") {
+    if (notNumber(input.question_id) || notText(input.kind)) return deny("invalid_value");
+    const qid = num(input.question_id);
+    if (qid == null || !Number.isInteger(qid) || qid < 1) return deny("invalid_value");
+    const kind = str(input.kind);
+    if (!kind || !Object.prototype.hasOwnProperty.call(FLAG_SAYS, kind)) return deny("invalid_value");
+    if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
+    const masked = maskQuotes(grant.latest);
+    const sentences = sentenceRanges(masked).map(([start, end, term]) => ({ s: norm(masked.slice(start, end)), term }));
+    if (sentences.some(({ s }) => FLAG_NO.test(s))) return deny("contradicts");
+    const says = sentences.some(({ s, term }) => {
+      if (term === "?" || conditional(s) || FLAG_UNSURE.test(s) || !FLAG_SUBJECT.test(s) || !FLAG_SAYS[kind].test(s)) return false;
+      // "not wrong", "not unclear": the word itself is negated.
+      return !(kind === "wrong" || kind === "unclear") || !/\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(s);
+    });
+    if (!says) return deny("flag_not_stated");
+    const named = questionLabels(grant.latest);
+    if (!(named.length > 0 ? named : grant.askedQuestions).includes(qid)) return deny("question_not_asked");
     return allow(tool, null);
   }
 
