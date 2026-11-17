@@ -35,8 +35,9 @@ export async function POST(req: NextRequest) {
       ingredient_count: row.ingredients.length,
     });
   } catch (e) {
+    console.error("supplements/seed", e);
     return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
+      { error: "Couldn't reach the supplement database. Try again." },
       { status: 502 },
     );
   }
