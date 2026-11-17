@@ -100,7 +100,8 @@ class _Rpc:
         if self.fn == "replace_cronometer_servings_and_daily":
             # The manual import's one call: the date-set replace (when there are rows)
             # plus the daily upsert, in one transaction.
-            assert set(self.params) == {"p_dates", "p_rows", "p_daily_rows"}, self.params.keys()
+            assert set(self.params) == {"p_dates", "p_rows", "p_daily_rows", "p_food_dates"}, \
+                self.params.keys()
             rows, drows = self.params["p_rows"], self.params["p_daily_rows"]
             assert rows or drows, "nothing to do"
             out = {"dates": 0, "deleted": 0, "inserted": 0}

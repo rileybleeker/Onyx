@@ -180,7 +180,13 @@ export const sha256Hex = (text: string): string => createHash("sha256").update(t
 /** Fields the tools resolve case-insensitively, or read as a fixed word (medium, answer, source). */
 const CASELESS_FIELDS = new Set(["stack", "product", "unit", "habit", "book", "medium", "source", "answer"]);
 /** Fields the tools read with Number(...): "2" and 2 are the same request. */
-const NUMERIC_FIELDS = new Set(["amount", "chapter_through", "chapter_from", "minutes", "chapter", "score", "total"]);
+const NUMERIC_FIELDS = new Set(["amount", "chapter_through", "chapter_from", "minutes", "chapter", "score", "total", "question_id", "version"]);
+/**
+ * The model's own wording about a call, never part of what it asks for: left out of the match, so a retry whose model
+ * words the grade or the feedback differently still finds the answer an earlier try stored for the same question and
+ * reply (and answers it from the stored result, which holds the grade that was kept).
+ */
+const UNMATCHED_FIELDS = new Set(["verdict", "feedback"]);
 
 /** "8:30" and "08:30" (and "8:30 PM" / "08:30pm") are the same clock time. */
 function clockTime(value: string): string {
@@ -198,7 +204,7 @@ export function matchingForm(input: unknown): unknown {
   const out: Record<string, unknown> = {};
   for (const [k, raw] of Object.entries(input as Record<string, unknown>)) {
     let v: unknown = typeof raw === "string" ? raw.trim() : raw;
-    if (v === null || v === undefined || v === "") continue;
+    if (v === null || v === undefined || v === "" || UNMATCHED_FIELDS.has(k)) continue;
     if (typeof v === "string" && CASELESS_FIELDS.has(k)) v = v.toLowerCase();
     if (typeof v === "string" && NUMERIC_FIELDS.has(k) && Number.isFinite(Number(v))) v = Number(v);
     if (Array.isArray(v)) v = v.map((t) => (typeof t !== "string" ? t : k === "times" ? clockTime(t.trim().toLowerCase()) : t.trim()));
@@ -231,6 +237,10 @@ export const RERUN_SAFE: ReadonlySet<string> = new Set([
   "log_reading_session",
   // The operation id is the quiz's op_key (pds.reading_record_quiz): the same key answers the stored receipt.
   "record_reading_quiz",
+  // Question-bank answers and flags (READ-QUIZ-01): the attempt key / flag key are derived from the operation id
+  // (lib/reading-recall-server.ts chatAttemptKey / chatFlagKey), so a re-run finds the row an earlier try stored.
+  "record_reading_answer",
+  "flag_reading_question",
 ]);
 
 /**
@@ -271,9 +281,15 @@ const UNCERTAIN: Record<string, string> = {
     "An earlier try of this message started recording this quiz result and Onyx cannot confirm it. Nothing was recorded now. Check /reading before asking again in a new message.",
 };
 export const PLAYLIST_TRACKS_UNCONFIRMED = "The playlist exists; Onyx cannot confirm all its tracks were added. Check it in Spotify.";
+const UNCERTAIN_BANK: Record<string, string> = {
+  record_reading_answer:
+    "An earlier try of this message started recording this answer and Onyx cannot confirm it. Nothing was recorded now. Check /reading before answering it again in a new message.",
+  flag_reading_question:
+    "An earlier try of this message started flagging this question and Onyx cannot confirm it. Nothing was flagged now. Check /reading before flagging it again in a new message.",
+};
 const UNCERTAIN_DEFAULT =
   "An earlier try of this message started this and Onyx cannot confirm it finished. Nothing was written now. Check the relevant page before asking again in a new message.";
-export const uncertainText = (tool: string): string => UNCERTAIN[tool] ?? UNCERTAIN_DEFAULT;
+export const uncertainText = (tool: string): string => UNCERTAIN[tool] ?? UNCERTAIN_BANK[tool] ?? UNCERTAIN_DEFAULT;
 export const RUNNING_TEXT = "This was still being saved when Onyx checked. Check again in a minute before sending anything again.";
 
 /* ------------------------------------------------------------------ */

@@ -67,7 +67,8 @@ T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 ENV_KEYS = ("GITHUB_ACTIONS", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REF", "GITHUB_SHA",
             "GITHUB_WORKFLOW", "GITHUB_JOB", "GITHUB_OUTPUT", "RUNNER_OS",
             "HRV_MODEL_REGISTRY", "HRV_MODEL_SELECTED_SHA256", "HRV_MODEL_PINNED",
-            "HRV_MODEL_PIN_BLOCKED", "HRV_MODEL_PIN_REASON", "HRV_MODEL_RESTORED")
+            "HRV_MODEL_PIN_BLOCKED", "HRV_MODEL_PIN_REASON", "HRV_MODEL_RESTORED",
+            "HRV_MODEL_PUBLISH")
 
 
 # ── synthetic pieces ─────────────────────────────────────────────────────────────────────────
@@ -430,8 +431,21 @@ def test_serving_report_names_every_unchecked_path():
             ({**ok, "HRV_MODEL_SELECTED_SHA256": "e" * 64, "HRV_MODEL_RESTORED": "false",
               "GITHUB_RUN_ID": "501", "GITHUB_RUN_ATTEMPT": "1"}, "partial", "not the selected"),
             ({"HRV_MODEL_REGISTRY": "not_applied"}, "partial", "not set up yet"),
-            # nothing published yet: the missing-model training of this run
-            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1"}, "success", None),
+            # nothing published yet: the missing-model training of this run, published in this run
+            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1",
+              "HRV_MODEL_PUBLISH": "published"}, "success", None),
+            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1",
+              "HRV_MODEL_PUBLISH": "already_published"}, "success", None),
+            # the same self-trained model with publication NOT confirmed: never success
+            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1",
+              "HRV_MODEL_PUBLISH": "not_published"}, "partial", "publishing it failed or did not run"),
+            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1",
+              "HRV_MODEL_PUBLISH": "not_attempted"}, "partial", "publication was not attempted"),
+            # an older workflow that passes no publication outcome: not confirmed either
+            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1"}, "partial",
+             "publication was not confirmed"),
+            ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "1",
+              "HRV_MODEL_PUBLISH": "something_else"}, "partial", "publication was not confirmed"),
             ({**ok, "GITHUB_RUN_ID": "500", "GITHUB_RUN_ATTEMPT": "2"}, "partial", "did not select"),
             ({}, "success", None),   # outside the workflow: the manifest checked out
         ]
@@ -700,6 +714,44 @@ def test_publishing_again_changes_nothing():
         _refused(lambda: ma.publish(db2, manifest), "other provenance")
         assert len(db2.registry()) == 1
     print("PASS: publishing the same artifact again is a no-op")
+
+
+def test_publish_reports_its_outcome_to_the_workflow():
+    """'publish' writes publish=published|already_published|not_published to $GITHUB_OUTPUT, so
+    the forecast heartbeat can tell a confirmed publication from a failed or skipped one; a
+    failed publish writes no output (the workflow derives 'not_published' from the outcome)."""
+    import io
+    import contextlib as cl
+
+    def run_publish(db, run_id, saved="true", ref=MASTER):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, _workspace(), \
+                _environ(**_run_env(run_id, ref=ref), GITHUB_OUTPUT=str(Path(tmp) / "out")):
+            ma.write_artifact(_bundle(), _provenance(run_id=run_id, deps=ma.dependency_versions()),
+                              Path("analysis_output") / "xgboost_hrv_model.pkl")
+            with cl.redirect_stdout(buf):
+                code = ma.cmd_publish(_Args(saved), db=db)
+            out_file = Path(os.environ["GITHUB_OUTPUT"])
+            outputs = dict(line.split("=", 1) for line in
+                           (out_file.read_text().splitlines() if out_file.exists() else []))
+        return code, outputs, buf.getvalue()
+
+    db = _FakeDb()
+    code, outputs, printed = run_publish(db, "910")
+    assert code == 0 and outputs == {"publish": "published"}
+    assert "publish=published" in printed
+    # publishing again (a retried workflow): already_published, still a confirmed publication
+    code, outputs, printed = run_publish(db, "911")
+    assert code == 0 and outputs == {"publish": "already_published"}
+    # the cache confirm step found nothing: not published, and no output is trusted from it
+    db2 = _FakeDb()
+    code, outputs, _ = run_publish(db2, "912", saved="")
+    assert code == 1 and outputs == {} and db2.registry() == []
+    # a branch training: reported, never published
+    db3 = _FakeDb()
+    code, outputs, _ = run_publish(db3, "913", ref="refs/heads/feature")
+    assert code == 0 and outputs == {"publish": "not_published"} and db3.registry() == []
+    print("PASS: the publish step reports its outcome; failures write no output")
 
 
 def _select_output(db) -> dict:
@@ -1046,6 +1098,7 @@ def test_forecast_workflow_never_saves_a_restored_model():
     assert save["if"] == "steps.trained.outcome == 'success'"
     assert save["with"]["key"] == "${{ steps.trained.outputs.key }}"
     assert steps[publish]["if"] == "steps.trained.outcome == 'success'"
+    assert steps[publish].get("id") == "publish", "the forecast step reads the publish outcome"
     assert "${{ steps.saved.outputs.cache-hit }}" in steps[publish]["run"]
     exact = next(s for _, s in model if s.get("id") == "model-cache")
     assert exact["with"]["key"] == "${{ steps.select.outputs.key }}" and "restore-keys" not in exact["with"]
@@ -1060,6 +1113,14 @@ def test_forecast_workflow_never_saves_a_restored_model():
     assert env["HRV_MODEL_SELECTED_SHA256"] == "${{ steps.select.outputs.sha }}"
     assert env["HRV_MODEL_RESTORED"] == "${{ steps.model-cache.outputs.cache-hit }}"
     assert env["HRV_MODEL_REGISTRY"] == "${{ steps.select.outputs.registry }}"
+    # the publication outcome of a model trained in this run reaches the forecast heartbeat:
+    # the publish step's output when it succeeded, not_published when it failed or was skipped
+    # after a training, not_attempted when nothing was trained here.
+    publish_env = env["HRV_MODEL_PUBLISH"]
+    assert "steps.publish.outcome == 'success'" in publish_env
+    assert "steps.publish.outputs.publish" in publish_env
+    assert "steps.trained.outcome == 'success' && 'not_published'" in publish_env
+    assert "'not_attempted'" in publish_env
     assert "steps.self-train.outcome != 'failure'" in steps[predict]["if"]
     assert "steps.select.outcome == 'success'" in steps[predict]["if"], "not after a failed setup step"
     # the legacy restore is for the table-not-applied window only; nothing is restored on an error

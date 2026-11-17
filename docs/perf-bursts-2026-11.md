@@ -3,7 +3,7 @@
 Status: **diagnosis only.** The last section (2026-11-16) adds a lazy-loading change for the two Today finance
 routes, proposed in PR #396: it is not deployed and its effect on speed has not been measured. The evidence rules out the suspected scheduled-job collisions and
 locates the stall, but it does not prove its cause. Three candidates remain open (below): our own fan-out,
-shared-CPU throttling and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
+shared-CPU contention and memory pressure (swap). The dashboard metrics favour memory pressure, but they are
 minute averages and cannot show a 2 s event. Read-only evidence: the
 three `perf-timing.yml` artifacts, Supabase edge / PostgREST / Postgres / Auth logs, `pg_stat_statements`,
 `pg_stat_activity`, `cron.job_run_details` and the GitHub Actions run list. Counts and timings only.
@@ -68,20 +68,27 @@ VM (CPU, memory or disk IO), not to one service. The logs do not show which.
 1. **Our own bursts overload the instance.** A /nutrition open (page + scroll neighbours + warm-up)
    sometimes lands as one ~1.5 s wave of 40-60 queries plus PostgREST JSON encoding, more than two shared
    cores finish quickly; whether it does depends on how the neighbour mounts and the warm-up step line up.
-2. **Shared-CPU throttling.** The small compute sizes run on burstable CPU; when the instance's CPU
-   allowance is spent (or a neighbour on the host takes it), the same burst takes seconds. The out-of-run
-   stalls (provisional, above) and the Auth slowdown fit this better than cause 1, but neither proves it.
-3. **Memory pressure (swap).** The Micro instance (1 GB) has about 500 MB in swap all week and memory
+2. **Shared-CPU contention (a hypothesis, not proof of CPU-credit exhaustion).** The small compute
+   sizes run on shared CPU; contention with other tenants on the host could stretch the same burst to
+   seconds. Supabase's documented burst behaviour for shared compute is disk IO, not a spendable CPU
+   allowance, so "burst balance spent" is not an available explanation for CPU. The minute-average CPU
+   idleness weakens this cause but cannot exclude a 2 s spike. The out-of-run stalls (provisional, above)
+   and the Auth slowdown fit it, but nothing here proves it.
+3. **Memory pressure (swap).** The Micro instance (1 GB) has about 450-650 MB in swap all week and memory
    commitment at its limit (see the metrics section). A burst that touches cold pages pays disk reads, and
-   that slows every service on the VM. This fits the instance-wide slowdown and the IOwait bump, and it fits the
-   idle CPU better than causes 1 and 2.
+   that slows every service on the VM. This fits the instance-wide slowdown and the IOwait bump, and it fits
+   the minute-average idle CPU better than causes 1 and 2 — which weakens, but does not exclude, the CPU
+   causes, because a minute average cannot show a 2 s burst.
 
 ## What the next measurement needs
 
 * **Instance CPU for the stall minutes** (21:31, 23:31 on 2026-11-16, and the next red run): CPU busy,
   CPU steal / burst balance and load, from the Supabase dashboard's database health charts or the project
-  metrics endpoint. High steal or an exhausted burst balance means cause 2; a spike to 100 % busy without
-  steal means cause 1. This needs Riley (dashboard) or a run holding the service key; neither was used here.
+  metrics endpoint. These are evidence, not a decision rule: high steal or an exhausted burst balance would
+  support cause 2, a sustained spike to 100 % busy without steal would support cause 1, and a quiet CPU
+  together with paging would support cause 3 — minute-level series may still miss a 2 s event, so absence
+  in these charts weakens a CPU cause without excluding it. This needs Riley (dashboard) or a run holding
+  the service key; neither was available when the diagnosis was written.
 * **An A/B on the same hour**: `/nutrition` with the continuous scroll on vs off
   (`sessionStorage["onyx.feed"] = "off"`). The harness is owned by PR #373 and was not changed here.
 
@@ -103,33 +110,38 @@ Read in the dashboard's Observability > Database charts and Settings > Infrastru
   management. Postgres settings are the Micro defaults (shared_buffers 256 MB, work_mem 3.5 MB).
 
 **Current reading (a hypothesis, not proof):** the instance-wide ~2 s stall fits **memory pressure** best: a burst of 40-60 queries on a
-1 GB box that is already about 500 MB into swap pages memory back in. That would explain why Auth's JWKS
-call slowed too, and why IOwait rises while CPU stays idle. A per-minute chart cannot show a 2 s event
-directly. The test is to move to a size with more RAM and see whether the isolated stalls stop in the
-hourly runs; if they do not, return to causes 1 and 2.
+1 GB box that is already about 450-650 MB into swap pages memory back in. That would explain why Auth's JWKS
+call slowed too, and why IOwait rises while CPU stays minute-average idle. A per-minute chart cannot show a
+2 s event directly, so this reading is a best fit, not an identification.
 
-**Fix:** compute size Small (2 GB RAM). About $15.04 a month against Micro's $9.81 (the Pro plan's $10
-compute credit covers Micro), so about +$5 a month. Applying it restarts the database for about 2 minutes.
-It needs Riley's yes because it changes the monthly bill. The cause-1 mitigation (staggered neighbour
-mounts) still lowers the burst size, but it does not remove the swap.
+**Mitigation experiment (not a cause-isolating test):** compute size Small (2 GB RAM). About $15.04 a month
+against Micro's $9.81 (the Pro plan's $10 compute credit covers Micro), so about +$5 a month. It needs
+Riley's approval because it changes the monthly bill, and applying it restarts the database for about
+2 minutes of downtime. Small does not isolate the cause: it also raises the baseline disk IO capacity (the
+documented shared-compute burst is disk IO) and the restart itself perturbs the instance, so a stall-free
+period after the resize would support the memory hypothesis without settling the cause, and a resize that
+changes nothing would weaken it. To be meaningful the experiment needs matched windows (same revision, same
+cache state, same workload), feed-on versus feed-off runs, a stall frequency with a sample count rather
+than a single run, and correlated paging, IO and CPU measurements from the dashboard across the windows.
+The cause-1 mitigation (staggered neighbour mounts) still lowers the burst size, but it does not remove the
+swap.
 
-## Why this PR ships no fix
+## Current state
 
-* The candidate causes need different fixes. The minute-level metrics favour memory pressure but cannot prove
-  it; the compute change that would test it changes the monthly bill and needs Riley's yes.
-* The cause-1 fix lives in `components/ContinuousScroll.tsx`, which PR #376 is editing; changing it here
-  would collide with that PR, and the perf harness that would prove a gain is owned by PR #373.
-* The cause-2 fix is a compute-size change with a monthly cost, which is Riley's decision.
-* Shipping a guess would also blur the before/after evidence the speed budget asks for. This PR is held
-  until the measurement above is in; then the matching fix goes in its own PR with before/after timings
-  from the hourly runs.
+The diagnosis is merged and PERF-02 is open: no fix and no compute change has been applied. The next
+measurement is still the one above — instance CPU for the stall minutes, and (with Riley's approval of the
+monthly cost) the Small resize run as the mitigation experiment with matched windows. The cause-1 fix
+lives in `components/ContinuousScroll.tsx`; the perf harness that would prove a gain is owned by PR #373.
+Whatever change lands, it goes in with before/after timings from the hourly runs, and neither loosens the
+budget nor moves the perf schedule.
 
 ## Fix options, by cause (not applied)
 
 * Cause 1: in `components/ContinuousScroll.tsx` (owned by PR #376), start a neighbour's mount only after the
   routed page's reads have settled and mount one neighbour at a time; the heaviest single read in the burst,
   `daily_micronutrient_totals` (~160 ms on every call), is a candidate for the matview treatment.
-* Cause 2 / memory: compute size Small (2 GB, about +$5 a month net; see the metrics section). Riley's decision: it changes the monthly cost.
+* Cause 2 / memory: the Small resize as the mitigation experiment described above (2 GB, about +$5 a month
+  net). It needs Riley's approval because it changes the monthly cost, and it cannot by itself identify the cause.
 
 Neither loosens the budget or moves the perf schedule.
 

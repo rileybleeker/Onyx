@@ -21,6 +21,11 @@ applied. This file keeps a later edit from quietly undoing the rules that check 
     locks and before anything is verified, replaced, removed or deleted,
   * a verified hour is a snapshot an ordinary upload cannot change; a newer run's upload is staged and
     replaces the snapshot only when that run finalizes complete,
+  * a complete run reconciles the covered hour set: a verified hour inside its window and coverage end
+    that its export does not list (it owns no copy and staged none) is re-marked unverified, so its
+    stale usage reads unknown, never complete coverage; a snapshot written by a newer complete export
+    (verified_export_at past the run's coverage end) is never rolled back by an older run; the hours
+    it may unmark are locked by the same FOR UPDATE pass as the hours it verifies,
   * the view keeps every existing column, in order, and appends the five completeness columns,
   * every reader asks the view for columns that exist.
 
@@ -153,6 +158,40 @@ def test_finalization_refuses_unsupported_runs_before_verifying():
     assert "'already', true" in fn
 
 
+def test_complete_run_reconciles_omitted_verified_hours():
+    fn = _no_comments(_function(_sql(MIGRATION), "finalize_phone_usage_run"))
+    verify = fn[fn.index("IF v_status = 'complete' THEN"):fn.index("INSERT INTO pds.phone_usage_sync_runs")]
+    enable = verify.index("set_config('onyx.phone_usage_verified_write', 'on', true)")
+    work = verify.index("WITH owned AS")
+    # The hours the reconciliation may unmark are locked by the same FOR UPDATE pass (same statement,
+    # same order) as the hours the run verifies and replaces, so the unmark is atomic with item writes.
+    lock = verify[:verify.index("FOR UPDATE;")]
+    for arm in ("OR (s.verified_at IS NOT NULL", "s.segment_start >= c.window_start", "s.segment_end <= v_cover"):
+        assert arm in lock, arm
+    # The omitted set: verified, not this run's own snapshot, inside window-to-coverage-end, not owned
+    # and not staged by this run (the export lists no copy of the hour).
+    reconcile = verify[verify.index("WITH omitted AS"):verify.index("SELECT count(*) INTO v_unmarked")]
+    for rule in ("s.verified_at IS NOT NULL", "s.verified_run_id IS DISTINCT FROM p_run_id",
+                 "COALESCE(s.verified_export_at, v_cover) <= v_cover",
+                 "s.segment_start >= c.window_start", "s.segment_end <= v_cover",
+                 "s.last_run_id IS DISTINCT FROM p_run_id",
+                 "NOT EXISTS (SELECT 1 FROM pds.phone_usage_pending_hours h"):
+        assert rule in reconcile, rule
+    # A newer complete run's snapshot (verified_export_at past this run's coverage end) is never rolled back.
+    assert "COALESCE(s.verified_export_at, v_cover) <= v_cover" in reconcile
+    # The unmark clears exactly the verification columns; usage rows are kept, only flagged unknown.
+    unmark = verify[verify.index("), unmarked AS ("):verify.index("SELECT count(*) INTO v_unmarked")]
+    assert "SET verified_at = NULL, verified_run_id = NULL, verified_export_at = NULL" in unmark
+    assert unmark.count("UPDATE pds.phone_usage_segments") == 1 and "DELETE FROM" not in unmark
+    # Inside the enabled-write branch, after the staged replacements, before the staged-cleanup delete
+    # (so an hour this run staged but could not replace keeps its verification).
+    assert work < verify.index("WITH omitted AS") and enable < verify.index("WITH omitted AS")
+    assert verify.index("WITH omitted AS") < verify.index(
+        "DELETE FROM pds.phone_usage_pending_hours h WHERE h.device = p_device AND h.run_id = p_run_id")
+    # Every answer carries the count, and the idempotent repeat reports zero.
+    assert fn.count("'hours_unmarked'") == 3
+
+
 def test_run_is_not_settled_while_a_staged_replacement_is_incomplete():
     fn = _no_comments(_function(_sql(MIGRATION), "finalize_phone_usage_run"))
     lock = fn.index("FOR UPDATE;")
@@ -272,7 +311,10 @@ def test_branch_check_is_rolled_back_and_refuses_real_data():
                  "later_complete_export_replaces_snapshot", "later_incomplete_export_keeps_snapshot",
                  "older_export_not_staged", "stale_source_limits_coverage", "legacy_item_refused",
                  "source_updated_at", "coverage_end", "staged_replacement_not_settled_early",
-                 "repeated_delivery_converges", "'staged_incomplete')::int <> 1"):
+                 "repeated_delivery_converges", "'staged_incomplete')::int <> 1",
+                 "hours_unmarked", "omitted_verified_hour_unmarked", "newer_snapshot_not_rolled_back",
+                 "an hour the export omitted stayed verified",
+                 "an older run rolled back a newer complete run''s snapshot"):
         assert case in body, case
     # Case 18 runs the interleaving in order: hour repeat (staged items emptied), original finalization (refused),
     # then the repeat's items, acknowledgement and finalization (settled).

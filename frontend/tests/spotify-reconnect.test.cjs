@@ -880,7 +880,8 @@ function statusDb(tokenData, spotifyBeat) {
     };
     return b;
   };
-  return { client: { from }, reads };
+  // /api/status also calls rpc("reading_bank_status") (READ-QUIZ-01 s2): answer "function missing" (not set up).
+  return { client: { from, rpc: () => Promise.resolve({ data: null, error: { code: "PGRST202" } }) }, reads };
 }
 
 async function statusWith(tokenData, beat) {
@@ -954,6 +955,17 @@ test("the two routes are owner-session only: never in the CI-token carve-out", (
   assert.equal((read("lib/spotify-reconnect.ts").match(/http:\/\/127\.0\.0\.1:8888\/callback"/g) || []).length, 1, "defined once");
   // the pure module is imported by a client component: it must hold no secret access
   assert.equal(/process\.env|SUPABASE_SERVICE_ROLE_KEY|CLIENT_SECRET/.test(read("lib/spotify-reconnect.ts").replace(/RECONNECT_ERRORS = \{[\s\S]*?\} as const;/, "")), false);
+});
+
+test("the journal list route keeps the browser from storing the body", () => {
+  const src = read("app/api/journal/list/route.ts");
+  assert.equal(/public|s-maxage/.test(src), false, "no public or s-maxage cache rule remains");
+  assert.match(src, /"Cache-Control"\s*:\s*"private, no-store"/, "the browser header is private, no-store");
+  assert.match(
+    src,
+    /"Vercel-CDN-Cache-Control"\s*:\s*"max-age=300, stale-while-revalidate=300"/,
+    "the CDN snapshot rule lives in Vercel-CDN-Cache-Control"
+  );
 });
 
 test("/status shows the Reconnect control on the Spotify card for a rejected token or a due date", () => {

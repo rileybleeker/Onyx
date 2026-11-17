@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildOrderItemRows, customizationsText, type HarvestOrder, type ItemCustomization, type ItemProvider } from "@/lib/delivery";
+import { estimateQuality } from "@/lib/delivery-estimate-quality";
 import {
   attemptTimeoutMs,
   callWithCountedRetries,
@@ -317,6 +318,11 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
     const src = todo[e.id];
     if (!src || used.has(e.id)) continue; // id out of range, or returned twice
     used.add(e.id);
+    // Quality gate (lib/delivery-estimate-quality.ts): an estimate that fails a rule is never
+    // stored, and is not counted as accepted, so the pilot's cost gate sees it like any other
+    // failed result (the harvester retries the dish one at a time, as with a model failure).
+    const quality = estimateQuality(e);
+    if (!quality.usable) continue;
     const zero = e.kind === "non_food";
     rows.push({
       est_key: src.est_key,
