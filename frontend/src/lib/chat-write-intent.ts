@@ -977,14 +977,16 @@ function intentClauses(text: string): IntentClause[] {
   let action = -1;
   let chains = -1;
   for (const [start, end, term] of sentenceRanges(masked)) {
-    const sentence = norm(masked.slice(start, end)).replace(/(\d):(\d)/g, "$1\u0001$2");
-    const sentenceText = sentence.replace(/\u0001/g, ":");
-    if (conditional(sentence)) { chain = null; lastChain = null; continue; }
+    // A colon inside a time ("8:30") and a comma inside a thousands group ("5,000", "1,250,000") are masked so they
+    // never split the clause; the marks are restored before the clause text is read.
+    const sentence = norm(masked.slice(start, end)).replace(/(\d):(\d)/g, "$1\u0001$2").replace(/(\d),(?=\d{3}(?!\d))/g, "$1\u0002");
+    const sentenceText = sentence.replace(/\u0001/g, ":").replace(/\u0002/g, ",");
+    if (conditional(sentence.replace(/\u0002/g, ","))) { chain = null; lastChain = null; continue; }
     let afterColon = false;
     const parts = sentence.split(CLAUSE_SEP);
     for (let k = 0; k < parts.length; k++) {
       if (k % 2 === 1) { if (parts[k].includes(":")) afterColon = true; continue; }
-      const whole = parts[k].replace(/\u0001/g, ":").replace(/^[\s,:;\-–—*•]+/, "").trim();
+      const whole = parts[k].replace(/\u0001/g, ":").replace(/\u0002/g, ",").replace(/^[\s,:;\-–—*•]+/, "").trim();
       if (!whole) continue;
       // The action is what the clause says before any reason or circumstance ("…because I forgot"): only that part
       // gives its polarity, names its record and carries its arguments. A clause that is only a reason ends the list.
