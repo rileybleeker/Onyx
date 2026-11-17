@@ -32,6 +32,26 @@ export type Outcome =
   /** The answer was lost: the dose may or may not be saved. */
   | { kind: "unconfirmed"; error: string };
 
+/**
+ * One send of one product, exactly as it went out: its event_key and the values it carried. Kept while the send's
+ * answer is unknown (`lost`), so the replay repeats the same key and the same payload even if Day, times, the amount
+ * or the selection changed since. Dropped once the send is confirmed or definitively refused (see `settle`).
+ */
+export interface Attempt {
+  /** A UUID, one per product per send. */
+  eventKey: string;
+  /** The amount sent (null = one serving, the label's). */
+  amount: number | null;
+  /** The unit sent with the amount ("serving" | a weight / IU | the product's own count unit). */
+  unit: string;
+  /** The shared clock times sent, as "HH:MM". */
+  times: string[];
+  /** The day sent (YYYY-MM-DD), null = today. */
+  date: string | null;
+  /** True once the answer was lost (a timeout, a dropped response, or a refused replay of such a send). */
+  lost: boolean;
+}
+
 export interface SelectedItem {
   productId: string;
   /** The amount as typed: "" = one serving (the label's). */
@@ -40,8 +60,8 @@ export interface SelectedItem {
   unit: string;
   /** null = not sent yet. */
   outcome: Outcome | null;
-  /** The event_key of this item's last send (a UUID). A lost answer's retry resends it; see `eventKeyFor`. */
-  eventKey?: string;
+  /** The send in flight or the one whose answer was lost; see `Attempt`. Undefined otherwise. */
+  attempt?: Attempt;
 }
 
 export type Selection = readonly SelectedItem[];
@@ -60,26 +80,27 @@ export const isSelected = (sel: Selection, productId: string): boolean => sel.so
 
 /**
  * Tap on an option: a product not selected is added (one serving, nothing sent); a selected one is removed. An item
- * that is being saved stays (its answer is on its way); a confirmed one is removed from this list only (the dose
- * itself stays logged, it is under "Logged today" with Undo).
+ * that is being saved stays (its answer is on its way), and so does one whose answer was lost (its replay must keep its
+ * key; "Log again" is its only way out); a confirmed one is removed from this list only (the dose itself stays logged,
+ * it is under "Logged today" with Undo).
  */
 export function toggleItem(sel: Selection, productId: string): Selection {
   const at = sel.findIndex((i) => i.productId === productId);
   if (at === -1) return [...sel, { productId, amount: "", unit: "serving", outcome: null }];
-  if (isSaving(sel[at].outcome)) return sel;
+  if (isSaving(sel[at].outcome) || sel[at].outcome?.kind === "unconfirmed") return sel;
   return sel.filter((_, i) => i !== at);
 }
 
 /**
  * Select a product with a dose already in (a Say it suggestion moved in with Edit). A product already waiting gets
  * the new dose; a confirmed one is replaced by a fresh entry (this is a new dose, the saved one stays logged); one
- * being saved is left alone.
+ * being saved, or whose answer was lost, is left alone.
  */
 export function addWithDose(sel: Selection, productId: string, dose: { amount: string; unit: string }): Selection {
   const at = sel.findIndex((i) => i.productId === productId);
   const fresh: SelectedItem = { productId, amount: dose.amount, unit: dose.unit, outcome: null };
   if (at === -1) return [...sel, fresh];
-  if (isSaving(sel[at].outcome)) return sel;
+  if (isSaving(sel[at].outcome) || sel[at].outcome?.kind === "unconfirmed") return sel;
   return sel.map((i, k) => (k === at ? fresh : i));
 }
 
@@ -118,36 +139,50 @@ export function sendable(sel: Selection, opts: { only?: readonly string[]; inclu
 export const countToLog = (sel: Selection): number => sendable(sel).length;
 
 /**
- * The event_key a product's POST carries. A product whose answer was lost (`unconfirmed`) keeps the key of its last
- * send, so its retry is a replay: the route returns the rows the first call stored instead of writing them again.
- * Every other send gets a fresh key (`fresh()`), so "Log selected" again is a genuinely new log.
+ * The attempt a product's POST carries. A product whose answer was lost keeps its attempt untouched (same event_key,
+ * same amount, unit, times and day), so its replay is the same request: the route returns the rows the first call
+ * stored instead of writing them again. Every other send is a genuinely new save: a fresh key (`fresh()`) and the
+ * values as they are now (`payload`).
  * One key per PRODUCT, not one per batch: the route reads a key's rows without a product filter
  * (rowsForEvent, lib/supplement-intake.ts), so a key shared by two products would hand the second one the first one's rows.
  */
-export function eventKeyFor(item: SelectedItem, fresh: () => string): string {
-  return item.outcome?.kind === "unconfirmed" && item.eventKey ? item.eventKey : fresh();
+export function attemptFor(item: SelectedItem, payload: Omit<Attempt, "eventKey" | "lost">, fresh: () => string): Attempt {
+  if (item.attempt?.lost) return item.attempt;
+  return { ...payload, eventKey: fresh(), lost: false };
 }
 
 /**
  * Queue `ids` for sending (their outcome becomes "saving") and record `bad` ids as refused without sending them.
- * `keys` gives each queued id the event_key it will be sent with (see `eventKeyFor`).
+ * `attempts` gives each queued id the attempt it is sent with (see `attemptFor`).
  */
 export function beginSend(
   sel: Selection,
   ids: readonly string[],
   bad: ReadonlyMap<string, string> = new Map(),
-  keys: ReadonlyMap<string, string> = new Map(),
+  attempts: ReadonlyMap<string, Attempt> = new Map(),
 ): Selection {
   return sel.map((i) => {
-    if (bad.has(i.productId)) return { ...i, outcome: { kind: "refused", error: bad.get(i.productId)! } };
-    if (ids.includes(i.productId)) return { ...i, outcome: { kind: "saving" }, eventKey: keys.get(i.productId) ?? i.eventKey };
+    if (bad.has(i.productId)) return { ...i, outcome: { kind: "refused", error: bad.get(i.productId)! }, attempt: undefined };
+    if (ids.includes(i.productId)) return { ...i, outcome: { kind: "saving" }, attempt: attempts.get(i.productId) ?? i.attempt };
     return i;
   });
 }
 
-/** An answer arrives for `productId`: kept only while that item is still waiting for it (never over another outcome). */
+/**
+ * An answer arrives for `productId`: kept only while that item is still waiting for it (never over another outcome).
+ * A lost answer keeps the attempt (marked `lost`) so its replay repeats it exactly. A refusal of a REPLAY does not
+ * prove the first send wrote nothing (the replay can be refused, e.g. a 401, while the first one committed), so it
+ * stays unconfirmed; only a definite refusal of a send that never lost its answer is "refused" and drops the attempt.
+ */
 export function settle(sel: Selection, productId: string, outcome: Outcome): Selection {
-  return sel.map((i) => (i.productId === productId && isSaving(i.outcome) ? { ...i, outcome } : i));
+  return sel.map((i) => {
+    if (i.productId !== productId || !isSaving(i.outcome)) return i;
+    if (outcome.kind === "unconfirmed") return { ...i, outcome, attempt: i.attempt ? { ...i.attempt, lost: true } : undefined };
+    if (outcome.kind === "refused" && i.attempt?.lost) {
+      return { ...i, outcome: { kind: "unconfirmed", error: `the repeat was refused (${outcome.error})` }, attempt: i.attempt };
+    }
+    return { ...i, outcome, attempt: undefined };
+  });
 }
 
 /** The dose of a saved item was removed (Undo): it is waiting again, with its amount and unit as they were. */

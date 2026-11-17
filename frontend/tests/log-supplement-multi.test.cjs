@@ -661,36 +661,40 @@ test("source: checkboxes with 44 px targets and visible focus; a tap writes noth
   // The route (which since #530 accepts an optional event_key) is not changed by the multi-select: still one product per
   // request. The section sends one event_key per product (fresh per send; a lost answer's retry reuses it, so the
   // route replays the stored rows), and the pure module decides which key goes out.
-  assert.match(src, /event_key: r\.eventKey/, "the multi-select sends its per-product event_key");
-  assert.match(src, /eventKeyFor\(item, \(\) => crypto\.randomUUID\(\)\)/);
+  assert.match(src, /event_key: a\.eventKey/, "the multi-select sends its per-product event_key");
+  assert.match(src, /attemptFor\(item, payload, \(\) => crypto\.randomUUID\(\)\)/);
 });
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-test("event_key: one key per product per send; a lost answer's retry keeps its key; a refused or fresh send gets a new one", () => {
+test("event_key: one key per product per send; a lost answer's replay keeps its attempt; a refused or new send gets a new one", () => {
   let n = 0;
   const fresh = () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`;
+  const payload = { amount: null, unit: "serving", times: ["08:30"], date: null };
   let sel = M.toggleItem(M.toggleItem(M.EMPTY_SELECTION, "a"), "b");
-  const ka = M.eventKeyFor(sel[0], fresh);
-  const kb = M.eventKeyFor(sel[1], fresh);
-  assert.notEqual(ka, kb, "two products in one batch never share a key (the route reads a key's rows without a product filter)");
-  sel = M.beginSend(sel, ["a", "b"], new Map(), new Map([["a", ka], ["b", kb]]));
-  assert.equal(sel[0].eventKey, ka);
+  const aa = M.attemptFor(sel[0], payload, fresh);
+  const ab = M.attemptFor(sel[1], payload, fresh);
+  assert.notEqual(aa.eventKey, ab.eventKey, "two products in one batch never share a key (the route reads a key's rows without a product filter)");
+  sel = M.beginSend(sel, ["a", "b"], new Map(), new Map([["a", aa], ["b", ab]]));
+  assert.equal(sel[0].attempt.eventKey, aa.eventKey);
   sel = M.settle(sel, "a", { kind: "unconfirmed", error: "No answer from Onyx" });
   sel = M.settle(sel, "b", SAVED());
-  assert.equal(M.eventKeyFor(sel[0], fresh), ka, "a lost answer's retry resends the same key: the route replays it");
-  const refusedA = sel.map((i) => (i.productId === "a" ? { ...i, outcome: { kind: "refused", error: "Synthetic refusal" } } : i));
-  assert.notEqual(M.eventKeyFor(refusedA[0], fresh), ka, "a refused send wrote nothing: its next send is a fresh log");
-  assert.notEqual(M.eventKeyFor(M.toggleItem(M.EMPTY_SELECTION, "c")[0], fresh), ka, "a new selection gets a fresh key");
+  assert.equal(M.attemptFor(sel[0], { ...payload, times: ["19:00"] }, fresh).eventKey, aa.eventKey, "a lost answer's replay resends the same key: the route replays it");
+  const refusedA = sel.map((i) => (i.productId === "a" ? { ...i, outcome: { kind: "refused", error: "Synthetic refusal" }, attempt: undefined } : i));
+  assert.notEqual(M.attemptFor(refusedA[0], payload, fresh).eventKey, aa.eventKey, "a refused send wrote nothing: its next send is a fresh log");
+  assert.notEqual(M.attemptFor(M.toggleItem(M.EMPTY_SELECTION, "c")[0], payload, fresh).eventKey, aa.eventKey, "a new selection gets a fresh key");
 });
 
-test("event_key: beginSend keeps the key of a retried item and sets the key on each queued item", () => {
+test("event_key: beginSend keeps the attempt of a replayed item and sets the attempt on each queued item", () => {
   const sel = M.toggleItem(M.toggleItem(M.EMPTY_SELECTION, "a"), "b");
-  const out = M.beginSend(sel, ["a"], new Map(), new Map([["a", "11111111-1111-4111-8111-111111111111"]]));
-  assert.equal(out[0].eventKey, "11111111-1111-4111-8111-111111111111");
-  assert.equal(out[1].eventKey, undefined, "an item not queued has no key yet");
-  const again = M.beginSend(M.settle(out, "a", { kind: "unconfirmed", error: "x" }), ["a"]);
-  assert.equal(again[0].eventKey, "11111111-1111-4111-8111-111111111111", "a retry without a new key keeps the old one");
+  const first = { eventKey: "11111111-1111-4111-8111-111111111111", amount: null, unit: "serving", times: ["08:30"], date: null, lost: false };
+  const out = M.beginSend(sel, ["a"], new Map(), new Map([["a", first]]));
+  assert.equal(out[0].attempt.eventKey, "11111111-1111-4111-8111-111111111111");
+  assert.equal(out[1].attempt, undefined, "an item not queued has no attempt yet");
+  const lost = M.settle(out, "a", { kind: "unconfirmed", error: "x" });
+  assert.equal(lost[0].attempt.lost, true);
+  const again = M.beginSend(lost, ["a"]);
+  assert.equal(again[0].attempt.eventKey, "11111111-1111-4111-8111-111111111111", "a retry without a new attempt keeps the old one");
 });
 
 test("section: each product is sent with its own event_key; a lost answer's retry resends the same key; a new Log selected sends fresh keys", async (t) => {
