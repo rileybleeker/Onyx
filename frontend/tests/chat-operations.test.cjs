@@ -423,7 +423,7 @@ test("missing ledger tables are reported as unavailable (the route then runs as 
 
 test("only keyed write tools are re-run; habit and highlight re-run in check mode; every other write tool is looked up", () => {
   for (const tool of receipts.WRITE_TOOLS) {
-    const keyed = ["log_supplement_intake", "log_supplement_stack", "log_reading_session", "record_reading_quiz"].includes(tool);
+    const keyed = ["log_supplement_intake", "log_supplement_stack", "log_reading_session", "record_reading_quiz", "record_reading_answer", "flag_reading_question"].includes(tool);
     const checked = ["mark_habit_complete", "add_book_highlight"].includes(tool);
     assert.equal(ops.RERUN_SAFE.has(tool), keyed, tool);
     assert.equal(ops.CHECK_ON_RERUN.has(tool), checked, tool);
@@ -1054,4 +1054,24 @@ test("storedContext: a retry reads the context the same call first ran with; a f
   const again = await retry.run(STACK, input(), write.execute());
   assert.equal(again.replayed, true);
   assert.equal(write.effects.size, 1);
+});
+
+test("question-bank answers and flags are keyed re-runs, matched by question and reply, never by the model's own grade wording (READ-QUIZ-01 S6)", () => {
+  assert.ok(ops.RERUN_SAFE.has("record_reading_answer") && ops.RERUN_SAFE.has("flag_reading_question"));
+  const call = { question_id: 1201, version: 2, answer: "The fog bell", verdict: "correct", feedback: "Right." };
+  // The grade and the feedback are the model's wording: a retry that words them differently is the same call.
+  assert.equal(ops.intentSha("record_reading_answer", call), ops.intentSha("record_reading_answer", { ...call, verdict: "partial", feedback: "Close." }));
+  assert.equal(ops.intentSha("record_reading_answer", call), ops.intentSha("record_reading_answer", { ...call, feedback: undefined, verdict: "incorrect" }));
+  // The question, its version and the reply are what the call asks for: a numeric string is the same number.
+  assert.equal(ops.intentSha("record_reading_answer", call), ops.intentSha("record_reading_answer", { ...call, question_id: "1201", version: "2" }));
+  for (const other of [{ question_id: 1202 }, { version: 3 }, { answer: "The horn" }]) {
+    assert.notEqual(ops.intentSha("record_reading_answer", call), ops.intentSha("record_reading_answer", { ...call, ...other }));
+  }
+  // The same question flagged another way is another call.
+  assert.notEqual(ops.intentSha("flag_reading_question", { question_id: 1201, kind: "wrong" }), ops.intentSha("flag_reading_question", { question_id: 1201, kind: "unclear" }));
+  // An unconfirmed one never reads "check the quiz result".
+  for (const tool of ["record_reading_answer", "flag_reading_question"]) {
+    assert.match(ops.uncertainText(tool), /\/reading/);
+    assert.notEqual(ops.uncertainText(tool), ops.uncertainText("log_supplement_intake"));
+  }
 });

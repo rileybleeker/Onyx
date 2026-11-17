@@ -201,6 +201,9 @@ function setup(t) {
         const row = [...rows.values()].find((r) => r.session_id === sid);
         if (row) for (const k of SESSION_VALUE_KEYS) if (k in body) row[k] = body[k];
         if (patchMode === "lost") throw new TypeError("Failed to fetch");
+        // "unconfirming": the server applies the edit, but the 200 that arrives names no stored session (a broken
+        // answer): the save is not confirmed, so the entry stays unsaved and its draft is not cleared.
+        if (patchMode === "unconfirming") return reply({ session: { session_id: 999999 }, xp_gained: 0, finished: false, overview: null });
         return reply({ session: { session_id: sid }, xp_gained: 0, finished: false, overview: null });
       }
       if (init.method === "DELETE" && url.startsWith("/api/reading/sessions?client_key=")) {
@@ -1201,6 +1204,71 @@ test("session end during a background retry whose create had landed: the replaye
   await h.mount();
   assert.equal(h.value("Through ch."), "", "the next session starts with an empty form");
   assert.equal(h.calls.length, before, "and opening it sends nothing");
+});
+
+test("a replayed create whose follow-up PATCH answers unconfirmed: the entry stays unsaved and keeps its values (PR 376 review)", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "lost"; // the server stores the session; the answer never arrives
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1, "stored on the server");
+  const key = h.posts()[0].body.client_key;
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
+
+  h.mode = "up";
+  h.patchMode = "unconfirming"; // the replay's PATCH is applied, but its 200 names no stored session
+  await h.click("Retry");
+  assert.equal(h.posts().length, 2, "the retry of the create went out");
+  assert.equal(h.posts()[1].body.client_key, key, "the same client_key");
+  assert.equal(h.patches().length, 1, "and the replay PATCH was sent onto the stored row");
+  assert.match(h.text(), /Not confirmed: The save was not confirmed\. Retrying\./, "an unconfirming PATCH is not a confirmation");
+  assert.doesNotMatch(h.text(), /Saved/, "never \"Saved\" without the stored session named");
+  assert.equal(h.value("Through ch."), "5", "the entry stays on screen");
+  assert.equal(h.work.has(), true, "still unsaved work");
+  assert.equal(h.retainer.find("log-reading").data.sessionId, [...h.rows.values()][0].session_id, "the session is kept for the retry");
+
+  h.patchMode = "up";
+  await h.tick(60_000); // the retry now gets a confirming PATCH answer
+  assert.match(h.text(), /Saved/, "confirmed once the PATCH named the stored session");
+  assert.doesNotMatch(h.text(), /Not confirmed/);
+  assert.equal(h.work.has(), false);
+  await h.unmount();
+  assert.equal(h.retainer.size, 0);
+});
+
+test("a replayed create whose PATCH confirms while a newer draft applied during the await: the newer draft is not cleared and is sent again (PR 376 review)", async (t) => {
+  const h = setup(t);
+  await h.mount();
+  h.mode = "lost";
+  await h.type("Through ch.", "5");
+  await h.tick(1500);
+  assert.equal(h.rows.size, 1, "stored on the server");
+  assert.match(h.text(), /Not confirmed: Couldn't reach Onyx\./);
+
+  h.mode = "up";
+  const release = h.holdSaves(); // hold the retry of the create in flight
+  await h.click("Retry");
+  assert.equal(h.calls[h.calls.length - 1].method, "POST", "the retry is out");
+  // A Say it draft arrives while the create's retry is still out: its values are not in the body being sent.
+  await h.say({ minutes: 20 });
+  assert.equal(h.value("Minutes"), "20", "the words filled the untouched minutes field");
+  assert.ok(h.draft, "the draft is pending");
+  await release(); // the create answers replayed; the replay PATCH confirms (its body is the pre-draft value)
+  assert.equal(h.patches().length, 1, "the replay PATCH was sent");
+  assert.equal(h.patches()[0].body.minutes, null, "it carried the value from before the draft (no minutes)");
+  assert.match(h.text(), /Not saved yet/, "the create and its PATCH confirmed, but the draft's newer value is not saved yet");
+  assert.doesNotMatch(h.text(), /Saved/, "never \"Saved\" while the newer value waits");
+  assert.ok(h.draft, "the newer draft is not cleared: its values were not sent");
+  assert.equal(h.value("Minutes"), "20", "and stays on screen");
+
+  await h.tick(1500); // the autosaver sends the newer value (with the draft's minutes)
+  const last = h.calls[h.calls.length - 1];
+  assert.equal(last.method, "PATCH", "the newer value is sent again");
+  assert.equal(last.body.minutes, 20, "with the draft's minutes");
+  assert.equal(h.draft, null, "cleared only once its values were confirmed");
+  await h.unmount();
+  assert.equal(h.retainer.size, 0);
 });
 
 test("remounted while the previous copy's create is out: the day the server stored is shown by the new copy", async (t) => {

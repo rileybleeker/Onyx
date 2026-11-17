@@ -67,6 +67,12 @@ function makeDb() {
     reserves: [],
     reserveCalls: [],
     finishCalls: [],
+    /** A database error the next pds.reading_bank_finish answers ({data: null, error}). */
+    finishError: null,
+    /** A code pds.reading_bank_finish answers with {ok: false} instead of recording (a refusal). */
+    finishRefuse: null,
+    /** true: the next pds.reading_bank_finish throws (a transport error) instead of answering. */
+    finishThrows: false,
     nextJob: 1,
   };
   const idea = (idea_id, chapter, importance, o = {}) =>
@@ -359,6 +365,7 @@ function fakeSupabase(db) {
       if (!job) return refuse(404, "not_found");
       if (job.status !== "running") return refuse(409, "not_running");
       if (p.attempts !== job.attempts || p.claim_seq !== job.claim_seq) return refuse(409, "lease_lost");
+      if (db.finishRefuse) return refuse(409, db.finishRefuse);
       db.finished.push(p);
       job.status = p.outcome === "retry" ? (job.attempts >= 3 ? "failed" : "queued") : p.outcome;
       job.cost_cents += p.cost_cents;
@@ -428,6 +435,8 @@ function fakeSupabase(db) {
       const run = () => {
         db.rpc.push(name);
         if (db.missing && name !== "behavioral_today_now") return { data: null, error: missingError, count: null };
+        if (db.finishThrows && name === "reading_bank_finish") throw Object.assign(new Error("connection closed"), { name: "ConnectionError" });
+        if (db.finishError && name === "reading_bank_finish") return { data: null, error: db.finishError, count: null };
         if (!rpcs[name]) throw new Error(`unexpected rpc ${name}`);
         let data = structuredClone(rpcs[name](structuredClone(args ?? {})));
         const count = opts?.count === "exact" && Array.isArray(data) ? data.length + db.countBias : null;
@@ -1028,6 +1037,38 @@ test("a grade job whose lease was taken over (another claim since) is refused by
   assert.equal(job.status, "running");
 });
 
+test("a grade finish the database never recorded (an error, a refusal, or a throw) is reported as a retry, never as the requested outcome, and counts no grade", async () => {
+  const reply = modelReply({ points: [{ id: "p1", hit: "yes" }, { id: "p2", hit: "yes" }], wrong_claims: [], feedback: "Right." });
+  // A bare job row as the claim left it (the "runGradeJob with a bare job row" test's shape), so the whole grade
+  // path runs to its finish; the fake's reading_bank_finish then answers per the db flag.
+  const bareJob = (db, k) => {
+    const job = [...db.jobs.values()][0];
+    Object.assign(job, { status: "running", attempts: 1, claim_seq: 1, reserved_cents: 1 });
+    return { job_id: job.job_id, book_id: BOOK, step: "grade", attempt_key: k, attempts: 1, claim_seq: 1, reserved_cents: 1 };
+  };
+  const run = async (setup) => {
+    const db = makeDb();
+    const r = load(db, fakeModel(reply));
+    const res = await r.attempt.POST(post(answer({ question_id: 1002, answer: "The keeper logs each change before dawn" })));
+    setup(db);
+    const out = await r.S.runGradeJob(r.supabase, bareJob(db, res.body.attempt_key), { client: r.model.client });
+    assert.equal(db.attempts.get(res.body.attempt_key).grading_status, "graded", "the grade itself was stored; only the finalization is unrecorded");
+    return { out, db };
+  };
+  // (1) a database error answer:
+  const a = await run((db) => { db.finishError = { code: "PGRST301", message: "could not serialize the response" }; });
+  assert.deepEqual([a.out.outcome, a.out.code, a.out.graded], ["retry", "finish_unrecorded", false], "a database error on the finish is a retry with finish_unrecorded");
+  assert.deepEqual([a.db.finished.length, [...a.db.jobs.values()][0].status], [0, "running"], "nothing recorded: the job stays running until the next claim settles it");
+  // (2) an answered refusal ({ok: false}, as lease_lost / not_running):
+  const b = await run((db) => { db.finishRefuse = "lease_lost"; });
+  assert.deepEqual([b.out.outcome, b.out.code, b.out.graded], ["retry", "finish_unrecorded", false], "a refused finish is a retry with finish_unrecorded");
+  assert.deepEqual([b.db.finished.length, [...b.db.jobs.values()][0].status], [0, "running"], "nothing recorded: the job stays running until the next claim settles it");
+  // (3) a thrown call (a transport error):
+  const c = await run((db) => { db.finishThrows = true; });
+  assert.deepEqual([c.out.outcome, c.out.code, c.out.graded], ["retry", "finish_unrecorded", false], "a thrown finish is a retry with finish_unrecorded");
+  assert.deepEqual([c.db.finished.length, [...c.db.jobs.values()][0].status], [0, "running"], "nothing recorded: the job stays running until the next claim settles it");
+});
+
 test("a chapter recall answer is graded per idea: a covered core idea counts, a missed one comes back as due tomorrow", async () => {
   const db = makeDb();
   db.ideas.set(105, { ...db.ideas.get(101), idea_id: 105, title: "Synthetic idea 105", statement: "Synthetic statement 105." });
@@ -1235,6 +1276,35 @@ test("chat: questions come through the same gate; a recorded answer is graded at
   assert.deepEqual([two.ok, two.attempt_key, two.replayed], [true, one.attempt_key, true]);
   assert.equal(db.attempts.size, 1);
   assert.equal(r.S.chatAttemptKey("toolu_synthetic_1"), one.attempt_key);
+});
+
+test("recordAttempt stores the reply as given and grades grade_answer when there is one (the chat's order answers); a request body cannot set it", async () => {
+  const db = makeDb();
+  const r = load(db);
+  const reply = "3 1 2 (not sure about the middle)";
+  const input = {
+    attempt_key: key(), question_id: 1003, version: 1, round_key: key(), round_date: null, round_kind: "chat",
+    answer: reply, grade_answer: "Light the lamp
+Watch the bay
+Write the entry", hinted: false, response_ms: null, quiz_key: null,
+  };
+  const res = await r.S.recordAttempt(r.supabase, input);
+  assert.deepEqual([res.status, res.body.verdict, res.body.grading_status], [200, "correct", "graded"]);
+  assert.equal(db.attempts.get(input.attempt_key).answer, reply, "the reply is what is stored, not the text the grade read");
+  // The same call replays; the same order in other words under the key is another request.
+  const again = await r.S.recordAttempt(r.supabase, input);
+  assert.deepEqual([again.status, again.body.replayed], [200, true]);
+  const other = await r.S.recordAttempt(r.supabase, { ...input, answer: "3, 1, 2" });
+  assert.deepEqual([other.status, other.body.error], [409, "key_reused"]);
+  assert.equal(db.attempts.size, 1);
+  // Without grade_answer the reply itself is graded (a reply that is not the steps one per line is incorrect).
+  const plain = await r.S.recordAttempt(r.supabase, { ...input, attempt_key: key(), round_key: key(), grade_answer: undefined });
+  assert.deepEqual([plain.status, plain.body.verdict], [200, "incorrect"]);
+  // The HTTP body never carries it.
+  const viaRoute = await r.attempt.POST(post(answer({ question_id: 1003, answer: reply, grade_answer: "Light the lamp
+Watch the bay
+Write the entry" })));
+  assert.equal(viaRoute.status, 400);
 });
 
 test("chat weak mode finds a lapsed idea scheduled for a later day, through the chapter's gated deck", async () => {

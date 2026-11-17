@@ -106,9 +106,13 @@ def doc(n: int, mime="application/pdf", data=PDF, status="ready", removed=False)
             "title": f"Synthetic title {n}", "notes": "synthetic note", "provider": "Synthetic clinic"}
 
 
-def lab(n: int, document=None) -> dict:
+def lab(n, document=None, *, value=1.5, value_text="", unit="u", ref_low=1.0, ref_high=2.0,
+        ref_text="1.0-2.0", ref_low_strict=False, ref_high_strict=False, collected_on="2026-01-10"):
     return {"id": uid(10_000 + n), "document_id": document, "removed_at": None,
-            "test_name": f"Synthetic test {n}", "value_num": 1.5, "unit": "u"}
+            "test_name": f"Synthetic test {n}", "value_num": value, "value_text": value_text,
+            "unit": unit, "ref_low": ref_low, "ref_high": ref_high, "ref_text": ref_text,
+            "ref_low_strict": ref_low_strict, "ref_high_strict": ref_high_strict,
+            "collected_on": collected_on}
 
 
 def healthy():
@@ -1010,8 +1014,14 @@ def test_drill_wipe_is_detected_and_full_restore_passes():
                      "signed_link_serves_file",
                      "bucket_private", "anon_tables_refused", "authenticated_tables_refused", "files_stored",
                      "anon_file_refused", "authenticated_file_refused", "stored_sizes_match",
-                     "lab_links_resolve", "manifest_document_state_match", "manifest_lab_links_match"):
+                     "lab_links_resolve", "manifest_document_state_match",
+                     "manifest_lab_links_match", "manifest_lab_removed_match", "manifest_lab_values_match",
+                     "manifest_lab_units_match", "manifest_lab_ranges_match", "manifest_lab_collected_match"):
             assert result(report, name)["result"] == "pass", name
+        # an identical restore matches on every compared lab field
+        for name in ("manifest_lab_links_match", "manifest_lab_removed_match", "manifest_lab_values_match",
+                     "manifest_lab_units_match", "manifest_lab_ranges_match", "manifest_lab_collected_match"):
+            assert result(report, name) == {"name": name, "result": "pass", "count": 0}, name
         assert_private_output(text)
 
 
@@ -1028,6 +1038,71 @@ def test_restore_that_cleared_or_moved_a_lab_link_fails():
                                                                   "count": 1}
             assert result(report, "lab_links_resolve")["result"] == "pass"
             assert result(report, "manifest_lab_rows")["result"] == "pass"
+            # the value and range fields were not changed: only the link differs
+            assert result(report, "manifest_lab_values_match")["result"] == "pass"
+            assert result(report, "manifest_lab_ranges_match")["result"] == "pass"
+
+
+def test_restore_that_changed_a_lab_value_fails():
+    docs, labs, files = healthy()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = seed_manifest(tmp, docs, labs, files)
+        # a restored lab value 1.5 becoming 999 must fail the drill comparison, with a count only
+        server = FakeServer(docs, [lab(1, uid(1), value=999), lab(2)], files)
+        code, text, report, _ = run(server, "--skip-backups", "--manifest", str(manifest), url=LOCAL)
+        assert code == 1, text
+        assert ("lab_results", rc.LAB_SELECT_DRILL) in server.selects  # the drill asks for the value columns
+        assert result(report, "manifest_lab_values_match") == {"name": "manifest_lab_values_match",
+                                                               "result": "fail", "count": 1}
+        for name in ("manifest_lab_links_match", "manifest_lab_removed_match", "manifest_lab_units_match",
+                     "manifest_lab_ranges_match", "manifest_lab_collected_match"):
+            assert result(report, name)["result"] == "pass", name
+        assert_private_output(text)
+
+
+def test_restore_that_changed_a_lab_unit_fails():
+    docs, labs, files = healthy()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = seed_manifest(tmp, docs, labs, files)
+        code, text, report, _ = run(FakeServer(docs, [lab(1, uid(1), unit="mg/dL"), lab(2)], files),
+                                    "--skip-backups", "--manifest", str(manifest), url=LOCAL)
+        assert code == 1, text
+        assert result(report, "manifest_lab_units_match") == {"name": "manifest_lab_units_match",
+                                                              "result": "fail", "count": 1}
+        assert result(report, "manifest_lab_values_match")["result"] == "pass"
+        assert result(report, "manifest_lab_ranges_match")["result"] == "pass"
+        assert_private_output(text)
+
+
+def test_restore_that_changed_a_lab_reference_range_fails():
+    docs, labs, files = healthy()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = seed_manifest(tmp, docs, labs, files)
+        for changed, reason in ((dict(ref_high=2.5), "a bound"), (dict(ref_text="1.0-2.5"), "the printed range"),
+                                (dict(ref_low_strict=True), "a strict flag"), (dict(ref_high_strict=True), "a strict flag")):
+            restored = [lab(1, uid(1), **changed), lab(2)]
+            code, text, report, _ = run(FakeServer(docs, restored, files), "--skip-backups", "--manifest",
+                                        str(manifest), url=LOCAL)
+            assert code == 1, (reason, text)
+            assert result(report, "manifest_lab_ranges_match") == {"name": "manifest_lab_ranges_match",
+                                                                   "result": "fail", "count": 1}, reason
+            assert result(report, "manifest_lab_values_match")["result"] == "pass"
+            assert result(report, "manifest_lab_units_match")["result"] == "pass"
+            assert_private_output(text)
+
+
+def test_production_mode_never_requests_the_drill_lab_columns():
+    # the production read stays at the current select: never a value, unit, range or date column
+    docs, labs, files = healthy()
+    server = FakeServer(docs, labs, files)
+    code, _, report, _ = run(server)
+    assert code == 2 and only_bytes_unknown(report)
+    assert ("lab_results", rc.LAB_SELECT) in server.selects
+    assert all(sel == rc.LAB_SELECT for table, sel in server.selects if table == "lab_results"), server.selects
+    for table, sel in server.selects:
+        for col in sel.split(","):
+            assert col not in ("value_num", "value_text", "unit", "ref_low", "ref_high",
+                               "ref_text", "ref_low_strict", "ref_high_strict", "collected_on"), (table, col)
 
 
 def test_restore_that_revived_a_removed_document_fails():

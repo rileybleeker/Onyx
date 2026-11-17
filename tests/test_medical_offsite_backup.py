@@ -25,6 +25,12 @@ the temporary folder, the printed output or the heartbeat. Covers:
     and the drill's references_hold fails; a row pointing into an excluded table is partial
     (parent_not_recoverable); experiment_days is an uncovered table (never requested, listed in the
     manifest);
+  * off-site confirmation: the run's own ciphertext must be IN the OneDrive cloud before anything counts as
+    off-site — its cloud-files state is read from the file's own attributes (the exact cfapi placeholder
+    bits: OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS, PINNED, UNPINNED, REPARSE_POINT; a plain local
+    file, an unreadable one, or a path outside OneDrive is pending_upload), polled for a bounded wait after
+    the folder-level check passes; an unconfirmed backup is a PARTIAL run (pending_upload) that prunes
+    nothing, and a later confirmed run prunes again; age alone is no longer evidence of an upload;
   * retention: newest 8 plus the first of each of the 3 latest months plus the newest backup whose
     completeness marker verifies (an empty or foreign marker is no evidence); only this job's names are
     removed; partial runs prune too but never the newest complete one; a marker that cannot be committed
@@ -335,6 +341,9 @@ class Base(unittest.TestCase):
         load = mock.patch.object(ob, "load_remote_confirmations", confirm_all)
         load.start()
         self.addCleanup(load.stop)
+        cloud = mock.patch.object(ob, "onedrive_cloud_state", lambda p: "in_sync")
+        cloud.start()
+        self.addCleanup(cloud.stop)
         self.sb = FakeSupabase()
         self.client = FakeClient()
         self.sleeps = []
@@ -885,6 +894,72 @@ class Retention(Base):
         self.assertIn("onyx-backup-20261104T000000Z.tar.age", keep)
         self.assertNotIn("onyx-backup-20261104T000000Z.tar.age", ob.retention_keep(names, complete))
         self.assertIn("onyx-backup-20261112T000000Z.tar.age", keep)
+    def test_a_complete_backup_is_kept_only_by_the_rules_not_by_its_age(self):
+        # the old UPLOAD_GRACE_HOURS rule (kept because it was "old enough to have uploaded") is gone: age is
+        # not evidence of an upload, the file's own cloud state is (tested below).
+        names = [f"onyx-backup-202611{d:02d}T000000Z.tar.age" for d in range(2, 13)]
+        complete = {"onyx-backup-20261112T000000Z.tar.age", "onyx-backup-20261104T000000Z.tar.age"}
+        keep = ob.retention_keep(names, complete)
+        self.assertNotIn("onyx-backup-20261104T000000Z.tar.age", keep,
+                         "an older complete backup is not kept on age alone")
+        self.assertIn("onyx-backup-20261112T000000Z.tar.age", keep, "the newest complete backup is kept")
+
+    def test_cloud_state_reads_the_placeholder_attribute_bits(self):
+        with mock.patch.object(ob.os, "name", "nt"), mock.patch.object(ob, "under_onedrive", lambda p: True):
+            for bit in (0x00001000, 0x00040000, 0x00400000, 0x00080000, 0x00100000, 0x00000400):
+                with mock.patch.object(ob, "file_attributes", return_value=bit):
+                    self.assertEqual(ob.onedrive_cloud_state(self.dest), "in_sync", f"bit {bit:#x}")
+            with mock.patch.object(ob, "file_attributes", return_value=0):  # a plain local file
+                self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
+            with mock.patch.object(ob, "file_attributes", return_value=0x00000020):  # just "archive"
+                self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
+            with mock.patch.object(ob, "file_attributes", return_value=None):  # unreadable
+                self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
+        with mock.patch.object(ob, "under_onedrive", lambda p: False):  # outside every OneDrive root
+            self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
+
+    def test_offsite_confirmed_polls_until_the_cloud_takes_the_file(self):
+        reads = iter(["pending_upload", "pending_upload", "in_sync"])
+        sleeps, ticks = [], iter([0.0, 10.0, 20.0, 30.0])
+        with mock.patch.object(ob, "onedrive_cloud_state", lambda p: next(reads)):
+            self.assertTrue(ob.offsite_confirmed(self.dest, self.dest, wait_seconds=30,
+                                                 sleep=sleeps.append, clock=lambda: next(ticks)))
+        self.assertEqual(sleeps, [ob.SYNC_POLL_SECONDS] * 2, "it waits between checks")
+
+    def test_offsite_confirmed_gives_up_when_the_wait_runs_out(self):
+        reads, sleeps = [], []
+        with mock.patch.object(ob, "onedrive_cloud_state", lambda p: reads.append(p) or "pending_upload"):
+            self.assertFalse(ob.offsite_confirmed(self.dest, self.dest, wait_seconds=0,
+                                                  sleep=sleeps.append, clock=lambda: 0.0))
+        self.assertEqual(len(reads), 1, "with no wait budget it checks once, then reports pending")
+
+    def test_pending_upload_is_partial_writes_no_marker_and_prunes_nothing(self):
+        self.dest.mkdir()
+        old = [self.dest / f"onyx-backup-2025{m:02d}01T000000Z.tar.age" for m in range(1, 13)]
+        for p in old:
+            p.write_bytes(b"x")
+        ob.write_ok_marker(old[0])
+        with mock.patch.object(ob, "onedrive_cloud_state", lambda p: "pending_upload"):
+            code, out = self.backup("--sync-wait", "0")
+        self.assertEqual(code, 2, out)
+        self.assertIn("pending_upload", out)
+        self.assertTrue(all(p.exists() for p in old), "a replacement the cloud does not hold prunes nothing")
+        self.assertEqual(self.markers(), [ob.ok_marker(old[0].name)], "the old marker is untouched")
+        self.assertEqual(len(self.written()), len(old) + 1, "the new ciphertext itself stays")
+        hb = self.heartbeats()
+        self.assertEqual((hb[0]["status"], hb[0]["error_message"]), ("partial", "pending_upload"))
+
+    def test_pending_upload_does_not_stop_a_later_confirmed_run_from_pruning(self):
+        self.dest.mkdir()
+        old = [self.dest / f"onyx-backup-2025{m:02d}01T000000Z.tar.age" for m in range(1, 13)]
+        for p in old:
+            p.write_bytes(b"x")
+        with mock.patch.object(ob, "onedrive_cloud_state", lambda p: "pending_upload"):
+            code, _ = self.backup("--sync-wait", "0")
+        self.assertEqual(code, 2)
+        code, out = self.backup()  # the next run's backup IS confirmed in the cloud
+        self.assertEqual(code, 0, out)
+        self.assertLessEqual(len(self.written()), ob.KEEP_WEEKLY + ob.KEEP_MONTHLY + 1)
 
     def names(self, times):
         return [f"onyx-backup-{t.strftime('%Y%m%dT%H%M%SZ')}.tar.age" for t in times]

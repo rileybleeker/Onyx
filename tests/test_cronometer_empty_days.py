@@ -166,18 +166,22 @@ class FakeDB:
         return len(drows)
 
     def _combined(self, p):
-        assert set(p) == {"p_dates", "p_rows", "p_daily_rows"}, p.keys()
+        assert set(p) == {"p_dates", "p_rows", "p_daily_rows", "p_food_dates"}, p.keys()
         dates, rows, drows = p["p_dates"], p["p_rows"], p["p_daily_rows"]
+        food = set(p["p_food_dates"])
         bad = lambda msg: FakeAPIError("22023", f"replace_cronometer_servings_and_daily: {msg}")  # noqa: E731
         if not rows and dates:
             raise bad("date(s) but no rows; this function never empties a day")
-        if not rows and not drows:
+        if not rows and not drows and not food:
             raise bad("no rows; nothing to do")
         ddates = [r.get("calendar_date") for r in drows]
         if len(set(ddates)) != len(ddates):
             raise bad("a date appears twice in p_daily_rows")
-        # every date this import writes starts its empty-day count over
-        for d in set(dates) | set(ddates):
+        # every date this import writes, and every day its inputs were shown to have
+        # (or possibly have) food on, starts its empty-day count over (OR-369: also
+        # food on a file that is not written, e.g. a servings file that lost its
+        # Food Name column, via p_food_dates)
+        for d in set(dates) | set(ddates) | food:
             self.candidates.pop(d, None)
         # never empties a day: no "no food" daily row over a stored one with food
         held = self._held(drows, set(dates))
@@ -840,6 +844,33 @@ def test_manual_import_writes_servings_and_daily_together_around_an_emptied_day(
         assert db.direct_daily_upserts == 0
         manual_calls = _calls(db, COMBINED_FN)
         assert len(manual_calls) == 1 and manual_calls[0]["p_daily_rows"], "one call, daily rows included"
+
+
+def test_manual_import_resets_a_candidate_seen_on_an_unclassifiable_file() -> None:
+    """OR-369: the manual writer forgot a day's empty-day record only for the dates it
+    WROTE. A manual import whose servings file shows food on a day but cannot be read
+    (it lost its Food Name column, so classify takes it as neither file and no
+    serving row is written) left that day's first look behind, and the next automated
+    export that missed the day would empty it on ONE look. The no-window path now
+    scans its inputs (the rejected files too, manual_food_dates) and passes the days
+    their rows show food on as p_food_dates, exactly as the window path does."""
+    servings, daily = _stored()
+    db = FakeDB(servings, daily)
+    db.candidates["2030-01-05"] = {"first_seen_at": datetime(2000, 1, 1, tzinfo=timezone.utc),
+                                   "last_seen_at": datetime(2000, 1, 1, tzinfo=timezone.utc),
+                                   "times_seen": 1}
+    with tempfile.TemporaryDirectory() as tmp:
+        dpath = _write(tmp, "dailysummary.csv", [D_HEADER, "2030-01-02,Total,200.0,2.0,false"])
+        spath = _write(tmp, "servings.csv", ["Day,Time,Group,Amount,Energy (kcal),Protein (g)",
+                                             "2030-01-05,8:00 AM,Breakfast,1.00 g,100.0,1.0"])
+        assert ci.classify(spath) is None, "a servings file without a Food Name column is unclassified"
+        _run(db, [spath, dpath])
+    assert [fn for fn, _ in db.rpc_calls] == [COMBINED_FN]
+    (p,) = _calls(db, COMBINED_FN)
+    assert p["p_dates"] == [] and p["p_rows"] == [], "an unclassifiable file writes no servings"
+    assert "2030-01-05" in p["p_food_dates"], p["p_food_dates"]
+    assert db.candidates == {}, "food seen on the day must reset its empty-day record"
+    assert _names(db, "2030-01-05") == ["test rice"], "the stored day is untouched"
 
 
 def test_any_write_of_a_day_starts_its_empty_day_count_over() -> None:
@@ -2034,7 +2065,7 @@ def test_window_sql_contract() -> None:
     assert ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
             "(v_empty || v_sempty) AND NOT (c.calendar_date = ANY (v_kept));") in flat
     assert ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
-            "(p_dates || v_daily_dates);") in flat
+            "(p_dates || v_daily_dates || p_food_dates);") in flat
     # Every empty-day delete feeds the backup table in the same statement.
     assert flat.count("INSERT INTO pds.cronometer_cleared_rows") == 2
     assert flat.count("RETURNING s.* ) INSERT INTO pds.cronometer_cleared_rows") == 1
@@ -2073,16 +2104,21 @@ def test_window_sql_contract() -> None:
     assert positions == sorted(positions), list(zip(order, positions))
 
     # The manual writer: same lock, the date-set function, the daily upsert, and its one
-    # delete forgets the empty-day record of every date it writes (Codex review),
-    # under the lock; it never deletes a serving or a daily row.
+    # delete forgets the empty-day record of every date it writes AND every date its
+    # inputs show (or may show) food on (Codex review; OR-369), under the lock; it never
+    # deletes a serving or a daily row.
     m = _body(flat, COMBINED_FN)
     assert lock in m and "pds.replace_cronometer_servings(p_dates, p_rows)" in m
     assert "pds.cronometer_upsert_daily(v_daily_write)" in m and "this function never empties a day" in m
     held = "v_held := pds.cronometer_daily_rows_held(p_daily_rows, p_dates);"
     assert held in m and m.index(lock) < m.index(held) < m.index("pds.cronometer_upsert_daily(v_daily_write)")
     assert "'daily_kept', jsonb_array_length(p_daily_rows) - jsonb_array_length(v_daily_write)" in m
-    reset = "DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY (p_dates || v_daily_dates);"
+    reset = ("DELETE FROM pds.cronometer_empty_day_candidates c WHERE c.calendar_date = ANY "
+             "(p_dates || v_daily_dates || p_food_dates);")
     assert m.upper().count("DELETE ") == 1 and reset in m
+    assert "this function never empties a day" in m and "no rows" in m
+    assert "array_position(p_food_dates, NULL) IS NOT NULL" in m, \
+        "the manual writer validates p_food_dates like the window function"
     assert "pds.cronometer_servings" not in m and "pds.cronometer_nutrition_daily" not in m, \
         "only the candidates are deleted; servings and daily rows only through the two functions"
     assert m.index(lock) < m.index(reset) < m.index("pds.replace_cronometer_servings(p_dates, p_rows)")
@@ -2126,7 +2162,7 @@ def test_window_sql_contract() -> None:
     assert upper.count("SECURITY INVOKER") == 4 and flat.count("SET search_path = pds, pg_temp") == 4
     for fsig in ("pds.replace_cronometer_servings_window(date, date, date[], jsonb, date[], date[], date[], jsonb, "
                  "integer)",
-                 "pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb)",
+                 "pds.replace_cronometer_servings_and_daily(date[], jsonb, jsonb, date[])",
                  "pds.cronometer_upsert_daily(jsonb)",
                  "pds.cronometer_daily_rows_held(jsonb, date[])"):
         assert f"REVOKE ALL ON FUNCTION {fsig} FROM PUBLIC;" in flat, fsig
