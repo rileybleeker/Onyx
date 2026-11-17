@@ -57,3 +57,22 @@ A local iPhone backup on a PC is another possible point-in-time research source,
 - Obtain explicit approval for the chosen access and data flow. Only then validate a narrowly selected conversation, report gaps, and consider broader history import.
 
 No user-facing page is added: an unavailable fake inbox would add clutter without providing a supported integration. The only route is the read-only status check above. The next implementation decision is the source adapter (Shortcuts push, approved Mac helper, or backup import), not a different messaging provider.
+
+## Shortcuts push (built 2026-11-17, off until the flag is set and Riley builds the automation)
+
+Decision (2026-11-17, no purchase, no Mac): the one source that needs neither is a Shortcuts personal automation on the phone, so the server side of that route is built. Riley's standing instruction was to decide and build; the Mac helper (about 380-500 USD used, or 90-165 USD a month rented) stays the only way to get HISTORY and is not bought.
+
+**What exists**
+- `POST /api/phone-messages/ingest` (CI token, an exact path in `isCiRoute()`; body `{sender, text, received_at?}` or `{messages: [...]}`, at most 20, text up to 4000 characters). It answers 503 `disabled` before any database call unless `ONYX_PHONE_MESSAGES_ENABLED` is exactly `true`. Optional `ONYX_PHONE_MESSAGES_SENDERS` (comma separated numbers or names) accepts only those senders. One-time / verification codes are dropped and never stored. A repeat of the same text is ignored. A missing, unreadable or future time means now; a text older than 30 days is skipped. Answers counts only. Heartbeat `phone_messages|push` on every call; `/status` card "iPhone Messages" (event driven: red only when the newest push failed, never because of age).
+- `pds.phone_messages` (`sql/phone_messages_schema.sql`): sender, text, received time. Service-role only. Kept 90 days (older rows are deleted on each push).
+- `GET /api/phone-messages/messages?days=&limit=&sender=` (owner session only) is the read side; `DELETE` with `{"all": true}` (owner session, same-origin JSON) removes everything and works with the flag off. No page uses it.
+- Pure rules and synthetic tests: `lib/phone-messages-ingest.ts`, `scripts/test-phone-messages-ingest.mjs`.
+
+**Coverage, stated honestly:** only new texts the automation sees from the moment it is switched on. Not the existing inbox, no history, no attachments, no sending (Send stays refused: the gate in `phone-messages.ts` has no adapter and the send flag is separate). Whether the Message trigger runs while the phone is locked with "Run Immediately" is unverified (Apple's page does not say).
+
+**Riley's one-time phone steps (physical, cannot be done from here)**
+1. Shortcuts, Automation, New, **Message**. Pick the sender(s) or a "message contains" phrase to scope it. Choose **Run Immediately** (not Ask Before Running).
+2. Action **Get Contents of URL**: URL `https://<the Onyx site>/api/phone-messages/ingest`, Method POST, header `x-onyx-ci-token` = the token the Screen Time shortcut already uses (`~/.onyx_ci_token` on the PC), Request Body JSON: `sender` = Shortcut Input's Sender, `text` = Shortcut Input's Content, `received_at` = Current Date formatted ISO 8601.
+3. Text yourself from a second number or ask a friend, with the phone locked; check `/status` -> iPhone Messages turns green and `GET /api/phone-messages/messages` lists it. Record whether it ran locked.
+
+**Retention / revocation:** turning the automation off stops new data; setting the flag off makes the endpoint refuse at once; `DELETE /api/phone-messages/messages {"all": true}` clears what is stored.
