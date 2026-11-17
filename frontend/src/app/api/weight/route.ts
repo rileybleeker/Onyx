@@ -28,7 +28,10 @@ export async function GET(req: NextRequest) {
     .gte("log_date", cutoffStr)
     .order("log_date", { ascending: true });
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/weight GET", error.message);
+    return NextResponse.json({ error: "Couldn't load your weight log. Try again." }, { status: 500 });
+  }
 
   return NextResponse.json({ days, rows: data ?? [] });
 }
@@ -73,7 +76,10 @@ export async function POST(req: NextRequest) {
     .select("log_date, weight_kg, notes, logged_at, source")
     .single();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/weight POST", error.message);
+    return NextResponse.json({ error: "Couldn't save your weight. Try again." }, { status: 500 });
+  }
   return NextResponse.json(data);
 }
 
@@ -126,7 +132,10 @@ export async function PATCH(req: NextRequest) {
     .select("log_date, weight_kg, notes, logged_at, source")
     .single();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/weight PATCH", error.message);
+    return NextResponse.json({ error: "Couldn't save your weight. Try again." }, { status: 500 });
+  }
   return NextResponse.json(data);
 }
 
@@ -148,6 +157,9 @@ export async function DELETE(req: NextRequest) {
     .from("weight_log")
     .delete()
     .eq("log_date", log_date);
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/weight DELETE", error.message);
+    return NextResponse.json({ error: "Couldn't save your weight. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ ok: true });
 }
