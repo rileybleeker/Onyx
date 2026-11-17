@@ -411,7 +411,7 @@ export default function NutritionPage({ initial, headingTestId = "page-heading" 
       await loadWeight();
     } catch (e) {
       console.error("Delete weight:", e);
-      alert(e instanceof Error ? e.message : String(e));
+      alert("Couldn't delete that weight entry. Try again.");
     }
   }
 

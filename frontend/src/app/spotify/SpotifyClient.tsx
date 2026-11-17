@@ -201,7 +201,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
       if (!resp.ok) throw new Error(json.error ?? `HTTP ${resp.status}`);
       setCreateResult(json);
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
+      console.error("Create playlist:", e);
+      setCreateError("Couldn't create the playlist. Try again.");
     } finally {
       setCreating(false);
     }
@@ -288,7 +289,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
         }
       }
     } catch (e) {
-      setGenError(e instanceof Error ? e.message : String(e));
+      console.error("Generate playlist:", e);
+      setGenError("Couldn't generate the playlist. Try again.");
     } finally {
       setGenRunning(false);
     }
@@ -306,7 +308,8 @@ export default function SpotifyPage({ initial, headingTestId = "page-heading" }:
     } else if (evt.type === "done") {
       setGenResult(evt.result as GenResult);
     } else if (evt.type === "error") {
-      setGenError(String(evt.message ?? "Unknown error"));
+      console.error("Generate playlist:", evt.message);
+      setGenError("Couldn't generate the playlist. Try again.");
     }
   }
 

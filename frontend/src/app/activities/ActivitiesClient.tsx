@@ -530,7 +530,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     } catch (e) {
       setRows(before);
       console.error("Delete activity:", e);
-      alert(`Failed to delete: ${e instanceof Error ? e.message : String(e)}`);
+      alert("Couldn't delete. Try again.");
     } finally {
       setDeletingId(null);
     }
@@ -566,7 +566,7 @@ export default function ActivitiesPage({ initial, headingTestId = "page-heading"
     } catch (e) {
       setRows((prev) => prev.map((r) => (r.id === act.id ? { ...r, ...prevValues } : r)));
       console.error("Categorize activity:", e);
-      alert(`Failed to save tags: ${e instanceof Error ? e.message : String(e)}`);
+      alert("Couldn't save the tags. Try again.");
       return false;
     }
   }
