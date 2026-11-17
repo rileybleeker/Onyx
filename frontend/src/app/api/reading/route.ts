@@ -25,6 +25,7 @@ export async function GET(req: NextRequest) {
     if (!overview) return NextResponse.json({ overview: null, books }, { status: 200 });
     return NextResponse.json({ overview, books });
   } catch (e) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : "failed" }, { status: 500 });
+    console.error("GET /api/reading failed:", e);
+    return NextResponse.json({ error: "Couldn't load your reading. Try again." }, { status: 500 });
   }
 }
