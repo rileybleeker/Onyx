@@ -675,7 +675,7 @@ class RecoveryTests(unittest.TestCase):
         for kw in cases:
             with self.subTest(kw=repr(kw)):
                 supa = FakeSupa([stored(ACCT_A, "synthetic-1001@example.org", GM(1001), labeled=False)])
-                fake = FakeIMAP(messages={b"1001": msg(1001, ["Agent/Action"])}, **kw)
+                fake = FakeIMAP(messages={b"1001": msg(1001, ["Agent/Action"])}, window=[], **kw)
                 r = run_with([fake], [(ACCT_A, "pw")], supa)
                 self.assertFalse(supa.row(ACCT_A, "synthetic-1001@example.org")["labeled"],
                                  "unknown membership: nothing is recovered")
