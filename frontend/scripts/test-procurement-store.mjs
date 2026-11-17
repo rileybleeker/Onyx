@@ -125,13 +125,13 @@ for (const real of [null, undefined, {}, { code: '42501', message: 'permission d
   const readResp = store.failureResponse(list, true);
   assert.equal(readResp.status, 200, 'a read must not fail the page');
   assert.equal(readResp.body.persisted, false); assert.equal(readResp.body.setupPending, true); assert.deepEqual(readResp.body.subscriptions, []);
-  assert.match(readResp.body.message, /Not saved yet - setup pending/);
+  assert.match(readResp.body.message, /Not saved yet: saving is not set up on this site/);
 
   const db = fakeDb([{ data: null, error: MISSING }]);
   const created = await store.createSubscriptionRecord(db, ok);
   assert.equal(created.setupPending, true); assert.equal(db.calls.length, 1, 'no insert is attempted against a missing table');
   const writeResp = store.failureResponse(created, false);
-  assert.equal(writeResp.status, 503); assert.equal(writeResp.body.setupPending, true); assert.match(writeResp.body.error, /Not saved yet - setup pending/);
+  assert.equal(writeResp.status, 503); assert.equal(writeResp.body.setupPending, true); assert.match(writeResp.body.error, /Not saved yet: saving is not set up on this site/);
 
   for (const call of [
     store.updateSubscriptionRecord(fakeDb([{ data: null, error: MISSING }]), 1, ok),
@@ -148,7 +148,7 @@ for (const real of [null, undefined, {}, { code: '42501', message: 'permission d
 
 // --- the page keeps working without the table ---
 const client = read('src/app/procurement/ProcurementClient.tsx');
-assert.match(client, /Not saved yet - setup pending/);
+assert.match(client, /Not saved yet: saving is not set up on this site/);
 assert.match(client, /setStore\(body && body\.setupPending === true \? 'pending' : 'unavailable'\)/);
 assert.match(client, /catch \{ if \(!cancelled\) setStore\('unavailable'\); \}/, 'a failed or non-JSON load must not break the page');
 for (const heading of ['Procurement', 'What this page reads', 'Track subscriptions', 'Plan an order', 'Why execution is disabled']) assert.ok(client.includes(`>${heading}</h`), heading);   // headings the smoke test and UI test rely on
