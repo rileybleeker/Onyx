@@ -484,6 +484,8 @@ export interface ClaimedJob {
   prompt_version: string;
   attempt_key: string | null;
   attempts: number;
+  /** The claim's claim_seq (never reset): with attempts, the fence the store and finish calls send. */
+  claim_seq: number;
   reserved_cents?: number | string | null;
   error_code?: string | null;
   store_receipt?: unknown;
@@ -543,7 +545,7 @@ class JobRun {
 
   private async reserve(total: number): Promise<boolean> {
     const { data, error } = await this.supabase.rpc("reading_bank_reserve", {
-      p: { job_id: this.job.job_id, attempts: this.job.attempts, total_cents: total, month_cap_cents: this.ctx.monthCapCents },
+      p: { job_id: this.job.job_id, attempts: this.job.attempts, claim_seq: this.job.claim_seq, total_cents: total, month_cap_cents: this.ctx.monthCapCents },
     });
     if (error || !plainObject(data) || data.ok !== true) {
       this.reserveCode = plainObject(data) && typeof data.code === "string" ? bankCode(data.code) : "other";
@@ -584,6 +586,7 @@ class JobRun {
     const p = {
       job_id: this.job.job_id,
       attempts: this.job.attempts,
+      claim_seq: this.job.claim_seq,
       outcome,
       cost_cents: round2(this.cost),
       usage: this.usage,
@@ -973,6 +976,8 @@ async function runBuildJob(supabase: Supa, run: JobRun): Promise<StepOutcome> {
     totalChapters: input.total_chapters,
     target,
     jobId: job.job_id,
+    attempts: job.attempts,
+    claimSeq: job.claim_seq,
     promptVersion: job.prompt_version,
     rebuilds: c.rebuilds,
     replace: true,
@@ -1125,6 +1130,8 @@ async function runHighlightsJob(supabase: Supa, run: JobRun): Promise<StepOutcom
     totalChapters: input.total_chapters,
     target,
     jobId: job.job_id,
+    attempts: job.attempts,
+    claimSeq: job.claim_seq,
     promptVersion: job.prompt_version,
     rebuilds: c.rebuilds,
     replace: false,
