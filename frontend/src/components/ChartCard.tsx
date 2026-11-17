@@ -47,6 +47,13 @@ interface ChartCardProps {
   id?: string;
 }
 
+const FDR_SENTENCE =
+  "Passed the multiple-comparison check, so this result is less likely to be chance";
+
+function sampleSentence(n: number): string {
+  return n === 1 ? "Based on 1 data point" : `Based on ${n} data points`;
+}
+
 function formatAge(d: Date): string | null {
   const ms = Date.now() - d.getTime();
   if (!Number.isFinite(ms)) return null;
@@ -110,8 +117,22 @@ export default function ChartCard({
   const metaItems: Array<MetaItem | null | undefined | false> = [
     ageStr ? { text: ageStr, tone: "tertiary" } : undefined,
     source ? { text: source, tone: "secondary" } : undefined,
-    confidence?.n != null ? { text: `n=${confidence.n}`, tone: "tertiary" } : undefined,
-    confidence?.fdrPasses ? { text: "FDR✓", tone: "up" } : undefined,
+    confidence?.n != null
+      ? {
+          text: `n=${confidence.n}`,
+          tone: "tertiary",
+          tooltip: sampleSentence(confidence.n),
+          srText: sampleSentence(confidence.n),
+        }
+      : undefined,
+    confidence?.fdrPasses
+      ? {
+          text: "FDR✓",
+          tone: "up",
+          tooltip: FDR_SENTENCE,
+          srText: FDR_SENTENCE,
+        }
+      : undefined,
   ];
   const hasMeta = metaItems.some(Boolean);
   const tickColor = tick ? TICK_VARS[tick as TickKey] ?? tick : undefined;
