@@ -603,8 +603,10 @@ function isDay(v: string): boolean {
 /**
  * The text with quoted spans masked out (same length, so positions line up). Someone else's words, never a request:
  * fenced code blocks (``` or ~~~, to the closing fence or the end), inline code, block quotes ("> …" and the lines
- * that continue them up to a blank line, as Markdown shows them), "double quotes" and curly quotes, also over
- * several lines. An opening quote or fence that is never closed masks everything after it (fail closed).
+ * that continue them up to a blank line, as Markdown shows them), "double quotes", curly quotes and 'straight single
+ * quotes', also over several lines. An opening single quote sits at the start or after whitespace or an opening
+ * bracket and closes at a quote that ends a word, so the apostrophe inside "don't" is never one. An opening quote or
+ * fence that is never closed masks everything after it (fail closed).
  */
 function maskQuotes(text: string): string {
   const chars = text.split("");
@@ -650,10 +652,12 @@ function maskQuotes(text: string): string {
     let close: number | null = null;
     if (c === '"') close = s.indexOf('"', i + 1);
     else if (c === "“") close = s.indexOf("”", i + 1);
-    else if (c === "‘" && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
-      // An opening single quote closes at a ’ that ends a word (not the apostrophe inside "don’t").
+    else if ((c === "‘" || c === "'") && (i === 0 || /[\s([{]/.test(s[i - 1]))) {
+      // An opening single quote (curly or straight) closes at the same quote that ends a word
+      // (not the apostrophe inside "don’t" / "don't").
+      const closer = c === "‘" ? /’(?![a-z])/i : /'(?![a-z])/i;
       const rest = s.slice(i + 1);
-      const m = /’(?![a-z])/i.exec(rest);
+      const m = closer.exec(rest);
       close = m ? i + 1 + (m.index ?? 0) : -1;
     } else continue;
     const to = close === null || close < 0 ? s.length : close + 1;
