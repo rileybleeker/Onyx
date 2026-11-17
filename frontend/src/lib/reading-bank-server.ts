@@ -172,6 +172,15 @@ export const OUTPUT_MAX_CHARS = 55_000;
 /** Highlights a build sends (the chapter's newest live highlights). */
 export const BUILD_HIGHLIGHTS_MAX = 80;
 export const EXISTING_TITLES_MAX = 400;
+/** Active idea rows read to find the current-edition titles (stale-edition rows are skipped after the read). */
+export const EXISTING_TITLES_SCAN = 1500;
+/**
+ * PostgREST filter for the rows that count as Riley's highlights. A Kindle note with no highlight under it is stored as
+ * a row whose passage is the note's own text (highlighted_at NULL, note_at set; tools/kindle_harvest/harvest.mjs): that
+ * is his comment, which never reaches a generation call (spec D15). Keep equal to the filter in
+ * pds.reading_bank_plan_input, the store and lib/reading-kindle.ts (a note = no highlighted_at and a note_at).
+ */
+export const LIVE_HIGHLIGHT_FILTER = "highlighted_at.not.is.null,note_at.is.null";
 export const NOT_IN_BOOK_MAX = 20;
 /** The mapping check: the titles must match for at least this share of the titled chapters. */
 export const MAP_TITLE_SHARE = 0.7;
@@ -203,6 +212,11 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 const uniqueInts = (vs: Iterable<unknown>) => [...new Set([...vs].map(Number).filter((n) => Number.isInteger(n) && n > 0))];
 type DbError = { code?: string; message?: string } | null | undefined;
 const errCode = (e: DbError) => (isMissingSchema(e) ? "schema_missing" : "other");
+/** A database error answer seen while running: a failed run (never a quiet code), with a safe code. */
+function recordDbFailure(summary: BankRunSummary, code: string): void {
+  summary.failed += 1;
+  summary.codes.push(code);
+}
 const chunks = <T>(list: T[], size: number) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, i * size + size));
 
 /** A step's time budget in a run (ms): STEP_MAX_SECONDS x scale, never below the step's floor (STEP_FLOOR_SECONDS). */
@@ -794,6 +808,7 @@ async function chapterHighlights(supabase: Supa, bookId: number, chapter: number
     .eq("book_id", bookId)
     .eq("chapter", chapter)
     .eq("archived", false)
+    .or(LIVE_HIGHLIGHT_FILTER)
     .order("highlight_id", { ascending: false })
     .limit(BUILD_HIGHLIGHTS_MAX);
   if (error) throw Object.assign(new Error("read"), { code: errCode(error) });
@@ -803,17 +818,33 @@ async function chapterHighlights(supabase: Supa, bookId: number, chapter: number
 }
 
 /**
+ * The current edition of each chapter: its table of contents row's hash, else the hash of a chapter with no row (a book
+ * tracked by hand has none), the same fallback as generation and pds.reading_bank_chapter_hash. Chapter 0 is the
+ * whole-book hash.
+ */
+export function currentHashOf(input: Pick<PlanInput, "chapters" | "chapter0_hash">): (chapter: number) => string {
+  const hashOf = new Map(input.chapters.map((c) => [c.chapter, c.chapter_hash]));
+  return (n) => (n === 0 ? input.chapter0_hash : (hashOf.get(n) ?? chapterHash(n, null)));
+}
+
+/**
  * Titles of active ideas to dedupe against: earlier chapters (a build, which replaces this chapter's own), or up to
  * and including this one (the highlights step, which adds to it). The whole-book chapter 0 dedupes against every
- * chapter (and, for the highlights step, itself).
+ * chapter (and, for the highlights step, itself). Only ideas of the CURRENT edition of their chapter count: after a
+ * table of contents change an old edition's ideas stay `active` until their chapter is rebuilt, but they are hidden
+ * everywhere else (practice, the export, the chapter sheet), so they must not suppress a replacement.
  */
-async function existingTitles(supabase: Supa, bookId: number, chapter: number, includeThis: boolean): Promise<string[]> {
-  let q = supabase.from("reading_ideas").select("title,chapter").eq("book_id", bookId).eq("status", "active");
+async function existingTitles(supabase: Supa, bookId: number, chapter: number, includeThis: boolean, currentHash: (chapter: number) => string): Promise<string[]> {
+  let q = supabase.from("reading_ideas").select("title,chapter,chapter_hash").eq("book_id", bookId).eq("status", "active");
   if (chapter > 0) q = includeThis ? q.lte("chapter", chapter) : q.lt("chapter", chapter);
   else if (!includeThis) q = q.gt("chapter", 0);
-  const { data, error } = await q.order("chapter", { ascending: false }).limit(EXISTING_TITLES_MAX);
+  const { data, error } = await q.order("chapter", { ascending: false }).limit(EXISTING_TITLES_SCAN);
   if (error) throw Object.assign(new Error("read"), { code: errCode(error) });
-  return ((data ?? []) as { title: unknown }[]).map((r) => String(r.title ?? "")).filter(Boolean);
+  return ((data ?? []) as { title: unknown; chapter: unknown; chapter_hash: unknown }[])
+    .filter((r) => r.chapter_hash === currentHash(Number(r.chapter)))
+    .map((r) => String(r.title ?? ""))
+    .filter(Boolean)
+    .slice(0, EXISTING_TITLES_MAX);
 }
 
 /**
@@ -934,7 +965,7 @@ async function runBuildJob(supabase: Supa, run: JobRun): Promise<StepOutcome> {
   const { evidence, notes } = evidenceFrom(source.output);
   const highlights = n > 0 ? await chapterHighlights(supabase, job.book_id, n) : [];
   const target = chapterTarget(c.span, halveTarget(job));
-  const titles = await existingTitles(supabase, job.book_id, n, false);
+  const titles = await existingTitles(supabase, job.book_id, n, false, currentHashOf(input));
   const base = {
     bookId: job.book_id,
     chapter: n,
@@ -1014,6 +1045,7 @@ async function runHighlightsJob(supabase: Supa, run: JobRun): Promise<StepOutcom
     .select("highlight_id,passage,location")
     .eq("book_id", job.book_id)
     .eq("archived", false)
+    .or(LIVE_HIGHLIGHT_FILTER)
     .in("highlight_id", fresh.map((h) => h.highlight_id));
   if (e1) return run.finish("retry", errCode(e1));
   const shaOf = new Map(fresh.map((h) => [h.highlight_id, h.passage_sha]));
@@ -1033,7 +1065,7 @@ async function runHighlightsJob(supabase: Supa, run: JobRun): Promise<StepOutcom
   const ideas = ((ideaRows ?? []) as { idea_id: unknown; title: unknown; statement: unknown; chapter_hash: unknown }[])
     .filter((i) => i.chapter_hash === c.hash)
     .map((i) => ({ idea_id: Number(i.idea_id), title: String(i.title ?? ""), statement: String(i.statement ?? "") }));
-  const titles = await existingTitles(supabase, job.book_id, n, true);
+  const titles = await existingTitles(supabase, job.book_id, n, true, currentHashOf(input));
   const notIn = await notInBook(supabase, job.book_id, n);
   const toc = tocUpTo(input, n);
   const target = chapterTarget(c.span);
@@ -1206,9 +1238,9 @@ export async function runBank(supabase: Supa, opts: RunBankOptions = {}): Promis
       p: { lease_seconds: lease, month_cap_cents: monthCap, estimates: STEP_ESTIMATE_CENTS, steps: fit },
     });
     if (error) {
-      const code = errCode(error);
-      summary.codes.push(code);
-      if (code === "schema_missing") summary.failed += 1;
+      // Any claim error (not only a missing schema) is a failed run: nothing can be processed, and a quiet `other`
+      // code would publish a success heartbeat and let the worker exit 0.
+      recordDbFailure(summary, errCode(error));
       break;
     }
     const answer = plainObject(data) ? data : {};
@@ -1239,9 +1271,9 @@ export async function runBank(supabase: Supa, opts: RunBankOptions = {}): Promis
     if (out.outcome === "done" && REPLAN_AFTER.has(job.step)) {
       try {
         const p = await planBook(supabase, job.book_id);
-        if (!p.ok) summary.codes.push(p.code);
+        if (!p.ok) recordDbFailure(summary, p.code);
       } catch {
-        summary.codes.push("other");
+        recordDbFailure(summary, "other");
       }
     }
   }
@@ -1442,7 +1474,7 @@ async function sweepGrades(supabase: Supa, ctx: { client: BankClient; monthCap: 
       .limit(GRADE_SWEEP_MAX),
   ]);
   const error = queued.error ?? expired.error;
-  if (error) summary.codes.push(errCode(error));
+  if (error) recordDbFailure(summary, errCode(error));
   const seen = new Set<number>();
   const rows = ([...((queued.data ?? []) as { job_id: unknown; created_at: unknown }[]), ...((expired.data ?? []) as { job_id: unknown; created_at: unknown }[])])
     .filter((r) => {
@@ -1459,7 +1491,11 @@ async function sweepGrades(supabase: Supa, ctx: { client: BankClient; monthCap: 
     const { data: claim, error: e2 } = await supabase.rpc("reading_bank_claim", {
       p: { job_id: Number(row.job_id), steps: ["grade"], lease_seconds: STEP_MAX_SECONDS.grade + 30, month_cap_cents: ctx.monthCap, estimates: { grade: STEP_ESTIMATE_CENTS.grade } },
     });
-    if (e2 || !plainObject(claim)) continue;
+    if (e2) {
+      recordDbFailure(summary, errCode(e2));
+      break;
+    }
+    if (!plainObject(claim)) continue;
     if (!plainObject(claim.job)) {
       if (claim.code === "monthly_cap") {
         summary.codes.push("monthly_cap");
@@ -1545,7 +1581,7 @@ export async function runWorker(supabase: Supa, opts: WorkerOptions = {}): Promi
     for (const id of ids) {
       const p = await planBook(supabase, id);
       if (p.ok) result.enqueued += p.enqueued;
-      else summary.codes.push(p.code);
+      else recordDbFailure(summary, p.code);
     }
     let client = opts.client ?? null;
     if (!client && process.env.ANTHROPIC_API_KEY) client = defaultBankClient();
@@ -1570,7 +1606,7 @@ export async function runWorker(supabase: Supa, opts: WorkerOptions = {}): Promi
     const days = opts.clearAnswersDays ?? clearAnswersDays(process.env.READING_BANK_CLEAR_ANSWERS_DAYS);
     if (days > 0 && clearAnswersDue(now())) {
       const { data: n, error: e3 } = await supabase.rpc("reading_clear_question_answers", { p_days: days });
-      if (e3) summary.codes.push(errCode(e3));
+      if (e3) recordDbFailure(summary, errCode(e3));
       else {
         result.cleared = num(n, 0);
         notes.push(`cleared ${result.cleared} answers`);
@@ -1831,8 +1867,7 @@ export async function getBankExport(supabase: Supa, slug: string | null): Promis
   const through = Math.max(0, Math.trunc(input.quiz_through) || 0);
   // The current edition of each chapter: its table of contents row's hash, else the hash of a chapter with no row
   // (a book tracked by hand has none), the same fallback as generation and pds.reading_bank_chapter_hash.
-  const hashOf = new Map(input.chapters.map((c) => [c.chapter, c.chapter_hash]));
-  const currentHash = (n: number) => (n === 0 ? input.chapter0_hash : (hashOf.get(n) ?? chapterHash(n, null)));
+  const currentHash = currentHashOf(input);
   type IdeaRow = { idea_id: number; chapter: number; unlock_chapter: number; chapter_hash: string; [k: string]: unknown };
   const ideasRead = await pagedSelect<IdeaRow>((from, to) =>
     supabase

@@ -334,6 +334,14 @@ test("the planner keys highlight freshness on content, never on updated_at", () 
   assert.match(plan, /src\.passage_sha = x\.sha/);
 });
 
+test("a Kindle note with no highlight under it (highlighted_at NULL, note_at set) is a comment: not offered, not evidence, not marked seen", () => {
+  const plan = fn(fnsMain, "pds.reading_bank_plan_input").body;
+  assert.match(plan, /NOT \(h\.highlighted_at IS NULL AND h\.note_at IS NOT NULL\)/, "the planner's highlight list");
+  const store = fn(fnsMain, "pds.reading_bank_store").body;
+  assert.match(store, /NOT \(h\.highlighted_at IS NULL AND h\.note_at IS NOT NULL\)/, "a highlight source must not be a standalone note");
+  assert.match(store, /NOT \(h2\.highlighted_at IS NULL AND h2\.note_at IS NOT NULL\)/, "the seen fallback");
+});
+
 test("the queue charges an expired lease's reservation and fences finish by attempt", () => {
   const claim = fn(fnsMain, "pds.reading_bank_claim").body;
   assert.match(claim, /cost_cents = cost_cents \+ reserved_cents/);

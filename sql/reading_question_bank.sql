@@ -906,7 +906,8 @@ BEGIN
     v_psha := NULL;
     IF v_src->>'kind' = 'highlight' THEN
       SELECT pds.reading_sha256(h.passage) INTO v_psha FROM pds.book_highlights h
-       WHERE h.highlight_id = (v_src->>'highlight_id')::bigint AND h.book_id = v_book AND NOT h.archived;
+       WHERE h.highlight_id = (v_src->>'highlight_id')::bigint AND h.book_id = v_book AND NOT h.archived
+         AND NOT (h.highlighted_at IS NULL AND h.note_at IS NOT NULL);   -- a standalone note is a comment, never evidence
       IF v_psha IS NULL THEN
         RAISE EXCEPTION USING ERRCODE = 'OXB02', MESSAGE = 'highlight evidence is not a live highlight of this book';
       END IF;
@@ -936,6 +937,7 @@ BEGIN
           SELECT h2.highlight_id, pds.reading_sha256(h2.passage)
             FROM pds.book_highlights h2
            WHERE p->'seen' IS NULL AND h2.book_id = v_book AND NOT h2.archived
+             AND NOT (h2.highlighted_at IS NULL AND h2.note_at IS NOT NULL)
              AND ((v_replace AND h2.chapter = v_ch)
                   OR h2.highlight_id IN (SELECT NULLIF(x->>'highlight_id', '')::bigint
                                            FROM jsonb_array_elements(COALESCE(p->'sources', '[]'::jsonb)) x WHERE x->>'kind' = 'highlight'))) s
@@ -1832,7 +1834,11 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pds, pg_tem
     'highlights', COALESCE((SELECT jsonb_agg(jsonb_build_object('highlight_id', x.highlight_id, 'chapter', x.chapter,
                 'passage_sha', x.sha) ORDER BY x.highlight_id)
                 FROM (SELECT h.highlight_id, h.chapter, pds.reading_sha256(h.passage) AS sha
-                        FROM pds.book_highlights h WHERE h.book_id = p_book AND NOT h.archived) x
+                        FROM pds.book_highlights h
+                       WHERE h.book_id = p_book AND NOT h.archived
+                         -- A Kindle note with no highlight under it is stored as a row whose passage is the note's own
+                         -- text (highlighted_at NULL, note_at set): Riley's comment, which never reaches a model.
+                         AND NOT (h.highlighted_at IS NULL AND h.note_at IS NOT NULL)) x
                WHERE NOT EXISTS (SELECT 1 FROM pds.reading_bank_highlight_seen sn
                                   WHERE sn.highlight_id = x.highlight_id AND sn.passage_sha = x.sha)
                  AND NOT EXISTS (SELECT 1 FROM pds.reading_bank_sources src

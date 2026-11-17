@@ -295,6 +295,14 @@ highlights step links the new passage again or the idea has other evidence, and 
   snippets of public pages; Riley's highlight passages (build and highlights steps); his answers to explain,
   cued-fallback and chapter recall questions (grading). Never: comments, recall notes, journal, email, health,
   finance or client material.
+- A Kindle note with no highlight under it is stored as a `book_highlights` row whose passage is the note's own text
+  (`highlighted_at` NULL, `note_at` set). That is a comment, so it is left out of the planner's highlight list
+  (`pds.reading_bank_plan_input`), of both generation reads (`LIVE_HIGHLIGHT_FILTER`), of the seen pairs and of the
+  evidence the store accepts.
 - Logs and heartbeats carry counts, chapter numbers and codes from a fixed list (`BANK_CODES`) only, never a title
-  or any text.
+  or any text. A database error answer on a claim, a plan read or the grade sweep is a failed run (failed heartbeat,
+  the worker script exits 1), not a quiet code.
+- The dedupe titles a build or highlights step shows the model come from the current edition of each chapter only:
+  after a table of contents change an old edition's ideas stay active until the chapter is rebuilt, but they are
+  hidden everywhere else and do not suppress a replacement.
 - Code, tests and docs are generic; tests use a synthetic book.

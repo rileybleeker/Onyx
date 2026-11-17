@@ -13,6 +13,7 @@ const TITLE = "The Lighthouse Ledger";
 const AUTHOR = "A. Synthetic Author";
 const PASSAGE_MARKER = "SYNTHETIC-PASSAGE-MARKER";
 const COMMENT_MARKER = "SYNTHETIC-COMMENT-MARKER";
+const NOTE_MARKER = "SYNTHETIC-NOTE-MARKER";
 const BOOK = 7;
 const sha = (t) => crypto.createHash("sha256").update(t, "utf8").digest("hex");
 
@@ -44,7 +45,7 @@ function makeDb(o = {}) {
     jobs: [],
     nextJob: 1,
     highlights: [
-      { highlight_id: 55, book_id: BOOK, chapter: 2, passage: `${PASSAGE_MARKER} the bell must ring until the fog lifts`, comment: `${COMMENT_MARKER} private note`, location: "p. 40", archived: false },
+      { highlight_id: 55, book_id: BOOK, chapter: 2, passage: `${PASSAGE_MARKER} the bell must ring until the fog lifts`, comment: `${COMMENT_MARKER} private note`, location: "p. 40", archived: false, highlighted_at: "2031-03-01T00:00:00Z", note_at: "2031-03-01T00:00:05Z" },
     ],
     seen: new Set(),
     ideas: [],
@@ -60,6 +61,10 @@ function makeDb(o = {}) {
     stores: [],
     cleared: [],
     throwOn: null,
+    /** An RPC that ANSWERS with a database error ({data: null, error}) instead of throwing: {name, code}. */
+    errorOn: null,
+    /** Simulates a plan input built before sql/reading_question_bank.sql excluded standalone Kindle notes. */
+    planIncludesNotes: false,
     /** A code pds.reading_bank_finish answers instead of finishing (a lease that was lost meanwhile). */
     refuseFinish: null,
     /** The next finish commits, but its answer never arrives (a transport error). */
@@ -78,6 +83,9 @@ const tocHashOf = (db) => B.tocHash(db.book.total_chapters, db.toc.map((c) => ({
 const running = (db) => db.jobs.filter((j) => j.status === "running" && j.lease_until >= db.clock);
 const monthSpent = (db) => db.monthBase + db.jobs.reduce((s, j) => s + j.cost_cents, 0) + running(db).reduce((s, j) => s + j.reserved_cents, 0);
 
+/** A Kindle note with no highlight under it: a row whose passage is the note's own text (the comment). */
+const isStandaloneNote = (h) => (h.highlighted_at ?? null) === null && (h.note_at ?? null) !== null;
+
 function planInput(db) {
   const bb = db.bb;
   const chapters = db.toc.map((c) => ({ chapter: c.chapter, title: c.title, start_page: c.start_page, end_page: c.end_page, chapter_hash: chHash(db, c.chapter) }));
@@ -90,7 +98,7 @@ function planInput(db) {
     bank: [...db.chapters.entries()].map(([chapter, c]) => ({ chapter, status: c.status, chapter_hash: c.chapter_hash ?? null, rebuilds: c.rebuilds ?? 0, built_rebuilds: c.built_rebuilds ?? 0, built_at: c.built_at ?? null, quizzable_since: c.quizzable_since ?? null })),
     jobs: db.jobs.filter((j) => j.step !== "grade").map((j) => ({ job_id: j.job_id, step: j.step, chapter: j.chapter, input_hash: j.input_hash, status: j.status, result: j.result })),
     highlights: db.highlights
-      .filter((h) => !h.archived && !db.seen.has(`${h.highlight_id}|${sha(h.passage)}`) && !cited.has(`${h.highlight_id}|${sha(h.passage)}`))
+      .filter((h) => !h.archived && (db.planIncludesNotes || !isStandaloneNote(h)) && !db.seen.has(`${h.highlight_id}|${sha(h.passage)}`) && !cited.has(`${h.highlight_id}|${sha(h.passage)}`))
       .map((h) => ({ highlight_id: h.highlight_id, chapter: h.chapter, passage_sha: sha(h.passage) })),
   };
 }
@@ -308,6 +316,7 @@ function fakeSupabase(db) {
         db.tick();
         db.rpc.push(name);
         if (db.throwOn === name) throw new Error("synthetic rpc failure");
+        if (db.errorOn && db.errorOn.name === name) return { data: null, error: { code: db.errorOn.code ?? "XX000", message: "synthetic" } };
         if (db.schema === "missing") return { data: null, error: MISSING };
         if (!R[name]) throw new Error(`unexpected rpc ${name}`);
         try {
@@ -352,6 +361,18 @@ function fakeSupabase(db) {
         gt: (c, v) => (filters.push((r) => instant(r[c]) > instant(v)), q),
         gte: (c, v) => (filters.push((r) => instant(r[c]) >= instant(v)), q),
         is: (c, v) => (filters.push((r) => (r[c] ?? null) === v), q),
+        // PostgREST or(): comma-separated "col.is.null" / "col.not.is.null" terms (the only forms the generator uses).
+        or: (expr) => (
+          filters.push((r) =>
+            String(expr).split(",").some((term) => {
+              const m = /^(\w+)\.(not\.)?is\.null$/.exec(term.trim());
+              if (!m) throw new Error(`unsupported or() term ${term}`);
+              const isNull = (r[m[1]] ?? null) === null;
+              return m[2] ? !isNull : isNull;
+            }),
+          ),
+          q
+        ),
         not: (c, op, v) => (filters.push((r) => (op === "is" ? (r[c] ?? null) !== v : true)), q),
         order: (c, o) => (orders.push([c, o?.ascending !== false]), q),
         limit: (n) => ((limit = n), q),
@@ -931,6 +952,74 @@ test("highlights step: a link is stored only when the verifier confirms it; a ne
   assert.ok(p.seen.some((s) => s.highlight_id === 55));
 });
 
+const standaloneNote = (id, chapter) => ({
+  highlight_id: id, book_id: BOOK, chapter, passage: `${NOTE_MARKER} my own thought about the ledger`, comment: null, location: "p. 41",
+  archived: false, highlighted_at: null, note_at: "2031-03-01T00:00:00Z",
+});
+
+test("a Kindle note with no highlight is Riley's comment: it reaches no model call and is no stored evidence or seen pair", async () => {
+  const db = makeDb();
+  db.highlights.push(standaloneNote(56, 2));
+  seedBuild(db);
+  const env = load(db, fakeModel({ structure: () => jsonMsg(BUILD_STRUCTURE), verify: () => jsonMsg(BUILD_VERIFY) }));
+  await kick(env);
+  assert.equal(db.stores.length, 1);
+  const calls = env.model.calls.filter((c) => c.role === "structure" || c.role === "verify");
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    const text = JSON.stringify(c.params);
+    assert.equal(text.includes(NOTE_MARKER), false, `${c.role} saw a standalone note`);
+    assert.equal(text.includes('"H56"'), false, `${c.role} was offered the note's id`);
+    assert.ok(text.includes(PASSAGE_MARKER), `${c.role} still sees the real highlight`);
+  }
+  const p = db.stores[0];
+  assert.deepEqual(p.sources.filter((x) => x.kind === "highlight").map((x) => x.highlight_id), [55]);
+  assert.deepEqual(p.seen.map((x) => x.highlight_id), [55]);
+});
+
+test("highlights step: a note an older plan input still lists is never sent; a chapter with only notes is skipped without a call", async () => {
+  const db = makeDb({ planIncludesNotes: true });
+  db.highlights.push(standaloneNote(56, 2));
+  seedBuilt(db);
+  const env = load(db);
+  await kick(env);
+  const call = env.model.calls.find((c) => c.role === "highlights");
+  assert.ok(call, "the real highlight is still sent");
+  const text = JSON.stringify(call.params);
+  assert.ok(text.includes(PASSAGE_MARKER));
+  assert.equal(text.includes(NOTE_MARKER), false);
+  assert.equal(text.includes('"H56"'), false);
+  assert.deepEqual(db.stores.at(-1).seen.map((x) => x.highlight_id), [55]);
+
+  const only = makeDb({ planIncludesNotes: true, highlights: [standaloneNote(56, 2)] });
+  seedBuilt(only);
+  const env2 = load(only);
+  await kick(env2);
+  assert.equal(env2.model.calls.some((c) => c.role === "highlights" || c.role === "verify"), false, "no model call for a note");
+  assert.equal(only.jobs.find((j) => j.step === "highlights")?.status, "skipped");
+  assert.equal(only.stores.length, 0);
+});
+
+test("dedupe titles come from the current edition only: an older edition's active idea does not suppress a replacement", async () => {
+  const run = async (stale) => {
+    const db = makeDb();
+    seedBuild(db);
+    db.ideas.push({ idea_id: 700, book_id: BOOK, chapter: 1, unlock_chapter: 1, chapter_hash: stale ? "f".repeat(64) : chHash(db, 1), title: "Ledger of passing ships", statement: "The keeper writes down each ship.", importance: "core", status: "active" });
+    const env = load(db, fakeModel({ structure: () => jsonMsg(BUILD_STRUCTURE), verify: () => jsonMsg(BUILD_VERIFY) }));
+    await kick(env);
+    const user = env.model.calls.find((c) => c.role === "structure").params.messages[0].content;
+    return { titles: db.stores[0].ideas.map((i) => i.title), user, reasons: db.jobs.find((j) => j.step === "build").counts.reasons };
+  };
+  const stale = await run(true);
+  assert.equal(stale.user.includes("Ledger of passing ships"), false, "an old edition's title is not shown to the model as existing");
+  assert.ok(stale.titles.includes("Ledger of passing ships"), "and does not drop the replacement");
+  assert.equal(stale.reasons.duplicate ?? 0, 0);
+  const live = await run(false);
+  assert.ok(live.user.includes("Ledger of passing ships"), "control: a current-edition title still counts");
+  assert.equal(live.titles.includes("Ledger of passing ships"), false);
+  assert.equal(live.reasons.duplicate, 1);
+});
+
 test("privacy: web-enabled calls never see a highlight; no call ever sees a comment", async () => {
   const db = makeDb();
   const env = load(db);
@@ -1143,6 +1232,47 @@ test("worker: plans every approved book, sweeps grades older than 2 minutes only
   assert.equal(env.S.clearAnswersDays("0"), 0);
   assert.equal(env.S.clearAnswersDays("10"), 180, "below T07's 30-day floor: the default");
   assert.equal(env.S.clearAnswersDays(undefined), 180);
+});
+
+test("a database error answer on a claim is a failed run, not a quiet code: kick, worker and the grade sweep", async () => {
+  const db = makeDb({ errorOn: { name: "reading_bank_claim", code: "XX000" } });
+  const env = load(db);
+  const r = await kick(env);
+  assert.equal(r.ran, true);
+  assert.equal(r.claimed, 0);
+  assert.equal(db.sync.at(-1).status, "failed", "the kick's heartbeat is failed, not success");
+  assert.match(db.sync.at(-1).error_message, /failed 1/);
+  assert.match(db.sync.at(-1).error_message, /codes .*other/);
+  assert.match(db.sync.at(-1).error_message, SAFE_MESSAGE);
+
+  db.clock += 51 * 60000; // past the heartbeat throttle for an equal status with nothing claimed
+  const w = await env.S.runWorker(env.supabase, { client: env.model.client, now: db.now, clearAnswersDays: 0 });
+  assert.equal(w.status, "failed", "the worker script exits 1 on this status");
+  assert.ok(w.codes.includes("other"));
+  assert.equal(w.heartbeat, "written");
+  assert.equal(db.sync.at(-1).status, "failed");
+  assert.match(env.S.workerLogLine(w), /^reading bank: failed /);
+  const src = fs.readFileSync(path.join(__dirname, "..", "scripts", "reading-bank-run.cjs"), "utf8");
+  assert.ok(src.includes('process.exit(result.status === "failed" ? 1 : 0)'));
+
+  // The grade sweep alone (every book off): its claim error is a failure too, and nothing is graded.
+  const off = makeDb({ errorOn: { name: "reading_bank_claim", code: "XX000" } });
+  off.bb.approved_at = null;
+  addJob(off, { step: "grade", attempt_key: "00000000-0000-4000-8000-000000000009", input_hash: "d".repeat(64), priority: 5, created_at: new Date(off.clock - 10 * 60000).toISOString() });
+  const env2 = load(off);
+  const w2 = await env2.S.runWorker(env2.supabase, { client: env2.model.client, now: off.now, clearAnswersDays: 0 });
+  assert.equal(w2.status, "failed");
+  assert.deepEqual(env2.grades, []);
+  assert.equal(off.sync.at(-1).status, "failed");
+});
+
+test("a database error answer while planning a book is a failed worker run too", async () => {
+  const db = makeDb({ errorOn: { name: "reading_bank_plan_input", code: "XX000" } });
+  const env = load(db);
+  const w = await env.S.runWorker(env.supabase, { client: env.model.client, now: db.now, clearAnswersDays: 0 });
+  assert.equal(w.status, "failed");
+  assert.ok(w.codes.includes("other"));
+  assert.equal(db.sync.at(-1).status, "failed");
 });
 
 test("the worker script prints one counts-only line and never a row or a message", () => {
