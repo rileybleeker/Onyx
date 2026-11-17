@@ -234,7 +234,7 @@ export function parseDeleteBody(body: unknown): number | null {
 
 /** API answer for a database error code (null = not one of ours: answer 500). */
 export function photoMealErrorMessage(code: string | null | undefined): { status: number; error: string; code?: string } | null {
-  if (isMissingRelation(code)) return { status: 503, error: "Photo meals are not set up yet: the database migration is pending." };
+  if (isMissingRelation(code)) return { status: 503, error: "Photo meals aren't available yet. Try again later." };
   if (code === "OXP01") return { status: 409, error: "That time has not happened yet.", code: "future" };
   if (code === "23514") return { status: 400, error: "A number is out of range." };
   return null;
