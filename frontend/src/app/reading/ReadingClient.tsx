@@ -927,6 +927,9 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
   const [open, setOpen] = useState(true);
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
+  // savingId drives the disabled state; the ref guards against a second call before React re-renders.
+  const [savingId, setSavingId] = useState<number | null>(null);
+  const savingRef = useRef<number | null>(null);
   const groups = useMemo(() => {
     const m = new Map<string, Highlight[]>();
     for (const h of o.highlights) {
@@ -937,6 +940,9 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
   }, [o.highlights]);
 
   const saveComment = async (h: Highlight) => {
+    if (savingRef.current === h.highlight_id) return;
+    savingRef.current = h.highlight_id;
+    setSavingId(h.highlight_id);
     try {
       const res = await fetch(`/api/reading/highlights/${h.highlight_id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ comment: draft }) });
       if (!res.ok) throw new Error((await res.json()).error || "failed");
@@ -945,6 +951,9 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
     } catch (e) {
       console.error("Highlight comment save failed:", e);
       onError("Couldn't save the comment. Try again.");
+    } finally {
+      savingRef.current = null;
+      setSavingId(null);
     }
   };
   const archive = async (h: Highlight) => {
@@ -979,11 +988,25 @@ function HighlightsList({ o, onChanged, onError }: { o: ReadingOverview; onChang
                     <p className="text-[13px] text-text-primary leading-relaxed">&ldquo;{h.passage}&rdquo;</p>
                     {editing === h.highlight_id ? (
                       <div className="mt-1.5 flex gap-2">
-                        <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} className="flex-1 bg-white/[0.03] border border-border-subtle rounded-control px-2 py-1 text-[13px] italic text-text-primary" />
-                        <button onClick={() => saveComment(h)} className="h-8 w-8 rounded-control border border-accent/60 text-accent inline-flex items-center justify-center">
+                        <input
+                          autoFocus
+                          value={draft}
+                          onChange={(e) => setDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") saveComment(h);
+                            else if (e.key === "Escape") setEditing(null);
+                          }}
+                          className="flex-1 bg-white/[0.03] border border-border-subtle rounded-control px-2 py-1 text-[13px] italic text-text-primary"
+                        />
+                        <button
+                          onClick={() => saveComment(h)}
+                          disabled={savingId === h.highlight_id}
+                          aria-label="Save comment"
+                          className="h-8 w-8 rounded-control border border-accent/60 text-accent inline-flex items-center justify-center disabled:opacity-50"
+                        >
                           <Check className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => setEditing(null)} className="h-8 w-8 rounded-control border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
+                        <button onClick={() => setEditing(null)} aria-label="Cancel comment" className="h-8 w-8 rounded-control border border-border-subtle text-text-tertiary inline-flex items-center justify-center">
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </div>
