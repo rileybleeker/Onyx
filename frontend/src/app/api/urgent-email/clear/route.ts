@@ -41,7 +41,10 @@ export async function POST(req: NextRequest) {
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) return answer({ error: "saving is not configured" }, 503);
+  if (!url || !key) {
+    console.error("urgent-email clear: Supabase URL or service key is not set");
+    return answer({ error: "Clearing isn't available right now. Try again later." }, 503);
+  }
   const db = createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
 
   const request = parsed.request;
