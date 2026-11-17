@@ -301,7 +301,7 @@ export function readConnection(load: CalendarLoadState, lastSync: CalendarSync |
   const failedRun = !!lastSync && (lastSync.status === "failed" || lastSync.status === "error");
   if (load === "not_connected" || health === "never") {
     return { ...base, status: "not-synced", statusLabel: "Not synced yet", detail: failedRun
-      ? "The calendar sync ran but its table is not set up yet, so no calendar events are shown."
+      ? "The calendar sync ran, but its setup is not finished yet, so no calendar events are shown."
       : "The hourly calendar sync has not run yet, so no calendar events are shown." };
   }
   if (health === "failing") {
