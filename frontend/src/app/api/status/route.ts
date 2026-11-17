@@ -49,6 +49,8 @@ const CADENCE: Record<string, string> = {
   cronometer: "Daily 10:30pm + 11am ET",
   // Predict: every hourly ETL + 23:50 ET (DST-gated).
   hrv_analysis: "Predict: hourly + 23:50 ET",
+  // Preprocessing fill check: written by the predict job (deduped to ~every 12 h while unchanged).
+  preprocessing: "With the HRV predict job (hourly + 23:50 ET)",
   // Retrain: hourly conditional on backfill detection + daily 12:00 UTC
   // unconditional safety-net. Tracked separately because the predict path
   // can stay green while the retrain crashes silently (the model is cached).
@@ -121,6 +123,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   cronometer:     { method: "automated",      label: "Web export ETL" },
   hrv_analysis:   { method: "automated",      label: "Computed" },
   hrv_retrain:    { method: "automated",      label: "Model retrain" },
+  preprocessing:  { method: "automated",      label: "Model forecast check" },
   experiments:    { method: "automated",      label: "Trial report" },
   spotify:        { method: "automated",      label: "API ETL" },
   reccobeats:     { method: "automated",      label: "API ETL" },
@@ -366,7 +369,7 @@ export async function GET() {
       ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, hrvPreprocessingSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -485,6 +488,14 @@ export async function GET() {
       // heartbeats which published artifact served the forecast and why a forecast was
       // skipped. Deduped, so its newest row can fall out of the 100-row window — own read.
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_predict").eq("data_type", "model_artifact")
+        .order("sync_start", { ascending: false }).limit(1),
+      // HRV forecast preprocessing fill (hrv_predict|preprocessing, PIPE-07): the predict job
+      // heartbeats whether the served model was trained with the current sparse-feature fill
+      // (success = moved back onto it; partial = an older, unstamped pickle is being served;
+      // failed = an unknown fill version (GUARD model_preprocessing:)). Same 12 h dedupe rule as
+      // the model-artifact heartbeat, so its newest row can fall out of the 100-row window —
+      // own read.
+      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "hrv_predict").eq("data_type", "preprocessing")
         .order("sync_start", { ascending: false }).limit(1),
       // Supplement stack reminders: the sms-reminders Worker polls /api/supplements/reminders/claim
       // and each poll (throttled to ~1/h when nothing is due) writes a heartbeat. Dedicated fetch so
@@ -796,6 +807,37 @@ export async function GET() {
           cadence: CADENCE.hrv_retrain,
           integrationMethod: METHOD.hrv_retrain.method,
           methodLabel: METHOD.hrv_retrain.label,
+        };
+      })(),
+      // HRV forecast preprocessing fill (hrv_predict|preprocessing, PIPE-07): whether the served
+      // model was trained with the current sparse-feature fill. A heartbeat-driven status card —
+      // the newest row's status is the card's (partial = Degraded, failed = Error); no row yet =
+      // Unknown. The card repeats only the heartbeat's own message, never model internals.
+      preprocessing: (() => {
+        const entry = (hrvPreprocessingSyncRes.data?.[0] as Record<string, unknown> | undefined)
+          ?? latestBySrcType["hrv_predict|preprocessing"] ?? null;
+        const lastSync = (entry?.sync_start as string) ?? null;
+        const ageH = lastSync ? (Date.now() - new Date(lastSync).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed"
+            ? "failed"
+            : entry.status === "partial"
+              ? "partial"
+              : "success";
+        return {
+          label: "HRV Forecast Fill",
+          lastSync,
+          status,
+          latestDataDate: lastSync ? lastSync.slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No run yet - the HRV predict job has not reported its preprocessing fill." : null),
+          cadence: CADENCE.preprocessing,
+          integrationMethod: METHOD.preprocessing.method,
+          methodLabel: METHOD.preprocessing.label,
         };
       })(),
       // N-of-1 trial report job (experiment_report.py). Heartbeat only: no report row, arm or result is
