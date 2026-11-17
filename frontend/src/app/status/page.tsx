@@ -459,6 +459,9 @@ function StatusView({ early }: { early: boolean }) {
   // carries heartbeat error text, so it is a memory-only key (lib/client-cache.ts isSensitiveKey).
   const [data, setData] = useState<StatusResponse | null>(() => clientCache.peek<StatusResponse>(STATUS_URL) ?? null);
   const [loading, setLoading] = useState(() => data === null);
+  // True after a failed read (network error or a non-OK response). With no data, the page shows the load-error panel
+  // instead of the healthy-looking summary (which would read "Active Errors: 0" for data that never arrived).
+  const [loadFailed, setLoadFailed] = useState(false);
   const refreshedAtRef = useRef<Date | null>(null);
   // The first load of a full page visit takes the GET the HTML started (once); later polls fetch for themselves.
   const firstLoad = useRef(early);
@@ -469,8 +472,11 @@ function StatusView({ early }: { early: boolean }) {
       const takeEarly = firstLoad.current;
       firstLoad.current = false;
       const res = await (takeEarly ? earlyOr(STATUS_URL, get) : get());
-      if (res.ok) {
+      if (!res.ok) {
+        setLoadFailed(true);
+      } else {
         const fresh: StatusResponse = await res.json();
+        setLoadFailed(false);
         clientCache.put(STATUS_URL, fresh);
         // Bail out of the commit when the poll returned the same payload
         // (perf round 3): fetchedAt is volatile — the server stamps it on
@@ -486,6 +492,7 @@ function StatusView({ early }: { early: boolean }) {
       }
     } catch (e) {
       console.error("Failed to fetch status:", e);
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
@@ -533,6 +540,23 @@ function StatusView({ early }: { early: boolean }) {
               </div>
             </div>
           ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (loadFailed && data === null) {
+    return (
+      <div className="space-y-6">
+        <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">System Status</h2>
+        <div role="alert" className="border border-red-500/30 bg-red-500/10 rounded-control p-4 flex items-center justify-between gap-4">
+          <p className="text-[13px] font-medium text-red-300">Could not load status. Try again.</p>
+          <button
+            onClick={load}
+            className="px-3 py-1.5 text-[13px] font-medium bg-white/5 text-text-secondary border border-border-subtle rounded-control hover:bg-white/10 transition-colors"
+          >
+            Retry
+          </button>
         </div>
       </div>
     );
