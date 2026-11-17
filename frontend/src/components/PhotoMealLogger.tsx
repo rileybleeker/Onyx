@@ -329,7 +329,7 @@ export default function PhotoMealLogger({
 
       {phase === "estimating" && (
         <div className="flex items-center gap-3">
-          {preview && <img src={preview} alt="" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
+          {preview && <img src={preview} alt="Selected meal photo, ready to log" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
           <p className="text-[12px] font-mono text-text-tertiary" role="status">Estimating…</p>
         </div>
       )}
@@ -337,7 +337,7 @@ export default function PhotoMealLogger({
       {(phase === "review" || phase === "saving") && (
         <div className="space-y-3">
           <div className="flex items-center gap-3">
-            {preview && <img src={preview} alt="" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
+            {preview && <img src={preview} alt="Selected meal photo, ready to log" className="w-16 h-16 object-cover rounded-control border border-border-subtle" />}
             <div className="text-[12px] text-text-tertiary">
               <div className="text-[15px] font-mono text-text-primary">{totals.kcal} kcal</div>
               <div className="font-mono">
