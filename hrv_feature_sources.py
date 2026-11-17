@@ -49,9 +49,11 @@ LINEAGE_RESULT_TYPE = "lineage"
 LINEAGE_RESULT_KEY = "source_fingerprints"
 LINEAGE_VERSION = 1
 
-# The lineage row is stored right after the analysis results. A lineage row older than the
-# newest result by more than this was not written by the latest retrain: it is not a baseline.
-LINEAGE_MAX_LAG = timedelta(hours=1)
+# The lineage row is the LAST hrv_analysis_results row a retrain writes, so after a complete run it
+# is the newest row (computed_at is the "last analysis"). A lineage row older than the newest row
+# was not written by the latest retrain (its own lineage write failed): it is not a baseline, with
+# no grace period (a retrain an hour after its predecessor must not inherit the older baseline).
+LINEAGE_MAX_LAG = timedelta(0)
 
 # An unknown check retrains only when the last retrain is at least this old, so a source that
 # stays unreadable costs one retrain every few hours (plus the daily 12:00 UTC run), not one an
@@ -336,6 +338,7 @@ def fingerprint(supa, fp: Fingerprint, before: str) -> dict:
     any other exception for a failed read (of the last relation tried)."""
     relations = (*fp.prefer, fp.relation)
     resp = None
+    used = fp.relation
     for i, relation in enumerate(relations):
         try:
             resp = supa.schema("pds").rpc(FINGERPRINT_RPC, _fingerprint_params(fp, relation, before)).execute()
@@ -345,12 +348,14 @@ def fingerprint(supa, fp: Fingerprint, before: str) -> dict:
             if i < len(relations) - 1:
                 continue    # the loader falls back the same way on any error
             raise
+        used = relation
         break
     data = resp.data
     row = data[0] if isinstance(data, list) and data else data
     if not isinstance(row, dict) or "fingerprint" not in row:
         raise ValueError("unexpected fingerprint response")
-    return {"row_count": int(row.get("row_count") or 0), "fingerprint": str(row["fingerprint"])}
+    return {"row_count": int(row.get("row_count") or 0), "fingerprint": str(row["fingerprint"]),
+            "relation": used}
 
 
 def capture(supa, today: date, now: datetime | None = None, sources=None) -> dict | None:
@@ -384,6 +389,19 @@ def mark_failed(snapshot: dict | None, names) -> None:
         entry = snapshot["sources"].get(name)
         if entry is not None:
             entry["error"] = "load_failed"
+
+
+def mark_relation_mismatch(snapshot: dict | None, loaded: dict[str, str]) -> None:
+    """`loaded` = {source name: relation the retrain actually read}. A source fingerprinted from a
+    different relation than the one training used (e.g. capture read the live view after the
+    matview failed, training then read a stale matview) is marked unknown: after the matview
+    refreshes, the two would otherwise match and hide an untrained correction."""
+    if not snapshot:
+        return
+    for name, relation in loaded.items():
+        entry = snapshot["sources"].get(name)
+        if entry is not None and not entry.get("error") and entry.get("relation") != relation:
+            entry["error"] = "relation_mismatch"
 
 
 def read_baseline(supa) -> tuple[dict | None, str | None, str | None]:

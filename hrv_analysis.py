@@ -602,6 +602,9 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
 SUPPLEMENT_ROLLUP_MAT = "supplement_intake_by_compound_mat"
 SUPPLEMENT_ROLLUP_VIEW = "supplement_intake_by_compound"
 _MISSING_RELATION_CODES = {"PGRST205", "42P01"}
+# Relation each fingerprinted source was actually loaded from this run (hrv_feature_sources
+# .mark_relation_mismatch compares it with the relation the fingerprint was taken from).
+LOADED_RELATIONS: dict[str, str] = {}
 
 
 def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
@@ -614,7 +617,9 @@ def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
     """
     fetch = fetch or fetch_all
     try:
-        return fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+        out = fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+        LOADED_RELATIONS["supplement_rollup"] = SUPPLEMENT_ROLLUP_MAT
+        return out
     except Exception as e:  # postgrest APIError, network error, ...
         code = getattr(e, "code", None)
         msg = f"  {SUPPLEMENT_ROLLUP_MAT} unavailable ({code or type(e).__name__}); reading {SUPPLEMENT_ROLLUP_VIEW}"
@@ -622,7 +627,9 @@ def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
             log.info(msg)
         else:
             log.warning(f"{msg}: {str(e)[:200]}")
-        return fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+        out = fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+        LOADED_RELATIONS["supplement_rollup"] = SUPPLEMENT_ROLLUP_VIEW
+        return out
 
 
 def to_date_str(s: pd.Series) -> pd.Series:
@@ -6507,6 +6514,7 @@ def main() -> str | None:
     )
     # Last, so it exists only when this run's results were stored (hrv_feature_sources.py).
     feature_sources.mark_failed(source_lineage, LOAD_FAILURES)
+    feature_sources.mark_relation_mismatch(source_lineage, LOADED_RELATIONS)
     if feature_sources.store_baseline(supa, source_lineage, INPUT_DATA_HASH):
         log.info(f"    Upserted: {feature_sources.LINEAGE_RESULT_TYPE}/{feature_sources.LINEAGE_RESULT_KEY}")
     elif source_lineage:
