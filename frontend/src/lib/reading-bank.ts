@@ -1103,7 +1103,7 @@ export interface BankRunSummary {
   failed: number;
   /** Claimed steps that finished done. */
   done: number;
-  /** Claimed steps that ended retry or failed (refusals included). */
+  /** Claimed steps that ended retry or failed (refusals and web-search-off failures excluded: partial codes, see recordOutcome). */
   unfinished: number;
   codes: string[];
 }
