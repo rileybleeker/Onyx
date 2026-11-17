@@ -1470,14 +1470,20 @@ export function authorizeWrite(
     if (!kind || !Object.prototype.hasOwnProperty.call(FLAG_SAYS, kind)) return deny("invalid_value");
     if ((ctx.used.perTool.get(tool) ?? 0) >= 1) return deny("once_per_request");
     const masked = maskQuotes(grant.latest);
-    const sentences = sentenceRanges(masked).map(([start, end, term]) => ({ s: norm(masked.slice(start, end)), term }));
+    // A comma inside a thousands group ("5,000") is masked (\u0002) before the clause split, as in the write path, so it
+    // never splits a clause; the mark is restored to a comma before the clause text is tested.
+    const sentences = sentenceRanges(masked).map(([start, end, term]) => {
+      const marked = norm(masked.slice(start, end)).replace(/(\d),(?=\d{3}(?!\d))/g, "$1\u0002");
+      return { s: marked.replace(/\u0002/g, ","), marked, term };
+    });
     if (sentences.some(({ s }) => FLAG_NO.test(s))) return deny("contradicts");
     // Each clause is judged on its own: its complaint (FLAG_SAYS), its subject (the question, FLAG_SUBJECT) and any
     // "Q<id>" it names must all sit in that clause. A hedge or a "not wrong" in a clause disqualifies only that clause.
     const hits: number[][] = [];
-    for (const { s, term } of sentences) {
+    for (const { s, marked, term } of sentences) {
       if (term === "?" || conditional(s)) continue;
-      for (const clause of s.split(FLAG_CLAUSE)) {
+      for (const rawClause of marked.split(FLAG_CLAUSE)) {
+        const clause = rawClause.replace(/\u0002/g, ",");
         if (!FLAG_SUBJECT.test(clause) || FLAG_OWN.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
         // "not wrong", "not unclear": the word itself is negated.
         if ((kind === "wrong" || kind === "unclear") && /\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(clause)) continue;
