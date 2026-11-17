@@ -18,8 +18,9 @@ export async function GET(req: NextRequest) {
     const hits = await dsldSearch(q, size);
     return NextResponse.json({ hits });
   } catch (e) {
+    console.error("supplements/search", e);
     return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
+      { error: "Couldn't reach the supplement database. Try again." },
       { status: 502 },
     );
   }
