@@ -578,13 +578,17 @@ def backfill_actuals() -> int:
         select="calendar_date,whoop_hrv_rmssd",
         filters=[("calendar_date", "gte", min_date)],
     )
-    if actuals_raw.empty:
-        return 0
-    matrix_hrv = dict(zip(actuals_raw["calendar_date"].astype(str), actuals_raw["whoop_hrv_rmssd"]))
-    # The read above is complete (paged to the end, a failure raises), so a night with no matrix row
-    # at all (its last source row was deleted) has no HRV now, exactly like a row with a NULL.
+    # The read above is complete (paged to the end, and a failed page raises, so a failed or partial
+    # read never reaches this point). A night with no matrix row at all (its last source row was
+    # deleted) therefore has no HRV now, exactly like a row with a NULL, and that includes a range
+    # where the successful read came back with no rows at all (PIPE09-R2: returning early there
+    # left the deleted nights scored, while one unrelated row would have cleared them).
     # plan_actual_updates still clears only inside the rescore window and for nights at least
     # CLEAR_AFTER_DAYS old, so a recent matrix lag keeps the stored actual.
+    if actuals_raw.empty:
+        matrix_hrv = {}
+    else:
+        matrix_hrv = dict(zip(actuals_raw["calendar_date"].astype(str), actuals_raw["whoop_hrv_rmssd"]))
     for d in preds["prediction_date"].astype(str).unique():
         matrix_hrv.setdefault(d, None)
 

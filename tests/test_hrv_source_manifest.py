@@ -722,6 +722,48 @@ class RescoreActuals(unittest.TestCase):
                   "model_version", "model_artifact_sha256"):
             self.assertEqual(row[k], issued[k])
 
+    def test_fully_empty_matrix_clears_mature_actuals_only(self):
+        # PIPE09-R2: the matrix read succeeds and returns no rows at all for the range (every source
+        # row of those nights was deleted). That is an authoritative empty answer, not a reason to
+        # stop: mature nights inside the window are cleared, recent and out-of-window ones are not.
+        hp = self.hp
+        db = FakeDb()
+
+        def issued(d, actual):
+            return {"prediction_date": d, "model": "xgboost", "horizon_days": 1,
+                    "model_version": f"{d}_v1", "predicted_hrv": 70.0, "prediction_lower": 50.0,
+                    "prediction_upper": 90.0, "actual_hrv": actual,
+                    "residual": None if actual is None else actual - 70.0,
+                    "created_at": f"{d}T15:00:00+00:00", "model_artifact_sha256": "b" * 64}
+
+        rows = [issued("2026-11-11", 60.0),   # mature, in the window: cleared
+                issued("2026-11-18", 58.0),   # under CLEAR_AFTER_DAYS old: kept for now
+                issued("2026-09-01", 40.0)]   # outside the rescore window: left as it is
+        db.tables["hrv_predictions"] = [dict(r) for r in rows]
+        db.tables["daily_health_matrix_behavioral"] = []
+        saved_supa, saved_today = hp.supa, hp.et_today
+        hp.supa, hp.et_today = db, (lambda: date(2026, 11, 20))
+        try:
+            self.assertEqual(hp.backfill_actuals(), 1)
+            self.assertEqual(hp.backfill_actuals(), 0, "a second run writes nothing")
+            self.assertEqual(db.tables["hrv_predictions"][1]["actual_hrv"], 58.0, "recent night kept")
+            # A failed matrix read stays fail-closed: it raises and writes nothing.
+            db.tables["hrv_predictions"][1]["actual_hrv"] = None
+            db.fail["daily_health_matrix_behavioral"] = "57014"
+            n_upserts = len(db.upserts)
+            with self.assertRaises(ApiError):
+                hp.backfill_actuals()
+            self.assertEqual(len(db.upserts), n_upserts)
+        finally:
+            hp.supa, hp.et_today = saved_supa, saved_today
+        by = {r["prediction_date"]: r for r in db.tables["hrv_predictions"]}
+        self.assertEqual((by["2026-11-11"]["actual_hrv"], by["2026-11-11"]["residual"]), (None, None))
+        self.assertEqual(by["2026-09-01"]["actual_hrv"], 40.0)
+        for r in rows:  # the issued forecast is never touched
+            for k in ("predicted_hrv", "prediction_lower", "prediction_upper", "created_at",
+                      "model_version", "model_artifact_sha256"):
+                self.assertEqual(by[r["prediction_date"]][k], r[k])
+
 
 class FailedLoadsAndSql(unittest.TestCase):
     def test_mark_failed_turns_a_source_into_an_error_entry(self):
