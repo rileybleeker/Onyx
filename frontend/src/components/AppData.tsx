@@ -85,10 +85,11 @@ const DATA: Record<string, () => DataWarmer[]> = {
     return [
       inboxWarmer,
       json("/api/reading"),
-      json("/api/urgent-email"),
-      json(`/api/calendar/events?from=${localDay(today)}&to=${localDay(tomorrow)}`),
-      json("/api/orders/summary"),
-      json("/api/procurement/renewals/summary"),
+      // Not read on any Financials page: skipped during the sweep there (its forecast reads are already slow).
+      { ...json("/api/urgent-email"), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
+      { ...json(`/api/calendar/events?from=${localDay(today)}&to=${localDay(tomorrow)}`), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
+      { ...json("/api/orders/summary"), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
+      { ...json("/api/procurement/renewals/summary"), skipOn: (page) => page === "/financials" || page.startsWith("/financials/") },
       json("/api/finance/alerts"),
       // The wind-down panel (components/sleep/WindDownPanel, opt-in): GET only, same key as its store.
       windDownWarmer(),
