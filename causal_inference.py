@@ -531,6 +531,11 @@ CONTINUOUS_TREATMENTS: tuple[tuple[str, str, str, str | None], ...] = (
     # Uber Eats deliveries (pds.delivery_daily, 2026-11-09). Timing + counts from
     # receipt emails; pre-Nov-2025 times are estimates (card charge − 70 min).
     ("delivery_last_meal_to_sleep_min", "nutrition", "Last delivered meal → sleep minutes above median", "min"),
+    # Photo-logged meals (pds.photo_meals, 2026-11-14): same gap-to-sleep construction as the
+    # delivery treatment, but from plate-photo meals; fills only days Cronometer does not
+    # already cover (hrv_analysis.merge_photo_meal_features). Sits in dropped_low_n until
+    # MIN_CONTINUOUS_N days accrue.
+    ("photo_last_meal_to_sleep_min", "nutrition", "Last photo-logged meal → sleep minutes above median", "min"),
     # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11). Apple's own numbers via the
     # Onyx Screen Time app; history starts ~2026-10-11, so these sit in dropped_low_n
     # until MIN_CONTINUOUS_N days accrue, then enter the FDR family on their own.

@@ -194,6 +194,12 @@ SOURCES: tuple[FeatureSource, ...] = (
     FeatureSource(name="delivery_daily",
                   feeds="delivery_daily (Uber Eats receipts, portions eaten, leftovers)",
                   fingerprint=Fingerprint("delivery_daily", "behavioral_date")),
+    # Photo-logged meals (plate photos on /nutrition). eaten_at / kcal only reach the pipeline;
+    # the pipeline loads only those columns plus capture_kind / deleted_at for routing.
+    FeatureSource(name="photo_meals",
+                  feeds="photo_meals (photo-logged meals: photo_*)",
+                  fingerprint=Fingerprint("photo_meals", "eaten_date",
+                                          exclude=("created_at", "updated_at"))),
     # est_intake_kcal (2026-11-16): views recomputed from delivery_order_items x
     # delivery_item_nutrition and photo_meals, so any correction (a portion, an eaten
     # fraction, a leftover, an edited photo meal) moves the views' rows. Days logged in
