@@ -290,6 +290,37 @@ BEGIN
     ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims WHERE claim_id = '00000000-0000-4000-8000-000000000025'), 'the claim stays for the sweep';
     ASSERT EXISTS (SELECT 1 FROM pds.reading_progress_owed WHERE owed_id = '00000000-0000-4000-8000-000000000026'), 'the obligation stays';
     ASSERT has_table_privilege('service_role', 'pds.reading_progress_owed', 'UPDATE'), 'the sweep can defer an obligation';
+
+    -- 21. Codex T01-R12/R14: an edit stores its Notion work in its own transaction. A move to another book stores a
+    --     claim that owes the new entry (replacing the old one) and both books' progress obligations; its replay finds
+    --     that claim pending and stores no claim on the old page's entry; a same-book edit of a session with an entry
+    --     stores a claim on that entry. Synthetic page and block ids, rolled back with everything else.
+    UPDATE pds.books SET notion_page_id = 'sql-regression-page-a' WHERE book_id = v_book;
+    UPDATE pds.books SET notion_page_id = 'sql-regression-page-b' WHERE book_id = v_book2;
+    r := pds.create_reading_session('00000000-0000-4000-8000-000000000027', v_book, DATE '2030-03-04', 1, 1, NULL, NULL, NULL, NULL, 'manual');
+    v_sid := (r->'session'->>'session_id')::bigint;
+    UPDATE pds.reading_sessions SET notion_block_id = 'sql-regression-blk-old' WHERE session_id = v_sid;
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-04', 1, 1, NULL, NULL, NULL, NULL, NULL);
+    ASSERT r->>'mirror_claim_id' IS NOT NULL, 'a move returns its claim';
+    ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims
+                    WHERE claim_id = (r->>'mirror_claim_id')::uuid AND owes_entry AND book_id = v_book2
+                      AND block_id IS NULL AND replaces_block_id = 'sql-regression-blk-old'), 'the claim owes the new entry and replaces the old one';
+    ASSERT jsonb_array_length(r->'progress_owed') = 2, 'both books owe their line';
+    ASSERT (SELECT count(*) FROM pds.reading_progress_owed AS o, jsonb_array_elements(r->'progress_owed') AS e
+             WHERE o.owed_id = (e->>'owed_id')::uuid) = 2, 'both obligations are stored';
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-04', 1, 1, NULL, NULL, NULL, NULL, NULL);
+    ASSERT (r->>'entry_pending')::boolean AND r->>'mirror_claim_id' IS NULL, 'the replay finds the move''s claim pending';
+    ASSERT (SELECT count(*) FROM pds.reading_mirror_claims WHERE session_id = v_sid) = 1, 'no claim on the old page''s entry';
+    UPDATE pds.reading_sessions SET notion_block_id = 'sql-regression-blk-new' WHERE session_id = v_sid;
+    r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-04', 1, 1, 30, NULL, NULL, NULL, NULL);
+    ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims
+                    WHERE claim_id = (r->>'mirror_claim_id')::uuid AND NOT owes_entry AND block_id = 'sql-regression-blk-new'), 'a same-book edit claims the entry it rewrites';
+
+    -- 22. Codex T01-R13: a removal row carries its own retry schedule, so the sweep takes rows by due time.
+    r := pds.remove_reading_session(v_sid, NULL, NULL);
+    ASSERT (r->>'removed')::boolean, 'removed';
+    ASSERT (SELECT attempts = 0 AND next_try_at > now() FROM pds.reading_session_removals WHERE session_id = v_sid),
+           'a new removal row is first due after its own cleanup ran';
 END $$;
 
 ROLLBACK;

@@ -132,8 +132,10 @@ CREATE OR REPLACE TRIGGER reading_sessions_refuse_discarded_key
 -- progress line (rewritten). The removal writes this row in the same transaction as the delete, and the route marks
 -- it done (mirror_done_at) once the entry is trashed. A removal whose answer was lost finds the session gone on
 -- its retry and answers this row instead, so the route replays the cleanup (Codex review of PR 376: before this,
--- a retry found nothing and the Notion entry stayed). Stored: ids, the session's day, the Notion block id. No
--- reading text.
+-- a retry found nothing and the Notion entry stayed). A row the sweep could not close is put back with a doubling
+-- delay up to six hours (`attempts`, `next_try_at`, Codex T01-R13), and the sweep takes open rows by their due time,
+-- never by their age: rows whose entry Notion keeps refusing stay open but can no longer hold back newer removals.
+-- Stored: ids, the session's day, the Notion block id, times and a count. No reading text.
 CREATE TABLE IF NOT EXISTS pds.reading_session_removals (
     session_id       bigint      PRIMARY KEY,
     client_key       uuid,
@@ -142,10 +144,17 @@ CREATE TABLE IF NOT EXISTS pds.reading_session_removals (
     notion_block_id  text,
     unfinished       boolean     NOT NULL DEFAULT false,
     removed_at       timestamptz NOT NULL DEFAULT now(),
-    mirror_done_at   timestamptz
+    mirror_done_at   timestamptz,
+    attempts         integer     NOT NULL DEFAULT 0,
+    next_try_at      timestamptz NOT NULL DEFAULT now() + interval '2 minutes'
 );
+-- For a table created by an earlier copy of this file.
+ALTER TABLE pds.reading_session_removals ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE pds.reading_session_removals ADD COLUMN IF NOT EXISTS next_try_at timestamptz NOT NULL DEFAULT now() + interval '2 minutes';
 CREATE INDEX IF NOT EXISTS idx_reading_session_removals_key
     ON pds.reading_session_removals (client_key) WHERE client_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_reading_session_removals_due
+    ON pds.reading_session_removals (next_try_at) WHERE mirror_done_at IS NULL;
 
 ALTER TABLE pds.reading_session_removals ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON pds.reading_session_removals FROM anon, authenticated;
@@ -164,9 +173,14 @@ COMMENT ON TABLE pds.reading_session_removals IS
 -- lib/reading-removal.ts settles a claim: the entry goes onto the live session when it is still on that book with no
 -- entry or the replaced one (and the replaced one is trashed), else the entry is trashed; a claim whose block id was
 -- never recorded is matched to the page's entry by its marker, never by its text, so it can only find its own entry.
--- A block id found by its marker is stored on the claim before the entry is rewritten (which drops the marker).
+-- A block id found by its marker is stored on the claim before the entry is rewritten (which removes the marker).
 -- A claim with no matching entry an hour after it was made is deleted (the entry was never created), once the entry
--- it replaces (a move) is settled. A row is first
+-- it replaces (a move) is settled. `owes_entry` (Codex T01-R14): the claim of a move to another book, written by
+-- pds.move_reading_session in the same transaction as the move, so the new entry is owed even when the route never
+-- runs its Notion step (the move's answer lost): a sweep that finds no entry for it an hour after the claim writes
+-- the entry itself (carrying the claim's marker), attaches it and trashes the replaced one. An edit that keeps the
+-- book stores a claim on the session's entry the same way, so its rewrite is owed before anything is written
+-- (T01-R12). A row is first
 -- due (`next_try_at`) 15 minutes after it is written, longer than a server function runs, and one the sweep could
 -- not settle is put back with a doubling delay up to six hours (`attempts`): rows are never given up for their age.
 -- Rows are deleted once settled. Stored: ids, times, a count. No reading text.
@@ -178,9 +192,13 @@ CREATE TABLE IF NOT EXISTS pds.reading_mirror_claims (
     replaces_block_id  text,
     claimed_at         timestamptz NOT NULL DEFAULT now(),
     attempts           integer     NOT NULL DEFAULT 0,
-    next_try_at        timestamptz NOT NULL DEFAULT now() + interval '15 minutes'
+    next_try_at        timestamptz NOT NULL DEFAULT now() + interval '15 minutes',
+    owes_entry         boolean     NOT NULL DEFAULT false
 );
+-- For a table created by an earlier copy of this file.
+ALTER TABLE pds.reading_mirror_claims ADD COLUMN IF NOT EXISTS owes_entry boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_reading_mirror_claims_due ON pds.reading_mirror_claims (next_try_at);
+CREATE INDEX IF NOT EXISTS idx_reading_mirror_claims_session ON pds.reading_mirror_claims (session_id);
 
 ALTER TABLE pds.reading_mirror_claims ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON pds.reading_mirror_claims FROM anon, authenticated;
@@ -515,7 +533,8 @@ BEGIN
 
     INSERT INTO pds.reading_session_removals (session_id, client_key, book_id, session_date, notion_block_id, unfinished)
     VALUES (v_row.session_id, v_row.client_key, v_row.book_id, v_row.session_date, v_row.notion_block_id, v_unfinished)
-    ON CONFLICT (session_id) DO UPDATE SET notion_block_id = EXCLUDED.notion_block_id, mirror_done_at = NULL
+    ON CONFLICT (session_id) DO UPDATE SET notion_block_id = EXCLUDED.notion_block_id, mirror_done_at = NULL,
+        attempts = 0, next_try_at = now() + interval '2 minutes'
     RETURNING * INTO v_rem;
 
     RETURN pg_catalog.jsonb_build_object(
@@ -622,9 +641,20 @@ $$;
 --    finish. Done here, from the row as it was under its lock, a retry finds nothing left to change.
 -- Locks: the session row, then both books' rows (lower id first), then the habit rows (fixed order): the same order
 -- as pds.remove_reading_session (session, book, habit row), so an edit and a removal cannot wait on each other.
+--  * The Notion work the edit owes is stored in the same transaction (Codex T01-R12, T01-R14), so it is owed even when
+--    the route's own Notion step never runs (the RPC's answer lost) or a separate insert would fail:
+--      a move to another book: a claim on the new book with `owes_entry` and the session's old entry as the entry it
+--        replaces (`mirror_claim_id`): the route writes the new entry under it, else the sweep does;
+--      an edit that keeps the book, of a session with an entry: a claim on that entry (`mirror_claim_id`), under which
+--        the route rewrites it; none while a move's claim still owes the session's new entry (`entry_pending`): that
+--        claim's entry is written from the session as it is then, and the old book's page entry is never rewritten
+--        in place (the replay of a move whose answer was lost finds the session already on its new book);
+--      the progress line of the session's book and of the book it left (`progress_owed`, one obligation row each,
+--        for books with a Notion page).
 -- Answers {moved: false} when the session no longer exists, else {moved: true, session, book (the session's book
--- after the edit), finished, unfinished, habit_marked, habit_created, habit_removed, habit_restored}. Raises OXR02 for
--- a Kindle session and OXR03 when the target book does not exist.
+-- after the edit), finished, unfinished, habit_marked, habit_created, habit_removed, habit_restored, mirror_claim_id,
+-- entry_pending, progress_owed: [{book_id, owed_id}]}. Raises OXR02 for a Kindle session and OXR03 when the target
+-- book does not exist.
 CREATE OR REPLACE FUNCTION pds.move_reading_session(
     p_session_id       bigint,
     p_book_id          bigint,
@@ -664,6 +694,10 @@ DECLARE
     v_created    boolean := false;
     v_removed    boolean := false;
     v_restored   boolean := false;
+    v_claim      uuid;
+    v_pending    boolean := false;
+    v_owed_id    uuid;
+    v_owed       jsonb := '[]'::jsonb;
 BEGIN
     IF p_session_id IS NULL OR p_book_id IS NULL OR p_session_date IS NULL THEN
         RAISE EXCEPTION 'session_id, book_id and session_date are required' USING ERRCODE = '22023';
@@ -774,6 +808,35 @@ BEGIN
         v_restored := COALESCE((v_settle ->> 'restored')::boolean, false);
     END IF;
 
+    -- The Notion work this edit owes, committed with it (Codex T01-R12, T01-R14; see the comment above).
+    IF NOT v_same_book THEN
+        IF v_prev.notion_block_id IS NOT NULL OR v_new_book.notion_page_id IS NOT NULL THEN
+            v_claim := pg_catalog.gen_random_uuid();
+            INSERT INTO pds.reading_mirror_claims (claim_id, session_id, book_id, block_id, replaces_block_id, owes_entry)
+            VALUES (v_claim, p_session_id, p_book_id, NULL, v_prev.notion_block_id, true);
+        END IF;
+    ELSIF v_row.notion_block_id IS NOT NULL THEN
+        IF EXISTS (SELECT 1 FROM pds.reading_mirror_claims AS c
+                    WHERE c.session_id = p_session_id AND c.owes_entry
+                      AND c.replaces_block_id = v_row.notion_block_id) THEN
+            v_pending := true;
+        ELSE
+            v_claim := pg_catalog.gen_random_uuid();
+            INSERT INTO pds.reading_mirror_claims (claim_id, session_id, book_id, block_id, replaces_block_id, owes_entry)
+            VALUES (v_claim, p_session_id, p_book_id, v_row.notion_block_id, NULL, false);
+        END IF;
+    END IF;
+    IF v_new_book.notion_page_id IS NOT NULL THEN
+        v_owed_id := pg_catalog.gen_random_uuid();
+        INSERT INTO pds.reading_progress_owed (owed_id, book_id) VALUES (v_owed_id, p_book_id);
+        v_owed := v_owed || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('book_id', p_book_id, 'owed_id', v_owed_id));
+    END IF;
+    IF NOT v_same_book AND v_old_book.book_id IS NOT NULL AND v_old_book.notion_page_id IS NOT NULL THEN
+        v_owed_id := pg_catalog.gen_random_uuid();
+        INSERT INTO pds.reading_progress_owed (owed_id, book_id) VALUES (v_owed_id, v_old_book.book_id);
+        v_owed := v_owed || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('book_id', v_old_book.book_id, 'owed_id', v_owed_id));
+    END IF;
+
     RETURN pg_catalog.jsonb_build_object(
         'moved', true,
         'session', pg_catalog.to_jsonb(v_row),
@@ -783,7 +846,10 @@ BEGIN
         'habit_marked', v_marked,
         'habit_created', v_created,
         'habit_removed', v_removed,
-        'habit_restored', v_restored);
+        'habit_restored', v_restored,
+        'mirror_claim_id', v_claim,
+        'entry_pending', v_pending,
+        'progress_owed', v_owed);
 END;
 $$;
 

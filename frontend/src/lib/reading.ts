@@ -584,8 +584,8 @@ export interface LogSessionInput {
   /**
    * Onyx Chat (SEC-04): the session must be stored WITH its key, because a retried chat message can only find it by
    * that key. A key that is not a UUID, or a key column that is missing, is then refused (SESSION_KEY_REQUIRED) and
-   * nothing is written, never a session without its key. Without it (the /log form) a missing column is still written
-   * without the key, as before sql/reading_sessions_client_key.sql existed.
+   * nothing is written, never a session without its key. A keyed create is never stored without its key for any
+   * caller (PR 376); without this flag a missing column is refused with the /log form's own text.
    */
   require_client_key?: boolean;
 }
@@ -822,7 +822,7 @@ async function moveSessionTx(
   },
   habitCreatedOn: string | null,
 ): Promise<
-  | { ok: true; session: ReadingSession; book: Book | null; finished: boolean; unfinished: boolean; marked: boolean; created: boolean }
+  | ({ ok: true; session: ReadingSession; book: Book | null; finished: boolean; unfinished: boolean; marked: boolean; created: boolean } & EditMirrorWork)
   | { ok: false; status: number; error: string }
 > {
   const { data, error } = await supabase.rpc("move_reading_session", {
@@ -843,7 +843,18 @@ async function moveSessionTx(
     if (discardsMissing(error)) return { ok: false, status: 503, error: MOVE_UNAVAILABLE };
     return { ok: false, status: 500, error: error.message ?? "Couldn't move the session." };
   }
-  const out = (data ?? null) as { moved?: unknown; session?: unknown; book?: unknown; finished?: unknown; unfinished?: unknown; habit_marked?: unknown; habit_created?: unknown } | null;
+  const out = (data ?? null) as {
+    moved?: unknown;
+    session?: unknown;
+    book?: unknown;
+    finished?: unknown;
+    unfinished?: unknown;
+    habit_marked?: unknown;
+    habit_created?: unknown;
+    mirror_claim_id?: unknown;
+    entry_pending?: unknown;
+    progress_owed?: unknown;
+  } | null;
   if (!out || typeof out !== "object" || typeof out.moved !== "boolean") return { ok: false, status: 500, error: "The move was not confirmed. Try again." };
   if (!out.moved) return { ok: false, status: 404, error: "That session no longer exists." };
   const raw = out.session;
@@ -862,7 +873,40 @@ async function moveSessionTx(
     unfinished: out.unfinished === true,
     marked: out.habit_marked === true,
     created: out.habit_created === true,
+    ...editMirrorWork(out),
   };
+}
+
+/**
+ * The Notion work an edit owes, stored by pds.move_reading_session in the edit's own transaction (Codex T01-R12,
+ * T01-R14): the route does it under these rows, and the sweep (lib/reading-removal.ts) finishes whatever the route
+ * could not, also when the route never ran its Notion step because the RPC's answer was lost.
+ */
+export interface EditMirrorWork {
+  /** The edit ran in pds.move_reading_session, so the fields below are what it stored (false: the plain-update fallback). */
+  mirrorStored: boolean;
+  /** The claim the route's entry work runs under: a move's new entry (owes it), or the rewrite of the session's entry. */
+  mirrorClaimId: string | null;
+  /** A move's claim still owes the session's entry: nothing is rewritten now, that claim writes it from the session. */
+  entryPending: boolean;
+  /** One stored progress obligation per book whose page line this edit changed. */
+  progressOwed: { bookId: number; owedId: string }[];
+}
+
+const NO_MIRROR_WORK: EditMirrorWork = { mirrorStored: false, mirrorClaimId: null, entryPending: false, progressOwed: [] };
+
+function editMirrorWork(out: { mirror_claim_id?: unknown; entry_pending?: unknown; progress_owed?: unknown }): EditMirrorWork {
+  const claim = typeof out.mirror_claim_id === "string" && UUID_RE.test(out.mirror_claim_id) ? out.mirror_claim_id : null;
+  const owed: { bookId: number; owedId: string }[] = [];
+  if (Array.isArray(out.progress_owed)) {
+    for (const o of out.progress_owed) {
+      if (!o || typeof o !== "object") continue;
+      const bookId = Number((o as Record<string, unknown>).book_id);
+      const owedId = (o as Record<string, unknown>).owed_id;
+      if (Number.isFinite(bookId) && typeof owedId === "string" && UUID_RE.test(owedId)) owed.push({ bookId, owedId });
+    }
+  }
+  return { mirrorStored: true, mirrorClaimId: claim, entryPending: out.entry_pending === true, progressOwed: owed };
 }
 
 /** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
@@ -1033,7 +1077,8 @@ export async function logSession(
         if (replayed) return replayed;
       }
       if (error.code === DISCARDED_KEY_CODE) return { ok: false, error: DISCARDED_ENTRY_ERROR, discarded: true };
-      if (missingColumn(error)) return { ok: false, error: KEYED_CREATE_NEEDS_COLUMN };
+      // Onyx Chat (require_client_key) gets its own refusal text; nothing is stored either way.
+      if (missingColumn(error)) return { ok: false, error: input.require_client_key ? SESSION_KEY_REQUIRED : KEYED_CREATE_NEEDS_COLUMN };
       const message = error.message ?? "Couldn't save the session.";
       // Only a confirmed refusal (a constraint or a raised error) is a 4xx. A transport failure, a missing code, a
       // connection / resource / shutdown / internal class or a lost response may have committed the create: the
@@ -1046,7 +1091,7 @@ export async function logSession(
     // 503, nothing stored, and the form retries.
     return { ok: false, error: KEYED_CREATE_UNAVAILABLE, unavailable: true };
   }
-  // Keyless creates only (chat and other callers): a plain insert, then the finish and the habit stamp.
+  // Keyless creates only (callers that sent no key): a plain insert, then the finish and the habit stamp.
   const { data, error } = await supabase.from("reading_sessions").insert(row).select(SESSION_COLS).single();
   if (error) return { ok: false, error: error.message };
   const session = data as ReadingSession;
@@ -1159,7 +1204,7 @@ export function parseSessionUpdate(raw: unknown): { ok: true; input: SessionUpda
 }
 
 export type SessionEditResult =
-  | {
+  | ({
       ok: true;
       book: Book;
       previousBook: Book;
@@ -1172,7 +1217,7 @@ export type SessionEditResult =
       habitMarked: boolean;
       /** The day of the habit row this session made, after the edit (send it back with the next edit); null = none. */
       habitCreatedOn: string | null;
-    }
+    } & EditMirrorWork)
   | { ok: false; status: number; error: string };
 
 async function editableSession(
@@ -1258,9 +1303,11 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
   let unfinished = false;
   let finishedOn = book.finished_on;
   let status = book.status;
+  let mirrorWork: EditMirrorWork = NO_MIRROR_WORK;
   const tx = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on);
   if (tx.ok) {
     session = tx.session;
+    mirrorWork = { mirrorStored: tx.mirrorStored, mirrorClaimId: tx.mirrorClaimId, entryPending: tx.entryPending, progressOwed: tx.progressOwed };
     habitMarked = tx.marked;
     finished = tx.finished;
     unfinished = tx.unfinished;
@@ -1308,6 +1355,7 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
     unfinished,
     habitMarked,
     habitCreatedOn,
+    ...mirrorWork,
   };
 }
 

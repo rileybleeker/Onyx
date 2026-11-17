@@ -211,12 +211,13 @@ async function writeProgressChecked(supabase: Supa, bookId: number): Promise<"ve
  * True when the line is checked, not owed, or owed durably (the sweep finishes it); false only when it is none of
  * these (the obligation could not be stored and the line could not be checked), so a removal's cleanup row stays open.
  */
-export async function rewriteProgressNow(supabase: Supa, bookId: number): Promise<boolean> {
+export async function rewriteProgressNow(supabase: Supa, bookId: number, storedOwedId: string | null = null): Promise<boolean> {
   // A write needs its obligation first (Codex review of PR 376): without a stored row, an older write landing last
   // followed by a failed check would stay stale for good and nobody would know. A row that cannot be stored after a
   // few tries means no write is made; false keeps a removal's cleanup row open, and the next write of the book
-  // (or the sweep, for its own rows) writes the line from the state then.
-  let owed = await addProgressOwed(supabase, bookId);
+  // (or the sweep, for its own rows) writes the line from the state then. `storedOwedId` = the obligation an edit's
+  // own transaction stored (pds.move_reading_session, Codex T01-R14): it is this writer's row, nothing more is added.
+  let owed: string | "missing" | null = storedOwedId ?? (await addProgressOwed(supabase, bookId));
   for (let attempt = 1; owed === null && attempt < 3; attempt++) {
     await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * attempt));
     owed = await addProgressOwed(supabase, bookId);
@@ -271,6 +272,11 @@ export interface MirrorClaim {
   replaces: string | null;
   claimedAt: string;
   attempts: number;
+  /**
+   * The claim of a move to another book, stored with the move (pds.move_reading_session, Codex T01-R14): it owes the
+   * session's entry on `bookId`'s page, so a sweep that finds no entry for it writes one.
+   */
+  owesEntry?: boolean;
 }
 
 /**
@@ -301,13 +307,17 @@ export async function claimMirror(
     attempts: 0,
     next_try_at: dueAt(0),
   };
-  const { error } = await supabase.from("reading_mirror_claims").insert(row);
-  if (relationMissing(error)) return "missing";
-  if (error) {
+  // A failed insert is tried again a few times (Codex T01-R12): null means no claim, and then nothing is written. A
+  // timed-out insert that committed after all leaves a second claim, which settles on its own (it finds no entry with
+  // its marker and replaces nothing, or it holds the same block id).
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { error } = await supabase.from("reading_mirror_claims").insert(row);
+    if (relationMissing(error)) return "missing";
+    if (!error) return { claimId: row.claim_id, sessionId, bookId, blockId, replaces, claimedAt, attempts: 0 };
     console.error("reading: mirror claim not stored:", error.code ?? "unknown");
-    return null;
+    if (attempt < 2) await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * (attempt + 1)));
   }
-  return { claimId: row.claim_id, sessionId, bookId, blockId, replaces, claimedAt, attempts: 0 };
+  return null;
 }
 
 /** The block id Notion answered, on the claim (which outlives the session). False when it could not be stored: the marker still finds the entry. */
@@ -374,9 +384,18 @@ export type Placement =
  * (Codex review of PR 376, round 6). The entry it replaces is trashed once the new one is attached. A step that
  * cannot finish here leaves the claim, which the sweep settles.
  */
-export async function placeEntry(supabase: Supa, book: Book, session: ReadingSession, replaces: string | null): Promise<Placement> {
+export async function placeEntry(
+  supabase: Supa,
+  book: Book,
+  session: ReadingSession,
+  replaces: string | null,
+  storedClaimId: string | null = null,
+): Promise<Placement> {
   if (!book.notion_page_id || !notionMirrorEnabled()) return { kind: "none" };
-  const claim = await claimMirror(supabase, session.session_id, book.book_id, replaces);
+  // `storedClaimId` = the claim a move stored in its own transaction (Codex T01-R14); otherwise one is stored now.
+  const claim: MirrorClaim | "missing" | null = storedClaimId
+    ? { claimId: storedClaimId, sessionId: session.session_id, bookId: book.book_id, blockId: null, replaces, claimedAt: new Date().toISOString(), attempts: 0, owesEntry: true }
+    : await claimMirror(supabase, session.session_id, book.book_id, replaces);
   if (claim === null) return { kind: "none" };
   const own = claim === "missing" ? null : claim;
   const blockId = await mirrorSession(book, session, own?.claimId ?? null);
@@ -451,18 +470,43 @@ export async function retireEntry(supabase: Supa, sessionId: number, oldBookId: 
  * BEFORE the rewrite, and it goes only once the rewrite is confirmed (refreshClaimEntry: the session read again still
  * holds this entry and renders the same entry). Each writer has its own claim, so when two edits' rewrites land in
  * the wrong order, the one whose older entry landed last cannot confirm it and its claim makes the sweep rewrite the
- * entry from the session as it is then. A failed rewrite is kept the same way. Without the claims table (the SQL file
- * not applied) or when no claim can be stored, the rewrite is made best effort, as before.
+ * entry from the session as it is then. A failed rewrite is kept the same way. `storedClaimId` = the claim the edit's
+ * own transaction stored (pds.move_reading_session), so the rewrite is owed even if this never runs. Without the
+ * claims table (the SQL file not applied) the rewrite is made best effort, as before it. A claim that cannot be stored
+ * (claimMirror already tried a few times) means NO rewrite (Codex T01-R12): an untracked rewrite that lands after a
+ * newer, confirmed one would stay in Notion with nothing left to repair it.
  */
-export async function refreshEntry(supabase: Supa, session: ReadingSession): Promise<void> {
+export async function refreshEntry(supabase: Supa, session: ReadingSession, storedClaimId: string | null = null): Promise<void> {
   const blockId = session.notion_block_id;
   if (!blockId || !notionMirrorEnabled()) return;
-  const claim = await claimMirror(supabase, session.session_id, session.book_id, null, blockId);
-  if (claim === "missing" || claim === null) {
+  const claim = storedClaimId ? { claimId: storedClaimId } : await claimMirror(supabase, session.session_id, session.book_id, null, blockId);
+  if (claim === "missing") {
     await updateMirroredSession(session);
     return;
   }
+  if (claim === null) {
+    console.error("reading: entry refresh skipped, no claim could be stored");
+    return;
+  }
   if (await refreshClaimEntry(supabase, session)) await dropClaim(supabase, claim.claimId);
+}
+
+/**
+ * A move to a book with no Notion page (Codex T01-R14): no new entry is owed, and the session's old entry comes off
+ * the old book's page under the move's stored claim (settleMirrorClaim: no page, so the replaced entry is trashed and
+ * taken off the session, then the claim goes). A trash that fails leaves the claim for the sweep.
+ */
+export async function retireUnderClaim(supabase: Supa, sessionId: number, bookId: number, replaces: string | null, claimId: string): Promise<boolean> {
+  return settleMirrorClaim(supabase, {
+    claimId,
+    sessionId,
+    bookId,
+    blockId: null,
+    replaces,
+    claimedAt: new Date().toISOString(),
+    attempts: 0,
+    owesEntry: true,
+  }).catch(() => false);
 }
 
 /**
@@ -517,8 +561,9 @@ async function settleReplaced(supabase: Supa, claim: MirrorClaim, session: Readi
  * this becomes its entry (conditionally), is brought up to date, and the replaced one is trashed. Otherwise (the
  * session is gone, on another book, or has another entry) this one is surplus: it is trashed and taken off the session
  * if it is still on it, the replaced entry is settled, and for a gone session the book's progress line is rewritten.
- * No entry found an hour after the claim: none was created, and the replaced entry of a move is still settled before
- * the claim goes. True when settled (the claim row is deleted); false leaves it for a later try. Exported for the tests.
+ * No entry found an hour after the claim: none was created. A move's claim (owesEntry, stored with the move) then
+ * writes the entry itself when the session still wants it (Codex T01-R14); otherwise the replaced entry of a move is
+ * still settled before the claim goes. True when settled (the claim row is deleted); false leaves it for a later try. Exported for the tests.
  */
 export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowMs = Date.now()): Promise<boolean> {
   const { data: sessionRow, error: sessionError } = await supabase
@@ -530,9 +575,10 @@ export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowM
   const session = (sessionRow as ReadingSession | null) ?? null;
   let blockId = claim.blockId;
   if (!blockId) {
-    const { data: bookRow, error: bookError } = await supabase.from("books").select("book_id,notion_page_id").eq("book_id", claim.bookId).maybeSingle();
+    const { data: bookRow, error: bookError } = await supabase.from("books").select(BOOK_COLS).eq("book_id", claim.bookId).maybeSingle();
     if (bookError) return false;
-    const pageId = (bookRow as { notion_page_id?: string | null } | null)?.notion_page_id ?? null;
+    const book = (bookRow as Book | null) ?? null;
+    const pageId = book?.notion_page_id ?? null;
     // No page: no entry can have been written; the entry a move replaced is still settled.
     if (!pageId) return (await settleReplaced(supabase, claim, session, null)) && dropClaim(supabase, claim.claimId);
     const found = await findSessionBlocksByMarker(pageId, claim.claimId);
@@ -542,7 +588,19 @@ export async function settleMirrorClaim(supabase: Supa, claim: MirrorClaim, nowM
     for (const extra of found) if (extra !== blockId && !(await removeMirroredBlock(extra))) return false;
     if (!blockId) {
       if (nowMs - Date.parse(claim.claimedAt) <= CLAIM_NOT_FOUND_MS) return false;
-      return (await settleReplaced(supabase, claim, session, null)) && dropClaim(supabase, claim.claimId);
+      // A move's claim owes the session's entry on this page (Codex T01-R14): when the session still wants it (on
+      // this book, with no entry or still the one this replaces), the entry is written here, under the claim's
+      // marker, and settled like an entry found by it (its id stored first, then attached and refreshed, the
+      // replaced one trashed). A failed write leaves the claim for a later try.
+      const wanted =
+        claim.owesEntry === true &&
+        book !== null &&
+        session !== null &&
+        session.book_id === claim.bookId &&
+        (session.notion_block_id === null || session.notion_block_id === claim.replaces);
+      if (!wanted || !book || !session) return (await settleReplaced(supabase, claim, session, null)) && dropClaim(supabase, claim.claimId);
+      blockId = await mirrorSession(book, session, claim.claimId);
+      if (!blockId) return false;
     }
     // The marker is the entry's only identity until now: the id is kept before any step can drop the marker.
     if (!(await recordClaimBlock(supabase, claim.claimId, blockId))) return false;
@@ -622,12 +680,15 @@ export async function trashLateBlock(
 }
 
 const RETRY_PAUSE_MS = 250;
+/** A removal row a late entry was recorded on is due this soon (the same two minutes as a new removal row). */
+const LATE_BLOCK_DUE_MS = 2 * 60_000;
 
 async function recordLateBlock(supabase: Supa, sessionId: number, blockId: string): Promise<boolean> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const { error } = await supabase
       .from("reading_session_removals")
-      .update({ notion_block_id: blockId, mirror_done_at: null })
+      // New work for the row: due again soon even when a sweep had put it back by hours (Codex T01-R13).
+      .update({ notion_block_id: blockId, mirror_done_at: null, next_try_at: new Date(Date.now() + LATE_BLOCK_DUE_MS).toISOString() })
       .eq("session_id", sessionId);
     if (!error) return true;
     console.error("reading: late block record failed:", error.code ?? "unknown");
@@ -646,19 +707,40 @@ async function trashWithRetry(blockId: string): Promise<boolean> {
 
 let lastSweep = 0;
 const SWEEP_EVERY_MS = 60_000;
-const SWEEP_MIN_AGE_MS = 2 * 60_000;
 const SWEEP_LIMIT = 5;
+
+/**
+ * A sweep takes an open removal row for itself before it runs its cleanup (Codex T01-R13), like a claim (leaseClaim):
+ * one conditional update moves the row's next try out by its doubling delay while it still has the try count this
+ * sweep read and is still open. A cleanup that fails (an entry Notion keeps refusing, a page Onyx can no longer write)
+ * therefore waits longer each time instead of being taken first by every sweep, and the rows behind it are reached.
+ * The row stays open (mirror_done_at NULL) until its cleanup succeeds: nothing is given up for its age.
+ */
+async function leaseRemoval(supabase: Supa, sessionId: number, attempts: number): Promise<boolean> {
+  const next = attempts + 1;
+  if (next >= LONG_OPEN_ATTEMPTS) console.error("reading: removal cleanup still open after tries:", next);
+  const { data, error } = await supabase
+    .from("reading_session_removals")
+    .update({ attempts: next, next_try_at: dueAt(next) })
+    .eq("session_id", sessionId)
+    .eq("attempts", attempts)
+    .is("mirror_done_at", null)
+    .select("session_id");
+  if (error) console.error("reading: removal cleanup not taken:", error.code ?? "unknown");
+  return !error && Array.isArray(data) && data.length === 1;
+}
 
 /**
  * Durable retry of the Notion work reading writes still owe (review of PR 376, rounds 3, 5 and 6): a removal's cleanup
  * (pds.reading_session_removals), an entry whose block id may not be stored (pds.reading_mirror_claims) and a progress
  * line that may be stale (pds.reading_progress_owed). Each is written down before or with its work, so nothing
  * depends on the client repeating a request or on the process that started it surviving. Every reading route that
- * already runs after() calls this: removal rows open for two minutes, claims and obligations once due (retryDelayMs:
- * never while their writer may still run, then with a doubling delay; nothing is given up), at most five of each kind
+ * already runs after() calls this: removal rows two minutes after they were written, claims and obligations once due
+ * (retryDelayMs: never while their writer may still run), then each with a doubling delay and taken by due time, so a
+ * row that keeps failing never holds back the others (Codex T01-R13); nothing is given up; at most five of each kind
  * (progress lines: five books), at most once a minute per server instance. Trashing a block twice and writing a
- * checked line twice are harmless, attaches are conditional, a claim is settled only by the sweep that took it
- * (leaseClaim), and a sweep that writes a progress line holds its own obligation while it does, so two sweeps meeting
+ * checked line twice are harmless, attaches are conditional, a claim or a removal row is handled only by the sweep that
+ * took it (leaseClaim, leaseRemoval), and a sweep that writes a progress line holds its own obligation while it does, so two sweeps meeting
  * do no damage. It writes only to Notion and to these rows (and an
  * entry's block id onto its session); it never changes reading data. Never throws.
  */
@@ -666,17 +748,21 @@ export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
   const now = Date.now();
   if (now - lastSweep < SWEEP_EVERY_MS) return 0;
   lastSweep = now;
-  const cutoff = new Date(now - SWEEP_MIN_AGE_MS).toISOString();
+  const nowIso = new Date(now).toISOString();
   let done = 0;
   try {
+    // Open rows by their due time, never by their age (Codex T01-R13): five rows that keep failing used to be the five
+    // oldest on every sweep and held back every newer removal.
     const { data, error } = await supabase
       .from("reading_session_removals")
-      .select("session_id,book_id,session_date,notion_block_id,unfinished,mirror_done_at")
+      .select("session_id,book_id,session_date,notion_block_id,unfinished,mirror_done_at,attempts")
       .is("mirror_done_at", null)
-      .lt("removed_at", cutoff)
-      .order("removed_at", { ascending: true })
+      .lt("next_try_at", nowIso)
+      .order("next_try_at", { ascending: true })
       .limit(SWEEP_LIMIT);
     for (const row of error ? [] : ((data ?? []) as Record<string, unknown>[])) {
+      // Taken by another sweep that found it too: that one runs it.
+      if (!(await leaseRemoval(supabase, Number(row.session_id), Number(row.attempts) || 0))) continue;
       const cleanup: RemovalCleanup = {
         sessionId: Number(row.session_id),
         bookId: Number(row.book_id),
@@ -691,11 +777,10 @@ export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
       done++;
     }
 
-    const nowIso = new Date(now).toISOString();
     if (notionMirrorEnabled()) {
       const { data: claims, error: claimsError } = await supabase
         .from("reading_mirror_claims")
-        .select("claim_id,session_id,book_id,block_id,replaces_block_id,claimed_at,attempts")
+        .select("claim_id,session_id,book_id,block_id,replaces_block_id,claimed_at,attempts,owes_entry")
         .lt("next_try_at", nowIso)
         .order("next_try_at", { ascending: true })
         .limit(SWEEP_LIMIT);
@@ -708,6 +793,7 @@ export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
           replaces: typeof c.replaces_block_id === "string" && c.replaces_block_id ? c.replaces_block_id : null,
           claimedAt: String(c.claimed_at),
           attempts: Number(c.attempts) || 0,
+          owesEntry: c.owes_entry === true,
         };
         // Taken by another sweep that found it too: that one settles it.
         if (!(await leaseClaim(supabase, claim))) continue;
