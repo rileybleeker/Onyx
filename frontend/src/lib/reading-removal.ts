@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { BOOK_COLS, getOverview, markRemovalMirrored, type Book, type ReadingOverview, type RemovalCleanup, type SessionRemoval } from "./reading";
+import { BOOK_COLS, getOverview, markRemovalMirrored, reopenRemovalCleanup, type Book, type ReadingOverview, type RemovalCleanup, type SessionRemoval } from "./reading";
 import { mirrorProgress, removeMirroredBlock } from "./reading-notion";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -65,6 +65,10 @@ export async function runRemovalCleanup(supabase: Supa, r: Extract<SessionRemova
   // Closed only while the row still records the entry this run handled (Codex T01-R9): a late entry a create
   // callback recorded meanwhile stays owed.
   if (trashed && progressDone && sessionId !== null) await markRemovalMirrored(supabase, sessionId, blockId);
+  // Overlapping workers on one row (Codex review of PR 376, round 5): another worker may have closed the row, and
+  // this one then wrote a line that no longer matches the database (rewriteProgressNow said false). Notion keeps the
+  // last write, so the row is reopened and the sweep writes the line again from the state then.
+  else if (sessionId !== null) await reopenRemovalCleanup(supabase, sessionId);
 }
 
 /** What the book page's progress line is written from, and a fingerprint of it (everything mirrorProgress reads). */
@@ -131,17 +135,51 @@ export async function trashLateBlock(
   blockId: string,
   rewriteProgress: () => Promise<boolean>,
 ): Promise<{ recorded: boolean; trashed: boolean; progressDone: boolean; complete: boolean }> {
-  const { error } = await supabase
-    .from("reading_session_removals")
-    .update({ notion_block_id: blockId, mirror_done_at: null })
-    .eq("session_id", sessionId);
-  if (error) console.error("reading: late block record failed:", error.code ?? "unknown");
-  const recorded = !error;
-  const trashed = await removeMirroredBlock(blockId);
+  const recorded = await recordLateBlock(supabase, sessionId, blockId);
+  const trashed = await trashWithRetry(blockId);
   const progressDone = await rewriteProgress().catch(() => false);
   const complete = recorded && trashed && progressDone;
   if (complete) await markRemovalMirrored(supabase, sessionId, blockId);
+  // Not recorded and not trashed: nothing durable knows this block (Codex review of PR 376, round 5). It is kept in
+  // memory and the sweep retries the record and the trash until both are confirmed (best effort across a restart:
+  // the session row is gone, so only this process still knows the block id).
+  if (!recorded && !trashed) pendingLate.set(blockId, { sessionId, blockId, rewriteProgress });
   return { recorded, trashed, progressDone, complete };
+}
+
+const RETRY_PAUSE_MS = 250;
+const pendingLate = new Map<string, { sessionId: number; blockId: string; rewriteProgress: () => Promise<boolean> }>();
+
+async function recordLateBlock(supabase: Supa, sessionId: number, blockId: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { error } = await supabase
+      .from("reading_session_removals")
+      .update({ notion_block_id: blockId, mirror_done_at: null })
+      .eq("session_id", sessionId);
+    if (!error) return true;
+    console.error("reading: late block record failed:", error.code ?? "unknown");
+    if (attempt < 2) await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * (attempt + 1)));
+  }
+  return false;
+}
+
+async function trashWithRetry(blockId: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await removeMirroredBlock(blockId)) return true;
+    if (attempt < 2) await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * (attempt + 1)));
+  }
+  return false;
+}
+
+/** Retries the late blocks that could be neither recorded nor trashed; one that is confirmed leaves the list. */
+async function retryPendingLate(supabase: Supa): Promise<void> {
+  for (const [key, w] of [...pendingLate]) {
+    const recorded = await recordLateBlock(supabase, w.sessionId, w.blockId);
+    const trashed = recorded ? false : await trashWithRetry(w.blockId);
+    // Recorded: the removal's open row owns the block now and the sweep below finishes it. Trashed: it is gone.
+    if (trashed) await w.rewriteProgress().catch(() => false);
+    if (recorded || trashed) pendingLate.delete(key);
+  }
 }
 
 let lastSweep = 0;
@@ -162,6 +200,7 @@ export async function sweepPendingRemovals(supabase: Supa): Promise<number> {
   if (now - lastSweep < SWEEP_EVERY_MS) return 0;
   lastSweep = now;
   try {
+    await retryPendingLate(supabase);
     const { data, error } = await supabase
       .from("reading_session_removals")
       .select("session_id,book_id,session_date,notion_block_id,unfinished,mirror_done_at")

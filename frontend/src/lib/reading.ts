@@ -739,6 +739,17 @@ export async function markRemovalMirrored(supabase: Supa, sessionId: number, blo
   if (error) console.error("reading: removal cleanup mark failed:", error.code ?? "unknown");
 }
 
+/**
+ * Reopens a removal's cleanup row (mirror_done_at back to NULL) so the sweep runs it again. Used by a worker whose
+ * progress write may have landed after another worker closed the row with a newer line (Codex review of PR 376,
+ * round 5): the stale line must not stay in Notion with the row closed. Replaying a cleanup is idempotent.
+ */
+export async function reopenRemovalCleanup(supabase: Supa, sessionId: number): Promise<boolean> {
+  const { error } = await supabase.from("reading_session_removals").update({ mirror_done_at: null }).eq("session_id", sessionId);
+  if (error) console.error("reading: removal cleanup reopen failed:", error.code ?? "unknown");
+  return !error;
+}
+
 const KEYED_CREATE_NEEDS_COLUMN = "Reading sessions can't be saved here until sql/reading_sessions_client_key.sql is applied.";
 const SESSION_KEYS = SESSION_COLS.split(",").map((c) => c.trim());
 
