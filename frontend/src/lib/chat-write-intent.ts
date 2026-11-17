@@ -1184,6 +1184,12 @@ const FLAG_UNSURE = /\b(?:maybe|might|perhaps|possibly|not sure|i think|i guess|
  * (RQS6-R1): a complaint about the answer is not a complaint about the question.
  */
 const FLAG_OWN = /\b(?:my|mine)\b|\bi\s+(?:typed|said|wrote|put|picked|chose|answered|entered|guessed|gave|meant|selected)\b|\b(?:answer|answers|reply|replies|response|guess|pick)\b(?!\s+key\b)/;
+/**
+ * The clause is about how the answer was marked or scored ("the score on Q4 was wrong", "Q4 was wrong to mark me down",
+ * "question 4 was marked wrong", "Q4 was graded unfairly"). A complaint about the marking is not a complaint about the
+ * question, so it never flags (RQS7-R1). "marked as wrong" is a flag phrase, so "marked" followed by "as" does not count.
+ */
+const FLAG_MARKING = /\b(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|points?|penali[sz]\w*|dock(?:ed|ing|s)?|deduct\w*|unfair\w*|credit|(?:marked|marking|marks?)\s+me\b|(?:marked|marking|marks)\b(?!\s+as\b))/;
 const FLAG_ADVERB = "(?:really |just |totally |completely |simply |actually |factually |plainly )?";
 /** Splits a sentence into clauses: a comma, colon or joining word ("but", "and", "which") starts a new one. */
 const FLAG_CLAUSE = /[,:]|\b(?:but|and|or|although|though|while|whereas|however|which|because|so|except)\b/;
@@ -1484,7 +1490,7 @@ export function authorizeWrite(
       if (term === "?" || conditional(s)) continue;
       for (const rawClause of marked.split(FLAG_CLAUSE)) {
         const clause = rawClause.replace(/\u0002/g, ",");
-        if (!FLAG_SUBJECT.test(clause) || FLAG_OWN.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
+        if (!FLAG_SUBJECT.test(clause) || FLAG_OWN.test(clause) || FLAG_MARKING.test(clause) || FLAG_UNSURE.test(clause) || !FLAG_SAYS[kind].test(clause)) continue;
         // "not wrong", "not unclear": the word itself is negated.
         if ((kind === "wrong" || kind === "unclear") && /\b(?:not|isn't|wasn't|never)\s+(?:\w+\s+)?(?:wrong|incorrect|false|inaccurate|mistaken|unclear|confusing|ambiguous|vague)\b/.test(clause)) continue;
         hits.push(clauseLabels(clause));

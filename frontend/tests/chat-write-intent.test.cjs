@@ -461,6 +461,19 @@ const MATRIX = [
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
   ["a flag: a complaint about the question's wording flags it as unclear", BANK_FLAG("The wording of Q1201 is unclear"),
     "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  // A complaint about how the answer was marked or scored is not a complaint about the question (RQS7-R1).
+  ["a flag: my answer to the question was marked wrong", BANK_FLAG("My answer to Q1201 was marked wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the score on the question was wrong", BANK_FLAG("The score on Q1201 was wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question was wrong to mark me down", BANK_FLAG("Q1201 was wrong to mark me down"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, refused("flag_not_stated")],
+  ["a flag: the question is unclear, and my answer was marked wrong in another clause", BANK_FLAG("Q1201 is unclear, and my answer was marked wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the question is named plainly as unclear", BANK_FLAG("Question 1201 is unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the question is marked as wrong, which is a flag phrase", BANK_FLAG("Q1201 is marked as wrong"),
+    "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
