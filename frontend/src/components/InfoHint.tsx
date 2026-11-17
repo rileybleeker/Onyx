@@ -11,8 +11,8 @@ import { Info } from "lucide-react";
  * rest, closed by default (AGENTS.md, Conventions, "UI copy").
  *
  * - variant "popover" (default): a small "i" button that opens a floating note. The visible dot
- *   is 18 px; its hit area is 44 px (an absolutely positioned ::before) so it is a full touch
- *   target without moving the layout. Escape, a tap outside, or tabbing away closes it; focus
+ *   is 18 px; the button around it is 44 px and pulled back by a -13 px margin, so it is a full
+ *   touch target without moving the layout. Escape, a tap outside, or tabbing away closes it; focus
  *   moves into the note on open and back to the button on Escape.
  * - variant "disclosure": a full-width "About this" row that expands in place (native
  *   <details>), for longer notes at the foot of a card or page.
@@ -123,14 +123,21 @@ function InfoPopover({ label, children, className }: { label: string; children: 
         aria-controls={open ? id : undefined}
         onClick={() => (open ? close(false) : setOpen(true))}
         className={clsx(
-          "relative inline-flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full text-text-tertiary transition-colors",
-          "before:absolute before:-inset-[13px] before:content-['']",
-          "hover:text-text-primary focus:outline-none focus-visible:ring-1 focus-visible:ring-accent",
-          open && "text-accent",
+          // The button itself is the 44 px touch target. A negative margin of 13 px on each side
+          // pulls it back to the 18 px footprint it always had, so surrounding text does not move.
+          "group inline-flex h-11 w-11 shrink-0 -m-[13px] items-center justify-center focus:outline-none",
           className,
         )}
       >
-        <Info aria-hidden className="h-3.5 w-3.5" />
+        <span
+          className={clsx(
+            "pointer-events-none inline-flex h-[18px] w-[18px] items-center justify-center rounded-full text-text-tertiary transition-colors",
+            "group-hover:text-text-primary group-focus-visible:ring-1 group-focus-visible:ring-accent",
+            open && "text-accent",
+          )}
+        >
+          <Info aria-hidden className="h-3.5 w-3.5" />
+        </span>
       </button>
       {open &&
         typeof document !== "undefined" &&
