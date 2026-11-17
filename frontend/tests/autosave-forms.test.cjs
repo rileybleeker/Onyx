@@ -753,7 +753,8 @@ test("overall budget: a refused budget is shown and not retried on its own", asy
   change(h.field(), "3200");
   await h.flush();
   await h.tick(1200);
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Not saved\. Try again\./, "the fixed sentence is shown, not the server's text");
+  assert.doesNotMatch(h.text(), /Synthetic refusal/);
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1);
 });
