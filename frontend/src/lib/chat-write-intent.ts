@@ -651,18 +651,34 @@ const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "
 const MONTH = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
+/** The day set of an action whose own words name two different days: it matches no real day, so every day check refuses it. */
+const AMBIGUOUS_DAY = "ambiguous";
+
+/** A day the text negates: "not the day before yesterday", "rather than yesterday", "instead of today". It names no day. */
+const NEGATED_DAY =
+  /\b(?:not|rather than|instead of|except)\s+(?:(?:on|the|for)\s+)*(?:day before yesterday|day before|yesterday|last night|today|tonight|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/g;
+
 /**
- * The days a text names, resolved against the request day: "today" / "this morning" is that day, "yesterday" the day
- * before it, "Tuesday" the last Tuesday, "Nov 9" the last Nov 9 on or before it, "3 days ago" three days before it.
+ * The day phrases a text names, resolved against the request day, one set of days per phrase: "today" / "this morning"
+ * is that day, "yesterday" the day before it, "day before yesterday" two days before it, "Tuesday" the last Tuesday,
+ * "Nov 9" the last Nov 9 on or before it, "3 days ago" three days before it. "day before yesterday" is one phrase (its
+ * "yesterday" and "the day before" do not count again); a negated day names none.
  */
-function statedDays(text: string, requestDay: string): Set<string> {
-  const out = new Set<string>();
+function statedDayPhrases(text: string, requestDay: string): Array<Set<string>> {
+  const phrases: Array<Set<string>> = [];
   const base = Date.parse(`${requestDay}T12:00:00Z`);
-  if (!Number.isFinite(base)) return out;
+  if (!Number.isFinite(base)) return phrases;
   const daysBack = (n: number) => new Date(base - n * 86_400_000);
   const iso = (d: Date) => d.toISOString().slice(0, 10);
+  /** One phrase and the days it names (a phrase that names no day adds nothing). */
+  const phrase = (days: Array<string | null>) => {
+    const set = new Set(days.filter((d): d is string => d !== null));
+    if (set.size > 0) phrases.push(set);
+  };
   const back = (from: number, to: number, keep: (d: Date) => boolean = () => true) => {
-    for (let n = from; n <= to; n++) if (keep(daysBack(n))) out.add(iso(daysBack(n)));
+    const days: string[] = [];
+    for (let n = from; n <= to; n++) if (keep(daysBack(n))) days.push(iso(daysBack(n)));
+    phrase(days);
   };
   const ymd = (y: number, m: number, d: number): string | null => {
     const dt = new Date(Date.UTC(y, m - 1, d, 12));
@@ -673,13 +689,14 @@ function statedDays(text: string, requestDay: string): Set<string> {
   /** The month / day on or before the request day (this year, else last year). */
   const latest = (m: number, d: number) => {
     const c = ymd(year, m, d);
-    const pick = c && c <= requestDay ? c : ymd(year - 1, m, d);
-    if (pick) out.add(pick);
+    phrase([c && c <= requestDay ? c : ymd(year - 1, m, d)]);
   };
-  const t = norm(text);
+  const blankOut = (m: string) => " ".repeat(m.length);
+  let t = norm(text).replace(NEGATED_DAY, blankOut);
+  if (/\bday before yesterday\b/.test(t)) back(2, 2);
+  t = t.replace(/\bday before yesterday\b/g, blankOut);
   if (/\b(?:today|tonight|this (?:morning|afternoon|evening)|earlier today)\b/.test(t)) back(0, 0);
   if (/\b(?:yesterday|last night)\b/.test(t)) back(1, 1);
-  if (/\bday before yesterday\b/.test(t)) back(2, 2);
   if (/\bthe (?:night|day) before\b/.test(t)) back(1, 2);
   for (const m of t.matchAll(/\b(\d{1,2}|[a-z]+) days? ago\b/g)) {
     const n = /^\d+$/.test(m[1]) ? Number(m[1]) : own(NUMBER_WORDS, m[1]);
@@ -694,24 +711,19 @@ function statedDays(text: string, requestDay: string): Set<string> {
   });
   for (const m of t.matchAll(new RegExp(`\\b${MONTH}\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, "g"))) latest(MONTHS.indexOf(m[1].slice(0, 3)) + 1, Number(m[2]));
   for (const m of t.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}\\b`, "g"))) latest(MONTHS.indexOf(m[2].slice(0, 3)) + 1, Number(m[1]));
-  for (const m of t.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
-    const d = ymd(Number(m[1]), Number(m[2]), Number(m[3]));
-    if (d) out.add(d);
-  }
+  for (const m of t.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) phrase([ymd(Number(m[1]), Number(m[2]), Number(m[3]))]);
   for (const m of t.matchAll(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2}|\d{4}))?\b/g)) {
     if (m[3]) {
       const y = Number(m[3]) < 100 ? 2000 + Number(m[3]) : Number(m[3]);
-      const d = ymd(y, Number(m[1]), Number(m[2]));
-      if (d) out.add(d);
+      phrase([ymd(y, Number(m[1]), Number(m[2]))]);
     } else latest(Number(m[1]), Number(m[2]));
   }
   for (const m of t.matchAll(/\bthe (\d{1,2})(?:st|nd|rd|th)\b/g)) {
     const d = Number(m[1]);
     const c = ymd(year, month, d);
-    const pick = c && c <= requestDay ? c : month === 1 ? ymd(year - 1, 12, d) : ymd(year, month - 1, d);
-    if (pick) out.add(pick);
+    phrase([c && c <= requestDay ? c : month === 1 ? ymd(year - 1, 12, d) : ymd(year, month - 1, d)]);
   }
-  return out;
+  return phrases;
 }
 
 /** The day before a YYYY-MM-DD date. */
@@ -1308,12 +1320,17 @@ const num = (v: unknown): number | null => (typeof v === "number" && Number.isFi
 
 /**
  * The days an action allows: the days it names, else the days its list names, else its sentence's, else none (the
- * caller's default: today, or last night for a sleep question).
+ * caller's default: today, or last night for a sleep question). One day from its own words: when the words that name
+ * the action's day name two different days ("yesterday … the day before yesterday"), the action allows neither, so
+ * every day check refuses it instead of guessing.
  */
 function allowedDays(a: Action, requestDay: string): Set<string> {
   for (const text of [a.text, a.chainText, a.sentence]) {
-    const days = statedDays(text, requestDay);
-    if (days.size > 0) return days;
+    const phrases = statedDayPhrases(text, requestDay);
+    if (phrases.length === 0) continue;
+    const key = (s: Set<string>) => [...s].sort().join(",");
+    if (phrases.some((p) => key(p) !== key(phrases[0]))) return new Set([AMBIGUOUS_DAY]);
+    return phrases[0];
   }
   return new Set();
 }
