@@ -740,9 +740,23 @@ def test_publish_reports_its_outcome_to_the_workflow():
     code, outputs, printed = run_publish(db, "910")
     assert code == 0 and outputs == {"publish": "published"}
     assert "publish=published" in printed
-    # publishing again (a retried workflow): already_published, still a confirmed publication
-    code, outputs, printed = run_publish(db, "911")
+    # the same run publishing again (a retried publish step: same run id and attempt, so the
+    # same bytes and provenance): already_published, still a confirmed publication
+    code, outputs, printed = run_publish(db, "910")
     assert code == 0 and outputs == {"publish": "already_published"}
+    assert len(db.registry()) == 1
+    # a later run (911) trained a new artifact: it is published as its own row
+    code, outputs, printed = run_publish(db, "911")
+    assert code == 0 and outputs == {"publish": "published"}
+    assert len(db.registry()) == 2
+    # the guard: the artifact on disk was trained by run 910, but this job is run 912 (not the
+    # training run): refused, no output, nothing written, the registry is unchanged
+    db6 = _FakeDb()
+    with _workspace(), _environ(**_run_env("912")):
+        ma.write_artifact(_bundle(), _provenance(run_id="910", deps=ma.dependency_versions()),
+                          Path("analysis_output") / "xgboost_hrv_model.pkl")
+        assert ma.cmd_publish(_Args("true"), db=db6) == 1
+        assert db6.registry() == []
     # the cache confirm step found nothing: not published, and no output is trusted from it
     db2 = _FakeDb()
     code, outputs, _ = run_publish(db2, "912", saved="")
