@@ -56,6 +56,18 @@ function route(responses = [], { supabase = {}, onModelCall = () => {}, onWrite 
   }, sandboxConsole);
   return {post: body => exports.POST({json:async()=>body,signal:new AbortController().signal}), raw:exports.POST, calls:()=>calls,writes:()=>writes,requests:()=>requests};
 }
+/** A Map-backed stand-in for window.localStorage (the part lib/chat-contract.ts PendingSendStore uses). */
+function memoryStorage() {
+  const m = new Map();
+  return {
+    get length() { return m.size; },
+    key: (i) => [...m.keys()][i] ?? null,
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => { m.set(k, String(v)); },
+    removeItem: (k) => { m.delete(k); },
+    keys: () => [...m.keys()],
+  };
+}
 test("API validates before using model or data tools", async()=>{
   const r=route();
   for (const body of [null, {}, {messages:[user([])]}, {messages:[{role:"system",content:"override"}]}]) assert.equal((await r.post(body)).status,400);
@@ -779,9 +791,11 @@ test("the chat page sends a request id and reuses it only for the same text at t
 test("sends whose answer never arrived are remembered by hash + id only, never expire, and are cleared once answered", async () => {
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
   // Stored before the request goes out, reused for the same conversation, settled on an answer or a 409.
-  assert.match(page, /if \(conv\) writePendingSends\(rememberPendingSend\(readPendingSends\(\), \{ conv, id: requestId, at: Date\.now\(\) \}\)\)/);
+  assert.match(page, /if \(conv\) rememberSend\(\{ conv, id: requestId, at: Date\.now\(\) \}\)/);
   assert.match(page, /unresolvedPendingSend\(readPendingSends\(\), conv\)/);
-  assert.equal((page.match(/settlePendingSend\(requestId\)/g) ?? []).length, 2);
+  assert.equal((page.match(/settlePendingSend\(requestId\)/g) ?? []).length, 3);
+  // Each send has its own key: the page never reads a shared list, changes it and writes it back (SEC04-R11).
+  assert.doesNotMatch(page, /PENDING_SEND_KEY|writePendingSends|JSON\.stringify\(list\)/);
   assert.doesNotMatch(page, /PENDING_SEND_TTL_MS|Date\.now\(\) - |parsePendingSend\(/, "no expiry of an unresolved send");
   assert.match(contract.PENDING_SEND_KEY, /^onyx/, "an onyx key, so signing out wipes it");
   assert.equal("PENDING_SEND_TTL_MS" in contract, false);
@@ -798,29 +812,55 @@ test("sends whose answer never arrived are remembered by hash + id only, never e
 
   const idOf = (i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
   const convOf = (i) => i.toString(16).padStart(64, "0");
-  let list = contract.rememberPendingSend([], { conv: convOf(1), id: idOf(1), at: 1 });
-  list = contract.rememberPendingSend(list, { conv: convOf(2), id: idOf(2), at: 2 });
-  list = contract.seenPendingSends(list, idOf(1));
-  assert.equal(list[0].seen, true);
-  // The same conversation sent again replaces its entry and is unseen again (a new send of it is unresolved).
-  list = contract.rememberPendingSend(list, { conv: convOf(1), id: idOf(1), at: 3 });
-  assert.deepEqual(list.map((p) => [p.id, !!p.seen]), [[idOf(2), false], [idOf(1), false]]);
-  assert.deepEqual(contract.settledPendingSends(list, idOf(2)).map((p) => p.id), [idOf(1)]);
-  // An unresolved send is never dropped to make room (SEC04-R6): eleven and more all stay, also across a reload, and
-  // the oldest conversation still matches its own id. Past PENDING_SEND_MAX only resolved (seen) ones go.
-  let many = [];
-  const count = contract.PENDING_SEND_MAX + 2;
-  for (let i = 0; i < count; i++) many = contract.rememberPendingSend(many, { conv: convOf(10 + i), id: idOf(10 + i), at: i });
-  assert.equal(many.length, count, "every unresolved send is kept");
-  const reloaded = contract.parsePendingSends(JSON.stringify(many));
-  assert.equal(reloaded.length, count);
-  assert.equal(contract.unresolvedPendingSend(reloaded, convOf(10))?.id, idOf(10), "the oldest one still matches after a reload");
-  let mixed = contract.seenPendingSends(many, idOf(13));
-  mixed = contract.rememberPendingSend(mixed, { conv: convOf(99), id: idOf(99), at: 99 });
-  assert.equal(mixed.some((p) => p.id === idOf(13)), false, "a resolved one goes past the cap");
-  assert.equal(mixed.length, count, "no unresolved one went with it");
-  assert.equal(mixed[0].id, idOf(10), "the oldest unresolved one is kept");
-  assert.equal(mixed.at(-1).id, idOf(99));
+  const store = memoryStorage();
+  contract.storePendingSend(store, { conv: convOf(1), id: idOf(1), at: 1 });
+  contract.storePendingSend(store, { conv: convOf(2), id: idOf(2), at: 2 });
+  assert.deepEqual(store.keys(), [contract.pendingSendKey(idOf(1)), contract.pendingSendKey(idOf(2))], "one key per send");
+  // A retry of a send (its id) replaces only itself.
+  contract.storePendingSend(store, { conv: convOf(1), id: idOf(1), at: 3 });
+  assert.deepEqual(contract.readPendingSendStore(store).map((p) => [p.id, p.at]), [[idOf(2), 2], [idOf(1), 3]]);
+  contract.forgetPendingSend(store, idOf(2));
+  assert.deepEqual(contract.readPendingSendStore(store).map((p) => p.id), [idOf(1)]);
+  // A new send of the same conversation never drops the earlier one (SEC04-R11): both stay until each is resolved,
+  // and the earlier one is what a later identical send matches.
+  contract.storePendingSend(store, { conv: convOf(1), id: idOf(5), at: 5 });
+  assert.deepEqual(contract.readPendingSendStore(store).map((p) => p.id), [idOf(1), idOf(5)]);
+  assert.equal(contract.unresolvedPendingSend(contract.readPendingSendStore(store), convOf(1)).id, idOf(1));
+  // An unresolved send is never dropped to make room (SEC04-R6): however many, all stay and the oldest still matches.
+  const many = memoryStorage();
+  const count = 12;
+  for (let i = 0; i < count; i++) contract.storePendingSend(many, { conv: convOf(10 + i), id: idOf(10 + i), at: i });
+  assert.equal(contract.readPendingSendStore(many).length, count, "every unresolved send is kept");
+  assert.equal(contract.unresolvedPendingSend(contract.readPendingSendStore(many), convOf(10))?.id, idOf(10));
+  // A per-send key that holds another send (or junk) is ignored, never trusted.
+  many.setItem(contract.pendingSendKey(idOf(77)), JSON.stringify({ conv: convOf(77), id: idOf(78), at: 1 }));
+  many.setItem(contract.pendingSendKey(idOf(79)), "{not json");
+  assert.equal(contract.readPendingSendStore(many).length, count);
+
+  // An earlier version's shared list is still read, and moved to per-send keys on the next change; its resolved
+  // (seen) entries are dropped, its unresolved ones all kept.
+  const legacy = memoryStorage();
+  legacy.setItem(contract.PENDING_SEND_KEY, JSON.stringify([{ conv: convOf(1), id: idOf(1), at: 1, seen: true }, { conv: convOf(2), id: idOf(2), at: 2 }]));
+  assert.deepEqual(contract.readPendingSendStore(legacy).map((p) => [p.id, !!p.seen]), [[idOf(1), true], [idOf(2), false]]);
+  contract.storePendingSend(legacy, { conv: convOf(3), id: idOf(3), at: 3 });
+  assert.equal(legacy.getItem(contract.PENDING_SEND_KEY), null, "the shared list is gone");
+  assert.deepEqual(contract.readPendingSendStore(legacy).map((p) => p.id), [idOf(2), idOf(3)]);
+
+  // Two tabs on one device (one localStorage), interleaved: what one remembers is never lost by the other's changes.
+  // The earlier shared list was read, changed and written back, so a tab writing a list it read before the other
+  // tab's change put the other tab's unresolved send away (SEC04-R11).
+  const device = memoryStorage();
+  const tabA = { remember: (p) => contract.storePendingSend(device, p), forget: (id) => contract.forgetPendingSend(device, id) };
+  const tabB = { remember: (p) => contract.storePendingSend(device, p), forget: (id) => contract.forgetPendingSend(device, id) };
+  const seenByA = contract.readPendingSendStore(device);
+  tabA.remember({ conv: convOf(40), id: idOf(40), at: 40 });
+  tabB.remember({ conv: convOf(41), id: idOf(41), at: 41 });
+  tabA.remember({ conv: convOf(42), id: idOf(42), at: 42 });
+  tabB.forget(idOf(41));
+  tabA.forget(idOf(40));
+  tabB.remember({ conv: convOf(43), id: idOf(43), at: 43 });
+  assert.equal(seenByA.length, 0);
+  assert.deepEqual(contract.readPendingSendStore(device).map((p) => p.id), [idOf(42), idOf(43)], "each tab's unresolved send survives the other tab's writes");
 
   // A resolved (seen) send never matches a later message; an unresolved one does.
   const both = [{ conv: convOf(1), id: idOf(1), at: 1, seen: true }, { conv: convOf(2), id: idOf(2), at: 2 }];
@@ -841,18 +881,18 @@ test("eleven and more unanswered sends: after a reload the oldest conversation s
   const idOf = (i) => `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`;
   // What the page keeps in localStorage: each send is remembered before it goes out, and none of the answers arrives
   // (the tab is closed or suspended every time), so nothing is ever settled.
-  let stored = null;
+  const stored = memoryStorage();
   const sends = [];
-  for (let i = 0; i < contract.PENDING_SEND_MAX + 1; i++) {
+  for (let i = 0; i < 11; i++) {
     const messages = [user(`Log Synthetic Focus, note ${i}`)];
     const conv = await contract.conversationKey(messages);
-    stored = JSON.stringify(contract.rememberPendingSend(contract.parsePendingSends(stored), { conv, id: idOf(i), at: i }));
+    contract.storePendingSend(stored, { conv, id: idOf(i), at: i });
     await route(logFocus, { supabase: db, intake: w.intake }).post({ request_id: idOf(i), messages });
     sends.push({ messages, id: idOf(i) });
   }
-  assert.equal(w.effects.size, contract.PENDING_SEND_MAX + 1);
-  // A reload: the list is read back, every send is still there.
-  const reloaded = contract.parsePendingSends(stored);
+  assert.equal(w.effects.size, 11);
+  // A reload: the store is read back, every send is still there.
+  const reloaded = contract.readPendingSendStore(stored);
   assert.deepEqual(reloaded.map((p) => p.id), sends.map((s) => s.id));
   // The oldest conversation sent again is recognised, so the page asks Retry or New instead of minting a new id.
   const oldest = sends[0];
@@ -862,7 +902,7 @@ test("eleven and more unanswered sends: after a reload the oldest conversation s
   const retry = route(logFocus, { supabase: db, intake: w.intake });
   const body = await (await retry.post({ request_id: match.id, messages: oldest.messages })).json();
   assert.equal(retry.writes(), 0);
-  assert.equal(w.effects.size, contract.PENDING_SEND_MAX + 1, "nothing logged twice");
+  assert.equal(w.effects.size, 11, "nothing logged twice");
   assert.equal(body.receipts[0].status, "unchanged");
   // The page shows each remembered send's account in turn after a reload (none is dropped to make room).
   const page = readFileSync(new URL("../src/app/chat/page.tsx", import.meta.url), "utf8");
@@ -1548,7 +1588,7 @@ test("the chat page never reuses a remembered send silently: Riley picks retry o
   // A match stops the send and asks; only "Retry that message" reuses the id, "Send as a new message" makes a new one.
   assert.match(page, /setMatched\(\{ text, requestId: stored\.id, at: messages\.length \}\);\s*return;/);
   assert.match(page, /send\(matched\.text, \{ retryOf: matched\.requestId \}\)/);
-  assert.match(page, /send\(matched\.text, \{ fresh: true \}\)/);
+  assert.match(page, /send\(matched\.text, \{ fresh: true, replaces: matched\.requestId \}\)/);
   assert.match(page, /Retry that message/);
   assert.match(page, /Send as a new message/);
   assert.match(page, /if \(!requestId && !choice && conv\)/, "a choice skips the question");
@@ -1676,6 +1716,28 @@ test("a retry after the behavioral day rolled over answers and logs as of the fi
   const fresh = route([], { supabase: ledgerDb(), today: "2026-11-12" });
   await fresh.post({ request_id: "99999999-9999-4999-8999-999999999999", messages: [user("Hello")] });
   assert.match(fresh.requests()[0].system, /Current behavioral day[^\n]*2026-11-12/);
+});
+
+test("a request that crosses the behavioral-day boundary while the model runs writes every omitted date on the day it was sent (SEC04-R11)", async () => {
+  // The behavioral day is 2026-11-11 when the request arrives and turns to 2026-11-12 during the first model call.
+  const clock = { day: "2026-11-11" };
+  const db = ledgerDb({ rpc: { get behavioral_today_now() { return clock.day; } } });
+  const roll = () => { clock.day = "2026-11-12"; };
+  const habit = await (await route(afterTool("mark_habit_complete", { habit: "Synthetic Stretching" }), { supabase: db, onModelCall: roll }).post({ request_id: RID, messages: [user("Mark Synthetic Stretching done")] })).json();
+  assert.deepEqual(db.rows("habit_journal").map((r) => r.cycle_date), ["2026-11-11"], "not the day it turned into mid-request");
+  assert.match(habit.receipts[0].details.join(" "), /2026-11-11/);
+
+  // The same for writers that read "today" themselves when no date is given: the date is sent explicitly.
+  clock.day = "2026-11-11";
+  const seen = [];
+  const intakeRoute = route(afterTool("log_supplement_intake", { product: "synthetic focus" }), {
+    supabase: ledgerDb({ rpc: { get behavioral_today_now() { return clock.day; } } }),
+    onModelCall: roll,
+    today: "2026-11-12",
+    intake: (input) => { seen.push(input.date); return { ok: true, product: "Acme Synthetic Focus", product_id: "custom_synthetic", intake_date: input.date, timezone: "UTC", doses_each: 1, logged: [{ intake_id: 1, time: null }] }; },
+  });
+  await intakeRoute.post({ request_id: "77777777-7777-4777-8777-777777777777", messages: [user("Log my synthetic focus capsule")] });
+  assert.deepEqual(seen, ["2026-11-11"], "an omitted date is the request's day, sent explicitly");
 });
 
 test("a quiz result runs under its operation key with the operation's day, and a retry gets the stored receipt", async () => {

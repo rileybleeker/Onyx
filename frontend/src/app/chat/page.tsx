@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
-import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, PENDING_SEND_KEY, conversationKey, earlierOutcomeUnknown, newRequestId, parsePendingSends, rememberPendingSend, requestIdForSend, settledPendingSends, unresolvedPendingSend, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
+import { CHAT_EXAMPLES, MAX_CHAT_CHARACTERS, MAX_CHAT_MESSAGES, conversationKey, earlierOutcomeUnknown, forgetPendingSend, newRequestId, readPendingSendStore, requestIdForSend, storePendingSend, unresolvedPendingSend, type ChatMessage, type FailedSendRef, type PendingSend, type SendChoice } from "@/lib/chat-contract";
 import { parseReceipts, type WriteReceipt } from "@/lib/chat-receipts";
 import ChatMarkdown from "@/components/ChatMarkdown";
 import ChatReceipts from "@/components/ChatReceipts";
@@ -14,9 +14,10 @@ type ShownMessage = ChatMessage & { receipts?: WriteReceipt[] };
  * The send that failed: its text, its request id and where in the conversation it was sent. Sending the same text
  * again from the same point reuses the id, so the server recognises the retry and shows what the first try already
  * saved instead of saving it twice (SEC-04, lib/chat-operations.ts). An edited message is a new request. A send whose
- * answer never arrived is also remembered on this device until it is resolved (hash + id only, PENDING_SEND_KEY, no
- * expiry). When the same conversation is sent again after a reload or a closed tab, Riley chooses: retry that send
- * (its id, so nothing is saved twice) or send it as a new message (a new id). A remembered send whose account Riley
+ * answer never arrived is also remembered on this device until it is resolved (hash + id only, one key per send so
+ * tabs never overwrite each other's, no expiry: lib/chat-contract.ts PENDING_SEND_KEY). When the same conversation is
+ * sent again after a reload or a closed tab, Riley chooses: retry that send (its id, so nothing is saved twice) or send
+ * it as a new message (a new id; the earlier one is abandoned, then forgotten). A remembered send whose account Riley
  * has already seen and dismissed is resolved and never matches again. Which id a send uses: requestIdForSend.
  */
 type FailedSend = FailedSendRef;
@@ -26,25 +27,36 @@ interface MatchedSend { text: string; requestId: string; at: number }
 
 function readPendingSends(): PendingSend[] {
   try {
-    return parsePendingSends(window.localStorage.getItem(PENDING_SEND_KEY));
+    return readPendingSendStore(window.localStorage);
   } catch {
     return [];
   }
 }
 
-function writePendingSends(list: PendingSend[]) {
+/** Remember a send before it goes out (its own key only: another tab's sends are never touched). */
+function rememberSend(send: PendingSend) {
   try {
-    if (list.length > 0) window.localStorage.setItem(PENDING_SEND_KEY, JSON.stringify(list));
-    else window.localStorage.removeItem(PENDING_SEND_KEY);
+    storePendingSend(window.localStorage, send);
   } catch {
     /* storage full or blocked: the in-memory retry still works */
   }
 }
 
-/** An answer (or a definite refusal) arrived for this request: it is resolved, forget it. */
+/** An answer (or a definite refusal) arrived for this request: it is resolved, forget it (its own key only). */
 function settlePendingSend(requestId: string) {
-  writePendingSends(settledPendingSends(readPendingSends(), requestId));
+  try {
+    forgetPendingSend(window.localStorage, requestId);
+  } catch {
+    /* storage blocked: nothing was stored either */
+  }
 }
+
+/**
+ * Statuses that prove this request never reached the replay ledger, so it wrote nothing and its id never runs:
+ * refused as invalid (400), too large (413), signed out (401) or forbidden (403) before the route ran. 409 (in
+ * progress / conflict), 422 / 499 (stopped after tools ran), 429 and 5xx are not definite. For a first send only.
+ */
+const NEVER_RAN = new Set([400, 401, 403, 413]);
 
 /**
  * A send whose answer never arrived, found after a reload: the conversation is gone, so the same message sent again
@@ -223,7 +235,16 @@ export default function ChatPage() {
     let staleId = false;
     try {
       if (!requestId) requestId = newRequestId();
-      if (conv) writePendingSends(rememberPendingSend(readPendingSends(), { conv, id: requestId, at: Date.now() }));
+      if (conv) rememberSend({ conv, id: requestId, at: Date.now() });
+      // "Send as a new message" over a remembered send: abandon that one on the server, so a late arrival of it runs
+      // nothing, and forget it only once that is recorded. Arrived first (running / settled) or not checkable: it
+      // stays remembered next to this one, so its account is still shown after a reload.
+      const replaced = choice && "fresh" in choice ? choice.replaces : undefined;
+      if (replaced && replaced !== requestId) {
+        void abandonPendingSend(replaced).then((outcome) => {
+          if (outcome === "abandoned") settlePendingSend(replaced);
+        });
+      }
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -240,6 +261,9 @@ export default function ChatPage() {
       if (data?.replay_safe === true || (res.status === 409 && data?.code === "request_in_progress")) safe = true;
       else if (res.ok) safe = false;
       setReplaySafe(safe);
+      // A first send refused before the route ran (or before its ledger) cannot have saved anything: not remembered.
+      // A retry's refusal says nothing about what its earlier try saved, so a reused id stays remembered.
+      if (!reusedId && (res.redirected || NEVER_RAN.has(res.status))) settlePendingSend(requestId);
       if (res.redirected || res.status === 401) throw new Error("Your session may have expired. Sign in again.");
       // The server no longer accepts this id for this message: the next send starts a new request.
       if (res.status === 409 && data?.code === "request_conflict") {
@@ -354,7 +378,7 @@ export default function ChatPage() {
             <button type="button" onClick={() => void send(matched.text, { retryOf: matched.requestId })} disabled={loading} className="text-sm text-accent border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
               Retry that message
             </button>
-            <button type="button" onClick={() => void send(matched.text, { fresh: true })} disabled={loading} className="text-sm text-text-secondary border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
+            <button type="button" onClick={() => void send(matched.text, { fresh: true, replaces: matched.requestId })} disabled={loading} className="text-sm text-text-secondary border border-border-subtle rounded-control px-3 py-1.5 disabled:opacity-40">
               Send as a new message
             </button>
           </div>

@@ -78,7 +78,8 @@ export function newRequestId(): string {
 }
 
 /** How a send picks its request id: as usual, the remembered send's id (a retry of it), or a new one (a new message). */
-export type SendChoice = { retryOf: string } | { fresh: true };
+/** `replaces`: the remembered send this new message was chosen over (abandoned on the server, then forgotten). */
+export type SendChoice = { retryOf: string } | { fresh: true; replaces?: string };
 
 /** The send of this page that failed (no answer, or an error): its text, its request id and where it was sent. */
 export interface FailedSendRef { text: string; requestId: string; at: number }
@@ -96,21 +97,26 @@ export function requestIdForSend(choice: SendChoice | undefined, previous: Faile
 
 /**
  * Sends whose answer never arrived (the tab was closed or reloaded, the phone suspended the app) are remembered on
- * this device under this key: per send a SHA-256 of the conversation as sent and its request id, never the text.
- * When exactly that conversation is sent again (e.g. the same first message in a fresh chat after a reload), the page
- * never reuses the id silently: Riley picks "Retry that message" (the id: the server answers from its ledger instead
- * of logging again) or "Send as a new message" (a new id, a new action). They do NOT expire: an answer may have been
- * lost after a write committed, however long ago, so each stays until it is resolved: its answer arrives, the server
- * refuses the id for good, or the server's definite account of what it saved was shown after a reload and
- * dismissed. "It never arrived" is not definite on its own (the request may still be on its way): dismissing that
- * first records the id as abandoned on the server (POST /api/chat/operations), which also refuses the request if it
- * arrives late, and only then is the send forgotten. A resolved send never matches a later message. There is no cap on unresolved sends:
- * one dropped to make room would lose its retry choice and its account, and the same message sent again would get a
- * new id and could log everything a second time. PENDING_SEND_MAX only bounds the list by dropping resolved (`seen`)
- * entries from an earlier version, oldest first. An "onyx" key, so signing out (or another account) wipes them.
+ * this device: per send a SHA-256 of the conversation as sent and its request id, never the text. When exactly that
+ * conversation is sent again (e.g. the same first message in a fresh chat after a reload), the page never reuses the
+ * id silently: Riley picks "Retry that message" (the id: the server answers from its ledger instead of logging again)
+ * or "Send as a new message" (a new id, a new action; the earlier id is then abandoned on the server and forgotten
+ * only once that is confirmed, otherwise it stays remembered next to the new one until it is resolved). They do NOT
+ * expire: an answer may have been lost after a write committed, however long ago, so each stays until it is resolved:
+ * its answer arrives, the server refuses the id for good, or the server's definite account of what it saved was shown
+ * after a reload and dismissed. "It never arrived" is not definite on its own (the request may still be on its way):
+ * dismissing that first records the id as abandoned on the server (POST /api/chat/operations), which also refuses the
+ * request if it arrives late, and only then is the send forgotten. There is no cap: one dropped to make room would
+ * lose its retry choice and its account, and the same message sent again would get a new id and could log everything
+ * a second time.
+ *
+ * Each send is stored under its OWN key (pendingSendKey: PENDING_SEND_KEY + "." + id), written and removed alone,
+ * never as part of a shared list that is read, changed and written back: two tabs remembering or settling sends at
+ * the same moment then never overwrite each other's entries (localStorage has no compare-and-set). PENDING_SEND_KEY
+ * itself is the list an earlier version kept; it is still read, and moved to per-send keys on the next change. An
+ * "onyx" key, so signing out (or another account) wipes them.
  */
 export const PENDING_SEND_KEY = "onyx.chat.pending";
-export const PENDING_SEND_MAX = 10;
 
 export interface PendingSend {
   /** SHA-256 (hex) of the conversation as sent. */
@@ -119,7 +125,7 @@ export interface PendingSend {
   id: string;
   /** When it was sent (epoch ms). */
   at: number;
-  /** Resolved (its account was shown and dismissed): never shown again and never matched (older stored entries). */
+  /** Resolved (its account was shown and dismissed), in an earlier version's list: never shown, never matched. */
   seen?: true;
 }
 
@@ -132,7 +138,7 @@ function pendingSendOf(v: unknown): PendingSend | null {
   return { conv: o.conv, id: o.id.toLowerCase(), at: o.at, ...(o.seen === true ? { seen: true as const } : {}) };
 }
 
-/** The stored pending sends, oldest first (a single stored object from an earlier version counts as one). Never by age. */
+/** Stored pending sends, oldest first (a list, or a single object, as an earlier version wrote them). Never by age. */
 export function parsePendingSends(raw: string | null): PendingSend[] {
   if (!raw) return [];
   try {
@@ -143,21 +149,66 @@ export function parsePendingSends(raw: string | null): PendingSend[] {
   }
 }
 
+/** The key one remembered send is stored under. */
+export const pendingSendKey = (id: string): string => `${PENDING_SEND_KEY}.${id.toLowerCase()}`;
+
+/** What the page uses of window.localStorage (a Map-backed stand-in in tests). */
+export interface PendingSendStore {
+  readonly length: number;
+  key(index: number): string | null;
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** Every remembered send on this device, oldest first: the per-send keys plus an earlier version's list. */
+export function readPendingSendStore(store: PendingSendStore): PendingSend[] {
+  const byId = new Map<string, PendingSend>();
+  for (const p of parsePendingSends(store.getItem(PENDING_SEND_KEY))) byId.set(p.id, p);
+  const keys: string[] = [];
+  for (let i = 0; i < store.length; i++) {
+    const k = store.key(i);
+    if (k && k.startsWith(`${PENDING_SEND_KEY}.`)) keys.push(k);
+  }
+  for (const k of keys) {
+    const [p] = parsePendingSends(store.getItem(k));
+    // A per-send key holds exactly the send it is named after (anything else is ignored, never trusted).
+    if (p && pendingSendKey(p.id) === k) byId.set(p.id, { conv: p.conv, id: p.id, at: p.at });
+  }
+  return [...byId.values()].sort((a, b) => a.at - b.at);
+}
+
 /**
- * The list with this send added. It replaces the entry with the same id (a retry of it) and the entry with the same
- * conversation: the page only sends an unresolved conversation again after asking, so that entry is either this send
- * (Retry that message) or one Riley chose to send as a new message, an explicit decision about it. Unresolved entries
- * are never dropped to make room (SEC-04): past PENDING_SEND_MAX only resolved (`seen`) ones go, oldest first.
+ * Move an earlier version's shared list to per-send keys: each unresolved entry gets its own key unless it has one,
+ * then the list is removed if no other tab changed it meanwhile. Resolved (`seen`) entries are dropped: they never
+ * match and are never shown. A race with another tab can at worst bring back an entry that tab just forgot (shown
+ * once more after a reload, then dismissed); it can never lose one.
  */
-export function rememberPendingSend(list: ReadonlyArray<PendingSend>, send: PendingSend): PendingSend[] {
-  const next = [...list.filter((p) => p.conv !== send.conv && p.id !== send.id), send];
-  let excess = next.length - PENDING_SEND_MAX;
-  if (excess <= 0) return next;
-  return next.filter((p) => {
-    if (!p.seen || excess <= 0) return true;
-    excess--;
-    return false;
-  });
+function migrateLegacyPendingSends(store: PendingSendStore) {
+  const raw = store.getItem(PENDING_SEND_KEY);
+  if (raw === null) return;
+  for (const p of parsePendingSends(raw)) {
+    if (p.seen) continue;
+    const k = pendingSendKey(p.id);
+    if (store.getItem(k) === null) store.setItem(k, JSON.stringify({ conv: p.conv, id: p.id, at: p.at }));
+  }
+  if (store.getItem(PENDING_SEND_KEY) === raw) store.removeItem(PENDING_SEND_KEY);
+}
+
+/**
+ * Remember a send before its request goes out. Only its own key is written: a retry of it (the same id) replaces
+ * itself, and no other send is ever dropped, also not one of the same conversation (Riley chose "Send as a new
+ * message" for it; the page abandons that one separately and forgets it only once the server confirms).
+ */
+export function storePendingSend(store: PendingSendStore, send: PendingSend) {
+  migrateLegacyPendingSends(store);
+  store.setItem(pendingSendKey(send.id), JSON.stringify({ conv: send.conv, id: send.id.toLowerCase(), at: send.at }));
+}
+
+/** Forget a send (its answer arrived, the server refused its id for good, or it was resolved): only its own key. */
+export function forgetPendingSend(store: PendingSendStore, id: string) {
+  migrateLegacyPendingSends(store);
+  store.removeItem(pendingSendKey(id));
 }
 
 /**
@@ -174,19 +225,13 @@ export function earlierOutcomeUnknown(reusedId: boolean, data: unknown): boolean
   return reusedId && d?.replay_safe !== true;
 }
 
-/** The list without this request (its answer arrived, or the server refused its id for good). */
-export const settledPendingSends = (list: ReadonlyArray<PendingSend>, id: string): PendingSend[] => list.filter((p) => p.id !== id);
-
 /**
- * The remembered send whose answer never arrived for exactly this conversation, unless it is resolved (`seen`); null
- * when there is none. The page then asks Riley whether a new send of it is that send again or a new message.
+ * The remembered send whose answer never arrived for exactly this conversation (the oldest, when several are), unless
+ * it is resolved (`seen`); null when there is none. The page then asks Riley whether a new send of it is that send
+ * again or a new message.
  */
 export const unresolvedPendingSend = (list: ReadonlyArray<PendingSend>, conv: string): PendingSend | null =>
   list.find((p) => p.conv === conv && !p.seen) ?? null;
-
-/** The list with this request marked seen (resolved: its account was shown and dismissed). */
-export const seenPendingSends = (list: ReadonlyArray<PendingSend>, id: string): PendingSend[] =>
-  list.map((p) => (p.id === id ? { ...p, seen: true as const } : p));
 
 /** SHA-256 (hex) of the conversation as the page sends it (role + text only); null when the browser has no Web Crypto. */
 export async function conversationKey(messages: ReadonlyArray<{ role: string; content: string }>): Promise<string | null> {

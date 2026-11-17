@@ -521,13 +521,13 @@ const PLAYLIST_MAYBE_CREATED =
  * A write-tool call that runs through the replay ledger (lib/chat-operations.ts), when the request carries a
  * request_id. `id` = the operation id: the supplement, stack, reading, quiz and playlist writes use it as their own
  * key, so a retry that re-runs the tool finds what an earlier try already wrote. `day` = the behavioral day the
- * operation first ran on (a new operation of a retry: the day the request was first sent), `today` = this moment's:
- * a re-run on a later day keeps an omitted date on the first day.
+ * operation first ran on (a new operation: the day the request was first sent). Every omitted date is that day, sent
+ * explicitly: a re-run on a later day, and a request that crosses the behavioral-day boundary while the model runs,
+ * both keep the date the request was sent on instead of re-reading "today" at write time.
  */
 interface OpContext {
   id: string;
   day: string;
-  today: string;
   /** The book being read when the operation first ran (a reading call that names no book): re-runs keep it. */
   bookId?: number;
   /** When the operation first ran (ISO): in check mode, a highlight changed since then may have been changed by it. */
@@ -581,8 +581,12 @@ async function removedGate(opId: string | undefined): Promise<string | null> {
   return removed === "none" ? null : JSON.stringify({ error: KEY_UNAVAILABLE });
 }
 
-/** The date to use when the model gave none: the operation's first day, when that is not today (a re-run). */
-const pinnedDate = (op?: OpContext): string | null => (op && op.day !== op.today ? op.day : null);
+/**
+ * The date to use when the model gave none: always the operation's day when the call runs through the ledger. Never
+ * left to the writer's own "today": that is read at write time, which after a day boundary crossed during the request
+ * (or on a later retry) is a different day from the one the request was sent on.
+ */
+const pinnedDate = (op?: OpContext): string | null => (op ? op.day : null);
 
 /** The book a reading call uses when it names none: the one pinned when the operation first ran. */
 const pinnedBook = (op: OpContext | undefined, input: Record<string, unknown>): { book_id: number } | Record<string, never> =>
@@ -1545,7 +1549,11 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
         .from("supplement_stack")
         .select("stack_id,name")
         .eq("is_active", true);
-      if (lookupErr) return JSON.stringify({ error: lookupErr.message });
+      if (lookupErr) {
+        // Code only: a database message can echo upstream detail, and it reaches the model and the receipt.
+        console.error("log_supplement_stack: stack lookup failed", lookupErr.code ?? "unknown");
+        return JSON.stringify({ error: "Onyx could not read your supplement stacks, so nothing was logged. Try again in a moment." });
+      }
 
       const lc = wanted.toLowerCase();
       const match =
@@ -1786,8 +1794,8 @@ export async function POST(req: NextRequest) {
       earlierUnconfirmed = true;
     }
     // A retry answers as of when the message was FIRST sent: its prompt time and behavioral day, and the day every new
-    // operation defaults to (an operation stored by an earlier try keeps its own context). `bday` stays this moment's
-    // behavioral day, so a write default that differs from it is sent as an explicit date (pinnedDate).
+    // operation defaults to (an operation stored by an earlier try keeps its own context). Every omitted date of a
+    // ledger write is sent as that day explicitly (pinnedDate), so a day boundary crossed later changes nothing.
     const pinned = ledger?.retry ? storedTemporal(ledger.requestContext) : null;
     const requestDay = pinned?.behavioral_today ?? bday;
     const promptTz = pinned?.time_zone ?? tz;
@@ -1849,7 +1857,6 @@ export async function POST(req: NextRequest) {
               (id, context, check) => runTool(block.name, input, {
                 id,
                 day: typeof context.behavioral_today === "string" ? context.behavioral_today : requestDay,
-                today: bday,
                 ...(typeof context.book_id === "number" ? { bookId: context.book_id } : {}),
                 ...(typeof context.started_at === "string" ? { startedAt: context.started_at } : {}),
                 ...(check ? { check: true } : {}),
