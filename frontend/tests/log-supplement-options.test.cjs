@@ -16,6 +16,14 @@ const { loadTs } = require("./helpers/load-ts.cjs");
 const { mountClient, response, deferred, withGlobals } = require("./helpers/hook-harness.cjs");
 
 const O = loadTs("lib/log-supplement-options.ts");
+// Every "Log selected" POST carries its own event_key (a fresh UUID per product; see lib/log-supplement-multi.ts).
+// The key's own rules are pinned in log-supplement-multi.test.cjs; here it is checked and set aside.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const sentBody = (write) => {
+  const { event_key, ...rest } = write.body;
+  assert.match(event_key, UUID_RE, "the POST carries an event_key");
+  return rest;
+};
 const TODAY = loadTs("lib/checkin.ts").fallbackBehavioralToday(new Date());
 
 const prod = (id, full_name, brand_name = "Synthetic Labs") => ({ product_id: id, brand_name, full_name, serving_size: 1, serving_unit: "capsule" });
@@ -256,7 +264,7 @@ test("section: tapping an option selects it like a checkbox and writes nothing; 
   await h.flush();
   assert.equal(h.calls.writes.length, 1);
   assert.equal(h.calls.writes[0].url, "/api/supplements/log-product");
-  assert.deepEqual(h.calls.writes[0].body, { product_id: "p-beta", product: "Synthetic Beta", amount: null, unit: null, times: [], date: null });
+  assert.deepEqual(sentBody(h.calls.writes[0]), { product_id: "p-beta", product: "Synthetic Beta", amount: null, unit: null, times: [], date: null });
   assert.equal(h.field("Amount for Synthetic Beta"), undefined, "a saved product is no longer edited");
   assert.match(h.text(), /Saved/);
 });
@@ -420,7 +428,7 @@ test("section: a batch answering after Riley selected another product keeps that
   second.resolve(response({ ok: false, error: "Synthetic refusal" }, 422));
   await h.flush();
   assert.equal(h.calls.writes.length, 2);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
+  assert.deepEqual(sentBody(h.calls.writes[1]), { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
   assert.equal(h.option("Synthetic Gamma").props["aria-checked"], true);
   assert.match(h.text(), /Not saved: Synthetic refusal/);
 });
@@ -454,8 +462,8 @@ test("section: a Say it product moved in with Edit keeps its amount, unit and ti
   await h.click("Log selected (2)");
   await h.flush();
   assert.equal(h.calls.writes.length, 3);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 15, unit: "mg", times: ["08:30"], date: null });
-  assert.deepEqual(h.calls.writes[2].body, { product_id: "p-gamma", product: "Synthetic Gamma", amount: null, unit: null, times: ["08:30"], date: null });
+  assert.deepEqual(sentBody(h.calls.writes[1]), { product_id: "p-beta", product: "Synthetic Beta", amount: 15, unit: "mg", times: ["08:30"], date: null });
+  assert.deepEqual(sentBody(h.calls.writes[2]), { product_id: "p-gamma", product: "Synthetic Gamma", amount: null, unit: null, times: ["08:30"], date: null });
 });
 
 test("source: the options are checkboxes with 44 px targets, accent when selected, visible focus; a tap only sets state", () => {
