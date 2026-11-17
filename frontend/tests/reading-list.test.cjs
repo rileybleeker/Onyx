@@ -126,6 +126,25 @@ test('reuse binds observed candidate version and membership, and stale choice re
   const retry=L.nextSend(refused.draft,key);assert.equal(retry.body.resolve,undefined);
 });
 
+test('retried remove acknowledgement produces the same Undo state as a first attempt',()=>{
+  const removeBody={op:'remove',op_key:key(),book_id:7,expected_version:1};
+  // A replayed remove answers 200 with the item the removal left, exactly like the first attempt.
+  const json=success(removeBody);
+  const ack=L.acknowledgement(removeBody,json);
+  assert.deepEqual(ack,{kind:'undo',item:json.item});
+  assert.equal(ack.kind,'undo');
+  assert.equal(ack.item.book_id,7);
+  // A retried Start / Restore behaves as its first attempt does.
+  assert.deepEqual(L.acknowledgement({...removeBody,op:'restore'},json),{kind:'clearUndo'});
+  assert.deepEqual(L.acknowledgement({...removeBody,op:'start',start_date:null},json),{kind:'resetStart'});
+  // move / edit carry no post-acknowledgement UI effect.
+  assert.deepEqual(L.acknowledgement({op:'move',op_key:key(),book_id:7,direction:'up',expected_order:[7]},json),{kind:'none'});
+  assert.deepEqual(L.acknowledgement({...removeBody,op:'edit',title:'x',author:null,edition:null},json),{kind:'none'});
+  // A remove answered without an item offers no Undo.
+  assert.deepEqual(L.acknowledgement(removeBody,{success:true,book_id:7,op_version:1}),{kind:'none'});
+  assert.deepEqual(L.acknowledgement(removeBody,null),{kind:'none'});
+});
+
 function fakeServer(result,error=null,readError=null){
   const calls=[];
   const row={book_id:7,slug:'synthetic-book',title:'Synthetic Book',author:null,status:'queued',edition_identifier:null,list_position:1024,list_removed_at:null,list_version:1,created_at:'2026-01-01'};

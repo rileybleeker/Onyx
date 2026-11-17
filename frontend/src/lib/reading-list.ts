@@ -396,6 +396,24 @@ export function applyAnswer(d: Draft, body: Body, status: number, json: Record<s
   return { draft: cleared, outcome: { kind: "refused", code } };
 }
 
+/**
+ * The UI acknowledgement of a DEFINITIVE answer (200) to a row action, applied by BOTH a first attempt and a
+ * retry of the same body (the server answers a replayed remove with the same `item`, so the retry must offer
+ * Undo exactly like the first attempt). move / edit / create carry no post-acknowledgement UI effect.
+ */
+export type AckEffect = { kind: "undo"; item: ListItem } | { kind: "clearUndo" } | { kind: "resetStart" } | { kind: "none" };
+
+export function acknowledgement(body: Body, json: Record<string, unknown> | null): AckEffect {
+  if (!json) return { kind: "none" };
+  if (body.op === "remove") {
+    const item = json.item as ListItem | null | undefined;
+    return item ? { kind: "undo", item } : { kind: "none" };
+  }
+  if (body.op === "restore") return { kind: "clearUndo" };
+  if (body.op === "start") return { kind: "resetStart" };
+  return { kind: "none" };
+}
+
 /** Riley keeps his words after a conflict: base them on the server's newer version, then they are sent. */
 export function keepMine(d: Draft): Draft {
   if (!d.conflict) return d;

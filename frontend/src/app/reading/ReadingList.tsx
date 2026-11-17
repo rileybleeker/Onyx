@@ -10,6 +10,7 @@ import { sameJson } from "@/lib/format";
 import type { Book } from "@/lib/reading";
 import {
   LIST_URL,
+  acknowledgement,
   applyAnswer,
   draftBaseline,
   draftSettled,
@@ -169,6 +170,7 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
         setRowMsg({ id: item.book_id, text: listErrorText(a.json.error as string) });
         return null;
       }
+      applyAck(body, a.json);
       return a.json;
     } catch (e) {
       setRowMsg({ id: item.book_id, text: e instanceof Error && e.message ? e.message : listErrorText(null), retry: body });
@@ -178,24 +180,24 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
     }
   };
 
-  const list = items ?? [];
-  const move = (item: ListItem, direction: "up" | "down") =>
-    void act(item, { op: "move", op_key: newOpKey(), book_id: item.book_id, direction, expected_order: list.map((i) => i.book_id) });
-  const remove = async (item: ListItem) => {
-    const j = await act(item, { op: "remove", op_key: newOpKey(), book_id: item.book_id, expected_version: item.version });
-    if (j?.item) setUndo(j.item as ListItem);
-  };
-  const restore = async (item: ListItem) => {
-    const j = await act(item, { op: "restore", op_key: newOpKey(), book_id: item.book_id, expected_version: item.version });
-    if (j) setUndo(null);
-  };
-  const start = async (item: ListItem) => {
-    const j = await act(item, { op: "start", op_key: newOpKey(), book_id: item.book_id, expected_version: item.version, start_date: startDate || null });
-    if (j) {
+  /** One acknowledgement path for a first attempt AND a retry: Undo for a removed book, reset of the start UI, etc. */
+  const applyAck = useCallback((body: Body, json: Record<string, unknown> | null) => {
+    const effect = acknowledgement(body, json);
+    if (effect.kind === "undo") setUndo(effect.item);
+    else if (effect.kind === "clearUndo") setUndo(null);
+    else if (effect.kind === "resetStart") {
       setStartFor(null);
       setStartDate("");
     }
-  };
+  }, []);
+
+  const list = items ?? [];
+  const move = (item: ListItem, direction: "up" | "down") =>
+    void act(item, { op: "move", op_key: newOpKey(), book_id: item.book_id, direction, expected_order: list.map((i) => i.book_id) });
+  const remove = (item: ListItem) => void act(item, { op: "remove", op_key: newOpKey(), book_id: item.book_id, expected_version: item.version });
+  const restore = (item: ListItem) => void act(item, { op: "restore", op_key: newOpKey(), book_id: item.book_id, expected_version: item.version });
+  const start = (item: ListItem) =>
+    void act(item, { op: "start", op_key: newOpKey(), book_id: item.book_id, expected_version: item.version, start_date: startDate || null });
 
   const retryPending = async () => {
     for (const p of [...localRef.current.pending]) {
@@ -204,6 +206,7 @@ export default function ReadingList({ books, onChanged }: { books: Book[]; onCha
         const a = await send(p.body);
         persist(withoutPending(localRef.current, p.body.op_key));
         if (a.status !== 200) setRowMsg({ id: Number(p.body.book_id ?? 0), text: listErrorText(a.json.error as string) });
+        else applyAck(p.body, a.json);
       } catch {
         return; // still unreachable: the rest stay recorded
       }
