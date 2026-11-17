@@ -394,6 +394,7 @@ export default function JournalSection() {
     let live = true;
     const hit = clientCache.peek<ListAnswer>(url);
     setList(hit ?? null);
+    setListFailed(false); // a failure for the previous day does not carry over while this day loads
     if (!hit) {
       void clientCache.read<ListAnswer>(url).then((v) => {
         if (!live || !v) return;
@@ -610,9 +611,24 @@ export default function JournalSection() {
               <p className="mt-1 text-[13px] text-text-tertiary">No journal entries today yet.</p>
             )
           ) : listFailed ? (
-            <p role="alert" className="mt-1 text-[13px] text-down">Couldn&apos;t load today&apos;s entries.</p>
+            <div className="mt-1 flex items-center gap-3">
+              <p role="alert" className="text-[13px] text-down">Couldn&apos;t load today&apos;s journal entries. Try again.</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setListFailed(false);
+                  void loadList(urlRef.current); // re-runs only today's list read
+                }}
+                className="min-h-11 px-3 text-[13px] text-text-secondary hover:text-text-primary underline underline-offset-2"
+              >
+                Retry
+              </button>
+            </div>
           ) : (
-            <div aria-hidden="true" className="mt-1 skeleton h-11 rounded-control" />
+            <>
+              <p role="status" className="mt-1 text-[13px] text-text-tertiary">Loading today&apos;s journal entries…</p>
+              <div aria-hidden="true" className="mt-1 skeleton h-11 rounded-control" />
+            </>
           )}
           {list && listFailed && <p className="mt-1 text-[12px] text-text-tertiary">Couldn&apos;t refresh; showing the last list.</p>}
         </div>
