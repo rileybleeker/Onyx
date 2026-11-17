@@ -103,6 +103,7 @@ except ImportError:
 import hashlib
 
 import hrv_alignment as al
+import hrv_feature_sources as feature_sources
 import hrv_model_artifact as model_artifact
 
 warnings.filterwarnings("ignore")
@@ -601,6 +602,9 @@ def fetch_all(table: str, select: str = "*", filters: list | None = None,
 SUPPLEMENT_ROLLUP_MAT = "supplement_intake_by_compound_mat"
 SUPPLEMENT_ROLLUP_VIEW = "supplement_intake_by_compound"
 _MISSING_RELATION_CODES = {"PGRST205", "42P01"}
+# Relation each fingerprinted source was actually loaded from this run (hrv_feature_sources
+# .mark_relation_mismatch compares it with the relation the fingerprint was taken from).
+LOADED_RELATIONS: dict[str, str] = {}
 
 
 def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
@@ -613,7 +617,9 @@ def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
     """
     fetch = fetch or fetch_all
     try:
-        return fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+        out = fetch(SUPPLEMENT_ROLLUP_MAT, select=select)
+        LOADED_RELATIONS["supplement_rollup"] = SUPPLEMENT_ROLLUP_MAT
+        return out
     except Exception as e:  # postgrest APIError, network error, ...
         code = getattr(e, "code", None)
         msg = f"  {SUPPLEMENT_ROLLUP_MAT} unavailable ({code or type(e).__name__}); reading {SUPPLEMENT_ROLLUP_VIEW}"
@@ -621,7 +627,9 @@ def fetch_supplement_rollup(select: str, fetch=None) -> pd.DataFrame:
             log.info(msg)
         else:
             log.warning(f"{msg}: {str(e)[:200]}")
-        return fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+        out = fetch(SUPPLEMENT_ROLLUP_VIEW, select=select)
+        LOADED_RELATIONS["supplement_rollup"] = SUPPLEMENT_ROLLUP_VIEW
+        return out
 
 
 def to_date_str(s: pd.Series) -> pd.Series:
@@ -806,6 +814,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  whoop_cycles.step_count load failed ({e!r}); continuing without WHOOP steps")
+        LOAD_FAILURES.add("whoop_cycles")
         data["whoop_steps"] = pd.DataFrame()
 
     # Recovery per cycle, for the alignment guard (hrv_alignment.check_matrix_hrv).
@@ -949,6 +958,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  delivery_daily load failed ({e!r}); continuing without delivery features")
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         data["delivery"] = pd.DataFrame()
     # How far the receipt ETL has verifiably looked: the view has a row only on days WITH an
     # order, so "no row" after the last order is a true zero only if the ETL kept running.
@@ -985,6 +995,10 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # Without the heartbeat AND the unread list, fall back to the conservative rule.
         data["delivery_covered_through"] = None
         data["delivery_unread_days"] = []
+        # The fallback zero-fills fewer days than the full read would; when the coverage reads
+        # recover, neither delivery_daily's nor delivery_email_log's fingerprint moves, so neither
+        # may be certified.
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         log.warning(f"  delivery coverage load failed ({e!r}); delivery coverage ends at the last order day")
 
     # iPhone Screen Time (pds.phone_usage_daily, 2026-11-11): Apple's own Screen Time
@@ -1001,6 +1015,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  phone_usage_daily load failed ({e!r}); continuing without screen-time features")
+        LOAD_FAILURES.add("phone_usage_daily")
         data["screen"] = pd.DataFrame()
 
     # Air quality (pds.air_quality_daily, 2026-11-11): daily PM2.5 / US AQI per ET clock day from
@@ -1015,6 +1030,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  air_quality_daily load failed ({e!r}); continuing without air-quality features")
+        LOAD_FAILURES.add("air_quality_daily")
         data["air_quality"] = pd.DataFrame()
 
     # Weather (pds.weather_daily, 2026-11-13): daily outdoor weather per ET clock day from the
@@ -1028,6 +1044,7 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
     except Exception as e:  # noqa: BLE001
         log.warning(f"  weather_daily load failed ({e!r}); continuing without weather features")
+        LOAD_FAILURES.add("weather_daily")
         data["weather"] = pd.DataFrame()
 
     # Notion personal Journal: structured metadata (mood, confidence, word_count,
@@ -1607,6 +1624,7 @@ def merge_delivery_features(df: pd.DataFrame, delivery: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Delivery feature merge failed ({e!r}); continuing without delivery features")
+        LOAD_FAILURES.update(("delivery_daily", "delivery_email_log"))
         return df
 
 
@@ -1693,6 +1711,7 @@ def merge_screen_time_features(df: pd.DataFrame, screen: pd.DataFrame | None) ->
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Screen-time feature merge failed ({e!r}); continuing without screen-time features")
+        LOAD_FAILURES.add("phone_usage_daily")
         return df
 
 
@@ -1746,6 +1765,7 @@ def merge_air_quality_features(df: pd.DataFrame, air: pd.DataFrame | None) -> pd
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Air-quality feature merge failed ({e!r}); continuing without air-quality features")
+        LOAD_FAILURES.add("air_quality_daily")
         return df
 
 
@@ -1852,6 +1872,7 @@ def merge_weather_features(df: pd.DataFrame, weather: pd.DataFrame | None,
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  Weather feature merge failed ({e!r}); continuing without weather features")
+        LOAD_FAILURES.add("weather_daily")
         return df
 
 
@@ -1920,6 +1941,7 @@ def merge_whoop_steps_features(df: pd.DataFrame, cycles: pd.DataFrame | None) ->
         return out
     except Exception as e:  # noqa: BLE001
         log.warning(f"  WHOOP steps merge failed ({e!r}); continuing without WHOOP steps")
+        LOAD_FAILURES.add("whoop_cycles")
         return df
 
 
@@ -2896,7 +2918,8 @@ def print_completeness(df: pd.DataFrame) -> None:
 #     total: it is left out, never read as 0 (the value of a day without an intake). The view
 #     filters out ingredients with no readable quantity, so those days come from a separate read of
 #     the intakes and their products (load_supplement_unquantified). When that read fails nothing
-#     is published (the stored result of the last complete run stays and the heartbeat is partial);
+#     is published (the stored result of the last complete run stays and the heartbeat is partial)
+#     and both relations are stored as unknown in the source baseline (never as consumed);
 #     when the rollup is empty the result is empty and replaces the stored one.
 # What was left out is on each result row (excluded_units / excluded_days) and, for compounds with
 # no estimate, in the coverage payload (supplement_impact / dose_response_coverage), which
@@ -2960,13 +2983,20 @@ def supplement_unquantified_days(products: pd.DataFrame | None,
     return out.sort_values(_UNQUANTIFIED_COLS).reset_index(drop=True)
 
 
-def load_supplement_unquantified(fetch=None) -> pd.DataFrame | None:
+# The two relations load_supplement_unquantified reads (hrv_feature_sources: supplement_products,
+# supplement_intake). A failed read marks both: the stage that failed is not reported, and neither
+# may be stored as consumed (PIPE09-R1).
+SUPPLEMENT_UNQUANTIFIED_SOURCES = ("supplement_products", "supplement_intake")
+
+
+def load_supplement_unquantified(fetch=None, failures: set[str] | None = None) -> pd.DataFrame | None:
     """Days a compound was taken from a product that gives no readable amount for it.
 
     Returns None when a read fails: the dose-response then runs without this check and says so in
-    its coverage (`unquantified_check`). Logs an error code or type only. `fetch` defaults to
-    fetch_all (injectable for tests). Intakes are read only when some product has such an
-    ingredient.
+    its coverage (`unquantified_check`), and both sources are added to `failures` (default
+    LOAD_FAILURES), so the stored source baseline marks them unknown instead of consumed and the
+    next backfill check retries. Logs an error code or type only. `fetch` defaults to fetch_all
+    (injectable for tests). Intakes are read only when some product has such an ingredient.
     """
     fetch = fetch or fetch_all
     try:
@@ -2977,6 +3007,7 @@ def load_supplement_unquantified(fetch=None) -> pd.DataFrame | None:
         return supplement_unquantified_days(products, intakes)
     except Exception as e:  # postgrest APIError, network error, ...
         log.warning(f"  Supplement amount check unavailable ({getattr(e, 'code', None) or type(e).__name__})")
+        (LOAD_FAILURES if failures is None else failures).update(SUPPLEMENT_UNQUANTIFIED_SOURCES)
         return None
 
 
@@ -6285,6 +6316,28 @@ def check_alignment(data: dict, df: pd.DataFrame) -> str | None:
     return None
 
 
+# Sources whose load or merge failed open this run: their stored baseline is marked unknown, so
+# the omitted history is never reported as consumed (hrv_feature_sources.mark_failed).
+LOAD_FAILURES: set[str] = set()
+
+
+def capture_source_lineage() -> dict | None:
+    """Fingerprints of the HRV inputs' history (hrv_feature_sources.capture). Fail-open: a problem
+    here never stops the retrain; the backfill check then sees no fresh baseline and says so."""
+    try:
+        snapshot = feature_sources.capture(supa, et_today())
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"  Source fingerprints not captured ({feature_sources.error_code(e)})")
+        return None
+    if snapshot is None:
+        log.info("  Source fingerprints skipped: pds.hrv_source_fingerprint is not installed")
+        return None
+    failed = sorted(n for n, v in snapshot["sources"].items() if v.get("error"))
+    log.info(f"  Source fingerprints captured for {len(snapshot['sources']) - len(failed)} source(s)"
+             + (f"; failed: {', '.join(failed)}" if failed else ""))
+    return snapshot
+
+
 def main() -> str | None:
     """Returns a warning for a PARTIAL heartbeat, or None for success."""
     global INPUT_DATA_HASH
@@ -6298,6 +6351,10 @@ def main() -> str | None:
 
     # ---------- Phase 1: Data Pipeline ----------
     log.info("=== PHASE 1: DATA PIPELINE ===")
+    # Fingerprints of every input's history, taken BEFORE the data is read (audit PIPE-09,
+    # hrv_feature_sources.py). Stored after the results below; the hourly backfill check compares
+    # against them, so an edit or deletion after this point triggers the next retrain.
+    source_lineage = capture_source_lineage()
     data = load_all_data()
     df = build_feature_matrix(data)
     print_completeness(df)
@@ -6455,6 +6512,13 @@ def main() -> str | None:
         },
         dose_response=dose_response,
     )
+    # Last, so it exists only when this run's results were stored (hrv_feature_sources.py).
+    feature_sources.mark_failed(source_lineage, LOAD_FAILURES)
+    feature_sources.mark_relation_mismatch(source_lineage, LOADED_RELATIONS)
+    if feature_sources.store_baseline(supa, source_lineage, INPUT_DATA_HASH):
+        log.info(f"    Upserted: {feature_sources.LINEAGE_RESULT_TYPE}/{feature_sources.LINEAGE_RESULT_KEY}")
+    elif source_lineage:
+        log.warning("    Source fingerprints not stored; the next backfill check treats the baseline as stale")
 
     # ---------- Run-Manifest Artifact (audit fix 4#38) ----------
     # Dump the full feature list + top-20 SHAP / permutation / controllable lists

@@ -2,10 +2,16 @@
 """
 Onyx HRV Backfill Detection
 ============================
-Scans health-data tables for historical rows (calendar date older than the
-rolling "recent" window) that have been written or updated since the last
-hrv_analysis.py run. Emits a GitHub Actions output flag so the companion
-workflow can conditionally trigger a full analysis retrain.
+Decides whether the HRV analysis must be retrained because the HISTORY of one of its inputs
+changed since the last retrain read its data: a backdated row, an edit, or a deletion. The
+inputs and how a change to each is seen live in ONE manifest, hrv_feature_sources.py, which the
+retrain also uses to record what it trained on (audit PIPE-09).
+
+Emits a GitHub Actions output flag (backfill_detected) so the companion workflow can trigger a
+full analysis retrain. A check that could not be made is UNKNOWN, never "no backfill": it writes a
+partial hrv_analysis|backfill_check heartbeat ("GUARD hrv_backfill_detection: ...") and retrains as
+a precaution once the last retrain is a few hours old. Logs and heartbeats carry source names and
+error codes only.
 
 Runs hourly via .github/workflows/hrv-retrain-on-backfill.yml.
 """
@@ -13,10 +19,14 @@ Runs hourly via .github/workflows/hrv-retrain-on-backfill.yml.
 import logging
 import os
 import sys
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from supabase import create_client
+
+import hrv_feature_sources as sources
+from sync_log_helper import log_sync
 
 load_dotenv()
 
@@ -31,36 +41,21 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supa = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Calendar dates older than (today - HISTORICAL_DAYS) are considered
-# "historical" — writes to recent days are expected from the hourly ETL
-# and should not count as backfill.
-HISTORICAL_DAYS = 2
+ET_TZ = ZoneInfo("America/New_York")
 
-TABLES_TO_CHECK = [
-    # (table, date_col, sync_col)
-    # whoop_journal removed 2026-06-11: frozen archive post-merge — all
-    # behavior rows (incl. WHOOP history) live in habit_journal, whose
-    # backfill trigger + row scan below cover them.
-    ("habit_journal", "cycle_date", "synced_at"),
-    ("myfitnesspal_nutrition", "calendar_date", "synced_at"),
-    ("garmin_daily_summary", "calendar_date", "synced_at"),
-    ("eight_sleep_trends", "calendar_date", "synced_at"),
-    ("whoop_cycles", "start_time", "updated_at"),
-]
+# Heartbeat of the detection itself. A partial row repeats at most every REPEAT_HOURS while the
+# same problem lasts (the /status sync history shows only the newest 100 rows); one success row is
+# written when the problem clears.
+HEARTBEAT = ("hrv_analysis", "backfill_check")
+REPEAT_HOURS = 6
 
-# Sources whose backfills only show up in pds.sync_log, not via row-level
-# sync_col timestamps. Currently just habit_journal — a Postgres trigger
-# (habit_journal_backfill_trigger) emits a sync_log row for every past-date
-# INSERT/UPDATE/DELETE, covering paths the row-scan check misses: the
-# UPDATE branch of upsert (doesn't bump synced_at) and DELETE (no row left
-# to find).
-SYNC_LOG_SIGNALS = [
-    # (source, data_type)
-    ("habit_journal", "backfill_signal"),
-]
+
+def et_today():
+    return datetime.now(ET_TZ).date()
 
 
 def get_last_analysis_time() -> str | None:
+    """Newest hrv_analysis_results.computed_at, None when there is none. Raises on a failed read."""
     resp = (
         supa.schema("pds")
         .from_("hrv_analysis_results")
@@ -72,50 +67,6 @@ def get_last_analysis_time() -> str | None:
     if not resp.data:
         return None
     return resp.data[0]["computed_at"]
-
-
-def has_backfilled_rows(table: str, date_col: str, sync_col: str,
-                        last_analysis: str, historical_cutoff: str) -> bool:
-    try:
-        resp = (
-            supa.schema("pds")
-            .from_(table)
-            .select(date_col)
-            .gt(sync_col, last_analysis)
-            .lt(date_col, historical_cutoff)
-            .limit(1)
-            .execute()
-        )
-        return bool(resp.data)
-    except Exception as e:
-        log.warning(f"  {table}: check failed ({e}) — treating as no backfill")
-        return False
-
-
-def has_sync_log_signal(source: str, data_type: str, last_analysis: str,
-                        historical_cutoff: str) -> bool:
-    """Detect backfill via pds.sync_log signals (currently used for
-    habit_journal mutations — see habit_journal_backfill_trigger).
-
-    The trigger only emits a sync_log row when the affected cycle_date is
-    in the past, so we filter on date_range_start < historical_cutoff to
-    stay consistent with the row-scan threshold (today-2)."""
-    try:
-        resp = (
-            supa.schema("pds")
-            .from_("sync_log")
-            .select("sync_start")
-            .eq("source", source)
-            .eq("data_type", data_type)
-            .gt("sync_start", last_analysis)
-            .lt("date_range_start", historical_cutoff)
-            .limit(1)
-            .execute()
-        )
-        return bool(resp.data)
-    except Exception as e:
-        log.warning(f"  sync_log[{source}/{data_type}]: check failed ({e}) — treating as no backfill")
-        return False
 
 
 def set_output(key: str, value: str) -> None:
@@ -140,7 +91,7 @@ def last_retrain_tripped_a_guard() -> str | None:
             .order("sync_start", desc=True).limit(1).execute()
         )
     except Exception as e:  # noqa: BLE001
-        log.warning(f"  guard check failed ({e}) — ignoring")
+        log.warning(f"  guard check failed ({sources.error_code(e)}) — ignoring")
         return None
     row = (resp.data or [None])[0]
     if row and row.get("status") == "failed" and str(row.get("error_message") or "").startswith("GUARD"):
@@ -148,43 +99,82 @@ def last_retrain_tripped_a_guard() -> str | None:
     return None
 
 
+def report(status: str, message: str | None, started_at: datetime) -> bool:
+    """Write the detection heartbeat unless it would repeat (see HEARTBEAT). Never raises.
+    Returns True when a row was written."""
+    source, data_type = HEARTBEAT
+    last = None
+    try:
+        resp = (
+            supa.schema("pds").from_("sync_log")
+            .select("status,error_message,sync_start")
+            .eq("source", source).eq("data_type", data_type)
+            .order("sync_start", desc=True).limit(1).execute()
+        )
+        last = (resp.data or [None])[0]
+    except Exception as e:  # noqa: BLE001 - the heartbeat must never stop the decision
+        log.warning(f"  heartbeat lookup failed ({sources.error_code(e)}); writing it anyway")
+    if status == "success":
+        if last is None or last.get("status") == "success":
+            return False
+    elif last and last.get("status") == status and last.get("error_message") == message:
+        start = sources.parse_ts(last.get("sync_start"))
+        if start and datetime.now(timezone.utc) - start < timedelta(hours=REPEAT_HOURS):
+            return False
+    log_sync(supa, source=source, data_type=data_type, status=status, records=0,
+             started_at=started_at, error=message)
+    return True
+
+
+def _age_hours(ts: str | None) -> float | None:
+    parsed = sources.parse_ts(ts)
+    if parsed is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 3600)
+
+
 def main() -> int:
+    started_at = datetime.now(timezone.utc)
     guard = last_retrain_tripped_a_guard()
     if guard:
         log.warning(f"Last retrain stopped on a guard — no hourly retry (daily run re-checks): {guard[:200]}")
         set_output("backfill_detected", "false")
         return 0
 
-    last_analysis = get_last_analysis_time()
+    try:
+        last_analysis = get_last_analysis_time()
+    except Exception as e:  # noqa: BLE001
+        code = sources.error_code(e)
+        msg = (f"GUARD hrv_backfill_detection: could not read the last analysis time ({code}); "
+               "retraining as a precaution")
+        log.warning(msg)
+        report("partial", msg, started_at)
+        set_output("backfill_detected", "true")
+        return 0
     if last_analysis is None:
         log.info("No prior hrv_analysis_results found — signaling initial run.")
         set_output("backfill_detected", "true")
         return 0
 
-    historical_cutoff = (date.today() - timedelta(days=HISTORICAL_DAYS)).isoformat()
+    today = et_today()
     log.info(f"Last analysis: {last_analysis}")
-    log.info(f"Historical cutoff: date < {historical_cutoff}")
+    log.info(f"Watching {len(sources.SOURCES)} sources (hrv_feature_sources.py); "
+             f"history = rows dated before today - settle days")
 
-    detected = False
-    for table, date_col, sync_col in TABLES_TO_CHECK:
-        if has_backfilled_rows(table, date_col, sync_col, last_analysis, historical_cutoff):
-            log.info(f"  {table}: backfilled rows present")
-            detected = True
-        else:
-            log.info(f"  {table}: no backfill")
+    baseline, baseline_at, baseline_error = sources.read_baseline(supa)
+    det = sources.detect(supa, today, last_analysis, baseline, baseline_at, baseline_error)
+    decision = sources.decide(det, _age_hours(last_analysis))
 
-    for source, data_type in SYNC_LOG_SIGNALS:
-        if has_sync_log_signal(source, data_type, last_analysis, historical_cutoff):
-            log.info(f"  sync_log[{source}/{data_type}]: backfill signal present")
-            detected = True
-        else:
-            log.info(f"  sync_log[{source}/{data_type}]: no signal")
+    for label in det.changed:
+        log.info(f"  changed: {label}")
+    for label in det.unknown:
+        log.warning(f"  unknown: {label}")
+    if not det.fingerprint_installed:
+        log.warning("  fingerprints: pds.hrv_source_fingerprint not installed — row scans and signals only")
+    log.info(f"Decision: {'retrain' if decision.retrain else 'no retrain'} ({decision.reason})")
 
-    set_output("backfill_detected", "true" if detected else "false")
-    if detected:
-        log.info("Backfill detected — signaling retrain.")
-    else:
-        log.info("No backfill detected — skipping retrain.")
+    report(decision.status, decision.message, started_at)
+    set_output("backfill_detected", "true" if decision.retrain else "false")
     return 0
 
 

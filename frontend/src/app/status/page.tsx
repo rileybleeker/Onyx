@@ -357,6 +357,7 @@ const HISTORY_TYPE_LABELS: Record<string, string> = {
   usage: "Usage",
   sessions: "Sessions",
   retrain: "Retrain",
+  backfill_check: "Backfill Check",
   report: "Trial Report",
   admin: "Trial Admin",
   weight: "Weight",
